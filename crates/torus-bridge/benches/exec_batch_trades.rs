@@ -1,10 +1,10 @@
 //! O3 micro-bench: execute_batch under a fills-heavy block over the
 //! prod-shaped NativeStateOverlay backend — 200 resting sells crossed by 200
-//! buys (200 fills = 600 trade-history KVs per block). A/B the per-fill
-//! trade-persist cost: inline overlay PUTs (pre-O3) vs deferred buffering
-//! (`ctx.defer_trades`, the live path with a background writer). The deferred
-//! variant times `take_pending_trade_batch` too — the handoff the exec thread pays;
-//! the RocksDB write itself is off-thread and intentionally not measured.
+//! buys (200 fills per block). A/B the trade-history cost: packed rows encoded
+//! and PUT inline into the overlay vs deferred (`ctx.defer_trades`, the live
+//! path: fills recorded, rows encoded and written by a background writer).
+//! Both variants time `take_pending_trade_fills` — the handoff the exec thread
+//! pays; the off-thread encode + RocksDB write is intentionally not measured.
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
@@ -106,13 +106,9 @@ fn bench_trades(c: &mut Criterion, name: &str, defer: bool) {
             |mut ctx| {
                 let result = NativeExecutor::execute_batch(&mut ctx, &buys);
                 assert!(result.results.iter().all(|r| r.success));
-                // The exec thread's full O3 cost includes the buffer handoff.
-                let pending = ctx.take_pending_trade_batch();
-                if defer {
-                    assert_eq!(pending.len(), FILLS_PER_BLOCK * 3);
-                } else {
-                    assert!(pending.is_empty());
-                }
+                // The exec thread's full O3 cost includes the fills handoff.
+                let pending = ctx.take_pending_trade_fills();
+                assert_eq!(pending.len(), FILLS_PER_BLOCK);
                 (ctx, pending)
             },
             BatchSize::LargeInput,

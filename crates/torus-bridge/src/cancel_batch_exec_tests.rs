@@ -271,12 +271,7 @@ fn cancel_batch_flag_on_matches_off_mixed_blocks() {
         assert!(flat.iter().any(|r| r.0 == "cancel_order" && r.1));
         assert!(flat.iter().any(|r| r.0 == "cancel_order" && !r.1));
         assert!(flat.iter().any(|r| r.0 == "modify_order" && r.1));
-        let trades = off
-            .cf_dump
-            .iter()
-            .filter(|(cf, _, _)| cf == CF_NATIVE_TRADES)
-            .count();
-        assert!(trades > 10, "scenario must fill: {trades} trades");
+        assert!(off.trade_index > 10, "scenario must fill: {} fills", off.trade_index);
         assert_eq!(off, on, "TORUS_CANCEL_BATCH diverged (seed {seed})");
     }
 }

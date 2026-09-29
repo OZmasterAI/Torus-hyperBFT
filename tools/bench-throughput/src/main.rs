@@ -1223,19 +1223,19 @@ fn run_matching_engine_on<T: torus_state::StateBackend>(
         NativeExecutor::execute_batch(&mut ctx, &actions);
         let elapsed = t.elapsed();
         ctx.metrics = None;
-        // Live O3 shape: the node hands buffered trade KVs to a background
+        // Live O3 shape: the node hands the block's fills to a background
         // writer after exec — draining here keeps the buffer from growing
         // across batches without charging the exec timer.
-        let deferred_kvs = ctx.take_pending_trades().len();
+        let deferred_fills = ctx.take_pending_trade_fills().len();
         let rate = batch_size as f64 / elapsed.as_secs_f64();
 
         println!(
-            "Batch {}: {:.0} orders/sec ({:.1}ms) | fills {} | deferred KVs {}",
+            "Batch {}: {:.0} orders/sec ({:.1}ms) | fills {} | deferred fills {}",
             format_num(batch_size as u64),
             rate,
             elapsed.as_secs_f64() * 1000.0,
             format_num((ctx.trade_index - fills_before) as u64),
-            format_num(deferred_kvs as u64),
+            format_num(deferred_fills as u64),
         );
         let enc = phase_metrics.encode();
         println!(

@@ -1,17 +1,18 @@
-//! O3: deferred trade-history writes (CF_NATIVE_TRADES / CF_NATIVE_USER_TRADES).
+//! O3 + s77: trade history (CF_NATIVE_TRADES / CF_NATIVE_USER_TRADES).
 //!
-//! These CFs are node-local (NOT in the native consensus root), so their writes
-//! can leave the execution critical path: with `ctx.defer_trades` set, fills
-//! buffer raw KVs in the context instead of PUTting into the state backend, and
-//! the caller hands them to a background writer. The deferred KVs must be
-//! byte-identical to what the inline path writes.
+//! These CFs are node-local (NOT in the native consensus root). Execution
+//! records one `TradeFill` per fill; the block's packed rows are built from
+//! all of its fills (`trade_rows::encode_block`). With `ctx.defer_trades` set,
+//! the caller takes the fills and writes the rows (background writer);
+//! otherwise each `execute_batch` writes them inline. Both give the same rows.
 
 use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::NativeBalance;
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::{StateBackend, StateDb};
+use torus_state::trade_rows::{decode_trade_row, decode_user_row, encode_block, TradeFill};
+use torus_state::{PackedCfBatch, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 // ---- Helpers (mirrors parallel_matching_tests.rs) ----
@@ -94,100 +95,100 @@ fn cf_rows<T: StateBackend>(state: &T, cf: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     state.iterate_cf(cf, None).expect("iterate cf")
 }
 
+fn trade_indices(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u32>> {
+    rows.iter()
+        .map(|(_, v)| decode_trade_row(v).unwrap().1.iter().map(|f| f.trade_index).collect())
+        .collect()
+}
+
+/// Write the block's rows the way the node's writer does.
+fn write_rows(db: &StateDb, fills: &[TradeFill]) {
+    let mut rows = PackedCfBatch::default();
+    encode_block(1, 1000, fills, &mut rows);
+    let writer = torus_state::BackgroundCfWriter::spawn_with_policy(
+        db.clone(),
+        "packed-trade-test",
+        1,
+        torus_state::BgWriterPolicy { chunk_kvs: 2, low_pri: false },
+    );
+    writer.send_packed(rows).unwrap();
+    drop(writer);
+}
+
 // ============================================================================
-// Baseline: default (defer off) writes trade rows inline, as before O3.
+// Baseline: default (defer off) writes packed rows inline.
 // ============================================================================
 
 #[test]
-fn defer_off_persists_trades_inline() {
+fn defer_off_writes_packed_rows_inline() {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db.clone());
     run_batch(&mut ctx);
 
     let trades = cf_rows(&db, CF_NATIVE_TRADES);
+    assert_eq!(trades.len(), 2, "one row per market (block 1, chunk 0)");
+    assert_eq!(trade_indices(&trades), vec![vec![0, 1], vec![2]]);
     let user_trades = cf_rows(&db, CF_NATIVE_USER_TRADES);
-    assert_eq!(trades.len(), 3, "3 fills -> 3 trade rows");
-    assert_eq!(user_trades.len(), 6, "3 fills -> maker + taker rows each");
-    assert!(
-        ctx.take_pending_trades().is_empty(),
-        "inline mode must not buffer"
+    let entries: Vec<(u8, Vec<(u32, u8)>)> = user_trades
+        .iter()
+        .map(|(k, v)| {
+            let e = decode_user_row(v).unwrap().1;
+            (k[0], e.iter().map(|e| (e.trade_index, e.role)).collect())
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            (1, vec![(0, 0), (2, 0)]), // maker on both markets
+            (2, vec![(1, 0)]),
+            (3, vec![(0, 1), (1, 1)]), // taker of both market-1 fills
+            (4, vec![(2, 1)]),
+        ]
     );
+    assert_eq!(ctx.trade_index, 3);
 }
 
 // ============================================================================
-// Deferred: nothing hits the backend; buffered KVs are byte-identical to the
-// inline path's rows.
+// Deferred: nothing hits the backend; the fills encode to the inline rows.
 // ============================================================================
 
 #[test]
-fn defer_on_buffers_trades_and_bytes_match_inline() {
-    // Inline reference run.
+fn defer_on_buffers_fills_and_rows_match_inline() {
     let (_dir_a, db_a) = open_test_db();
     let mut ctx_a = make_ctx(db_a.clone());
     run_batch(&mut ctx_a);
-    let ref_trades = cf_rows(&db_a, CF_NATIVE_TRADES);
-    let ref_user_trades = cf_rows(&db_a, CF_NATIVE_USER_TRADES);
 
-    // Deferred run on a fresh DB.
     let (_dir_b, db_b) = open_test_db();
     let mut ctx_b = make_ctx(db_b.clone());
     ctx_b.defer_trades = true;
     run_batch(&mut ctx_b);
 
-    assert!(
-        cf_rows(&db_b, CF_NATIVE_TRADES).is_empty(),
-        "deferred mode must not write CF_NATIVE_TRADES during exec"
-    );
-    assert!(
-        cf_rows(&db_b, CF_NATIVE_USER_TRADES).is_empty(),
-        "deferred mode must not write CF_NATIVE_USER_TRADES during exec"
-    );
+    assert!(cf_rows(&db_b, CF_NATIVE_TRADES).is_empty(), "deferred: no trade rows during exec");
+    assert!(cf_rows(&db_b, CF_NATIVE_USER_TRADES).is_empty(), "deferred: no user rows during exec");
 
-    let pending = ctx_b.take_pending_trade_batch();
-    assert_eq!(
-        pending.len(),
-        9,
-        "3 fills x (1 trade + maker + taker) = 9 buffered KVs"
-    );
-    assert!(
-        ctx_b.take_pending_trades().is_empty(),
-        "take_pending_trades must drain the buffer"
-    );
+    let fills = ctx_b.take_pending_trade_fills();
+    let idx: Vec<u32> = fills.iter().map(|f| f.trade_index).collect();
+    assert_eq!(idx, vec![0, 1, 2]);
+    assert_eq!((fills[0].market, fills[0].maker, fills[0].taker), (1, addr(1), addr(3)));
+    assert_eq!(fills[0].price_raw, fp(100).raw());
+    assert_eq!(fills[0].qty_raw, fp(5).raw());
+    assert_eq!(fills[0].taker_side, 0, "taker bought");
+    assert!(ctx_b.take_pending_trade_fills().is_empty(), "take must drain");
 
-    // Use the real packed writer across row boundaries, then drain on shutdown.
-    let writer = torus_state::BackgroundCfWriter::spawn_with_policy(
-        db_b.clone(),
-        "packed-trade-test",
-        1,
-        torus_state::BgWriterPolicy { chunk_kvs: 2, low_pri: false },
-    );
-    writer.send_packed(pending).unwrap();
-    drop(writer);
-    assert_eq!(
-        cf_rows(&db_b, CF_NATIVE_TRADES),
-        ref_trades,
-        "deferred CF_NATIVE_TRADES rows must be byte-identical to inline"
-    );
-    assert_eq!(
-        cf_rows(&db_b, CF_NATIVE_USER_TRADES),
-        ref_user_trades,
-        "deferred CF_NATIVE_USER_TRADES rows must be byte-identical to inline"
-    );
+    write_rows(&db_b, &fills);
+    for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+        assert_eq!(cf_rows(&db_b, cf), cf_rows(&db_a, cf), "{cf}: deferred rows == inline rows");
+    }
 }
 
 // ============================================================================
-// Deferred buffer accumulates across execute_batch calls (app.rs runs pre_evm
-// and post_evm batches on one ctx and takes once, after all phases).
+// Fills accumulate across execute_batch calls (app.rs runs pre_evm and
+// post_evm batches on one ctx); the block's rows hold both phases' fills.
 // ============================================================================
 
-#[test]
-fn pending_trades_accumulate_across_batches() {
-    let (_dir, db) = open_test_db();
-    let mut ctx = make_ctx(db.clone());
-    ctx.defer_trades = true;
-
+fn two_phase_block(ctx: &mut NativeExecContext) {
     for t in 1..=2u8 {
-        fund_native(&ctx, &addr(t), fp(1_000_000));
+        fund_native(ctx, &addr(t), fp(1_000_000));
     }
     let batch1: Vec<(Address, NativeAction)> = vec![
         (addr(1), NativeAction::PlaceOrder(limit(1, false, 100, 5))),
@@ -197,21 +198,56 @@ fn pending_trades_accumulate_across_batches() {
         (addr(1), NativeAction::PlaceOrder(limit(1, false, 100, 3))),
         (addr(2), NativeAction::PlaceOrder(limit(1, true, 100, 3))),
     ];
-    let r1 = NativeExecutor::execute_batch(&mut ctx, &batch1);
-    let r2 = NativeExecutor::execute_batch(&mut ctx, &batch2);
+    let r1 = NativeExecutor::execute_batch(ctx, &batch1);
+    let r2 = NativeExecutor::execute_batch(ctx, &batch2);
     assert!(r1.results.iter().all(|r| r.success));
     assert!(r2.results.iter().all(|r| r.success));
+}
 
-    let pending = ctx.take_pending_trades();
-    assert_eq!(
-        pending.len(),
-        6,
-        "2 fills x 3 KVs, accumulated across calls"
-    );
+#[test]
+fn fills_accumulate_across_batches() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    ctx.defer_trades = true;
+    two_phase_block(&mut ctx);
+    let fills = ctx.take_pending_trade_fills();
+    let idx: Vec<u32> = fills.iter().map(|f| f.trade_index).collect();
+    assert_eq!(idx, vec![0, 1], "trade_index keeps advancing across calls");
 
-    // Distinct keys — trade_index kept advancing across batches.
-    let mut keys: Vec<&(&str, Vec<u8>, Vec<u8>)> = pending.iter().collect();
-    keys.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    keys.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    assert_eq!(keys.len(), 6, "all buffered keys must be distinct");
+    // Inline: the second call's rows must not drop the first call's fill.
+    let (_dir_i, db_i) = open_test_db();
+    let mut ctx_i = make_ctx(db_i.clone());
+    two_phase_block(&mut ctx_i);
+    assert_eq!(trade_indices(&cf_rows(&db_i, CF_NATIVE_TRADES)), vec![vec![0, 1]]);
+
+    write_rows(&db, &fills);
+    for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+        assert_eq!(cf_rows(&db, cf), cf_rows(&db_i, cf), "{cf}");
+    }
+}
+
+// ============================================================================
+// s77: trade_index counts every fill in both settle paths, history on or off.
+// ============================================================================
+
+#[test]
+fn trade_index_counts_fills_in_both_settle_paths_with_history_on_and_off() {
+    for history in [true, false] {
+        for parallel in [false, true] {
+            let (_dir, db) = open_test_db();
+            let mut ctx = make_ctx(db.clone());
+            ctx.defer_trades = true;
+            ctx.trade_history = history;
+            for t in 1..=4u8 {
+                fund_native(&ctx, &addr(t), fp(1_000_000));
+            }
+            let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+            assert!(r.results.iter().all(|r| r.success));
+            let case = format!("history={history} parallel={parallel}");
+            assert_eq!(ctx.trade_index, 3, "{case}");
+            let fills = ctx.take_pending_trade_fills();
+            assert_eq!(fills.len(), if history { 3 } else { 0 }, "{case}");
+            assert!(fills.iter().map(|f| f.trade_index).eq(0..fills.len() as u32), "{case}");
+        }
+    }
 }

@@ -28,6 +28,10 @@ use torus_state::cf::{
     CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
     CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
 };
+use torus_state::trade_rows::{
+    decode_trade_row, decode_user_row, parse_trade_key, parse_user_trade_key, trade_key,
+    MarketTrade, TRADE_KEY_LEN,
+};
 use torus_types::FixedPoint;
 
 use crate::error::RpcError;
@@ -57,30 +61,26 @@ struct StoredMarket {
     initial_margin_raw: i128,
 }
 
-/// Trade data stored in CF_NATIVE_TRADES.
-/// Key: market_id(8 BE) + block_number(8 BE) + trade_index(4 BE).
-#[derive(BorshDeserialize)]
-pub(crate) struct StoredTrade {
-    pub trade_id: u128,
-    pub price_raw: i128,
-    pub quantity_raw: i128,
-    pub side: u8,
-    pub block_number: u64,
-    pub timestamp: u64,
+/// One `CF_NATIVE_TRADES` entry as returned over RPC (`trade_id` is the
+/// fill's per-block `trade_index`).
+fn rpc_trade(market_id: &str, block: u64, timestamp: u64, t: &MarketTrade) -> RpcTrade {
+    RpcTrade {
+        trade_id: hex_u128(t.trade_index as u128),
+        market_id: market_id.to_string(),
+        price: hex_fp(FixedPoint::from_raw(t.price_raw)),
+        quantity: hex_fp(FixedPoint::from_raw(t.qty_raw)),
+        side: if t.taker_side == 0 { "buy" } else { "sell" }.to_string(),
+        block_number: hex_u64(block),
+        timestamp: hex_u64(timestamp),
+    }
 }
 
-/// Per-user trade data stored in CF_NATIVE_USER_TRADES.
-/// Key: trader(20) + (u64::MAX - block)(8 BE) + trade_index(4 BE).
-#[derive(BorshDeserialize)]
-pub(crate) struct StoredUserTrade {
-    pub trade_id: u128,
-    pub market_id: u64,
-    pub price_raw: i128,
-    pub quantity_raw: i128,
-    pub side: u8,
-    pub role: u8,
-    pub block_number: u64,
-    pub timestamp: u64,
+/// Decode one packed trade-history row (key + value) for RPC.
+fn decode_market_row(key: &[u8], value: &[u8]) -> Result<(u64, u64, Vec<MarketTrade>), ErrorObjectOwned> {
+    let (_, block, _) = parse_trade_key(key)
+        .ok_or_else(|| RpcError::Internal(format!("trade key length {}", key.len())))?;
+    let (timestamp, fills) = decode_trade_row(value).map_err(|e| RpcError::Internal(e.to_string()))?;
+    Ok((block, timestamp, fills))
 }
 
 // ============================================================================
@@ -946,8 +946,9 @@ impl TorusApiServer for RpcState {
         let pruned_up_to = self.pruned_up_to.load(Relaxed);
 
         // Reverse-iterate from the upper bound of this market's key range.
-        // Key format: market_id(8) + block_number(8) + trade_index(4) = 20 bytes.
-        let mut upper = [0xFFu8; 20];
+        // Key format: market_id(8) + block_number(8) + chunk(2) = 18 bytes;
+        // each row holds up to 1024 fills in trade_index order.
+        let mut upper = [0xFFu8; TRADE_KEY_LEN];
         upper[..8].copy_from_slice(&prefix);
         let iter = db.iterator_cf(
             cf,
@@ -955,44 +956,26 @@ impl TorusApiServer for RpcState {
         );
         let mut trades = Vec::with_capacity(limit);
 
-        for item in iter {
+        'rows: for item in iter {
             let (key, value) = item
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
             if !key.starts_with(&prefix) {
                 break;
             }
+            let (block, timestamp, fills) = decode_market_row(&key, &value)?;
 
-            // Key: market_id(8) + block_number(8) + trade_index(4)
             // Since we iterate newest-first, once we hit a pruned block all
             // remaining entries are older — stop immediately.
-            if key.len() >= 16 && pruned_up_to > 0 {
-                let block = u64::from_be_bytes(key[8..16].try_into().unwrap());
-                if block < pruned_up_to {
-                    break;
-                }
+            if pruned_up_to > 0 && block < pruned_up_to {
+                break;
             }
 
-            let trade = StoredTrade::try_from_slice(&value)
-                .map_err(|e| RpcError::Internal(format!("borsh decode trade: {e}")))
-                .map_err(ErrorObjectOwned::from)?;
-
-            trades.push(RpcTrade {
-                trade_id: hex_u128(trade.trade_id),
-                market_id: market_id.clone(),
-                price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
-                quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
-                side: if trade.side == 0 {
-                    "buy".to_string()
-                } else {
-                    "sell".to_string()
-                },
-                block_number: hex_u64(trade.block_number),
-                timestamp: hex_u64(trade.timestamp),
-            });
-
-            if trades.len() >= limit {
-                break;
+            for t in fills.iter().rev() {
+                trades.push(rpc_trade(&market_id, block, timestamp, t));
+                if trades.len() >= limit {
+                    break 'rows;
+                }
             }
         }
 
@@ -1436,16 +1419,10 @@ impl TorusApiServer for RpcState {
             None => return Ok(vec![]),
         };
 
-        // Build start key: market_id(8) + from_block(8) + 0x00000000
-        let mut start_key = [0u8; 20];
-        start_key[..8].copy_from_slice(&mid.to_be_bytes());
-        start_key[8..16].copy_from_slice(&from.to_be_bytes());
-
-        // Build end key: market_id(8) + (to_block+1)(8)
-        let end_block = to.saturating_add(1);
-        let mut end_prefix = [0u8; 16];
-        end_prefix[..8].copy_from_slice(&mid.to_be_bytes());
-        end_prefix[8..16].copy_from_slice(&end_block.to_be_bytes());
+        // market_id(8) + block(8) + chunk(2): from (from_block, chunk 0) up to
+        // the first key of to_block + 1.
+        let start_key = trade_key(mid, from, 0);
+        let end_key = trade_key(mid, to.saturating_add(1), 0);
 
         let iter = db.iterator_cf(
             cf,
@@ -1453,39 +1430,22 @@ impl TorusApiServer for RpcState {
         );
         let mut trades = Vec::with_capacity(limit.min(256));
 
-        for item in iter {
+        'rows: for item in iter {
             let (key, value) = item
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
 
             // Stop if we've left this market or past the end block
-            if key.len() < 16 || key[..8] != mid.to_be_bytes() {
+            if key.len() < 8 || key[..8] != mid.to_be_bytes() || key[..] >= end_key[..] {
                 break;
             }
-            if key[..16] >= end_prefix[..] {
-                break;
-            }
+            let (block, timestamp, fills) = decode_market_row(&key, &value)?;
 
-            let trade = StoredTrade::try_from_slice(&value)
-                .map_err(|e| RpcError::Internal(format!("borsh decode trade: {e}")))
-                .map_err(ErrorObjectOwned::from)?;
-
-            trades.push(RpcTrade {
-                trade_id: hex_u128(trade.trade_id),
-                market_id: market_id.clone(),
-                price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
-                quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
-                side: if trade.side == 0 {
-                    "buy".to_string()
-                } else {
-                    "sell".to_string()
-                },
-                block_number: hex_u64(trade.block_number),
-                timestamp: hex_u64(trade.timestamp),
-            });
-
-            if trades.len() >= limit {
-                break;
+            for t in &fills {
+                trades.push(rpc_trade(&market_id, block, timestamp, t));
+                if trades.len() >= limit {
+                    break 'rows;
+                }
             }
         }
 
@@ -1698,46 +1658,39 @@ impl TorusApiServer for RpcState {
             rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
         );
 
+        // Each row holds the trader's fills in one block, in trade_index order.
         let mut trades = Vec::with_capacity(limit.min(256));
-        for item in iter {
+        'rows: for item in iter {
             let (key, value) = item
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
             if !key.starts_with(prefix) {
                 break;
             }
-
-            let trade = StoredUserTrade::try_from_slice(&value)
-                .map_err(|e| RpcError::Internal(format!("borsh decode user trade: {e}")))
+            let (_, block) = parse_user_trade_key(&key)
+                .ok_or_else(|| RpcError::Internal(format!("user trade key length {}", key.len())))
+                .map_err(ErrorObjectOwned::from)?;
+            let (timestamp, entries) = decode_user_row(&value)
+                .map_err(|e| RpcError::Internal(e.to_string()))
                 .map_err(ErrorObjectOwned::from)?;
 
-            if let Some(mf) = market_filter {
-                if trade.market_id != mf {
+            for trade in entries {
+                if market_filter.is_some_and(|mf| trade.market != mf) {
                     continue;
                 }
-            }
-
-            trades.push(RpcUserTrade {
-                trade_id: hex_u128(trade.trade_id),
-                market_id: hex_u64(trade.market_id),
-                side: if trade.side == 0 {
-                    "buy".to_string()
-                } else {
-                    "sell".to_string()
-                },
-                price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
-                quantity: hex_fp(FixedPoint::from_raw(trade.quantity_raw)),
-                role: if trade.role == 0 {
-                    "maker".to_string()
-                } else {
-                    "taker".to_string()
-                },
-                block_number: hex_u64(trade.block_number),
-                timestamp: hex_u64(trade.timestamp),
-            });
-
-            if trades.len() >= limit {
-                break;
+                trades.push(RpcUserTrade {
+                    trade_id: hex_u128(trade.trade_index as u128),
+                    market_id: hex_u64(trade.market),
+                    side: if trade.taker_side == 0 { "buy" } else { "sell" }.to_string(),
+                    price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
+                    quantity: hex_fp(FixedPoint::from_raw(trade.qty_raw)),
+                    role: if trade.role == 0 { "maker" } else { "taker" }.to_string(),
+                    block_number: hex_u64(block),
+                    timestamp: hex_u64(timestamp),
+                });
+                if trades.len() >= limit {
+                    break 'rows;
+                }
             }
         }
 

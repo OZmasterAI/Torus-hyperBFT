@@ -483,8 +483,8 @@ pub fn set_latest_height(state: &RpcState, height: u64) {
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
 /// Used by the on_commit_block handler to feed the `new_trades` broadcast channel.
 pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
-    use borsh::BorshDeserialize;
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
+    use torus_state::trade_rows::{decode_trade_row, trade_key};
 
     let db = state.inner();
     let market_cf = match db.cf_handle(CF_NATIVE_MARKETS) {
@@ -496,7 +496,6 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
         None => return vec![],
     };
 
-    let height_bytes = block_height.to_be_bytes();
     let mut trades = Vec::new();
 
     // Iterate all known market IDs and seek into CF_NATIVE_TRADES for each.
@@ -505,15 +504,13 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
             Ok(kv) => kv,
             Err(_) => continue,
         };
-        if market_key.len() != 8 {
+        let Ok(market_bytes) = <[u8; 8]>::try_from(&market_key[..]) else {
             continue;
-        }
+        };
+        let market_id = u64::from_be_bytes(market_bytes);
 
-        // Build seek key: market_id(8) + block_height(8) + trade_index(0)
-        let mut start_key = [0u8; 20];
-        start_key[..8].copy_from_slice(&market_key);
-        start_key[8..16].copy_from_slice(&height_bytes);
-
+        // Rows market_id(8) + block_height(8) + chunk(2), from chunk 0.
+        let start_key = trade_key(market_id, block_height, 0);
         let iter = db.iterator_cf(
             trade_cf,
             rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
@@ -523,40 +520,22 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
                 Ok(kv) => kv,
                 Err(_) => break,
             };
-            if key.len() < 16 {
+            // Same market and block (the chunk is the last 2 bytes).
+            if key.len() != start_key.len() || key[..16] != start_key[..16] {
                 break;
             }
-            // Verify market_id prefix matches
-            if key[..8] != market_key[..] {
-                break;
-            }
-            // Verify block_number matches
-            if key[8..16] != height_bytes[..] {
-                break;
-            }
-
-            // Deserialize StoredTrade (borsh: trade_id u128 + price_raw i128 +
-            // quantity_raw i128 + side u8 + block_number u64 + timestamp u64)
-            #[derive(BorshDeserialize)]
-            struct StoredTrade {
-                trade_id: u128,
-                price_raw: i128,
-                quantity_raw: i128,
-                side: u8,
-                block_number: u64,
-                timestamp: u64,
-            }
-
-            if let Ok(t) = StoredTrade::try_from_slice(&value) {
-                let market_id = u64::from_be_bytes(market_key[..8].try_into().unwrap());
+            let Ok((timestamp, fills)) = decode_trade_row(&value) else {
+                continue;
+            };
+            for t in fills {
                 trades.push(serde_json::json!({
                     "marketId": format!("0x{:x}", market_id),
-                    "tradeId": format!("0x{:x}", t.trade_id),
+                    "tradeId": format!("0x{:x}", t.trade_index),
                     "price": format!("0x{:x}", t.price_raw),
-                    "quantity": format!("0x{:x}", t.quantity_raw),
-                    "side": if t.side == 0 { "buy" } else { "sell" },
-                    "blockNumber": format!("0x{:x}", t.block_number),
-                    "timestamp": format!("0x{:x}", t.timestamp),
+                    "quantity": format!("0x{:x}", t.qty_raw),
+                    "side": if t.taker_side == 0 { "buy" } else { "sell" },
+                    "blockNumber": format!("0x{:x}", block_height),
+                    "timestamp": format!("0x{:x}", timestamp),
                 }));
             }
         }
@@ -2314,7 +2293,7 @@ mod tests {
     use borsh::BorshSerialize;
     use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
     use torus_core::precompiles::{write_order_book_snapshot, OrderBookSnapshot, PriceLevel};
-    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
+    use torus_state::cf::CF_NATIVE_MARKETS;
     use torus_types::FixedPoint;
 
     fn fp(v: i64) -> FixedPoint {
@@ -2336,30 +2315,148 @@ mod tests {
             .unwrap();
     }
 
-    fn store_trade(
-        state: &StateDb,
-        market_id: u64,
-        trade_id: u128,
-        price_raw: i128,
-        qty_raw: i128,
-        side: u8,
-        block: u64,
-        ts: u64,
-        index: u32,
-    ) {
-        let mut key = Vec::with_capacity(20);
-        key.extend_from_slice(&market_id.to_be_bytes());
-        key.extend_from_slice(&block.to_be_bytes());
-        key.extend_from_slice(&index.to_be_bytes());
+    use torus_state::trade_rows::TradeFill;
 
-        let mut data = Vec::new();
-        BorshSerialize::serialize(&trade_id, &mut data).unwrap();
-        BorshSerialize::serialize(&price_raw, &mut data).unwrap();
-        BorshSerialize::serialize(&qty_raw, &mut data).unwrap();
-        BorshSerialize::serialize(&side, &mut data).unwrap();
-        BorshSerialize::serialize(&block, &mut data).unwrap();
-        BorshSerialize::serialize(&ts, &mut data).unwrap();
-        state.put_cf_raw(CF_NATIVE_TRADES, &key, &data).unwrap();
+    /// One fill of `market`; `side` 0 = taker bought.
+    fn tfill(index: u32, market: u64, maker: Address, taker: Address, price_raw: i128, qty_raw: i128, side: u8) -> TradeFill {
+        TradeFill { trade_index: index, market, maker, taker, price_raw, qty_raw, taker_side: side }
+    }
+
+    /// Write one block's trade-history rows (both CFs) with the node's codec.
+    fn store_block_fills(state: &StateDb, block: u64, ts: u64, fills: &[TradeFill]) {
+        let mut rows = torus_state::PackedCfBatch::default();
+        torus_state::trade_rows::encode_block(block, ts, fills, &mut rows);
+        for (cf, key, value) in rows.iter() {
+            state.put_cf_raw(cf, key, value).unwrap();
+        }
+    }
+
+    /// One fill in market `market_id` at `block` (trade id = `index`).
+    fn store_trade(state: &StateDb, market_id: u64, index: u32, price_raw: i128, qty_raw: i128, side: u8, block: u64, ts: u64) {
+        let (maker, taker) = (Address::from([0xA1; 20]), Address::from([0xB2; 20]));
+        store_block_fills(state, block, ts, &[tfill(index, market_id, maker, taker, price_raw, qty_raw, side)]);
+    }
+
+    async fn rpc_client(state: StateDb, mempool: Arc<Mempool>, executor: Arc<EvmExecutor>) -> (jsonrpsee::server::ServerHandle, jsonrpsee::http_client::HttpClient) {
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        (handle, client)
+    }
+
+    fn ids(trades: &[RpcTrade]) -> Vec<String> {
+        trades.iter().map(|t| t.trade_id.clone()).collect()
+    }
+
+    fn hex_ids(ids: impl IntoIterator<Item = u128>) -> Vec<String> {
+        ids.into_iter().map(hex_u128).collect()
+    }
+
+    /// 1,030 fills of market 1 in block 7 (chunks 0 and 1), 2 fills of market 2.
+    fn store_chunked_block(state: &StateDb) {
+        let (a, b) = (Address::from([0x01; 20]), Address::from([0x02; 20]));
+        let mut fills: Vec<TradeFill> = (0..1030u32)
+            .map(|i| tfill(i, 1, a, b, 100 + i as i128, 1 + i as i128, (i % 2) as u8))
+            .collect();
+        fills.push(tfill(1030, 2, b, a, 7, 8, 1));
+        fills.push(tfill(1031, 2, b, a, 9, 10, 0));
+        store_block_fills(state, 7, 1_700_000_007, &fills);
+    }
+
+    #[tokio::test]
+    async fn trade_history_limit_spans_chunk_boundary_newest_first() {
+        let (_dir, state, mempool, executor) = setup();
+        store_trade(&state, 1, 3, 50, 1, 0, 6, 1_700_000_006);
+        store_chunked_block(&state);
+        let (handle, client) = rpc_client(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistory", jsonrpsee::rpc_params!["0x1", 10u32])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids((1020..1030).rev()), "chunk 1 (6) then chunk 0 (4)");
+        assert_eq!(t[0].price, hex_fp(FixedPoint::from_raw(1129)));
+        assert_eq!(t[0].quantity, hex_fp(FixedPoint::from_raw(1030)));
+        assert_eq!((t[0].side.as_str(), t[1].side.as_str()), ("sell", "buy"));
+        assert_eq!(t[0].block_number, hex_u64(7));
+        assert_eq!(t[0].timestamp, hex_u64(1_700_000_007));
+        assert_eq!(t[0].market_id, "0x1");
+        // Past the block into the previous one.
+        let all: Vec<RpcTrade> = client
+            .request("torus_getTradeHistory", jsonrpsee::rpc_params!["0x1", 1000u32])
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1000);
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistory", jsonrpsee::rpc_params!["0x2", 100u32])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids([1031, 1030]));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trade_history_range_oldest_first_with_limit() {
+        let (_dir, state, mempool, executor) = setup();
+        store_trade(&state, 1, 3, 50, 1, 0, 6, 1_700_000_006);
+        store_chunked_block(&state);
+        store_trade(&state, 1, 0, 60, 1, 1, 8, 1_700_000_008);
+        store_trade(&state, 1, 0, 70, 1, 1, 9, 1_700_000_009);
+        let (handle, client) = rpc_client(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistoryRange", jsonrpsee::rpc_params!["0x1", "0x6", "0x8", 5000u64])
+            .await
+            .unwrap();
+        let blocks: Vec<&str> = t.iter().map(|t| t.block_number.as_str()).collect();
+        assert_eq!(t.len(), 1 + 1030 + 1, "block 9 is out of range");
+        assert_eq!((blocks[0], blocks[1], blocks[1031]), ("0x6", "0x7", "0x8"));
+        assert_eq!(ids(&t[1..1031]), hex_ids(0..1030), "ascending across the chunk boundary");
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistoryRange", jsonrpsee::rpc_params!["0x1", "0x7", "0x7", 1025u64])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids(0..1025));
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn scan_trades_for_block_lists_every_market_in_order() {
+        let (_dir, state, _mempool, _executor) = setup();
+        store_market(&state, 1, "BTC", "USD");
+        store_market(&state, 2, "ETH", "USD");
+        store_trade(&state, 1, 0, 50, 1, 0, 6, 1_700_000_006);
+        store_chunked_block(&state);
+        let t = scan_trades_for_block(&state, 7);
+        assert_eq!(t.len(), 1032);
+        let ids: Vec<&str> = t.iter().map(|t| t["tradeId"].as_str().unwrap()).collect();
+        let want: Vec<String> = (0..1032u32).map(|i| format!("0x{i:x}")).collect();
+        assert_eq!(ids, want, "market 1 (both chunks) then market 2");
+        assert_eq!(
+            t[1031],
+            serde_json::json!({
+                "marketId": "0x2", "tradeId": "0x407", "price": "0x9", "quantity": "0xa",
+                "side": "buy", "blockNumber": "0x7", "timestamp": "0x6553f107",
+            })
+        );
+        assert!(scan_trades_for_block(&state, 8).is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_trades_rpc_matches_scan() {
+        let (_dir, state, mempool, executor) = setup();
+        store_market(&state, 1, "BTC", "USD");
+        store_market(&state, 2, "ETH", "USD");
+        store_chunked_block(&state);
+        let (handle, client) = rpc_client(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let t: Vec<RpcTrade> = client
+            .request("torus_getBlockTrades", jsonrpsee::rpc_params![7u64])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids(0..1032));
+        handle.stop().unwrap();
     }
 
     #[tokio::test]
@@ -2599,29 +2696,9 @@ mod tests {
         let (_dir, state, mempool, executor) = setup();
         let price = 50000i64 as i128 * FixedPoint::SCALE;
         let qty = 1i128 * FixedPoint::SCALE;
-        store_trade(&state, 1, 100, price, qty, 0, 10, 1700000010, 0);
-        store_trade(
-            &state,
-            1,
-            101,
-            price + FixedPoint::SCALE,
-            qty,
-            1,
-            11,
-            1700000011,
-            0,
-        );
-        store_trade(
-            &state,
-            1,
-            102,
-            price - FixedPoint::SCALE,
-            qty,
-            0,
-            12,
-            1700000012,
-            0,
-        );
+        store_trade(&state, 1, 100, price, qty, 0, 10, 1700000010);
+        store_trade(&state, 1, 101, price + FixedPoint::SCALE, qty, 1, 11, 1700000011);
+        store_trade(&state, 1, 102, price - FixedPoint::SCALE, qty, 0, 12, 1700000012);
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -2648,17 +2725,7 @@ mod tests {
         let price = 50000i64 as i128 * FixedPoint::SCALE;
         let qty = 1i128 * FixedPoint::SCALE;
         for i in 0..5u32 {
-            store_trade(
-                &state,
-                1,
-                i as u128,
-                price,
-                qty,
-                0,
-                i as u64,
-                1700000000 + i as u64,
-                0,
-            );
+            store_trade(&state, 1, i, price, qty, 0, i as u64, 1700000000 + i as u64);
         }
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
@@ -2711,7 +2778,7 @@ mod tests {
     // ========================================================================
 
     use torus_core::order_book::OrderBook;
-    use torus_state::cf::{CF_NATIVE_ORDER_BOOKS, CF_NATIVE_USER_TRADES};
+    use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
     use torus_types::{OrderType, PlaceOrderParams, Side, TimeInForce};
 
     fn store_order_book_with_orders(
@@ -2742,36 +2809,48 @@ mod tests {
             .unwrap();
     }
 
-    fn store_user_trade(
-        state: &StateDb,
-        trader: &Address,
-        trade_id: u128,
-        market_id: u64,
-        price_raw: i128,
-        qty_raw: i128,
-        side: u8,
-        role: u8,
-        block: u64,
-        ts: u64,
-        index: u32,
-    ) {
-        let desc_block = u64::MAX - block;
-        let mut key = [0u8; 32];
-        key[..20].copy_from_slice(trader.as_slice());
-        key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        key[28..32].copy_from_slice(&index.to_be_bytes());
-        let mut data = Vec::with_capacity(74);
-        data.extend_from_slice(&trade_id.to_le_bytes());
-        data.extend_from_slice(&market_id.to_le_bytes());
-        data.extend_from_slice(&price_raw.to_le_bytes());
-        data.extend_from_slice(&qty_raw.to_le_bytes());
-        data.push(side);
-        data.push(role);
-        data.extend_from_slice(&block.to_le_bytes());
-        data.extend_from_slice(&ts.to_le_bytes());
-        state
-            .put_cf_raw(CF_NATIVE_USER_TRADES, &key, &data)
-            .unwrap();
+    /// One fill at `block` with `trader` in `role` (0 = maker, 1 = taker);
+    /// trade id = `index`.
+    fn store_user_trade(state: &StateDb, trader: &Address, index: u32, market_id: u64, price_raw: i128, qty_raw: i128, side: u8, role: u8, block: u64, ts: u64) {
+        let other = Address::from([0x5A; 20]);
+        let (maker, taker) = if role == 0 { (*trader, other) } else { (other, *trader) };
+        store_block_fills(state, block, ts, &[tfill(index, market_id, maker, taker, price_raw, qty_raw, side)]);
+    }
+
+    #[tokio::test]
+    async fn user_trades_newest_block_first_then_trade_index_with_filter_and_limit() {
+        let (_dir, state, mempool, executor) = setup();
+        let (me, other) = (Address::from([0x33; 20]), Address::from([0x44; 20]));
+        // Block 4: me in three fills (market 2, 1, 1); block 5: one fill.
+        store_block_fills(&state, 4, 40, &[
+            tfill(0, 2, me, other, 10, 1, 0),
+            tfill(1, 1, other, me, 11, 1, 1),
+            tfill(2, 1, other, other, 12, 1, 0),
+            tfill(3, 1, me, other, 13, 1, 1),
+        ]);
+        store_block_fills(&state, 5, 50, &[tfill(0, 1, other, me, 14, 1, 0)]);
+        let (handle, client) = rpc_client(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let get = |market: Option<&str>, limit: u32| {
+            let client = client.clone();
+            let params = match market {
+                Some(m) => jsonrpsee::rpc_params![hex_address(me), m, limit],
+                None => jsonrpsee::rpc_params![hex_address(me), None::<String>, limit],
+            };
+            async move {
+                let t: Vec<RpcUserTrade> = client.request("torus_getUserTrades", params).await.unwrap();
+                t.iter().map(|t| (t.block_number.clone(), t.trade_id.clone(), t.role.clone(), t.market_id.clone())).collect::<Vec<_>>()
+            }
+        };
+        let row = |b: u64, id: u128, role: &str, m: u64| (hex_u64(b), hex_u128(id), role.to_string(), hex_u64(m));
+        assert_eq!(
+            get(None, 100).await,
+            vec![row(5, 0, "taker", 1), row(4, 0, "maker", 2), row(4, 1, "taker", 1), row(4, 3, "maker", 1)]
+        );
+        assert_eq!(get(None, 2).await, vec![row(5, 0, "taker", 1), row(4, 0, "maker", 2)]);
+        assert_eq!(get(Some("0x1"), 2).await, vec![row(5, 0, "taker", 1), row(4, 1, "taker", 1)], "limit after filter");
+        assert_eq!(get(Some("0x2"), 100).await, vec![row(4, 0, "maker", 2)]);
+        handle.stop().unwrap();
     }
 
     #[tokio::test]
@@ -2956,8 +3035,8 @@ mod tests {
         let trader = Address::from([0xDD; 20]);
         let price = 50000i64 as i128 * FixedPoint::SCALE;
         let qty = 1i128 * FixedPoint::SCALE;
-        store_user_trade(&state, &trader, 1, 1, price, qty, 0, 1, 10, 1700000010, 0);
-        store_user_trade(&state, &trader, 2, 1, price, qty, 1, 0, 11, 1700000011, 0);
+        store_user_trade(&state, &trader, 1, 1, price, qty, 0, 1, 10, 1700000010);
+        store_user_trade(&state, &trader, 2, 1, price, qty, 1, 0, 11, 1700000011);
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -2984,8 +3063,8 @@ mod tests {
         let trader = Address::from([0xEE; 20]);
         let price = 50000i64 as i128 * FixedPoint::SCALE;
         let qty = 1i128 * FixedPoint::SCALE;
-        store_user_trade(&state, &trader, 1, 1, price, qty, 0, 1, 10, 1700000010, 0);
-        store_user_trade(&state, &trader, 2, 2, price, qty, 0, 1, 11, 1700000011, 0);
+        store_user_trade(&state, &trader, 1, 1, price, qty, 0, 1, 10, 1700000010);
+        store_user_trade(&state, &trader, 2, 2, price, qty, 0, 1, 11, 1700000011);
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -3323,45 +3402,9 @@ mod tests {
         let price = 50000i64 as i128 * FixedPoint::SCALE;
         let qty = 1i128 * FixedPoint::SCALE;
         // Insert three trades at blocks 5, 20, and 10 (out of order).
-        store_user_trade(
-            &state,
-            &trader,
-            100,
-            1,
-            price,
-            qty,
-            0,
-            1,
-            5,
-            1_700_000_005,
-            0,
-        );
-        store_user_trade(
-            &state,
-            &trader,
-            200,
-            1,
-            price,
-            qty,
-            1,
-            0,
-            20,
-            1_700_000_020,
-            0,
-        );
-        store_user_trade(
-            &state,
-            &trader,
-            300,
-            1,
-            price,
-            qty,
-            0,
-            1,
-            10,
-            1_700_000_010,
-            0,
-        );
+        store_user_trade(&state, &trader, 100, 1, price, qty, 0, 1, 5, 1_700_000_005);
+        store_user_trade(&state, &trader, 200, 1, price, qty, 1, 0, 20, 1_700_000_020);
+        store_user_trade(&state, &trader, 300, 1, price, qty, 0, 1, 10, 1_700_000_010);
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
