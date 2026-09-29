@@ -21,7 +21,7 @@ pub use backend::{AtomicWriteOp, FrozenPending, NativeFlushStats, NativeStateOve
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, PackedCfBatch, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
-pub use native_da::NativeDaStore;
+pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, PrunerConfig, StatePruner};
 pub use erasure::ErasureParams;

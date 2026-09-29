@@ -16,7 +16,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
-use torus_state::{ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
+use torus_state::{DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -729,13 +729,22 @@ impl Mempool {
     /// per-hash read). Hot compact-block reconstruct uses this so ~25 bodies
     /// cost one mutex take + one DB read instead of 25 each.
     pub fn get_native_da_batch(&self, hashes: &[B256]) -> Vec<Option<SignedNativeAction>> {
+        self.get_native_da_batch_timed(hashes).0
+    }
+
+    /// [`get_native_da_batch`](Self::get_native_da_batch) plus the read's
+    /// `MultiGet`/decode split (zero on a store error).
+    pub fn get_native_da_batch_timed(
+        &self,
+        hashes: &[B256],
+    ) -> (Vec<Option<SignedNativeAction>>, DaReadTiming) {
         // A buffered ingress mirror (T2.2) must be observable here too.
         self.flush_da_mirrors();
-        match self.da_store.get_batch(hashes) {
+        match self.da_store.get_batch_timed(hashes) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("native DA store read failed: {e}");
-                vec![None; hashes.len()]
+                (vec![None; hashes.len()], DaReadTiming::default())
             }
         }
     }
@@ -866,12 +875,13 @@ impl Mempool {
     /// Flush buffered ingress DA mirrors as one `WriteBatch` (T2.2). Called
     /// before every selection path (a body must be durable before its action
     /// can be selected) and before DA reads, plus opportunistically by
-    /// size/age from [`Mempool::mirror_to_da`].
-    pub fn flush_da_mirrors(&self) {
+    /// size/age from [`Mempool::mirror_to_da`]. Returns how many buffered
+    /// bodies it tried to write (0 when nothing was pending).
+    pub fn flush_da_mirrors(&self) -> usize {
         let actions = {
             let mut pending = self.da_pending.lock().unwrap();
             if pending.actions.is_empty() {
-                return;
+                return 0;
             }
             pending.first_at = None;
             std::mem::take(&mut pending.actions)
@@ -881,8 +891,11 @@ impl Mempool {
             // T2 hardening: on a durable-write failure the taken batch would
             // otherwise be lost while its pool entries stay selectable. Re-queue
             // it (front, preserving age order) so a later flush retries.
+            let flushed = actions.len();
             self.requeue_failed_da_batch(actions);
+            return flushed;
         }
+        actions.len()
     }
 
     /// Re-queue a DA-mirror batch that failed to persist (`put_batch` Err) so a
@@ -1204,6 +1217,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         (dir, state)
+    }
+
+    /// s76: `flush_da_mirrors` reports how many buffered bodies it wrote, so
+    /// the validate-path flush timer can be read per body.
+    #[test]
+    fn flush_da_mirrors_returns_flushed_count() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let a = gauge_test_action(1);
+        let b = gauge_test_action(2);
+        pool.mirror_to_da(&a);
+        pool.mirror_to_da(&b);
+        assert_eq!(pool.flush_da_mirrors(), 2);
+        assert_eq!(pool.flush_da_mirrors(), 0, "nothing left buffered");
+        let (got, _timing) = pool.get_native_da_batch_timed(&[
+            torus_types::compute_action_hash(&a),
+            torus_types::compute_action_hash(&b),
+        ]);
+        assert!(got.iter().all(Option::is_some));
     }
 
     fn gauge_test_action(nonce: u64) -> SignedNativeAction {

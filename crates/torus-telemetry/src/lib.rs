@@ -327,6 +327,22 @@ pub struct Metrics {
     /// Consensus thread: `custody_native_shards_best_effort` inside
     /// `validate_block` (~0 when `TORUS_SHARD_CUSTODY=0`).
     pub validate_block_custody_seconds: Histogram,
+    /// s76 item 6: split of `validate_block_da_reconstruct_seconds` on the
+    /// compact path. Ingress DA-mirror flush (`put_batch` of buffered bodies)
+    /// done before the first read.
+    pub validate_block_da_flush_seconds: Histogram,
+    /// s76: bodies written by that flush (monotonic).
+    pub validate_block_da_flush_bodies: Counter,
+    /// s76: the first read's RocksDB `MultiGet`.
+    pub validate_block_da_multiget_seconds: Histogram,
+    /// s76: the first read's bincode decode of every body.
+    pub validate_block_da_decode_seconds: Histogram,
+    /// s76: the bounded local wait for bodies missing on the first read
+    /// (observed only when one was missing).
+    pub validate_block_da_wait_seconds: Histogram,
+    /// s76: the attested path's `staking.get_validator` lookup, split from
+    /// `validate_block_attest_seconds` (the rest is digest + ed25519 verify).
+    pub validate_block_attest_lookup_seconds: Histogram,
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
@@ -1448,6 +1464,42 @@ impl Metrics {
             "Consensus thread: shard custody encode inside validate_block",
             validate_block_custody_seconds.clone(),
         );
+        let validate_block_da_flush_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_da_flush_seconds",
+            "Consensus thread: ingress DA-mirror flush before the compact reconstruct read",
+            validate_block_da_flush_seconds.clone(),
+        );
+        let validate_block_da_flush_bodies = Counter::default();
+        registry.register(
+            "torus_validate_block_da_flush_bodies",
+            "Bodies written by the ingress DA-mirror flush inside validate_block",
+            validate_block_da_flush_bodies.clone(),
+        );
+        let validate_block_da_multiget_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_da_multiget_seconds",
+            "Consensus thread: RocksDB MultiGet of the compact reconstruct's first read",
+            validate_block_da_multiget_seconds.clone(),
+        );
+        let validate_block_da_decode_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_da_decode_seconds",
+            "Consensus thread: body decode of the compact reconstruct's first read",
+            validate_block_da_decode_seconds.clone(),
+        );
+        let validate_block_da_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_da_wait_seconds",
+            "Consensus thread: local wait for bodies missing on the first read",
+            validate_block_da_wait_seconds.clone(),
+        );
+        let validate_block_attest_lookup_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_validate_block_attest_lookup_seconds",
+            "Consensus thread: proposer validator lookup inside the attestation check",
+            validate_block_attest_lookup_seconds.clone(),
+        );
         let on_committed_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_on_committed_block_seconds",
@@ -1946,6 +1998,12 @@ impl Metrics {
             validate_block_da_reconstruct_seconds,
             validate_block_attest_seconds,
             validate_block_custody_seconds,
+            validate_block_da_flush_seconds,
+            validate_block_da_flush_bodies,
+            validate_block_da_multiget_seconds,
+            validate_block_da_decode_seconds,
+            validate_block_da_wait_seconds,
+            validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
             mempool_remove_committed_seconds,
             exec_resting_orders,
@@ -2182,6 +2240,12 @@ mod tests {
             "torus_validate_block_da_reconstruct_seconds",
             "torus_validate_block_attest_seconds",
             "torus_validate_block_custody_seconds",
+            "torus_validate_block_da_flush_seconds",
+            "torus_validate_block_da_flush_bodies_total",
+            "torus_validate_block_da_multiget_seconds",
+            "torus_validate_block_da_decode_seconds",
+            "torus_validate_block_da_wait_seconds",
+            "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
             "torus_mempool_remove_committed_seconds",
         ] {

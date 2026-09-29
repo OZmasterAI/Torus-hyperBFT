@@ -2692,7 +2692,12 @@ impl<N: Network> HotStuff<N> {
             Err(_) => return Ok(BodyInsert::Deferred),
         };
         let validate_block_request = ValidateBlockRequest::new(&block, app_view);
+        // s76 item 6: stamp validate end, tree insert end and commit-feed end so
+        // the next leader's parent-body path can be split per view.
+        let trace_start = crate::logging::body_fetch_trace_enabled()
+            .then(crate::logging::BodyFetchTraceStamp::capture);
         let validation = app.validate_block(validate_block_request);
+        let trace_validated = trace_start.map(|_| crate::logging::BodyFetchTraceStamp::capture());
         // Read the discriminant before the `if let` below moves `validation`'s fields.
         let app_invalid = matches!(validation, ValidateBlockResponse::Invalid);
 
@@ -2712,6 +2717,7 @@ impl<N: Network> HotStuff<N> {
                 block: block.clone(),
             })
             .publish(&self.event_publisher);
+            let trace_inserted = trace_start.map(|_| crate::logging::BodyFetchTraceStamp::capture());
 
             let update_result = block_tree
                 .update(&block.justify, &self.event_publisher)
@@ -2730,6 +2736,7 @@ impl<N: Network> HotStuff<N> {
                         committed_block_hashes: vec![],
                     }
                 });
+            let trace_committed = update_result.committed_block_hashes.len();
             // s72 fix D: our deferred proposal is waiting on exactly this block.
             // Skip the feed (on_committed_block: materialize, durable persist,
             // exec dispatch) so the retried proposal goes out first; the commit
@@ -2758,6 +2765,15 @@ impl<N: Network> HotStuff<N> {
             } else {
                 self.process_update_result(update_result, block_tree, app);
             }
+            if let (Some(start), Some(validated), Some(inserted)) =
+                (trace_start, trace_validated, trace_inserted)
+            {
+                let fed = crate::logging::BodyFetchTraceStamp::capture();
+                log::info!("body_fetch_diag insert: {} validated_mono_us={} inserted_mono_us={} fed_mono_us={} fed_unix_us={} hash={} height={} result=valid committed={}",
+                    start, validated.mono_us, inserted.mono_us, fed.mono_us, fed.unix_us,
+                    crate::logging::BodyFetchTraceId(block.hash.bytes()), block.height.int(),
+                    trace_committed);
+            }
 
             let validator_set_state = block_tree.validator_set_state()?;
             let _ = self
@@ -2778,6 +2794,12 @@ impl<N: Network> HotStuff<N> {
                     block.hash,
                     self.header_vote_invalid_count
                 );
+            }
+            if let (Some(start), Some(validated)) = (trace_start, trace_validated) {
+                log::info!("body_fetch_diag insert: {} validated_mono_us={} hash={} height={} result={}",
+                    start, validated.mono_us,
+                    crate::logging::BodyFetchTraceId(block.hash.bytes()), block.height.int(),
+                    if app_invalid { "invalid" } else { "missing" });
             }
             log::warn!("body validation failed for block hash={:?}", block.hash);
             Ok(if app_invalid { BodyInsert::Invalid } else { BodyInsert::MissingData })
