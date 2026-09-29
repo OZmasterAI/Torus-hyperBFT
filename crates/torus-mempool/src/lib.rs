@@ -38,7 +38,9 @@ pub use crate::native_pool::is_cancel;
 pub struct DaBatchTiming {
     /// Buffered ingress bodies written by the call's mirror flush.
     pub flushed: usize,
-    pub flush: std::time::Duration,
+    /// Flush wall time; `None` when every body was already durable.
+    pub flush: Option<std::time::Duration>,
+    /// Both reads (the first, and the re-read of misses after a flush).
     pub read: DaReadTiming,
 }
 
@@ -742,24 +744,59 @@ impl Mempool {
     }
 
     /// [`get_native_da_batch`](Self::get_native_da_batch) plus how long its
-    /// single mirror flush and the read's `MultiGet`/decode took (read times
-    /// zero on a store error).
+    /// mirror flush (if any) and reads took (read times zero on a store error).
+    ///
+    /// s76 step 2: read FIRST and flush only on a miss. A body the store
+    /// already has is as durable as a flush would make it (same DB, same write
+    /// options; see [`NativeDaStore::missing`]), so the whole ingress buffer —
+    /// mostly other blocks' bodies — is written only when a requested body may
+    /// be sitting in it. A miss flushes, then re-reads just the misses.
     pub fn get_native_da_batch_timed(
         &self,
         hashes: &[B256],
     ) -> (Vec<Option<SignedNativeAction>>, DaBatchTiming) {
+        let mut timing = DaBatchTiming::default();
+        let mut actions = self.read_native_da_batch(hashes, &mut timing.read);
+        let missing: Vec<usize> = actions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.is_none().then_some(i))
+            .collect();
+        if missing.is_empty() {
+            return (actions, timing);
+        }
         // A buffered ingress mirror (T2.2) must be observable here too.
         let started = std::time::Instant::now();
-        let flushed = self.flush_da_mirrors();
-        let flush = started.elapsed();
-        let (actions, read) = match self.da_store.get_batch_timed(hashes) {
-            Ok(v) => v,
+        timing.flushed = self.flush_da_mirrors();
+        timing.flush = Some(started.elapsed());
+        if timing.flushed > 0 {
+            let still: Vec<B256> = missing.iter().map(|&i| hashes[i]).collect();
+            let found = self.read_native_da_batch(&still, &mut timing.read);
+            for (i, action) in missing.into_iter().zip(found) {
+                actions[i] = action;
+            }
+        }
+        (actions, timing)
+    }
+
+    /// One DA-store batch read, adding its times to `timing`. A store error
+    /// logs and reads every slot as absent (fail closed, as before).
+    fn read_native_da_batch(
+        &self,
+        hashes: &[B256],
+        timing: &mut DaReadTiming,
+    ) -> Vec<Option<SignedNativeAction>> {
+        match self.da_store.get_batch_timed(hashes) {
+            Ok((actions, read)) => {
+                timing.multi_get += read.multi_get;
+                timing.decode += read.decode;
+                actions
+            }
             Err(e) => {
                 tracing::error!("native DA store read failed: {e}");
-                (vec![None; hashes.len()], DaReadTiming::default())
+                vec![None; hashes.len()]
             }
-        };
-        (actions, DaBatchTiming { flushed, flush, read })
+        }
     }
 
     /// Presence check for a SET of native-action bodies in the durable DA
@@ -1264,9 +1301,41 @@ mod tests {
         let (got, timing) = pool.get_native_da_batch_timed(&hashes);
         assert!(got.iter().all(Option::is_some), "flushed bodies are readable");
         assert_eq!(timing.flushed, 2);
+        assert!(timing.flush.is_some(), "a miss flushes");
         assert!(timing.read.multi_get > std::time::Duration::ZERO);
         let (_, timing) = pool.get_native_da_batch_timed(&hashes);
         assert_eq!(timing.flushed, 0);
+        assert!(timing.flush.is_none(), "all present: no flush");
+    }
+
+    /// s76 step 2: a read whose bodies are all durable does not write the
+    /// ingress buffer (other blocks' bodies); a miss still flushes it and
+    /// re-reads, so a body that was only buffered is found.
+    #[test]
+    fn durable_hit_skips_flush_miss_still_flushes() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let durable = gauge_test_action(1);
+        let buffered = gauge_test_action(2);
+        pool.mirror_native_to_da(std::slice::from_ref(&durable)).unwrap();
+        pool.mirror_to_da(&buffered);
+
+        let (got, timing) =
+            pool.get_native_da_batch_timed(&[torus_types::compute_action_hash(&durable)]);
+        assert!(got[0].is_some());
+        assert!(timing.flush.is_none());
+        assert_eq!(pool.da_pending.lock().unwrap().actions.len(), 1, "unrelated body left buffered");
+
+        let (got, timing) =
+            pool.get_native_da_batch_timed(&[torus_types::compute_action_hash(&buffered)]);
+        assert!(got[0].is_some(), "buffered body found after the miss flush");
+        assert!(timing.flush.is_some());
+        assert_eq!(timing.flushed, 1);
+        assert!(pool.da_pending.lock().unwrap().actions.is_empty());
+        assert!(NativeDaStore::new(state)
+            .get(&torus_types::compute_action_hash(&buffered))
+            .unwrap()
+            .is_some(), "flushed body is in the store");
     }
 
     fn gauge_test_action(nonce: u64) -> SignedNativeAction {

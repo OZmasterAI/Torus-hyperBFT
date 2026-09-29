@@ -328,8 +328,9 @@ pub struct Metrics {
     /// `validate_block` (~0 when `TORUS_SHARD_CUSTODY=0`).
     pub validate_block_custody_seconds: Histogram,
     /// s76 item 6: split of `validate_block_da_reconstruct_seconds` on the
-    /// compact path. Ingress DA-mirror flush (`put_batch` of buffered bodies)
-    /// done before the first read.
+    /// compact path. Ingress DA-mirror flush (`put_batch` of buffered bodies),
+    /// run only when the first read missed a body (s76 step 2); the count is
+    /// the number of validates that flushed.
     pub validate_block_da_flush_seconds: Histogram,
     /// s76: bodies written by that flush (monotonic).
     pub validate_block_da_flush_bodies: Counter,
