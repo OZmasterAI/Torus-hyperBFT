@@ -973,6 +973,195 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// EVM-PF-05: Lockbox precompile (0x0820) vs revm's block-level State cache.
+//
+// Each block below is executed through `execute_block` and then committed with
+// `commit_evm_bundle_incremental` — exactly the consensus commit path
+// (torus-consensus app.rs). Fees are zeroed (base_fee 0, gas_price 0) so value
+// conservation is exact: EVM balances + native balances (in wei) never change.
+// ---------------------------------------------------------------------------
+
+const LOCKBOX: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x20,
+]);
+
+/// Wei per native FixedPoint raw unit on the pre-fix code (1:1 raw cast).
+const WEI_PER_NATIVE_RAW: u128 = 1;
+
+fn zero_fee_block_cfg(number: u64) -> BlockEnvCfg {
+    BlockEnvCfg {
+        number,
+        timestamp: 1_000_000 + number,
+        beneficiary: Address::with_last_byte(0xFF),
+        gas_limit: 30_000_000,
+        base_fee: 0,
+    }
+}
+
+fn lockbox_calldata(sig: &str, amount: u128) -> Vec<u8> {
+    let sig_hash = alloy_primitives::keccak256(sig.as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&sig_hash[..4]);
+    let mut word = [0u8; 32];
+    word[16..32].copy_from_slice(&amount.to_be_bytes());
+    calldata.extend_from_slice(&word);
+    calldata
+}
+
+fn lockbox_tx(from: Address, sig: &str, amount: u128, value: U256, nonce: u64) -> TxEnv {
+    TxEnv {
+        caller: from,
+        gas_limit: 200_000,
+        gas_price: 0,
+        kind: TxKind::Call(LOCKBOX),
+        value,
+        data: Bytes::from(lockbox_calldata(sig, amount)),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    }
+}
+
+fn evm_balance(db: &StateDb, who: &Address) -> U256 {
+    db.get_account(who)
+        .unwrap()
+        .map(|a| a.balance)
+        .unwrap_or(U256::ZERO)
+}
+
+fn native_raw(db: &StateDb, who: &Address) -> u128 {
+    let bal = torus_core::position::PositionManager::new(db.clone())
+        .get_native_balance(who)
+        .unwrap();
+    bal.available.raw() as u128
+}
+
+fn seed_native(db: &StateDb, who: &Address, raw: i128) {
+    torus_core::position::PositionManager::new(db.clone())
+        .put_native_balance(
+            who,
+            &torus_core::position::NativeBalance {
+                available: torus_types::FixedPoint::from_raw(raw),
+                order_margin: torus_types::FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+}
+
+/// Total value in wei across every account the lockbox tests touch.
+fn total_wei(db: &StateDb, who: &[Address]) -> U256 {
+    let mut total = U256::ZERO;
+    for a in who {
+        total += evm_balance(db, a);
+        total += U256::from(native_raw(db, a)) * U256::from(WEI_PER_NATIVE_RAW);
+    }
+    total + evm_balance(db, &LOCKBOX) + evm_balance(db, &Address::with_last_byte(0xFF))
+}
+
+/// Execute `txs` as block `number` and commit the bundle via the consensus
+/// incremental commit path. Returns the receipt statuses.
+fn run_and_commit_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool> {
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let result = executor
+        .execute_block(db, &zero_fee_block_cfg(number), txs, false)
+        .unwrap();
+    torus_state::incremental::commit_evm_bundle_incremental(db, &result.bundle, None).unwrap();
+    result.receipts.iter().map(|r| r.status).collect()
+}
+
+/// Block A: deposit-to-native, THEN an ordinary transfer by the same caller.
+/// The lockbox debit written to CF_ACCOUNTS mid-block must survive the bundle
+/// commit of revm's cached caller account.
+#[test]
+fn lockbox_block_a_deposit_then_transfer_conserves_value() {
+    let (_dir, db) = open_test_db();
+    let e0 = U256::from(1_000_000u64);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let d: u128 = 300_000;
+    let t = U256::from(100_000u64);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            lockbox_tx(ALICE, "depositToNative(uint128)", d, U256::ZERO, 0),
+            transfer_tx(ALICE, BOB, t, 1, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true]);
+
+    assert_eq!(native_raw(&db, &ALICE), d, "native credited");
+    assert_eq!(
+        evm_balance(&db, &ALICE),
+        e0 - U256::from(d * WEI_PER_NATIVE_RAW) - t,
+        "ALICE EVM must be debited for BOTH the deposit and the transfer"
+    );
+    assert_eq!(evm_balance(&db, &BOB), t);
+    assert_eq!(total_wei(&db, &parties), before, "value conservation");
+}
+
+/// Block B: ALICE receives a transfer, THEN deposits it. The lockbox must see
+/// the in-block EVM balance, not the stale pre-block CF_ACCOUNTS value.
+#[test]
+fn lockbox_block_b_transfer_in_then_deposit_sees_fresh_balance() {
+    let (_dir, db) = open_test_db();
+    let e0 = U256::from(1_000_000u64);
+    db.put_account(&BOB, &test_account(e0)).unwrap();
+    db.put_account(&ALICE, &test_account(U256::ZERO)).unwrap();
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let t = U256::from(500_000u64);
+    let d: u128 = 400_000;
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            transfer_tx(BOB, ALICE, t, 0, 0),
+            lockbox_tx(ALICE, "depositToNative(uint128)", d, U256::ZERO, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true], "deposit of in-block funds must succeed");
+    assert_eq!(native_raw(&db, &ALICE), d);
+    assert_eq!(evm_balance(&db, &ALICE), t - U256::from(d * WEI_PER_NATIVE_RAW));
+    assert_eq!(total_wei(&db, &parties), before, "value conservation");
+}
+
+/// Block C: withdraw-from-native, THEN a transfer by the same caller. The EVM
+/// credit must survive the bundle commit (otherwise value is destroyed).
+#[test]
+fn lockbox_block_c_withdraw_then_transfer_conserves_value() {
+    let (_dir, db) = open_test_db();
+    let e0 = U256::from(1_000_000u64);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+    let n0: i128 = 900_000;
+    seed_native(&db, &ALICE, n0);
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let w: u128 = 200_000;
+    let t = U256::from(100_000u64);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            lockbox_tx(ALICE, "withdrawFromNative(uint128)", w, U256::ZERO, 0),
+            transfer_tx(ALICE, BOB, t, 1, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true]);
+    assert_eq!(native_raw(&db, &ALICE), n0 as u128 - w);
+    assert_eq!(
+        evm_balance(&db, &ALICE),
+        e0 + U256::from(w * WEI_PER_NATIVE_RAW) - t,
+        "withdraw credit must survive the bundle commit"
+    );
+    assert_eq!(total_wei(&db, &parties), before, "value conservation");
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {
