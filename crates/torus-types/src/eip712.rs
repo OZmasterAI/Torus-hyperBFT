@@ -282,16 +282,16 @@ fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
 /// EIP-712 struct hash for one order *inside* a batch (no nonce — the nonce is
 /// bound once at the batch level). Distinct typehash from `PlaceOrder` so a single
 /// order and a batch element can never collide.
-fn hash_place_order_item(p: &PlaceOrderParams) -> B256 {
-    let th = keccak256(
-        "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
-         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId)",
-    );
-    let mut buf = Vec::with_capacity(10 * 32);
+///
+/// `th` is the `PlaceOrderItem` typehash and `buf` a scratch buffer, both
+/// owned by the batch caller so a 400-order batch hashes the typehash once
+/// and allocates once (s77 profile: the per-item typehash was ~40% of the
+/// batch struct hash).
+fn hash_place_order_item(th: &B256, p: &PlaceOrderParams, buf: &mut Vec<u8>) -> B256 {
+    buf.clear();
     buf.extend_from_slice(&th.0);
-    append_place_order_fields(&mut buf, p);
-    keccak256(&buf)
+    append_place_order_fields(buf, p);
+    keccak256(&buf[..])
 }
 
 /// EIP-712 struct hash for a batch of orders under one signature + one nonce.
@@ -302,9 +302,15 @@ fn hash_place_order_item(p: &PlaceOrderParams) -> B256 {
 /// truncation/extension changes the hash even if it weren't already implied.
 fn hash_place_order_batch(orders: &[PlaceOrderParams], nonce: u64) -> B256 {
     let th = keccak256("PlaceOrderBatch(bytes32 ordersHash,uint64 count,uint64 nonce)");
+    let item_th = keccak256(
+        "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
+         uint8 orderType,uint8 timeInForce,bool reduceOnly,\
+         uint64 clientOrderId,bool hasClientOrderId)",
+    );
+    let mut item_buf = Vec::with_capacity(10 * 32);
     let mut acc = Vec::with_capacity(orders.len() * 32);
     for p in orders {
-        acc.extend_from_slice(&hash_place_order_item(p).0);
+        acc.extend_from_slice(&hash_place_order_item(&item_th, p, &mut item_buf).0);
     }
     let orders_hash = keccak256(&acc);
     let mut buf = Vec::with_capacity(4 * 32);
@@ -1212,6 +1218,30 @@ mod tests {
         let b = eip712_domain_separator();
         assert_eq!(a, b);
         assert_ne!(a, B256::ZERO);
+    }
+
+    /// s77: the batch struct hash hoists the item typehash out of the per-order
+    /// loop. Pinned to the value the pre-hoist code produced for a 400-order
+    /// batch (the golden fixtures only cover batches of 1-2 orders).
+    #[test]
+    fn place_order_batch_400_struct_hash_is_pinned() {
+        let orders: Vec<_> = (0..400u64)
+            .map(|i| PlaceOrderParams {
+                market_id: i % 10,
+                is_buy: i % 2 == 0,
+                price: FixedPoint::from_raw(6_500_000_000_000 + i as i128 * 1000),
+                quantity: FixedPoint::from_raw(10_000_000),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: Some(i),
+            })
+            .collect();
+        let h = eip712_struct_hash(&NativeAction::PlaceOrderBatch(orders), TEST_NONCE);
+        assert_eq!(
+            format!("{h}"),
+            "0xe83baa8e255a6aa0ec45ab4148e0e17f5d07b9acbf8c5b4ba54b843bf7d83bda"
+        );
     }
 
     #[test]
