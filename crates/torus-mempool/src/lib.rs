@@ -33,6 +33,15 @@ pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
 pub use crate::native_pool::is_cancel;
 
+/// Timing of one [`Mempool::get_native_da_batch_timed`] call (s76).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DaBatchTiming {
+    /// Buffered ingress bodies written by the call's mirror flush.
+    pub flushed: usize,
+    pub flush: std::time::Duration,
+    pub read: DaReadTiming,
+}
+
 /// Mempool configuration.
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
@@ -732,21 +741,25 @@ impl Mempool {
         self.get_native_da_batch_timed(hashes).0
     }
 
-    /// [`get_native_da_batch`](Self::get_native_da_batch) plus the read's
-    /// `MultiGet`/decode split (zero on a store error).
+    /// [`get_native_da_batch`](Self::get_native_da_batch) plus how long its
+    /// single mirror flush and the read's `MultiGet`/decode took (read times
+    /// zero on a store error).
     pub fn get_native_da_batch_timed(
         &self,
         hashes: &[B256],
-    ) -> (Vec<Option<SignedNativeAction>>, DaReadTiming) {
+    ) -> (Vec<Option<SignedNativeAction>>, DaBatchTiming) {
         // A buffered ingress mirror (T2.2) must be observable here too.
-        self.flush_da_mirrors();
-        match self.da_store.get_batch_timed(hashes) {
+        let started = std::time::Instant::now();
+        let flushed = self.flush_da_mirrors();
+        let flush = started.elapsed();
+        let (actions, read) = match self.da_store.get_batch_timed(hashes) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("native DA store read failed: {e}");
                 (vec![None; hashes.len()], DaReadTiming::default())
             }
-        }
+        };
+        (actions, DaBatchTiming { flushed, flush, read })
     }
 
     /// Presence check for a SET of native-action bodies in the durable DA
@@ -1231,11 +1244,29 @@ mod tests {
         pool.mirror_to_da(&b);
         assert_eq!(pool.flush_da_mirrors(), 2);
         assert_eq!(pool.flush_da_mirrors(), 0, "nothing left buffered");
-        let (got, _timing) = pool.get_native_da_batch_timed(&[
+    }
+
+    /// s76: the timed batch read does its ONE flush itself and reports it, so
+    /// the validate path never flushes a second time to time it (1067cc5 did,
+    /// adding an untimed RocksDB write per compact validate).
+    #[test]
+    fn timed_batch_read_reports_its_single_flush() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let a = gauge_test_action(1);
+        let b = gauge_test_action(2);
+        pool.mirror_to_da(&a);
+        pool.mirror_to_da(&b);
+        let hashes = [
             torus_types::compute_action_hash(&a),
             torus_types::compute_action_hash(&b),
-        ]);
-        assert!(got.iter().all(Option::is_some));
+        ];
+        let (got, timing) = pool.get_native_da_batch_timed(&hashes);
+        assert!(got.iter().all(Option::is_some), "flushed bodies are readable");
+        assert_eq!(timing.flushed, 2);
+        assert!(timing.read.multi_get > std::time::Duration::ZERO);
+        let (_, timing) = pool.get_native_da_batch_timed(&hashes);
+        assert_eq!(timing.flushed, 0);
     }
 
     fn gauge_test_action(nonce: u64) -> SignedNativeAction {

@@ -3842,20 +3842,15 @@ impl TorusApp {
         // restart (livelock root cause, mem 28e1a821). ONE batched read (single
         // mirror flush + single RocksDB MultiGet) — the per-hash loop cost
         // 23-31 ms per ~25-action block on the consensus thread, all hits.
-        // s76: the flush runs here first so its write is timed apart from the
-        // read (the read's own flush then finds nothing pending).
-        let flush_timer = std::time::Instant::now();
-        let flushed = mempool.flush_da_mirrors();
-        let flush_elapsed = flush_timer.elapsed();
-        let (mut actions, read_timing) = mempool.get_native_da_batch_timed(hashes);
+        let (mut actions, timing) = mempool.get_native_da_batch_timed(hashes);
         if let Some(m) = metrics.as_ref() {
             m.validate_block_da_flush_seconds
-                .observe(flush_elapsed.as_secs_f64());
-            m.validate_block_da_flush_bodies.inc_by(flushed as u64);
+                .observe(timing.flush.as_secs_f64());
+            m.validate_block_da_flush_bodies.inc_by(timing.flushed as u64);
             m.validate_block_da_multiget_seconds
-                .observe(read_timing.multi_get.as_secs_f64());
+                .observe(timing.read.multi_get.as_secs_f64());
             m.validate_block_da_decode_seconds
-                .observe(read_timing.decode.as_secs_f64());
+                .observe(timing.read.decode.as_secs_f64());
         }
         debug_assert_eq!(actions.len(), hashes.len());
         let mut missing: Vec<usize> = actions
