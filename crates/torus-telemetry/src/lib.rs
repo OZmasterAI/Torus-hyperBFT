@@ -413,6 +413,16 @@ pub struct Metrics {
     /// serial binary; the bench harness waits for 0 on every node before
     /// taking the 3-validator determinism digest.
     pub flush_worker_depth: Gauge,
+    /// s77 order latency: age `now - nonce` of every native action at each
+    /// stage (see [`OrderStage`]). The bench stamps `nonce = now_ms` when it
+    /// signs, so on the bench this is time since submission.
+    pub order_age_admit_seconds: Histogram,
+    pub order_age_commit_seconds: Histogram,
+    pub order_age_exec_seconds: Histogram,
+    pub order_age_durable_seconds: Histogram,
+    pub order_age_fills_visible_seconds: Histogram,
+    /// Actions whose nonce was ahead of this node's clock (observed as age 0).
+    pub order_age_future_nonce: Counter,
     /// `save_order_books` pass 1 — the journal DRAIN (+ level digests). Reads
     /// the LIVE book levels the next block's engine mutates, so it can never
     /// leave the exec thread. Observed once per native block; 0 in book modes
@@ -1604,6 +1614,46 @@ impl Metrics {
             flush_worker_depth.clone(),
         );
 
+        // s77 order latency: 5 ms .. ~11 min. Under overload an order can wait
+        // well past the 60 s nonce window (s77 cell: exec queue pinned at 64
+        // blocks, fills beyond 82 s), so the top bucket must not clip it.
+        let order_age = |registry: &mut Registry, name: &str, help: &str| {
+            let h = Histogram::new(exponential_buckets(0.005, 2.0, 18));
+            registry.register(name, help, h.clone());
+            h
+        };
+        let order_age_admit_seconds = order_age(
+            &mut registry,
+            "torus_order_age_admit_seconds",
+            "Order age (now - nonce) when the RPC node admits a native action",
+        );
+        let order_age_commit_seconds = order_age(
+            &mut registry,
+            "torus_order_age_commit_seconds",
+            "Order age (now - nonce) when its committed block is handed to execution",
+        );
+        let order_age_exec_seconds = order_age(
+            &mut registry,
+            "torus_order_age_exec_seconds",
+            "Order age (now - nonce) when its block has executed",
+        );
+        let order_age_durable_seconds = order_age(
+            &mut registry,
+            "torus_order_age_durable_seconds",
+            "Order age (now - nonce) when its block's state is durable (readable over RPC)",
+        );
+        let order_age_fills_visible_seconds = order_age(
+            &mut registry,
+            "torus_order_age_fills_visible_seconds",
+            "Order age (now - nonce) when its block's trade rows are written (fills readable over RPC)",
+        );
+        let order_age_future_nonce = Counter::default();
+        registry.register(
+            "torus_order_age_future_nonce",
+            "Native actions whose nonce was ahead of this node's clock (observed as age 0)",
+            order_age_future_nonce.clone(),
+        );
+
         let exec_save_books_drain_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_save_books_drain_seconds",
@@ -2019,6 +2069,12 @@ impl Metrics {
             exec_handoff_wait_seconds,
             flush_worker_seconds,
             flush_worker_depth,
+            order_age_admit_seconds,
+            order_age_commit_seconds,
+            order_age_exec_seconds,
+            order_age_durable_seconds,
+            order_age_fills_visible_seconds,
+            order_age_future_nonce,
             exec_save_books_drain_seconds,
             exec_save_books_write_seconds,
             exec_native_blocks,
@@ -2074,6 +2130,53 @@ impl Metrics {
         encode(&mut buf, &self.registry).expect("metrics encoding should not fail");
         buf
     }
+
+    /// Observe `now - nonce` for each action at `stage`, on the wall clock.
+    pub fn observe_order_ages(&self, stage: OrderStage, nonces: impl IntoIterator<Item = u64>) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        self.observe_order_ages_at(stage, now_ms, nonces);
+    }
+
+    /// [`Self::observe_order_ages`] at an explicit `now_ms`. A nonce ahead of
+    /// `now_ms` is observed as 0 and counted on `order_age_future_nonce`.
+    pub fn observe_order_ages_at(
+        &self,
+        stage: OrderStage,
+        now_ms: u64,
+        nonces: impl IntoIterator<Item = u64>,
+    ) {
+        let h = match stage {
+            OrderStage::Admit => &self.order_age_admit_seconds,
+            OrderStage::Commit => &self.order_age_commit_seconds,
+            OrderStage::Exec => &self.order_age_exec_seconds,
+            OrderStage::Durable => &self.order_age_durable_seconds,
+            OrderStage::FillsVisible => &self.order_age_fills_visible_seconds,
+        };
+        for nonce in nonces {
+            if nonce > now_ms {
+                self.order_age_future_nonce.inc();
+            }
+            h.observe(now_ms.saturating_sub(nonce) as f64 / 1000.0);
+        }
+    }
+}
+
+/// Where in its life a native action's age is observed (s77 order latency).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderStage {
+    /// The RPC node admitted it to its mempool.
+    Admit,
+    /// Its committed block was handed to execution (body in hand).
+    Commit,
+    /// Its block executed.
+    Exec,
+    /// Its block's state is durable, so balances, positions and orders are
+    /// readable over RPC.
+    Durable,
+    /// Its block's trade rows are written, so fills are readable over RPC.
+    FillsVisible,
 }
 
 impl Default for Metrics {
@@ -2148,6 +2251,26 @@ pub async fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s77 order latency: one observation of `now - nonce` per action, a
+    /// future nonce counts as age 0 plus one on the skew counter, and every
+    /// stage series exists from start-up so the harness can tell "zero" from
+    /// "absent".
+    #[test]
+    fn order_age_observes_now_minus_nonce_per_action() {
+        let m = Metrics::new();
+        m.observe_order_ages_at(OrderStage::Admit, 3_000, [1_000, 2_500, 5_000]);
+        let text = m.encode();
+        assert!(text.contains("torus_order_age_admit_seconds_count 3"), "{text}");
+        assert!(text.contains("torus_order_age_admit_seconds_sum 2.5"), "{text}");
+        assert!(text.contains("torus_order_age_future_nonce_total 1"), "{text}");
+        for stage in ["commit", "exec", "durable", "fills_visible"] {
+            assert!(
+                text.contains(&format!("torus_order_age_{stage}_seconds_count 0")),
+                "{stage} series must exist at 0:\n{text}"
+            );
+        }
+    }
 
     #[test]
     fn metrics_encode_nonempty() {

@@ -548,10 +548,51 @@ def check_view_hists_sampled():
     assert not missing, "VIEW_HISTS series not sampled in WIDE_COLS: %r" % missing
 
 
+# s77 order latency: 100 exec observations, 50 at or below 1.28 s and the
+# rest at or below 2.56 s => p50 = 1280 ms (bucket edge), p90 = 2304 ms and
+# p99 = 2534.4 ms by in-bucket interpolation.
+ORDER_AGE_EXEC_BUCKETS = [("0.64", 0), ("1.28", 50), ("2.56", 100), ("+Inf", 100)]
+ORDER_AGE_STAGES = ("admit", "commit", "exec", "durable", "fills_visible")
+
+
+def check_order_age():
+    """Per-stage order-age percentiles land in phase_by_node[*].order_age_ms
+    over [t_bench0, t_drain]; a stage without samples is None, and a cell
+    without buckets.csv (older harness) still summarizes with all None."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out)
+        with open(os.path.join(out, "buckets.csv"), "a") as f:
+            for node in ("val0", "val1", "val2"):
+                for le, cum in ORDER_AGE_EXEC_BUCKETS:
+                    f.write("1000,%s,torus_order_age_exec_seconds_bucket,%s,0\n" % (node, le))
+                    f.write("%d,%s,torus_order_age_exec_seconds_bucket,%s,%d\n"
+                            % (1000 + SPAN, node, le, cum))
+        age = run(out)["phase_by_node"]["val0"]["order_age_ms"]
+        assert set(age) == set(ORDER_AGE_STAGES), age
+        assert age["exec"] == {"n": 100, "p50": 1280.0, "p90": 2304.0, "p99": 2534.4}, age
+        for stage in ("admit", "commit", "durable", "fills_visible"):
+            assert age[stage] is None, (stage, age)
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, bl1="none")
+        age = run(out)["phase_by_node"]["val0"]["order_age_ms"]
+        assert all(v is None for v in age.values()), age
+
+
+def check_order_age_buckets_sampled():
+    """run-cell.sh must sample every stage's bucket series."""
+    with open(os.path.join(HERE, "run-cell.sh")) as f:
+        line = next(l for l in f if l.startswith("BUCKET_METRICS="))
+    for stage in ORDER_AGE_STAGES:
+        name = "torus_order_age_%s_seconds_bucket" % stage
+        assert name in line, "BUCKET_METRICS is missing %s" % name
+
+
 def main_s58():
     """s58 additions, invoked from __main__ after main()."""
     check_view_window()
     check_view_hists_sampled()
+    check_order_age()
+    check_order_age_buckets_sampled()
     print("test_summarize.py: OK")
 
 

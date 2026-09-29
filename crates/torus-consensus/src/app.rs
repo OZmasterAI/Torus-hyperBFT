@@ -42,6 +42,7 @@ use torus_state::cf::{
     META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
+use torus_telemetry::OrderStage;
 use torus_types::{
     Address, ChainConfig, CompactBlock, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
@@ -1892,6 +1893,16 @@ impl ExecutionContext {
                 }
                 return;
             }
+            // s77 order latency: this block's action nonces, observed at exec
+            // here and later at durable / fills_visible.
+            let order_nonces: Vec<u64> = if self.metrics.is_some() {
+                torus_block.native_actions.iter().map(|a| a.nonce).collect()
+            } else {
+                Vec::new()
+            };
+            if let Some(ref m) = self.metrics {
+                m.observe_order_ages(OrderStage::Exec, order_nonces.iter().copied());
+            }
             // r6 engine-untimed-attribution: the post-engine tail runs on the
             // exec thread inside the engine window but outside every
             // execute_batch phase timer — time it separately.
@@ -2030,6 +2041,7 @@ impl ExecutionContext {
                     pending: frozen,
                     evm_addrs,
                     books: deferred_books,
+                    order_nonces: order_nonces.clone(),
                 }) {
                     return;
                 }
@@ -2134,6 +2146,7 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_flush_seconds
                     .observe(flush_timer.elapsed().as_secs_f64());
+                m.observe_order_ages(OrderStage::Durable, order_nonces.iter().copied());
             }
             } // end serial flush
 
@@ -2145,18 +2158,32 @@ impl ExecutionContext {
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
             if !trades.is_empty() {
-                let fallback = match &self.trade_writer {
-                    Some(writer) => writer.send_packed(trades).err(),
-                    None => Some(trades),
+                // s77 order latency: fills are readable over RPC once these rows land.
+                let fallback = match (&self.trade_writer, &self.metrics) {
+                    (Some(writer), Some(m)) => {
+                        let m = m.clone();
+                        let nonces = order_nonces.clone();
+                        writer
+                            .send_packed_then(
+                                trades,
+                                Box::new(move || {
+                                    m.observe_order_ages(OrderStage::FillsVisible, nonces)
+                                }),
+                            )
+                            .err()
+                            .map(|(kvs, _)| kvs)
+                    }
+                    (Some(writer), None) => writer.send_packed(trades).err(),
+                    (None, _) => Some(trades),
                 };
                 // Writer gone (or absent): write synchronously so no rows are lost.
                 if let Some(kvs) = fallback {
                     for (cf, key, value) in kvs.iter() {
                         let _ = self.state_db.put_cf_raw(cf, key, value);
                     }
-                }
-                if let (Some(m), Some(w)) = (&self.metrics, &self.trade_writer) {
-                    m.trade_writer_queued_batches.set(w.queued_batches() as i64);
+                    if let Some(ref m) = self.metrics {
+                        m.observe_order_ages(OrderStage::FillsVisible, order_nonces.iter().copied());
+                    }
                 }
             }
         }
@@ -2270,6 +2297,12 @@ impl ExecutionContext {
         if let Some(ref m) = self.metrics {
             m.block_height.set(height as i64);
             m.blocks_committed.inc();
+            // Refreshed on EVERY block (s77): set only on trade blocks it froze
+            // at its last value once trades stopped, and the harness drain
+            // waits for it to reach 0.
+            if let Some(ref w) = self.trade_writer {
+                m.trade_writer_queued_batches.set(w.queued_batches() as i64);
+            }
             let tx_count = torus_block.header.evm_tx_count as u64
                 + torus_block.header.native_action_count as u64;
             m.block_transactions_count.observe(tx_count as f64);
@@ -5506,6 +5539,13 @@ impl TorusApp {
                 native = torus_block.native_actions.len(),
                 "on_committed_block: sending to execution pipeline"
             );
+            // s77 order latency: committed, body in hand, handed to execution.
+            if let Some(ref m) = self.metrics {
+                m.observe_order_ages(
+                    OrderStage::Commit,
+                    torus_block.native_actions.iter().map(|a| a.nonce),
+                );
+            }
 
             if !torus_block.native_actions.is_empty() {
                 if let Some(ref mempool) = self.mempool {
@@ -11670,6 +11710,30 @@ mod crash_recovery_tests {
     /// thread a message that reports both rows durable, so exec skips the redundant
     /// rewrite. The rows must really be on disk when the message is sent, and the
     /// commit manifest for that height must be gone (pruned in the same batch).
+    /// s77 order latency: the commit stage is observed once per native action
+    /// when its committed block is handed to execution.
+    #[test]
+    fn order_age_commit_observed_at_dispatch() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+
+        let a5 = vec![sign_claim_rewards(5), sign_claim_rewards(6)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_order_age_commit_seconds_count 2"),
+            "one commit observation per native action:\n{text}"
+        );
+    }
+
     #[test]
     fn dispatch_reports_durable_rows_after_persisting_them() {
         let (config, state_db) = make_test_config_and_db();
@@ -12033,6 +12097,98 @@ mod crash_recovery_tests {
     }
 
     /// §5 `exec_pipeline_state_identical_over_sequence`: the same sequence ON vs
+    /// s77 order latency: over the pipeline fixture, serial and pipelined, every
+    /// native action is observed once at `exec` and once at `durable` (serial
+    /// flush, flush worker, or barrier), and `fills_visible` exactly for the
+    /// actions of the blocks whose trade rows were written.
+    #[test]
+    fn order_age_stages_observed_once_per_native_action() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &state_db);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            ctx.metrics = Some(metrics.clone());
+            ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
+                state_db.clone(),
+                "test-trade-writer",
+                8,
+            ));
+            if on {
+                ctx.attach_flush_worker(None);
+            }
+            let blocks = pipeline_fixture_blocks();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            drop(ctx); // drains + joins W and the trade writer
+
+            let native: usize = blocks.iter().map(|b| b.native_actions.len()).sum();
+            let traded: std::collections::BTreeSet<u64> =
+                StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None)
+                    .unwrap()
+                    .iter()
+                    .map(|(k, _)| u64::from_be_bytes(k[8..16].try_into().unwrap()))
+                    .collect();
+            let filled: usize = blocks
+                .iter()
+                .filter(|b| traded.contains(&b.header.height))
+                .map(|b| b.native_actions.len())
+                .sum();
+            assert!(filled > 0, "fixture must produce fills (on={on})");
+
+            let text = metrics.encode();
+            let count = |stage: &str| {
+                metric_value(&text, &format!("torus_order_age_{stage}_seconds_count")) as usize
+            };
+            assert_eq!(count("exec"), native, "exec (on={on}):\n{text}");
+            assert_eq!(count("durable"), native, "durable (on={on}):\n{text}");
+            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on}):\n{text}");
+        }
+    }
+
+    /// s77: the trade-writer backlog gauge must stay live on blocks WITHOUT
+    /// trades (empties keep coming while the chain drains); the harness drain
+    /// waits on it, so a value frozen at the last trade block would hang it.
+    #[test]
+    fn trade_writer_gauge_refreshes_on_blocks_without_trades() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let (mut config, _) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
+            state_db.clone(),
+            "test-trade-writer",
+            8,
+        ));
+        let blocks = pipeline_fixture_blocks();
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &state_db, b);
+        }
+        let writer = ctx.trade_writer.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while writer.queued_batches() > 0 {
+            assert!(std::time::Instant::now() < deadline, "writer never drained");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let last = blocks.last().unwrap();
+        let mut empty = make_block(last.header.height + 1, vec![]);
+        empty.header.parent_hash = alloy_primitives::keccak256(last.header.canonical_header_bytes());
+        dispatch_and_execute(&ctx, &state_db, &empty);
+
+        let text = metrics.encode();
+        assert_eq!(
+            metric_value(&text, "torus_trade_writer_queued_batches"),
+            0.0,
+            "an empty block must refresh the drained writer's gauge:\n{text}"
+        );
+    }
+
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
     /// root — across empties, an epoch boundary (serial), a duplicated action
     /// (nonce guard through the layer), a session created in k and used by verify
@@ -12519,6 +12675,7 @@ mod crash_recovery_tests {
                     pending: frozen,
                     evm_addrs: vec![],
                     books: Some(save),
+                    order_nonces: vec![],
                 })
                 .unwrap();
             assert!(worker.wait_idle());
@@ -12535,6 +12692,7 @@ mod crash_recovery_tests {
                 pending: frozen3,
                 evm_addrs: vec![],
                 books: Some(save3.unwrap()),
+                order_nonces: vec![],
             })
             .unwrap();
         assert!(gate.wait_received(3), "W must have taken job 3");
@@ -12572,6 +12730,7 @@ mod crash_recovery_tests {
                 pending: frozen,
                 evm_addrs: vec![],
                 books: save,
+                order_nonces: vec![],
             })
             .unwrap();
         assert!(!worker_c.wait_idle(), "wait_idle must report the failure");
