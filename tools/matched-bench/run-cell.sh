@@ -37,8 +37,9 @@
 #                exactly the compiled values); BLOCK_CAP=100 is the pre-r4
 #                cap-100 control.
 #   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
-#                sender i to url i % 3). Unset/0 (default) = val0 only, the
-#                ingress every earlier cell used. Recorded via cell.bench_cmd.
+#                sender i to url i % 3). DEFAULT since s76 (unset = all).
+#                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
+#                Recorded via cell.bench_cmd.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)
 #   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
@@ -104,7 +105,7 @@
 #                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,104p' "$0"; exit 2; }
+usage() { sed -n '2,105p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -241,9 +242,9 @@ RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
 # s76: which validators take bench ingress (see BENCH_RPCS in the usage).
 bench_rpc_urls() {
     case "${BENCH_RPCS:-}" in
-        ""|0) printf '%s\n' "${RPCS[0]}" ;;
-        all) (IFS=,; printf '%s\n' "${RPCS[*]}") ;;
-        *) echo "FATAL: BENCH_RPCS must be unset, 0 or all (got '$BENCH_RPCS')" >&2; return 2 ;;
+        0) printf '%s\n' "${RPCS[0]}" ;;
+        ""|all) (IFS=,; printf '%s\n' "${RPCS[*]}") ;;
+        *) echo "FATAL: BENCH_RPCS must be unset, all or 0 (got '$BENCH_RPCS')" >&2; return 2 ;;
     esac
 }
 BENCH_RPC_URLS=$(bench_rpc_urls) || exit 2
