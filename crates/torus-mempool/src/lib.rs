@@ -496,6 +496,9 @@ impl Mempool {
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
         self.mirror_to_da(&action);
+        // `None` for session actions. Computed once: it is both the dedup
+        // lookup below and the key the pool insert seeds (s77).
+        let cache_key = torus_types::verified_cache_key(&action);
         let verified_sender = match &action.signature {
             torus_types::ActionSignature::Eip712(_) => {
                 // T2.1 fast-path: dedup against the verified-sender trust
@@ -504,8 +507,7 @@ impl Mempool {
                 // sender a fresh recover of these exact bytes would — this
                 // node derived it locally on an earlier ingest of the same
                 // signed action (RPC ingress or a prior gossip copy).
-                let cached = torus_types::verified_cache_key(&action)
-                    .and_then(|key| self.verified_sender(&key));
+                let cached = cache_key.and_then(|key| self.verified_sender(&key));
                 match cached {
                     Some(sender) => sender,
                     None => action.recover_sender().map_err(|e| {
@@ -534,7 +536,7 @@ impl Mempool {
         }
         // This node re-derived the sender from the signature above -> locally
         // verified, so the entry may seed the exec trust-cache.
-        self.admit_gossip(claimed_sender, action, true)
+        self.admit_gossip(claimed_sender, action, cache_key)
     }
 
     pub fn add_native_action_from_gossip_trusted(
@@ -551,12 +553,12 @@ impl Mempool {
         self.mirror_to_da(&action);
         // Sender is CLAIMED by the peer and NOT re-derived here -> not locally
         // verified; must never be short-circuited at exec.
-        self.admit_gossip(sender, action, false)
+        self.admit_gossip(sender, action, None)
     }
 
     /// Shared gossip admission: nonce-window gate + batch-size guard + pool insert
-    /// with the given provenance. `verified_locally` distinguishes the recover path
-    /// (true, seeds the trust-cache) from the raw trusted path (false).
+    /// with the given provenance. `cache_key` is the recover path's
+    /// `verified_cache_key` (seeds the trust-cache) and `None` on the raw trusted path.
     ///
     /// The durable DA mirror is the CALLER's responsibility (each public entry
     /// point mirrors the body exactly once, BEFORE authenticating/gating it) — so
@@ -566,7 +568,7 @@ impl Mempool {
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
-        verified_locally: bool,
+        cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
         // G1 defensive layer (O2): an oversize/empty batch must never enter
         // the POOL (an honest node must never SELECT it into a proposal). It
@@ -593,7 +595,7 @@ impl Mempool {
                 "nonce too far in future".into(),
             ));
         }
-        self.submit_native_action_inner(sender, action, verified_locally)
+        self.submit_native_action_inner(sender, action, cache_key)
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
@@ -634,27 +636,21 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
-        self.submit_native_action_inner(sender, action, true)
+        let cache_key = torus_types::verified_cache_key(&action);
+        self.submit_native_action_inner(sender, action, cache_key)
     }
 
-    /// Native insert with explicit provenance. `verified_locally` records whether
+    /// Native insert with explicit provenance. `cache_key` is `Some` only when
     /// THIS node verified the signature and resolved `sender` from it (RPC ingress
-    /// or gossip-RECOVER). Only locally-verified EIP-712 actions seed the exec
-    /// trust-cache (keyed by the signature-committing `verified_cache_key`);
-    /// gossip-TRUSTED admits pass `false` and are never short-circuited at exec.
+    /// or gossip-RECOVER): it is that action's `verified_cache_key`, which seeds
+    /// the exec trust-cache. It is `None` for non-EIP-712 (session) actions and for
+    /// gossip-TRUSTED admits, which are never short-circuited at exec.
     fn submit_native_action_inner(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
-        verified_locally: bool,
+        cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
-        // Derive the trust-cache key BEFORE `action` is moved into the pool. `None`
-        // for non-EIP-712 (session) actions, which are never short-circuited.
-        let cache_key = if verified_locally {
-            torus_types::verified_cache_key(&action)
-        } else {
-            None
-        };
 
         {
             let mut pool = self.native.write().unwrap();
