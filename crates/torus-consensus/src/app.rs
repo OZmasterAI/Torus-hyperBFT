@@ -3840,13 +3840,15 @@ impl TorusApp {
         // Read the DURABLE DA store, not the ephemeral nonce-gated mempool: a
         // block-referenced body survives the 60s nonce window, pool eviction, and a
         // restart (livelock root cause, mem 28e1a821). ONE batched read (single
-        // mirror flush + single RocksDB MultiGet) — the per-hash loop cost
-        // 23-31 ms per ~25-action block on the consensus thread, all hits.
+        // RocksDB MultiGet; the ingress mirror is flushed only on a miss, s76)
+        // — the per-hash loop cost 23-31 ms per ~25-action block on the
+        // consensus thread, all hits.
         let (mut actions, timing) = mempool.get_native_da_batch_timed(hashes);
         if let Some(m) = metrics.as_ref() {
-            m.validate_block_da_flush_seconds
-                .observe(timing.flush.as_secs_f64());
-            m.validate_block_da_flush_bodies.inc_by(timing.flushed as u64);
+            if let Some(flush) = timing.flush {
+                m.validate_block_da_flush_seconds.observe(flush.as_secs_f64());
+                m.validate_block_da_flush_bodies.inc_by(timing.flushed as u64);
+            }
             m.validate_block_da_multiget_seconds
                 .observe(timing.read.multi_get.as_secs_f64());
             m.validate_block_da_decode_seconds
@@ -8807,12 +8809,16 @@ mod crash_recovery_tests {
         ));
         let text = metrics.encode();
         for name in [
-            "torus_validate_block_da_flush_seconds_count",
             "torus_validate_block_da_multiget_seconds_count",
             "torus_validate_block_da_decode_seconds_count",
         ] {
             assert_eq!(metric_count(&text, name), 1, "{name}");
         }
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_flush_seconds_count"),
+            0,
+            "s76 step 2: bodies already durable, no ingress flush"
+        );
         assert_eq!(
             metric_count(&text, "torus_validate_block_da_wait_seconds_count"),
             0,
@@ -8827,6 +8833,11 @@ mod crash_recovery_tests {
         ));
         let text = metrics.encode();
         assert_eq!(metric_count(&text, "torus_validate_block_da_multiget_seconds_count"), 2);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_flush_seconds_count"),
+            1,
+            "a miss flushes before giving up"
+        );
         assert_eq!(metric_count(&text, "torus_validate_block_da_wait_seconds_count"), 1);
     }
 
