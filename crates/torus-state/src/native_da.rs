@@ -47,6 +47,14 @@ fn arrivals() -> &'static ArrivalNotifier {
 /// CF-backed (survives restart). Cheap to clone — it shares the underlying
 /// [`StateDb`] handle (an `Arc<DB>`), so every consensus / mempool / network
 /// site can hold its own `NativeDaStore` over the one database.
+/// Wall time of one [`NativeDaStore::get_batch_timed`] read, split into the
+/// RocksDB `MultiGet` and the body decode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DaReadTiming {
+    pub multi_get: std::time::Duration,
+    pub decode: std::time::Duration,
+}
+
 #[derive(Clone)]
 pub struct NativeDaStore {
     db: StateDb,
@@ -158,10 +166,20 @@ impl NativeDaStore {
     /// body is `Err(InvalidData)` exactly as in `get`. The hot compact-block
     /// reconstruct path uses this instead of a per-hash `get` loop.
     pub fn get_batch(&self, hashes: &[B256]) -> Result<Vec<Option<SignedNativeAction>>, StateError> {
+        self.get_batch_timed(hashes).map(|(actions, _)| actions)
+    }
+
+    /// [`get_batch`](Self::get_batch) plus how long the `MultiGet` and the
+    /// decode took (s76 validate-path timers).
+    pub fn get_batch_timed(
+        &self,
+        hashes: &[B256],
+    ) -> Result<(Vec<Option<SignedNativeAction>>, DaReadTiming), StateError> {
         if hashes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), DaReadTiming::default()));
         }
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        let started = std::time::Instant::now();
         // Decode directly from pinned values: the generic raw MultiGet copies
         // each full body into a temporary Vec that this path would discard.
         // Input is deliberately not sorted; duplicates and caller order matter.
@@ -172,7 +190,9 @@ impl NativeDaStore {
             .batched_multi_get_cf(cf, hashes.iter().map(|hash| hash.as_slice()), false)
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-        pinned
+        let multi_get = started.elapsed();
+        let started = std::time::Instant::now();
+        let actions = pinned
             .into_iter()
             .map(|slot| match slot {
                 Some(bytes) => bincode::deserialize(&bytes)
@@ -180,7 +200,8 @@ impl NativeDaStore {
                     .map_err(|e| StateError::InvalidData(e.to_string())),
                 None => Ok(None),
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((actions, DaReadTiming { multi_get, decode: started.elapsed() }))
     }
 
     /// Positions in `hashes` whose body is absent, in input order, from one
@@ -346,6 +367,32 @@ mod tests {
         assert_eq!(got[2].as_ref().map(compute_action_hash), Some(h3));
 
         assert!(store.get_batch(&[]).expect("empty get_batch").is_empty());
+    }
+
+    /// s76: the timed variant returns exactly what `get_batch` returns, plus
+    /// the MultiGet and decode split the hot reconstruct timers need.
+    #[test]
+    fn get_batch_timed_matches_get_batch() {
+        let (_dir, store) = temp_store();
+        let a1 = dummy_action(1);
+        let h1 = compute_action_hash(&a1);
+        let missing = B256::repeat_byte(0xAB);
+        store.put_batch(&[a1]).expect("put_batch");
+
+        let (got, timing) = store.get_batch_timed(&[h1, missing]).expect("get_batch_timed");
+        let plain = store.get_batch(&[h1, missing]).expect("get_batch");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].as_ref().map(compute_action_hash), Some(h1));
+        assert!(got[1].is_none());
+        assert_eq!(
+            got.iter().map(|a| a.as_ref().map(compute_action_hash)).collect::<Vec<_>>(),
+            plain.iter().map(|a| a.as_ref().map(compute_action_hash)).collect::<Vec<_>>()
+        );
+        assert!(timing.multi_get > std::time::Duration::ZERO);
+
+        let (empty, timing) = store.get_batch_timed(&[]).expect("empty");
+        assert!(empty.is_empty());
+        assert_eq!(timing, DaReadTiming::default());
     }
 
     /// `missing` reports the input positions whose body is absent, in input

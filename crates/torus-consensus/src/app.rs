@@ -3842,8 +3842,16 @@ impl TorusApp {
         // restart (livelock root cause, mem 28e1a821). ONE batched read (single
         // mirror flush + single RocksDB MultiGet) — the per-hash loop cost
         // 23-31 ms per ~25-action block on the consensus thread, all hits.
-        let mut actions: Vec<Option<torus_types::SignedNativeAction>> =
-            mempool.get_native_da_batch(hashes);
+        let (mut actions, timing) = mempool.get_native_da_batch_timed(hashes);
+        if let Some(m) = metrics.as_ref() {
+            m.validate_block_da_flush_seconds
+                .observe(timing.flush.as_secs_f64());
+            m.validate_block_da_flush_bodies.inc_by(timing.flushed as u64);
+            m.validate_block_da_multiget_seconds
+                .observe(timing.read.multi_get.as_secs_f64());
+            m.validate_block_da_decode_seconds
+                .observe(timing.read.decode.as_secs_f64());
+        }
         debug_assert_eq!(actions.len(), hashes.len());
         let mut missing: Vec<usize> = actions
             .iter()
@@ -3856,6 +3864,8 @@ impl TorusApp {
         // this proposal arrives, but that push can race the CompactBlock under load.
         // Poll briefly so a late push lands before we resort to the network.
         if !missing.is_empty() {
+            let _wait_span =
+                ObserveOnDrop::new(metrics.clone(), |m| &m.validate_block_da_wait_seconds);
             // S391 wake-on-arrival: block on the DA-store arrival notifier with the
             // same 20ms slice instead of a fixed sleep — a racing push wakes this
             // thread at delivery time, while the worst case stays the old tick
@@ -4524,7 +4534,13 @@ impl TorusApp {
                 }
             } else {
                 let proposer_addr = torus_block.header.proposer;
-                let proposer_pubkey = match staking.get_validator(&proposer_addr) {
+                let lookup_timer = std::time::Instant::now();
+                let proposer_record = staking.get_validator(&proposer_addr);
+                if let Some(m) = metrics.as_ref() {
+                    m.validate_block_attest_lookup_seconds
+                        .observe(lookup_timer.elapsed().as_secs_f64());
+                }
+                let proposer_pubkey = match proposer_record {
                     Ok(Some(val)) => match ed25519_dalek::VerifyingKey::from_bytes(&val.pubkey) {
                         Ok(vk) => vk,
                         Err(_) => {
@@ -8758,6 +8774,84 @@ mod crash_recovery_tests {
                 "torus_validate_block_attest_seconds_count"
             ),
             0
+        );
+    }
+
+    /// s76 item 6: the compact reconstruct is split into the ingress-mirror
+    /// flush, the RocksDB MultiGet, the body decode and the missing-body wait,
+    /// each observed on the calling thread. The wait only observes when a body
+    /// was missing on the first read.
+    #[test]
+    fn validate_da_subphase_timers_observe() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db,
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+
+        let actions = vec![sign_claim_rewards(2)];
+        mempool.mirror_native_to_da(&actions).unwrap();
+        let block = make_block(5, actions);
+        let datum = encode_proposal_datum(&block, true);
+        assert!(matches!(
+            app.validate_datum(&datum, &data_hash_of(&datum)),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        let text = metrics.encode();
+        for name in [
+            "torus_validate_block_da_flush_seconds_count",
+            "torus_validate_block_da_multiget_seconds_count",
+            "torus_validate_block_da_decode_seconds_count",
+        ] {
+            assert_eq!(metric_count(&text, name), 1, "{name}");
+        }
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_wait_seconds_count"),
+            0,
+            "all bodies present: no wait"
+        );
+
+        let missing = make_block(6, vec![sign_claim_rewards(3)]);
+        let missing_datum = encode_proposal_datum(&missing, true);
+        assert!(matches!(
+            app.validate_datum(&missing_datum, &data_hash_of(&missing_datum)),
+            ValidateBlockResponse::MissingData
+        ));
+        let text = metrics.encode();
+        assert_eq!(metric_count(&text, "torus_validate_block_da_multiget_seconds_count"), 2);
+        assert_eq!(metric_count(&text, "torus_validate_block_da_wait_seconds_count"), 1);
+    }
+
+    /// s76 item 6: the attested path's validator lookup is timed apart from
+    /// the digest + signature verify.
+    #[test]
+    fn validate_attest_lookup_observes() {
+        let (config, state_db) = make_test_config_and_db();
+        let metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
+        let app = TorusApp::new(state_db, &config, metrics.clone(), None, None);
+        let mut block = make_block(5, vec![sign_claim_rewards(1)]);
+        block.header.sig_attestation = [1u8; 64];
+        // Unregistered proposer: rejected, but only after the lookup ran.
+        assert!(!TorusApp::validate_body_checks_core(
+            &block,
+            &app.state_db,
+            &app.staking,
+            &metrics,
+        ));
+        assert_eq!(
+            metric_count(
+                &metrics.as_ref().unwrap().encode(),
+                "torus_validate_block_attest_lookup_seconds_count"
+            ),
+            1
         );
     }
 
