@@ -1486,6 +1486,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// (`TORUS_TRADE_HISTORY=0`, node-local; for validators that do not serve
     /// trade-history RPC). Default true.
     pub trade_history: bool,
+    /// s77 split experiment: when false (`TORUS_TRADE_HISTORY=trades`), the
+    /// per-market `CF_NATIVE_TRADES` row is still written but the two per-user
+    /// `CF_NATIVE_USER_TRADES` rows are not. Default true.
+    pub user_trade_history: bool,
     /// Trade-history rows packed into one byte arena while deferring writes.
     pending_trades: PackedCfBatch,
 
@@ -1933,6 +1937,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             trade_index: 0,
             defer_trades: false,
             trade_history: true,
+            user_trade_history: true,
             pending_trades: PackedCfBatch::default(),
             metrics: None,
             fatal_error: load_error,
@@ -5112,14 +5117,19 @@ impl NativeExecutor {
         if ctx.defer_trades {
             ctx.pending_trades
                 .push(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
-            ctx.pending_trades
-                .push(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
-            ctx.pending_trades
-                .push(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
+            if ctx.user_trade_history {
+                ctx.pending_trades
+                    .push(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
+                ctx.pending_trades
+                    .push(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
+            }
         } else {
             let _ = ctx
                 .state
                 .put_cf_raw(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
+            if !ctx.user_trade_history {
+                return;
+            }
             let _ = ctx
                 .state
                 .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);

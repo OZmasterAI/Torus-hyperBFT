@@ -360,6 +360,12 @@ fn parse_trade_history_toggle(raw: Option<String>) -> bool {
     raw.map_or(true, |v| v.trim() != "0")
 }
 
+/// s77 split experiment: per-user rows are written unless the value is `"0"`
+/// (no history) or `"trades"` (per-market rows only).
+fn parse_user_trade_history_toggle(raw: Option<String>) -> bool {
+    raw.map_or(true, |v| !matches!(v.trim(), "0" | "trades"))
+}
+
 fn trade_history_enabled() -> bool {
     parse_trade_history_toggle(std::env::var("TORUS_TRADE_HISTORY").ok())
 }
@@ -534,6 +540,9 @@ struct ExecutionContext {
     /// s77: `TORUS_TRADE_HISTORY=0` turns off the node-local trade-history
     /// rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`); default on.
     trade_history: bool,
+    /// s77 split experiment: `TORUS_TRADE_HISTORY=trades` keeps the per-market
+    /// trade rows but skips the per-user rows.
+    user_trade_history: bool,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1885,6 +1894,7 @@ impl ExecutionContext {
             // per-fill overlay PUTs; they are handed over after the flush below.
             ctx.defer_trades = self.trade_writer.is_some();
             ctx.trade_history = self.trade_history;
+            ctx.user_trade_history = self.user_trade_history;
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -3318,6 +3328,9 @@ impl TorusApp {
             // O3: 256 queued blocks of trade KVs max — a full queue blocks the
             // execution thread (backpressure) instead of ballooning memory.
             trade_history: trade_history_enabled(),
+            user_trade_history: parse_user_trade_history_toggle(
+                std::env::var("TORUS_TRADE_HISTORY").ok(),
+            ),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -6155,6 +6168,10 @@ mod exec_dispatch_tests {
         assert!(parse_trade_history_toggle(Some("1".into())));
         assert!(!parse_trade_history_toggle(Some("0".into())));
         assert!(!parse_trade_history_toggle(Some(" 0 ".into())));
+        assert!(parse_trade_history_toggle(Some("trades".into())));
+        assert!(!parse_user_trade_history_toggle(Some("trades".into())));
+        assert!(!parse_user_trade_history_toggle(Some("0".into())));
+        assert!(parse_user_trade_history_toggle(None));
     }
 
     #[test]
@@ -9854,6 +9871,7 @@ mod crash_recovery_tests {
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
             trade_history: true,
+            user_trade_history: true,
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -12250,6 +12268,37 @@ mod crash_recovery_tests {
             }
         }
         assert_eq!(root_on, root_off, "native root must not depend on trade history");
+    }
+
+    /// s77 split experiment: `TORUS_TRADE_HISTORY=trades` keeps the per-market
+    /// `CF_NATIVE_TRADES` rows and drops only the per-user rows; everything
+    /// else, including the trade rows themselves, is identical to full history.
+    #[test]
+    fn trade_history_trades_only_skips_user_rows_only() {
+        let run = |user_rows: bool| {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &state_db);
+            ctx.user_trade_history = user_rows;
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            (dump_all_cfs(&state_db), root)
+        };
+        let (full, root_full) = run(true);
+        let (split, root_split) = run(false);
+        for ((cf, a), (_, b)) in full.iter().zip(split.iter()) {
+            if *cf == torus_state::cf::CF_NATIVE_USER_TRADES {
+                assert!(!a.is_empty() && b.is_empty(), "user rows only in full mode");
+            } else {
+                assert_eq!(a, b, "CF {cf} must match full history");
+            }
+        }
+        assert_eq!(root_full, root_split);
     }
 
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
