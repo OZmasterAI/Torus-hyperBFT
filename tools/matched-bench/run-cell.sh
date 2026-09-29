@@ -31,11 +31,11 @@
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
 #                would otherwise bind first — see block_cap_bundle below).
 #                Applied after RECORD_ENV and before EXTRA_ENV, so EXTRA_ENV
-#                can still override any single knob. DEFAULT 200 since the r3
-#                merge (block-cap-raise-sweep winner); since r4 the COMPILED
-#                node defaults ARE the cap-200 bundle (BLOCK_CAP=200 exports
-#                exactly the compiled values); BLOCK_CAP=100 is the pre-r4
-#                cap-100 control.
+#                can still override any single knob. DEFAULT 400 since s76
+#                (200 from r3 to s75); the COMPILED node defaults are the
+#                same bundle (BLOCK_CAP=400 exports exactly the compiled
+#                values). BLOCK_CAP=200 = the r3-s75 default; BLOCK_CAP=100
+#                = the pre-r4 cap-100 control.
 #   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
 #                sender i to url i % 3). DEFAULT since s76 (unset = all).
 #                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
@@ -230,7 +230,11 @@ block_cap_bundle() { # $1=N -> prints K=V lines
 # in rate_limit.rs `compiled_defaults_reproduce_the_r3_cap200_bundle`), so the
 # BLOCK_CAP=200 export is a no-op on r4+ binaries and keeps OLDER binaries
 # equivalent; BLOCK_CAP=100 = the pre-r4 control cell.
-BLOCK_CAP=${BLOCK_CAP:-200}
+# s76: harness and compiled defaults move to cap 400 (NATIVE_TOTAL_BLOCK_CAP
+# 400 / ORDERS_PER_BLOCK 200_000 / BLOCK_BYTES 12 MB / trust-cache 64_000,
+# pinned in `compiled_defaults_reproduce_the_cap400_bundle`); BLOCK_CAP=200 =
+# the r4 default.
+BLOCK_CAP=${BLOCK_CAP:-400}
 if [ -n "$BLOCK_CAP" ]; then
     [[ "$BLOCK_CAP" =~ ^[0-9]+$ ]] && [ "$BLOCK_CAP" -ge 1 ] || { echo "FATAL: BLOCK_CAP must be a positive integer" >&2; exit 2; }
     mapfile -t BLOCK_CAP_ENV < <(block_cap_bundle "$BLOCK_CAP")

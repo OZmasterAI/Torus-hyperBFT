@@ -87,14 +87,22 @@ pub fn native_per_block_cap() -> usize {
 /// [`NATIVE_BLOCK_BYTES_CAP`], [`default_verified_sender_cache_cap`]);
 /// `TORUS_NATIVE_TOTAL_BLOCK_CAP=100` restores the previous behaviour.
 ///
+/// s76: raised to 400 (sweep s76-cap + s76-conc, 6 cells per cap, 3-val
+/// loopback, bs400): total matched orders +14% over cap 200 (every cap-400 cell
+/// above every cap-200 cell), nonce-expired actions ~0 vs 2-9k, best-60s +7-22%;
+/// block time ~+20% (747-896 vs 579-737 ms). Blocks were 219-273 actions, not
+/// full: the single-box rig, not the chain, was the ceiling.
+/// `TORUS_NATIVE_TOTAL_BLOCK_CAP=200` restores the r4 default.
+///
 /// Enforced only in produce_block selection; validate_block does not reject on
 /// count, so mixed cap values across validators don't fork (rolling-upgrade
 /// safe; the raise is proposer-local policy, not a chain parameter). WAN caveat
 /// stands: the win was measured on loopback — a multi-box WAN fleet at bs400
-/// pushes ~5.6 MB pre-proposal bodies per block (direct push up to the 8 MB
+/// pushes ~3.8 MB pre-proposal bodies per 200 actions, ~7.6 MB for a full
+/// cap-400 block (direct push up to the 8 MB
 /// `torus_network::caps::DIRECT_PUSH_BODY_BYTES` floor, hash-manifest + pull
 /// above it).
-pub const NATIVE_TOTAL_BLOCK_CAP: usize = 200;
+pub const NATIVE_TOTAL_BLOCK_CAP: usize = 400;
 
 /// Effective total native action cap: `TORUS_NATIVE_TOTAL_BLOCK_CAP` overrides
 /// the compiled default PER NODE. Proposer-local selection policy (enforced
@@ -197,7 +205,10 @@ pub use torus_types::NATIVE_ORDERS_PER_BATCH_CAP;
 /// run-cell.sh `block_cap_bundle 200`), so an unset env reproduces the r3
 /// selection caps exactly. Still the worst-case-exec-time bound: 100k orders
 /// per block at the measured ~1 s exec block time.
-pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 100_000;
+///
+/// s76: 200_000 = `max(50_000, 400 * 400 * 5/4)` (`block_cap_bundle 400`), so
+/// the orders cap still never binds before the cap-400 action cap.
+pub const NATIVE_ORDERS_PER_BLOCK_CAP: usize = 200_000;
 
 /// The r3 bundle's reference client batch size (bench `--batch-size 400`), the
 /// shape the cap-200 companion defaults were derived against. Sizing constant
@@ -254,7 +265,8 @@ pub fn native_orders_per_block_cap() -> usize {
 /// codec, 16 MiB) must still carry a full body during catch-up; bodies above
 /// the 8 MB direct-push floor go out as a hash manifest and are pulled in
 /// chunks; the shard read cap (`MAX_NATIVE_DA_SHARDS_MSG_SIZE`, 8 MiB) admits
-/// the 6 MB worst-case k=2 shard of a 12 MB body.
+/// the 6 MB worst-case k=2 shard of a 12 MB body. s76: unchanged at the cap-400
+/// default (the bundle clamps to this ceiling).
 pub const NATIVE_BLOCK_BYTES_CAP: usize = 12_000_000;
 
 /// Effective native block bytes cap: `TORUS_NATIVE_BLOCK_BYTES_CAP` overrides
@@ -275,7 +287,7 @@ pub fn native_block_bytes_cap() -> usize {
 /// action hash -> recovered sender). Sized to comfortably bridge the in-flight
 /// window between ingress/gossip-recover and execution: the exec pipeline lags up
 /// to the exec queue depth (64 committed blocks, app.rs `sync_channel(64)`) behind
-/// consensus, each block up to `NATIVE_TOTAL_BLOCK_CAP` actions (6400 at cap 100, 12_800 at the r4 cap 200) => the
+/// consensus, each block up to `NATIVE_TOTAL_BLOCK_CAP` actions (6400 at cap 100, 25_600 at the s76 cap 400) => the
 /// hard floor. Shipped at ~2.5x margin so churn / gossip dups don't evict
 /// still-needed entries before exec reads them. Over-cap or cold => cache MISS =>
 /// full recover + slash (safe). ~32B/entry => ~0.5MB at this cap.
@@ -292,8 +304,8 @@ pub fn native_block_bytes_cap() -> usize {
 /// env value still wins verbatim. This is NOT a clamp on the NUMBER of actions a
 /// block can carry — it never bounds selection — but it is the trust-cache sizing
 /// that keeps a raised cap fast. At cap 100 the resolved value is exactly this
-/// constant; r4 (compiled cap 200, unset env) resolves to 32_000 — the r3
-/// bundle's `TORUS_VERIFIED_SENDER_CACHE_CAP` value. This constant stays the
+/// constant; s76 (compiled cap 400, unset env) resolves to 64_000 — the
+/// cap-400 bundle's `TORUS_VERIFIED_SENDER_CACHE_CAP` value. This constant stays the
 /// historical floor, not the shipped default.
 pub const VERIFIED_SENDER_CACHE_CAP: usize = 16_384;
 
@@ -333,7 +345,7 @@ pub fn resolve_verified_sender_cache_cap(raw: Option<String>, total_block_cap: u
 }
 
 /// Compiled-cap view of [`resolve_verified_sender_cache_cap`] (kept for
-/// callers/tests that pin the compiled-default contract; cap 200 since r4).
+/// callers/tests that pin the compiled-default contract; cap 400 since s76).
 pub fn parse_verified_sender_cache_cap(raw: Option<String>) -> usize {
     resolve_verified_sender_cache_cap(raw, NATIVE_TOTAL_BLOCK_CAP)
 }
@@ -465,11 +477,11 @@ mod tests {
 
     #[test]
     fn native_block_cap_defaults_are_exactly_todays_values() {
-        // r4: the compiled defaults ARE the r3 cap-200 bundle. These pin the
-        // "unset env => byte-identical to run-cell.sh BLOCK_CAP=200" contract:
+        // s76: the compiled defaults ARE the cap-400 bundle. These pin the
+        // "unset env => byte-identical to run-cell.sh BLOCK_CAP=400" contract:
         // the per-block native TOTAL cap and per-SENDER cap defaults must not
         // drift; the trust-cache FLOOR constant stays the historical 16_384.
-        assert_eq!(NATIVE_TOTAL_BLOCK_CAP, 200, "per-block total native cap default (r3 winner)");
+        assert_eq!(NATIVE_TOTAL_BLOCK_CAP, 400, "per-block total native cap default (s76 sweep)");
         assert_eq!(NATIVE_PER_BLOCK_CAP, 64, "per-sender native cap default");
         assert_eq!(
             VERIFIED_SENDER_CACHE_CAP, 16_384,
@@ -477,14 +489,14 @@ mod tests {
         );
     }
 
-    /// r4: the compiled companion defaults reproduce tools/matched-bench
-    /// run-cell.sh `block_cap_bundle 200` at the reference bs400 shape exactly:
-    ///   orders = max(50_000, N*400*5/4)                       => 100_000
-    ///   cache  = max(16_384, 64*N*5/2)                        =>  32_000
+    /// s76: the compiled companion defaults reproduce tools/matched-bench
+    /// run-cell.sh `block_cap_bundle 400` at the reference bs400 shape exactly:
+    ///   orders = max(50_000, N*400*5/4)                       => 200_000
+    ///   cache  = max(16_384, 64*N*5/2)                        =>  64_000
     ///   bytes  = min(12_000_000, max(6_000_000, N*400*150))   => 12_000_000
-    /// so an unset env is the r3 record cell, not a fourth configuration.
+    /// so an unset env is the s76 sweep's cap-400 cell, not another configuration.
     #[test]
-    fn compiled_defaults_reproduce_the_r3_cap200_bundle() {
+    fn compiled_defaults_reproduce_the_cap400_bundle() {
         let n = NATIVE_TOTAL_BLOCK_CAP;
         let b = BLOCK_CAP_BUNDLE_REF_BATCH;
         assert_eq!(b, 400);
@@ -492,9 +504,9 @@ mod tests {
         let cache = (64 * n * 5 / 2).max(16_384);
         let bytes = (n * b * 150).max(6_000_000).min(12_000_000);
         assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, orders, "orders-per-block companion cap");
-        assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, 100_000);
+        assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, 200_000);
         assert_eq!(default_verified_sender_cache_cap(n), cache, "trust-cache derived default");
-        assert_eq!(default_verified_sender_cache_cap(n), 32_000);
+        assert_eq!(default_verified_sender_cache_cap(n), 64_000);
         assert_eq!(NATIVE_BLOCK_BYTES_CAP, bytes, "block bytes companion cap");
         assert_eq!(NATIVE_BLOCK_BYTES_CAP, 12_000_000);
         // The orders cap never binds before the action cap at the reference
@@ -509,9 +521,9 @@ mod tests {
     #[test]
     fn verified_sender_cache_cap_parse_resolves_and_defaults() {
         // Unset / malformed / zero => the cap-derived default for the compiled
-        // cap (32_000 at cap 200 — the r3 bundle value).
+        // cap (64_000 at cap 400 — the s76 bundle value).
         let compiled_default = default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP);
-        assert_eq!(compiled_default, 32_000);
+        assert_eq!(compiled_default, 64_000);
         assert_eq!(parse_verified_sender_cache_cap(None), compiled_default);
         assert_eq!(
             parse_verified_sender_cache_cap(Some("not-a-number".into())),
@@ -552,10 +564,10 @@ mod tests {
     fn default_verified_sender_cache_cap_is_unchanged_at_cap_100_and_scales_above() {
         // cap 100 (the pre-r4 compiled default / `TORUS_NATIVE_TOTAL_BLOCK_CAP=100`
         // control): 64*100*2.5 = 16_000 < 16_384 => the historical default is
-        // byte-identical. r4's compiled cap 200 => 32_000 (r3 bundle value).
+        // byte-identical. s76's compiled cap 400 => 64_000 (bundle value).
         assert_eq!(default_verified_sender_cache_cap(100), VERIFIED_SENDER_CACHE_CAP);
         assert_eq!(default_verified_sender_cache_cap(100), 16_384);
-        assert_eq!(default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP), 32_000);
+        assert_eq!(default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP), 64_000);
         // Never BELOW the compiled default (a lowered cap keeps the 16_384).
         assert_eq!(default_verified_sender_cache_cap(10), 16_384);
         assert_eq!(default_verified_sender_cache_cap(0), 16_384);
