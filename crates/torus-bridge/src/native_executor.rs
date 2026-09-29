@@ -1482,6 +1482,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// background writer after all exec phases. Off by default: every existing
     /// caller keeps inline writes.
     pub defer_trades: bool,
+    /// s77: when false, no trade-history rows are built or written at all
+    /// (`TORUS_TRADE_HISTORY=0`, node-local; for validators that do not serve
+    /// trade-history RPC). Default true.
+    pub trade_history: bool,
     /// Trade-history rows packed into one byte arena while deferring writes.
     pending_trades: PackedCfBatch,
 
@@ -1928,6 +1932,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             total_native_fees: 0,
             trade_index: 0,
             defer_trades: false,
+            trade_history: true,
             pending_trades: PackedCfBatch::default(),
             metrics: None,
             fatal_error: load_error,
@@ -4360,6 +4365,7 @@ impl NativeExecutor {
             let positions = &ctx.positions;
             let margin_configs = &ctx.margin_configs;
             let (block_height, timestamp) = (ctx.block_height, ctx.timestamp);
+            let trade_history = ctx.trade_history;
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
 
             // Per-market weight for the LPT packer: plan cost is one pass over
@@ -4389,6 +4395,7 @@ impl NativeExecutor {
                         prepared,
                         block_height,
                         timestamp,
+                        trade_history,
                     )
                 }))
                 .map_err(|payload| {
@@ -4600,6 +4607,7 @@ impl NativeExecutor {
         prepared: &[PreparedOrder<'_>],
         block_height: u64,
         timestamp: u64,
+        trade_history: bool,
     ) -> MarketSettlePlan {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
@@ -4669,7 +4677,7 @@ impl NativeExecutor {
 
             // Trade rows (skipped wholesale on a failed order, like sequential;
             // the definitive index is stamped in pass B).
-            let trades: Vec<TradeKvs> = if fill_error.is_none() {
+            let trades: Vec<TradeKvs> = if fill_error.is_none() && trade_history {
                 result
                     .fills
                     .iter()
@@ -5098,6 +5106,9 @@ impl NativeExecutor {
     /// Route one fill's trade rows: buffered under `defer_trades` (O3), else
     /// inline overlay PUTs — exactly the classic persist_trade tail.
     fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
+        if !ctx.trade_history {
+            return;
+        }
         if ctx.defer_trades {
             ctx.pending_trades
                 .push(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);

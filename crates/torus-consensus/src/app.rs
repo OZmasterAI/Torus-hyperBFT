@@ -353,6 +353,17 @@ fn parse_nonblocking_dispatch_toggle(raw: Option<String>) -> bool {
     }
 }
 
+/// s77: parse `TORUS_TRADE_HISTORY`. Unset, empty or anything but `"0"` ⇒ on
+/// (today's behavior); `"0"` ⇒ no trade-history rows are written. Node-local:
+/// the two trade CFs are outside the native consensus root.
+fn parse_trade_history_toggle(raw: Option<String>) -> bool {
+    raw.map_or(true, |v| v.trim() != "0")
+}
+
+fn trade_history_enabled() -> bool {
+    parse_trade_history_toggle(std::env::var("TORUS_TRADE_HISTORY").ok())
+}
+
 /// Effective dispatch mode. Fresh env read per call, like
 /// [`exec_throttle_watermarks`]: dispatch runs once per committed block, the
 /// read is noise, and fresh reads keep same-process tests deterministic.
@@ -520,6 +531,9 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// s77: `TORUS_TRADE_HISTORY=0` turns off the node-local trade-history
+    /// rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`); default on.
+    trade_history: bool,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1870,6 +1884,7 @@ impl ExecutionContext {
             // trade-history KVs (node-local, non-root CFs) instead of paying
             // per-fill overlay PUTs; they are handed over after the flush below.
             ctx.defer_trades = self.trade_writer.is_some();
+            ctx.trade_history = self.trade_history;
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -3302,6 +3317,7 @@ impl TorusApp {
             exec_trust_cache: config.exec_trust_cache,
             // O3: 256 queued blocks of trade KVs max — a full queue blocks the
             // execution thread (backpressure) instead of ballooning memory.
+            trade_history: trade_history_enabled(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -6130,6 +6146,15 @@ mod exec_dispatch_tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(cap);
         app.exec_tx = Some(tx);
         rx
+    }
+
+    #[test]
+    fn trade_history_toggle_defaults_on_and_zero_disables() {
+        assert!(parse_trade_history_toggle(None));
+        assert!(parse_trade_history_toggle(Some("".into())));
+        assert!(parse_trade_history_toggle(Some("1".into())));
+        assert!(!parse_trade_history_toggle(Some("0".into())));
+        assert!(!parse_trade_history_toggle(Some(" 0 ".into())));
     }
 
     #[test]
@@ -9828,6 +9853,7 @@ mod crash_recovery_tests {
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
+            trade_history: true,
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -12187,6 +12213,43 @@ mod crash_recovery_tests {
             0.0,
             "an empty block must refresh the drained writer's gauge:\n{text}"
         );
+    }
+
+    /// s77 trade-history switch: with trade history OFF no row reaches the two
+    /// node-local trade CFs, and every OTHER CF plus the persisted native root
+    /// is byte-identical to a run with it ON — the switch cannot touch
+    /// consensus state.
+    #[test]
+    fn trade_history_off_writes_no_trade_rows_and_leaves_state_identical() {
+        let run = |history: bool| {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &state_db);
+            ctx.trade_history = history;
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            (dump_all_cfs(&state_db), root)
+        };
+        let (on, root_on) = run(true);
+        let (off, root_off) = run(false);
+        let trade_cfs = [
+            torus_state::cf::CF_NATIVE_TRADES,
+            torus_state::cf::CF_NATIVE_USER_TRADES,
+        ];
+        for ((cf, rows_on), (_, rows_off)) in on.iter().zip(off.iter()) {
+            if trade_cfs.contains(cf) {
+                assert!(!rows_on.is_empty(), "fixture must write {cf} when on");
+                assert!(rows_off.is_empty(), "{cf} must stay empty when off");
+            } else {
+                assert_eq!(rows_on, rows_off, "CF {cf} must not depend on trade history");
+            }
+        }
+        assert_eq!(root_on, root_off, "native root must not depend on trade history");
     }
 
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
