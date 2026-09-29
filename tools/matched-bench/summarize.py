@@ -252,6 +252,26 @@ def cadence(rs, lo, hi, buckets, node):
     }
 
 
+ORDER_AGE_STAGES = ("admit", "commit", "exec", "durable", "fills_visible")
+
+
+def order_age(buckets, node):
+    """s77 order latency: per-stage age (now - nonce) percentiles in ms from
+    `torus_order_age_<stage>_seconds` buckets. None for a stage with no
+    samples in the window (or a node binary that predates the metric)."""
+    out = {}
+    for stage in ORDER_AGE_STAGES:
+        pairs = buckets.get((node, "torus_order_age_%s_seconds_bucket" % stage))
+        n = pairs[-1][1] if pairs else 0
+        if n <= 0:
+            out[stage] = None
+            continue
+        out[stage] = {"n": int(n)}
+        for key, q in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+            out[stage][key] = round(hist_quantile(pairs, q) * 1000.0, 1)
+    return out
+
+
 CADENCE_KEYS = ["committed_blocks", "executed_native_blocks", "wall_ms_per_committed_block",
                 "wall_ms_per_native_block", "native_blk_s", "empty_blk_s", "exec_thread_busy_fraction",
                 "commit_interval_ms_avg", "commit_interval_ms_p50", "commit_interval_ms_p95"]
@@ -497,6 +517,9 @@ for node, rs in rows.items():
         "running_compactions": gstat("rocksdb_running_compactions"),
         "trade_writer_queued_batches": gstat("trade_writer_queued_batches"),
     }
+    # s77: over bench+drain, so orders submitted late in the window still
+    # reach every stage.
+    p["order_age_ms"] = order_age(BUCKETS, node)
     phase[node] = p
 
 # ---------------------------------------------------------------- consensus (metrics-before/after)
@@ -1110,6 +1133,14 @@ if p0:
           " ".join(f"{k}={v['ms']}("
                    + ("off-chain" if v["pct_of_block"] is None else f"{v['pct_of_block']}%")
                    + ")" for k, v in p0["phases"].items()))
+
+    # s77 order latency: age since submit at each stage, ms p50/p90/p99.
+    def _age(v):
+        return "-" if v is None else "%s/%s/%s" % (v["p50"], v["p90"], v["p99"])
+    for node in sorted(phase):
+        age = phase[node].get("order_age_ms") or {}
+        print(f"ORDER_AGE {node} (ms p50/p90/p99): "
+              + " ".join(f"{stage}={_age(v)}" for stage, v in age.items()))
 
     # bl1 exec-chain ruler: the critical chain, what came off it, and the
     # denominator. chain_ms=None means the node binary predates bl1.

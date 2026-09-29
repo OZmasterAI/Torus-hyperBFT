@@ -444,6 +444,7 @@ impl Mempool {
             .validate(current_time_ms, self.config.chain_id)
             .map_err(|e| MempoolError::NativeValidationFailed(e.to_string()))?;
         self.submit_native_action(sender, action.clone())?;
+        self.observe_admit_age(&action);
         // Mirror the admitted body to the durable DA store (out-of-band delivery).
         self.mirror_to_da(&action);
         self.gossip_native_action(sender, &action);
@@ -474,10 +475,18 @@ impl Mempool {
         }
 
         self.submit_native_action(sender, action.clone())?;
+        self.observe_admit_age(&action);
         // Mirror the admitted body to the durable DA store (out-of-band delivery).
         self.mirror_to_da(&action);
         self.gossip_native_action(sender, &action);
         Ok(())
+    }
+
+    /// s77 order latency: age at RPC admission (the ingress node only).
+    fn observe_admit_age(&self, action: &SignedNativeAction) {
+        if let Some(m) = self.metrics.get() {
+            m.observe_order_ages(torus_telemetry::OrderStage::Admit, [action.nonce]);
+        }
     }
 
     /// Insert a native action received from gossip with a pre-verified sender.
@@ -2102,6 +2111,36 @@ mod tests {
         assert!(
             pool.get_native_by_hash(&hash).is_none(),
             "pool entry removed after commit"
+        );
+    }
+
+    #[test]
+    fn order_age_admit_observed_once_per_admitted_action() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let sender = action.recover_sender().unwrap();
+
+        pool.add_native_action_presigned(sender, action.clone()).unwrap();
+        assert!(pool.add_native_action_presigned(sender, action.clone()).is_err());
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms() + 1,
+            &key,
+        ))
+        .unwrap();
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_order_age_admit_seconds_count 2"),
+            "one observation per ADMITTED action; the rejected duplicate adds none:\n{text}"
         );
     }
 

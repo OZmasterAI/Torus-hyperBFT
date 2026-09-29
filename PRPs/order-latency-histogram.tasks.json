@@ -1,0 +1,13 @@
+{
+  "prp": "order-latency-histogram",
+  "created": "2026-09-29T21:00:00+02:00",
+  "tasks": [
+    {"id": 1, "name": "telemetry stage histograms + observe_order_ages", "status": "pending", "files": ["crates/torus-telemetry/src/lib.rs"], "validate": "cargo test --release -p torus-telemetry order_age", "depends_on": []},
+    {"id": 2, "name": "trade writer completion hook (send_packed_then)", "status": "pending", "files": ["crates/torus-state/src/bg_writer.rs"], "validate": "cargo test --release -p torus-state bg_writer", "depends_on": []},
+    {"id": 3, "name": "admit stage in mempool", "status": "pending", "files": ["crates/torus-mempool/src/lib.rs"], "validate": "cargo test --release -p torus-mempool order_age", "depends_on": [1]},
+    {"id": 4, "name": "exec, serial durable, fills_visible", "status": "pending", "files": ["crates/torus-consensus/src/app.rs"], "validate": "cargo test --release -p torus-consensus order_age", "depends_on": [1, 2]},
+    {"id": 5, "name": "pipelined durable via flush worker", "status": "pending", "files": ["crates/torus-consensus/src/exec_pipeline.rs", "crates/torus-consensus/src/app.rs"], "validate": "cargo test --release -p torus-consensus order_age", "depends_on": [4]},
+    {"id": 6, "name": "commit stage in dispatch_to_exec", "status": "pending", "files": ["crates/torus-consensus/src/app.rs"], "validate": "cargo test --release -p torus-consensus", "depends_on": [1]},
+    {"id": 7, "name": "harness buckets + summarize percentiles", "status": "pending", "files": ["tools/matched-bench/run-cell.sh", "tools/matched-bench/summarize.py", "tools/matched-bench/test_summarize.py"], "validate": "python3 -m pytest tools/matched-bench/test_summarize.py -q", "depends_on": []}
+  ]
+}

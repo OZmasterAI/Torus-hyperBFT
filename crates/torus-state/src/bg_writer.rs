@@ -103,24 +103,26 @@ impl PackedCfBatch {
     }
 }
 
-#[derive(Debug)]
+/// Runs on the writer thread once a batch's rows are written (not on failure).
+pub type OnWritten = Box<dyn FnOnce() + Send>;
+
 enum CfBatch {
     Raw(Vec<RawCfKv>),
-    Packed(PackedCfBatch),
+    Packed(PackedCfBatch, Option<OnWritten>),
 }
 
 impl CfBatch {
     fn len(&self) -> usize {
         match self {
             Self::Raw(kvs) => kvs.len(),
-            Self::Packed(kvs) => kvs.len(),
+            Self::Packed(kvs, _) => kvs.len(),
         }
     }
 
     fn write(&self, db: &StateDb, policy: BgWriterPolicy) -> Result<(), StateError> {
         match self {
             Self::Raw(kvs) => write_kvs_chunked(db, kvs, policy),
-            Self::Packed(kvs) => write_rows_chunked(db, kvs.iter(), policy),
+            Self::Packed(kvs, _) => write_rows_chunked(db, kvs.iter(), policy),
         }
     }
 }
@@ -212,8 +214,15 @@ impl BackgroundCfWriter {
                 // recv() returns every queued batch even after the sender is
                 // dropped, then errors — drain-on-shutdown falls out for free.
                 while let Ok(kvs) = rx.recv() {
-                    if let Err(e) = kvs.write(&db, policy) {
-                        tracing::error!(%e, n = kvs.len(), "background CF writer: batch failed");
+                    match kvs.write(&db, policy) {
+                        Ok(()) => {
+                            if let CfBatch::Packed(_, Some(on_written)) = kvs {
+                                on_written();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, n = kvs.len(), "background CF writer: batch failed");
+                        }
                     }
                     drained.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -232,16 +241,31 @@ impl BackgroundCfWriter {
         self.send_batch(CfBatch::Raw(kvs))
             .map_err(|batch| match batch {
                 CfBatch::Raw(kvs) => kvs,
-                CfBatch::Packed(_) => unreachable!("send_batch returns the original batch"),
+                CfBatch::Packed(..) => unreachable!("send_batch returns the original batch"),
             })
     }
 
     /// Queue packed rows with the same backpressure and handback as [`Self::send`].
     pub fn send_packed(&self, kvs: PackedCfBatch) -> Result<(), PackedCfBatch> {
-        self.send_batch(CfBatch::Packed(kvs))
+        self.send_batch(CfBatch::Packed(kvs, None))
             .map_err(|batch| match batch {
-                CfBatch::Packed(kvs) => kvs,
+                CfBatch::Packed(kvs, _) => kvs,
                 CfBatch::Raw(_) => unreachable!("send_batch returns the original batch"),
+            })
+    }
+
+    /// [`Self::send_packed`], running `on_written` on the writer thread once the
+    /// rows are written (never if the write fails). If the writer is gone, both
+    /// are handed back unrun.
+    pub fn send_packed_then(
+        &self,
+        kvs: PackedCfBatch,
+        on_written: OnWritten,
+    ) -> Result<(), (PackedCfBatch, OnWritten)> {
+        self.send_batch(CfBatch::Packed(kvs, Some(on_written)))
+            .map_err(|batch| match batch {
+                CfBatch::Packed(kvs, Some(on_written)) => (kvs, on_written),
+                _ => unreachable!("send_batch returns the original batch"),
             })
     }
 
@@ -571,6 +595,33 @@ mod tests {
                 "user-trade row {i} must be durable after drop"
             );
         }
+    }
+
+    /// s77 order latency: the completion hook runs once, and only after the
+    /// batch's rows are readable (it marks "fills visible over RPC").
+    #[test]
+    fn send_packed_then_runs_hook_after_rows_are_readable() {
+        let (_dir, db) = open_test_db();
+        let writer = BackgroundCfWriter::spawn(db.clone(), "test-cf-writer", 8);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = db.clone();
+        let mut batch = PackedCfBatch::default();
+        batch.push(CF_NATIVE_TRADES, b"k", b"v");
+        writer
+            .send_packed_then(
+                batch,
+                Box::new(move || {
+                    tx.send(reader.get_cf_raw(CF_NATIVE_TRADES, b"k").unwrap()).unwrap();
+                }),
+            )
+            .map_err(|_| "writer gone")
+            .unwrap();
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("hook must run");
+        assert_eq!(seen, Some(b"v".to_vec()), "row must be readable when the hook runs");
+        drop(writer);
+        assert!(rx.try_recv().is_err(), "hook must run exactly once");
     }
 
     #[test]

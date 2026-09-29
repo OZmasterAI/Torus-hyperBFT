@@ -502,7 +502,8 @@ WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_
 # (no extra HTTP). summarize.py turns these into commit-cadence p50/p95 and
 # chain / hand-off percentiles; a cell run by an older harness simply has no
 # buckets.csv and gets None for every percentile.
-BUCKET_METRICS="torus_commit_interval_seconds_bucket torus_exec_chain_seconds_bucket torus_exec_handoff_wait_seconds_bucket torus_flush_worker_seconds_bucket"
+# s77: end-to-end order latency, age (now - nonce) at each stage.
+BUCKET_METRICS="torus_commit_interval_seconds_bucket torus_exec_chain_seconds_bucket torus_exec_handoff_wait_seconds_bucket torus_flush_worker_seconds_bucket torus_order_age_admit_seconds_bucket torus_order_age_commit_seconds_bucket torus_order_age_exec_seconds_bucket torus_order_age_durable_seconds_bucket torus_order_age_fills_visible_seconds_bucket"
 WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
 echo "ts,node,metric,le,count" > "$OUT/buckets.csv"

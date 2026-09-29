@@ -69,6 +69,9 @@ pub enum Job {
         pending: Arc<FrozenPending>,
         evm_addrs: Vec<Address>,
         books: Option<torus_bridge::native_executor::DeferredBookSave>,
+        /// s77 order latency: the block's action nonces, observed at `durable`
+        /// once the job's batch is written.
+        order_nonces: Vec<u64>,
     },
     /// An empty / non-native block: advance the applied-height marker, in order
     /// behind the previous block's batch. `pending` is the 1-key marker layer the
@@ -308,6 +311,11 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 m.exec_flush_seconds.observe(wall);
             }
         }
+        if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), Some(m), Job::Flush { order_nonces, .. }) =
+            (&result, &env.metrics, &job)
+        {
+            m.observe_order_ages(torus_telemetry::OrderStage::Durable, order_nonces.iter().copied());
+        }
         match result {
             Ok(Ok(())) => {
                 shared.durable_height.store(height, Ordering::SeqCst);
@@ -370,6 +378,7 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             pending,
             evm_addrs,
             books,
+            ..
         } => {
             // Deferred book save: apply pass 2 (if any) into a sidecar overlay
             // FIRST — its reads (stop-row diff, meta compare) see heights <
