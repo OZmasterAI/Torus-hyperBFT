@@ -36,6 +36,10 @@
 #                node defaults ARE the cap-200 bundle (BLOCK_CAP=200 exports
 #                exactly the compiled values); BLOCK_CAP=100 is the pre-r4
 #                cap-100 control.
+#   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
+#                sender i to url i % 3). DEFAULT since s76 (unset = all).
+#                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
+#                Recorded via cell.bench_cmd.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)
 #   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
@@ -101,7 +105,7 @@
 #                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,101p' "$0"; exit 2; }
+usage() { sed -n '2,105p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -235,6 +239,15 @@ else
 fi
 
 RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
+# s76: which validators take bench ingress (see BENCH_RPCS in the usage).
+bench_rpc_urls() {
+    case "${BENCH_RPCS:-}" in
+        0) printf '%s\n' "${RPCS[0]}" ;;
+        ""|all) (IFS=,; printf '%s\n' "${RPCS[*]}") ;;
+        *) echo "FATAL: BENCH_RPCS must be unset, all or 0 (got '$BENCH_RPCS')" >&2; return 2 ;;
+    esac
+}
+BENCH_RPC_URLS=$(bench_rpc_urls) || exit 2
 METS=(9161 9162 9163)
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
@@ -514,7 +527,7 @@ sleep 3
 kill -0 "$SAMPLER_PID" 2>/dev/null || die "metrics sampler exited (see sampler.log)"
 
 # ---------------------------------------------------------------- 6. bench
-BENCH_CMD=("$BENCH" consensus --rpc-urls "${RPCS[0]}" --econ --senders "$SENDERS" --sender-offset 60 \
+BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SENDERS" --sender-offset 60 \
     --markets "$MARKETS" --batch-size "$BATCH" --submit-batch "$SUBMIT" --format bin --concurrency "$CONC" \
     --duration "$DUR" --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total "$RATE")
 # LOCALITY shape (unset = flag omitted = uniform draw over 1..=MARKETS, i.e. the

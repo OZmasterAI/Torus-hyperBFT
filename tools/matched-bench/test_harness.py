@@ -974,6 +974,43 @@ class CrashGateSummaryTest(unittest.TestCase):
         self.assertEqual(a["agreement_verdict"], "DISAGREE")
 
 
+# ------------------------------------ run-cell.sh: s76 BENCH_RPCS (bench ingress)
+class BenchRpcUrlsTest(unittest.TestCase):
+    """run-cell.sh's bench_rpc_urls: unset/all (default since s76) spreads the
+    senders over all three validators (the bench pins sender i to url i % n);
+    BENCH_RPCS=0 is the val0-only ingress every pre-s76 cell used; anything
+    else is a fatal typo, never a silent run of the wrong shape."""
+
+    def setUp(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        a = src.index("bench_rpc_urls() {")
+        self.fn = src[a:src.index("\n}\n", a) + 3]
+
+    def urls(self, value=None):
+        env = {k: v for k, v in os.environ.items() if k != "BENCH_RPCS"}
+        if value is not None:
+            env["BENCH_RPCS"] = value
+        r = subprocess.run(
+            ["bash", "-c", self.fn + "\nRPCS=(http://a:1 http://b:2 http://c:3); bench_rpc_urls"],
+            capture_output=True, text=True, env=env, timeout=30)
+        return r.returncode, r.stdout.strip()
+
+    def test_zero_keeps_val0_only(self):
+        self.assertEqual(self.urls("0"), (0, "http://a:1"))
+
+    def test_unset_and_all_pass_every_validator_comma_separated(self):
+        every = (0, "http://a:1,http://b:2,http://c:3")
+        self.assertEqual(self.urls(), every)
+        self.assertEqual(self.urls(""), every)
+        self.assertEqual(self.urls("all"), every)
+
+    def test_unknown_value_is_fatal(self):
+        rc, out = self.urls("val1")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out, "")
+
+
 # ------------------------------------ run-cell.sh: s75 multi-crash kill sequence
 STUB_CRASH_KILL = r"""#!/usr/bin/env bash
 # stub: records its call, writes the record like crash-kill.sh, never kills.

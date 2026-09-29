@@ -39,10 +39,13 @@ pub(crate) const SUBMIT_BATCH_MAX: usize = 100;
 /// this higher explicitly via the env var below.
 pub(crate) const DEFAULT_MAX_RESPONSE_MB: u32 = 10;
 
-/// Default jsonrpsee `max_connections`. Today's hardcoded value (64) — a low cap
-/// both throttles ingress and starves the bench monitor's connections
-/// (measurement blind spot, #41). Overridable via `TORUS_RPC_MAX_CONNS`.
-pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 64;
+/// Default jsonrpsee `max_connections` (#41). 64 throttled ingress below the
+/// bench's 256 in-flight requests and starved the bench monitor; s76 raised it
+/// to 512 (processed and matched rose within noise; no errors). Submission CPU
+/// stays bounded by [`SUBMIT_PERMITS`] + [`SUBMIT_QUEUE_TIMEOUT`], so extra
+/// connections queue clients rather than add work. Overridable via
+/// `TORUS_RPC_MAX_CONNS` (`64` = the pre-s76 value).
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 512;
 
 /// Env var: max jsonrpsee response body size in MiB (#40).
 pub(crate) const ENV_MAX_RESPONSE_MB: &str = "TORUS_RPC_MAX_RESPONSE_MB";
@@ -65,7 +68,7 @@ pub(crate) fn resolve_max_response_bytes(raw: Option<&str>) -> u32 {
 }
 
 /// Resolve jsonrpsee `max_connections` from a raw env value. Pure/testable;
-/// empty / unset / unparsable / zero fall back to the exact-today default (64).
+/// empty / unset / unparsable / zero fall back to the default (512).
 pub(crate) fn resolve_max_connections(raw: Option<&str>) -> u32 {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => match s.parse::<u32>() {
@@ -331,9 +334,8 @@ impl RpcServer {
             metrics: self.state.metrics.clone(),
         };
         let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
-        // #40/#41: response-size and connection caps are env-configurable, both
-        // defaulting to today's values (10 MiB / 64) so an unset environment is
-        // byte-for-byte identical to the hardcoded config it replaces.
+        // #40/#41: response-size and connection caps are env-configurable
+        // (defaults 10 MiB / 512 connections).
         let max_response_bytes =
             resolve_max_response_bytes(std::env::var(ENV_MAX_RESPONSE_MB).ok().as_deref());
         let max_connections =
@@ -600,21 +602,23 @@ mod rpc_limit_env_tests {
         assert_eq!(resolve_max_response_bytes(Some("100000")), u32::MAX);
     }
 
+    /// s76: default raised 64 -> 512. 64 throttled ingress below the bench's
+    /// 256 in-flight requests; CPU stays bounded by SUBMIT_PERMITS.
     #[test]
-    fn max_connections_unset_is_todays_64_default() {
-        assert_eq!(resolve_max_connections(None), 64);
-        assert_eq!(resolve_max_connections(Some("")), 64);
-        assert_eq!(resolve_max_connections(Some("  ")), 64);
-        assert_eq!(DEFAULT_MAX_CONNECTIONS, 64);
+    fn max_connections_unset_is_the_512_default() {
+        assert_eq!(resolve_max_connections(None), 512);
+        assert_eq!(resolve_max_connections(Some("")), 512);
+        assert_eq!(resolve_max_connections(Some("  ")), 512);
+        assert_eq!(DEFAULT_MAX_CONNECTIONS, 512);
     }
 
     #[test]
     fn max_connections_parses_and_rejects_bad_values() {
-        assert_eq!(resolve_max_connections(Some("256")), 256);
+        assert_eq!(resolve_max_connections(Some("64")), 64);
         assert_eq!(resolve_max_connections(Some(" 1024 ")), 1024);
         // Zero / garbage fall back to the default rather than disabling ingress.
-        assert_eq!(resolve_max_connections(Some("0")), 64);
-        assert_eq!(resolve_max_connections(Some("xyz")), 64);
+        assert_eq!(resolve_max_connections(Some("0")), 512);
+        assert_eq!(resolve_max_connections(Some("xyz")), 512);
     }
 }
 
