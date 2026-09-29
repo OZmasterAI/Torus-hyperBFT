@@ -16,6 +16,10 @@ FLUSH = 'torus_flush_worker_depth'
 FLOW = ('torus_orders_placed_accepted_total', 'torus_orders_matched_total',
         'torus_native_actions_processed_total', 'torus_orders_resting_total')
 REQUIRED = (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH) + FLOW
+# s77: fills are readable over RPC only once the trade writer has written them,
+# so its backlog is pending work for the drain. Optional: an older node binary
+# without the gauge drains as before.
+TRADE_WRITER = 'torus_trade_writer_queued_batches'
 MAX_SAMPLE_GAP_S = 5
 DEFAULT_STALL_S = 30
 IDLE_EXEC_QUEUE_MAX = 2  # Empty blocks can be in flight while native state is quiet.
@@ -121,7 +125,7 @@ class DrainTracker:
         elif self.last_time is not None and not 0 < now - self.last_time <= MAX_SAMPLE_GAP_S:
             good = False
             reason = 'scrape gap'
-        eligible = good and not any(pending(s) for s in samples)
+        eligible = good and not any(pending(s) or s.get(TRADE_WRITER, 0) > 0 for s in samples)
         same = eligible and self.base is not None and all(s[k] == b[k]
                     for s, b in zip(samples, self.base) for k in FLOW)
         if not same:
@@ -141,7 +145,7 @@ def parse_metrics(text):
     sample = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0] in REQUIRED:
+        if len(parts) == 2 and (parts[0] in REQUIRED or parts[0] == TRADE_WRITER):
             try:
                 value = float(parts[1])
                 if math.isfinite(value) and value >= 0:

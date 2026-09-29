@@ -2185,9 +2185,6 @@ impl ExecutionContext {
                         m.observe_order_ages(OrderStage::FillsVisible, order_nonces.iter().copied());
                     }
                 }
-                if let (Some(m), Some(w)) = (&self.metrics, &self.trade_writer) {
-                    m.trade_writer_queued_batches.set(w.queued_batches() as i64);
-                }
             }
         }
 
@@ -2300,6 +2297,12 @@ impl ExecutionContext {
         if let Some(ref m) = self.metrics {
             m.block_height.set(height as i64);
             m.blocks_committed.inc();
+            // Refreshed on EVERY block (s77): set only on trade blocks it froze
+            // at its last value once trades stopped, and the harness drain
+            // waits for it to reach 0.
+            if let Some(ref w) = self.trade_writer {
+                m.trade_writer_queued_batches.set(w.queued_batches() as i64);
+            }
             let tx_count = torus_block.header.evm_tx_count as u64
                 + torus_block.header.native_action_count as u64;
             m.block_transactions_count.observe(tx_count as f64);
@@ -12144,6 +12147,46 @@ mod crash_recovery_tests {
             assert_eq!(count("durable"), native, "durable (on={on}):\n{text}");
             assert_eq!(count("fills_visible"), filled, "fills_visible (on={on}):\n{text}");
         }
+    }
+
+    /// s77: the trade-writer backlog gauge must stay live on blocks WITHOUT
+    /// trades (empties keep coming while the chain drains); the harness drain
+    /// waits on it, so a value frozen at the last trade block would hang it.
+    #[test]
+    fn trade_writer_gauge_refreshes_on_blocks_without_trades() {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let (mut config, _) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
+            state_db.clone(),
+            "test-trade-writer",
+            8,
+        ));
+        let blocks = pipeline_fixture_blocks();
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &state_db, b);
+        }
+        let writer = ctx.trade_writer.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while writer.queued_batches() > 0 {
+            assert!(std::time::Instant::now() < deadline, "writer never drained");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let last = blocks.last().unwrap();
+        let mut empty = make_block(last.header.height + 1, vec![]);
+        empty.header.parent_hash = alloy_primitives::keccak256(last.header.canonical_header_bytes());
+        dispatch_and_execute(&ctx, &state_db, &empty);
+
+        let text = metrics.encode();
+        assert_eq!(
+            metric_value(&text, "torus_trade_writer_queued_batches"),
+            0.0,
+            "an empty block must refresh the drained writer's gauge:\n{text}"
+        );
     }
 
     /// OFF yields byte-identical state in EVERY CF and the same persisted native

@@ -9,7 +9,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES,
+from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES, TRADE_WRITER,
                     DrainTracker, acceptance, assess_liveness, parse_metrics)
 from test_harness import BENCH_START, run_summarize, write_agreement, write_cell
 from collect_logs import collect
@@ -34,6 +34,22 @@ class DrainTest(unittest.TestCase):
         tracker = DrainTracker(10)
         for t in range(100):
             self.assertFalse(tracker.observe(t, [sample() for _ in NODES])['drained'])
+
+    def test_trade_writer_backlog_blocks_drain_until_empty(self):
+        # s77: fills are only readable over RPC once the trade writer has
+        # written them, so a backlog is pending work; a node binary without
+        # the gauge (older build) drains as before.
+        tracker = DrainTracker(10)
+        for t in range(30):
+            nodes = [dict(sample(100+t), **{TRADE_WRITER: 5}) for _ in NODES]
+            self.assertFalse(tracker.observe(t, nodes)['drained'])
+        drained = [tracker.observe(t, [dict(sample(100+t), **{TRADE_WRITER: 0}) for _ in NODES])
+                   for t in range(30, 42)]
+        self.assertFalse(drained[0]['drained'])
+        self.assertTrue(drained[-1]['drained'])
+
+    def test_parse_metrics_keeps_trade_writer_gauge(self):
+        self.assertEqual(parse_metrics(f"{TRADE_WRITER} 7\n")[TRADE_WRITER], 7.0)
 
     def test_pending_work_resets_quiet_interval(self):
         for field, value in [(MEMPOOL, 1), (EXEC_QUEUE, 3), (FLUSH, 1)]:

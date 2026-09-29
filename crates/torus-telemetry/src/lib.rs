@@ -1614,9 +1614,11 @@ impl Metrics {
             flush_worker_depth.clone(),
         );
 
-        // s77 order latency: 5 ms .. ~82 s (the nonce window is 60 s).
+        // s77 order latency: 5 ms .. ~11 min. Under overload an order can wait
+        // well past the 60 s nonce window (s77 cell: exec queue pinned at 64
+        // blocks, fills beyond 82 s), so the top bucket must not clip it.
         let order_age = |registry: &mut Registry, name: &str, help: &str| {
-            let h = Histogram::new(exponential_buckets(0.005, 2.0, 15));
+            let h = Histogram::new(exponential_buckets(0.005, 2.0, 18));
             registry.register(name, help, h.clone());
             h
         };
