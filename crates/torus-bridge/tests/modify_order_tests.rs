@@ -333,3 +333,73 @@ fn reserve_modify_cancel_returns_margin_exactly() {
         assert_bal(&ctx, &owner, fp(FUNDING), FixedPoint::ZERO, "all margin back");
     }
 }
+
+/// s515 review 3 (item 5a): only a NEW price is tick-checked. A resting order
+/// whose price is off the book's current tick (tick changed after it rested,
+/// or a legacy row) can still be resized; repricing it must land on the tick.
+#[test]
+fn qty_only_modify_of_off_tick_order_is_accepted() {
+    for path in PATHS {
+        let (_d, mut ctx, owner, id) = owner_with_bid(path);
+        ctx.order_books.get_mut(&1).unwrap().tick_size = fp(3); // 100 is now off-tick
+        let r = run(&mut ctx, path, &[modify(owner, id, None, Some(fp(2)))]);
+        assert!(r[0].success, "{path:?}: qty-only modify: {:?}", r[0].error);
+        assert_eq!(order(&ctx, id), Some((fp(100), fp(2))), "{path:?}");
+        // Same price re-sent is not a new price either.
+        let r = run(&mut ctx, path, &[modify(owner, id, Some(fp(100)), Some(fp(3)))]);
+        assert!(r[0].success, "{path:?}: unchanged price: {:?}", r[0].error);
+        assert_eq!(order(&ctx, id), Some((fp(100), fp(3))), "{path:?}");
+        // A new off-tick price is still rejected; an on-tick one is accepted.
+        let r = run(&mut ctx, path, &[modify(owner, id, Some(fp(98)), None)]);
+        assert!(!r[0].success, "{path:?}: new off-tick price must be rejected");
+        let r = run(&mut ctx, path, &[modify(owner, id, Some(fp(99)), None)]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_eq!(order(&ctx, id), Some((fp(99), fp(3))), "{path:?}");
+        // 99*3/20 = 14.85 reserved.
+        let r = run(&mut ctx, path, &[(owner, NativeAction::CancelOrder { order_id: id })]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_bal(&ctx, &owner, fp(FUNDING), FixedPoint::ZERO, "all margin back");
+    }
+}
+
+/// s515 review 3 (item 5b): the reduce-only clamp mirrors placement — the
+/// lot applies to the REQUESTED quantity, the clamp to the position may land
+/// below the lot (placement rests such an order too; it closes the position
+/// exactly).
+#[test]
+fn reduce_only_modify_clamp_below_lot_mirrors_placement() {
+    for path in PATHS {
+        let t = addr(1);
+        let maker = addr(2);
+        let (_d, mut ctx) = fresh(&[t, maker]);
+        // t goes long 5 @100, then the lot becomes 10.
+        place_one(&mut ctx, path, maker, limit(1, false, 100, 5));
+        let r = run(&mut ctx, path, &[place(t, limit(1, true, 100, 5))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        ctx.order_books.get_mut(&1).unwrap().lot_size = fp(10);
+        let ro_sell = |qty| PlaceOrderParams {
+            reduce_only: true,
+            ..limit(1, false, 200, qty)
+        };
+        // Placement: 20 (>= lot) clamped to the position 5 (< lot) rests.
+        let ro = place_one(&mut ctx, path, t, ro_sell(20));
+        assert_eq!(order(&ctx, ro), Some((fp(200), fp(5))), "{path:?}: placement clamp");
+        // Modify: same convention.
+        let r = run(&mut ctx, path, &[modify(t, ro, Some(fp(210)), Some(fp(30)))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_eq!(order(&ctx, ro), Some((fp(210), fp(5))), "{path:?}: modify clamp");
+        // A REQUESTED quantity below the lot is rejected, as placement does.
+        let r = run(&mut ctx, path, &[modify(t, ro, None, Some(fp(4)))]);
+        assert!(!r[0].success, "{path:?}: requested qty below lot");
+        assert_eq!(order(&ctx, ro), Some((fp(210), fp(5))), "{path:?}: unchanged");
+        let before = ctx.next_global_order_id;
+        let r = run(&mut ctx, path, &[place(t, ro_sell(4))]);
+        let rests = ctx
+            .order_books
+            .get(&1)
+            .unwrap()
+            .get_order(before)
+            .is_some();
+        assert!(!r[0].success || !rests, "{path:?}: placement rejects it too");
+    }
+}
