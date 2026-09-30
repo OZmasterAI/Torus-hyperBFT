@@ -1722,11 +1722,17 @@ impl ExecutionContext {
                     let precomputed_root = validated.evm_root_updates;
                     // F1 (s515): the EVM-applied marker rides the writer-precompile
                     // overlay, so BOTH commit paths below land it in the bundle's batch.
-                    let _ = validated.native_writes.put_cf_raw(
+                    // s515 review 3: without it the block would commit silently
+                    // reverting to non-idempotent replay — fail-stop instead.
+                    if let Err(e) = validated.native_writes.put_cf_raw(
                         CF_CONSENSUS_META,
                         META_EVM_APPLIED,
                         &evm_applied_record(height, computed_fee_revenue),
-                    );
+                    ) {
+                        tracing::error!(%e, height, "FATAL: failed to stage the EVM-applied marker — refusing to commit the block without it (fail-stop)");
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
                     // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
                     // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
                     // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
