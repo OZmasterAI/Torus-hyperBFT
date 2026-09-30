@@ -242,6 +242,7 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::RevokeSession { session_pubkey } => {
             hash_revoke_session(session_pubkey, nonce)
         }
+        NativeAction::ClaimUnbonded => hash_claim_unbonded(nonce),
     }
 }
 
@@ -430,6 +431,14 @@ fn hash_permanent_stake(amount: &U256, nonce: u64) -> B256 {
 
 fn hash_claim_rewards(nonce: u64) -> B256 {
     let th = keccak256("ClaimRewards(uint64 nonce)");
+    let mut buf = Vec::with_capacity(2 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+fn hash_claim_unbonded(nonce: u64) -> B256 {
+    let th = keccak256("ClaimUnbonded(uint64 nonce)");
     let mut buf = Vec::with_capacity(2 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u64(nonce));
@@ -768,6 +777,7 @@ pub fn requires_eip712(action: &NativeAction) -> bool {
             | NativeAction::Undelegate { .. }
             | NativeAction::PermanentStake { .. }
             | NativeAction::ClaimRewards
+            | NativeAction::ClaimUnbonded
     )
 }
 
@@ -1452,6 +1462,7 @@ mod tests {
                 maintenance_margin_bps: 300,
             }),
             NativeAction::DelistMarket { market_id: 99 },
+            NativeAction::ClaimUnbonded,
         ];
 
         for (i, action) in actions.into_iter().enumerate() {

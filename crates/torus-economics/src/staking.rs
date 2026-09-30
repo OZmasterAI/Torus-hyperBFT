@@ -224,6 +224,28 @@ impl<T: StateBackend> StakingManager<T> {
         Ok(released)
     }
 
+    /// User-initiated claim (`NativeAction::ClaimUnbonded`): release every matured
+    /// unbonding entry across all of `delegator`'s delegations. Returns the total
+    /// credited. Errors WITHOUT touching state if nothing has matured.
+    pub fn claim_unbonded(&self, delegator: Address, current_block: u64) -> Result<U256> {
+        let matured: Vec<Address> = self
+            .delegations_for_delegator(&delegator)?
+            .into_iter()
+            .filter(|d| d.unbonding.iter().any(|e| current_block >= e.release_block))
+            .map(|d| d.validator)
+            .collect();
+        if matured.is_empty() {
+            return Err(EconomicsError::NoMaturedUnbonding(delegator));
+        }
+
+        let mut total = U256::ZERO;
+        for validator in matured {
+            total += self.process_unbonding(delegator, validator, current_block)?;
+        }
+        tracing::debug!(%delegator, %total, "matured unbonding claimed");
+        Ok(total)
+    }
+
     // ========================================================================
     // Permanent staking
     // ========================================================================

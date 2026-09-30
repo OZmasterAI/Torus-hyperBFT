@@ -158,4 +158,8 @@ pub enum EconomicsError {
     // Governance initialization (FIX MED-NEW-15)
     #[error("governance params not initialized — call set_governance_params at genesis")]
     GovernanceNotInitialized,
+
+    // Unbonding claim (ClaimUnbonded native action)
+    #[error("no matured unbonding to claim for {0}")]
+    NoMaturedUnbonding(Address),
 }

@@ -3555,6 +3555,7 @@ impl NativeExecutor {
                 Self::exec_permanent_stake(ctx, sender, *amount)
             }
             NativeAction::ClaimRewards => Self::exec_claim_rewards(ctx, sender),
+            NativeAction::ClaimUnbonded => Self::exec_claim_unbonded(ctx, sender),
             // FIX ECON-FIND-15: TopUpSelfStake via NativeAction.
             NativeAction::TopUpSelfStake { amount } => {
                 match ctx.staking.top_up_self_stake(*sender, *amount) {
@@ -6224,6 +6225,18 @@ impl NativeExecutor {
         }
     }
 
+    /// Release every matured unbonding entry across all of the sender's
+    /// delegations. Errors (no state change) if nothing has matured.
+    fn exec_claim_unbonded<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+    ) -> NativeActionResult {
+        match ctx.staking.claim_unbonded(*sender, ctx.block_height) {
+            Ok(_) => NativeActionResult::ok("claim_unbonded", 2000),
+            Err(e) => NativeActionResult::err("claim_unbonded", e.to_string()),
+        }
+    }
+
     fn exec_jail_vote<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
@@ -6912,7 +6925,8 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
         NativeAction::Delegate { .. }
         | NativeAction::Undelegate { .. }
         | NativeAction::PermanentStake { .. }
-        | NativeAction::ClaimRewards => ActionCategory::Staking,
+        | NativeAction::ClaimRewards
+        | NativeAction::ClaimUnbonded => ActionCategory::Staking,
         _ => ActionCategory::Other,
     }
 }
@@ -7014,6 +7028,7 @@ fn core_writer_to_native(qa: &QueuedAction) -> NativeAction {
         QueuedActionKind::LockPermanent { amount } => NativeAction::PermanentStake {
             amount: fp_to_u256(*amount),
         },
+        QueuedActionKind::ClaimUnbonded => NativeAction::ClaimUnbonded,
     }
 }
 
