@@ -7,7 +7,8 @@ executor output, so all validators must run the same build.
 
 | Bug | Change |
 |-----|--------|
-| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it. Margin is reserved at the cap (market *sells* at `max(cap, best bid)`, see F5 — in a batch, also at least the highest price of an earlier bid of the same batch in that market that passed its own margin reservation and can rest: `Limit` GTC / PostOnly, price on the tick, qty `>=` lot, and not certain to be fully filled by the pre-batch asks at or below its price. IOC / FOK, invalid and unfunded bids never raise it); the unused part is released when the order stops resting. A price × qty that overflows is rejected (no panic). |
+| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it and the unfilled remainder is cancelled. **Margin (Hyperliquid-style, review 4):** a market order (buy or sell; a triggered stop-market is placed as one at trigger time) reserves `qty × mark price / tiered max leverage` — the limit-order formula at the **mark** (the oracle's aggregated stake-weighted price for the market). With no usable oracle price (none, stale, `<= 0`) it reserves at its **cap**. Nothing else in the block or batch moves that reservation. Its whole reservation is released after matching. A pending stop-market still holds `reserve(cap, qty)` until it fires. A price × qty that overflows is rejected (no panic). |
+| match-time margin (review 4) | Margin is checked **again as the order matches** (Hyperliquid: "when orders are placed and again when they match"). This applies to every taker whose fills can cost more than it reserved: market buys / sells (fills anywhere up to the cap) and **limit sells** (they fill at bids `>=` their price). Before each fill: initial margin of all its fills so far incl. this one (+ for a GTC limit, the reservation its unfilled rest would keep) `<=` its reservation + the available balance right after it. The fill that does not fit is cut to the largest lot multiple that does, then **filling stops and the rest is cancelled** (it never rests). A FOK order whose complete fill does not fit is rejected whole. **Reduce-only orders are exempt** (reducing needs no margin); makers and limit buys are unaffected. |
 | 2 — `reduce_only` | Enforced. Placement from a flat position or on the increasing side is rejected (stops included, on every path); an oversize order is clamped to the position size and reserves margin only for the clamped size; resting reduce-only orders are shrunk / cancelled when the position shrinks, closes or flips (margin released). A reduce-only maker never fills past its owner's position. |
 | stops | Triggered stops are now placed through the normal path after the block's matching settles: they reserve margin, move positions, respect the StopMarket cap and re-check `reduce_only` at trigger time. |
 | ModifyOrder | Only the order's **owner** may modify it (was: any account, margin charged to the owner). Validated like placement before anything changes: price `> 0`, a *new* price on the tick (a quantity-only modify of an order resting off the current tick is accepted), quantity `> 0` and `>=` lot, at least one field set; a new price at / through the opposite best is **rejected** (a modify never matches — cancel and place instead). A reduce-only order is clamped to the position (rejected when there is nothing to reduce); as in placement the lot applies to the requested quantity, so the clamp may rest below the lot. Margin uses the placement formula (tiered leverage): the difference to the new reservation is reserved first (insufficient margin ⇒ rejected, order and balances unchanged) or released exactly; overflowing price × qty is rejected. A quantity-only decrease keeps time priority. |
@@ -40,8 +41,39 @@ executor output, so all validators must run the same build.
   account addresses) went with the marker. Main's one-flush-batch EVM commit
   (93d4fff) latches the fail-stop instead when an EVM block's batch cannot be
   built or its flush fails.
+* Review 4 — more fail-stops (the node halts; operator restores / resyncs):
+  * B1: once the fail-stop is latched, no further block is executed or
+    flushed. The boot replay stops at the failed height (it used to run the
+    later heights on top of the missing state and move the native marker
+    past it);
+  * B2-B4 (superseded with the marker): B3 (malformed marker) and B4 (failed
+    `commit_pending_bundle` fallback) concerned the marker's separate EVM
+    commit. On main (93d4fff) the EVM batch, incremental or the plain
+    `pending_bundle_batch` fallback, is the prefix of the block's one flush
+    batch, and a batch that cannot be built latches the fail-stop. B2 (fail-stop
+    when a fallback bundle writes contract storage while the incremental root
+    is active) is not on this branch: the plain fallback still writes no
+    `CF_HASHED_*` / `CF_TRIE_*` rows, so after a fallback the incremental trie
+    can lag the full scan (open item).
 
 ## Known deferred items (not fixed on this branch)
+
+* Mark price in production: the oracle stores validator submissions, but no
+  block-execution path runs the aggregation (`aggregate_oracle_prices` has
+  no caller). So no market has a mark yet, and market orders reserve at
+  their cap (buys conservatively; sells at ~0, bounded only by the
+  match-time check).
+* A pending stop-market holds margin at its cap, not the mark. Its book row
+  stores no other price, and the release at trigger time must be exact.
+* Batch mode: the match-time budget uses the Phase-2 balance. For a sender
+  with several orders in one batch, that balance is already reduced by its
+  earlier orders' reservations and does not include realized PnL from their
+  fills. The single path sees both. Identical when a sender has one order
+  per block.
+* After an incremental-batch failure the plain fallback leaves the
+  incremental trie stale (accounts and storage). With the incremental root on
+  (the default) later EVM roots are computed on that stale trie; the
+  validator `StateRootMismatch` check is the safety net (see B2 above).
 
 * A `ModifyOrder` whose new price would cross the book is rejected; Hyperliquid
   (cancel + new order) would match it.
