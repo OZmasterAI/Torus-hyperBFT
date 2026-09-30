@@ -23,6 +23,7 @@ use torus_state::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
     CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
 };
+use torus_state::trade_rows::TradeFill;
 use torus_state::{StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
@@ -102,6 +103,9 @@ struct RunFingerprint {
     cf_dump: Vec<(String, Vec<u8>, Vec<u8>)>,
     results: Vec<Vec<(bool, Option<String>)>>,
     total_gas: Vec<u64>,
+    /// s80: each batch's recorded fills, including the order ids and
+    /// per-party position effects that the rows do not store.
+    fills: Vec<Vec<TradeFill>>,
     trade_index: u32,
     next_global_order_id: u128,
     /// The consensus-authoritative native state root (full scan) — the
@@ -149,6 +153,7 @@ fn run_batches_workers(
 
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
+    let mut fills = Vec::new();
     for batch in batches {
         let r =
             NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, parallel, settle_workers);
@@ -164,6 +169,9 @@ fn run_batches_workers(
                 .collect(),
         );
         total_gas.push(r.total_gas);
+        // Taking restarts the inline rows from this batch's fills; the
+        // fills themselves carry everything the rows would.
+        fills.push(ctx.take_pending_trade_fills());
     }
     ctx.save_order_books();
 
@@ -171,6 +179,7 @@ fn run_batches_workers(
         cf_dump: state_dump(&ctx),
         results,
         total_gas,
+        fills,
         trade_index: ctx.trade_index,
         next_global_order_id: ctx.next_global_order_id,
         state_root: compute_native_state_root(&ctx.state).expect("state root"),
@@ -662,6 +671,7 @@ fn default_mode_multi_market_settles() {
     }
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
+    let mut fills = Vec::new();
     for batch in &batches {
         let r = NativeExecutor::execute_batch(&mut ctx, batch);
         results.push(
@@ -671,12 +681,16 @@ fn default_mode_multi_market_settles() {
                 .collect::<Vec<_>>(),
         );
         total_gas.push(r.total_gas);
+        // Taking restarts the inline rows from this batch's fills; the
+        // fills themselves carry everything the rows would.
+        fills.push(ctx.take_pending_trade_fills());
     }
     ctx.save_order_books();
 
     assert_eq!(golden.cf_dump, state_dump(&ctx), "default-mode state diverged");
     assert_eq!(golden.results, results, "default-mode results diverged");
     assert_eq!(golden.total_gas, total_gas, "default-mode gas diverged");
+    assert_eq!(golden.fills, fills, "default-mode fills diverged");
     assert_eq!(golden.trade_index, ctx.trade_index);
     assert_eq!(golden.next_global_order_id, ctx.next_global_order_id);
 }

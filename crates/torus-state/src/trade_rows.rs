@@ -40,7 +40,7 @@ const USER_ENTRY: usize = 4 + 8 + 16 + 16 + 1 + 1;
 
 /// One fill as the executor records it; `encode_block` turns a block's fills
 /// into rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TradeFill {
     pub trade_index: u32,
     pub market: u64,
@@ -50,6 +50,15 @@ pub struct TradeFill {
     pub qty_raw: i128,
     /// 0 = taker bought, 1 = taker sold.
     pub taker_side: u8,
+    // s80, stream-only: `encode_block` ignores the fields below (rows unchanged).
+    pub maker_order_id: u128,
+    pub taker_order_id: u128,
+    /// Signed position size before the fill (long > 0, short < 0, none = 0).
+    pub maker_start_raw: i128,
+    pub taker_start_raw: i128,
+    /// Realized PnL of the fill's close part (0 = no close part).
+    pub maker_pnl_raw: i128,
+    pub taker_pnl_raw: i128,
 }
 
 /// One entry of a `CF_NATIVE_TRADES` row.
@@ -275,6 +284,13 @@ mod tests {
             price_raw: 1_000 + i as i128,
             qty_raw: -(i as i128) - 7,
             taker_side: (i % 2) as u8,
+            // Stream-only fields: non-zero so the row tests show they are ignored.
+            maker_order_id: 10 + i as u128,
+            taker_order_id: 20 + i as u128,
+            maker_start_raw: -3,
+            taker_start_raw: 4,
+            maker_pnl_raw: 5,
+            taker_pnl_raw: -6,
         }
     }
 

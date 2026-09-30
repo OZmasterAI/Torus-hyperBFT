@@ -15,7 +15,7 @@ use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
-use torus_core::position::{MarginType, NativeBalance, PositionCache, PositionManager};
+use torus_core::position::{FillEffect, MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
@@ -234,6 +234,9 @@ struct OrderSettlePlan {
     /// error text, trader, pnl). Emitted precisely when `apply_fill_cached`
     /// returns `Some` — including `Some(ZERO)` (still materializes the row).
     pnl_events: Vec<(&'static str, Address, FixedPoint)>,
+    /// s80: `[taker, maker]` position effect of each applied fill, in fill
+    /// order (recorded with the fills; output-only).
+    fill_effects: Vec<[FillEffect; 2]>,
     /// First position-side fill-application failure, pre-formatted like the
     /// sequential path ("taker fill failed: …" / "maker fill failed: …").
     fill_error: Option<String>,
@@ -1390,6 +1393,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     fills_block: u64,
     /// Inline mode: how many of `pending_fills` already have rows written.
     inline_fills_written: usize,
+    /// s80: `[taker, maker]` effect of each fill of the order being settled
+    /// (sequential and single-action paths); reused so settling allocates
+    /// nothing per order.
+    fill_effects_scratch: Vec<[FillEffect; 2]>,
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
@@ -1838,6 +1845,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             pending_fills: Vec::new(),
             fills_block: 0,
             inline_fills_written: 0,
+            fill_effects_scratch: Vec::new(),
             metrics: None,
             fatal_error: load_error,
             book_mode,
@@ -4132,9 +4140,10 @@ impl NativeExecutor {
                 // per fill) is gone and both caches stay the single in-batch
                 // authority for their rows.
                 let mut fill_failed = false;
+                ctx.fill_effects_scratch.clear();
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
-                    if let Err(e) = Self::apply_fill_via_caches(
+                    let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
                         bal_cache,
@@ -4144,14 +4153,17 @@ impl NativeExecutor {
                         fill.quantity,
                         fill.price,
                     ) {
-                        results[prep.index] = NativeActionResult::err(
-                            "place_order",
-                            format!("taker fill failed: {e}"),
-                        );
-                        fill_failed = true;
-                        break;
-                    }
-                    if let Err(e) = Self::apply_fill_via_caches(
+                        Ok(effect) => effect,
+                        Err(e) => {
+                            results[prep.index] = NativeActionResult::err(
+                                "place_order",
+                                format!("taker fill failed: {e}"),
+                            );
+                            fill_failed = true;
+                            break;
+                        }
+                    };
+                    let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
                         bal_cache,
@@ -4161,13 +4173,17 @@ impl NativeExecutor {
                         fill.quantity,
                         fill.price,
                     ) {
-                        results[prep.index] = NativeActionResult::err(
-                            "place_order",
-                            format!("maker fill failed: {e}"),
-                        );
-                        fill_failed = true;
-                        break;
-                    }
+                        Ok(effect) => effect,
+                        Err(e) => {
+                            results[prep.index] = NativeActionResult::err(
+                                "place_order",
+                                format!("maker fill failed: {e}"),
+                            );
+                            fill_failed = true;
+                            break;
+                        }
+                    };
+                    ctx.fill_effects_scratch.push([taker, maker]);
                 }
 
                 if fill_failed {
@@ -4178,9 +4194,10 @@ impl NativeExecutor {
                     continue;
                 }
 
-                // Persist trades
-                for fill in &result.fills {
-                    Self::persist_trade(ctx, market_id, fill);
+                // Persist trades (with each fill's effects from above).
+                for (i, fill) in result.fills.iter().enumerate() {
+                    let [taker, maker] = ctx.fill_effects_scratch[i];
+                    Self::persist_trade(ctx, market_id, fill, taker, maker);
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4497,8 +4514,8 @@ impl NativeExecutor {
                 }
 
                 // Record fills in canonical order, exactly like persist_trade.
-                for fill in &result.fills {
-                    Self::persist_trade(ctx, market_id, fill);
+                for (fill, &[taker, maker]) in result.fills.iter().zip(&oplan.fill_effects) {
+                    Self::persist_trade(ctx, market_id, fill, taker, maker);
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4574,14 +4591,16 @@ impl NativeExecutor {
             // cache; PnL events recorded in exact order; first POSITION-side
             // failure stops the order like sequential (its message matches).
             let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
+            let mut fill_effects = Vec::with_capacity(result.fills.len());
             let mut fill_error: Option<String> = None;
             'fills: for fill in &result.fills {
                 let taker_is_buy = fill.maker_side != Side::Buy;
-                for (side, trader, is_buy) in [
+                let mut pair = [FillEffect::default(); 2];
+                for (slot, (side, trader, is_buy)) in pair.iter_mut().zip([
                     ("taker", &fill.taker, taker_is_buy),
                     ("maker", &fill.maker, fill.maker_side == Side::Buy),
-                ] {
-                    match positions.apply_fill_cached(
+                ]) {
+                    match positions.apply_fill_cached_effect(
                         &mut pos_cache,
                         trader,
                         market_id,
@@ -4590,19 +4609,25 @@ impl NativeExecutor {
                         fill.price,
                         MarginType::Cross,
                     ) {
-                        Ok(Some(pnl)) => pnl_events.push((side, *trader, pnl)),
-                        Ok(None) => {}
+                        Ok(effect) => {
+                            if let Some(pnl) = effect.closed_pnl {
+                                pnl_events.push((side, *trader, pnl));
+                            }
+                            *slot = effect;
+                        }
                         Err(e) => {
                             fill_error = Some(format!("{side} fill failed: {e}"));
                             break 'fills;
                         }
                     }
                 }
+                fill_effects.push(pair);
             }
 
             orders.push(OrderSettlePlan {
                 margin_release,
                 pnl_events,
+                fill_effects,
                 fill_error,
             });
         }
@@ -4624,10 +4649,11 @@ impl NativeExecutor {
 
     /// C1: apply one side of a fill entirely through the per-batch write-back
     /// caches. The position read-modify-write hits `pos_cache`; if the fill
-    /// had a close component, `apply_fill_cached` returns the realized PnL and
-    /// it is credited through `bal_cache` (exactly when the classic
+    /// had a close component, `apply_fill_cached_effect` returns the realized
+    /// PnL and it is credited through `bal_cache` (exactly when the classic
     /// `apply_fill` would have written the balance row — including a zero PnL,
     /// which still materializes the row). No overlay access on the hot path.
+    /// Returns the fill's effect (s80: recorded with the fill).
     #[allow(clippy::too_many_arguments)]
     fn apply_fill_via_caches<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -4638,8 +4664,8 @@ impl NativeExecutor {
         is_buy: bool,
         qty: FixedPoint,
         price: FixedPoint,
-    ) -> Result<(), CoreError> {
-        if let Some(pnl) = positions.apply_fill_cached(
+    ) -> Result<FillEffect, CoreError> {
+        let effect = positions.apply_fill_cached_effect(
             pos_cache,
             trader,
             market_id,
@@ -4647,12 +4673,13 @@ impl NativeExecutor {
             qty,
             price,
             MarginType::Cross,
-        )? {
+        )?;
+        if let Some(pnl) = effect.closed_pnl {
             let mut bal = bal_cache.load(positions, trader)?;
             bal.available += pnl;
             bal_cache.set(trader, bal);
         }
-        Ok(())
+        Ok(effect)
     }
 
     // ========================================================================
@@ -4950,9 +4977,10 @@ impl NativeExecutor {
 
         // Apply fills to position manager.
         // FIX 22 (ECON-FIND-23): Propagate fill errors instead of discarding them.
+        ctx.fill_effects_scratch.clear();
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
-            if let Err(e) = ctx.positions.apply_fill(
+            let taker = match ctx.positions.apply_fill(
                 &fill.taker,
                 market_id,
                 taker_is_buy,
@@ -4960,13 +4988,19 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
-                // Funnel (perf A1): died on fill application, not on the book.
-                if let Some(ref m) = ctx.metrics {
-                    m.orders_rejected_other.inc();
+                Ok(effect) => effect,
+                Err(e) => {
+                    // Funnel (perf A1): died on fill application, not on the book.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
+                    return NativeActionResult::err(
+                        "place_order",
+                        format!("taker fill failed: {e}"),
+                    );
                 }
-                return NativeActionResult::err("place_order", format!("taker fill failed: {e}"));
-            }
-            if let Err(e) = ctx.positions.apply_fill(
+            };
+            let maker = match ctx.positions.apply_fill(
                 &fill.maker,
                 market_id,
                 fill.maker_side == Side::Buy,
@@ -4974,18 +5008,26 @@ impl NativeExecutor {
                 fill.price,
                 MarginType::Cross,
             ) {
-                // Funnel (perf A1): died on fill application, not on the book.
-                if let Some(ref m) = ctx.metrics {
-                    m.orders_rejected_other.inc();
+                Ok(effect) => effect,
+                Err(e) => {
+                    // Funnel (perf A1): died on fill application, not on the book.
+                    if let Some(ref m) = ctx.metrics {
+                        m.orders_rejected_other.inc();
+                    }
+                    return NativeActionResult::err(
+                        "place_order",
+                        format!("maker fill failed: {e}"),
+                    );
                 }
-                return NativeActionResult::err("place_order", format!("maker fill failed: {e}"));
-            }
+            };
+            ctx.fill_effects_scratch.push([taker, maker]);
         }
 
         // Persist trades to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
         // These CFs are NOT in the state root, so writes cannot affect consensus.
-        for fill in &result.fills {
-            Self::persist_trade(ctx, market_id, fill);
+        for (i, fill) in result.fills.iter().enumerate() {
+            let [taker, maker] = ctx.fill_effects_scratch[i];
+            Self::persist_trade(ctx, market_id, fill, taker, maker);
         }
 
         if let Some(ref m) = ctx.metrics {
@@ -4998,10 +5040,13 @@ impl NativeExecutor {
 
     /// Record one fill for this block's trade-history rows (written after the
     /// batch, see `defer_trades`) and advance the per-block fill counter.
+    /// `taker` / `maker` are the fill's position effects (s80, output-only).
     fn persist_trade<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
+        taker: FillEffect,
+        maker: FillEffect,
     ) {
         if ctx.trade_history {
             if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
@@ -5019,6 +5064,12 @@ impl NativeExecutor {
                 price_raw: fill.price.raw(),
                 qty_raw: fill.quantity.raw(),
                 taker_side: if fill.maker_side == Side::Buy { 1 } else { 0 },
+                maker_order_id: fill.maker_order_id,
+                taker_order_id: fill.taker_order_id,
+                maker_start_raw: maker.start_size.raw(),
+                taker_start_raw: taker.start_size.raw(),
+                maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
+                taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
             });
         }
         ctx.trade_index += 1;
