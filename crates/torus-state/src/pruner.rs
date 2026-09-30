@@ -47,7 +47,7 @@
 //! | `cf_trie_nodes` | node_hash | MPT reachability analysis needed (research-level) |
 //! | `cf_trie_accounts` | node_hash | Same as above |
 //! | `cf_trie_storage` | node_hash | Same as above |
-//! | `cf_native_trades` | market_id(8) + block(8) + idx(4) | Market ID is leading prefix, not height |
+//! | `cf_native_trades` | market_id(8) + block(8) + chunk(2) | Market ID is leading prefix, not height |
 //! | `cf_slash_records` | validator(20) + height(8) | Validator is leading prefix |
 //! | `cf_jail_votes` | target(20) + voter(20) | No height component |
 //! | `cf_tx_hash_to_location` | tx_hash(32) | Not height-keyed (stale pointers return None safely) |

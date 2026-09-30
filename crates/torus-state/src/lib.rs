@@ -14,11 +14,12 @@ pub mod overlay;
 pub mod pruner;
 pub mod shard_store;
 pub mod snapshot;
+pub mod trade_rows;
 pub mod trie;
 pub mod trie_cursor;
 
 pub use backend::{AtomicWriteOp, FrozenPending, NativeFlushStats, NativeStateOverlay, StateBackend};
-pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, PackedCfBatch, RawCfKv};
+pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};

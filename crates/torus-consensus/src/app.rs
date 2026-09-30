@@ -353,6 +353,17 @@ fn parse_nonblocking_dispatch_toggle(raw: Option<String>) -> bool {
     }
 }
 
+/// s77: parse `TORUS_TRADE_HISTORY`. Unset, empty or anything but `"0"` ⇒ on
+/// (today's behavior); `"0"` ⇒ no trade-history rows are written. Node-local:
+/// the two trade CFs are outside the native consensus root.
+fn parse_trade_history_toggle(raw: Option<String>) -> bool {
+    raw.map_or(true, |v| v.trim() != "0")
+}
+
+fn trade_history_enabled() -> bool {
+    parse_trade_history_toggle(std::env::var("TORUS_TRADE_HISTORY").ok())
+}
+
 /// Effective dispatch mode. Fresh env read per call, like
 /// [`exec_throttle_watermarks`]: dispatch runs once per committed block, the
 /// read is noise, and fresh reads keep same-process tests deterministic.
@@ -520,6 +531,9 @@ struct ExecutionContext {
     /// ExecutionContext at execution-thread exit, which drains the queue before
     /// `TorusApp::Drop`'s join returns (shutdown flush ordering).
     trade_writer: Option<torus_state::BackgroundCfWriter>,
+    /// s77: `TORUS_TRADE_HISTORY=0` turns off the node-local trade-history
+    /// rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`); default on.
+    trade_history: bool,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1878,10 +1892,11 @@ impl ExecutionContext {
                 }
             }
             ctx.metrics = self.metrics.clone();
-            // O3: with a background writer present, fills buffer their
-            // trade-history KVs (node-local, non-root CFs) instead of paying
-            // per-fill overlay PUTs; they are handed over after the flush below.
-            ctx.defer_trades = self.trade_writer.is_some();
+            // O3 + s77: exec only records the block's fills; their packed
+            // trade-history rows (node-local, non-root CFs) are encoded and
+            // written after the flush below (background writer, or inline).
+            ctx.defer_trades = true;
+            ctx.trade_history = self.trade_history;
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -2029,9 +2044,10 @@ impl ExecutionContext {
                 );
             }
 
-            // O3: this block's buffered trade-history KVs (handed to the background
-            // writer AFTER the flush / hand-off below, never before).
-            let trades = ctx.take_pending_trade_batch();
+            // O3: this block's fills (their rows go to the background writer
+            // AFTER the flush / hand-off below, never before).
+            let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
+            let fills = ctx.take_pending_trade_fills();
 
             if pipelined {
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
@@ -2162,39 +2178,37 @@ impl ExecutionContext {
             }
             } // end serial flush
 
-            // O3: hand this block's buffered trade-history KVs to the background
-            // writer — off the execution thread, after the atomic state flush
+            // O3: hand this block's fills to the background writer, which
+            // encodes and writes their trade-history rows — off the execution thread, after the atomic state flush
             // (or, on the fast path, after the hand-off to W: trade rows may land
             // before batch(N) is durable — keys are deterministic per block and a
             // crash-replay rewrite is idempotent, design §3.1 row 7).
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
-            if !trades.is_empty() {
+            if !fills.is_empty() {
+                // s77: the rows are encoded on the writer thread, not here.
+                let encode: torus_state::EncodeRows = Box::new(move || {
+                    let mut rows = torus_state::PackedCfBatch::default();
+                    torus_state::trade_rows::encode_block(fills_block, fills_ts, &fills, &mut rows);
+                    rows
+                });
                 // s77 order latency: fills are readable over RPC once these rows land.
-                let fallback = match (&self.trade_writer, &self.metrics) {
-                    (Some(writer), Some(m)) => {
-                        let m = m.clone();
-                        let nonces = order_nonces.clone();
-                        writer
-                            .send_packed_then(
-                                trades,
-                                Box::new(move || {
-                                    m.observe_order_ages(OrderStage::FillsVisible, nonces)
-                                }),
-                            )
-                            .err()
-                            .map(|(kvs, _)| kvs)
-                    }
-                    (Some(writer), None) => writer.send_packed(trades).err(),
-                    (None, _) => Some(trades),
+                let on_written = self.metrics.clone().map(|m| {
+                    let nonces = order_nonces.clone();
+                    Box::new(move || m.observe_order_ages(OrderStage::FillsVisible, nonces))
+                        as torus_state::bg_writer::OnWritten
+                });
+                let fallback = match &self.trade_writer {
+                    Some(writer) => writer.send_encode_then(encode, on_written).err(),
+                    None => Some((encode, on_written)),
                 };
                 // Writer gone (or absent): write synchronously so no rows are lost.
-                if let Some(kvs) = fallback {
-                    for (cf, key, value) in kvs.iter() {
+                if let Some((encode, on_written)) = fallback {
+                    for (cf, key, value) in encode().iter() {
                         let _ = self.state_db.put_cf_raw(cf, key, value);
                     }
-                    if let Some(ref m) = self.metrics {
-                        m.observe_order_ages(OrderStage::FillsVisible, order_nonces.iter().copied());
+                    if let Some(on_written) = on_written {
+                        on_written();
                     }
                 }
             }
@@ -3314,6 +3328,7 @@ impl TorusApp {
             exec_trust_cache: config.exec_trust_cache,
             // O3: 256 queued blocks of trade KVs max — a full queue blocks the
             // execution thread (backpressure) instead of ballooning memory.
+            trade_history: trade_history_enabled(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -3355,6 +3370,13 @@ impl TorusApp {
         // TORUS_INCREMENTAL_STATE_ROOT is enabled.
         if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db) {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
+        }
+        // s77 packed trade rows: node-local trade history in the old per-fill
+        // format is wiped once, before replay writes any new-format rows.
+        match torus_state::trade_rows::ensure_trade_history_format(&state_db) {
+            Ok(true) => tracing::info!("trade history: old row format wiped (packed rows from here on)"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(%e, "trade history: format check failed"),
         }
 
         // Crash recovery runs synchronously before spawning the pipeline. FIX 1b:
@@ -6145,6 +6167,15 @@ mod exec_dispatch_tests {
     }
 
     #[test]
+    fn trade_history_toggle_defaults_on_and_zero_disables() {
+        assert!(parse_trade_history_toggle(None));
+        assert!(parse_trade_history_toggle(Some("".into())));
+        assert!(parse_trade_history_toggle(Some("1".into())));
+        assert!(!parse_trade_history_toggle(Some("0".into())));
+        assert!(!parse_trade_history_toggle(Some(" 0 ".into())));
+    }
+
+    #[test]
     fn nonblocking_toggle_defaults_off_and_zero_disables() {
         // Unset/empty/"0" => blocking send, bit-identical to today.
         assert!(!parse_nonblocking_dispatch_toggle(None));
@@ -8099,6 +8130,27 @@ mod crash_recovery_tests {
         assert_eq!(app.last_header.height, 1, "last_header should be updated");
     }
 
+    /// s77 packed trade rows: the first start with the new format wipes the
+    /// old per-fill trade-history rows (before replay) and writes the marker.
+    #[test]
+    fn startup_wipes_old_format_trade_history() {
+        use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
+        use torus_state::trade_rows::{META_TRADE_HISTORY_FORMAT, TRADE_HISTORY_FORMAT};
+        let (config, state_db) = make_test_config_and_db();
+        state_db.put_cf_raw(CF_NATIVE_TRADES, &[1; 20], &[0; 65]).unwrap();
+        state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &[2; 32], &[0; 74]).unwrap();
+
+        let _app = TorusApp::new(state_db.clone(), &config, None, None, None);
+
+        for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+            assert!(StateBackend::iterate_cf(&state_db, cf, None).unwrap().is_empty(), "{cf}");
+        }
+        assert_eq!(
+            state_db.get_cf_raw(CF_CONSENSUS_META, META_TRADE_HISTORY_FORMAT).unwrap(),
+            Some(vec![TRADE_HISTORY_FORMAT])
+        );
+    }
+
     #[test]
     fn pending_proposal_encoding_matches_existing_wire_format() {
         for actions in [
@@ -9840,6 +9892,7 @@ mod crash_recovery_tests {
             // None -> trades write inline through the overlay (pre-O3 behavior),
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
+            trade_history: true,
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -10248,9 +10301,9 @@ mod crash_recovery_tests {
         );
     }
 
-    /// O3: with a background trade writer attached, fills buffer their
-    /// trade-history KVs during exec (`ctx.defer_trades`) and the writer
-    /// persists them off the execution thread. Dropping the ExecutionContext
+    /// O3 + s77: with a background trade writer attached, the block's fills are
+    /// encoded into packed trade-history rows and written off the execution
+    /// thread. Dropping the ExecutionContext
     /// closes the writer's channel, drains the queue, and joins — the shutdown
     /// flush ordering — so every row must be durable afterwards.
     #[test]
@@ -10319,12 +10372,20 @@ mod crash_recovery_tests {
         let user_trades =
             StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_USER_TRADES, None)
                 .unwrap();
-        assert_eq!(
-            trades.len(),
-            1,
-            "one fill -> one trade row via the background writer"
-        );
-        assert_eq!(user_trades.len(), 2, "maker + taker user-trade rows");
+        assert_eq!(trades.len(), 1, "one market row via the background writer");
+        let (market, block, chunk) = torus_state::trade_rows::parse_trade_key(&trades[0].0).unwrap();
+        assert_eq!((market, block, chunk), (1, 2, 0));
+        let (ts, fills) = torus_state::trade_rows::decode_trade_row(&trades[0].1).unwrap();
+        assert_eq!(ts, block2.header.timestamp);
+        assert_eq!(fills.len(), 1, "one fill");
+        assert_eq!(fills[0].qty_raw, FixedPoint::SCALE);
+        assert_eq!(user_trades.len(), 2, "one row each for maker and taker");
+        let roles: Vec<u8> = user_trades
+            .iter()
+            .flat_map(|(_, v)| torus_state::trade_rows::decode_user_row(v).unwrap().1)
+            .map(|e| e.role)
+            .collect();
+        assert_eq!(roles.iter().copied().collect::<std::collections::BTreeSet<_>>(), [0, 1].into());
     }
 
     // ---- L3 flush-pipe (b): async post-flush stage (TORUS_ASYNC_POST_FLUSH) ----
@@ -12126,7 +12187,8 @@ mod crash_recovery_tests {
     /// actions of the blocks whose trade rows were written.
     #[test]
     fn order_age_stages_observed_once_per_native_action() {
-        for on in [false, true] {
+        // `writer = false`: no trade writer, rows take the synchronous fallback.
+        for (on, writer) in [(false, true), (true, true), (false, false), (true, false)] {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
             let (mut config, _) = make_test_config_and_db();
@@ -12134,11 +12196,9 @@ mod crash_recovery_tests {
             let mut ctx = make_exec_ctx(&config, &state_db);
             let metrics = Arc::new(torus_telemetry::Metrics::new());
             ctx.metrics = Some(metrics.clone());
-            ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
-                state_db.clone(),
-                "test-trade-writer",
-                8,
-            ));
+            ctx.trade_writer = writer.then(|| {
+                torus_state::BackgroundCfWriter::spawn(state_db.clone(), "test-trade-writer", 8)
+            });
             if on {
                 ctx.attach_flush_worker(None);
             }
@@ -12153,22 +12213,22 @@ mod crash_recovery_tests {
                 StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None)
                     .unwrap()
                     .iter()
-                    .map(|(k, _)| u64::from_be_bytes(k[8..16].try_into().unwrap()))
+                    .map(|(k, _)| torus_state::trade_rows::parse_trade_key(k).unwrap().1)
                     .collect();
             let filled: usize = blocks
                 .iter()
                 .filter(|b| traded.contains(&b.header.height))
                 .map(|b| b.native_actions.len())
                 .sum();
-            assert!(filled > 0, "fixture must produce fills (on={on})");
+            assert!(filled > 0, "fixture must produce fills (on={on} writer={writer})");
 
             let text = metrics.encode();
             let count = |stage: &str| {
                 metric_value(&text, &format!("torus_order_age_{stage}_seconds_count")) as usize
             };
-            assert_eq!(count("exec"), native, "exec (on={on}):\n{text}");
-            assert_eq!(count("durable"), native, "durable (on={on}):\n{text}");
-            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on}):\n{text}");
+            assert_eq!(count("exec"), native, "exec (on={on} writer={writer}):\n{text}");
+            assert_eq!(count("durable"), native, "durable (on={on} writer={writer}):\n{text}");
+            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on} writer={writer}):\n{text}");
         }
     }
 
@@ -12210,6 +12270,43 @@ mod crash_recovery_tests {
             0.0,
             "an empty block must refresh the drained writer's gauge:\n{text}"
         );
+    }
+
+    /// s77 trade-history switch: with trade history OFF no row reaches the two
+    /// node-local trade CFs, and every OTHER CF plus the persisted native root
+    /// is byte-identical to a run with it ON — the switch cannot touch
+    /// consensus state.
+    #[test]
+    fn trade_history_off_writes_no_trade_rows_and_leaves_state_identical() {
+        let run = |history: bool| {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &state_db);
+            ctx.trade_history = history;
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            (dump_all_cfs(&state_db), root)
+        };
+        let (on, root_on) = run(true);
+        let (off, root_off) = run(false);
+        let trade_cfs = [
+            torus_state::cf::CF_NATIVE_TRADES,
+            torus_state::cf::CF_NATIVE_USER_TRADES,
+        ];
+        for ((cf, rows_on), (_, rows_off)) in on.iter().zip(off.iter()) {
+            if trade_cfs.contains(cf) {
+                assert!(!rows_on.is_empty(), "fixture must write {cf} when on");
+                assert!(rows_off.is_empty(), "{cf} must stay empty when off");
+            } else {
+                assert_eq!(rows_on, rows_off, "CF {cf} must not depend on trade history");
+            }
+        }
+        assert_eq!(root_on, root_off, "native root must not depend on trade history");
     }
 
     /// OFF yields byte-identical state in EVERY CF and the same persisted native

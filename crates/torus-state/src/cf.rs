@@ -72,6 +72,7 @@ pub const CF_DEV_POOL: &str = "cf_dev_pool";
 
 // Oracle
 pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
+/// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_NATIVE_USER_TRADES: &str = "cf_native_user_trades";
 

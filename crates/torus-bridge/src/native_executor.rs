@@ -23,8 +23,8 @@ use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
-use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::{PackedCfBatch, RawCfKv, StateBackend, StateDb};
+use torus_state::trade_rows::{encode_block, TradeFill};
+use torus_state::{PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
     SessionScope, Side, TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
@@ -223,108 +223,6 @@ struct PreparedOrder<'a> {
     margin_reserved: FixedPoint,
 }
 
-/// One fill's trade-history rows — exactly the bytes `persist_trade` has
-/// always written to `CF_NATIVE_TRADES` (primary) and `CF_NATIVE_USER_TRADES`
-/// (maker + taker secondary index). C3: settle workers byte-build these
-/// off-thread with a PROVISIONAL trade index; the single-threaded apply pass
-/// stamps the definitive per-block index (`stamp_trade_index`) in canonical
-/// settlement order before routing, so the persisted key sequence is
-/// byte-identical to the sequential path's inline `persist_trade` calls.
-struct TradeKvs {
-    trade_key: [u8; 20],
-    trade_data: [u8; 65],
-    maker_key: [u8; 32],
-    maker_data: [u8; 74],
-    taker_key: [u8; 32],
-    taker_data: [u8; 74],
-}
-
-#[cfg(test)]
-#[path = "trade_kvs_tests.rs"]
-mod trade_kvs_tests;
-
-impl TradeKvs {
-    /// Byte-identical to the classic inline `persist_trade` construction.
-    fn build(
-        market_id: MarketId,
-        block_height: u64,
-        timestamp: u64,
-        trade_index: u32,
-        fill: &torus_core::order_book::Fill,
-    ) -> Self {
-        let taker_side: u8 = if fill.maker_side == Side::Buy { 1 } else { 0 };
-
-        // Primary key: market_id(8) + block_number(8) + trade_index(4)
-        let mut trade_key = [0u8; 20];
-        trade_key[..8].copy_from_slice(&market_id.to_be_bytes());
-        trade_key[8..16].copy_from_slice(&block_height.to_be_bytes());
-        trade_key[16..20].copy_from_slice(&trade_index.to_be_bytes());
-
-        let trade_id = trade_index as u128;
-        let price_raw = fill.price.raw();
-        let quantity_raw = fill.quantity.raw();
-
-        // Borsh-serialize trade data (matches StoredTrade layout).
-        // Fixed-width rows need no separate heap allocation per fill.
-        let mut trade_data = [0u8; 65];
-        trade_data[..16].copy_from_slice(&trade_id.to_le_bytes());
-        trade_data[16..32].copy_from_slice(&price_raw.to_le_bytes());
-        trade_data[32..48].copy_from_slice(&quantity_raw.to_le_bytes());
-        trade_data[48] = taker_side;
-        trade_data[49..57].copy_from_slice(&block_height.to_le_bytes());
-        trade_data[57..65].copy_from_slice(&timestamp.to_le_bytes());
-
-        // Secondary index: per-user trades (descending block order).
-        // 16+8+16+16+1+1+8+8 = 74 bytes exactly.
-        let desc_block = u64::MAX - block_height;
-        let mut maker_data = [0u8; 74];
-        maker_data[..16].copy_from_slice(&trade_id.to_le_bytes());
-        maker_data[16..24].copy_from_slice(&market_id.to_le_bytes());
-        maker_data[24..40].copy_from_slice(&price_raw.to_le_bytes());
-        maker_data[40..56].copy_from_slice(&quantity_raw.to_le_bytes());
-        maker_data[56] = taker_side;
-        maker_data[57] = 0u8; // role: maker
-        maker_data[58..66].copy_from_slice(&block_height.to_le_bytes());
-        maker_data[66..74].copy_from_slice(&timestamp.to_le_bytes());
-
-        let mut maker_key = [0u8; 32];
-        maker_key[..20].copy_from_slice(fill.maker.as_slice());
-        maker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        maker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
-
-        // Taker entry (flip role byte at offset 57: 16+8+16+16+1)
-        let mut taker_data = maker_data;
-        taker_data[57] = 1u8; // role: taker
-        let mut taker_key = [0u8; 32];
-        taker_key[..20].copy_from_slice(fill.taker.as_slice());
-        taker_key[20..28].copy_from_slice(&desc_block.to_be_bytes());
-        taker_key[28..32].copy_from_slice(&trade_index.to_be_bytes());
-
-        Self {
-            trade_key,
-            trade_data,
-            maker_key,
-            maker_data,
-            taker_key,
-            taker_data,
-        }
-    }
-
-    /// Stamp the definitive per-block trade index over the provisional one:
-    /// 4-byte BE index in each of the 3 keys, 16-byte LE trade_id at the head
-    /// of each of the 3 values. Offsets are fixed by the layouts in `build`.
-    fn stamp_trade_index(&mut self, idx: u32) {
-        let be = idx.to_be_bytes();
-        let id_le = (idx as u128).to_le_bytes();
-        self.trade_key[16..20].copy_from_slice(&be);
-        self.trade_data[0..16].copy_from_slice(&id_le);
-        self.maker_key[28..32].copy_from_slice(&be);
-        self.maker_data[0..16].copy_from_slice(&id_le);
-        self.taker_key[28..32].copy_from_slice(&be);
-        self.taker_data[0..16].copy_from_slice(&id_le);
-    }
-}
-
 /// C3: everything a settle worker precomputes for ONE prepared order —
 /// aligned index-for-index with the market's `PreparedOrder`s/match results.
 /// All of it is either market-local (position transitions live in the plan's
@@ -341,8 +239,6 @@ struct OrderSettlePlan {
     /// First position-side fill-application failure, pre-formatted like the
     /// sequential path ("taker fill failed: …" / "maker fill failed: …").
     fill_error: Option<String>,
-    /// Prebuilt trade rows (provisional index), empty when `fill_error`.
-    trades: Vec<TradeKvs>,
 }
 
 /// C3: one market's full settlement plan, computed off-thread by a pure pass
@@ -1474,18 +1370,28 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 
     /// Accumulated native fees during this block.
     pub total_native_fees: u64,
-    /// Per-block trade counter for unique trade keys.
+    /// Per-block fill counter (`trade_id` of each fill); counts every fill,
+    /// with trade history on or off.
     pub trade_index: u32,
 
-    /// O3: when set, trade-history writes (`CF_NATIVE_TRADES` /
-    /// `CF_NATIVE_USER_TRADES` — node-local CFs outside the native consensus
-    /// root, never read during execution) are buffered in `pending_trades`
-    /// instead of PUT into the state backend, for the caller to hand to a
-    /// background writer after all exec phases. Off by default: every existing
-    /// caller keeps inline writes.
+    /// O3: when set, the block's fills (`pending_fills`) are left for the
+    /// caller to take after all exec phases and to write as packed rows
+    /// (`trade_rows::encode_block`, `CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`
+    /// — node-local CFs outside the native consensus root, never read during
+    /// execution), e.g. on a background writer. Off by default: each
+    /// `execute_batch` then writes the rows of all the block's fills so far
+    /// inline.
     pub defer_trades: bool,
-    /// Trade-history rows packed into one byte arena while deferring writes.
-    pending_trades: PackedCfBatch,
+    /// s77: when false, no fills are recorded and no trade-history rows are
+    /// written (`TORUS_TRADE_HISTORY=0`, node-local; for validators that do not
+    /// serve trade-history RPC). Default true.
+    pub trade_history: bool,
+    /// This block's fills in `trade_index` order (s77 packed trade rows).
+    pending_fills: Vec<TradeFill>,
+    /// Block height of `pending_fills` (inline mode clears them on a new height).
+    fills_block: u64,
+    /// Inline mode: how many of `pending_fills` already have rows written.
+    inline_fills_written: usize,
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
@@ -1930,7 +1836,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             total_native_fees: 0,
             trade_index: 0,
             defer_trades: false,
-            pending_trades: PackedCfBatch::default(),
+            trade_history: true,
+            pending_fills: Vec::new(),
+            fills_block: 0,
+            inline_fills_written: 0,
             metrics: None,
             fatal_error: load_error,
             book_mode,
@@ -2010,17 +1919,12 @@ impl<T: StateBackend> NativeExecContext<T> {
         Some(u64::from_be_bytes(bytes.try_into().ok()?))
     }
 
-    /// Drain the trade-history KVs buffered under `defer_trades`. The caller
-    /// owns durability from here (background writer, or synchronous fallback).
-    /// Legacy allocating representation; execution uses the packed drain below.
-    pub fn take_pending_trades(&mut self) -> Vec<RawCfKv> {
-        self.take_pending_trade_batch().into_raw()
-    }
-
-    /// Drain trade rows without allocating a separate key/value Vec per row.
-    /// The caller owns the same post-flush durability and fallback obligations.
-    pub fn take_pending_trade_batch(&mut self) -> PackedCfBatch {
-        std::mem::take(&mut self.pending_trades)
+    /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
+    /// caller owns writing their rows from here (`trade_rows::encode_block`
+    /// on a background writer, or a synchronous fallback).
+    pub fn take_pending_trade_fills(&mut self) -> Vec<TradeFill> {
+        self.inline_fills_written = 0;
+        std::mem::take(&mut self.pending_fills)
     }
 
     /// PROFILER (s470): total resting orders across every loaded book. Sampled
@@ -3252,6 +3156,31 @@ impl NativeExecutor {
         sender: &Address,
         action: &NativeAction,
     ) -> NativeActionResult {
+        let result = Self::execute_action(ctx, sender, action);
+        Self::write_trades_inline(ctx);
+        result
+    }
+
+    /// Without `defer_trades`: write the rows of ALL the block's fills so far,
+    /// if any fill is new. A later call rewrites the same keys with a superset,
+    /// so calls within a block never drop each other's fills.
+    fn write_trades_inline<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        if ctx.defer_trades || ctx.pending_fills.len() == ctx.inline_fills_written {
+            return;
+        }
+        let mut rows = PackedCfBatch::default();
+        encode_block(ctx.fills_block, ctx.timestamp, &ctx.pending_fills, &mut rows);
+        for (cf, key, value) in rows.iter() {
+            let _ = ctx.state.put_cf_raw(cf, key, value);
+        }
+        ctx.inline_fills_written = ctx.pending_fills.len();
+    }
+
+    fn execute_action<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        action: &NativeAction,
+    ) -> NativeActionResult {
         match action {
             // ---- Order book ----
             NativeAction::PlaceOrder(params) => Self::exec_place_order(ctx, sender, params),
@@ -3500,6 +3429,18 @@ impl NativeExecutor {
     }
 
     fn execute_batch_inner<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        actions: &[(Address, NativeAction)],
+        settle_mode: SettleMode,
+        engine_mode: EngineMode,
+        cancel_batch: bool,
+    ) -> NativeBatchResult {
+        let out = Self::execute_batch_phases(ctx, actions, settle_mode, engine_mode, cancel_batch);
+        Self::write_trades_inline(ctx);
+        out
+    }
+
+    fn execute_batch_phases<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         actions: &[(Address, NativeAction)],
         settle_mode: SettleMode,
@@ -4437,7 +4378,6 @@ impl NativeExecutor {
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
             let margin_configs = &ctx.margin_configs;
-            let (block_height, timestamp) = (ctx.block_height, ctx.timestamp);
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
 
             // Per-market weight for the LPT packer: plan cost is one pass over
@@ -4465,8 +4405,6 @@ impl NativeExecutor {
                         cfg,
                         mbr,
                         prepared,
-                        block_height,
-                        timestamp,
                     )
                 }))
                 .map_err(|payload| {
@@ -4636,12 +4574,9 @@ impl NativeExecutor {
                     continue;
                 }
 
-                // Persist trades: stamp the definitive per-block index into
-                // the worker-built bytes, then route exactly like persist_trade.
-                for mut kvs in oplan.trades {
-                    kvs.stamp_trade_index(ctx.trade_index);
-                    Self::route_trade_kvs(ctx, kvs);
-                    ctx.trade_index += 1;
+                // Record fills in canonical order, exactly like persist_trade.
+                for fill in &result.fills {
+                    Self::persist_trade(ctx, market_id, fill);
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4676,8 +4611,6 @@ impl NativeExecutor {
         cfg: Option<&MarketMarginConfig>,
         mbr: &crate::market_workers::MarketBatchResult,
         prepared: &[PreparedOrder<'_>],
-        block_height: u64,
-        timestamp: u64,
     ) -> MarketSettlePlan {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
@@ -4720,23 +4653,10 @@ impl NativeExecutor {
                 }
             }
 
-            // Trade rows (skipped wholesale on a failed order, like sequential;
-            // the definitive index is stamped in pass B).
-            let trades: Vec<TradeKvs> = if fill_error.is_none() {
-                result
-                    .fills
-                    .iter()
-                    .map(|f| TradeKvs::build(market_id, block_height, timestamp, 0, f))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
             orders.push(OrderSettlePlan {
                 margin_release,
                 pnl_events,
                 fill_error,
-                trades,
             });
         }
 
@@ -5429,46 +5349,32 @@ impl NativeExecutor {
         NativeActionResult::ok("place_order", 1000)
     }
 
-    /// Persist a single fill to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES —
-    /// inline, or buffered for a background writer when `ctx.defer_trades`
-    /// (O3; both CFs are node-local, outside the native consensus root).
+    /// Record one fill for this block's trade-history rows (written after the
+    /// batch, see `defer_trades`) and advance the per-block fill counter.
     fn persist_trade<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
     ) {
-        let kvs = TradeKvs::build(
-            market_id,
-            ctx.block_height,
-            ctx.timestamp,
-            ctx.trade_index,
-            fill,
-        );
-        Self::route_trade_kvs(ctx, kvs);
-        ctx.trade_index += 1;
-    }
-
-    /// Route one fill's trade rows: buffered under `defer_trades` (O3), else
-    /// inline overlay PUTs — exactly the classic persist_trade tail.
-    fn route_trade_kvs<T: StateBackend>(ctx: &mut NativeExecContext<T>, kvs: TradeKvs) {
-        if ctx.defer_trades {
-            ctx.pending_trades
-                .push(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
-            ctx.pending_trades
-                .push(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
-            ctx.pending_trades
-                .push(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
-        } else {
-            let _ = ctx
-                .state
-                .put_cf_raw(CF_NATIVE_TRADES, &kvs.trade_key, &kvs.trade_data);
-            let _ = ctx
-                .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.maker_key, &kvs.maker_data);
-            let _ = ctx
-                .state
-                .put_cf_raw(CF_NATIVE_USER_TRADES, &kvs.taker_key, &kvs.taker_data);
+        if ctx.trade_history {
+            if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
+                // Inline mode, context reused for a new block: the earlier
+                // block's rows are already written.
+                ctx.pending_fills.clear();
+                ctx.inline_fills_written = 0;
+            }
+            ctx.fills_block = ctx.block_height;
+            ctx.pending_fills.push(TradeFill {
+                trade_index: ctx.trade_index,
+                market: market_id,
+                maker: fill.maker,
+                taker: fill.taker,
+                price_raw: fill.price.raw(),
+                qty_raw: fill.quantity.raw(),
+                taker_side: if fill.maker_side == Side::Buy { 1 } else { 0 },
+            });
         }
+        ctx.trade_index += 1;
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.

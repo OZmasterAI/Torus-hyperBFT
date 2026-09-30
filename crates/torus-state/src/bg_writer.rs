@@ -106,9 +106,13 @@ impl PackedCfBatch {
 /// Runs on the writer thread once a batch's rows are written (not on failure).
 pub type OnWritten = Box<dyn FnOnce() + Send>;
 
+/// Builds a batch's rows on the writer thread (s77 packed trade rows).
+pub type EncodeRows = Box<dyn FnOnce() -> PackedCfBatch + Send>;
+
 enum CfBatch {
     Raw(Vec<RawCfKv>),
     Packed(PackedCfBatch, Option<OnWritten>),
+    Encode(EncodeRows, Option<OnWritten>),
 }
 
 impl CfBatch {
@@ -116,6 +120,15 @@ impl CfBatch {
         match self {
             Self::Raw(kvs) => kvs.len(),
             Self::Packed(kvs, _) => kvs.len(),
+            Self::Encode(..) => 0,
+        }
+    }
+
+    /// Run a pending encoder, so the batch holds its rows.
+    fn encoded(self) -> Self {
+        match self {
+            Self::Encode(encode, on_written) => Self::Packed(encode(), on_written),
+            other => other,
         }
     }
 
@@ -123,6 +136,7 @@ impl CfBatch {
         match self {
             Self::Raw(kvs) => write_kvs_chunked(db, kvs, policy),
             Self::Packed(kvs, _) => write_rows_chunked(db, kvs.iter(), policy),
+            Self::Encode(..) => unreachable!("encoded before write"),
         }
     }
 }
@@ -214,6 +228,7 @@ impl BackgroundCfWriter {
                 // recv() returns every queued batch even after the sender is
                 // dropped, then errors — drain-on-shutdown falls out for free.
                 while let Ok(kvs) = rx.recv() {
+                    let kvs = kvs.encoded();
                     match kvs.write(&db, policy) {
                         Ok(()) => {
                             if let CfBatch::Packed(_, Some(on_written)) = kvs {
@@ -241,7 +256,7 @@ impl BackgroundCfWriter {
         self.send_batch(CfBatch::Raw(kvs))
             .map_err(|batch| match batch {
                 CfBatch::Raw(kvs) => kvs,
-                CfBatch::Packed(..) => unreachable!("send_batch returns the original batch"),
+                _ => unreachable!("send_batch returns the original batch"),
             })
     }
 
@@ -250,21 +265,21 @@ impl BackgroundCfWriter {
         self.send_batch(CfBatch::Packed(kvs, None))
             .map_err(|batch| match batch {
                 CfBatch::Packed(kvs, _) => kvs,
-                CfBatch::Raw(_) => unreachable!("send_batch returns the original batch"),
+                _ => unreachable!("send_batch returns the original batch"),
             })
     }
 
-    /// [`Self::send_packed`], running `on_written` on the writer thread once the
-    /// rows are written (never if the write fails). If the writer is gone, both
-    /// are handed back unrun.
-    pub fn send_packed_then(
+    /// Queue an encoder that builds the batch's rows on the writer thread, then
+    /// run `on_written` there once the rows are written (never if the write
+    /// fails). If the writer is gone, both are handed back unrun.
+    pub fn send_encode_then(
         &self,
-        kvs: PackedCfBatch,
-        on_written: OnWritten,
-    ) -> Result<(), (PackedCfBatch, OnWritten)> {
-        self.send_batch(CfBatch::Packed(kvs, Some(on_written)))
+        encode: EncodeRows,
+        on_written: Option<OnWritten>,
+    ) -> Result<(), (EncodeRows, Option<OnWritten>)> {
+        self.send_batch(CfBatch::Encode(encode, on_written))
             .map_err(|batch| match batch {
-                CfBatch::Packed(kvs, Some(on_written)) => (kvs, on_written),
+                CfBatch::Encode(encode, on_written) => (encode, on_written),
                 _ => unreachable!("send_batch returns the original batch"),
             })
     }
@@ -597,31 +612,67 @@ mod tests {
         }
     }
 
-    /// s77 order latency: the completion hook runs once, and only after the
-    /// batch's rows are readable (it marks "fills visible over RPC").
+    /// s77: the encoder runs on the writer thread, its rows are written, then
+    /// the completion hook runs once, with the rows readable (it marks "fills
+    /// visible over RPC").
     #[test]
-    fn send_packed_then_runs_hook_after_rows_are_readable() {
+    fn send_encode_then_encodes_on_writer_thread_then_runs_hook() {
         let (_dir, db) = open_test_db();
         let writer = BackgroundCfWriter::spawn(db.clone(), "test-cf-writer", 8);
         let (tx, rx) = std::sync::mpsc::channel();
+        let enc_tx = tx.clone();
         let reader = db.clone();
-        let mut batch = PackedCfBatch::default();
-        batch.push(CF_NATIVE_TRADES, b"k", b"v");
         writer
-            .send_packed_then(
-                batch,
+            .send_encode_then(
                 Box::new(move || {
-                    tx.send(reader.get_cf_raw(CF_NATIVE_TRADES, b"k").unwrap()).unwrap();
+                    let name = std::thread::current().name().map(str::to_string);
+                    enc_tx.send(("encode", name.map(String::into_bytes))).unwrap();
+                    let mut batch = PackedCfBatch::default();
+                    batch.push(CF_NATIVE_TRADES, b"k", b"v");
+                    batch
                 }),
+                Some(Box::new(move || {
+                    let row = reader.get_cf_raw(CF_NATIVE_TRADES, b"k").unwrap();
+                    tx.send(("hook", row)).unwrap();
+                })),
             )
             .map_err(|_| "writer gone")
             .unwrap();
-        let seen = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("hook must run");
-        assert_eq!(seen, Some(b"v".to_vec()), "row must be readable when the hook runs");
+        let recv = || rx.recv_timeout(std::time::Duration::from_secs(5)).expect("closure must run");
+        assert_eq!(recv(), ("encode", Some(b"test-cf-writer".to_vec())));
+        assert_eq!(recv(), ("hook", Some(b"v".to_vec())), "row must be readable when the hook runs");
         drop(writer);
-        assert!(rx.try_recv().is_err(), "hook must run exactly once");
+        assert!(rx.try_recv().is_err(), "each closure must run exactly once");
+    }
+
+    #[test]
+    fn send_encode_then_hands_both_closures_back_unrun_when_writer_gone() {
+        let (tx, rx) = sync_channel::<CfBatch>(1);
+        drop(rx);
+        let writer = BackgroundCfWriter {
+            tx: Some(tx),
+            handle: None,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (r1, r2) = (ran.clone(), ran.clone());
+        let (encode, hook) = writer
+            .send_encode_then(
+                Box::new(move || {
+                    r1.fetch_add(1, Ordering::Relaxed);
+                    PackedCfBatch::default()
+                }),
+                Some(Box::new(move || {
+                    r2.fetch_add(10, Ordering::Relaxed);
+                })),
+            )
+            .map_err(|(e, h)| (e, h.expect("hook handed back")))
+            .unwrap_err();
+        assert_eq!(ran.load(Ordering::Relaxed), 0, "nothing runs on handback");
+        assert_eq!(writer.queued_batches(), 0);
+        encode();
+        hook();
+        assert_eq!(ran.load(Ordering::Relaxed), 11);
     }
 
     #[test]
