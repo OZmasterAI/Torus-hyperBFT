@@ -7,10 +7,10 @@ executor output, so all validators must run the same build.
 
 | Bug | Change |
 |-----|--------|
-| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it. Margin is reserved at the cap (market *sells* at `max(cap, best bid)`, see F5 — in a batch, also at least the highest Limit-buy price placed earlier in the same batch in that market); the unused part is released when the order stops resting. A price × qty that overflows is rejected (no panic). |
+| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it. Margin is reserved at the cap (market *sells* at `max(cap, best bid)`, see F5 — in a batch, also at least the highest price of an earlier bid of the same batch in that market that passed its own margin reservation and can rest: `Limit` GTC / PostOnly, price on the tick, qty `>=` lot, and not certain to be fully filled by the pre-batch asks at or below its price. IOC / FOK, invalid and unfunded bids never raise it); the unused part is released when the order stops resting. A price × qty that overflows is rejected (no panic). |
 | 2 — `reduce_only` | Enforced. Placement from a flat position or on the increasing side is rejected (stops included, on every path); an oversize order is clamped to the position size and reserves margin only for the clamped size; resting reduce-only orders are shrunk / cancelled when the position shrinks, closes or flips (margin released). A reduce-only maker never fills past its owner's position. |
 | stops | Triggered stops are now placed through the normal path after the block's matching settles: they reserve margin, move positions, respect the StopMarket cap and re-check `reduce_only` at trigger time. |
-| ModifyOrder | Only the order's **owner** may modify it (was: any account, margin charged to the owner). Validated like placement before anything changes: price `> 0` on the tick, quantity `> 0` and `>=` lot, at least one field set; a new price at / through the opposite best is **rejected** (a modify never matches — cancel and place instead). A reduce-only order is clamped to the position (rejected when there is nothing to reduce). Margin uses the placement formula (tiered leverage): the difference to the new reservation is reserved first (insufficient margin ⇒ rejected, order and balances unchanged) or released exactly; overflowing price × qty is rejected. A quantity-only decrease keeps time priority. |
+| ModifyOrder | Only the order's **owner** may modify it (was: any account, margin charged to the owner). Validated like placement before anything changes: price `> 0`, a *new* price on the tick (a quantity-only modify of an order resting off the current tick is accepted), quantity `> 0` and `>=` lot, at least one field set; a new price at / through the opposite best is **rejected** (a modify never matches — cancel and place instead). A reduce-only order is clamped to the position (rejected when there is nothing to reduce); as in placement the lot applies to the requested quantity, so the clamp may rest below the lot. Margin uses the placement formula (tiered leverage): the difference to the new reservation is reserved first (insufficient margin ⇒ rejected, order and balances unchanged) or released exactly; overflowing price × qty is rejected. A quantity-only decrease keeps time priority. |
 | 3 — unbonding | New `ClaimUnbonded` native action (canonical action tag **26**; EIP-712 `ClaimUnbonded(uint64 nonce)`, fund-moving, not session-signable) and CoreWriterStaking `claimUnbonded()` (queued kind tag **7**). Releases every matured unbonding entry of the sender, all-or-nothing. |
 | 4 — listing | `ListMarket` / `DelistMarket` / `UpdateMarketParams` native actions now error ("governance-only"). Listings go through governance; the market id is `max(existing) + 1`, assigned at proposal **execution**. |
 | 5/6 — lockbox 0x0820 | Native amounts are 8-dec, EVM is 18-dec wei: native→EVM ×10^10; EVM→native floors ÷10^10 and burns the dust. `depositToNative(uint128)` is **payable** and requires `msg.value == arg`; the value is burned in-frame and the native credit is queued for the **next block**. `withdrawFromNative(uint128)` is non-payable, takes a multiple of 10^10 wei, and is also applied next block. Queue rows now commit atomically with the block's EVM bundle (F1), together with a node-local EVM-applied marker (`cf_consensus_meta` / `evm_applied_block` = height ‖ fee revenue, not in any root): after a crash between the EVM commit and the native flush, replay skips the block's EVM txs and runs the native phase with the stored fee revenue, so a tx skipped the first time (e.g. nonce too high) can never execute on replay. |
@@ -33,8 +33,19 @@ executor output, so all validators must run the same build.
 * F1 — the EVM-applied marker is written from this build on; a node restarted
   on data from an older build has none and replays EVM as before (fresh
   genesis: never the case). A marker AHEAD of the block being executed means
-  that block's EVM is durable but its fee revenue is lost — the node
-  fail-stops rather than re-executing it.
+  a LATER block's EVM is already durable while this block's native phase is
+  not — the node fail-stops rather than executing it on top of that state.
+  The check runs for every block, with or without EVM txs (it cannot fire in
+  normal operation: EVM blocks are pipeline barriers and replay starts above
+  the durable native marker).
+* F1 (review 3) — operational fail-stops / marker format:
+  * failing to stage the marker into the block's EVM batch fail-stops the
+    node (never commits a bundle without it);
+  * the marker is `height ‖ fee revenue` (24 bytes); when the incremental EVM
+    commit failed and the plain `commit_pending_bundle` fallback was used, it
+    also carries a flags byte (`0x01`) and the bundle's account addresses, so
+    an EVM-skipped crash replay re-syncs `CF_HASHED_*` / `CF_TRIE_*` for them
+    (the bare 24-byte record still decodes). Node-local, not in any root.
 
 ## Known deferred items (not fixed on this branch)
 
