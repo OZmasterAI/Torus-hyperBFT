@@ -69,7 +69,8 @@ in trade order. Blocks without a matching fill send nothing.
 | `closedPnl` | Realized PnL of the fill's closing part; `0.00000000` when the fill only opened or increased |
 | `dir` | `Open Long`, `Open Short`, `Close Long`, `Close Short`, `Long > Short` or `Short > Long` (a flip) |
 
-A self-trade (the user is both maker and taker) gives two entries, maker first.
+There are no self-trades: an order that would match the same user's resting
+order cancels that resting order instead (self-trade prevention).
 
 ## Encoding
 
@@ -87,6 +88,10 @@ A self-trade (the user is both maker and taker) gives two entries, maker first.
   committed, so fills are never retracted.
 - **Order:** blocks arrive in height order. Within a block, entries are in
   `tradeId` order.
+- **Only while subscribed:** streams carry fills only while a subscriber is
+  connected. A node records fills for the streams only while at least one
+  stream subscriber exists, so a block executing at the moment you subscribe
+  may be missed; backfill covers it.
 - **Ahead of history:** a fill can arrive on the stream shortly **before**
   `torus_getUserTrades` / `torus_getTradeHistory*` return it, because the
   history rows are written just after.

@@ -110,9 +110,10 @@ pub fn trades_for_market(block: &BlockFills, market: Option<u64>) -> Vec<RpcStre
 }
 
 /// The `userFills` rows of one block for `user`: one entry per (fill, role)
-/// where `user` is maker or taker. A self-trade yields two entries, maker
-/// first. `side`, `orderId`, `startPosition`, `closedPnl` and `dir` are the
-/// user's own.
+/// where `user` is maker or taker. `side`, `orderId`, `startPosition`,
+/// `closedPnl` and `dir` are the user's own. Self-trades cannot happen (the
+/// book's self-trade prevention cancels the resting order); if a fill ever had
+/// `user` on both sides it would yield two entries, maker then taker.
 pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
     let mut out = Vec::new();
     for f in &block.fills {
