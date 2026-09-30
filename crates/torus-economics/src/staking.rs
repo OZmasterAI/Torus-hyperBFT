@@ -6,10 +6,10 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::{
-    CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
+    CF_ACCOUNTS, CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
     CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
-use torus_state::{StateBackend, StateDb};
+use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 
 use crate::rewards::FeeSplitter;
 
@@ -227,21 +227,65 @@ impl<T: StateBackend> StakingManager<T> {
     /// User-initiated claim (`NativeAction::ClaimUnbonded`): release every matured
     /// unbonding entry across all of `delegator`'s delegations. Returns the total
     /// credited. Errors WITHOUT touching state if nothing has matured.
+    ///
+    /// F4 (s515 review): all-or-nothing. Every delegation's post-claim row and the
+    /// credited balance are computed first, then land in ONE `atomic_write` — a
+    /// failure (read, encode, overflow, write) leaves no partial release behind.
+    /// The resulting rows are exactly what `process_unbonding` per validator
+    /// writes (fully drained record deleted, else rewritten).
     pub fn claim_unbonded(&self, delegator: Address, current_block: u64) -> Result<U256> {
-        let matured: Vec<Address> = self
-            .delegations_for_delegator(&delegator)?
-            .into_iter()
-            .filter(|d| d.unbonding.iter().any(|e| current_block >= e.release_block))
-            .map(|d| d.validator)
-            .collect();
-        if matured.is_empty() {
+        let overflow = || {
+            EconomicsError::State(torus_state::StateError::InvalidData(
+                "claim_unbonded: released amount overflows".to_string(),
+            ))
+        };
+        let mut total = U256::ZERO;
+        let mut rows: Vec<([u8; 40], Option<Vec<u8>>)> = Vec::new();
+        for mut d in self.delegations_for_delegator(&delegator)? {
+            let (matured, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut d.unbonding)
+                .into_iter()
+                .partition(|e| current_block >= e.release_block);
+            if matured.is_empty() {
+                continue;
+            }
+            for e in &matured {
+                total = total.checked_add(e.amount).ok_or_else(overflow)?;
+            }
+            d.unbonding = remaining;
+            let row = if d.amount.is_zero() && d.unbonding.is_empty() {
+                None
+            } else {
+                Some(borsh::to_vec(&d).map_err(|e| EconomicsError::Borsh(e.to_string()))?)
+            };
+            rows.push((delegation_key(&delegator, &d.validator), row));
+        }
+        if rows.is_empty() {
             return Err(EconomicsError::NoMaturedUnbonding(delegator));
         }
 
-        let mut total = U256::ZERO;
-        for validator in matured {
-            total += self.process_unbonding(delegator, validator, current_block)?;
-        }
+        let mut account = self.state.get_account(&delegator)?.unwrap_or_default();
+        account.balance = account.balance.checked_add(total).ok_or_else(overflow)?;
+        let account_bytes = torus_state::db::encode_account_info(&account);
+        let mut ops: Vec<AtomicWriteOp<'_>> = rows
+            .iter()
+            .map(|(key, row)| match row {
+                Some(value) => AtomicWriteOp::Put {
+                    cf: CF_STAKING_DELEGATIONS,
+                    key,
+                    value,
+                },
+                None => AtomicWriteOp::Delete {
+                    cf: CF_STAKING_DELEGATIONS,
+                    key,
+                },
+            })
+            .collect();
+        ops.push(AtomicWriteOp::Put {
+            cf: CF_ACCOUNTS,
+            key: delegator.as_slice(),
+            value: &account_bytes,
+        });
+        self.state.atomic_write(&ops)?;
         tracing::debug!(%delegator, %total, "matured unbonding claimed");
         Ok(total)
     }
