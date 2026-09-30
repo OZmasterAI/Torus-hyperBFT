@@ -3870,16 +3870,17 @@ impl NativeExecutor {
             // batch in this market (positions are keyed per market, and only
             // this worker fills this market), so every order is checked
             // against the position left by the block's earlier orders.
-            let has_ro_sender = prepared.iter().any(|p| p.params.reduce_only);
-            if has_ro_sender || book.has_reduce_only_orders() {
+            // Review 5: checked takers (margin budget) are tracked the same
+            // way — their closing fills are free at match time — so every
+            // path frees exactly the position the single path would read.
+            let tracked = |p: &PreparedOrder<'_>| p.params.reduce_only || p.margin_budget.is_some();
+            let has_tracked_sender = prepared.iter().any(tracked);
+            if has_tracked_sender || book.has_reduce_only_orders() {
                 let ro = Self::reduce_only_positions_for(
                     &ctx.positions,
                     &book,
                     market_id,
-                    prepared
-                        .iter()
-                        .filter(|p| p.params.reduce_only)
-                        .map(|p| p.sender),
+                    prepared.iter().filter(|p| tracked(p)).map(|p| p.sender),
                 );
                 book.set_reduce_only_positions(ro);
             }
@@ -4977,16 +4978,36 @@ impl NativeExecutor {
     /// initial margin than it reserved, so the book re-checks every fill
     /// against a [`TakerMarginLimit`]: a market order (reserved at the mark,
     /// fills anywhere up to its cap) and a limit SELL (reserved at its limit,
-    /// fills at bids >= it). A limit buy fills at asks <= its limit, i.e.
-    /// within its reservation. Reduce-only orders are exempt (Hyperliquid:
-    /// reducing needs no margin); stops are checked once triggered.
+    /// fills at bids >= it). A GTC / PostOnly limit buy fills at asks <= its
+    /// limit, i.e. within its full reservation. Review 5: an IOC / FOK limit
+    /// buy reserves only for its opening part ([`never_rests`]), so it is
+    /// checked too. Reduce-only orders are exempt (Hyperliquid: reducing
+    /// needs no margin); stops are checked once triggered.
     fn match_margin_checked(params: &PlaceOrderParams) -> bool {
         !params.reduce_only
             && match params.order_type {
                 OrderType::Market => true,
-                OrderType::Limit => !params.is_buy,
+                OrderType::Limit => !params.is_buy || Self::never_rests(params),
                 _ => false,
             }
+    }
+
+    /// s515 review 5 (F2): an order that can never rest — market, or an IOC /
+    /// FOK limit. Its whole placement reservation is released after matching
+    /// (`rested_qty` = 0), so it reserves only for the quantity beyond what
+    /// closes the sender's opposite-side position ([`reduce_only_allowance`]
+    /// — closing needs no margin, Hyperliquid) without touching the A5
+    /// identity. An order that can rest keeps reserving its full quantity:
+    /// the reservation of a resting row is `reserve(price, remaining)` for
+    /// every later release, so it cannot hold less.
+    fn never_rests(params: &PlaceOrderParams) -> bool {
+        match params.order_type {
+            OrderType::Market => true,
+            OrderType::Limit => {
+                matches!(params.time_in_force, TimeInForce::IOC | TimeInForce::FOK)
+            }
+            _ => false,
+        }
     }
 
     /// s515 review 4: the market's leverage tiers, shared by its checked
@@ -5038,6 +5059,12 @@ impl NativeExecutor {
     ///   or oversize order no longer reserves (and starves the sender's later
     ///   orders of) margin it can never use, and since the clamp — hence the
     ///   resting remainder — never exceeds the bound, A5 telescoping stays exact.
+    /// - Review 5: an order that never rests ([`never_rests`], reduce-only or
+    ///   not) reserves only for the quantity beyond the pre-batch closing
+    ///   allowance. The book re-derives the closing part at match time from
+    ///   the position advanced through the batch's earlier fills; if those
+    ///   shrank it, the extra opening part is charged against the order's
+    ///   budget there (the reservation itself is released whole anyway).
     fn phase2_reservation_basis<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
@@ -5084,6 +5111,12 @@ impl NativeExecutor {
                     .entry((sender, params.market_id))
                     .or_insert(FixedPoint::ZERO);
                 *g = sat_add(*g, params.quantity);
+            }
+            if Self::never_rests(params) {
+                // A read error charges the whole order (conservative).
+                if let Ok(pos) = Self::signed_position(&ctx.positions, &sender, params.market_id) {
+                    qty -= qty.min(reduce_only_allowance(pos, params.is_buy));
+                }
             }
             if price != Self::reserve_price(params) || qty != params.quantity {
                 out.insert(i, (price, qty));
@@ -5288,12 +5321,24 @@ impl NativeExecutor {
         // F4: a reduce-only non-stop order only for the quantity the book
         // will let it keep (the clamp to the position it reads below). F2: an
         // overflowing notional rejects.
-        let reserve_qty = match ro_pos {
+        let mut reserve_qty = match ro_pos {
             Some(pos) if !Self::is_stop(params) => {
                 params.quantity.min(reduce_only_allowance(pos, params.is_buy))
             }
             _ => params.quantity,
         };
+        // Review 5 (F2): an order that never rests reserves only for what it
+        // would open beyond closing the current position (a read error
+        // charges it whole — conservative; the book then treats it as flat).
+        if Self::never_rests(params) {
+            let pos = match ro_pos {
+                Some(pos) => Ok(pos),
+                None => Self::signed_position(&ctx.positions, sender, market_id),
+            };
+            if let Ok(pos) = pos {
+                reserve_qty -= reserve_qty.min(reduce_only_allowance(pos, params.is_buy));
+            }
+        }
         let mark = if matches!(params.order_type, OrderType::Market) {
             Self::mark_price(ctx, market_id)
         } else {
@@ -5366,12 +5411,15 @@ impl NativeExecutor {
             .or_insert_with(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
 
         // s515 (BUG 2): police reduce-only orders against CURRENT positions.
-        if params.reduce_only || book.has_reduce_only_orders() {
+        // Review 5: a checked taker's position too — its closing fills are
+        // free at match time (same source and freshness as the policing).
+        let track_sender = params.reduce_only || checked;
+        if track_sender || book.has_reduce_only_orders() {
             let ro = Self::reduce_only_positions_for(
                 &ctx.positions,
                 book,
                 market_id,
-                params.reduce_only.then_some(*sender).into_iter(),
+                track_sender.then_some(*sender).into_iter(),
             );
             book.set_reduce_only_positions(ro);
         }

@@ -839,3 +839,146 @@ fn batch_resting_high_bid_ahead_is_bounded_at_match_time() {
         assert_bal(&ctx, &addr(2), fp(25), FixedPoint::ZERO, "taker released exactly");
     }
 }
+
+// ============================================================================
+// (i) F2 (s515 review 5): closing needs no margin (Hyperliquid). The part of
+//     a plain (non-reduce-only) order that reduces the sender's opposite-side
+//     position is free — at placement for an order that cannot rest (market,
+//     IOC / FOK limit), and at match time for every checked taker; only the
+//     quantity beyond it (that flips / opens) is charged.
+// ============================================================================
+
+/// `taker` ends up at signed position `size` (+long / -short) in market 1 at
+/// 100 against `cp`, then holds `avail` available with 95 of order margin in
+/// a resting order that never interacts (long: ask 10 @190; short: bid
+/// 190 @10). The counterparty's order is fully consumed.
+fn open_then_lock(
+    ctx: &mut NativeExecContext,
+    path: Path,
+    taker: Address,
+    cp: Address,
+    size: i64,
+    avail: FixedPoint,
+) {
+    let long = size > 0;
+    let r = run(ctx, path, &[place(cp, limit(1, !long, 100, size.abs()))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    let r = run(ctx, path, &[place(taker, limit(1, long, 100, size.abs()))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_eq!(pos(ctx, &taker), fp(size), "{path:?}: position opened");
+    fund_native(ctx, &taker, avail + fp(95));
+    let lock = if long { limit(1, false, 190, 10) } else { limit(1, true, 10, 190) };
+    let r = run(ctx, path, &[place(taker, lock)]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_bal(ctx, &taker, avail, fp(95), "after lock");
+}
+
+/// The review scenario: long 20 @100, 95 of 100 locked (available 5), a
+/// plain market sell of 20 into bid 100 x 20. It used to fill 1 unit (IM 5)
+/// and cancel 19; closing is free, so all 20 fill. With a mark of 100 the
+/// placement reservation (100) used to reject it outright.
+#[test]
+fn plain_market_sell_closing_a_long_fills_fully_without_margin() {
+    for with_mark in [false, true] {
+        for path in PATHS {
+            let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+            let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+            open_then_lock(&mut ctx, path, taker, cp, 20, fp(5));
+            if with_mark {
+                set_mark(&ctx, 1, fp(100));
+            }
+            run(&mut ctx, path, &[place(maker, limit(1, true, 100, 20))]);
+            let r = run(&mut ctx, path, &[place(taker, market(1, false, fp(1), 20))]);
+            let what = format!("{path:?} mark={with_mark}");
+            assert!(r[0].success, "{what}: {:?}", r[0].error);
+            assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: fully closed");
+            assert!(resting(&ctx, &maker).is_empty(), "{what}: bid consumed");
+            assert_eq!(resting(&ctx, &taker), vec![fp(10)], "{what}: lock untouched");
+            assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+        }
+    }
+}
+
+/// Long 20, plain market sell 30 into bid 100 x 30: 20 close free, the 10
+/// that open a short cost 10 x 100 / 20 = 50. Available 50: all 30 fill;
+/// available 49: 20 + 9 fill, 1 is cancelled.
+#[test]
+fn plain_sell_through_a_long_charges_only_the_flip() {
+    for (avail, end_pos) in [(50, -10), (49, -9)] {
+        for path in PATHS {
+            let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+            let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+            open_then_lock(&mut ctx, path, taker, cp, 20, fp(avail));
+            run(&mut ctx, path, &[place(maker, limit(1, true, 100, 30))]);
+            let r = run(&mut ctx, path, &[place(taker, market(1, false, fp(1), 30))]);
+            let what = format!("{path:?} avail={avail}");
+            assert!(r[0].success, "{what}: {:?}", r[0].error);
+            assert_eq!(pos(&ctx, &taker), fp(end_pos), "{what}");
+            assert!(resting(&ctx, &taker).len() == 1, "{what}: sell never rests");
+            assert_bal(&ctx, &taker, fp(avail), fp(95), &what);
+        }
+    }
+}
+
+/// Symmetric: short 20, a market buy of 20 (cap 200 — its placement
+/// reservation used to be 200) or an IOC limit buy 20 @100 (used to reserve
+/// 100) closes it with 5 available.
+#[test]
+fn plain_buy_closing_a_short_fills_fully_without_margin() {
+    let buys = [market(1, true, fp(200), 20), ioc(limit(1, true, 100, 20))];
+    for buy in buys {
+        for path in PATHS {
+            let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+            let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+            open_then_lock(&mut ctx, path, taker, cp, -20, fp(5));
+            run(&mut ctx, path, &[place(maker, limit(1, false, 100, 20))]);
+            let r = run(&mut ctx, path, &[place(taker, buy.clone())]);
+            let what = format!("{path:?} {:?}", buy.order_type);
+            assert!(r[0].success, "{what}: {:?}", r[0].error);
+            assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: fully closed");
+            assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+        }
+    }
+}
+
+/// A GTC limit sell closing a long: it still reserves its full notional at
+/// placement (its resting rows' reservation is price x remaining, see the
+/// s515 doc), but its closing fills are free at match time. Long 20, sell
+/// 20 @100 GTC with exactly its 100 reservation available, bid 150 x 20:
+/// each fill at 150 used to cost 7.5 against a 5/unit hold — nothing filled.
+#[test]
+fn gtc_limit_sell_closing_a_long_is_free_at_match_time() {
+    for path in PATHS {
+        let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+        let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+        open_then_lock(&mut ctx, path, taker, cp, 20, fp(100));
+        run(&mut ctx, path, &[place(maker, limit(1, true, 150, 20))]);
+        let r = run(&mut ctx, path, &[place(taker, limit(1, false, 100, 20))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: fully closed at 150");
+        // Realized PnL 20 x (150 - 100) = 1000 on top of the 100 released.
+        assert_bal(&ctx, &taker, fp(1_100), fp(95), &format!("{path:?}"));
+    }
+}
+
+/// Two plain market sells of 20 in ONE batch from long 20 (available 5, no
+/// mark): the first closes free; the second opens and is charged against
+/// the position the book has advanced through the first (not the pre-batch
+/// long) — 1 unit (IM 5) on every path.
+#[test]
+fn second_closing_order_in_a_batch_sees_the_position_after_the_first() {
+    for path in PATHS {
+        let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+        let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+        open_then_lock(&mut ctx, path, taker, cp, 20, fp(5));
+        run(&mut ctx, path, &[place(maker, limit(1, true, 100, 40))]);
+        let sells = NativeAction::PlaceOrderBatch(vec![
+            market(1, false, fp(1), 20),
+            market(1, false, fp(1), 20),
+        ]);
+        let r = run(&mut ctx, path, &[(taker, sells)]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_eq!(pos(&ctx, &taker), -fp(1), "{path:?}: 20 closed free, 1 opened");
+        assert_bal(&ctx, &taker, fp(5), fp(95), &format!("{path:?}"));
+    }
+}
