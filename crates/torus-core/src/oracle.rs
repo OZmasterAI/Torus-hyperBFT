@@ -238,10 +238,12 @@ impl<T: StateBackend> OracleManager<T> {
     }
 
     // 2.8b.2 + 2.8b.4: Aggregate prices using stake-weighted median with outlier rejection.
-    /// `now` is the current block's header timestamp (s). With >= min reporters
-    /// a FRESH aggregate `{price, current_block, reporters, now}` is written;
-    /// otherwise nothing is written and the last aggregate (if not stale) is
-    /// returned — it keeps its timestamp and ages.
+    /// `now` is the current block's header timestamp (s); `validator_stakes` is
+    /// the Active set (its sum is the quorum's total). With >= min reporters
+    /// holding > 2/3 of that stake (both after the outlier cut) a FRESH
+    /// aggregate `{price, current_block, reporters, now}` is written; otherwise
+    /// nothing is written and the last aggregate (if not stale) is returned —
+    /// it keeps its timestamp and ages.
     pub fn aggregate_price(
         &self,
         market_id: MarketId,
@@ -275,7 +277,16 @@ impl<T: StateBackend> OracleManager<T> {
         // 2.8b.4: Outlier rejection
         let filtered = reject_outliers(&price_stake_pairs);
 
-        if filtered.len() < self.config.min_oracle_reporters {
+        // Review M1: a fresh price needs >= min reporters AND > 2/3 of the Active
+        // stake, both over the set AFTER the outlier cut — the set whose
+        // weighted median is the price. The cut uses the UNWEIGHTED median, so
+        // a low-stake head-count majority can cut high-stake honest reports;
+        // counting before the cut would let that minority set the price.
+        let total_stake = stake_sum(validator_stakes.iter().map(|(_, s)| *s));
+        let counted_stake = stake_sum(filtered.iter().map(|(_, s)| *s));
+        if filtered.len() < self.config.min_oracle_reporters
+            || !has_stake_quorum(counted_stake, total_stake)
+        {
             return self.get_last_valid_price(market_id, now);
         }
 
@@ -443,6 +454,19 @@ fn reject_outliers(pairs: &[(FixedPoint, FixedPoint)]) -> Vec<(FixedPoint, Fixed
         .collect()
 }
 
+/// Raw (i128) sum of stakes, saturating (stakes are whole-token power, >= 0).
+fn stake_sum(stakes: impl Iterator<Item = FixedPoint>) -> i128 {
+    stakes.fold(0i128, |acc, s| acc.saturating_add(s.raw()))
+}
+
+/// `3·counted > 2·total`, integer-exact and overflow-free: with
+/// `rest = total − counted` it is `counted > 2·rest`, i.e.
+/// `counted − rest > rest`. Requires `0 <= counted <= total`.
+fn has_stake_quorum(counted: i128, total: i128) -> bool {
+    let rest = total - counted;
+    counted > rest && counted - rest > rest
+}
+
 /// Stake-weighted median: sort by price, walk cumulative stake to 50%.
 fn weighted_median(pairs: &[(FixedPoint, FixedPoint)]) -> FixedPoint {
     if pairs.is_empty() {
@@ -548,6 +572,22 @@ mod tests {
         let filtered = reject_outliers(&pairs);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, fp(100));
+    }
+
+    /// 3·counted > 2·total, strict, exact at the boundary, no overflow.
+    #[test]
+    fn stake_quorum_is_strictly_above_two_thirds() {
+        assert!(!has_stake_quorum(6, 9));
+        assert!(has_stake_quorum(7, 9));
+        assert!(!has_stake_quorum(2, 3));
+        assert!(has_stake_quorum(3, 3));
+        assert!(!has_stake_quorum(0, 0), "no stake: no quorum");
+        assert!(!has_stake_quorum(200_000_000, 300_000_000)); // raw of 2 of 3 tokens
+        assert!(has_stake_quorum(200_000_001, 300_000_000));
+        let m = i128::MAX;
+        assert!(has_stake_quorum(m, m), "no overflow");
+        assert!(!has_stake_quorum(m / 3 * 2, m / 3 * 3));
+        assert!(has_stake_quorum(m / 3 * 2 + 1, m / 3 * 3));
     }
 
     #[test]
