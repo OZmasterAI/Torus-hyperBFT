@@ -2,7 +2,8 @@
 
 A node pushes fills to WebSocket clients through two JSON-RPC subscriptions:
 
-- `newTrades`: public trades, per market or for all markets.
+- `newTrades`: public trades, per market or for all markets. All markets is
+  off on validators by default (see [All-markets `newTrades`](#all-markets-newtrades)).
 - `userFills`: the fills of one address, with its position effect.
 
 Both are fed from execution (the fills each executed block produced), not read
@@ -23,7 +24,7 @@ the kind and its params:
 
 | Kind | Params | Notes |
 |---|---|---|
-| `newTrades` | `marketId` (optional, hex u64 like `"0x1"`) | Omit it for every market. |
+| `newTrades` | `marketId` (optional, hex u64 like `"0x1"`) | Omit it for every market, where the node allows that (see below). |
 | `userFills` | `user` (required, 20-byte hex address) | Fills where `user` is maker or taker. |
 
 - The reply is a subscription id.
@@ -32,10 +33,41 @@ the kind and its params:
   subscription is created.
 - A node allows 1000 subscriptions at once and rejects more with `-32000`.
 
+### All-markets `newTrades`
+
+At full load one block's all-markets array can be tens of MB of JSON. So
+`newTrades` without `marketId` is:
+
+- **rejected on validators** by default, with `-32602`:
+  `invalid params: newTrades without marketId is disabled on this node
+  (validator); subscribe per market or use an RPC node; operators:
+  TORUS_ALL_MARKET_TRADES=1`;
+- **allowed on `--rpc-only` nodes** by default.
+
+Per-market `newTrades` and `userFills` are allowed on every node.
+
+Operators override the default with the node-local env var
+`TORUS_ALL_MARKET_TRADES`:
+
+| Value | All-markets `newTrades` |
+|---|---|
+| unset | allowed only on `--rpc-only` nodes |
+| `1` | allowed |
+| `0` | rejected (the message still says "validator") |
+| anything else | a warning is logged; the default applies |
+
+The node reads it once at startup. It is checked only when a subscription is
+opened, so it adds nothing to execution or to block delivery.
+
 ## Messages
 
 Each notification carries **one executed block's matching fills as an array**,
 in trade order. Blocks without a matching fill send nothing.
+
+A block's `newTrades` array is **serialized once per filter** (all markets, or
+one `marketId`) and the same bytes go to every subscriber with that filter.
+Extra subscribers on a filter add only the frame copy, not a new
+serialization. `userFills` arrays are built per subscriber.
 
 ### `newTrades`
 

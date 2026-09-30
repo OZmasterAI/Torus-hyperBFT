@@ -16,7 +16,8 @@ torus-telemetry = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# raw_value: a newTrades payload is serialized once and shared (s80 fix 2).
+serde_json = { workspace = true, features = ["raw_value"] }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-consensus = { workspace = true }

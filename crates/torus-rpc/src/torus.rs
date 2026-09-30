@@ -1738,6 +1738,16 @@ impl TorusApiServer for RpcState {
                 return Ok(());
             }
         };
+        // s80 fix 2: all-markets newTrades is node-configurable (off on
+        // validators by default); per-market and userFills always pass.
+        if kind == crate::streams::StreamKind::NewTrades(None) && !self.all_market_trades {
+            pending
+                .reject(ErrorObjectOwned::from(RpcError::InvalidParams(
+                    crate::streams::ALL_MARKET_TRADES_DISABLED.to_string(),
+                )))
+                .await;
+            return Ok(());
+        }
         let Some(_slot) = SubscriptionSlot::acquire(&self.active_subscriptions) else {
             pending
                 .reject(ErrorObjectOwned::owned(
@@ -1771,11 +1781,23 @@ impl TorusApiServer for RpcState {
                 Err(RecvError::Closed) => return Ok(()),
             };
             let msg = match kind {
+                // Serialized once per (block, filter), shared by all
+                // subscribers with this filter; embedded here verbatim.
                 crate::streams::StreamKind::NewTrades(market) => {
-                    stream_message(&sink, &crate::streams::trades_for_market(&block, market))?
+                    match block.new_trades_payload(market).await? {
+                        Some(payload) => {
+                            let raw: &serde_json::value::RawValue = &payload;
+                            Some(jsonrpsee::SubscriptionMessage::new(
+                                sink.method_name(),
+                                sink.subscription_id(),
+                                &raw,
+                            )?)
+                        }
+                        None => None,
+                    }
                 }
                 crate::streams::StreamKind::UserFills(user) => {
-                    stream_message(&sink, &crate::streams::fills_for_user(&block, user))?
+                    stream_message(&sink, &crate::streams::fills_for_user(&block.fills, user))?
                 }
             };
             if let Some(msg) = msg {

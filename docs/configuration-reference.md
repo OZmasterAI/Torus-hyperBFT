@@ -47,6 +47,7 @@
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Overridden by `--log-level`. Controls tracing filter. Examples: `info`, `torus_consensus=debug,info`, `trace`. |
+| `TORUS_ALL_MARKET_TRADES` | Allows all-markets `newTrades` WebSocket subscriptions (no `marketId`). Unset: allowed only on `--rpc-only` nodes, rejected with `-32602` on validators. `1`: allowed. `0`: rejected. Any other value logs a warning and uses the default. Read once at startup. Per-market `newTrades` and `userFills` are always allowed. See `docs/api/streams.md`. |
 
 ## Port Assignments
 

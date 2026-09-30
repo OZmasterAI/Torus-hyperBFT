@@ -1,12 +1,19 @@
-//! s80: pure builders for the `newTrades` and `userFills` WebSocket streams.
+//! s80: builders for the `newTrades` and `userFills` WebSocket streams.
 //!
 //! The execution thread publishes each executed block's fills once as an
-//! `Arc<BlockFills>`; every subscription turns that block into its own
-//! filtered array here. Field encodings match the backfill RPCs
+//! `Arc<BlockFills>`; the notifier wraps it in a [`StreamBlock`]. A
+//! `newTrades` array is serialized once per (block, filter) and shared by
+//! every subscriber with that filter; `userFills` arrays are built per
+//! subscriber. Field encodings match the backfill RPCs
 //! (`torus_getTradeHistory*`, `torus_getUserTrades`): ids, heights and
 //! timestamps are hex, FixedPoint values are decimal strings.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use alloy_primitives::Address;
+use serde_json::value::RawValue;
+use tokio::sync::OnceCell;
 use torus_state::trade_rows::{BlockFills, TradeFill};
 use torus_types::FixedPoint;
 
@@ -60,6 +67,37 @@ pub fn parse_stream_kind(
     }
 }
 
+/// Node-local switch for all-markets `newTrades` (s80 fix 2).
+pub const ENV_ALL_MARKET_TRADES: &str = "TORUS_ALL_MARKET_TRADES";
+
+/// The `-32602` message for an all-markets `newTrades` on a node that has it off.
+pub const ALL_MARKET_TRADES_DISABLED: &str =
+    "newTrades without marketId is disabled on this node (validator); subscribe per \
+     market or use an RPC node; operators: TORUS_ALL_MARKET_TRADES=1";
+
+/// Whether all-markets `newTrades` is allowed, from `TORUS_ALL_MARKET_TRADES`
+/// (`env`) and the node mode: unset → only on `--rpc-only` nodes; `"1"` → on;
+/// `"0"` → off. Any other value logs a warning and uses the default.
+pub fn all_market_trades_allowed(env: Option<&str>, rpc_only: bool) -> bool {
+    match env.map(str::trim) {
+        None => rpc_only,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => {
+            tracing::warn!(
+                "{ENV_ALL_MARKET_TRADES}={other:?} is not 0 or 1; using the default \
+                 (all-markets newTrades {})",
+                if rpc_only {
+                    "on: RPC node"
+                } else {
+                    "off: validator"
+                }
+            );
+            rpc_only
+        }
+    }
+}
+
 /// HL-style direction of a fill for one party: `start_raw` is the party's
 /// signed position before the fill, `user_bought` its side, `qty_raw` the
 /// fill size.
@@ -107,6 +145,76 @@ pub fn trades_for_market(block: &BlockFills, market: Option<u64>) -> Vec<RpcStre
             taker: hex_address(f.taker),
         })
         .collect()
+}
+
+/// A serialized `newTrades` array, or `None` when the filter matched no fill.
+pub type TradesPayload = Option<Arc<RawValue>>;
+
+/// One executed block as broadcast to the stream subscriptions (s80 fix 2).
+///
+/// Created empty by the notifier (O(1) on the execution thread). The first
+/// subscription task that needs a `newTrades` filter serializes it; every
+/// other subscriber with that filter reuses the same bytes.
+pub struct StreamBlock {
+    pub fills: Arc<BlockFills>,
+    all_markets: OnceCell<TradesPayload>,
+    /// The lock is held only to find or insert a market's cell, never while
+    /// serializing.
+    per_market: Mutex<HashMap<u64, Arc<OnceCell<TradesPayload>>>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+impl StreamBlock {
+    pub fn new(fills: Arc<BlockFills>) -> Self {
+        Self {
+            fills,
+            all_markets: OnceCell::new(),
+            per_market: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            builds: Default::default(),
+        }
+    }
+
+    /// The `newTrades` array of this block for `market` (all markets when
+    /// `None`), serialized once per filter. Concurrent callers with the same
+    /// filter wait for the first one's result.
+    pub async fn new_trades_payload(
+        &self,
+        market: Option<u64>,
+    ) -> Result<TradesPayload, serde_json::Error> {
+        let build = || async { self.build(market) };
+        match market {
+            None => self.all_markets.get_or_try_init(build).await.cloned(),
+            Some(m) => {
+                let cell = self
+                    .per_market
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(m)
+                    .or_default()
+                    .clone();
+                cell.get_or_try_init(build).await.cloned()
+            }
+        }
+    }
+
+    fn build(&self, market: Option<u64>) -> Result<TradesPayload, serde_json::Error> {
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rows = trades_for_market(&self.fills, market);
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::from(serde_json::value::to_raw_value(&rows)?)))
+    }
+
+    /// How many payloads this block has serialized (tests only).
+    #[cfg(test)]
+    pub(crate) fn payload_builds(&self) -> usize {
+        self.builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The `userFills` rows of one block for `user`: one entry per (fill, role)
@@ -405,6 +513,62 @@ mod tests {
         );
     }
 
+    // --- StreamBlock (s80 fix 2) --------------------------------------------
+
+    /// Each `newTrades` filter is serialized once per block: later calls get
+    /// the same cached bytes, and those bytes are exactly what the old
+    /// per-subscriber serialization produced.
+    #[tokio::test]
+    async fn streams_stream_block_serializes_each_filter_once() {
+        let sb = StreamBlock::new(std::sync::Arc::new(block()));
+        assert_eq!(sb.payload_builds(), 0, "nothing is built up front");
+
+        let m1 = sb.new_trades_payload(Some(1)).await.unwrap().unwrap();
+        let m1_again = sb.new_trades_payload(Some(1)).await.unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&m1, &m1_again));
+        assert_eq!(
+            m1.get(),
+            serde_json::to_string(&trades_for_market(&block(), Some(1))).unwrap()
+        );
+
+        let all = sb.new_trades_payload(None).await.unwrap().unwrap();
+        let all_again = sb.new_trades_payload(None).await.unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&all, &all_again));
+        assert_eq!(
+            all.get(),
+            serde_json::to_string(&trades_for_market(&block(), None)).unwrap()
+        );
+
+        // A market without fills yields no payload, also computed once.
+        assert!(sb.new_trades_payload(Some(9)).await.unwrap().is_none());
+        assert!(sb.new_trades_payload(Some(9)).await.unwrap().is_none());
+        assert_eq!(sb.payload_builds(), 3, "one build per (block, filter)");
+    }
+
+    // --- all_market_trades_allowed (s80 fix 2) ------------------------------
+
+    #[test]
+    fn streams_all_market_trades_flag() {
+        for (env, rpc_only, want) in [
+            (None, false, false),
+            (None, true, true),
+            (Some("1"), false, true),
+            (Some("1"), true, true),
+            (Some("0"), false, false),
+            (Some("0"), true, false),
+            // Anything else warns and falls back to the default.
+            (Some("yes"), false, false),
+            (Some("yes"), true, true),
+            (Some(""), false, false),
+        ] {
+            assert_eq!(
+                all_market_trades_allowed(env, rpc_only),
+                want,
+                "env={env:?} rpc_only={rpc_only}"
+            );
+        }
+    }
+
     // --- parse_stream_kind -------------------------------------------------
 
     #[test]
@@ -478,11 +642,22 @@ mod subscribe_ws_tests {
     }
 
     async fn start(notifier: BlockNotifier) -> Node {
+        start_with(notifier, None).await
+    }
+
+    /// A node configured like `torus-node` with `TORUS_ALL_MARKET_TRADES=env`
+    /// on a validator (`rpc_only = false`) or an RPC node.
+    async fn start_node(env: Option<&str>, rpc_only: bool) -> Node {
+        let allowed = all_market_trades_allowed(env, rpc_only);
+        start_with(BlockNotifier::new(), Some(allowed)).await
+    }
+
+    async fn start_with(notifier: BlockNotifier, all_market_trades: Option<bool>) -> Node {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
         let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
-        let server = RpcServer::new(
+        let mut server = RpcServer::new(
             state,
             mempool,
             executor,
@@ -490,6 +665,9 @@ mod subscribe_ws_tests {
             100,
             notifier.clone(),
         );
+        if let Some(allowed) = all_market_trades {
+            server.set_all_market_trades(allowed);
+        }
         let subs = server.state().active_subscriptions.clone();
         let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         Node {
@@ -539,6 +717,26 @@ mod subscribe_ws_tests {
             self.recv_within(Duration::from_secs(5))
                 .await
                 .expect("timed out waiting for a frame")
+        }
+
+        /// The next notification as `(subscription, raw result text, frame
+        /// text)`, with the bytes exactly as sent.
+        async fn recv_raw_result(&mut self) -> (Value, String, String) {
+            #[derive(serde::Deserialize)]
+            struct Frame {
+                params: Params,
+            }
+            #[derive(serde::Deserialize)]
+            struct Params {
+                subscription: Value,
+                result: Box<serde_json::value::RawValue>,
+            }
+            let t = match tokio::time::timeout(Duration::from_secs(5), self.rx.receive()).await {
+                Ok(Ok(ReceivedMessage::Text(t))) => t,
+                _ => panic!("no text frame"),
+            };
+            let f: Frame = serde_json::from_str(&t).unwrap_or_else(|e| panic!("{e}: {t}"));
+            (f.params.subscription, f.params.result.get().to_string(), t)
         }
 
         /// `None` on timeout. A timed-out receive is not cancel-safe (it can
@@ -760,5 +958,124 @@ mod subscribe_ws_tests {
         // Closing the connection ends the other one.
         drop(ws);
         wait_subs(&node.subs, 0).await;
+    }
+
+    // --- s80 fix 2: TORUS_ALL_MARKET_TRADES ----------------------------------
+
+    /// A validator (default flag) rejects all-markets `newTrades` before
+    /// accepting it, and still serves per-market `newTrades` and `userFills`.
+    #[tokio::test]
+    async fn validator_rejects_all_market_trades_by_default() {
+        let node = start_node(None, false).await;
+        let mut ws = connect(node.addr).await;
+        for params in [json!(["newTrades"]), json!(["newTrades", {}])] {
+            let rp = ws.request("torus_subscribe", params.clone()).await;
+            assert_eq!(rp["error"]["code"], -32602, "{params}: {rp}");
+            assert_eq!(
+                rp["error"]["message"],
+                "invalid params: newTrades without marketId is disabled on this node \
+                 (validator); subscribe per market or use an RPC node; operators: \
+                 TORUS_ALL_MARKET_TRADES=1",
+                "{rp}"
+            );
+        }
+        assert_eq!(node.subs.load(Ordering::Relaxed), 0);
+
+        let m1 = ws
+            .subscribe(json!(["newTrades", {"marketId": "0x1"}]))
+            .await;
+        let user = format!("0x{}", "aa".repeat(20));
+        let uf = ws.subscribe(json!(["userFills", { "user": user }])).await;
+        wait_subs(&node.subs, 2).await;
+        node.notifier.notify_fills(Arc::new(super::tests::block()));
+        let mut got = [false, false];
+        for _ in 0..2 {
+            let n = ws.recv().await;
+            let sub = &n["params"]["subscription"];
+            got[usize::from(*sub == uf)] = true;
+            assert!(*sub == m1 || *sub == uf, "{n}");
+        }
+        assert_eq!(got, [true, true]);
+    }
+
+    /// The other flag cases: an RPC node allows all-markets by default, "1"
+    /// allows it on a validator, "0" rejects it on an RPC node.
+    #[tokio::test]
+    async fn all_market_trades_flag_overrides_node_default() {
+        for (env, rpc_only, allowed) in [
+            (None, true, true),
+            (Some("1"), false, true),
+            (Some("0"), true, false),
+        ] {
+            let node = start_node(env, rpc_only).await;
+            let mut ws = connect(node.addr).await;
+            let rp = ws.request("torus_subscribe", json!(["newTrades"])).await;
+            let case = format!("env={env:?} rpc_only={rpc_only}: {rp}");
+            if allowed {
+                assert!(rp.get("error").is_none(), "{case}");
+                wait_subs(&node.subs, 1).await;
+            } else {
+                assert_eq!(rp["error"]["code"], -32602, "{case}");
+                assert_eq!(node.subs.load(Ordering::Relaxed), 0, "{case}");
+                // Per-market stays allowed.
+                ws.subscribe(json!(["newTrades", {"marketId": "0x1"}]))
+                    .await;
+                wait_subs(&node.subs, 1).await;
+            }
+        }
+    }
+
+    /// Subscribers with the same filter receive byte-identical `result`
+    /// payloads (equal to the old per-subscriber serialization), and each
+    /// (block, filter) payload is built once.
+    #[tokio::test]
+    async fn same_filter_subscribers_share_one_payload() {
+        let node = start_node(None, true).await;
+        let mut ws = connect(node.addr).await;
+        let m1a = ws
+            .subscribe(json!(["newTrades", {"marketId": "0x1"}]))
+            .await;
+        let m1b = ws
+            .subscribe(json!(["newTrades", {"marketId": "0x1"}]))
+            .await;
+        let alla = ws.subscribe(json!(["newTrades"])).await;
+        let allb = ws.subscribe(json!(["newTrades", {}])).await;
+        wait_subs(&node.subs, 4).await;
+        // Observe the published block to inspect its payload cache.
+        let mut probe = node.notifier.new_trades.subscribe();
+
+        node.notifier.notify_fills(Arc::new(super::tests::block()));
+        let mut frames = std::collections::HashMap::new();
+        for _ in 0..4 {
+            let (sub, result, frame) = ws.recv_raw_result().await;
+            // The whole frame is byte-for-byte the pre-fix-2 layout.
+            assert_eq!(
+                frame,
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"torus_subscription","params":{{"subscription":{sub},"result":{result}}}}}"#
+                )
+            );
+            assert!(frames.insert(sub.to_string(), result).is_none());
+        }
+        let get = |s: &Value| frames[&s.to_string()].clone();
+        let b7 = super::tests::block();
+        let want_m1 = serde_json::to_string(&trades_for_market(&b7, Some(1))).unwrap();
+        let want_all = serde_json::to_string(&trades_for_market(&b7, None)).unwrap();
+        assert_eq!(get(&m1a), want_m1);
+        assert_eq!(get(&m1b), want_m1);
+        assert_eq!(get(&alla), want_all);
+        assert_eq!(get(&allb), want_all);
+
+        let sb = probe.recv().await.unwrap();
+        assert_eq!(
+            sb.payload_builds(),
+            2,
+            "one build per filter, not per subscriber"
+        );
+        let p1 = sb.new_trades_payload(Some(1)).await.unwrap().unwrap();
+        let p2 = sb.new_trades_payload(Some(1)).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&p1, &p2));
+        assert_eq!(p1.get(), want_m1);
+        assert_eq!(sb.payload_builds(), 2);
     }
 }

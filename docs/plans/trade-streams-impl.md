@@ -365,7 +365,9 @@ Option A (owner-approved, s80), with these decisions:
   - Compare with s78-packed-packed-r1 (99.1k, 46.0). One cell detects a
     regression above ~5% only.
   - If the rig allows, run a second cell with one all-markets `newTrades`
-    subscriber attached to val0.
+    subscriber attached to val0. Since s80 fix 2 val0 needs
+    `TORUS_ALL_MARKET_TRADES=1` for that (validators reject all-markets
+    `newTrades` by default).
 - **Verify:** AGREE PASS; matched/s ≥ ~94k and CPU-s/1M ≤ ~48. Otherwise stop
   and profile before merging.
 - **Depends on:** Task 7
@@ -380,6 +382,9 @@ Option A (owner-approved, s80), with these decisions:
    - Start the local devnet with this binary, attach `websocat` (or a small
      Python `websockets` client) with `torus_subscribe("newTrades")` and
      `torus_subscribe("userFills", {user})`, then drive crossing orders.
+     Since s80 fix 2 a validator rejects all-markets `newTrades` unless it
+     runs with `TORUS_ALL_MARKET_TRADES=1`; otherwise pass a `marketId` or
+     use an `--rpc-only` node.
    - Check that every fill arrives once, in height order, and matches
      `torus_getBlockTrades` / `torus_getUserTrades` for the same heights.
 3. Repeat step 2 with `TORUS_TRADE_HISTORY=0`: the streams deliver and the
@@ -395,6 +400,14 @@ Option A (owner-approved, s80), with these decisions:
 - Reverting Tasks 5-7 restores the old commit-time `newTrades`.
 
 ## Owner decisions (s80)
+
+- Fix 2 (after the Task 9 cell with one all-markets subscriber on val0:
+  22-33 MB of JSON per block, up to 15 s behind execution, ~+0.5 core):
+  - a block's `newTrades` array is serialized once per filter (all markets
+    or one `marketId`) and shared by its subscribers (`StreamBlock` in
+    `streams.rs`); `userFills` stays per subscriber;
+  - all-markets `newTrades` is rejected on validators and allowed on
+    `--rpc-only` nodes by default; `TORUS_ALL_MARKET_TRADES=1|0` overrides.
 
 - `torus_getUserTrades` switches from the taker's side for both roles to the
   user's own side (Task 1, step 6), matching HL `userFills` and the new stream.

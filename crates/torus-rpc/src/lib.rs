@@ -99,6 +99,8 @@ use torus_evm::EvmExecutor;
 use torus_mempool::Mempool;
 use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::trade_rows::BlockFills;
+
+use crate::streams::StreamBlock;
 use torus_state::StateDb;
 
 use crate::eth::EthApiServer;
@@ -114,8 +116,10 @@ pub struct BlockNotifier {
     pub pending_txs: broadcast::Sender<B256>,
     /// s80: one message per executed block with fills, fed by the execution
     /// thread's fill sink. Capacity is in blocks; a subscriber that falls
-    /// further behind is closed with a lag error.
-    pub new_trades: broadcast::Sender<Arc<BlockFills>>,
+    /// further behind is closed with a lag error. Each block is wrapped in a
+    /// [`StreamBlock`] so a `newTrades` filter is serialized once per block
+    /// and shared by its subscribers (s80 fix 2).
+    pub new_trades: broadcast::Sender<Arc<StreamBlock>>,
 }
 
 /// Blocks a `newTrades`/`userFills` subscriber may fall behind before it is
@@ -158,9 +162,10 @@ impl BlockNotifier {
 
     /// Publish one executed block's fills to the `newTrades`/`userFills`
     /// streams (s80). Called from the execution thread's fill sink; never
-    /// blocks (a send with no subscribers is dropped).
+    /// blocks (a send with no subscribers is dropped). Wrapping is O(1): the
+    /// JSON is built later by the subscription tasks.
     pub fn notify_fills(&self, block: Arc<BlockFills>) {
-        let _ = self.new_trades.send(block);
+        let _ = self.new_trades.send(Arc::new(StreamBlock::new(block)));
     }
 }
 
@@ -247,6 +252,9 @@ pub struct RpcState {
     pub(crate) tx_submit_limiter: TxSubmitLimiter,
     /// Global cap on active WebSocket subscriptions (HIGH-NEW-05).
     pub(crate) active_subscriptions: Arc<AtomicUsize>,
+    /// Whether all-markets `newTrades` (no `marketId`) is allowed (s80 fix 2).
+    /// Consulted only when a subscription is opened.
+    pub(crate) all_market_trades: bool,
     /// Prometheus metrics handle.
     pub(crate) metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// This node's ed25519 verifying key (for leader comparison).
@@ -300,6 +308,7 @@ impl RpcServer {
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
                 active_subscriptions: Arc::new(AtomicUsize::new(0)),
+                all_market_trades: true,
                 metrics: None,
                 own_vk: None,
                 leader_vk_fn: None,
@@ -349,6 +358,13 @@ impl RpcServer {
     /// Get a shared handle to the pruned-up-to atomic.
     pub fn pruned_up_to(&self) -> Arc<AtomicU64> {
         self.state.pruned_up_to.clone()
+    }
+
+    /// Allow or reject all-markets `newTrades` subscriptions (s80 fix 2).
+    /// Allowed unless set; `torus-node` sets it from
+    /// [`streams::all_market_trades_allowed`] (off on validators by default).
+    pub fn set_all_market_trades(&mut self, allowed: bool) {
+        self.state.all_market_trades = allowed;
     }
 
     /// Set the Prometheus metrics handle for RPC instrumentation.

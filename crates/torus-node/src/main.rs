@@ -932,6 +932,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
+    // s80 fix 2: all-markets newTrades is off on validators unless
+    // TORUS_ALL_MARKET_TRADES=1 (on for --rpc-only unless =0). Read once here.
+    let all_market_trades = torus_rpc::streams::all_market_trades_allowed(
+        std::env::var(torus_rpc::streams::ENV_ALL_MARKET_TRADES)
+            .ok()
+            .as_deref(),
+        cli.rpc_only,
+    );
+    info!(all_market_trades, "all-markets newTrades subscriptions");
+    rpc_server.set_all_market_trades(all_market_trades);
 
     // Leader forwarding: RPC → network bridge
     let own_vk = verifying_key.to_bytes();
