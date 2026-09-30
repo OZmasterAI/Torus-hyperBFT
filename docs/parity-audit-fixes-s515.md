@@ -24,9 +24,9 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
 | 5/6 — lockbox 0x0820 | Native amounts are 8-dec, EVM is 18-dec wei: native→EVM ×10^10; EVM→native floors ÷10^10 and burns the dust. `depositToNative(uint128)` is **payable** and requires `msg.value == arg`; the value is burned in-frame and the native credit is queued for the **next block**. `withdrawFromNative(uint128)` is non-payable, takes a multiple of 10^10 wei, and is also applied next block. Queue rows now commit atomically with the block's EVM bundle (F1). This branch first added a node-local EVM-applied marker (`cf_consensus_meta` / `evm_applied_block`) so crash replay could skip a committed block's EVM txs; that marker was superseded by main's one-flush-batch EVM commit (93d4fff): the bundle, its queue rows, the native phase and the applied-height marker land in ONE write, so after a crash the whole block replays from its parent state and a tx skipped the first time (e.g. nonce too high) can never execute on replay. |
 | writer precompiles | DELEGATECALL / CALLCODE / STATICCALL to any writer precompile (CoreWriter 0x0810, CoreWriterStaking 0x0811, Lockbox 0x0820) reverts — they act for `msg.sender`, so only a plain CALL is accepted. Readers 0x0800–0x0803 stay callable any way. |
 | Oracle submissions (s517 T3/T4) | `SubmitOraclePrices` is validated as a whole before anything is written (all-or-nothing): sender an Active validator (as before), 1..=256 entries (`MAX_ORACLE_PRICES_PER_SUBMISSION`), no repeated market, market listed (governance), `0 < price <= 10^12` units. One row per (market, validator): a new submission overwrites the validator's previous one. |
-| Oracle aggregation / mark (s517 T2, T5–T7) | Runs at the **start of every block**, before any action (`begin_block_oracle`): prune, then aggregate every listed market (ascending); the whole block reads one mark, and a submission of block h counts from block h+1. Time-based on the block header timestamp: a validator's latest submission counts while `<= 10 s` old; **min 3 reporters** (Active validators, whole-token stake weight), 3×MAD outlier cut (exact integers), **stake-weighted median**. Fewer than 3 ⇒ the last aggregate is kept and ages. **Usable** (one rule for every reader) iff it exists, `price > 0` and it is `<= 60 s` older than the block's timestamp. Readers: `AccountReader::mark` / market-order reservation, precompiles 0x0802 (stale flag) and 0x0800 (position UPnL), RPC `torus_getMarkPrice` (stale ⇒ `markPrice = indexPrice = 0`, `timestamp 0`) and `torus_getPosition` (stale ⇒ UPnL at entry price) — "now" is the latest committed header's timestamp. ABIs unchanged. Per-market errors never abort the block; a storage fault fail-stops. The native phase also runs while submission rows exist, so an idle chain still aggregates. |
+| Oracle aggregation / mark (s517 T2, T5–T7) | Runs at the **start of every block**, before any action (`begin_block_oracle`): prune, then aggregate every listed market (ascending); the whole block reads one mark, and a submission of block h counts from block h+1. Time-based on the block header timestamp: a validator's latest submission counts while `<= 10 s` old; 3×MAD outlier cut (exact integers), **stake-weighted median** (Active validators, whole-token stake weight). **Fresh-price rule (review M1):** after the outlier cut, **at least 3 reporters** whose stake is **more than 2/3 of the total Active stake** (checked in exact integers as `3 × reporting > 2 × total`; exactly 2/3 is not enough). Otherwise the last aggregate is kept and ages, so 3 colluding validators cannot keep a price fresh while the honest feeders are down. The quorum counts the reporters left after the cut (the same set as the median). The cut uses the unweighted median, so counting before it would let many low-stake validators cut the high-stake honest reports and set the price. Cost: an honest report that gets cut does not count toward the quorum. At exactly half the stake, the weighted median picks the **lower** price (cumulative stake `>= total / 2`). **Usable** (one rule for every reader) iff it exists, `price > 0` and it is `<= 60 s` older than the block's timestamp. Readers: `AccountReader::mark` / market-order reservation, precompiles 0x0802 (stale flag) and 0x0800 (position UPnL), RPC `torus_getMarkPrice` (stale ⇒ `markPrice = indexPrice = 0`, `timestamp 0`) and `torus_getPosition` (stale ⇒ UPnL at entry price) — "now" is the latest committed header's timestamp. ABIs unchanged. **EVM vs native (review M3):** the EVM section of block h runs before `begin_block_oracle`, so EVM transactions (precompiles 0x0802 / 0x0800) in block h read the aggregate written by block h−1, while native actions in block h read block h's. Both are deterministic. `torus_getMarkPrice`'s `timestamp` is the aggregate's **block number**, not a time (pre-existing). Per-market errors never abort the block; a storage fault fail-stops. The native phase also runs while submission rows exist, so an idle chain still aggregates. |
 | Epoch processing (s517 T0) | Runs on **every** epoch-boundary block. It lived in the native phase, which an empty block skipped, so an empty boundary block ran no epoch (no rewards / inflation, no validator status changes). Empty non-boundary blocks are unchanged. |
-| Block timestamps (s517 T0b/T1) | Body validation (`validate_block` → `finish_validate`) rejects a proposal whose timestamp is below its parent's or more than **5 s** ahead of the local clock (`MAX_BLOCK_TIMESTAMP_DRIFT_SECS`); the proposer uses `max(now, parent.ts)`. Not applied on block sync, to blocks at or below the committed height, in execution or in replay. Every execution path reads the committed header timestamp. **Validators need NTP-synced clocks** (a node more than 5 s behind rejects valid proposals). Replicas vote on the header **before** body validation (pre-existing), so a bad timestamp is never executed but can stall, and committed history can still hold one; oracle ages clamp at 0. |
+| Block timestamps (s517 T0b/T1) | Body validation (`validate_block` → `finish_validate`) rejects a proposal whose timestamp is below its parent's, more than **5 s** ahead of the local clock (`MAX_BLOCK_TIMESTAMP_DRIFT_SECS`). The proposer uses `max(now, parent.ts)`. **No lower bound (review M2, open):** a byzantine leader can propose `ts = parent.ts` after a stall, so an old oracle aggregate has age 0 in that leader's blocks (the next honest proposer moves time to `now`). A "not more than 30 s behind" rule cannot be enforced yet: fresh and late-recovered bodies share one validation path, so it would also reject honest late bodies (network-wide pause → wedge), and a hotstuff-level flag is bypassed by withholding the body. It becomes enforceable with the "validate before voting" consensus item. Not applied on block sync, to blocks at or below the committed height, in execution or in replay. Every execution path reads the committed header timestamp. **Validators need NTP-synced clocks** (a node more than 5 s behind the proposer rejects valid proposals). Replicas vote on the header **before** body validation (pre-existing), so a bad timestamp is never executed but can stall, and committed history can still hold one; oracle ages clamp at 0. |
 
 ## Deployment requirements
 
@@ -72,8 +72,15 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
   **Fresh genesis semantics** for the changed `CF_NATIVE_ORACLE` row layouts:
   submissions are keyed `"sub"‖market‖validator` (31 bytes, was 39 with the
   block number) and the aggregate row is 36 bytes (a timestamp appended to the
-  28-byte row). Old rows are not migrated: old submission rows are never
-  overwritten, and a 28-byte aggregate does not decode as usable.
+  28-byte row). Old rows are not migrated, and a 28-byte aggregate does not
+  decode as usable. **Upgrade (review L2):** an old 39-byte submission key
+  starts with the new `"sub"‖market` prefix and its value layout is
+  unchanged, so it decodes: it counts next to the validator's new row while
+  it is `<= 10 s` old, and the first block-start prune deletes it, which is a
+  native-root write. The epoch fix (T0) runs epoch processing on EMPTY
+  boundary blocks, so replaying old history with the new binary changes
+  state at those blocks. Deploy with a **fresh genesis**: never replay old
+  history with the new binary.
 
 ## Known deferred items (not fixed on this branch)
 
@@ -111,7 +118,8 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
   uses the flat 20x default).
 * **Mark price in production — aggregation fixed on `feat/oracle-aggregation`
   (s517).** Time-based (a submission counts 10 s, the aggregate is stale 60 s
-  after the last fresh one), stake-weighted median, min 3 reporters,
+  after the last fresh one), stake-weighted median, min 3 reporters holding
+  more than 2/3 of the Active stake,
   aggregation at every block start, submission hardening (see *Oracle
   aggregation / mark*, *Oracle submissions*). **Still deferred:**
   * no price feeder exists (item B, `docs/plans/oracle-aggregation.md`):
@@ -125,7 +133,10 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
   on a proposal's header before its body is validated (incl. the timestamp
   rule, see *Block timestamps*). A bad block is never executed, but it can
   gather votes and stall the round, and committed history can hold an
-  out-of-range timestamp. Move validity checks before the vote.
+  out-of-range timestamp. Move validity checks before the vote, and add the
+  timestamp lower bound there (reject a proposal more than 30 s behind the
+  local clock, CometBFT PBTS-style; review M2, which cannot be enforced
+  before this).
 * **F3 — B2 fail-stop scope.** B2 (the fallback commit would write contract
   storage while the incremental root is active — it is ON by default) is
   node-local in practice: a deterministic trie error fails block validation
