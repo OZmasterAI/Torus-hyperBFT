@@ -118,18 +118,7 @@ impl Indexer {
 
         // Index trades into OHLCV candles (Phase 7B)
         if let Ok(trades) = self.rpc.get_block_trades(height).await {
-            for t in &trades {
-                let market_id = val_hex_i64(t, "marketId");
-                let timestamp = val_hex_i64(t, "timestamp");
-                let price_raw = parse_dec_fp(val_str(t, "price").as_str()) as i64;
-                let qty_raw = parse_dec_fp(val_str(t, "quantity").as_str()) as i64;
-                if let Err(e) = self
-                    .db
-                    .upsert_candle(market_id, timestamp, price_raw, qty_raw)
-                {
-                    warn!("Failed to upsert candle at height {height}: {e}");
-                }
-            }
+            index_trades(&self.db, height, &trades);
         }
 
         // Snapshot validators every 100 blocks
@@ -346,9 +335,32 @@ pub fn parse_native_action_row(
     }
 }
 
-/// Raw value of a `torus_*` decimal FixedPoint string (s80); 0 if unparsable.
-fn parse_dec_fp(s: &str) -> i128 {
-    s.parse::<FixedPoint>().map(|f| f.raw()).unwrap_or(0)
+/// Fold one block's `torus_getBlockTrades` rows into the OHLCV candles. A
+/// trade whose price or quantity does not parse (e.g. an old node still
+/// returning fixed-point hex) is skipped with a warning, never written as 0.
+fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
+    for t in trades {
+        let market_id = val_hex_i64(t, "marketId");
+        let timestamp = val_hex_i64(t, "timestamp");
+        let (price, qty) = (val_str(t, "price"), val_str(t, "quantity"));
+        let parsed = (parse_dec_fp(&price), parse_dec_fp(&qty));
+        let (Some(price_raw), Some(qty_raw)) = parsed else {
+            warn!(
+                "Skipping trade at height {height} (market {market_id}): \
+                 unparsable price {price:?} / quantity {qty:?}"
+            );
+            continue;
+        };
+        let (price_raw, qty_raw) = (price_raw as i64, qty_raw as i64);
+        if let Err(e) = db.upsert_candle(market_id, timestamp, price_raw, qty_raw) {
+            warn!("Failed to upsert candle at height {height}: {e}");
+        }
+    }
+}
+
+/// Raw value of a `torus_*` decimal FixedPoint string (s80); None if unparsable.
+fn parse_dec_fp(s: &str) -> Option<i128> {
+    s.parse::<FixedPoint>().ok().map(|f| f.raw())
 }
 
 fn extract_i64(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<i64> {
@@ -383,10 +395,57 @@ mod tests {
 
     #[test]
     fn parse_dec_fp_reads_decimal_trade_fields() {
-        assert_eq!(parse_dec_fp("0.00000009"), 9);
-        assert_eq!(parse_dec_fp("123.45000000"), 12_345_000_000);
-        assert_eq!(parse_dec_fp("-0.50000000"), -50_000_000);
-        assert_eq!(parse_dec_fp("0x9"), 0, "old hex encoding is not a decimal");
+        assert_eq!(parse_dec_fp("0.00000009"), Some(9));
+        assert_eq!(parse_dec_fp("123.45000000"), Some(12_345_000_000));
+        assert_eq!(parse_dec_fp("-0.50000000"), Some(-50_000_000));
+        assert_eq!(
+            parse_dec_fp("0x9"),
+            None,
+            "old hex encoding is not a decimal"
+        );
+        assert_eq!(parse_dec_fp(""), None, "a missing field is not zero");
+    }
+
+    /// s80 review: a trade whose price or quantity does not parse (an old node
+    /// still returning fixed-point hex) is skipped, never written as a 0-price
+    /// candle; a decimal trade is applied.
+    #[test]
+    fn index_trades_skips_unparsable_price_or_quantity() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let trade = |price: &str, qty: &str| json!({"marketId": "0x1", "timestamp": "0x3c", "price": price, "quantity": qty});
+        index_trades(
+            &db,
+            7,
+            &[
+                trade("0x2dfd4c490", "2.50000000"),
+                trade("100.00000000", "0x3b9aca0"),
+            ],
+        );
+        assert!(
+            db.get_candles(1, "1m", None, None, 10).unwrap().is_empty(),
+            "hex price/quantity must not create a candle"
+        );
+
+        index_trades(&db, 8, &[trade("100.00000000", "2.50000000")]);
+        index_trades(&db, 9, &[trade("0x2dfd4c490", "1.00000000")]);
+        let candles = db.get_candles(1, "1m", None, None, 10).unwrap();
+        assert_eq!(candles.len(), 1);
+        let c = &candles[0];
+        assert_eq!(
+            (c.open_time, c.open, c.high, c.low, c.close),
+            (
+                60,
+                10_000_000_000,
+                10_000_000_000,
+                10_000_000_000,
+                10_000_000_000
+            )
+        );
+        assert_eq!(
+            (c.volume, c.trade_count),
+            (250_000_000, 1),
+            "the hex trade changed nothing"
+        );
     }
 
     #[test]
