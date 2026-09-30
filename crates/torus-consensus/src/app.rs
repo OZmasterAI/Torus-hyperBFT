@@ -1656,26 +1656,27 @@ impl ExecutionContext {
         // overlay), the next-block queue rows from CF_CORE_WRITER_QUEUE, and the
         // header / receipts from `commit_block_metadata` (written before the
         // bundle, see below).
-        let evm_applied = if has_evm {
-            read_evm_applied(&self.state_db)
-        } else {
-            None
-        };
-        match evm_applied {
+        //
+        // s515 review 3: read for EVERY block. EVM blocks are pipeline barriers
+        // (every earlier native flush is durable before one commits its bundle)
+        // and replay starts above the durable native marker, so in normal
+        // operation the marker is <= the height being executed.
+        match read_evm_applied(&self.state_db) {
             Some(applied) if applied.height > height => {
-                // A later block's EVM is durable while this height's native phase
-                // is not: this height's fee revenue is gone and re-executing its
-                // EVM would double-apply it. Unrecoverable locally — fail-stop.
+                // A LATER block's EVM is durable while this height's native phase
+                // is not: re-executing this block would run it on top of later
+                // EVM state (and, with EVM txs, double-apply them). Unrecoverable
+                // locally — fail-stop.
                 tracing::error!(
                     height,
                     evm_applied = applied.height,
                     "FATAL: EVM-applied marker is ahead of the block being executed — refusing \
-                     to re-execute its EVM txs (fail-stop)"
+                     to execute it (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
                 return;
             }
-            Some(applied) if applied.height == height => {
+            Some(applied) if applied.height == height && has_evm => {
                 tracing::warn!(
                     height,
                     fee_revenue = applied.fee_revenue,
@@ -13532,6 +13533,24 @@ mod crash_recovery_tests {
     fn f1_evm_marker_ahead_of_block_fail_stops() {
         let (config, db) = f1_config();
         let [b1, _] = f1_blocks(vec![f1_transfer(Address::with_last_byte(0xB0), U256::from(1u64), 0)]);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &evm_applied_record(2, 0))
+            .unwrap();
+        let before = dump_all_cfs(&db);
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&b1, vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing executed");
+    }
+
+    /// s515 review 3 (item 4): the marker-ahead check covers EVM-less blocks
+    /// too — an EVM-less block 1 executed while the marker says block 2's EVM
+    /// is durable is a replay below durable EVM state: fail-stop.
+    #[test]
+    fn r3_evm_marker_ahead_of_evm_less_block_fail_stops() {
+        let (config, db) = f1_config();
+        let [b1, _] = f1_blocks(vec![]);
         drop(TorusApp::new(db.clone(), &config, None, None, None));
         db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &evm_applied_record(2, 0))
             .unwrap();
