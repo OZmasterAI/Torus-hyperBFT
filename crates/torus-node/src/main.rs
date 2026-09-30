@@ -814,6 +814,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 7. Block notifier + shared height counter (consensus replica <-> RPC server)
     let notifier = BlockNotifier::new();
     let notifier_for_replica = notifier.clone();
+    // s80: newTrades / userFills are fed from execution (each executed block's
+    // fills), not read back from the DB at commit. Set before the replica starts.
+    let notifier_for_fills = notifier.clone();
+    app.set_fill_sink(Arc::new(move |block| notifier_for_fills.notify_fills(block)));
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
