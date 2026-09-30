@@ -5821,6 +5821,15 @@ impl NativeExecutor {
     // Block-level processing helpers (called by validator pipeline)
     // ========================================================================
 
+    /// Whether CoreWriter / lockbox actions are queued for `height` — the block
+    /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
+    /// for a block with no native actions and no fees. Queue entries are written by EVM
+    /// execution straight to the DB, so a DB read is authoritative here. A read error
+    /// errs on the side of running the drain.
+    pub fn core_writer_due(state_db: &StateDb, height: u64) -> bool {
+        CoreWriterQueue::pending_count(state_db, height).map_or(true, |n| n > 0)
+    }
+
     /// Drain and execute CoreWriter actions queued from the previous block.
     ///
     /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
@@ -5853,11 +5862,30 @@ impl NativeExecutor {
                 continue;
             }
 
-            let action = core_writer_to_native(qa);
-            let result = Self::execute(ctx, &qa.trader, &action);
+            let result = match core_writer_to_native(qa) {
+                Some(action) => Self::execute(ctx, &qa.trader, &action),
+                None => Self::exec_settle_lockbox_deposit(ctx, qa),
+            };
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// Native leg of a lockbox 0x0820 `depositToNative` queued last block (EVM-PF-05):
+    /// credit native ONLY — the EVM value was burned inside the depositing tx. Kept off
+    /// the `NativeAction` path on purpose: no user-signed action may credit native
+    /// without an EVM debit.
+    fn exec_settle_lockbox_deposit<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        qa: &QueuedAction,
+    ) -> NativeActionResult {
+        let QueuedActionKind::LockboxDeposit { amount } = qa.kind else {
+            return NativeActionResult::err("lockbox_deposit", "not a lockbox deposit".into());
+        };
+        match Lockbox::credit_native(&ctx.state, &qa.trader, amount) {
+            Ok(()) => NativeActionResult::ok("lockbox_deposit", 1500),
+            Err(e) => NativeActionResult::err("lockbox_deposit", e.to_string()),
+        }
     }
 
     /// Aggregate oracle prices for listed markets after oracle submissions.
@@ -6223,8 +6251,11 @@ fn sort_deterministic(actions: &mut Vec<(Address, NativeAction)>) {
 // ============================================================================
 
 /// Convert a CoreWriter queued action to a NativeAction for execution.
-fn core_writer_to_native(qa: &QueuedAction) -> NativeAction {
-    match &qa.kind {
+///
+/// `None` for `LockboxDeposit`: its native-only credit has no `NativeAction` form and is
+/// settled directly by `drain_core_writer`.
+fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
+    Some(match &qa.kind {
         QueuedActionKind::PlaceOrder {
             market_id,
             side,
@@ -6260,7 +6291,13 @@ fn core_writer_to_native(qa: &QueuedAction) -> NativeAction {
         QueuedActionKind::LockPermanent { amount } => NativeAction::PermanentStake {
             amount: fp_to_u256(*amount),
         },
-    }
+        // Lockbox 0x0820 `withdrawFromNative`: the same debit-native / credit-EVM
+        // (×10^10) path as a signed TransferToSpot; fails cleanly if native is short.
+        QueuedActionKind::LockboxWithdraw { amount } => NativeAction::TransferToSpot {
+            amount: fp_to_u256(*amount),
+        },
+        QueuedActionKind::LockboxDeposit { .. } => return None,
+    })
 }
 
 fn decode_order_type(code: u8) -> OrderType {

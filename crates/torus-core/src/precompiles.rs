@@ -7,7 +7,7 @@
 //!   0x0803 — StakingReader (read)
 //!   0x0810 — CoreWriter (write: orders, delayed)
 //!   0x0811 — CoreWriterStaking (write: staking, delayed)
-//!   0x0820 — Lockbox (write: asset transfers, immediate)
+//!   0x0820 — Lockbox (write: EVM <-> native transfers, native leg delayed)
 
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
@@ -18,7 +18,7 @@ use torus_state::{StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId, OrderId, U256};
 
 use crate::error::CoreError;
-use crate::lockbox::Lockbox;
+use crate::lockbox::{wei_to_fp_floor, WEI_PER_NATIVE_UNIT};
 use crate::position::{
     borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp, NativeBalance, Position,
 };
@@ -264,7 +264,26 @@ pub fn execute_precompile(
     state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
-    execute_precompile_inner(address, input, caller, state_db, current_block, false)
+    execute_precompile_inner(address, input, caller, U256::ZERO, state_db, current_block, false)
+}
+
+/// [`execute_precompile`] for a call that carries EVM value.
+///
+/// `call_value` is the wei revm has ALREADY moved from `caller` into the precompile
+/// address for this frame (a CALL's transferred value; zero for any other scheme). Only
+/// the lockbox `depositToNative` accepts value — every other precompile / selector
+/// rejects it, which reverts the frame and returns the wei to the caller. The caller of
+/// this function (the EVM precompile provider) owns burning an accepted deposit's value
+/// from the precompile address inside the same frame.
+pub fn execute_precompile_with_value(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    call_value: U256,
+    state_db: &impl StateBackend,
+    current_block: u64,
+) -> Result<Vec<u8>, CoreError> {
+    execute_precompile_inner(address, input, caller, call_value, state_db, current_block, false)
 }
 
 /// Read-only variant for eth_call / eth_estimateGas simulation.
@@ -282,13 +301,14 @@ pub fn execute_precompile_read_only(
     state_db: &impl StateBackend,
     current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
-    execute_precompile_inner(address, input, caller, state_db, current_block, true)
+    execute_precompile_inner(address, input, caller, U256::ZERO, state_db, current_block, true)
 }
 
 fn execute_precompile_inner(
     address: &Address,
     input: &[u8],
     caller: &Address,
+    call_value: U256,
     state_db: &impl StateBackend,
     current_block: u64,
     read_only: bool,
@@ -309,6 +329,14 @@ fn execute_precompile_inner(
         ));
     }
 
+    // Non-payable: value sent to any Torus precompile other than the lockbox would be
+    // stranded at the precompile address forever. Reverting returns it.
+    if !call_value.is_zero() && id != ADDR_LOCKBOX {
+        return Err(CoreError::InvalidPrecompileInput(format!(
+            "precompile 0x{id:04x} is not payable"
+        )));
+    }
+
     match id {
         ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db),
         ADDR_BALANCE_READER => balance_reader(input, state_db),
@@ -316,7 +344,7 @@ fn execute_precompile_inner(
         ADDR_STAKING_READER => staking_reader(input, state_db),
         ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
         ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
-        ADDR_LOCKBOX => lockbox_precompile(input, caller, state_db),
+        ADDR_LOCKBOX => lockbox_precompile(input, caller, call_value, state_db, current_block),
         _ => Err(CoreError::InvalidPrecompileInput(format!(
             "unknown precompile 0x{id:04x}"
         ))),
@@ -950,38 +978,87 @@ fn core_writer_staking(
 // Lockbox Precompile (0x0820) — task 2.4.5
 // ============================================================================
 
+/// Lockbox precompile — Hyperliquid model (EVM-PF-05 fix).
+///
+/// It NEVER writes `CF_ACCOUNTS` or native balances: a raw mid-EVM account write is
+/// invisible to revm's block-level `State` cache, which later overwrites it at bundle
+/// commit (deposit minted native value, withdraw destroyed EVM value). Instead:
+///
+/// * `depositToNative(uint128 amountWei)` — PAYABLE. `amountWei` must equal
+///   `msg.value`. revm has already moved the value out of the caller through its own
+///   journal (so any enclosing revert undoes it); the EVM provider burns it from 0x0820
+///   in the same frame. This enqueues a `LockboxDeposit` crediting
+///   `floor(msg.value / 10^10)` native units NEXT block; the remainder (< 10^10 wei)
+///   is burned (HyperCore semantics). Zero value: no-op. Nonzero value that is all dust
+///   (< 1 native unit) reverts — it would destroy the whole amount for no credit.
+/// * `withdrawFromNative(uint128 amountWei)` — non-payable. `amountWei` must be a
+///   whole number of native units (multiple of 10^10). Enqueues a `LockboxWithdraw`
+///   that debits `amountWei / 10^10` native and credits `amountWei` EVM wei NEXT block;
+///   if the native balance is insufficient at drain time it fails there with no state
+///   change. Zero: no-op.
+///
+/// Both return `true` = "queued", not "executed". The queue write goes through the
+/// per-tx / per-frame native journal, so a reverted frame drops it.
 fn lockbox_precompile(
     input: &[u8],
     caller: &Address,
+    call_value: U256,
     state_db: &impl StateBackend,
+    current_block: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
-    if sel == selector_for("depositToNative(uint128)") {
-        let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
-        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
-        if amount_raw > i128::MAX as u128 {
-            return Err(CoreError::Overflow(
-                "lockbox deposit amount exceeds i128::MAX".into(),
-            ));
+    let kind = if sel == selector_for("depositToNative(uint128)") {
+        let amount_wei = U256::from(abi::decode_u128(&abi::word(input, 0)?));
+        if amount_wei != call_value {
+            return Err(CoreError::InvalidInput(format!(
+                "depositToNative: amount {amount_wei} must equal msg.value {call_value} (wei)"
+            )));
         }
-        let amount = FixedPoint::from_raw(amount_raw as i128);
-        Lockbox::deposit_to_native(state_db, caller, amount)?;
-        Ok(abi::encode_bool(true).to_vec())
+        if call_value.is_zero() {
+            return Ok(abi::encode_bool(true).to_vec());
+        }
+        let (amount, _dust_burned) = wei_to_fp_floor(call_value)
+            .ok_or_else(|| CoreError::Overflow("lockbox deposit exceeds i128::MAX".into()))?;
+        if amount <= FixedPoint::ZERO {
+            return Err(CoreError::InvalidInput(format!(
+                "depositToNative: {call_value} wei is below one native unit \
+                 ({WEI_PER_NATIVE_UNIT} wei) and would be burned entirely"
+            )));
+        }
+        QueuedActionKind::LockboxDeposit { amount }
     } else if sel == selector_for("withdrawFromNative(uint128)") {
-        let amount_raw = abi::decode_u128(&abi::word(input, 0)?);
-        // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
-        if amount_raw > i128::MAX as u128 {
-            return Err(CoreError::Overflow(
-                "lockbox withdraw amount exceeds i128::MAX".into(),
+        if !call_value.is_zero() {
+            return Err(CoreError::InvalidInput(
+                "withdrawFromNative is not payable".into(),
             ));
         }
-        let amount = FixedPoint::from_raw(amount_raw as i128);
-        Lockbox::withdraw_from_native(state_db, caller, amount)?;
-        Ok(abi::encode_bool(true).to_vec())
+        let amount_wei = abi::decode_u128(&abi::word(input, 0)?);
+        if amount_wei == 0 {
+            return Ok(abi::encode_bool(true).to_vec());
+        }
+        if amount_wei % WEI_PER_NATIVE_UNIT != 0 {
+            return Err(CoreError::InvalidInput(format!(
+                "withdrawFromNative: {amount_wei} wei is not a multiple of one native unit \
+                 ({WEI_PER_NATIVE_UNIT} wei)"
+            )));
+        }
+        // u128::MAX / 10^10 < i128::MAX, so the cast cannot overflow.
+        let amount = FixedPoint::from_raw((amount_wei / WEI_PER_NATIVE_UNIT) as i128);
+        QueuedActionKind::LockboxWithdraw { amount }
     } else {
-        Err(CoreError::UnknownSelector(sel))
-    }
+        return Err(CoreError::UnknownSelector(sel));
+    };
+
+    CoreWriterQueue::enqueue(
+        state_db,
+        &QueuedAction {
+            trader: *caller,
+            kind,
+            block_queued: current_block,
+        },
+    )?;
+    Ok(abi::encode_bool(true).to_vec())
 }
 
 // ============================================================================
@@ -1126,7 +1203,22 @@ pub enum QueuedActionKind {
     LockPermanent {
         amount: FixedPoint,
     },
+    /// Lockbox 0x0820 `depositToNative`: credit `amount` native. The EVM value was
+    /// already burned in the depositing tx — the drain must NOT debit EVM again.
+    LockboxDeposit {
+        amount: FixedPoint,
+    },
+    /// Lockbox 0x0820 `withdrawFromNative`: debit `amount` native, credit
+    /// `amount × 10^10` wei EVM (via `Lockbox::withdraw_from_native`).
+    LockboxWithdraw {
+        amount: FixedPoint,
+    },
 }
+
+/// Borsh tags of the lockbox kinds. Kept clear of the dense 0.. range used by the
+/// CoreWriter kinds so the CoreWriter set can keep growing without a tag clash.
+const TAG_LOCKBOX_DEPOSIT: u8 = 0x20;
+const TAG_LOCKBOX_WITHDRAW: u8 = 0x21;
 
 impl BorshSerialize for QueuedAction {
     fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
@@ -1196,6 +1288,14 @@ impl BorshSerialize for QueuedActionKind {
                 w.write_all(&[6])?;
                 borsh_write_fp(amount, w)?;
             }
+            Self::LockboxDeposit { amount } => {
+                w.write_all(&[TAG_LOCKBOX_DEPOSIT])?;
+                borsh_write_fp(amount, w)?;
+            }
+            Self::LockboxWithdraw { amount } => {
+                w.write_all(&[TAG_LOCKBOX_WITHDRAW])?;
+                borsh_write_fp(amount, w)?;
+            }
         }
         Ok(())
     }
@@ -1258,6 +1358,12 @@ impl BorshDeserialize for QueuedActionKind {
                 let amount = borsh_read_fp(r)?;
                 Ok(Self::LockPermanent { amount })
             }
+            TAG_LOCKBOX_DEPOSIT => Ok(Self::LockboxDeposit {
+                amount: borsh_read_fp(r)?,
+            }),
+            TAG_LOCKBOX_WITHDRAW => Ok(Self::LockboxWithdraw {
+                amount: borsh_read_fp(r)?,
+            }),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid QueuedActionKind discriminant: {x}"),
