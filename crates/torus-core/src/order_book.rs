@@ -9,7 +9,8 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use crate::fast_hash::{FastMap, FastSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -188,7 +189,7 @@ impl LevelHashCacheEntry {
 
 /// Per-book incremental level-hash cache (L3, `TORUS_LEVEL_HASH_CACHE`).
 struct LevelHashCache {
-    entries: HashMap<(u8, i128), LevelHashCacheEntry>,
+    entries: FastMap<(u8, i128), LevelHashCacheEntry>,
     max_entries: usize,
     tick: u64,
     /// O(new-tail) sponge extensions on a `Seeded` entry.
@@ -244,9 +245,9 @@ pub struct OrderBook {
     /// Sell side: price → time-ordered queue. Best ask = first key (lowest).
     asks: BTreeMap<FixedPoint, VecDeque<Order>>,
     /// O(1) order lookup by ID → location.
-    order_index: HashMap<OrderId, OrderLocation>,
+    order_index: FastMap<OrderId, OrderLocation>,
     /// Per-trader order tracking for cancel-all.
-    trader_orders: HashMap<Address, Vec<OrderId>>,
+    trader_orders: FastMap<Address, Vec<OrderId>>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
     pub tick_size: FixedPoint,
@@ -267,7 +268,7 @@ pub struct OrderBook {
     // top, forking the state root.
     /// Insertion sequence per resting order (assigned by `insert_order`,
     /// preserved by in-place modifies, reassigned on cancel+reinsert).
-    order_seq: HashMap<OrderId, u64>,
+    order_seq: FastMap<OrderId, u64>,
     /// Monotonic seq allocator. Part of the persisted meta row (consensus).
     next_seq: u64,
     /// Row journal: order ids whose persisted row must be upserted (still
@@ -275,20 +276,20 @@ pub struct OrderBook {
     row_journal: BTreeSet<OrderId>,
     /// Order ids that currently have a persisted row — lets the save skip
     /// deletes for orders placed AND removed between two saves.
-    row_exists: HashSet<OrderId>,
+    row_exists: FastSet<OrderId>,
     /// Level journal: `(side_tag, raw_price)` of every price level touched
     /// since the last save. Drained by `take_level_ops`.
     level_journal: BTreeSet<(u8, i128)>,
     /// Levels that currently have a persisted level row (skip-useless-
     /// tombstones role, mirrors `row_exists`).
-    level_exists: HashSet<(u8, i128)>,
+    level_exists: FastSet<(u8, i128)>,
 
     // ---- L3 level-hash sponge cache (node-local, in-RAM only) ----
     /// Per-level prefix-invalidation epoch: bumped by EVERY non-append queue
     /// mutation while the cache is enabled. Entries are NEVER removed for the
     /// lifetime of this book instance (a re-created level must not see a
     /// reset epoch). Never serialized.
-    level_epoch: HashMap<(u8, i128), u64>,
+    level_epoch: FastMap<(u8, i128), u64>,
     /// The cache itself. `None` = disabled (default; `take_level_ops` runs
     /// today's exact one-shot path). Never serialized.
     level_hash_cache: Option<Box<LevelHashCache>>,
@@ -306,7 +307,7 @@ pub struct OrderBook {
     /// Per-level chunk aggregates (`chunk_idx → (digest, Σqty, count)`),
     /// built in full on a level's first drain and maintained incrementally
     /// afterwards. A level with NO entry is (re)built from its queue.
-    level_chunks: HashMap<(u8, i128), BTreeMap<u64, ChunkAgg>>,
+    level_chunks: FastMap<(u8, i128), BTreeMap<u64, ChunkAgg>>,
     /// `(side_tag, raw_price, chunk_idx)` of every chunk touched since its
     /// level was last drained — recorded at EVERY queue-mutation site (the
     /// same sites that journal the level). Drained per level by
@@ -331,24 +332,24 @@ impl OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: FastMap::default(),
+            trader_orders: FastMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
             next_id: 1,
             last_trade_price: None,
             triggering_stops: false,
-            order_seq: HashMap::new(),
+            order_seq: FastMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: FastSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: FastSet::default(),
+            level_epoch: FastMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: FastMap::default(),
             dirty_chunks: BTreeSet::new(),
         }
     }
@@ -839,7 +840,7 @@ impl OrderBook {
     #[inline]
     fn queue_position(
         queue: &VecDeque<Order>,
-        order_seq: &HashMap<OrderId, u64>,
+        order_seq: &FastMap<OrderId, u64>,
         order_id: OrderId,
     ) -> Option<usize> {
         if let Some(&seq) = order_seq.get(&order_id) {
@@ -1046,12 +1047,12 @@ impl OrderBook {
         maker_side: Side,
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
-        order_index: &mut HashMap<OrderId, OrderLocation>,
-        trader_orders: &mut HashMap<Address, Vec<OrderId>>,
-        order_seq: &mut HashMap<OrderId, u64>,
+        order_index: &mut FastMap<OrderId, OrderLocation>,
+        trader_orders: &mut FastMap<Address, Vec<OrderId>>,
+        order_seq: &mut FastMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
-        level_epoch: &mut HashMap<(u8, i128), u64>,
+        level_epoch: &mut FastMap<(u8, i128), u64>,
         cache_on: bool,
         dirty_chunks: &mut BTreeSet<(u8, i128, u64)>,
         chunked_on: bool,
@@ -1146,7 +1147,7 @@ impl OrderBook {
     #[inline]
     fn bump_level_epoch(
         cache_on: bool,
-        level_epoch: &mut HashMap<(u8, i128), u64>,
+        level_epoch: &mut FastMap<(u8, i128), u64>,
         tag: u8,
         raw_price: i128,
     ) {
@@ -1856,7 +1857,7 @@ impl OrderBook {
             Some(c) => c.max_entries = max_entries,
             None => {
                 self.level_hash_cache = Some(Box::new(LevelHashCache {
-                    entries: HashMap::new(),
+                    entries: FastMap::default(),
                     max_entries,
                     tick: 0,
                     hits: 0,
@@ -2114,7 +2115,7 @@ impl OrderBook {
     /// (cleared first).
     fn rebuild_all_chunks(
         queue: &VecDeque<Order>,
-        order_seq: &HashMap<OrderId, u64>,
+        order_seq: &FastMap<OrderId, u64>,
         chunks: &mut BTreeMap<u64, ChunkAgg>,
     ) {
         chunks.clear();
@@ -2174,7 +2175,7 @@ impl OrderBook {
     /// O(log depth) seq lookups + O(members of the chunk).
     fn rebuild_one_chunk(
         queue: &VecDeque<Order>,
-        order_seq: &HashMap<OrderId, u64>,
+        order_seq: &FastMap<OrderId, u64>,
         chunks: &mut BTreeMap<u64, ChunkAgg>,
         idx: u64,
     ) {
@@ -2573,24 +2574,24 @@ impl BorshDeserialize for OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: FastMap::default(),
+            trader_orders: FastMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
             next_id,
             last_trade_price,
             triggering_stops: false,
-            order_seq: HashMap::new(),
+            order_seq: FastMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: FastSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: FastSet::default(),
+            level_epoch: FastMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: FastMap::default(),
             dirty_chunks: BTreeSet::new(),
         };
 

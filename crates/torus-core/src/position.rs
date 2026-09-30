@@ -2,7 +2,7 @@
 //!
 //! Stores positions in CF_NATIVE_POSITIONS and native balances in CF_NATIVE_BALANCES.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FastMap, FastSet};
 use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -543,8 +543,8 @@ fn fill_transition(
 /// [`flush_all`]: Self::flush_all
 #[derive(Default)]
 pub struct PositionCache {
-    map: HashMap<(Address, MarketId), Option<Position>>,
-    dirty: HashSet<(Address, MarketId)>,
+    map: FastMap<(Address, MarketId), Option<Position>>,
+    dirty: FastSet<(Address, MarketId)>,
 }
 
 impl PositionCache {

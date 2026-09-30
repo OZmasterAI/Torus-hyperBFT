@@ -3,6 +3,7 @@
 pub mod book_reader;
 pub mod book_rows;
 pub mod error;
+pub mod fast_hash;
 pub mod liquidation;
 pub mod lockbox;
 pub mod margin;

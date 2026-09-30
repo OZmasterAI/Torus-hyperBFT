@@ -3,7 +3,7 @@
 //! Dispatches PlaceOrder batches to scoped threads for concurrent matching.
 //! Each thread temporarily owns its market's OrderBook for cache-local access.
 
-use std::collections::HashMap;
+use torus_core::fast_hash::FastMap;
 
 use alloy_primitives::Address;
 use torus_core::order_book::{OrderBook, PlaceResult};
@@ -71,7 +71,7 @@ impl MarketWorkerPool {
     /// `thread::scope` and killing the execution thread (which left consensus
     /// zombie-advancing on a closed exec channel).
     pub fn match_parallel(
-        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
+        batches: FastMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
         timestamp: u64,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
         Self::match_parallel_capped(batches, timestamp, Self::resolve_worker_cap())
@@ -81,7 +81,7 @@ impl MarketWorkerPool {
     /// Split out so tests can force a small cap independent of the host's core
     /// count; the public entry point supplies the resolved cap.
     pub fn match_parallel_capped<'a>(
-        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'a>>)>,
+        batches: FastMap<MarketId, (OrderBook, Vec<MatchRequest<'a>>)>,
         timestamp: u64,
         max_workers: usize,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
@@ -357,7 +357,7 @@ mod worker_panic_containment_tests {
     /// Healthy input keeps working through the new `Result` surface.
     #[test]
     fn empty_batches_return_ok_empty() {
-        let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::new();
+        let batches: FastMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = FastMap::default();
         let results =
             MarketWorkerPool::match_parallel(batches, 1000).expect("no worker, no panic");
         assert!(results.is_empty());

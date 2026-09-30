@@ -77,6 +77,8 @@ revm = { version = "36", features = ["optional_no_base_fee"] }
 # only (CI: ubuntu-latest x86_64; no wasm or cross jobs). Adding a wasm target
 # would require making this feature target-conditional.
 alloy-primitives = { version = "1.5", features = ["serde", "asm-keccak"] }
+# Seeded (runtime-rng) hasher for execution-path maps; see torus-core fast_hash.
+ahash = "0.8"
 alloy-consensus = "1.8"
 alloy-eips = "1.8"
 alloy-rlp = "0.3"

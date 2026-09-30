@@ -7,6 +7,7 @@
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
 use std::collections::HashMap;
+use torus_core::fast_hash::{FastMap, FastSet};
 
 use alloy_primitives::{Address, B256};
 use torus_core::error::CoreError;
@@ -106,7 +107,7 @@ pub struct EpochBoundaryResult {
 /// over distinct per-sender keys, so it is state-independent of iteration order; the map
 /// is otherwise never iterated.
 struct BalanceCache {
-    map: HashMap<Address, CachedBalance>,
+    map: FastMap<Address, CachedBalance>,
     dirty: Vec<Address>,
 }
 
@@ -118,7 +119,7 @@ struct CachedBalance {
 impl BalanceCache {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: FastMap::default(),
             dirty: Vec::new(),
         }
     }
@@ -1170,7 +1171,7 @@ pub struct ResidentBooks {
 }
 
 struct ResidentInner {
-    books: HashMap<MarketId, OrderBook>,
+    books: FastMap<MarketId, OrderBook>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
@@ -1344,16 +1345,16 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub state: T,
 
     /// Order books (per market, in-memory).
-    pub order_books: HashMap<MarketId, OrderBook>,
+    pub order_books: FastMap<MarketId, OrderBook>,
     /// Markets whose book was mutated during THIS block (placed / matched /
     /// cancelled / modified). `save_order_books` writes only these — untouched
     /// books already hold identical bytes in the CF, so skipping them is
     /// byte-identical in final state (state-root-safe even in mixed
     /// deployments) and turns the old O(all resting orders) rewrite into
     /// O(touched) (S395).
-    pub dirty_books: std::collections::HashSet<MarketId>,
+    pub dirty_books: FastSet<MarketId>,
     /// Per-market margin configuration.
-    pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
+    pub margin_configs: FastMap<MarketId, MarketMarginConfig>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -1838,8 +1839,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             governance,
             state,
             order_books,
-            dirty_books: std::collections::HashSet::new(),
-            margin_configs: HashMap::new(),
+            dirty_books: FastSet::default(),
+            margin_configs: FastMap::default(),
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -2001,18 +2002,18 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// written under `TORUS_BOOK_ROWS=1/2` but this node runs without it —
     /// fatal (the classic loader would silently see empty books and diverge
     /// from the fleet).
-    fn load_order_books(state: &T) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
+    fn load_order_books(state: &T) -> (FastMap<MarketId, OrderBook>, u128, Option<String>) {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let mut books = HashMap::new();
+        let mut books = FastMap::default();
         let mut max_order_id: u128 = 0;
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
                 if Self::is_book_row_key(&key) {
                     return (
-                        HashMap::new(),
+                        FastMap::default(),
                         1,
                         Some(
                             "C4: cf_native_order_books holds per-order/level rows but \
@@ -2094,10 +2095,10 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// book (no shadows). Returns (books, next_global_order_id, fatal error).
     fn load_order_books_rows(
         state: &T,
-    ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
+    ) -> (FastMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (FastMap::default(), 1, Some(msg));
 
         // Per-market accumulators.
         #[derive(Default)]
@@ -2157,7 +2158,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
-        let mut books = HashMap::new();
+        let mut books = FastMap::default();
         let mut max_order_id: u128 = 0;
 
         // Deterministic rebuild order (market id ascending).
@@ -2200,10 +2201,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         chunked: bool,
         timings: &mut LoadTimings,
         workers: usize,
-    ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
+    ) -> (FastMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (FastMap::default(), 1, Some(msg));
 
         let load_start = std::time::Instant::now();
         let t0 = load_start;
@@ -2469,7 +2470,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         };
         timings.books_wall_ns = t_books.elapsed().as_nanos();
 
-        let mut books = HashMap::new();
+        let mut books = FastMap::default();
         let mut max_order_id: u128 = 0;
         for (market_id, loaded) in results {
             let (book, rebuild_ns, verify_ns) = match loaded {
@@ -3628,7 +3629,7 @@ impl NativeExecutor {
         // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
         // — the prepared order carries an 8-byte reference through Phases 2-4
         // instead of a per-order deep clone of `PlaceOrderParams`.
-        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+        let mut market_batches: FastMap<MarketId, Vec<PreparedOrder<'_>>> = FastMap::default();
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
@@ -3665,7 +3666,7 @@ impl NativeExecutor {
             // groups is irrelevant — shards are disjoint — but keep it
             // deterministic anyway).
             let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
-            let mut group_of: HashMap<Address, usize> = HashMap::new();
+            let mut group_of: FastMap<Address, usize> = FastMap::default();
             for &i in &place_order_indices {
                 let (sender, entry) = &flat[i];
                 let params: &PlaceOrderParams = match entry {
@@ -3818,8 +3819,8 @@ impl NativeExecutor {
 
         // ---- Phase 3: Parallel matching ----
         let match_timer = std::time::Instant::now();
-        let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
-            HashMap::new();
+        let mut worker_batches: FastMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
+            FastMap::default();
 
         for (&market_id, prepared) in &market_batches {
             let book = ctx
@@ -3977,7 +3978,7 @@ impl NativeExecutor {
     /// nothing shared has been mutated).
     fn phase2_parallel_prepare<T: StateBackend>(
         positions: &PositionManager<T>,
-        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        margin_configs: &FastMap<MarketId, MarketMarginConfig>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -4081,7 +4082,7 @@ impl NativeExecutor {
     fn settle_market_results_sequential<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_results: Vec<crate::market_workers::MarketBatchResult>,
-        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        market_batches: &FastMap<MarketId, Vec<PreparedOrder<'_>>>,
         results: &mut [NativeActionResult],
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
@@ -4328,7 +4329,7 @@ impl NativeExecutor {
     fn settle_market_results_parallel<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_results: Vec<crate::market_workers::MarketBatchResult>,
-        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        market_batches: &FastMap<MarketId, Vec<PreparedOrder<'_>>>,
         results: &mut [NativeActionResult],
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
