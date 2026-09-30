@@ -6262,6 +6262,21 @@ impl NativeExecutor {
             .expect("FixedPoint division error")
     }
 
+    /// F3 (s515 review): cancel-and-replace of the SENDER's resting order
+    /// (Hyperliquid modify = cancel + new order), validated like placement
+    /// BEFORE anything is touched:
+    /// - ownership (like `exec_cancel_order`);
+    /// - price > 0 on the book's tick, quantity > 0 and (when changed) >= lot;
+    /// - no crossing: the replacement is re-inserted, never matched, so a
+    ///   price at / through the opposite best is rejected (the client cancels
+    ///   and places instead) rather than resting a crossed book;
+    /// - reduce-only: clamped to the position (placement's allowance), and
+    ///   rejected when there is nothing left to reduce;
+    /// - margin with placement's formula (`try_reserve_for_qty_cfg`: tiered
+    ///   leverage, overflow rejects): the order's outstanding reservation is
+    ///   `reserve(price, remaining)` (A5 telescoping), so the delta to
+    ///   `reserve(new price, new qty)` is reserved (insufficient ⇒ rejected,
+    ///   book and balances untouched) or released exactly — no drift.
     fn exec_modify_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
@@ -6269,78 +6284,118 @@ impl NativeExecutor {
         new_price: Option<FixedPoint>,
         new_qty: Option<FixedPoint>,
     ) -> NativeActionResult {
-        // Only the order's owner may modify it (same check as `exec_cancel_order`).
-        for book in ctx.order_books.values() {
-            if let Some(order) = book.get_order(order_id) {
-                if order.trader != *sender {
-                    return NativeActionResult::err(
-                        "modify_order",
-                        format!(
-                            "order {order_id} belongs to {}, not sender {sender}",
-                            order.trader
-                        ),
-                    );
-                }
-                break;
+        let err = |msg: String| NativeActionResult::err("modify_order", msg);
+        if new_price.is_none() && new_qty.is_none() {
+            return err("nothing to modify: no new price or quantity".to_string());
+        }
+        // Order ids are global, so at most one book holds it.
+        let Some((market_id, old)) = ctx
+            .order_books
+            .iter()
+            .find_map(|(mid, b)| b.get_order(order_id).map(|o| (*mid, o.clone())))
+        else {
+            return err(format!("order {order_id} not found"));
+        };
+        if old.trader != *sender {
+            return err(format!(
+                "order {order_id} belongs to {}, not sender {sender}",
+                old.trader
+            ));
+        }
+        let book = &ctx.order_books[&market_id];
+        let is_buy = old.side == Side::Buy;
+
+        let price = new_price.unwrap_or(old.price);
+        if price <= FixedPoint::ZERO {
+            return err(format!("modify rejected: price must be positive, got {price}"));
+        }
+        if book.tick_size > FixedPoint::ZERO && price.raw() % book.tick_size.raw() != 0 {
+            return err(format!(
+                "modify rejected: price {price} is not a multiple of the tick {}",
+                book.tick_size
+            ));
+        }
+        let mut qty = new_qty.unwrap_or(old.remaining_qty);
+        if qty <= FixedPoint::ZERO {
+            return err(format!("modify rejected: quantity must be positive, got {qty}"));
+        }
+        if new_qty.is_some() && qty < book.lot_size {
+            return err(format!(
+                "modify rejected: quantity {qty} below the lot size {}",
+                book.lot_size
+            ));
+        }
+        let crosses = if is_buy {
+            book.best_ask().is_some_and(|ask| price >= ask)
+        } else {
+            book.best_bid().is_some_and(|bid| price <= bid)
+        };
+        if crosses {
+            return err(format!(
+                "modify rejected: price {price} would cross the book (a modify never matches; \
+                 cancel and place a new order instead)"
+            ));
+        }
+        if old.reduce_only {
+            let pos = match Self::signed_position(&ctx.positions, sender, market_id) {
+                Ok(pos) => pos,
+                Err(e) => return err(e.to_string()),
+            };
+            let allowance = reduce_only_allowance(pos, is_buy);
+            if allowance == FixedPoint::ZERO {
+                return err("reduce-only order rejected: no position to reduce".to_string());
+            }
+            qty = qty.min(allowance);
+        }
+        if price == old.price && qty == old.remaining_qty {
+            return NativeActionResult::ok("modify_order", 800);
+        }
+
+        let cfg = ctx.margin_configs.get(&market_id);
+        // Placed through try_reserve_for_qty_cfg, so it cannot overflow; a
+        // legacy row that would cannot have reserved anything.
+        let old_reserved = Self::try_reserve_for_qty_cfg(cfg, old.price, old.remaining_qty)
+            .unwrap_or(FixedPoint::ZERO);
+        let new_reserved = match Self::try_reserve_for_qty_cfg(cfg, price, qty) {
+            Ok(m) => m,
+            Err(msg) => return err(msg),
+        };
+        let extra = new_reserved - old_reserved;
+        if extra > FixedPoint::ZERO {
+            let mut bal = match ctx.positions.get_native_balance(sender) {
+                Ok(bal) => bal,
+                Err(e) => return err(e.to_string()),
+            };
+            if bal.available < extra {
+                return err(format!(
+                    "insufficient margin for modify: need {extra}, have {}",
+                    bal.available
+                ));
+            }
+            bal.available -= extra;
+            bal.order_margin += extra;
+            if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                return err(e.to_string());
             }
         }
-        for book in ctx.order_books.values_mut() {
-            // Capture old order state for margin delta calculation.
-            let old_order = book.get_order(order_id).cloned();
-            if let Ok(modified) = book.modify_order(order_id, new_price, new_qty) {
-                ctx.dirty_books.insert(book.market_id);
-                // FIX 2 (ECON-FIND-05): Adjust order margin for the modified order.
-                if let Some(old) = old_order {
-                    let market_id = book.market_id;
-                    let old_notional = old.price * old.remaining_qty;
-                    let new_notional = modified.price * modified.remaining_qty;
 
-                    let max_lev_old = ctx
-                        .margin_configs
-                        .get(&market_id)
-                        .map(|c| effective_max_leverage(&c.tiers, old_notional))
-                        .unwrap_or(20);
-                    let max_lev_new = ctx
-                        .margin_configs
-                        .get(&market_id)
-                        .map(|c| effective_max_leverage(&c.tiers, new_notional))
-                        .unwrap_or(20);
-
-                    let old_margin = old_notional
-                        / FixedPoint::from_raw(max_lev_old as i128 * FixedPoint::SCALE);
-                    let new_margin = new_notional
-                        / FixedPoint::from_raw(max_lev_new as i128 * FixedPoint::SCALE);
-
-                    if new_margin > old_margin {
-                        let delta = new_margin - old_margin;
-                        if let Ok(mut bal) = ctx.positions.get_native_balance(&modified.trader) {
-                            if bal.available < delta {
-                                return NativeActionResult::err(
-                                    "modify_order",
-                                    format!(
-                                        "insufficient margin for modify: need {delta}, have {}",
-                                        bal.available
-                                    ),
-                                );
-                            }
-                            bal.available -= delta;
-                            bal.order_margin += delta;
-                            let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
-                        }
-                    } else if old_margin > new_margin {
-                        let delta = old_margin - new_margin;
-                        if let Ok(mut bal) = ctx.positions.get_native_balance(&modified.trader) {
-                            let release = delta.min(bal.order_margin);
-                            bal.order_margin -= release;
-                            bal.available += release;
-                            let _ = ctx.positions.put_native_balance(&modified.trader, &bal);
-                        }
-                    }
-                }
-                return NativeActionResult::ok("modify_order", 800);
-            }
+        let book = ctx
+            .order_books
+            .get_mut(&market_id)
+            .expect("market found above");
+        // Unchanged fields stay `None`: a qty-only decrease keeps time priority.
+        if let Err(e) = book.modify_order(
+            order_id,
+            (price != old.price).then_some(price),
+            (qty != old.remaining_qty).then_some(qty),
+        ) {
+            // Unreachable (the order was found above) — undo the reserve.
+            Self::release_order_margin(ctx, sender, extra);
+            return err(e.to_string());
         }
-        NativeActionResult::err("modify_order", format!("order {order_id} not found"))
+        ctx.dirty_books.insert(market_id);
+        Self::release_order_margin(ctx, sender, -extra);
+        NativeActionResult::ok("modify_order", 800)
     }
 
     // ========================================================================
