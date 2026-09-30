@@ -3088,6 +3088,112 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Item 2: a stale aggregate reads as absent — markPrice = indexPrice = 0,
+    /// timestamp 0 (ABI unchanged). Usable at age 60, stale at 61 (header time).
+    #[tokio::test]
+    async fn torus_get_mark_price_hides_a_stale_oracle_price() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        for (latest_ts, want) in [(5_060u64, Some(fp(50_000))), (5_061, None)] {
+            let (_dir, state, mempool, executor) = setup();
+            let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+            let reps = [
+                Address::from([0xA1; 20]),
+                Address::from([0xA2; 20]),
+                Address::from([0xA3; 20]),
+            ];
+            for v in &reps {
+                oracle.submit_price(v, 1, fp(50_000), 10, 5_000).unwrap();
+            }
+            let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+            oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: latest_ts,
+                    ..test_header(20, 0, 0)
+                },
+            );
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let mp: RpcMarkPrice = client
+                .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x1"])
+                .await
+                .unwrap();
+            let (px, ts) = match want {
+                Some(p) => (p, 10),
+                None => (FixedPoint::ZERO, 0),
+            };
+            assert_eq!(
+                (mp.mark_price, mp.index_price, mp.timestamp),
+                (hex_fp(px), hex_fp(px), ts),
+                "latest header ts {latest_ts}"
+            );
+            handle.stop().unwrap();
+        }
+    }
+
+    /// Item 2: getPosition's unrealized PnL uses the oracle aggregate only
+    /// while usable (age <= 60 s of header time); stale ⇒ entry price (PnL 0).
+    #[tokio::test]
+    async fn torus_get_position_ignores_a_stale_oracle_price() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        for (latest_ts, want_pnl) in [(5_060u64, fp(5_000)), (5_061, FixedPoint::ZERO)] {
+            let (_dir, state, mempool, executor) = setup();
+            let trader = Address::from([0x11; 20]);
+            PositionManager::new(state.clone())
+                .put_position(&Position {
+                    trader,
+                    market_id: 1,
+                    is_long: true,
+                    size: fp(5),
+                    entry_price: fp(50000),
+                    realized_pnl: fp(100),
+                    isolated_margin: fp(2500),
+                    margin_type: MarginType::Isolated,
+                })
+                .unwrap();
+            let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+            let reps = [
+                Address::from([0xA1; 20]),
+                Address::from([0xA2; 20]),
+                Address::from([0xA3; 20]),
+            ];
+            for v in &reps {
+                oracle.submit_price(v, 1, fp(51_000), 10, 5_000).unwrap();
+            }
+            let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+            oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: latest_ts,
+                    ..test_header(20, 0, 0)
+                },
+            );
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let pos: Option<RpcPosition> = client
+                .request(
+                    "torus_getPosition",
+                    jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pos.unwrap().unrealized_pnl,
+                hex_fp(want_pnl),
+                "latest header ts {latest_ts}"
+            );
+            handle.stop().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn torus_get_user_trades_basic() {
         let (_dir, state, mempool, executor) = setup();
