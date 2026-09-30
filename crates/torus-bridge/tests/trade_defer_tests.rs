@@ -233,22 +233,43 @@ fn fills_accumulate_across_batches() {
 #[test]
 fn trade_index_counts_fills_in_both_settle_paths_with_history_on_and_off() {
     for history in [true, false] {
-        for parallel in [false, true] {
-            let (_dir, db) = open_test_db();
-            let mut ctx = make_ctx(db.clone());
-            ctx.defer_trades = true;
-            ctx.trade_history = history;
-            for t in 1..=4u8 {
-                fund_native(&ctx, &addr(t), fp(1_000_000));
+        for record_fills in [false, true] {
+            for parallel in [false, true] {
+                let (_dir, db) = open_test_db();
+                let mut ctx = make_ctx(db.clone());
+                ctx.defer_trades = true;
+                ctx.trade_history = history;
+                ctx.record_fills = record_fills;
+                for t in 1..=4u8 {
+                    fund_native(&ctx, &addr(t), fp(1_000_000));
+                }
+                let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+                assert!(r.results.iter().all(|r| r.success));
+                let case = format!("history={history} record_fills={record_fills} parallel={parallel}");
+                assert_eq!(ctx.trade_index, 3, "{case}");
+                let fills = ctx.take_pending_trade_fills();
+                assert_eq!(fills.len(), if history || record_fills { 3 } else { 0 }, "{case}");
+                assert!(fills.iter().map(|f| f.trade_index).eq(0..fills.len() as u32), "{case}");
             }
-            let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
-            assert!(r.results.iter().all(|r| r.success));
-            let case = format!("history={history} parallel={parallel}");
-            assert_eq!(ctx.trade_index, 3, "{case}");
-            let fills = ctx.take_pending_trade_fills();
-            assert_eq!(fills.len(), if history { 3 } else { 0 }, "{case}");
-            assert!(fills.iter().map(|f| f.trade_index).eq(0..fills.len() as u32), "{case}");
         }
+    }
+
+    // s80: inline mode with history off records fills for the stream but
+    // writes no trade rows.
+    for parallel in [false, true] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db.clone());
+        ctx.trade_history = false;
+        ctx.record_fills = true;
+        for t in 1..=4u8 {
+            fund_native(&ctx, &addr(t), fp(1_000_000));
+        }
+        let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+        assert!(r.results.iter().all(|r| r.success));
+        for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+            assert!(cf_rows(&db, cf).is_empty(), "{cf} parallel={parallel}");
+        }
+        assert_eq!(ctx.take_pending_trade_fills().len(), 3, "parallel={parallel}");
     }
 }
 

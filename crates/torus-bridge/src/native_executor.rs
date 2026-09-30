@@ -1383,10 +1383,14 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// `execute_batch` then writes the rows of all the block's fills so far
     /// inline.
     pub defer_trades: bool,
-    /// s77: when false, no fills are recorded and no trade-history rows are
-    /// written (`TORUS_TRADE_HISTORY=0`, node-local; for validators that do not
-    /// serve trade-history RPC). Default true.
+    /// s77: when false, no trade-history rows are written and no fills are
+    /// recorded unless `record_fills` is set (`TORUS_TRADE_HISTORY=0`,
+    /// node-local; for validators that do not serve trade-history RPC).
+    /// Default true.
     pub trade_history: bool,
+    /// s80: record fills for the stream sink even with trade history off.
+    /// Default false.
+    pub record_fills: bool,
     /// This block's fills in `trade_index` order (s77 packed trade rows).
     pending_fills: Vec<TradeFill>,
     /// Block height of `pending_fills` (inline mode clears them on a new height).
@@ -1842,6 +1846,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             trade_index: 0,
             defer_trades: false,
             trade_history: true,
+            record_fills: false,
             pending_fills: Vec::new(),
             fills_block: 0,
             inline_fills_written: 0,
@@ -3166,8 +3171,12 @@ impl NativeExecutor {
     /// Without `defer_trades`: write the rows of ALL the block's fills so far,
     /// if any fill is new. A later call rewrites the same keys with a superset,
     /// so calls within a block never drop each other's fills.
+    /// Nothing with trade history off (fills recorded only for `record_fills`).
     fn write_trades_inline<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
-        if ctx.defer_trades || ctx.pending_fills.len() == ctx.inline_fills_written {
+        if !ctx.trade_history
+            || ctx.defer_trades
+            || ctx.pending_fills.len() == ctx.inline_fills_written
+        {
             return;
         }
         let mut rows = PackedCfBatch::default();
@@ -5048,7 +5057,7 @@ impl NativeExecutor {
         taker: FillEffect,
         maker: FillEffect,
     ) {
-        if ctx.trade_history {
+        if ctx.trade_history || ctx.record_fills {
             if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
                 // Inline mode, context reused for a new block: the earlier
                 // block's rows are already written.
