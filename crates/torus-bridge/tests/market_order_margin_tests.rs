@@ -485,3 +485,45 @@ fn market_sell_reserves_at_best_bid_not_cap() {
         assert_bal(&ctx, &taker, fp(FUNDING), FixedPoint::ZERO, "taker released");
     }
 }
+
+/// F2 (s515 review, second pass): the batch Phase-2 basis read the PRE-batch
+/// best bid, but an earlier in-batch bid can raise it before the market sell
+/// matches. Pre-batch best bid 100; another sender's GTC bid at 150 sorts
+/// first; the taker's PlaceOrderBatch holds a market sell (cap 1) of 4:
+/// 150 * 4 / 20 = 30 > 25 available → rejected (it reserved 20 at 100 and
+/// then filled at 150).
+#[test]
+fn batch_market_sell_reserves_at_earlier_in_batch_bid() {
+    for path in PATHS {
+        let maker = addr(1);
+        let bidder = addr(3);
+        let taker = addr(2);
+        let (_d, mut ctx) = fresh(path, &[maker, bidder]);
+        fund_native(&ctx, &taker, fp(25));
+        let r = run(&mut ctx, path, &[place(maker, limit(1, true, 100, 4))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+
+        let sell = NativeAction::PlaceOrderBatch(vec![market(1, false, fp(1), 4)]);
+        let r = run(
+            &mut ctx,
+            path,
+            &[place(bidder, limit(1, true, 150, 4)), (taker, sell.clone())],
+        );
+        assert!(r[0].success, "{path:?}: bid {:?}", r[0].error);
+        assert!(!r[1].success, "{path:?}: market sell must be rejected for margin");
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: no short opened");
+        assert_eq!(resting(&ctx, &bidder), vec![fp(4)], "{path:?}: 150 bid untouched");
+        assert_bal(&ctx, &taker, fp(25), FixedPoint::ZERO, "taker");
+
+        // Enough margin for 150: fills against the in-batch bid, all released.
+        fund_native(&ctx, &taker, fp(30));
+        let r = run(
+            &mut ctx,
+            path,
+            &[place(bidder, limit(1, true, 150, 4)), (taker, sell)],
+        );
+        assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+        assert_eq!(pos(&ctx, &taker), -fp(4), "{path:?}: short opened at 150");
+        assert_bal(&ctx, &taker, fp(30), FixedPoint::ZERO, "taker released");
+    }
+}

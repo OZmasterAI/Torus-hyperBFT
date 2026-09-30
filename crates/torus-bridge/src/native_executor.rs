@@ -4936,7 +4936,13 @@ impl NativeExecutor {
     /// reservation basis `(price, qty)` — default `(reserve_price, quantity)`
     /// — from PRE-BATCH state only, computed ONCE so the serial and sharded
     /// prepare paths see identical inputs.
-    /// - Market sell: priced by [`reservation_price`].
+    /// - Market sell: priced by [`reservation_price`], raised to the highest
+    ///   limit price of an EARLIER in-batch Limit buy in that market (F2,
+    ///   second review): Phase 3 matches each market's orders in this flat
+    ///   order, so such a bid can rest above the pre-batch best bid before
+    ///   the sell matches. Conservative (the bid may be rejected or fill
+    ///   away) and deterministic; exact for the A5 identity because a market
+    ///   order never rests (its whole reservation is released).
     /// - Reduce-only non-stop order: sized to min(qty, bound), where bound is
     ///   an upper bound on the book's match-time clamp — the pre-batch
     ///   allowance plus everything that can still grow the position before the
@@ -4953,10 +4959,24 @@ impl NativeExecutor {
             |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
         let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
+        // Highest Limit-buy price seen so far in the batch, per market.
+        let mut batch_bid: HashMap<MarketId, FixedPoint> = HashMap::new();
         let mut out = HashMap::new();
         for &(i, sender, params) in orders {
             let book = ctx.order_books.get(&params.market_id);
-            let price = Self::reservation_price(params, book);
+            let mut price = Self::reservation_price(params, book);
+            match params.order_type {
+                OrderType::Market if !params.is_buy => {
+                    if let Some(&bid) = batch_bid.get(&params.market_id) {
+                        price = price.max(bid);
+                    }
+                }
+                OrderType::Limit if params.is_buy => {
+                    let bid = batch_bid.entry(params.market_id).or_insert(params.price);
+                    *bid = (*bid).max(params.price);
+                }
+                _ => {}
+            }
             let mut qty = params.quantity;
             if params.reduce_only && !Self::is_stop(params) {
                 // A position read error polices as flat in the book; keep the
