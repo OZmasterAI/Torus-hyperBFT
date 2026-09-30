@@ -5,6 +5,9 @@
 `docs/plans/oracle-aggregation-impl.md`): epoch processing on every boundary
 block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
 60 s (T2/T8), submission hardening (T3/T4), block-start aggregation (T5–T7).
+Review follow-ups (s517): fresh price needs >= 3 reporters holding
+> 2/3 of the Active stake (see *Decisions* 4–5, *Notes* below). The
+timestamp lower bound (M2) is NOT implemented — open, see Decision 5.
 Not merged / pushed. Next: liquidation, then B (feeder),
 then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
 
@@ -109,6 +112,40 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
 2. **Min reporters:** keep the fixed 3 (as coded). On a 3-validator net all
    three must be submitting for the price to stay fresh.
 3. Hook point: start of block, before `execute_batch(pre_evm)` (one mark per block).
+4. **Stake quorum (review M1):** a fresh aggregate needs >= 3 reporters AND
+   their stake > 2/3 of the total Active stake (`3 × reporting > 2 × total`,
+   exact integers). Both counts use the reporters left after the outlier cut:
+   the cut uses the unweighted median, so counting before it would let a
+   low-stake head-count majority cut the honest high-stake reports and set
+   the price. Otherwise the last price is kept and goes stale. HL documents
+   only a stake-weighted median; > 2/3 matches the BFT honest-stake bound.
+5. **Timestamp lower bound (review M2) — OPEN, not implemented.** A
+   byzantine leader can propose `ts = parent.ts` after a stall, so an old
+   aggregate has age 0 in that block. A "reject ts < local − 30 s" rule
+   cannot be enforced today: every body (fresh or recovered late) reaches
+   the app through the same `try_insert_body` → `validate_block` path, so
+   the rule would also reject honest bodies validated > 30 s late (a
+   network-wide pause could then wedge an already-certified block), and a
+   hotstuff "fresh" flag is bypassable because the leader can withhold the
+   body (replicas vote on headers first). Exposure: only blocks proposed by
+   byzantine leaders — the next honest proposer uses `max(now, parent.ts)`
+   and the old price goes stale. Fix with the consensus item "validate
+   before voting (CometBFT-style)": once bodies are validated before the
+   vote, the 30 s lag check is enforceable like CometBFT PBTS.
+
+## Notes (review, s517)
+
+* **M3:** the EVM section of block h runs before `begin_block_oracle`, so
+  EVM transactions in block h read block h−1's aggregate while native
+  actions read block h's. Deterministic; documented, not changed.
+* **L2 (upgrade):** old 39-byte submission keys match the new
+  `"sub"‖market` prefix and decode (same value layout); they are pruned by
+  the first block-start step. The T0 epoch fix changes the replay of old
+  empty boundary blocks. Fresh genesis; old history is not replayed with the
+  new binary.
+* The weighted median picks the lower price at exactly half the stake.
+* `RpcMarkPrice.timestamp` returns the aggregate's block number, not a time
+  (pre-existing).
 
 ## Open Questions
 
