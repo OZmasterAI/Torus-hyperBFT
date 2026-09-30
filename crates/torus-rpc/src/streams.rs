@@ -114,9 +114,15 @@ pub fn trades_for_market(block: &BlockFills, market: Option<u64>) -> Vec<RpcStre
 /// `closedPnl` and `dir` are the user's own. Self-trades cannot happen (the
 /// book's self-trade prevention cancels the resting order); if a fill ever had
 /// `user` on both sides it would yield two entries, maker then taker.
+///
+/// The per-user fields come from `block.extras`. A block without them (it
+/// executed before anyone subscribed) yields nothing.
 pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
     let mut out = Vec::new();
-    for f in &block.fills {
+    if block.extras.len() != block.fills.len() {
+        return out;
+    }
+    for (f, e) in block.fills.iter().zip(&block.extras) {
         let taker_bought = f.taker_side == 0;
         if f.maker == user {
             out.push(user_fill(
@@ -124,9 +130,9 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 f,
                 "maker",
                 !taker_bought,
-                f.maker_order_id,
-                f.maker_start_raw,
-                f.maker_pnl_raw,
+                e.maker_order_id,
+                e.maker_start_raw,
+                e.maker_pnl_raw,
             ));
         }
         if f.taker == user {
@@ -135,9 +141,9 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 f,
                 "taker",
                 taker_bought,
-                f.taker_order_id,
-                f.taker_start_raw,
-                f.taker_pnl_raw,
+                e.taker_order_id,
+                e.taker_start_raw,
+                e.taker_pnl_raw,
             ));
         }
     }
@@ -175,6 +181,7 @@ fn user_fill(
 mod tests {
     use super::*;
     use serde_json::json;
+    use torus_state::trade_rows::FillExtras;
 
     const S: i128 = FixedPoint::SCALE;
     const A: Address = Address::repeat_byte(0xaa);
@@ -186,18 +193,25 @@ mod tests {
     /// - #1 market 2: A (taker, long 0.5) sells 1 @50 to C (maker, short 2).
     /// - #2 market 1: B self-trades 1 @101 (maker long 2.5, taker long 1.5).
     pub(super) fn block() -> BlockFills {
+        let fill = |trade_index, market, maker, taker, price_raw, qty_raw, taker_side| TradeFill {
+            trade_index,
+            market,
+            maker,
+            taker,
+            price_raw,
+            qty_raw,
+            taker_side,
+        };
         BlockFills {
             height: 7,
             timestamp: 1_700_000_007,
             fills: vec![
-                TradeFill {
-                    trade_index: 0,
-                    market: 1,
-                    maker: A,
-                    taker: B,
-                    price_raw: 100 * S,
-                    qty_raw: 25 * S / 10,
-                    taker_side: 0,
+                fill(0, 1, A, B, 100 * S, 25 * S / 10, 0),
+                fill(1, 2, C, A, 50 * S, S, 1),
+                fill(2, 1, B, B, 101 * S, S, 0),
+            ],
+            extras: vec![
+                FillExtras {
                     maker_order_id: 11,
                     taker_order_id: 22,
                     maker_start_raw: 3 * S,
@@ -205,14 +219,7 @@ mod tests {
                     maker_pnl_raw: -825 * S / 10,
                     taker_pnl_raw: 0,
                 },
-                TradeFill {
-                    trade_index: 1,
-                    market: 2,
-                    maker: C,
-                    taker: A,
-                    price_raw: 50 * S,
-                    qty_raw: S,
-                    taker_side: 1,
+                FillExtras {
                     maker_order_id: 33,
                     taker_order_id: 44,
                     maker_start_raw: -2 * S,
@@ -220,14 +227,7 @@ mod tests {
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 125 * S / 100,
                 },
-                TradeFill {
-                    trade_index: 2,
-                    market: 1,
-                    maker: B,
-                    taker: B,
-                    price_raw: 101 * S,
-                    qty_raw: S,
-                    taker_side: 0,
+                FillExtras {
                     maker_order_id: 55,
                     taker_order_id: 66,
                     maker_start_raw: 25 * S / 10,
@@ -386,6 +386,23 @@ mod tests {
     #[test]
     fn streams_fills_for_absent_user_is_empty() {
         assert!(fills_for_user(&block(), Address::repeat_byte(0xdd)).is_empty());
+    }
+
+    /// s80 fix 1: a block executed before anyone subscribed has no extras;
+    /// `userFills` skips it, `newTrades` still delivers it.
+    #[test]
+    fn streams_block_without_extras_skips_user_fills_only() {
+        let full = block();
+        let mut bare = block();
+        bare.extras.clear();
+        for user in [A, B, C] {
+            assert!(fills_for_user(&bare, user).is_empty());
+            assert!(!fills_for_user(&full, user).is_empty());
+        }
+        assert_eq!(
+            to_json(&trades_for_market(&bare, None)),
+            to_json(&trades_for_market(&full, None))
+        );
     }
 
     // --- parse_stream_kind -------------------------------------------------
@@ -555,12 +572,14 @@ mod subscribe_ws_tests {
 
     /// Height 8: one fill, market 2, C (maker) and B (taker). A is absent.
     fn block8() -> BlockFills {
-        let mut f = super::tests::block().fills[1];
+        let b7 = super::tests::block();
+        let mut f = b7.fills[1];
         f.taker = Address::repeat_byte(0xbb);
         BlockFills {
             height: 8,
             timestamp: 1_700_000_008,
             fills: vec![f],
+            extras: vec![b7.extras[1]],
         }
     }
 

@@ -21,7 +21,7 @@ use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
 };
-use torus_state::trade_rows::{encode_block, TradeFill};
+use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
@@ -235,7 +235,8 @@ struct OrderSettlePlan {
     /// returns `Some` — including `Some(ZERO)` (still materializes the row).
     pnl_events: Vec<(&'static str, Address, FixedPoint)>,
     /// s80: `[taker, maker]` position effect of each applied fill, in fill
-    /// order (recorded with the fills; output-only).
+    /// order (output-only, for the fills' `FillExtras`). Only filled while a
+    /// stream wants fills (`record_fills`); otherwise empty, never allocated.
     fill_effects: Vec<[FillEffect; 2]>,
     /// First position-side fill-application failure, pre-formatted like the
     /// sequential path ("taker fill failed: …" / "maker fill failed: …").
@@ -1388,18 +1389,25 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// node-local; for validators that do not serve trade-history RPC).
     /// Default true.
     pub trade_history: bool,
-    /// s80: record fills for the stream sink even with trade history off.
-    /// Default false.
+    /// s80: a stream wants this block's fills: record them even with trade
+    /// history off, AND record each fill's stream-only `FillExtras` (order
+    /// ids, position effects). When false, settling does exactly the s78 work
+    /// (no effect bookkeeping, no extras). Output-only either way: state,
+    /// results and the native root do not depend on it. Default false.
     pub record_fills: bool,
     /// This block's fills in `trade_index` order (s77 packed trade rows).
     pending_fills: Vec<TradeFill>,
+    /// s80: the `FillExtras` of `pending_fills` — exactly as long and
+    /// index-aligned while `record_fills` is set, else empty. Cleared and
+    /// taken together with `pending_fills`.
+    pending_extras: Vec<FillExtras>,
     /// Block height of `pending_fills` (inline mode clears them on a new height).
     fills_block: u64,
     /// Inline mode: how many of `pending_fills` already have rows written.
     inline_fills_written: usize,
     /// s80: `[taker, maker]` effect of each fill of the order being settled
-    /// (sequential and single-action paths); reused so settling allocates
-    /// nothing per order.
+    /// (sequential and single-action paths), only while `record_fills`;
+    /// reused so settling allocates nothing per order.
     fill_effects_scratch: Vec<[FillEffect; 2]>,
 
     /// Optional metrics handle for Prometheus instrumentation.
@@ -1848,6 +1856,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             trade_history: true,
             record_fills: false,
             pending_fills: Vec::new(),
+            pending_extras: Vec::new(),
             fills_block: 0,
             inline_fills_written: 0,
             fill_effects_scratch: Vec::new(),
@@ -1933,9 +1942,20 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
     /// caller owns writing their rows from here (`trade_rows::encode_block`
     /// on a background writer, or a synchronous fallback).
+    /// Drops their extras (see `take_pending_fills_and_extras`).
     pub fn take_pending_trade_fills(&mut self) -> Vec<TradeFill> {
+        self.take_pending_fills_and_extras().0
+    }
+
+    /// Drain the block's fills and their stream-only extras (s80). The extras
+    /// are empty unless `record_fills` was set, else index-aligned with the
+    /// fills.
+    pub fn take_pending_fills_and_extras(&mut self) -> (Vec<TradeFill>, Vec<FillExtras>) {
         self.inline_fills_written = 0;
-        std::mem::take(&mut self.pending_fills)
+        (
+            std::mem::take(&mut self.pending_fills),
+            std::mem::take(&mut self.pending_extras),
+        )
     }
 
     /// PROFILER (s470): total resting orders across every loaded book. Sampled
@@ -4148,8 +4168,13 @@ impl NativeExecutor {
                 // so the old per-fill flush_and_evict (2 overlay round-trips
                 // per fill) is gone and both caches stay the single in-batch
                 // authority for their rows.
+                // s80: effects are kept (for the fills' extras) only while a
+                // stream wants fills; otherwise this is the s78 loop.
                 let mut fill_failed = false;
-                ctx.fill_effects_scratch.clear();
+                let record_fills = ctx.record_fills;
+                if record_fills {
+                    ctx.fill_effects_scratch.clear();
+                }
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
                     let taker = match Self::apply_fill_via_caches(
@@ -4192,7 +4217,9 @@ impl NativeExecutor {
                             break;
                         }
                     };
-                    ctx.fill_effects_scratch.push([taker, maker]);
+                    if record_fills {
+                        ctx.fill_effects_scratch.push([taker, maker]);
+                    }
                 }
 
                 if fill_failed {
@@ -4203,10 +4230,17 @@ impl NativeExecutor {
                     continue;
                 }
 
-                // Persist trades (with each fill's effects from above).
-                for (i, fill) in result.fills.iter().enumerate() {
-                    let [taker, maker] = ctx.fill_effects_scratch[i];
-                    Self::persist_trade(ctx, market_id, fill, taker, maker);
+                // Persist trades (with each fill's effects from above while a
+                // stream wants fills).
+                if record_fills {
+                    for (i, fill) in result.fills.iter().enumerate() {
+                        let [taker, maker] = ctx.fill_effects_scratch[i];
+                        Self::persist_trade_with_extras(ctx, market_id, fill, taker, maker);
+                    }
+                } else {
+                    for fill in &result.fills {
+                        Self::persist_trade(ctx, market_id, fill);
+                    }
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4326,6 +4360,7 @@ impl NativeExecutor {
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
             let margin_configs = &ctx.margin_configs;
+            let record_fills = ctx.record_fills;
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
 
             // Per-market weight for the LPT packer: plan cost is one pass over
@@ -4353,6 +4388,7 @@ impl NativeExecutor {
                         cfg,
                         mbr,
                         prepared,
+                        record_fills,
                     )
                 }))
                 .map_err(|payload| {
@@ -4523,8 +4559,14 @@ impl NativeExecutor {
                 }
 
                 // Record fills in canonical order, exactly like persist_trade.
-                for (fill, &[taker, maker]) in result.fills.iter().zip(&oplan.fill_effects) {
-                    Self::persist_trade(ctx, market_id, fill, taker, maker);
+                if ctx.record_fills {
+                    for (fill, &[taker, maker]) in result.fills.iter().zip(&oplan.fill_effects) {
+                        Self::persist_trade_with_extras(ctx, market_id, fill, taker, maker);
+                    }
+                } else {
+                    for fill in &result.fills {
+                        Self::persist_trade(ctx, market_id, fill);
+                    }
                 }
 
                 if let Some(ref m) = ctx.metrics {
@@ -4554,11 +4596,13 @@ impl NativeExecutor {
     /// respect to shared state — reads positions through a fresh per-market
     /// cache, mutates only plan-local data. Mirrors the sequential loop's
     /// per-order semantics exactly (see `settle_market_results_sequential`).
+    /// `record_fills` (s80): also keep each fill's effects for its extras.
     fn compute_market_settle_plan<T: StateBackend>(
         positions: &PositionManager<T>,
         cfg: Option<&MarketMarginConfig>,
         mbr: &crate::market_workers::MarketBatchResult,
         prepared: &[PreparedOrder<'_>],
+        record_fills: bool,
     ) -> MarketSettlePlan {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
@@ -4600,7 +4644,7 @@ impl NativeExecutor {
             // cache; PnL events recorded in exact order; first POSITION-side
             // failure stops the order like sequential (its message matches).
             let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
-            let mut fill_effects = Vec::with_capacity(result.fills.len());
+            let mut fill_effects = Vec::new();
             let mut fill_error: Option<String> = None;
             'fills: for fill in &result.fills {
                 let taker_is_buy = fill.maker_side != Side::Buy;
@@ -4630,7 +4674,9 @@ impl NativeExecutor {
                         }
                     }
                 }
-                fill_effects.push(pair);
+                if record_fills {
+                    fill_effects.push(pair);
+                }
             }
 
             orders.push(OrderSettlePlan {
@@ -4986,7 +5032,11 @@ impl NativeExecutor {
 
         // Apply fills to position manager.
         // FIX 22 (ECON-FIND-23): Propagate fill errors instead of discarding them.
-        ctx.fill_effects_scratch.clear();
+        // s80: effects are kept only while a stream wants fills.
+        let record_fills = ctx.record_fills;
+        if record_fills {
+            ctx.fill_effects_scratch.clear();
+        }
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
             let taker = match ctx.positions.apply_fill(
@@ -5029,14 +5079,22 @@ impl NativeExecutor {
                     );
                 }
             };
-            ctx.fill_effects_scratch.push([taker, maker]);
+            if record_fills {
+                ctx.fill_effects_scratch.push([taker, maker]);
+            }
         }
 
         // Persist trades to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
         // These CFs are NOT in the state root, so writes cannot affect consensus.
-        for (i, fill) in result.fills.iter().enumerate() {
-            let [taker, maker] = ctx.fill_effects_scratch[i];
-            Self::persist_trade(ctx, market_id, fill, taker, maker);
+        if record_fills {
+            for (i, fill) in result.fills.iter().enumerate() {
+                let [taker, maker] = ctx.fill_effects_scratch[i];
+                Self::persist_trade_with_extras(ctx, market_id, fill, taker, maker);
+            }
+        } else {
+            for fill in &result.fills {
+                Self::persist_trade(ctx, market_id, fill);
+            }
         }
 
         if let Some(ref m) = ctx.metrics {
@@ -5049,19 +5107,18 @@ impl NativeExecutor {
 
     /// Record one fill for this block's trade-history rows (written after the
     /// batch, see `defer_trades`) and advance the per-block fill counter.
-    /// `taker` / `maker` are the fill's position effects (s80, output-only).
+    /// While `record_fills` is set, callers use `persist_trade_with_extras`.
     fn persist_trade<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
-        taker: FillEffect,
-        maker: FillEffect,
     ) {
         if ctx.trade_history || ctx.record_fills {
             if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
                 // Inline mode, context reused for a new block: the earlier
                 // block's rows are already written.
                 ctx.pending_fills.clear();
+                ctx.pending_extras.clear();
                 ctx.inline_fills_written = 0;
             }
             ctx.fills_block = ctx.block_height;
@@ -5073,15 +5130,32 @@ impl NativeExecutor {
                 price_raw: fill.price.raw(),
                 qty_raw: fill.quantity.raw(),
                 taker_side: if fill.maker_side == Side::Buy { 1 } else { 0 },
-                maker_order_id: fill.maker_order_id,
-                taker_order_id: fill.taker_order_id,
-                maker_start_raw: maker.start_size.raw(),
-                taker_start_raw: taker.start_size.raw(),
-                maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
-                taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
             });
         }
         ctx.trade_index += 1;
+    }
+
+    /// s80, only while `record_fills`: `persist_trade` plus the fill's
+    /// stream-only extras (`taker` / `maker` are its position effects), so
+    /// `pending_extras` stays index-aligned with `pending_fills`.
+    fn persist_trade_with_extras<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
+        fill: &torus_core::order_book::Fill,
+        taker: FillEffect,
+        maker: FillEffect,
+    ) {
+        debug_assert!(ctx.record_fills, "extras are recorded only for a stream");
+        Self::persist_trade(ctx, market_id, fill);
+        ctx.pending_extras.push(FillExtras {
+            maker_order_id: fill.maker_order_id,
+            taker_order_id: fill.taker_order_id,
+            maker_start_raw: maker.start_size.raw(),
+            taker_start_raw: taker.start_size.raw(),
+            maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
+            taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
+        });
+        debug_assert_eq!(ctx.pending_extras.len(), ctx.pending_fills.len());
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.

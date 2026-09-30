@@ -2367,7 +2367,7 @@ mod tests {
 
     /// One fill of `market`; `side` 0 = taker bought.
     fn tfill(index: u32, market: u64, maker: Address, taker: Address, price_raw: i128, qty_raw: i128, side: u8) -> TradeFill {
-        TradeFill { trade_index: index, market, maker, taker, price_raw, qty_raw, taker_side: side, ..Default::default() }
+        TradeFill { trade_index: index, market, maker, taker, price_raw, qty_raw, taker_side: side }
     }
 
     /// Write one block's trade-history rows (both CFs) with the node's codec.

@@ -91,7 +91,8 @@ order cancels that resting order instead (self-trade prevention).
 - **Only while subscribed:** streams carry fills only while a subscriber is
   connected. A node records fills for the streams only while at least one
   stream subscriber exists, so a block executing at the moment you subscribe
-  may be missed; backfill covers it.
+  may be missed; backfill covers it. `userFills` may also skip the block
+  executing at the moment you subscribe, even when `newTrades` delivers it.
 - **Ahead of history:** a fill can arrive on the stream shortly **before**
   `torus_getUserTrades` / `torus_getTradeHistory*` return it, because the
   history rows are written just after.

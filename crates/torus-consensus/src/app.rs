@@ -1892,8 +1892,10 @@ impl ExecutionContext {
             ctx.defer_trades = true;
             ctx.trade_history = self.trade_history;
             // s80: while a stream sink wants fills (someone is subscribed),
-            // they are recorded even with trade history off (they never touch
-            // state either way). Checked once per block, before execution.
+            // they are recorded even with trade history off, together with
+            // their stream-only extras (never touching state either way).
+            // With no subscriber, exec records only what history needs (s78).
+            // Checked once per block, before execution.
             ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
 
             let engine_timer = std::time::Instant::now();
@@ -2045,7 +2047,8 @@ impl ExecutionContext {
             // O3: this block's fills (their rows go to the background writer
             // AFTER the flush / hand-off below, never before).
             let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
-            let fills = ctx.take_pending_trade_fills();
+            // s80: `extras` is empty unless a stream wanted this block's fills.
+            let (fills, extras) = ctx.take_pending_fills_and_extras();
 
             if pipelined {
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
@@ -2193,6 +2196,7 @@ impl ExecutionContext {
                     height: fills_block,
                     timestamp: fills_ts,
                     fills,
+                    extras,
                 });
                 if let Some(sink) = self.fill_sink.get() {
                     sink.send_fills(block.clone());
@@ -12430,11 +12434,34 @@ mod crash_recovery_tests {
                 .collect();
             assert_eq!(from_sink, from_rows, "stream and history disagree (on={on})");
             for b in &seen {
-                for f in &b.fills {
-                    assert_ne!(f.maker_order_id, 0, "fills carry order ids");
-                    assert_ne!(f.taker_order_id, 0, "fills carry order ids");
+                // A wanting sink: every fill carries its extras.
+                assert_eq!(b.extras.len(), b.fills.len(), "extras index-aligned (on={on})");
+                for e in &b.extras {
+                    assert_ne!(e.maker_order_id, 0, "extras carry order ids");
+                    assert_ne!(e.taker_order_id, 0, "extras carry order ids");
                 }
             }
+        }
+    }
+
+    /// s80 fix 1: with trade history ON and a sink nobody listens to
+    /// (`wants_fills` false), blocks still reach the sink (for `newTrades`)
+    /// but carry no extras, and every CF and the native root match a run
+    /// without a sink.
+    #[test]
+    fn fill_sink_not_wanted_with_history_on_gets_fills_without_extras() {
+        for on in [false, true] {
+            let (plain, root_plain, _) = run_fill_fixture(on, true, None);
+            let (idle, root_idle, seen) = run_fill_fixture(on, true, Some(false));
+            let seen = seen.unwrap();
+            assert_eq!(fill_summary(&seen), vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)], "on={on}");
+            assert!(seen.iter().all(|b| b.extras.is_empty()), "no subscriber, no extras (on={on})");
+            let (_, _, wanted) = run_fill_fixture(on, true, Some(true));
+            for (a, b) in seen.iter().zip(wanted.unwrap().iter()) {
+                assert_eq!(a.fills, b.fills, "the fills do not depend on a subscriber (on={on})");
+            }
+            assert_dumps_equal(&plain, &idle, &format!("idle sink vs none, history on (on={on})"));
+            assert_eq!(root_plain, root_idle, "native root (on={on})");
         }
     }
 
@@ -12449,7 +12476,10 @@ mod crash_recovery_tests {
             assert_eq!(fill_summary(&seen), vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)]);
             let with_history = with_history.unwrap();
             for (a, b) in seen.iter().zip(with_history.iter()) {
-                assert_eq!((a.height, a.timestamp, &a.fills), (b.height, b.timestamp, &b.fills));
+                assert_eq!(
+                    (a.height, a.timestamp, &a.fills, &a.extras),
+                    (b.height, b.timestamp, &b.fills, &b.extras)
+                );
             }
             for cf in [torus_state::cf::CF_NATIVE_TRADES, torus_state::cf::CF_NATIVE_USER_TRADES] {
                 assert!(cf_rows(&dump, cf).is_empty(), "{cf} must stay empty (on={on})");

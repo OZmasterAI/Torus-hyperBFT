@@ -40,7 +40,7 @@ const USER_ENTRY: usize = 4 + 8 + 16 + 16 + 1 + 1;
 
 /// One fill as the executor records it; `encode_block` turns a block's fills
 /// into rows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TradeFill {
     pub trade_index: u32,
     pub market: u64,
@@ -50,7 +50,12 @@ pub struct TradeFill {
     pub qty_raw: i128,
     /// 0 = taker bought, 1 = taker sold.
     pub taker_side: u8,
-    // s80, stream-only: `encode_block` ignores the fields below (rows unchanged).
+}
+
+/// Stream-only data of one fill (s80), recorded only while a stream subscriber
+/// exists. Not in the history rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FillExtras {
     pub maker_order_id: u128,
     pub taker_order_id: u128,
     /// Signed position size before the fill (long > 0, short < 0, none = 0).
@@ -68,14 +73,17 @@ pub struct BlockFills {
     pub height: u64,
     pub timestamp: u64,
     pub fills: Vec<TradeFill>,
+    /// Either empty (no stream subscriber when the block executed) or exactly
+    /// `fills.len()` long, `extras[i]` belonging to `fills[i]`.
+    pub extras: Vec<FillExtras>,
 }
 
 /// Stream consumer of executed blocks' fills (s80). Called on the execution
 /// thread; must not block.
 pub trait FillSink: Send + Sync {
     /// Whether anyone currently wants fills (checked once per block before
-    /// execution). False = the block records no fills for the sink (with
-    /// trade history off it records none at all).
+    /// execution). False = the block records no `FillExtras` (and with trade
+    /// history off no fills at all).
     fn wants_fills(&self) -> bool;
     /// One executed block's fills (only blocks with fills), in height order.
     fn send_fills(&self, block: std::sync::Arc<BlockFills>);
@@ -304,14 +312,14 @@ mod tests {
             price_raw: 1_000 + i as i128,
             qty_raw: -(i as i128) - 7,
             taker_side: (i % 2) as u8,
-            // Stream-only fields: non-zero so the row tests show they are ignored.
-            maker_order_id: 10 + i as u128,
-            taker_order_id: 20 + i as u128,
-            maker_start_raw: -3,
-            taker_start_raw: 4,
-            maker_pnl_raw: 5,
-            taker_pnl_raw: -6,
         }
+    }
+
+    /// s80 fix 1: the stream-only data lives in `FillExtras`, so the per-fill
+    /// record keeps the s78 size (96 bytes, measured at d930405).
+    #[test]
+    fn trade_rows_fill_record_keeps_s78_size() {
+        assert_eq!(std::mem::size_of::<TradeFill>(), 96);
     }
 
     fn encode(block: u64, ts: u64, fills: &[TradeFill]) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
