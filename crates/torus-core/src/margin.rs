@@ -52,6 +52,28 @@ pub fn effective_max_leverage(tiers: &[MarginTier], notional: FixedPoint) -> u32
     1 // fallback: 1x
 }
 
+/// Max leverage of an order in a market without a [`MarketMarginConfig`].
+pub const DEFAULT_ORDER_MAX_LEVERAGE: u32 = 20;
+
+/// THE order initial-margin formula (s515): `notional / max leverage`, the
+/// leverage taken from `tiers` for this notional ([`DEFAULT_ORDER_MAX_LEVERAGE`]
+/// without a market config), truncating integer division. The executor's
+/// placement reservation / releases and the book's match-time margin check
+/// both use it, so they agree to the last raw unit. A 0x tier panics exactly
+/// like the executor's historical formula (pinned by its integer-margin
+/// tests); placement reserves through it first, so the book never sees one.
+pub fn order_initial_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) -> FixedPoint {
+    let lev = tiers.map_or(DEFAULT_ORDER_MAX_LEVERAGE, |t| {
+        effective_max_leverage(t, notional)
+    });
+    notional
+        .raw()
+        .checked_div(i128::from(lev))
+        .map(FixedPoint::from_raw)
+        .ok_or(torus_types::ArithmeticError::DivisionByZero)
+        .expect("FixedPoint division error")
+}
+
 // ============================================================================
 // Market configuration for margin
 // ============================================================================
