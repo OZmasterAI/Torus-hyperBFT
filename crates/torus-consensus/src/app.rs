@@ -4044,7 +4044,14 @@ impl TorusApp {
             ReplayGapOutcome::Complete(last_header) => (last_header, None),
             // The fail-stop is latched (the node halts on it); nothing past
             // `height` was executed.
-            ReplayGapOutcome::Failed { last_good, .. } => (last_good, None),
+            ReplayGapOutcome::Failed { height, last_good } => {
+                tracing::error!(
+                    failed_height = height,
+                    last_good_height = last_good.height,
+                    "crash recovery: replay stopped at a fail-stop"
+                );
+                (last_good, None)
+            }
             ReplayGapOutcome::Hole { height, last_good } => {
                 // FIX 1b: do NOT latch exec_failed / die pre-network. Park at the
                 // hole and let boot complete; the live strict-order heal loop +
