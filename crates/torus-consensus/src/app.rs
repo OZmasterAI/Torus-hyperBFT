@@ -609,6 +609,10 @@ struct ExecutionContext {
     /// block takes the `commit_pending_bundle` fallback.
     #[cfg(test)]
     test_force_incremental_commit_fail: bool,
+    /// Test-only (s515 review 4): make staging the EVM-applied marker into the
+    /// block's EVM batch fail.
+    #[cfg(test)]
+    test_fail_marker_staging: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -651,31 +655,44 @@ struct EvmApplied {
 const EVM_APPLIED_FALLBACK: u8 = 0x01;
 
 /// Record layout: height (8 BE) ‖ fee revenue (16 BE) [‖ flags (1) ‖ addresses
-/// (20 each)]. The legacy / normal-commit record is the bare 24 bytes.
-fn read_evm_applied(state_db: &StateDb) -> Option<EvmApplied> {
-    let data = state_db
-        .get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED)
-        .ok()
-        .flatten()?;
+/// (20 each)]. The legacy / normal-commit record is the bare 24 bytes; the only
+/// flags value written is [`EVM_APPLIED_FALLBACK`].
+///
+/// s515 review 4: `Ok(None)` ONLY when the row is absent. A row that is
+/// present but malformed (short, unknown flags, partial address), or a failed
+/// read, is `Err`: treating it as "no marker" re-executes the block's EVM on
+/// top of its already-committed bundle (a double-apply), so the caller
+/// fail-stops instead.
+fn read_evm_applied(state_db: &StateDb) -> Result<Option<EvmApplied>, String> {
+    let data = match state_db.get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(format!("read failed: {e}")),
+    };
     if data.len() < 24 {
-        return None;
+        return Err(format!("{} bytes (< 24)", data.len()));
     }
     let fallback_accounts = match data.get(24) {
         None => None,
+        Some(&EVM_APPLIED_FALLBACK) if (data.len() - 25) % 20 == 0 => {
+            Some(data[25..].chunks_exact(20).map(Address::from_slice).collect())
+        }
         Some(&flags) => {
-            let rest = &data[25..];
-            if rest.len() % 20 != 0 {
-                return None;
-            }
-            (flags & EVM_APPLIED_FALLBACK != 0)
-                .then(|| rest.chunks_exact(20).map(Address::from_slice).collect())
+            return Err(format!(
+                "bad trailer: flags {flags:#04x}, {} trailing bytes",
+                data.len() - 25
+            ))
         }
     };
-    Some(EvmApplied {
-        height: u64::from_be_bytes(data[..8].try_into().ok()?),
-        fee_revenue: u128::from_be_bytes(data[8..24].try_into().ok()?),
+    let mut height = [0u8; 8];
+    height.copy_from_slice(&data[..8]);
+    let mut fee_revenue = [0u8; 16];
+    fee_revenue.copy_from_slice(&data[8..24]);
+    Ok(Some(EvmApplied {
+        height: u64::from_be_bytes(height),
+        fee_revenue: u128::from_be_bytes(fee_revenue),
         fallback_accounts,
-    })
+    }))
 }
 
 fn evm_applied_record(height: u64, fee_revenue: u128) -> [u8; 24] {
@@ -1255,6 +1272,13 @@ enum ReplayGapOutcome {
         height: u64,
         last_good: TorusBlockHeader,
     },
+    /// s515 review 4: executing `height` latched the fail-stop (`exec_failed`).
+    /// The loop stopped there — no later height was executed or flushed on
+    /// top of the missing state. `last_good` is the last height that executed.
+    Failed {
+        height: u64,
+        last_good: TorusBlockHeader,
+    },
 }
 
 /// Replay every committed-but-unexecuted block in `(applied, committed]`, in ascending height order
@@ -1271,6 +1295,10 @@ enum ReplayGapOutcome {
 ///
 /// On a `Hole` the loop STOPS immediately: it does NOT execute or mark the offending height (or any
 /// height past it), so `applied` stays below the hole and the caller can latch the fail-stop.
+///
+/// `execute` returns whether the node may go on (s515 review 4: `false` once it latched the
+/// fail-stop, e.g. a marker-ahead or marker-staging fail-stop) — the loop then stops at that height
+/// (`Failed`), so nothing after it executes and the native marker never passes it.
 fn replay_gap<H, B, X>(
     applied: u64,
     committed: u64,
@@ -1281,7 +1309,7 @@ fn replay_gap<H, B, X>(
 where
     H: FnMut(u64) -> Option<TorusBlockHeader>,
     B: FnMut(u64) -> Option<TorusBlockBody>,
-    X: FnMut(&TorusBlock),
+    X: FnMut(&TorusBlock) -> bool,
 {
     let mut last_good = torus_bridge::genesis_parent_header();
     for height in (applied + 1)..=committed {
@@ -1326,7 +1354,14 @@ where
             }
         };
 
-        execute(&block);
+        if !execute(&block) {
+            tracing::error!(
+                height,
+                committed_height = committed,
+                "crash recovery: FAIL-STOP while replaying committed height — not executing any later height"
+            );
+            return ReplayGapOutcome::Failed { height, last_good };
+        }
         last_good = header;
     }
     ReplayGapOutcome::Complete(last_good)
@@ -1493,6 +1528,14 @@ impl ExecutionContext {
     ) {
         let height = torus_block.header.height;
 
+        // s515 review 4: the fail-stop latch is never cleared, and whatever
+        // tripped it left this node's state incomplete — execute (and flush)
+        // nothing on top of it (boot replay, live pipeline alike).
+        if self.exec_failed.load(Ordering::SeqCst) {
+            tracing::error!(height, "fail-stop latched — refusing to execute block");
+            return;
+        }
+
         // T1.2 body-determinism FAIL-STOP: the committed header is the consensus
         // datum; its `native_action_count` is a hashed field of the eth header.
         // If the body handed to execution carries a DIFFERENT number of native
@@ -1592,6 +1635,41 @@ impl ExecutionContext {
             return;
         }
 
+        // s515 F1 / review 3 / review 4: the EVM-applied marker (see the EVM
+        // section below), read for EVERY block and checked BEFORE anything is
+        // written — the buffered slashes below are direct DB writes, so a
+        // fail-stop here leaves no partial state. EVM blocks are pipeline
+        // barriers (every earlier native flush is durable before one commits
+        // its bundle) and replay starts above the durable native marker, so in
+        // normal operation the marker is <= the height being executed.
+        let evm_applied = match read_evm_applied(&self.state_db) {
+            Ok(applied) => applied,
+            Err(e) => {
+                tracing::error!(
+                    height,
+                    error = %e,
+                    "FATAL: EVM-applied marker is malformed — cannot tell whether this block's \
+                     EVM bundle is committed (re-executing it could double-apply) — fail-stop"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        if let Some(applied) = evm_applied.as_ref().filter(|a| a.height > height) {
+            // A LATER block's EVM is durable while this height's native phase
+            // is not: re-executing this block would run it on top of later
+            // EVM state (and, with EVM txs, double-apply them). Unrecoverable
+            // locally — fail-stop.
+            tracing::error!(
+                height,
+                evm_applied = applied.height,
+                "FATAL: EVM-applied marker is ahead of the block being executed — refusing \
+                 to execute it (fail-stop)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+
         for slash in pending_slashes {
             match self
                 .staking
@@ -1655,27 +1733,9 @@ impl ExecutionContext {
         // `encode_account_info` bytes `seed_from_bundle` would put in the
         // overlay), the next-block queue rows from CF_CORE_WRITER_QUEUE, and the
         // header / receipts from `commit_block_metadata` (written before the
-        // bundle, see below).
-        //
-        // s515 review 3: read for EVERY block. EVM blocks are pipeline barriers
-        // (every earlier native flush is durable before one commits its bundle)
-        // and replay starts above the durable native marker, so in normal
-        // operation the marker is <= the height being executed.
-        match read_evm_applied(&self.state_db) {
-            Some(applied) if applied.height > height => {
-                // A LATER block's EVM is durable while this height's native phase
-                // is not: re-executing this block would run it on top of later
-                // EVM state (and, with EVM txs, double-apply them). Unrecoverable
-                // locally — fail-stop.
-                tracing::error!(
-                    height,
-                    evm_applied = applied.height,
-                    "FATAL: EVM-applied marker is ahead of the block being executed — refusing \
-                     to execute it (fail-stop)"
-                );
-                self.exec_failed.store(true, Ordering::SeqCst);
-                return;
-            }
+        // bundle, see below). The marker was read (and a marker ahead of this
+        // height fail-stopped) before the slash flush above.
+        match evm_applied {
             Some(applied) if applied.height == height && has_evm => {
                 tracing::warn!(
                     height,
@@ -1724,11 +1784,22 @@ impl ExecutionContext {
                     // overlay, so BOTH commit paths below land it in the bundle's batch.
                     // s515 review 3: without it the block would commit silently
                     // reverting to non-idempotent replay — fail-stop instead.
-                    if let Err(e) = validated.native_writes.put_cf_raw(
-                        CF_CONSENSUS_META,
-                        META_EVM_APPLIED,
-                        &evm_applied_record(height, computed_fee_revenue),
-                    ) {
+                    #[cfg(test)]
+                    let fail_staging = self.test_fail_marker_staging;
+                    #[cfg(not(test))]
+                    let fail_staging = false;
+                    let staged = if fail_staging {
+                        Err(torus_state::StateError::InvalidData(
+                            "test: forced marker staging failure".into(),
+                        ))
+                    } else {
+                        validated.native_writes.put_cf_raw(
+                            CF_CONSENSUS_META,
+                            META_EVM_APPLIED,
+                            &evm_applied_record(height, computed_fee_revenue),
+                        )
+                    };
+                    if let Err(e) = staged {
                         tracing::error!(%e, height, "FATAL: failed to stage the EVM-applied marker — refusing to commit the block without it (fail-stop)");
                         self.exec_failed.store(true, Ordering::SeqCst);
                         return;
@@ -3548,6 +3619,8 @@ impl TorusApp {
             test_crash_after_evm_commit: false,
             #[cfg(test)]
             test_force_incremental_commit_fail: false,
+            #[cfg(test)]
+            test_fail_marker_staging: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -3921,11 +3994,17 @@ impl TorusApp {
             committed,
             |height| load_replay_header(state_db, height),
             |height| load_replay_body(state_db, height),
-            |block| exec_ctx.execute_committed_block(block, vec![]),
+            |block| {
+                exec_ctx.execute_committed_block(block, vec![]);
+                !exec_ctx.exec_failed.load(Ordering::SeqCst)
+            },
         );
 
         match outcome {
             ReplayGapOutcome::Complete(last_header) => (last_header, None),
+            // The fail-stop is latched (the node halts on it); nothing past
+            // `height` was executed.
+            ReplayGapOutcome::Failed { last_good, .. } => (last_good, None),
             ReplayGapOutcome::Hole { height, last_good } => {
                 // FIX 1b: do NOT latch exec_failed / die pre-network. Park at the
                 // hole and let boot complete; the live strict-order heal loop +
@@ -7229,7 +7308,10 @@ mod crash_recovery_tests {
             3,
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
-            |block| executed_order.push(block.header.height),
+            |block| {
+                executed_order.push(block.header.height);
+                true
+            },
         );
 
         assert_eq!(
@@ -7271,7 +7353,10 @@ mod crash_recovery_tests {
             3,
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
-            |block| executed_order.push(block.header.height),
+            |block| {
+                executed_order.push(block.header.height);
+                true
+            },
         );
 
         assert!(
@@ -10106,6 +10191,8 @@ mod crash_recovery_tests {
             test_crash_after_evm_commit: false,
             #[cfg(test)]
             test_force_incremental_commit_fail: false,
+            #[cfg(test)]
+            test_fail_marker_staging: false,
         }
     }
 
@@ -13590,5 +13677,148 @@ mod crash_recovery_tests {
             assert_eq!(incremental, full, "{what}: incremental trie tracks the full scan");
         }
         assert_dumps_equal(&reference, &crashed, "crash-replayed vs never-crashed (fallback)");
+    }
+
+    // ---- s515 review 4: fail-stops that must leave nothing behind ----
+
+    /// Boot an f1 fixture (no committed blocks yet), then commit `blocks`
+    /// durably without executing them — the state a crash leaves for the boot
+    /// replay.
+    fn r4_committed(blocks: &[TorusBlock]) -> (ChainConfig, StateDb) {
+        let (config, db) = f1_config();
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        for b in blocks {
+            persist_block_for_test(&db, b);
+        }
+        (config, db)
+    }
+
+    /// B1 (review 4 F-2): `replay_gap` ignored a fail-stop latched while
+    /// executing a height and went on executing (and flushing) the later ones.
+    #[test]
+    fn r4_replay_gap_stops_at_a_failed_height() {
+        let blocks: Vec<TorusBlock> = (1..=3).map(|h| make_block(h, vec![])).collect();
+        let mut executed = Vec::new();
+        let outcome = replay_gap(
+            0,
+            3,
+            |h| Some(blocks[h as usize - 1].header.clone()),
+            |h| Some(blocks[h as usize - 1].body()),
+            |block| {
+                executed.push(block.header.height);
+                block.header.height != 2
+            },
+        );
+        assert_eq!(executed, vec![1, 2], "nothing after the failed height runs");
+        match outcome {
+            ReplayGapOutcome::Failed { height, last_good } => {
+                assert_eq!(height, 2);
+                assert_eq!(last_good.height, 1);
+            }
+            other => panic!("expected Failed {{ height: 2 }}, got {other:?}"),
+        }
+    }
+
+    /// B1 end-to-end: a marker-ahead fail-stop at height 1 of the boot replay
+    /// (EVM marker at 2) must not let height 2 (marker == 2, EVM-less) and 3
+    /// execute on top of it — native marker unchanged, nothing written.
+    #[test]
+    fn r4_boot_replay_stops_at_marker_ahead_fail_stop() {
+        let blocks: Vec<TorusBlock> = (1..=3).map(|h| make_block(h, vec![])).collect();
+        let (config, db) = r4_committed(&blocks);
+        db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &evm_applied_record(2, 0))
+            .unwrap();
+        let before = dump_all_cfs(&db);
+        let ctx = make_exec_ctx(&config, &db);
+        let _ = TorusApp::replay_committed(&db, &ctx);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), None, "native marker unchanged");
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing at or after the failed height");
+    }
+
+    /// B1 end-to-end: a marker-staging failure (b63d401) at height 1 — its EVM
+    /// bundle is never committed — must stop the replay there: the EVM-less
+    /// height 2 used to execute and advance the native marker past it.
+    #[test]
+    fn r4_boot_replay_stops_after_marker_staging_failure() {
+        let bob = Address::with_last_byte(0xB0);
+        let [b1, b2] = f1_blocks(vec![f1_transfer(bob, U256::from(1u64), 0)]);
+        let (config, db) = r4_committed(&[b1, b2]);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_fail_marker_staging = true;
+        let _ = TorusApp::replay_committed(&db, &ctx);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), None, "native marker unchanged");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED).unwrap().is_none(), "no EVM-applied marker");
+        assert_eq!(read_evm_balance(&db, bob), U256::ZERO, "bundle never committed");
+    }
+
+    /// B1: the marker-ahead check runs BEFORE the buffered slashes are flushed
+    /// (direct DB writes), so the fail-stop leaves no partial writes; and once
+    /// the latch is set, nothing executes any more.
+    #[test]
+    fn r4_marker_ahead_fail_stop_flushes_no_slash() {
+        let (config, db) = f1_config();
+        let [b1, _] = f1_blocks(vec![]);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        let ctx = make_exec_ctx(&config, &db);
+        let v = Address::with_last_byte(0x51);
+        ctx.staking
+            .credit_balance(&v, torus_economics::MIN_SELF_DELEGATION)
+            .unwrap();
+        ctx.staking
+            .register_validator(v, [7; 32], 0, torus_economics::MIN_SELF_DELEGATION)
+            .unwrap();
+        db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &evm_applied_record(2, 0))
+            .unwrap();
+        let before = dump_all_cfs(&db);
+        let slash = || PendingSlash {
+            validator: v,
+            fraction_bps: 500,
+            reason: SlashReason::DoubleSign,
+            tombstone: true,
+        };
+        ctx.execute_committed_block(&b1, vec![slash()]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "no slash flushed");
+
+        // Latched: even a block that would pass every check is not executed.
+        db.delete_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED).unwrap();
+        let before = dump_all_cfs(&db);
+        ctx.execute_committed_block(&b1, vec![slash()]);
+        drop(ctx);
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing runs after a fail-stop");
+    }
+
+    /// B3 (review 4 F-5): a present but MALFORMED marker is not "no marker"
+    /// (that re-executes the block's EVM — a double-apply): fail-stop, for
+    /// EVM and EVM-less blocks alike.
+    #[test]
+    fn r4_malformed_evm_marker_fail_stops() {
+        let good = evm_applied_record(1, 7).to_vec();
+        let with = |tail: &[u8]| [good.as_slice(), tail].concat();
+        let bob = Address::with_last_byte(0xB0);
+        for (what, marker) in [
+            ("short", good[..10].to_vec()),
+            ("unknown flag", with(&[0x02])),
+            ("zero flag with addresses", with(&[&[0x00][..], &[0xAB; 20]].concat())),
+            ("partial address", with(&[&[EVM_APPLIED_FALLBACK][..], &[0xAB; 5]].concat())),
+        ] {
+            for txs in [vec![], vec![f1_transfer(bob, U256::from(1u64), 0)]] {
+                let what = format!("{what}, {} evm txs", txs.len());
+                let (config, db) = f1_config();
+                let [b1, _] = f1_blocks(txs);
+                drop(TorusApp::new(db.clone(), &config, None, None, None));
+                db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &marker).unwrap();
+                let before = dump_all_cfs(&db);
+                let ctx = make_exec_ctx(&config, &db);
+                ctx.execute_committed_block(&b1, vec![]);
+                assert!(ctx.exec_failed.load(Ordering::SeqCst), "{what}: must fail-stop");
+                drop(ctx);
+                assert_dumps_equal(&before, &dump_all_cfs(&db), &what);
+            }
+        }
     }
 }
