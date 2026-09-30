@@ -420,7 +420,7 @@ fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
     let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
     let agg = ctx
         .oracle
-        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .aggregate_price(market_id, ctx.block_height, ctx.timestamp, &stakes)
         .unwrap();
     assert_eq!(agg, price, "test oracle aggregates to the mark");
 }

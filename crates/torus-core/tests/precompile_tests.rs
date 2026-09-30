@@ -70,16 +70,18 @@ fn get_evm_balance(db: &StateDb, address: &Address) -> U256 {
     }
 }
 
-/// Write an aggregated oracle price to CF_NATIVE_ORACLE.
-fn write_oracle_price(db: &StateDb, market_id: MarketId, price: FixedPoint, block: u64) {
+/// Write an aggregated oracle price to CF_NATIVE_ORACLE: the 36-byte row
+/// price(16) || block(8) || num_reporters(4) || block timestamp(8).
+fn write_oracle_price(db: &StateDb, market_id: MarketId, price: FixedPoint, block: u64, ts: u64) {
     let mut key = Vec::with_capacity(11);
     key.extend_from_slice(b"agg");
     key.extend_from_slice(&market_id.to_be_bytes());
 
-    let mut data = Vec::with_capacity(28);
+    let mut data = Vec::with_capacity(36);
     data.extend_from_slice(&price.raw().to_be_bytes());
     data.extend_from_slice(&block.to_be_bytes());
     data.extend_from_slice(&3u32.to_be_bytes()); // num_reporters
+    data.extend_from_slice(&ts.to_be_bytes());
 
     db.put_cf_raw("cf_native_oracle", &key, &data).unwrap();
 }
@@ -198,7 +200,7 @@ fn order_book_reader_get_order_book() {
     // Call precompile
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = build_input("getOrderBook(bytes32)", &[encode_market_id(1)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
 
     // Decode: 4 offsets + arrays. Verify we got data back.
     assert!(output.len() > 128); // At least 4 offset words
@@ -224,7 +226,7 @@ fn order_book_reader_get_position() {
     .unwrap();
 
     // Write oracle price for unrealized PnL computation
-    write_oracle_price(&db, 1, fp(51_000), 100);
+    write_oracle_price(&db, 1, fp(51_000), 100, 1_000);
 
     // Call precompile
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
@@ -232,7 +234,7 @@ fn order_book_reader_get_position() {
         "getPosition(address,bytes32)",
         &[encode_addr(&trader), encode_market_id(1)],
     );
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
 
     // 5 words = 160 bytes
     assert_eq!(output.len(), 160);
@@ -273,7 +275,7 @@ fn order_book_reader_get_open_orders() {
         "getOpenOrders(address,bytes32)",
         &[encode_addr(&trader), encode_market_id(1)],
     );
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
 
     // Should have 4 dynamic arrays with 2 elements each
     assert!(output.len() > 128);
@@ -309,7 +311,7 @@ fn balance_reader_get_balances() {
     // Call precompile
     let address = precompile_address(ADDR_BALANCE_READER);
     let input = build_input("getBalances(address)", &[encode_addr(&trader)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
 
     // 4 static values = 128 bytes
     assert_eq!(output.len(), 128);
@@ -335,7 +337,7 @@ fn balance_reader_clamps_negative_available_to_zero() {
         .unwrap();
     let address = precompile_address(ADDR_BALANCE_READER);
     let input = build_input("getBalances(address)", &[encode_addr(&trader)]);
-    let out = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let out = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
     let word = |i: usize| u128::from_be_bytes(out[32 * i + 16..32 * i + 32].try_into().unwrap());
     assert_eq!(word(0), 0, "native_balance");
     assert_eq!(word(2), fp(300).raw() as u128, "total_margin_used");
@@ -350,11 +352,11 @@ fn balance_reader_clamps_negative_available_to_zero() {
 fn oracle_reader_get_price() {
     let (_dir, db) = setup();
 
-    write_oracle_price(&db, 1, fp(50_000), 95);
+    write_oracle_price(&db, 1, fp(50_000), 95, 1_000);
 
     let address = precompile_address(ADDR_ORACLE_READER);
     let input = build_input("getPrice(bytes32)", &[encode_market_id(1)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 1_005).unwrap();
 
     // 3 values = 96 bytes
     assert_eq!(output.len(), 96);
@@ -367,7 +369,7 @@ fn oracle_reader_get_price() {
     let block = u64::from_be_bytes(output[56..64].try_into().unwrap());
     assert_eq!(block, 95);
 
-    // Stale: 100 - 95 = 5, not > 100, so not stale
+    // Stale: 1_005 - 1_000 = 5 s, not > 60, so not stale
     assert_eq!(output[95], 0); // false
 }
 
@@ -375,14 +377,60 @@ fn oracle_reader_get_price() {
 fn oracle_reader_stale_price() {
     let (_dir, db) = setup();
 
-    write_oracle_price(&db, 1, fp(50_000), 10);
+    write_oracle_price(&db, 1, fp(50_000), 10, 1_000);
 
     let address = precompile_address(ADDR_ORACLE_READER);
     let input = build_input("getPrice(bytes32)", &[encode_market_id(1)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 200).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 200, 1_061).unwrap();
 
-    // Stale: 200 - 10 = 190, > 100, so stale=true
+    // Stale: 1_061 - 1_000 = 61 s, > 60, so stale=true
     assert_eq!(output[95], 1); // true
+}
+
+/// 0x0802 getAllPrices: stale flags from timestamps (60 s).
+#[test]
+fn oracle_reader_get_all_prices_uses_timestamps() {
+    let (_dir, db) = setup();
+    write_oracle_price(&db, 1, fp(50_000), 5, 1_000);
+    write_oracle_price(&db, 2, fp(3_000), 9, 1_050);
+    let address = precompile_address(ADDR_ORACLE_READER);
+    let input = build_input("getAllPrices()", &[]);
+    let out = execute_precompile(&address, &input, &addr(0), &db, 10, 1_061).unwrap();
+    // three dynamic arrays; the stale-flag array is the third — decode its 2 elements
+    let off = u64::from_be_bytes(out[88..96].try_into().unwrap()) as usize; // 3rd head word
+    assert_eq!(u64::from_be_bytes(out[off + 24..off + 32].try_into().unwrap()), 2, "len");
+    assert_eq!(out[off + 63], 1, "market 1: age 61 -> stale");
+    assert_eq!(out[off + 95], 0, "market 2: age 11 -> fresh");
+}
+
+/// 0x0800 getPosition UPnL uses the price only while usable (ABI unchanged).
+#[test]
+fn order_book_reader_get_position_ignores_a_stale_oracle_price() {
+    let (_dir, db) = setup();
+    let trader = addr(1);
+    PositionManager::new(db.clone())
+        .put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(5),
+            entry_price: fp(50_000),
+            realized_pnl: fp(100),
+            isolated_margin: fp(2_500),
+            margin_type: torus_core::position::MarginType::Isolated,
+        })
+        .unwrap();
+    write_oracle_price(&db, 1, fp(51_000), 100, 1_000);
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let input =
+        build_input("getPosition(address,bytes32)", &[encode_addr(&trader), encode_market_id(1)]);
+    let upnl = |ts: u64| {
+        let out = execute_precompile(&address, &input, &addr(0), &db, 200, ts).unwrap();
+        i128::from_be_bytes(out[80..96].try_into().unwrap())
+    };
+    assert_eq!(upnl(1_060), fp(5_000).raw(), "age 60: 5 x (51,000 - 50,000)");
+    assert_eq!(upnl(1_061), 0, "age 61: stale -> 0");
+    assert_eq!(upnl(900), fp(5_000).raw(), "clock behind the row: age clamps at 0 (usable)");
 }
 
 // ============================================================================
@@ -415,7 +463,7 @@ fn staking_reader_get_staking_info() {
 
     let address = precompile_address(ADDR_STAKING_READER);
     let input = build_input("getStakingInfo(address)", &[encode_addr(&staker)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
 
     // 4 values = 128 bytes
     assert_eq!(output.len(), 128);
@@ -451,7 +499,7 @@ fn core_writer_place_order_queues_action() {
         ],
     );
 
-    let output = execute_precompile(&address, &input, &caller, &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &caller, &db, 100, 0).unwrap();
 
     // Output should be a bytes32 (order_id) = 32 bytes
     assert_eq!(output.len(), 32);
@@ -473,7 +521,7 @@ fn core_writer_cancel_order_queues_action() {
     let address = precompile_address(ADDR_CORE_WRITER);
     let input = build_input("cancelOrder(bytes32)", &[abi::encode_order_id(42)]);
 
-    let output = execute_precompile(&address, &input, &caller, &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &caller, &db, 100, 0).unwrap();
     assert_eq!(output.len(), 32);
     assert_eq!(output[31], 1); // true
 
@@ -499,7 +547,7 @@ fn core_writer_staking_delegate_queues_action() {
         ],
     );
 
-    let output = execute_precompile(&address, &input, &caller, &db, 50).unwrap();
+    let output = execute_precompile(&address, &input, &caller, &db, 50, 0).unwrap();
     assert_eq!(output[31], 1); // success
 
     assert_eq!(CoreWriterQueue::pending_count(&db, 51).unwrap(), 1);
@@ -535,8 +583,8 @@ fn writer_precompile_journals_through_overlay() {
 
     // Two placeOrder calls in the same journal: read-your-writes gives seq 0 then 1.
     // (order_id = (block+1) << 64 | seq, so the low 64 bits carry the sequence.)
-    let out0 = execute_precompile(&address, &input, &caller, &overlay, 100).unwrap();
-    let out1 = execute_precompile(&address, &input, &caller, &overlay, 100).unwrap();
+    let out0 = execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
+    let out1 = execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
     let id0 = u128::from_be_bytes(out0[16..32].try_into().unwrap());
     let id1 = u128::from_be_bytes(out1[16..32].try_into().unwrap());
     assert_eq!(id0 & u64::MAX as u128, 0, "first enqueue gets seq 0");
@@ -727,7 +775,7 @@ fn lockbox_precompile_deposit() {
         &[abi::encode_u128(value.to::<u128>())],
     );
 
-    let output = execute_precompile_with_value(&address, &input, &trader, value, &db, 100).unwrap();
+    let output = execute_precompile_with_value(&address, &input, &trader, value, &db, 100, 0).unwrap();
     assert_eq!(output[31], 1); // true = queued
 
     // No direct balance writes at the precompile layer.
@@ -759,12 +807,12 @@ fn lockbox_precompile_deposit_rejects_bad_value() {
 
     // amount argument != msg.value
     assert!(
-        execute_precompile_with_value(&address, &deposit(wei(1)), &trader, U256::ZERO, &db, 100)
+        execute_precompile_with_value(&address, &deposit(wei(1)), &trader, U256::ZERO, &db, 100, 0)
             .is_err()
     );
     // all dust: < one native unit (10^10 wei) would credit nothing
     let dust = U256::from(9_999_999_999u64);
-    assert!(execute_precompile_with_value(&address, &deposit(dust), &trader, dust, &db, 100)
+    assert!(execute_precompile_with_value(&address, &deposit(dust), &trader, dust, &db, 100, 0)
         .is_err());
     // zero: no-op success, nothing queued
     assert!(execute_precompile_with_value(
@@ -773,16 +821,17 @@ fn lockbox_precompile_deposit_rejects_bad_value() {
         &trader,
         U256::ZERO,
         &db,
-        100
+        100,
+        0,
     )
     .is_ok());
     // value to a non-payable precompile / selector
     let withdraw = build_input("withdrawFromNative(uint128)", &[abi::encode_u128(0)]);
-    assert!(execute_precompile_with_value(&address, &withdraw, &trader, wei(1), &db, 100).is_err());
+    assert!(execute_precompile_with_value(&address, &withdraw, &trader, wei(1), &db, 100, 0).is_err());
     let core_writer = precompile_address(ADDR_CORE_WRITER);
     let cancel = build_input("cancelOrder(bytes32)", &[abi::encode_u128(1)]);
     assert!(
-        execute_precompile_with_value(&core_writer, &cancel, &trader, wei(1), &db, 100).is_err()
+        execute_precompile_with_value(&core_writer, &cancel, &trader, wei(1), &db, 100, 0).is_err()
     );
 
     assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0);
@@ -810,7 +859,7 @@ fn lockbox_precompile_withdraw() {
         &[abi::encode_u128(wei(2_000).to::<u128>())],
     );
 
-    let output = execute_precompile(&address, &input, &trader, &db, 100).unwrap();
+    let output = execute_precompile(&address, &input, &trader, &db, 100, 0).unwrap();
     assert_eq!(output[31], 1); // true = queued
 
     // Nothing moves at the precompile layer (EVM-PF-05) ...
@@ -830,7 +879,7 @@ fn lockbox_precompile_withdraw() {
         "withdrawFromNative(uint128)",
         &[abi::encode_u128(wei(1).to::<u128>() + 1)],
     );
-    assert!(execute_precompile(&address, &odd, &trader, &db, 100).is_err());
+    assert!(execute_precompile(&address, &odd, &trader, &db, 100, 0).is_err());
 }
 
 #[test]
@@ -861,7 +910,7 @@ fn unknown_selector_returns_error() {
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = vec![0xDE, 0xAD, 0xBE, 0xEF]; // bogus selector
 
-    let result = execute_precompile(&address, &input, &addr(0), &db, 100);
+    let result = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
     assert!(matches!(result, Err(CoreError::UnknownSelector(_))));
 }
 
@@ -890,7 +939,7 @@ fn read_only_denies_lockbox_deposit_no_state_change() {
     );
 
     // Read-only: must be denied AND leave both balances untouched.
-    let result = execute_precompile_read_only(&address, &input, &trader, &db, 100);
+    let result = execute_precompile_read_only(&address, &input, &trader, &db, 100, 0);
     assert!(
         result.is_err(),
         "writer precompile must be denied in read-only mode"
@@ -928,7 +977,7 @@ fn read_only_denies_core_writer_no_enqueue() {
         ],
     );
 
-    let result = execute_precompile_read_only(&address, &input, &caller, &db, 100);
+    let result = execute_precompile_read_only(&address, &input, &caller, &db, 100, 0);
     assert!(
         result.is_err(),
         "core_writer must be denied in read-only mode"
@@ -949,7 +998,7 @@ fn read_only_denies_core_writer_staking_no_enqueue() {
         ],
     );
 
-    let result = execute_precompile_read_only(&address, &input, &addr(1), &db, 50);
+    let result = execute_precompile_read_only(&address, &input, &addr(1), &db, 50, 0);
     assert!(result.is_err());
     assert_eq!(CoreWriterQueue::pending_count(&db, 51).unwrap(), 0);
 }
@@ -961,8 +1010,8 @@ fn read_only_is_transparent_for_reader_precompiles() {
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = build_input("getOrderBook(bytes32)", &[encode_market_id(1)]);
 
-    let ro = execute_precompile_read_only(&address, &input, &addr(0), &db, 100);
-    let normal = execute_precompile(&address, &input, &addr(0), &db, 100);
+    let ro = execute_precompile_read_only(&address, &input, &addr(0), &db, 100, 0);
+    let normal = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
     assert!(
         ro.is_ok(),
         "reader precompile must still run in read-only mode"
