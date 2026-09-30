@@ -4114,7 +4114,7 @@ mod tests {
         let params = PlaceOrderParams {
             market_id: 1,
             is_buy: true,
-            price: FixedPoint::ZERO,
+            price: fp(120), // s515: stop-market slippage cap
             quantity: fp_frac(0, 50_000_000),
             order_type: OrderType::StopMarket { trigger: fp(100) },
             time_in_force: TimeInForce::GTC,
@@ -4202,7 +4202,7 @@ mod tests {
             PlaceOrderParams {
                 market_id: 1,
                 is_buy: true,
-                price: FixedPoint::ZERO,
+                price: fp(120), // s515: stop-market slippage cap
                 quantity: fp(5),
                 order_type: OrderType::StopMarket { trigger: fp(90) },
                 time_in_force: TimeInForce::GTC,
@@ -4226,7 +4226,7 @@ mod tests {
             PlaceOrderParams {
                 market_id: 1,
                 is_buy: true,
-                price: FixedPoint::ZERO,
+                price: fp(120), // s515: stop-market slippage cap
                 quantity: fp(5),
                 order_type: OrderType::StopMarket { trigger: fp(110) },
                 time_in_force: TimeInForce::GTC,
