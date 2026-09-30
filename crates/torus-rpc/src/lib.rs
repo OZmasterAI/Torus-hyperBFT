@@ -3424,16 +3424,21 @@ mod tests {
         let market_id: u64 = 7;
         let oracle_price = fp(42000);
 
-        // Write a StoredAggregatedPrice entry for market 7.
-        // Binary layout: price(i128 16 BE) + block_number(u64 8 BE) + num_reporters(u32 4 BE).
+        // Write a StoredAggregatedPrice entry for market 7. Binary layout:
+        // price(i128 16 BE) + block_number(u64 8 BE) + num_reporters(u32 4 BE)
+        // + block timestamp(u64 8 BE).
         let mut key = Vec::with_capacity(11);
         key.extend_from_slice(b"agg");
         key.extend_from_slice(&market_id.to_be_bytes());
-        let mut value = Vec::with_capacity(28);
+        let latest = test_header(1, 0, 0);
+        let mut value = Vec::with_capacity(36);
         value.extend_from_slice(&oracle_price.raw().to_be_bytes());
         value.extend_from_slice(&1u64.to_be_bytes()); // block_number
         value.extend_from_slice(&3u32.to_be_bytes()); // num_reporters
+        value.extend_from_slice(&latest.timestamp.to_be_bytes()); // fresh: age 0
         state.put_cf_raw(CF_NATIVE_ORACLE, &key, &value).unwrap();
+        // Item 2: the mark is time-based — "now" is the latest header's timestamp.
+        store_header(&state, &latest);
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;

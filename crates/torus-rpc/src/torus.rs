@@ -379,6 +379,19 @@ enum SubmitSlot {
 }
 
 impl RpcState {
+    /// Item 2: the oracle aggregate of `mid` if USABLE ([`OraclePrice::usable`]:
+    /// time-based, stale 60 s of block time after the last fresh aggregate)
+    /// at the latest committed block's header timestamp. No header (or an
+    /// unreadable one) ⇒ no mark.
+    fn usable_oracle_price(&self, mid: u64) -> Option<torus_core::oracle::OraclePrice> {
+        let latest = self.latest_height.load(Ordering::Relaxed);
+        let (header, _, _) = crate::eth::get_header_with_hash(self, latest).ok().flatten()?;
+        OracleManager::new(self.state.clone(), OracleConfig::default())
+            .get_price(mid, header.timestamp)
+            .ok()
+            .filter(|op| op.usable().is_some())
+    }
+
     /// Count one admission-path rejection under its concrete reason label.
     fn count_admit_reject(&self, reason: &str) {
         if let Some(ref m) = self.metrics {
@@ -792,13 +805,10 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Compute unrealized PnL using oracle price; fall back to entry price.
-                let current_block = self.latest_height.load(Ordering::Relaxed);
-                let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
-                let mark_price = oracle
-                    .get_price(mid, current_block)
-                    .map(|op| op.price)
-                    .unwrap_or(p.entry_price);
+                // Compute unrealized PnL at the usable oracle price; fall back to entry price.
+                let mark_price = self
+                    .usable_oracle_price(mid)
+                    .map_or(p.entry_price, |op| op.price);
                 let unrealized = p.unrealized_pnl(mark_price);
 
                 // Simplified liquidation price estimate.
@@ -1603,12 +1613,10 @@ impl TorusApiServer for RpcState {
 
     async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
-        let current_block = self.latest_height.load(Ordering::Relaxed);
 
-        let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
-        let (mark_price, index_price, timestamp) = match oracle.get_price(mid, current_block) {
-            Ok(op) => (op.price, op.price, op.block_number),
-            Err(_) => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
+        let (mark_price, index_price, timestamp) = match self.usable_oracle_price(mid) {
+            Some(op) => (op.price, op.price, op.block_number),
+            None => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
         };
 
         // Last trade price from the order book. Under the row layouts it lives

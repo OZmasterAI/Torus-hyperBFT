@@ -100,7 +100,7 @@ fn test_core_writer_precompile_call() {
         ],
     );
 
-    let result = execute_precompile(&addr, &input, &caller, &h.state_db, current_block).unwrap();
+    let result = execute_precompile(&addr, &input, &caller, &h.state_db, current_block, 0).unwrap();
     // CoreWriter returns a u64 sequence number in 32 bytes
     assert_eq!(result.len(), 32);
 

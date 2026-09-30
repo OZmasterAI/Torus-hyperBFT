@@ -441,7 +441,8 @@ enum PrepOutcome {
 struct AccountReader<'a, T: StateBackend> {
     positions: &'a PositionManager<T>,
     oracle: &'a OracleManager<T>,
-    height: u64,
+    /// The block's header timestamp (s): the clock of the oracle mark rule.
+    now: u64,
     margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
 }
 
@@ -450,21 +451,20 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         Self {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
-            height: ctx.block_height,
+            now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
         }
     }
 
-    /// s515 review 4 mark: the aggregated oracle price, `None` when absent,
-    /// stale (older than the oracle's max age at this block height),
-    /// non-positive or unreadable. Only oracle aggregation writes that row
-    /// and no native action runs it, so every placement of a block (single,
-    /// batch serial, batch sharded) reads the same value on every validator.
+    /// s515 review 4 mark: the aggregated oracle price while usable
+    /// ([`OraclePrice::usable`](torus_core::oracle::OraclePrice::usable):
+    /// time-based, stale 60 s of block time after the last fresh aggregate),
+    /// `None` when absent, stale, non-positive or unreadable. Only oracle
+    /// aggregation writes that row, before any action of the block, so every
+    /// placement of a block (single, batch serial, batch sharded) reads the
+    /// same value on every validator.
     fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
-        match self.oracle.get_price(market_id, self.height) {
-            Ok(p) if !p.stale && p.price > FixedPoint::ZERO => Some(p.price),
-            _ => None,
-        }
+        self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable())
     }
 
     fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
@@ -3783,7 +3783,7 @@ impl NativeExecutor {
         let reader = AccountReader {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
-            height: ctx.block_height,
+            now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
         };
 
@@ -5630,7 +5630,7 @@ impl NativeExecutor {
         let reader = AccountReader {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
-            height: ctx.block_height,
+            now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
         };
         let needs_account = !params.reduce_only;
@@ -6816,7 +6816,7 @@ impl NativeExecutor {
         for &market_id in markets {
             match ctx
                 .oracle
-                .aggregate_price(market_id, ctx.block_height, validator_stakes)
+                .aggregate_price(market_id, ctx.block_height, ctx.timestamp, validator_stakes)
             {
                 Ok(_) => results.push(NativeActionResult::ok("oracle_aggregate", 500)),
                 Err(e) => results.push(NativeActionResult::err("oracle_aggregate", e.to_string())),

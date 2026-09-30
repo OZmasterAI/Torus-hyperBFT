@@ -52,7 +52,7 @@ fn test_order_book_reader_with_snapshot() {
     let addr = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = call_data("getOrderBook(bytes32)", &[abi::encode_market_id(market_id)]);
     let caller = Address::ZERO;
-    let result = execute_precompile(&addr, &input, &caller, &h.state_db, 1).unwrap();
+    let result = execute_precompile(&addr, &input, &caller, &h.state_db, 1, 0).unwrap();
 
     // Response: (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
     // Head: 4 offset words, then each array is [length, elements...]
@@ -100,7 +100,7 @@ fn test_order_book_reader_position() {
             abi::encode_market_id(market_id),
         ],
     );
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1).unwrap();
+    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1, 0).unwrap();
 
     // getPosition returns: (int128 size, uint128 entry_price, int128 unrealized, int128 realized, uint128 margin)
     assert_eq!(result.len(), 160, "5 words × 32 bytes");
@@ -133,7 +133,7 @@ fn test_balance_reader() {
 
     let addr = precompile_address(ADDR_BALANCE_READER);
     let input = call_data("getBalances(address)", &[abi::encode_address(&trader)]);
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1).unwrap();
+    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1, 0).unwrap();
 
     // getBalances returns: (uint128 native, uint128 evm, uint128 margin, uint128 available)
     assert_eq!(result.len(), 128, "4 words × 32 bytes");
@@ -162,8 +162,16 @@ fn test_oracle_reader_after_aggregation() {
 
     let addr = precompile_address(ADDR_ORACLE_READER);
     let input = call_data("getPrice(bytes32)", &[abi::encode_market_id(market_id)]);
-    let result =
-        execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, block_number).unwrap();
+    // Same block: age 0 (the harness stamps block h with 1_700_000_000 + h).
+    let result = execute_precompile(
+        &addr,
+        &input,
+        &Address::ZERO,
+        &h.state_db,
+        block_number,
+        1_700_000_000 + block_number,
+    )
+    .unwrap();
 
     // getPrice returns: (uint128 price, uint64 block_number, bool stale)
     assert_eq!(result.len(), 96);
@@ -179,7 +187,7 @@ fn test_oracle_reader_after_aggregation() {
     assert_eq!(stale, 0, "price should not be stale");
 }
 
-/// Oracle price goes stale after DEFAULT_MAX_ORACLE_AGE (100 blocks).
+/// Oracle price goes stale 60 s (block time) after its aggregate.
 #[test]
 fn test_oracle_reader_stale_price() {
     let h = TestHarness::new();
@@ -190,10 +198,12 @@ fn test_oracle_reader_stale_price() {
     let addr = precompile_address(ADDR_ORACLE_READER);
     let input = call_data("getPrice(bytes32)", &[abi::encode_market_id(market_id)]);
 
-    // Query at block 111 (10 + 101 > 100 max age)
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 111).unwrap();
-    let stale = result[95];
-    assert_eq!(stale, 1, "price should be stale after 100 blocks");
+    // Aggregate stamped 1_700_000_010: fresh at age 60, stale at 61.
+    for (now, want) in [(1_700_000_070u64, 0u8), (1_700_000_071, 1)] {
+        let result =
+            execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 11, now).unwrap();
+        assert_eq!(result[95], want, "now {now}");
+    }
 }
 
 // ============================================================================
@@ -227,7 +237,7 @@ fn test_staking_reader_via_delegation() {
     // Query via StakingReader precompile
     let addr = precompile_address(ADDR_STAKING_READER);
     let input = call_data("getStakingInfo(address)", &[abi::encode_address(&staker)]);
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1).unwrap();
+    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1, 0).unwrap();
 
     // getStakingInfo returns: (uint128 delegated, uint128 permanent, uint128 rewards, address validator)
     assert_eq!(result.len(), 128);
@@ -277,7 +287,7 @@ fn test_cross_consistency_order_then_read() {
     // Now read via precompile
     let addr = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = call_data("getOrderBook(bytes32)", &[abi::encode_market_id(market_id)]);
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1).unwrap();
+    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1, 0).unwrap();
 
     // Verify bid count = 1
     let offset0 = u32::from_be_bytes(result[28..32].try_into().unwrap()) as usize;

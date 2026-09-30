@@ -31,6 +31,9 @@ pub struct TorusPrecompiles {
     /// also reverts native side effects.
     journal: NativeStateOverlay,
     current_block: u64,
+    /// The block's header timestamp (seconds) — the clock of the oracle
+    /// staleness rule in 0x0800 / 0x0802 (item 2).
+    current_timestamp: u64,
     /// eth_call / eth_estimateGas simulation: deny state-mutating (writer) precompiles so
     /// a simulation can't durably mutate the shared `StateDb` outside consensus.
     read_only: bool,
@@ -39,8 +42,13 @@ pub struct TorusPrecompiles {
 impl TorusPrecompiles {
     /// Create a provider for real transaction/block execution (writer precompiles enabled,
     /// buffered in `journal` until the executor commits or discards them per tx).
-    pub fn new(spec: SpecId, journal: NativeStateOverlay, current_block: u64) -> Self {
-        Self::with_mode(spec, journal, current_block, false)
+    pub fn new(
+        spec: SpecId,
+        journal: NativeStateOverlay,
+        current_block: u64,
+        current_timestamp: u64,
+    ) -> Self {
+        Self::with_mode(spec, journal, current_block, current_timestamp, false)
     }
 
     /// Create a provider for eth_call / eth_estimateGas simulation, where `read_only`
@@ -49,12 +57,14 @@ impl TorusPrecompiles {
         spec: SpecId,
         journal: NativeStateOverlay,
         current_block: u64,
+        current_timestamp: u64,
         read_only: bool,
     ) -> Self {
         Self {
             eth: EthPrecompiles::new(spec),
             journal,
             current_block,
+            current_timestamp,
             read_only,
         }
     }
@@ -120,6 +130,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &inputs.caller,
                     &self.journal,
                     self.current_block,
+                    self.current_timestamp,
                 )
             } else if !is_reader_precompile(id) && (!inputs.scheme.is_call() || inputs.is_static)
             {
@@ -138,6 +149,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     call_value,
                     &self.journal,
                     self.current_block,
+                    self.current_timestamp,
                 )
             }
         };

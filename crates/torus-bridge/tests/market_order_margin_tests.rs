@@ -474,7 +474,7 @@ fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
     let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
     let agg = ctx
         .oracle
-        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .aggregate_price(market_id, ctx.block_height, ctx.timestamp, &stakes)
         .unwrap();
     assert_eq!(agg, price, "test oracle aggregates to the mark");
 }
@@ -549,7 +549,8 @@ fn market_order_without_oracle_reserves_at_cap() {
     }
 }
 
-/// A STALE oracle price (older than the max oracle age) is no mark either.
+/// A STALE oracle price is no mark either: 61 s (block time) after the
+/// aggregate it is stale.
 #[test]
 fn market_order_with_stale_oracle_reserves_at_cap() {
     for path in PATHS {
@@ -557,7 +558,7 @@ fn market_order_with_stale_oracle_reserves_at_cap() {
         let taker = addr(2);
         let (_d, mut ctx) = fresh(path, &[maker]);
         set_mark(&ctx, 1, fp(100));
-        ctx.block_height += 1_000;
+        ctx.timestamp += 61; // 61 s after the aggregate: stale
         fund_native(&ctx, &taker, fp(60));
         let r = run(&mut ctx, path, &[place(maker, limit(1, false, 100, 10))]);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);

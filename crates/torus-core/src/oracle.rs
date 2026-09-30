@@ -16,16 +16,35 @@ use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, bo
 // Constants
 // ============================================================================
 
-/// Max oracle age in blocks before price is considered stale.
-/// FIX MED-NEW-13: Single source of truth — also used by precompiles.rs.
-pub(crate) const DEFAULT_MAX_ORACLE_AGE: u64 = 100;
+/// Oracle price max age in SECONDS of block (header) time: an aggregate is
+/// usable while `now − its timestamp <= 60`. Single source for precompiles.rs.
+pub(crate) const DEFAULT_MAX_ORACLE_AGE_SECS: u64 = 60;
+/// A validator's latest submission counts while `now − its block ts <= 10`.
+const DEFAULT_ORACLE_WINDOW_SECS: u64 = 10;
 const DEFAULT_MIN_ORACLE_REPORTERS: usize = 3;
+
+/// Most entries one `SubmitOraclePrices` may carry. A valid submission has one
+/// entry per LISTED market (duplicates are rejected), so the cap only has to
+/// exceed the listed-market count (HL lists ~200 perps); it bounds one action's
+/// validation reads and row writes. A feeder with more markets splits them.
+pub const MAX_ORACLE_PRICES_PER_SUBMISSION: usize = 256;
+
+/// Largest accepted oracle price: 10^12 units (raw 10^20). Far above any asset
+/// and small enough that every aggregation sum / product stays far inside i128
+/// (its `FixedPoint` operators panic on overflow).
+pub const MAX_ORACLE_PRICE_RAW: i128 = 1_000_000_000_000 * FixedPoint::SCALE;
+
+/// Accepted range of one oracle price: `0 < price <= MAX_ORACLE_PRICE_RAW`.
+pub fn valid_oracle_price(price: FixedPoint) -> bool {
+    price > FixedPoint::ZERO && price.raw() <= MAX_ORACLE_PRICE_RAW
+}
 
 // ============================================================================
 // Types
 // ============================================================================
 
-/// A single validator's price submission for a market at a given block.
+/// A validator's latest price submission for a market; `block_number` /
+/// `timestamp` are the submitting block's height and header timestamp.
 #[derive(Clone, Debug)]
 pub struct OracleSubmission {
     pub validator: Address,
@@ -73,17 +92,31 @@ impl BorshDeserialize for OracleSubmission {
 #[derive(Clone, Debug)]
 pub struct OraclePrice {
     pub price: FixedPoint,
+    /// Height of the block that wrote the last FRESH aggregate.
     pub block_number: u64,
+    /// `now − timestamp > max_age_secs` (saturating: a future timestamp is age 0).
     pub stale: bool,
     pub num_reporters: usize,
+    /// Block (header) timestamp of the last FRESH aggregate, seconds.
+    pub timestamp: u64,
 }
 
-/// Aggregated price stored in state for quick reads.
+impl OraclePrice {
+    /// The mark rule of every reader: fresh (age <= max age) and > 0.
+    pub fn usable(&self) -> Option<FixedPoint> {
+        (!self.stale && self.price > FixedPoint::ZERO).then_some(self.price)
+    }
+}
+
+/// Aggregated price stored in state for quick reads:
+/// price(16) ‖ block(8) ‖ reporters(4) ‖ timestamp(8) = 36 bytes
+/// (the precompiles decode the same offsets).
 #[derive(Clone, Debug)]
 struct StoredAggregatedPrice {
     price: FixedPoint,
     block_number: u64,
     num_reporters: u32,
+    timestamp: u64,
 }
 
 impl BorshSerialize for StoredAggregatedPrice {
@@ -91,6 +124,7 @@ impl BorshSerialize for StoredAggregatedPrice {
         borsh_write_fp(&self.price, w)?;
         w.write_all(&self.block_number.to_be_bytes())?;
         w.write_all(&self.num_reporters.to_be_bytes())?;
+        w.write_all(&self.timestamp.to_be_bytes())?;
         Ok(())
     }
 }
@@ -104,28 +138,34 @@ impl BorshDeserialize for StoredAggregatedPrice {
         let mut nb = [0u8; 4];
         r.read_exact(&mut nb)?;
         let num_reporters = u32::from_be_bytes(nb);
+        let mut tb = [0u8; 8];
+        r.read_exact(&mut tb)?;
+        let timestamp = u64::from_be_bytes(tb);
         Ok(Self {
             price,
             block_number,
             num_reporters,
+            timestamp,
         })
     }
 }
 
-/// Oracle configuration.
+/// Oracle configuration. Times are seconds of block (header) time.
 #[derive(Clone, Debug)]
 pub struct OracleConfig {
-    pub max_oracle_age: u64,
+    /// Seconds after the last fresh aggregate's block timestamp before it is stale.
+    pub max_age_secs: u64,
     pub min_oracle_reporters: usize,
-    pub aggregation_window: u64,
+    /// Seconds a submission counts after its block timestamp.
+    pub window_secs: u64,
 }
 
 impl Default for OracleConfig {
     fn default() -> Self {
         Self {
-            max_oracle_age: DEFAULT_MAX_ORACLE_AGE,
+            max_age_secs: DEFAULT_MAX_ORACLE_AGE_SECS,
             min_oracle_reporters: DEFAULT_MIN_ORACLE_REPORTERS,
-            aggregation_window: 10,
+            window_secs: DEFAULT_ORACLE_WINDOW_SECS,
         }
     }
 }
@@ -134,13 +174,14 @@ impl Default for OracleConfig {
 // Keys
 // ============================================================================
 
-/// Submission key: "sub" + market_id(8) + validator(20) + block(8) = 39 bytes.
-fn submission_key(market_id: MarketId, validator: &Address, block_number: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(39);
+/// Submission key: "sub" + market_id(8) + validator(20) = 31 bytes — ONE row
+/// per (market, validator): a new submission overwrites, so the row is the
+/// validator's latest.
+fn submission_key(market_id: MarketId, validator: &Address) -> Vec<u8> {
+    let mut key = Vec::with_capacity(31);
     key.extend_from_slice(b"sub");
     key.extend_from_slice(&market_id.to_be_bytes());
     key.extend_from_slice(validator.as_slice());
-    key.extend_from_slice(&block_number.to_be_bytes());
     key
 }
 
@@ -190,24 +231,30 @@ impl<T: StateBackend> OracleManager<T> {
             block_number,
             timestamp,
         };
-        let key = submission_key(market_id, validator, block_number);
+        let key = submission_key(market_id, validator);
         let data = borsh::to_vec(&submission).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
         Ok(())
     }
 
     // 2.8b.2 + 2.8b.4: Aggregate prices using stake-weighted median with outlier rejection.
+    /// `now` is the current block's header timestamp (s). With >= min reporters
+    /// a FRESH aggregate `{price, current_block, reporters, now}` is written;
+    /// otherwise nothing is written and the last aggregate (if not stale) is
+    /// returned — it keeps its timestamp and ages.
     pub fn aggregate_price(
         &self,
         market_id: MarketId,
         current_block: u64,
+        now: u64,
         validator_stakes: &[(Address, FixedPoint)],
     ) -> Result<FixedPoint, CoreError> {
-        let window_start = current_block.saturating_sub(self.config.aggregation_window);
-        let submissions = self.collect_submissions(market_id, window_start, current_block)?;
+        let submissions = self.collect_submissions(market_id, now)?;
 
+        // Item 2: no counting row is "fewer than min reporters" too — keep the
+        // last price (it ages), never an error while that price is usable.
         if submissions.is_empty() {
-            return Err(CoreError::NoOraclePrice(market_id));
+            return self.get_last_valid_price(market_id, now);
         }
 
         // Build (price, stake) pairs — only include validators with known stake
@@ -222,21 +269,21 @@ impl<T: StateBackend> OracleManager<T> {
         }
 
         if price_stake_pairs.is_empty() {
-            return Err(CoreError::NoOraclePrice(market_id));
+            return self.get_last_valid_price(market_id, now);
         }
 
         // 2.8b.4: Outlier rejection
         let filtered = reject_outliers(&price_stake_pairs);
 
         if filtered.len() < self.config.min_oracle_reporters {
-            return self.get_last_valid_price(market_id, current_block);
+            return self.get_last_valid_price(market_id, now);
         }
 
         // FIX 19: Single-reporter safety — bound price change vs last valid price (ECON-PF-18)
         // When only one reporter passes filters, cap deviation at 10% from last known price
         // to prevent a single validator from manipulating the oracle.
         if filtered.len() == 1 {
-            if let Ok(last_price) = self.get_last_valid_price(market_id, current_block) {
+            if let Ok(last_price) = self.get_last_valid_price(market_id, now) {
                 if last_price > FixedPoint::ZERO {
                     let single_price = filtered[0].0;
                     let diff = if single_price > last_price {
@@ -249,7 +296,7 @@ impl<T: StateBackend> OracleManager<T> {
                     let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
                     let max_change = last_price * max_deviation_bps / bps_denom;
                     if diff > max_change {
-                        return self.get_last_valid_price(market_id, current_block);
+                        return self.get_last_valid_price(market_id, now);
                     }
                 }
             }
@@ -262,6 +309,7 @@ impl<T: StateBackend> OracleManager<T> {
             price,
             block_number: current_block,
             num_reporters: filtered.len() as u32,
+            timestamp: now,
         };
         let key = aggregated_price_key(market_id);
         let data = borsh::to_vec(&stored).map_err(|e| CoreError::Borsh(e.to_string()))?;
@@ -271,87 +319,87 @@ impl<T: StateBackend> OracleManager<T> {
     }
 
     // 2.8b.3: Get the current oracle price with staleness detection.
-    pub fn get_price(
+    /// `now` = the reader's block (header) timestamp; stale iff
+    /// `now − aggregate timestamp > max_age_secs` (saturating: age clamps at 0).
+    pub fn get_price(&self, market_id: MarketId, now: u64) -> Result<OraclePrice, CoreError> {
+        let stored = self.stored_aggregate(market_id)?;
+        Ok(OraclePrice {
+            price: stored.price,
+            block_number: stored.block_number,
+            stale: self.is_stale(&stored, now),
+            num_reporters: stored.num_reporters as usize,
+            timestamp: stored.timestamp,
+        })
+    }
+
+    /// Block-start step: delete every submission row (all markets) whose block
+    /// timestamp is more than the window older than `now`, and rows that do not
+    /// decode. Rows are one per (market, validator), so the pass is bounded by
+    /// validators × markets. Errors propagate. Returns the number deleted.
+    pub fn prune_submissions(&self, now: u64) -> Result<usize, CoreError> {
+        let mut pruned = 0;
+        for (key, value) in self.state.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub"))? {
+            let old = match OracleSubmission::try_from_slice(&value) {
+                Ok(sub) => now.saturating_sub(sub.timestamp) > self.config.window_secs,
+                Err(_) => true,
+            };
+            if old {
+                self.state.delete_cf_raw(CF_NATIVE_ORACLE, &key)?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    /// Whether any submission row exists (the block's oracle step is due).
+    pub fn has_submissions(&self) -> Result<bool, CoreError> {
+        Ok(!self.state.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub"))?.is_empty())
+    }
+
+    /// The submissions of `market_id` that count at `now`: decodable, block
+    /// timestamp within the window (`now − ts <= window_secs`, saturating) and
+    /// price in range. Read-only (pruning is [`Self::prune_submissions`]); one
+    /// row per validator, in key order.
+    fn collect_submissions(
         &self,
         market_id: MarketId,
-        current_block: u64,
-    ) -> Result<OraclePrice, CoreError> {
+        now: u64,
+    ) -> Result<Vec<OracleSubmission>, CoreError> {
+        let prefix = submission_market_prefix(market_id);
+        Ok(self
+            .state
+            .iterate_cf(CF_NATIVE_ORACLE, Some(&prefix))?
+            .iter()
+            .filter_map(|(_, value)| OracleSubmission::try_from_slice(value).ok())
+            .filter(|sub| {
+                now.saturating_sub(sub.timestamp) <= self.config.window_secs
+                    && valid_oracle_price(sub.price)
+            })
+            .collect())
+    }
+
+    fn stored_aggregate(&self, market_id: MarketId) -> Result<StoredAggregatedPrice, CoreError> {
         let key = aggregated_price_key(market_id);
         match self.state.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
-            Some(data) => {
-                let stored = StoredAggregatedPrice::try_from_slice(&data)
-                    .map_err(|e| CoreError::Borsh(e.to_string()))?;
-                let stale =
-                    current_block.saturating_sub(stored.block_number) > self.config.max_oracle_age;
-                Ok(OraclePrice {
-                    price: stored.price,
-                    block_number: stored.block_number,
-                    stale,
-                    num_reporters: stored.num_reporters as usize,
-                })
-            }
+            Some(data) => StoredAggregatedPrice::try_from_slice(&data)
+                .map_err(|e| CoreError::Borsh(e.to_string())),
             None => Err(CoreError::NoOraclePrice(market_id)),
         }
     }
 
-    /// Collect all submissions for a market within a block range (latest per validator).
-    /// FIX 17: Also prunes old submissions to prevent unbounded growth (ECON-FIND-18).
-    fn collect_submissions(
-        &self,
-        market_id: MarketId,
-        start_block: u64,
-        end_block: u64,
-    ) -> Result<Vec<OracleSubmission>, CoreError> {
-        let prefix = submission_market_prefix(market_id);
-        let entries = self.state.iterate_cf(CF_NATIVE_ORACLE, Some(&prefix))?;
-
-        let mut latest_per_validator: std::collections::BTreeMap<Address, OracleSubmission> =
-            std::collections::BTreeMap::new();
-        let mut keys_to_prune: Vec<Vec<u8>> = Vec::new();
-
-        for (key, value) in &entries {
-            if let Ok(sub) = OracleSubmission::try_from_slice(value) {
-                if sub.block_number < start_block {
-                    keys_to_prune.push(key.clone());
-                } else if sub.block_number <= end_block {
-                    match latest_per_validator.get(&sub.validator) {
-                        Some(existing) if existing.block_number >= sub.block_number => {}
-                        _ => {
-                            latest_per_validator.insert(sub.validator, sub);
-                        }
-                    }
-                }
-            }
-        }
-
-        let prune_limit = 100;
-        for key in keys_to_prune.iter().take(prune_limit) {
-            let _ = self.state.delete_cf_raw(CF_NATIVE_ORACLE, key);
-        }
-
-        Ok(latest_per_validator.into_values().collect())
+    fn is_stale(&self, stored: &StoredAggregatedPrice, now: u64) -> bool {
+        now.saturating_sub(stored.timestamp) > self.config.max_age_secs
     }
 
     /// AUDIT FIX ECON-FIND-20: `get_last_valid_price` now enforces the same
     /// staleness check as `get_price`. Without this, a price from block 0 could
     /// be returned as if current when used as a fallback in `aggregate_price`.
-    fn get_last_valid_price(
-        &self,
-        market_id: MarketId,
-        current_block: u64,
-    ) -> Result<FixedPoint, CoreError> {
-        let key = aggregated_price_key(market_id);
-        match self.state.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
-            Some(data) => {
-                let stored = StoredAggregatedPrice::try_from_slice(&data)
-                    .map_err(|e| CoreError::Borsh(e.to_string()))?;
-                if current_block.saturating_sub(stored.block_number) > self.config.max_oracle_age {
-                    return Err(CoreError::StaleOraclePrice(market_id));
-                }
-                Ok(stored.price)
-            }
-            None => Err(CoreError::NoOraclePrice(market_id)),
+    fn get_last_valid_price(&self, market_id: MarketId, now: u64) -> Result<FixedPoint, CoreError> {
+        let stored = self.stored_aggregate(market_id)?;
+        if self.is_stale(&stored, now) {
+            return Err(CoreError::StaleOraclePrice(market_id));
         }
+        Ok(stored.price)
     }
 }
 
@@ -374,48 +422,23 @@ fn simple_median(prices: &[FixedPoint]) -> FixedPoint {
     }
 }
 
-/// Mean absolute deviation from median — used instead of std dev to avoid sqrt.
-/// MAD = sum(|x - median|) / n
-fn mean_abs_deviation(prices: &[FixedPoint], median: FixedPoint) -> FixedPoint {
-    if prices.is_empty() {
-        return FixedPoint::ZERO;
-    }
-    let n = FixedPoint::from_raw(prices.len() as i128 * FixedPoint::SCALE);
-    let mut sum = FixedPoint::ZERO;
-    for &p in prices {
-        let diff = p - median;
-        let abs_diff = if diff < FixedPoint::ZERO { -diff } else { diff };
-        sum += abs_diff;
-    }
-    sum / n
-}
-
-/// Reject outliers > 3 * MAD from simple median (robust, no sqrt needed).
+/// Reject outliers: keep x iff |x − median| <= 3 × MAD, MAD = Σ|p − median| / n
+/// (robust, no sqrt) — compared EXACTLY in raw integers as
+/// n·|x − median| <= 3·Σ|p − median| (R9; inputs are bounded by
+/// MAX_ORACLE_PRICE_RAW: no overflow). The FixedPoint form truncated MAD and
+/// cut the boundary case (two equal prices + one other).
 fn reject_outliers(pairs: &[(FixedPoint, FixedPoint)]) -> Vec<(FixedPoint, FixedPoint)> {
     if pairs.len() <= 1 {
         return pairs.to_vec();
     }
-
     let prices: Vec<FixedPoint> = pairs.iter().map(|(p, _)| *p).collect();
-    let med = simple_median(&prices);
-    let mad = mean_abs_deviation(&prices, med);
-
-    // Threshold = 3 * MAD (roughly equivalent to 2 std devs for normal distributions)
-    let three = FixedPoint::from_raw(3 * FixedPoint::SCALE);
-    let threshold = mad * three;
-
-    // If MAD is zero (all same price), keep everything
-    if threshold == FixedPoint::ZERO {
-        return pairs.to_vec();
-    }
-
+    let med = simple_median(&prices).raw();
+    let dev = |p: FixedPoint| (p.raw() - med).abs();
+    let n = prices.len() as i128;
+    let three_sum: i128 = 3 * prices.iter().map(|&p| dev(p)).sum::<i128>();
     pairs
         .iter()
-        .filter(|(price, _)| {
-            let diff = *price - med;
-            let abs_diff = if diff < FixedPoint::ZERO { -diff } else { diff };
-            abs_diff <= threshold
-        })
+        .filter(|(p, _)| n * dev(*p) <= three_sum)
         .cloned()
         .collect()
 }

@@ -114,18 +114,21 @@ impl TestHarness {
             .unwrap();
     }
 
-    /// Write an aggregated oracle price directly to CF_NATIVE_ORACLE.
+    /// Write an aggregated oracle price directly to CF_NATIVE_ORACLE, stamped
+    /// with block `block_number`'s timestamp in this harness
+    /// ([`Self::exec_context`]: `1_700_000_000 + height`).
     pub fn set_oracle_price(&self, market_id: MarketId, price: FixedPoint, block_number: u64) {
         let mut key = Vec::with_capacity(11);
         key.extend_from_slice(b"agg");
         key.extend_from_slice(&market_id.to_be_bytes());
 
-        // Format: price(i128 16 BE) + block_number(u64 8 BE) + timestamp(u64 8 BE) + count(u32 4 BE)
+        // Format (StoredAggregatedPrice): price(i128 16 BE) + block_number(u64 8 BE)
+        // + count(u32 4 BE) + timestamp(u64 8 BE)
         let mut value = Vec::with_capacity(36);
         value.extend_from_slice(&price.raw().to_be_bytes());
         value.extend_from_slice(&block_number.to_be_bytes());
-        value.extend_from_slice(&(1_700_000_000u64 + block_number).to_be_bytes());
         value.extend_from_slice(&1u32.to_be_bytes());
+        value.extend_from_slice(&(1_700_000_000u64 + block_number).to_be_bytes());
 
         self.state_db
             .put_cf_raw(CF_NATIVE_ORACLE, &key, &value)

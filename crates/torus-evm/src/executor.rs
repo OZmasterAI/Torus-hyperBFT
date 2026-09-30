@@ -216,6 +216,7 @@ impl EvmExecutor {
                 SpecId::CANCUN,
                 journal.clone(),
                 block_cfg.number,
+                block_cfg.timestamp,
                 call_mode,
             ));
         // T4.4: run via the inspector path so `NativeJournalInspector` sees every call frame
@@ -285,6 +286,7 @@ impl EvmExecutor {
                 SpecId::CANCUN,
                 journal.clone(),
                 block_cfg.number,
+                block_cfg.timestamp,
             ));
 
         let mut receipts = Vec::with_capacity(transactions.len());
@@ -428,6 +430,7 @@ impl EvmExecutor {
                 SpecId::CANCUN,
                 journal.clone(),
                 block_cfg.number,
+                block_cfg.timestamp,
             ));
 
         let mut receipts = Vec::with_capacity(transactions.len());

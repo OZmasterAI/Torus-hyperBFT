@@ -943,6 +943,21 @@ fn reject_outliers(pairs: &[(FixedPoint, FixedPoint)]) -> Vec<(FixedPoint, Fixed
 
 **validate:** `cargo test -j6 -p torus-core --test oracle_tests && cargo test -j6 -p torus-core --lib oracle::tests && cargo test -j6 -p torus-bridge --test market_order_margin_tests && cargo test -j6 -p torus-bridge --test account_margin_tests && cargo test -j6 -p torus-bridge --test modify_order_tests && cargo check --workspace --all-targets` (+ T8's validate before committing) · depends_on: [1]
 
+**Correction s517 (as implemented):**
+* `aggregate_price`: an EMPTY counting set (no row within 10 s) and "no row from a staked
+  validator" now also take the below-min path (`get_last_valid_price(market, now)`, no write)
+  instead of `Err(NoOraclePrice)` — required by the plan's own
+  `a_submission_counts_for_ten_seconds` (age 11 ⇒ last price); with no prior aggregate it is
+  still `Err` (`aggregate_price_is_read_only_on_submissions`).
+* `get_price` / `get_last_valid_price` share `stored_aggregate` + `is_stale` (one staleness rule).
+* RPC: one helper `RpcState::usable_oracle_price(mid)` (torus.rs) used by `getPosition` and
+  `getMarkPrice`; a missing OR unreadable latest header ⇒ no mark. The existing
+  `get_mark_price_from_oracle` test (lib.rs) now writes the 36-byte row and stores the latest
+  header (it wrote a 28-byte row and no header).
+* RED: compile errors (new API); behavioural RED with the time-based API in place and the old
+  outlier code: `two_equal_prices_and_one_other_keep_all_three` (R9) and
+  `a_submission_counts_for_ten_seconds` (the gap above). oracle_tests adds 9 new tests (not 10).
+
 ### T3 — economics: listed markets (`governance.rs`)
 
 **Test first** — append to `crates/torus-economics/tests/governance_tests.rs`:
@@ -1840,6 +1855,19 @@ fn decode_agg(data: &[u8], now: u64) -> Option<(FixedPoint, u64, bool)> {
   on RPC `eth_call`).
 
 **validate:** `cargo test -j6 -p torus-core --test precompile_tests && cargo test -j6 -p torus-evm && cargo test -j6 -p torus-integration-tests --test cross_vm_read --test cross_vm_write && cargo check --workspace --all-targets` · depends_on: [2] (same commit as T2)
+
+**Correction s517 (as implemented):**
+* Extra test `torus-evm/tests/evm_tests.rs::precompile_oracle_reader_uses_the_block_timestamp`
+  (0x0802 via `execute_tx`: age 60 fresh, 61 stale) — pins that `block_cfg.timestamp` reaches
+  the precompiles; RED with the provider passing a placeholder `0`.
+* `get_oracle_price_fp` returns `StaleOraclePrice` for a stale row, `NoOraclePrice` for
+  absent / short / non-positive.
+* `execute_precompile_inner` has 8 params: `#[allow(clippy::too_many_arguments)]`.
+* Integration harness `set_oracle_price` (`torus-integration-tests/tests/common/mod.rs`) wrote
+  price‖block‖**ts‖count** (36 B, fields swapped — undecodable by `OracleManager`); now the
+  canonical price‖block‖count‖ts. `cross_vm_read` oracle tests pass the harness timestamps
+  (`1_700_000_000 + h`); the stale test checks age 60 / 61. `lockbox_e2e` now sees a usable
+  mark (still green). Other call sites pass `0`.
 
 ### T9 — RPC `getMarkPrice` / `getPosition` staleness tests (implementation landed in T2)
 
