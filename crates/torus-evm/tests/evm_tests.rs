@@ -973,6 +973,407 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// EVM-PF-05: Lockbox precompile (0x0820) vs revm's block-level State cache.
+//
+// Each block below is executed through `execute_block` and then committed with
+// `commit_evm_bundle_incremental` — exactly the consensus commit path
+// (torus-consensus app.rs). Fees are zeroed (base_fee 0, gas_price 0) so value
+// conservation is exact.
+//
+// Pre-fix (RED) the precompile read-modify-wrote the caller's CF_ACCOUNTS record
+// mid-block; revm's cached caller account then overwrote it at bundle commit
+// (deposit minted native value, withdraw destroyed EVM value, and the deposit saw
+// the stale pre-block balance). Post-fix (Hyperliquid model) the precompile never
+// touches CF_ACCOUNTS or native balances: the EVM leg moves through revm's own
+// journal (deposit = payable call, value burned in-frame) and the native leg is a
+// CoreWriter action queued for the next block. The native half of these flows
+// (drain_core_writer) is covered in torus-bridge/tests/lockbox_queue_tests.rs.
+// ---------------------------------------------------------------------------
+
+use torus_core::lockbox::WEI_PER_NATIVE_UNIT;
+use torus_core::precompiles::{QueuedAction, QueuedActionKind};
+
+const LOCKBOX: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x20,
+]);
+
+/// `n` whole native tokens in wei (18 decimals).
+fn tokens_wei(n: u64) -> U256 {
+    U256::from(n) * U256::from(1_000_000_000_000_000_000u128)
+}
+
+fn zero_fee_block_cfg(number: u64) -> BlockEnvCfg {
+    BlockEnvCfg {
+        number,
+        timestamp: 1_000_000 + number,
+        beneficiary: Address::with_last_byte(0xFF),
+        gas_limit: 30_000_000,
+        base_fee: 0,
+    }
+}
+
+fn lockbox_calldata(sig: &str, amount: U256) -> Vec<u8> {
+    let sig_hash = alloy_primitives::keccak256(sig.as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&sig_hash[..4]);
+    calldata.extend_from_slice(&amount.to_be_bytes::<32>());
+    calldata
+}
+
+fn deposit_calldata(wei: U256) -> Vec<u8> {
+    lockbox_calldata("depositToNative(uint128)", wei)
+}
+
+fn withdraw_calldata(wei: U256) -> Vec<u8> {
+    lockbox_calldata("withdrawFromNative(uint128)", wei)
+}
+
+fn call_tx(from: Address, to: Address, data: Vec<u8>, value: U256, nonce: u64) -> TxEnv {
+    TxEnv {
+        caller: from,
+        gas_limit: 1_000_000,
+        gas_price: 0,
+        kind: TxKind::Call(to),
+        value,
+        data: Bytes::from(data),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    }
+}
+
+fn evm_balance(db: &StateDb, who: &Address) -> U256 {
+    db.get_account(who)
+        .unwrap()
+        .map(|a| a.balance)
+        .unwrap_or(U256::ZERO)
+}
+
+fn native_raw(db: &StateDb, who: &Address) -> i128 {
+    torus_core::position::PositionManager::new(db.clone())
+        .get_native_balance(who)
+        .unwrap()
+        .available
+        .raw()
+}
+
+fn seed_native(db: &StateDb, who: &Address, raw: i128) {
+    torus_core::position::PositionManager::new(db.clone())
+        .put_native_balance(
+            who,
+            &torus_core::position::NativeBalance {
+                available: torus_types::FixedPoint::from_raw(raw),
+                order_margin: torus_types::FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+}
+
+/// Actions queued for `block` (non-destructive read of CF_CORE_WRITER_QUEUE).
+fn queued_for(db: &StateDb, block: u64) -> Vec<QueuedAction> {
+    // Drain through a throwaway overlay: the deletes stay in the overlay, the DB
+    // is untouched.
+    CoreWriterQueue::drain(&torus_state::NativeStateOverlay::new(db.clone()), block).unwrap()
+}
+
+/// Net native credit (in wei) still pending in the queue for `block`:
+/// deposits add, withdrawals subtract (they move native value back to EVM).
+fn pending_native_wei(db: &StateDb, block: u64) -> (U256, U256) {
+    let (mut credit, mut debit) = (U256::ZERO, U256::ZERO);
+    for qa in queued_for(db, block) {
+        match qa.kind {
+            QueuedActionKind::LockboxDeposit { amount } => {
+                credit += U256::from(amount.raw() as u128) * U256::from(WEI_PER_NATIVE_UNIT)
+            }
+            QueuedActionKind::LockboxWithdraw { amount } => {
+                debit += U256::from(amount.raw() as u128) * U256::from(WEI_PER_NATIVE_UNIT)
+            }
+            _ => {}
+        }
+    }
+    (credit, debit)
+}
+
+/// Total value in wei: every EVM balance the tests touch + native balances
+/// (scaled ×10^10) + the lockbox address itself (must stay 0 — burned in-frame).
+fn total_wei(db: &StateDb, who: &[Address]) -> U256 {
+    let mut total = U256::ZERO;
+    for a in who {
+        total += evm_balance(db, a);
+        total += U256::from(native_raw(db, a) as u128) * U256::from(WEI_PER_NATIVE_UNIT);
+    }
+    total + evm_balance(db, &LOCKBOX) + evm_balance(db, &Address::with_last_byte(0xFF))
+}
+
+/// Execute `txs` as block `number` and commit the bundle via the consensus
+/// incremental commit path. Returns the receipt statuses.
+fn run_and_commit_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool> {
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let result = executor
+        .execute_block(db, &zero_fee_block_cfg(number), txs, false)
+        .unwrap();
+    torus_state::incremental::commit_evm_bundle_incremental(db, &result.bundle, None).unwrap();
+    result.receipts.iter().map(|r| r.status).collect()
+}
+
+/// Block A: deposit-to-native (payable, with sub-unit dust), THEN an ordinary
+/// transfer by the same caller. revm debits the deposit value like any value
+/// transfer; the value is burned (0x0820 holds nothing); the native credit
+/// floor(value / 10^10) is queued for block 2; the dust is burned.
+#[test]
+fn lockbox_block_a_deposit_then_transfer_conserves_value() {
+    let (_dir, db) = open_test_db();
+    let e0 = tokens_wei(1_000);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let dust = U256::from(1_234_567u64); // < 10^10 wei: burned, not credited
+    let v = tokens_wei(300) + dust;
+    let t = tokens_wei(100);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            call_tx(ALICE, LOCKBOX, deposit_calldata(v), v, 0),
+            transfer_tx(ALICE, BOB, t, 1, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true]);
+
+    assert_eq!(evm_balance(&db, &ALICE), e0 - v - t, "EVM debited for deposit AND transfer");
+    assert_eq!(evm_balance(&db, &BOB), t);
+    assert_eq!(evm_balance(&db, &LOCKBOX), U256::ZERO, "deposit value burned, not held");
+    assert_eq!(native_raw(&db, &ALICE), 0, "native leg is NOT applied mid-block");
+
+    let queued = queued_for(&db, 2);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].trader, ALICE);
+    assert!(matches!(
+        queued[0].kind,
+        QueuedActionKind::LockboxDeposit { amount } if amount.raw() == 300 * 100_000_000
+    ));
+
+    let (credit, _) = pending_native_wei(&db, 2);
+    assert_eq!(
+        total_wei(&db, &parties) + credit + dust,
+        before,
+        "conservation: EVM + native + queued credit + burned dust"
+    );
+}
+
+/// Block B: ALICE receives a transfer, THEN deposits it. The deposit value is
+/// checked by revm against ALICE's in-block balance (no stale CF_ACCOUNTS read).
+#[test]
+fn lockbox_block_b_transfer_in_then_deposit_sees_fresh_balance() {
+    let (_dir, db) = open_test_db();
+    let e0 = tokens_wei(1_000);
+    db.put_account(&BOB, &test_account(e0)).unwrap();
+    db.put_account(&ALICE, &test_account(U256::ZERO)).unwrap();
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let t = tokens_wei(500);
+    let v = tokens_wei(400);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            transfer_tx(BOB, ALICE, t, 0, 0),
+            call_tx(ALICE, LOCKBOX, deposit_calldata(v), v, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true], "deposit of in-block funds must succeed");
+    assert_eq!(evm_balance(&db, &ALICE), t - v);
+    assert_eq!(evm_balance(&db, &LOCKBOX), U256::ZERO);
+    let (credit, _) = pending_native_wei(&db, 2);
+    assert_eq!(credit, v);
+    assert_eq!(total_wei(&db, &parties) + credit, before, "value conservation");
+}
+
+/// Block C: withdraw-from-native, THEN a transfer by the same caller. The
+/// withdraw is queued only — no mid-block CF_ACCOUNTS / native write for revm to
+/// clobber; the native debit + EVM credit happen next block via the drain.
+#[test]
+fn lockbox_block_c_withdraw_then_transfer_conserves_value() {
+    let (_dir, db) = open_test_db();
+    let e0 = tokens_wei(1_000);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+    let n0: i128 = 900 * 100_000_000;
+    seed_native(&db, &ALICE, n0);
+    let parties = [ALICE, BOB];
+    let before = total_wei(&db, &parties);
+
+    let w = tokens_wei(200);
+    let t = tokens_wei(100);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![
+            call_tx(ALICE, LOCKBOX, withdraw_calldata(w), U256::ZERO, 0),
+            transfer_tx(ALICE, BOB, t, 1, 0),
+        ],
+    );
+    assert_eq!(statuses, vec![true, true]);
+    assert_eq!(native_raw(&db, &ALICE), n0, "native debit is deferred to the drain");
+    assert_eq!(evm_balance(&db, &ALICE), e0 - t, "EVM credit is deferred to the drain");
+    let queued = queued_for(&db, 2);
+    assert_eq!(queued.len(), 1);
+    assert!(matches!(
+        queued[0].kind,
+        QueuedActionKind::LockboxWithdraw { amount } if amount.raw() == 200 * 100_000_000
+    ));
+    assert_eq!(total_wei(&db, &parties), before, "nothing moves until the drain");
+}
+
+/// Runtime bytecode that forwards its calldata AND its callvalue to `target`
+/// via CALL, POPs the success flag, then executes `tail` (STOP or REVERT).
+fn forward_with_value_code(target: &Address, tail: &[u8]) -> Vec<u8> {
+    #[rustfmt::skip]
+    let mut code = vec![
+        0x36,             // CALLDATASIZE
+        0x5f, 0x5f,       // PUSH0 PUSH0
+        0x37,             // CALLDATACOPY   mem[0..cds] = calldata
+        0x5f,             // PUSH0          retSize
+        0x5f,             // PUSH0          retOffset
+        0x36,             // CALLDATASIZE   argsSize
+        0x5f,             // PUSH0          argsOffset
+        0x34,             // CALLVALUE      value
+        0x73,             // PUSH20         <target>
+    ];
+    code.extend_from_slice(target.as_slice());
+    #[rustfmt::skip]
+    code.extend_from_slice(&[
+        0x5a,             // GAS
+        0xf1,             // CALL
+        0x50,             // POP
+    ]);
+    code.extend_from_slice(tail);
+    code
+}
+
+/// A deposit made inside a CAUGHT reverted sub-call must neither enqueue nor
+/// lose value: revm returns the wei to the frame that sent it, and the native
+/// journal checkpoint drops the queued credit.
+#[test]
+fn lockbox_deposit_in_reverted_subcall_enqueues_nothing_and_loses_nothing() {
+    let (_dir, db) = open_test_db();
+    let e0 = tokens_wei(1_000);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+
+    // inner: forwards value+calldata to 0x0820, then REVERTs.
+    let inner = Address::new([0xB1; 20]);
+    install_contract(&db, &inner, &forward_with_value_code(&LOCKBOX, &[0x5f, 0x5f, 0xfd]));
+    // outer: forwards value+calldata to inner, swallows its failure, STOPs.
+    let outer = Address::new([0xA1; 20]);
+    install_contract(&db, &outer, &forward_with_value_code(&inner, &[0x00]));
+
+    let parties = [ALICE, inner, outer];
+    let before = total_wei(&db, &parties);
+    let v = tokens_wei(7);
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![call_tx(ALICE, outer, deposit_calldata(v), v, 0)],
+    );
+    assert_eq!(statuses, vec![true], "outer swallows the inner revert");
+
+    assert!(queued_for(&db, 2).is_empty(), "reverted frame must not enqueue");
+    assert_eq!(evm_balance(&db, &ALICE), e0 - v);
+    assert_eq!(evm_balance(&db, &outer), v, "value returned to outer by the inner revert");
+    assert_eq!(evm_balance(&db, &LOCKBOX), U256::ZERO);
+    assert_eq!(total_wei(&db, &parties), before, "no value lost or minted");
+}
+
+/// Wrong-context / malformed lockbox calls revert and leave no trace.
+#[test]
+fn lockbox_rejects_bad_calls_without_side_effects() {
+    let (_dir, db) = open_test_db();
+    let e0 = tokens_wei(1_000);
+    db.put_account(&ALICE, &test_account(e0)).unwrap();
+    seed_native(&db, &ALICE, 50 * 100_000_000);
+
+    let one = tokens_wei(1);
+    let txs = vec![
+        // amount argument must equal msg.value
+        call_tx(ALICE, LOCKBOX, deposit_calldata(one), U256::ZERO, 0),
+        // all-dust deposit would credit nothing: rejected, not burned
+        call_tx(
+            ALICE,
+            LOCKBOX,
+            deposit_calldata(U256::from(WEI_PER_NATIVE_UNIT - 1)),
+            U256::from(WEI_PER_NATIVE_UNIT - 1),
+            1,
+        ),
+        // withdraw is not payable
+        call_tx(ALICE, LOCKBOX, withdraw_calldata(one), one, 2),
+        // withdraw amount must be a whole number of native units (10^10 wei)
+        call_tx(ALICE, LOCKBOX, withdraw_calldata(one + U256::from(1u8)), U256::ZERO, 3),
+        // value sent to a non-payable Torus precompile (CoreWriter) is refused
+        call_tx(
+            ALICE,
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x10]),
+            cancel_order_calldata(1),
+            one,
+            4,
+        ),
+    ];
+    let statuses = run_and_commit_block(&db, 1, txs);
+    assert_eq!(statuses, vec![false; 5], "every bad call reverts");
+    assert_eq!(evm_balance(&db, &ALICE), e0, "reverted value returned");
+    assert_eq!(native_raw(&db, &ALICE), 50 * 100_000_000);
+    assert!(queued_for(&db, 2).is_empty());
+}
+
+/// Runtime bytecode that DELEGATECALLs `target` with its calldata, then STOPs
+/// if the delegatecall succeeded and REVERTs otherwise.
+fn delegatecall_code(target: &Address) -> Vec<u8> {
+    #[rustfmt::skip]
+    let mut code = vec![
+        0x36,             // CALLDATASIZE
+        0x5f, 0x5f,       // PUSH0 PUSH0
+        0x37,             // CALLDATACOPY
+        0x5f,             // PUSH0          retSize
+        0x5f,             // PUSH0          retOffset
+        0x36,             // CALLDATASIZE   argsSize
+        0x5f,             // PUSH0          argsOffset
+        0x73,             // PUSH20         <target>
+    ];
+    code.extend_from_slice(target.as_slice());
+    #[rustfmt::skip]
+    code.extend_from_slice(&[
+        0x5a,             // GAS
+        0xf4,             // DELEGATECALL
+        0x60, 0x25,       // PUSH1 37 (JUMPDEST offset)
+        0x57,             // JUMPI
+        0x5f, 0x5f, 0xfd, // PUSH0 PUSH0 REVERT
+        0x5b,             // JUMPDEST (ok)
+        0x00,             // STOP
+    ]);
+    code
+}
+
+/// DELEGATECALL into 0x0820 would run the lockbox with msg.sender = the EOA
+/// that called the delegating contract (so any contract could move a caller's
+/// native funds); it must revert.
+#[test]
+fn lockbox_rejects_delegatecall() {
+    let (_dir, db) = open_test_db();
+    db.put_account(&ALICE, &test_account(tokens_wei(10))).unwrap();
+    seed_native(&db, &ALICE, 50 * 100_000_000);
+    let proxy = Address::new([0xD1; 20]);
+    install_contract(&db, &proxy, &delegatecall_code(&LOCKBOX));
+
+    let statuses = run_and_commit_block(
+        &db,
+        1,
+        vec![call_tx(ALICE, proxy, withdraw_calldata(tokens_wei(1)), U256::ZERO, 0)],
+    );
+    assert_eq!(statuses, vec![false]);
+    assert!(queued_for(&db, 2).is_empty());
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

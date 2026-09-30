@@ -4,15 +4,17 @@
 //! alongside standard Ethereum ones. Delegates native-state reads/writes to
 //! [`torus_core::precompiles::execute_precompile`].
 
-use revm::context::{Cfg, ContextTr, LocalContextTr};
+use revm::context::{Cfg, ContextTr, JournalTr, LocalContextTr};
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{Address, Bytes};
+use revm::primitives::{Address, Bytes, U256};
 
+use torus_core::error::CoreError;
 use torus_core::precompiles::{
-    execute_precompile, execute_precompile_read_only, is_precompile, precompile_gas,
-    ALL_PRECOMPILE_ADDRESSES,
+    execute_precompile_read_only, execute_precompile_with_value, is_precompile, precompile_gas,
+    ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::NativeStateOverlay;
 
@@ -87,6 +89,15 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
         }
 
+        // Wei revm already moved into this precompile for this frame: only a CALL's
+        // transferred value counts (DELEGATECALL value is apparent, CALLCODE sends to the
+        // caller itself).
+        let call_value = if inputs.target_address == address {
+            inputs.transfer_value().unwrap_or_default()
+        } else {
+            U256::ZERO
+        };
+
         // Resolve calldata (same SharedBuffer / Bytes pattern as EthPrecompiles).
         let result = {
             let r;
@@ -110,15 +121,45 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &self.journal,
                     self.current_block,
                 )
+            } else if id == ADDR_LOCKBOX && (!inputs.scheme.is_call() || inputs.is_static) {
+                // The lockbox acts for msg.sender: a DELEGATECALL / CALLCODE would let any
+                // contract act for ITS caller, and a static context forbids state change.
+                Err(CoreError::InvalidPrecompileInput(
+                    "lockbox requires a plain non-static CALL".into(),
+                ))
             } else {
-                execute_precompile(
+                execute_precompile_with_value(
                     &address,
                     input_bytes,
                     &inputs.caller,
+                    call_value,
                     &self.journal,
                     self.current_block,
                 )
             }
+        };
+
+        // EVM-PF-05 (Hyperliquid model): only an accepted lockbox deposit succeeds with
+        // value (every other precompile/selector rejects it). Its wei is BURNED here, in
+        // the same frame and through revm's journal, so it leaves EVM supply atomically
+        // with the queued native credit, 0x0820 never accumulates a balance, and any
+        // enclosing revert restores it (the queued credit is dropped with that frame).
+        let result = match result {
+            Ok(output) if id == ADDR_LOCKBOX && !call_value.is_zero() => {
+                let burned = context
+                    .journal_mut()
+                    .load_account_mut(address)
+                    .map(|mut acct| acct.data.decr_balance(call_value))
+                    .unwrap_or(false);
+                if burned {
+                    Ok(output)
+                } else {
+                    Err(CoreError::InvalidPrecompileInput(
+                        "lockbox: failed to burn deposit value".into(),
+                    ))
+                }
+            }
+            other => other,
         };
 
         // Build InterpreterResult.
