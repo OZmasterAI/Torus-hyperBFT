@@ -5060,8 +5060,11 @@ impl NativeExecutor {
     ///   orders of) margin it can never use, and since the clamp — hence the
     ///   resting remainder — never exceeds the bound, A5 telescoping stays exact.
     /// - Review 5: an order that never rests ([`never_rests`], reduce-only or
-    ///   not) reserves only for the quantity beyond the pre-batch closing
-    ///   allowance. The book re-derives the closing part at match time from
+    ///   not) reserves only for the quantity beyond the closing allowance
+    ///   still left: the pre-batch allowance for that sender / market / side,
+    ///   used up (in flat order) by EVERY earlier order of the sender on that
+    ///   side, whatever its type — so one allowance never frees two orders.
+    ///   The book re-derives the closing part at match time from
     ///   the position advanced through the batch's earlier fills; if those
     ///   shrank it, the extra opening part is charged against the order's
     ///   budget there (the reservation itself is released whole anyway).
@@ -5074,6 +5077,8 @@ impl NativeExecutor {
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
         let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
         let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
+        let mut closing: HashMap<(Address, MarketId, bool), (Option<FixedPoint>, FixedPoint)> =
+            HashMap::new();
         let mut out = HashMap::new();
         for &(i, sender, params) in orders {
             let book = ctx.order_books.get(&params.market_id);
@@ -5112,12 +5117,21 @@ impl NativeExecutor {
                     .or_insert(FixedPoint::ZERO);
                 *g = sat_add(*g, params.quantity);
             }
+            // `(pre-batch allowance, read lazily; quantity of the sender's
+            // earlier orders on this side)`. Every order on the side, of any
+            // type, uses the allowance up (conservative).
+            let key = (sender, params.market_id, params.is_buy);
+            let (allowance, used) = closing.entry(key).or_insert((None, FixedPoint::ZERO));
             if Self::never_rests(params) {
-                // A read error charges the whole order (conservative).
-                if let Ok(pos) = Self::signed_position(&ctx.positions, &sender, params.market_id) {
-                    qty -= qty.min(reduce_only_allowance(pos, params.is_buy));
-                }
+                // A read error frees nothing — charges whole (conservative).
+                let allowance = *allowance.get_or_insert_with(|| {
+                    Self::signed_position(&ctx.positions, &sender, params.market_id)
+                        .map_or(FixedPoint::ZERO, |pos| reduce_only_allowance(pos, params.is_buy))
+                });
+                let left = (allowance - *used).max(FixedPoint::ZERO);
+                qty -= qty.min(left);
             }
+            *used = sat_add(*used, params.quantity);
             if price != Self::reserve_price(params) || qty != params.quantity {
                 out.insert(i, (price, qty));
             }
@@ -5330,12 +5344,11 @@ impl NativeExecutor {
         // Review 5 (F2): an order that never rests reserves only for what it
         // would open beyond closing the current position (a read error
         // charges it whole — conservative; the book then treats it as flat).
+        if Self::never_rests(params) && ro_pos.is_none() {
+            ro_pos = Self::signed_position(&ctx.positions, sender, market_id).ok();
+        }
         if Self::never_rests(params) {
-            let pos = match ro_pos {
-                Some(pos) => Ok(pos),
-                None => Self::signed_position(&ctx.positions, sender, market_id),
-            };
-            if let Ok(pos) = pos {
+            if let Some(pos) = ro_pos {
                 reserve_qty -= reserve_qty.min(reduce_only_allowance(pos, params.is_buy));
             }
         }
@@ -5415,12 +5428,18 @@ impl NativeExecutor {
         // free at match time (same source and freshness as the policing).
         let track_sender = params.reduce_only || checked;
         if track_sender || book.has_reduce_only_orders() {
-            let ro = Self::reduce_only_positions_for(
+            // The sender's position read above is reused (only the balance
+            // was written since); a failed / skipped read reads it here.
+            let reread = track_sender && ro_pos.is_none();
+            let mut ro = Self::reduce_only_positions_for(
                 &ctx.positions,
                 book,
                 market_id,
-                track_sender.then_some(*sender).into_iter(),
+                reread.then_some(*sender).into_iter(),
             );
+            if let (true, Some(pos)) = (track_sender, ro_pos) {
+                ro.insert(*sender, pos);
+            }
             book.set_reduce_only_positions(ro);
         }
 

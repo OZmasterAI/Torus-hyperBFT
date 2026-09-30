@@ -982,3 +982,96 @@ fn second_closing_order_in_a_batch_sees_the_position_after_the_first() {
         assert_bal(&ctx, &taker, fp(5), fp(95), &format!("{path:?}"));
     }
 }
+
+/// `ps` from `sender` as separate PlaceOrder actions (on `Path::Single`: the
+/// true single-action path, one `execute` each) or as one PlaceOrderBatch.
+fn orders(sender: Address, batched: bool, ps: Vec<PlaceOrderParams>) -> Vec<(Address, NativeAction)> {
+    if batched {
+        vec![(sender, NativeAction::PlaceOrderBatch(ps))]
+    } else {
+        ps.into_iter().map(|p| place(sender, p)).collect()
+    }
+}
+
+/// Every path, each with the orders as separate actions and as one batch.
+const BATCHED_PATHS: [(bool, Path); 6] = [
+    (false, Path::Single),
+    (false, Path::Batch),
+    (false, Path::Parallel),
+    (true, Path::Single),
+    (true, Path::Batch),
+    (true, Path::Parallel),
+];
+
+/// Review 5 follow-up: the pre-batch closing allowance is SHARED by the
+/// sender's orders on that side, not granted to each. Short 20 @100,
+/// available 5, no mark, three market buys of 20 (cap 200) in one batch: the
+/// first closes free, the second and third would each open 20 and reserve
+/// 20 x 200 / 20 = 200 > 5 — rejected, as on the single path. They used to
+/// each reserve 0 with a budget of 5 and open 1 unit apiece (long 2 on 5 of
+/// margin, 40x).
+#[test]
+fn batch_closing_allowance_is_consumed_by_earlier_orders() {
+    for (batched, path) in BATCHED_PATHS {
+        let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+        let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+        open_then_lock(&mut ctx, path, taker, cp, -20, fp(5));
+        run(&mut ctx, path, &[place(maker, limit(1, false, 100, 60))]);
+        let buy = market(1, true, fp(200), 20);
+        let r = run(&mut ctx, path, &orders(taker, batched, vec![buy.clone(), buy.clone(), buy]));
+        let what = format!("{path:?} batched={batched}: {r:?}");
+        let ok: Vec<bool> = r.iter().map(|x| x.success).collect();
+        // A PlaceOrderBatch through `execute` collapses to one summary result.
+        let want = if batched && matches!(path, Path::Single) { vec![false] } else { vec![true, false, false] };
+        assert_eq!(ok, want, "{what}: the 2nd and 3rd buys are rejected");
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: closed, nothing opened");
+        assert_eq!(resting(&ctx, &maker), vec![fp(40)], "{what}: only 20 filled");
+        assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+    }
+}
+
+/// Two closing sells of 10 from long 20 in one batch (mark 100, available
+/// 5): the allowance of 20 covers both, so neither reserves (each would
+/// otherwise need 10 x 100 / 20 = 50).
+#[test]
+fn batch_two_partial_closes_share_the_allowance_free() {
+    for (batched, path) in BATCHED_PATHS {
+        let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+        let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+        open_then_lock(&mut ctx, path, taker, cp, 20, fp(5));
+        set_mark(&ctx, 1, fp(100));
+        run(&mut ctx, path, &[place(maker, limit(1, true, 100, 20))]);
+        let sell = market(1, false, fp(1), 10);
+        let r = run(&mut ctx, path, &orders(taker, batched, vec![sell.clone(), sell]));
+        let what = format!("{path:?} batched={batched}: {r:?}");
+        assert!(r.iter().all(|x| x.success), "{what}");
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: both closed free");
+        assert!(resting(&ctx, &maker).is_empty(), "{what}: bid consumed");
+        assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+    }
+}
+
+/// Closing sell 20 then a second sell 20 from long 20 (mark 100, available
+/// 5): the first uses the whole allowance, so the second is charged in full
+/// at placement (20 x 100 / 20 = 100 > 5) and rejected — as on the single
+/// path. It used to reserve 0 and open 1 unit on its budget of 5.
+#[test]
+fn batch_second_sell_beyond_the_allowance_is_charged() {
+    for (batched, path) in BATCHED_PATHS {
+        let (maker, cp, taker) = (addr(1), addr(3), addr(2));
+        let (_d, mut ctx) = fresh(path, &[maker, cp, taker]);
+        open_then_lock(&mut ctx, path, taker, cp, 20, fp(5));
+        set_mark(&ctx, 1, fp(100));
+        run(&mut ctx, path, &[place(maker, limit(1, true, 100, 40))]);
+        let sell = market(1, false, fp(1), 20);
+        let r = run(&mut ctx, path, &orders(taker, batched, vec![sell.clone(), sell]));
+        let what = format!("{path:?} batched={batched}: {r:?}");
+        let ok: Vec<bool> = r.iter().map(|x| x.success).collect();
+        // A PlaceOrderBatch through `execute` collapses to one summary result.
+        let want = if batched && matches!(path, Path::Single) { vec![false] } else { vec![true, false] };
+        assert_eq!(ok, want, "{what}: the 2nd sell is rejected");
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: closed, nothing opened");
+        assert_eq!(resting(&ctx, &maker), vec![fp(20)], "{what}: only 20 filled");
+        assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+    }
+}
