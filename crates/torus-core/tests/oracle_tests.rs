@@ -384,7 +384,8 @@ fn out_of_range_rows_are_ignored_not_a_panic() {
     }
     mgr.submit_price(&addr(4), 1, FixedPoint::from_raw(i128::MAX), 100, 0).unwrap();
     mgr.submit_price(&addr(5), 1, fp(-5), 100, 0).unwrap();
-    let stakes: Vec<_> = (1..=5u8).map(|v| (addr(v), fp(1))).collect();
+    // v4 / v5 are not counted as reporting: v1..v3 must hold > 2/3 (30 of 32).
+    let stakes: Vec<_> = (1..=5u8).map(|v| (addr(v), fp(if v <= 3 { 10 } else { 1 }))).collect();
     assert_eq!(mgr.aggregate_price(1, 100, 0, &stakes).unwrap(), fp(100));
     assert_eq!(mgr.get_price(1, 0).unwrap().num_reporters, 3);
 }
@@ -438,4 +439,153 @@ fn ages_clamp_at_zero_when_timestamps_run_backwards() {
     let p = mgr.get_price(1, 500).unwrap();
     assert!(!p.stale, "aggregate stamped after now: age 0");
     assert_eq!(p.usable(), Some(fp(100)));
+}
+
+// ============================================================================
+// Stake quorum (review M1): a FRESH aggregate needs >= 3 reporters AND the
+// counted reporters' stake > 2/3 of the Active stake passed in — else the last
+// price is kept (it ages to stale). Counted = window + stake filter AND the
+// outlier cut: the stake that actually sets the median.
+// ============================================================================
+
+fn equal_stakes(n: u8) -> Vec<(Address, FixedPoint)> {
+    (1..=n).map(|v| (addr(v), fp(1))).collect()
+}
+
+/// Validators 1..=n submit `price` at `ts` (block 1); block 2 aggregates at `ts`.
+fn seed_fresh(mgr: &OracleManager, stakes: &[(Address, FixedPoint)], price: i64, ts: u64) {
+    for (a, _) in stakes {
+        mgr.submit_price(a, 1, fp(price), 1, ts).unwrap();
+    }
+    assert_eq!(mgr.aggregate_price(1, 2, ts, stakes).unwrap(), fp(price), "seed");
+    assert_eq!(mgr.get_price(1, ts).unwrap().timestamp, ts);
+}
+
+/// 10 equal: 3 colluders @200 + 2 honest @100 = 50% of stake -> no fresh
+/// price; the last (100, stamped block 2 / ts 1000) is kept.
+#[test]
+fn quorum_three_colluders_and_two_honest_of_ten_is_not_fresh() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    let stakes = equal_stakes(10);
+    seed_fresh(&mgr, &stakes, 100, 1_000);
+    for (v, p) in [(1u8, 200), (2, 200), (3, 200), (4, 100), (5, 100)] {
+        mgr.submit_price(&addr(v), 1, fp(p), 3, 1_020).unwrap();
+    }
+    assert_eq!(mgr.aggregate_price(1, 4, 1_020, &stakes).unwrap(), fp(100), "last price kept");
+    let p = mgr.get_price(1, 1_020).unwrap();
+    assert_eq!((p.price, p.block_number, p.timestamp), (fp(100), 2, 1_000), "not re-stamped");
+}
+
+/// 7 of 10 equal (70% > 2/3) -> fresh.
+#[test]
+fn quorum_seven_of_ten_is_fresh() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    let stakes = equal_stakes(10);
+    seed_fresh(&mgr, &stakes, 100, 1_000);
+    for v in 1..=7u8 {
+        mgr.submit_price(&addr(v), 1, fp(150), 3, 1_020).unwrap();
+    }
+    assert_eq!(mgr.aggregate_price(1, 4, 1_020, &stakes).unwrap(), fp(150));
+    let p = mgr.get_price(1, 1_020).unwrap();
+    assert_eq!((p.block_number, p.timestamp, p.num_reporters), (4, 1_020, 7));
+}
+
+/// Exactly 2/3 is NOT a quorum (strict): 6 of 9 equal; no prior price -> error.
+#[test]
+fn quorum_exactly_two_thirds_is_not_fresh() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    for v in 1..=6u8 {
+        mgr.submit_price(&addr(v), 1, fp(100), 1, 1_000).unwrap();
+    }
+    assert!(mgr.aggregate_price(1, 2, 1_000, &equal_stakes(9)).is_err());
+    assert!(mgr.get_price(1, 1_000).is_err(), "nothing written");
+    mgr.submit_price(&addr(7), 1, fp(100), 1, 1_000).unwrap();
+    assert_eq!(mgr.aggregate_price(1, 2, 1_000, &equal_stakes(9)).unwrap(), fp(100), "7 of 9");
+}
+
+/// Unequal stakes: the quorum is stake, not head count.
+#[test]
+fn quorum_is_stake_weighted_not_head_count() {
+    // 70 / 10 / 10 / 10: three small validators (30%) are not a quorum ...
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    let stakes = vec![(addr(1), fp(70)), (addr(2), fp(10)), (addr(3), fp(10)), (addr(4), fp(10))];
+    for v in 2..=4u8 {
+        mgr.submit_price(&addr(v), 1, fp(100), 1, 1_000).unwrap();
+    }
+    assert!(mgr.aggregate_price(1, 2, 1_000, &stakes).is_err(), "3 reporters, 30% stake");
+    // ... the whale + two small ones (90%) are; the weighted median is the whale's.
+    mgr.submit_price(&addr(1), 1, fp(120), 1, 1_000).unwrap();
+    mgr.submit_price(&addr(4), 1, fp(80), 1, 1_000).unwrap();
+    assert_eq!(mgr.aggregate_price(1, 2, 1_000, &stakes).unwrap(), fp(120));
+
+    // 2 / 2 / 2 / 3 (total 9): {2,2,2} = 6 = exactly 2/3 -> no; {2,2,3} = 7 -> yes.
+    let (_dir2, db2) = setup();
+    let mgr = mgr_on(&db2);
+    let stakes = vec![(addr(1), fp(2)), (addr(2), fp(2)), (addr(3), fp(2)), (addr(4), fp(3))];
+    for v in 1..=3u8 {
+        mgr.submit_price(&addr(v), 1, fp(100), 1, 1_000).unwrap();
+    }
+    assert!(mgr.aggregate_price(1, 2, 1_000, &stakes).is_err(), "6 of 9");
+    let (_dir3, db3) = setup();
+    let mgr = mgr_on(&db3);
+    for v in 2..=4u8 {
+        mgr.submit_price(&addr(v), 1, fp(100), 1, 1_000).unwrap();
+    }
+    assert_eq!(mgr.aggregate_price(1, 2, 1_000, &stakes).unwrap(), fp(100), "7 of 9");
+}
+
+/// Review M1 scenario: honest feeders go down after ts 1000; 3 attackers (30%)
+/// keep submitting the old price every second. Before: 3 reporters re-stamped
+/// the price every block and it never went stale. Now the honest rows count
+/// through ts 1010 (window), so the last fresh stamp is 1010: stale at 1071.
+#[test]
+fn quorum_three_attackers_cannot_keep_a_price_alive() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    let stakes = equal_stakes(10);
+    seed_fresh(&mgr, &stakes, 100, 1_000);
+    for ts in 1_001..=1_100u64 {
+        for v in 1..=3u8 {
+            mgr.submit_price(&addr(v), 1, fp(100), ts, ts).unwrap();
+        }
+        mgr.prune_submissions(ts).unwrap();
+        let _ = mgr.aggregate_price(1, ts + 1, ts, &stakes);
+    }
+    assert_eq!(mgr.get_price(1, 1_070).unwrap().usable(), Some(fp(100)), "age 60");
+    let p = mgr.get_price(1, 1_071).unwrap();
+    assert_eq!((p.usable(), p.timestamp), (None, 1_010), "age 61: stale, not re-stamped");
+}
+
+/// The quorum is measured on the set AFTER the outlier cut. The cut uses the
+/// UNWEIGHTED median, so 7 low-stake attackers (7%) can cut 3 honest whales
+/// (93%) as outliers; counting before the cut would then let 7% set the price.
+#[test]
+fn quorum_is_counted_after_the_outlier_cut() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    let mut stakes: Vec<_> = (1..=7u8).map(|v| (addr(v), fp(1))).collect();
+    stakes.extend((8..=10u8).map(|v| (addr(v), fp(31))));
+    for v in 1..=10u8 {
+        mgr.submit_price(&addr(v), 1, fp(if v <= 7 { 200 } else { 100 }), 1, 1_000).unwrap();
+    }
+    assert!(mgr.aggregate_price(1, 2, 1_000, &stakes).is_err(), "7% after the cut: no price");
+    assert!(mgr.get_price(1, 1_000).is_err(), "nothing written");
+}
+
+/// Liveness side of the same rule: 8 of 10 equal report, one wild -> 7 kept
+/// (70%) -> fresh.
+#[test]
+fn quorum_survives_one_cut_outlier_with_enough_stake_left() {
+    let (_dir, db) = setup();
+    let mgr = mgr_on(&db);
+    for v in 1..=7u8 {
+        mgr.submit_price(&addr(v), 1, fp(100), 1, 1_000).unwrap();
+    }
+    mgr.submit_price(&addr(8), 1, fp(50_000), 1, 1_000).unwrap();
+    assert_eq!(mgr.aggregate_price(1, 2, 1_000, &equal_stakes(10)).unwrap(), fp(100));
+    assert_eq!(mgr.get_price(1, 1_000).unwrap().num_reporters, 7);
 }
