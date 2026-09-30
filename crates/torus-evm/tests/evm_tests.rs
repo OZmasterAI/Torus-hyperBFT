@@ -1396,6 +1396,87 @@ fn lockbox_rejects_delegatecall() {
     assert!(queued_for(&db, 2).is_empty());
 }
 
+/// Runtime bytecode that forwards its calldata to `target` with call-family
+/// `opcode` (CALL 0xf1 / CALLCODE 0xf2 / DELEGATECALL 0xf4, zero value), then
+/// STOPs if the inner call succeeded and REVERTs otherwise.
+fn forwarding_code(target: &Address, opcode: u8) -> Vec<u8> {
+    let with_value = matches!(opcode, 0xf1 | 0xf2);
+    #[rustfmt::skip]
+    let mut code = vec![
+        0x36,             // CALLDATASIZE
+        0x5f, 0x5f,       // PUSH0 PUSH0
+        0x37,             // CALLDATACOPY
+        0x5f,             // PUSH0          retSize
+        0x5f,             // PUSH0          retOffset
+        0x36,             // CALLDATASIZE   argsSize
+        0x5f,             // PUSH0          argsOffset
+    ];
+    if with_value {
+        code.push(0x5f); // PUSH0          value
+    }
+    code.push(0x73); // PUSH20 <target>
+    code.extend_from_slice(target.as_slice());
+    let jumpdest = code.len() as u8 + 8;
+    #[rustfmt::skip]
+    code.extend_from_slice(&[
+        0x5a,             // GAS
+        opcode,
+        0x60, jumpdest,   // PUSH1 <ok>
+        0x57,             // JUMPI
+        0x5f, 0x5f, 0xfd, // PUSH0 PUSH0 REVERT
+        0x5b,             // JUMPDEST (ok)
+        0x00,             // STOP
+    ]);
+    code
+}
+
+/// PRE-EXISTING HIGH (s515 review): every writer precompile acts for
+/// msg.sender, and DELEGATECALL / CALLCODE hand the precompile the ORIGINAL
+/// caller — so any contract a user calls could place/cancel orders or
+/// (un)delegate as that user. Only a plain CALL may reach a writer; a
+/// forwarding contract that CALLs acts as itself.
+#[test]
+fn writer_precompiles_reject_delegatecall_and_callcode() {
+    let writer = |id: u8| {
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, id])
+    };
+    let undelegate = {
+        let sig = alloy_primitives::keccak256("undelegate(address,uint128)".as_bytes());
+        let mut data = sig[..4].to_vec();
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(Address::with_last_byte(0x77).as_slice());
+        data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+        data
+    };
+    let cases = [
+        ("CoreWriter 0x0810", writer(0x10), cancel_order_calldata(7)),
+        ("CoreWriterStaking 0x0811", writer(0x11), undelegate),
+    ];
+    for (name, target, data) in cases {
+        for (opcode, op_name, ok) in [(0xf4, "DELEGATECALL", false), (0xf2, "CALLCODE", false), (0xf1, "CALL", true)] {
+            let (_dir, db) = open_test_db();
+            db.put_account(&ALICE, &test_account(tokens_wei(10))).unwrap();
+            let proxy = Address::new([0xD2; 20]);
+            install_contract(&db, &proxy, &forwarding_code(&target, opcode));
+
+            let statuses = run_and_commit_block(
+                &db,
+                1,
+                vec![call_tx(ALICE, proxy, data.clone(), U256::ZERO, 0)],
+            );
+            let queued = queued_for(&db, 2);
+            if ok {
+                assert_eq!(statuses, vec![true], "{name} via {op_name} must work");
+                assert_eq!(queued.len(), 1, "{name} via {op_name}: one queued action");
+                assert_eq!(queued[0].trader, proxy, "{name}: a CALL acts as the contract");
+            } else {
+                assert_eq!(statuses, vec![false], "{name} via {op_name} must revert");
+                assert!(queued.is_empty(), "{name} via {op_name}: nothing queued as ALICE");
+            }
+        }
+    }
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

@@ -13,8 +13,8 @@ use revm::primitives::{Address, Bytes, U256};
 
 use torus_core::error::CoreError;
 use torus_core::precompiles::{
-    execute_precompile_read_only, execute_precompile_with_value, is_precompile, precompile_gas,
-    ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
+    execute_precompile_read_only, execute_precompile_with_value, is_precompile,
+    is_reader_precompile, precompile_gas, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::NativeStateOverlay;
 
@@ -121,11 +121,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &self.journal,
                     self.current_block,
                 )
-            } else if id == ADDR_LOCKBOX && (!inputs.scheme.is_call() || inputs.is_static) {
-                // The lockbox acts for msg.sender: a DELEGATECALL / CALLCODE would let any
-                // contract act for ITS caller, and a static context forbids state change.
+            } else if !is_reader_precompile(id) && (!inputs.scheme.is_call() || inputs.is_static)
+            {
+                // Every writer (CoreWriter 0x0810, CoreWriterStaking 0x0811, Lockbox 0x0820)
+                // acts for msg.sender: a DELEGATECALL / CALLCODE hands it the ORIGINAL caller,
+                // so any contract a user calls could trade / (un)delegate / move funds as
+                // that user; a static context forbids state change. Readers stay callable.
                 Err(CoreError::InvalidPrecompileInput(
-                    "lockbox requires a plain non-static CALL".into(),
+                    "writer precompile requires a plain non-static CALL".into(),
                 ))
             } else {
                 execute_precompile_with_value(
