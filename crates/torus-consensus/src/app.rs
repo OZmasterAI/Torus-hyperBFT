@@ -605,6 +605,10 @@ struct ExecutionContext {
     /// flush that a hard crash can hit.
     #[cfg(test)]
     test_crash_after_evm_commit: bool,
+    /// Test-only (s515 review 3): make the incremental EVM commit fail so the
+    /// block takes the `commit_pending_bundle` fallback.
+    #[cfg(test)]
+    test_force_incremental_commit_fail: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -631,26 +635,63 @@ fn write_native_applied_height(state_db: &StateDb, height: u64) {
     );
 }
 
-/// s515 F1: `(height, fee revenue)` of the last block whose EVM bundle is
-/// committed (`META_EVM_APPLIED`, written in the bundle's own batch).
-fn read_evm_applied(state_db: &StateDb) -> Option<(u64, u128)> {
+/// s515 F1: the last block whose EVM bundle is committed (`META_EVM_APPLIED`,
+/// written in the bundle's own batch).
+struct EvmApplied {
+    height: u64,
+    fee_revenue: u128,
+    /// s515 review 3: `Some(bundle accounts)` when the bundle committed through
+    /// the `commit_pending_bundle` fallback, which writes no CF_HASHED_* /
+    /// CF_TRIE_* rows — they must be re-synced for these accounts.
+    fallback_accounts: Option<Vec<Address>>,
+}
+
+/// `META_EVM_APPLIED` flag byte (offset 24): fallback commit; the record then
+/// ends with the bundle's account addresses (20 bytes each).
+const EVM_APPLIED_FALLBACK: u8 = 0x01;
+
+/// Record layout: height (8 BE) ‖ fee revenue (16 BE) [‖ flags (1) ‖ addresses
+/// (20 each)]. The legacy / normal-commit record is the bare 24 bytes.
+fn read_evm_applied(state_db: &StateDb) -> Option<EvmApplied> {
     let data = state_db
         .get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED)
         .ok()
         .flatten()?;
-    if data.len() != 24 {
+    if data.len() < 24 {
         return None;
     }
-    Some((
-        u64::from_be_bytes(data[..8].try_into().ok()?),
-        u128::from_be_bytes(data[8..].try_into().ok()?),
-    ))
+    let fallback_accounts = match data.get(24) {
+        None => None,
+        Some(&flags) => {
+            let rest = &data[25..];
+            if rest.len() % 20 != 0 {
+                return None;
+            }
+            (flags & EVM_APPLIED_FALLBACK != 0)
+                .then(|| rest.chunks_exact(20).map(Address::from_slice).collect())
+        }
+    };
+    Some(EvmApplied {
+        height: u64::from_be_bytes(data[..8].try_into().ok()?),
+        fee_revenue: u128::from_be_bytes(data[8..24].try_into().ok()?),
+        fallback_accounts,
+    })
 }
 
 fn evm_applied_record(height: u64, fee_revenue: u128) -> [u8; 24] {
     let mut rec = [0u8; 24];
     rec[..8].copy_from_slice(&height.to_be_bytes());
     rec[8..].copy_from_slice(&fee_revenue.to_be_bytes());
+    rec
+}
+
+fn evm_applied_fallback_record(height: u64, fee_revenue: u128, accounts: &[Address]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(25 + 20 * accounts.len());
+    rec.extend_from_slice(&evm_applied_record(height, fee_revenue));
+    rec.push(EVM_APPLIED_FALLBACK);
+    for a in accounts {
+        rec.extend_from_slice(a.as_slice());
+    }
     rec
 }
 
@@ -1621,27 +1662,38 @@ impl ExecutionContext {
             None
         };
         match evm_applied {
-            Some((applied, _)) if applied > height => {
+            Some(applied) if applied.height > height => {
                 // A later block's EVM is durable while this height's native phase
                 // is not: this height's fee revenue is gone and re-executing its
                 // EVM would double-apply it. Unrecoverable locally — fail-stop.
                 tracing::error!(
                     height,
-                    evm_applied = applied,
+                    evm_applied = applied.height,
                     "FATAL: EVM-applied marker is ahead of the block being executed — refusing \
                      to re-execute its EVM txs (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
                 return;
             }
-            Some((applied, fee_revenue)) if applied == height => {
+            Some(applied) if applied.height == height => {
                 tracing::warn!(
                     height,
-                    fee_revenue,
+                    fee_revenue = applied.fee_revenue,
                     "crash recovery: EVM bundle already committed for this height — skipping \
                      EVM re-execution, replaying the native phase from the persisted marker"
                 );
-                computed_fee_revenue = fee_revenue;
+                computed_fee_revenue = applied.fee_revenue;
+                // s515 review 3: the fallback commit wrote no CF_HASHED_* /
+                // CF_TRIE_* rows and the crash may have hit before its resync;
+                // the skipped bundle cannot feed the dirty list, so re-sync the
+                // accounts the marker recorded (no-op for those already synced).
+                if let Some(accounts) = applied.fallback_accounts {
+                    if let Err(e) =
+                        torus_state::incremental::resync_evm_accounts(&self.state_db, &accounts)
+                    {
+                        tracing::error!(%e, height, "failed to resync incremental trie after fallback EVM commit (replay)");
+                    }
+                }
             }
             _ if has_evm => match self.validator.validate_block_for_catchup(
                 torus_block,
@@ -1686,21 +1738,59 @@ impl ExecutionContext {
                     // re-executes the block's EVM on replay against the unchanged base;
                     // a crash after it skips EVM on replay (marker above). Exactly one
                     // credit either way.
-                    match torus_state::incremental::commit_evm_block_incremental(
-                        &self.state_db,
-                        &validated.bundle,
-                        precomputed_root,
-                        Some(&validated.native_writes),
-                    ) {
+                    #[cfg(test)]
+                    let force_fallback = self.test_force_incremental_commit_fail;
+                    #[cfg(not(test))]
+                    let force_fallback = false;
+                    let incremental = if force_fallback {
+                        Err(torus_state::StateError::InvalidData(
+                            "test: forced incremental commit failure".into(),
+                        ))
+                    } else {
+                        torus_state::incremental::commit_evm_block_incremental(
+                            &self.state_db,
+                            &validated.bundle,
+                            precomputed_root,
+                            Some(&validated.native_writes),
+                        )
+                    };
+                    match incremental {
                         Ok(_root) => {}
                         Err(e) => {
                             tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
-                            if let Err(e2) = BlockCommitter::commit_pending_bundle(
+                            // s515 review 3: the fallback writes no hashed-mirror /
+                            // trie rows. Flag the marker with the bundle's accounts
+                            // (same batch) so an EVM-skipped replay re-syncs them.
+                            let mut accounts: Vec<Address> =
+                                validated.bundle.state.keys().copied().collect();
+                            accounts.sort_unstable();
+                            if let Err(e) = validated.native_writes.put_cf_raw(
+                                CF_CONSENSUS_META,
+                                META_EVM_APPLIED,
+                                &evm_applied_fallback_record(height, computed_fee_revenue, &accounts),
+                            ) {
+                                tracing::error!(%e, height, "FATAL: failed to stage the EVM-applied marker — refusing to commit the block without it (fail-stop)");
+                                self.exec_failed.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                            match BlockCommitter::commit_pending_bundle(
                                 &self.state_db,
                                 &validated.bundle,
                                 Some(&validated.native_writes),
                             ) {
-                                tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
+                                Err(e2) => {
+                                    tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
+                                }
+                                // Re-sync now: a block with no native phase never
+                                // reaches the post-flush resync below.
+                                Ok(()) => {
+                                    if let Err(e) = torus_state::incremental::resync_evm_accounts(
+                                        &self.state_db,
+                                        &accounts,
+                                    ) {
+                                        tracing::error!(%e, height, "failed to resync incremental trie after fallback EVM commit");
+                                    }
+                                }
                             }
                         }
                     }
@@ -3449,6 +3539,8 @@ impl TorusApp {
             test_book_mode: None,
             #[cfg(test)]
             test_crash_after_evm_commit: false,
+            #[cfg(test)]
+            test_force_incremental_commit_fail: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -10005,6 +10097,8 @@ mod crash_recovery_tests {
             test_book_mode: None,
             #[cfg(test)]
             test_crash_after_evm_commit: false,
+            #[cfg(test)]
+            test_force_incremental_commit_fail: false,
         }
     }
 
@@ -13352,11 +13446,18 @@ mod crash_recovery_tests {
     /// commit and a restart (`TorusApp::new` boot replay) re-runs it. Returns the
     /// full post-state dump.
     fn f1_run(txs: Vec<Vec<u8>>, crash: bool) -> (Vec<CfDump>, StateDb) {
+        f1_run_with(txs, crash, false)
+    }
+
+    /// [`f1_run`]; with `fallback`, block 1's EVM commits through the
+    /// `commit_pending_bundle` fallback (incremental commit forced to fail).
+    fn f1_run_with(txs: Vec<Vec<u8>>, crash: bool, fallback: bool) -> (Vec<CfDump>, StateDb) {
         let (config, db) = f1_config();
         let [b1, b2] = f1_blocks(txs);
         drop(TorusApp::new(db.clone(), &config, None, None, None));
         let mut ctx = make_exec_ctx(&config, &db);
         ctx.test_crash_after_evm_commit = crash;
+        ctx.test_force_incremental_commit_fail = fallback;
         ctx.execute_committed_block(&b1, vec![]);
         drop(ctx);
         if crash {
@@ -13440,5 +13541,29 @@ mod crash_recovery_tests {
         assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
         drop(ctx);
         assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing executed");
+    }
+
+    /// s515 review 3 (item 2): the `commit_pending_bundle` fallback writes no
+    /// hashed-mirror / trie rows; the bundle's accounts are re-synced into
+    /// CF_HASHED_* / CF_TRIE_*. A crash after the fallback commit must still
+    /// get them re-synced on the EVM-skipped replay (the bundle is not
+    /// re-executed, so it cannot feed the dirty list).
+    #[test]
+    fn r3_fallback_commit_crash_replay_resyncs_incremental_trie() {
+        let bob = Address::with_last_byte(0xB0);
+        let wei = U256::from(5u64) * U256::from(1_000_000_000_000_000_000u128);
+        let txs = || vec![f1_transfer(bob, wei, 0)];
+        let (reference, ref_db) = f1_run_with(txs(), false, true);
+        let (crashed, crash_db) = f1_run_with(txs(), true, true);
+        for (db, what) in [(&ref_db, "never-crashed"), (&crash_db, "crash-replayed")] {
+            let (incremental, _) = torus_state::incremental::incremental_evm_root(
+                db,
+                &BundleState::default(),
+            )
+            .unwrap();
+            let full = torus_state::trie::compute_state_root_from_db(db).unwrap();
+            assert_eq!(incremental, full, "{what}: incremental trie tracks the full scan");
+        }
+        assert_dumps_equal(&reference, &crashed, "crash-replayed vs never-crashed (fallback)");
     }
 }
