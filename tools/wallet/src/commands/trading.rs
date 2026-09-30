@@ -53,6 +53,17 @@ pub(crate) async fn cmd_place_order(
             ))
         }
     };
+    // Mirrors the executor (s515): a market order is an aggressive IOC limit,
+    // so its price is the worst acceptable fill price and must be positive.
+    if matches!(order_type_enum, OrderType::Market | OrderType::StopMarket { .. })
+        && price_fp <= torus_types::FixedPoint::ZERO
+    {
+        return Err(
+            "--price is required for market / stop-market orders: it is the slippage cap \
+             (worst acceptable price) and must be > 0"
+                .to_string(),
+        );
+    }
 
     let tif_enum = match tif.to_lowercase().as_str() {
         "gtc" => TimeInForce::GTC,
