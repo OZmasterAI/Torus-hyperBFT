@@ -1,13 +1,14 @@
 # Hyperliquid-parity audit fixes (s515) — client & deploy notes
 
 Branch `fix/parity-audit-bugs`. Consensus-visible: every change below alters
-executor output, so all validators must run the same build.
+executor output, so all validators must run the same build. The oracle, epoch
+and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
 
 ## Client-visible behaviour / ABI
 
 | Bug | Change |
 |-----|--------|
-| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it and the unfilled remainder is cancelled. **Margin (Hyperliquid-style, review 4):** a market order (buy or sell; a triggered stop-market is placed as one at trigger time) reserves `qty × mark price / tiered max leverage` — the limit-order formula at the **mark** (the oracle's aggregated stake-weighted price for the market). With no usable oracle price (none, stale, `<= 0`) it reserves at its **cap** — today always the case in production (nothing in block execution aggregates oracle prices, see *Known deferred items*). **Review 5:** only the quantity beyond what closes the sender's opposite-side position is reserved (see *closing needs no margin*). Nothing else in the block or batch moves that reservation. Its whole reservation is released after matching. A pending stop-market still holds `reserve(cap, qty)` until it fires. A price × qty that overflows is rejected (no panic). |
+| 1 — market orders | `Market` / `StopMarket` `price` is a **required** worst-acceptable-price cap (`<= 0` rejected); the book never matches past it and the unfilled remainder is cancelled. **Margin (Hyperliquid-style, review 4):** a market order (buy or sell; a triggered stop-market is placed as one at trigger time) reserves `qty × mark price / tiered max leverage` — the limit-order formula at the **mark** (the oracle's aggregated stake-weighted price for the market). With no usable oracle price (none, stale, `<= 0`) it reserves at its **cap** — today always the case in production (block execution aggregates every block, but no price feeder submits prices, see *Known deferred items*). **Review 5:** only the quantity beyond what closes the sender's opposite-side position is reserved (see *closing needs no margin*). Nothing else in the block or batch moves that reservation. Its whole reservation is released after matching. A pending stop-market still holds `reserve(cap, qty)` until it fires. A price × qty that overflows is rejected (no panic). |
 | match-time margin (review 4, F1 s517) | Margin is checked **again as the order matches** (Hyperliquid: "when orders are placed and again when they match"), **account-level** (F1). **Takers** whose fills can cost more than they reserved — market buys / sells, **limit sells**, IOC / FOK limit buys — are checked before each fill: the **increase of the position's initial margin at the position-size tier** (the position valued at the mark, entry price without one; the closing part releases its IM; plus, for a GTC limit, the part of its unfilled rest that would OPEN, at its limit) must fit the order's reservation + the sender's **running free margin** in that book. Batch: a sender's free margin after all its Phase-2 reservations (minus what its unchecked orders committed beyond their reservations, see *Placement gate*) is an **exclusive** pool of the market of its first checked taker (flat order) — its other markets start at 0 — so no two market workers spend the same free margin; in that book its takers share the pool as a running budget, credited by their closing fills. A fill that does not fit is cut to the largest lot multiple that does, then filling stops and the rest is cancelled (never rests); a FOK order whose complete fill does not fit is rejected whole. **Makers** are checked too (HL `marginCanceled`, see *Makers*). Reduce-only orders are exempt; GTC / PostOnly limit **buys** are not re-checked at match (they fill at or below their limit; their account cost is enforced at placement). |
 | closing needs no margin (review 5, F2; F1 s517) | Hyperliquid never charges margin to reduce a position. **Match time:** the part of a checked taker's fills that reduces the sender's opposite-side position is free and **releases that position's initial margin** (F1), so a flip is charged only the net IM change; a purely closing fill always fits, even for an under-margined account. The **resting** part of a GTC order that would only close is not charged at match either. The position is the one reduce-only policing uses — read at placement (single path) or when the batch's matching starts, then advanced through every fill of the block in that market — so all three paths free the same quantity (e.g. long 20, two market sells of 20 in one batch: the first closes free, the second opens 1 unit on the IM its predecessor released). **Placement:** an order that cannot rest (market, IOC / FOK limit — reduce-only or not) reserves only for its quantity beyond the closing allowance of the current position (single path) / the pre-batch position (batch), running per sender / market / side across the batch's orders so one allowance never frees two orders. Its whole reservation is released after matching. A GTC / PostOnly order still **reserves** its full quantity at placement (a resting row's reservation is `price × remaining` for every later release), but its account check (see *Placement gate*) charges only what it would open, and under strict HL that reservation no longer needs free cash. Example: long 20 @100, 95 of 100 locked in resting orders, plain market sell 20 → all 20 fill. |
 | leverage tiers at match time (review 5, F4) | Fills and the GTC hold are one notional charged at that notional's tier (they were charged apart, each at its own lower tier, which undercharged across a tier boundary). The need is monotone in the fill size, so the "largest lot multiple that fits" search is exact. |
@@ -22,6 +23,10 @@ executor output, so all validators must run the same build.
 | 4 — listing | `ListMarket` / `DelistMarket` / `UpdateMarketParams` native actions now error ("governance-only"). Listings go through governance; the market id is `max(existing) + 1`, assigned at proposal **execution**. |
 | 5/6 — lockbox 0x0820 | Native amounts are 8-dec, EVM is 18-dec wei: native→EVM ×10^10; EVM→native floors ÷10^10 and burns the dust. `depositToNative(uint128)` is **payable** and requires `msg.value == arg`; the value is burned in-frame and the native credit is queued for the **next block**. `withdrawFromNative(uint128)` is non-payable, takes a multiple of 10^10 wei, and is also applied next block. Queue rows now commit atomically with the block's EVM bundle (F1). This branch first added a node-local EVM-applied marker (`cf_consensus_meta` / `evm_applied_block`) so crash replay could skip a committed block's EVM txs; that marker was superseded by main's one-flush-batch EVM commit (93d4fff): the bundle, its queue rows, the native phase and the applied-height marker land in ONE write, so after a crash the whole block replays from its parent state and a tx skipped the first time (e.g. nonce too high) can never execute on replay. |
 | writer precompiles | DELEGATECALL / CALLCODE / STATICCALL to any writer precompile (CoreWriter 0x0810, CoreWriterStaking 0x0811, Lockbox 0x0820) reverts — they act for `msg.sender`, so only a plain CALL is accepted. Readers 0x0800–0x0803 stay callable any way. |
+| Oracle submissions (s517 T3/T4) | `SubmitOraclePrices` is validated as a whole before anything is written (all-or-nothing): sender an Active validator (as before), 1..=256 entries (`MAX_ORACLE_PRICES_PER_SUBMISSION`), no repeated market, market listed (governance), `0 < price <= 10^12` units. One row per (market, validator): a new submission overwrites the validator's previous one. |
+| Oracle aggregation / mark (s517 T2, T5–T7) | Runs at the **start of every block**, before any action (`begin_block_oracle`): prune, then aggregate every listed market (ascending); the whole block reads one mark, and a submission of block h counts from block h+1. Time-based on the block header timestamp: a validator's latest submission counts while `<= 10 s` old; **min 3 reporters** (Active validators, whole-token stake weight), 3×MAD outlier cut (exact integers), **stake-weighted median**. Fewer than 3 ⇒ the last aggregate is kept and ages. **Usable** (one rule for every reader) iff it exists, `price > 0` and it is `<= 60 s` older than the block's timestamp. Readers: `AccountReader::mark` / market-order reservation, precompiles 0x0802 (stale flag) and 0x0800 (position UPnL), RPC `torus_getMarkPrice` (stale ⇒ `markPrice = indexPrice = 0`, `timestamp 0`) and `torus_getPosition` (stale ⇒ UPnL at entry price) — "now" is the latest committed header's timestamp. ABIs unchanged. Per-market errors never abort the block; a storage fault fail-stops. The native phase also runs while submission rows exist, so an idle chain still aggregates. |
+| Epoch processing (s517 T0) | Runs on **every** epoch-boundary block. It lived in the native phase, which an empty block skipped, so an empty boundary block ran no epoch (no rewards / inflation, no validator status changes). Empty non-boundary blocks are unchanged. |
+| Block timestamps (s517 T0b/T1) | Body validation (`validate_block` → `finish_validate`) rejects a proposal whose timestamp is below its parent's or more than **5 s** ahead of the local clock (`MAX_BLOCK_TIMESTAMP_DRIFT_SECS`); the proposer uses `max(now, parent.ts)`. Not applied on block sync, to blocks at or below the committed height, in execution or in replay. Every execution path reads the committed header timestamp. **Validators need NTP-synced clocks** (a node more than 5 s behind rejects valid proposals). Replicas vote on the header **before** body validation (pre-existing), so a bad timestamp is never executed but can stall, and committed history can still hold one; oracle ages clamp at 0. |
 
 ## Deployment requirements
 
@@ -61,6 +66,14 @@ executor output, so all validators must run the same build.
     is active) is not on this branch: the plain fallback still writes no
     `CF_HASHED_*` / `CF_TRIE_*` rows, so after a fallback the incremental trie
     can lag the full scan (open item).
+* Oracle (s517, `feat/oracle-aggregation`) — **lockstep**: aggregation at every
+  block start writes the native root, and the epoch, timestamp and submission
+  rules change which blocks and actions are valid; a mixed set forks.
+  **Fresh genesis semantics** for the changed `CF_NATIVE_ORACLE` row layouts:
+  submissions are keyed `"sub"‖market‖validator` (31 bytes, was 39 with the
+  block number) and the aggregate row is 36 bytes (a timestamp appended to the
+  28-byte row). Old rows are not migrated: old submission rows are never
+  overwritten, and a 28-byte aggregate does not decode as usable.
 
 ## Known deferred items (not fixed on this branch)
 
@@ -96,14 +109,23 @@ executor output, so all validators must run the same build.
   exceed collateral: `available < 0` with no UPnL behind it is **bad debt**.
   `ctx.margin_configs` is also never populated in production (every market
   uses the flat 20x default).
-* **Mark price in production (next item: wire oracle aggregation into block
-  execution).** The oracle stores validator submissions, but nothing in
-  block execution runs the aggregation (`aggregate_oracle_prices` has no
-  caller). So no market has a mark: every market order reserves at its cap
-  (buys conservatively, sells at ~0 — the match-time check is their real
-  bound), and F1 values every position at its **entry price** (UPnL 0), so
-  unrealized profit funds nothing and unrealized losses are not charged
-  until the mark exists.
+* **Mark price in production — aggregation fixed on `feat/oracle-aggregation`
+  (s517).** Time-based (a submission counts 10 s, the aggregate is stale 60 s
+  after the last fresh one), stake-weighted median, min 3 reporters,
+  aggregation at every block start, submission hardening (see *Oracle
+  aggregation / mark*, *Oracle submissions*). **Still deferred:**
+  * no price feeder exists (item B, `docs/plans/oracle-aggregation.md`):
+    nothing submits `SubmitOraclePrices` in production, so no market has a
+    mark yet — market orders reserve at their cap (sells at ~0 — the
+    match-time check is their real bound) and F1 values positions at their
+    **entry price** (UPnL 0). On a 3-validator net all three must submit
+    for the price to stay fresh;
+  * mark = oracle aggregate, not the Hyperliquid mark formula (item C).
+* **Validate before voting (CometBFT-style), consensus item.** Replicas vote
+  on a proposal's header before its body is validated (incl. the timestamp
+  rule, see *Block timestamps*). A bad block is never executed, but it can
+  gather votes and stall the round, and committed history can hold an
+  out-of-range timestamp. Move validity checks before the vote.
 * **F3 — B2 fail-stop scope.** B2 (the fallback commit would write contract
   storage while the incremental root is active — it is ON by default) is
   node-local in practice: a deterministic trie error fails block validation

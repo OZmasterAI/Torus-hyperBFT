@@ -1,5 +1,13 @@
 # Design: Oracle aggregation into block execution (item 2)
 
+**Status (s517):** option A implemented on `feat/oracle-aggregation`
+(4893393..b7a8080 + T9 RPC tests; plan rev. 2 in
+`docs/plans/oracle-aggregation-impl.md`): epoch processing on every boundary
+block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
+60 s (T2/T8), submission hardening (T3/T4), block-start aggregation (T5–T7).
+Not merged / pushed. Next: liquidation, then B (feeder),
+then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
+
 Branch `fix/parity-audit-bugs` (s517), after F1 (`3e9365e`). Liquidation (item 3)
 depends on this.
 
