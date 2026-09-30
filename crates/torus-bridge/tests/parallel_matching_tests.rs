@@ -331,6 +331,7 @@ fn worker_pool_single_market_no_thread_overhead() {
         sender: addr(1),
         params: &buy,
         order_id: 1,
+        margin: None,
     }];
 
     let mut batches = HashMap::new();
@@ -356,6 +357,7 @@ fn worker_pool_multiple_markets_parallel() {
         sender: addr(1),
         params: &buy1,
         order_id: 100,
+        margin: None,
     }];
 
     // Market 2: buy only → rests
@@ -365,6 +367,7 @@ fn worker_pool_multiple_markets_parallel() {
         sender: addr(2),
         params: &buy2,
         order_id: 101,
+        margin: None,
     }];
 
     // Market 3: sell only → rests
@@ -374,6 +377,7 @@ fn worker_pool_multiple_markets_parallel() {
         sender: addr(3),
         params: &sell3,
         order_id: 102,
+        margin: None,
     }];
 
     batches.insert(1u64, (book1, requests1));
@@ -957,16 +961,19 @@ fn capped_batches<'a>(
                 sender: addr(1),
                 params: &params[0],
                 order_id: (m * 100 + 1) as OrderId,
+                margin: None,
             },
             MatchRequest {
                 sender: addr(2),
                 params: &params[1],
                 order_id: (m * 100 + 2) as OrderId,
+                margin: None,
             },
             MatchRequest {
                 sender: addr(3),
                 params: &params[2],
                 order_id: (m * 100 + 3) as OrderId,
+                margin: None,
             },
         ];
         batches.insert(m, (book, requests));

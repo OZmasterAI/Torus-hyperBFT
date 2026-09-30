@@ -44,6 +44,7 @@ impl OrderBook {
                         cache_on,
                         &mut self.dirty_chunks,
                         chunked_on,
+                        None,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -78,6 +79,7 @@ impl OrderBook {
                         cache_on,
                         &mut self.dirty_chunks,
                         chunked_on,
+                        None,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);
@@ -181,7 +183,7 @@ fn assert_match(actual: &mut OrderBook, expected: &mut OrderBook, taker: Order, 
     let taker = if market { unbounded(taker) } else { taker };
     let mut new_taker = taker.clone();
     let mut old_taker = taker;
-    let (new_fills, new_stp, new_cuts) = actual.execute_match(&mut new_taker);
+    let (new_fills, new_stp, new_cuts) = actual.execute_match(&mut new_taker, None);
     assert!(new_cuts.is_empty());
     let (old_fills, old_stp) = expected.execute_match_legacy(&mut old_taker, market);
     assert_eq!(new_taker, old_taker);
@@ -270,7 +272,7 @@ fn occupied_matching_preserves_partial_state_when_matching_panics() {
             new_taker.remaining_qty = FixedPoint::MAX;
             let mut old_taker = new_taker.clone();
             let new = catch_unwind(AssertUnwindSafe(|| {
-                actual.execute_match(&mut new_taker)
+                actual.execute_match(&mut new_taker, None)
             }))
             .unwrap_err();
             let old = catch_unwind(AssertUnwindSafe(|| {

@@ -7,15 +7,19 @@
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use torus_core::error::CoreError;
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
-use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
+use torus_core::margin::{
+    effective_max_leverage, order_initial_margin, MarginTier, MarketMarginConfig,
+};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    reduce_only_allowance, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, TriggeredStop,
+    reduce_only_allowance, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions,
+    TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
@@ -221,6 +225,9 @@ struct PreparedOrder<'a> {
     params: &'a PlaceOrderParams,
     order_id: u128,
     margin_reserved: FixedPoint,
+    /// s515 review 4: match-time margin budget (reservation + the sender's
+    /// available balance right after it, Phase-2 view); `None` = unchecked.
+    margin_budget: Option<FixedPoint>,
 }
 
 /// C3: everything a settle worker precomputes for ONE prepared order —
@@ -409,140 +416,14 @@ enum EngineMode {
 /// L3-ENG: one Phase-2 outcome for a single flattened PlaceOrder, computed by
 /// a sharded worker and applied by the serial stitch in flat order.
 enum PrepOutcome {
-    /// Margin reserved (possibly ZERO for market orders) — the stitch assigns
-    /// the global order id and builds the `PreparedOrder`.
-    Pass(FixedPoint),
+    /// Margin reserved (possibly ZERO for market orders) and the match-time
+    /// margin budget (s515 review 4, `None` = unchecked) — the stitch
+    /// assigns the global order id and builds the `PreparedOrder`.
+    Pass(FixedPoint, Option<FixedPoint>),
     /// Rejected pre-book. `margin` selects the funnel counter
     /// (`orders_rejected_margin` vs `orders_rejected_other`); `msg` is the
     /// exact serial-path error string.
     Reject { margin: bool, msg: String },
-}
-
-/// F2 (s515 review 3): per-market upper bound on the highest bid an
-/// execute_batch market SELL can hit ABOVE the pre-batch best bid — a bid of
-/// this batch resting ahead of it (Phase 3 matches each market's orders in
-/// flat order). Fed in flat order with the orders that PASSED their Phase-2
-/// reservation, so an unfunded bid never counts. A passed buy raises the
-/// bound only if it can rest: a `Limit` with a resting TIF (GTC / PostOnly —
-/// IOC / FOK never rest) that clears the book's static checks (price > 0 on
-/// the tick, qty >= lot), and is not certain to be fully filled by the
-/// pre-batch asks at or below its price. Only "robust" asks are relied on:
-/// non-reduce-only (a reduce-only ask can shrink / cancel mid-batch) and
-/// owned by a trader with no buy of this batch in the market (STP cancels a
-/// maker of the taker's own). Cancels / modifies run in Phase 1, before this
-/// book is read, so a robust ask leaves only by being filled — each unit by a
-/// unit of a passed buy. If the robust depth at <= price exceeds the passed
-/// buy quantity through this bid, a robust ask at <= price survives the bid's
-/// matching, so the bid cannot rest. Pure function of pre-batch state and
-/// flat-order outcomes: the serial prepare feeds it as it goes and the
-/// sharded prepare replays it over the worker outcomes (identical result).
-struct BatchBidBound {
-    /// False when the batch holds no market sell — every call is a no-op.
-    active: bool,
-    /// (market, sender) of every non-stop buy in the batch (STP candidates).
-    buyers: std::collections::HashSet<(MarketId, Address)>,
-    markets: HashMap<MarketId, BatchBidMarket>,
-}
-
-struct BatchBidMarket {
-    /// Highest price of a passed bid that can rest.
-    max_bid: Option<FixedPoint>,
-    /// Quantity of every passed non-stop buy so far (upper bound on the ask
-    /// quantity this batch's buys can consume).
-    bought: FixedPoint,
-    /// Robust pre-batch ask levels ascending: (price, cumulative qty).
-    robust_asks: Option<Vec<(FixedPoint, FixedPoint)>>,
-}
-
-impl BatchBidBound {
-    fn new(orders: &[(usize, Address, &PlaceOrderParams)]) -> Self {
-        let active = orders
-            .iter()
-            .any(|(_, _, p)| !p.is_buy && matches!(p.order_type, OrderType::Market));
-        let buyers = if active {
-            orders
-                .iter()
-                .filter(|(_, _, p)| p.is_buy && !NativeExecutor::is_stop(p))
-                .map(|(_, s, p)| (p.market_id, *s))
-                .collect()
-        } else {
-            Default::default()
-        };
-        Self {
-            active,
-            buyers,
-            markets: HashMap::new(),
-        }
-    }
-
-    /// The Phase-2 reservation price of `params` given its basis price.
-    fn price(&self, params: &PlaceOrderParams, basis_price: FixedPoint) -> FixedPoint {
-        if !self.active || params.is_buy || !matches!(params.order_type, OrderType::Market) {
-            return basis_price;
-        }
-        match self.markets.get(&params.market_id).and_then(|m| m.max_bid) {
-            Some(bid) => basis_price.max(bid),
-            None => basis_price,
-        }
-    }
-
-    /// Record an order that passed its Phase-2 reservation.
-    fn on_pass(&mut self, books: &HashMap<MarketId, OrderBook>, params: &PlaceOrderParams) {
-        if !self.active || !params.is_buy || NativeExecutor::is_stop(params) {
-            return;
-        }
-        let book = books.get(&params.market_id);
-        let buyers = &self.buyers;
-        let m = self
-            .markets
-            .entry(params.market_id)
-            .or_insert(BatchBidMarket {
-                max_bid: None,
-                bought: FixedPoint::ZERO,
-                robust_asks: None,
-            });
-        m.bought = FixedPoint::from_raw(m.bought.raw().saturating_add(params.quantity.raw()));
-        // Phase 3 creates a missing book with tick = lot = 1.
-        let (tick, lot) = book.map_or((FixedPoint::ONE, FixedPoint::ONE), |b| {
-            (b.tick_size, b.lot_size)
-        });
-        let can_rest = matches!(params.order_type, OrderType::Limit)
-            && matches!(
-                params.time_in_force,
-                TimeInForce::GTC | TimeInForce::PostOnly
-            )
-            && params.price > FixedPoint::ZERO
-            && !(tick > FixedPoint::ZERO && params.price.raw() % tick.raw() != 0)
-            && params.quantity >= lot;
-        if !can_rest {
-            return;
-        }
-        let market_id = params.market_id;
-        let asks = m.robust_asks.get_or_insert_with(|| {
-            let mut cum = FixedPoint::ZERO;
-            let mut levels = Vec::new();
-            for (&price, queue) in book.into_iter().flat_map(|b| b.ask_queues()) {
-                for o in queue {
-                    if !o.reduce_only && !buyers.contains(&(market_id, o.trader)) {
-                        cum = FixedPoint::from_raw(cum.raw().saturating_add(o.remaining_qty.raw()));
-                    }
-                }
-                levels.push((price, cum));
-            }
-            levels
-        });
-        // Robust depth at <= price (levels ascending, cumulative).
-        let n = asks.partition_point(|&(p, _)| p <= params.price);
-        let depth = if n == 0 {
-            FixedPoint::ZERO
-        } else {
-            asks[n - 1].1
-        };
-        if depth > m.bought {
-            return; // a robust ask at <= price outlives it: never rests
-        }
-        m.max_bid = Some(m.max_bid.map_or(params.price, |b| b.max(params.price)));
-    }
 }
 
 #[cfg(test)]
@@ -3757,10 +3638,9 @@ impl NativeExecutor {
         // replays flat order to assign order ids — byte-identical to the
         // serial loop (docs/design-parallel-engine.md §3). Any worker panic
         // falls back to the serial loop with nothing shared mutated.
-        // F4/F5: reservation basis overrides from pre-batch state, shared by
-        // the serial and sharded prepare paths (identical inputs).
-        // F2 (review 3): the in-batch bid bound is fed with PASSED orders
-        // in flat order (serial loop below / replay after the sharded one).
+        // F4 / review 4: reservation basis overrides (reduce-only size, the
+        // market orders' mark price) from pre-batch state, computed once and
+        // shared by the serial and sharded prepare paths (identical inputs).
         let place_orders: Vec<(usize, Address, &PlaceOrderParams)> = place_order_indices
             .iter()
             .map(|&i| match &flat[i] {
@@ -3769,7 +3649,6 @@ impl NativeExecutor {
             })
             .collect();
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
-        let mut bid_bound = BatchBidBound::new(&place_orders);
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
         if engine_threads >= 2
@@ -3803,35 +3682,10 @@ impl NativeExecutor {
                     n,
                 ) {
                     Some((outcomes, worker_cache)) => {
-                        // F2 (review 3): workers priced every order at the
-                        // static basis. Replay the bid bound over their
-                        // outcomes in flat order; if it raises any market
-                        // sell, that sell's outcome (and so its sender's
-                        // later ones) may differ — discard the shards
-                        // (nothing shared was mutated) and prepare serially.
-                        let mut replay = BatchBidBound::new(&place_orders);
-                        let mut raised = false;
-                        for &(i, _, params) in &place_orders {
-                            let basis_price =
-                                basis.get(&i).map_or(Self::reserve_price(params), |b| b.0);
-                            if replay.price(params, basis_price) != basis_price {
-                                raised = true;
-                                break;
-                            }
-                            if matches!(outcomes[i], Some(PrepOutcome::Pass(_))) {
-                                replay.on_pass(&ctx.order_books, params);
-                            }
-                        }
-                        if raised {
-                            tracing::debug!(
-                                "F2: in-batch bid raises a market sell — serial prepare"
-                            );
-                        } else {
-                            // Sender shards are disjoint, so the merged cache
-                            // is exactly the serial loop's cache.
-                            bal_cache.merge_disjoint(worker_cache);
-                            prep_outcomes = Some(outcomes);
-                        }
+                        // Sender shards are disjoint, so the merged cache is
+                        // exactly the serial loop's cache.
+                        bal_cache.merge_disjoint(worker_cache);
+                        prep_outcomes = Some(outcomes);
                     }
                     None => {
                         tracing::error!(
@@ -3855,7 +3709,7 @@ impl NativeExecutor {
                     unreachable!("every place index has a worker outcome");
                 };
                 match outcome {
-                    PrepOutcome::Pass(margin_reserved) => {
+                    PrepOutcome::Pass(margin_reserved, margin_budget) => {
                         let order_id = ctx.next_global_order_id;
                         ctx.next_global_order_id += 1;
                         market_batches
@@ -3867,6 +3721,7 @@ impl NativeExecutor {
                                 params,
                                 order_id,
                                 margin_reserved,
+                                margin_budget,
                             });
                     }
                     PrepOutcome::Reject { margin, msg } => {
@@ -3908,14 +3763,13 @@ impl NativeExecutor {
 
                 // Reserve margin (same logic as exec_place_order Phase 2).
                 // A5: reserve and every later release share reserve_for_qty_cfg.
-                // s515 (BUG 1): every order type reserves (market at its cap).
-                // F4/F5: basis overrides; F2: an overflowing notional rejects.
+                // s515 (BUG 1): every order type reserves (market at the mark
+                // price, the cap without one). F4 / review 4: basis
+                // overrides; F2: an overflowing notional rejects.
                 let (res_price, res_qty) = basis
                     .get(&i)
                     .copied()
                     .unwrap_or((Self::reserve_price(params), params.quantity));
-                // F2 (review 3): raised to an earlier passed in-batch bid.
-                let res_price = bid_bound.price(params, res_price);
                 let order_margin_required = match Self::try_reserve_for_qty_cfg(
                     ctx.margin_configs.get(&market_id),
                     res_price,
@@ -3931,7 +3785,13 @@ impl NativeExecutor {
                     }
                 };
 
-                if order_margin_required > FixedPoint::ZERO {
+                // s515 review 4: a checked taker's match-time budget is its
+                // reservation + the available balance left after it (= the
+                // available balance it was reserved from), in this Phase-2
+                // per-sender fold — the view the sharded prepare reproduces.
+                let checked = Self::match_margin_checked(params);
+                let mut margin_budget = None;
+                if order_margin_required > FixedPoint::ZERO || checked {
                     match bal_cache.load(&ctx.positions, sender) {
                         Ok(mut bal) => {
                             if bal.available < order_margin_required {
@@ -3948,9 +3808,14 @@ impl NativeExecutor {
                                 );
                                 continue;
                             }
-                            bal.available -= order_margin_required;
-                            bal.order_margin += order_margin_required;
-                            bal_cache.set(sender, bal);
+                            if checked {
+                                margin_budget = Some(bal.available);
+                            }
+                            if order_margin_required > FixedPoint::ZERO {
+                                bal.available -= order_margin_required;
+                                bal.order_margin += order_margin_required;
+                                bal_cache.set(sender, bal);
+                            }
                         }
                         Err(e) => {
                             // Funnel (perf A1): died pre-book on a balance read error.
@@ -3962,8 +3827,6 @@ impl NativeExecutor {
                         }
                     }
                 }
-
-                bid_bound.on_pass(&ctx.order_books, params);
 
                 // Assign global order ID (monotonic, pre-matching)
                 let order_id = ctx.next_global_order_id;
@@ -3978,6 +3841,7 @@ impl NativeExecutor {
                         params,
                         order_id,
                         margin_reserved: order_margin_required,
+                        margin_budget,
                     });
             }
         }
@@ -4020,12 +3884,18 @@ impl NativeExecutor {
                 book.set_reduce_only_positions(ro);
             }
 
+            // s515 review 4: one shared copy of the market's tiers for the
+            // checked takers' match-time margin limits.
+            let tiers = Self::margin_tiers(ctx.margin_configs.get(&market_id));
             let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
                 .map(|p| MatchRequest {
                     sender: p.sender,
                     params: p.params,
                     order_id: p.order_id,
+                    margin: p
+                        .margin_budget
+                        .map(|budget| Self::taker_margin_limit(&tiers, p.params, budget)),
                 })
                 .collect();
 
@@ -4230,7 +4100,10 @@ impl NativeExecutor {
                                             continue;
                                         }
                                     };
-                                    if required > FixedPoint::ZERO {
+                                    // s515 review 4: same budget as the serial loop.
+                                    let checked = Self::match_margin_checked(params);
+                                    let mut budget = None;
+                                    if required > FixedPoint::ZERO || checked {
                                         match cache.load(positions, sender) {
                                             Ok(mut bal) => {
                                                 if bal.available < required {
@@ -4246,9 +4119,14 @@ impl NativeExecutor {
                                                     ));
                                                     continue;
                                                 }
-                                                bal.available -= required;
-                                                bal.order_margin += required;
-                                                cache.set(sender, bal);
+                                                if checked {
+                                                    budget = Some(bal.available);
+                                                }
+                                                if required > FixedPoint::ZERO {
+                                                    bal.available -= required;
+                                                    bal.order_margin += required;
+                                                    cache.set(sender, bal);
+                                                }
                                             }
                                             Err(e) => {
                                                 out.push((
@@ -4262,7 +4140,7 @@ impl NativeExecutor {
                                             }
                                         }
                                     }
-                                    out.push((i, PrepOutcome::Pass(required)));
+                                    out.push((i, PrepOutcome::Pass(required, budget)));
                                 }
                             }
                             (out, cache)
@@ -4931,11 +4809,9 @@ impl NativeExecutor {
         if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
             return FixedPoint::ZERO;
         }
-        let notional = price * qty;
-        let max_lev = cfg
-            .map(|c| effective_max_leverage(&c.tiers, notional))
-            .unwrap_or(20);
-        Self::margin_at_integer_leverage(notional, max_lev)
+        // s515 review 4: the formula lives in torus-core so the book's
+        // match-time margin check computes it identically.
+        order_initial_margin(cfg.map(|c| c.tiers.as_slice()), price * qty)
     }
 
     /// F2 (s515 review): the PLACEMENT-time reservation — [`reserve_for_qty_cfg`]
@@ -5051,11 +4927,13 @@ impl NativeExecutor {
         out
     }
 
-    /// s515 (BUG 1): the price an order's margin is reserved — and every
-    /// release computed — at: the limit price, the market / stop-market
-    /// slippage cap (`params.price`), or a stop-limit's limit. One price per
-    /// order keeps the A5 telescoping identity (Σ released == reserved) for
-    /// every order type.
+    /// s515 (BUG 1): the price a RESTING / pending order's margin is
+    /// reserved — and every release computed — at: the limit price, a
+    /// pending stop-market's slippage cap (`params.price`; its row stores no
+    /// other price, so the trigger-time release is exact), or a stop-limit's
+    /// limit. One price per order keeps the A5 telescoping identity
+    /// (Σ released == reserved) for every order type. A `Market` order
+    /// reserves at [`reservation_price`] instead (it never rests).
     fn reserve_price(params: &PlaceOrderParams) -> FixedPoint {
         match params.order_type {
             OrderType::StopLimit { limit, .. } => limit,
@@ -5063,19 +4941,75 @@ impl NativeExecutor {
         }
     }
 
-    /// F5 (s515 review): the price the PLACEMENT reservation is taken at. A
-    /// market SELL's cap is its LOWEST acceptable price (clients send ~1), so
-    /// it bounds nothing; its fills happen at bids <= the best bid, so it
-    /// reserves at max(cap, best bid) (the cap alone with no bids). Everything
-    /// else reserves at [`reserve_price`]. Safe for the A5 identity: a market
-    /// order never rests, so its whole reservation is released after matching
-    /// (a triggered stop-market sell is priced here at trigger time).
-    fn reservation_price(params: &PlaceOrderParams, book: Option<&OrderBook>) -> FixedPoint {
+    /// s515 review 4 (Hyperliquid: "the margin required to open a position
+    /// is position_size * mark_price / leverage"): the price the PLACEMENT
+    /// reservation is taken at. A `Market` order (buy or sell, incl. a
+    /// triggered stop-market, which is placed as one at trigger time)
+    /// reserves at the market's MARK price, falling back to its cap when the
+    /// market has no usable oracle price; everything else reserves at
+    /// [`reserve_price`]. Safe for the A5 identity: a market order never
+    /// rests, so its whole reservation is released after matching. Fills
+    /// worse than the mark are bounded by the match-time check instead
+    /// ([`match_margin_checked`]).
+    fn reservation_price(params: &PlaceOrderParams, mark: Option<FixedPoint>) -> FixedPoint {
         match params.order_type {
-            OrderType::Market if !params.is_buy => book
-                .and_then(|b| b.best_bid())
-                .map_or(params.price, |bid| bid.max(params.price)),
+            OrderType::Market => mark.unwrap_or(params.price),
             _ => Self::reserve_price(params),
+        }
+    }
+
+    /// s515 review 4: the mark price of `market_id` — the stake-weighted
+    /// median aggregated by the oracle and committed in state — or `None`
+    /// when there is none, it is stale (older than the oracle's max age at
+    /// this block height), non-positive, or unreadable. Only oracle
+    /// aggregation writes that row and no native action runs it, so every
+    /// placement of a block (single, batch serial, batch sharded) reads the
+    /// same value on every validator.
+    fn mark_price<T: StateBackend>(ctx: &NativeExecContext<T>, market_id: MarketId) -> Option<FixedPoint> {
+        match ctx.oracle.get_price(market_id, ctx.block_height) {
+            Ok(p) if !p.stale && p.price > FixedPoint::ZERO => Some(p.price),
+            _ => None,
+        }
+    }
+
+    /// s515 review 4 (Hyperliquid: margin is checked "when orders are placed
+    /// and again when they match"): whether a taker's fills can cost more
+    /// initial margin than it reserved, so the book re-checks every fill
+    /// against a [`TakerMarginLimit`]: a market order (reserved at the mark,
+    /// fills anywhere up to its cap) and a limit SELL (reserved at its limit,
+    /// fills at bids >= it). A limit buy fills at asks <= its limit, i.e.
+    /// within its reservation. Reduce-only orders are exempt (Hyperliquid:
+    /// reducing needs no margin); stops are checked once triggered.
+    fn match_margin_checked(params: &PlaceOrderParams) -> bool {
+        !params.reduce_only
+            && match params.order_type {
+                OrderType::Market => true,
+                OrderType::Limit => !params.is_buy,
+                _ => false,
+            }
+    }
+
+    /// s515 review 4: the market's leverage tiers, shared by its checked
+    /// takers' [`TakerMarginLimit`]s.
+    fn margin_tiers(cfg: Option<&MarketMarginConfig>) -> Option<Arc<[MarginTier]>> {
+        cfg.map(|c| Arc::from(c.tiers.as_slice()))
+    }
+
+    /// s515 review 4: the book-side match-time margin limit of a checked
+    /// taker with `budget` (its reservation + the available balance after
+    /// it). A GTC limit's remainder can rest and keeps `reserve(limit, left)`,
+    /// so that hold counts against the budget too.
+    fn taker_margin_limit(
+        tiers: &Option<Arc<[MarginTier]>>,
+        params: &PlaceOrderParams,
+        budget: FixedPoint,
+    ) -> TakerMarginLimit {
+        let can_rest = matches!(params.order_type, OrderType::Limit)
+            && params.time_in_force == TimeInForce::GTC;
+        TakerMarginLimit {
+            budget,
+            tiers: tiers.clone(),
+            hold_price: can_rest.then(|| Self::reserve_price(params)),
         }
     }
 
@@ -5089,14 +5023,13 @@ impl NativeExecutor {
         )
     }
 
-    /// F4/F5 (s515 review): per-order overrides of the batch Phase-2
+    /// F4 (s515 review) / review 4: per-order overrides of the batch Phase-2
     /// reservation basis `(price, qty)` — default `(reserve_price, quantity)`
     /// — from PRE-BATCH state only, computed ONCE so the serial and sharded
     /// prepare paths see identical inputs.
-    /// - Market sell: priced by [`reservation_price`]. (Phase 2 raises it
-    ///   further to an earlier PASSED in-batch bid that can rest — F2, see
-    ///   [`BatchBidBound`]; exact for the A5 identity because a market order
-    ///   never rests, so its whole reservation is released.)
+    /// - Market order: priced by [`reservation_price`] at the market's mark
+    ///   price, read once per market (the oracle row does not change within
+    ///   the block — see [`mark_price`]), so identical to the single path.
     /// - Reduce-only non-stop order: sized to min(qty, bound), where bound is
     ///   an upper bound on the book's match-time clamp — the pre-batch
     ///   allowance plus everything that can still grow the position before the
@@ -5113,10 +5046,18 @@ impl NativeExecutor {
             |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
         let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
+        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
         let mut out = HashMap::new();
         for &(i, sender, params) in orders {
             let book = ctx.order_books.get(&params.market_id);
-            let price = Self::reservation_price(params, book);
+            let mark = if matches!(params.order_type, OrderType::Market) {
+                *marks
+                    .entry(params.market_id)
+                    .or_insert_with(|| Self::mark_price(ctx, params.market_id))
+            } else {
+                None
+            };
+            let price = Self::reservation_price(params, mark);
             let mut qty = params.quantity;
             if params.reduce_only && !Self::is_stop(params) {
                 // A position read error polices as flat in the book; keep the
@@ -5341,21 +5282,26 @@ impl NativeExecutor {
 
         // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
         // A5: reserve and every later release share reserve_for_qty_cfg.
-        // s515 (BUG 1): EVERY order type reserves — a market order at its
-        // price cap (it used to reserve ZERO); the unused part comes back
-        // below once the order no longer rests.
-        // F5: a market sell at max(cap, best bid). F4: a reduce-only non-stop
-        // order only for the quantity the book will let it keep (the clamp to
-        // the position it reads below). F2: an overflowing notional rejects.
+        // s515 (BUG 1): EVERY order type reserves — a market order (it used
+        // to reserve ZERO) at the mark price, the cap without one (review
+        // 4); the unused part comes back below once the order no longer rests.
+        // F4: a reduce-only non-stop order only for the quantity the book
+        // will let it keep (the clamp to the position it reads below). F2: an
+        // overflowing notional rejects.
         let reserve_qty = match ro_pos {
             Some(pos) if !Self::is_stop(params) => {
                 params.quantity.min(reduce_only_allowance(pos, params.is_buy))
             }
             _ => params.quantity,
         };
+        let mark = if matches!(params.order_type, OrderType::Market) {
+            Self::mark_price(ctx, market_id)
+        } else {
+            None
+        };
         let order_margin_required = match Self::try_reserve_for_qty_cfg(
             ctx.margin_configs.get(&market_id),
-            Self::reservation_price(params, ctx.order_books.get(&market_id)),
+            Self::reservation_price(params, mark),
             reserve_qty,
         ) {
             Ok(m) => m,
@@ -5367,7 +5313,11 @@ impl NativeExecutor {
             }
         };
 
-        if order_margin_required > FixedPoint::ZERO {
+        // s515 review 4: a checked taker's match-time budget — its
+        // reservation + the available balance left after it.
+        let checked = Self::match_margin_checked(params);
+        let mut margin_budget = None;
+        if order_margin_required > FixedPoint::ZERO || checked {
             match ctx.positions.get_native_balance(sender) {
                 Ok(mut bal) => {
                     if bal.available < order_margin_required {
@@ -5383,14 +5333,19 @@ impl NativeExecutor {
                             ),
                         );
                     }
-                    bal.available -= order_margin_required;
-                    bal.order_margin += order_margin_required;
-                    if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
-                        // Funnel (perf A1): died pre-book on a balance write error.
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_other.inc();
+                    if checked {
+                        margin_budget = Some(bal.available);
+                    }
+                    if order_margin_required > FixedPoint::ZERO {
+                        bal.available -= order_margin_required;
+                        bal.order_margin += order_margin_required;
+                        if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                            // Funnel (perf A1): died pre-book on a balance write error.
+                            if let Some(ref m) = ctx.metrics {
+                                m.orders_rejected_other.inc();
+                            }
+                            return NativeActionResult::err("place_order", e.to_string());
                         }
-                        return NativeActionResult::err("place_order", e.to_string());
                     }
                 }
                 Err(e) => {
@@ -5424,7 +5379,15 @@ impl NativeExecutor {
         // FIX 6 (ECON-FIND-09): Sync global order ID counter to prevent cross-market collisions.
         // s515: a triggered stop keeps its own (already allocated) id.
         book.set_next_order_id(forced_id.unwrap_or(ctx.next_global_order_id));
-        let result = book.place_order(params.clone(), *sender, ctx.timestamp);
+        let margin_limit = margin_budget.map(|budget| {
+            Self::taker_margin_limit(
+                &Self::margin_tiers(ctx.margin_configs.get(&market_id)),
+                params,
+                budget,
+            )
+        });
+        let result =
+            book.place_order_with_margin(params.clone(), *sender, ctx.timestamp, margin_limit.as_ref());
         book.clear_reduce_only_positions();
         if forced_id.is_some() {
             book.set_next_order_id(ctx.next_global_order_id);
