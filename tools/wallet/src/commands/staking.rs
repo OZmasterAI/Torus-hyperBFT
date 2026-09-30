@@ -1,4 +1,4 @@
-//! Staking commands: delegate, undelegate, claim-rewards.
+//! Staking commands: delegate, undelegate, claim-rewards, claim-unbonded.
 
 use torus_types::NativeAction;
 
@@ -39,6 +39,10 @@ pub(crate) async fn cmd_undelegate(
 
 pub(crate) async fn cmd_claim_rewards(cli: &Cli, rpc: &RpcClient) -> Result<(), String> {
     submit_native_action(cli, rpc, NativeAction::ClaimRewards).await
+}
+
+pub(crate) async fn cmd_claim_unbonded(cli: &Cli, rpc: &RpcClient) -> Result<(), String> {
+    submit_native_action(cli, rpc, NativeAction::ClaimUnbonded).await
 }
 
 pub(crate) async fn cmd_permanent_stake(

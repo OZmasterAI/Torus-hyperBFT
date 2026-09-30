@@ -196,7 +196,7 @@ pub enum SessionScope {
     /// TransferToPerp, TransferToSpot only.
     TransfersOnly,
     /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards.
+    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded.
     Full,
 }
 
@@ -231,6 +231,7 @@ impl SessionScope {
                     | NativeAction::Undelegate { .. }
                     | NativeAction::PermanentStake { .. }
                     | NativeAction::ClaimRewards
+                    | NativeAction::ClaimUnbonded
             ),
         }
     }
@@ -626,6 +627,11 @@ pub enum NativeAction {
     DelistMarket {
         market_id: MarketId,
     },
+
+    // === Staking (appended — keep existing serde variant indices stable) ===
+    /// Release every matured unbonding entry across all of the sender's
+    /// delegations back to their balance (explicit claim, Hyperliquid-style).
+    ClaimUnbonded,
 }
 
 impl NativeAction {
@@ -890,6 +896,9 @@ impl NativeAction {
             NativeAction::RevokeSession { session_pubkey } => {
                 buf.push(24);
                 buf.extend_from_slice(session_pubkey);
+            }
+            NativeAction::ClaimUnbonded => {
+                buf.push(26);
             }
         }
     }

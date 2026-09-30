@@ -111,6 +111,7 @@ fn actions() -> Vec<NativeAction> {
             market_id: u64::MAX,
         },
         NativeAction::TopUpSelfStake { amount: U256::MAX },
+        NativeAction::ClaimUnbonded,
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
         for new_qty in [None, Some(FixedPoint::MAX)] {
@@ -199,7 +200,7 @@ fn append_canonical_bytes_matches_frozen_encoder_for_all_variants() {
     }
     assert_eq!(
         tags,
-        (0u8..=25).collect(),
+        (0u8..=26).collect(),
         "all action tags must be covered"
     );
 }
@@ -578,6 +579,7 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
             buf.push(24);
             buf.extend_from_slice(session_pubkey);
         }
+        NativeAction::ClaimUnbonded => buf.push(26),
     }
     buf
 }

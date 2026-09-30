@@ -252,6 +252,7 @@ fn all_vectors() -> Vec<Vector> {
             },
         ),
         build_vector("ClaimRewards", NativeAction::ClaimRewards),
+        build_vector("ClaimUnbonded", NativeAction::ClaimUnbonded),
         build_vector(
             "TopUpSelfStake",
             NativeAction::TopUpSelfStake {
@@ -503,6 +504,37 @@ fn v_byte_is_27_or_28_for_all_variants() {
             v.signature.v
         );
     }
+}
+
+#[test]
+fn claim_unbonded_struct_hash_matches_spec() {
+    // ClaimUnbonded(uint64 nonce): typehash || abi.encode(uint64 nonce).
+    let th = alloy_primitives::keccak256("ClaimUnbonded(uint64 nonce)");
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(th.as_slice());
+    buf.extend_from_slice(&[0u8; 24]);
+    buf.extend_from_slice(&PINNED_NONCE.to_be_bytes());
+    let expected = alloy_primitives::keccak256(&buf);
+    assert_eq!(
+        eip712_struct_hash(&NativeAction::ClaimUnbonded, PINNED_NONCE),
+        expected
+    );
+    assert_ne!(
+        eip712_struct_hash(&NativeAction::ClaimUnbonded, PINNED_NONCE),
+        eip712_struct_hash(&NativeAction::ClaimRewards, PINNED_NONCE)
+    );
+}
+
+#[test]
+fn claim_unbonded_is_fund_moving_and_appends_canonical_tag() {
+    // Releases stake to the balance: same auth class as ClaimRewards.
+    assert!(torus_types::eip712::requires_eip712(
+        &NativeAction::ClaimUnbonded
+    ));
+    assert!(!torus_types::SessionScope::Full.allows(&NativeAction::ClaimUnbonded));
+    // Appended canonical tag (26) — tags 0..=25 are unchanged.
+    assert_eq!(NativeAction::ClaimUnbonded.canonical_bytes(), vec![26]);
+    assert_eq!(NativeAction::ClaimRewards.canonical_bytes(), vec![10]);
 }
 
 #[test]
