@@ -12164,7 +12164,8 @@ mod crash_recovery_tests {
     /// actions of the blocks whose trade rows were written.
     #[test]
     fn order_age_stages_observed_once_per_native_action() {
-        for on in [false, true] {
+        // `writer = false`: no trade writer, rows take the synchronous fallback.
+        for (on, writer) in [(false, true), (true, true), (false, false), (true, false)] {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
             let (mut config, _) = make_test_config_and_db();
@@ -12172,11 +12173,9 @@ mod crash_recovery_tests {
             let mut ctx = make_exec_ctx(&config, &state_db);
             let metrics = Arc::new(torus_telemetry::Metrics::new());
             ctx.metrics = Some(metrics.clone());
-            ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
-                state_db.clone(),
-                "test-trade-writer",
-                8,
-            ));
+            ctx.trade_writer = writer.then(|| {
+                torus_state::BackgroundCfWriter::spawn(state_db.clone(), "test-trade-writer", 8)
+            });
             if on {
                 ctx.attach_flush_worker(None);
             }
@@ -12198,15 +12197,15 @@ mod crash_recovery_tests {
                 .filter(|b| traded.contains(&b.header.height))
                 .map(|b| b.native_actions.len())
                 .sum();
-            assert!(filled > 0, "fixture must produce fills (on={on})");
+            assert!(filled > 0, "fixture must produce fills (on={on} writer={writer})");
 
             let text = metrics.encode();
             let count = |stage: &str| {
                 metric_value(&text, &format!("torus_order_age_{stage}_seconds_count")) as usize
             };
-            assert_eq!(count("exec"), native, "exec (on={on}):\n{text}");
-            assert_eq!(count("durable"), native, "durable (on={on}):\n{text}");
-            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on}):\n{text}");
+            assert_eq!(count("exec"), native, "exec (on={on} writer={writer}):\n{text}");
+            assert_eq!(count("durable"), native, "durable (on={on} writer={writer}):\n{text}");
+            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on} writer={writer}):\n{text}");
         }
     }
 

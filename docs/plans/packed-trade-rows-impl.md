@@ -115,4 +115,7 @@ like today):
 
 Revert the merge. History written in the new format is not readable by the
 old code; the old code keeps working (it reads nothing from new-format rows —
-wipe the two CFs to start clean).
+wipe the two CFs to start clean). Also delete the `trade_history_format` key in
+`CF_CONSENSUS_META`, so a later upgrade wipes the old-format rows the old code
+wrote meanwhile. (New-code readers skip undecodable rows with a warning, so a
+leftover row never fails a query.)

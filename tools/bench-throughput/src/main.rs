@@ -1182,6 +1182,8 @@ fn run_matching_engine_on<T: torus_state::StateBackend>(
         let t = Instant::now();
         NativeExecutor::execute_batch(&mut ctx, &warmup_actions);
         let elapsed = t.elapsed();
+        // Drop the warmup's fills so the first timed batch does not re-write them.
+        ctx.take_pending_trade_fills();
         println!(
             "Warmup:  {} orders in {:.1}ms ({:.0} orders/sec)",
             format_num(warmup as u64),

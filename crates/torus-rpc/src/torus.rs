@@ -75,12 +75,19 @@ fn rpc_trade(market_id: &str, block: u64, timestamp: u64, t: &MarketTrade) -> Rp
     }
 }
 
-/// Decode one packed trade-history row (key + value) for RPC.
-fn decode_market_row(key: &[u8], value: &[u8]) -> Result<(u64, u64, Vec<MarketTrade>), ErrorObjectOwned> {
-    let (_, block, _) = parse_trade_key(key)
-        .ok_or_else(|| RpcError::Internal(format!("trade key length {}", key.len())))?;
-    let (timestamp, fills) = decode_trade_row(value).map_err(|e| RpcError::Internal(e.to_string()))?;
-    Ok((block, timestamp, fills))
+/// Decode one packed trade-history row (key + value) for RPC as
+/// `(block, timestamp, fills)`. An undecodable row (e.g. a leftover old-format
+/// row) is skipped with a warning, so it never fails the whole query.
+fn decode_market_row(key: &[u8], value: &[u8]) -> Option<(u64, u64, Vec<MarketTrade>)> {
+    let decoded = parse_trade_key(key)
+        .ok_or_else(|| format!("key length {}", key.len()))
+        .and_then(|(_, block, _)| {
+            let (timestamp, fills) = decode_trade_row(value).map_err(|e| e.to_string())?;
+            Ok((block, timestamp, fills))
+        });
+    decoded
+        .map_err(|e| tracing::warn!(key = %hex::encode(key), "skipping trade row: {e}"))
+        .ok()
 }
 
 // ============================================================================
@@ -963,7 +970,9 @@ impl TorusApiServer for RpcState {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let (block, timestamp, fills) = decode_market_row(&key, &value)?;
+            let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
+                continue;
+            };
 
             // Since we iterate newest-first, once we hit a pruned block all
             // remaining entries are older — stop immediately.
@@ -1439,7 +1448,9 @@ impl TorusApiServer for RpcState {
             if key.len() < 8 || key[..8] != mid.to_be_bytes() || key[..] >= end_key[..] {
                 break;
             }
-            let (block, timestamp, fills) = decode_market_row(&key, &value)?;
+            let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
+                continue;
+            };
 
             for t in &fills {
                 trades.push(rpc_trade(&market_id, block, timestamp, t));
@@ -1667,12 +1678,20 @@ impl TorusApiServer for RpcState {
             if !key.starts_with(prefix) {
                 break;
             }
-            let (_, block) = parse_user_trade_key(&key)
-                .ok_or_else(|| RpcError::Internal(format!("user trade key length {}", key.len())))
-                .map_err(ErrorObjectOwned::from)?;
-            let (timestamp, entries) = decode_user_row(&value)
-                .map_err(|e| RpcError::Internal(e.to_string()))
-                .map_err(ErrorObjectOwned::from)?;
+            // Skip an undecodable row (e.g. leftover old format), as above.
+            let decoded = parse_user_trade_key(&key)
+                .ok_or_else(|| format!("key length {}", key.len()))
+                .and_then(|(_, block)| {
+                    let (timestamp, entries) = decode_user_row(&value).map_err(|e| e.to_string())?;
+                    Ok((block, timestamp, entries))
+                });
+            let (block, timestamp, entries) = match decoded {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(key = %hex::encode(&key), "skipping user trade row: {e}");
+                    continue;
+                }
+            };
 
             for trade in entries {
                 if market_filter.is_some_and(|mf| trade.market != mf) {

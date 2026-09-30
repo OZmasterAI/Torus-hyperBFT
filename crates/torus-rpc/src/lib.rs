@@ -521,8 +521,12 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
                 Err(_) => break,
             };
             // Same market and block (the chunk is the last 2 bytes).
-            if key.len() != start_key.len() || key[..16] != start_key[..16] {
+            if key.len() < 16 || key[..16] != start_key[..16] {
                 break;
+            }
+            // Skip an undecodable row (e.g. a leftover old-format 20-byte key).
+            if key.len() != start_key.len() {
+                continue;
             }
             let Ok((timestamp, fills)) = decode_trade_row(&value) else {
                 continue;
@@ -2418,6 +2422,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&t), hex_ids(0..1025));
+        handle.stop().unwrap();
+    }
+
+    /// Review s78: a leftover old-format row (20 / 32-byte key) or a corrupt
+    /// value is skipped, never fails the whole query.
+    #[tokio::test]
+    async fn undecodable_trade_rows_are_skipped() {
+        use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
+        let (_dir, state, mempool, executor) = setup();
+        let me = Address::from([0x33; 20]);
+        store_market(&state, 1, "BTC", "USD");
+        store_user_trade(&state, &me, 4, 1, 10, 1, 0, 0, 4, 40);
+        store_user_trade(&state, &me, 2, 1, 10, 1, 0, 1, 6, 60);
+        // Old per-fill rows, between and after the new ones.
+        let mut old = [0u8; 20];
+        old[7] = 1;
+        old[15] = 5;
+        state.put_cf_raw(CF_NATIVE_TRADES, &old, &[0; 65]).unwrap();
+        let mut old_user = [0x33u8; 32];
+        old_user[20..28].copy_from_slice(&(!5u64).to_be_bytes());
+        state.put_cf_raw(CF_NATIVE_USER_TRADES, &old_user, &[0; 74]).unwrap();
+        // An old row inside block 7, between chunk 0 and chunk 1.
+        let mut old7 = [0u8; 20];
+        old7[..16].copy_from_slice(&torus_state::trade_rows::trade_key(1, 7, 0)[..16]);
+        old7[19] = 3;
+        state.put_cf_raw(CF_NATIVE_TRADES, &old7, &[0; 65]).unwrap();
+        // New-format key with a corrupt value (block 7).
+        state
+            .put_cf_raw(CF_NATIVE_TRADES, &torus_state::trade_rows::trade_key(1, 7, 0), &[9; 3])
+            .unwrap();
+        let (handle, client) = rpc_client(state.clone(), mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistory", jsonrpsee::rpc_params!["0x1", 100u32])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids([2, 4]));
+        let t: Vec<RpcTrade> = client
+            .request("torus_getTradeHistoryRange", jsonrpsee::rpc_params!["0x1", "0x0", "0x9", 100u64])
+            .await
+            .unwrap();
+        assert_eq!(ids(&t), hex_ids([4, 2]));
+        let u: Vec<RpcUserTrade> = client
+            .request("torus_getUserTrades", jsonrpsee::rpc_params![hex_address(me)])
+            .await
+            .unwrap();
+        let blocks: Vec<&str> = u.iter().map(|t| t.block_number.as_str()).collect();
+        assert_eq!(blocks, vec!["0x6", "0x4"]);
+        assert!(scan_trades_for_block(&state, 7).is_empty());
+        store_block_fills(&state, 8, 80, &(0..1025).map(|i| tfill(i, 1, me, me, 1, 1, 0)).collect::<Vec<_>>());
+        let mut old8 = [0u8; 20];
+        old8[..16].copy_from_slice(&torus_state::trade_rows::trade_key(1, 8, 0)[..16]);
+        old8[19] = 3;
+        state.put_cf_raw(CF_NATIVE_TRADES, &old8, &[0; 65]).unwrap();
+        assert_eq!(scan_trades_for_block(&state, 8).len(), 1025, "old row between chunks is skipped");
         handle.stop().unwrap();
     }
 

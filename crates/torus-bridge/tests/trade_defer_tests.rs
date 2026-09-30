@@ -251,3 +251,65 @@ fn trade_index_counts_fills_in_both_settle_paths_with_history_on_and_off() {
         }
     }
 }
+
+// ============================================================================
+// Review s78: inline mode keeps blocks apart when a context is reused across
+// heights, and the single-action `execute` path writes its rows too.
+// ============================================================================
+
+/// Rows of one CF as (block, trade indices) — market rows only.
+fn market_rows_by_block(db: &StateDb) -> Vec<(u64, Vec<u32>)> {
+    cf_rows(db, CF_NATIVE_TRADES)
+        .iter()
+        .map(|(k, v)| {
+            let (_, block, _) = torus_state::trade_rows::parse_trade_key(k).unwrap();
+            (block, decode_trade_row(v).unwrap().1.iter().map(|f| f.trade_index).collect())
+        })
+        .collect()
+}
+
+#[test]
+fn inline_ctx_reused_across_heights_writes_each_block_once() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    two_phase_block(&mut ctx); // block 1: fills 0 and 1
+    ctx.block_height = 2;
+    ctx.timestamp = 2000;
+    let r = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[
+            (addr(1), NativeAction::PlaceOrder(limit(1, false, 100, 2))),
+            (addr(2), NativeAction::PlaceOrder(limit(1, true, 100, 2))),
+        ],
+    );
+    assert!(r.results.iter().all(|r| r.success));
+    assert_eq!(market_rows_by_block(&db), vec![(1, vec![0, 1]), (2, vec![2])]);
+    let user_blocks: Vec<(u64, usize)> = cf_rows(&db, CF_NATIVE_USER_TRADES)
+        .iter()
+        .map(|(k, v)| {
+            let (_, block) = torus_state::trade_rows::parse_user_trade_key(k).unwrap();
+            (block, decode_user_row(v).unwrap().1.len())
+        })
+        .collect();
+    // Trader 1 and trader 2: block 2 (newest first) then block 1.
+    assert_eq!(user_blocks, vec![(2, 1), (1, 2), (2, 1), (1, 2)]);
+}
+
+#[test]
+fn single_action_execute_writes_rows_inline() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone());
+    for t in 1..=2u8 {
+        fund_native(&ctx, &addr(t), fp(1_000_000));
+    }
+    let place = |ctx: &mut NativeExecContext, who: u8, is_buy: bool, qty: i64| {
+        let r = NativeExecutor::execute(ctx, &addr(who), &NativeAction::PlaceOrder(limit(1, is_buy, 100, qty)));
+        assert!(r.success, "{:?}", r.error);
+    };
+    place(&mut ctx, 1, false, 5);
+    place(&mut ctx, 2, true, 2);
+    assert_eq!(market_rows_by_block(&db), vec![(1, vec![0])]);
+    place(&mut ctx, 2, true, 3);
+    assert_eq!(market_rows_by_block(&db), vec![(1, vec![0, 1])], "superset rewrite");
+    assert_eq!(cf_rows(&db, CF_NATIVE_USER_TRADES).len(), 2);
+}

@@ -1386,6 +1386,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub trade_history: bool,
     /// This block's fills in `trade_index` order (s77 packed trade rows).
     pending_fills: Vec<TradeFill>,
+    /// Block height of `pending_fills` (inline mode clears them on a new height).
+    fills_block: u64,
+    /// Inline mode: how many of `pending_fills` already have rows written.
+    inline_fills_written: usize,
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
@@ -1832,6 +1836,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             defer_trades: false,
             trade_history: true,
             pending_fills: Vec::new(),
+            fills_block: 0,
+            inline_fills_written: 0,
             metrics: None,
             fatal_error: load_error,
             book_mode,
@@ -1915,6 +1921,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// caller owns writing their rows from here (`trade_rows::encode_block`
     /// on a background writer, or a synchronous fallback).
     pub fn take_pending_trade_fills(&mut self) -> Vec<TradeFill> {
+        self.inline_fills_written = 0;
         std::mem::take(&mut self.pending_fills)
     }
 
@@ -3143,6 +3150,31 @@ impl NativeExecutor {
         sender: &Address,
         action: &NativeAction,
     ) -> NativeActionResult {
+        let result = Self::execute_action(ctx, sender, action);
+        Self::write_trades_inline(ctx);
+        result
+    }
+
+    /// Without `defer_trades`: write the rows of ALL the block's fills so far,
+    /// if any fill is new. A later call rewrites the same keys with a superset,
+    /// so calls within a block never drop each other's fills.
+    fn write_trades_inline<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        if ctx.defer_trades || ctx.pending_fills.len() == ctx.inline_fills_written {
+            return;
+        }
+        let mut rows = PackedCfBatch::default();
+        encode_block(ctx.fills_block, ctx.timestamp, &ctx.pending_fills, &mut rows);
+        for (cf, key, value) in rows.iter() {
+            let _ = ctx.state.put_cf_raw(cf, key, value);
+        }
+        ctx.inline_fills_written = ctx.pending_fills.len();
+    }
+
+    fn execute_action<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        action: &NativeAction,
+    ) -> NativeActionResult {
         match action {
             // ---- Order book ----
             NativeAction::PlaceOrder(params) => Self::exec_place_order(ctx, sender, params),
@@ -3393,15 +3425,7 @@ impl NativeExecutor {
         cancel_batch: bool,
     ) -> NativeBatchResult {
         let out = Self::execute_batch_phases(ctx, actions, settle_mode, engine_mode, cancel_batch);
-        if !ctx.defer_trades && !ctx.pending_fills.is_empty() {
-            // Rows of ALL the block's fills so far: a later call rewrites the
-            // same keys with a superset, so phases never drop each other's fills.
-            let mut rows = PackedCfBatch::default();
-            encode_block(ctx.block_height, ctx.timestamp, &ctx.pending_fills, &mut rows);
-            for (cf, key, value) in rows.iter() {
-                let _ = ctx.state.put_cf_raw(cf, key, value);
-            }
-        }
+        Self::write_trades_inline(ctx);
         out
     }
 
@@ -4980,6 +5004,13 @@ impl NativeExecutor {
         fill: &torus_core::order_book::Fill,
     ) {
         if ctx.trade_history {
+            if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
+                // Inline mode, context reused for a new block: the earlier
+                // block's rows are already written.
+                ctx.pending_fills.clear();
+                ctx.inline_fills_written = 0;
+            }
+            ctx.fills_block = ctx.block_height;
             ctx.pending_fills.push(TradeFill {
                 trade_index: ctx.trade_index,
                 market: market_id,
