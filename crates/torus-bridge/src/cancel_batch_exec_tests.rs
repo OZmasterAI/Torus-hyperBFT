@@ -307,7 +307,8 @@ fn cancel_all_of_stop_only_senders_persists_stop_removal() {
         NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: 1,
             is_buy: true,
-            price: FixedPoint::ZERO,
+            // s515: a stop-market needs a positive price cap.
+            price: fp(trigger + 10),
             quantity: fp(1),
             order_type: OrderType::StopMarket {
                 trigger: fp(trigger),

@@ -451,6 +451,7 @@ impl OrderBook {
                 continue;
             };
             self.trader_orders.remove(sender);
+            self.forget_reduce_only_trader(sender);
             let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
             for order in &orders {
                 let loc = self
@@ -631,6 +632,7 @@ mod tests {
             side: Side::Buy,
             trigger_price: fp(200),
             limit_price: None,
+            price_cap: FixedPoint::ZERO,
             quantity: fp(1),
             time_in_force: TimeInForce::GTC,
             timestamp: 0,
@@ -644,6 +646,7 @@ mod tests {
             side: Side::Sell,
             trigger_price: fp(50),
             limit_price: None,
+            price_cap: FixedPoint::ZERO,
             quantity: fp(1),
             time_in_force: TimeInForce::GTC,
             timestamp: 0,

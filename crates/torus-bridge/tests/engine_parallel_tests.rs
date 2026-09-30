@@ -606,11 +606,11 @@ fn interleave(lists: Vec<Vec<(Address, NativeAction)>>) -> Vec<(Address, NativeA
     }
 }
 
+/// s515: a market order needs a positive price cap; 60 is the test asks.
 fn market_buy(market_id: MarketId, qty: i64) -> PlaceOrderParams {
     PlaceOrderParams {
-        price: FixedPoint::ZERO,
         order_type: OrderType::Market,
-        ..order(market_id, true, FixedPoint::ZERO, fp(qty), TimeInForce::IOC)
+        ..order(market_id, true, fp(60), fp(qty), TimeInForce::IOC)
     }
 }
 
@@ -719,7 +719,7 @@ fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
     let (a, b) = (addr(1), addr(6));
     let stop = PlaceOrderParams {
         order_type: OrderType::StopMarket { trigger: fp(200) },
-        ..gtc(1, true, 0, 1)
+        ..gtc(1, true, 210, 1)
     };
     let reduce_only = PlaceOrderParams {
         reduce_only: true,
@@ -764,7 +764,7 @@ fn open_limit_counts_pending_stops_at_block_start() {
         order_type: OrderType::StopMarket {
             trigger: fp(trigger),
         },
-        ..gtc(2, true, 0, 1)
+        ..gtc(2, true, trigger + 10, 1)
     };
     let mut block1 = interleave(vec![resting(a, 998), resting(b, 10)]);
     block1.push(place(a, stop(200)));
@@ -1074,7 +1074,7 @@ fn open_limit_same_after_reload_or_resident_in_every_book_mode() {
         order_type: OrderType::StopMarket {
             trigger: fp(trigger),
         },
-        ..gtc(2, true, 0, 1)
+        ..gtc(2, true, trigger + 10, 1)
     };
     let mut block1 = interleave(vec![resting(a, 998), resting(b, 5)]);
     block1.push(place(a, stop(200)));
