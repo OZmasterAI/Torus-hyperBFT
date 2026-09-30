@@ -831,3 +831,21 @@ fn explicit_free_listing_id_is_honoured() {
     gov.execute_proposal(id, 120).unwrap();
     assert_eq!(market_ids(gov.state()), vec![1, 42]);
 }
+
+/// Item 2: the oracle aggregates exactly the listed markets — the 8-byte keys
+/// of CF_NATIVE_MARKETS, ascending; metadata rows (other key lengths) skipped.
+#[test]
+fn listed_market_ids_are_the_8_byte_keys_ascending() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let gov = GovernanceManager::new(db.clone());
+    for id in [9u64, 1, 300] {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &id.to_be_bytes(), b"m").unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_MARKETS, b"__book_mode__", &[1]).unwrap();
+    db.put_cf_raw(CF_NATIVE_MARKETS, b"__next_global_order_id__", &7u128.to_be_bytes())
+        .unwrap();
+    assert_eq!(gov.listed_market_ids().unwrap(), vec![1, 9, 300]);
+    assert!(gov.market_exists(9).unwrap());
+    assert!(!gov.market_exists(2).unwrap());
+}

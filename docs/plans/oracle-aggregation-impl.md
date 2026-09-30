@@ -1207,6 +1207,14 @@ fn only_active_validators_may_submit() {
 
 **validate:** `cargo test -j6 -p torus-bridge --test oracle_block_tests submission && cargo test -j6 -p torus-bridge --test oracle_block_tests only_active` · depends_on: [2, 3]
 
+**Correction s517:** the T4 test file's import list was trimmed to what T4's
+tests use (dropped `NativeBalance`, `NativeStateOverlay`, `OrderType`,
+`PlaceOrderParams`, `TimeInForce` — unused until T5+; re-add with those
+tests). No existing test submitted prices for an unlisted market through the
+executor: the consensus oracle fixture already lists market 1; the
+`native_bridge_tests` / `chaos` submissions are classify/sort only or come
+from a non-validator (already rejected).
+
 ### T5 — bridge: `begin_block_oracle` + `oracle_due` + `whole_token_power`
 
 **Test first** — append to `oracle_block_tests.rs`:

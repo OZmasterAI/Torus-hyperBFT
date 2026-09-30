@@ -7225,6 +7225,28 @@ impl NativeExecutor {
             }
         }
 
+        use torus_core::oracle::{valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP};
+        let err = |m: String| NativeActionResult::err("submit_oracle_prices", m);
+        // Item 2: validate EVERY entry before writing any (no per-action rollback)
+        // — the action is all-or-nothing.
+        if prices.is_empty() || prices.len() > CAP {
+            return err(format!("a submission carries 1..={CAP} prices, got {}", prices.len()));
+        }
+        let mut seen = BTreeSet::new();
+        for &(market_id, price) in prices {
+            if !seen.insert(market_id) {
+                return err(format!("duplicate market {market_id} in submission"));
+            }
+            match ctx.governance.market_exists(market_id) {
+                Ok(true) => {}
+                Ok(false) => return err(format!("market {market_id} is not listed")),
+                Err(e) => return err(e.to_string()),
+            }
+            if !valid_oracle_price(price) {
+                return err(format!("invalid oracle price {price} for market {market_id}"));
+            }
+        }
+
         for &(market_id, price) in prices {
             if let Err(e) =
                 ctx.oracle
