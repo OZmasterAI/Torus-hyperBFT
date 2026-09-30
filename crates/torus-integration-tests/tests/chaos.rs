@@ -376,6 +376,70 @@ fn native_incremental_root_matches_full_scan_under_real_execution() {
     }
 }
 
+/// Item 2: the block-start oracle step (agg rows rewritten, sub rows deleted)
+/// keeps the incremental native root equal to the full scan.
+#[test]
+fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
+    use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORACLE};
+    use torus_state::native_trie::{build_native_trie_to_cf, native_root_full, persisted_native_root};
+    use torus_state::{NativeStateOverlay, StateBackend};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_db = StateDb::open(tmp.path()).unwrap();
+    let staking = StakingManager::new(state_db.clone());
+    for (v, mult) in [(21u8, 1u64), (22, 1), (23, 3)] {
+        staking
+            .put_validator(&addr(v), &ValidatorState {
+                address: addr(v),
+                pubkey: [v; 32],
+                commission_bps: 0,
+                self_stake: MIN_SELF_DELEGATION * U256::from(mult),
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            })
+            .unwrap();
+    }
+    for m in [1u64, 2] {
+        state_db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
+    build_native_trie_to_cf(&state_db).unwrap();
+
+    for block in 1..=30u64 {
+        let overlay = NativeStateOverlay::new(state_db.clone());
+        let mut ctx = NativeExecContext::new(
+            overlay.clone(), block, 1_700_000_000 + block, 0, 1_000, 100,
+            Address::ZERO, Address::ZERO, Address::ZERO,
+        );
+        NativeExecutor::begin_block_oracle(&mut ctx);
+        let actions: Vec<_> = if block <= 12 {
+            [21u8, 22, 23]
+                .iter()
+                .map(|&v| (addr(v), NativeAction::SubmitOraclePrices(OracleSubmission {
+                    prices: vec![(1, fp(50_000 + block as i64 + v as i64)), (2, fp(10))],
+                    timestamp: 0,
+                })))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let r = NativeExecutor::execute_batch(&mut ctx, &actions);
+        assert!(r.results.iter().all(|x| x.success), "block {block}");
+        assert!(ctx.fatal_error.is_none());
+        overlay.flush_with_native_trie(&state_db).unwrap();
+        assert_eq!(
+            persisted_native_root(&state_db).unwrap(),
+            native_root_full(&state_db).unwrap(),
+            "block {block}: incremental native root != full scan (oracle step)"
+        );
+    }
+    let agg1 = [b"agg".as_slice(), &1u64.to_be_bytes()].concat();
+    assert!(state_db.get_cf_raw(CF_NATIVE_ORACLE, &agg1).unwrap().is_some());
+    assert!(StateBackend::iterate_cf(&state_db, CF_NATIVE_ORACLE, Some(b"sub")).unwrap().is_empty());
+}
+
 /// Execution ordering: verify tech-req section 2.2 ordering is enforced.
 /// Cancels before new orders, non-GTC before GTC.
 #[test]

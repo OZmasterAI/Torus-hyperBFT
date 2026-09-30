@@ -1956,29 +1956,49 @@ impl ExecutionContext {
         let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
         // T0: epochs run by height (HL: by round count), whatever the block carries.
         let epoch_boundary = EpochManager::is_epoch_boundary(height, self.epoch_length);
+        // bl2 exec pipeline: the overlay is built BEFORE verify so that the
+        // session lookup and the nonce replay guard below read through it —
+        // on the fast path its parent layer is the previous block's (possibly
+        // not yet durable) pending set, which is where a session created or a
+        // nonce consumed by block N−1 lives. On the serial path the overlay is
+        // empty with no parent, so every read is exactly the DB read it was.
+        // Item 2 (C1): it is built before the native gate so the oracle
+        // due-check reads DB + the pipelined parent layer (block h−1's rows may
+        // not be durable yet) — never `self.state_db` alone, which would diverge.
+        let parent = if pipelined {
+            self.last_job.lock().unwrap().clone()
+        } else {
+            None
+        };
+        debug_assert!(
+            parent.as_ref().is_none_or(|p| p.height() + 1 == height),
+            "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
+            parent.as_ref().map(|p| p.height())
+        );
+        let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        // Item 2 (C1): while submission rows exist the block-start oracle step is
+        // due. A read error is a node fault: fail-stop (C4), never "assume".
+        let oracle_due = match NativeExecutor::oracle_due(&overlay) {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::error!(%e, height, "FATAL: oracle due-check read failed — halting execution pipeline (fail-stop)");
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if fold_header {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
+        };
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
-        let run_native = has_native || computed_fee_revenue > 0 || core_writer_due || epoch_boundary;
+        let run_native = has_native
+            || computed_fee_revenue > 0
+            || core_writer_due
+            || epoch_boundary
+            || oracle_due;
         if run_native {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
-            // bl2 exec pipeline: the overlay is built BEFORE verify so that the
-            // session lookup and the nonce replay guard below read through it —
-            // on the fast path its parent layer is the previous block's (possibly
-            // not yet durable) pending set, which is where a session created or a
-            // nonce consumed by block N−1 lives. On the serial path the overlay is
-            // empty with no parent, so every read is exactly the DB read it was.
-            let parent = if pipelined {
-                self.last_job.lock().unwrap().clone()
-            } else {
-                None
-            };
-            debug_assert!(
-                parent.as_ref().is_none_or(|p| p.height() + 1 == height),
-                "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
-                parent.as_ref().map(|p| p.height())
-            );
-            let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
@@ -2199,6 +2219,11 @@ impl ExecutionContext {
             ctx.trade_history = self.trade_history;
 
             let engine_timer = std::time::Instant::now();
+            // Item 2: aggregate every listed market BEFORE any action, at the block
+            // timestamp — the whole block (placements, modify, withdrawals,
+            // CoreWriter) reads one mark. A storage fault sets `fatal_error`
+            // (the fail-stop check after the batches catches it).
+            let _ = NativeExecutor::begin_block_oracle(&mut ctx);
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
             NativeExecutor::execute_batch(&mut ctx, &post_evm);
             // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
@@ -2575,7 +2600,7 @@ impl ExecutionContext {
 
         // ---- Update tracking ----
         // T156-F1: when the native execution path ran (`run_native`: native actions, fee revenue,
-        // a due CoreWriter row or an epoch boundary), the applied-height marker was already folded
+        // a due CoreWriter row, an epoch boundary or oracle submission rows), the applied-height marker was already folded
         // into that path's atomic flush batch above (flush_with_native_trie_and_marker), so native
         // state and the marker committed together. Only blocks that skipped the native path
         // entirely (empty or pure-EVM non-boundary blocks, whose re-execution is idempotent) still
@@ -14419,5 +14444,189 @@ mod crash_recovery_tests {
             let v = &rows[0].1;
             assert_eq!(u64::from_be_bytes(v[v.len() - 8..].try_into().unwrap()), 777_777, "{path}");
         }
+    }
+
+    /// The mark as AccountReader::mark sees it at block timestamp `now` (+ stamp block).
+    fn mark_at(db: &StateDb, now: u64) -> Option<(FixedPoint, u64)> {
+        let ctx = torus_bridge::native_executor::NativeExecContext::new(
+            db.clone(), 0, now, 0, 1_000, 4, Address::ZERO, Address::ZERO, Address::ZERO,
+        );
+        let p = ctx.oracle.get_price(ORACLE_MARKET, now).ok()?;
+        p.usable().map(|m| (m, p.block_number))
+    }
+
+    /// Signed submissions through committed blocks (ts = 1000 + h). Block 2 has
+    /// NO native action and still aggregates (rows exist -> the step is due).
+    #[test]
+    fn oracle_e2e_three_validators_set_the_mark_from_the_next_block() {
+        let (config, db) = oracle_fixture_db();
+        oracle_put_validator(&db, 65, 1, torus_economics::ValidatorStatus::Candidate);
+        let ctx = make_exec_ctx(&config, &db);
+        let blocks = oracle_blocks(&[
+            &[(61, 100), (62, 101), (63, 102), (64, 999), (65, 999)], // 64 unregistered, 65 Candidate
+            &[],
+            &[(61, 200), (62, 200), (63, 200)],
+            &[],
+        ]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(oracle_sub_rows(&db).len(), 3, "only Active validators' rows are stored");
+        assert_eq!(mark_at(&db, 1_001), None, "block 1's submissions are not aggregated in block 1");
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(mark_at(&db, 1_002), Some((px(102), 2)), "stake-weighted (simple median 101)");
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "block 3's prices count from block 4");
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        assert_eq!(mark_at(&db, 1_004), Some((px(200), 4)));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(4));
+    }
+
+    /// 1: V1..V3 @100; 2..=11 empty (fresh through ts 1011, age 10); 12: V1, V2
+    /// @150 -> 2 reporters: last price kept, stamp stays (11, 1011); rows gone at
+    /// 23 (block 12's rows, ts 1012, age 11); usable through ts 1071, stale at 1072.
+    #[test]
+    fn oracle_e2e_two_reporters_keep_the_last_price_until_stale() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let mut rounds: Vec<&[(u8, i64)]> = vec![&[(61, 100), (62, 100), (63, 100)]];
+        rounds.extend(std::iter::repeat_n(&[][..], 10)); // 2..=11
+        rounds.push(&[(61, 150), (62, 150)]); // 12
+        rounds.extend(std::iter::repeat_n(&[][..], 12)); // 13..=24
+        let blocks = oracle_blocks(&rounds);
+        for b in &blocks[..11] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert_eq!(mark_at(&db, 1_011), Some((px(100), 11)));
+        for b in &blocks[11..13] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert_eq!(mark_at(&db, 1_013), Some((px(100), 11)), "2 reporters: last price, stamp kept");
+        for b in &blocks[13..] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(oracle_sub_rows(&db).is_empty());
+        assert_eq!(read_native_applied_height(&db), Some(24));
+        assert_eq!(mark_at(&db, 1_071), Some((px(100), 11)), "age 60: usable");
+        assert_eq!(mark_at(&db, 1_072), None, "age 61: stale -> no mark");
+    }
+
+    /// A block that runs the native phase ONLY for the oracle keeps the resident
+    /// books (T0's single flag: no second, untouched-block advance).
+    #[test]
+    fn oracle_e2e_oracle_only_block_keeps_the_resident_books() {
+        let (config, db) = oracle_fixture_db();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_book_mode = Some(torus_bridge::native_executor::BookMode::Classic);
+        let blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[]]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(1));
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(mark_at(&db, 1_002), Some((px(100), 2)));
+        assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(2), "holder not drained");
+    }
+
+    /// 1: V1..V3 @100; 2 empty; 3: V1..V3 @200; 4..=6 empty; 7: V1 @300, V2 @310;
+    /// 8..=14 empty (ts = 1000 + h).
+    fn oracle_determinism_blocks() -> Vec<TorusBlock> {
+        let full = |p: i64| vec![(61u8, p), (62, p), (63, p)];
+        let (r1, r3) = (full(100), full(200));
+        // 300 / 310 keeps the fixture away from the 3 x MAD boundary.
+        let r7: Vec<(u8, i64)> = vec![(61, 300), (62, 310)];
+        let e: &[(u8, i64)] = &[];
+        oracle_blocks(&[&r1[..], e, &r3[..], e, e, e, &r7[..], e, e, e, e, e, e, e])
+    }
+
+    enum OracleRun {
+        Serial,
+        /// Flush worker ON and PARKED inside job 1: block 2's due-check and
+        /// aggregation see block 1's rows only through the parent layer.
+        PipelinedParked,
+        /// Blocks 1..=4 executed; 5..=14 committed durably, then boot replay.
+        Replay,
+    }
+
+    fn run_oracle_fixture(
+        mode: OracleRun,
+        blocks: &[TorusBlock],
+    ) -> (Vec<CfDump>, torus_types::B256, StateDb) {
+        let (config, db) = oracle_fixture_db();
+        match mode {
+            OracleRun::Serial => {
+                let ctx = make_exec_ctx(&config, &db);
+                for b in blocks {
+                    dispatch_and_execute(&ctx, &db, b);
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            }
+            OracleRun::PipelinedParked => {
+                let gate = crate::exec_pipeline::WorkerGate::new();
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.attach_flush_worker(Some(gate.clone()));
+                gate.hold();
+                dispatch_and_execute(&ctx, &db, &blocks[0]);
+                assert!(gate.wait_received(1));
+                let (db2, rest) = (db.clone(), blocks[1..].to_vec());
+                let t = std::thread::spawn(move || {
+                    for b in &rest {
+                        dispatch_and_execute(&ctx, &db2, b);
+                    }
+                    ctx
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                gate.release();
+                let ctx = t.join().unwrap();
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                drop(ctx); // drains + joins W
+            }
+            OracleRun::Replay => {
+                let ctx = make_exec_ctx(&config, &db);
+                for b in &blocks[..4] {
+                    dispatch_and_execute(&ctx, &db, b);
+                }
+                for b in &blocks[4..] {
+                    persist_committed_block_durably(&db, b);
+                }
+                let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                assert_eq!(parked, None);
+                assert_eq!(last.height, blocks.len() as u64);
+            }
+        }
+        assert_eq!(read_native_applied_height(&db), Some(blocks.len() as u64));
+        let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+        (dump_all_cfs(&db), root, db)
+    }
+
+    #[test]
+    fn oracle_determinism_serial_pipelined_and_replay_are_identical() {
+        let blocks = oracle_determinism_blocks();
+        let (serial, root_s, db_s) = run_oracle_fixture(OracleRun::Serial, &blocks);
+        let (piped, root_p, _) = run_oracle_fixture(OracleRun::PipelinedParked, &blocks);
+        let (replay, root_r, _) = run_oracle_fixture(OracleRun::Replay, &blocks);
+        // Non-vacuous: 8..=13: V1 300, V2 310 (ts 1007), V3 200 (ts 1003, 3x) in the
+        // window through ts 1013 -> stake-weighted 200, re-stamped; 14: V3's row
+        // (age 11) pruned -> 2 reporters, stamp stays 13; block 7's 2 rows remain.
+        assert_eq!(mark_at(&db_s, 1_014), Some((px(200), 13)));
+        assert_eq!(oracle_sub_rows(&db_s).len(), 2);
+        assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "oracle: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    /// Correction s517 (T7): the final dump above cannot see a skipped block-2
+    /// aggregation (block 3 re-aggregates the same rows and overwrites it).
+    /// Here block 3's timestamp jumps to 1012: block 1's rows (ts 1001, age 11)
+    /// are pruned unaggregated, so block 2's aggregate — due ONLY through the
+    /// parked parent layer on the pipelined path — is the final mark.
+    #[test]
+    fn oracle_determinism_parent_layer_due_check_is_observable() {
+        let mut blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[], &[]]);
+        blocks[2].header.timestamp = 1_012; // last block: no child to relink
+        let (serial, root_s, db_s) = run_oracle_fixture(OracleRun::Serial, &blocks);
+        let (piped, root_p, _) = run_oracle_fixture(OracleRun::PipelinedParked, &blocks);
+        assert_eq!(mark_at(&db_s, 1_012), Some((px(100), 2)), "block 2's aggregate survives");
+        assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
+        assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
+        assert_eq!(root_s, root_p);
     }
 }

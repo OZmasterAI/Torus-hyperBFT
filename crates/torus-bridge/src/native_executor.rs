@@ -6770,6 +6770,15 @@ impl NativeExecutor {
         CoreWriterQueue::pending_count(state_db, height).map_or(true, |n| n > 0)
     }
 
+    /// Item 2: whether this block must run the native phase for the oracle —
+    /// any submission row in `state` (the block's overlay: DB + pipelined parent
+    /// layer). Without rows the block-start step writes nothing, so "aggregate
+    /// every block" == "run it whenever a row exists". Errors propagate (the
+    /// caller fail-stops; never "assume due / not due").
+    pub fn oracle_due<T: StateBackend>(state: &T) -> Result<bool, CoreError> {
+        OracleManager::new(state.clone(), OracleConfig::default()).has_submissions()
+    }
+
     /// Drain and execute CoreWriter actions queued from the previous block.
     ///
     /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
@@ -6828,7 +6837,49 @@ impl NativeExecutor {
         }
     }
 
-    /// Aggregate oracle prices for listed markets after oracle submissions.
+    /// Item 2 (option A) block-start step — runs FIRST in every executed native
+    /// block, before any action: deletes submission rows older than the window
+    /// (all markets), then aggregates every listed market from the rows of
+    /// EARLIER blocks, weighted by the whole-token stake of Active validators,
+    /// at the block timestamp. Nothing else writes the aggregate row, so the
+    /// whole block reads one mark. Per-market errors are results; a storage
+    /// error in the global reads (prune, market list, validator set) is a node
+    /// fault → `fatal_error` (fail-stop, never a silently skipped aggregation).
+    pub fn begin_block_oracle<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Vec<NativeActionResult> {
+        match Self::oracle_inputs(ctx) {
+            Ok((markets, stakes)) => Self::aggregate_oracle_prices(ctx, &markets, &stakes),
+            Err(e) => {
+                ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The step's global reads: prune, listed markets (ascending), Active stakes.
+    #[allow(clippy::type_complexity)]
+    fn oracle_inputs<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+    ) -> Result<(Vec<MarketId>, Vec<(Address, FixedPoint)>), String> {
+        ctx.oracle.prune_submissions(ctx.timestamp).map_err(|e| e.to_string())?;
+        let markets = ctx.governance.listed_market_ids().map_err(|e| e.to_string())?;
+        let stakes = ctx
+            .staking
+            .all_validators()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|v| v.status == ValidatorStatus::Active)
+            .map(|v| {
+                let power = i128::from(whole_token_power(&v));
+                (v.address, FixedPoint::from_raw(power * FixedPoint::SCALE))
+            })
+            .collect();
+        Ok((markets, stakes))
+    }
+
+    /// Aggregate oracle prices for `markets` at the block timestamp — called by
+    /// [`Self::begin_block_oracle`]. One result per market.
     pub fn aggregate_oracle_prices<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         markets: &[MarketId],
@@ -7045,13 +7096,19 @@ impl NativeExecutor {
     }
 }
 
+/// Whole-token voting / oracle power: floor(wei / 10^18), saturating at
+/// u64::MAX (U256 wei would overflow FixedPoint).
+fn whole_token_power(v: &torus_economics::ValidatorState) -> u64 {
+    let wei = U256::from(10u64).pow(U256::from(18u64));
+    (v.total_stake() / wei).try_into().unwrap_or(u64::MAX)
+}
+
 /// Build a ValidatorSet from current Active validators in staking state.
 /// Uses the same power conversion as `EpochManager::compute_new_validator_set`.
 fn build_current_validator_set(
     staking: &StakingManager<impl StateBackend>,
     epoch: u64,
 ) -> ValidatorSet {
-    let wei = U256::from(10u64).pow(U256::from(18u64));
     let validators: Vec<ValidatorInfo> = match staking.all_validators() {
         Ok(all) => all
             .into_iter()
@@ -7059,7 +7116,7 @@ fn build_current_validator_set(
             .map(|v| ValidatorInfo {
                 address: v.address,
                 pubkey: PublicKey(v.pubkey),
-                power: (v.total_stake() / wei).try_into().unwrap_or(u64::MAX),
+                power: whole_token_power(&v),
                 commission_bps: v.commission_bps,
             })
             .collect(),

@@ -1766,6 +1766,15 @@ No implementation expected (gates); a failure is a bug in T0-T6.
 
 **validate:** `cargo test -j6 -p torus-consensus --lib oracle_determinism && cargo test -j6 -p torus-integration-tests --test chaos oracle` · depends_on: [6]
 
+**Correction s517** (landed with T5/T6): (1) the fixture above was vacuous for the
+parent-layer due-check — a mutation (`oracle_due(&self.state_db)` instead of the overlay)
+still passed, because block 3 re-aggregates block 1's rows and overwrites block 2's
+aggregate. `run_oracle_fixture` now takes the block list, and
+`oracle_determinism_parent_layer_due_check_is_observable` (blocks 1 @100 ×3, 2 empty, 3 empty
+with ts 1012 → block 1's rows pruned unaggregated, so block 2's aggregate is the final mark)
+fails under that mutation and passes on the real code. (2) `oracle_inputs` carries
+`#[allow(clippy::type_complexity)]`; the T6 test uses `repeat_n` (clippy).
+
 ### T8 — precompiles 0x0802 / 0x0800 on the time-based rule (EVM timestamp threaded)
 
 **Part of `══ COMMIT 3 (oracle core) ══`** — implemented together with T2, committed once.
