@@ -555,6 +555,17 @@ impl OrderBook {
                     return PlaceResult::rejected(order_id);
                 }
             }
+            // F4 (s515 review): a policed reduce-only stop must be able to reduce
+            // the CURRENT position when placed — the same rule the executor's
+            // single-action pre-check applies (the batch path relies on this one).
+            // It is re-checked, and clamped, at trigger time.
+            if params.reduce_only {
+                if let Some(pos) = self.reduce_only_positions.get(&trader) {
+                    if reduce_only_allowance(pos, params.is_buy) <= FixedPoint::ZERO {
+                        return PlaceResult::rejected(order_id);
+                    }
+                }
+            }
             self.pending_stops.push(StopOrder {
                 id: order_id,
                 trader,
@@ -648,6 +659,14 @@ impl OrderBook {
         }
         for c in &reduce_only_cuts {
             self.reduce_only_index.remove(&(c.trader, c.order_id));
+        }
+        // ...and so do fully filled ones (F6: a stale entry kept
+        // `has_reduce_only_orders()` true, so every later placement in this
+        // market loaded policing positions for nothing).
+        for f in &fills {
+            if !self.order_index.contains_key(&f.maker_order_id) {
+                self.reduce_only_index.remove(&(f.maker, f.maker_order_id));
+            }
         }
 
         // s515 (reduce-only, resting orders): every policed trader whose

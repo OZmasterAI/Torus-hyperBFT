@@ -409,3 +409,79 @@ fn triggered_stop_market_fills_settle_positions_and_margin() {
         assert_bal(&ctx, &m2, fp(FUNDING), FixedPoint::ZERO, "maker released");
     }
 }
+
+// ============================================================================
+// (e) F2 (s515 review): price × qty overflow is a rejection, never a panic
+// ============================================================================
+
+/// A cap of 1e22 with qty 1e9 has a notional past `i128::MAX` raw. The
+/// reservation used to `expect()` on the multiplication — every validator
+/// panicked on the same action (the parallel prepare fell back to serial and
+/// panicked again): a chain halt. It must be rejected with balances untouched.
+#[test]
+fn market_order_notional_overflow_rejected_without_panic() {
+    let huge_cap = FixedPoint::from_raw(10i128.pow(22) * FixedPoint::SCALE);
+    for path in PATHS {
+        for is_buy in [true, false] {
+            let maker = addr(1);
+            let taker = addr(2);
+            let (_d, mut ctx) = fresh(path, &[maker, taker]);
+            let r = run(&mut ctx, path, &[place(maker, limit(1, !is_buy, 100, 4))]);
+            assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+
+            for p in [
+                market(1, is_buy, huge_cap, 1_000_000_000),
+                stop_market(1, is_buy, if is_buy { 200 } else { 50 }, huge_cap, 1_000_000_000),
+                PlaceOrderParams {
+                    price: huge_cap,
+                    ..limit(1, is_buy, 1, 1_000_000_000)
+                },
+            ] {
+                let what = format!("{path:?} buy={is_buy} {:?}", p.order_type);
+                let r = run(&mut ctx, path, &[place(taker, p)]);
+                assert!(!r[0].success, "{what}: overflowing notional must be rejected");
+                let err = r[0].error.as_deref().unwrap_or("");
+                assert!(err.contains("overflow"), "{what}: unexpected error {err:?}");
+                assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: no fill");
+                assert_bal(&ctx, &taker, fp(FUNDING), FixedPoint::ZERO, &what);
+            }
+            assert_eq!(resting(&ctx, &maker), vec![fp(4)], "{path:?}: maker untouched");
+            assert!(resting(&ctx, &taker).is_empty(), "{path:?}: nothing rests");
+        }
+    }
+}
+
+// ============================================================================
+// (f) F5 (s515 review): a market SELL reserves at max(cap, best bid)
+// ============================================================================
+
+/// A sell's cap is its LOWEST acceptable price (clients send ~1), so
+/// reserving at the cap reserved ~nothing while the order opened a short at
+/// the bids. Fills happen at bids <= best bid, so max(cap, best bid) bounds
+/// the notional: 100 * 4 / 20 = 20 > 10 available → rejected.
+#[test]
+fn market_sell_reserves_at_best_bid_not_cap() {
+    for path in PATHS {
+        let maker = addr(1);
+        let taker = addr(2);
+        let (_d, mut ctx) = fresh(path, &[maker]);
+        fund_native(&ctx, &taker, fp(10));
+        let r = run(&mut ctx, path, &[place(maker, limit(1, true, 100, 4))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+
+        let r = run(&mut ctx, path, &[place(taker, market(1, false, fp(1), 4))]);
+        assert!(!r[0].success, "{path:?}: must be rejected for margin");
+        let err = r[0].error.as_deref().unwrap_or("");
+        assert!(err.contains("insufficient margin"), "{path:?}: unexpected error {err:?}");
+        assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: no short opened");
+        assert_eq!(resting(&ctx, &maker), vec![fp(4)], "{path:?}: bid untouched");
+        assert_bal(&ctx, &taker, fp(10), FixedPoint::ZERO, "taker");
+
+        // With enough margin the same order fills and releases everything.
+        fund_native(&ctx, &taker, fp(FUNDING));
+        let r = run(&mut ctx, path, &[place(taker, market(1, false, fp(1), 4))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert_eq!(pos(&ctx, &taker), -fp(4), "{path:?}: short opened at the bid");
+        assert_bal(&ctx, &taker, fp(FUNDING), FixedPoint::ZERO, "taker released");
+    }
+}
