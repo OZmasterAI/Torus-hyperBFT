@@ -1,12 +1,14 @@
 //! Transfer commands: send (EVM), transfer-to-perp, transfer-to-spot, withdraw.
 //!
-//! Native transfers use `U256` wei (18 decimals). Only `parse_trs_to_wei` here —
-//! never `str::parse::<FixedPoint>`.
+//! Units: `send` is an EVM value transfer in wei (18 decimals, `parse_trs_to_wei`).
+//! The native lockbox actions (transfer-to-perp / transfer-to-spot / withdraw) carry
+//! NATIVE 8-decimal units (`parse_trs_to_native_units`); the node moves
+//! `amount × 10^10` wei on the EVM side.
 
 use torus_types::NativeAction;
 
 use crate::keystore::address_from_key;
-use crate::parse::{parse_address, parse_trs_to_wei};
+use crate::parse::{parse_address, parse_trs_to_native_units, parse_trs_to_wei};
 use crate::rpc::RpcClient;
 use crate::sign::{build_and_sign_eip1559_tx, load_signing_key, submit_native_action};
 use crate::Cli;
@@ -60,13 +62,8 @@ pub(crate) async fn cmd_transfer_to_perp(
     rpc: &RpcClient,
     amount: &str,
 ) -> Result<(), String> {
-    let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(
-        cli,
-        rpc,
-        NativeAction::TransferToPerp { amount: amount_wei },
-    )
-    .await
+    let amount = parse_trs_to_native_units(amount)?;
+    submit_native_action(cli, rpc, NativeAction::TransferToPerp { amount }).await
 }
 
 pub(crate) async fn cmd_transfer_to_spot(
@@ -74,13 +71,8 @@ pub(crate) async fn cmd_transfer_to_spot(
     rpc: &RpcClient,
     amount: &str,
 ) -> Result<(), String> {
-    let amount_wei = parse_trs_to_wei(amount)?;
-    submit_native_action(
-        cli,
-        rpc,
-        NativeAction::TransferToSpot { amount: amount_wei },
-    )
-    .await
+    let amount = parse_trs_to_native_units(amount)?;
+    submit_native_action(cli, rpc, NativeAction::TransferToSpot { amount }).await
 }
 
 pub(crate) async fn cmd_withdraw(
@@ -90,12 +82,12 @@ pub(crate) async fn cmd_withdraw(
     amount: &str,
 ) -> Result<(), String> {
     let to_addr = parse_address(to)?;
-    let amount_wei = parse_trs_to_wei(amount)?;
+    let amount = parse_trs_to_native_units(amount)?;
     submit_native_action(
         cli,
         rpc,
         NativeAction::Withdraw {
-            amount: amount_wei,
+            amount,
             to: to_addr,
         },
     )

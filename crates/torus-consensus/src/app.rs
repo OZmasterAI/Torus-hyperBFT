@@ -1837,8 +1837,14 @@ impl ExecutionContext {
 
         // Bug (b): every boundary block runs the native phase (even when empty)
         // — it applies / computes the validator-set plans (`process_epoch_boundary`).
+        // CoreWriter / lockbox actions queued by the previous block's EVM txs target THIS
+        // height and are drained only on the native path — run it for them too, or an
+        // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
+        // value is already burned, so a stranded credit is lost value).
+        let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
         let run_native = has_native
             || computed_fee_revenue > 0
+            || core_writer_due
             || EpochManager::is_epoch_boundary(height, self.epoch_length);
 
         // ---- Native execution ----
@@ -11022,24 +11028,34 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Wei per native raw unit: the EVM side is 18-decimal, native `FixedPoint` 8-decimal.
+    const WEI_PER_NATIVE_RAW: u64 = 10_000_000_000;
+
     /// Seed an EVM balance into CF_ACCOUNTS (72-byte record: balance ++ nonce ++ code_hash).
     /// `Lockbox::get_evm_balance` reads the first 32 bytes big-endian.
+    ///
+    /// `balance` is in NATIVE 8-decimal raw units (the unit of the native lockbox actions
+    /// these tests sign); it is stored as 18-decimal wei (×10^10).
     fn fund_evm_balance(state_db: &StateDb, addr: Address, balance: U256) {
+        let wei = balance * U256::from(WEI_PER_NATIVE_RAW);
         let mut rec = vec![0u8; 72];
-        rec[..32].copy_from_slice(&balance.to_be_bytes::<32>());
+        rec[..32].copy_from_slice(&wei.to_be_bytes::<32>());
         state_db
             .put_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice(), &rec)
             .unwrap();
     }
 
+    /// EVM balance in NATIVE 8-decimal raw units (wei / 10^10; the tests only move
+    /// whole native units, so the division is exact).
     fn read_evm_balance(state_db: &StateDb, addr: Address) -> U256 {
-        match state_db
+        let wei = match state_db
             .get_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice())
             .unwrap()
         {
             Some(d) if d.len() >= 32 => U256::from_be_slice(&d[..32]),
             _ => U256::ZERO,
-        }
+        };
+        wei / U256::from(WEI_PER_NATIVE_RAW)
     }
 
     /// REGRESSION (correctness/fund-safety): an identical native action committed in
@@ -11057,7 +11073,8 @@ mod crash_recovery_tests {
         let (config, state_db) = make_test_config_and_db();
         let exec_ctx = make_exec_ctx(&config, &state_db);
 
-        // amount is a raw 8-decimal FixedPoint (u256_to_fp), NOT 18-decimal wei.
+        // Native lockbox action amounts are raw 8-decimal FixedPoint units (u256_to_fp),
+        // NOT 18-decimal wei; the lockbox debits amount × 10^10 wei from the EVM side.
         let amount_raw: u128 = FixedPoint::ONE.raw() as u128; // 1.0 == 100_000_000
         let amount = U256::from(amount_raw);
         let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
