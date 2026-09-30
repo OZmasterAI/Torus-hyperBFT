@@ -708,6 +708,133 @@ fn takes_open_slot(p: &PlaceOrderParams) -> bool {
         )
 }
 
+/// F2 (s515 review 3): per-market upper bound on the highest bid an
+/// execute_batch market SELL can hit ABOVE the pre-batch best bid — a bid of
+/// this batch resting ahead of it (Phase 3 matches each market's orders in
+/// flat order). Fed in flat order with the orders that PASSED their Phase-2
+/// reservation, so an unfunded bid never counts. A passed buy raises the
+/// bound only if it can rest: a `Limit` with a resting TIF (GTC / PostOnly —
+/// IOC / FOK never rest) that clears the book's static checks (price > 0 on
+/// the tick, qty >= lot), and is not certain to be fully filled by the
+/// pre-batch asks at or below its price. Only "robust" asks are relied on:
+/// non-reduce-only (a reduce-only ask can shrink / cancel mid-batch) and
+/// owned by a trader with no buy of this batch in the market (STP cancels a
+/// maker of the taker's own). Cancels / modifies run in Phase 1, before this
+/// book is read, so a robust ask leaves only by being filled — each unit by a
+/// unit of a passed buy. If the robust depth at <= price exceeds the passed
+/// buy quantity through this bid, a robust ask at <= price survives the bid's
+/// matching, so the bid cannot rest. Pure function of pre-batch state and
+/// flat-order outcomes: the serial prepare feeds it as it goes and the
+/// sharded prepare replays it over the worker outcomes (identical result).
+struct BatchBidBound {
+    /// False when the batch holds no market sell — every call is a no-op.
+    active: bool,
+    /// (market, sender) of every non-stop buy in the batch (STP candidates).
+    buyers: std::collections::HashSet<(MarketId, Address)>,
+    markets: HashMap<MarketId, BatchBidMarket>,
+}
+
+struct BatchBidMarket {
+    /// Highest price of a passed bid that can rest.
+    max_bid: Option<FixedPoint>,
+    /// Quantity of every passed non-stop buy so far (upper bound on the ask
+    /// quantity this batch's buys can consume).
+    bought: FixedPoint,
+    /// Robust pre-batch ask levels ascending: (price, cumulative qty).
+    robust_asks: Option<Vec<(FixedPoint, FixedPoint)>>,
+}
+
+impl BatchBidBound {
+    fn new(orders: &[(usize, Address, &PlaceOrderParams)]) -> Self {
+        let active = orders
+            .iter()
+            .any(|(_, _, p)| !p.is_buy && matches!(p.order_type, OrderType::Market));
+        let buyers = if active {
+            orders
+                .iter()
+                .filter(|(_, _, p)| p.is_buy && !NativeExecutor::is_stop(p))
+                .map(|(_, s, p)| (p.market_id, *s))
+                .collect()
+        } else {
+            Default::default()
+        };
+        Self {
+            active,
+            buyers,
+            markets: HashMap::new(),
+        }
+    }
+
+    /// The Phase-2 reservation price of `params` given its basis price.
+    fn price(&self, params: &PlaceOrderParams, basis_price: FixedPoint) -> FixedPoint {
+        if !self.active || params.is_buy || !matches!(params.order_type, OrderType::Market) {
+            return basis_price;
+        }
+        match self.markets.get(&params.market_id).and_then(|m| m.max_bid) {
+            Some(bid) => basis_price.max(bid),
+            None => basis_price,
+        }
+    }
+
+    /// Record an order that passed its Phase-2 reservation.
+    fn on_pass(&mut self, books: &HashMap<MarketId, OrderBook>, params: &PlaceOrderParams) {
+        if !self.active || !params.is_buy || NativeExecutor::is_stop(params) {
+            return;
+        }
+        let book = books.get(&params.market_id);
+        let buyers = &self.buyers;
+        let m = self
+            .markets
+            .entry(params.market_id)
+            .or_insert(BatchBidMarket {
+                max_bid: None,
+                bought: FixedPoint::ZERO,
+                robust_asks: None,
+            });
+        m.bought = FixedPoint::from_raw(m.bought.raw().saturating_add(params.quantity.raw()));
+        // Phase 3 creates a missing book with tick = lot = 1.
+        let (tick, lot) = book.map_or((FixedPoint::ONE, FixedPoint::ONE), |b| {
+            (b.tick_size, b.lot_size)
+        });
+        let can_rest = matches!(params.order_type, OrderType::Limit)
+            && matches!(
+                params.time_in_force,
+                TimeInForce::GTC | TimeInForce::PostOnly
+            )
+            && params.price > FixedPoint::ZERO
+            && !(tick > FixedPoint::ZERO && params.price.raw() % tick.raw() != 0)
+            && params.quantity >= lot;
+        if !can_rest {
+            return;
+        }
+        let market_id = params.market_id;
+        let asks = m.robust_asks.get_or_insert_with(|| {
+            let mut cum = FixedPoint::ZERO;
+            let mut levels = Vec::new();
+            for (&price, queue) in book.into_iter().flat_map(|b| b.ask_queues()) {
+                for o in queue {
+                    if !o.reduce_only && !buyers.contains(&(market_id, o.trader)) {
+                        cum = FixedPoint::from_raw(cum.raw().saturating_add(o.remaining_qty.raw()));
+                    }
+                }
+                levels.push((price, cum));
+            }
+            levels
+        });
+        // Robust depth at <= price (levels ascending, cumulative).
+        let n = asks.partition_point(|&(p, _)| p <= params.price);
+        let depth = if n == 0 {
+            FixedPoint::ZERO
+        } else {
+            asks[n - 1].1
+        };
+        if depth > m.bought {
+            return; // a robust ask at <= price outlives it: never rests
+        }
+        m.max_bid = Some(m.max_bid.map_or(params.price, |b| b.max(params.price)));
+    }
+}
+
 #[cfg(test)]
 mod parallel_engine_toggle_tests {
     use super::parse_parallel_engine_threads;
@@ -3974,16 +4101,17 @@ impl NativeExecutor {
         // falls back to the serial loop with nothing shared mutated.
         // F4/F5: reservation basis overrides from pre-batch state, shared by
         // the serial and sharded prepare paths (identical inputs).
-        let basis = {
-            let orders: Vec<(usize, Address, &PlaceOrderParams)> = place_order_indices
-                .iter()
-                .map(|&i| match &flat[i] {
-                    (sender, FlatAction::Place(p)) => (i, *sender, *p),
-                    (_, FlatAction::Other(_)) => unreachable!(),
-                })
-                .collect();
-            Self::phase2_reservation_basis(ctx, &orders)
-        };
+        // F2 (review 3): the in-batch bid bound is fed with PASSED orders
+        // in flat order (serial loop below / replay after the sharded one).
+        let place_orders: Vec<(usize, Address, &PlaceOrderParams)> = place_order_indices
+            .iter()
+            .map(|&i| match &flat[i] {
+                (sender, FlatAction::Place(p)) => (i, *sender, *p),
+                (_, FlatAction::Other(_)) => unreachable!(),
+            })
+            .collect();
+        let basis = Self::phase2_reservation_basis(ctx, &place_orders);
+        let mut bid_bound = BatchBidBound::new(&place_orders);
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
         if engine_threads >= 2
@@ -4018,10 +4146,35 @@ impl NativeExecutor {
                     n,
                 ) {
                     Some((outcomes, worker_cache)) => {
-                        // Sender shards are disjoint, so the merged cache is
-                        // exactly the serial loop's cache.
-                        bal_cache.merge_disjoint(worker_cache);
-                        prep_outcomes = Some(outcomes);
+                        // F2 (review 3): workers priced every order at the
+                        // static basis. Replay the bid bound over their
+                        // outcomes in flat order; if it raises any market
+                        // sell, that sell's outcome (and so its sender's
+                        // later ones) may differ — discard the shards
+                        // (nothing shared was mutated) and prepare serially.
+                        let mut replay = BatchBidBound::new(&place_orders);
+                        let mut raised = false;
+                        for &(i, _, params) in &place_orders {
+                            let basis_price =
+                                basis.get(&i).map_or(Self::reserve_price(params), |b| b.0);
+                            if replay.price(params, basis_price) != basis_price {
+                                raised = true;
+                                break;
+                            }
+                            if matches!(outcomes[i], Some(PrepOutcome::Pass(_))) {
+                                replay.on_pass(&ctx.order_books, params);
+                            }
+                        }
+                        if raised {
+                            tracing::debug!(
+                                "F2: in-batch bid raises a market sell — serial prepare"
+                            );
+                        } else {
+                            // Sender shards are disjoint, so the merged cache
+                            // is exactly the serial loop's cache.
+                            bal_cache.merge_disjoint(worker_cache);
+                            prep_outcomes = Some(outcomes);
+                        }
                     }
                     None => {
                         tracing::error!(
@@ -4120,6 +4273,8 @@ impl NativeExecutor {
                     .get(&i)
                     .copied()
                     .unwrap_or((Self::reserve_price(params), params.quantity));
+                // F2 (review 3): raised to an earlier passed in-batch bid.
+                let res_price = bid_bound.price(params, res_price);
                 let order_margin_required = match Self::try_reserve_for_qty_cfg(
                     ctx.margin_configs.get(&market_id),
                     res_price,
@@ -4170,6 +4325,7 @@ impl NativeExecutor {
                 if taken.is_some() {
                     *slots = taken;
                 }
+                bid_bound.on_pass(&ctx.order_books, params);
 
                 // Assign global order ID (monotonic, pre-matching)
                 let order_id = ctx.next_global_order_id;
@@ -5531,13 +5687,10 @@ impl NativeExecutor {
     /// reservation basis `(price, qty)` — default `(reserve_price, quantity)`
     /// — from PRE-BATCH state only, computed ONCE so the serial and sharded
     /// prepare paths see identical inputs.
-    /// - Market sell: priced by [`reservation_price`], raised to the highest
-    ///   limit price of an EARLIER in-batch Limit buy in that market (F2,
-    ///   second review): Phase 3 matches each market's orders in this flat
-    ///   order, so such a bid can rest above the pre-batch best bid before
-    ///   the sell matches. Conservative (the bid may be rejected or fill
-    ///   away) and deterministic; exact for the A5 identity because a market
-    ///   order never rests (its whole reservation is released).
+    /// - Market sell: priced by [`reservation_price`]. (Phase 2 raises it
+    ///   further to an earlier PASSED in-batch bid that can rest — F2, see
+    ///   [`BatchBidBound`]; exact for the A5 identity because a market order
+    ///   never rests, so its whole reservation is released.)
     /// - Reduce-only non-stop order: sized to min(qty, bound), where bound is
     ///   an upper bound on the book's match-time clamp — the pre-batch
     ///   allowance plus everything that can still grow the position before the
@@ -5554,24 +5707,10 @@ impl NativeExecutor {
             |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
         let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
-        // Highest Limit-buy price seen so far in the batch, per market.
-        let mut batch_bid: HashMap<MarketId, FixedPoint> = HashMap::new();
         let mut out = HashMap::new();
         for &(i, sender, params) in orders {
             let book = ctx.order_books.get(&params.market_id);
-            let mut price = Self::reservation_price(params, book);
-            match params.order_type {
-                OrderType::Market if !params.is_buy => {
-                    if let Some(&bid) = batch_bid.get(&params.market_id) {
-                        price = price.max(bid);
-                    }
-                }
-                OrderType::Limit if params.is_buy => {
-                    let bid = batch_bid.entry(params.market_id).or_insert(params.price);
-                    *bid = (*bid).max(params.price);
-                }
-                _ => {}
-            }
+            let price = Self::reservation_price(params, book);
             let mut qty = params.quantity;
             if params.reduce_only && !Self::is_stop(params) {
                 // A position read error polices as flat in the book; keep the
