@@ -170,6 +170,18 @@ impl Default for BlockNotifier {
     }
 }
 
+/// s80: the execution thread's fill sink. Fills are recorded only while at
+/// least one `newTrades`/`userFills` subscriber exists.
+impl torus_state::trade_rows::FillSink for BlockNotifier {
+    fn wants_fills(&self) -> bool {
+        self.new_trades.receiver_count() > 0
+    }
+
+    fn send_fills(&self, block: Arc<BlockFills>) {
+        self.notify_fills(block);
+    }
+}
+
 /// Per-sender transaction submission rate limiter (Batch EK: EVM-FIND-19).
 /// Counts submissions at send_raw_transaction time, not at block commit time.
 #[derive(Clone)]
@@ -635,6 +647,19 @@ mod tests {
     use torus_mempool::{Mempool, MempoolConfig};
     use torus_state::cf::{CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_RECEIPTS};
     use torus_types::{Receipt, TorusBlockBody, TorusBlockHeader};
+
+    /// s80 review: the node records fills for the streams only while someone
+    /// is subscribed — `wants_fills` follows the trade channel's receivers.
+    #[test]
+    fn block_notifier_wants_fills_only_with_a_subscriber() {
+        use torus_state::trade_rows::FillSink;
+        let notifier = BlockNotifier::new();
+        assert!(!notifier.wants_fills(), "no subscriber: no fills wanted");
+        let rx = notifier.new_trades.subscribe();
+        assert!(notifier.wants_fills(), "a subscriber wants fills");
+        drop(rx);
+        assert!(!notifier.wants_fills(), "last subscriber gone: no fills wanted");
+    }
 
     fn test_header(height: u64, gas_used: u64, base_fee: u64) -> TorusBlockHeader {
         TorusBlockHeader {

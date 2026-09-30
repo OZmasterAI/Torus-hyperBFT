@@ -70,9 +70,16 @@ pub struct BlockFills {
     pub fills: Vec<TradeFill>,
 }
 
-/// Called on the execution thread once per executed block with fills, in
-/// height order; must not block.
-pub type FillSink = std::sync::Arc<dyn Fn(std::sync::Arc<BlockFills>) + Send + Sync>;
+/// Stream consumer of executed blocks' fills (s80). Called on the execution
+/// thread; must not block.
+pub trait FillSink: Send + Sync {
+    /// Whether anyone currently wants fills (checked once per block before
+    /// execution). False = the block records no fills for the sink (with
+    /// trade history off it records none at all).
+    fn wants_fills(&self) -> bool;
+    /// One executed block's fills (only blocks with fills), in height order.
+    fn send_fills(&self, block: std::sync::Arc<BlockFills>);
+}
 
 /// One entry of a `CF_NATIVE_TRADES` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

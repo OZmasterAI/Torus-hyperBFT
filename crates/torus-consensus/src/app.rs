@@ -535,10 +535,11 @@ struct ExecutionContext {
     /// rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`); default on.
     trade_history: bool,
     /// s80: optional stream sink for each executed block's fills, shared with
-    /// `TorusApp` (`set_fill_sink`). Empty = no fills are handed out and
-    /// execution is exactly as without streams. Set before consensus starts;
+    /// `TorusApp` (`set_fill_sink`). Empty, or a sink whose `wants_fills` is
+    /// false, = no extra fills are recorded and execution is exactly as
+    /// without streams. Set before consensus starts;
     /// boot replay runs before it can be set, so replayed blocks never reach it.
-    fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>>,
+    fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1890,9 +1891,10 @@ impl ExecutionContext {
             // written after the flush below (background writer, or inline).
             ctx.defer_trades = true;
             ctx.trade_history = self.trade_history;
-            // s80: with a stream sink installed, fills are recorded even with
-            // trade history off (they never touch state either way).
-            ctx.record_fills = self.fill_sink.get().is_some();
+            // s80: while a stream sink wants fills (someone is subscribed),
+            // they are recorded even with trade history off (they never touch
+            // state either way). Checked once per block, before execution.
+            ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -2193,7 +2195,7 @@ impl ExecutionContext {
                     fills,
                 });
                 if let Some(sink) = self.fill_sink.get() {
-                    sink(block.clone());
+                    sink.send_fills(block.clone());
                 }
                 if self.trade_history {
                     // s77: the rows are encoded on the writer thread, not here.
@@ -2564,7 +2566,7 @@ pub struct TorusApp {
     /// re-persisting or falling back to "unknown ⇒ rewrite at exec".
     exec_prepared_durable: DurableRows,
     /// s80: the execution thread's fill sink slot (see `set_fill_sink`).
-    fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>>,
+    fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -3324,7 +3326,7 @@ impl TorusApp {
         let exec_queue_len = Arc::new(AtomicU64::new(0));
 
         // s80: fill-sink slot, shared with the exec thread (see `set_fill_sink`).
-        let fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>> =
+        let fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>> =
             Default::default();
 
         // Execution pipeline context — owns its own copies for thread safety.
@@ -3600,7 +3602,7 @@ impl TorusApp {
     /// (see `FillSink`). Must be called before consensus starts, so no
     /// executed block is missed; boot replay inside `new()` runs without a
     /// sink, by design. A second call is ignored (logged).
-    pub fn set_fill_sink(&self, sink: torus_state::trade_rows::FillSink) {
+    pub fn set_fill_sink(&self, sink: Arc<dyn torus_state::trade_rows::FillSink>) {
         if self.fill_sink.set(sink).is_err() {
             tracing::warn!("fill sink already set; ignoring the second one");
         }
@@ -12336,23 +12338,38 @@ mod crash_recovery_tests {
 
     type SeenFills = Arc<std::sync::Mutex<Vec<Arc<torus_state::trade_rows::BlockFills>>>>;
 
+    /// s80: a recording fill sink; `wants` is what `wants_fills` reports.
+    struct TestSink {
+        wants: bool,
+        seen: SeenFills,
+    }
+
+    impl torus_state::trade_rows::FillSink for TestSink {
+        fn wants_fills(&self) -> bool {
+            self.wants
+        }
+        fn send_fills(&self, block: Arc<torus_state::trade_rows::BlockFills>) {
+            self.seen.lock().unwrap().push(block);
+        }
+    }
+
     /// s80: run the pipeline fixture (exec pipeline `on`/off, trade history
-    /// on/off, optionally with a recording fill sink), drain, and return the
-    /// full dump, the persisted native root and what the sink received.
+    /// on/off, optionally with a recording fill sink whose `wants_fills` is
+    /// `sink_wants`), drain, and return the full dump, the persisted native
+    /// root and what the sink received.
     fn run_fill_fixture(
         on: bool,
         history: bool,
-        with_sink: bool,
+        sink_wants: Option<bool>,
     ) -> (Vec<CfDump>, torus_types::B256, Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>) {
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let mut ctx = pipeline_ctx(&state_db, on, None);
         ctx.trade_history = history;
         let seen: SeenFills = Default::default();
-        if with_sink {
-            let s = seen.clone();
-            let sink: torus_state::trade_rows::FillSink =
-                Arc::new(move |b| s.lock().unwrap().push(b));
+        if let Some(wants) = sink_wants {
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                Arc::new(TestSink { wants, seen: seen.clone() });
             assert!(ctx.fill_sink.set(sink).is_ok());
         }
         for b in &pipeline_fixture_blocks() {
@@ -12361,7 +12378,7 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
         drop(ctx); // drains + joins W
         let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
-        let seen = with_sink.then(|| seen.lock().unwrap().clone());
+        let seen = sink_wants.is_some().then(|| seen.lock().unwrap().clone());
         (dump_all_cfs(&state_db), root, seen)
     }
 
@@ -12382,7 +12399,7 @@ mod crash_recovery_tests {
     #[test]
     fn fill_sink_receives_every_executed_block_in_order() {
         for on in [false, true] {
-            let (dump, _root, seen) = run_fill_fixture(on, true, true);
+            let (dump, _root, seen) = run_fill_fixture(on, true, Some(true));
             let seen = seen.unwrap();
             assert_eq!(
                 fill_summary(&seen),
@@ -12426,8 +12443,8 @@ mod crash_recovery_tests {
     #[test]
     fn fill_sink_works_with_trade_history_off() {
         for on in [false, true] {
-            let (_, _, with_history) = run_fill_fixture(on, true, true);
-            let (dump, _root, seen) = run_fill_fixture(on, false, true);
+            let (_, _, with_history) = run_fill_fixture(on, true, Some(true));
+            let (dump, _root, seen) = run_fill_fixture(on, false, Some(true));
             let seen = seen.unwrap();
             assert_eq!(fill_summary(&seen), vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)]);
             let with_history = with_history.unwrap();
@@ -12446,11 +12463,29 @@ mod crash_recovery_tests {
     fn no_fill_sink_leaves_state_identical() {
         for on in [false, true] {
             for history in [true, false] {
-                let (plain, root_plain, _) = run_fill_fixture(on, history, false);
-                let (sunk, root_sunk, _) = run_fill_fixture(on, history, true);
+                let (plain, root_plain, _) = run_fill_fixture(on, history, None);
+                let (sunk, root_sunk, _) = run_fill_fixture(on, history, Some(true));
                 assert_dumps_equal(&plain, &sunk, &format!("sink vs none (on={on} history={history})"));
                 assert_eq!(root_plain, root_sunk, "native root (on={on} history={history})");
             }
+        }
+    }
+
+    /// s80 review: with trade history OFF and a sink installed that nobody
+    /// listens to (`wants_fills` false, e.g. a validator with no stream
+    /// subscriber), no fill is recorded — the sink gets nothing, no trade row
+    /// is written, and every CF and the native root match a run without a sink.
+    #[test]
+    fn fill_sink_not_wanted_records_nothing_with_history_off() {
+        for on in [false, true] {
+            let (plain, root_plain, _) = run_fill_fixture(on, false, None);
+            let (idle, root_idle, seen) = run_fill_fixture(on, false, Some(false));
+            assert!(seen.unwrap().is_empty(), "an unwanted sink must receive nothing (on={on})");
+            for cf in [torus_state::cf::CF_NATIVE_TRADES, torus_state::cf::CF_NATIVE_USER_TRADES] {
+                assert!(cf_rows(&idle, cf).is_empty(), "{cf} must stay empty (on={on})");
+            }
+            assert_dumps_equal(&plain, &idle, &format!("idle sink vs none (on={on})"));
+            assert_eq!(root_plain, root_idle, "native root (on={on})");
         }
     }
 
