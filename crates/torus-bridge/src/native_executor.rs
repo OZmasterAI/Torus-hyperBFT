@@ -3239,6 +3239,10 @@ impl<T: StateBackend> NativeExecContext<T> {
 /// prevent other actions from executing (deterministic batch semantics).
 pub struct NativeExecutor;
 
+/// Error for the direct admin market actions (`ListMarket`, `DelistMarket`,
+/// `UpdateMarketParams`): markets change only through governance.
+const GOVERNANCE_ONLY_MSG: &str = "governance-only: submit a proposal";
+
 impl NativeExecutor {
     /// Execute a single native action for the given sender.
     pub fn execute<T: StateBackend>(
@@ -3359,16 +3363,20 @@ impl NativeExecutor {
                 Self::exec_revoke_session(ctx, sender, session_pubkey)
             }
 
-            // ---- Admin (governance-gated, stubs) ----
-            // AUDIT: ECON-PF-07 -- Intentional stubs. Market management (listing,
-            // delisting, param updates) will be implemented in the market registry
-            // feature. Variants are defined now so governance pipeline and EIP-712
-            // encoding are stable before the registry is built.
+            // ---- Admin (governance-only) ----
+            // AUDIT: ECON-PF-07 -- There is no authority check on the direct path, so
+            // these are REJECTED (previously a silent ok no-op, which told clients a
+            // listing had succeeded). Market changes go through
+            // SubmitProposal(ProposalAction::*) and execute via governance.
             NativeAction::UpdateMarketParams { .. } => {
-                NativeActionResult::ok("update_market_params", 0)
+                NativeActionResult::err("update_market_params", GOVERNANCE_ONLY_MSG.into())
             }
-            NativeAction::ListMarket(_) => NativeActionResult::ok("list_market", 0),
-            NativeAction::DelistMarket { .. } => NativeActionResult::ok("delist_market", 0),
+            NativeAction::ListMarket(_) => {
+                NativeActionResult::err("list_market", GOVERNANCE_ONLY_MSG.into())
+            }
+            NativeAction::DelistMarket { .. } => {
+                NativeActionResult::err("delist_market", GOVERNANCE_ONLY_MSG.into())
+            }
         }
     }
 
@@ -5714,16 +5722,27 @@ impl NativeExecutor {
                     new_value: value.clone(),
                 })
             }
-            ProposalAction::ListMarket(listing) => Some(ExecutionPayload::MarketListing {
-                market_id: 0, // auto-assigned
-                base_asset: listing.base_asset.clone(),
-                quote_asset: listing.quote_asset.clone(),
-                lot_size: listing.lot_size,
-                tick_size: listing.tick_size,
-                initial_margin: torus_types::FixedPoint::from_raw(
-                    listing.maintenance_margin_bps as i128 * torus_types::FixedPoint::SCALE / 10000,
-                ),
-            }),
+            ProposalAction::ListMarket(listing) => {
+                if listing.max_leverage == 0 {
+                    return NativeActionResult::err(
+                        "submit_proposal",
+                        "market listing max_leverage must be > 0".into(),
+                    );
+                }
+                Some(ExecutionPayload::MarketListing {
+                    market_id: 0, // assigned at execution time (max existing id + 1)
+                    base_asset: listing.base_asset.clone(),
+                    quote_asset: listing.quote_asset.clone(),
+                    lot_size: listing.lot_size,
+                    tick_size: listing.tick_size,
+                    // Initial margin = 1 / max_leverage, in the genesis convention
+                    // (percent as FixedPoint: 20x -> "5.0"). maintenance_margin_bps
+                    // is a different quantity and has no slot in the market row.
+                    initial_margin: torus_types::FixedPoint::from_raw(
+                        100 * torus_types::FixedPoint::SCALE / listing.max_leverage as i128,
+                    ),
+                })
+            }
             ProposalAction::UpdateMarketParams { .. } | ProposalAction::DelistMarket { .. } => {
                 None // text-only for now
             }

@@ -159,4 +159,8 @@ pub enum EconomicsError {
     // Unbonding claim (ClaimUnbonded native action)
     #[error("no matured unbonding to claim for {0}")]
     NoMaturedUnbonding(Address),
+
+    // Governance market listing
+    #[error("market id {0} already exists")]
+    MarketIdInUse(u64),
 }
