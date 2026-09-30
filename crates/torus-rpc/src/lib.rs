@@ -512,7 +512,7 @@ pub fn set_latest_height(state: &RpcState, height: u64) {
 }
 
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
-/// Used by the on_commit_block handler to feed the `new_trades` broadcast channel.
+/// Serves `torus_getBlockTrades` (the streams are fed from execution, s80).
 pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
     use torus_state::trade_rows::{decode_trade_row, trade_key};
