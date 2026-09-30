@@ -128,7 +128,29 @@ Proposed semantics:
   receivers; block sync fills are new to this node's subscribers.
 - A new crate or tokio in torus-consensus: a plain closure sink is enough.
 
-## Open Questions
+## Decisions (owner, s80)
+
+The questions below were settled as follows:
+
+- **Q1 (granularity):** one message per block.
+- **Q2 (names):** keep `newTrades` and add `userFills`, in the JSON-RPC
+  envelope. HL protocol compatibility would be a separate adapter.
+- **Q3 (order ids):** added.
+- **Q4 (lag policy):** close with an error.
+
+Also decided:
+
+- **Decimal strings:** all `torus_*` FixedPoint outputs switch to decimal
+  strings.
+- **`getUserTrades` side:** it now reports the user's own side.
+- **PnL fields:** `closedPnl`, `startPosition` and `dir` go on the stream. Adding
+  them to the history rows is a later step, gated on a 4+4 cell A/B.
+- **Out of scope:** trading fees and book-based liquidation fills are separate
+  future features.
+
+See `docs/plans/trade-streams-impl.md` and `docs/api/streams.md`.
+
+## Open Questions (as first written)
 
 1. Message granularity: one message per block (array) per subscription, or
    keep one message per trade? (Recommend per block: 100k fills/s as single
