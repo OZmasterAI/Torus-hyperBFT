@@ -13,7 +13,7 @@ source "$R/bench-guard.sh"
 # run_cell.py puts each cell's devnet DB next to itself: use a per-campaign copy
 # so prune-cell.sh (CAMPAIGN_DIR=$C) finds it.
 [ -f "$C/run_cell.py" ] || cp "$R/s60-campaign-20260918/run_cell.py" "$C/run_cell.py"
-WT=/home/18c/projects/wt/s63-body-fetch
+WT=/home/18c/projects/Torus-hyperBFT
 PREFIX=$(basename "$C" | sed 's/-[0-9]\{8\}$//')
 declare -A ART ENV
 ORDER=""
