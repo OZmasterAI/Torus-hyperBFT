@@ -60,11 +60,11 @@ impl BlockProposer {
     /// current state, computes the post-execution state root, and fills in
     /// all header fields. Does NOT commit the EVM bundle.
     ///
-    /// CAVEAT: `execute_block` persists writer-precompile side effects (CoreWriter /
-    /// lockbox queue entries) of successful txs straight to `state_db`
-    /// (`NativeStateOverlay::commit_tx`), so building a block here and later executing
-    /// the committed copy would enqueue those actions twice. Only tests call this today
-    /// (production executes blocks once, post-commit, in `torus-consensus` app.rs).
+    /// F1 (s515): writer-precompile side effects (CoreWriter / lockbox queue rows)
+    /// stay pending in `exec_result.native_writes` — nothing is written to `state_db`,
+    /// so building a block that never commits leaves no queued action behind. Only
+    /// tests call this today (production executes blocks once, post-commit, in
+    /// `torus-consensus` app.rs).
     pub fn build_block(
         &self,
         state_db: &StateDb,

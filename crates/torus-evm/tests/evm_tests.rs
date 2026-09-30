@@ -992,7 +992,7 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
 // EVM-PF-05: Lockbox precompile (0x0820) vs revm's block-level State cache.
 //
 // Each block below is executed through `execute_block` and then committed with
-// `commit_evm_bundle_incremental` — exactly the consensus commit path
+// `evm_block_batch_incremental` (bundle + queue rows, one batch) — the consensus commit path
 // (torus-consensus app.rs). Fees are zeroed (base_fee 0, gas_price 0) so value
 // conservation is exact.
 //
@@ -1128,7 +1128,14 @@ fn run_and_commit_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool>
     let result = executor
         .execute_block(db, &zero_fee_block_cfg(number), txs, false)
         .unwrap();
-    torus_state::incremental::commit_evm_bundle_incremental(db, &result.bundle, None).unwrap();
+    let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(
+        db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
+    db.write(batch).unwrap();
     result.receipts.iter().map(|r| r.status).collect()
 }
 
