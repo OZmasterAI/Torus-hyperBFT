@@ -342,6 +342,8 @@ LOADGEN-SUSPECT.
   (bench CPU, RPC latency, sender state).
 - **Remaining CPU targets from the s77 profile.**
   - Exec-thread SipHash (`RandomState`, ~9% of the execution thread).
+    Tried in s82 (ahash): no measurable effect, not merged; see
+    `s82-exec-hasher-2026-09-30.md`.
   - `compute_action_hash` runs twice per action, once at pool insert and
     once at DA `put_batch` (~75 µs per action, per the s77 profile memory
     record; not re-measured).
