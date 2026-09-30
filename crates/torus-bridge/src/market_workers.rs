@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use alloy_primitives::Address;
-use torus_core::order_book::{OrderBook, PlaceResult, TakerMarginLimit};
+use torus_core::order_book::{MakerAccountSource, OrderBook, PlaceResult, TakerMarginLimit};
 use torus_types::{MarketId, OrderId, PlaceOrderParams};
 
 /// A single order to be matched by a worker thread.
@@ -76,7 +76,17 @@ impl MarketWorkerPool {
         batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
         timestamp: u64,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
-        Self::match_parallel_capped(batches, timestamp, Self::resolve_worker_cap())
+        Self::match_parallel_with(batches, timestamp, None)
+    }
+
+    /// F1 (s517 #4): [`Self::match_parallel`] with the source of makers'
+    /// accounts (read-only, `Sync`; `None` = makers unchecked).
+    pub fn match_parallel_with(
+        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
+        timestamp: u64,
+        makers: Option<&dyn MakerAccountSource>,
+    ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
+        Self::match_parallel_capped_with(batches, timestamp, Self::resolve_worker_cap(), makers)
     }
 
     /// [`Self::match_parallel`] with an explicit worker cap (>= 1 enforced).
@@ -87,6 +97,16 @@ impl MarketWorkerPool {
         timestamp: u64,
         max_workers: usize,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
+        Self::match_parallel_capped_with(batches, timestamp, max_workers, None)
+    }
+
+    /// F1 (s517 #4): [`Self::match_parallel_capped`] with the makers' source.
+    pub fn match_parallel_capped_with<'a>(
+        batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'a>>)>,
+        timestamp: u64,
+        max_workers: usize,
+        makers: Option<&dyn MakerAccountSource>,
+    ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
         if batches.is_empty() {
             return Ok(Vec::new());
         }
@@ -95,7 +115,7 @@ impl MarketWorkerPool {
         if batches.len() == 1 {
             let (market_id, (book, requests)) = batches.into_iter().next().unwrap();
             return Self::run_contained(market_id, || {
-                Self::match_market(market_id, book, requests, timestamp)
+                Self::match_market(market_id, book, requests, timestamp, makers)
             })
             .map(|r| vec![r]);
         }
@@ -127,11 +147,12 @@ impl MarketWorkerPool {
         // keeps `chunk[0]` valid as the join-failure representative below.
         chunks.retain(|c| !c.is_empty());
 
-        // Copy-capture closure (only `timestamp: u64`) so each worker gets its
-        // own copy — the actual per-market matcher `process_chunk` runs.
+        // Copy-capture closure (`timestamp: u64` and, F1, the shared `Sync`
+        // makers ref) so each worker gets its own copy — the actual
+        // per-market matcher `process_chunk` runs.
         let match_one =
             move |market_id: MarketId, book: OrderBook, requests: Vec<MatchRequest<'a>>| {
-                Self::match_market(market_id, book, requests, timestamp)
+                Self::match_market(market_id, book, requests, timestamp, makers)
             };
 
         std::thread::scope(|s| {
@@ -308,17 +329,19 @@ impl MarketWorkerPool {
         mut book: OrderBook,
         requests: Vec<MatchRequest<'_>>,
         timestamp: u64,
+        makers: Option<&dyn MakerAccountSource>,
     ) -> MarketBatchResult {
         let mut results = Vec::with_capacity(requests.len());
 
         for req in requests {
             book.set_next_order_id(req.order_id);
             // C2: THE one params copy in the pipeline — the book takes ownership.
-            let place_result = book.place_order_with_margin(
+            let place_result = book.place_order_with_accounts(
                 req.params.clone(),
                 req.sender,
                 timestamp,
                 req.margin.as_ref(),
+                makers,
             );
 
             results.push(MatchResult {

@@ -851,7 +851,13 @@ fn batch_resting_high_bid_ahead_is_bounded_at_match_time() {
 /// `taker` ends up at signed position `size` (+long / -short) in market 1 at
 /// 100 against `cp`, then holds `avail` available with 95 of order margin in
 /// a resting order that never interacts (long: ask 10 @190; short: bid
-/// 190 @10). The counterparty's order is fully consumed.
+/// 20 @95). The counterparty's order is fully consumed.
+///
+/// F1 (s517): the short lock was a bid 190 @10 — filled, it would open a
+/// 170 long, so the account-level placement check now (correctly, HL)
+/// charges its opening part (IM(2,000 + 1,700) − IM(2,000) = 85 > free 0)
+/// and rejects it. The fixture only needs "95 locked, never matched": a
+/// purely closing bid 20 @95 reserves exactly 95 and sits below every ask.
 fn open_then_lock(
     ctx: &mut NativeExecContext,
     path: Path,
@@ -867,7 +873,7 @@ fn open_then_lock(
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     assert_eq!(pos(ctx, &taker), fp(size), "{path:?}: position opened");
     fund_native(ctx, &taker, avail + fp(95));
-    let lock = if long { limit(1, false, 190, 10) } else { limit(1, true, 10, 190) };
+    let lock = if long { limit(1, false, 190, 10) } else { limit(1, true, 95, 20) };
     let r = run(ctx, path, &[place(taker, lock)]);
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     assert_bal(ctx, &taker, avail, fp(95), "after lock");

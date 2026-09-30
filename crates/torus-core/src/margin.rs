@@ -7,7 +7,7 @@ use torus_state::StateBackend;
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
-use crate::position::{MarginType, Position, PositionManager};
+use crate::position::{MarginType, NativeBalance, Position, PositionManager};
 
 // ============================================================================
 // Margin Tiers — leverage limits by notional size
@@ -72,6 +72,122 @@ pub fn order_initial_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) 
         .map(FixedPoint::from_raw)
         .ok_or(torus_types::ArithmeticError::DivisionByZero)
         .expect("FixedPoint division error")
+}
+
+// ============================================================================
+// Account-level margin (F1, s517) — Hyperliquid cross margin, computed
+// ============================================================================
+
+/// F1: the price a position is valued at — the market's mark, else its entry
+/// price (s517 decision 2: UPnL 0 and IM at entry notional without a mark).
+pub fn position_price(pos: &Position, mark: Option<FixedPoint>) -> FixedPoint {
+    mark.unwrap_or(pos.entry_price)
+}
+
+/// F1: IM change when one market's (position [+ resting]) notional goes from
+/// `before` to `after`, both at their own POSITION-size tier. < 0 = released.
+pub fn im_delta(tiers: Option<&[MarginTier]>, before: FixedPoint, after: FixedPoint) -> FixedPoint {
+    order_initial_margin(tiers, after) - order_initial_margin(tiers, before)
+}
+
+/// F1: margin need of placing `qty` on side `is_buy` against signed position
+/// `signed` (valued at `px`), priced at `price`: the larger of the IM delta of
+/// a complete fill (the closing part releases IM) and — for an order that can
+/// rest — of resting its opening part. `<= 0`: it only reduces. `None` on
+/// overflow. The book's match-time need is the same notional arithmetic.
+pub fn placement_need(
+    tiers: Option<&[MarginTier]>,
+    signed: FixedPoint,
+    px: FixedPoint,
+    is_buy: bool,
+    qty: FixedPoint,
+    price: FixedPoint,
+    can_rest: bool,
+) -> Option<FixedPoint> {
+    let size = if signed < FixedPoint::ZERO { -signed } else { signed };
+    let closing = qty.min(crate::order_book::reduce_only_allowance(signed, is_buy));
+    let opening_notional = price.checked_mul(qty - closing).ok()?;
+    let before = size.checked_mul(px).ok()?;
+    let left = (size - closing).checked_mul(px).ok()?;
+    let filled = im_delta(tiers, before, left.checked_add(opening_notional).ok()?);
+    if !can_rest {
+        return Some(filled);
+    }
+    let rested = im_delta(tiers, before, before.checked_add(opening_notional).ok()?);
+    Some(filled.max(rested))
+}
+
+/// F1: one trader's cross-margin account (never stored — decision 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountView {
+    pub available: FixedPoint,
+    pub order_margin: FixedPoint,
+    /// Σ unrealized PnL at [`position_price`].
+    pub upnl: FixedPoint,
+    /// Σ position IM at [`position_price`], each at its market's position-size tier.
+    pub position_im: FixedPoint,
+    /// Σ |size| × [`position_price`].
+    pub notional: FixedPoint,
+}
+
+impl AccountView {
+    /// Cross positions only (every production position is Cross).
+    pub fn build<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+    ) -> Result<Self, CoreError> {
+        let of = |_| CoreError::Overflow("account margin overflows i128".into());
+        let mut v = Self {
+            available: bal.available,
+            order_margin: bal.order_margin,
+            upnl: FixedPoint::ZERO,
+            position_im: FixedPoint::ZERO,
+            notional: FixedPoint::ZERO,
+        };
+        for pos in positions.iter().filter(|p| p.margin_type == MarginType::Cross) {
+            let px = position_price(pos, mark(pos.market_id));
+            let n = pos.size.checked_mul(px).map_err(of)?;
+            let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
+            v.upnl = v.upnl.checked_add(diff.checked_mul(pos.size).map_err(of)?).map_err(of)?;
+            v.notional = v.notional.checked_add(n).map_err(of)?;
+            v.position_im = v
+                .position_im
+                .checked_add(order_initial_margin(tiers(pos.market_id), n))
+                .map_err(of)?;
+        }
+        Ok(v)
+    }
+
+    /// Collateral + UPnL.
+    pub fn equity(&self) -> FixedPoint {
+        self.available + self.order_margin + self.upnl
+    }
+
+    /// What the positions add to (or take from) free margin: UPnL − IM.
+    pub fn pos_net(&self) -> FixedPoint {
+        self.upnl - self.position_im
+    }
+
+    /// equity − (position IM + order margin) = available + [`Self::pos_net`].
+    pub fn free(&self) -> FixedPoint {
+        self.available + self.pos_net()
+    }
+
+    /// HL `transfer_margin_required`: max(Σ IM, 10% × Σ notional).
+    pub fn transfer_required(&self) -> FixedPoint {
+        self.position_im.max(FixedPoint::from_raw(self.notional.raw() / 10))
+    }
+
+    /// s517 decision 5, SAFE variant (user, s517): the cash bound
+    /// `amount <= available` AND equity WITHOUT the resting orders'
+    /// reservations (`available + upnl`) after the withdrawal covers
+    /// [`Self::transfer_required`]. A negative `available` withdraws nothing.
+    pub fn withdrawal_allowed(&self, amount: FixedPoint) -> bool {
+        amount <= self.available
+            && self.equity() - self.order_margin - amount >= self.transfer_required()
+    }
 }
 
 // ============================================================================
@@ -197,7 +313,8 @@ impl MarginEngine {
         )
     }
 
-    /// Compute cross-margin equity: balance + sum(unrealized PnL across all positions).
+    /// F1: [`AccountView::equity`] — collateral (available + order margin) + UPnL
+    /// at the mark, entry price without one.
     pub fn cross_margin_equity(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
@@ -205,47 +322,35 @@ impl MarginEngine {
     ) -> Result<FixedPoint, CoreError> {
         let bal = positions.get_native_balance(trader)?;
         let all_pos = positions.positions_for_trader(trader)?;
-
-        // FIX 3 (ECON-FIND-08): Subtract order_margin to avoid double-counting
-        // funds committed to open orders as free equity.
-        let mut equity = bal.available - bal.order_margin;
-        for pos in &all_pos {
-            if pos.margin_type != MarginType::Cross {
-                continue;
-            }
-            if let Some(mark) = oracle_price_for(oracle_prices, pos.market_id) {
-                equity += pos.unrealized_pnl(mark);
-            }
-        }
-        Ok(equity)
+        let view = AccountView::build(
+            &bal,
+            &all_pos,
+            |m| oracle_price_for(oracle_prices, m),
+            |_| None,
+        )?;
+        Ok(view.equity())
     }
 
-    /// Total maintenance margin required across all cross-margin positions.
+    /// F1: Σ maintenance of cross positions — IM ([`order_initial_margin`],
+    /// position-size tier) at [`position_price`] × maintenance_factor_bps / 10,000.
     pub fn total_maintenance_margin(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
         config: &MarketMarginConfig,
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Result<FixedPoint, CoreError> {
-        let all_pos = positions.positions_for_trader(trader)?;
+        // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
+        let maint_num =
+            FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
+        let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
         let mut total = FixedPoint::ZERO;
-
-        for pos in &all_pos {
+        for pos in positions.positions_for_trader(trader)? {
             if pos.margin_type != MarginType::Cross {
                 continue;
             }
-            if let Some(mark) = oracle_price_for(oracle_prices, pos.market_id) {
-                let notional = pos.notional(mark);
-                let max_lev = effective_max_leverage(&config.tiers, notional);
-                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                let initial = notional / lev_fp;
-                // Maintenance = initial * maintenance_factor_bps / 10000
-                // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
-                let maint_num =
-                    FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
-                let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-                total += initial * maint_num / bps_denom;
-            }
+            let px = position_price(&pos, oracle_price_for(oracle_prices, pos.market_id));
+            let initial = order_initial_margin(Some(&config.tiers), pos.notional(px));
+            total += initial * maint_num / bps_denom;
         }
         Ok(total)
     }
@@ -441,9 +546,11 @@ mod tests {
         assert_eq!(effective_max_leverage(&tiers, fp(50_000_000)), 5);
     }
 
-    // FIX 3: Cross-margin equity subtracts order_margin
+    // F1 (s517): equity counts collateral once — `available` is already net of
+    // `order_margin` (every reservation moves it out of `available`), so the
+    // old FIX 3 subtraction counted reserved collateral as a loss.
     #[test]
-    fn cross_margin_equity_deducts_order_margin() {
+    fn cross_margin_equity_counts_order_margin_once() {
         let (_dir, pm) = setup();
         let trader = addr(1);
 
@@ -458,8 +565,8 @@ mod tests {
 
         let oracle_prices: Vec<(u64, FixedPoint)> = vec![];
         let equity = MarginEngine::cross_margin_equity(&pm, &trader, &oracle_prices).unwrap();
-        // equity = available - order_margin = 10000 - 3000 = 7000
-        assert_eq!(equity, fp(7_000));
+        // equity = available + order_margin = 10000 + 3000 = 13000
+        assert_eq!(equity, fp(13_000));
     }
 
     // FIX 4: Maintenance margin BPS scaling is correct

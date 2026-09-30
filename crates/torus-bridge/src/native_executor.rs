@@ -14,12 +14,13 @@ use torus_core::error::CoreError;
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
-    effective_max_leverage, order_initial_margin, MarginTier, MarketMarginConfig,
+    effective_max_leverage, order_initial_margin, placement_need, position_price, AccountView,
+    MarginTier, MarketMarginConfig,
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    reduce_only_allowance, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions,
-    TakerMarginLimit, TriggeredStop,
+    reduce_only_allowance, AccountMargins, MakerAccount, MakerAccountSource, OrderBook,
+    OrderStatus, PlaceResult, ReduceOnlyPositions, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
@@ -225,9 +226,15 @@ struct PreparedOrder<'a> {
     params: &'a PlaceOrderParams,
     order_id: u128,
     margin_reserved: FixedPoint,
-    /// s515 review 4: match-time margin budget (reservation + the sender's
-    /// available balance right after it, Phase-2 view); `None` = unchecked.
-    margin_budget: Option<FixedPoint>,
+    /// F1 (s517): `Some(UPnL − position IM)` of a checked taker's sender
+    /// (pre-batch); `None` = unchecked. Its match-time budget is its own
+    /// reservation + the sender's exclusive pool (D2, see Phase 3).
+    checked_pos_net: Option<FixedPoint>,
+    /// Review fix 1 (s517): an UNCHECKED order's position-tier need beyond
+    /// its order-tier reservation (never re-checked at match, D7) — comes
+    /// off its sender's D2 pool. ZERO for checked takers (the book charges
+    /// their need at match).
+    excess_im: FixedPoint,
 }
 
 /// C3: everything a settle worker precomputes for ONE prepared order —
@@ -416,14 +423,136 @@ enum EngineMode {
 /// L3-ENG: one Phase-2 outcome for a single flattened PlaceOrder, computed by
 /// a sharded worker and applied by the serial stitch in flat order.
 enum PrepOutcome {
-    /// Margin reserved (possibly ZERO for market orders) and the match-time
-    /// margin budget (s515 review 4, `None` = unchecked) — the stitch
-    /// assigns the global order id and builds the `PreparedOrder`.
-    Pass(FixedPoint, Option<FixedPoint>),
+    /// Margin reserved (possibly ZERO for market orders) and, F1 (s517),
+    /// `Some(UPnL − position IM)` of a checked taker's sender (`None` =
+    /// unchecked) — the stitch assigns the global order id and builds the
+    /// `PreparedOrder`. Review fix 1: plus the order's `excess_im`.
+    Pass(FixedPoint, Option<FixedPoint>, FixedPoint),
     /// Rejected pre-book. `margin` selects the funnel counter
     /// (`orders_rejected_margin` vs `orders_rejected_other`); `msg` is the
     /// exact serial-path error string.
     Reject { margin: bool, msg: String },
+}
+
+/// F1 (s517): read-only inputs of the account-level margin formulas —
+/// shared by placement (single + Phase 2), modify and withdrawals, so every
+/// path computes the same numbers. Only READS state; in Phase 3 the backend
+/// is frozen (write-back caches, flushed after settlement).
+struct AccountReader<'a, T: StateBackend> {
+    positions: &'a PositionManager<T>,
+    oracle: &'a OracleManager<T>,
+    height: u64,
+    margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
+}
+
+impl<'a, T: StateBackend> AccountReader<'a, T> {
+    fn of(ctx: &'a NativeExecContext<T>) -> Self {
+        Self {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            height: ctx.block_height,
+            margin_configs: &ctx.margin_configs,
+        }
+    }
+
+    /// s515 review 4 mark: the aggregated oracle price, `None` when absent,
+    /// stale (older than the oracle's max age at this block height),
+    /// non-positive or unreadable. Only oracle aggregation writes that row
+    /// and no native action runs it, so every placement of a block (single,
+    /// batch serial, batch sharded) reads the same value on every validator.
+    fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
+        match self.oracle.get_price(market_id, self.height) {
+            Ok(p) if !p.stale && p.price > FixedPoint::ZERO => Some(p.price),
+            _ => None,
+        }
+    }
+
+    fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
+        self.margin_configs.get(&market_id).map(|c| c.tiers.as_slice())
+    }
+
+    /// F1: `trader`'s cross-margin account with balance `bal` — positions at
+    /// the mark, else at entry (s517 decision 2).
+    fn view(&self, trader: &Address, bal: &NativeBalance) -> Result<AccountView, CoreError> {
+        let ps = self.positions.positions_for_trader(trader)?;
+        AccountView::build(bal, &ps, |m| self.mark(m), |m| self.tiers(m))
+    }
+
+    /// F1: UPnL − position IM of `trader` (balance-independent part of `free`).
+    fn pos_net(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
+        Ok(self.view(trader, &NativeBalance::default())?.pos_net())
+    }
+
+    /// F1: signed position in `market_id` and the price it is valued at
+    /// (mark, else entry; ZERO when flat without a mark).
+    fn position_px(
+        &self,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<(FixedPoint, FixedPoint), CoreError> {
+        let mark = self.mark(market_id);
+        Ok(match self.positions.get_position(trader, market_id)? {
+            Some(p) => (
+                if p.is_long { p.size } else { -p.size },
+                position_price(&p, mark),
+            ),
+            None => (FixedPoint::ZERO, mark.unwrap_or(FixedPoint::ZERO)),
+        })
+    }
+}
+
+impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
+    /// F1 (s517 #4): a maker's account as the book first sees it — balance
+    /// and positions from the backend (Phase 3: the frozen post-Phase-1
+    /// state; single path: current state). A read error snapshots as free 0
+    /// / flat (deterministic).
+    fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
+        let free = self
+            .positions
+            .get_native_balance(maker)
+            .and_then(|b| self.view(maker, &b))
+            .map_or(FixedPoint::ZERO, |v| v.free());
+        let (signed_pos, px) = self
+            .position_px(maker, market_id)
+            .unwrap_or((FixedPoint::ZERO, FixedPoint::ZERO));
+        MakerAccount { free, signed_pos, px }
+    }
+}
+
+/// L3-ENG: one Phase-2 fold — the balance cache of the senders it prepares.
+/// Keys are per sender, so a shard's fold equals the serial fold restricted
+/// to its senders.
+struct SenderFold {
+    cache: BalanceCache,
+    /// F1: each sender's UPnL − position IM (pre-batch, read once).
+    pos_nets: HashMap<Address, FixedPoint>,
+    /// F1: (sender, market) → (projected signed position, valuation price):
+    /// the pre-batch position advanced by the sender's earlier ACCEPTED
+    /// non-reduce-only orders of this batch (as if filled — conservative),
+    /// so a later order is charged at the projected position's tier.
+    proj: HashMap<(Address, MarketId), (FixedPoint, FixedPoint)>,
+    /// F1 (Decision s517): Σ position IM the sender's earlier accepted
+    /// orders of this batch are projected to RELEASE (their closing parts).
+    /// Credited to `free` only when checking a match-checked order — its
+    /// fills are re-checked against the real position in Phase 3. Never
+    /// part of the Phase-3 pool (the book credits the real release).
+    released: HashMap<Address, FixedPoint>,
+    /// Review fix 1 (s517): Σ position-tier need beyond the order-tier
+    /// reservation of the sender's accepted orders of this batch — committed
+    /// but not debited; off `free` in its later Phase-2 checks.
+    committed: HashMap<Address, FixedPoint>,
+}
+
+impl SenderFold {
+    fn new(cache: BalanceCache) -> Self {
+        Self {
+            cache,
+            pos_nets: HashMap::new(),
+            proj: HashMap::new(),
+            released: HashMap::new(),
+            committed: HashMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3649,6 +3778,14 @@ impl NativeExecutor {
             })
             .collect();
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
+        // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
+        // coexists with the stitch's `&mut ctx.next_global_order_id`.
+        let reader = AccountReader {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            height: ctx.block_height,
+            margin_configs: &ctx.margin_configs,
+        };
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
         if engine_threads >= 2
@@ -3673,14 +3810,7 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
-                match Self::phase2_parallel_prepare(
-                    &ctx.positions,
-                    &ctx.margin_configs,
-                    &basis,
-                    &groups,
-                    engine_threads,
-                    n,
-                ) {
+                match Self::phase2_parallel_prepare(&reader, &basis, &groups, engine_threads, n) {
                     Some((outcomes, worker_cache)) => {
                         // Sender shards are disjoint, so the merged cache is
                         // exactly the serial loop's cache.
@@ -3700,149 +3830,77 @@ impl NativeExecutor {
             // Serial stitch in flat order: ids go to passing orders exactly
             // as the serial loop assigns them.
             for &i in &place_order_indices {
-                let (sender, entry) = &flat[i];
-                let params: &PlaceOrderParams = match entry {
-                    FlatAction::Place(p) => p,
-                    FlatAction::Other(_) => unreachable!(),
+                let (sender, params) = match &flat[i] {
+                    (s, FlatAction::Place(p)) => (s, *p),
+                    (_, FlatAction::Other(_)) => unreachable!(),
                 };
                 let Some(outcome) = outcomes[i].take() else {
                     unreachable!("every place index has a worker outcome");
                 };
-                match outcome {
-                    PrepOutcome::Pass(margin_reserved, margin_budget) => {
-                        let order_id = ctx.next_global_order_id;
-                        ctx.next_global_order_id += 1;
-                        market_batches
-                            .entry(params.market_id)
-                            .or_default()
-                            .push(PreparedOrder {
-                                index: i,
-                                sender: *sender,
-                                params,
-                                order_id,
-                                margin_reserved,
-                                margin_budget,
-                            });
-                    }
-                    PrepOutcome::Reject { margin, msg } => {
-                        // Funnel (perf A1): same counters as the serial loop.
-                        if let Some(ref m) = ctx.metrics {
-                            if margin {
-                                m.orders_rejected_margin.inc();
-                            } else {
-                                m.orders_rejected_other.inc();
-                            }
-                        }
-                        results[i] = NativeActionResult::err("place_order", msg);
-                    }
-                }
+                Self::stitch_outcome(
+                    &mut ctx.next_global_order_id,
+                    &ctx.metrics,
+                    &mut market_batches,
+                    &mut results,
+                    i,
+                    sender,
+                    params,
+                    outcome,
+                );
             }
         } else {
+            // L3-ENG: the serial loop runs literally the sharded workers'
+            // step ([`Self::prepare_one`]) over one fold, in flat order.
+            let mut fold = SenderFold::new(std::mem::replace(&mut bal_cache, BalanceCache::new()));
             for &i in &place_order_indices {
-                let (sender, entry) = &flat[i];
-                let params: &PlaceOrderParams = match entry {
-                    FlatAction::Place(p) => p,
-                    FlatAction::Other(_) => unreachable!(),
+                let (sender, params) = match &flat[i] {
+                    (s, FlatAction::Place(p)) => (s, *p),
+                    (_, FlatAction::Other(_)) => unreachable!(),
                 };
+                let outcome = Self::prepare_one(&reader, &basis, &mut fold, i, sender, params);
+                Self::stitch_outcome(
+                    &mut ctx.next_global_order_id,
+                    &ctx.metrics,
+                    &mut market_batches,
+                    &mut results,
+                    i,
+                    sender,
+                    params,
+                    outcome,
+                );
+            }
+            bal_cache = fold.cache;
+        }
 
-                let market_id = params.market_id;
-
-                // s515 (BUG 1): market / stop orders need a positive price cap.
-                // Reduce-only is NOT pre-checked here: Phase 2 only sees
-                // pre-batch positions, so the book polices it at match time
-                // against positions advanced through this batch's earlier
-                // fills (Phase 3) — the freshest position, as in sequential.
-                // (F4: its RESERVATION is bounded by `basis` though.)
-                if let Err(msg) = Self::validate_order_price(params) {
-                    if let Some(ref m) = ctx.metrics {
-                        m.orders_rejected_other.inc();
-                    }
-                    results[i] = NativeActionResult::err("place_order", msg);
-                    continue;
-                }
-
-                // Reserve margin (same logic as exec_place_order Phase 2).
-                // A5: reserve and every later release share reserve_for_qty_cfg.
-                // s515 (BUG 1): every order type reserves (market at the mark
-                // price, the cap without one). F4 / review 4: basis
-                // overrides; F2: an overflowing notional rejects.
-                let (res_price, res_qty) = basis
-                    .get(&i)
-                    .copied()
-                    .unwrap_or((Self::reserve_price(params), params.quantity));
-                let order_margin_required = match Self::try_reserve_for_qty_cfg(
-                    ctx.margin_configs.get(&market_id),
-                    res_price,
-                    res_qty,
-                ) {
-                    Ok(m) => m,
-                    Err(msg) => {
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_other.inc();
-                        }
-                        results[i] = NativeActionResult::err("place_order", msg);
-                        continue;
-                    }
-                };
-
-                // s515 review 4: a checked taker's match-time budget is its
-                // reservation + the available balance left after it (= the
-                // available balance it was reserved from), in this Phase-2
-                // per-sender fold — the view the sharded prepare reproduces.
-                let checked = Self::match_margin_checked(params);
-                let mut margin_budget = None;
-                if order_margin_required > FixedPoint::ZERO || checked {
-                    match bal_cache.load(&ctx.positions, sender) {
-                        Ok(mut bal) => {
-                            if bal.available < order_margin_required {
-                                // Funnel (perf A1): died pre-book on the margin reserve.
-                                if let Some(ref m) = ctx.metrics {
-                                    m.orders_rejected_margin.inc();
-                                }
-                                results[i] = NativeActionResult::err(
-                                    "place_order",
-                                    format!(
-                                        "insufficient margin: need {order_margin_required}, have {}",
-                                        bal.available
-                                    ),
-                                );
-                                continue;
-                            }
-                            if checked {
-                                margin_budget = Some(bal.available);
-                            }
-                            if order_margin_required > FixedPoint::ZERO {
-                                bal.available -= order_margin_required;
-                                bal.order_margin += order_margin_required;
-                                bal_cache.set(sender, bal);
-                            }
-                        }
-                        Err(e) => {
-                            // Funnel (perf A1): died pre-book on a balance read error.
-                            if let Some(ref m) = ctx.metrics {
-                                m.orders_rejected_other.inc();
-                            }
-                            results[i] = NativeActionResult::err("place_order", e.to_string());
-                            continue;
-                        }
-                    }
-                }
-
-                // Assign global order ID (monotonic, pre-matching)
-                let order_id = ctx.next_global_order_id;
-                ctx.next_global_order_id += 1;
-
-                market_batches
-                    .entry(market_id)
-                    .or_default()
-                    .push(PreparedOrder {
-                        index: i,
-                        sender: *sender,
-                        params,
-                        order_id,
-                        margin_reserved: order_margin_required,
-                        margin_budget,
-                    });
+        // F1 (s517, D2): a sender's free margin after ALL its Phase-2
+        // reservations is an EXCLUSIVE budget of the market of its FIRST
+        // checked taker (flat order); in that book its takers share it as a
+        // running budget; its other markets start at 0 — no two market
+        // workers spend the same free margin. Sorted by flat index, never
+        // HashMap order.
+        let mut checked_takers: Vec<(usize, Address, MarketId, FixedPoint)> = market_batches
+            .values()
+            .flatten()
+            .filter_map(|p| p.checked_pos_net.map(|n| (p.index, p.sender, p.params.market_id, n)))
+            .collect();
+        checked_takers.sort_unstable_by_key(|c| c.0);
+        // Review fix 1 (s517): unchecked orders' committed-but-undebited
+        // need comes off their sender's pool (exact integer sum).
+        let mut excess_by_sender: HashMap<Address, FixedPoint> = HashMap::new();
+        for p in market_batches.values().flatten() {
+            if p.excess_im > FixedPoint::ZERO {
+                *excess_by_sender.entry(p.sender).or_insert(FixedPoint::ZERO) += p.excess_im;
+            }
+        }
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
+        let mut pooled: BTreeSet<Address> = BTreeSet::new();
+        for (_, sender, market_id, pos_net) in checked_takers {
+            if pooled.insert(sender) {
+                let available = bal_cache
+                    .load(&ctx.positions, &sender)
+                    .map_or(FixedPoint::ZERO, |b| b.available);
+                let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
+                pools.insert((sender, market_id), available + pos_net - excess);
             }
         }
 
@@ -3870,17 +3928,18 @@ impl NativeExecutor {
             // batch in this market (positions are keyed per market, and only
             // this worker fills this market), so every order is checked
             // against the position left by the block's earlier orders.
-            // Review 5: checked takers (margin budget) are tracked the same
-            // way — their closing fills are free at match time — so every
-            // path frees exactly the position the single path would read.
-            let tracked = |p: &PreparedOrder<'_>| p.params.reduce_only || p.margin_budget.is_some();
-            let has_tracked_sender = prepared.iter().any(tracked);
-            if has_tracked_sender || book.has_reduce_only_orders() {
+            // Review 5: checked takers are tracked the same way — their
+            // closing fills are free at match time — so every path frees
+            // exactly the position the single path would read. F1 (s517):
+            // EVERY sender of the batch in this market is tracked (checked
+            // takers value their position; maker checks need in-batch
+            // positions).
+            if !prepared.is_empty() || book.has_reduce_only_orders() {
                 let ro = Self::reduce_only_positions_for(
                     &ctx.positions,
                     &book,
                     market_id,
-                    prepared.iter().filter(|p| tracked(p)).map(|p| p.sender),
+                    prepared.iter().map(|p| p.sender),
                 );
                 book.set_reduce_only_positions(ro);
             }
@@ -3888,6 +3947,23 @@ impl NativeExecutor {
             // s515 review 4: one shared copy of the market's tiers for the
             // checked takers' match-time margin limits.
             let tiers = Self::margin_tiers(ctx.margin_configs.get(&market_id));
+            // F1 (s517, D2): each checked sender's exclusive pool (0 outside
+            // the market of its first checked taker) and valuation price.
+            let mut am = AccountMargins::new(tiers.clone());
+            for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
+                if am.get(&p.sender).is_none() {
+                    let px = reader
+                        .position_px(&p.sender, market_id)
+                        .map_or(FixedPoint::ZERO, |(_, px)| px);
+                    // Review fix 4 (s517): only the pool market's entry is
+                    // the sender's account (shared with its makers there).
+                    match pools.get(&(p.sender, market_id)) {
+                        Some(&pool) => am.insert(p.sender, pool, px),
+                        None => am.insert_taker_only(p.sender, px),
+                    }
+                }
+            }
+            book.set_account_margins(am);
             let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
                 .map(|p| MatchRequest {
@@ -3895,16 +3971,20 @@ impl NativeExecutor {
                     params: p.params,
                     order_id: p.order_id,
                     margin: p
-                        .margin_budget
-                        .map(|budget| Self::taker_margin_limit(&tiers, p.params, budget)),
+                        .checked_pos_net
+                        .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
                 })
                 .collect();
 
             worker_batches.insert(market_id, (book, requests));
         }
 
-        let mut market_results = match MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp)
-        {
+        // F1 (s517 #4): workers only READ the backend through `reader`.
+        let mut market_results = match MarketWorkerPool::match_parallel_with(
+            worker_batches,
+            ctx.timestamp,
+            Some(&reader),
+        ) {
             Ok(r) => r,
             Err(panic) => {
                 // T1.5 FAIL-STOP: the panicking worker consumed its market's
@@ -3951,6 +4031,7 @@ impl NativeExecutor {
         let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
         for mbr in market_results.iter_mut() {
             mbr.book.clear_reduce_only_positions();
+            mbr.book.clear_account_margins();
             for r in &mbr.results {
                 triggered.extend(r.result.triggered_stops.iter().cloned());
             }
@@ -4041,6 +4122,200 @@ impl NativeExecutor {
         NativeBatchResult { results, total_gas }
     }
 
+    /// L3-ENG: Phase 2 of ONE PlaceOrder — shared by the serial loop and
+    /// the sharded workers so both run literally the same code. s515:
+    /// validation + the reservation formula of `exec_place_order`; F4 /
+    /// review 4: `basis` overrides; F2: an overflowing notional rejects.
+    /// Review 4: a checked taker's match-time budget is its reservation +
+    /// the available balance left after it, in this per-sender fold.
+    /// Reduce-only is NOT pre-checked here: Phase 2 only sees pre-batch
+    /// positions, so the book polices it at match time (Phase 3).
+    fn prepare_one<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        fold: &mut SenderFold,
+        i: usize,
+        sender: &Address,
+        params: &PlaceOrderParams,
+    ) -> PrepOutcome {
+        if let Err(msg) = Self::validate_order_price(params) {
+            return PrepOutcome::Reject { margin: false, msg };
+        }
+        let (res_price, res_qty) = basis
+            .get(&i)
+            .copied()
+            .unwrap_or((Self::reserve_price(params), params.quantity));
+        let required = match Self::try_reserve_for_qty_cfg(
+            reader.margin_configs.get(&params.market_id),
+            res_price,
+            res_qty,
+        ) {
+            Ok(r) => r,
+            Err(msg) => return PrepOutcome::Reject { margin: false, msg },
+        };
+        let checked = Self::match_margin_checked(params);
+        let needs_account = !params.reduce_only;
+        let mut pos_net = FixedPoint::ZERO;
+        let mut excess = FixedPoint::ZERO;
+        if required > FixedPoint::ZERO || checked || needs_account {
+            match fold.cache.load(reader.positions, sender) {
+                Ok(mut bal) => {
+                    // F1 (s517, D1 strict HL): the account check is the ONLY
+                    // placement gate — no `available >= reservation`; the
+                    // debit below may take `available` negative.
+                    if needs_account {
+                        let pn = match fold.pos_nets.get(sender) {
+                            Some(v) => *v,
+                            None => match reader.pos_net(sender) {
+                                Ok(v) => *fold.pos_nets.entry(*sender).or_insert(v),
+                                Err(e) => {
+                                    return PrepOutcome::Reject {
+                                        margin: false,
+                                        msg: e.to_string(),
+                                    }
+                                }
+                            },
+                        };
+                        let key = (*sender, params.market_id);
+                        let (signed, px) = match fold.proj.get(&key) {
+                            Some(v) => *v,
+                            None => match reader.position_px(sender, params.market_id) {
+                                Ok(v) => *fold.proj.entry(key).or_insert(v),
+                                Err(e) => {
+                                    return PrepOutcome::Reject {
+                                        margin: false,
+                                        msg: e.to_string(),
+                                    }
+                                }
+                            },
+                        };
+                        // Decision s517: only a match-checked order sees the
+                        // projected releases of the sender's earlier orders;
+                        // unchecked ones (GTC buys, stops) stay strict.
+                        let credit = if checked {
+                            fold.released.get(sender).copied().unwrap_or(FixedPoint::ZERO)
+                        } else {
+                            FixedPoint::ZERO
+                        };
+                        // Review fix 1: minus what earlier orders committed.
+                        let committed =
+                            fold.committed.get(sender).copied().unwrap_or(FixedPoint::ZERO);
+                        let need = match Self::account_check(
+                            reader.tiers(params.market_id),
+                            signed,
+                            px,
+                            params,
+                            res_price,
+                            bal.available + pn + credit - committed,
+                        ) {
+                            Ok(need) => need,
+                            Err(msg) => return PrepOutcome::Reject { margin: true, msg },
+                        };
+                        // Review fix 1 (s517): the need beyond the reservation
+                        // stays committed (the projection advances the
+                        // position as if filled).
+                        excess = (need - required).max(FixedPoint::ZERO);
+                        if excess > FixedPoint::ZERO {
+                            let acc = fold.committed.entry(*sender).or_insert(FixedPoint::ZERO);
+                            *acc += excess;
+                        }
+                        pos_net = pn;
+                    }
+                    if required > FixedPoint::ZERO {
+                        bal.available -= required;
+                        bal.order_margin += required;
+                        fold.cache.set(sender, bal);
+                    }
+                }
+                Err(e) => {
+                    return PrepOutcome::Reject {
+                        margin: false,
+                        msg: e.to_string(),
+                    }
+                }
+            }
+        }
+        // F1 (D6): project the accepted order as if filled, valuing an
+        // in-batch position at its first order's price.
+        if needs_account && !Self::is_stop(params) {
+            if let Some(e) = fold.proj.get_mut(&(*sender, params.market_id)) {
+                // Decision s517: the IM its closing part releases (at the
+                // projection's valuation; overflow = no credit).
+                let tiers = reader.tiers(params.market_id);
+                let size = if e.0 < FixedPoint::ZERO { -e.0 } else { e.0 };
+                let closing = params.quantity.min(reduce_only_allowance(e.0, params.is_buy));
+                let release = size
+                    .checked_mul(e.1)
+                    .ok()
+                    .zip((size - closing).checked_mul(e.1).ok())
+                    .map(|(b, a)| -torus_core::margin::im_delta(tiers, b, a));
+                if let Some(r) = release.filter(|r| *r > FixedPoint::ZERO) {
+                    let acc = fold.released.entry(*sender).or_insert(FixedPoint::ZERO);
+                    *acc = acc.checked_add(r).unwrap_or(*acc);
+                }
+                e.0 = if params.is_buy {
+                    e.0 + params.quantity
+                } else {
+                    e.0 - params.quantity
+                };
+                if e.1 == FixedPoint::ZERO {
+                    e.1 = res_price;
+                }
+            }
+        }
+        PrepOutcome::Pass(
+            required,
+            checked.then_some(pos_net),
+            if checked { FixedPoint::ZERO } else { excess },
+        )
+    }
+
+    /// L3-ENG: apply one Phase-2 outcome in flat order — a pass gets the
+    /// next global order id and joins its market's batch; a reject records
+    /// its funnel counter (`orders_rejected_margin` vs `_other`) and error.
+    /// Field-level borrows, so it coexists with an [`AccountReader`].
+    #[allow(clippy::too_many_arguments)]
+    fn stitch_outcome<'a>(
+        next_id: &mut u128,
+        metrics: &Option<Arc<torus_telemetry::Metrics>>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'a>>>,
+        results: &mut [NativeActionResult],
+        i: usize,
+        sender: &Address,
+        params: &'a PlaceOrderParams,
+        outcome: PrepOutcome,
+    ) {
+        match outcome {
+            PrepOutcome::Pass(margin_reserved, checked_pos_net, excess_im) => {
+                let order_id = *next_id;
+                *next_id += 1;
+                market_batches
+                    .entry(params.market_id)
+                    .or_default()
+                    .push(PreparedOrder {
+                        index: i,
+                        sender: *sender,
+                        params,
+                        order_id,
+                        margin_reserved,
+                        checked_pos_net,
+                        excess_im,
+                    });
+            }
+            PrepOutcome::Reject { margin, msg } => {
+                // Funnel (perf A1): died pre-book.
+                if let Some(ref m) = metrics {
+                    if margin {
+                        m.orders_rejected_margin.inc();
+                    } else {
+                        m.orders_rejected_other.inc();
+                    }
+                }
+                results[i] = NativeActionResult::err("place_order", msg);
+            }
+        }
+    }
+
     /// L3-ENG: sharded Phase-2 prepare. `groups` is the per-sender partition
     /// of the batch's PlaceOrders (each sender's orders in flat order);
     /// workers process disjoint contiguous shards of the sender list, each
@@ -4057,8 +4332,7 @@ impl NativeExecutor {
     /// `None` if any worker panicked (caller falls back to the serial loop —
     /// nothing shared has been mutated).
     fn phase2_parallel_prepare<T: StateBackend>(
-        positions: &PositionManager<T>,
-        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        reader: &AccountReader<'_, T>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
@@ -4074,77 +4348,20 @@ impl NativeExecutor {
                 .map(|shard_groups| {
                     s.spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut cache = BalanceCache::new();
+                            let mut fold = SenderFold::new(BalanceCache::new());
                             let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(
                                 shard_groups.iter().map(|(_, o)| o.len()).sum(),
                             );
                             for (sender, orders) in shard_groups {
                                 for &(i, params) in orders {
-                                    // s515: same validation + formula as the
-                                    // serial loop / exec_place_order.
-                                    if let Err(msg) = Self::validate_order_price(params) {
-                                        out.push((i, PrepOutcome::Reject { margin: false, msg }));
-                                        continue;
-                                    }
-                                    let (res_price, res_qty) = basis
-                                        .get(&i)
-                                        .copied()
-                                        .unwrap_or((Self::reserve_price(params), params.quantity));
-                                    let required = match Self::try_reserve_for_qty_cfg(
-                                        margin_configs.get(&params.market_id),
-                                        res_price,
-                                        res_qty,
-                                    ) {
-                                        Ok(r) => r,
-                                        Err(msg) => {
-                                            out.push((i, PrepOutcome::Reject { margin: false, msg }));
-                                            continue;
-                                        }
-                                    };
-                                    // s515 review 4: same budget as the serial loop.
-                                    let checked = Self::match_margin_checked(params);
-                                    let mut budget = None;
-                                    if required > FixedPoint::ZERO || checked {
-                                        match cache.load(positions, sender) {
-                                            Ok(mut bal) => {
-                                                if bal.available < required {
-                                                    out.push((
-                                                        i,
-                                                        PrepOutcome::Reject {
-                                                            margin: true,
-                                                            msg: format!(
-                                                                "insufficient margin: need {required}, have {}",
-                                                                bal.available
-                                                            ),
-                                                        },
-                                                    ));
-                                                    continue;
-                                                }
-                                                if checked {
-                                                    budget = Some(bal.available);
-                                                }
-                                                if required > FixedPoint::ZERO {
-                                                    bal.available -= required;
-                                                    bal.order_margin += required;
-                                                    cache.set(sender, bal);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                out.push((
-                                                    i,
-                                                    PrepOutcome::Reject {
-                                                        margin: false,
-                                                        msg: e.to_string(),
-                                                    },
-                                                ));
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    out.push((i, PrepOutcome::Pass(required, budget)));
+                                    // L3-ENG: literally the serial loop's step.
+                                    out.push((
+                                        i,
+                                        Self::prepare_one(reader, basis, &mut fold, i, sender, params),
+                                    ));
                                 }
                             }
-                            (out, cache)
+                            (out, fold.cache)
                         }))
                         .map_err(|_| ())
                     })
@@ -4890,7 +5107,8 @@ impl NativeExecutor {
             }
             // s515: quantity cut from resting reduce-only orders telescopes
             // exactly like consumption by a fill.
-            for c in &r.reduce_only_cuts {
+            // F1 (s517 #4): so does a maker cancelled for margin.
+            for c in r.reduce_only_cuts.iter().chain(&r.margin_cancels) {
                 let e = consumed
                     .entry(c.order_id)
                     .or_insert((c.trader, c.price, FixedPoint::ZERO));
@@ -4961,16 +5179,9 @@ impl NativeExecutor {
 
     /// s515 review 4: the mark price of `market_id` — the stake-weighted
     /// median aggregated by the oracle and committed in state — or `None`
-    /// when there is none, it is stale (older than the oracle's max age at
-    /// this block height), non-positive, or unreadable. Only oracle
-    /// aggregation writes that row and no native action runs it, so every
-    /// placement of a block (single, batch serial, batch sharded) reads the
-    /// same value on every validator.
+    /// (F1: one formula, [`AccountReader::mark`]).
     fn mark_price<T: StateBackend>(ctx: &NativeExecContext<T>, market_id: MarketId) -> Option<FixedPoint> {
-        match ctx.oracle.get_price(market_id, ctx.block_height) {
-            Ok(p) if !p.stale && p.price > FixedPoint::ZERO => Some(p.price),
-            _ => None,
-        }
+        AccountReader::of(ctx).mark(market_id)
     }
 
     /// s515 review 4 (Hyperliquid: margin is checked "when orders are placed
@@ -4982,7 +5193,8 @@ impl NativeExecutor {
     /// limit, i.e. within its full reservation. Review 5: an IOC / FOK limit
     /// buy reserves only for its opening part ([`never_rests`]), so it is
     /// checked too. Reduce-only orders are exempt (Hyperliquid: reducing
-    /// needs no margin); stops are checked once triggered.
+    /// needs no margin); stops are checked once triggered. F1 (s517): the
+    /// budget is the reservation + the sender's running free margin.
     fn match_margin_checked(params: &PlaceOrderParams) -> bool {
         !params.reduce_only
             && match params.order_type {
@@ -5017,20 +5229,56 @@ impl NativeExecutor {
     }
 
     /// s515 review 4: the book-side match-time margin limit of a checked
-    /// taker with `budget` (its reservation + the available balance after
-    /// it). A GTC limit's remainder can rest and keeps `reserve(limit, left)`,
-    /// so that hold counts against the budget too.
+    /// taker. F1 (s517): `reserved` is the order's own reservation; the book
+    /// adds the sender's running free margin (`AccountMargins`). A GTC
+    /// limit's remainder can rest and keeps `reserve(limit, left)`, so its
+    /// opening part counts against the budget too.
     fn taker_margin_limit(
         tiers: &Option<Arc<[MarginTier]>>,
         params: &PlaceOrderParams,
-        budget: FixedPoint,
+        reserved: FixedPoint,
     ) -> TakerMarginLimit {
         let can_rest = matches!(params.order_type, OrderType::Limit)
             && params.time_in_force == TimeInForce::GTC;
         TakerMarginLimit {
-            budget,
+            budget: reserved,
             tiers: tiers.clone(),
             hold_price: can_rest.then(|| Self::reserve_price(params)),
+        }
+    }
+
+    /// F1 (s517): THE placement gate (strict HL, D1 — there is no
+    /// `available >= reservation` gate any more): the order's need at the
+    /// POSITION-size tier (closing part free) must be `<= 0` (only reduces)
+    /// or `<= free` (available + UPnL − position IM, before this
+    /// reservation; `available` may be negative). Reduce-only orders are
+    /// clamped to the position, so they only reduce and are skipped. A
+    /// pending stop is checked as a resting order at its reservation price
+    /// (it is re-checked when it triggers); without this, stops would have
+    /// no gate at all.
+    fn account_check(
+        tiers: Option<&[MarginTier]>,
+        signed: FixedPoint,
+        px: FixedPoint,
+        params: &PlaceOrderParams,
+        res_price: FixedPoint,
+        free: FixedPoint,
+    ) -> Result<FixedPoint, String> {
+        if params.reduce_only {
+            return Ok(FixedPoint::ZERO);
+        }
+        // A flat (or unmarked) position is valued at the order's own price.
+        let px = if px > FixedPoint::ZERO { px } else { res_price };
+        let can_rest = !Self::never_rests(params); // stops: true
+        match placement_need(tiers, signed, px, params.is_buy, params.quantity, res_price, can_rest) {
+            None => Err(format!(
+                "order notional overflows: price {res_price} x quantity {}",
+                params.quantity
+            )),
+            Some(need) if need > FixedPoint::ZERO && need > free => {
+                Err(format!("insufficient margin: need {need}, have {free} (account)"))
+            }
+            Some(need) => Ok(need),
         }
     }
 
@@ -5357,9 +5605,10 @@ impl NativeExecutor {
         } else {
             None
         };
+        let res_price = Self::reservation_price(params, mark);
         let order_margin_required = match Self::try_reserve_for_qty_cfg(
             ctx.margin_configs.get(&market_id),
-            Self::reservation_price(params, mark),
+            res_price,
             reserve_qty,
         ) {
             Ok(m) => m,
@@ -5372,27 +5621,60 @@ impl NativeExecutor {
         };
 
         // s515 review 4: a checked taker's match-time budget — its
-        // reservation + the available balance left after it.
+        // reservation (F1: + the sender's free margin after it, installed
+        // in the book as `AccountMargins` below).
         let checked = Self::match_margin_checked(params);
         let mut margin_budget = None;
-        if order_margin_required > FixedPoint::ZERO || checked {
+        // F1 (s517): read from FIELDS — the book below borrows
+        // `ctx.order_books` mutably.
+        let reader = AccountReader {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            height: ctx.block_height,
+            margin_configs: &ctx.margin_configs,
+        };
+        let needs_account = !params.reduce_only;
+        let mut account = None;
+        if order_margin_required > FixedPoint::ZERO || checked || needs_account {
             match ctx.positions.get_native_balance(sender) {
                 Ok(mut bal) => {
-                    if bal.available < order_margin_required {
-                        // Funnel (perf A1): died pre-book on the margin reserve.
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_margin.inc();
+                    // F1 (s517, D1 strict HL): the account-level check is
+                    // the ONLY placement gate — the old `available >=
+                    // reservation` rejection is gone, so the debit below may
+                    // take `available` negative (UPnL funds it).
+                    if needs_account {
+                        let acct = reader
+                            .position_px(sender, market_id)
+                            .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)));
+                        let (signed, px, pos_net) = match acct {
+                            Ok(a) => a,
+                            Err(e) => {
+                                // Funnel (perf A1): died pre-book on a state read error.
+                                if let Some(ref m) = ctx.metrics {
+                                    m.orders_rejected_other.inc();
+                                }
+                                return NativeActionResult::err("place_order", e.to_string());
+                            }
+                        };
+                        let free = bal.available + pos_net;
+                        if let Err(msg) = Self::account_check(
+                            reader.tiers(market_id),
+                            signed,
+                            px,
+                            params,
+                            res_price,
+                            free,
+                        ) {
+                            // Funnel (perf A1): died pre-book on the margin check.
+                            if let Some(ref m) = ctx.metrics {
+                                m.orders_rejected_margin.inc();
+                            }
+                            return NativeActionResult::err("place_order", msg);
                         }
-                        return NativeActionResult::err(
-                            "place_order",
-                            format!(
-                                "insufficient margin: need {order_margin_required}, have {}",
-                                bal.available
-                            ),
-                        );
+                        account = Some((free, px));
                     }
                     if checked {
-                        margin_budget = Some(bal.available);
+                        margin_budget = Some(order_margin_required);
                     }
                     if order_margin_required > FixedPoint::ZERO {
                         bal.available -= order_margin_required;
@@ -5453,9 +5735,23 @@ impl NativeExecutor {
                 budget,
             )
         });
-        let result =
-            book.place_order_with_margin(params.clone(), *sender, ctx.timestamp, margin_limit.as_ref());
+        // F1 (s517): the sender's free margin after this reservation, for
+        // the match-time check.
+        let mut am = AccountMargins::new(Self::margin_tiers(ctx.margin_configs.get(&market_id)));
+        if let (true, Some((free, px))) = (checked, account) {
+            am.insert(*sender, free - order_margin_required, px);
+        }
+        book.set_account_margins(am);
+        // F1 (s517 #4): makers are checked on every fill (HL marginCanceled).
+        let result = book.place_order_with_accounts(
+            params.clone(),
+            *sender,
+            ctx.timestamp,
+            margin_limit.as_ref(),
+            Some(&reader),
+        );
         book.clear_reduce_only_positions();
+        book.clear_account_margins();
         if forced_id.is_some() {
             book.set_next_order_id(ctx.next_global_order_id);
         } else {
@@ -5873,17 +6169,47 @@ impl NativeExecutor {
             Err(msg) => return err(msg),
         };
         let extra = new_reserved - old_reserved;
+        // F1 (s517, D1 strict HL) + review fixes 3/5: THE modify gate — the
+        // new order's POSITION-tier need (`placement_need`, as at placement;
+        // closing is free) minus what the old order gives back (the larger
+        // of its need and its reservation) must fit the account's free
+        // margin (UPnL counts). No `available >= extra` gate: the debit below may
+        // take `available` negative. Reduce-only orders only reduce.
+        if !old.reduce_only {
+            let reader = AccountReader::of(ctx);
+            let acct = reader
+                .position_px(sender, market_id)
+                .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
+                .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)));
+            let ((signed, px, pos_net), bal) = match acct {
+                Ok(a) => a,
+                Err(e) => return err(e.to_string()),
+            };
+            let px = if px > FixedPoint::ZERO { px } else { price };
+            let tiers = cfg.map(|c| c.tiers.as_slice());
+            let need = |q, p| placement_need(tiers, signed, px, is_buy, q, p, true);
+            let Some(need_new) = need(qty, price) else {
+                return err(format!("order notional overflows: price {price} x quantity {qty}"));
+            };
+            // Review fix 5 (s517): cancel-and-replace equivalence — the old
+            // order gives back its whole reservation (>= its need when it
+            // has a closing part, D4); an overflowing old need falls back to
+            // it too (a shrink is never rejected).
+            let old_cost = need(old.remaining_qty, old.price)
+                .map_or(old_reserved, |n| n.max(old_reserved));
+            let delta = need_new - old_cost;
+            let free = bal.available + pos_net;
+            if need_new > FixedPoint::ZERO && delta > FixedPoint::ZERO && delta > free {
+                return err(format!(
+                    "insufficient margin for modify: need {delta}, have {free} (account)"
+                ));
+            }
+        }
         if extra > FixedPoint::ZERO {
             let mut bal = match ctx.positions.get_native_balance(sender) {
                 Ok(bal) => bal,
                 Err(e) => return err(e.to_string()),
             };
-            if bal.available < extra {
-                return err(format!(
-                    "insufficient margin for modify: need {extra}, have {}",
-                    bal.available
-                ));
-            }
             bal.available -= extra;
             bal.order_margin += extra;
             if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
@@ -6346,6 +6672,9 @@ impl NativeExecutor {
                 return NativeActionResult::err("withdraw_from_native", "amount overflow".into())
             }
         };
+        if let Err(msg) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::err("withdraw_from_native", msg);
+        }
         match Lockbox::withdraw_from_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_from_native", 1500),
             Err(e) => NativeActionResult::err("withdraw_from_native", e.to_string()),
@@ -6363,10 +6692,45 @@ impl NativeExecutor {
             Some(fp) => fp,
             None => return NativeActionResult::err("withdraw_to", "amount overflow".into()),
         };
+        if let Err(msg) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::err("withdraw_to", msg);
+        }
         match Lockbox::withdraw_from_native_to(&ctx.state, sender, to, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
             Err(e) => NativeActionResult::err("withdraw_to", e.to_string()),
         }
+    }
+
+    /// F1 (s517 decision 5, Hyperliquid `transfer_margin_required`): a native
+    /// withdrawal — TransferToSpot, Withdraw, and CoreWriter LockboxWithdraw
+    /// (drains as TransferToSpot) — must leave equity minus order margin >=
+    /// max(Σ position IM, 10% × Σ position notional) (D3, SAFE variant: the
+    /// resting orders' reservations are not collateral for the positions).
+    /// `amount > available` (incl. any amount while `available < 0`) is left
+    /// to the Lockbox's own cash check (error text unchanged).
+    fn check_withdrawal_margin<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        sender: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), String> {
+        let bal = ctx
+            .positions
+            .get_native_balance(sender)
+            .map_err(|e| e.to_string())?;
+        if amount <= FixedPoint::ZERO || amount > bal.available {
+            return Ok(());
+        }
+        let view = AccountReader::of(ctx)
+            .view(sender, &bal)
+            .map_err(|e| e.to_string())?;
+        if view.withdrawal_allowed(amount) {
+            return Ok(());
+        }
+        Err(format!(
+            "withdrawal of {amount} would leave the account under-margined: equity after (excl. order margin) {}, required {}",
+            view.equity() - view.order_margin - amount,
+            view.transfer_required()
+        ))
     }
 
     // ========================================================================

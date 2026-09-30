@@ -376,3 +376,57 @@ fn insurance_fund_absorbs_loss() {
     assert_eq!(bal1.available, fp(10_000));
     assert_eq!(bal2.available, fp(10_000));
 }
+
+/// F1: collateral held as order margin is equity. Available 0 + 600 reserved,
+/// long 1 @50,000 at mark 50,000: maintenance 500 <= 600 → NOT liquidatable.
+/// The old equity (available − order_margin = −600) flagged it.
+#[test]
+fn reserved_order_margin_counts_as_equity_once() {
+    let (_dir, pm) = setup();
+    let trader = addr(1);
+    pm.put_native_balance(
+        &trader,
+        &NativeBalance {
+            available: FixedPoint::ZERO,
+            order_margin: fp(600),
+        },
+    )
+    .unwrap();
+    make_cross_long(&pm, &trader, 1, fp(1), fp(50_000));
+    let config = MarketMarginConfig::new(1, 50);
+    let liqs =
+        LiquidationEngine::check_liquidations(&pm, &[trader], &config, &[(1, fp(50_000))]).unwrap();
+    assert!(liqs.is_empty(), "{liqs:?}");
+}
+
+/// F1/D1: with UPnL-funded reservations, `available` < 0 is not a loss —
+/// collateral is `available + order_margin`. Cash −100, 300 reserved, long
+/// 1 @50,000 liquidated at 50,000 (PnL 0, penalty 2.5% = 1,250): collateral
+/// 200 − 1,250 → deficit 1,050 (was: 100 + 1,250 = 1,350, and the 300
+/// reservation was later released on top — minting it back).
+#[test]
+fn liquidation_deficit_counts_order_margin_as_collateral() {
+    let (_dir, pm) = setup();
+    let trader = addr(1);
+    pm.put_native_balance(
+        &trader,
+        &NativeBalance {
+            available: -fp(100),
+            order_margin: fp(300),
+        },
+    )
+    .unwrap();
+    make_cross_long(&pm, &trader, 1, fp(1), fp(50_000));
+    let pos = pm.get_position(&trader, 1).unwrap().unwrap();
+    let liq = torus_core::liquidation::Liquidation {
+        trader,
+        market_id: 1,
+        position: pos,
+        shortfall: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    let r = LiquidationEngine::execute_liquidation(&pm, &liq, fp(50_000)).unwrap();
+    assert_eq!(r.remaining_deficit, fp(1_050));
+    let bal = pm.get_native_balance(&trader).unwrap();
+    assert_eq!((bal.available, bal.order_margin), (-fp(300), fp(300)));
+}

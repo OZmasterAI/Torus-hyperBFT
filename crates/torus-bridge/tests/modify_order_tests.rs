@@ -403,3 +403,128 @@ fn reduce_only_modify_clamp_below_lot_mirrors_placement() {
         assert!(!r[0].success || !rests, "{path:?}: placement rejects it too");
     }
 }
+
+// ============================================================================
+// F1 (s517): a modify's extra reservation is checked against the ACCOUNT
+// ============================================================================
+
+/// Publish `price` as market `market_id`'s aggregated oracle (mark) price
+/// (copied from market_order_margin_tests.rs).
+fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
+    let reporters = [addr(150), addr(151), addr(152)];
+    for v in &reporters {
+        ctx.oracle
+            .submit_price(v, market_id, price, ctx.block_height, ctx.timestamp)
+            .unwrap();
+    }
+    let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
+    let agg = ctx
+        .oracle
+        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .unwrap();
+    assert_eq!(agg, price, "test oracle aggregates to the mark");
+}
+
+/// `t` (addr 2) funded 100, long 10 @100 in m2 (IM 50) against addr 3, and
+/// a resting bid 1 @90 in m1 (reserves 4.5) → available 95.5. Returns the
+/// bid's id.
+fn long_m2_with_bid_m1(ctx: &mut NativeExecContext) -> u128 {
+    let (t, cp) = (addr(2), addr(3));
+    fund_native(ctx, &cp, fp(1_000));
+    fund_native(ctx, &t, fp(100));
+    NativeExecutor::execute(ctx, &cp, &NativeAction::PlaceOrder(limit(2, false, 100, 10)));
+    assert!(NativeExecutor::execute(ctx, &t, &NativeAction::PlaceOrder(limit(2, true, 100, 10))).success);
+    assert!(NativeExecutor::execute(ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 90, 1))).success);
+    ctx.order_books[&1].orders_for_trader(&t)[0].id
+}
+
+/// F1 (s517): a modify's extra reservation must fit the account's free
+/// margin, not just `available`. Free = 95.5 − 50 = 45.5: qty 11 (+45) ok;
+/// qty 12 (+49.5) rejected (was accepted: 49.5 <= available 95.5).
+#[test]
+fn modify_extra_reservation_needs_account_free_margin() {
+    for (qty, ok) in [(11, true), (12, false)] {
+        let (_d, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        let id = long_m2_with_bid_m1(&mut ctx);
+        let (s, a) = modify(addr(2), id, None, Some(fp(qty)));
+        let r = NativeExecutor::execute(&mut ctx, &s, &a);
+        assert_eq!(r.success, ok, "qty {qty}: {:?}", r.error);
+    }
+}
+
+/// F1 / D1 (strict HL): UPnL funds a modify beyond cash. Mark m2 at 150:
+/// UPnL +500, IM 75 → free 95.5 + 425 = 520.5. Modify the bid to 100 @90
+/// (reservation 450, extra 445.5 > available 95.5): ACCEPTED, available
+/// −350 (the removed `available < extra` gate rejected it).
+#[test]
+fn modify_extra_reservation_can_be_funded_by_upnl() {
+    let (_d, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    let id = long_m2_with_bid_m1(&mut ctx);
+    set_mark(&ctx, 2, fp(150));
+    let (s, a) = modify(addr(2), id, None, Some(fp(100)));
+    let r = NativeExecutor::execute(&mut ctx, &s, &a);
+    assert!(r.success, "{:?}", r.error);
+    assert_bal(&ctx, &addr(2), -fp(350), fp(450), "UPnL-funded");
+}
+
+/// Review fix 3 (s517): a modify is gated on the POSITION-tier need change
+/// (`placement_need(new) − placement_need(old)`), not the reservation delta.
+/// m1 tiers 20x <= 1,000, 5x above. `t` (100) long 5 @100 in m1 (IM 25),
+/// bid 4 @100 (need IM(900) − IM(500) = 20, reserves 20) → available 80,
+/// free 55. Bid → 6: need IM(1,100) − 25 = 195, +175 > 55 → REJECTED (the
+/// reservation delta is only 10; a fresh buy 6 @100 on this account would
+/// need 195 too). Bid → 5: need IM(1,000) − 25 = 25, +5 <= 55 → accepted.
+#[test]
+fn modify_is_gated_on_the_position_tier_need() {
+    for (qty, ok) in [(6, false), (5, true)] {
+        let (_d, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        let mut c = torus_core::margin::MarketMarginConfig::new(1, 999);
+        c.tiers = vec![
+            torus_core::margin::MarginTier { max_notional: fp(1_000), max_leverage: 20 },
+            torus_core::margin::MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 },
+        ];
+        ctx.margin_configs.insert(1, c);
+        let (t, cp) = (addr(2), addr(3));
+        fund_native(&ctx, &cp, fp(1_000));
+        fund_native(&ctx, &t, fp(100));
+        NativeExecutor::execute(&mut ctx, &cp, &NativeAction::PlaceOrder(limit(1, false, 100, 5)));
+        assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 5))).success);
+        assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 4))).success);
+        assert_bal(&ctx, &t, fp(80), fp(20), "setup");
+        let id = ctx.order_books[&1].orders_for_trader(&t)[0].id;
+        let (s, a) = modify(t, id, None, Some(fp(qty)));
+        let r = NativeExecutor::execute(&mut ctx, &s, &a);
+        assert_eq!(r.success, ok, "qty {qty}: {:?}", r.error);
+    }
+}
+
+/// Review fix 5 (s517): the modify gate credits the old order's full
+/// reservation (cancel-and-replace equivalence), not just its need. Flat
+/// 10x: long 10 @100 (IM 100) with 200 available (free 100); GTC sell 15
+/// @100 rests (need IM(1,500) − 100 = 50, reserves 150 → available 50,
+/// free −50). Reprice to 101: need 50.5 − max(50, 150) < 0 → ACCEPTED
+/// (was: 50.5 − 50 = 0.5 > −50 → rejected, though cancel + place passes:
+/// 50.5 <= 100). Extra reservation 1.5 → 48.5 / 151.5.
+#[test]
+fn modify_credits_the_old_reservation() {
+    let (_d, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    let mut c = torus_core::margin::MarketMarginConfig::new(1, 999);
+    c.tiers = vec![torus_core::margin::MarginTier { max_notional: FixedPoint::MAX, max_leverage: 10 }];
+    ctx.margin_configs.insert(1, c);
+    let (t, cp) = (addr(2), addr(3));
+    fund_native(&ctx, &cp, fp(1_000));
+    fund_native(&ctx, &t, fp(200));
+    NativeExecutor::execute(&mut ctx, &cp, &NativeAction::PlaceOrder(limit(1, false, 100, 10)));
+    assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 10))).success);
+    assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, false, 100, 15))).success);
+    assert_bal(&ctx, &t, fp(50), fp(150), "setup");
+    let id = ctx.order_books[&1].orders_for_trader(&t)[0].id;
+    let (s, a) = modify(t, id, Some(fp(101)), None);
+    let r = NativeExecutor::execute(&mut ctx, &s, &a);
+    assert!(r.success, "{:?}", r.error);
+    assert_bal(&ctx, &t, FixedPoint::from_raw(4_850_000_000), FixedPoint::from_raw(15_150_000_000), "repriced");
+}

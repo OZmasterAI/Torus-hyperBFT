@@ -229,11 +229,13 @@ impl LiquidationEngine {
         // Remove the position
         positions.delete_position(&pos.trader, pos.market_id)?;
 
-        // Check if remaining equity covers the loss
-        let remaining_deficit = if bal.available < FixedPoint::ZERO {
-            let deficit = -bal.available;
-            bal.available = FixedPoint::ZERO;
-            deficit
+        // Check if remaining equity covers the loss. F1/D1 (s517): collateral
+        // is available + order_margin — available alone may be negative while
+        // resting orders hold UPnL-funded reservations; those release later.
+        let collateral = bal.available + bal.order_margin;
+        let remaining_deficit = if collateral < FixedPoint::ZERO {
+            bal.available = -bal.order_margin;
+            -collateral
         } else {
             FixedPoint::ZERO
         };
