@@ -6196,9 +6196,11 @@ impl NativeExecutor {
 
     /// Whether CoreWriter / lockbox actions are queued for `height` — the block
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
-    /// for a block with no native actions and no fees. Queue entries are written by EVM
-    /// execution straight to the DB, so a DB read is authoritative here. A read error
-    /// errs on the side of running the drain.
+    /// for a block with no native actions and no fees. Queue entries for `height` are
+    /// buffered by block `height - 1`'s EVM execution and committed in the SAME atomic
+    /// batch as that block's EVM bundle (s515 F1), which lands before this block runs
+    /// — so a DB read is authoritative here. A read error errs on the side of running
+    /// the drain.
     pub fn core_writer_due(state_db: &StateDb, height: u64) -> bool {
         CoreWriterQueue::pending_count(state_db, height).map_or(true, |n| n > 0)
     }
