@@ -1457,13 +1457,17 @@ impl<N: Network> HotStuff<N> {
                 .phase_vote_collectors
                 .update_validator_sets(&validator_set_state);
 
-            // 5. Vote, if I am allowed to vote and if I haven't voted in this view yet.
+            // 5. Vote, if I am allowed to vote and if I haven't voted in this view yet,
+            // and the block passes the pre-vote data check (rebase s87, T0b: the same
+            // vote-time rules as the header-first path; insertion above never applies
+            // them, so a block others certify is still accepted here).
             if is_phase_voter(
                 &self.config.keypair.public(),
                 &validator_set_state,
                 &proposal.block.justify,
             ) && (block_tree.highest_view_voted()?.is_none()
                 || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
+                && Self::vote_check(&proposal.block, block_tree, app)? == BlockDataCheck::Held
             {
                 let vote_phase = if validator_set_updates.is_some() {
                     Phase::Prepare
@@ -2653,8 +2657,30 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
         let hash = header.block_hash;
-        let held = if block_tree.contains(&hash) || self.pending_bodies.contains_key(&hash) {
+        let held = if self.pending_bodies.contains_key(&hash) {
             true
+        } else if block_tree.contains(&hash) {
+            // Rebase s87 (T0b): validated on insertion, but vote-time-only rules
+            // (the local-clock bound) are in the data check alone.
+            let check = match block_tree.block(&hash)? {
+                Some(block) => Self::vote_check(&block, block_tree, app)?,
+                None => BlockDataCheck::Missing,
+            };
+            match check {
+                BlockDataCheck::Held => true,
+                BlockDataCheck::Missing => {
+                    if let Some((_, recheck)) = self.awaiting_body_vote.as_mut() {
+                        *recheck = Some(Instant::now() + BODY_VOTE_RECHECK_INTERVAL);
+                    }
+                    false
+                }
+                // The tree holds the one body bound to this hash: no other
+                // copy can change the verdict.
+                BlockDataCheck::Invalid => {
+                    self.awaiting_body_vote = None;
+                    false
+                }
+            }
         } else if let Some(block) = body.filter(|block| block.hash == hash) {
             let check = app.check_block_data(block, &block_tree.app_view(None)?);
             match check {
@@ -2680,6 +2706,26 @@ impl<N: Network> HotStuff<N> {
             }
         }
         Ok(())
+    }
+
+    /// Rebase s87 (T0b): [`App::check_block_data`] for a block this replica
+    /// already holds and validated (in the tree, or a full proposal just
+    /// inserted): it may vote only on `Held`. Vote-time-only rules (the
+    /// local-clock bound on the block timestamp) live there, never in
+    /// `validate_block`, so insertion of a certified block never applies them.
+    fn vote_check<K: KVStore>(
+        block: &Block,
+        block_tree: &BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<BlockDataCheck, HotStuffError> {
+        let check = app.check_block_data(block, &block_tree.app_view(None)?);
+        if check != BlockDataCheck::Held {
+            log::warn!(
+                "not voting (yet): {} fails the pre-vote data check ({check:?})",
+                crate::logging::block_prefix(&block.hash)
+            );
+        }
+        Ok(check)
     }
 
     /// Phase-vote for `header`, the current view's checked proposal header
@@ -2745,8 +2791,15 @@ impl<N: Network> HotStuff<N> {
         };
         let hash = header.block_hash;
         let due = recheck.is_some_and(|due| Instant::now() >= due);
-        if header.view != self.view_info.view || block_tree.contains(&hash) {
+        // Rebase s87 (T0b): an in-tree block is checked once, then only when a
+        // `Missing` verdict's re-check is due (no data check per loop tick).
+        if header.view != self.view_info.view
+            || (block_tree.contains(&hash) && (recheck.is_none() || due))
+        {
             return self.vote_if_body_held(None, block_tree, app);
+        }
+        if block_tree.contains(&hash) {
+            return Ok(());
         }
         if due {
             match self.deferred_bodies.get(&hash).cloned() {
@@ -5196,7 +5249,57 @@ mod vote_after_body_tests {
         f.tree.insert(&f.block, None, None).unwrap();
         f.tick();
         assert!(f.voted());
-        assert_eq!(f.app.check_calls, 0, "a block in the tree was validated on insertion");
+        // Rebase s87 (T0b): every vote is preceded by the data check, also for
+        // a block already in the tree (it may hold vote-time-only rules).
+        assert_eq!(f.app.check_calls, 1);
+    }
+
+    /// T0b (rebase s87): a block in the tree (inserted by another path:
+    /// validation passed) is still not voted when the data check refuses it —
+    /// a vote-time-only rule such as the local-clock bound. It stays inserted.
+    #[test]
+    fn block_in_the_tree_failing_the_data_check_is_not_voted() {
+        let mut f = Follower::new(&[BlockDataCheck::Invalid], valid);
+        f.header();
+        f.tree.insert(&f.block, None, None).unwrap();
+        f.tick();
+        assert!(!f.voted());
+        assert_eq!(f.app.check_calls, 1);
+        assert!(f.tree.contains(&f.block.hash));
+    }
+
+    fn full_proposal(f: &Follower) -> HotStuffMessage {
+        HotStuffMessage::Proposal(Proposal {
+            chain_id: ChainID::new(0),
+            view: f.view,
+            block: f.block.clone(),
+            tc: None,
+            nec: None,
+        })
+    }
+
+    /// T0b (rebase s87): the full-proposal path validates and inserts first,
+    /// then votes only if the data check passes — the same pre-vote rule as
+    /// the header-first path. A refused block is still inserted (no wedge if
+    /// others certify it).
+    #[test]
+    fn full_proposal_failing_the_data_check_is_inserted_but_not_voted() {
+        let mut f = Follower::new(&[BlockDataCheck::Invalid], valid);
+        let msg = full_proposal(&f);
+        f.receive(msg);
+        assert!(f.tree.contains(&f.block.hash), "validated and inserted");
+        assert!(!f.voted(), "no vote for a block that fails the data check");
+        assert_eq!(f.app.check_calls, 1);
+    }
+
+    #[test]
+    fn full_proposal_passing_the_data_check_is_voted() {
+        let mut f = Follower::new(&[], valid);
+        let msg = full_proposal(&f);
+        f.receive(msg);
+        assert!(f.tree.contains(&f.block.hash));
+        assert!(f.voted());
+        assert_eq!(f.app.check_calls, 1);
     }
 
     /// The deferred vote re-checks the lock clause: a lock that moved to a

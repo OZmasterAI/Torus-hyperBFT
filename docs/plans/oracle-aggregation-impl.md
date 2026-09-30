@@ -268,6 +268,26 @@ ok, empty FAILED "empty boundary block 4 must distribute validator inflation".
 
 ### T0b — consensus: block-timestamp validation + proposer never regresses (**own commit, second**)
 
+> **Superseded placement (rebase s87 onto main, owner option A).** The `finish_validate` /
+> `TsRule` / `validate_block_with` placement below was the s517 design. On main a replica votes
+> once it holds the body, BEFORE `validate_block` (973cc74), and every rule that can reject a
+> block runs before the vote (e89eaaa), so a certified block always inserts. As landed:
+> * `ts >= parent.ts` is in `check_parent_link` (a pure header comparison): before the vote and
+>   in `validate_block` (insertion) alike.
+> * `ts <= local clock + MAX_BLOCK_TIMESTAMP_DRIFT_SECS` (5 s) is pre-vote only:
+>   `check_timestamp_drift` in `check_proposal_data`, reached from hotstuff's
+>   `App::check_block_data`. Hotstuff now runs that check before EVERY vote for a proposal
+>   (header-first body, a block already in the tree, a full proposal right after its
+>   insertion); a refused block is still inserted. Never applied at insertion, on block sync,
+>   in execution or in crash replay.
+> * No `TsRule`, `validate_block_with`, `effective_ts_rule` or `validate_datum_with`; tests
+>   inject the clock via `TorusApp::test_now_secs`. Proposer: `max(now, parent.ts)` as planned.
+> * Tests: `far_future_proposal_is_refused_before_the_vote`,
+>   `far_future_block_is_accepted_at_insertion_sync_execution_and_replay` (no wedge),
+>   `regressing_timestamp_is_refused_before_the_vote_and_by_the_parent_link`, plus hotstuff
+>   `full_proposal_failing_the_data_check_is_inserted_but_not_voted` and
+>   `block_in_the_tree_failing_the_data_check_is_not_voted`.
+
 `══ COMMIT 2 (timestamp) ══` — after T0, before any oracle work, e.g.
 `feat(consensus): reject proposals whose timestamp regresses or runs ahead of the local clock`.
 Includes T1's pin test (the oracle clock reads the committed header) in the same commit.
@@ -481,6 +501,23 @@ Option<TsRule>` is the one gate `finish_validate` uses: `None` when `rule` is `N
 RED: `check_proposal_timestamp` / `TsRule` / `validate_datum_with` do not exist; the proposer
 test fails whenever the parent is ahead of the clock (today `timestamp = now`).
 
+**Correction s517 (as implemented on crab; superseded on rebase s87, see the note at the top of T0b):**
+* `validate_block_with(request, proposal_path: bool)` (not `ts_rule`): the rule needs the
+  request's block tree for the parent, so it is built inside — `validate_block` passes `true`,
+  `validate_block_for_sync` `false`. Parent ts = `parent_timestamp(&request)` (genesis PC ⇒
+  `genesis_parent_header().timestamp`, else `block_tree().block(&justify.block)` → header).
+* `decode_datum_header` decodes only the header prefix (`bincode::deserialize::<TorusBlockHeader>`,
+  trailing body ignored; both datum formats start with the header) — cheap on the vote path;
+  `produce_block` uses it too. Pinned by `proposal_timestamp_datum_header_decodes_full_and_compact`.
+* `unix_now_secs()` shared by proposer and validator; tests inject `local_now` via `TsRule`.
+* `finish_validate(block, ts_rule)` — its 3 existing test callers pass `None`; `validate_datum`
+  (test entry) = `validate_datum_with(.., None)`, so existing async-validate tests are unchanged.
+* `app_with_tip` just sets `last_header` (no execution needed); `vote_rule(parent_ts, now)` drops
+  the unused `app` param. Test names share the `proposal_timestamp` prefix; the committed-height
+  skip is also tested end-to-end (`proposal_timestamp_rule_skips_committed_heights`, heights 3/4,
+  regressing AND far-future ts accepted), and split from the sync/execution/replay test.
+* validate: `cargo test -j6 -p torus-consensus --lib -- proposal_timestamp oracle_clock`.
+
 **validate:** `cargo test -j6 -p torus-consensus --lib timestamp && cargo test -j6 -p torus-consensus --lib async_validate && cargo test -j6 -p torus-consensus --lib crash && cargo test -j6 -p torus-consensus --lib oracle_clock` · depends_on: [0]
 
 ### T1 — verify & pin: the committed header timestamp reaches execution on every path
@@ -603,6 +640,9 @@ No implementation. Record the *Timestamp finding* (incl. S1) in
 `docs/plans/oracle-aggregation.md` → *Open Questions* (answered) in the same commit.
 
 Lands in `══ COMMIT 2 (timestamp) ══` together with T0b.
+
+**Correction s517:** the pin also asserts `!ctx.exec_failed` per path; otherwise as drafted
+(GREEN on first run, as expected for a pin).
 
 **validate:** `cargo test -j6 -p torus-consensus --lib oracle_clock` · depends_on: ["0b"]
 

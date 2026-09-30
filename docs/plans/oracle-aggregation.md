@@ -106,3 +106,17 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
 
 1. Staleness: 100 blocks / window 10 blocks — confirm in seconds at today's
    block time during planning.
+2. **Block timestamp — answered (s517, T0b + T1).** The header timestamp is the
+   proposer's wall clock in seconds, hashed into the block identity; every
+   execution path (live dispatch, `execute_committed_block`, crash replay) reads
+   the COMMITTED header, and oracle submission rows store it
+   (`oracle_clock_is_the_committed_header_timestamp_on_every_path`). It was not
+   validated; from T0b (placement per rebase s87, owner option A) a block with
+   `ts < parent.ts` is refused by `check_parent_link` (before the vote and on
+   insertion: a pure header comparison), and a replica refuses to VOTE for a block
+   with `ts > local clock + 5 s` (pre-vote check only; never at insertion, block
+   sync, execution or replay, so a certified block cannot wedge the chain). The
+   proposer uses `max(now, parent.ts)`. A certified block was voted by a quorum
+   whose honest members checked the drift bound, so its timestamp is at most
+   ~5 s ahead of an honest clock; the oracle's ages still clamp at 0
+   (`saturating_sub`). Validators need NTP-synced clocks.

@@ -1456,6 +1456,18 @@ fn check_parent_link(
         }
     };
     let expected = alloy_primitives::keccak256(parent.canonical_header_bytes());
+    // T0b (rebase s87): the timestamp never regresses below the parent's. A
+    // pure header comparison, so it holds the same on every replica and runs
+    // before the vote and on insertion alike.
+    if header.timestamp < parent.timestamp {
+        tracing::warn!(
+            height = header.height,
+            timestamp = header.timestamp,
+            parent_timestamp = parent.timestamp,
+            "REJECTED -- block timestamp regresses below its parent's"
+        );
+        return BlockDataCheck::Invalid;
+    }
     if header.height == parent.height + 1 && header.parent_hash == expected {
         return BlockDataCheck::Held;
     }
@@ -1467,6 +1479,33 @@ fn check_parent_link(
         "REJECTED -- header does not link to its parent block's header (ancestry violation)"
     );
     BlockDataCheck::Invalid
+}
+
+/// T0b: max seconds a proposal's header timestamp may run ahead of this
+/// node's clock before it refuses to VOTE for it (pre-vote only, see
+/// [`check_timestamp_drift`]).
+pub(crate) const MAX_BLOCK_TIMESTAMP_DRIFT_SECS: u64 = 5;
+
+/// T0b (rebase s87, owner option A): the local-clock half of the timestamp
+/// rule. Pre-vote ONLY (`check_proposal_data`, reached from hotstuff's
+/// `check_block_data` before every vote): clocks differ between replicas, so
+/// it must never reject a block at insertion, on block sync, at execution or
+/// in crash replay — a certified far-future block is accepted there.
+fn check_timestamp_drift(ts: u64, local_now: u64) -> Result<(), String> {
+    if ts > local_now.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_SECS) {
+        return Err(format!(
+            "timestamp {ts} > local clock {local_now} + {MAX_BLOCK_TIMESTAMP_DRIFT_SECS}s"
+        ));
+    }
+    Ok(())
+}
+
+/// This node's wall clock, UNIX seconds (the header timestamp unit).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---- Execution pipeline ----
@@ -2800,6 +2839,9 @@ pub struct TorusApp {
     epoch_length: u64,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
+    /// Tests: the local clock (UNIX s) the pre-vote timestamp check reads.
+    #[cfg(test)]
+    test_now_secs: Option<u64>,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     in_flight_hashes: InFlightHashLedger,
@@ -3764,6 +3806,8 @@ impl TorusApp {
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
+            #[cfg(test)]
+            test_now_secs: None,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             in_flight_hashes: InFlightHashLedger::default(),
@@ -4390,6 +4434,15 @@ impl TorusApp {
         }
     }
 
+    /// The local clock the pre-vote timestamp check reads (T0b).
+    fn local_now_secs(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.test_now_secs {
+            return now;
+        }
+        unix_now_secs()
+    }
+
     fn hash_datum(bytes: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -4930,6 +4983,12 @@ impl TorusApp {
         if link != BlockDataCheck::Held {
             return link;
         }
+        // T0b (rebase s87): refuse to vote for a block too far ahead of this
+        // node's clock. Vote-time only: `validate_block` never applies it.
+        if let Err(reason) = check_timestamp_drift(header.timestamp, self.local_now_secs()) {
+            tracing::warn!(height = header.height, %reason, "not voting -- block timestamp");
+            return BlockDataCheck::Invalid;
+        }
         let Some(compact) = compact.filter(|c| !c.native_action_hashes.is_empty()) else {
             return BlockDataCheck::Held;
         };
@@ -4966,10 +5025,8 @@ impl TorusApp {
         // covers mempool selection, DA mirror, attestation, construction, encode.
         let build_timer = std::time::Instant::now();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // T0b: never below the parent (validators reject a regressing timestamp).
+        let timestamp = unix_now_secs().max(parent_header.timestamp);
 
         let gas_limit = if parent_header.evm_gas_limit == 0 {
             torus_evm::DEFAULT_BLOCK_GAS_LIMIT
@@ -5123,15 +5180,7 @@ impl App<RocksKVStore> for TorusApp {
                     let datums = parent_block.data.vec();
                     datums
                         .first()
-                        .and_then(|d| {
-                            bincode::deserialize::<TorusBlock>(d.bytes())
-                                .map(|b| b.header)
-                                .or_else(|_| {
-                                    bincode::deserialize::<CompactBlock>(d.bytes())
-                                        .map(|cb| cb.header)
-                                })
-                                .ok()
-                        })
+                        .and_then(|d| datum_header(d.bytes()))
                         .unwrap_or_else(|| self.last_header.clone())
                 } else {
                     self.last_header.clone()
@@ -15651,5 +15700,312 @@ mod crash_recovery_tests {
         let empty = epoch_fixture(false);
         assert!(empty.rewarded, "empty boundary block 4 must distribute validator inflation");
         assert_eq!(empty, epoch_fixture(true), "empty vs non-empty boundary must match");
+    }
+
+    // ---- T0b: block timestamp rule (rebase s87, owner option A) ----
+
+    #[test]
+    fn proposal_timestamp_drift_bound() {
+        assert!(check_timestamp_drift(1_005, 1_000).is_ok(), "drift 5");
+        assert!(check_timestamp_drift(1_006, 1_000).is_err(), "drift 6");
+        assert!(check_timestamp_drift(0, 0).is_ok(), "first block after genesis (ts 0)");
+        assert!(check_timestamp_drift(50, 1_000).is_ok(), "behind the clock");
+        assert!(check_timestamp_drift(u64::MAX, u64::MAX).is_ok(), "no overflow");
+    }
+
+    /// The parent-timestamp source reads the header of either datum format.
+    #[test]
+    fn proposal_timestamp_datum_header_decodes_full_and_compact() {
+        let mut b = make_block(7, vec![sign_claim_rewards(7)]);
+        b.header.timestamp = 123_456;
+        for compact in [false, true] {
+            let h = datum_header(&encode_proposal_datum(&b, compact)).unwrap();
+            assert_eq!(h.canonical_header_bytes(), b.header.canonical_header_bytes(), "compact={compact}");
+        }
+    }
+
+    fn ts_app(now: u64) -> TorusApp {
+        let (config, db) = make_test_config_and_db();
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        app.test_now_secs = Some(now);
+        app
+    }
+
+    fn child_of(parent: &TorusBlock, ts: u64) -> TorusBlock {
+        let h = parent.header.height + 1;
+        let mut b = make_block(h, vec![]);
+        b.header.parent_hash = alloy_primitives::keccak256(parent.header.canonical_header_bytes());
+        b.header.timestamp = ts;
+        b
+    }
+
+    fn tip_2000() -> TorusBlock {
+        let mut parent = make_block(4, vec![]);
+        parent.header.timestamp = 2_000;
+        parent
+    }
+
+    /// `check_proposal_data` (the pre-vote check) of `block` on the parent
+    /// header `parent` (a non-genesis justify).
+    fn pre_vote(app: &mut TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        app.check_proposal_data(&hs_block(block, justify_for(&hs_parent)), move |_| {
+            ParentHeader::Header(Box::new(header))
+        })
+    }
+
+    /// A far-future proposal gets no vote: the pre-vote check refuses a
+    /// timestamp more than MAX_BLOCK_TIMESTAMP_DRIFT_SECS ahead of the local
+    /// clock; at the bound it votes.
+    #[test]
+    fn far_future_proposal_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_015)), BlockDataCheck::Held);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_016)), BlockDataCheck::Invalid);
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 9_999_999)),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// No wedge: the same far-future block, once certified, is accepted
+    /// wherever it is inserted — validate_block's link check (insertion /
+    /// header + body / full proposal), the datum path (also block sync), and
+    /// execution / crash replay never read the local clock.
+    #[test]
+    fn far_future_block_is_accepted_at_insertion_sync_execution_and_replay() {
+        let parent = tip_2000();
+        let far = child_of(&parent, 9_999_999);
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &far), BlockDataCheck::Invalid, "no vote");
+
+        // Insertion: validate_block's parent-link check, then the datum path.
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        assert_eq!(
+            check_parent_link(&far.header, &justify_for(&hs_parent), move |_| {
+                ParentHeader::Header(Box::new(header))
+            }),
+            BlockDataCheck::Held
+        );
+        let datum = encode_proposal_datum(&far, false);
+        assert!(matches!(
+            app.validate_datum(&datum, &data_hash_of(&datum)),
+            ValidateBlockResponse::Valid { .. }
+        ));
+
+        // Execution and crash replay.
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut b1 = make_block(1, vec![]);
+            b1.header.timestamp = 9_999_999;
+            if replay {
+                persist_committed_block_durably(&db, &b1);
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                ctx.execute_committed_block(&b1, vec![]);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "replay={replay}");
+        }
+    }
+
+    /// A regressing timestamp is refused before the vote and by
+    /// `check_parent_link` (so also on insertion: a certified block never
+    /// regresses, because a quorum ran the same pure header check).
+    #[test]
+    fn regressing_timestamp_is_refused_before_the_vote_and_by_the_parent_link() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_000)), BlockDataCheck::Held);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 1_999)), BlockDataCheck::Invalid);
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        for (ts, want) in [(2_000, BlockDataCheck::Held), (1_999, BlockDataCheck::Invalid)] {
+            let header = parent.header.clone();
+            assert_eq!(
+                check_parent_link(&child_of(&parent, ts).header, &justify_for(&hs_parent), move |_| {
+                    ParentHeader::Header(Box::new(header))
+                }),
+                want,
+                "ts {ts}"
+            );
+        }
+    }
+
+    /// Genesis / first block: parent = genesis_parent_header (ts 0): only the
+    /// drift bound can refuse it.
+    #[test]
+    fn proposal_timestamp_first_block_only_has_the_drift_bound() {
+        let mut app = ts_app(1_700_000_000);
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let mut b1 = make_block(1, vec![]);
+        b1.header.timestamp = 1_700_000_000;
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Held
+        );
+        b1.header.timestamp = 1_700_000_006;
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// The proposer never emits a timestamp below its parent's, even when the
+    /// parent's is ahead of the local clock (within drift), and the block it
+    /// produces passes the pre-vote rule on a validator with the same clock.
+    #[test]
+    fn proposal_timestamp_from_proposer_after_future_ish_parent_is_valid() {
+        let (config, db) = make_test_config_and_db();
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        let now = unix_now_secs();
+        let mut parent = app.last_header.clone();
+        parent.timestamp = now + 3;
+        let _ = app.build_proposal(parent.clone());
+        let produced = &app.pending_proposals[&(parent.height + 1)].block;
+        assert!(produced.header.timestamp >= parent.timestamp, "never below the parent");
+        assert!(check_timestamp_drift(produced.header.timestamp, now).is_ok());
+    }
+
+    /// Committed history is accepted as-is: execution and crash replay never
+    /// check the timestamp (a regressing one included).
+    #[test]
+    fn proposal_timestamp_execution_and_replay_accept_committed_history() {
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut blocks = vec![
+                make_block(1, vec![sign_claim_rewards(1)]),
+                make_block(2, vec![sign_claim_rewards(2)]),
+            ];
+            blocks[0].header.timestamp = 5_000;
+            blocks[1].header.timestamp = 4_000;
+            link_blocks(&mut blocks);
+            if replay {
+                for b in &blocks {
+                    persist_committed_block_durably(&db, b);
+                }
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                for b in &blocks {
+                    ctx.execute_committed_block(b, vec![]);
+                }
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(2), "replay={replay}");
+        }
+    }
+
+    // ---- item 2: oracle helpers ----
+
+    const ORACLE_MARKET: u64 = 1;
+    /// (signing-key seed, stake multiple of MIN_SELF_DELEGATION).
+    const ORACLE_VALIDATORS: [(u8, u64); 3] = [(61, 1), (62, 1), (63, 3)];
+
+    fn oracle_key(seed: u8) -> k256::ecdsa::SigningKey {
+        k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap()
+    }
+
+    fn oracle_addr(seed: u8) -> Address {
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 0, &oracle_key(seed))
+            .recover_sender()
+            .unwrap()
+    }
+
+    fn oracle_put_validator(db: &StateDb, seed: u8, mult: u64, status: torus_economics::ValidatorStatus) {
+        StakingManager::new(db.clone())
+            .put_validator(
+                &oracle_addr(seed),
+                &torus_economics::ValidatorState {
+                    address: oracle_addr(seed),
+                    pubkey: [seed; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION * U256::from(mult),
+                    total_delegated: U256::ZERO,
+                    status,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                },
+            )
+            .unwrap();
+    }
+
+    /// 3 Active validators, market 1 listed, epoch length 1000 (no boundary).
+    fn oracle_fixture_db() -> (ChainConfig, StateDb) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000;
+        for (seed, mult) in ORACLE_VALIDATORS {
+            oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
+        }
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &ORACLE_MARKET.to_be_bytes(), b"listed")
+            .unwrap();
+        (config, db)
+    }
+
+    fn px(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// Heights 1..=rounds.len() (ts = 1000 + h: one second per block); round i =
+    /// the (seed, price) submissions of block i+1; linked to actual parents.
+    fn oracle_blocks(rounds: &[&[(u8, i64)]]) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> = rounds
+            .iter()
+            .enumerate()
+            .map(|(i, subs)| {
+                let h = i as u64 + 1;
+                let actions = subs
+                    .iter()
+                    .map(|&(seed, price)| {
+                        torus_types::eip712::sign_native_action(
+                            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                                prices: vec![(ORACLE_MARKET, px(price))],
+                                timestamp: 0,
+                            }),
+                            h * 1_000 + seed as u64,
+                            &oracle_key(seed),
+                        )
+                    })
+                    .collect();
+                make_block(h, actions)
+            })
+            .collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn oracle_sub_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_ORACLE, Some(b"sub")).unwrap()
+    }
+
+    /// T1: the oracle clock is the COMMITTED header timestamp. The submission
+    /// row stores it (last 8 bytes of the value) — identical on the live
+    /// dispatch path, execute_committed_block and crash replay.
+    #[test]
+    fn oracle_clock_is_the_committed_header_timestamp_on_every_path() {
+        for path in ["serial", "dispatch", "replay"] {
+            let (config, db) = oracle_fixture_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut blocks = oracle_blocks(&[&[(61, 100)]]);
+            blocks[0].header.timestamp = 777_777; // height 1: parent is the genesis header
+            match path {
+                "serial" => ctx.execute_committed_block(&blocks[0], vec![]),
+                "dispatch" => dispatch_and_execute(&ctx, &db, &blocks[0]),
+                _ => {
+                    persist_committed_block_durably(&db, &blocks[0]);
+                    let (_, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{path}");
+                }
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{path}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "{path}");
+            let rows = oracle_sub_rows(&db);
+            assert_eq!(rows.len(), 1, "{path}");
+            let v = &rows[0].1;
+            assert_eq!(u64::from_be_bytes(v[v.len() - 8..].try_into().unwrap()), 777_777, "{path}");
+        }
     }
 }
