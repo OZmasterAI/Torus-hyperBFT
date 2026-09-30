@@ -1,16 +1,23 @@
-# s82: execution-path hasher (SipHash → ahash) — no effect, not merged — 2026-09-30
+# s82: execution-path hasher (SipHash → ahash) — ~3% node CPU, below A/B resolution, parked — 2026-09-30
 
 Branch `perf/s82-exec-hasher` `3dabdb4` (main `9c80e29` + 1, local only,
-parked). Campaign `~/bench-results-matched/s82-hash-20260930`.
+parked). Campaigns `~/bench-results-matched/s82-hash-20260930` (A/B) and
+`~/bench-results-matched/s82-prof-20260930` (profiles of both binaries).
 
 ## Summary
 
 - The s77 profile put std `RandomState` SipHash at ~9% of the execution
   thread (`s77-s80-trade-history-and-streams-2026-09-30.md` §1).
-- Replacing it with seeded ahash on every execution-path map gave **no
-  measurable change**: exec-thread CPU-s/1M −0.9% ± 3.7% (95%, adjusted for
-  cell throughput). The ~7% saving predicted from the profile is excluded.
-- Nothing changes for traders or API users. Not merged.
+- The 4+4 A/B of seeded ahash on the execution-path maps showed no
+  measurable change: node CPU-s/1M +0.9% ± 2.3%, matched/s +0.4% (p=0.91).
+- Profiles of both binaries (§ Profiles) show the change works in code:
+  SipHash 2.58 → 0.19 CPU-s/1M/node, all hash-map code 3.06 → 1.88. The net
+  saving, ~3% of node CPU (~2.5% on the A/B's whole-cell scale), is at or
+  below what a 4+4 A/B can resolve. No throughput gain.
+- The A/B's primary metric (exec-thread CPU-s/1M from `pidstat -t`) could not
+  see the saving: 83% of the SipHash ran in short-lived per-block worker
+  threads that pidstat's per-thread lines miss (§ Profiles).
+- Nothing changes for traders or API users. Parked, not merged.
 
 ## Change
 
@@ -75,11 +82,65 @@ ms/1k fills −0.1% ± 2.3%. No thread's CPU-s/1M moved by more than ~4%.
   0.04) or blocks/s (r = 0.25). Treated as chance.
 - The branch binary does contain the change (73 `ahash::` symbols vs 11).
 
+## Profiles (`s82-prof-20260930`)
+
+One cell per binary, s77-prof recipe (`perf-watch.sh`: `perf record -a -F 99`
+for 60 s from 90 s into the bench, then 15 s `--call-graph dwarf` on the node
+pids, here with `-m 2048`: no lost events, s77 lost 17%). main
+`s82prof-main-r1` (88.9k matched/s, AGREE; `perf/`), branch
+`s82prof-branch-r1` (98.9k, AGREE; `perf-branch/`). Symbols: `sudo perf
+script -f`, then `c++filt` (binutils 2.42 demangles Rust v0).
+
+### Current main, where CPU goes (profile window, 92.6k matched/s/node)
+
+| area | s77 `07a34c2` | s82 main | share now |
+|---|---|---|---|
+| execution (long-lived thread + per-block workers) | 15.0 | 13.4 (3.4 + 10.0) | 34% |
+| signature verify (gossip + ingress) | 13.5 | 9.0 | 23% |
+| storage (rocksdb low + high, flush, trade writer) | 23.2 | 9.7 | 25% |
+| tokio, hotstuff, rpc, other | 8.6 | 7.2 | 18% |
+| total, CPU-s/1M/node | 60.3 | 39.3 | |
+
+- **Per-block worker threads.** `drain_book`, `match_parallel_capped` and
+  `settle_market_results_parallel` run on scoped threads spawned for every
+  block (~1,300 distinct thread ids per node sampled in 60 s). They inherit
+  the name `torus-execution` and hold three quarters of execution CPU. The
+  spawning itself is cheap: page clearing and spin-lock samples are 0.24% and
+  0.55% of node samples, mostly RocksDB appends and condvar waits.
+- **Measurement gap.** `pidstat -t` (host sampler, 1 s) prints per-thread
+  lines only for threads alive at a sample, so these workers are missing
+  from the per-thread tables (the "exec-thread" rows here and in s77-s80).
+  Their CPU is in the process total: in s82hash the per-thread sum is 34.2
+  CPU-s/1M against a node total of 47.1.
+- SipHash is 6.6% of node CPU on main, 83% of it in the workers: `order_seq`
+  / `order_index` / `row_exists` inserts in `insert_order`, `PositionCache`,
+  `trader_orders`.
+- Keccak (flat) 15.8% of node CPU, mostly `eip712_struct_hash` on the verify
+  threads. The duplicate `compute_action_hash` (pool insert + DA
+  `put_batch`) is only ~0.4-0.8%. ZSTD (compaction) ~3.8%.
+
+### main vs branch, hash-map code (CPU-s/1M/node)
+
+| | main | branch |
+|---|---|---|
+| SipHash symbols | 2.58 | 0.19 |
+| all hash-map symbols (SipHash, ahash, hashbrown insert/probe) | 3.06 | 1.88 |
+
+The table work (probe, insert, remove) stays, and ahash is not free
+(`HashMap<u128, u64>::insert` 0.47, `HashMap<u128, OrderLocation>` 0.41 on
+the branch), so the saving is 1.2 CPU-s/1M, not the whole SipHash share.
+Whole-window totals are not comparable between two single profiled cells:
+the branch window came out at 50.8 CPU-s/1M against 39.4, driven by gossip
+verify, compaction and tokio, which the change does not touch.
+
 ## Conclusion
 
-- The s77 SipHash share does not translate into a saving on current main.
-  That profile ran on `07a34c2` (before hash dedup and packed rows), and its
-  dwarf capture lost 17% of events.
-- Re-profile current main before sizing the other CPU targets (duplicate
-  `compute_action_hash`, compaction ZSTD).
-- Stats: `stats.txt` / `stats.py` in the campaign dir.
+- The change does what it should in code (~3% of node CPU) but gives no
+  throughput and is below the 4+4 A/B's resolution. Parked on
+  `perf/s82-exec-hasher`.
+- A/B CPU comparisons must use the process total (`node total`), not
+  per-thread rows, while execution runs on per-block threads.
+- The remaining CPU targets from this profile are all small: duplicate
+  `compute_action_hash` <1%, per-block thread spawning <1%, ZSTD ~4%.
+- Stats: `stats.txt` / `stats.py` in the A/B campaign dir; profiles `agg.txt`,
+  `flat.txt`, `dwarf.dm.txt` in the profile campaign dir.
