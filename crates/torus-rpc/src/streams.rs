@@ -72,8 +72,8 @@ pub const ENV_ALL_MARKET_TRADES: &str = "TORUS_ALL_MARKET_TRADES";
 
 /// The `-32602` message for an all-markets `newTrades` on a node that has it off.
 pub const ALL_MARKET_TRADES_DISABLED: &str =
-    "newTrades without marketId is disabled on this node (validator); subscribe per \
-     market or use an RPC node; operators: TORUS_ALL_MARKET_TRADES=1";
+    "newTrades without marketId is disabled on this node; subscribe per market or \
+     use a node that allows it; operators: TORUS_ALL_MARKET_TRADES=1";
 
 /// Whether all-markets `newTrades` is allowed, from `TORUS_ALL_MARKET_TRADES`
 /// (`env`) and the node mode: unset → only on `--rpc-only` nodes; `"1"` → on;
@@ -973,8 +973,8 @@ mod subscribe_ws_tests {
             assert_eq!(rp["error"]["code"], -32602, "{params}: {rp}");
             assert_eq!(
                 rp["error"]["message"],
-                "invalid params: newTrades without marketId is disabled on this node \
-                 (validator); subscribe per market or use an RPC node; operators: \
+                "invalid params: newTrades without marketId is disabled on this node; \
+                 subscribe per market or use a node that allows it; operators: \
                  TORUS_ALL_MARKET_TRADES=1",
                 "{rp}"
             );

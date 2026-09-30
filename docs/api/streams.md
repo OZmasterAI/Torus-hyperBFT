@@ -39,8 +39,8 @@ At full load one block's all-markets array can be tens of MB of JSON. So
 `newTrades` without `marketId` is:
 
 - **rejected on validators** by default, with `-32602`:
-  `invalid params: newTrades without marketId is disabled on this node
-  (validator); subscribe per market or use an RPC node; operators:
+  `invalid params: newTrades without marketId is disabled on this node;
+  subscribe per market or use a node that allows it; operators:
   TORUS_ALL_MARKET_TRADES=1`;
 - **allowed on `--rpc-only` nodes** by default.
 
@@ -53,7 +53,7 @@ Operators override the default with the node-local env var
 |---|---|
 | unset | allowed only on `--rpc-only` nodes |
 | `1` | allowed |
-| `0` | rejected (the message still says "validator") |
+| `0` | rejected |
 | anything else | a warning is logged; the default applies |
 
 The node reads it once at startup. It is checked only when a subscription is
