@@ -26,3 +26,6 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 k256 = { workspace = true }
 tracing-subscriber = { workspace = true }
+# s515 F1 crash-replay tests: signed EVM txs through the committed-block path.
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-rlp = { workspace = true }

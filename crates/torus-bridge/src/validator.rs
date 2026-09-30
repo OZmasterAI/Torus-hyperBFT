@@ -151,6 +151,10 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
+        // Catch-up skips invalid txs one by one. That makes re-executing a block
+        // against its OWN committed bundle non-idempotent (a nonce-too-high tx can
+        // become valid), so crash replay never does it: torus-consensus skips EVM
+        // for a height whose `META_EVM_APPLIED` marker is durable (s515 F1).
         let mut exec_result =
             evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
 

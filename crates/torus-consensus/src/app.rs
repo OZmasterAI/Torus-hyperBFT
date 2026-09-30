@@ -38,7 +38,7 @@ use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::Mempool;
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_COMMIT_MANIFEST, CF_CONSENSUS_META,
+    CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_COMMIT_MANIFEST, CF_CONSENSUS_META, META_EVM_APPLIED,
     META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
@@ -600,6 +600,11 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only crash injection (s515 F1): return right after the EVM section
+    /// has committed — the window between the EVM bundle commit and the native
+    /// flush that a hard crash can hit.
+    #[cfg(test)]
+    test_crash_after_evm_commit: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -624,6 +629,29 @@ fn write_native_applied_height(state_db: &StateDb, height: u64) {
         META_NATIVE_APPLIED_HEIGHT,
         &height.to_be_bytes(),
     );
+}
+
+/// s515 F1: `(height, fee revenue)` of the last block whose EVM bundle is
+/// committed (`META_EVM_APPLIED`, written in the bundle's own batch).
+fn read_evm_applied(state_db: &StateDb) -> Option<(u64, u128)> {
+    let data = state_db
+        .get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED)
+        .ok()
+        .flatten()?;
+    if data.len() != 24 {
+        return None;
+    }
+    Some((
+        u64::from_be_bytes(data[..8].try_into().ok()?),
+        u128::from_be_bytes(data[8..].try_into().ok()?),
+    ))
+}
+
+fn evm_applied_record(height: u64, fee_revenue: u128) -> [u8; 24] {
+    let mut rec = [0u8; 24];
+    rec[..8].copy_from_slice(&height.to_be_bytes());
+    rec[8..].copy_from_slice(&fee_revenue.to_be_bytes());
+    rec
 }
 
 fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
@@ -1572,8 +1600,50 @@ impl ExecutionContext {
         let evm_timer = std::time::Instant::now();
         let mut bundle = BundleState::default();
         let mut computed_fee_revenue: u128 = 0;
-        if has_evm {
-            match self.validator.validate_block_for_catchup(
+        // s515 F1: EVM-applied marker (height ‖ fee revenue), committed in the
+        // SAME batch as this block's bundle. A crash between that commit and the
+        // native flush below restarts with the native marker at height-1 but the
+        // bundle already durable; re-executing the EVM txs on replay is NOT
+        // idempotent (the catch-up path skips invalid txs one by one, so a tx
+        // rejected the first time — nonce too high — can be valid against the
+        // committed bundle and burn + enqueue a lockbox credit no other validator
+        // has, and a tx that ran the first time is now skipped, zeroing the fee
+        // revenue). So replay skips EVM execution and rebuilds what the native
+        // phase consumes from durable state: the fee revenue from the marker, the
+        // bundle's accounts from CF_ACCOUNTS (committed with the same
+        // `encode_account_info` bytes `seed_from_bundle` would put in the
+        // overlay), the next-block queue rows from CF_CORE_WRITER_QUEUE, and the
+        // header / receipts from `commit_block_metadata` (written before the
+        // bundle, see below).
+        let evm_applied = if has_evm {
+            read_evm_applied(&self.state_db)
+        } else {
+            None
+        };
+        match evm_applied {
+            Some((applied, _)) if applied > height => {
+                // A later block's EVM is durable while this height's native phase
+                // is not: this height's fee revenue is gone and re-executing its
+                // EVM would double-apply it. Unrecoverable locally — fail-stop.
+                tracing::error!(
+                    height,
+                    evm_applied = applied,
+                    "FATAL: EVM-applied marker is ahead of the block being executed — refusing \
+                     to re-execute its EVM txs (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
+            Some((applied, fee_revenue)) if applied == height => {
+                tracing::warn!(
+                    height,
+                    fee_revenue,
+                    "crash recovery: EVM bundle already committed for this height — skipping \
+                     EVM re-execution, replaying the native phase from the persisted marker"
+                );
+                computed_fee_revenue = fee_revenue;
+            }
+            _ if has_evm => match self.validator.validate_block_for_catchup(
                 torus_block,
                 &self.state_db,
                 &self.evm_executor,
@@ -1581,20 +1651,41 @@ impl ExecutionContext {
                 Ok(validated) => {
                     computed_fee_revenue =
                         torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                    // s515 F1: header / body / receipts BEFORE the bundle. A crash
+                    // between the two replays EVM execution against the same base
+                    // (bundle not durable ⇒ marker not durable), rewriting identical
+                    // rows; once the bundle (+ marker) is durable replay skips EVM,
+                    // so the receipts must already be there.
+                    if let Err(e) = BlockCommitter::commit_block_metadata(
+                        &self.state_db,
+                        torus_block,
+                        &validated.receipts,
+                    ) {
+                        tracing::error!(%e, height, "failed to commit block metadata");
+                    }
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
                     let precomputed_root = validated.evm_root_updates;
+                    // F1 (s515): the EVM-applied marker rides the writer-precompile
+                    // overlay, so BOTH commit paths below land it in the bundle's batch.
+                    let _ = validated.native_writes.put_cf_raw(
+                        CF_CONSENSUS_META,
+                        META_EVM_APPLIED,
+                        &evm_applied_record(height, computed_fee_revenue),
+                    );
                     // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
                     // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
                     // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
                     // Falls back to the plain commit if the incremental path errors, so a trie bug
                     // can never halt the chain (the full-scan root stays primary unless the flag is on).
                     // F1 (s515): the block's writer-precompile queue rows (CoreWriter /
-                    // lockbox actions for height+1) ride the SAME batch as the bundle, so
-                    // a queued lockbox credit is durable iff its EVM burn is: an EVM
-                    // error below drops both, and a crash before this write replays the
-                    // block from scratch (exactly one credit).
+                    // lockbox actions for height+1) and the EVM-applied marker ride the
+                    // SAME batch as the bundle, so a queued lockbox credit is durable iff
+                    // its EVM burn is: an EVM error drops both; a crash before this write
+                    // re-executes the block's EVM on replay against the unchanged base;
+                    // a crash after it skips EVM on replay (marker above). Exactly one
+                    // credit either way.
                     match torus_state::incremental::commit_evm_block_incremental(
                         &self.state_db,
                         &validated.bundle,
@@ -1613,20 +1704,15 @@ impl ExecutionContext {
                             }
                         }
                     }
-                    if let Err(e) = BlockCommitter::commit_block_metadata(
-                        &self.state_db,
-                        torus_block,
-                        &validated.receipts,
-                    ) {
-                        tracing::error!(%e, height, "failed to commit block metadata");
-                    }
                     bundle = validated.bundle;
                 }
                 Err(e) => {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
-            }
-        } else if !durable.header && !has_native {
+            },
+            _ => {}
+        }
+        if !has_evm && !durable.header && !has_native {
             // Empty / non-native block whose header the dispatcher did NOT
             // already land (boot crash-replay, or a failed dispatch-time batch):
             // no native flush batch to ride, keep the standalone header put
@@ -1650,6 +1736,10 @@ impl ExecutionContext {
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
+        }
+        #[cfg(test)]
+        if self.test_crash_after_evm_commit {
+            return;
         }
 
         // ---- Native execution ----
@@ -3357,6 +3447,8 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_commit: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -9911,6 +10003,8 @@ mod crash_recovery_tests {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_commit: false,
         }
     }
 
@@ -13165,5 +13259,186 @@ mod crash_recovery_tests {
         assert!(ctx.flush_worker.is_none());
         assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(Some("0".to_string())));
         assert!(crate::exec_pipeline::parse_exec_pipeline_toggle(None));
+    }
+
+    // ---- s515 review F1: crash between the EVM bundle commit and the native flush ----
+    //
+    // The EVM bundle (+ its writer-precompile queue rows) commits in one batch, the
+    // native phase (fee distribution, CoreWriter drain, applied-height marker) in a
+    // later one. A crash in between must not re-execute the EVM txs on replay: the
+    // committed/catch-up path skips per-tx invalid txs, so a tx invalid the first time
+    // (nonce too high) can be VALID against the post-bundle state — a lockbox deposit
+    // no other validator executed — and a tx valid the first time is skipped, zeroing
+    // the replayed fee revenue.
+
+    fn f1_key() -> k256::ecdsa::SigningKey {
+        k256::ecdsa::SigningKey::from_slice(&[0x5A; 32]).unwrap()
+    }
+
+    fn f1_addr(sk: &k256::ecdsa::SigningKey) -> Address {
+        let vk = k256::ecdsa::VerifyingKey::from(sk);
+        let point = vk.to_encoded_point(false);
+        Address::from_slice(&alloy_primitives::keccak256(&point.as_bytes()[1..])[12..])
+    }
+
+    const F1_LOCKBOX: Address = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x20,
+    ]);
+
+    /// RLP-encoded signed EIP-1559 tx (max fee 2 gwei > the fixture's 1 gwei base fee).
+    fn f1_tx(to: Address, value: U256, nonce: u64, gas_limit: u64, input: Vec<u8>) -> Vec<u8> {
+        use alloy_consensus::SignableTransaction;
+        use alloy_rlp::Encodable;
+        let tx = alloy_consensus::TxEip1559 {
+            chain_id: torus_evm::TORUS_CHAIN_ID,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 2_000_000_000,
+            max_priority_fee_per_gas: 0,
+            to: alloy_primitives::TxKind::Call(to),
+            value,
+            access_list: Default::default(),
+            input: input.into(),
+        };
+        let (sig, rec) = f1_key()
+            .sign_prehash_recoverable(tx.signature_hash().as_ref())
+            .unwrap();
+        let bytes: [u8; 64] = sig.to_bytes().into();
+        let sig = alloy_primitives::Signature::new(
+            U256::from_be_slice(&bytes[..32]),
+            U256::from_be_slice(&bytes[32..]),
+            rec.is_y_odd(),
+        );
+        let mut buf = Vec::new();
+        alloy_consensus::TxEnvelope::Eip1559(tx.into_signed(sig)).encode(&mut buf);
+        buf
+    }
+
+    /// `depositToNative(uint128)` of `wei` (payable, msg.value == arg).
+    fn f1_deposit(wei: U256, nonce: u64) -> Vec<u8> {
+        let mut data = alloy_primitives::keccak256(b"depositToNative(uint128)")[..4].to_vec();
+        data.extend_from_slice(&wei.to_be_bytes::<32>());
+        f1_tx(F1_LOCKBOX, wei, nonce, 200_000, data)
+    }
+
+    fn f1_transfer(to: Address, wei: U256, nonce: u64) -> Vec<u8> {
+        f1_tx(to, wei, nonce, 21_000, vec![])
+    }
+
+    fn f1_config() -> (ChainConfig, StateDb) {
+        let (mut config, db) = make_test_config_and_db();
+        config.treasury_address = Address::with_last_byte(0x71);
+        config.dev_pool_address = Address::with_last_byte(0x72);
+        let mut rec = vec![0u8; 72];
+        let funded = U256::from(1_000u64) * U256::from(1_000_000_000_000_000_000u128);
+        rec[..32].copy_from_slice(&funded.to_be_bytes::<32>());
+        rec[40..].copy_from_slice(alloy_primitives::KECCAK256_EMPTY.as_slice());
+        db.put_cf_raw(torus_state::cf::CF_ACCOUNTS, f1_addr(&f1_key()).as_slice(), &rec)
+            .unwrap();
+        (config, db)
+    }
+
+    /// Block 1 carries `txs`; block 2 is empty (drains block 1's queued lockbox rows).
+    fn f1_blocks(txs: Vec<Vec<u8>>) -> [TorusBlock; 2] {
+        let mut b1 = make_block(1, vec![]);
+        b1.header.evm_tx_count = txs.len() as u32;
+        b1.evm_transactions = txs;
+        let mut b2 = make_block(2, vec![]);
+        b2.header.parent_hash = alloy_primitives::keccak256(b1.header.canonical_header_bytes());
+        [b1, b2]
+    }
+
+    /// Boot, execute both blocks; with `crash`, block 1 stops right after its EVM
+    /// commit and a restart (`TorusApp::new` boot replay) re-runs it. Returns the
+    /// full post-state dump.
+    fn f1_run(txs: Vec<Vec<u8>>, crash: bool) -> (Vec<CfDump>, StateDb) {
+        let (config, db) = f1_config();
+        let [b1, b2] = f1_blocks(txs);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_crash_after_evm_commit = crash;
+        ctx.execute_committed_block(&b1, vec![]);
+        drop(ctx);
+        if crash {
+            assert_eq!(read_native_applied_height(&db), None, "crash left block 1 native-unapplied");
+        }
+        // Restart: boot replay re-executes every committed height above the marker.
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&b2, vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), Some(2));
+        (dump_all_cfs(&db), db)
+    }
+
+    fn f1_native_balance_row(db: &StateDb) -> Option<Vec<u8>> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_BALANCES, None)
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k.starts_with(f1_addr(&f1_key()).as_slice()))
+            .map(|(_, v)| v)
+    }
+
+    /// Block 1 = [T1: nonce 1 deposit, T2: nonce 0 transfer]. First run: T1 is
+    /// skipped (nonce too high), T2 applies. Replay must NOT re-run the EVM: the
+    /// sender's nonce is now 1, which would make T1 valid — a deposit + native
+    /// credit no uncrashed validator has.
+    #[test]
+    fn f1_crash_between_evm_commit_and_native_flush_does_not_revive_skipped_tx() {
+        let wei = U256::from(300u64) * U256::from(1_000_000_000_000_000_000u128);
+        let bob = Address::with_last_byte(0xB0);
+        let txs = || vec![f1_deposit(wei, 1), f1_transfer(bob, U256::from(1u64), 0)];
+        let (reference, ref_db) = f1_run(txs(), false);
+        let (crashed, crash_db) = f1_run(txs(), true);
+        assert!(f1_native_balance_row(&ref_db).is_none(), "reference node: T1 never executed");
+        assert!(
+            f1_native_balance_row(&crash_db).is_none(),
+            "replayed node must not credit the skipped deposit"
+        );
+        assert_dumps_equal(&reference, &crashed, "crash-replayed vs never-crashed (skipped tx)");
+    }
+
+    /// Block 1 = [deposit nonce 0]. Replay must reuse block 1's fee revenue (not 0)
+    /// and leave exactly one lockbox credit.
+    #[test]
+    fn f1_crash_between_evm_commit_and_native_flush_keeps_fees_and_one_credit() {
+        let wei = U256::from(300u64) * U256::from(1_000_000_000_000_000_000u128);
+        let txs = || vec![f1_deposit(wei, 0)];
+        let (reference, ref_db) = f1_run(txs(), false);
+        let (crashed, crash_db) = f1_run(txs(), true);
+        let treasury = Address::with_last_byte(0x71);
+        assert!(
+            read_evm_balance(&ref_db, treasury) > U256::ZERO,
+            "fixture must exercise fee distribution"
+        );
+        assert!(f1_native_balance_row(&ref_db).is_some(), "reference node: one credit");
+        assert_eq!(f1_native_balance_row(&crash_db), f1_native_balance_row(&ref_db));
+        assert!(
+            StateBackend::iterate_cf(&crash_db, torus_state::cf::CF_CORE_WRITER_QUEUE, None)
+                .unwrap()
+                .is_empty(),
+            "queue fully drained"
+        );
+        assert_dumps_equal(&reference, &crashed, "crash-replayed vs never-crashed (fees)");
+    }
+
+    /// An EVM-applied marker AHEAD of the block being executed means this height's
+    /// fee revenue is gone and its EVM effects are already durable: fail-stop
+    /// rather than re-execute them.
+    #[test]
+    fn f1_evm_marker_ahead_of_block_fail_stops() {
+        let (config, db) = f1_config();
+        let [b1, _] = f1_blocks(vec![f1_transfer(Address::with_last_byte(0xB0), U256::from(1u64), 0)]);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        db.put_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED, &evm_applied_record(2, 0))
+            .unwrap();
+        let before = dump_all_cfs(&db);
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&b1, vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing executed");
     }
 }

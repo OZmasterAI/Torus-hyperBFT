@@ -130,6 +130,13 @@ pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
 /// Key in CF_CONSENSUS_META: last block height where native post-commit completed.
 pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 
+/// Key in CF_CONSENSUS_META (s515 F1): the last block whose EVM bundle is committed.
+/// Value: height (8 BE) ‖ that block's EVM fee revenue (16 BE u128). Written in the
+/// SAME atomic batch as the bundle, so a crash between the EVM commit and the native
+/// flush replays the native phase from it instead of re-executing the EVM txs.
+/// Node-local crash bookkeeping like `META_NATIVE_APPLIED_HEIGHT` (not in any root).
+pub const META_EVM_APPLIED: &[u8] = b"evm_applied_block";
+
 // Trie (MPT state root)
 pub const CF_TRIE_NODES: &str = "cf_trie_nodes";
 /// Account-trie branch nodes for reth's `StateRoot`. Key: path nibbles (1 byte/nibble),
