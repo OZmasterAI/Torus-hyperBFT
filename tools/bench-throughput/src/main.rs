@@ -511,7 +511,7 @@ mod ammo_plan_tests {
 //     stretch T.
 //
 // CROSSING SHAPE: every (sender, market) pair trades ONE side only
-// (parity of sender_idx + market_id), so a sender can never self-trade (STP
+// (legacy parity for uniform plans; assigned-owner rank for locality), so a sender can never self-trade (STP
 // cancels would leak margin without producing a fill). Each order is priced off
 // a fixed per-run mid: passive (rests) at mid -/+ d and aggressive (crosses) at
 // mid +/- d, d ~ U[1, band] ticks, aggressive with probability --cross-fraction.
@@ -568,7 +568,7 @@ impl EconShape {
     }
 }
 
-/// Fixed side per (sender, market): a sender only ever buys or only ever sells
+/// Legacy uniform-plan side per (sender, market): a sender only ever buys or only ever sells
 /// in a given market, so its taker orders can never hit its own resting orders
 /// (STP maker-cancels leak margin and produce no fill). Parity splits every
 /// market's senders 50/50 buyers/sellers, so aggregate flow is balanced and
@@ -587,9 +587,10 @@ fn econ_place_order(
     rng: &mut impl Rng,
     sender_idx: usize,
     market_id: u64,
+    plan: MarketPlan,
     shape: &EconShape,
 ) -> PlaceOrderParams {
-    let is_buy = econ_side_is_buy(sender_idx, market_id);
+    let is_buy = plan.econ_side_is_buy(sender_idx, market_id);
     let aggressive = rng.gen_bool(shape.cross_fraction);
     let d = rng.gen_range(1..=shape.band as i128);
     // Aggressive buy above mid / aggressive sell below mid cross the opposing
@@ -634,12 +635,12 @@ fn econ_action(
     }
     if batch_size <= 1 {
         let market_id = plan.pick(rng, sender_idx);
-        return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, shape));
+        return NativeAction::PlaceOrder(econ_place_order(rng, sender_idx, market_id, plan, shape));
     }
     let orders: Vec<PlaceOrderParams> = (0..batch_size)
         .map(|_| {
             let market_id = plan.pick(rng, sender_idx);
-            econ_place_order(rng, sender_idx, market_id, shape)
+            econ_place_order(rng, sender_idx, market_id, plan, shape)
         })
         .collect();
     NativeAction::PlaceOrderBatch(orders)
@@ -683,7 +684,7 @@ mod econ_shape_tests {
         for sender_idx in 0..50 {
             for _ in 0..200 {
                 let market_id = rng.gen_range(1..=10);
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(10), &shape);
                 let m = phase2_margin(&p);
                 assert!(
                     m >= lo && m <= hi,
@@ -719,7 +720,7 @@ mod econ_shape_tests {
         for &(sender_idx, market_id) in &[(0usize, 1u64), (7, 3), (42, 10)] {
             let want = econ_side_is_buy(sender_idx, market_id);
             for _ in 0..100 {
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &shape);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(10), &shape);
                 assert_eq!(p.is_buy, want, "side must never flip for a (sender, market)");
             }
         }
@@ -738,8 +739,8 @@ mod econ_shape_tests {
         let passive = EconShape::new(1500, 0, 5, 0.0, 0.0);
         for sender_idx in 0..20 {
             for market_id in 1..=4u64 {
-                let a = econ_place_order(&mut rng, sender_idx, market_id, &aggr);
-                let p = econ_place_order(&mut rng, sender_idx, market_id, &passive);
+                let a = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(4), &aggr);
+                let p = econ_place_order(&mut rng, sender_idx, market_id, MarketPlan::uniform(4), &passive);
                 if a.is_buy {
                     assert!(a.price > mid, "aggressive buy must cross above mid");
                 } else {
@@ -852,14 +853,32 @@ impl MarketPlan {
         Self::new(markets, 0)
     }
 
+    /// Alternate the actual owners of each market, not all possible senders.
+    /// In the flattened assignment slots i*K+j, market m occurs at
+    /// (m-1)+q*N. Its owners therefore have ranks q=0,1,... with no gaps:
+    /// alternating q gives exactly equal sides for an even owner count and
+    /// a difference of one for an odd count. A sender's side stays fixed.
+    fn econ_side_is_buy(&self, sender_idx: usize, market_id: u64) -> bool {
+        if self.per_sender == 0 || self.per_sender == self.markets {
+            // Preserve the existing default/full-market workload exactly.
+            return econ_side_is_buy(sender_idx, market_id);
+        }
+        let slots = sender_idx as u128 * self.per_sender as u128;
+        let markets = self.markets as u128;
+        let offset = (market_id as u128 - 1 + markets - slots % markets) % markets;
+        debug_assert!(offset < self.per_sender as u128, "market outside sender's plan");
+        let owner_rank = (slots + offset) / markets;
+        (owner_rank + market_id as u128) % 2 == 0
+    }
+
     /// `sender_idx`'s fixed market set, in assignment order.
     fn markets_for(&self, sender_idx: usize) -> Vec<u64> {
         if self.per_sender == 0 {
             return (1..=self.markets).collect();
         }
-        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
+        let start = sender_idx as u128 * self.per_sender as u128 % self.markets as u128;
         (0..self.per_sender)
-            .map(|j| (start + j) % self.markets + 1)
+            .map(|j| ((start + j as u128) % self.markets as u128 + 1) as u64)
             .collect()
     }
 
@@ -868,14 +887,117 @@ impl MarketPlan {
         if self.per_sender == 0 {
             return rng.gen_range(1..=self.markets);
         }
-        let start = (sender_idx as u64).wrapping_mul(self.per_sender) % self.markets;
-        (start + rng.gen_range(0..self.per_sender)) % self.markets + 1
+        let start = sender_idx as u128 * self.per_sender as u128 % self.markets as u128;
+        ((start + rng.gen_range(0..self.per_sender) as u128) % self.markets as u128 + 1) as u64
     }
 }
 
 #[cfg(test)]
 mod market_plan_tests {
     use super::*;
+
+    #[test]
+    fn locality_sides_balance_actual_market_owners() {
+        // Include the two formerly one-sided shapes, non-divisor K, odd owner
+        // counts, and markets with too few owners to support opposing flow.
+        for (markets, per_sender, senders) in [
+            (10, 1, 5_000), (300, 3, 5_000), (10, 3, 51),
+            (7, 3, 101), (9, 8, 17), (10, 1, 3),
+        ] {
+            let plan = MarketPlan::new(markets, per_sender);
+            let mut counts = vec![[0usize; 2]; markets as usize + 1];
+            for sender in 0..senders {
+                for market in plan.markets_for(sender) {
+                    let side = usize::from(plan.econ_side_is_buy(sender, market));
+                    counts[market as usize][side] += 1;
+                    // Every sender-count prefix must remain balanced, not just
+                    // the final round multiple of the assignment period.
+                    let [sell, buy] = counts[market as usize];
+                    assert!(sell.abs_diff(buy) <= 1,
+                        "N={markets} K={per_sender} sender={sender} market={market}: {sell}/{buy}");
+                }
+            }
+            for [sell, buy] in &counts[1..] {
+                if sell + buy >= 2 {
+                    assert!(*sell > 0 && *buy > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locality_econ_generation_uses_fixed_balanced_sides() {
+        let shape = EconShape::new(1500, 0, 1, 0.5, 0.0);
+        for (markets, per_sender) in [(10, 1), (300, 3), (7, 3)] {
+            let plan = MarketPlan::new(markets, per_sender);
+            for sender in 0..200 {
+                let mut rng = StdRng::seed_from_u64(sender as u64);
+                for _ in 0..2 {
+                    let NativeAction::PlaceOrderBatch(orders) =
+                        econ_action(&mut rng, sender, plan, 32, &shape)
+                    else { panic!("expected placement batch") };
+                    for order in orders {
+                        assert!(plan.markets_for(sender).contains(&order.market_id));
+                        assert_eq!(order.is_buy, plan.econ_side_is_buy(sender, order.market_id));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_econ_actions_remain_byte_identical_to_legacy_generator() {
+        // Freeze the pre-fix action generation here, including RNG consumption.
+        fn legacy_order(rng: &mut impl Rng, sender: usize, market: u64, shape: &EconShape) -> PlaceOrderParams {
+            let is_buy = (sender as u64).wrapping_add(market) % 2 == 0;
+            let aggressive = rng.gen_bool(shape.cross_fraction);
+            let d = rng.gen_range(1..=shape.band as i128);
+            let price_units = if is_buy == aggressive { shape.mid as i128 + d } else { shape.mid as i128 - d };
+            let price = FixedPoint::from_raw(price_units * FixedPoint::SCALE);
+            let target = FixedPoint::from_raw(shape.target_margin as i128 * FixedPoint::SCALE);
+            let leverage = FixedPoint::from_raw(NATIVE_DEFAULT_LEVERAGE * FixedPoint::SCALE);
+            let quantity = (target * leverage / price).max(FixedPoint::ONE);
+            PlaceOrderParams {
+                market_id: market, is_buy, price, quantity, order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC, reduce_only: false, client_order_id: None,
+            }
+        }
+        fn legacy_action(rng: &mut impl Rng, sender: usize, markets: u64, batch: usize, shape: &EconShape) -> NativeAction {
+            if shape.cancel_fraction > 0.0 && rng.gen_bool(shape.cancel_fraction) {
+                return NativeAction::CancelAllOrders { market_id: None };
+            }
+            if batch <= 1 {
+                let market = rng.gen_range(1..=markets);
+                return NativeAction::PlaceOrder(legacy_order(rng, sender, market, shape));
+            }
+            NativeAction::PlaceOrderBatch((0..batch).map(|_| {
+                let market = rng.gen_range(1..=markets);
+                legacy_order(rng, sender, market, shape)
+            }).collect())
+        }
+        let shape = EconShape::new(1500, 0, 5, 0.5, 0.05);
+        for batch in [1, 4, 400] {
+            for sender in [0, 9, 42] {
+                let mut legacy_rng = StdRng::seed_from_u64(23);
+                let mut current_rng = legacy_rng.clone();
+                for _ in 0..64 {
+                    assert_eq!(
+                        bincode::serialize(&econ_action(&mut current_rng, sender, MarketPlan::uniform(10), batch, &shape)).unwrap(),
+                        bincode::serialize(&legacy_action(&mut legacy_rng, sender, 10, batch, &shape)).unwrap(),
+                    );
+                }
+            }
+        }
+        // Explicit K>=N already used legacy sides and must continue to do so.
+        for k in [10, 99] {
+            let plan = MarketPlan::new(10, k);
+            for sender in 0..50 {
+                for market in plan.markets_for(sender) {
+                    assert_eq!(plan.econ_side_is_buy(sender, market), econ_side_is_buy(sender, market));
+                }
+            }
+        }
+    }
 
     // --markets-per-sender 0 (default) must keep TODAY's shape: every order
     // draws uniformly from 1..=markets, and the whole range is used.
@@ -2088,6 +2210,9 @@ async fn run_consensus(
             plan.per_sender,
             plan.markets_for(0)
         );
+        if econ.is_some() && plan.per_sender < plan.markets {
+            println!("Locality sides: per-market-owner-rank-v1 (odd owner counts differ by one)");
+        }
     }
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
