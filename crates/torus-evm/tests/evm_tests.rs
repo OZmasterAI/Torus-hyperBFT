@@ -885,6 +885,20 @@ fn block_execution_journals_writer_precompiles_per_tx() {
     assert!(!result.receipts[0].status, "first tx reverts");
     assert!(result.receipts[1].status, "second tx succeeds");
 
+    // F1 (s515): nothing is durable until the block commit, which writes the
+    // queue rows in the same batch as the bundle.
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        0,
+        "queue rows must not be durable before the bundle commit"
+    );
+    torus_state::incremental::commit_evm_block_incremental(
+        &db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
     assert_eq!(
         CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
         1,
@@ -977,7 +991,7 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
 // EVM-PF-05: Lockbox precompile (0x0820) vs revm's block-level State cache.
 //
 // Each block below is executed through `execute_block` and then committed with
-// `commit_evm_bundle_incremental` — exactly the consensus commit path
+// `commit_evm_block_incremental` — exactly the consensus commit path
 // (torus-consensus app.rs). Fees are zeroed (base_fee 0, gas_price 0) so value
 // conservation is exact.
 //
@@ -1113,7 +1127,13 @@ fn run_and_commit_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool>
     let result = executor
         .execute_block(db, &zero_fee_block_cfg(number), txs, false)
         .unwrap();
-    torus_state::incremental::commit_evm_bundle_incremental(db, &result.bundle, None).unwrap();
+    torus_state::incremental::commit_evm_block_incremental(
+        db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
     result.receipts.iter().map(|r| r.status).collect()
 }
 

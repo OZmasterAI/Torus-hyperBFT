@@ -123,6 +123,13 @@ pub struct BlockExecResult {
     /// Indices of input txs that were included (only differs from 0..N when
     /// `skip_invalid` is true and some txs were dropped).
     pub included_indices: Vec<usize>,
+    /// F1 (s515): writer-precompile side effects of the block's SUCCESSFUL txs
+    /// (CoreWriter / lockbox queue rows for the next block), still pending —
+    /// nothing was written to the `StateDb`. The committer persists them in the
+    /// SAME atomic batch as `bundle` (`commit_evm_block_incremental`), so a queued
+    /// native credit is durable iff the EVM burn that paid for it is. Dropping
+    /// the result (execution error, crash before commit) drops them too.
+    pub native_writes: NativeStateOverlay,
 }
 
 /// EVM executor configured for the Torus chain.
@@ -262,9 +269,13 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
-        // T4.4: per-tx journal for writer-precompile side effects — committed to the
-        // StateDb only when the tx succeeds, discarded on revert/halt. Applied-write
-        // ordering for successful txs matches the pre-journal direct-write behavior.
+        // T4.4: journal for writer-precompile side effects — a tx's writes are kept
+        // only when it succeeds, dropped on revert/halt.
+        // F1 (s515): the journal is BLOCK-scoped: kept writes stay pending (later txs
+        // read them — next_sequence) and are returned in `native_writes` for the
+        // committer to persist atomically with the bundle. Nothing touches the DB
+        // here, so a block that errors part-way (or a crash before the bundle
+        // commit) leaves no queued action behind.
         let journal = NativeStateOverlay::new(state_db.clone());
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
@@ -288,11 +299,12 @@ impl EvmExecutor {
 
             // T4.4: inspector path so writer-precompile side effects are checkpointed
             // per call frame (caught inner-frame reverts roll back their native writes).
+            journal.begin_tx();
             let result = match evm.inspect_tx_commit(tx) {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
-                    journal.discard_tx();
+                    journal.revert_tx();
                     continue;
                 }
                 Err(e) => return Err(map_evm_err(e)),
@@ -319,11 +331,9 @@ impl EvmExecutor {
 
             // T4.4: revert must revert writer-precompile side effects too.
             if success {
-                journal
-                    .commit_tx(state_db)
-                    .map_err(|e| EvmError::Internal(format!("precompile journal commit: {e}")))?;
+                journal.keep_tx();
             } else {
-                journal.discard_tx();
+                journal.revert_tx();
             }
 
             // Only include logs from successful transactions.
@@ -378,6 +388,7 @@ impl EvmExecutor {
             gas_used: cumulative_gas,
             logs_bloom: block_bloom,
             included_indices,
+            native_writes: journal,
         })
     }
 
@@ -405,9 +416,9 @@ impl EvmExecutor {
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
             .with_db(state);
 
-        // T4.4: per-tx journal for writer-precompile side effects. Precompiles still
-        // read/write native state against the underlying `state_db` (the overlay base),
-        // exactly as before — but durably only when the calling tx succeeds.
+        // T4.4: journal for writer-precompile side effects. Precompiles read native
+        // state from the underlying `state_db` (the overlay base).
+        // F1 (s515): block-scoped, returned in `native_writes` (see `execute_block`).
         let journal = NativeStateOverlay::new(overlay.base().clone());
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
@@ -431,11 +442,12 @@ impl EvmExecutor {
 
             // T4.4: inspector path so writer-precompile side effects are checkpointed
             // per call frame (caught inner-frame reverts roll back their native writes).
+            journal.begin_tx();
             let result = match evm.inspect_tx_commit(tx) {
                 Ok(r) => r,
                 Err(EVMError::Transaction(tx_err)) if skip_invalid => {
                     tracing::warn!(idx, ?tx_err, "skipping invalid tx during block proposal");
-                    journal.discard_tx();
+                    journal.revert_tx();
                     continue;
                 }
                 Err(e) => return Err(map_evm_err(e)),
@@ -462,11 +474,9 @@ impl EvmExecutor {
 
             // T4.4: revert must revert writer-precompile side effects too.
             if success {
-                journal
-                    .commit_tx(overlay.base())
-                    .map_err(|e| EvmError::Internal(format!("precompile journal commit: {e}")))?;
+                journal.keep_tx();
             } else {
-                journal.discard_tx();
+                journal.revert_tx();
             }
 
             let (torus_logs, tx_bloom) = if success {
@@ -519,6 +529,7 @@ impl EvmExecutor {
             gas_used: cumulative_gas,
             logs_bloom: block_bloom,
             included_indices,
+            native_writes: journal,
         })
     }
 }

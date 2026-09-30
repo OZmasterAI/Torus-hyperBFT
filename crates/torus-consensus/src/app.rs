@@ -1576,10 +1576,16 @@ impl ExecutionContext {
                     // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
                     // Falls back to the plain commit if the incremental path errors, so a trie bug
                     // can never halt the chain (the full-scan root stays primary unless the flag is on).
-                    match torus_state::incremental::commit_evm_bundle_incremental(
+                    // F1 (s515): the block's writer-precompile queue rows (CoreWriter /
+                    // lockbox actions for height+1) ride the SAME batch as the bundle, so
+                    // a queued lockbox credit is durable iff its EVM burn is: an EVM
+                    // error below drops both, and a crash before this write replays the
+                    // block from scratch (exactly one credit).
+                    match torus_state::incremental::commit_evm_block_incremental(
                         &self.state_db,
                         &validated.bundle,
                         precomputed_root,
+                        Some(&validated.native_writes),
                     ) {
                         Ok(_root) => {}
                         Err(e) => {
@@ -1587,6 +1593,7 @@ impl ExecutionContext {
                             if let Err(e2) = BlockCommitter::commit_pending_bundle(
                                 &self.state_db,
                                 &validated.bundle,
+                                Some(&validated.native_writes),
                             ) {
                                 tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
                             }

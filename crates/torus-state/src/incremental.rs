@@ -380,6 +380,22 @@ pub fn commit_evm_bundle_incremental(
     bundle: &BundleState,
     precomputed: Option<(B256, TrieUpdates)>,
 ) -> Result<B256, StateError> {
+    commit_evm_block_incremental(db, bundle, precomputed, None)
+}
+
+/// [`commit_evm_bundle_incremental`] plus the block's writer-precompile side effects.
+///
+/// F1 (s515): `native_writes` is the block-scoped journal the EVM executor returns
+/// ([`BlockExecResult::native_writes`] in torus-evm — the CoreWriter / lockbox queue
+/// rows for the NEXT block). They land in the SAME atomic batch as the bundle, so a
+/// queued lockbox credit can never be durable without the EVM burn that paid for it
+/// (dropped bundle ⇒ no credit; crash-replay ⇒ exactly one credit).
+pub fn commit_evm_block_incremental(
+    db: &StateDb,
+    bundle: &BundleState,
+    precomputed: Option<(B256, TrieUpdates)>,
+    native_writes: Option<&crate::NativeStateOverlay>,
+) -> Result<B256, StateError> {
     let (root, trie_updates) = match precomputed {
         Some(pair) => pair,
         None => incremental_evm_root(db, bundle)?,
@@ -388,6 +404,9 @@ pub fn commit_evm_bundle_incremental(
     apply_bundle_plain(db, &mut batch, bundle)?;
     apply_bundle_hashed(db, &mut batch, bundle)?;
     write_trie_updates(db, &mut batch, &trie_updates)?;
+    if let Some(native) = native_writes {
+        native.append_pending_to_batch(db, &mut batch)?;
+    }
     db.write(batch)?;
     Ok(root)
 }

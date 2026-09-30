@@ -200,10 +200,13 @@ impl BlockCommitter {
     ///
     /// Unlike [`commit_block`](Self::commit_block), this does NOT write block
     /// headers, bodies, receipts, or indices — those are written eagerly
-    /// during validation. This only applies account/storage/code changes.
+    /// during validation. This only applies account/storage/code changes,
+    /// plus (F1, s515) the block's writer-precompile queue rows
+    /// (`native_writes`) in the SAME atomic batch.
     pub fn commit_pending_bundle(
         state_db: &StateDb,
         bundle: &BundleState,
+        native_writes: Option<&torus_state::NativeStateOverlay>,
     ) -> Result<(), BridgeError> {
         let mut batch = rocksdb::WriteBatch::default();
 
@@ -242,6 +245,9 @@ impl BlockCommitter {
         for (code_hash, bytecode) in &bundle.contracts {
             let raw = bytecode.bytes();
             batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
+        }
+        if let Some(native) = native_writes {
+            native.append_pending_to_batch(state_db, &mut batch)?;
         }
 
         state_db.write(batch)?;

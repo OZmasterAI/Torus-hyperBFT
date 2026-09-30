@@ -581,6 +581,15 @@ pub struct NativeStateOverlay {
     parent: Option<Arc<FrozenPending>>,
 }
 
+impl std::fmt::Debug for NativeStateOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeStateOverlay")
+            .field("pending_writes", &self.pending_write_count())
+            .field("parent_height", &self.parent_height())
+            .finish()
+    }
+}
+
 impl NativeStateOverlay {
     pub fn new(db: StateDb) -> Self {
         Self::with_parent(db, None)
@@ -650,6 +659,49 @@ impl NativeStateOverlay {
     pub fn discard_tx(&self) {
         let mut state = self.pending.write().unwrap();
         state.clear();
+    }
+
+    /// F1 (s515): open a transaction scope inside a BLOCK-scoped journal. Pending
+    /// writes of earlier transactions stay; everything written from here on is
+    /// undo-logged so [`revert_tx`](Self::revert_tx) can drop exactly this tx's
+    /// writes. Resets the frame checkpoint stack (it must not leak across txs).
+    pub fn begin_tx(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.journal_log.clear();
+        state.checkpoints.clear();
+        state.checkpoints.push(0);
+    }
+
+    /// F1 (s515): close the transaction scope KEEPING its writes pending in the
+    /// block journal (nothing is persisted — the block commit flushes them).
+    pub fn keep_tx(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.journal_log.clear();
+        state.checkpoints.clear();
+    }
+
+    /// F1 (s515): close the transaction scope DROPPING its writes; earlier
+    /// transactions' pending writes are untouched.
+    pub fn revert_tx(&self) {
+        {
+            let mut state = self.pending.write().unwrap();
+            state.checkpoints.clear();
+            state.checkpoints.push(0);
+        }
+        self.revert_to_checkpoint();
+    }
+
+    /// F1 (s515): append every pending write/delete to `batch` WITHOUT writing
+    /// or clearing — lets a caller persist this overlay in the same atomic
+    /// `WriteBatch` as other state (the EVM block commit folds the block's
+    /// writer-precompile queue rows into the bundle's batch).
+    pub fn append_pending_to_batch(
+        &self,
+        target: &StateDb,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StateError> {
+        let state = self.pending.read().unwrap();
+        state.append_to_batch(target.inner(), batch)
     }
 
     /// T4.4 revert-safety: open a call-frame checkpoint over the writer-precompile journal.
@@ -1561,6 +1613,37 @@ mod tests {
         overlay.discard_tx();
         assert_eq!(overlay.pending_write_count(), 0);
         assert!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().is_none());
+    }
+
+    /// F1 (s515): block-scoped journal — a reverted tx drops only its own writes
+    /// (including overwrites of an earlier tx's key); kept txs stay pending and
+    /// nothing reaches the DB until the caller batches them.
+    #[test]
+    fn block_journal_tx_scopes_keep_and_revert() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db.clone());
+
+        overlay.begin_tx();
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"a").unwrap();
+        overlay.keep_tx();
+
+        overlay.begin_tx();
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"b").unwrap();
+        StateBackend::put_cf_raw(&overlay, cf, b"k2", b"c").unwrap();
+        overlay.checkpoint(); // an inner frame left open must not leak
+        overlay.revert_tx();
+
+        let k1 = StateBackend::get_cf_raw(&overlay, cf, b"k1").unwrap();
+        assert_eq!(k1.as_deref(), Some(&b"a"[..]));
+        assert!(StateBackend::get_cf_raw(&overlay, cf, b"k2").unwrap().is_none());
+        assert!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().is_none(), "nothing durable yet");
+
+        let mut batch = WriteBatch::default();
+        overlay.append_pending_to_batch(&db, &mut batch).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().as_deref(), Some(&b"a"[..]));
+        assert!(StateDb::get_cf_raw(&db, cf, b"k2").unwrap().is_none());
     }
 
     #[test]

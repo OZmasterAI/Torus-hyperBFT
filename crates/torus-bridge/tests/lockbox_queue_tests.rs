@@ -5,7 +5,7 @@
 //! burned in-frame); the native leg is queued and applied next block by
 //! `NativeExecutor::drain_core_writer`, which runs on the native path after the
 //! block's EVM bundle has been committed. Each block here is executed with
-//! `execute_block` and committed with `commit_evm_bundle_incremental` (the consensus
+//! `execute_block` and committed with `commit_evm_block_incremental` (the consensus
 //! commit path); fees are zero so value conservation is exact.
 
 use alloy_primitives::{Address, Bytes, B256, U256};
@@ -148,7 +148,13 @@ fn evm_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool> {
     let result = EvmExecutor::new(TORUS_CHAIN_ID)
         .execute_block(db, &cfg, txs, false)
         .unwrap();
-    torus_state::incremental::commit_evm_bundle_incremental(db, &result.bundle, None).unwrap();
+    torus_state::incremental::commit_evm_block_incremental(
+        db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
     result.receipts.iter().map(|r| r.status).collect()
 }
 
@@ -288,4 +294,81 @@ fn round_trip_native_to_evm_and_back_is_lossless() {
     assert_eq!(native(&db, &ALICE), fp(5));
     assert_eq!(evm_balance(&db, &ALICE), U256::ZERO);
     assert_eq!(evm_balance(&db, &LOCKBOX), U256::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// F1 (s515 review): the queued native leg must commit ATOMICALLY with the EVM
+// bundle that burned the deposit — never before it. Pre-fix, `execute_block`
+// persisted each successful tx's queue row straight to RocksDB, so (a) a block
+// whose EVM execution errored AFTER a deposit (bundle dropped, burn never
+// persisted) still credited native next block, and (b) a crash before the bundle
+// commit replayed the tx with a fresh sequence number — a double credit.
+// ---------------------------------------------------------------------------
+
+/// Committed block whose EVM execution errors after a successful deposit (the
+/// app logs "EVM execution failed for committed block" and moves on): no bundle
+/// is committed, so nothing may be queued for the next block.
+#[test]
+fn deposit_in_errored_evm_block_credits_nothing_next_block() {
+    let (_dir, db) = open_test_db();
+    let e0 = wei(1_000);
+    fund_evm(&db, &ALICE, e0);
+
+    // Each tx fits the block gas limit on its own; together they exceed it, so
+    // `execute_block` returns BlockGasLimitExceeded after the deposit succeeded.
+    let cfg = BlockEnvCfg {
+        number: 1,
+        timestamp: 1_000_001,
+        beneficiary: BENEFICIARY,
+        gas_limit: 100_000,
+        base_fee: 0,
+    };
+    let mut dep = deposit(ALICE, wei(300), 0);
+    dep.gas_limit = 100_000;
+    let txs = vec![
+        dep,
+        transfer(ALICE, BOB, wei(1), 1),
+        transfer(ALICE, BOB, wei(1), 2),
+        transfer(ALICE, BOB, wei(1), 3),
+        transfer(ALICE, BOB, wei(1), 4),
+    ];
+    let err = EvmExecutor::new(TORUS_CHAIN_ID).execute_block(&db, &cfg, txs, true);
+    assert!(
+        matches!(err, Err(torus_evm::EvmError::BlockGasLimitExceeded { .. })),
+        "block must error mid-way: {err:?}"
+    );
+
+    assert_eq!(drain(&db, 2), vec![], "no queued action may outlive the dropped bundle");
+    assert_eq!(native(&db, &ALICE), FixedPoint::ZERO, "no native mint");
+    assert_eq!(evm_balance(&db, &ALICE), e0, "burn was never persisted either");
+}
+
+/// Crash after EVM execution but before the bundle commit: restart replays the
+/// same block. Exactly one native credit must result.
+#[test]
+fn replayed_deposit_block_credits_native_exactly_once() {
+    let (_dir, db) = open_test_db();
+    let e0 = wei(1_000);
+    fund_evm(&db, &ALICE, e0);
+    let before = total_wei(&db);
+
+    let cfg = BlockEnvCfg {
+        number: 1,
+        timestamp: 1_000_001,
+        beneficiary: BENEFICIARY,
+        gas_limit: 30_000_000,
+        base_fee: 0,
+    };
+    // First execution: result dropped (crash before the bundle commit).
+    let crashed = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block(&db, &cfg, vec![deposit(ALICE, wei(300), 0)], true)
+        .unwrap();
+    drop(crashed);
+    // Replay: same block, committed this time.
+    assert_eq!(evm_block(&db, 1, vec![deposit(ALICE, wei(300), 0)]), vec![true]);
+
+    assert_eq!(drain(&db, 2), vec![(true, None)], "exactly one queued credit");
+    assert_eq!(native(&db, &ALICE), fp(300));
+    assert_eq!(evm_balance(&db, &ALICE), e0 - wei(300));
+    assert_eq!(total_wei(&db), before, "value conservation across the replay");
 }
