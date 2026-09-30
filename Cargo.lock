@@ -7008,6 +7008,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "torus-types",
  "tower",
  "tower-http",
  "tracing",

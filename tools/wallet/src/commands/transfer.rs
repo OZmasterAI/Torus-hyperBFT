@@ -1,7 +1,7 @@
 //! Transfer commands: send (EVM), transfer-to-perp, transfer-to-spot, withdraw.
 //!
 //! Native transfers use `U256` wei (18 decimals). Only `parse_trs_to_wei` here —
-//! never `parse_decimal_to_fixed_point`.
+//! never `str::parse::<FixedPoint>`.
 
 use torus_types::NativeAction;
 

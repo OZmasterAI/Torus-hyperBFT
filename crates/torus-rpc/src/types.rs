@@ -242,17 +242,13 @@ pub struct LogFilter {
 }
 
 // ============================================================================
-// FixedPoint hex helper
+// FixedPoint decimal helper
 // ============================================================================
 
-/// Format a FixedPoint as a hex string of its raw i128 value.
-pub fn hex_fp(v: FixedPoint) -> String {
-    let raw = v.raw();
-    if raw >= 0 {
-        format!("{:#x}", raw as u128)
-    } else {
-        format!("-{:#x}", (-raw) as u128)
-    }
+/// Format a FixedPoint as a decimal string (`"123.45000000"`) for `torus_*`
+/// outputs (s80). `eth_*` outputs stay hex.
+pub fn dec_fp(v: FixedPoint) -> String {
+    v.to_string()
 }
 
 // ============================================================================

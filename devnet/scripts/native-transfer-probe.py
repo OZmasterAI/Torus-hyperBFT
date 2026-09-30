@@ -21,6 +21,7 @@ Usage:
 import json
 import sys
 import time
+from decimal import Decimal
 
 import requests
 from Crypto.Hash import keccak as keccak_mod
@@ -183,8 +184,13 @@ def block_number(url):
 
 
 def get_balances(addr, url):
+    """Balances as raw ints: evmBalance is hex wei; the FixedPoint fields are
+    decimal strings (s80), scaled to raw 8-decimal units."""
     r = rpc("torus_getBalances", [addr], url)["result"]
-    return {k: int(v, 16) for k, v in r.items()}
+    return {
+        k: int(v, 16) if k == "evmBalance" else int(Decimal(v).scaleb(8))
+        for k, v in r.items()
+    }
 
 
 def block_native(height, url):

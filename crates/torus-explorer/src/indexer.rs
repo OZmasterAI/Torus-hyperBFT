@@ -1,5 +1,6 @@
 use jsonrpsee::rpc_params;
 use serde_json::Value;
+use torus_types::FixedPoint;
 use tracing::{info, warn};
 
 use crate::db::*;
@@ -120,8 +121,8 @@ impl Indexer {
             for t in &trades {
                 let market_id = val_hex_i64(t, "marketId");
                 let timestamp = val_hex_i64(t, "timestamp");
-                let price_raw = parse_hex_i128(val_str(t, "price").as_str()) as i64;
-                let qty_raw = parse_hex_i128(val_str(t, "quantity").as_str()) as i64;
+                let price_raw = parse_dec_fp(val_str(t, "price").as_str()) as i64;
+                let qty_raw = parse_dec_fp(val_str(t, "quantity").as_str()) as i64;
                 if let Err(e) = self
                     .db
                     .upsert_candle(market_id, timestamp, price_raw, qty_raw)
@@ -345,9 +346,9 @@ pub fn parse_native_action_row(
     }
 }
 
-fn parse_hex_i128(s: &str) -> i128 {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    i128::from_str_radix(s, 16).unwrap_or(0)
+/// Raw value of a `torus_*` decimal FixedPoint string (s80); 0 if unparsable.
+fn parse_dec_fp(s: &str) -> i128 {
+    s.parse::<FixedPoint>().map(|f| f.raw()).unwrap_or(0)
 }
 
 fn extract_i64(at: &str, inner: Option<&Value>, field: &str, types: &[&str]) -> Option<i64> {
@@ -379,6 +380,14 @@ fn extract_val_str(at: &str, inner: Option<&Value>, field: &str, types: &[&str])
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_dec_fp_reads_decimal_trade_fields() {
+        assert_eq!(parse_dec_fp("0.00000009"), 9);
+        assert_eq!(parse_dec_fp("123.45000000"), 12_345_000_000);
+        assert_eq!(parse_dec_fp("-0.50000000"), -50_000_000);
+        assert_eq!(parse_dec_fp("0x9"), 0, "old hex encoding is not a decimal");
+    }
 
     #[test]
     fn parse_block_from_rpc_json() {

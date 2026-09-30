@@ -64,11 +64,11 @@ height() {  # committed height as decimal (0 on failure)
         | grep -oE '"result":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1)
   [ -n "$hex" ] && printf '%d\n' "$hex" 2>/dev/null || echo 0
 }
-native_balance() {  # hex native balance for an EVM address ($1); empty on failure/absent
+native_balance() {  # decimal native balance (s80) for an EVM address ($1); empty on failure/absent
   # RPC serializes RpcBalances in camelCase -> "nativeBalance"; accept snake_case too.
   curl -s --max-time 5 -X POST "$RPC" -H 'content-type: application/json' \
        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"torus_getBalances\",\"params\":[\"$1\"]}" 2>/dev/null \
-    | grep -oiE '"native_?balance":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1
+    | grep -oiE '"native_?balance":"-?[0-9.]+"' | grep -oE -- '-?[0-9.]+' | head -1
 }
 sender_addr() {  # derived EVM address for sender index $1, SAME key path the bench uses
   "$BIN" gen-accounts --offset "$1" --count 1 2>/dev/null | awk '{print $2; exit}'
@@ -165,7 +165,7 @@ for idx in "$SENDER_OFFSET" "$last_idx"; do
     echo "  WARN: torus_getBalances unreadable for idx $idx ($addr) — will smoke-test"
     funding_ok=0; break
   fi
-  if [ "$bal" = "0x0" ] || [ "$bal" = "0x00" ]; then
+  if [ "$bal" = "0.00000000" ]; then
     echo "!! ABORT: sender idx $idx ($addr) has ZERO native balance."
     echo "   genesis must fund senders $SENDER_OFFSET..$last_idx; check SENDER_OFFSET / genesis funding."
     exit 1

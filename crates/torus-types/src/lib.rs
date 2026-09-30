@@ -171,6 +171,57 @@ impl std::fmt::Display for FixedPoint {
     }
 }
 
+/// Parse a decimal string: `"1.5"`, `".5"`, `"100"`, `"-1.5"`, `"0.00000001"`.
+/// Up to 8 fractional digits; the inverse of `Display`.
+/// Rejects empty strings, non-digits (including hex and `+`), more than one
+/// `.` and more than 8 decimal places.
+impl std::str::FromStr for FixedPoint {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err("empty decimal string".into());
+        }
+        let (negative, body) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let (whole_str, frac_str) = body.split_once('.').unwrap_or((body, ""));
+        if whole_str.is_empty() && frac_str.is_empty() {
+            return Err("invalid decimal: missing digits".into());
+        }
+        if !whole_str
+            .bytes()
+            .chain(frac_str.bytes())
+            .all(|b| b.is_ascii_digit())
+        {
+            return Err(format!("invalid decimal: {s:?}"));
+        }
+        if frac_str.len() > Self::DECIMALS as usize {
+            return Err(format!("too many decimal places (max {})", Self::DECIMALS));
+        }
+        let whole: i128 = if whole_str.is_empty() {
+            0
+        } else {
+            whole_str
+                .parse()
+                .map_err(|e| format!("invalid whole part: {e}"))?
+        };
+        let frac: i128 = if frac_str.is_empty() {
+            0
+        } else {
+            format!("{frac_str:0<8}")
+                .parse()
+                .map_err(|e| format!("invalid fraction: {e}"))?
+        };
+        let raw = whole
+            .checked_mul(Self::SCALE)
+            .and_then(|w| w.checked_add(frac))
+            .ok_or("decimal overflow")?;
+        Ok(Self(if negative { -raw } else { raw }))
+    }
+}
+
 // ============================================================================
 // Cryptographic Primitives
 // ============================================================================
@@ -1382,6 +1433,45 @@ mod tests {
         let three = FixedPoint::from_raw(3 * FixedPoint::SCALE);
         let result = ten / three;
         assert_eq!(result.raw(), 333_333_333);
+    }
+
+    #[test]
+    fn fixed_point_from_str_parses_decimals() {
+        let p = |s: &str| s.parse::<FixedPoint>().map(|f| f.raw());
+        assert_eq!(p("123.45"), Ok(12_345_000_000));
+        assert_eq!(p("-0.5"), Ok(-50_000_000));
+        assert_eq!(p(".5"), Ok(50_000_000));
+        assert_eq!(p("100"), Ok(10_000_000_000));
+        assert_eq!(p("0.00000001"), Ok(1));
+        for bad in [
+            "",
+            "-",
+            ".",
+            "1.123456789",
+            "1.2.3",
+            "0x10",
+            "abc",
+            "--5",
+            "1.-5",
+            "+5",
+        ] {
+            assert!(p(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn fixed_point_display_round_trips_through_from_str() {
+        for raw in [
+            -150_000_000,
+            0,
+            12_345_000_000,
+            -1,
+            i128::MAX,
+            i128::MIN + 1,
+        ] {
+            let x = FixedPoint::from_raw(raw);
+            assert_eq!(x.to_string().parse::<FixedPoint>(), Ok(x));
+        }
     }
 
     // ---- Checked arithmetic tests (ECON-PF-01, ECON-PF-02) ----

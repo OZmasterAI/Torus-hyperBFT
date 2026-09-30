@@ -1,11 +1,10 @@
 //! Trading commands: place-order, cancel-order, cancel-all, modify-order.
 //!
 //! Prices and quantities are `FixedPoint` (8 decimals, i128). All decimal args
-//! flow through `parse_decimal_to_fixed_point` — never `parse_trs_to_wei`.
+//! flow through `str::parse::<FixedPoint>` — never `parse_trs_to_wei`.
 
-use torus_types::{NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
-use crate::parse::parse_decimal_to_fixed_point;
 use crate::rpc::RpcClient;
 use crate::sign::submit_native_action;
 use crate::Cli;
@@ -29,8 +28,8 @@ pub(crate) async fn cmd_place_order(
         "sell" => false,
         _ => return Err(format!("--side must be 'buy' or 'sell' (got '{side}')")),
     };
-    let price_fp = parse_decimal_to_fixed_point(price)?;
-    let qty_fp = parse_decimal_to_fixed_point(quantity)?;
+    let price_fp = price.parse::<FixedPoint>()?;
+    let qty_fp = quantity.parse::<FixedPoint>()?;
 
     let order_type_enum = match order_type.to_lowercase().as_str() {
         "limit" => OrderType::Limit,
@@ -38,13 +37,13 @@ pub(crate) async fn cmd_place_order(
         "stop-market" => {
             let t = trigger_price.ok_or("--trigger-price required for stop-market")?;
             OrderType::StopMarket {
-                trigger: parse_decimal_to_fixed_point(t)?,
+                trigger: t.parse::<FixedPoint>()?,
             }
         }
         "stop-limit" => {
             let t = trigger_price.ok_or("--trigger-price required for stop-limit")?;
             OrderType::StopLimit {
-                trigger: parse_decimal_to_fixed_point(t)?,
+                trigger: t.parse::<FixedPoint>()?,
                 limit: price_fp,
             }
         }
@@ -108,11 +107,11 @@ pub(crate) async fn cmd_modify_order(
         return Err("--price or --quantity required for modify-order".into());
     }
     let new_price = match new_price {
-        Some(p) => Some(parse_decimal_to_fixed_point(p)?),
+        Some(p) => Some(p.parse::<FixedPoint>()?),
         None => None,
     };
     let new_qty = match new_quantity {
-        Some(q) => Some(parse_decimal_to_fixed_point(q)?),
+        Some(q) => Some(q.parse::<FixedPoint>()?),
         None => None,
     };
     submit_native_action(

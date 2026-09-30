@@ -67,8 +67,8 @@ fn rpc_trade(market_id: &str, block: u64, timestamp: u64, t: &MarketTrade) -> Rp
     RpcTrade {
         trade_id: hex_u128(t.trade_index as u128),
         market_id: market_id.to_string(),
-        price: hex_fp(FixedPoint::from_raw(t.price_raw)),
-        quantity: hex_fp(FixedPoint::from_raw(t.qty_raw)),
+        price: dec_fp(FixedPoint::from_raw(t.price_raw)),
+        quantity: dec_fp(FixedPoint::from_raw(t.qty_raw)),
         side: if t.taker_side == 0 { "buy" } else { "sell" }.to_string(),
         block_number: hex_u64(block),
         timestamp: hex_u64(timestamp),
@@ -683,8 +683,8 @@ fn decode_order_book_levels(
             depth
                 .into_iter()
                 .map(|(price, quantity, n)| RpcPriceLevel {
-                    price: hex_fp(price),
-                    quantity: hex_fp(quantity),
+                    price: dec_fp(price),
+                    quantity: dec_fp(quantity),
                     order_count: n as u32,
                 })
                 .collect::<Vec<_>>()
@@ -698,8 +698,8 @@ fn decode_order_book_levels(
         levels
             .iter()
             .map(|lvl| RpcPriceLevel {
-                price: hex_fp(lvl.price),
-                quantity: hex_fp(lvl.quantity),
+                price: dec_fp(lvl.price),
+                quantity: dec_fp(lvl.quantity),
                 order_count: 0,
             })
             .collect::<Vec<_>>()
@@ -713,8 +713,8 @@ fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
     levels
         .into_iter()
         .map(|l| RpcPriceLevel {
-            price: hex_fp(l.price),
-            quantity: hex_fp(l.quantity),
+            price: dec_fp(l.price),
+            quantity: dec_fp(l.quantity),
             order_count: l.order_count,
         })
         .collect()
@@ -816,13 +816,13 @@ impl TorusApiServer for RpcState {
                 Ok(Some(RpcPosition {
                     market_id,
                     side: side.to_string(),
-                    size: hex_fp(p.size),
-                    entry_price: hex_fp(p.entry_price),
-                    unrealized_pnl: hex_fp(unrealized),
-                    realized_pnl: hex_fp(p.realized_pnl),
-                    margin: hex_fp(p.isolated_margin),
+                    size: dec_fp(p.size),
+                    entry_price: dec_fp(p.entry_price),
+                    unrealized_pnl: dec_fp(unrealized),
+                    realized_pnl: dec_fp(p.realized_pnl),
+                    margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
-                    liquidation_price: hex_fp(liquidation_price),
+                    liquidation_price: dec_fp(liquidation_price),
                 }))
             }
         }
@@ -867,10 +867,10 @@ impl TorusApiServer for RpcState {
         let native_total = native_bal.available + native_bal.order_margin;
 
         Ok(RpcBalances {
-            native_balance: hex_fp(native_total),
+            native_balance: dec_fp(native_total),
             evm_balance: hex_u256(evm_balance),
-            total_margin_used: hex_fp(total_margin),
-            available_balance: hex_fp(native_bal.available),
+            total_margin_used: dec_fp(total_margin),
+            available_balance: dec_fp(native_bal.available),
             permanent_stake,
         })
     }
@@ -921,8 +921,8 @@ impl TorusApiServer for RpcState {
                 market_id: hex_u64(mid),
                 base_asset: market.base_asset,
                 quote_asset: market.quote_asset,
-                lot_size: hex_fp(FixedPoint::from_raw(market.lot_size_raw)),
-                tick_size: hex_fp(FixedPoint::from_raw(market.tick_size_raw)),
+                lot_size: dec_fp(FixedPoint::from_raw(market.lot_size_raw)),
+                tick_size: dec_fp(FixedPoint::from_raw(market.tick_size_raw)),
                 status: "active".to_string(),
             });
 
@@ -1563,8 +1563,8 @@ impl TorusApiServer for RpcState {
             None => {
                 return Ok(RpcOpenInterest {
                     market_id,
-                    long_oi: hex_fp(FixedPoint::ZERO),
-                    short_oi: hex_fp(FixedPoint::ZERO),
+                    long_oi: dec_fp(FixedPoint::ZERO),
+                    short_oi: dec_fp(FixedPoint::ZERO),
                 });
             }
         };
@@ -1596,8 +1596,8 @@ impl TorusApiServer for RpcState {
 
         Ok(RpcOpenInterest {
             market_id,
-            long_oi: hex_fp(long_oi),
-            short_oi: hex_fp(short_oi),
+            long_oi: dec_fp(long_oi),
+            short_oi: dec_fp(short_oi),
         })
     }
 
@@ -1635,9 +1635,9 @@ impl TorusApiServer for RpcState {
 
         Ok(RpcMarkPrice {
             market_id,
-            mark_price: hex_fp(mark_price),
-            index_price: hex_fp(index_price),
-            last_trade_price: hex_fp(last_trade_price),
+            mark_price: dec_fp(mark_price),
+            index_price: dec_fp(index_price),
+            last_trade_price: dec_fp(last_trade_price),
             timestamp,
         })
     }
@@ -1697,12 +1697,14 @@ impl TorusApiServer for RpcState {
                 if market_filter.is_some_and(|mf| trade.market != mf) {
                     continue;
                 }
+                // s80: the user's own side (a maker is opposite the taker).
+                let user_bought = (trade.taker_side == 0) == (trade.role == 1);
                 trades.push(RpcUserTrade {
                     trade_id: hex_u128(trade.trade_index as u128),
                     market_id: hex_u64(trade.market),
-                    side: if trade.taker_side == 0 { "buy" } else { "sell" }.to_string(),
-                    price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
-                    quantity: hex_fp(FixedPoint::from_raw(trade.qty_raw)),
+                    side: if user_bought { "buy" } else { "sell" }.to_string(),
+                    price: dec_fp(FixedPoint::from_raw(trade.price_raw)),
+                    quantity: dec_fp(FixedPoint::from_raw(trade.qty_raw)),
                     role: if trade.role == 0 { "maker" } else { "taker" }.to_string(),
                     block_number: hex_u64(block),
                     timestamp: hex_u64(timestamp),
@@ -1858,9 +1860,9 @@ fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpe
         order_id: hex_u128(order.id),
         market_id: hex_u64(market_id),
         side: side.to_string(),
-        price: hex_fp(order.price),
-        remaining_qty: hex_fp(order.remaining_qty),
-        original_qty: hex_fp(order.original_qty),
+        price: dec_fp(order.price),
+        remaining_qty: dec_fp(order.remaining_qty),
+        original_qty: dec_fp(order.original_qty),
         order_type: order_type.to_string(),
         time_in_force: time_in_force.to_string(),
         reduce_only: order.reduce_only,
@@ -2086,7 +2088,7 @@ mod order_book_decode_tests {
     use torus_types::{Address, FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
 
     use super::decode_order_book_levels;
-    use crate::types::hex_fp;
+    use crate::types::dec_fp;
 
     fn limit(is_buy: bool, price: FixedPoint, quantity: FixedPoint) -> PlaceOrderParams {
         PlaceOrderParams {
@@ -2125,17 +2127,17 @@ mod order_book_decode_tests {
             decode_order_book_levels(&blob).expect("the PRODUCTION blob must decode");
 
         assert_eq!(bids.len(), 1, "one aggregated bid level");
-        assert_eq!(bids[0].price, hex_fp(bid_px));
+        assert_eq!(bids[0].price, dec_fp(bid_px));
         assert_eq!(
             bids[0].quantity,
-            hex_fp(FixedPoint::from_raw(1_200)),
+            dec_fp(FixedPoint::from_raw(1_200)),
             "level quantity must be the SUM of resting remaining quantities"
         );
         assert_eq!(bids[0].order_count, 2, "two resting orders on the level");
 
         assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].price, hex_fp(ask_px));
-        assert_eq!(asks[0].quantity, hex_fp(q3));
+        assert_eq!(asks[0].price, dec_fp(ask_px));
+        assert_eq!(asks[0].quantity, dec_fp(q3));
         assert_eq!(asks[0].order_count, 1);
     }
 
@@ -2152,7 +2154,7 @@ mod order_book_decode_tests {
         let (bids, asks) =
             decode_order_book_levels(&blob).expect("the legacy snapshot must still decode");
         assert_eq!(bids.len(), 1);
-        assert_eq!(bids[0].quantity, hex_fp(FixedPoint::from_raw(42)));
+        assert_eq!(bids[0].quantity, dec_fp(FixedPoint::from_raw(42)));
         assert_eq!(asks.len(), 0);
     }
 }
