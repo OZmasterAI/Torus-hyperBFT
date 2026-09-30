@@ -1454,25 +1454,29 @@ impl<T: StateBackend> GovernanceManager<T> {
 
     /// Get and increment the proposal counter. Returns the new ID (starts at 1).
     /// Whether a market row exists at `market_id` in CF_NATIVE_MARKETS.
-    fn market_exists(&self, market_id: u64) -> Result<bool> {
+    pub fn market_exists(&self, market_id: u64) -> Result<bool> {
         Ok(self
             .state
             .get_cf_raw(CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
             .is_some())
     }
 
-    /// Next free market id: max existing 8-byte market key + 1 (1 if none).
-    /// Non-market metadata rows in the CF (`__book_mode__`,
-    /// `__next_global_order_id__`) have keys != 8 bytes and are skipped.
-    fn next_market_id(&self) -> Result<u64> {
-        let max = self
+    /// Listed market ids: the 8-byte big-endian keys of CF_NATIVE_MARKETS,
+    /// ascending. Metadata rows (`__book_mode__`, `__next_global_order_id__`)
+    /// have other key lengths and are skipped.
+    pub fn listed_market_ids(&self) -> Result<Vec<u64>> {
+        Ok(self
             .state
             .iterate_cf(CF_NATIVE_MARKETS, None)?
             .iter()
             .filter(|(k, _)| k.len() == 8)
             .map(|(k, _)| u64::from_be_bytes(k[..8].try_into().unwrap()))
-            .max()
-            .unwrap_or(0);
+            .collect())
+    }
+
+    /// Next free market id: max listed market id + 1 (1 if none).
+    fn next_market_id(&self) -> Result<u64> {
+        let max = self.listed_market_ids()?.last().copied().unwrap_or(0);
         max.checked_add(1)
             .ok_or(EconomicsError::MarketIdInUse(u64::MAX))
     }
