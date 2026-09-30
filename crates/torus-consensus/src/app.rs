@@ -1954,7 +1954,11 @@ impl ExecutionContext {
         // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
         // value is already burned, so a stranded credit is lost value).
         let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
-        if has_native || computed_fee_revenue > 0 || core_writer_due {
+        // T0: epochs run by height (HL: by round count), whatever the block carries.
+        let epoch_boundary = EpochManager::is_epoch_boundary(height, self.epoch_length);
+        // C2: the ONE flag for "this block ran the native phase" (marker / books below).
+        let run_native = has_native || computed_fee_revenue > 0 || core_writer_due || epoch_boundary;
+        if run_native {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
@@ -2570,13 +2574,13 @@ impl ExecutionContext {
         }
 
         // ---- Update tracking ----
-        // T156-F1: when the native execution path ran (native actions and/or fee revenue), the
-        // applied-height marker was already folded into that path's atomic flush batch above
-        // (flush_with_native_trie_and_marker), so native state and the marker committed together.
-        // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
-        // empty or pure-EVM blocks, whose re-execution is idempotent) still need a standalone marker
-        // write here.
-        if !(has_native || computed_fee_revenue > 0) {
+        // T156-F1: when the native execution path ran (`run_native`: native actions, fee revenue,
+        // a due CoreWriter row or an epoch boundary), the applied-height marker was already folded
+        // into that path's atomic flush batch above (flush_with_native_trie_and_marker), so native
+        // state and the marker committed together. Only blocks that skipped the native path
+        // entirely (empty or pure-EVM non-boundary blocks, whose re-execution is idempotent) still
+        // need a standalone marker write here.
+        if !run_native {
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
                 // batch on W (a direct put here would land before batch(N−1) and be
@@ -2646,7 +2650,7 @@ impl ExecutionContext {
             // Gated on the SAME predicate as the native section above, so
             // `exec_chain_seconds_count == exec_engine_seconds_count` and
             // `_sum / _count` is directly ms-per-native-block.
-            if has_native || computed_fee_revenue > 0 {
+            if run_native {
                 m.exec_chain_seconds.observe(block_secs);
                 // bl2: on the fast path the REAL rendezvous wait was observed in
                 // `pipeline_handoff`; only the serial path records the 0.
@@ -13925,5 +13929,117 @@ mod crash_recovery_tests {
         assert_eq!(read_native_applied_height(&db), None, "native phase not run");
         assert!(db.get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED).unwrap().is_none(), "no EVM-applied marker");
         assert_eq!(read_evm_balance(&db, bob), U256::ZERO);
+    }
+
+    // ---- T0: epoch processing on EVERY boundary block ----
+
+    /// What the T0 fixture observed. `rewarded`: validator inflation reached the
+    /// validators at boundary 4. `validators`: (address, status, stake) after the
+    /// run. `vs_updates_at`: whether consensus-side `epoch_validator_set_updates`
+    /// emitted a validator-set change at boundaries 4 and 8 (a spurious diff
+    /// switches hotstuff out of the 2-chain Generic commit, memory d8e0cf6b).
+    #[derive(Debug, PartialEq)]
+    struct EpochOutcome {
+        rewarded: bool,
+        validators: Vec<(Address, torus_economics::ValidatorStatus, U256)>,
+        vs_updates_at: [bool; 2],
+    }
+
+    /// T0: epoch processing (permanent-stake rewards, validator inflation,
+    /// native-side rotation) lives in the native phase, which is skipped for a
+    /// block with no native action, fee or due CoreWriter row. HL runs epochs by
+    /// round count: an EMPTY boundary block must still run it. Four Active
+    /// validators (the BFT minimum), so the consensus-side rotation check is
+    /// not vacuous.
+    fn epoch_fixture(boundary_action: bool) -> EpochOutcome {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let staking = StakingManager::new(db.clone());
+        let vals: Vec<Address> = (1..=4u8).map(|i| Address::new([0x50 + i; 20])).collect();
+        for (i, v) in vals.iter().enumerate() {
+            let pubkey = ed25519_dalek::SigningKey::from_bytes(&[0x50 + i as u8; 32])
+                .verifying_key()
+                .to_bytes();
+            staking
+                .put_validator(v, &torus_economics::ValidatorState {
+                    address: *v,
+                    pubkey,
+                    commission_bps: 500,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION * U256::from(100 + i as u64),
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                })
+                .unwrap();
+        }
+        // Consensus side: genesis set from staking, as on a real node.
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3u64 {
+            let root_before = torus_state::native_trie::persisted_native_root(&db).unwrap();
+            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            // Empty NON-boundary blocks keep skipping the native phase: marker
+            // only, native root untouched, no epoch side effect.
+            assert_eq!(read_native_applied_height(&db), Some(h));
+            assert_eq!(
+                torus_state::native_trie::persisted_native_root(&db).unwrap(),
+                root_before,
+                "empty non-boundary block {h} must not touch native state"
+            );
+            assert!(vals.iter().all(|v| staking.get_pending_rewards(v).unwrap().is_none()));
+        }
+        // Block 4 = epoch boundary; its proposal asks for the set change first.
+        let at4 = app.epoch_validator_set_updates(4).is_some();
+        let actions = if boundary_action { vec![sign_claim_rewards(4)] } else { vec![] };
+        ctx.execute_committed_block(&make_block(4, actions), vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(4));
+        let rewarded = vals.iter().all(|v| {
+            staking.get_pending_rewards(v).unwrap().is_some_and(|r| r.amount > U256::ZERO)
+        });
+        // Blocks 5-7 empty, linked to the persisted block 4 (non-empty in the
+        // control); the rotation at boundary 8 then reads 4's post-state + 5-7.
+        let stored4 = db.get_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes()).unwrap().unwrap();
+        let mut parent_hash = B256::from_slice(&stored4[..32]);
+        for h in 5..=7u64 {
+            let mut b = make_block(h, vec![]);
+            b.header.parent_hash = parent_hash;
+            parent_hash = alloy_primitives::keccak256(b.header.canonical_header_bytes());
+            ctx.execute_committed_block(&b, vec![]);
+            assert_eq!(read_native_applied_height(&db), Some(h));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        let at8 = app.epoch_validator_set_updates(8).is_some();
+        drop(ctx);
+        let validators = staking
+            .all_validators()
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.address, v.status, v.total_stake()))
+            .collect();
+        EpochOutcome { rewarded, validators, vs_updates_at: [at4, at8] }
+    }
+
+    /// Control (GREEN today): a NON-empty boundary block credits inflation and
+    /// changes nothing on the consensus side (unchanged set -> no updates).
+    #[test]
+    fn nonempty_epoch_boundary_block_runs_epoch_processing() {
+        let out = epoch_fixture(true);
+        assert!(out.rewarded, "control: inflation must be non-zero for this fixture");
+        assert_eq!(out.vs_updates_at, [false, false], "no validator-set diff: {out:?}");
+        assert!(out
+            .validators
+            .iter()
+            .all(|(_, s, _)| *s == torus_economics::ValidatorStatus::Active));
+    }
+
+    /// T0: the EMPTY boundary block runs the same epoch processing and yields the
+    /// SAME validator statuses / stakes / consensus-side updates as the control.
+    #[test]
+    fn empty_epoch_boundary_block_runs_epoch_processing() {
+        let empty = epoch_fixture(false);
+        assert!(empty.rewarded, "empty boundary block 4 must distribute validator inflation");
+        assert_eq!(empty, epoch_fixture(true), "empty vs non-empty boundary must match");
     }
 }
