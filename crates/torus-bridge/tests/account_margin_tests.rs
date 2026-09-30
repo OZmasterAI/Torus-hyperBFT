@@ -1,0 +1,710 @@
+//! F1 (s517): account-level margin, Hyperliquid cross margin (computed).
+//!
+//! `docs/plans/account-level-margin-f1.md` (decisions s517 are binding) and
+//! `docs/plans/account-level-margin-f1-impl.md`. Pins:
+//!   - withdrawals (TransferToSpot, Withdraw{to}) keep the account's transfer
+//!     margin, SAFE variant: `amount <= available` AND equity − order margin −
+//!     amount >= max(Σ position IM, 10% × Σ position notional);
+//!   - placement is checked against the ACCOUNT's free margin (UPnL counts,
+//!     position-size tier, closing is free) — the only placement gate (D1,
+//!     strict HL: `available` may go negative);
+//!   - the match-time budget is the order's reservation + the sender's running
+//!     free margin (exclusive per batch, D2).
+//!
+//! Every scenario runs through all three PlaceOrder paths (`per_path!`):
+//! single-action `execute`, `execute_batch` serial Phase 2, and the sharded
+//! parallel Phase 2. Helpers copied from `market_order_margin_tests.rs`.
+
+use alloy_primitives::{Address, U256};
+
+use torus_bridge::native_executor::{NativeActionResult, NativeExecContext, NativeExecutor};
+use torus_core::margin::{MarginTier, MarketMarginConfig};
+use torus_core::position::NativeBalance;
+use torus_state::StateDb;
+use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+// ---- Helpers (copied from market_order_margin_tests.rs) ----
+
+fn open_test_db() -> (tempfile::TempDir, StateDb) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db = StateDb::open(dir.path()).expect("open db");
+    (dir, db)
+}
+
+fn addr(n: u8) -> Address {
+    Address::new([n; 20])
+}
+
+fn fp(v: i64) -> FixedPoint {
+    FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+}
+
+/// `v / 100` as a FixedPoint (exact: 2 decimals).
+fn fp_cents(v: i64) -> FixedPoint {
+    FixedPoint::from_raw(v as i128 * (FixedPoint::SCALE / 100))
+}
+
+fn make_ctx(state_db: StateDb) -> NativeExecContext {
+    NativeExecContext::new(
+        state_db,
+        1,         // block_height
+        1000,      // timestamp
+        0,         // epoch
+        100,       // epoch_length
+        10,        // max_validators
+        addr(99),  // proposer
+        addr(100), // treasury
+        addr(101), // dev_pool
+    )
+}
+
+fn fund_native(ctx: &NativeExecContext, trader: &Address, amount: FixedPoint) {
+    let bal = NativeBalance {
+        available: amount,
+        order_margin: FixedPoint::ZERO,
+    };
+    ctx.positions.put_native_balance(trader, &bal).unwrap();
+}
+
+fn limit(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+    PlaceOrderParams {
+        market_id,
+        is_buy,
+        price: fp(price),
+        quantity: fp(qty),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
+
+fn market(market_id: MarketId, is_buy: bool, cap: FixedPoint, qty: i64) -> PlaceOrderParams {
+    PlaceOrderParams {
+        market_id,
+        is_buy,
+        price: cap,
+        quantity: fp(qty),
+        order_type: OrderType::Market,
+        time_in_force: TimeInForce::IOC,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
+
+fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
+    (sender, NativeAction::PlaceOrder(p))
+}
+
+fn bal(ctx: &NativeExecContext, trader: &Address) -> NativeBalance {
+    ctx.positions.get_native_balance(trader).unwrap()
+}
+
+fn assert_bal(
+    ctx: &NativeExecContext,
+    trader: &Address,
+    avail: FixedPoint,
+    margin: FixedPoint,
+    what: &str,
+) {
+    let b = bal(ctx, trader);
+    assert_eq!(b.available, avail, "{what}: available");
+    assert_eq!(b.order_margin, margin, "{what}: order_margin");
+}
+
+const FUNDING: i64 = 1_000;
+
+/// Filler sender for the parallel-prepare path (needs >= 2 distinct senders):
+/// a tiny resting bid in an unrelated market.
+fn filler() -> Address {
+    addr(200)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Path {
+    /// `NativeExecutor::execute` per action (exec_place_order).
+    Single,
+    /// `execute_batch` canonical serial Phase-2 prepare.
+    Batch,
+    /// `execute_batch` sharded parallel Phase-2 prepare (+ parallel settle).
+    Parallel,
+}
+
+fn run(ctx: &mut NativeExecContext, path: Path, actions: &[(Address, NativeAction)]) -> Vec<NativeActionResult> {
+    match path {
+        Path::Single => actions
+            .iter()
+            .map(|(s, a)| NativeExecutor::execute(ctx, s, a))
+            .collect(),
+        Path::Batch => NativeExecutor::execute_batch_engine_mode(ctx, actions, 1).results,
+        Path::Parallel => {
+            let mut v = actions.to_vec();
+            v.push(place(filler(), limit(9, true, 1, 1)));
+            let mut r = NativeExecutor::execute_batch_engine_mode(ctx, &v, 4).results;
+            r.pop();
+            r
+        }
+    }
+}
+
+fn fresh(path: Path, traders: &[Address]) -> (tempfile::TempDir, NativeExecContext) {
+    let (dir, db) = open_test_db();
+    let ctx = make_ctx(db);
+    for t in traders {
+        fund_native(&ctx, t, fp(FUNDING));
+    }
+    if matches!(path, Path::Parallel) {
+        fund_native(&ctx, &filler(), fp(FUNDING));
+    }
+    (dir, ctx)
+}
+
+/// Publish `price` as market `market_id`'s aggregated oracle (mark) price at
+/// the context's block: three equally staked reporters, so the stake-weighted
+/// median is exactly `price`.
+fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
+    let reporters = [addr(150), addr(151), addr(152)];
+    for v in &reporters {
+        ctx.oracle
+            .submit_price(v, market_id, price, ctx.block_height, ctx.timestamp)
+            .unwrap();
+    }
+    let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
+    let agg = ctx
+        .oracle
+        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .unwrap();
+    assert_eq!(agg, price, "test oracle aggregates to the mark");
+}
+
+// ---- F1 helpers ----
+
+/// Signed position size (+long / -short / 0 flat) of `t` in market `m`.
+fn pos_in(ctx: &NativeExecContext, t: &Address, m: MarketId) -> FixedPoint {
+    match ctx.positions.get_position(t, m).unwrap() {
+        Some(p) if p.is_long => p.size,
+        Some(p) => -p.size,
+        None => FixedPoint::ZERO,
+    }
+}
+
+/// Remaining quantities of `t`'s resting orders in market `m`.
+fn resting_in(ctx: &NativeExecContext, t: &Address, m: MarketId) -> Vec<FixedPoint> {
+    ctx.order_books
+        .get(&m)
+        .map(|b| b.orders_for_trader(t).iter().map(|o| o.remaining_qty).collect())
+        .unwrap_or_default()
+}
+
+fn abs(x: FixedPoint) -> FixedPoint {
+    if x < FixedPoint::ZERO {
+        -x
+    } else {
+        x
+    }
+}
+
+fn raw(x: FixedPoint) -> U256 {
+    U256::from(x.raw() as u128)
+}
+
+fn to_spot(t: Address, a: FixedPoint) -> (Address, NativeAction) {
+    (t, NativeAction::TransferToSpot { amount: raw(a) })
+}
+
+fn withdraw_to(t: Address, a: FixedPoint) -> (Address, NativeAction) {
+    (t, NativeAction::Withdraw { amount: raw(a), to: addr(77) })
+}
+
+fn tiered(ctx: &mut NativeExecContext, m: MarketId, tiers: Vec<MarginTier>) {
+    let mut c = MarketMarginConfig::new(m, 999);
+    c.tiers = tiers;
+    ctx.margin_configs.insert(m, c);
+}
+
+/// `t` long 10 @100 in market 1 (20x: IM 50, notional 1,000) with `avail`
+/// available and no order margin; counterparty addr(3).
+fn long_10(ctx: &mut NativeExecContext, path: Path, t: Address, avail: FixedPoint) {
+    fund_native(ctx, &addr(3), fp(FUNDING));
+    let r = run(ctx, path, &[place(addr(3), limit(1, false, 100, 10))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    fund_native(ctx, &t, avail);
+    let r = run(ctx, path, &[place(t, limit(1, true, 100, 10))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_eq!(pos_in(ctx, &t, 1), fp(10), "{path:?}");
+    assert_bal(ctx, &t, avail, FixedPoint::ZERO, "after open");
+}
+
+/// One `#[test]` per PlaceOrder path: `<case>::single|batch|parallel`.
+macro_rules! per_path {
+    ($case:ident) => {
+        mod $case {
+            use super::*;
+            #[test]
+            fn single() {
+                super::$case(Path::Single)
+            }
+            #[test]
+            fn batch() {
+                super::$case(Path::Batch)
+            }
+            #[test]
+            fn parallel() {
+                super::$case(Path::Parallel)
+            }
+        }
+    };
+}
+
+// ============================================================================
+// Withdrawals (s517 decision 5, D3 = SAFE variant)
+// ============================================================================
+
+/// F1 (s517): long 10 @100 on 150: equity 150, required max(IM 50, 10% ×
+/// 1,000) = 100. 50 leaves exactly 100 (ok); 51 is rejected (was: allowed,
+/// only `available >= amount` was checked). TransferToSpot and Withdraw{to}.
+fn withdraw_keeps_the_transfer_margin(path: Path) {
+    for (amount, ok) in [(50, true), (51, false)] {
+        for to_evm in [false, true] {
+            let t = addr(2);
+            let (_d, mut ctx) = fresh(path, &[]);
+            long_10(&mut ctx, path, t, fp(150));
+            let a = if to_evm { withdraw_to(t, fp(amount)) } else { to_spot(t, fp(amount)) };
+            let r = run(&mut ctx, path, &[a]);
+            let what = format!("{path:?} to_evm={to_evm} amount={amount}");
+            assert_eq!(r[0].success, ok, "{what}: {:?}", r[0].error);
+            if !ok {
+                assert!(r[0].error.as_deref().unwrap_or("").contains("under-margined"), "{what}: {:?}", r[0].error);
+            }
+            assert_bal(&ctx, &t, fp(if ok { 150 - amount } else { 150 }), FixedPoint::ZERO, &what);
+        }
+    }
+}
+per_path!(withdraw_keeps_the_transfer_margin);
+
+/// F1 (s517): at 5x the position IM (200) dominates the 10% floor (100):
+/// 250 → 50 ok, 51 not.
+fn withdraw_position_im_dominates_at_low_leverage(path: Path) {
+    for (amount, ok) in [(50, true), (51, false)] {
+        let t = addr(2);
+        let (_d, mut ctx) = fresh(path, &[]);
+        tiered(&mut ctx, 1, vec![MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 }]);
+        long_10(&mut ctx, path, t, fp(250));
+        let r = run(&mut ctx, path, &[to_spot(t, fp(amount))]);
+        assert_eq!(r[0].success, ok, "{path:?} {amount}: {:?}", r[0].error);
+    }
+}
+per_path!(withdraw_position_im_dominates_at_low_leverage);
+
+/// F1 (s517): UPnL counts toward equity but never makes more than
+/// `available` withdrawable. Mark 120: equity 150 + 200, required max(60, 120).
+fn withdraw_counts_upnl_but_not_beyond_available(path: Path) {
+    for (amount, ok) in [(150, true), (151, false)] {
+        let t = addr(2);
+        let (_d, mut ctx) = fresh(path, &[]);
+        long_10(&mut ctx, path, t, fp(150));
+        set_mark(&ctx, 1, fp(120));
+        let r = run(&mut ctx, path, &[to_spot(t, fp(amount))]);
+        assert_eq!(r[0].success, ok, "{path:?} {amount}: {:?}", r[0].error);
+    }
+}
+per_path!(withdraw_counts_upnl_but_not_beyond_available);
+
+/// F1 (s517) regression: flat accounts withdraw everything.
+fn withdraw_flat_account_everything(path: Path) {
+    let t = addr(2);
+    let (_d, mut ctx) = fresh(path, &[t]);
+    let r = run(&mut ctx, path, &[to_spot(t, fp(FUNDING))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_bal(&ctx, &t, FixedPoint::ZERO, FixedPoint::ZERO, "flat");
+}
+per_path!(withdraw_flat_account_everything);
+
+/// F1 (s517 D3, SAFE variant): 5x everywhere. Long 5 @100 in m1 (IM 100,
+/// 10% floor 50), a resting bid 5 @100 in m2 (reservation 100), 100
+/// available: withdrawing 100 would leave only the reservation behind the
+/// position → REJECTED (the unsafe variant, equity − amount = 100 >= 100,
+/// allowed it; if the bid then filled, IM 200 would sit on 100).
+fn withdraw_cannot_use_resting_reservations_as_collateral(path: Path) {
+    let t = addr(2);
+    let (_d, mut ctx) = fresh(path, &[addr(3)]);
+    let five_x = vec![MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 }];
+    tiered(&mut ctx, 1, five_x.clone());
+    tiered(&mut ctx, 2, five_x);
+    fund_native(&ctx, &t, fp(200));
+    run(&mut ctx, path, &[place(addr(3), limit(1, false, 100, 5))]);
+    assert!(run(&mut ctx, path, &[place(t, limit(1, true, 100, 5))])[0].success, "{path:?}");
+    assert!(run(&mut ctx, path, &[place(t, limit(2, true, 100, 5))])[0].success, "{path:?}");
+    assert_bal(&ctx, &t, fp(100), fp(100), "position + resting bid");
+    for amount in [100, 1] {
+        let r = run(&mut ctx, path, &[to_spot(t, fp(amount))]);
+        assert!(!r[0].success, "{path:?} amount={amount}: must be rejected");
+        assert!(r[0].error.as_deref().unwrap_or("").contains("under-margined"), "{path:?}: {:?}", r[0].error);
+    }
+    assert_bal(&ctx, &t, fp(100), fp(100), "unchanged");
+}
+per_path!(withdraw_cannot_use_resting_reservations_as_collateral);
+
+// ============================================================================
+// Placement: the account check is the ONLY gate (D1, strict HL)
+// ============================================================================
+
+/// F1 repro (design doc): 100 at 20x, market sell 20 @100 (IM 100) twice in
+/// successive blocks. Per-order margin gave the second the same 100 again
+/// (~40x). Account-level: the second is rejected; still short 20.
+fn forty_x_sequential(path: Path) {
+    let (maker, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[maker]);
+    fund_native(&ctx, &t, fp(100));
+    run(&mut ctx, path, &[place(maker, limit(1, true, 100, 40))]);
+    let sell = market(1, false, fp(1), 20);
+    let r = run(&mut ctx, path, &[place(t, sell.clone())]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_eq!(pos_in(&ctx, &t, 1), -fp(20), "{path:?}: first opens 20x");
+    let r = run(&mut ctx, path, &[place(t, sell)]);
+    assert!(!r[0].success, "{path:?}: second must be rejected");
+    assert!(r[0].error.as_deref().unwrap_or("").starts_with("insufficient margin"), "{path:?}: {:?}", r[0].error);
+    assert_eq!(pos_in(&ctx, &t, 1), -fp(20), "{path:?}");
+    assert_bal(&ctx, &t, fp(100), FixedPoint::ZERO, "no reservation left");
+}
+per_path!(forty_x_sequential);
+
+/// F1: the same two sells in ONE run (single path: two blocks; batch: one
+/// batch — sell A takes 19 on the exclusive pool, sell B the last 1). Never
+/// past 20.
+fn forty_x_one_batch(path: Path) {
+    let (maker, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[maker]);
+    fund_native(&ctx, &t, fp(100));
+    run(&mut ctx, path, &[place(maker, limit(1, true, 100, 40))]);
+    let sell = market(1, false, fp(1), 20);
+    run(&mut ctx, path, &[place(t, sell.clone()), place(t, sell)]);
+    assert_eq!(pos_in(&ctx, &t, 1), -fp(20), "{path:?}: at most 20x");
+    assert_bal(&ctx, &t, fp(100), FixedPoint::ZERO, "released");
+}
+per_path!(forty_x_one_batch);
+
+/// F1: two checked market sells of one sender in two markets in one run
+/// cannot both spend the same 100 (per-order margin opened 39-40 on 100).
+fn cross_market_cannot_double_spend(path: Path) {
+    let (m1, m2, t) = (addr(1), addr(3), addr(2));
+    let (_d, mut ctx) = fresh(path, &[m1, m2]);
+    fund_native(&ctx, &t, fp(100));
+    run(&mut ctx, path, &[place(m1, limit(1, true, 100, 20)), place(m2, limit(2, true, 100, 20))]);
+    run(&mut ctx, path, &[place(t, market(1, false, fp(1), 20)), place(t, market(2, false, fp(1), 20))]);
+    let open = abs(pos_in(&ctx, &t, 1)) + abs(pos_in(&ctx, &t, 2));
+    assert!(open <= fp(20), "{path:?}: opened {open} on 100 at 20x");
+    assert_bal(&ctx, &t, fp(100), FixedPoint::ZERO, "released");
+}
+per_path!(cross_market_cannot_double_spend);
+
+fn tiers_20_then_5() -> Vec<MarginTier> {
+    vec![
+        MarginTier { max_notional: fp(1_000), max_leverage: 20 },
+        MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 },
+    ]
+}
+
+/// F1: tiers <= 1,000 at 20x, above 5x; 200 funded; GTC buys of 5 @100 (IM
+/// 25 each at its own tier). The 3rd makes the POSITION 1,500 (IM 300): +250
+/// > free 150 → rejected. One block per order.
+fn position_tier_per_block(path: Path) {
+    let (maker, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[maker]);
+    tiered(&mut ctx, 1, tiers_20_then_5());
+    fund_native(&ctx, &t, fp(200));
+    run(&mut ctx, path, &[place(maker, limit(1, false, 100, 20))]);
+    let mut ok = Vec::new();
+    for _ in 0..3 {
+        ok.push(run(&mut ctx, path, &[place(t, limit(1, true, 100, 5))])[0].success);
+    }
+    assert_eq!(ok, vec![true, true, false], "{path:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), fp(10), "{path:?}");
+}
+per_path!(position_tier_per_block);
+
+/// F1: the same three buys in ONE run (batch: the Phase-2 projection
+/// charges the 3rd at the projected position's tier).
+fn position_tier_one_run(path: Path) {
+    let (maker, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[maker]);
+    tiered(&mut ctx, 1, tiers_20_then_5());
+    fund_native(&ctx, &t, fp(200));
+    run(&mut ctx, path, &[place(maker, limit(1, false, 100, 20))]);
+    let buy = limit(1, true, 100, 5);
+    let r = run(&mut ctx, path, &[place(t, buy.clone()), place(t, buy.clone()), place(t, buy)]);
+    let ok: Vec<bool> = r.iter().map(|x| x.success).collect();
+    assert_eq!(ok, vec![true, true, false], "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), fp(10), "{path:?}");
+}
+per_path!(position_tier_one_run);
+
+/// F1: funded 100, long 10 @100 in m1 (IM 50). GTC buy `qty` @100 in m2.
+/// mark 110: UPnL +100, IM 55 → free 145 ≥ 100 (qty 20) ✓;
+/// mark 100: free 50 < 100 ✗, qty 10 (50) ✓; mark 95: free 2.5 < 5 (qty 1) ✗.
+fn upnl_counts(path: Path) {
+    for (mark, qty, ok) in [(110, 20, true), (100, 20, false), (100, 10, true), (95, 1, false)] {
+        let t = addr(2);
+        let (_d, mut ctx) = fresh(path, &[addr(4)]);
+        long_10(&mut ctx, path, t, fp(100));
+        set_mark(&ctx, 1, fp(mark));
+        run(&mut ctx, path, &[place(addr(4), limit(2, false, 100, qty))]);
+        let r = run(&mut ctx, path, &[place(t, limit(2, true, 100, qty))]);
+        assert_eq!(r[0].success, ok, "{path:?} mark={mark} qty={qty}: {:?}", r[0].error);
+    }
+}
+per_path!(upnl_counts);
+
+/// F1 (s517 #2): no oracle — the position is valued at ENTRY (UPnL 0), not
+/// at the last trade: long 10 @100 on 100 → free 50 even after others trade
+/// at 120.
+fn no_mark_values_at_entry(path: Path) {
+    for (qty, ok) in [(10, true), (11, false)] {
+        let t = addr(2);
+        let (_d, mut ctx) = fresh(path, &[addr(4), addr(5), addr(6)]);
+        long_10(&mut ctx, path, t, fp(100));
+        run(&mut ctx, path, &[place(addr(5), limit(1, false, 120, 1))]);
+        run(&mut ctx, path, &[place(addr(6), limit(1, true, 120, 1))]);
+        run(&mut ctx, path, &[place(addr(4), limit(2, false, 100, qty))]);
+        let r = run(&mut ctx, path, &[place(t, limit(2, true, 100, qty))]);
+        assert_eq!(r[0].success, ok, "{path:?} qty={qty}: {:?}", r[0].error);
+    }
+}
+per_path!(no_mark_values_at_entry);
+
+/// s517 D1 (STRICT HL): unrealized profit funds a reservation beyond cash.
+/// Funded 100, long 10 @100 in m1; mark 150: UPnL +500, IM 75 → free 525.
+/// A resting GTC bid 60 @100 in m2 reserves 300 > available 100: ACCEPTED,
+/// available goes to −200 (the old `available >= reservation` gate rejected
+/// it). Without a mark (entry fallback, UPnL 0): free 50 < 300 → rejected.
+fn upnl_funds_a_reservation_beyond_cash(path: Path) {
+    for with_mark in [true, false] {
+        let t = addr(2);
+        let (_d, mut ctx) = fresh(path, &[]);
+        long_10(&mut ctx, path, t, fp(100));
+        if with_mark {
+            set_mark(&ctx, 1, fp(150));
+        }
+        let r = run(&mut ctx, path, &[place(t, limit(2, true, 100, 60))]);
+        let what = format!("{path:?} mark={with_mark}");
+        assert_eq!(r[0].success, with_mark, "{what}: {:?}", r[0].error);
+        if with_mark {
+            assert_bal(&ctx, &t, -fp(200), fp(300), &what);
+            assert_eq!(resting_in(&ctx, &t, 2), vec![fp(60)], "{what}");
+        } else {
+            assert!(r[0].error.as_deref().unwrap_or("").starts_with("insufficient margin"), "{what}");
+            assert_bal(&ctx, &t, fp(100), FixedPoint::ZERO, &what);
+        }
+    }
+}
+per_path!(upnl_funds_a_reservation_beyond_cash);
+
+/// s517 D1: a negative-cash account withdraws nothing (cash bound `amount
+/// <= available`, lockbox) on either withdrawal action; closing the
+/// profitable position realizes the UPnL and brings `available` back >= 0
+/// with collateral conserved: −200 − 75 (the closing sell's reservation) +
+/// 500 (PnL 10 × (150 − 100)) + 75 (released) = 300, order margin still
+/// 300 (the m2 bid), total 600 = 100 funded + 500.
+fn negative_cash_cannot_withdraw_and_closing_restores_it(path: Path) {
+    let (t, bidder) = (addr(2), addr(5));
+    let (_d, mut ctx) = fresh(path, &[bidder]);
+    long_10(&mut ctx, path, t, fp(100));
+    set_mark(&ctx, 1, fp(150));
+    assert!(run(&mut ctx, path, &[place(t, limit(2, true, 100, 60))])[0].success, "{path:?}");
+    for a in [to_spot(t, fp(1)), withdraw_to(t, fp(1))] {
+        let r = run(&mut ctx, path, &[a]);
+        assert!(!r[0].success, "{path:?}: negative cash must not withdraw");
+    }
+    assert_bal(&ctx, &t, -fp(200), fp(300), "unchanged");
+    run(&mut ctx, path, &[place(bidder, limit(1, true, 150, 10))]);
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 150, 10))]);
+    assert!(r[0].success, "{path:?}: closing is always allowed: {:?}", r[0].error);
+    assert_eq!(pos_in(&ctx, &t, 1), FixedPoint::ZERO, "{path:?}");
+    assert_bal(&ctx, &t, fp(300), fp(300), "PnL realized, bid still reserved");
+}
+per_path!(negative_cash_cannot_withdraw_and_closing_restores_it);
+
+// ============================================================================
+// Decision s517 (T7): Phase 2 credits the IM that the sender's EARLIER
+// orders of the batch are projected to release ONLY to match-checked orders
+// ============================================================================
+
+/// `t` long 20 @100 in market 1 (20x: IM 100) with 200 available and no
+/// order margin; counterparty addr(3), whose ask is fully consumed.
+fn long_20_on_200(ctx: &mut NativeExecContext, path: Path, t: Address) {
+    fund_native(ctx, &addr(3), fp(FUNDING));
+    assert!(run(ctx, path, &[place(addr(3), limit(1, false, 100, 20))])[0].success, "{path:?}");
+    fund_native(ctx, &t, fp(200));
+    assert!(run(ctx, path, &[place(t, limit(1, true, 100, 20))])[0].success, "{path:?}");
+    assert_eq!(pos_in(ctx, &t, 1), fp(20), "{path:?}");
+    assert_bal(ctx, &t, fp(200), FixedPoint::ZERO, "after open");
+}
+
+/// Decision s517 (strict side): long 20 @100 (IM 100), 200 available. One
+/// run = [GTC sell 20 @110 that RESTS (no bids; reserves 110 → available
+/// 90), GTC buy 10 @100 in m2 (need IM 50)]. The buy is unchecked at match,
+/// so it gets NO credit for the sell's projected release: free = 90 − 100 =
+/// −10 < 50 → rejected (with the credit, 90 + 0 ≥ 50 would have passed —
+/// and the sell released nothing). Same on every path.
+fn unchecked_order_gets_no_projected_release_credit(path: Path) {
+    let t = addr(2);
+    let (_d, mut ctx) = fresh(path, &[]);
+    long_20_on_200(&mut ctx, path, t);
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 110, 20)), place(t, limit(2, true, 100, 10))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert!(!r[1].success, "{path:?}: the GTC buy must be rejected");
+    assert!(r[1].error.as_deref().unwrap_or("").starts_with("insufficient margin"), "{path:?}: {:?}", r[1].error);
+    assert_eq!(resting_in(&ctx, &t, 1), vec![fp(20)], "{path:?}: the sell rests");
+    assert!(resting_in(&ctx, &t, 2).is_empty(), "{path:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), fp(20), "{path:?}");
+    assert_bal(&ctx, &t, fp(90), fp(110), &format!("{path:?}"));
+}
+per_path!(unchecked_order_gets_no_projected_release_credit);
+
+/// Decision s517 (checked side): same long, maker addr(4) asks 5 @100 in
+/// m1. One run = [GTC sell 20 @110 that rests (available 90), market BUY 1
+/// cap 100 (reserves 5; increases the long)]. Batch paths: the market buy
+/// is match-checked, so Phase 2 credits the sell's projected release (100)
+/// and ACCEPTS it (need 5 on the projected flat position <= 90 − 100 + 100
+/// = 90). At match the real position is still long 20: need IM(2,100) −
+/// IM(2,000) = 5 > budget 5 + pool (85 − 100 = −15) = −10 → nothing fills,
+/// the reservation comes back. Single path: the sell rests first, the buy
+/// sees the real long (need 5 > free −10) and is rejected at placement.
+/// Either way: still long 20, maker's ask untouched, 90 / 110.
+fn checked_order_credit_is_bounded_at_match(path: Path) {
+    let (t, mk) = (addr(2), addr(4));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    long_20_on_200(&mut ctx, path, t);
+    assert!(run(&mut ctx, path, &[place(mk, limit(1, false, 100, 5))])[0].success, "{path:?}");
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 110, 20)), place(t, market(1, true, fp(100), 1))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    let accepted = !matches!(path, Path::Single);
+    assert_eq!(r[1].success, accepted, "{path:?}: {:?}", r[1].error);
+    assert_eq!(pos_in(&ctx, &t, 1), fp(20), "{path:?}: nothing released, nothing opened");
+    assert_eq!(resting_in(&ctx, &mk, 1), vec![fp(5)], "{path:?}: maker's ask untouched");
+    assert_eq!(resting_in(&ctx, &t, 1), vec![fp(20)], "{path:?}: the sell rests");
+    assert_bal(&ctx, &t, fp(90), fp(110), &format!("{path:?}"));
+}
+per_path!(checked_order_credit_is_bounded_at_match);
+
+// ============================================================================
+// Makers: HL `marginCanceled` (s517 decision 4)
+// ============================================================================
+
+/// F1 (s517 #4, HL marginCanceled): M (100) rests bid 10 @100 in m1 (50
+/// reserved), then opens long 10 @100 in m2 (IM 50). Mark m2 at 90: UPnL
+/// −100, IM 45 → free −95. T's market sell 10 in m1 cancels M's bid (its
+/// reservation comes back) and fills M2's bid @99. At mark 100 (free 0) M's
+/// bid fills (IM 50 == its share).
+fn maker_margin_cancel(path: Path) {
+    for (mark, cancelled) in [(90, true), (100, false)] {
+        let (m, cp, m2, t) = (addr(1), addr(3), addr(4), addr(2));
+        let (_d, mut ctx) = fresh(path, &[cp, m2, t]);
+        fund_native(&ctx, &m, fp(100));
+        assert!(run(&mut ctx, path, &[place(m, limit(1, true, 100, 10))])[0].success);
+        run(&mut ctx, path, &[place(cp, limit(2, false, 100, 10))]);
+        assert!(run(&mut ctx, path, &[place(m, limit(2, true, 100, 10))])[0].success);
+        assert_eq!(pos_in(&ctx, &m, 2), fp(10));
+        set_mark(&ctx, 2, fp(mark));
+        run(&mut ctx, path, &[place(m2, limit(1, true, 99, 10))]);
+        let r = run(&mut ctx, path, &[place(t, market(1, false, fp(1), 10))]);
+        let what = format!("{path:?} mark={mark}");
+        assert!(r[0].success, "{what}: {:?}", r[0].error);
+        assert_eq!(pos_in(&ctx, &t, 1), -fp(10), "{what}");
+        assert!(resting_in(&ctx, &m, 1).is_empty(), "{what}: M's bid gone either way");
+        assert_eq!(pos_in(&ctx, &m, 1), if cancelled { FixedPoint::ZERO } else { fp(10) }, "{what}");
+        assert_eq!(pos_in(&ctx, &m2, 1), if cancelled { fp(10) } else { FixedPoint::ZERO }, "{what}");
+        assert_bal(&ctx, &m, fp(100), FixedPoint::ZERO, &format!("{what}: reservation released"));
+    }
+}
+per_path!(maker_margin_cancel);
+
+// ============================================================================
+// Review fixes s517
+// ============================================================================
+
+/// Review fix 1 (s517): Phase 2 admits an order by its POSITION-tier need
+/// but debits only the order-tier reservation; the part of the need beyond
+/// it must stay committed for the sender's later orders of the batch.
+/// Tiers <= 1,000 at 20x, above 5x; mark 100; long 10 (IM 50) on 300 →
+/// free 250. One run of two GTC buys 5 @100 crossing asks: #1 needs
+/// IM(1,500) − IM(1,000) = 250 <= 250 (reserves 25, commits 225 more); #2
+/// needs IM(2,000) − IM(1,500) = 100 > 0 left → REJECTED on every path
+/// (was: 100 <= 275 − 50 → long 20, IM 400 on equity 300).
+fn batch_commits_the_position_tier_need(path: Path) {
+    let t = addr(2);
+    let (_d, mut ctx) = fresh(path, &[addr(3)]);
+    tiered(&mut ctx, 1, tiers_20_then_5());
+    run(&mut ctx, path, &[place(addr(3), limit(1, false, 100, 20))]);
+    fund_native(&ctx, &t, fp(FUNDING));
+    assert!(run(&mut ctx, path, &[place(t, limit(1, true, 100, 10))])[0].success, "{path:?}");
+    fund_native(&ctx, &t, fp(300));
+    set_mark(&ctx, 1, fp(100));
+    let buy = limit(1, true, 100, 5);
+    let r = run(&mut ctx, path, &[place(t, buy.clone()), place(t, buy)]);
+    let ok: Vec<bool> = r.iter().map(|x| x.success).collect();
+    assert_eq!(ok, vec![true, false], "{path:?}: {r:?}");
+    assert!(r[1].error.as_deref().unwrap_or("").starts_with("insufficient margin"), "{path:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), fp(15), "{path:?}");
+    assert_bal(&ctx, &t, fp(300), FixedPoint::ZERO, &format!("{path:?}"));
+}
+per_path!(batch_commits_the_position_tier_need);
+
+/// Review fix 2 (s517): a sender's D2 taker pool (0 outside the market of
+/// its first checked taker) is NOT its maker free margin. M (1,000) long 5
+/// @100 in m2 (tiers 20x <= 1,000, 5x above) rests bid 10 @100 there. One
+/// run: M market-sells 1 in m1 (its first checked taker → m1 gets the
+/// pool) and 1 in m2 (closing, fills addr 4's bid @101); then X market-
+/// sells 10 in m2 into M's bid. M's fill costs IM(1,400) − IM(400) − its
+/// share IM(1,000) = 260 − 50 = 210 <= its snapshot free (~925) → FILLS
+/// (was: checked against the m2 pool 0 → marginCanceled).
+fn maker_uses_its_snapshot_not_the_taker_pool(path: Path) {
+    let (m, cp, b, x) = (addr(1), addr(3), addr(4), addr(6));
+    let (_d, mut ctx) = fresh(path, &[m, cp, b, x]);
+    tiered(&mut ctx, 2, tiers_20_then_5());
+    run(&mut ctx, path, &[place(cp, limit(2, false, 100, 5))]);
+    assert!(run(&mut ctx, path, &[place(m, limit(2, true, 100, 5))])[0].success, "{path:?}");
+    assert!(run(&mut ctx, path, &[place(m, limit(2, true, 100, 10))])[0].success, "{path:?}");
+    run(&mut ctx, path, &[place(b, limit(1, true, 100, 1)), place(b, limit(2, true, 101, 1))]);
+    let r = run(
+        &mut ctx,
+        path,
+        &[
+            place(m, market(1, false, fp(1), 1)),
+            place(m, market(2, false, fp(1), 1)),
+            place(x, market(2, false, fp(1), 10)),
+        ],
+    );
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &x, 2), -fp(10), "{path:?}: X filled against M's bid");
+    assert_eq!(pos_in(&ctx, &m, 2), fp(14), "{path:?}: 5 − 1 + 10");
+    assert!(resting_in(&ctx, &m, 2).is_empty(), "{path:?}");
+}
+per_path!(maker_uses_its_snapshot_not_the_taker_pool);
+
+/// Review fix 4 (s517): in the book holding a sender's D2 taker pool, its
+/// resting makers are checked against that SAME running entry (not the
+/// pre-batch snapshot). m1 tiers 20x <= 1,000, 5x above. S (242.5) rests
+/// bid 5 @90 (22.5) → pre-batch free 220. One run: S market-buys 11 cap 100
+/// into asks @100 (need IM(1,100) = 220 = its whole pool → running free 0),
+/// then T market-sells 5 into S's bid: S's cost IM(990 + 450) − IM(990) −
+/// share 22.5 = 216 > 0 → S's bid is margin-cancelled (was: 216 <= the
+/// snapshot 220 → filled, long 16 on 242.5). Single path: after the buy S
+/// is long 11 at entry 100 (free 0), cost 67.5 → cancelled too. Every path:
+/// S long 11, T flat, S's bid gone, all of S's reservations released.
+fn maker_in_its_pool_market_shares_the_pool(path: Path) {
+    let (s, cp, t) = (addr(1), addr(3), addr(2));
+    let (_d, mut ctx) = fresh(path, &[cp, t]);
+    tiered(&mut ctx, 1, tiers_20_then_5());
+    fund_native(&ctx, &s, fp_cents(24_250));
+    assert!(run(&mut ctx, path, &[place(s, limit(1, true, 90, 5))])[0].success, "{path:?}");
+    run(&mut ctx, path, &[place(cp, limit(1, false, 100, 11))]);
+    assert_bal(&ctx, &s, fp(220), fp_cents(2_250), "setup");
+    let r = run(&mut ctx, path, &[place(s, market(1, true, fp(100), 11)), place(t, market(1, false, fp(1), 5))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_eq!(pos_in(&ctx, &s, 1), fp(11), "{path:?}: the bid must not fill");
+    assert_eq!(pos_in(&ctx, &t, 1), FixedPoint::ZERO, "{path:?}");
+    assert!(resting_in(&ctx, &s, 1).is_empty(), "{path:?}: bid margin-cancelled");
+    assert_bal(&ctx, &s, fp_cents(24_250), FixedPoint::ZERO, &format!("{path:?}"));
+}
+per_path!(maker_in_its_pool_market_shares_the_pool);

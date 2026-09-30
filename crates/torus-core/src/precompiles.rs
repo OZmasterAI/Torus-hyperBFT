@@ -204,6 +204,13 @@ pub mod abi {
         encode_u128(fp.raw() as u128)
     }
 
+    /// F1/D1 (s517): a balance that may be negative, as a `uint128`:
+    /// negative → 0 (the ABI stays `uint128`; a raw cast would wrap it to
+    /// ~2^128).
+    pub fn encode_balance_as_u128(fp: FixedPoint) -> [u8; 32] {
+        encode_u128(fp.raw().max(0) as u128)
+    }
+
     pub fn encode_fp_as_i128(fp: FixedPoint) -> [u8; 32] {
         encode_i128(fp.raw())
     }
@@ -565,11 +572,12 @@ fn read_balances(state_db: &impl StateBackend, trader: &Address) -> Result<Vec<u
     };
 
     let mut out = Vec::with_capacity(128);
-    out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.available));
+    // F1/D1 (s517): `available` may be negative — reported as 0.
+    out.extend_from_slice(&abi::encode_balance_as_u128(native_bal.available));
     out.extend_from_slice(&abi::encode_u128(evm_balance));
     out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.order_margin));
     // available = native_available (native balance not locked in orders)
-    out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.available));
+    out.extend_from_slice(&abi::encode_balance_as_u128(native_bal.available));
     Ok(out)
 }
 

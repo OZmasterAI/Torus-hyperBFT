@@ -2,7 +2,8 @@
 
 use torus_core::error::CoreError;
 use torus_core::margin::{
-    default_margin_tiers, effective_max_leverage, MarginEngine, MarketMarginConfig,
+    default_margin_tiers, effective_max_leverage, order_initial_margin, placement_need,
+    AccountView, MarginEngine, MarginTier, MarketMarginConfig,
 };
 use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_state::StateDb;
@@ -457,4 +458,125 @@ fn unrealized_pnl_short() {
 
     assert_eq!(pos.unrealized_pnl(fp(48_000)), fp(6_000));
     assert_eq!(pos.unrealized_pnl(fp(52_000)), fp(-6_000));
+}
+
+fn cross(market_id: u64, is_long: bool, size: i64, entry: i64) -> Position {
+    Position {
+        trader: addr(1),
+        market_id,
+        is_long,
+        size: fp(size),
+        entry_price: fp(entry),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    }
+}
+
+fn tiers_20_then_5() -> Vec<MarginTier> {
+    vec![
+        MarginTier { max_notional: fp(1_000), max_leverage: 20 },
+        MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 },
+    ]
+}
+
+/// F1: equity = available + order_margin + UPnL (order margin ONCE); UPnL,
+/// notional and IM at the mark, at the entry price without one (s517 #2).
+#[test]
+fn account_view_values_positions_at_mark_else_entry() {
+    let bal = NativeBalance { available: fp(1_000), order_margin: fp(300) };
+    let ps = [cross(1, true, 10, 100), cross(2, false, 5, 200)];
+    // m1 mark 110: UPnL +100, notional 1,100, IM 55. m2 no mark: 0 / 1,000 / 50.
+    let v = AccountView::build(&bal, &ps, |m| (m == 1).then(|| fp(110)), |_| None).unwrap();
+    assert_eq!(v.upnl, fp(100));
+    assert_eq!(v.notional, fp(2_100));
+    assert_eq!(v.position_im, fp(105));
+    assert_eq!(v.equity(), fp(1_400));
+    assert_eq!(v.pos_net(), -fp(5));
+    assert_eq!(v.free(), fp(995));
+}
+
+/// F1: a position's IM uses the POSITION's notional tier (1,500 → 5x).
+#[test]
+fn account_view_charges_the_position_size_tier() {
+    let t = tiers_20_then_5();
+    let bal = NativeBalance { available: fp(1_000), order_margin: FixedPoint::ZERO };
+    let v = AccountView::build(&bal, &[cross(1, true, 15, 100)], |_| None, |_| Some(t.as_slice())).unwrap();
+    assert_eq!(v.position_im, fp(300));
+}
+
+/// F1 (s517 #5, SAFE variant): amount <= available AND
+/// equity − order_margin − amount >= max(Σ IM, 10% × Σ notional).
+#[test]
+fn account_view_withdrawal_rule() {
+    let bal = NativeBalance { available: fp(150), order_margin: FixedPoint::ZERO };
+    let v = AccountView::build(&bal, &[cross(1, true, 10, 100)], |_| None, |_| None).unwrap();
+    assert_eq!(v.transfer_required(), fp(100)); // max(IM 50, 10% x 1,000)
+    assert!(v.withdrawal_allowed(fp(50)));
+    assert!(!v.withdrawal_allowed(fp(51)));
+    assert!(!v.withdrawal_allowed(fp(151)));
+    let flat = AccountView::build(&bal, &[], |_| None, |_| None).unwrap();
+    assert!(flat.withdrawal_allowed(fp(150)));
+}
+
+/// F1 (s517 D3 = SAFE): a resting order's reservation is not collateral for
+/// the positions. 5x: long 5 @100 (IM 100, 10% floor 50), 100 reserved by a
+/// resting order, 100 available: withdrawing 100 would leave the positions
+/// backed only by the reservation → REJECTED (equity − amount = 100 would
+/// have passed). Nothing is withdrawable (100 + 0 − 1 < 100).
+#[test]
+fn account_view_reservations_do_not_back_withdrawals() {
+    let t = vec![MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 }];
+    let bal = NativeBalance { available: fp(100), order_margin: fp(100) };
+    let v = AccountView::build(&bal, &[cross(1, true, 5, 100)], |_| None, |_| Some(t.as_slice())).unwrap();
+    assert_eq!(v.transfer_required(), fp(100));
+    assert!(!v.withdrawal_allowed(fp(100)));
+    assert!(!v.withdrawal_allowed(fp(1)));
+}
+
+/// F1 (D1 = strict HL): a negative cash balance withdraws nothing.
+#[test]
+fn account_view_negative_available_withdraws_nothing() {
+    let bal = NativeBalance { available: -fp(200), order_margin: fp(300) };
+    let v = AccountView::build(&bal, &[cross(1, true, 10, 100)], |_| Some(fp(150)), |_| None).unwrap();
+    assert!(v.free() > FixedPoint::ZERO); // UPnL 500 − IM 75 − 200
+    assert!(!v.withdrawal_allowed(fp(1)));
+}
+
+/// F1: placement need — same side at the position tier, closing <= 0, a
+/// flip releases the old IM, a resting order's opening part counts.
+#[test]
+fn account_placement_need() {
+    let t = tiers_20_then_5();
+    let t = Some(t.as_slice());
+    let z = FixedPoint::ZERO;
+    // long 10 valued at 100 (IM 50): buy 5 @100 → 1,500 (IM 300): +250
+    assert_eq!(placement_need(t, fp(10), fp(100), true, fp(5), fp(100), false), Some(fp(250)));
+    // closing sell 5: IM 50 → 25
+    assert_eq!(placement_need(t, fp(10), fp(100), false, fp(5), fp(100), false), Some(-fp(25)));
+    // flip: sell 15 → short 5 (IM 25): −25
+    assert_eq!(placement_need(t, fp(10), fp(100), false, fp(15), fp(100), false), Some(-fp(25)));
+    // the same sell as a resting GTC: its opening 5 on top of the long: IM(1,500) − 50
+    assert_eq!(placement_need(t, fp(10), fp(100), false, fp(15), fp(100), true), Some(fp(250)));
+    // a resting closing sell needs nothing
+    assert_eq!(placement_need(t, fp(10), fp(100), false, fp(10), fp(100), true), Some(z));
+    // flat: plain order IM
+    assert_eq!(placement_need(t, z, z, true, fp(5), fp(100), true), Some(fp(25)));
+    assert_eq!(order_initial_margin(t, fp(500)), fp(25));
+}
+
+/// F1 (s517 #2): without an oracle price, maintenance is taken at the entry
+/// price (was: the position was skipped → 0).
+#[test]
+fn maintenance_uses_entry_price_without_a_mark() {
+    let (_dir, pm) = setup();
+    let trader = addr(1);
+    pm.put_position(&Position {
+        trader,
+        ..cross(1, true, 1, 50_000)
+    })
+    .unwrap();
+    let config = MarketMarginConfig::new(1, 50);
+    let m = MarginEngine::total_maintenance_margin(&pm, &trader, &config, &[]).unwrap();
+    assert_eq!(m, fp(500)); // IM 50,000/50 = 1,000 × 50%
 }

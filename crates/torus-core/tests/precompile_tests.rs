@@ -323,6 +323,25 @@ fn balance_reader_get_balances() {
     assert_eq!(evm, 5_000u128 * FixedPoint::SCALE as u128);
 }
 
+/// F1/D1 (s517): `available` may be negative (UPnL-funded reservations). The
+/// uint128 ABI fields report it as 0 — `raw as u128` used to wrap −200 to
+/// ~3.4e38. Order margin is reported as is.
+#[test]
+fn balance_reader_clamps_negative_available_to_zero() {
+    let (_dir, db) = setup();
+    let trader = addr(1);
+    PositionManager::new(db.clone())
+        .put_native_balance(&trader, &NativeBalance { available: -fp(200), order_margin: fp(300) })
+        .unwrap();
+    let address = precompile_address(ADDR_BALANCE_READER);
+    let input = build_input("getBalances(address)", &[encode_addr(&trader)]);
+    let out = execute_precompile(&address, &input, &addr(0), &db, 100).unwrap();
+    let word = |i: usize| u128::from_be_bytes(out[32 * i + 16..32 * i + 32].try_into().unwrap());
+    assert_eq!(word(0), 0, "native_balance");
+    assert_eq!(word(2), fp(300).raw() as u128, "total_margin_used");
+    assert_eq!(word(3), 0, "available");
+}
+
 // ============================================================================
 // OracleReader Precompile Tests
 // ============================================================================

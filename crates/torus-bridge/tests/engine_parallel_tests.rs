@@ -1287,3 +1287,108 @@ fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
     }
     assert!(runs.windows(2).all(|w| w[0] == w[1]));
 }
+
+// ============================================================================
+// F1 (s517): account-level margin shapes
+// ============================================================================
+
+/// Publish `price` as market `market_id`'s aggregated oracle (mark) price
+/// (copied from market_order_margin_tests.rs).
+fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
+    let reporters = [addr(150), addr(151), addr(152)];
+    for v in &reporters {
+        ctx.oracle
+            .submit_price(v, market_id, price, ctx.block_height, ctx.timestamp)
+            .unwrap();
+    }
+    let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
+    let agg = ctx
+        .oracle
+        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .unwrap();
+    assert_eq!(agg, price, "test oracle aggregates to the mark");
+}
+
+fn mkt(market_id: MarketId, is_buy: bool, cap: i64, qty: i64) -> PlaceOrderParams {
+    PlaceOrderParams {
+        order_type: OrderType::Market,
+        time_in_force: TimeInForce::IOC,
+        ..gtc(market_id, is_buy, cap, qty)
+    }
+}
+
+/// F1 (s517): account-level shapes — a sender with positions sending
+/// checked takers into three markets in one batch (exclusive pool, running
+/// budget, flip), an under-water maker cancelled mid-batch (HL
+/// marginCanceled), a UPnL-funded reservation taking cash negative, a
+/// withdrawal against positions — byte-identical for threads {off, 2, 4, 8}.
+#[test]
+fn f1_account_margin_shapes_identical() {
+    let (t, mk) = (addr(40), addr(41));
+    let mut b1 = Vec::new();
+    for m in 1..=4u64 {
+        if m < 4 {
+            b1.push(place(addr(2), gtc(m, false, 100, 40))); // no asks in m4
+        }
+        b1.push(place(addr(3), gtc(m, true, 99, 40)));
+    }
+    b1.push(place(t, gtc(1, true, 100, 10))); // t long 10 in m1
+    b1.push(place(mk, gtc(4, true, 100, 10))); // mk's bid rests at the top of m4
+    b1.push(place(mk, gtc(2, true, 100, 10))); // mk long 10 in m2 (mark 80 later: under water)
+    let b2 = vec![
+        place(t, mkt(1, false, 1, 30)), // flip: 10 close, 20 open
+        place(t, mkt(2, false, 1, 20)),
+        place(t, mkt(3, false, 1, 20)),
+        place(addr(5), mkt(4, false, 1, 10)), // hits mk's bid first
+        place(t, gtc(5, true, 100, 60)),      // D1: UPnL-funded (mark m1 150), cash → negative
+        (
+            t,
+            NativeAction::TransferToSpot {
+                amount: alloy_primitives::U256::from(fp(1).raw() as u128),
+            },
+        ),
+    ];
+    let run = |threads: usize| -> RunFingerprint {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        for a in [addr(2), addr(3), addr(5)] {
+            fund_native(&ctx, &a, fp(1_000_000));
+        }
+        fund_native(&ctx, &t, fp(200));
+        fund_native(&ctx, &mk, fp(100));
+        let mut results = Vec::new();
+        let mut total_gas = Vec::new();
+        for (k, batch) in [b1.clone(), b2.clone()].iter().enumerate() {
+            if k == 1 {
+                set_mark(&ctx, 2, fp(80)); // mk under water before batch 2
+                set_mark(&ctx, 1, fp(150)); // t in profit: funds the m5 bid beyond cash
+            }
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, batch, threads);
+            assert!(ctx.fatal_error.is_none());
+            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            total_gas.push(r.total_gas);
+        }
+        // Sanity: the shape really exercises the maker cancel — mk's m4 bid
+        // is gone and mk never got a position there.
+        assert!(
+            ctx.order_books.get(&4).is_none_or(|b| b.orders_for_trader(&mk).is_empty()),
+            "threads={threads}: mk's under-water bid must be margin-cancelled"
+        );
+        assert!(ctx.positions.get_position(&mk, 4).unwrap().is_none(), "threads={threads}");
+        ctx.save_order_books();
+        RunFingerprint {
+            cf_dump: state_dump(&ctx),
+            results,
+            total_gas,
+            trade_index: ctx.trade_index,
+            next_global_order_id: ctx.next_global_order_id,
+            state_root: compute_native_state_root(&ctx.state).expect("state root"),
+        }
+    };
+    let golden = run(0);
+    for threads in [2usize, 4, 8] {
+        for _ in 0..5 {
+            assert_eq!(golden, run(threads), "threads={threads}");
+        }
+    }
+}

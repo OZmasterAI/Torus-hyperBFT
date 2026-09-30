@@ -15,7 +15,7 @@ use revm::state::AccountInfo;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::lockbox::WEI_PER_NATIVE_UNIT;
-use torus_core::position::{NativeBalance, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_evm::{BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 use torus_types::FixedPoint;
@@ -372,4 +372,33 @@ fn replayed_deposit_block_credits_native_exactly_once() {
     assert_eq!(native(&db, &ALICE), fp(300));
     assert_eq!(evm_balance(&db, &ALICE), e0 - wei(300));
     assert_eq!(total_wei(&db), before, "value conservation across the replay");
+}
+
+/// F1 (s517 #5): a queued `withdrawFromNative` (drains as TransferToSpot)
+/// obeys the transfer margin: long 10 @100 (10% floor 100) on 150 native —
+/// 51 fails at the drain, 50 passes.
+#[test]
+fn queued_withdraw_respects_account_transfer_margin() {
+    for (amount, ok) in [(51u64, false), (50, true)] {
+        let (_dir, db) = open_test_db();
+        fund_evm(&db, &ALICE, wei(10));
+        seed_native(&db, &ALICE, fp(150));
+        PositionManager::new(db.clone())
+            .put_position(&Position {
+                trader: ALICE,
+                market_id: 1,
+                is_long: true,
+                size: fp(10),
+                entry_price: fp(100),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            })
+            .unwrap();
+        assert_eq!(evm_block(&db, 1, vec![withdraw(ALICE, wei(amount), 0)]), vec![true]);
+        let results = drain(&db, 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, ok, "amount {amount}: {:?}", results[0].1);
+        assert_eq!(native(&db, &ALICE), fp(if ok { 150 - amount as i64 } else { 150 }));
+    }
 }
