@@ -1927,25 +1927,30 @@ impl ExecutionContext {
             parent.as_ref().map(|p| p.height())
         );
         let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
-        // due. A read error is a node fault: fail-stop (C4), never "assume".
-        let oracle_due = match NativeExecutor::oracle_due(&overlay) {
-            Ok(due) => due,
-            Err(e) => {
-                tracing::error!(%e, height, "FATAL: oracle due-check read failed — halting execution pipeline (fail-stop)");
-                self.exec_failed.store(true, Ordering::SeqCst);
-                if fold_header {
-                    persist_block_header(&self.state_db, torus_block);
-                }
-                return;
-            }
-        };
-        // Item 2: while submission rows exist the native phase runs (oracle step).
-        let run_native = has_native
+        // due — read only when nothing else runs the native phase (review L1).
+        // A read error is a node fault: fail-stop (C4), never "assume".
+        // Bug (b): every boundary block runs it too (validator-set plans).
+        let run_native = if has_native
             || computed_fee_revenue > 0
             || core_writer_due
             || EpochManager::is_epoch_boundary(height, self.epoch_length)
-            || oracle_due;
+        {
+            true
+        } else {
+            match NativeExecutor::oracle_due(&overlay) {
+                Ok(due) => due,
+                Err(e) => {
+                    tracing::error!(%e, height, "FATAL: oracle due-check read failed — halting execution pipeline (fail-stop)");
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    if fold_header {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
+                    return;
+                }
+            }
+        };
 
         // ---- Native execution ----
         if run_native {
