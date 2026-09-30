@@ -6425,7 +6425,8 @@ impl NativeExecutor {
     /// (Hyperliquid modify = cancel + new order), validated like placement
     /// BEFORE anything is touched:
     /// - ownership (like `exec_cancel_order`);
-    /// - price > 0 on the book's tick, quantity > 0 and (when changed) >= lot;
+    /// - price > 0, a NEW price on the book's tick; quantity > 0 and (when
+    ///   changed) >= lot — before the reduce-only clamp, as in placement;
     /// - no crossing: the replacement is re-inserted, never matched, so a
     ///   price at / through the opposite best is rejected (the client cancels
     ///   and places instead) rather than resting a crossed book;
@@ -6468,7 +6469,12 @@ impl NativeExecutor {
         if price <= FixedPoint::ZERO {
             return err(format!("modify rejected: price must be positive, got {price}"));
         }
-        if book.tick_size > FixedPoint::ZERO && price.raw() % book.tick_size.raw() != 0 {
+        // s515 review 3: only a NEW price is tick-checked — an order resting
+        // off the current tick (tick changed, legacy row) can still be resized.
+        if price != old.price
+            && book.tick_size > FixedPoint::ZERO
+            && price.raw() % book.tick_size.raw() != 0
+        {
             return err(format!(
                 "modify rejected: price {price} is not a multiple of the tick {}",
                 book.tick_size
@@ -6478,6 +6484,9 @@ impl NativeExecutor {
         if qty <= FixedPoint::ZERO {
             return err(format!("modify rejected: quantity must be positive, got {qty}"));
         }
+        // Placement's convention (s515 review 3): the lot applies to the
+        // REQUESTED quantity; the reduce-only clamp below may land under it
+        // (it closes the position exactly — placement rests such an order too).
         if new_qty.is_some() && qty < book.lot_size {
             return err(format!(
                 "modify rejected: quantity {qty} below the lot size {}",
