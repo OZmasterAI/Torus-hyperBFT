@@ -61,6 +61,19 @@ pub struct TradeFill {
     pub taker_pnl_raw: i128,
 }
 
+/// One executed block's fills, shared by the trade writer and the stream sink
+/// (s80).
+#[derive(Debug)]
+pub struct BlockFills {
+    pub height: u64,
+    pub timestamp: u64,
+    pub fills: Vec<TradeFill>,
+}
+
+/// Called on the execution thread once per executed block with fills, in
+/// height order; must not block.
+pub type FillSink = std::sync::Arc<dyn Fn(std::sync::Arc<BlockFills>) + Send + Sync>;
+
 /// One entry of a `CF_NATIVE_TRADES` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketTrade {

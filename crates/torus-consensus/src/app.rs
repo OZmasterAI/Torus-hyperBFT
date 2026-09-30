@@ -534,6 +534,11 @@ struct ExecutionContext {
     /// s77: `TORUS_TRADE_HISTORY=0` turns off the node-local trade-history
     /// rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`); default on.
     trade_history: bool,
+    /// s80: optional stream sink for each executed block's fills, shared with
+    /// `TorusApp` (`set_fill_sink`). Empty = no fills are handed out and
+    /// execution is exactly as without streams. Set before consensus starts;
+    /// boot replay runs before it can be set, so replayed blocks never reach it.
+    fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>>,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1885,6 +1890,9 @@ impl ExecutionContext {
             // written after the flush below (background writer, or inline).
             ctx.defer_trades = true;
             ctx.trade_history = self.trade_history;
+            // s80: with a stream sink installed, fills are recorded even with
+            // trade history off (they never touch state either way).
+            ctx.record_fills = self.fill_sink.get().is_some();
 
             let engine_timer = std::time::Instant::now();
             NativeExecutor::execute_batch(&mut ctx, &pre_evm);
@@ -2173,30 +2181,50 @@ impl ExecutionContext {
             // crash-replay rewrite is idempotent, design §3.1 row 7).
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
+            //
+            // s80: the fills are wrapped once; the stream sink (if installed)
+            // and the trade writer share the same Arc. Emitted here, after the
+            // flush / hand-off, so a block whose hand-off failed (shutdown)
+            // is never streamed.
             if !fills.is_empty() {
-                // s77: the rows are encoded on the writer thread, not here.
-                let encode: torus_state::EncodeRows = Box::new(move || {
-                    let mut rows = torus_state::PackedCfBatch::default();
-                    torus_state::trade_rows::encode_block(fills_block, fills_ts, &fills, &mut rows);
-                    rows
+                let block = Arc::new(torus_state::trade_rows::BlockFills {
+                    height: fills_block,
+                    timestamp: fills_ts,
+                    fills,
                 });
-                // s77 order latency: fills are readable over RPC once these rows land.
-                let on_written = self.metrics.clone().map(|m| {
-                    let nonces = order_nonces.clone();
-                    Box::new(move || m.observe_order_ages(OrderStage::FillsVisible, nonces))
-                        as torus_state::bg_writer::OnWritten
-                });
-                let fallback = match &self.trade_writer {
-                    Some(writer) => writer.send_encode_then(encode, on_written).err(),
-                    None => Some((encode, on_written)),
-                };
-                // Writer gone (or absent): write synchronously so no rows are lost.
-                if let Some((encode, on_written)) = fallback {
-                    for (cf, key, value) in encode().iter() {
-                        let _ = self.state_db.put_cf_raw(cf, key, value);
-                    }
-                    if let Some(on_written) = on_written {
-                        on_written();
+                if let Some(sink) = self.fill_sink.get() {
+                    sink(block.clone());
+                }
+                if self.trade_history {
+                    // s77: the rows are encoded on the writer thread, not here.
+                    let encode: torus_state::EncodeRows = Box::new(move || {
+                        let mut rows = torus_state::PackedCfBatch::default();
+                        torus_state::trade_rows::encode_block(
+                            block.height,
+                            block.timestamp,
+                            &block.fills,
+                            &mut rows,
+                        );
+                        rows
+                    });
+                    // s77 order latency: fills are readable over RPC once these rows land.
+                    let on_written = self.metrics.clone().map(|m| {
+                        let nonces = order_nonces.clone();
+                        Box::new(move || m.observe_order_ages(OrderStage::FillsVisible, nonces))
+                            as torus_state::bg_writer::OnWritten
+                    });
+                    let fallback = match &self.trade_writer {
+                        Some(writer) => writer.send_encode_then(encode, on_written).err(),
+                        None => Some((encode, on_written)),
+                    };
+                    // Writer gone (or absent): write synchronously so no rows are lost.
+                    if let Some((encode, on_written)) = fallback {
+                        for (cf, key, value) in encode().iter() {
+                            let _ = self.state_db.put_cf_raw(cf, key, value);
+                        }
+                        if let Some(on_written) = on_written {
+                            on_written();
+                        }
                     }
                 }
             }
@@ -2535,6 +2563,8 @@ pub struct TorusApp {
     /// same height reports the same (still-true) durability instead of
     /// re-persisting or falling back to "unknown ⇒ rewrite at exec".
     exec_prepared_durable: DurableRows,
+    /// s80: the execution thread's fill sink slot (see `set_fill_sink`).
+    fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -3293,6 +3323,10 @@ impl TorusApp {
         // (inc at dispatch, dec after execution — see field docs).
         let exec_queue_len = Arc::new(AtomicU64::new(0));
 
+        // s80: fill-sink slot, shared with the exec thread (see `set_fill_sink`).
+        let fill_sink: Arc<std::sync::OnceLock<torus_state::trade_rows::FillSink>> =
+            Default::default();
+
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
             config.chain_id,
@@ -3317,6 +3351,7 @@ impl TorusApp {
             // O3: 256 queued blocks of trade KVs max — a full queue blocks the
             // execution thread (backpressure) instead of ballooning memory.
             trade_history: trade_history_enabled(),
+            fill_sink: fill_sink.clone(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -3443,6 +3478,7 @@ impl TorusApp {
             exec_queue_len,
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
+            fill_sink,
         };
 
         // Item 3 (TORUS_ASYNC_VALIDATE): resolved ONCE here and LOGGED in both
@@ -3557,6 +3593,17 @@ impl TorusApp {
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
         self.pre_proposal_tx = Some(tx);
+    }
+
+    /// s80: install the stream sink for executed blocks' fills. The execution
+    /// thread calls it once per executed block with fills, in height order
+    /// (see `FillSink`). Must be called before consensus starts, so no
+    /// executed block is missed; boot replay inside `new()` runs without a
+    /// sink, by design. A second call is ignored (logged).
+    pub fn set_fill_sink(&self, sink: torus_state::trade_rows::FillSink) {
+        if self.fill_sink.set(sink).is_err() {
+            tracing::warn!("fill sink already set; ignoring the second one");
+        }
     }
 
     /// Attach the RARE pull-fallback transport (Task 6). Called once at startup with
@@ -9881,6 +9928,7 @@ mod crash_recovery_tests {
             // keeping these tests' reads deterministic right after execution.
             trade_writer: None,
             trade_history: true,
+            fill_sink: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -12284,6 +12332,126 @@ mod crash_recovery_tests {
             }
         }
         assert_eq!(root_on, root_off, "native root must not depend on trade history");
+    }
+
+    type SeenFills = Arc<std::sync::Mutex<Vec<Arc<torus_state::trade_rows::BlockFills>>>>;
+
+    /// s80: run the pipeline fixture (exec pipeline `on`/off, trade history
+    /// on/off, optionally with a recording fill sink), drain, and return the
+    /// full dump, the persisted native root and what the sink received.
+    fn run_fill_fixture(
+        on: bool,
+        history: bool,
+        with_sink: bool,
+    ) -> (Vec<CfDump>, torus_types::B256, Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>) {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let mut ctx = pipeline_ctx(&state_db, on, None);
+        ctx.trade_history = history;
+        let seen: SeenFills = Default::default();
+        if with_sink {
+            let s = seen.clone();
+            let sink: torus_state::trade_rows::FillSink =
+                Arc::new(move |b| s.lock().unwrap().push(b));
+            assert!(ctx.fill_sink.set(sink).is_ok());
+        }
+        for b in &pipeline_fixture_blocks() {
+            dispatch_and_execute(&ctx, &state_db, b);
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+        drop(ctx); // drains + joins W
+        let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+        let seen = with_sink.then(|| seen.lock().unwrap().clone());
+        (dump_all_cfs(&state_db), root, seen)
+    }
+
+    fn cf_rows<'a>(dump: &'a [CfDump], cf: &str) -> &'a [(Vec<u8>, Vec<u8>)] {
+        &dump.iter().find(|(name, _)| *name == cf).unwrap().1
+    }
+
+    /// (height, fill count, first fill's trade_index) per delivered block.
+    fn fill_summary(seen: &[Arc<torus_state::trade_rows::BlockFills>]) -> Vec<(u64, usize, u32)> {
+        seen.iter()
+            .map(|b| (b.height, b.fills.len(), b.fills[0].trade_index))
+            .collect()
+    }
+
+    /// s80: every executed block with fills reaches the sink exactly once, in
+    /// height order, with serial and pipelined execution alike — and the
+    /// delivered fills equal the trade-history rows for the same heights.
+    #[test]
+    fn fill_sink_receives_every_executed_block_in_order() {
+        for on in [false, true] {
+            let (dump, _root, seen) = run_fill_fixture(on, true, true);
+            let seen = seen.unwrap();
+            assert_eq!(
+                fill_summary(&seen),
+                vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)],
+                "pipeline on={on}"
+            );
+            let mut from_rows = Vec::new();
+            for (key, value) in cf_rows(&dump, torus_state::cf::CF_NATIVE_TRADES) {
+                let (market, height, _chunk) = torus_state::trade_rows::parse_trade_key(key).unwrap();
+                let (ts, trades) = torus_state::trade_rows::decode_trade_row(value).unwrap();
+                for t in trades {
+                    from_rows.push((height, ts, market, t));
+                }
+            }
+            let from_sink: Vec<_> = seen
+                .iter()
+                .flat_map(|b| {
+                    b.fills.iter().map(|f| {
+                        let t = torus_state::trade_rows::MarketTrade {
+                            trade_index: f.trade_index,
+                            price_raw: f.price_raw,
+                            qty_raw: f.qty_raw,
+                            taker_side: f.taker_side,
+                        };
+                        (b.height, b.timestamp, f.market, t)
+                    })
+                })
+                .collect();
+            assert_eq!(from_sink, from_rows, "stream and history disagree (on={on})");
+            for b in &seen {
+                for f in &b.fills {
+                    assert_ne!(f.maker_order_id, 0, "fills carry order ids");
+                    assert_ne!(f.taker_order_id, 0, "fills carry order ids");
+                }
+            }
+        }
+    }
+
+    /// s80: with trade history OFF a sink still gets the same blocks, and no
+    /// trade row is written.
+    #[test]
+    fn fill_sink_works_with_trade_history_off() {
+        for on in [false, true] {
+            let (_, _, with_history) = run_fill_fixture(on, true, true);
+            let (dump, _root, seen) = run_fill_fixture(on, false, true);
+            let seen = seen.unwrap();
+            assert_eq!(fill_summary(&seen), vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)]);
+            let with_history = with_history.unwrap();
+            for (a, b) in seen.iter().zip(with_history.iter()) {
+                assert_eq!((a.height, a.timestamp, &a.fills), (b.height, b.timestamp, &b.fills));
+            }
+            for cf in [torus_state::cf::CF_NATIVE_TRADES, torus_state::cf::CF_NATIVE_USER_TRADES] {
+                assert!(cf_rows(&dump, cf).is_empty(), "{cf} must stay empty (on={on})");
+            }
+        }
+    }
+
+    /// s80: installing a sink changes nothing on disk — every CF and the
+    /// persisted native root match a run without one (history on and off).
+    #[test]
+    fn no_fill_sink_leaves_state_identical() {
+        for on in [false, true] {
+            for history in [true, false] {
+                let (plain, root_plain, _) = run_fill_fixture(on, history, false);
+                let (sunk, root_sunk, _) = run_fill_fixture(on, history, true);
+                assert_dumps_equal(&plain, &sunk, &format!("sink vs none (on={on} history={history})"));
+                assert_eq!(root_plain, root_sunk, "native root (on={on} history={history})");
+            }
+        }
     }
 
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
