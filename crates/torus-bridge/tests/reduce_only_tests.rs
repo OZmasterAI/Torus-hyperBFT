@@ -480,3 +480,100 @@ fn triggered_reduce_only_stop_with_position_closes_it() {
         assert_bal(&ctx, &t, fp(FUNDING - 24), FixedPoint::ZERO, "stop settled");
     }
 }
+
+// ============================================================================
+// F4 (s515 review): single-action vs batch agreement
+// ============================================================================
+
+/// (A) The batch path skipped the executor's reduce-only pre-check and the
+/// book's stop branch returned before its own check, so a reduce-only
+/// StopMarket from a FLAT trader rested as PendingTrigger in batch mode but
+/// was rejected in single mode. Every path must reject it.
+#[test]
+fn reduce_only_stop_from_flat_trader_rejected_on_every_path() {
+    for path in PATHS {
+        let t = addr(1);
+        let (_d, mut ctx) = fresh(path, &[t]);
+        let r = run(&mut ctx, path, &[place(t, ro_stop_sell(95, 90, 4))]);
+        // Batch results report book-level rejections as processed (as in
+        // reduce_only_without_position_rejected); the book state is the test.
+        if matches!(path, Path::Single) {
+            assert!(!r[0].success, "single: flat reduce-only stop must be rejected");
+        }
+        let pending = ctx.order_books.get(&1).map_or(0, |b| b.pending_stop_count());
+        assert_eq!(pending, 0, "{path:?}: nothing pending");
+        assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, "trader");
+    }
+}
+
+/// (B) A doomed reduce-only order (flat trader) reserved its FULL quantity in
+/// batch Phase 2, starving the same sender's later order in the block, which
+/// the single path accepts. 150 @100 would reserve 750, leaving 250 < 300.
+#[test]
+fn doomed_reduce_only_does_not_starve_later_order_in_batch() {
+    for path in PATHS {
+        let t = addr(1);
+        let (_d, mut ctx) = fresh(path, &[t]);
+        let r = run(
+            &mut ctx,
+            path,
+            &[
+                place(t, ro(limit(1, false, 100, 150))),
+                place(t, limit(1, true, 100, 60)),
+            ],
+        );
+        if matches!(path, Path::Single) {
+            assert!(!r[0].success, "single: flat reduce-only rejected");
+        }
+        assert!(r[1].success, "{path:?}: later order must not be starved: {:?}", r[1].error);
+        assert_eq!(resting(&ctx, &t), vec![fp(60)], "{path:?}");
+        assert_bal(&ctx, &t, fp(FUNDING - 300), fp(300), "only the bid reserved");
+    }
+}
+
+/// (B) Same for an oversize reduce-only order that the book clamps to the
+/// position: it reserves (and rests) for the clamped quantity only.
+#[test]
+fn clamped_reduce_only_does_not_starve_later_order_in_batch() {
+    for path in PATHS {
+        let t = addr(1);
+        let m1 = addr(2);
+        let (_d, mut ctx) = fresh(path, &[t, m1]);
+        open_long_4(&mut ctx, path, t, m1);
+        // RO sell 150 @100 clamps to 4 (reserve 20); bid 60 @90 reserves 270.
+        let r = run(
+            &mut ctx,
+            path,
+            &[
+                place(t, ro(limit(1, false, 100, 150))),
+                place(t, limit(1, true, 90, 60)),
+            ],
+        );
+        assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+        assert_eq!(resting(&ctx, &t), vec![fp(4), fp(60)], "{path:?}");
+        assert_bal(&ctx, &t, fp(FUNDING - 290), fp(290), "clamped RO + bid reserved");
+    }
+}
+
+// ============================================================================
+// F6 (s515 review): fully filled reduce-only makers leave the index
+// ============================================================================
+
+#[test]
+fn fully_filled_reduce_only_maker_leaves_the_index() {
+    use torus_core::order_book::OrderBook;
+    let mut book = OrderBook::new(1, FixedPoint::ONE, FixedPoint::ONE);
+    // No policing positions installed: the maker rests as-is.
+    let r = book.place_order(ro(limit(1, false, 100, 4)), addr(1), 1);
+    assert!(book.get_order(r.order_id).is_some(), "reduce-only maker rests");
+    assert!(book.has_reduce_only_orders());
+
+    let r = book.place_order(limit(1, true, 100, 4), addr(2), 2);
+    assert_eq!(r.fills.len(), 1, "maker fully filled");
+    assert_eq!(book.order_count(), 0);
+    assert!(
+        !book.has_reduce_only_orders(),
+        "stale index entry keeps every later placement loading positions"
+    );
+    assert!(book.reduce_only_traders().is_empty());
+}

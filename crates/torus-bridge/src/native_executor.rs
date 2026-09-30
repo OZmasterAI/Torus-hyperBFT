@@ -3972,6 +3972,19 @@ impl NativeExecutor {
         // replays flat order to assign order ids — byte-identical to the
         // serial loop (docs/design-parallel-engine.md §3). Any worker panic
         // falls back to the serial loop with nothing shared mutated.
+        // F4/F5: reservation basis overrides from pre-batch state, shared by
+        // the serial and sharded prepare paths (identical inputs).
+        let basis = {
+            let orders: Vec<(usize, Address, &PlaceOrderParams)> = place_order_indices
+                .iter()
+                .map(|&i| match &flat[i] {
+                    (sender, FlatAction::Place(p)) => (i, *sender, *p),
+                    (_, FlatAction::Other(_)) => unreachable!(),
+                })
+                .collect();
+            Self::phase2_reservation_basis(ctx, &orders)
+        };
+
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
         if engine_threads >= 2
             && (matches!(engine_mode, EngineMode::Force(_))
@@ -3999,6 +4012,7 @@ impl NativeExecutor {
                     &ctx.positions,
                     &ctx.margin_configs,
                     &open_at_start,
+                    &basis,
                     &groups,
                     engine_threads,
                     n,
@@ -4089,6 +4103,7 @@ impl NativeExecutor {
                 // pre-batch positions, so the book polices it at match time
                 // against positions advanced through this batch's earlier
                 // fills (Phase 3) — the freshest position, as in sequential.
+                // (F4: its RESERVATION is bounded by `basis` though.)
                 if let Err(msg) = Self::validate_order_price(params) {
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -4098,14 +4113,27 @@ impl NativeExecutor {
                 }
 
                 // Reserve margin (same logic as exec_place_order Phase 2).
-                // A5: reserve and every later release share reserve_for_qty.
+                // A5: reserve and every later release share reserve_for_qty_cfg.
                 // s515 (BUG 1): every order type reserves (market at its cap).
-                let order_margin_required = Self::reserve_for_qty(
-                    ctx,
-                    market_id,
-                    Self::reserve_price(params),
-                    params.quantity,
-                );
+                // F4/F5: basis overrides; F2: an overflowing notional rejects.
+                let (res_price, res_qty) = basis
+                    .get(&i)
+                    .copied()
+                    .unwrap_or((Self::reserve_price(params), params.quantity));
+                let order_margin_required = match Self::try_reserve_for_qty_cfg(
+                    ctx.margin_configs.get(&market_id),
+                    res_price,
+                    res_qty,
+                ) {
+                    Ok(m) => m,
+                    Err(msg) => {
+                        if let Some(ref m) = ctx.metrics {
+                            m.orders_rejected_other.inc();
+                        }
+                        results[i] = NativeActionResult::err("place_order", msg);
+                        continue;
+                    }
+                };
 
                 if order_margin_required > FixedPoint::ZERO {
                     match bal_cache.load(&ctx.positions, sender) {
@@ -4376,6 +4404,7 @@ impl NativeExecutor {
         positions: &PositionManager<T>,
         margin_configs: &HashMap<MarketId, MarketMarginConfig>,
         open_at_start: &HashMap<Address, u32>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -4419,11 +4448,24 @@ impl NativeExecutor {
                                         }));
                                         continue;
                                     }
-                                    let required = Self::reserve_for_qty_cfg(
+                                    let (res_price, res_qty) = basis
+                                        .get(&i)
+                                        .copied()
+                                        .unwrap_or((Self::reserve_price(params), params.quantity));
+                                    let required = match Self::try_reserve_for_qty_cfg(
                                         margin_configs.get(&params.market_id),
-                                        Self::reserve_price(params),
-                                        params.quantity,
-                                    );
+                                        res_price,
+                                        res_qty,
+                                    ) {
+                                        Ok(r) => r,
+                                        Err(msg) => {
+                                            out.push((i, PrepOutcome::Reject {
+                                                reason: RejectReason::Other,
+                                                msg,
+                                            }));
+                                            continue;
+                                        }
+                                    };
                                     if required > FixedPoint::ZERO {
                                         match cache.load(positions, sender) {
                                             Ok(mut bal) => {
@@ -5216,18 +5258,11 @@ impl NativeExecutor {
     /// (telescoping), so over an order's whole lifetime
     /// Σ releases == the original reservation — no truncation dust stranded
     /// in `order_margin`, no over-release into other orders' reservations.
-    fn reserve_for_qty<T: StateBackend>(
-        ctx: &NativeExecContext<T>,
-        market_id: MarketId,
-        price: FixedPoint,
-        qty: FixedPoint,
-    ) -> FixedPoint {
-        Self::reserve_for_qty_cfg(ctx.margin_configs.get(&market_id), price, qty)
-    }
-
-    /// C3: ctx-free core of [`reserve_for_qty`] — pure in (market margin
-    /// config, price, qty), so settle-plan workers can compute release
-    /// amounts off-thread with byte-identical arithmetic.
+    ///
+    /// C3: ctx-free — pure in (market margin config, price, qty), so
+    /// settle-plan workers can compute release amounts off-thread with
+    /// byte-identical arithmetic. Placement goes through
+    /// [`try_reserve_for_qty_cfg`] (F2: overflow rejects instead of panicking).
     fn reserve_for_qty_cfg(
         cfg: Option<&MarketMarginConfig>,
         price: FixedPoint,
@@ -5241,6 +5276,25 @@ impl NativeExecutor {
             .map(|c| effective_max_leverage(&c.tiers, notional))
             .unwrap_or(20);
         Self::margin_at_integer_leverage(notional, max_lev)
+    }
+
+    /// F2 (s515 review): the PLACEMENT-time reservation — [`reserve_for_qty_cfg`]
+    /// (byte-identical result), except that a price × qty past `i128::MAX` is an
+    /// order rejection instead of a panic (every validator would panic on the
+    /// same action — a chain halt). Every later release is a difference of
+    /// `reserve_for_qty_cfg` at quantities <= the reserved one, so it cannot
+    /// overflow once this passed.
+    fn try_reserve_for_qty_cfg(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> Result<FixedPoint, String> {
+        if price > FixedPoint::ZERO && qty > FixedPoint::ZERO && price.checked_mul(qty).is_err() {
+            return Err(format!(
+                "order notional overflows: price {price} x quantity {qty}"
+            ));
+        }
+        Ok(Self::reserve_for_qty_cfg(cfg, price, qty))
     }
 
     /// A5: margin releases owed to RESTING (maker) orders that were consumed
@@ -5447,6 +5501,91 @@ impl NativeExecutor {
         }
     }
 
+    /// F5 (s515 review): the price the PLACEMENT reservation is taken at. A
+    /// market SELL's cap is its LOWEST acceptable price (clients send ~1), so
+    /// it bounds nothing; its fills happen at bids <= the best bid, so it
+    /// reserves at max(cap, best bid) (the cap alone with no bids). Everything
+    /// else reserves at [`reserve_price`]. Safe for the A5 identity: a market
+    /// order never rests, so its whole reservation is released after matching
+    /// (a triggered stop-market sell is priced here at trigger time).
+    fn reservation_price(params: &PlaceOrderParams, book: Option<&OrderBook>) -> FixedPoint {
+        match params.order_type {
+            OrderType::Market if !params.is_buy => book
+                .and_then(|b| b.best_bid())
+                .map_or(params.price, |bid| bid.max(params.price)),
+            _ => Self::reserve_price(params),
+        }
+    }
+
+    /// F4 (s515 review): whether `params` is a stop (pending until triggered).
+    /// A reduce-only stop reserves its full quantity — it is re-checked and
+    /// clamped only at trigger time.
+    fn is_stop(params: &PlaceOrderParams) -> bool {
+        matches!(
+            params.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        )
+    }
+
+    /// F4/F5 (s515 review): per-order overrides of the batch Phase-2
+    /// reservation basis `(price, qty)` — default `(reserve_price, quantity)`
+    /// — from PRE-BATCH state only, computed ONCE so the serial and sharded
+    /// prepare paths see identical inputs.
+    /// - Market sell: priced by [`reservation_price`].
+    /// - Reduce-only non-stop order: sized to min(qty, bound), where bound is
+    ///   an upper bound on the book's match-time clamp — the pre-batch
+    ///   allowance plus everything that can still grow the position before the
+    ///   order matches (the sender's resting non-reduce-only orders in that
+    ///   market and its earlier non-reduce-only orders in this batch). A doomed
+    ///   or oversize order no longer reserves (and starves the sender's later
+    ///   orders of) margin it can never use, and since the clamp — hence the
+    ///   resting remainder — never exceeds the bound, A5 telescoping stays exact.
+    fn phase2_reservation_basis<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> HashMap<usize, (FixedPoint, FixedPoint)> {
+        let sat_add =
+            |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
+        let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
+        let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
+        let mut out = HashMap::new();
+        for &(i, sender, params) in orders {
+            let book = ctx.order_books.get(&params.market_id);
+            let price = Self::reservation_price(params, book);
+            let mut qty = params.quantity;
+            if params.reduce_only && !Self::is_stop(params) {
+                // A position read error polices as flat in the book; keep the
+                // full reservation then (conservative).
+                if let Ok(pos) = Self::signed_position(&ctx.positions, &sender, params.market_id) {
+                    let resting = book.map_or(FixedPoint::ZERO, |b| {
+                        b.orders_for_trader(&sender)
+                            .iter()
+                            .filter(|o| !o.reduce_only)
+                            .fold(FixedPoint::ZERO, |acc, o| sat_add(acc, o.remaining_qty))
+                    });
+                    let grown = growth
+                        .get(&(sender, params.market_id))
+                        .copied()
+                        .unwrap_or(FixedPoint::ZERO);
+                    let bound = sat_add(
+                        sat_add(reduce_only_allowance(pos, params.is_buy), resting),
+                        grown,
+                    );
+                    qty = qty.min(bound);
+                }
+            } else if track_growth && !params.reduce_only {
+                let g = growth
+                    .entry((sender, params.market_id))
+                    .or_insert(FixedPoint::ZERO);
+                *g = sat_add(*g, params.quantity);
+            }
+            if price != Self::reserve_price(params) || qty != params.quantity {
+                out.insert(i, (price, qty));
+            }
+        }
+        out
+    }
+
     /// s515 (BUG 1): Hyperliquid parity — a market order is an aggressive
     /// IOC limit, so its `price` is a REQUIRED worst-acceptable-price cap
     /// (the book never matches past it). Pre-s515 a market order reserved
@@ -5591,12 +5730,14 @@ impl NativeExecutor {
         mut queue: VecDeque<TriggeredStop>,
     ) {
         while let Some(stop) = queue.pop_front() {
-            let reserved = Self::reserve_for_qty(
-                ctx,
-                stop.params.market_id,
+            // F2: a (legacy) row whose price × qty overflows cannot have
+            // reserved anything — release nothing instead of panicking.
+            let reserved = Self::try_reserve_for_qty_cfg(
+                ctx.margin_configs.get(&stop.params.market_id),
                 stop.params.price,
                 stop.params.quantity,
-            );
+            )
+            .unwrap_or(FixedPoint::ZERO);
             Self::release_order_margin(ctx, &stop.trader, reserved);
             let r = Self::place_order_inner(ctx, &stop.trader, &stop.params, Some(stop.id), &mut queue);
             if !r.success {
@@ -5625,12 +5766,16 @@ impl NativeExecutor {
 
         // s515 (BUG 1): market / stop orders need a positive price cap.
         // s515 (BUG 2): reduce-only needs a position it can reduce.
+        let mut ro_pos = None;
         let pre_check = Self::validate_order_price(params).err().or_else(|| {
             if !params.reduce_only {
                 return None;
             }
             match Self::signed_position(&ctx.positions, sender, market_id) {
-                Ok(pos) => Self::reduce_only_violation(pos, params),
+                Ok(pos) => {
+                    ro_pos = Some(pos);
+                    Self::reduce_only_violation(pos, params)
+                }
                 Err(e) => Some(e.to_string()),
             }
         });
@@ -5643,12 +5788,32 @@ impl NativeExecutor {
         }
 
         // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
-        // A5: reserve and every later release share reserve_for_qty.
+        // A5: reserve and every later release share reserve_for_qty_cfg.
         // s515 (BUG 1): EVERY order type reserves — a market order at its
         // price cap (it used to reserve ZERO); the unused part comes back
         // below once the order no longer rests.
-        let order_margin_required =
-            Self::reserve_for_qty(ctx, market_id, Self::reserve_price(params), params.quantity);
+        // F5: a market sell at max(cap, best bid). F4: a reduce-only non-stop
+        // order only for the quantity the book will let it keep (the clamp to
+        // the position it reads below). F2: an overflowing notional rejects.
+        let reserve_qty = match ro_pos {
+            Some(pos) if !Self::is_stop(params) => {
+                params.quantity.min(reduce_only_allowance(pos, params.is_buy))
+            }
+            _ => params.quantity,
+        };
+        let order_margin_required = match Self::try_reserve_for_qty_cfg(
+            ctx.margin_configs.get(&market_id),
+            Self::reservation_price(params, ctx.order_books.get(&market_id)),
+            reserve_qty,
+        ) {
+            Ok(m) => m,
+            Err(msg) => {
+                if let Some(ref m) = ctx.metrics {
+                    m.orders_rejected_other.inc();
+                }
+                return NativeActionResult::err("place_order", msg);
+            }
+        };
 
         if order_margin_required > FixedPoint::ZERO {
             match ctx.positions.get_native_balance(sender) {
