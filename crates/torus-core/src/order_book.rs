@@ -71,6 +71,113 @@ pub struct PlaceResult {
     /// cancelled maker's remaining order-margin reservation
     /// (`price × remaining_qty` at cancel time).
     pub self_trade_cancels: Vec<Order>,
+    /// s515: quantity of THIS order still holding a reservation after
+    /// placement — the remainder put on the book (Resting / PartiallyFilled),
+    /// the whole stop quantity (PendingTrigger), else zero. The executor's
+    /// taker release is `reserve(qty) - reserve(rested_qty)`, which stays
+    /// exact when a reduce-only clamp shrank the order below `params.quantity`.
+    pub rested_qty: FixedPoint,
+    /// s515 (reduce-only): quantity removed from resting reduce-only orders
+    /// (makers cut at match time, or shrunk / cancelled by the post-fill
+    /// sweep) so they can never open or increase a position. The executor
+    /// releases these like maker consumption.
+    pub reduce_only_cuts: Vec<ReduceOnlyCut>,
+    /// s515: stop orders whose trigger fired on this order's fills. They are
+    /// removed from the book's pending set but NOT executed here — the
+    /// executor places each one through its normal placement path (price
+    /// cap, reduce-only re-check against the position AT TRIGGER TIME,
+    /// margin, settlement of its fills).
+    pub triggered_stops: Vec<TriggeredStop>,
+}
+
+impl PlaceResult {
+    fn rejected(order_id: OrderId) -> Self {
+        PlaceResult {
+            order_id,
+            status: OrderStatus::Rejected,
+            fills: vec![],
+            self_trade_cancels: vec![],
+            rested_qty: FixedPoint::ZERO,
+            reduce_only_cuts: vec![],
+            triggered_stops: vec![],
+        }
+    }
+}
+
+/// s515: quantity cut from a resting reduce-only order (see
+/// [`PlaceResult::reduce_only_cuts`]). `price` is the order's resting price —
+/// its margin reservation is `reserve(price, remaining)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReduceOnlyCut {
+    pub order_id: OrderId,
+    pub trader: Address,
+    pub price: FixedPoint,
+    pub qty: FixedPoint,
+}
+
+/// s515: a stop whose trigger fired; `params` is the order to place (Market
+/// capped at the stop's price cap, or Limit at the stop-limit price) and
+/// `id` the stop's own order id, which the placed order keeps.
+#[derive(Clone, Debug)]
+pub struct TriggeredStop {
+    pub id: OrderId,
+    pub trader: Address,
+    pub params: PlaceOrderParams,
+    pub timestamp: u64,
+}
+
+/// s515: signed positions (+long / -short) in this book's market of the
+/// traders whose reduce-only orders the book must police during a placement
+/// (or a batch of placements). Supplied by the executor via
+/// [`OrderBook::set_reduce_only_positions`]; the book keeps it current across
+/// its own fills. A trader ABSENT from the map is not policed (book-only
+/// callers and legacy tests), so the executor must insert every trader with
+/// a resting reduce-only order ([`OrderBook::reduce_only_traders`]) plus
+/// every reduce-only sender — flat traders as zero.
+#[derive(Clone, Debug, Default)]
+pub struct ReduceOnlyPositions {
+    positions: BTreeMap<Address, FixedPoint>,
+}
+
+impl ReduceOnlyPositions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, trader: Address, signed_size: FixedPoint) {
+        self.positions.insert(trader, signed_size);
+    }
+
+    pub fn get(&self, trader: &Address) -> Option<FixedPoint> {
+        self.positions.get(trader).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    fn apply_fill(&mut self, trader: &Address, is_buy: bool, qty: FixedPoint) {
+        if let Some(p) = self.positions.get_mut(trader) {
+            if is_buy {
+                *p += qty;
+            } else {
+                *p -= qty;
+            }
+        }
+    }
+}
+
+/// s515: how much a reduce-only order on side `is_buy` may still fill against
+/// signed position `signed_pos` — the position size when the order reduces
+/// it, zero when flat or when the order would increase it.
+pub fn reduce_only_allowance(signed_pos: FixedPoint, is_buy: bool) -> FixedPoint {
+    if is_buy && signed_pos < FixedPoint::ZERO {
+        -signed_pos
+    } else if !is_buy && signed_pos > FixedPoint::ZERO {
+        signed_pos
+    } else {
+        FixedPoint::ZERO
+    }
 }
 
 /// Order placement outcome.
@@ -100,6 +207,11 @@ struct StopOrder {
     side: Side,
     trigger_price: FixedPoint,
     limit_price: Option<FixedPoint>,
+    /// s515: a StopMarket's slippage cap (worst acceptable price) — the
+    /// placed order's `params.price`. ZERO for StopLimit (its limit is the
+    /// cap) and for legacy rows persisted before caps existed (such a stop
+    /// is rejected at trigger time: a market order needs a positive cap).
+    price_cap: FixedPoint,
     quantity: FixedPoint,
     time_in_force: TimeInForce,
     timestamp: u64,
@@ -253,8 +365,16 @@ pub struct OrderBook {
     pub lot_size: FixedPoint,
     next_id: OrderId,
     last_trade_price: Option<FixedPoint>,
-    /// Guard against recursive stop triggering.
-    triggering_stops: bool,
+
+    // ---- s515 reduce-only policing (in-RAM only, never serialized) ----
+    /// `(trader, order_id)` of resting reduce-only orders — derived from the
+    /// orders themselves (added by `insert_order` / `insert_loaded_order`).
+    /// Removal is best-effort (cancel paths, sweeps); a stale entry is purged
+    /// by the next sweep of its trader and is otherwise harmless.
+    reduce_only_index: BTreeSet<(Address, OrderId)>,
+    /// Positions of the traders policed during the current placement(s);
+    /// empty = no reduce-only enforcement. See [`ReduceOnlyPositions`].
+    reduce_only_positions: ReduceOnlyPositions,
 
     // ---- Per-order-row persistence state (journal-in-book, 3c) ----
     //
@@ -338,7 +458,8 @@ impl OrderBook {
             lot_size,
             next_id: 1,
             last_trade_price: None,
-            triggering_stops: false,
+            reduce_only_index: BTreeSet::new(),
+            reduce_only_positions: ReduceOnlyPositions::default(),
             order_seq: HashMap::new(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
@@ -364,6 +485,16 @@ impl OrderBook {
     // ========================================================================
 
     /// Place an order. Main entry point dispatching by order type and TIF.
+    ///
+    /// s515 (Hyperliquid parity):
+    /// - `Market` / `StopMarket` carry a REQUIRED slippage cap in
+    ///   `params.price` (a market order is an aggressive IOC limit): matching
+    ///   never crosses it and the unfilled remainder is cancelled.
+    /// - Reduce-only orders are policed against the positions installed by
+    ///   [`Self::set_reduce_only_positions`] (placement clamp, match-time
+    ///   maker cap, post-fill re-fit of resting reduce-only orders).
+    /// - Stops that fire are returned in [`PlaceResult::triggered_stops`] for
+    ///   the executor to place — never executed inline.
     pub fn place_order(
         &mut self,
         params: PlaceOrderParams,
@@ -375,22 +506,20 @@ impl OrderBook {
 
         // Dust order rejection (2.1b.2): qty must be >= lot_size
         if params.quantity < self.lot_size {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+            return PlaceResult::rejected(order_id);
         }
 
-        // FIX 7 (ECON-FIND-10): Limit orders must have positive price
-        if matches!(params.order_type, OrderType::Limit) && params.price <= FixedPoint::ZERO {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+        // FIX 7 (ECON-FIND-10): Limit orders must have positive price.
+        // s515: so must Market / StopMarket (the price is the slippage cap)
+        // and a StopLimit's limit.
+        let price_invalid = match params.order_type {
+            OrderType::Limit | OrderType::Market | OrderType::StopMarket { .. } => {
+                params.price <= FixedPoint::ZERO
+            }
+            OrderType::StopLimit { limit, .. } => limit <= FixedPoint::ZERO,
+        };
+        if price_invalid {
+            return PlaceResult::rejected(order_id);
         }
 
         // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders
@@ -398,110 +527,58 @@ impl OrderBook {
             && self.tick_size > FixedPoint::ZERO
             && params.price.raw() % self.tick_size.raw() != 0
         {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+            return PlaceResult::rejected(order_id);
         }
 
         // FIX 10 (ECON-FIND-17): Limit orders per trader per market
         let trader_order_count = self.trader_orders.get(&trader).map_or(0, |ids| ids.len());
         if trader_order_count >= MAX_ORDERS_PER_TRADER_PER_MARKET {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+            return PlaceResult::rejected(order_id);
         }
 
         // Stop orders → store in pending_stops
-        match params.order_type {
-            OrderType::StopMarket { trigger } => {
-                // FIX 9 (ECON-FIND-12): Validate trigger direction
-                if let Some(current_price) = self.last_trade_price {
-                    let invalid_trigger = match side {
-                        Side::Buy => trigger <= current_price,
-                        Side::Sell => trigger >= current_price,
-                    };
-                    if invalid_trigger {
-                        return PlaceResult {
-                            order_id,
-                            status: OrderStatus::Rejected,
-                            fills: vec![],
-                            self_trade_cancels: vec![],
-                        };
-                    }
-                }
-                self.pending_stops.push(StopOrder {
-                    id: order_id,
-                    trader,
-                    market_id: params.market_id,
-                    side,
-                    trigger_price: trigger,
-                    limit_price: None,
-                    quantity: params.quantity,
-                    time_in_force: params.time_in_force,
-                    timestamp,
-                    reduce_only: params.reduce_only,
-                    client_order_id: params.client_order_id,
-                });
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::PendingTrigger,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
-            }
+        let stop = match params.order_type {
+            OrderType::StopMarket { trigger } => Some((trigger, None, params.price)),
             OrderType::StopLimit { trigger, limit } => {
-                // FIX 9 (ECON-FIND-12): Validate trigger direction
-                if let Some(current_price) = self.last_trade_price {
-                    let invalid_trigger = match side {
-                        Side::Buy => trigger <= current_price,
-                        Side::Sell => trigger >= current_price,
-                    };
-                    if invalid_trigger {
-                        return PlaceResult {
-                            order_id,
-                            status: OrderStatus::Rejected,
-                            fills: vec![],
-                            self_trade_cancels: vec![],
-                        };
-                    }
-                }
-                self.pending_stops.push(StopOrder {
-                    id: order_id,
-                    trader,
-                    market_id: params.market_id,
-                    side,
-                    trigger_price: trigger,
-                    limit_price: Some(limit),
-                    quantity: params.quantity,
-                    time_in_force: params.time_in_force,
-                    timestamp,
-                    reduce_only: params.reduce_only,
-                    client_order_id: params.client_order_id,
-                });
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::PendingTrigger,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
+                Some((trigger, Some(limit), FixedPoint::ZERO))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((trigger, limit_price, price_cap)) = stop {
+            // FIX 9 (ECON-FIND-12): Validate trigger direction
+            if let Some(current_price) = self.last_trade_price {
+                let invalid_trigger = match side {
+                    Side::Buy => trigger <= current_price,
+                    Side::Sell => trigger >= current_price,
+                };
+                if invalid_trigger {
+                    return PlaceResult::rejected(order_id);
+                }
+            }
+            self.pending_stops.push(StopOrder {
+                id: order_id,
+                trader,
+                market_id: params.market_id,
+                side,
+                trigger_price: trigger,
+                limit_price,
+                price_cap,
+                quantity: params.quantity,
+                time_in_force: params.time_in_force,
+                timestamp,
+                reduce_only: params.reduce_only,
+                client_order_id: params.client_order_id,
+            });
+            return PlaceResult {
+                status: OrderStatus::PendingTrigger,
+                rested_qty: params.quantity,
+                ..PlaceResult::rejected(order_id)
+            };
         }
 
         // PostOnly: reject if would cross the spread
         if params.time_in_force == TimeInForce::PostOnly && self.would_cross(side, params.price) {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+            return PlaceResult::rejected(order_id);
         }
 
         let is_market = matches!(params.order_type, OrderType::Market);
@@ -513,12 +590,25 @@ impl OrderBook {
                 Side::Sell => !self.bids.is_empty(),
             };
             if !has_liquidity {
-                return PlaceResult {
-                    order_id,
-                    status: OrderStatus::Rejected,
-                    fills: vec![],
-                    self_trade_cancels: vec![],
-                };
+                return PlaceResult::rejected(order_id);
+            }
+        }
+
+        // s515 (reduce-only, placement + match time): a policed reduce-only
+        // order may only reduce the trader's CURRENT position — rejected when
+        // flat or on the increasing side, clamped to the position size when
+        // larger (Hyperliquid resizes reduce-only orders to the position).
+        // Its own fills reduce the position one-for-one (STP keeps it from
+        // ever matching the trader's own orders), so the clamp holds through
+        // matching.
+        let mut quantity = params.quantity;
+        if params.reduce_only {
+            if let Some(pos) = self.reduce_only_positions.get(&trader) {
+                let allowed = reduce_only_allowance(pos, params.is_buy);
+                if allowed <= FixedPoint::ZERO {
+                    return PlaceResult::rejected(order_id);
+                }
+                quantity = quantity.min(allowed);
             }
         }
 
@@ -527,8 +617,8 @@ impl OrderBook {
             trader,
             side,
             price: params.price,
-            remaining_qty: params.quantity,
-            original_qty: params.quantity,
+            remaining_qty: quantity,
+            original_qty: quantity,
             order_type: params.order_type,
             time_in_force: params.time_in_force,
             timestamp,
@@ -538,24 +628,50 @@ impl OrderBook {
 
         // FOK: pre-check full fill availability
         if params.time_in_force == TimeInForce::FOK
-            && !self.can_fill_completely(side, params.price, params.quantity, trader, is_market)
+            && !self.can_fill_completely(side, params.price, quantity, trader)
         {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
+            return PlaceResult::rejected(order_id);
         }
 
         // Execute matching
-        let (fills, self_trade_cancels) = self.execute_match(&mut order, is_market);
+        let (fills, self_trade_cancels, mut reduce_only_cuts) = self.execute_match(&mut order);
 
         if let Some(last_fill) = fills.last() {
             self.last_trade_price = Some(last_fill.price);
         }
 
+        // Reduce-only makers removed during matching (STP or cap) leave the index.
+        for o in &self_trade_cancels {
+            if o.reduce_only {
+                self.reduce_only_index.remove(&(o.trader, o.id));
+            }
+        }
+        for c in &reduce_only_cuts {
+            self.reduce_only_index.remove(&(c.trader, c.order_id));
+        }
+
+        // s515 (reduce-only, resting orders): every policed trader whose
+        // position these fills moved — and the placing trader, whose new
+        // order competes with its older ones — gets its resting reduce-only
+        // orders re-fitted to the position (shrunk / cancelled).
+        let mut taker_ro_left = None;
+        if !self.reduce_only_positions.is_empty() {
+            let mut touched: BTreeSet<Address> = BTreeSet::new();
+            touched.insert(trader);
+            for f in &fills {
+                touched.insert(f.maker);
+                touched.insert(f.taker);
+            }
+            for t in touched {
+                let left = self.sweep_reduce_only(t, &mut reduce_only_cuts);
+                if t == trader {
+                    taker_ro_left = left;
+                }
+            }
+        }
+
         // Determine outcome
+        let mut rested_qty = FixedPoint::ZERO;
         let status = if order.remaining_qty == FixedPoint::ZERO {
             OrderStatus::Filled
         } else if is_market
@@ -564,25 +680,139 @@ impl OrderBook {
         {
             OrderStatus::Cancelled
         } else {
-            // GTC / PostOnly: rest remainder on book
-            self.insert_order(order);
-            if fills.is_empty() {
-                OrderStatus::Resting
+            // s515: a resting reduce-only remainder ranks behind the
+            // trader's older reduce-only orders — it keeps only the position
+            // budget they left.
+            if let (true, Some(left)) = (order.reduce_only, taker_ro_left) {
+                order.remaining_qty = order.remaining_qty.min(left);
+            }
+            if order.remaining_qty == FixedPoint::ZERO {
+                if fills.is_empty() {
+                    OrderStatus::Rejected
+                } else {
+                    OrderStatus::Cancelled
+                }
             } else {
-                OrderStatus::PartiallyFilled
+                // GTC / PostOnly: rest remainder on book
+                rested_qty = order.remaining_qty;
+                self.insert_order(order);
+                if fills.is_empty() {
+                    OrderStatus::Resting
+                } else {
+                    OrderStatus::PartiallyFilled
+                }
             }
         };
 
-        // Trigger stops (non-recursive)
-        if !fills.is_empty() && !self.triggering_stops {
-            self.trigger_stops();
-        }
+        // Stops fired by these fills go back to the caller (s515).
+        let triggered_stops = if fills.is_empty() {
+            Vec::new()
+        } else {
+            self.trigger_stops()
+        };
 
         PlaceResult {
             order_id,
             status,
             fills,
             self_trade_cancels,
+            rested_qty,
+            reduce_only_cuts,
+            triggered_stops,
+        }
+    }
+
+    /// s515: re-fit `trader`'s resting reduce-only orders to its current
+    /// (policed) position, oldest order first: orders on the reducing side
+    /// keep up to the remaining position budget, everything else (flat, or
+    /// the increasing side after a flip) is cancelled. Records a cut for
+    /// every quantity removed; returns the budget left over, or `None` if
+    /// `trader` is not policed.
+    fn sweep_reduce_only(
+        &mut self,
+        trader: Address,
+        cuts: &mut Vec<ReduceOnlyCut>,
+    ) -> Option<FixedPoint> {
+        let pos = self.reduce_only_positions.get(&trader)?;
+        let reduces_buy = pos < FixedPoint::ZERO;
+        let mut budget = if reduces_buy { -pos } else { pos };
+        let ids: Vec<OrderId> = self
+            .reduce_only_index
+            .range((trader, OrderId::MIN)..=(trader, OrderId::MAX))
+            .map(|&(_, id)| id)
+            .collect();
+        for id in ids {
+            let Some((is_buy, remaining, price)) = self
+                .get_order(id)
+                .map(|o| (o.side == Side::Buy, o.remaining_qty, o.price))
+            else {
+                self.reduce_only_index.remove(&(trader, id));
+                continue;
+            };
+            let keep = if budget > FixedPoint::ZERO && is_buy == reduces_buy {
+                remaining.min(budget)
+            } else {
+                FixedPoint::ZERO
+            };
+            budget -= keep;
+            if keep == remaining {
+                continue;
+            }
+            // cancel_order drops the index entry; the in-place modify keeps
+            // time priority (qty decrease only).
+            let applied = if keep == FixedPoint::ZERO {
+                self.cancel_order(id).is_ok()
+            } else {
+                self.modify_order(id, None, Some(keep)).is_ok()
+            };
+            if applied {
+                cuts.push(ReduceOnlyCut {
+                    order_id: id,
+                    trader,
+                    price,
+                    qty: remaining - keep,
+                });
+            }
+        }
+        Some(budget)
+    }
+
+    /// s515: traders owning (possibly stale) resting reduce-only orders in
+    /// this book, ascending — the executor loads their positions into
+    /// [`ReduceOnlyPositions`] before placing.
+    pub fn reduce_only_traders(&self) -> Vec<Address> {
+        let mut out: Vec<Address> = self.reduce_only_index.iter().map(|&(t, _)| t).collect();
+        out.dedup();
+        out
+    }
+
+    /// s515: does this book hold any (possibly stale) resting reduce-only
+    /// order? Cheap gate for loading [`ReduceOnlyPositions`].
+    pub fn has_reduce_only_orders(&self) -> bool {
+        !self.reduce_only_index.is_empty()
+    }
+
+    /// s515: install the positions to police for the next placement(s).
+    /// Must be cleared ([`Self::clear_reduce_only_positions`]) once the
+    /// caller's placements are done — a stale map would police against
+    /// out-of-date positions.
+    pub fn set_reduce_only_positions(&mut self, positions: ReduceOnlyPositions) {
+        self.reduce_only_positions = positions;
+    }
+
+    pub fn clear_reduce_only_positions(&mut self) {
+        self.reduce_only_positions = ReduceOnlyPositions::default();
+    }
+
+    /// Drop every reduce-only index entry of `trader` (cancel-all paths).
+    fn forget_reduce_only_trader(&mut self, trader: &Address) {
+        let keys: Vec<(Address, OrderId)> = self
+            .reduce_only_index
+            .range((*trader, OrderId::MIN)..=(*trader, OrderId::MAX))
+            .copied()
+            .collect();
+        for k in keys {
+            self.reduce_only_index.remove(&k);
         }
     }
 
@@ -609,6 +839,9 @@ impl OrderBook {
 
         if queue.is_empty() {
             book.remove(&loc.price);
+        }
+        if order.reduce_only {
+            self.reduce_only_index.remove(&(order.trader, order_id));
         }
 
         if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
@@ -642,6 +875,7 @@ impl OrderBook {
 
     /// Cancel all orders for a trader. Returns cancelled orders.
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+        self.forget_reduce_only_trader(&trader);
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids,
             None => return vec![],
@@ -775,9 +1009,10 @@ impl OrderBook {
         Ok(replacement)
     }
 
-    /// Manually trigger pending stop orders.
-    pub fn check_stops(&mut self) {
-        self.trigger_stops();
+    /// Manually evaluate pending stop orders against the last trade price.
+    /// Fired stops are removed and returned for the caller to place (s515).
+    pub fn check_stops(&mut self) -> Vec<TriggeredStop> {
+        self.trigger_stops()
     }
 
     // ========================================================================
@@ -958,9 +1193,18 @@ impl OrderBook {
     // ========================================================================
 
     /// Core matching: taker vs opposite side of the book.
-    fn execute_match(&mut self, taker: &mut Order, is_market: bool) -> (Vec<Fill>, Vec<Order>) {
+    ///
+    /// s515: the taker's price is a hard bound for EVERY order type — for a
+    /// market order it is the slippage cap (the old `!is_market` bypass let a
+    /// market order sweep the whole book at any price). Returns
+    /// `(fills, self_trade_cancels, reduce_only_cuts)`.
+    fn execute_match(
+        &mut self,
+        taker: &mut Order,
+    ) -> (Vec<Fill>, Vec<Order>, Vec<ReduceOnlyCut>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
+        let mut reduce_only_cuts = Vec::new();
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
 
@@ -972,7 +1216,7 @@ impl OrderBook {
                         None => break,
                     };
                     let best_ask = *level.key();
-                    if !is_market && best_ask > taker.price {
+                    if best_ask > taker.price {
                         break;
                     }
                     let queue = level.get_mut();
@@ -983,6 +1227,8 @@ impl OrderBook {
                         Side::Sell,
                         &mut fills,
                         &mut self_trade_cancels,
+                        &mut reduce_only_cuts,
+                        &mut self.reduce_only_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
@@ -1005,7 +1251,7 @@ impl OrderBook {
                         None => break,
                     };
                     let best_bid = *level.key();
-                    if !is_market && best_bid < taker.price {
+                    if best_bid < taker.price {
                         break;
                     }
                     let queue = level.get_mut();
@@ -1016,6 +1262,8 @@ impl OrderBook {
                         Side::Buy,
                         &mut fills,
                         &mut self_trade_cancels,
+                        &mut reduce_only_cuts,
+                        &mut self.reduce_only_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
@@ -1033,7 +1281,7 @@ impl OrderBook {
             }
         }
 
-        (fills, self_trade_cancels)
+        (fills, self_trade_cancels, reduce_only_cuts)
     }
 
     /// Match taker against orders at a single price level.
@@ -1046,6 +1294,8 @@ impl OrderBook {
         maker_side: Side,
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
+        reduce_only_cuts: &mut Vec<ReduceOnlyCut>,
+        ro_positions: &mut ReduceOnlyPositions,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, Vec<OrderId>>,
         order_seq: &mut HashMap<OrderId, u64>,
@@ -1091,13 +1341,45 @@ impl OrderBook {
                 continue;
             }
 
+            // s515 (reduce-only, match time): a policed reduce-only maker
+            // fills at most its owner's CURRENT position (which this very
+            // sweep may already have moved through the owner's other
+            // orders); with nothing left to reduce it is cut from the book.
+            let mut maker_fillable = maker.remaining_qty;
+            if maker.reduce_only {
+                if let Some(pos) = ro_positions.get(&maker.trader) {
+                    let allowed = reduce_only_allowance(pos, maker.side == Side::Buy);
+                    if allowed <= FixedPoint::ZERO {
+                        let cut = queue.pop_front().unwrap();
+                        order_index.remove(&cut.id);
+                        if let Some(ids) = trader_orders.get_mut(&cut.trader) {
+                            ids.retain(|&id| id != cut.id);
+                        }
+                        let seq = order_seq.remove(&cut.id);
+                        Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
+                        row_journal.insert(cut.id);
+                        reduce_only_cuts.push(ReduceOnlyCut {
+                            order_id: cut.id,
+                            trader: cut.trader,
+                            price: cut.price,
+                            qty: cut.remaining_qty,
+                        });
+                        continue;
+                    }
+                    maker_fillable = maker_fillable.min(allowed);
+                }
+            }
+
             // Capture maker info before mutable borrow
             let maker_id = maker.id;
             let maker_addr = maker.trader;
             let maker_side = maker.side;
-            let maker_remaining = maker.remaining_qty;
 
-            let fill_qty = taker.remaining_qty.min(maker_remaining);
+            let fill_qty = taker.remaining_qty.min(maker_fillable);
+            if !ro_positions.is_empty() {
+                ro_positions.apply_fill(&taker.trader, taker.side == Side::Buy, fill_qty);
+                ro_positions.apply_fill(&maker_addr, maker_side == Side::Buy, fill_qty);
+            }
 
             fills.push(Fill {
                 maker_order_id: maker_id,
@@ -1192,6 +1474,9 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
+        if order.reduce_only {
+            self.reduce_only_index.insert((trader, id));
+        }
         book.entry(price).or_default().push_back(order);
 
         self.order_index.insert(id, OrderLocation { side, price });
@@ -1222,117 +1507,101 @@ impl OrderBook {
     }
 
     /// Read-only pre-check: can a FOK order be completely filled?
+    ///
+    /// Mirrors `execute_match` exactly: the price bound applies to every
+    /// order type (s515: a market order's price is its cap), self-owned
+    /// makers are skipped (STP), and a policed reduce-only maker contributes
+    /// at most its owner's position as it evolves through the walk.
     fn can_fill_completely(
         &self,
         side: Side,
         price: FixedPoint,
         qty: FixedPoint,
         trader: Address,
-        is_market: bool,
     ) -> bool {
         let mut remaining = qty;
-        match side {
-            Side::Buy => {
-                for (&ask_price, queue) in &self.asks {
-                    if !is_market && ask_price > price {
-                        break;
-                    }
-                    for order in queue {
-                        if order.trader == trader {
-                            continue;
-                        }
-                        remaining -= remaining.min(order.remaining_qty);
-                        if remaining <= FixedPoint::ZERO {
-                            return true;
-                        }
-                    }
+        // Maker positions moved by earlier makers of this walk (policed only).
+        let mut walked: BTreeMap<Address, FixedPoint> = BTreeMap::new();
+        let levels: Box<dyn Iterator<Item = (&FixedPoint, &VecDeque<Order>)>> = match side {
+            Side::Buy => Box::new(self.asks.iter().take_while(|(&p, _)| p <= price)),
+            Side::Sell => Box::new(self.bids.iter().rev().take_while(|(&p, _)| p >= price)),
+        };
+        for (_, queue) in levels {
+            for order in queue {
+                if order.trader == trader {
+                    continue;
                 }
-            }
-            Side::Sell => {
-                for (&bid_price, queue) in self.bids.iter().rev() {
-                    if !is_market && bid_price < price {
-                        break;
-                    }
-                    for order in queue {
-                        if order.trader == trader {
-                            continue;
-                        }
-                        remaining -= remaining.min(order.remaining_qty);
-                        if remaining <= FixedPoint::ZERO {
-                            return true;
-                        }
-                    }
+                let mut fillable = order.remaining_qty;
+                let pos = walked
+                    .get(&order.trader)
+                    .copied()
+                    .or_else(|| self.reduce_only_positions.get(&order.trader));
+                if let (true, Some(pos)) = (order.reduce_only, pos) {
+                    fillable = fillable.min(reduce_only_allowance(pos, order.side == Side::Buy));
+                }
+                let take = remaining.min(fillable);
+                if let Some(pos) = pos {
+                    let signed = if order.side == Side::Buy { take } else { -take };
+                    walked.insert(order.trader, pos + signed);
+                }
+                remaining -= take;
+                if remaining <= FixedPoint::ZERO {
+                    return true;
                 }
             }
         }
         false
     }
 
-    /// Trigger pending stop orders based on last trade price.
-    fn trigger_stops(&mut self) {
-        let price = match self.last_trade_price {
-            Some(p) => p,
-            None => return,
+    /// Evaluate pending stop orders against the last trade price.
+    ///
+    /// s515: fired stops are REMOVED and RETURNED (trigger order), never
+    /// placed here. Placing them inline bypassed the executor entirely —
+    /// their fills never reached positions or margin, their reservation was
+    /// never released, a StopMarket matched with no price cap, and a
+    /// reduce-only TP/SL could not be re-checked against the position at
+    /// trigger time. The executor now places each returned stop through its
+    /// normal path; that placement's own fills re-evaluate the remaining
+    /// stops (cascades stay bounded: every stop fires at most once).
+    fn trigger_stops(&mut self) -> Vec<TriggeredStop> {
+        let Some(current_price) = self.last_trade_price else {
+            return Vec::new();
         };
-
-        self.triggering_stops = true;
-
-        for _ in 0..10 {
-            let current_price = self.last_trade_price.unwrap_or(price);
-
-            let mut triggered = Vec::new();
-            self.pending_stops.retain(|stop| {
-                let fire = match stop.side {
-                    Side::Buy => current_price >= stop.trigger_price,
-                    Side::Sell => current_price <= stop.trigger_price,
-                };
-                if fire {
-                    triggered.push(stop.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-
-            if triggered.is_empty() {
-                break;
+        let mut fired = Vec::new();
+        self.pending_stops.retain(|stop| {
+            let fire = match stop.side {
+                Side::Buy => current_price >= stop.trigger_price,
+                Side::Sell => current_price <= stop.trigger_price,
+            };
+            if fire {
+                fired.push(stop.clone());
             }
-
-            let prev_price = current_price;
-            for stop in triggered {
-                let (order_type, order_price) = match stop.limit_price {
-                    None => (OrderType::Market, FixedPoint::ZERO),
+            !fire
+        });
+        fired
+            .into_iter()
+            .map(|stop| {
+                let (order_type, price) = match stop.limit_price {
+                    None => (OrderType::Market, stop.price_cap),
                     Some(limit) => (OrderType::Limit, limit),
                 };
-                let params = PlaceOrderParams {
-                    market_id: stop.market_id,
-                    is_buy: stop.side == Side::Buy,
-                    price: order_price,
-                    quantity: stop.quantity,
-                    order_type,
-                    time_in_force: stop.time_in_force,
-                    reduce_only: stop.reduce_only,
-                    client_order_id: stop.client_order_id,
-                };
-                let result = self.place_order(params, stop.trader, stop.timestamp);
-                if result.status == OrderStatus::Rejected {
-                    tracing::warn!(
-                        stop_id = stop.id,
-                        trader = %stop.trader,
-                        market_id = stop.market_id,
-                        trigger_price = ?stop.trigger_price,
-                        "stop order triggered but resulting order rejected"
-                    );
+                TriggeredStop {
+                    id: stop.id,
+                    trader: stop.trader,
+                    timestamp: stop.timestamp,
+                    params: PlaceOrderParams {
+                        market_id: stop.market_id,
+                        is_buy: stop.side == Side::Buy,
+                        price,
+                        quantity: stop.quantity,
+                        order_type,
+                        time_in_force: stop.time_in_force,
+                        reduce_only: stop.reduce_only,
+                        client_order_id: stop.client_order_id,
+                    },
                 }
-            }
-
-            // No price change → no new triggers
-            if self.last_trade_price == Some(prev_price) {
-                break;
-            }
-        }
-
-        self.triggering_stops = false;
+            })
+            .collect()
     }
 }
 
@@ -1510,6 +1779,9 @@ impl OrderBook {
                 .is_none_or(|&prev| prev < seq),
             "insert_loaded_order: seq {seq} not ascending within its level"
         );
+        if order.reduce_only {
+            self.reduce_only_index.insert((trader, id));
+        }
         queue.push_back(order);
         self.order_index.insert(id, OrderLocation { side, price });
         self.trader_orders.entry(trader).or_default().push(id);
@@ -2389,7 +2661,13 @@ impl BorshSerialize for StopOrder {
             Side::Sell => 1u8,
         }])?;
         borsh_write_fp(&self.trigger_price, w)?;
+        // Tag 0 = market (no cap: legacy), 1 = limit, 2 = market + s515
+        // price cap. A cap-less stop keeps the exact pre-s515 bytes.
         match &self.limit_price {
+            None if self.price_cap > FixedPoint::ZERO => {
+                w.write_all(&[2u8])?;
+                borsh_write_fp(&self.price_cap, w)?;
+            }
             None => w.write_all(&[0u8])?,
             Some(lp) => {
                 w.write_all(&[1u8])?;
@@ -2440,10 +2718,16 @@ impl BorshDeserialize for StopOrder {
 
         let mut lp_tag = [0u8; 1];
         r.read_exact(&mut lp_tag)?;
-        let limit_price = if lp_tag[0] == 0 {
-            None
-        } else {
-            Some(borsh_read_fp(r)?)
+        let (limit_price, price_cap) = match lp_tag[0] {
+            0 => (None, FixedPoint::ZERO),
+            1 => (Some(borsh_read_fp(r)?), FixedPoint::ZERO),
+            2 => (None, borsh_read_fp(r)?),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid stop price tag",
+                ))
+            }
         };
 
         let quantity = borsh_read_fp(r)?;
@@ -2488,6 +2772,7 @@ impl BorshDeserialize for StopOrder {
             side,
             trigger_price,
             limit_price,
+            price_cap,
             quantity,
             time_in_force,
             timestamp,
@@ -2580,7 +2865,8 @@ impl BorshDeserialize for OrderBook {
             lot_size,
             next_id,
             last_trade_price,
-            triggering_stops: false,
+            reduce_only_index: BTreeSet::new(),
+            reduce_only_positions: ReduceOnlyPositions::default(),
             order_seq: HashMap::new(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
@@ -2670,11 +2956,13 @@ mod tests {
         }
     }
 
+    /// s515: a market order's price is its slippage cap — these sweep
+    /// helpers use a cap no test book reaches.
     fn market_buy(qty: FixedPoint) -> PlaceOrderParams {
         PlaceOrderParams {
             market_id: 1,
             is_buy: true,
-            price: FixedPoint::ZERO,
+            price: fp(1_000_000_000),
             quantity: qty,
             order_type: OrderType::Market,
             time_in_force: TimeInForce::GTC,
@@ -2687,7 +2975,7 @@ mod tests {
         PlaceOrderParams {
             market_id: 1,
             is_buy: false,
-            price: FixedPoint::ZERO,
+            price: FixedPoint::from_raw(1),
             quantity: qty,
             order_type: OrderType::Market,
             time_in_force: TimeInForce::GTC,
@@ -3052,11 +3340,11 @@ mod tests {
         // Place a buy at 95 as liquidity
         ob.place_order(limit_buy(fp(95), fp(10)), addr(2), 2);
 
-        // Stop market buy: trigger at 100
+        // Stop market buy: trigger at 100, slippage cap 110
         let params = PlaceOrderParams {
             market_id: 1,
             is_buy: true,
-            price: FixedPoint::ZERO,
+            price: fp(110),
             quantity: fp(5),
             order_type: OrderType::StopMarket { trigger: fp(100) },
             time_in_force: TimeInForce::GTC,
@@ -3070,10 +3358,58 @@ mod tests {
         // Trade at 100 to trigger the stop: sell at 95 matches the buy at 95
         // Actually we need a trade that sets last_trade_price >= 100
         // Let's do a buy that matches the sell at 105
-        ob.place_order(limit_buy(fp(105), fp(1)), addr(4), 4);
-        // This trade at 105 triggers the stop buy (trigger=100, 105>=100)
-        // The stop converts to market buy, fills against remaining sell at 105
+        // This trade at 105 triggers the stop buy (trigger=100, 105>=100).
+        // s515: the fired stop is handed back (as a market buy capped at
+        // 110, keeping its id) for the executor to place — not run inline.
+        let r = ob.place_order(limit_buy(fp(105), fp(1)), addr(4), 4);
         assert_eq!(ob.pending_stop_count(), 0);
+        assert_eq!(r.triggered_stops.len(), 1);
+        let t = &r.triggered_stops[0];
+        assert_eq!(t.trader, addr(3));
+        assert_eq!(t.params.order_type, OrderType::Market);
+        assert_eq!(t.params.price, fp(110));
+        assert_eq!(t.params.quantity, fp(5));
+        // Nothing beyond the trigger trade consumed the ask.
+        assert_eq!(ob.ask_depth(), vec![(fp(105), fp(9), 1)]);
+    }
+
+    #[test]
+    fn stop_market_without_price_cap_rejected() {
+        let mut ob = book();
+        let params = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ZERO,
+            quantity: fp(5),
+            order_type: OrderType::StopMarket { trigger: fp(100) },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        assert_eq!(ob.place_order(params, addr(3), 3).status, OrderStatus::Rejected);
+        assert_eq!(ob.pending_stop_count(), 0);
+    }
+
+    #[test]
+    fn market_order_respects_price_cap() {
+        let mut ob = book();
+        ob.place_order(limit_sell(fp(100), fp(3)), addr(1), 1);
+        ob.place_order(limit_sell(fp(101), fp(3)), addr(2), 2);
+        ob.place_order(limit_sell(fp(103), fp(3)), addr(3), 3);
+        let mut p = market_buy(fp(9));
+        p.price = fp(101);
+        let r = ob.place_order(p, addr(4), 4);
+        assert_eq!(r.status, OrderStatus::Cancelled);
+        let filled: FixedPoint = r.fills.iter().map(|f| f.quantity).fold(FixedPoint::ZERO, |a, b| a + b);
+        assert_eq!(filled, fp(6));
+        assert!(r.fills.iter().all(|f| f.price <= fp(101)));
+        assert_eq!(r.rested_qty, FixedPoint::ZERO);
+        assert_eq!(ob.ask_depth(), vec![(fp(103), fp(3), 1)]);
+
+        // Zero cap: rejected outright.
+        let mut p = market_buy(fp(1));
+        p.price = FixedPoint::ZERO;
+        assert_eq!(ob.place_order(p, addr(4), 5).status, OrderStatus::Rejected);
     }
 
     #[test]
@@ -3778,7 +4114,7 @@ mod tests {
         let params = PlaceOrderParams {
             market_id: 1,
             is_buy: true,
-            price: FixedPoint::ZERO,
+            price: fp(120), // s515: stop-market slippage cap
             quantity: fp_frac(0, 50_000_000),
             order_type: OrderType::StopMarket { trigger: fp(100) },
             time_in_force: TimeInForce::GTC,
@@ -3866,7 +4202,7 @@ mod tests {
             PlaceOrderParams {
                 market_id: 1,
                 is_buy: true,
-                price: FixedPoint::ZERO,
+                price: fp(120), // s515: stop-market slippage cap
                 quantity: fp(5),
                 order_type: OrderType::StopMarket { trigger: fp(90) },
                 time_in_force: TimeInForce::GTC,
@@ -3890,7 +4226,7 @@ mod tests {
             PlaceOrderParams {
                 market_id: 1,
                 is_buy: true,
-                price: FixedPoint::ZERO,
+                price: fp(120), // s515: stop-market slippage cap
                 quantity: fp(5),
                 order_type: OrderType::StopMarket { trigger: fp(110) },
                 time_in_force: TimeInForce::GTC,

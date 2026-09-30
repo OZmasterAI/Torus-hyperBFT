@@ -94,7 +94,8 @@ fn bench_market_sweep(c: &mut Criterion) {
                 let params = PlaceOrderParams {
                     market_id: 1,
                     is_buy: true,
-                    price: FixedPoint::ZERO,
+                    // s515: a market order's price is its slippage cap.
+                    price: fp(109),
                     quantity: fp(10),
                     order_type: OrderType::Market,
                     time_in_force: TimeInForce::GTC,

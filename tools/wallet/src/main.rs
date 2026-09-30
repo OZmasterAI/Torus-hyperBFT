@@ -180,7 +180,8 @@ pub(crate) enum Command {
         /// Side: buy or sell
         #[arg(long)]
         side: String,
-        /// Limit price (decimal, up to 8 places)
+        /// Limit price; for market / stop-market orders the REQUIRED
+        /// slippage cap (worst acceptable price) (decimal, up to 8 places)
         #[arg(long)]
         price: String,
         /// Quantity (decimal, up to 8 places)

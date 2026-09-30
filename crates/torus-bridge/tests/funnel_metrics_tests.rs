@@ -86,7 +86,8 @@ fn market_order(market_id: MarketId, is_buy: bool, qty: i64) -> PlaceOrderParams
     PlaceOrderParams {
         market_id,
         is_buy,
-        price: FixedPoint::ZERO,
+        // s515: a market order's price is its REQUIRED slippage cap.
+        price: if is_buy { fp(1_000) } else { fp(1) },
         quantity: fp(qty),
         order_type: OrderType::Market,
         time_in_force: TimeInForce::IOC,
