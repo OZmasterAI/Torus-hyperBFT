@@ -9,6 +9,9 @@ impl OrderBook {
     ) -> (Vec<Fill>, Vec<Order>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
+        // s515: the kernel's reduce-only hooks stay inert (nothing policed).
+        let mut reduce_only_cuts = Vec::new();
+        let mut ro_positions = ReduceOnlyPositions::default();
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
 
@@ -30,6 +33,8 @@ impl OrderBook {
                         Side::Sell,
                         &mut fills,
                         &mut self_trade_cancels,
+                        &mut reduce_only_cuts,
+                        &mut ro_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
@@ -62,6 +67,8 @@ impl OrderBook {
                         Side::Buy,
                         &mut fills,
                         &mut self_trade_cancels,
+                        &mut reduce_only_cuts,
+                        &mut ro_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
                         &mut self.order_seq,
@@ -79,8 +86,20 @@ impl OrderBook {
             }
         }
 
+        assert!(reduce_only_cuts.is_empty());
         (fills, self_trade_cancels)
     }
+}
+
+/// s515: `execute_match` bounds EVERY taker by its price (a market order's
+/// price is its slippage cap). The frozen legacy traversal's unbounded
+/// `market` sweep is reproduced by giving the taker an unreachable price.
+fn unbounded(mut taker: Order) -> Order {
+    taker.price = match taker.side {
+        Side::Buy => FixedPoint::MAX,
+        Side::Sell => FixedPoint::from_raw(1),
+    };
+    taker
 }
 
 fn fp(n: i128) -> FixedPoint {
@@ -159,9 +178,11 @@ fn assert_book_state(actual: &OrderBook, expected: &OrderBook) {
 }
 
 fn assert_match(actual: &mut OrderBook, expected: &mut OrderBook, taker: Order, market: bool) {
+    let taker = if market { unbounded(taker) } else { taker };
     let mut new_taker = taker.clone();
     let mut old_taker = taker;
-    let (new_fills, new_stp) = actual.execute_match(&mut new_taker, market);
+    let (new_fills, new_stp, new_cuts) = actual.execute_match(&mut new_taker);
+    assert!(new_cuts.is_empty());
     let (old_fills, old_stp) = expected.execute_match_legacy(&mut old_taker, market);
     assert_eq!(new_taker, old_taker);
     assert_eq!(new_stp, old_stp);
@@ -245,11 +266,11 @@ fn occupied_matching_preserves_partial_state_when_matching_panics() {
                 queue[0].remaining_qty = FixedPoint::from_raw(1);
                 queue[1].remaining_qty = FixedPoint::from_raw(i128::MIN);
             }
-            let mut new_taker = order(1000, 9, side, 100, 1);
+            let mut new_taker = unbounded(order(1000, 9, side, 100, 1));
             new_taker.remaining_qty = FixedPoint::MAX;
             let mut old_taker = new_taker.clone();
             let new = catch_unwind(AssertUnwindSafe(|| {
-                actual.execute_match(&mut new_taker, true)
+                actual.execute_match(&mut new_taker)
             }))
             .unwrap_err();
             let old = catch_unwind(AssertUnwindSafe(|| {

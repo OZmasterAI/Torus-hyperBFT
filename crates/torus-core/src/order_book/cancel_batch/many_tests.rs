@@ -62,6 +62,7 @@ fn stop(id: u64, trader: Address) -> StopOrder {
         side: Side::Buy,
         trigger_price: fp(200),
         limit_price: None,
+        price_cap: FixedPoint::ZERO,
         quantity: fp(1),
         time_in_force: TimeInForce::GTC,
         timestamp: 0,

@@ -113,7 +113,7 @@ fn classify_market_order() {
     let action = NativeAction::PlaceOrder(PlaceOrderParams {
         market_id: 1,
         is_buy: true,
-        price: fp(0),
+        price: fp(100),
         quantity: fp(1),
         order_type: OrderType::Market,
         time_in_force: TimeInForce::IOC,

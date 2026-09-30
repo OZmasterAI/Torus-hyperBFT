@@ -48,7 +48,8 @@ fn market_buy(qty: FixedPoint) -> PlaceOrderParams {
     PlaceOrderParams {
         market_id: 1,
         is_buy: true,
-        price: FixedPoint::ZERO,
+        // s515: a market order's price is its slippage cap.
+        price: fp(1_000_000),
         quantity: qty,
         order_type: OrderType::Market,
         time_in_force: TimeInForce::GTC,
@@ -212,7 +213,7 @@ fn determinism_stop_orders() {
             PlaceOrderParams {
                 market_id: 1,
                 is_buy: true,
-                price: FixedPoint::ZERO,
+                price: fp(110), // s515: stop-market slippage cap
                 quantity: fp(5),
                 order_type: OrderType::StopMarket { trigger: fp(100) },
                 time_in_force: TimeInForce::GTC,
