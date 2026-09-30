@@ -527,3 +527,124 @@ fn batch_market_sell_reserves_at_earlier_in_batch_bid() {
         assert_bal(&ctx, &taker, fp(30), FixedPoint::ZERO, "taker released");
     }
 }
+
+// ============================================================================
+// (g) F2 (s515 review 3): only a bid that can REST before the sell raises the
+//     batch market-sell reservation (funded, valid, resting TIF, not consumed
+//     by pre-batch asks) - otherwise any account could grief every later
+//     market sell in the batch with an unfundable / non-resting high bid.
+// ============================================================================
+
+/// Pre-batch: maker bid 100 x 4, then `setup` (one block each). The batch is
+/// `[ahead, taker market sell 4]`. Taker holds 25: enough at 100 (20), not at
+/// 150 (30). addr(3) / addr(4) are funded, addr(0) (sorts first) holds nothing.
+fn run_sell_after(
+    path: Path,
+    setup: &[(Address, NativeAction)],
+    ahead: (Address, NativeAction),
+) -> (Vec<NativeActionResult>, NativeExecContext, tempfile::TempDir) {
+    let (d, mut ctx) = fresh(path, &[addr(1), addr(3), addr(4)]);
+    fund_native(&ctx, &addr(2), fp(25));
+    let r = run(&mut ctx, path, &[place(addr(1), limit(1, true, 100, 4))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    for a in setup {
+        let r = run(&mut ctx, path, std::slice::from_ref(a));
+        assert!(r[0].success, "{path:?}: setup {:?}", r[0].error);
+    }
+    let sell = NativeAction::PlaceOrderBatch(vec![market(1, false, fp(1), 4)]);
+    let r = run(&mut ctx, path, &[ahead, (addr(2), sell)]);
+    (r, ctx, d)
+}
+
+fn assert_sell_filled_at_100(path: Path, r: &[NativeActionResult], ctx: &NativeExecContext) {
+    let taker = addr(2);
+    assert!(r[1].success, "{path:?}: market sell must pass: {:?}", r[1].error);
+    assert_eq!(pos(ctx, &taker), -fp(4), "{path:?}: short opened at the 100 bid");
+    assert_bal(ctx, &taker, fp(25), FixedPoint::ZERO, "taker released");
+}
+
+fn ioc(mut p: PlaceOrderParams) -> PlaceOrderParams {
+    p.time_in_force = TimeInForce::IOC;
+    p
+}
+
+#[test]
+fn batch_unfunded_ioc_high_bid_does_not_raise_market_sell_reservation() {
+    for path in PATHS {
+        let bid = ioc(limit(1, true, 1_000_000, 1));
+        let (r, ctx, _d) = run_sell_after(path, &[], place(addr(0), bid));
+        assert!(!r[0].success, "{path:?}: unfunded bid must be rejected");
+        assert_sell_filled_at_100(path, &r, &ctx);
+    }
+}
+
+#[test]
+fn batch_funded_ioc_bid_does_not_raise_market_sell_reservation() {
+    for path in PATHS {
+        let bid = ioc(limit(1, true, 150, 1));
+        let (r, ctx, _d) = run_sell_after(path, &[], place(addr(3), bid));
+        assert!(r[0].success, "{path:?}: IOC bid (cancelled) {:?}", r[0].error);
+        assert!(resting(&ctx, &addr(3)).is_empty(), "{path:?}: IOC never rests");
+        assert_sell_filled_at_100(path, &r, &ctx);
+    }
+}
+
+#[test]
+fn batch_off_tick_or_dust_high_bid_does_not_raise_market_sell_reservation() {
+    for path in PATHS {
+        // Off-tick (tick 1.0) and dust (qty < lot 1.0): rejected by the book.
+        for bid in [
+            PlaceOrderParams { price: fp_cents(15_050), ..limit(1, true, 0, 1) },
+            PlaceOrderParams { quantity: fp_cents(50), ..limit(1, true, 150, 0) },
+        ] {
+            let (r, ctx, _d) = run_sell_after(path, &[], place(addr(3), bid));
+            // (A book-level reject is a successful action with status Rejected.)
+            assert!(resting(&ctx, &addr(3)).is_empty(), "{path:?}: invalid bid never rests");
+            assert_sell_filled_at_100(path, &r, &ctx);
+        }
+    }
+}
+
+#[test]
+fn batch_unfunded_gtc_high_bid_does_not_raise_market_sell_reservation() {
+    for path in PATHS {
+        let (r, ctx, _d) = run_sell_after(path, &[], place(addr(0), limit(1, true, 150, 4)));
+        assert!(!r[0].success, "{path:?}: unfunded GTC bid must be rejected for margin");
+        assert!(resting(&ctx, &addr(0)).is_empty(), "{path:?}");
+        assert_sell_filled_at_100(path, &r, &ctx);
+    }
+}
+
+/// A funded GTC bid above the pre-batch best ask (120 x 10) fills against it
+/// and cannot rest at 150: the sell still reserves at 100.
+#[test]
+fn batch_bid_through_best_ask_that_cannot_rest_is_ignored() {
+    for path in PATHS {
+        let setup = [place(addr(4), limit(1, false, 120, 10))];
+        let (r, ctx, _d) = run_sell_after(path, &setup, place(addr(3), limit(1, true, 150, 1)));
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        assert!(resting(&ctx, &addr(3)).is_empty(), "{path:?}: bid filled at 120");
+        assert_eq!(pos(&ctx, &addr(3)), fp(1), "{path:?}");
+        assert_sell_filled_at_100(path, &r, &ctx);
+    }
+}
+
+/// Soundness of the ask bound: a bid that EXHAUSTS the asks (120 x 1, bid
+/// 150 x 4 -> 3 rest at 150), or whose own ask is STP-cancelled, does rest at
+/// 150 - the sell must still reserve at 150 (30 > 25 -> rejected).
+#[test]
+fn batch_bid_through_best_ask_that_rests_still_counts() {
+    for path in PATHS {
+        for (ask_owner, bid_qty) in [(addr(4), 4), (addr(3), 1)] {
+            let setup = [place(ask_owner, limit(1, false, 120, 1))];
+            let ahead = place(addr(3), limit(1, true, 150, bid_qty));
+            let (r, ctx, _d) = run_sell_after(path, &setup, ahead);
+            let what = format!("{path:?} ask_owner={ask_owner}");
+            assert!(r[0].success, "{what}: {:?}", r[0].error);
+            assert!(!resting(&ctx, &addr(3)).is_empty(), "{what}: bid rests at 150");
+            assert!(!r[1].success, "{what}: sell must reserve at 150");
+            assert_eq!(pos(&ctx, &addr(2)), FixedPoint::ZERO, "{what}");
+            assert_bal(&ctx, &addr(2), fp(25), FixedPoint::ZERO, "taker");
+        }
+    }
+}
