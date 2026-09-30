@@ -737,6 +737,14 @@ impl<T: StateBackend> GovernanceManager<T> {
             Self::validate_param_change(param_key, new_value)?;
         }
 
+        // An explicit (nonzero) listing id must not collide with a live market.
+        // Re-checked at execution (another listing may take it during the vote).
+        if let Some(ExecutionPayload::MarketListing { market_id, .. }) = &execution_payload {
+            if *market_id != 0 && self.market_exists(*market_id)? {
+                return Err(EconomicsError::MarketIdInUse(*market_id));
+            }
+        }
+
         // Derive proposal type from payload.
         let proposal_type = match &execution_payload {
             Some(ExecutionPayload::ParameterChange { .. }) => ProposalType::ParameterChange,
@@ -1085,6 +1093,17 @@ impl<T: StateBackend> GovernanceManager<T> {
                 tick_size,
                 initial_margin,
             } => {
+                // market_id 0 = auto-assign at EXECUTION time: max existing market
+                // id + 1. Deterministic (same CF contents on every validator), and
+                // two proposals executing in one block get distinct ids because
+                // the first write is visible to the second scan.
+                let market_id = if *market_id == 0 {
+                    self.next_market_id()?
+                } else if self.market_exists(*market_id)? {
+                    return Err(EconomicsError::MarketIdInUse(*market_id));
+                } else {
+                    *market_id
+                };
                 let key = market_id.to_be_bytes();
                 let mut data = Vec::new();
                 BorshSerialize::serialize(base_asset, &mut data)
@@ -1434,6 +1453,30 @@ impl<T: StateBackend> GovernanceManager<T> {
     }
 
     /// Get and increment the proposal counter. Returns the new ID (starts at 1).
+    /// Whether a market row exists at `market_id` in CF_NATIVE_MARKETS.
+    fn market_exists(&self, market_id: u64) -> Result<bool> {
+        Ok(self
+            .state
+            .get_cf_raw(CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
+            .is_some())
+    }
+
+    /// Next free market id: max existing 8-byte market key + 1 (1 if none).
+    /// Non-market metadata rows in the CF (`__book_mode__`,
+    /// `__next_global_order_id__`) have keys != 8 bytes and are skipped.
+    fn next_market_id(&self) -> Result<u64> {
+        let max = self
+            .state
+            .iterate_cf(CF_NATIVE_MARKETS, None)?
+            .iter()
+            .filter(|(k, _)| k.len() == 8)
+            .map(|(k, _)| u64::from_be_bytes(k[..8].try_into().unwrap()))
+            .max()
+            .unwrap_or(0);
+        max.checked_add(1)
+            .ok_or(EconomicsError::MarketIdInUse(u64::MAX))
+    }
+
     fn next_proposal_id(&self) -> Result<u64> {
         let current = match self.state.get_cf_raw(CF_FEE_CONFIG, PROPOSAL_COUNTER_KEY)? {
             Some(data) if data.len() == 8 => u64::from_be_bytes(data.try_into().unwrap()),

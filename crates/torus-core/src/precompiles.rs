@@ -923,6 +923,16 @@ fn core_writer_staking(
         CoreWriterQueue::enqueue(state_db, &action)?;
         // Actual amount determined at execution time
         Ok(abi::encode_u128(0).to_vec())
+    } else if sel == selector_for("claimUnbonded()") {
+        // Release every matured unbonding entry of the caller (all validators).
+        let action = QueuedAction {
+            trader: *caller,
+            kind: QueuedActionKind::ClaimUnbonded,
+            block_queued: current_block,
+        };
+        CoreWriterQueue::enqueue(state_db, &action)?;
+        // Actual amount determined at execution time
+        Ok(abi::encode_u128(0).to_vec())
     } else if sel == selector_for("lockPermanent(uint128)") {
         let amount = abi::decode_u128(&abi::word(input, 0)?);
         // FIX ECON-FIND-26: Validate u128 fits in i128 before cast
@@ -1126,6 +1136,8 @@ pub enum QueuedActionKind {
     LockPermanent {
         amount: FixedPoint,
     },
+    /// Claim all matured unbonding entries (borsh tag 7 — appended).
+    ClaimUnbonded,
 }
 
 impl BorshSerialize for QueuedAction {
@@ -1196,6 +1208,9 @@ impl BorshSerialize for QueuedActionKind {
                 w.write_all(&[6])?;
                 borsh_write_fp(amount, w)?;
             }
+            Self::ClaimUnbonded => {
+                w.write_all(&[7])?;
+            }
         }
         Ok(())
     }
@@ -1258,6 +1273,7 @@ impl BorshDeserialize for QueuedActionKind {
                 let amount = borsh_read_fp(r)?;
                 Ok(Self::LockPermanent { amount })
             }
+            7 => Ok(Self::ClaimUnbonded),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid QueuedActionKind discriminant: {x}"),
