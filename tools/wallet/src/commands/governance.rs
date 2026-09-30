@@ -1,10 +1,10 @@
 //! Governance commands: vote, submit-proposal.
 
 use torus_types::{
-    MarketListing, MarketParams, NativeAction, Proposal, ProposalAction, VoteOption,
+    FixedPoint, MarketListing, MarketParams, NativeAction, Proposal, ProposalAction, VoteOption,
 };
 
-use crate::parse::{parse_address, parse_decimal_to_fixed_point};
+use crate::parse::parse_address;
 use crate::rpc::RpcClient;
 use crate::sign::submit_native_action;
 use crate::Cli;
@@ -78,8 +78,8 @@ fn parse_proposal_action(proposal_type: &str, params_json: &str) -> Result<Propo
         "list-market" => Ok(ProposalAction::ListMarket(MarketListing {
             base_asset: req_str(&v, "base_asset")?.to_string(),
             quote_asset: req_str(&v, "quote_asset")?.to_string(),
-            tick_size: parse_decimal_to_fixed_point(req_str(&v, "tick_size")?)?,
-            lot_size: parse_decimal_to_fixed_point(req_str(&v, "lot_size")?)?,
+            tick_size: req_str(&v, "tick_size")?.parse::<FixedPoint>()?,
+            lot_size: req_str(&v, "lot_size")?.parse::<FixedPoint>()?,
             max_leverage: req_u64(&v, "max_leverage")? as u32,
             maintenance_margin_bps: req_u64(&v, "maintenance_margin_bps")? as u32,
         })),
@@ -89,8 +89,8 @@ fn parse_proposal_action(proposal_type: &str, params_json: &str) -> Result<Propo
         "update-market-params" => Ok(ProposalAction::UpdateMarketParams {
             market_id: req_u64(&v, "market_id")?,
             params: MarketParams {
-                tick_size: parse_decimal_to_fixed_point(req_str(&v, "tick_size")?)?,
-                lot_size: parse_decimal_to_fixed_point(req_str(&v, "lot_size")?)?,
+                tick_size: req_str(&v, "tick_size")?.parse::<FixedPoint>()?,
+                lot_size: req_str(&v, "lot_size")?.parse::<FixedPoint>()?,
                 max_leverage: req_u64(&v, "max_leverage")? as u32,
                 maintenance_margin_bps: req_u64(&v, "maintenance_margin_bps")? as u32,
                 max_funding_rate_bps: req_u64(&v, "max_funding_rate_bps")? as u32,

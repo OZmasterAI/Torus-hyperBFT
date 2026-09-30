@@ -242,17 +242,13 @@ pub struct LogFilter {
 }
 
 // ============================================================================
-// FixedPoint hex helper
+// FixedPoint decimal helper
 // ============================================================================
 
-/// Format a FixedPoint as a hex string of its raw i128 value.
-pub fn hex_fp(v: FixedPoint) -> String {
-    let raw = v.raw();
-    if raw >= 0 {
-        format!("{:#x}", raw as u128)
-    } else {
-        format!("-{:#x}", (-raw) as u128)
-    }
+/// Format a FixedPoint as a decimal string (`"123.45000000"`) for `torus_*`
+/// outputs (s80). `eth_*` outputs stay hex.
+pub fn dec_fp(v: FixedPoint) -> String {
+    v.to_string()
 }
 
 // ============================================================================
@@ -369,6 +365,34 @@ pub struct RpcUserTrade {
     pub price: String,
     pub quantity: String,
     pub role: String,
+    pub block_number: String,
+    pub timestamp: String,
+}
+
+/// One `newTrades` stream row (s80): a public trade plus both parties.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcStreamTrade {
+    #[serde(flatten)]
+    pub trade: RpcTrade,
+    pub maker: String,
+    pub taker: String,
+}
+
+/// One `userFills` stream row (s80): one fill from one party's view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserFill {
+    pub trade_id: String,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    pub quantity: String,
+    pub role: String,
+    pub order_id: String,
+    pub start_position: String,
+    pub closed_pnl: String,
+    pub dir: String,
     pub block_number: String,
     pub timestamp: String,
 }

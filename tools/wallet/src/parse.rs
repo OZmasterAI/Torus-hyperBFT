@@ -1,13 +1,13 @@
 //! Parsing helpers for CLI argument → native types.
 //!
 //! - `parse_trs_to_wei`: decimal TRS → U256 (18 decimals). Used for all TRS transfers/staking.
-//! - `parse_decimal_to_fixed_point`: decimal → FixedPoint (8 decimals, i128).
-//!   Used for trading prices/quantities and market parameters.
+//! - Decimal → `FixedPoint` (8 decimals, i128) is `str::parse::<FixedPoint>`
+//!   (torus-types). Used for trading prices/quantities and market parameters.
 //! - `parse_address`: hex string → 20-byte EVM address.
 //! - `parse_pubkey`: 64 hex chars → 32-byte `PublicKey`.
 
 use alloy_primitives::{Address, U256};
-use torus_types::{FixedPoint, PublicKey};
+use torus_types::PublicKey;
 
 pub(crate) fn parse_trs_to_wei(trs: &str) -> Result<U256, String> {
     let parts: Vec<&str> = trs.split('.').collect();
@@ -45,59 +45,6 @@ pub(crate) fn parse_address(s: &str) -> Result<Address, String> {
     Ok(Address::from_slice(&bytes))
 }
 
-/// Parse decimal string to `FixedPoint` (8 decimal places, i128 scaled by 10^8).
-///
-/// Accepts `"1.5"`, `".5"` (no leading zero), `"100"`, `"-1.5"`, `"0.00000001"`.
-/// Up to 8 fractional digits.
-/// Rejects empty strings, non-numeric input, and more than 8 decimal places.
-pub(crate) fn parse_decimal_to_fixed_point(s: &str) -> Result<FixedPoint, String> {
-    if s.is_empty() {
-        return Err("empty decimal string".into());
-    }
-    let (sign, body) = match s.strip_prefix('-') {
-        Some(rest) => (-1i128, rest),
-        None => (1i128, s),
-    };
-    if body.is_empty() {
-        return Err("invalid decimal: missing digits".into());
-    }
-    let parts: Vec<&str> = body.split('.').collect();
-    let (whole_str, frac_str) = match parts.len() {
-        1 => (parts[0], ""),
-        2 => (parts[0], parts[1]),
-        _ => return Err("invalid decimal: multiple '.'".into()),
-    };
-    if whole_str.is_empty() && frac_str.is_empty() {
-        return Err("invalid decimal: missing digits".into());
-    }
-    if frac_str.len() > FixedPoint::DECIMALS as usize {
-        return Err(format!(
-            "too many decimal places (max {})",
-            FixedPoint::DECIMALS
-        ));
-    }
-    let whole: i128 = if whole_str.is_empty() {
-        0
-    } else {
-        whole_str
-            .parse()
-            .map_err(|e| format!("invalid whole part: {e}"))?
-    };
-    let frac: i128 = if frac_str.is_empty() {
-        0
-    } else {
-        let padded = format!("{frac_str:0<8}");
-        padded
-            .parse()
-            .map_err(|e| format!("invalid fraction: {e}"))?
-    };
-    let raw = whole
-        .checked_mul(FixedPoint::SCALE)
-        .and_then(|w| w.checked_add(frac))
-        .ok_or("decimal overflow")?;
-    Ok(FixedPoint::from_raw(sign * raw))
-}
-
 pub(crate) fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -112,6 +59,7 @@ pub(crate) fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use torus_types::FixedPoint;
 
     #[test]
     fn test_parse_trs_to_wei() {
@@ -152,34 +100,19 @@ mod tests {
 
     #[test]
     fn test_parse_decimal_to_fixed_point() {
-        assert_eq!(
-            parse_decimal_to_fixed_point("1.5").unwrap().raw(),
-            150_000_000
-        );
-        assert_eq!(
-            parse_decimal_to_fixed_point("100").unwrap().raw(),
-            10_000_000_000
-        );
-        assert_eq!(parse_decimal_to_fixed_point("0.00000001").unwrap().raw(), 1);
-        assert_eq!(
-            parse_decimal_to_fixed_point("0.001").unwrap().raw(),
-            100_000
-        );
-        assert_eq!(
-            parse_decimal_to_fixed_point("-1.5").unwrap().raw(),
-            -150_000_000
-        );
-        assert_eq!(parse_decimal_to_fixed_point("0").unwrap().raw(), 0);
-        assert_eq!(
-            parse_decimal_to_fixed_point(".5").unwrap().raw(),
-            50_000_000
-        );
+        assert_eq!("1.5".parse::<FixedPoint>().unwrap().raw(), 150_000_000);
+        assert_eq!("100".parse::<FixedPoint>().unwrap().raw(), 10_000_000_000);
+        assert_eq!("0.00000001".parse::<FixedPoint>().unwrap().raw(), 1);
+        assert_eq!("0.001".parse::<FixedPoint>().unwrap().raw(), 100_000);
+        assert_eq!("-1.5".parse::<FixedPoint>().unwrap().raw(), -150_000_000);
+        assert_eq!("0".parse::<FixedPoint>().unwrap().raw(), 0);
+        assert_eq!(".5".parse::<FixedPoint>().unwrap().raw(), 50_000_000);
         // 9 decimals — too many
-        assert!(parse_decimal_to_fixed_point("1.123456789").is_err());
-        assert!(parse_decimal_to_fixed_point("").is_err());
-        assert!(parse_decimal_to_fixed_point("abc").is_err());
-        assert!(parse_decimal_to_fixed_point("-").is_err());
-        assert!(parse_decimal_to_fixed_point("1.2.3").is_err());
+        assert!("1.123456789".parse::<FixedPoint>().is_err());
+        assert!("".parse::<FixedPoint>().is_err());
+        assert!("abc".parse::<FixedPoint>().is_err());
+        assert!("-".parse::<FixedPoint>().is_err());
+        assert!("1.2.3".parse::<FixedPoint>().is_err());
     }
 
     #[test]

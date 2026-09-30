@@ -69,7 +69,7 @@ height() {
 native_balance() {
   curl -s --max-time 5 -X POST "$RPC" -H 'content-type: application/json' \
        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"torus_getBalances\",\"params\":[\"$1\"]}" 2>/dev/null \
-    | grep -oiE '"native_?balance":"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+' | head -1
+    | grep -oiE '"native_?balance":"-?[0-9.]+"' | grep -oE -- '-?[0-9.]+' | head -1
 }
 sender_addr() { "$BIN" gen-accounts --offset "$1" --count 1 2>/dev/null | awk '{print $2; exit}'; }
 metric() { curl -s --max-time 5 "$METRICS/metrics" 2>/dev/null | awk -v k="$1" '$1==k{print $2; exit}'; }
@@ -105,7 +105,7 @@ last_idx=$(( SENDER_OFFSET + max_s - 1 ))
 for idx in "$SENDER_OFFSET" "$last_idx"; do
   addr=$(sender_addr "$idx"); bal=$(native_balance "$addr")
   [ -z "$bal" ] && { echo "  WARN: balance unreadable for idx $idx ($addr)"; continue; }
-  { [ "$bal" = "0x0" ] || [ "$bal" = "0x00" ]; } && { echo "!! ABORT: idx $idx ($addr) ZERO balance"; exit 1; }
+  [ "$bal" = "0.00000000" ] && { echo "!! ABORT: idx $idx ($addr) ZERO balance"; exit 1; }
   echo "  funded: idx $idx $addr native_balance=$bal"
 done
 echo "=== prechecks passed ==="

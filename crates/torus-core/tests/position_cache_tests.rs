@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use torus_core::position::{
-    position_key, MarginType, NativeBalance, PositionCache, PositionManager,
+    position_key, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
 };
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
@@ -147,6 +147,69 @@ fn cached_partial_fills_match_reference() {
     let pos = pm_cached.get_position(&addr(1), 7).unwrap().unwrap();
     assert_eq!(pos.size, fp(1));
     assert!(pos.is_long);
+}
+
+// ============================================================================
+// FillEffect: start position and closed PnL of each fill (s80 userFills)
+// ============================================================================
+
+/// Fixed-point from tenths (325 -> 32.5).
+fn fp_tenths(v: i64) -> FixedPoint {
+    FixedPoint::from_raw(v as i128 * FixedPoint::SCALE / 10)
+}
+
+#[test]
+fn apply_fill_cached_effect_reports_start_and_pnl() {
+    // (is_buy, qty, price, expected start_size, expected closed_pnl)
+    let steps: Vec<(bool, i64, i64, FixedPoint, Option<FixedPoint>)> = vec![
+        // Open long 5 @100.
+        (true, 5, 100, FixedPoint::ZERO, None),
+        // Increase to 8; entry (500+330)/8 = 103.75.
+        (true, 3, 110, fp(5), None),
+        // Partial close 2: (120-103.75)*2 = 32.5.
+        (false, 2, 120, fp(8), Some(fp_tenths(325))),
+        // Flip: close 6 at (90-103.75)*6 = -82.5, then short 4 @90.
+        (false, 10, 90, fp(6), Some(fp_tenths(-825))),
+        // Full close of the short 4 @90: flat.
+        (true, 4, 90, fp(-4), Some(FixedPoint::ZERO)),
+    ];
+    let trader = addr(1);
+
+    // Cached path.
+    let (_d1, pm) = setup();
+    let mut cache = PositionCache::new();
+    for (i, &(is_buy, qty, price, start, pnl)) in steps.iter().enumerate() {
+        let effect = pm
+            .apply_fill_cached_effect(&mut cache, &trader, 1, is_buy, fp(qty), fp(price), MarginType::Cross)
+            .unwrap();
+        assert_eq!(
+            effect,
+            FillEffect { start_size: start, closed_pnl: pnl },
+            "cached step {i}"
+        );
+        if i == 3 {
+            let pos = cache.load(&pm, &trader, 1).unwrap().unwrap();
+            assert!(!pos.is_long, "flip leaves a short");
+            assert_eq!(pos.size, fp(4));
+            assert_eq!(pos.entry_price, fp(90));
+        }
+    }
+    cache.flush_all(&pm).unwrap();
+    assert!(pm.get_position(&trader, 1).unwrap().is_none(), "final buy closes the short");
+
+    // Uncached path on a fresh manager reports the same effects.
+    let (_d2, pm_ref) = setup();
+    for (i, &(is_buy, qty, price, start, pnl)) in steps.iter().enumerate() {
+        let effect = pm_ref
+            .apply_fill(&trader, 1, is_buy, fp(qty), fp(price), MarginType::Cross)
+            .unwrap();
+        assert_eq!(
+            effect,
+            FillEffect { start_size: start, closed_pnl: pnl },
+            "uncached step {i}"
+        );
+    }
+    assert!(pm_ref.get_position(&trader, 1).unwrap().is_none());
 }
 
 // ============================================================================

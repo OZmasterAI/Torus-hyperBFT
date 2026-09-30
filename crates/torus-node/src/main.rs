@@ -24,7 +24,7 @@ use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
-use torus_rpc::{find_latest_height, scan_trades_for_block, BlockNotifier, RpcServer};
+use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
 use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
@@ -814,6 +814,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 7. Block notifier + shared height counter (consensus replica <-> RPC server)
     let notifier = BlockNotifier::new();
     let notifier_for_replica = notifier.clone();
+    // s80: newTrades / userFills are fed from execution (each executed block's
+    // fills), not read back from the DB at commit; fills are recorded only
+    // while a stream subscriber exists. Set before the replica starts.
+    app.set_fill_sink(Arc::new(notifier.clone()));
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
@@ -911,8 +915,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {}
             }
-            let trades = scan_trades_for_block(&state_db_for_handler, height);
-            notifier_for_replica.notify_new_trades(trades);
         })
         .build()
         .start();
@@ -930,6 +932,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
+    // s80 fix 2: all-markets newTrades is off on validators unless
+    // TORUS_ALL_MARKET_TRADES=1 (on for --rpc-only unless =0). Read once here.
+    let all_market_trades = torus_rpc::streams::all_market_trades_allowed(
+        std::env::var(torus_rpc::streams::ENV_ALL_MARKET_TRADES)
+            .ok()
+            .as_deref(),
+        cli.rpc_only,
+    );
+    info!(all_market_trades, "all-markets newTrades subscriptions");
+    rpc_server.set_all_market_trades(all_market_trades);
 
     // Leader forwarding: RPC → network bridge
     let own_vk = verifying_key.to_bytes();

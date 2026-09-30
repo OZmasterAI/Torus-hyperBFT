@@ -22,7 +22,7 @@ use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor}
 use torus_core::position::NativeBalance;
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::{Mempool, MempoolConfig};
-use torus_rpc::types::{hex_fp, RpcMarkPrice, RpcOpenOrder, RpcOrderBook};
+use torus_rpc::types::{dec_fp, RpcMarkPrice, RpcOpenOrder, RpcOrderBook};
 use torus_rpc::{BlockNotifier, RpcServer};
 use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -145,14 +145,14 @@ async fn get_order_book_serves_every_mode() {
             .unwrap_or_else(|e| panic!("{mode:?}: getOrderBook failed: {e}"));
 
         assert_eq!(book.bids.len(), 2, "{mode:?}: two bid levels");
-        assert_eq!(book.bids[0].price, hex_fp(fp(100)), "{mode:?}: best bid first");
-        assert_eq!(book.bids[0].quantity, hex_fp(fp(3)), "{mode:?}: post-fill qty");
+        assert_eq!(book.bids[0].price, dec_fp(fp(100)), "{mode:?}: best bid first");
+        assert_eq!(book.bids[0].quantity, dec_fp(fp(3)), "{mode:?}: post-fill qty");
         assert_eq!(book.bids[0].order_count, 1, "{mode:?}");
-        assert_eq!(book.bids[1].price, hex_fp(fp(99)), "{mode:?}");
-        assert_eq!(book.bids[1].quantity, hex_fp(fp(7)), "{mode:?}");
+        assert_eq!(book.bids[1].price, dec_fp(fp(99)), "{mode:?}");
+        assert_eq!(book.bids[1].quantity, dec_fp(fp(7)), "{mode:?}");
         assert_eq!(book.asks.len(), 1, "{mode:?}: one ask level");
-        assert_eq!(book.asks[0].price, hex_fp(fp(105)), "{mode:?}");
-        assert_eq!(book.asks[0].quantity, hex_fp(fp(4)), "{mode:?}");
+        assert_eq!(book.asks[0].price, dec_fp(fp(105)), "{mode:?}");
+        assert_eq!(book.asks[0].quantity, dec_fp(fp(4)), "{mode:?}");
 
         handle.stop().unwrap();
     }
@@ -208,7 +208,7 @@ async fn get_mark_price_reports_last_trade_price_in_every_mode() {
             .unwrap_or_else(|e| panic!("{mode:?}: getMarkPrice failed: {e}"));
         assert_eq!(
             mp.last_trade_price,
-            hex_fp(fp(100)),
+            dec_fp(fp(100)),
             "{mode:?}: last trade price must come off the persisted book"
         );
 
@@ -217,7 +217,7 @@ async fn get_mark_price_reports_last_trade_price_in_every_mode() {
             .request("torus_getMarkPrice", rpc_params!["0x2"])
             .await
             .unwrap();
-        assert_eq!(mp2.last_trade_price, hex_fp(FixedPoint::ZERO), "{mode:?}");
+        assert_eq!(mp2.last_trade_price, dec_fp(FixedPoint::ZERO), "{mode:?}");
 
         handle.stop().unwrap();
     }

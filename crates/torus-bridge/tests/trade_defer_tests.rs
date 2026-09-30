@@ -9,9 +9,9 @@
 use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
-use torus_core::position::NativeBalance;
+use torus_core::position::{MarginType, NativeBalance};
 use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
-use torus_state::trade_rows::{decode_trade_row, decode_user_row, encode_block, TradeFill};
+use torus_state::trade_rows::{decode_trade_row, decode_user_row, encode_block, FillExtras, TradeFill};
 use torus_state::{PackedCfBatch, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
@@ -233,23 +233,121 @@ fn fills_accumulate_across_batches() {
 #[test]
 fn trade_index_counts_fills_in_both_settle_paths_with_history_on_and_off() {
     for history in [true, false] {
-        for parallel in [false, true] {
-            let (_dir, db) = open_test_db();
-            let mut ctx = make_ctx(db.clone());
-            ctx.defer_trades = true;
-            ctx.trade_history = history;
-            for t in 1..=4u8 {
-                fund_native(&ctx, &addr(t), fp(1_000_000));
+        for record_fills in [false, true] {
+            for parallel in [false, true] {
+                let (_dir, db) = open_test_db();
+                let mut ctx = make_ctx(db.clone());
+                ctx.defer_trades = true;
+                ctx.trade_history = history;
+                ctx.record_fills = record_fills;
+                for t in 1..=4u8 {
+                    fund_native(&ctx, &addr(t), fp(1_000_000));
+                }
+                let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+                assert!(r.results.iter().all(|r| r.success));
+                let case = format!("history={history} record_fills={record_fills} parallel={parallel}");
+                assert_eq!(ctx.trade_index, 3, "{case}");
+                let (fills, extras) = ctx.take_pending_fills_and_extras();
+                assert_eq!(fills.len(), if history || record_fills { 3 } else { 0 }, "{case}");
+                assert!(fills.iter().map(|f| f.trade_index).eq(0..fills.len() as u32), "{case}");
+                // s80 fix 1: stream-only extras only while a stream wants them.
+                assert_eq!(extras.len(), if record_fills { 3 } else { 0 }, "{case}");
             }
-            let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
-            assert!(r.results.iter().all(|r| r.success));
-            let case = format!("history={history} parallel={parallel}");
-            assert_eq!(ctx.trade_index, 3, "{case}");
-            let fills = ctx.take_pending_trade_fills();
-            assert_eq!(fills.len(), if history { 3 } else { 0 }, "{case}");
-            assert!(fills.iter().map(|f| f.trade_index).eq(0..fills.len() as u32), "{case}");
         }
     }
+
+    // s80: inline mode with history off records fills for the stream but
+    // writes no trade rows.
+    for parallel in [false, true] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db.clone());
+        ctx.trade_history = false;
+        ctx.record_fills = true;
+        for t in 1..=4u8 {
+            fund_native(&ctx, &addr(t), fp(1_000_000));
+        }
+        let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+        assert!(r.results.iter().all(|r| r.success));
+        for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+            assert!(cf_rows(&db, cf).is_empty(), "{cf} parallel={parallel}");
+        }
+        let (fills, extras) = ctx.take_pending_fills_and_extras();
+        assert_eq!((fills.len(), extras.len()), (3, 3), "parallel={parallel}");
+    }
+}
+
+// ============================================================================
+// s80 fix 1: with no stream subscriber (`record_fills` false) execution
+// records exactly the s78 fill records — no stream-only extras.
+// ============================================================================
+
+/// `size_of::<TradeFill>()` at d930405 (s78), measured there: 96 bytes.
+const S78_TRADE_FILL_SIZE: usize = 96;
+
+#[test]
+fn no_subscriber_records_s78_fill_records_only() {
+    assert_eq!(std::mem::size_of::<TradeFill>(), S78_TRADE_FILL_SIZE, "TradeFill keeps the s78 layout");
+    for defer in [true, false] {
+        for parallel in [false, true] {
+            let case = format!("defer={defer} parallel={parallel}");
+            let run = |record_fills: bool| {
+                let (_dir, db) = open_test_db();
+                let mut ctx = make_ctx(db);
+                ctx.defer_trades = defer;
+                assert!(ctx.trade_history && !ctx.record_fills, "defaults: history on, no subscriber");
+                ctx.record_fills = record_fills;
+                for t in 1..=4u8 {
+                    fund_native(&ctx, &addr(t), fp(1_000_000));
+                }
+                let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &crossing_actions(), parallel);
+                assert!(r.results.iter().all(|r| r.success), "{case}");
+                ctx.take_pending_fills_and_extras()
+            };
+            let (fills, extras) = run(false);
+            assert_eq!(fills.len(), 3, "{case}: history on records the fills");
+            assert!(extras.is_empty(), "{case}: no subscriber, no extras");
+            // A subscriber adds the extras and changes nothing in the fills.
+            let (fills_sub, extras_sub) = run(true);
+            assert_eq!(fills_sub, fills, "{case}");
+            assert_eq!(extras_sub.len(), 3, "{case}");
+        }
+    }
+
+    // Single-action path.
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    for t in 1..=2u8 {
+        fund_native(&ctx, &addr(t), fp(1_000_000));
+    }
+    for (who, is_buy) in [(1u8, false), (2, true)] {
+        let r = NativeExecutor::execute(&mut ctx, &addr(who), &NativeAction::PlaceOrder(limit(1, is_buy, 100, 5)));
+        assert!(r.success, "{:?}", r.error);
+    }
+    let (fills, extras) = ctx.take_pending_fills_and_extras();
+    assert_eq!((fills.len(), extras.len()), (1, 0), "single action, no subscriber");
+}
+
+/// Inline mode with a subscriber: a context reused for a new height drops the
+/// earlier block's fills and extras together, so they stay index-aligned.
+#[test]
+fn inline_mode_keeps_extras_aligned_across_heights() {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    ctx.record_fills = true;
+    two_phase_block(&mut ctx); // block 1: fills 0 and 1
+    ctx.block_height = 2;
+    let r = NativeExecutor::execute_batch(
+        &mut ctx,
+        &[
+            (addr(1), NativeAction::PlaceOrder(limit(1, false, 100, 2))),
+            (addr(2), NativeAction::PlaceOrder(limit(1, true, 100, 2))),
+        ],
+    );
+    assert!(r.results.iter().all(|r| r.success));
+    let (fills, extras) = ctx.take_pending_fills_and_extras();
+    assert_eq!(fills.iter().map(|f| f.trade_index).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(extras.len(), 1);
+    assert_ne!(extras[0].maker_order_id, 0);
 }
 
 // ============================================================================
@@ -299,6 +397,7 @@ fn inline_ctx_reused_across_heights_writes_each_block_once() {
 fn single_action_execute_writes_rows_inline() {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db.clone());
+    ctx.record_fills = true;
     for t in 1..=2u8 {
         fund_native(&ctx, &addr(t), fp(1_000_000));
     }
@@ -307,9 +406,140 @@ fn single_action_execute_writes_rows_inline() {
         assert!(r.success, "{:?}", r.error);
     };
     place(&mut ctx, 1, false, 5);
+    let maker_id = resting_id(&ctx, 1, 1);
+    let taker_ids = [ctx.next_global_order_id, ctx.next_global_order_id + 1];
     place(&mut ctx, 2, true, 2);
     assert_eq!(market_rows_by_block(&db), vec![(1, vec![0])]);
     place(&mut ctx, 2, true, 3);
     assert_eq!(market_rows_by_block(&db), vec![(1, vec![0, 1])], "superset rewrite");
     assert_eq!(cf_rows(&db, CF_NATIVE_USER_TRADES).len(), 2);
+
+    // s80: order ids and position effects on the single-action path too.
+    let (fills, extras) = ctx.take_pending_fills_and_extras();
+    assert_eq!(fills.len(), extras.len());
+    let got: Vec<(u128, u128, i128, i128, i128, i128)> = extras
+        .iter()
+        .map(|e| (e.maker_order_id, e.taker_order_id, e.maker_start_raw, e.taker_start_raw, e.maker_pnl_raw, e.taker_pnl_raw))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (maker_id, taker_ids[0], 0, 0, 0, 0),
+            (maker_id, taker_ids[1], fp(-2).raw(), fp(2).raw(), 0, 0),
+        ]
+    );
+}
+
+// ============================================================================
+// s80: every recorded fill carries both order ids and each party's position
+// effect (start size, closed PnL), identically in both settle paths.
+// ============================================================================
+
+/// Deferred-mode context with traders 1..=4 funded and a stream subscriber
+/// (`record_fills`), so fills carry their extras.
+fn funded_ctx(db: StateDb) -> NativeExecContext {
+    let mut ctx = make_ctx(db);
+    ctx.defer_trades = true;
+    ctx.record_fills = true;
+    for t in 1..=4u8 {
+        fund_native(&ctx, &addr(t), fp(1_000_000));
+    }
+    ctx
+}
+
+/// Run `batches` in one settle mode; returns the fills recorded so far, each
+/// paired with its extras (asserted index-aligned).
+fn settle_fills(
+    ctx: &mut NativeExecContext,
+    batches: &[Vec<(Address, NativeAction)>],
+    parallel: bool,
+) -> Vec<(TradeFill, FillExtras)> {
+    for batch in batches {
+        let r = NativeExecutor::execute_batch_settle_mode(ctx, batch, parallel);
+        assert!(r.results.iter().all(|r| r.success), "{:?}", r.results);
+    }
+    let (fills, extras) = ctx.take_pending_fills_and_extras();
+    assert_eq!(fills.len(), extras.len(), "extras index-aligned with fills");
+    fills.into_iter().zip(extras).collect()
+}
+
+/// Id of `trader`'s only resting order on `market`.
+fn resting_id(ctx: &NativeExecContext, market: MarketId, trader: u8) -> u128 {
+    let orders = ctx.order_books[&market].orders_for_trader(&addr(trader));
+    assert_eq!(orders.len(), 1, "trader {trader} market {market}");
+    orders[0].id
+}
+
+#[test]
+fn fills_carry_order_ids_and_position_effects() {
+    // crossing_actions, makers first so their book ids can be read back.
+    let actions = crossing_actions();
+    let batches = [
+        vec![actions[0].clone(), actions[1].clone(), actions[3].clone()],
+        vec![actions[2].clone(), actions[4].clone()],
+    ];
+    let mut by_mode = Vec::new();
+    for parallel in [false, true] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = funded_ctx(db);
+        let mut fills = settle_fills(&mut ctx, &batches[..1], parallel);
+        assert!(fills.is_empty());
+        let maker_ids = [resting_id(&ctx, 1, 1), resting_id(&ctx, 1, 2), resting_id(&ctx, 2, 1)];
+        // Order ids are assigned in action order before matching.
+        let next = ctx.next_global_order_id;
+        fills = settle_fills(&mut ctx, &batches[1..], parallel);
+        assert_eq!(fills.len(), 3, "parallel={parallel}");
+        let ids: Vec<(u128, u128)> = fills.iter().map(|(_, e)| (e.maker_order_id, e.taker_order_id)).collect();
+        assert_eq!(ids, vec![(maker_ids[0], next), (maker_ids[1], next), (maker_ids[2], next + 1)]);
+        assert!(ids.iter().all(|&(m, t)| m != 0 && t != 0));
+        assert_eq!((fills[0].1.taker_start_raw, fills[0].1.taker_pnl_raw), (0, 0));
+        // Taker 3's second fill starts from the first one's 5 long.
+        assert_eq!(fills[1].1.taker_start_raw, fp(5).raw());
+        by_mode.push(fills);
+    }
+    assert_eq!(by_mode[0], by_mode[1], "sequential fills and extras == parallel");
+}
+
+#[test]
+fn fills_carry_closed_pnl_of_a_partial_close() {
+    let batches = vec![
+        vec![
+            (addr(1), NativeAction::PlaceOrder(limit(1, false, 100, 10))),
+            (addr(2), NativeAction::PlaceOrder(limit(1, true, 100, 10))),
+        ],
+        vec![
+            (addr(3), NativeAction::PlaceOrder(limit(1, true, 110, 4))),
+            (addr(1), NativeAction::PlaceOrder(limit(1, true, 90, 3))),
+            // Trader 2 (long 10 @100) sells 6 @110: closes 4 as taker, rests 2.
+            (addr(2), NativeAction::PlaceOrder(limit(1, false, 110, 6))),
+            // Trader 1 (short 10 @100) closes 3 @90 as maker.
+            (addr(4), NativeAction::PlaceOrder(limit(1, false, 90, 3))),
+        ],
+    ];
+    let mut by_mode = Vec::new();
+    for parallel in [false, true] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = funded_ctx(db);
+        let fills = settle_fills(&mut ctx, &batches, parallel);
+        assert_eq!(fills.len(), 3, "parallel={parallel}");
+        assert_eq!(fills[1].1.taker_order_id, resting_id(&ctx, 1, 2), "taker remainder rests");
+        by_mode.push(fills);
+    }
+    assert_eq!(by_mode[0], by_mode[1], "sequential fills and extras == parallel");
+    let fills = &by_mode[0];
+    assert_eq!((fills[1].1.taker_start_raw, fills[1].1.taker_pnl_raw), (fp(10).raw(), fp(40).raw()));
+    assert_eq!((fills[2].1.maker_start_raw, fills[2].1.maker_pnl_raw), (fp(-10).raw(), fp(30).raw()));
+
+    // Separate PositionManager replay of the same fills (taker, then maker).
+    let (_dir, db) = open_test_db();
+    let pm = torus_core::position::PositionManager::new(db);
+    let raw = |e: torus_core::position::FillEffect| (e.start_size.raw(), e.closed_pnl.map_or(0, |p| p.raw()));
+    for (f, e) in fills {
+        let (price, qty) = (FixedPoint::from_raw(f.price_raw), FixedPoint::from_raw(f.qty_raw));
+        let taker_is_buy = f.taker_side == 0;
+        let t = pm.apply_fill(&f.taker, f.market, taker_is_buy, qty, price, MarginType::Cross).unwrap();
+        let m = pm.apply_fill(&f.maker, f.market, !taker_is_buy, qty, price, MarginType::Cross).unwrap();
+        assert_eq!((e.taker_start_raw, e.taker_pnl_raw), raw(t), "taker of fill {}", f.trade_index);
+        assert_eq!((e.maker_start_raw, e.maker_pnl_raw), raw(m), "maker of fill {}", f.trade_index);
+    }
 }

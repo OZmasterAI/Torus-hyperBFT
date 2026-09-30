@@ -6,6 +6,7 @@
 pub mod error;
 pub mod eth;
 pub mod net;
+pub mod streams;
 pub mod torus;
 pub mod types;
 pub mod web3;
@@ -97,6 +98,9 @@ use tokio::sync::broadcast;
 use torus_evm::EvmExecutor;
 use torus_mempool::Mempool;
 use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::trade_rows::BlockFills;
+
+use crate::streams::StreamBlock;
 use torus_state::StateDb;
 
 use crate::eth::EthApiServer;
@@ -110,15 +114,34 @@ pub struct BlockNotifier {
     pub new_heads: broadcast::Sender<serde_json::Value>,
     pub new_logs: broadcast::Sender<Vec<serde_json::Value>>,
     pub pending_txs: broadcast::Sender<B256>,
-    pub new_trades: broadcast::Sender<Vec<serde_json::Value>>,
+    /// s80: one message per executed block with fills, fed by the execution
+    /// thread's fill sink. Capacity is in blocks; a subscriber that falls
+    /// further behind is closed with a lag error. Each block is wrapped in a
+    /// [`StreamBlock`] so a `newTrades` filter is serialized once per block
+    /// and shared by its subscribers (s80 fix 2).
+    pub new_trades: broadcast::Sender<Arc<StreamBlock>>,
 }
+
+/// Blocks a `newTrades`/`userFills` subscriber may fall behind before it is
+/// closed with a lag error.
+const TRADE_STREAM_CAPACITY: usize = 256;
 
 impl BlockNotifier {
     pub fn new() -> Self {
+        Self::with_capacities(TRADE_STREAM_CAPACITY)
+    }
+
+    /// A notifier whose trade stream holds only `n` blocks (lag tests).
+    #[cfg(test)]
+    pub(crate) fn with_trade_capacity(n: usize) -> Self {
+        Self::with_capacities(n)
+    }
+
+    fn with_capacities(trade_blocks: usize) -> Self {
         let (new_heads, _) = broadcast::channel(256);
         let (new_logs, _) = broadcast::channel(256);
         let (pending_txs, _) = broadcast::channel(1024);
-        let (new_trades, _) = broadcast::channel(256);
+        let (new_trades, _) = broadcast::channel(trade_blocks);
         Self {
             new_heads,
             new_logs,
@@ -137,17 +160,30 @@ impl BlockNotifier {
         let _ = self.pending_txs.send(hash);
     }
 
-    /// Notify subscribers of new trades from a committed block.
-    pub fn notify_new_trades(&self, trades: Vec<serde_json::Value>) {
-        if !trades.is_empty() {
-            let _ = self.new_trades.send(trades);
-        }
+    /// Publish one executed block's fills to the `newTrades`/`userFills`
+    /// streams (s80). Called from the execution thread's fill sink; never
+    /// blocks (a send with no subscribers is dropped). Wrapping is O(1): the
+    /// JSON is built later by the subscription tasks.
+    pub fn notify_fills(&self, block: Arc<BlockFills>) {
+        let _ = self.new_trades.send(Arc::new(StreamBlock::new(block)));
     }
 }
 
 impl Default for BlockNotifier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// s80: the execution thread's fill sink. Fills are recorded only while at
+/// least one `newTrades`/`userFills` subscriber exists.
+impl torus_state::trade_rows::FillSink for BlockNotifier {
+    fn wants_fills(&self) -> bool {
+        self.new_trades.receiver_count() > 0
+    }
+
+    fn send_fills(&self, block: Arc<BlockFills>) {
+        self.notify_fills(block);
     }
 }
 
@@ -216,6 +252,9 @@ pub struct RpcState {
     pub(crate) tx_submit_limiter: TxSubmitLimiter,
     /// Global cap on active WebSocket subscriptions (HIGH-NEW-05).
     pub(crate) active_subscriptions: Arc<AtomicUsize>,
+    /// Whether all-markets `newTrades` (no `marketId`) is allowed (s80 fix 2).
+    /// Consulted only when a subscription is opened.
+    pub(crate) all_market_trades: bool,
     /// Prometheus metrics handle.
     pub(crate) metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// This node's ed25519 verifying key (for leader comparison).
@@ -269,6 +308,7 @@ impl RpcServer {
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
                 active_subscriptions: Arc::new(AtomicUsize::new(0)),
+                all_market_trades: true,
                 metrics: None,
                 own_vk: None,
                 leader_vk_fn: None,
@@ -318,6 +358,13 @@ impl RpcServer {
     /// Get a shared handle to the pruned-up-to atomic.
     pub fn pruned_up_to(&self) -> Arc<AtomicU64> {
         self.state.pruned_up_to.clone()
+    }
+
+    /// Allow or reject all-markets `newTrades` subscriptions (s80 fix 2).
+    /// Allowed unless set; `torus-node` sets it from
+    /// [`streams::all_market_trades_allowed`] (off on validators by default).
+    pub fn set_all_market_trades(&mut self, allowed: bool) {
+        self.state.all_market_trades = allowed;
     }
 
     /// Set the Prometheus metrics handle for RPC instrumentation.
@@ -481,7 +528,7 @@ pub fn set_latest_height(state: &RpcState, height: u64) {
 }
 
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
-/// Used by the on_commit_block handler to feed the `new_trades` broadcast channel.
+/// Serves `torus_getBlockTrades` (the streams are fed from execution, s80).
 pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
     use torus_state::trade_rows::{decode_trade_row, trade_key};
@@ -535,8 +582,8 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
                 trades.push(serde_json::json!({
                     "marketId": format!("0x{:x}", market_id),
                     "tradeId": format!("0x{:x}", t.trade_index),
-                    "price": format!("0x{:x}", t.price_raw),
-                    "quantity": format!("0x{:x}", t.qty_raw),
+                    "price": torus_types::FixedPoint::from_raw(t.price_raw).to_string(),
+                    "quantity": torus_types::FixedPoint::from_raw(t.qty_raw).to_string(),
                     "side": if t.taker_side == 0 { "buy" } else { "sell" },
                     "blockNumber": format!("0x{:x}", block_height),
                     "timestamp": format!("0x{:x}", timestamp),
@@ -616,6 +663,19 @@ mod tests {
     use torus_mempool::{Mempool, MempoolConfig};
     use torus_state::cf::{CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_RECEIPTS};
     use torus_types::{Receipt, TorusBlockBody, TorusBlockHeader};
+
+    /// s80 review: the node records fills for the streams only while someone
+    /// is subscribed — `wants_fills` follows the trade channel's receivers.
+    #[test]
+    fn block_notifier_wants_fills_only_with_a_subscriber() {
+        use torus_state::trade_rows::FillSink;
+        let notifier = BlockNotifier::new();
+        assert!(!notifier.wants_fills(), "no subscriber: no fills wanted");
+        let rx = notifier.new_trades.subscribe();
+        assert!(notifier.wants_fills(), "a subscriber wants fills");
+        drop(rx);
+        assert!(!notifier.wants_fills(), "last subscriber gone: no fills wanted");
+    }
 
     fn test_header(height: u64, gas_used: u64, base_fee: u64) -> TorusBlockHeader {
         TorusBlockHeader {
@@ -2380,8 +2440,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&t), hex_ids((1020..1030).rev()), "chunk 1 (6) then chunk 0 (4)");
-        assert_eq!(t[0].price, hex_fp(FixedPoint::from_raw(1129)));
-        assert_eq!(t[0].quantity, hex_fp(FixedPoint::from_raw(1030)));
+        assert_eq!(t[0].price, dec_fp(FixedPoint::from_raw(1129)));
+        assert_eq!(t[0].quantity, dec_fp(FixedPoint::from_raw(1030)));
         assert_eq!((t[0].side.as_str(), t[1].side.as_str()), ("sell", "buy"));
         assert_eq!(t[0].block_number, hex_u64(7));
         assert_eq!(t[0].timestamp, hex_u64(1_700_000_007));
@@ -2495,7 +2555,7 @@ mod tests {
         assert_eq!(
             t[1031],
             serde_json::json!({
-                "marketId": "0x2", "tradeId": "0x407", "price": "0x9", "quantity": "0xa",
+                "marketId": "0x2", "tradeId": "0x407", "price": "0.00000009", "quantity": "0.00000010",
                 "side": "buy", "blockNumber": "0x7", "timestamp": "0x6553f107",
             })
         );
@@ -2555,8 +2615,8 @@ mod tests {
             .unwrap();
         assert_eq!(book.bids.len(), 2);
         assert_eq!(book.asks.len(), 2);
-        assert_eq!(book.bids[0].price, hex_fp(fp(50000)));
-        assert_eq!(book.asks[0].price, hex_fp(fp(50100)));
+        assert_eq!(book.bids[0].price, dec_fp(fp(50000)));
+        assert_eq!(book.asks[0].price, dec_fp(fp(50100)));
         handle.stop().unwrap();
     }
 
@@ -2607,9 +2667,9 @@ mod tests {
             .unwrap();
         let pos = pos.unwrap();
         assert_eq!(pos.side, "long");
-        assert_eq!(pos.size, hex_fp(fp(5)));
-        assert_eq!(pos.entry_price, hex_fp(fp(50000)));
-        assert_eq!(pos.realized_pnl, hex_fp(fp(100)));
+        assert_eq!(pos.size, dec_fp(fp(5)));
+        assert_eq!(pos.entry_price, dec_fp(fp(50000)));
+        assert_eq!(pos.realized_pnl, dec_fp(fp(100)));
         assert_eq!(pos.margin_mode, "isolated");
         handle.stop().unwrap();
     }
@@ -2674,14 +2734,14 @@ mod tests {
             .await
             .unwrap();
         // native_balance = available + order_margin = 10500
-        assert_eq!(bal.native_balance, hex_fp(fp(10000) + fp(500)));
+        assert_eq!(bal.native_balance, dec_fp(fp(10000) + fp(500)));
         assert_eq!(
             bal.evm_balance,
             hex_u256(U256::from(2_000_000_000_000_000_000u128))
         );
         // total_margin_used = order_margin (no positions)
-        assert_eq!(bal.total_margin_used, hex_fp(fp(500)));
-        assert_eq!(bal.available_balance, hex_fp(fp(10000)));
+        assert_eq!(bal.total_margin_used, dec_fp(fp(500)));
+        assert_eq!(bal.available_balance, dec_fp(fp(10000)));
         handle.stop().unwrap();
     }
 
@@ -2723,7 +2783,7 @@ mod tests {
             .await
             .unwrap();
         // total_margin_used = order_margin(1000) + isolated(500) = 1500
-        assert_eq!(bal.total_margin_used, hex_fp(fp(1500)));
+        assert_eq!(bal.total_margin_used, dec_fp(fp(1500)));
         handle.stop().unwrap();
     }
 
@@ -3031,8 +3091,8 @@ mod tests {
             .request("torus_getOpenInterest", jsonrpsee::rpc_params!["0x1"])
             .await
             .unwrap();
-        assert_eq!(oi.long_oi, hex_fp(fp(10)));
-        assert_eq!(oi.short_oi, hex_fp(fp(7)));
+        assert_eq!(oi.long_oi, dec_fp(fp(10)));
+        assert_eq!(oi.short_oi, dec_fp(fp(7)));
         handle.stop().unwrap();
     }
 
@@ -3084,7 +3144,7 @@ mod tests {
             .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x1"])
             .await
             .unwrap();
-        assert_eq!(mp.last_trade_price, hex_fp(fp(50000)));
+        assert_eq!(mp.last_trade_price, dec_fp(fp(50000)));
         handle.stop().unwrap();
     }
 
@@ -3113,6 +3173,30 @@ mod tests {
         assert_eq!(trades[1].trade_id, hex_u128(1));
         assert_eq!(trades[0].role, "maker");
         assert_eq!(trades[1].role, "taker");
+        handle.stop().unwrap();
+    }
+
+    /// s80: getUserTrades reports the user's own side; a maker is on the
+    /// opposite side of the taker. Public feeds keep the taker side.
+    #[tokio::test]
+    async fn user_trades_report_the_users_own_side() {
+        let (_dir, state, mempool, executor) = setup();
+        let me = Address::from([0x33; 20]);
+        store_market(&state, 1, "BTC", "USD");
+        // (index, taker side, role): maker vs a selling taker, maker vs a
+        // buying taker, taker selling, taker buying.
+        for (i, side, role) in [(0, 1, 0), (1, 0, 0), (2, 1, 1), (3, 0, 1)] {
+            store_user_trade(&state, &me, i, 1, 10, 1, side, role, 4 + i as u64, 40);
+        }
+        let (handle, client) = rpc_client(state.clone(), mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let u: Vec<RpcUserTrade> = client
+            .request("torus_getUserTrades", jsonrpsee::rpc_params![hex_address(me)])
+            .await
+            .unwrap();
+        let got: Vec<(&str, &str)> = u.iter().map(|t| (t.role.as_str(), t.side.as_str())).collect();
+        assert_eq!(got, vec![("taker", "buy"), ("taker", "sell"), ("maker", "sell"), ("maker", "buy")]);
+        assert_eq!(scan_trades_for_block(&state, 4)[0]["side"], "sell", "public feed keeps the taker side");
         handle.stop().unwrap();
     }
 
@@ -3240,7 +3324,7 @@ mod tests {
             .unwrap();
         // Only the second order should remain.
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].price, hex_fp(fp(47000)));
+        assert_eq!(orders[0].price, dec_fp(fp(47000)));
         handle.stop().unwrap();
     }
 
@@ -3408,8 +3492,8 @@ mod tests {
             .request("torus_getOpenInterest", jsonrpsee::rpc_params!["0x63"])
             .await
             .unwrap();
-        assert_eq!(oi.long_oi, hex_fp(FixedPoint::ZERO));
-        assert_eq!(oi.short_oi, hex_fp(FixedPoint::ZERO));
+        assert_eq!(oi.long_oi, dec_fp(FixedPoint::ZERO));
+        assert_eq!(oi.short_oi, dec_fp(FixedPoint::ZERO));
         handle.stop().unwrap();
     }
 
@@ -3445,10 +3529,10 @@ mod tests {
             .await
             .unwrap();
         // Oracle price must surface as mark_price and index_price.
-        assert_eq!(mp.mark_price, hex_fp(oracle_price));
-        assert_eq!(mp.index_price, hex_fp(oracle_price));
+        assert_eq!(mp.mark_price, dec_fp(oracle_price));
+        assert_eq!(mp.index_price, dec_fp(oracle_price));
         // No trades occurred in this book so last_trade_price must be zero.
-        assert_eq!(mp.last_trade_price, hex_fp(FixedPoint::ZERO));
+        assert_eq!(mp.last_trade_price, dec_fp(FixedPoint::ZERO));
         handle.stop().unwrap();
     }
 

@@ -67,8 +67,8 @@ fn rpc_trade(market_id: &str, block: u64, timestamp: u64, t: &MarketTrade) -> Rp
     RpcTrade {
         trade_id: hex_u128(t.trade_index as u128),
         market_id: market_id.to_string(),
-        price: hex_fp(FixedPoint::from_raw(t.price_raw)),
-        quantity: hex_fp(FixedPoint::from_raw(t.qty_raw)),
+        price: dec_fp(FixedPoint::from_raw(t.price_raw)),
+        quantity: dec_fp(FixedPoint::from_raw(t.qty_raw)),
         side: if t.taker_side == 0 { "buy" } else { "sell" }.to_string(),
         block_number: hex_u64(block),
         timestamp: hex_u64(timestamp),
@@ -683,8 +683,8 @@ fn decode_order_book_levels(
             depth
                 .into_iter()
                 .map(|(price, quantity, n)| RpcPriceLevel {
-                    price: hex_fp(price),
-                    quantity: hex_fp(quantity),
+                    price: dec_fp(price),
+                    quantity: dec_fp(quantity),
                     order_count: n as u32,
                 })
                 .collect::<Vec<_>>()
@@ -698,8 +698,8 @@ fn decode_order_book_levels(
         levels
             .iter()
             .map(|lvl| RpcPriceLevel {
-                price: hex_fp(lvl.price),
-                quantity: hex_fp(lvl.quantity),
+                price: dec_fp(lvl.price),
+                quantity: dec_fp(lvl.quantity),
                 order_count: 0,
             })
             .collect::<Vec<_>>()
@@ -713,8 +713,8 @@ fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
     levels
         .into_iter()
         .map(|l| RpcPriceLevel {
-            price: hex_fp(l.price),
-            quantity: hex_fp(l.quantity),
+            price: dec_fp(l.price),
+            quantity: dec_fp(l.quantity),
             order_count: l.order_count,
         })
         .collect()
@@ -816,13 +816,13 @@ impl TorusApiServer for RpcState {
                 Ok(Some(RpcPosition {
                     market_id,
                     side: side.to_string(),
-                    size: hex_fp(p.size),
-                    entry_price: hex_fp(p.entry_price),
-                    unrealized_pnl: hex_fp(unrealized),
-                    realized_pnl: hex_fp(p.realized_pnl),
-                    margin: hex_fp(p.isolated_margin),
+                    size: dec_fp(p.size),
+                    entry_price: dec_fp(p.entry_price),
+                    unrealized_pnl: dec_fp(unrealized),
+                    realized_pnl: dec_fp(p.realized_pnl),
+                    margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
-                    liquidation_price: hex_fp(liquidation_price),
+                    liquidation_price: dec_fp(liquidation_price),
                 }))
             }
         }
@@ -867,10 +867,10 @@ impl TorusApiServer for RpcState {
         let native_total = native_bal.available + native_bal.order_margin;
 
         Ok(RpcBalances {
-            native_balance: hex_fp(native_total),
+            native_balance: dec_fp(native_total),
             evm_balance: hex_u256(evm_balance),
-            total_margin_used: hex_fp(total_margin),
-            available_balance: hex_fp(native_bal.available),
+            total_margin_used: dec_fp(total_margin),
+            available_balance: dec_fp(native_bal.available),
             permanent_stake,
         })
     }
@@ -921,8 +921,8 @@ impl TorusApiServer for RpcState {
                 market_id: hex_u64(mid),
                 base_asset: market.base_asset,
                 quote_asset: market.quote_asset,
-                lot_size: hex_fp(FixedPoint::from_raw(market.lot_size_raw)),
-                tick_size: hex_fp(FixedPoint::from_raw(market.tick_size_raw)),
+                lot_size: dec_fp(FixedPoint::from_raw(market.lot_size_raw)),
+                tick_size: dec_fp(FixedPoint::from_raw(market.tick_size_raw)),
                 status: "active".to_string(),
             });
 
@@ -1563,8 +1563,8 @@ impl TorusApiServer for RpcState {
             None => {
                 return Ok(RpcOpenInterest {
                     market_id,
-                    long_oi: hex_fp(FixedPoint::ZERO),
-                    short_oi: hex_fp(FixedPoint::ZERO),
+                    long_oi: dec_fp(FixedPoint::ZERO),
+                    short_oi: dec_fp(FixedPoint::ZERO),
                 });
             }
         };
@@ -1596,8 +1596,8 @@ impl TorusApiServer for RpcState {
 
         Ok(RpcOpenInterest {
             market_id,
-            long_oi: hex_fp(long_oi),
-            short_oi: hex_fp(short_oi),
+            long_oi: dec_fp(long_oi),
+            short_oi: dec_fp(short_oi),
         })
     }
 
@@ -1635,9 +1635,9 @@ impl TorusApiServer for RpcState {
 
         Ok(RpcMarkPrice {
             market_id,
-            mark_price: hex_fp(mark_price),
-            index_price: hex_fp(index_price),
-            last_trade_price: hex_fp(last_trade_price),
+            mark_price: dec_fp(mark_price),
+            index_price: dec_fp(index_price),
+            last_trade_price: dec_fp(last_trade_price),
             timestamp,
         })
     }
@@ -1697,12 +1697,14 @@ impl TorusApiServer for RpcState {
                 if market_filter.is_some_and(|mf| trade.market != mf) {
                     continue;
                 }
+                // s80: the user's own side (a maker is opposite the taker).
+                let user_bought = (trade.taker_side == 0) == (trade.role == 1);
                 trades.push(RpcUserTrade {
                     trade_id: hex_u128(trade.trade_index as u128),
                     market_id: hex_u64(trade.market),
-                    side: if trade.taker_side == 0 { "buy" } else { "sell" }.to_string(),
-                    price: hex_fp(FixedPoint::from_raw(trade.price_raw)),
-                    quantity: hex_fp(FixedPoint::from_raw(trade.qty_raw)),
+                    side: if user_bought { "buy" } else { "sell" }.to_string(),
+                    price: dec_fp(FixedPoint::from_raw(trade.price_raw)),
+                    quantity: dec_fp(FixedPoint::from_raw(trade.qty_raw)),
                     role: if trade.role == 0 { "maker" } else { "taker" }.to_string(),
                     block_number: hex_u64(block),
                     timestamp: hex_u64(timestamp),
@@ -1724,10 +1726,29 @@ impl TorusApiServer for RpcState {
         sub_type: String,
         params: Option<serde_json::Value>,
     ) -> SubscriptionResult {
-        const MAX_SUBSCRIPTIONS: usize = 1000;
+        use tokio::sync::broadcast::error::RecvError;
 
-        let count = self.active_subscriptions.load(Relaxed);
-        if count >= MAX_SUBSCRIPTIONS {
+        // Validate before accepting: a bad request is rejected, never accepted.
+        let kind = match crate::streams::parse_stream_kind(&sub_type, params.as_ref()) {
+            Ok(k) => k,
+            Err(msg) => {
+                pending
+                    .reject(ErrorObjectOwned::from(RpcError::InvalidParams(msg)))
+                    .await;
+                return Ok(());
+            }
+        };
+        // s80 fix 2: all-markets newTrades is node-configurable (off on
+        // validators by default); per-market and userFills always pass.
+        if kind == crate::streams::StreamKind::NewTrades(None) && !self.all_market_trades {
+            pending
+                .reject(ErrorObjectOwned::from(RpcError::InvalidParams(
+                    crate::streams::ALL_MARKET_TRADES_DISABLED.to_string(),
+                )))
+                .await;
+            return Ok(());
+        }
+        let Some(_slot) = SubscriptionSlot::acquire(&self.active_subscriptions) else {
             pending
                 .reject(ErrorObjectOwned::owned(
                     -32000,
@@ -1736,65 +1757,93 @@ impl TorusApiServer for RpcState {
                 ))
                 .await;
             return Ok(());
-        }
-        self.active_subscriptions.fetch_add(1, Relaxed);
-
+        };
+        // Subscribe before accepting so no block after the reply is missed.
+        let mut rx = self.notifier.new_trades.subscribe();
         let sink = pending.accept().await?;
-        let subs = self.active_subscriptions.clone();
 
-        match sub_type.as_str() {
-            "newTrades" => {
-                // Optional marketId filter from params
-                let market_filter: Option<String> = params
-                    .as_ref()
-                    .and_then(|p| p.get("marketId"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase());
-
-                let mut rx = self.notifier.new_trades.subscribe();
-                tokio::spawn(async move {
-                    while let Ok(trades) = rx.recv().await {
-                        for trade in &trades {
-                            // Apply marketId filter if specified
-                            let should_send = match &market_filter {
-                                Some(filter) => trade
-                                    .get("marketId")
-                                    .and_then(|v| v.as_str())
-                                    .map(|m| m.to_lowercase() == *filter)
-                                    .unwrap_or(true),
-                                None => true,
-                            };
-                            if should_send {
-                                match jsonrpsee::SubscriptionMessage::new(
-                                    "torus_subscription",
-                                    sink.subscription_id(),
-                                    trade,
-                                ) {
-                                    Ok(msg) => {
-                                        if sink.send(msg).await.is_err() {
-                                            subs.fetch_sub(1, Relaxed);
-                                            return;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        subs.fetch_sub(1, Relaxed);
-                                        return;
-                                    }
-                                }
-                            }
+        // jsonrpsee runs this future on its own task until it returns; the
+        // returned error becomes the subscription's close notification.
+        loop {
+            let block = tokio::select! {
+                _ = sink.closed() => return Ok(()),
+                r = rx.recv() => r,
+            };
+            let block = match block {
+                Ok(b) => b,
+                Err(RecvError::Lagged(n)) => {
+                    return Err(format!(
+                        "subscriber lagged: {n} blocks dropped; resubscribe and backfill \
+                         with torus_getTradeHistoryRange / torus_getUserTrades"
+                    )
+                    .into());
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            };
+            let msg = match kind {
+                // Serialized once per (block, filter), shared by all
+                // subscribers with this filter; embedded here verbatim.
+                crate::streams::StreamKind::NewTrades(market) => {
+                    match block.new_trades_payload(market).await? {
+                        Some(payload) => {
+                            let raw: &serde_json::value::RawValue = &payload;
+                            Some(jsonrpsee::SubscriptionMessage::new(
+                                sink.method_name(),
+                                sink.subscription_id(),
+                                &raw,
+                            )?)
                         }
+                        None => None,
                     }
-                    subs.fetch_sub(1, Relaxed);
-                });
-            }
-            _ => {
-                subs.fetch_sub(1, Relaxed);
-                tracing::warn!("unknown torus subscription kind: {sub_type}");
+                }
+                crate::streams::StreamKind::UserFills(user) => {
+                    stream_message(&sink, &crate::streams::fills_for_user(&block.fills, user))?
+                }
+            };
+            if let Some(msg) = msg {
+                if sink.send(msg).await.is_err() {
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
+}
+
+/// `torus_subscribe` cap on active WebSocket subscriptions (HIGH-NEW-05). The
+/// counter is shared with `eth_subscribe`.
+const MAX_SUBSCRIPTIONS: usize = 1000;
+
+/// One slot of the subscription cap; released on drop, so every exit path of
+/// a subscription frees it.
+struct SubscriptionSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl SubscriptionSlot {
+    fn acquire(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        counter
+            .fetch_update(Relaxed, Relaxed, |n| {
+                (n < MAX_SUBSCRIPTIONS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(counter.clone()))
+    }
+}
+
+impl Drop for SubscriptionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+/// One stream message holding a block's `rows`, or `None` when the block has
+/// none for this subscriber.
+fn stream_message<T: serde::Serialize>(
+    sink: &jsonrpsee::SubscriptionSink,
+    rows: &[T],
+) -> Result<Option<jsonrpsee::SubscriptionMessage>, serde_json::Error> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    jsonrpsee::SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &rows).map(Some)
 }
 
 // ============================================================================
@@ -1858,9 +1907,9 @@ fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpe
         order_id: hex_u128(order.id),
         market_id: hex_u64(market_id),
         side: side.to_string(),
-        price: hex_fp(order.price),
-        remaining_qty: hex_fp(order.remaining_qty),
-        original_qty: hex_fp(order.original_qty),
+        price: dec_fp(order.price),
+        remaining_qty: dec_fp(order.remaining_qty),
+        original_qty: dec_fp(order.original_qty),
         order_type: order_type.to_string(),
         time_in_force: time_in_force.to_string(),
         reduce_only: order.reduce_only,
@@ -2086,7 +2135,7 @@ mod order_book_decode_tests {
     use torus_types::{Address, FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
 
     use super::decode_order_book_levels;
-    use crate::types::hex_fp;
+    use crate::types::dec_fp;
 
     fn limit(is_buy: bool, price: FixedPoint, quantity: FixedPoint) -> PlaceOrderParams {
         PlaceOrderParams {
@@ -2125,17 +2174,17 @@ mod order_book_decode_tests {
             decode_order_book_levels(&blob).expect("the PRODUCTION blob must decode");
 
         assert_eq!(bids.len(), 1, "one aggregated bid level");
-        assert_eq!(bids[0].price, hex_fp(bid_px));
+        assert_eq!(bids[0].price, dec_fp(bid_px));
         assert_eq!(
             bids[0].quantity,
-            hex_fp(FixedPoint::from_raw(1_200)),
+            dec_fp(FixedPoint::from_raw(1_200)),
             "level quantity must be the SUM of resting remaining quantities"
         );
         assert_eq!(bids[0].order_count, 2, "two resting orders on the level");
 
         assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].price, hex_fp(ask_px));
-        assert_eq!(asks[0].quantity, hex_fp(q3));
+        assert_eq!(asks[0].price, dec_fp(ask_px));
+        assert_eq!(asks[0].quantity, dec_fp(q3));
         assert_eq!(asks[0].order_count, 1);
     }
 
@@ -2152,7 +2201,7 @@ mod order_book_decode_tests {
         let (bids, asks) =
             decode_order_book_levels(&blob).expect("the legacy snapshot must still decode");
         assert_eq!(bids.len(), 1);
-        assert_eq!(bids[0].quantity, hex_fp(FixedPoint::from_raw(42)));
+        assert_eq!(bids[0].quantity, dec_fp(FixedPoint::from_raw(42)));
         assert_eq!(asks.len(), 0);
     }
 }

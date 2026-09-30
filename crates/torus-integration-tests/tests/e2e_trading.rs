@@ -323,10 +323,9 @@ async fn test_rpc_position_consistency() {
     let side = rpc_pos["side"].as_str().unwrap();
     assert_eq!(side, "long");
 
-    // Size should be 2.0 in FixedPoint raw hex
-    let size_hex = rpc_pos["size"].as_str().unwrap();
-    let size_raw = i128::from_str_radix(size_hex.strip_prefix("0x").unwrap(), 16).unwrap();
-    assert_eq!(size_raw, TestHarness::fp(2).raw() as i128);
+    // Size should be 2.0 as a FixedPoint decimal string
+    let size: FixedPoint = rpc_pos["size"].as_str().unwrap().parse().unwrap();
+    assert_eq!(size, TestHarness::fp(2));
 }
 
 /// RPC consistency: balances match direct state reads.
@@ -345,10 +344,9 @@ async fn test_rpc_balances_consistency() {
         .await
         .unwrap();
 
-    // native_balance should be 5000 in FixedPoint hex
-    let native_hex = rpc_bal["nativeBalance"].as_str().unwrap();
-    let native_raw = i128::from_str_radix(native_hex.strip_prefix("0x").unwrap(), 16).unwrap();
-    assert_eq!(native_raw, TestHarness::fp(5000).raw() as i128);
+    // native_balance should be 5000 as a FixedPoint decimal string
+    let native: FixedPoint = rpc_bal["nativeBalance"].as_str().unwrap().parse().unwrap();
+    assert_eq!(native, TestHarness::fp(5000));
 
     // EVM balance should be non-zero
     let evm_hex = rpc_bal["evmBalance"].as_str().unwrap();

@@ -23,6 +23,7 @@ use torus_state::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
     CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
 };
+use torus_state::trade_rows::{FillExtras, TradeFill};
 use torus_state::{StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce,
@@ -102,6 +103,12 @@ struct RunFingerprint {
     cf_dump: Vec<(String, Vec<u8>, Vec<u8>)>,
     results: Vec<Vec<(bool, Option<String>)>>,
     total_gas: Vec<u64>,
+    /// s80: each batch's recorded fills.
+    fills: Vec<Vec<TradeFill>>,
+    /// s80: each batch's stream-only fill extras (order ids, per-party
+    /// position effects) — index-aligned with `fills` while a stream
+    /// subscriber exists (`record_fills`), empty otherwise.
+    extras: Vec<Vec<FillExtras>>,
     trade_index: u32,
     next_global_order_id: u128,
     /// The consensus-authoritative native state root (full scan) — the
@@ -128,10 +135,16 @@ fn state_dump(ctx: &NativeExecContext) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// Run `batches` through one context (fresh DB) with the given settle mode,
-/// then fingerprint the world.
+/// Run `batches` through one context (fresh DB) with the given settle mode
+/// and a stream subscriber (`record_fills`, so the fill extras are compared
+/// too), then fingerprint the world.
 fn run_batches(batches: &[Vec<(Address, NativeAction)>], parallel: bool) -> RunFingerprint {
     run_batches_workers(batches, parallel, None)
+}
+
+/// `run_batches` without a stream subscriber: fills only, no extras (s80 fix 1).
+fn run_batches_no_subscriber(batches: &[Vec<(Address, NativeAction)>], parallel: bool) -> RunFingerprint {
+    run_batches_opts(batches, parallel, None, false)
 }
 
 /// `run_batches` with the pass-A settle worker cap pinned. `None` = the
@@ -141,14 +154,26 @@ fn run_batches_workers(
     parallel: bool,
     settle_workers: Option<usize>,
 ) -> RunFingerprint {
+    run_batches_opts(batches, parallel, settle_workers, true)
+}
+
+fn run_batches_opts(
+    batches: &[Vec<(Address, NativeAction)>],
+    parallel: bool,
+    settle_workers: Option<usize>,
+    record_fills: bool,
+) -> RunFingerprint {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
+    ctx.record_fills = record_fills;
     for n in 1..=32u8 {
         fund_native(&ctx, &addr(n), fp(1_000_000));
     }
 
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
+    let mut fills = Vec::new();
+    let mut extras = Vec::new();
     for batch in batches {
         let r =
             NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, parallel, settle_workers);
@@ -164,6 +189,12 @@ fn run_batches_workers(
                 .collect(),
         );
         total_gas.push(r.total_gas);
+        // Taking restarts the inline rows from this batch's fills; the
+        // fills themselves carry everything the rows would.
+        let (f, e) = ctx.take_pending_fills_and_extras();
+        assert_eq!(e.len(), if record_fills { f.len() } else { 0 }, "extras: aligned or empty");
+        fills.push(f);
+        extras.push(e);
     }
     ctx.save_order_books();
 
@@ -171,6 +202,8 @@ fn run_batches_workers(
         cf_dump: state_dump(&ctx),
         results,
         total_gas,
+        fills,
+        extras,
         trade_index: ctx.trade_index,
         next_global_order_id: ctx.next_global_order_id,
         state_root: compute_native_state_root(&ctx.state).expect("state root"),
@@ -309,6 +342,18 @@ fn parallel_settle_state_identical_to_sequential_50x() {
             golden, par,
             "parallel settle diverged from sequential on run {run}"
         );
+    }
+
+    // s80 fix 1: without a subscriber the paths still agree, and the run
+    // differs from the subscriber run only by the missing extras.
+    let golden_ns = run_batches_no_subscriber(&batches, false);
+    assert!(golden_ns.extras.iter().all(|e| e.is_empty()));
+    let mut stripped = run_batches(&batches, false);
+    stripped.extras.iter_mut().for_each(Vec::clear);
+    assert_eq!(stripped, golden_ns, "a subscriber changes nothing but the extras");
+    for run in 0..10 {
+        let par = run_batches_no_subscriber(&batches, true);
+        assert_eq!(golden_ns, par, "no-subscriber parallel settle diverged on run {run}");
     }
 }
 
@@ -653,7 +698,8 @@ fn default_mode_multi_market_settles() {
     // point must settle a cross-market batch with the same observable outcome
     // as explicit sequential mode.
     let batches = fuzz_batches(0x0BAD_F00D);
-    let golden = run_batches(&batches, false);
+    // execute_batch runs with the default `record_fills` (false).
+    let golden = run_batches_no_subscriber(&batches, false);
 
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
@@ -662,6 +708,7 @@ fn default_mode_multi_market_settles() {
     }
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
+    let mut fills = Vec::new();
     for batch in &batches {
         let r = NativeExecutor::execute_batch(&mut ctx, batch);
         results.push(
@@ -671,12 +718,18 @@ fn default_mode_multi_market_settles() {
                 .collect::<Vec<_>>(),
         );
         total_gas.push(r.total_gas);
+        // Taking restarts the inline rows from this batch's fills; the
+        // fills themselves carry everything the rows would.
+        let (f, e) = ctx.take_pending_fills_and_extras();
+        assert!(e.is_empty(), "no subscriber, no extras");
+        fills.push(f);
     }
     ctx.save_order_books();
 
     assert_eq!(golden.cf_dump, state_dump(&ctx), "default-mode state diverged");
     assert_eq!(golden.results, results, "default-mode results diverged");
     assert_eq!(golden.total_gas, total_gas, "default-mode gas diverged");
+    assert_eq!(golden.fills, fills, "default-mode fills diverged");
     assert_eq!(golden.trade_index, ctx.trade_index);
     assert_eq!(golden.next_global_order_id, ctx.next_global_order_id);
 }
