@@ -1726,10 +1726,19 @@ impl TorusApiServer for RpcState {
         sub_type: String,
         params: Option<serde_json::Value>,
     ) -> SubscriptionResult {
-        const MAX_SUBSCRIPTIONS: usize = 1000;
+        use tokio::sync::broadcast::error::RecvError;
 
-        let count = self.active_subscriptions.load(Relaxed);
-        if count >= MAX_SUBSCRIPTIONS {
+        // Validate before accepting: a bad request is rejected, never accepted.
+        let kind = match crate::streams::parse_stream_kind(&sub_type, params.as_ref()) {
+            Ok(k) => k,
+            Err(msg) => {
+                pending
+                    .reject(ErrorObjectOwned::from(RpcError::InvalidParams(msg)))
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(_slot) = SubscriptionSlot::acquire(&self.active_subscriptions) else {
             pending
                 .reject(ErrorObjectOwned::owned(
                     -32000,
@@ -1738,65 +1747,81 @@ impl TorusApiServer for RpcState {
                 ))
                 .await;
             return Ok(());
-        }
-        self.active_subscriptions.fetch_add(1, Relaxed);
-
+        };
+        // Subscribe before accepting so no block after the reply is missed.
+        let mut rx = self.notifier.new_trades.subscribe();
         let sink = pending.accept().await?;
-        let subs = self.active_subscriptions.clone();
 
-        match sub_type.as_str() {
-            "newTrades" => {
-                // Optional marketId filter from params
-                let market_filter: Option<String> = params
-                    .as_ref()
-                    .and_then(|p| p.get("marketId"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase());
-
-                let mut rx = self.notifier.new_trades.subscribe();
-                tokio::spawn(async move {
-                    while let Ok(trades) = rx.recv().await {
-                        for trade in &trades {
-                            // Apply marketId filter if specified
-                            let should_send = match &market_filter {
-                                Some(filter) => trade
-                                    .get("marketId")
-                                    .and_then(|v| v.as_str())
-                                    .map(|m| m.to_lowercase() == *filter)
-                                    .unwrap_or(true),
-                                None => true,
-                            };
-                            if should_send {
-                                match jsonrpsee::SubscriptionMessage::new(
-                                    "torus_subscription",
-                                    sink.subscription_id(),
-                                    trade,
-                                ) {
-                                    Ok(msg) => {
-                                        if sink.send(msg).await.is_err() {
-                                            subs.fetch_sub(1, Relaxed);
-                                            return;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        subs.fetch_sub(1, Relaxed);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    subs.fetch_sub(1, Relaxed);
-                });
-            }
-            _ => {
-                subs.fetch_sub(1, Relaxed);
-                tracing::warn!("unknown torus subscription kind: {sub_type}");
+        // jsonrpsee runs this future on its own task until it returns; the
+        // returned error becomes the subscription's close notification.
+        loop {
+            let block = tokio::select! {
+                _ = sink.closed() => return Ok(()),
+                r = rx.recv() => r,
+            };
+            let block = match block {
+                Ok(b) => b,
+                Err(RecvError::Lagged(n)) => {
+                    return Err(format!(
+                        "subscriber lagged: {n} blocks dropped; resubscribe and backfill \
+                         with torus_getTradeHistoryRange / torus_getUserTrades"
+                    )
+                    .into());
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            };
+            let msg = match kind {
+                crate::streams::StreamKind::NewTrades(market) => {
+                    stream_message(&sink, &crate::streams::trades_for_market(&block, market))?
+                }
+                crate::streams::StreamKind::UserFills(user) => {
+                    stream_message(&sink, &crate::streams::fills_for_user(&block, user))?
+                }
+            };
+            if let Some(msg) = msg {
+                if sink.send(msg).await.is_err() {
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
+}
+
+/// `torus_subscribe` cap on active WebSocket subscriptions (HIGH-NEW-05). The
+/// counter is shared with `eth_subscribe`.
+const MAX_SUBSCRIPTIONS: usize = 1000;
+
+/// One slot of the subscription cap; released on drop, so every exit path of
+/// a subscription frees it.
+struct SubscriptionSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl SubscriptionSlot {
+    fn acquire(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        counter
+            .fetch_update(Relaxed, Relaxed, |n| {
+                (n < MAX_SUBSCRIPTIONS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(counter.clone()))
+    }
+}
+
+impl Drop for SubscriptionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+/// One stream message holding a block's `rows`, or `None` when the block has
+/// none for this subscriber.
+fn stream_message<T: serde::Serialize>(
+    sink: &jsonrpsee::SubscriptionSink,
+    rows: &[T],
+) -> Result<Option<jsonrpsee::SubscriptionMessage>, serde_json::Error> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    jsonrpsee::SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &rows).map(Some)
 }
 
 // ============================================================================

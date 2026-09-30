@@ -6,6 +6,7 @@
 pub mod error;
 pub mod eth;
 pub mod net;
+pub mod streams;
 pub mod torus;
 pub mod types;
 pub mod web3;
@@ -97,6 +98,7 @@ use tokio::sync::broadcast;
 use torus_evm::EvmExecutor;
 use torus_mempool::Mempool;
 use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::trade_rows::BlockFills;
 use torus_state::StateDb;
 
 use crate::eth::EthApiServer;
@@ -110,15 +112,32 @@ pub struct BlockNotifier {
     pub new_heads: broadcast::Sender<serde_json::Value>,
     pub new_logs: broadcast::Sender<Vec<serde_json::Value>>,
     pub pending_txs: broadcast::Sender<B256>,
-    pub new_trades: broadcast::Sender<Vec<serde_json::Value>>,
+    /// s80: one message per executed block with fills, fed by the execution
+    /// thread's fill sink. Capacity is in blocks; a subscriber that falls
+    /// further behind is closed with a lag error.
+    pub new_trades: broadcast::Sender<Arc<BlockFills>>,
 }
+
+/// Blocks a `newTrades`/`userFills` subscriber may fall behind before it is
+/// closed with a lag error.
+const TRADE_STREAM_CAPACITY: usize = 256;
 
 impl BlockNotifier {
     pub fn new() -> Self {
+        Self::with_capacities(TRADE_STREAM_CAPACITY)
+    }
+
+    /// A notifier whose trade stream holds only `n` blocks (lag tests).
+    #[cfg(test)]
+    pub(crate) fn with_trade_capacity(n: usize) -> Self {
+        Self::with_capacities(n)
+    }
+
+    fn with_capacities(trade_blocks: usize) -> Self {
         let (new_heads, _) = broadcast::channel(256);
         let (new_logs, _) = broadcast::channel(256);
         let (pending_txs, _) = broadcast::channel(1024);
-        let (new_trades, _) = broadcast::channel(256);
+        let (new_trades, _) = broadcast::channel(trade_blocks);
         Self {
             new_heads,
             new_logs,
@@ -137,11 +156,11 @@ impl BlockNotifier {
         let _ = self.pending_txs.send(hash);
     }
 
-    /// Notify subscribers of new trades from a committed block.
-    pub fn notify_new_trades(&self, trades: Vec<serde_json::Value>) {
-        if !trades.is_empty() {
-            let _ = self.new_trades.send(trades);
-        }
+    /// Publish one executed block's fills to the `newTrades`/`userFills`
+    /// streams (s80). Called from the execution thread's fill sink; never
+    /// blocks (a send with no subscribers is dropped).
+    pub fn notify_fills(&self, block: Arc<BlockFills>) {
+        let _ = self.new_trades.send(block);
     }
 }
 

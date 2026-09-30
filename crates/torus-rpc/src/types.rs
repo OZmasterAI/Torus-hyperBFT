@@ -369,6 +369,34 @@ pub struct RpcUserTrade {
     pub timestamp: String,
 }
 
+/// One `newTrades` stream row (s80): a public trade plus both parties.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcStreamTrade {
+    #[serde(flatten)]
+    pub trade: RpcTrade,
+    pub maker: String,
+    pub taker: String,
+}
+
+/// One `userFills` stream row (s80): one fill from one party's view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserFill {
+    pub trade_id: String,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    pub quantity: String,
+    pub role: String,
+    pub order_id: String,
+    pub start_position: String,
+    pub closed_pnl: String,
+    pub dir: String,
+    pub block_number: String,
+    pub timestamp: String,
+}
+
 // ============================================================================
 // Torus Staking RPC Response Types (2.9.3)
 // ============================================================================

@@ -24,7 +24,7 @@ use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
-use torus_rpc::{find_latest_height, scan_trades_for_block, BlockNotifier, RpcServer};
+use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
 use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
@@ -911,8 +911,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {}
             }
-            let trades = scan_trades_for_block(&state_db_for_handler, height);
-            notifier_for_replica.notify_new_trades(trades);
         })
         .build()
         .start();
