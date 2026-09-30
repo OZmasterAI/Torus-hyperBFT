@@ -314,8 +314,9 @@ impl<T: StateBackend> PositionManager<T> {
         fill_qty: FixedPoint,
         fill_price: FixedPoint,
         margin_type: MarginType,
-    ) -> Result<(), CoreError> {
+    ) -> Result<FillEffect, CoreError> {
         let existing = self.get_position(trader, market_id)?;
+        let start_size = signed_size(&existing);
         let (new_pos, pnl) =
             fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
         match new_pos {
@@ -327,7 +328,7 @@ impl<T: StateBackend> PositionManager<T> {
         if let Some(pnl) = pnl {
             self.credit_realized_pnl(trader, pnl)?;
         }
-        Ok(())
+        Ok(FillEffect { start_size, closed_pnl: pnl })
     }
 
     /// C1: `apply_fill`, but the position read-modify-write goes through a
@@ -337,6 +338,7 @@ impl<T: StateBackend> PositionManager<T> {
     /// BalanceCache). `Some(pnl)` is emitted exactly when the classic path
     /// would have called its internal PnL credit — including `Some(ZERO)` for
     /// a flat close, which still materializes the trader's balance row.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_fill_cached(
         &self,
         cache: &mut PositionCache,
@@ -347,14 +349,37 @@ impl<T: StateBackend> PositionManager<T> {
         fill_price: FixedPoint,
         margin_type: MarginType,
     ) -> Result<Option<FixedPoint>, CoreError> {
+        self.apply_fill_cached_effect(
+            cache, trader, market_id, is_buy, fill_qty, fill_price, margin_type,
+        )
+        .map(|e| e.closed_pnl)
+    }
+
+    /// [`apply_fill_cached`], also reporting the trader's signed position
+    /// size before the fill (s80 userFills `startPosition`). Same transition,
+    /// same cache writes, and no balance is touched.
+    ///
+    /// [`apply_fill_cached`]: Self::apply_fill_cached
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fill_cached_effect(
+        &self,
+        cache: &mut PositionCache,
+        trader: &Address,
+        market_id: MarketId,
+        is_buy: bool,
+        fill_qty: FixedPoint,
+        fill_price: FixedPoint,
+        margin_type: MarginType,
+    ) -> Result<FillEffect, CoreError> {
         let existing = cache.load(self, trader, market_id)?;
+        let start_size = signed_size(&existing);
         let (new_pos, pnl) =
             fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
         match new_pos {
             Some(pos) => cache.set(pos),
             None => cache.remove(trader, market_id),
         }
-        Ok(pnl)
+        Ok(FillEffect { start_size, closed_pnl: pnl })
     }
 
     /// Credit (or debit if negative) realized PnL to native balance.
@@ -369,6 +394,31 @@ impl<T: StateBackend> PositionManager<T> {
 // ============================================================================
 // Fill transition (pure) + PositionCache (C1)
 // ============================================================================
+
+/// What one fill did to one trader's position (s80 userFills stream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillEffect {
+    /// Signed position size before the fill (long > 0, short < 0, none = 0).
+    pub start_size: FixedPoint,
+    /// Realized PnL of the fill's close component (None = no close part).
+    pub closed_pnl: Option<FixedPoint>,
+}
+
+// Hand-written: `FixedPoint` has no `Default`.
+impl Default for FillEffect {
+    fn default() -> Self {
+        Self { start_size: FixedPoint::ZERO, closed_pnl: None }
+    }
+}
+
+/// Signed size of an optional position (long > 0, short < 0, none = 0).
+fn signed_size(p: &Option<Position>) -> FixedPoint {
+    match p {
+        Some(p) if p.is_long => p.size,
+        Some(p) => FixedPoint::ZERO - p.size,
+        None => FixedPoint::ZERO,
+    }
+}
 
 /// Pure fill transition shared by [`PositionManager::apply_fill`] and
 /// [`PositionManager::apply_fill_cached`] so the two paths cannot drift.
