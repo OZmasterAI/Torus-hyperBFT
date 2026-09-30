@@ -411,6 +411,17 @@ pub fn commit_evm_block_incremental(
     Ok(root)
 }
 
+/// s515 review 4: whether committing `bundle` changes any contract storage — a
+/// changed slot, or a selfdestructed account (its storage is wiped). The
+/// account-only [`resync_evm_accounts`] cannot bring `CF_HASHED_STORAGE` / the
+/// storage tries in line with such a bundle.
+pub fn bundle_touches_storage(bundle: &BundleState) -> bool {
+    bundle
+        .state
+        .values()
+        .any(|a| !a.storage.is_empty() || a.was_destroyed())
+}
+
 /// Re-sync the incremental EVM trie (`CF_HASHED_ACCOUNTS` + `CF_TRIE_*`) for accounts whose
 /// `CF_ACCOUNTS` entry changed OUTSIDE the EVM-bundle commit — i.e. native post-commit (fee
 /// distribution to treasury/dev_pool, validator rewards) crediting EVM account balances.

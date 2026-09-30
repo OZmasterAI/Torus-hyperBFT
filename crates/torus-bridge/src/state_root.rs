@@ -28,6 +28,16 @@ fn incremental_state_root_enabled() -> bool {
     }
 }
 
+/// s515 review 4: whether the EVM root is served by the incremental trie — the
+/// runtime flag is on (the default) AND the persistent trie is built (the node
+/// builds it at boot) — i.e. whether stale `CF_HASHED_*` / `CF_TRIE_*` rows would
+/// make the root diverge from the full scan. A failed built-check counts as
+/// active (the caller fail-stops rather than guess).
+pub fn incremental_evm_root_active(state_db: &StateDb) -> bool {
+    incremental_state_root_enabled()
+        && torus_state::incremental::is_trie_built(state_db).unwrap_or(true)
+}
+
 /// EVM post-bundle root honoring the incremental flag. Split out with an explicit `incremental`
 /// param so both paths are unit-testable without touching process env.
 ///

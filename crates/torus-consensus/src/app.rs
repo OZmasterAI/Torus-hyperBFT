@@ -613,6 +613,10 @@ struct ExecutionContext {
     /// block's EVM batch fail.
     #[cfg(test)]
     test_fail_marker_staging: bool,
+    /// Test-only (s515 review 4): make the `commit_pending_bundle` fallback
+    /// itself fail.
+    #[cfg(test)]
+    test_force_fallback_commit_fail: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1836,6 +1840,22 @@ impl ExecutionContext {
                         Ok(_root) => {}
                         Err(e) => {
                             tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
+                            // s515 review 4 (F-3): the fallback's resync below
+                            // is account-only; a bundle that wrote contract
+                            // storage or selfdestructed would leave
+                            // CF_HASHED_STORAGE / the storage tries stale, so
+                            // the incremental root would diverge from the full
+                            // scan. Nothing to do with the incremental root off;
+                            // with it on, fail-stop before committing anything.
+                            if torus_state::incremental::bundle_touches_storage(&validated.bundle)
+                                && torus_bridge::state_root::incremental_evm_root_active(
+                                    &self.state_db,
+                                )
+                            {
+                                tracing::error!(height, "FATAL: fallback EVM commit would write contract storage / selfdestruct with the incremental root on — its account-only resync cannot keep the storage tries in sync (fail-stop)");
+                                self.exec_failed.store(true, Ordering::SeqCst);
+                                return;
+                            }
                             // s515 review 3: the fallback writes no hashed-mirror /
                             // trie rows. Flag the marker with the bundle's accounts
                             // (same batch) so an EVM-skipped replay re-syncs them.
@@ -1851,13 +1871,31 @@ impl ExecutionContext {
                                 self.exec_failed.store(true, Ordering::SeqCst);
                                 return;
                             }
-                            match BlockCommitter::commit_pending_bundle(
-                                &self.state_db,
-                                &validated.bundle,
-                                Some(&validated.native_writes),
-                            ) {
+                            #[cfg(test)]
+                            let fail_fallback = self.test_force_fallback_commit_fail;
+                            #[cfg(not(test))]
+                            let fail_fallback = false;
+                            let fallback = if fail_fallback {
+                                Err(torus_state::StateError::InvalidData(
+                                    "test: forced fallback commit failure".into(),
+                                )
+                                .into())
+                            } else {
+                                BlockCommitter::commit_pending_bundle(
+                                    &self.state_db,
+                                    &validated.bundle,
+                                    Some(&validated.native_writes),
+                                )
+                            };
+                            match fallback {
+                                // s515 review 4 (F-6): the bundle (and the
+                                // marker / queue rows riding its batch) is not
+                                // durable — running the native phase on top of
+                                // it would diverge. Fail-stop like b63d401.
                                 Err(e2) => {
-                                    tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
+                                    tracing::error!(%e2, height, "FATAL: failed to commit EVM bundle (fallback) — fail-stop");
+                                    self.exec_failed.store(true, Ordering::SeqCst);
+                                    return;
                                 }
                                 // Re-sync now: a block with no native phase never
                                 // reaches the post-flush resync below.
@@ -3621,6 +3659,8 @@ impl TorusApp {
             test_force_incremental_commit_fail: false,
             #[cfg(test)]
             test_fail_marker_staging: false,
+            #[cfg(test)]
+            test_force_fallback_commit_fail: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -10193,6 +10233,8 @@ mod crash_recovery_tests {
             test_force_incremental_commit_fail: false,
             #[cfg(test)]
             test_fail_marker_staging: false,
+            #[cfg(test)]
+            test_force_fallback_commit_fail: false,
         }
     }
 
@@ -13475,6 +13517,16 @@ mod crash_recovery_tests {
 
     /// RLP-encoded signed EIP-1559 tx (max fee 2 gwei > the fixture's 1 gwei base fee).
     fn f1_tx(to: Address, value: U256, nonce: u64, gas_limit: u64, input: Vec<u8>) -> Vec<u8> {
+        f1_tx_kind(alloy_primitives::TxKind::Call(to), value, nonce, gas_limit, input)
+    }
+
+    fn f1_tx_kind(
+        kind: alloy_primitives::TxKind,
+        value: U256,
+        nonce: u64,
+        gas_limit: u64,
+        input: Vec<u8>,
+    ) -> Vec<u8> {
         use alloy_consensus::SignableTransaction;
         use alloy_rlp::Encodable;
         let tx = alloy_consensus::TxEip1559 {
@@ -13483,7 +13535,7 @@ mod crash_recovery_tests {
             gas_limit,
             max_fee_per_gas: 2_000_000_000,
             max_priority_fee_per_gas: 0,
-            to: alloy_primitives::TxKind::Call(to),
+            to: kind,
             value,
             access_list: Default::default(),
             input: input.into(),
@@ -13681,6 +13733,13 @@ mod crash_recovery_tests {
 
     // ---- s515 review 4: fail-stops that must leave nothing behind ----
 
+    /// Contract creation whose init code writes storage: `SSTORE(0, 1)`.
+    fn r4_create_with_storage(nonce: u64) -> Vec<u8> {
+        // PUSH1 1  PUSH1 0  SSTORE  STOP
+        let init = vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        f1_tx_kind(alloy_primitives::TxKind::Create, U256::ZERO, nonce, 200_000, init)
+    }
+
     /// Boot an f1 fixture (no committed blocks yet), then commit `blocks`
     /// durably without executing them — the state a crash leaves for the boot
     /// replay.
@@ -13792,6 +13851,26 @@ mod crash_recovery_tests {
         assert_dumps_equal(&before, &dump_all_cfs(&db), "nothing runs after a fail-stop");
     }
 
+    /// B2 (review 4 F-3): the fallback resync is account-only, so a fallback
+    /// commit that wrote contract storage (or selfdestructed) would leave the
+    /// hashed storage / storage tries stale while the incremental root is on
+    /// (the default; the trie is built at boot) — fail-stop before committing.
+    #[test]
+    fn r4_fallback_commit_touching_storage_fail_stops() {
+        let (config, db) = f1_config();
+        let [b1, _] = f1_blocks(vec![r4_create_with_storage(0)]);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_force_incremental_commit_fail = true;
+        ctx.execute_committed_block(&b1, vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        let contract = f1_addr(&f1_key()).create(0);
+        assert!(db.get_account(&contract).unwrap().is_none(), "bundle not committed");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED).unwrap().is_none(), "no EVM-applied marker");
+        assert_eq!(read_native_applied_height(&db), None);
+    }
+
     /// B3 (review 4 F-5): a present but MALFORMED marker is not "no marker"
     /// (that re-executes the block's EVM — a double-apply): fail-stop, for
     /// EVM and EVM-less blocks alike.
@@ -13820,5 +13899,24 @@ mod crash_recovery_tests {
                 assert_dumps_equal(&before, &dump_all_cfs(&db), &what);
             }
         }
+    }
+
+    /// B4 (review 4 F-6): the fallback `commit_pending_bundle` failing used to
+    /// log and continue with the native phase on top of a missing bundle.
+    #[test]
+    fn r4_failed_fallback_commit_fail_stops() {
+        let (config, db) = f1_config();
+        let bob = Address::with_last_byte(0xB0);
+        let [b1, _] = f1_blocks(vec![f1_transfer(bob, U256::from(1u64), 0)]);
+        drop(TorusApp::new(db.clone(), &config, None, None, None));
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_force_incremental_commit_fail = true;
+        ctx.test_force_fallback_commit_fail = true;
+        ctx.execute_committed_block(&b1, vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), None, "native phase not run");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_EVM_APPLIED).unwrap().is_none(), "no EVM-applied marker");
+        assert_eq!(read_evm_balance(&db, bob), U256::ZERO);
     }
 }
