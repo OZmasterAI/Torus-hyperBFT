@@ -2,6 +2,7 @@
 //!
 //! Tasks 2.8b.1–2.8b.4: submission, aggregation, staleness detection, manipulation resistance.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -259,16 +260,16 @@ impl<T: StateBackend> OracleManager<T> {
             return self.get_last_valid_price(market_id, now);
         }
 
-        // Build (price, stake) pairs — only include validators with known stake
-        let mut price_stake_pairs: Vec<(FixedPoint, FixedPoint)> = Vec::new();
-        for sub in &submissions {
-            if let Some((_, stake)) = validator_stakes
-                .iter()
-                .find(|(addr, _)| *addr == sub.validator)
-            {
-                price_stake_pairs.push((sub.price, *stake));
-            }
+        // Build (price, stake) pairs — only include validators with known stake.
+        // First entry wins on a duplicate address (as the former linear `find`).
+        let mut stake_of: BTreeMap<Address, FixedPoint> = BTreeMap::new();
+        for (addr, stake) in validator_stakes {
+            stake_of.entry(*addr).or_insert(*stake);
         }
+        let price_stake_pairs: Vec<(FixedPoint, FixedPoint)> = submissions
+            .iter()
+            .filter_map(|sub| stake_of.get(&sub.validator).map(|stake| (sub.price, *stake)))
+            .collect();
 
         if price_stake_pairs.is_empty() {
             return self.get_last_valid_price(market_id, now);
@@ -363,8 +364,9 @@ impl<T: StateBackend> OracleManager<T> {
     }
 
     /// Whether any submission row exists (the block's oracle step is due).
+    /// Stops at the first row.
     pub fn has_submissions(&self) -> Result<bool, CoreError> {
-        Ok(!self.state.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub"))?.is_empty())
+        Ok(self.state.prefix_exists(CF_NATIVE_ORACLE, b"sub")?)
     }
 
     /// The submissions of `market_id` that count at `now`: decodable, block

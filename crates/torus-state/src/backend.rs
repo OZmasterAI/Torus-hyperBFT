@@ -42,6 +42,13 @@ pub trait StateBackend: Clone + Send + Sync {
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError>;
 
+    /// Whether any key starting with `prefix` exists — `!iterate_cf(prefix)
+    /// .is_empty()`. `StateDb` and `NativeStateOverlay` stop at the first live
+    /// key instead of loading every row.
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        Ok(!self.iterate_cf(cf, Some(prefix))?.is_empty())
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
 
     fn get_account(&self, address: &Address) -> Result<Option<AccountInfo>, StateError> {
@@ -143,6 +150,19 @@ impl StateBackend for StateDb {
             }
         }
         Ok(results)
+    }
+
+    /// First key at/after `prefix` only (keys are sorted: if it does not
+    /// start with `prefix`, none does).
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        match db.prefix_iterator_cf(cf_handle, prefix).next() {
+            Some(item) => Ok(item?.0.starts_with(prefix)),
+            None => Ok(false),
+        }
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
@@ -1098,6 +1118,17 @@ pub struct NativeFlushStats {
     pub dirty_entries_by_cf: [usize; 6],
 }
 
+/// A layer's pending-write keys starting with `prefix`, in key order.
+fn writes_under<'a>(
+    writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+    prefix: &'a [u8],
+) -> impl Iterator<Item = &'a Vec<u8>> {
+    writes
+        .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        .map(|(k, _)| k)
+        .take_while(move |k| k.starts_with(prefix))
+}
+
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         // C2: interned CF + borrowed key lookup — ZERO allocations on this path
@@ -1188,6 +1219,48 @@ impl StateBackend for NativeStateOverlay {
         Ok(merged.into_iter().collect())
     }
 
+    /// Same answer as the merged `iterate_cf`, without materialising it: a key
+    /// is live per the layered point-read rule (pending, then parent, then DB).
+    /// Checks pending / parent writes under `prefix`, then walks DB keys and
+    /// stops at the first one no layer tombstones — it skips at most the
+    /// tombstones under `prefix`.
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            return StateBackend::prefix_exists(&self.db, cf, prefix);
+        };
+        let live = |key: &[u8]| -> bool {
+            if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
+                return hit.is_some();
+            }
+            match self.parent.as_ref().and_then(|p| p.state.lookup(id, key)) {
+                Some(hit) => hit.is_some(),
+                None => true,
+            }
+        };
+        if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
+            return Ok(true);
+        }
+        if let Some(parent) = &self.parent {
+            if writes_under(&parent.state.cf(id).writes, prefix).any(|k| live(k)) {
+                return Ok(true);
+            }
+        }
+        let db = self.db.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        for item in db.prefix_iterator_cf(cf_handle, prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if live(&key) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
         // Intern every CF FIRST so an unregistered name rejects the whole op set
         // before any mutation (atomic even on the error path).
@@ -1233,6 +1306,53 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
         (db, dir)
+    }
+
+    /// `prefix_exists` == `!iterate_cf(prefix).is_empty()` for every layering
+    /// of two keys over DB / parent (frozen) / pending: absent, write, tombstone.
+    #[test]
+    fn prefix_exists_matches_iterate_cf_over_every_layering() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        // per key: (in DB, parent op, pending op); op 0 = none, 1 = write, 2 = delete
+        let states: Vec<(bool, u8, u8)> = (0..18u8).map(|i| (i % 2 == 1, (i / 2) % 3, i / 6)).collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k]].concat();
+        let combos: Vec<[(bool, u8, u8); 2]> =
+            states.iter().flat_map(|&a| states.iter().map(move |&b| [a, b])).collect();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), b"db").unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: usize| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &key(c, k as u8), b"w").unwrap(),
+                        2 => ov.delete_cf_raw(cf, &key(c, k as u8)).unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        apply(&parent, 0);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+        apply(&overlay, 1);
+        let (mut yes, mut no) = (0, 0);
+        for (c, combo) in combos.iter().enumerate() {
+            let p = prefix(c);
+            let want = !overlay.iterate_cf(cf, Some(&p)).unwrap().is_empty();
+            assert_eq!(overlay.prefix_exists(cf, &p).unwrap(), want, "overlay combo {c}: {combo:?}");
+            let want_db = !StateBackend::iterate_cf(&db, cf, Some(&p)).unwrap().is_empty();
+            assert_eq!(StateBackend::prefix_exists(&db, cf, &p).unwrap(), want_db, "db combo {c}");
+            if want { yes += 1 } else { no += 1 }
+        }
+        assert!(yes > 0 && no > 0, "non-vacuous: {yes} / {no}");
+        assert!(!overlay.prefix_exists(cf, b"q").unwrap(), "no key under the prefix");
     }
 
     #[test]
