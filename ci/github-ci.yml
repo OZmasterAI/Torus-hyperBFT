@@ -1,3 +1,8 @@
+# ARCHIVED (s80): this GitHub Actions workflow is disabled to save Actions
+# minutes (it had failed on every push since 2026-09-23, on warnings).
+# Run the same jobs locally with ci/run-local.sh. To re-enable on GitHub,
+# move this file back to .github/workflows/ci.yml.
+
 name: CI
 
 on:
