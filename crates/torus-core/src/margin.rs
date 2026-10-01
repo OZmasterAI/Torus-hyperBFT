@@ -74,6 +74,12 @@ pub fn order_initial_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) 
         .expect("FixedPoint division error")
 }
 
+/// Item 3 (HL): maintenance margin = half the initial margin at max leverage
+/// (position-size tier), truncating — THE formula of liquidation.
+pub fn maintenance_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) -> FixedPoint {
+    FixedPoint::from_raw(order_initial_margin(tiers, notional).raw() / 2)
+}
+
 // ============================================================================
 // Account-level margin (F1, s517) — Hyperliquid cross margin, computed
 // ============================================================================
@@ -128,6 +134,8 @@ pub struct AccountView {
     pub position_im: FixedPoint,
     /// Σ |size| × [`position_price`].
     pub notional: FixedPoint,
+    /// Item 3: Σ [`maintenance_margin`] at [`position_price`], each market's tiers.
+    pub maintenance: FixedPoint,
 }
 
 impl AccountView {
@@ -145,6 +153,7 @@ impl AccountView {
             upnl: FixedPoint::ZERO,
             position_im: FixedPoint::ZERO,
             notional: FixedPoint::ZERO,
+            maintenance: FixedPoint::ZERO,
         };
         for pos in positions.iter().filter(|p| p.margin_type == MarginType::Cross) {
             let px = position_price(pos, mark(pos.market_id));
@@ -152,10 +161,9 @@ impl AccountView {
             let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
             v.upnl = v.upnl.checked_add(diff.checked_mul(pos.size).map_err(of)?).map_err(of)?;
             v.notional = v.notional.checked_add(n).map_err(of)?;
-            v.position_im = v
-                .position_im
-                .checked_add(order_initial_margin(tiers(pos.market_id), n))
-                .map_err(of)?;
+            let t = tiers(pos.market_id);
+            v.position_im = v.position_im.checked_add(order_initial_margin(t, n)).map_err(of)?;
+            v.maintenance = v.maintenance.checked_add(maintenance_margin(t, n)).map_err(of)?;
         }
         Ok(v)
     }
@@ -268,8 +276,12 @@ impl MarginEngine {
             MarginType::Cross => {
                 // Cross: available + sum(unrealized PnL) - sum(maintenance) >= initial
                 let equity = Self::cross_margin_equity(positions, trader, oracle_prices)?;
-                let maint =
-                    Self::total_maintenance_margin(positions, trader, config, oracle_prices)?;
+                let maint = Self::total_maintenance_margin(
+                    positions,
+                    trader,
+                    |_| Some(config.tiers.as_slice()),
+                    oracle_prices,
+                )?;
                 let free_margin = equity - maint;
                 if free_margin < required_initial {
                     return Err(CoreError::InsufficientMargin {
@@ -331,28 +343,24 @@ impl MarginEngine {
         Ok(view.equity())
     }
 
-    /// F1: Σ maintenance of cross positions — IM ([`order_initial_margin`],
-    /// position-size tier) at [`position_price`] × maintenance_factor_bps / 10,000.
-    pub fn total_maintenance_margin(
+    /// Item 3 (F6): [`AccountView::maintenance`] — Σ [`maintenance_margin`] of
+    /// cross positions at [`position_price`], each at ITS market's `tiers`
+    /// (was: one config's tiers × `maintenance_factor_bps` for every position).
+    pub fn total_maintenance_margin<'t>(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
-        config: &MarketMarginConfig,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Result<FixedPoint, CoreError> {
-        // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
-        let maint_num =
-            FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
-        let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-        let mut total = FixedPoint::ZERO;
-        for pos in positions.positions_for_trader(trader)? {
-            if pos.margin_type != MarginType::Cross {
-                continue;
-            }
-            let px = position_price(&pos, oracle_price_for(oracle_prices, pos.market_id));
-            let initial = order_initial_margin(Some(&config.tiers), pos.notional(px));
-            total += initial * maint_num / bps_denom;
-        }
-        Ok(total)
+        let bal = positions.get_native_balance(trader)?;
+        let all_pos = positions.positions_for_trader(trader)?;
+        let view = AccountView::build(
+            &bal,
+            &all_pos,
+            |m| oracle_price_for(oracle_prices, m),
+            tiers,
+        )?;
+        Ok(view.maintenance)
     }
 
     /// Check maintenance margin for a specific isolated position.
@@ -601,8 +609,14 @@ mod tests {
         // maintenance_factor_bps = 5000 (50%)
         let oracle_prices = vec![(1u64, fp(50_000))];
 
-        let maint =
-            MarginEngine::total_maintenance_margin(&pm, &trader, &config, &oracle_prices).unwrap();
+        // Item 3: per-market tiers closure (signature only; value unchanged).
+        let maint = MarginEngine::total_maintenance_margin(
+            &pm,
+            &trader,
+            |_| Some(config.tiers.as_slice()),
+            &oracle_prices,
+        )
+        .unwrap();
 
         // Notional = 1 * 50000 = 50000
         // Tier: 50000 <= 100000 → max_leverage = 50

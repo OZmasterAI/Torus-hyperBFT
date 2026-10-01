@@ -2,8 +2,8 @@
 
 use torus_core::error::CoreError;
 use torus_core::margin::{
-    default_margin_tiers, effective_max_leverage, order_initial_margin, placement_need,
-    AccountView, MarginEngine, MarginTier, MarketMarginConfig,
+    default_margin_tiers, effective_max_leverage, maintenance_margin, order_initial_margin,
+    placement_need, AccountView, MarginEngine, MarginTier, MarketMarginConfig,
 };
 use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_state::StateDb;
@@ -577,6 +577,48 @@ fn maintenance_uses_entry_price_without_a_mark() {
     })
     .unwrap();
     let config = MarketMarginConfig::new(1, 50);
-    let m = MarginEngine::total_maintenance_margin(&pm, &trader, &config, &[]).unwrap();
+    let m = MarginEngine::total_maintenance_margin(
+        &pm,
+        &trader,
+        |_| Some(config.tiers.as_slice()),
+        &[],
+    )
+    .unwrap();
     assert_eq!(m, fp(500)); // IM 50,000/50 = 1,000 × 50%
+}
+
+/// Item 3: MM = half the IM at max leverage, POSITION-size tier, each market's
+/// own tiers (truncating).
+#[test]
+fn maintenance_is_half_the_position_size_tier_im_per_market() {
+    let t = tiers_20_then_5();
+    assert_eq!(maintenance_margin(Some(&t), fp(1_000)), fp(25)); // 20x: IM 50
+    assert_eq!(maintenance_margin(Some(&t), fp(1_500)), fp(150)); // 5x: IM 300
+    assert_eq!(maintenance_margin(None, fp(1_000)), fp(25)); // default 20x
+    assert_eq!(maintenance_margin(None, FixedPoint::from_raw(39)).raw(), 0); // IM raw 1 -> 0
+    let bal = NativeBalance { available: fp(1_000), order_margin: FixedPoint::ZERO };
+    // m1: tiers_20_then_5, 15 @ 100 = 1,500 -> 5x, MM 150; m2: no tiers, 10 @ 100 -> MM 25.
+    let ps = [cross(1, true, 15, 100), cross(2, false, 10, 100)];
+    let v = AccountView::build(&bal, &ps, |_| None, |m| (m == 1).then_some(t.as_slice())).unwrap();
+    assert_eq!(v.maintenance, fp(175));
+}
+
+/// F6: total_maintenance_margin uses EACH market's tiers (was: one config's
+/// tiers for every position).
+#[test]
+fn total_maintenance_margin_uses_each_markets_tiers() {
+    let (_dir, pm) = setup();
+    let trader = addr(1);
+    pm.put_position(&Position { trader, ..cross(1, true, 15, 100) }).unwrap();
+    pm.put_position(&Position { trader, ..cross(2, true, 15, 100) }).unwrap();
+    let t = tiers_20_then_5();
+    let m = MarginEngine::total_maintenance_margin(
+        &pm,
+        &trader,
+        |m| (m == 1).then_some(t.as_slice()),
+        &[],
+    )
+    .unwrap();
+    // m1: 1,500 at 5x -> MM 150; m2: 1,500 at the default 20x -> MM 37.5
+    assert_eq!(m, fp(150) + FixedPoint::from_raw(3_750_000_000));
 }
