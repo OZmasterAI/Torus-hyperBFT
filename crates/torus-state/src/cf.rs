@@ -97,6 +97,20 @@ pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 
     key
 }
 
+/// Build the hot-oracle-signer reverse-index key in [`CF_NATIVE_ORACLE`]:
+/// `"sgn" ‖ signer(20)` -> validator(20) (s517, `SetOracleSigner`).
+///
+/// Single source of truth for exec (`exec_set_oracle_signer`, reporter
+/// resolution) and mempool admission. The prefix cannot collide with the
+/// oracle's `"sub"` / `"agg"` rows. It lives here and not in
+/// `CF_STAKING_VALIDATORS`, whose every value `all_validators` decodes.
+pub fn oracle_signer_key(signer: &alloy_primitives::Address) -> [u8; 23] {
+    let mut key = [0u8; 23];
+    key[..3].copy_from_slice(b"sgn");
+    key[3..].copy_from_slice(signer.as_slice());
+    key
+}
+
 // Native-action data-availability (DA) body store (Phase C: native-action DA)
 /// Durable native-action bodies keyed by 32-byte action-hash. Value: bincode(SignedNativeAction).
 ///
@@ -224,3 +238,21 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_BOOK_ORDER_ROWS,
     CF_NATIVE_LIQUIDATION,
 ];
+
+#[cfg(test)]
+mod oracle_signer_key_tests {
+    use super::*;
+
+    /// s517 oracle feeder S1: the signer reverse index key is `"sgn" ‖ signer`
+    /// and cannot collide with the oracle `"sub"` / `"agg"` prefixes.
+    #[test]
+    fn oracle_signer_key_layout() {
+        let a = alloy_primitives::Address::repeat_byte(0x5a);
+        let k = oracle_signer_key(&a);
+        assert_eq!(k.len(), 23);
+        assert_eq!(&k[..3], b"sgn");
+        assert_eq!(&k[3..], a.as_slice());
+        assert_ne!(&k[..3], b"sub");
+        assert_ne!(&k[..3], b"agg");
+    }
+}

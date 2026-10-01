@@ -397,6 +397,7 @@ impl Genesis {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             let data = borsh::to_vec(&state)
                 .map_err(|e| GenesisError::InvalidHex(format!("borsh encode validator: {e}")))?;

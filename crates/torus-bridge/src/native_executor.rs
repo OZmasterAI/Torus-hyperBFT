@@ -3454,6 +3454,9 @@ impl NativeExecutor {
             NativeAction::RotateValidatorKey { new_pubkey } => {
                 Self::exec_rotate_key(ctx, sender, new_pubkey)
             }
+            NativeAction::SetOracleSigner { signer } => {
+                Self::exec_set_oracle_signer(ctx, sender, *signer)
+            }
 
             // ---- Session Keys ----
             NativeAction::CreateSession {
@@ -6567,26 +6570,18 @@ impl NativeExecutor {
         prices: &[(MarketId, FixedPoint)],
         _submission_timestamp: u64,
     ) -> NativeActionResult {
-        // FIX 18 (ECON-FIND-19): Verify sender is an active, non-jailed validator.
-        match ctx.staking.get_validator(sender) {
-            Ok(Some(v)) => {
-                use torus_economics::types::ValidatorStatus;
-                if v.status != ValidatorStatus::Active {
-                    return NativeActionResult::err(
-                        "submit_oracle_prices",
-                        format!("validator {sender} is not active (status: {:?})", v.status),
-                    );
-                }
-            }
-            Ok(None) => {
-                return NativeActionResult::err(
-                    "submit_oracle_prices",
-                    format!("{sender} is not a registered validator"),
-                );
-            }
-            Err(e) => {
-                return NativeActionResult::err("submit_oracle_prices", e.to_string());
-            }
+        // FIX 18 (ECON-FIND-19): the REPORTER must be an active, non-jailed
+        // validator. s517: the reporter is the sender itself (direct submission)
+        // or the validator whose registered hot oracle signer the sender is.
+        let (reporter, status) = match Self::resolve_oracle_reporter(ctx, sender) {
+            Ok(r) => r,
+            Err(m) => return NativeActionResult::err("submit_oracle_prices", m),
+        };
+        if status != torus_economics::types::ValidatorStatus::Active {
+            return NativeActionResult::err(
+                "submit_oracle_prices",
+                format!("validator {reporter} is not active (status: {status:?})"),
+            );
         }
 
         use torus_core::oracle::{valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP};
@@ -6614,12 +6609,93 @@ impl NativeExecutor {
         for &(market_id, price) in prices {
             if let Err(e) =
                 ctx.oracle
-                    .submit_price(sender, market_id, price, ctx.block_height, ctx.timestamp)
+                    .submit_price(&reporter, market_id, price, ctx.block_height, ctx.timestamp)
             {
                 return NativeActionResult::err("submit_oracle_prices", e.to_string());
             }
         }
         NativeActionResult::ok("submit_oracle_prices", 1000)
+    }
+
+    /// The validator an oracle submission from `sender` reports for, with its
+    /// status: the sender's own validator record first (direct submission),
+    /// else the hot-signer index cross-checked against that validator's
+    /// record, so a stale index entry never resolves.
+    fn resolve_oracle_reporter<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        sender: &Address,
+    ) -> Result<(Address, torus_economics::types::ValidatorStatus), String> {
+        if let Some(v) = ctx.staking.get_validator(sender).map_err(|e| e.to_string())? {
+            return Ok((*sender, v.status));
+        }
+        let key = torus_state::cf::oracle_signer_key(sender);
+        let raw = ctx.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).map_err(|e| e.to_string())?;
+        if let Some(v) = raw.filter(|b| b.len() == 20).map(|b| Address::from_slice(&b)) {
+            if let Some(rec) = ctx.staking.get_validator(&v).map_err(|e| e.to_string())? {
+                if rec.oracle_signer == Some(*sender) {
+                    return Ok((v, rec.status));
+                }
+            }
+        }
+        Err(format!("{sender} is not a registered validator or oracle signer"))
+    }
+
+    /// `SetOracleSigner` (s517): set, rotate or (with `Address::ZERO`) clear
+    /// the sender validator's hot oracle signer. Every check runs before the
+    /// first write (no per-action rollback). Writes: the old index entry is
+    /// deleted, the new one written, the record updated — rotation invalidates
+    /// the old signer at once.
+    fn exec_set_oracle_signer<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        signer: Address,
+    ) -> NativeActionResult {
+        use torus_economics::types::ValidatorStatus;
+        use torus_state::cf::{oracle_signer_key, CF_NATIVE_ORACLE};
+        let err = |m: String| NativeActionResult::err("set_oracle_signer", m);
+        let mut v = match ctx.staking.get_validator(sender) {
+            Ok(Some(v)) if v.status != ValidatorStatus::Tombstoned => v,
+            Ok(Some(_)) => return err(format!("validator {sender} is tombstoned")),
+            Ok(None) => return err(format!("{sender} is not a registered validator")),
+            Err(e) => return err(e.to_string()),
+        };
+        let new = (signer != Address::ZERO).then_some(signer);
+        if v.oracle_signer == new {
+            return NativeActionResult::ok("set_oracle_signer", 1000);
+        }
+        if let Some(s) = new {
+            match ctx.staking.get_validator(&s) {
+                Ok(None) => {}
+                Ok(Some(_)) => return err(format!("signer {s} is a validator")),
+                Err(e) => return err(e.to_string()),
+            }
+            match ctx.state.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s)) {
+                Ok(None) => {}
+                Ok(Some(owner)) => {
+                    return err(format!(
+                        "signer {s} already serves validator 0x{}",
+                        alloy_primitives::hex::encode(owner)
+                    ))
+                }
+                Err(e) => return err(e.to_string()),
+            }
+        }
+        // Writes (validation complete).
+        if let Some(old) = v.oracle_signer {
+            if let Err(e) = ctx.state.delete_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&old)) {
+                return err(e.to_string());
+            }
+        }
+        if let Some(s) = new {
+            if let Err(e) = ctx.state.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s), sender.as_slice()) {
+                return err(e.to_string());
+            }
+        }
+        v.oracle_signer = new;
+        match ctx.staking.put_validator(sender, &v) {
+            Ok(()) => NativeActionResult::ok("set_oracle_signer", 2000),
+            Err(e) => err(e.to_string()),
+        }
     }
 
     // ========================================================================

@@ -946,6 +946,37 @@ Run everything from the worktree with `CARGO_TARGET_DIR=/home/crab/projects/Toru
 * **R-venues.** Exchange symbols can drift, fixture shapes can go stale, bulk response bodies are capped at 4 MiB, and rate limits allow 1 request per venue per 3 s.
 * **R-depeg.** With `par`, a stablecoin depeg goes straight into the price. Use `kraken_usdt` if that matters.
 
+## Implementation corrections (s517)
+
+Each item notes a place where the plan draft was changed during implementation.
+
+**Commit 1 (oracle signer)**
+
+* Correction s517 (S1). At `76ae0ba` there are 6 `ValidatorState { … }` literals
+  (staking, genesis, app.rs ×2, chaos, oracle_block_tests), not 10.
+* Correction s517 (S1). `execute_action` is an exhaustive match. The S1
+  `check --workspace` therefore runs after S2, which adds the dispatch arm. The
+  S2 RED was `E0004 non-exhaustive patterns`.
+* Correction s517 (S1). `action_hash_scratch_tests.rs` keeps an independent
+  frozen encoder and a tag-coverage pin. The frozen encoder gets the tag-27 arm
+  and the pin becomes `0..=27`.
+* Correction s517 (S2). The no-op check compares
+  `Option` (`v.oracle_signer == new`). Clearing an unset signer is therefore a
+  no-op success, not a write.
+* Correction s517 (S3). `resolve_oracle_reporter` returns
+  `(validator, status)`. The Active check then needs no second record read. The
+  error texts are unchanged.
+* Correction s517 (S3, D-S1 test).
+  * `Delegate { validator: V1 }` is dropped from the signer's action list. A
+    third party may delegate to V1; that changes `V1.total_delegated`
+    legitimately and is not authority over V1.
+  * `ModifyOrder` and `ClaimUnbonded` are added to the list.
+  * The signer is funded, so its own order really rests.
+  * The dump covers the rows of the account and staking CFs whose key carries
+    V1, plus V1's in-memory resting orders.
+* Q-S1 was decided by the user: the signer's own account is unrestricted. There is
+  no per-action lookup.
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).
