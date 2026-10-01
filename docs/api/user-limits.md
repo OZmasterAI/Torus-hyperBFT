@@ -6,14 +6,18 @@ markets (Hyperliquid model):
     limit = min(1000 + floor(cumVolume / 5,000,000), 5000)
 
 - `cumVolume` is the address's lifetime traded notional (`price * qty`, quote
-  units). Maker and taker both add it on every fill. The limit uses the value
-  stored when the block starts; a block's fills raise it for the next block.
+  units). Maker and taker both add it on every fill.
+- The count and the limit are taken when each execution batch starts. A block
+  runs two batches (before and after its EVM transactions), so fills raise the
+  limit from the next batch on, which can be later in the same block.
 - Open orders are resting orders (GTC, PostOnly) and pending stops
   (StopMarket, StopLimit). Market, IOC and FOK orders never rest, so they are
   never counted or rejected by the limit.
 - A restable order past the limit is rejected with an error starting with
-  `open order limit`. Within one block, every accepted restable order uses a
-  slot until the next block, even if it fills completely.
+  `open order limit`. Within one batch, every accepted restable order uses a
+  slot until the batch ends, even if it fills completely or the book then
+  rejects it (PostOnly would cross, dust quantity, off-tick price): the check
+  runs before matching, so it is conservative.
 - With 1000 or more open orders, reduce-only and stop orders are rejected even
   when the volume-scaled limit has room.
 - `CancelAllOrders` also cancels the sender's pending stops.
