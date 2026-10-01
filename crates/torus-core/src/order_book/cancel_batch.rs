@@ -349,7 +349,7 @@ impl OrderBook {
         let mut by_id: Vec<(OrderId, usize)> = Vec::with_capacity(total);
         for (sender, range) in senders.iter().zip(&ranges) {
             let Some(range) = range else { continue };
-            for (output, id) in (range.start..).zip(&self.trader_orders[sender]) {
+            for (output, id) in (range.start..).zip(self.trader_orders[sender].iter()) {
                 let loc = self.order_index.get(id)?;
                 let queue = match loc.side {
                     Side::Buy => self.bids.get(&loc.price),
@@ -623,7 +623,7 @@ mod tests {
         }
         // Make receipt order neither level order nor FIFO order. Recovery may
         // restore trader order lists differently; cancellation must honor it.
-        book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
+        book.trader_orders.get_mut(&addr(1)).unwrap().edit(|v| v.reverse());
         book.pending_stops.push(StopOrder {
             id: 900_000,
             trader: addr(1),
@@ -690,7 +690,7 @@ mod tests {
             for shape in 0..5 {
                 let mut a = fixture(2048, 40, shape, mode);
                 let mut b = fixture(2048, 40, shape, mode);
-                let expected = a.trader_orders[&addr(1)].clone();
+                let expected = a.trader_orders[&addr(1)].to_vec();
                 assert!(a.cancel_batch_has_concentrated_prefix(&expected));
                 let got = a.cancel_all(addr(1), Some(999));
                 assert_eq!(got, b.cancel_all_original(addr(1), Some(999)));
@@ -717,7 +717,7 @@ mod tests {
         let mut a = fixture(2048, 40, 0, 3);
         let mut b = fixture(2048, 40, 0, 3);
         for book in [&mut a, &mut b] {
-            let ids = book.trader_orders[&addr(1)].clone();
+            let ids = book.trader_orders[&addr(1)].to_vec();
             book.modify_order(ids[0], None, Some(fp(2))).unwrap();
             book.modify_order(ids[1], None, Some(fp(7))).unwrap();
             book.modify_order(ids[2], Some(fp(111)), None).unwrap();
@@ -777,7 +777,7 @@ mod tests {
             let mut a = fixture(depth, per_level, 0, 0);
             let mut b = fixture(depth, per_level, 0, 0);
             for book in [&mut a, &mut b] {
-                let id = book.trader_orders[&addr(1)][3];
+                let id = book.trader_orders[&addr(1)].to_vec()[3];
                 match case {
                     2 => {
                         book.order_index.remove(&id);
@@ -795,11 +795,11 @@ mod tests {
                         book.trader_orders
                             .get_mut(&addr(1))
                             .unwrap()
-                            .insert(0, 999_999);
+                            .edit(|v| v.insert(0, 999_999));
                     }
                     _ => {}
                 }
-                let ids = book.trader_orders[&addr(1)].clone();
+                let ids = book.trader_orders[&addr(1)].to_vec();
                 assert!(book.try_cancel_all_batch(&ids).is_none());
             }
             assert_eq!(
@@ -836,7 +836,7 @@ mod tests {
         for depth in [1, 32, 1024] {
             let mut a = scattered(depth);
             let mut b = scattered(depth);
-            let ids = a.trader_orders[&addr(1)].clone();
+            let ids = a.trader_orders[&addr(1)].to_vec();
             assert_eq!(ids.len(), 32);
             assert!(a.order_count() >= 1024);
             assert!(!a.cancel_batch_has_concentrated_prefix(&ids));
@@ -859,9 +859,9 @@ mod tests {
             book.trader_orders
                 .get_mut(&addr(1))
                 .unwrap()
-                .rotate_right(1);
+                .edit(|v| v.rotate_right(1));
         }
-        let ids = a.trader_orders[&addr(1)].clone();
+        let ids = a.trader_orders[&addr(1)].to_vec();
         assert!(!a.cancel_batch_has_concentrated_prefix(&ids));
         assert!(a.try_cancel_all_batch(&ids).is_none());
         assert_same(&mut a, &mut b);
@@ -893,7 +893,7 @@ mod tests {
                 (crate::book_rows::SIDE_TAG_ASK, fp(110).raw()),
                 u64::MAX - 1,
             );
-            let ids = book.trader_orders[&addr(1)].clone();
+            let ids = book.trader_orders[&addr(1)].to_vec();
             assert!(book.try_cancel_all_batch(&ids).is_none());
         }
         let got =
@@ -917,7 +917,7 @@ impl OrderBook {
     fn cancel_all_original(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
         self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
-            Some(ids) => ids,
+            Some(ids) => ids.to_vec(),
             None => return vec![],
         };
 
