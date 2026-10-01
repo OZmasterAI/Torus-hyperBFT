@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 use crate::cf::*;
 use crate::db::StateDb;
 
@@ -81,6 +83,86 @@ pub fn key_is_hashed(cf_id: u8, key: &[u8]) -> bool {
         ID_CONSENSUS_META => META_CONSENSUS_PREFIXES.iter().any(|p| key.starts_with(p)),
         _ => true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hash function
+// ---------------------------------------------------------------------------
+
+/// Streaming per-block domain digests `D_native(n)` / `D_evm(n)`: SHA-256 over
+/// the block's writes to the domain in `(cf_id, key)` order, each framed as
+/// `cf_id ‖ len(key) u32 BE ‖ key ‖ (0x00 | 0x01 ‖ len(value) u32 BE ‖ value)`.
+/// Callers feed entries in canonical order; the key filter is applied here.
+pub struct BlockDigest {
+    native: Sha256,
+    evm: Sha256,
+    entries: usize,
+}
+
+impl Default for BlockDigest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockDigest {
+    pub fn new() -> Self {
+        Self {
+            native: Sha256::new(),
+            evm: Sha256::new(),
+            entries: 0,
+        }
+    }
+
+    /// Fold one write (in canonical order). Excluded keys are skipped.
+    #[inline]
+    pub fn push(&mut self, cf_id: u8, key: &[u8], value: Option<&[u8]>) {
+        if !key_is_hashed(cf_id, key) {
+            return;
+        }
+        let h = if cf_id >= EVM_DOMAIN_FIRST_ID {
+            &mut self.evm
+        } else {
+            &mut self.native
+        };
+        h.update([cf_id]);
+        h.update((key.len() as u32).to_be_bytes());
+        h.update(key);
+        match value {
+            None => h.update([0u8]),
+            Some(v) => {
+                h.update([1u8]);
+                h.update((v.len() as u32).to_be_bytes());
+                h.update(v);
+            }
+        }
+        self.entries += 1;
+    }
+
+    /// Number of hashed entries folded so far.
+    pub fn entries(&self) -> usize {
+        self.entries
+    }
+
+    /// `h_n = SHA-256(prev ‖ height u64 BE ‖ D_native ‖ D_evm)`.
+    pub fn chain(self, prev: &[u8; 32], height: u64) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(prev);
+        h.update(height.to_be_bytes());
+        h.update(self.native.finalize());
+        h.update(self.evm.finalize());
+        h.finalize().into()
+    }
+}
+
+/// `h_n` from `h_{n-1}` and block `n`'s consensus writes, which must be in
+/// canonical `(cf_id, key)` order (as produced by the flush).
+pub fn next_running_hash(prev: &[u8; 32], height: u64, writes: &[WriteEntry]) -> [u8; 32] {
+    let mut d = BlockDigest::new();
+    for (id, k, v) in writes {
+        d.push(*id, k, v.as_deref());
+    }
+    d.chain(prev, height)
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +241,85 @@ mod tests {
             CF_TRIE_ACCOUNTS,
         ] {
             assert_eq!(hashed_cf_id(derived), None, "{derived} must not be hashed");
+        }
+    }
+
+    fn golden_writes() -> Vec<WriteEntry> {
+        vec![
+            (1, b"pos-a".to_vec(), Some(b"v1".to_vec())),
+            (6, b"nonce-key".to_vec(), None), // tombstone
+            (21, b"pending_rotation:x".to_vec(), Some(b"r".to_vec())),
+            // excluded by the key filter: must not change the hash
+            (21, META_NATIVE_APPLIED_HEIGHT.to_vec(), Some(100u64.to_be_bytes().to_vec())),
+            (4, b"__book_mode__".to_vec(), Some(vec![3])),
+            // EVM domain
+            (0x80, vec![0xaa; 20], Some(b"acct".to_vec())),
+            (0x81, b"slot".to_vec(), Some(vec![1; 32])),
+        ]
+    }
+
+    fn hex(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Golden vector, computed independently (Python hashlib) from the spec:
+    /// h_n = SHA-256(h_{n-1} ‖ n u64 BE ‖ D_native ‖ D_evm), D_x = SHA-256 over
+    /// cf_id ‖ len(key) u32 BE ‖ key ‖ (0x00 | 0x01 ‖ len(value) u32 BE ‖ value).
+    #[test]
+    fn running_hash_golden_vector() {
+        let mut w = golden_writes();
+        w.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let h = next_running_hash(&[0x11; 32], 100, &w);
+        assert_eq!(hex(&h), "186ec6603996d1d00398948fde70c2d9b7e295cf09d1a3661d52a4af7af311c6");
+        // Empty block from the zero hash: both domains are SHA-256("").
+        let e = next_running_hash(&[0; 32], 1, &[]);
+        assert_eq!(hex(&e), "09886290c37994a0d854cf970cb95cb3e6cd9440fa19bed923c3ea7d1d340c43");
+    }
+
+    /// Any byte change in any input changes the hash; excluded keys do not.
+    #[test]
+    fn running_hash_every_byte_matters() {
+        let mut base = golden_writes();
+        base.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let h0 = next_running_hash(&[0x11; 32], 100, &base);
+        assert_ne!(next_running_hash(&[0x12; 32], 100, &base), h0, "prev");
+        assert_ne!(next_running_hash(&[0x11; 32], 101, &base), h0, "height");
+        let hashed: Vec<usize> = (0..base.len())
+            .filter(|&i| key_is_hashed(base[i].0, &base[i].1))
+            .collect();
+        for &i in &hashed {
+            let mut w = base.clone();
+            w[i].1.push(0);
+            assert_ne!(next_running_hash(&[0x11; 32], 100, &w), h0, "key of entry {i}");
+            let mut w = base.clone();
+            w[i].2 = match &w[i].2 {
+                Some(v) if !v.is_empty() => {
+                    let mut v = v.clone();
+                    v[0] ^= 1;
+                    Some(v)
+                }
+                Some(_) => None,
+                None => Some(Vec::new()), // tombstone vs empty value differ
+            };
+            assert_ne!(next_running_hash(&[0x11; 32], 100, &w), h0, "value of entry {i}");
+            let mut w = base.clone();
+            w.remove(i);
+            assert_ne!(next_running_hash(&[0x11; 32], 100, &w), h0, "dropping entry {i}");
+        }
+        // Moving a write between domains (same key/value, other cf_id) differs.
+        let mut w = base.clone();
+        let evm = w.iter().position(|e| e.0 == 0x80).unwrap();
+        w[evm].0 = 0x7f;
+        w.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        assert_ne!(next_running_hash(&[0x11; 32], 100, &w), h0, "domain split");
+        // Excluded keys: changing or dropping them leaves the hash alone.
+        for i in (0..base.len()).filter(|i| !hashed.contains(i)) {
+            let mut w = base.clone();
+            w[i].2 = Some(b"other".to_vec());
+            assert_eq!(next_running_hash(&[0x11; 32], 100, &w), h0, "excluded entry {i}");
+            let mut w = base.clone();
+            w.remove(i);
+            assert_eq!(next_running_hash(&[0x11; 32], 100, &w), h0, "excluded entry {i} dropped");
         }
     }
 

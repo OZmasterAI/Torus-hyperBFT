@@ -7220,6 +7220,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "torus-types",
