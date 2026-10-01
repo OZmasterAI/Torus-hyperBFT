@@ -286,6 +286,29 @@ pub(crate) fn validate_known_markets(
             }
             Ok(())
         }
+        // s517: the exec submission rules (NE exec_submit_oracle_prices) at
+        // ingress, so a feeder gets an error instead of a silent exec failure.
+        // Ingress-only: exec re-checks everything.
+        torus_types::NativeAction::SubmitOraclePrices(sub) => {
+            use torus_core::oracle::{valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP};
+            if sub.prices.is_empty() || sub.prices.len() > CAP {
+                return Err(format!(
+                    "oracle submission carries 1..={CAP} prices, got {}",
+                    sub.prices.len()
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for &(mid, price) in &sub.prices {
+                if !seen.insert(mid) {
+                    return Err(format!("duplicate market {mid} in oracle submission"));
+                }
+                check(mid)?;
+                if !valid_oracle_price(price) {
+                    return Err(format!("invalid oracle price {price} for market {mid}"));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1211,9 +1234,8 @@ impl TorusApiServer for RpcState {
         let result = validators
             .into_iter()
             .map(|v| {
-                let status = all_states
-                    .iter()
-                    .find(|s| s.address == v.address)
+                let state = all_states.iter().find(|s| s.address == v.address);
+                let status = state
                     .map(|s| match s.status {
                         ValidatorStatus::Candidate => "candidate",
                         ValidatorStatus::Active => "active",
@@ -1228,6 +1250,7 @@ impl TorusApiServer for RpcState {
                     power: hex_u64(v.power),
                     commission_bps: v.commission_bps,
                     status: status.to_string(),
+                    oracle_signer: state.and_then(|s| s.oracle_signer).map(hex_address),
                 }
             })
             .collect();
@@ -2320,6 +2343,57 @@ mod ack_scratch_tests {
             });
             assert_eq!(actual, expected);
         }
+    }
+}
+
+
+/// s517 oracle feeder R2: ingress applies the exec submission rules to
+/// `SubmitOraclePrices` (the feeder gets an error instead of a silent exec failure).
+#[cfg(test)]
+mod oracle_ingress_tests {
+    use super::*;
+    use torus_core::oracle::{MAX_ORACLE_PRICES_PER_SUBMISSION, MAX_ORACLE_PRICE_RAW};
+    use torus_types::{FixedPoint, MarketId, NativeAction, OracleSubmission};
+
+    const NOW: u64 = 1_000_000;
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn verify(state: &torus_state::StateDb, prices: Vec<(MarketId, FixedPoint)>) -> Result<(), String> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(OracleSubmission { prices, timestamp: 0 }),
+            NOW,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+        verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, state, NOW).map(|_| ())
+    }
+
+    #[test]
+    fn oracle_submission_ingress_checks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        state.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market").unwrap();
+        let over = FixedPoint::from_raw(MAX_ORACLE_PRICE_RAW + 1);
+        let many: Vec<_> = (0..=MAX_ORACLE_PRICES_PER_SUBMISSION as u64).map(|m| (m, fp(1))).collect();
+        let cases: Vec<(Vec<(MarketId, FixedPoint)>, &str)> = vec![
+            (vec![(1, fp(100)), (2, fp(100))], "unknown market_id 2"),
+            (vec![(1, fp(100)), (1, fp(101))], "duplicate market 1"),
+            (vec![(1, FixedPoint::ZERO)], "invalid oracle price"),
+            (vec![(1, fp(-5))], "invalid oracle price"),
+            (vec![(1, over)], "invalid oracle price"),
+            (vec![], "1..=256"),
+            (many, "1..=256"),
+        ];
+        for (prices, needle) in cases {
+            let e = verify(&state, prices).expect_err(needle);
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        verify(&state, vec![(1, fp(100))]).unwrap();
+        verify(&state, vec![(1, FixedPoint::from_raw(MAX_ORACLE_PRICE_RAW))]).unwrap();
     }
 }
 
