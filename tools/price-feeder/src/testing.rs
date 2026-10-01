@@ -25,6 +25,23 @@ pub fn fixture(ex: Exchange) -> &'static str {
     }
 }
 
+/// [`fixture`] with the venue timestamps (OKX rows, Bybit `time`, KuCoin
+/// `data.time`) set to `now_ms`, for tests that run on the wall clock.
+pub fn fixture_at(ex: Exchange, now_ms: u64) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(fixture(ex)).expect("fixture json");
+    match ex {
+        Exchange::Okx => {
+            for row in v["data"].as_array_mut().into_iter().flatten() {
+                row["ts"] = serde_json::Value::String(now_ms.to_string());
+            }
+        }
+        Exchange::Bybit => v["time"] = now_ms.into(),
+        Exchange::Kucoin => v["data"]["time"] = now_ms.into(),
+        _ => {}
+    }
+    v.to_string()
+}
+
 type Route = (String, Result<String, String>, Duration);
 
 #[derive(Default)]
@@ -40,6 +57,15 @@ pub struct FakeHttp {
 }
 
 impl FakeHttp {
+    /// [`Self::with_fixtures`] with venue timestamps at `now_ms` ([`fixture_at`]).
+    pub fn with_fixtures_at(now_ms: u64) -> Self {
+        let h = FakeHttp::default();
+        for ex in Exchange::ALL {
+            h.route(&format!("fake://{}", ex.name()), Ok(fixture_at(ex, now_ms)));
+        }
+        h
+    }
+
     /// Every venue at `fake://<venue>` answering with its recorded fixture.
     pub fn with_fixtures() -> Self {
         let h = FakeHttp::default();

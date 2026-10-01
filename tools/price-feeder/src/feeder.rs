@@ -97,19 +97,23 @@ pub fn usdt_usd(cfg: &Config, fetcher: &Fetcher, now_ms: u64) -> Option<FixedPoi
     if !v.is_fresh(now_ms, cfg.max_source_age_ms) {
         return None;
     }
-    let &(b, a) = v.quotes.get(KRAKEN_USDT_USD)?;
-    mid(b, a)
+    let t = v.quotes.get(KRAKEN_USDT_USD)?;
+    mid(t.bid, t.ask)
 }
 
 /// Market `m`'s samples from the last fetched quotes (any age; `aggregate`
-/// applies freshness), plus the `venue:symbol`s with no usable quote.
+/// applies freshness), plus the `venue:symbol`s with no usable quote. Review
+/// L3: a sample's time is the venue's own timestamp when it sends one (never
+/// later than our fetch time), else the fetch time.
 pub fn market_samples(cfg: &Config, fetcher: &Fetcher, m: &MarketCfg) -> (Vec<Sample>, Vec<String>) {
     let mut samples = Vec::new();
     let mut missing = Vec::new();
     for (ex, sym, quote) in cfg.venues_for(m) {
         let s = fetcher.venue(ex).and_then(|v| {
-            let &(b, a) = v.quotes.get(sym)?;
-            Some(Sample { exchange: ex, mid: mid(b, a)?, quote, fetched_at_ms: v.fetched_at_ms? })
+            let t = v.quotes.get(sym)?;
+            let fetched = v.fetched_at_ms?;
+            let at = t.ts_ms.map_or(fetched, |ts| ts.min(fetched));
+            Some(Sample { exchange: ex, mid: mid(t.bid, t.ask)?, quote, fetched_at_ms: at })
         });
         match s {
             Some(s) => samples.push(s),
@@ -560,5 +564,20 @@ mod tests {
         clock.set(T0 + 6_000);
         assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::MarketsUnavailable(_)));
         assert_eq!(n.submitted().len(), 2);
+    }
+
+    /// Review L3: a quote's age is the venue's own timestamp when it sends one
+    /// (OKX here, 6 s old) — not the time we fetched it.
+    #[tokio::test]
+    async fn venue_timestamp_ages_a_quote() {
+        let (http, clock, n) = (Arc::new(FakeHttp::with_fixtures()), FakeClock::new(T0), node("active"));
+        let mut okx: serde_json::Value = serde_json::from_str(crate::testing::fixture(Exchange::Okx)).unwrap();
+        for row in okx["data"].as_array_mut().unwrap() {
+            row["ts"] = serde_json::Value::String((T0 - 6_000).to_string());
+        }
+        http.route("fake://okx", Ok(okx.to_string()));
+        let mut f = feeder(cfg(""), &n, &http, &clock);
+        assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::Submitted { ok: 1, .. }));
+        assert_eq!(f.status().lock().unwrap().markets[&1].sources, 6, "OKX's 6 s old quote is stale");
     }
 }
