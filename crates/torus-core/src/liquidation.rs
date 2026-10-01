@@ -120,8 +120,12 @@ impl LiquidationEngine {
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Result<Option<Vec<Liquidation>>, CoreError> {
         let equity = MarginEngine::cross_margin_equity(positions, trader, oracle_prices)?;
-        let maintenance =
-            MarginEngine::total_maintenance_margin(positions, trader, config, oracle_prices)?;
+        let maintenance = MarginEngine::total_maintenance_margin(
+            positions,
+            trader,
+            |_| Some(config.tiers.as_slice()),
+            oracle_prices,
+        )?;
 
         if equity >= maintenance {
             return Ok(None);
