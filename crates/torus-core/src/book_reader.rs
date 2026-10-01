@@ -572,6 +572,37 @@ pub fn read_open_orders<S: StateBackend>(
     Ok(out)
 }
 
+/// Open-order slots `trader` holds over all markets in any layout: resting
+/// orders plus pending stops, as `OrderBook::open_order_count` counts them.
+pub fn read_open_order_count<S: StateBackend>(
+    state: &S,
+    trader: &Address,
+    layout: BookLayout,
+) -> Result<usize, CoreError> {
+    let root = iterate_optional_cf(state, CF_NATIVE_ORDER_BOOKS, None)?;
+    let market = |key: &[u8]| u64::from_be_bytes(key[..8].try_into().unwrap());
+    if layout == BookLayout::Classic {
+        let mut count = 0;
+        for (key, blob) in &root {
+            if key_shape(key) == Some(KeyShape::ClassicBlob) {
+                count += decode_classic_book(blob, market(key))?.open_order_count(trader);
+            }
+        }
+        return Ok(count);
+    }
+    let mut count = read_open_orders(state, trader, None, layout, usize::MAX)?.len();
+    for (key, bytes) in &root {
+        if key_shape(key) == Some(KeyShape::StopRow) {
+            let mid = market(key);
+            let mut one = OrderBook::new(mid, FixedPoint::ONE, FixedPoint::ONE);
+            one.restore_stop_row(bytes)
+                .map_err(|e| layout_err(format!("market {mid}: {e}")))?;
+            count += one.open_order_count(trader);
+        }
+    }
+    Ok(count)
+}
+
 /// Rebuild one market's full `OrderBook` from the row layouts (mode 1: root CF
 /// order rows; mode 2: node-local order rows). Read-only. `None` when the
 /// market has no book at all.

@@ -13,7 +13,7 @@ use rocksdb::IteratorMode;
 use torus_core::book_reader::{self, BookLayout};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::OrderBook;
-use torus_core::position::PositionManager;
+use torus_core::position::{open_order_limit, PositionManager};
 use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
 use torus_economics::rewards::FeeSplitter;
@@ -109,6 +109,9 @@ pub trait TorusApi {
 
     #[method(name = "getBalances")]
     async fn get_balances(&self, trader: String) -> RpcResult<RpcBalances>;
+
+    #[method(name = "getUserLimits")]
+    async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
     // --- 2.9.2: Market info ---
     #[method(name = "getMarkets")]
@@ -878,6 +881,21 @@ impl TorusApiServer for RpcState {
             total_margin_used: dec_fp(total_margin),
             available_balance: dec_fp(native_bal.available),
             permanent_stake,
+        })
+    }
+
+    async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits> {
+        let addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        let cum_volume = PositionManager::new(self.state.clone())
+            .get_cum_volume(&addr)
+            .map_err(book_read_err)?;
+        let layout = book_layout(&self.state)?;
+        let open_orders = book_reader::read_open_order_count(&self.state, &addr, layout)
+            .map_err(book_read_err)?;
+        Ok(RpcUserLimits {
+            open_orders: open_orders as u64,
+            open_order_limit: open_order_limit(cum_volume),
+            cum_volume: dec_fp(cum_volume),
         })
     }
 
