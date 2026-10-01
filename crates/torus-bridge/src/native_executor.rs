@@ -327,6 +327,11 @@ impl BalanceCache {
     }
 }
 
+// Item 3 (s517): the end-of-block liquidation step (child module: sees the
+// private placement / stop / cancel helpers and `AccountReader`).
+#[path = "liquidation_step.rs"]
+mod liquidation_step;
+
 #[cfg(test)]
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
