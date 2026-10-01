@@ -206,6 +206,34 @@ pub fn position_key(trader: &Address, market_id: MarketId) -> [u8; 28] {
     key
 }
 
+/// Cumulative-volume key: `b"cvlm"`(4) + trader(20) = 24 bytes, in
+/// `CF_NATIVE_BALANCES` next to the 20-byte balance rows (same precedent as
+/// the insurance-fund row). Value: raw `FixedPoint`, 16 bytes BE.
+pub fn cum_volume_key(trader: &Address) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..4].copy_from_slice(b"cvlm");
+    key[4..].copy_from_slice(trader.as_slice());
+    key
+}
+
+// ============================================================================
+// Open-order limit (Hyperliquid model)
+// ============================================================================
+
+/// Open orders every user may hold, summed over all markets.
+pub const OPEN_ORDER_BASE_LIMIT: u32 = 1000;
+/// One more open order per this much lifetime traded notional (quote units).
+pub const OPEN_ORDER_VOLUME_STEP: i128 = 5_000_000;
+/// Hard cap on the open-order limit.
+pub const OPEN_ORDER_MAX_LIMIT: u32 = 5000;
+
+/// `min(1000 + floor(cum_volume / 5M), 5000)`.
+pub fn open_order_limit(cum_volume: FixedPoint) -> u32 {
+    let steps = cum_volume.raw().max(0) / (OPEN_ORDER_VOLUME_STEP * FixedPoint::SCALE);
+    let extra = steps.min(i128::from(OPEN_ORDER_MAX_LIMIT - OPEN_ORDER_BASE_LIMIT));
+    OPEN_ORDER_BASE_LIMIT + extra as u32
+}
+
 // ============================================================================
 // PositionManager — CRUD for positions and native balances
 // ============================================================================
@@ -292,6 +320,31 @@ impl<T: StateBackend> PositionManager<T> {
         bal.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state
             .put_cf_raw_owned(CF_NATIVE_BALANCES, trader.as_slice(), data)?;
+        Ok(())
+    }
+
+    /// Lifetime traded notional (maker + taker) of `trader`; zero if absent.
+    pub fn get_cum_volume(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
+        match self
+            .state
+            .get_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(trader))?
+        {
+            Some(data) => {
+                let raw: [u8; 16] = data.as_slice().try_into().map_err(|_| {
+                    CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", data.len()))
+                })?;
+                Ok(FixedPoint::from_raw(i128::from_be_bytes(raw)))
+            }
+            None => Ok(FixedPoint::ZERO),
+        }
+    }
+
+    pub fn put_cum_volume(&self, trader: &Address, volume: FixedPoint) -> Result<(), CoreError> {
+        self.state.put_cf_raw(
+            CF_NATIVE_BALANCES,
+            &cum_volume_key(trader),
+            &volume.raw().to_be_bytes(),
+        )?;
         Ok(())
     }
 
