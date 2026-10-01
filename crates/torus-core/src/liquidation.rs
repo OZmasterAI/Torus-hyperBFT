@@ -37,6 +37,13 @@ pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
 /// D5 (decided, user s517): accounts acted on per block.
 pub const LIQ_ACT_PER_BLOCK: usize = 64;
+/// Review H3 (s517): ADL counterparties are searched in at most this many
+/// `CF_NATIVE_POSITIONS` rows (key order, paged) per ADL'd position. Beyond
+/// it the ranking covers that window only; a partial close is retried by a
+/// later step. Deterministic; bounds the rare ADL path's cost.
+pub const ADL_MAX_SCAN_ROWS: usize = 65_536;
+/// Rows per seek of the bounded walks.
+const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
 pub const COOLDOWN_TAG: u8 = 0x02;
 pub const PREV_MARK_TAG: u8 = 0x03;
@@ -323,16 +330,33 @@ pub fn adl_close<T: StateBackend>(
 }
 
 /// ADL counterparties in `m`: every position on side `want_long`, `exclude`
-/// skipped, in `CF_NATIVE_POSITIONS` key order (one CF pass); `av` values each.
+/// skipped, in `CF_NATIVE_POSITIONS` key order; `av` values each. Review H3:
+/// a paged walk of at most `max_rows` rows (the caller passes
+/// [`ADL_MAX_SCAN_ROWS`]) — never a whole-CF load.
 pub fn adl_candidates<T: StateBackend>(
     pm: &PositionManager<T>,
     m: MarketId,
     exclude: &Address,
     want_long: bool,
+    max_rows: usize,
     av: impl Fn(&Address) -> Result<FixedPoint, CoreError>,
 ) -> Result<Vec<AdlCandidate>, CoreError> {
+    let mut rows = Vec::new();
+    let mut start: Vec<u8> = Vec::new();
+    while rows.len() < max_rows {
+        let want = SCAN_PAGE.min(max_rows - rows.len());
+        let page = pm.state().iterate_cf_from(CF_NATIVE_POSITIONS, &start, want)?;
+        let done = page.len() < want;
+        if let Some((k, _)) = page.last() {
+            start = [k.as_slice(), &[0u8]].concat(); // the next key after k
+        }
+        rows.extend(page);
+        if done {
+            break;
+        }
+    }
     let mut out = Vec::new();
-    for (k, v) in pm.state().iterate_cf(CF_NATIVE_POSITIONS, None)? {
+    for (k, v) in rows {
         if k.len() != 28 || k[20..28] != m.to_be_bytes() {
             continue;
         }
@@ -377,30 +401,34 @@ pub fn settle_flat_deficit<T: StateBackend>(
 // Candidate walk (C1) and CF_NATIVE_LIQUIDATION rows
 // ============================================================================
 
+/// The smallest key above every `t ‖ market` key and at most the next
+/// trader's first key: `t ‖ ff×8 ‖ 00`.
+fn past_trader(t: &Address) -> Vec<u8> {
+    [t.as_slice(), &[0xff; 8], &[0x00]].concat()
+}
+
 /// C1: candidates = distinct traders of `CF_NATIVE_POSITIONS` (keys `trader ‖
 /// market`, sorted by trader), ascending, strictly after `after`, at most
-/// `limit` (the caller passes SCAN + 1 to detect a cut).
+/// `limit`. Review H3: one bounded seek per trader (`iterate_cf_from` with
+/// limit 1, then skip past the trader's rows) — never a whole-CF load.
 pub fn traders_after<T: StateBackend>(
     state: &T,
     after: Option<Address>,
     limit: usize,
 ) -> Result<Vec<Address>, CoreError> {
     let mut out: Vec<Address> = Vec::new();
-    if limit == 0 {
-        return Ok(out);
-    }
-    for (k, _) in state.iterate_cf(CF_NATIVE_POSITIONS, None)? {
+    let mut start = after.as_ref().map_or_else(Vec::new, past_trader);
+    while out.len() < limit {
+        let Some((k, _)) = state.iterate_cf_from(CF_NATIVE_POSITIONS, &start, 1)?.pop() else {
+            break;
+        };
         if k.len() != 28 {
+            start = [k.as_slice(), &[0u8]].concat();
             continue;
         }
         let t = Address::from_slice(&k[..20]);
-        if after.is_some_and(|a| t <= a) || out.last() == Some(&t) {
-            continue;
-        }
         out.push(t);
-        if out.len() == limit {
-            break;
-        }
+        start = past_trader(&t);
     }
     Ok(out)
 }

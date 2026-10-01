@@ -1,7 +1,7 @@
 //! Item 3: Hyperliquid-style liquidation, core — docs/plans/liquidation.md.
 
 use torus_core::liquidation::{
-    adl_close, adl_rank, backstop, bankruptcy_price, classify, settle_flat_deficit,
+    adl_candidates, adl_close, adl_rank, backstop, bankruptcy_price, classify, settle_flat_deficit,
     slippage_cap, stage1_qty, traders_after, AdlCandidate, Health, LIQUIDATOR_VAULT,
 };
 use torus_core::margin::{AccountView, MarginTier};
@@ -268,4 +268,22 @@ fn bankruptcy_price_rounds_against_the_trader() {
     // overflow / zero size -> None (caller falls back to the mark)
     assert_eq!(bankruptcy_price(FixedPoint::MAX, true, FixedPoint::from_raw(1), fp(1)), None);
     assert_eq!(bankruptcy_price(fp(1), true, FixedPoint::ZERO, fp(1)), None);
+}
+
+/// Review H3 (s517): ADL candidates come from a BOUNDED walk of the positions
+/// CF (`max_rows` rows in key order, paged) — never a full-CF load. Rows:
+/// addr(1) long, addr(2) short, addr(3) short (market 1), addr(4) market 2.
+#[test]
+fn adl_candidates_scan_at_most_max_rows() {
+    let (_d, pm) = setup();
+    open_pair(&pm, &addr(1), &addr(2), 1, 3, 100);
+    open_pair(&pm, &addr(5), &addr(3), 1, 1, 100);
+    open_pair(&pm, &addr(4), &addr(6), 2, 1, 100);
+    let shorts = |rows: usize| -> Vec<Address> {
+        adl_candidates(&pm, 1, &addr(1), false, rows, |_| Ok(fp(1))).unwrap().iter().map(|c| c.trader).collect()
+    };
+    assert_eq!(shorts(usize::MAX), vec![addr(2), addr(3)]);
+    assert_eq!(shorts(2), vec![addr(2)], "rows addr(1), addr(2) only");
+    assert_eq!(shorts(1), Vec::<Address>::new());
+    assert_eq!(shorts(0), Vec::<Address>::new());
 }

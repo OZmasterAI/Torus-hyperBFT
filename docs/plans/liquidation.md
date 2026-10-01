@@ -60,6 +60,13 @@ C5 recorded as known limitations.
   row is deleted whenever a step sees the market without a usable mark, so it is always the
   immediately preceding usable mark.
 
+* **H3 — bounded scans.** `StateBackend::iterate_cf_from(cf, start, limit)` (StateDb: RocksDB
+  seek; overlay: merge of DB / parent / pending honouring tombstones). The candidate walk seeks
+  once per trader (`trader ‖ ff×8 ‖ 00` skips its rows); ADL counterparties are searched in at
+  most `ADL_MAX_SCAN_ROWS` = 65,536 position rows (key order, pages of 1,024) per ADL'd
+  position — with more rows the HL ranking covers that window only and a partial close is
+  retried by a later step (known limitation).
+
 ## Hyperliquid reference (docs, as summarized in research memory a054f368)
 
 * MM = half the initial margin at max leverage (per asset tier table).
