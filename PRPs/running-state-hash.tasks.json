@@ -5,7 +5,7 @@
   {
    "id": 0,
    "name": "Classify every CF and its writer paths",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-state/src/cf.rs",
     "crates/torus-consensus/src/app.rs"
@@ -16,7 +16,7 @@
   {
    "id": 1,
    "name": "Write-set determinism gate",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-consensus/src/app.rs",
     "crates/torus-bridge/src/native_executor.rs"
@@ -29,7 +29,7 @@
   {
    "id": 2,
    "name": "Hash function + frozen cf_id table",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-state/src/backend.rs",
     "crates/torus-state/Cargo.toml"
@@ -42,7 +42,7 @@
   {
    "id": 3,
    "name": "Capture all consensus writes and persist hash in batch",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-state/src/backend.rs",
     "crates/torus-consensus/src/exec_pipeline.rs",
@@ -57,7 +57,7 @@
   {
    "id": 4,
    "name": "Activation height + crash/replay",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-consensus/src/app.rs"
    ],
@@ -69,7 +69,7 @@
   {
    "id": 5,
    "name": "AttestStateHash action + tally",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-types/src/lib.rs",
     "crates/torus-types/src/eip712.rs",
@@ -84,7 +84,7 @@
   {
    "id": 6,
    "name": "Auto-submission by validators",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-consensus/src/app.rs"
    ],
@@ -96,7 +96,7 @@
   {
    "id": 7,
    "name": "Mismatch detection + gated fail-stop",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-consensus/src/app.rs",
     "crates/torus-telemetry/src/lib.rs"
@@ -109,7 +109,7 @@
   {
    "id": 8,
    "name": "RPC torus_getStateHash",
-   "status": "pending",
+   "status": "done",
    "files": [
     "crates/torus-rpc/src/torus.rs"
    ],

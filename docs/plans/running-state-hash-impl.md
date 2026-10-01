@@ -348,3 +348,33 @@ deletes the row at restart and fails unless the key is excluded.
    at the next checkpoint scan if mempool admission failed); after a restart a
    checkpoint is re-submitted only if this validator's vote is not on-chain. A
    pre-restart submission that still lands is rejected on-chain (first vote wins).
+6. Hashing cost is higher than the plan's 1-4 ms estimate (release, this host:
+   SHA-256 ~1.4 GB/s with SHA-NI): digest 3.3 ms at 10k rows, ~25 ms at 60k rows
+   (32 B keys, 96 B values). To keep it off the flush wall, blocks with >= 4096
+   pending entries digest on a scoped thread overlapped with the WriteBatch build
+   (same bytes hashed): root-skip flush wall 33.5 vs 31.7 ms (10k) and 214.8 vs
+   226.9 ms (60k), with vs without the hash (`running_hash_cost_per_block_release`).
+   The digest still uses one extra core for that time; Task 9 must confirm
+   matched/s at 100/300 markets (s83 300m blocks carry ~100k fills).
+7. The slash loop now runs through a per-block overlay + one `commit_tx` (same
+   bytes as the direct puts) so the out-of-batch recorder sees it;
+   `ExecutionContext.staking` became unused and was removed.
+
+## Implementation status (s83)
+
+Tasks 0-8 done on `feat/running-state-hash`; Task 9 (devnet drill + bench cells)
+is open. Task 4's activation record landed with Task 3 (the hashed flush needs
+it); its tests were verified by mutation (activation record disabled -> fails).
+
+### Open risks
+
+- Pre-existing consensus divergence sources the hash will now report (correctly):
+  locally observed equivocation slashes (`on_speculative_rollback`) applied to
+  whichever block a node dispatches next; consensus-thread epoch rotation racing
+  with execution lag > 1 epoch; EVM crash window (bundle durable, native batch
+  not) re-executing EVM on its own post-state at replay.
+- Activation = first hashed height of a DB: all nodes must start hashing at the
+  same height (coordinated upgrade or fresh genesis); a node restored from a
+  snapshot keeps the META hash (snapshots copy every CF).
+- 3 validators: a > 2/3 quorum needs all three; one diverged or silent validator
+  means no quorum hash; fail-stop (off) would halt the chain.
