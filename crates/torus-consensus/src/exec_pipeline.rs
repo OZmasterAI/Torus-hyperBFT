@@ -435,6 +435,8 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
                 Ok(stats) => {
                     if let Some(m) = &env.metrics {
                         m.exec_root_seconds.observe(stats.root_seconds);
+                        m.state_hash_seconds.observe(stats.state_hash_seconds);
+                        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
                         m.exec_state_write_seconds.observe(stats.write_seconds);
                         m.exec_state_write_build_seconds
                             .observe(stats.write_build_seconds);

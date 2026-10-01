@@ -19,7 +19,10 @@ pub mod trade_rows;
 pub mod trie;
 pub mod trie_cursor;
 
-pub use backend::{AtomicWriteOp, FrozenPending, NativeFlushStats, NativeStateOverlay, StateBackend};
+pub use backend::{
+    AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
+    OutOfBatchRecorder, StateBackend,
+};
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;

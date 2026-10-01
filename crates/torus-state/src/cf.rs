@@ -135,6 +135,19 @@ pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 /// Written in the flush's atomic batch; cleared only by a full `build_native_trie_to_cf`.
 pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
 
+/// Key in CF_CONSENSUS_META (node-local, never hashed): the running state hash after the last
+/// applied block, `height(8 BE) ‖ hash(32)`. Written in the flush's atomic batch with
+/// `META_NATIVE_APPLIED_HEIGHT` (docs/plans/running-state-hash-impl.md).
+pub const META_RUNNING_STATE_HASH: &[u8] = b"running_state_hash";
+
+/// Key in CF_CONSENSUS_META (node-local): the first height this DB hashed (`h_0` = zeros was its
+/// predecessor), 8 BE. Written once, in the batch of that height.
+pub const META_RUNNING_STATE_HASH_ACTIVATION: &[u8] = b"running_state_hash_activation";
+
+/// Key prefix in CF_CONSENSUS_META (node-local): running-hash checkpoint
+/// `prefix ‖ height(8 BE)` -> hash(32), every `STATE_HASH_CHECKPOINT_INTERVAL` heights.
+pub const META_STATE_HASH_CHECKPOINT_PREFIX: &[u8] = b"state_hash_ckpt:";
+
 // Trie (MPT state root)
 pub const CF_TRIE_NODES: &str = "cf_trie_nodes";
 /// Account-trie branch nodes for reth's `StateRoot`. Key: path nibbles (1 byte/nibble),

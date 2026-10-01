@@ -166,6 +166,111 @@ pub fn next_running_hash(prev: &[u8; 32], height: u64, writes: &[WriteEntry]) ->
 }
 
 // ---------------------------------------------------------------------------
+// Persistence (CF_CONSENSUS_META, node-local)
+// ---------------------------------------------------------------------------
+
+/// Checkpoint every N heights (`height % N == 0`); the on-chain attestation
+/// heights.
+pub const STATE_HASH_CHECKPOINT_INTERVAL: u64 = 100;
+/// Checkpoints kept (older ones are deleted in the batch of a new one).
+pub const STATE_HASH_CHECKPOINT_RETAIN: u64 = 64;
+
+/// `(height, h_height)` of the last hashed block, if this DB has hashed any.
+pub fn read_running_hash(db: &StateDb) -> Option<(u64, [u8; 32])> {
+    let v = db
+        .get_cf_raw(CF_CONSENSUS_META, META_RUNNING_STATE_HASH)
+        .ok()
+        .flatten()?;
+    (v.len() == 40).then(|| {
+        let height = u64::from_be_bytes(v[..8].try_into().unwrap());
+        (height, v[8..].try_into().unwrap())
+    })
+}
+
+/// First height this DB hashed (see `META_RUNNING_STATE_HASH_ACTIVATION`).
+pub fn read_activation_height(db: &StateDb) -> Option<u64> {
+    let v = db
+        .get_cf_raw(CF_CONSENSUS_META, META_RUNNING_STATE_HASH_ACTIVATION)
+        .ok()
+        .flatten()?;
+    Some(u64::from_be_bytes(v.as_slice().try_into().ok()?))
+}
+
+fn checkpoint_key(height: u64) -> Vec<u8> {
+    let mut k = META_STATE_HASH_CHECKPOINT_PREFIX.to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
+/// The local checkpoint hash at `height`, if retained.
+pub fn read_checkpoint(db: &StateDb, height: u64) -> Option<[u8; 32]> {
+    let v = db.get_cf_raw(CF_CONSENSUS_META, &checkpoint_key(height)).ok().flatten()?;
+    v.as_slice().try_into().ok()
+}
+
+/// Heights of the retained checkpoints, ascending.
+pub fn checkpoint_heights(db: &StateDb) -> Vec<u64> {
+    use crate::backend::StateBackend;
+    StateBackend::iterate_cf(db, CF_CONSENSUS_META, Some(META_STATE_HASH_CHECKPOINT_PREFIX))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, _)| {
+            let h = k.get(META_STATE_HASH_CHECKPOINT_PREFIX.len()..)?;
+            Some(u64::from_be_bytes(h.try_into().ok()?))
+        })
+        .collect()
+}
+
+/// The hash `height` chains from: the stored `h_{height-1}`, or `h_0` (zeros)
+/// on a DB that has never hashed (activation — recorded in the same batch by
+/// [`append_to_batch`]). A stored height other than `height - 1` means a
+/// hashed height was skipped or re-flushed: logged, and the chain continues
+/// from what is stored (the on-chain vote then exposes the gap).
+pub(crate) fn prev_for(db: &StateDb, height: u64) -> ([u8; 32], bool) {
+    match read_running_hash(db) {
+        Some((stored, hash)) => {
+            if stored + 1 != height {
+                tracing::error!(
+                    stored,
+                    height,
+                    "running state hash: chain gap (stored height is not the predecessor)"
+                );
+            }
+            (hash, false)
+        }
+        None => ([0; 32], true),
+    }
+}
+
+/// Append `h_height` (+ activation record, checkpoint and checkpoint pruning)
+/// to the flush's atomic batch.
+pub(crate) fn append_to_batch(
+    db: &StateDb,
+    batch: &mut rocksdb::WriteBatch,
+    height: u64,
+    hash: &[u8; 32],
+    activation: bool,
+) -> Result<(), crate::StateError> {
+    let cf = db.cf_handle(CF_CONSENSUS_META)?;
+    let mut v = Vec::with_capacity(40);
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(hash);
+    batch.put_cf(cf, META_RUNNING_STATE_HASH, v);
+    if activation {
+        batch.put_cf(cf, META_RUNNING_STATE_HASH_ACTIVATION, height.to_be_bytes());
+    }
+    if height % STATE_HASH_CHECKPOINT_INTERVAL == 0 {
+        batch.put_cf(cf, checkpoint_key(height), hash);
+        if let Some(old) =
+            height.checked_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN)
+        {
+            batch.delete_cf(cf, checkpoint_key(old));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Test capture hook (cross-crate determinism tests). Off unless a test arms it:
 // one relaxed atomic load per flush in production.
 // ---------------------------------------------------------------------------

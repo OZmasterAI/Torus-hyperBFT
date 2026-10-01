@@ -6926,12 +6926,15 @@ dependencies = [
 name = "torus-consensus"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
+ "alloy-rlp",
  "bincode",
  "ed25519-dalek",
  "hotstuff_rs",
  "k256",
  "rayon",
+ "revm",
  "rocksdb",
  "serde_json",
  "sha2",

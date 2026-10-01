@@ -509,7 +509,6 @@ struct ExecutionContext {
     state_db: StateDb,
     validator: BlockValidator,
     evm_executor: EvmExecutor,
-    staking: StakingManager,
     epoch_length: u64,
     max_validators: u32,
     treasury_address: Address,
@@ -1435,6 +1434,37 @@ impl ExecutionContext {
         true
     }
 
+    /// Running state hash: block `height`'s consensus writes made durable
+    /// outside its flush batch (Task 0), lowest priority first: the epoch
+    /// boundary's snapshot of every `cf_staking_validators` row and pending
+    /// key rotation (the consensus thread rotates them at proposal time, which
+    /// no height owns — the boundary block's execution is the deterministic
+    /// point), then the recorded slash / writer-precompile commits, then the
+    /// EVM bundle. All three are read or recorded after they became durable,
+    /// so overlapping keys agree.
+    fn running_hash_extras(
+        &self,
+        height: u64,
+        out_of_batch: torus_state::OutOfBatchRecorder,
+        bundle_extras: torus_state::HashExtras,
+    ) -> torus_state::HashExtras {
+        let mut extras = torus_state::HashExtras::new();
+        if EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            for (cf, prefix) in [
+                (torus_state::cf::CF_STAKING_VALIDATORS, None),
+                (CF_CONSENSUS_META, Some(&b"pending_rotation:"[..])),
+            ] {
+                match StateBackend::iterate_cf(&self.state_db, cf, prefix) {
+                    Ok(rows) => rows.iter().for_each(|(k, v)| extras.put(cf, k, v)),
+                    Err(e) => tracing::error!(%e, height, cf, "running hash: epoch snapshot read failed"),
+                }
+            }
+        }
+        extras.extend(out_of_batch.finish());
+        extras.extend(bundle_extras);
+        extras
+    }
+
     fn execute_committed_block_with(
         &self,
         torus_block: &TorusBlock,
@@ -1542,11 +1572,15 @@ impl ExecutionContext {
             return;
         }
 
+        // Running state hash: record this block's consensus writes that become
+        // durable OUTSIDE its flush batch (slashes, EVM writer precompiles) — see
+        // `hash_extras` below. The slashes go through a per-block overlay and ONE
+        // `commit_tx` (same bytes as the direct puts) so the recorder sees them.
+        let out_of_batch = torus_state::OutOfBatchRecorder::begin();
+        let slash_overlay = NativeStateOverlay::new(self.state_db.clone());
+        let slash_staking = StakingManager::new(slash_overlay.clone());
         for slash in pending_slashes {
-            match self
-                .staking
-                .slash(slash.validator, slash.fraction_bps, slash.reason, 0)
-            {
+            match slash_staking.slash(slash.validator, slash.fraction_bps, slash.reason, 0) {
                 Ok(amount) => {
                     tracing::info!(
                         %slash.validator,
@@ -1564,7 +1598,7 @@ impl ExecutionContext {
                 }
             }
             if slash.tombstone {
-                if let Err(e) = self.staking.tombstone_validator(&slash.validator) {
+                if let Err(e) = slash_staking.tombstone_validator(&slash.validator) {
                     tracing::error!(
                         %slash.validator,
                         %e,
@@ -1572,6 +1606,9 @@ impl ExecutionContext {
                     );
                 }
             }
+        }
+        if let Err(e) = slash_overlay.commit_tx(&self.state_db) {
+            tracing::error!(%e, height, "CRITICAL: failed to write buffered slashes");
         }
 
         tracing::info!(
@@ -1590,6 +1627,7 @@ impl ExecutionContext {
         // is attributed rather than sitting in the block residual.
         let evm_timer = std::time::Instant::now();
         let mut bundle = BundleState::default();
+        let mut bundle_extras = torus_state::HashExtras::new();
         let mut computed_fee_revenue: u128 = 0;
         if has_evm {
             match self.validator.validate_block_for_catchup(
@@ -1614,14 +1652,17 @@ impl ExecutionContext {
                         &validated.bundle,
                         precomputed_root,
                     ) {
-                        Ok(_root) => {}
+                        Ok(_root) => bundle_extras.add_evm_bundle(&validated.bundle),
                         Err(e) => {
                             tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
-                            if let Err(e2) = BlockCommitter::commit_pending_bundle(
+                            match BlockCommitter::commit_pending_bundle(
                                 &self.state_db,
                                 &validated.bundle,
                             ) {
-                                tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)");
+                                Ok(()) => bundle_extras.add_evm_bundle(&validated.bundle),
+                                Err(e2) => {
+                                    tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)")
+                                }
                             }
                         }
                     }
@@ -1664,6 +1705,8 @@ impl ExecutionContext {
                 .observe(evm_timer.elapsed().as_secs_f64());
         }
 
+        let mut hash_extras = Some(self.running_hash_extras(height, out_of_batch, bundle_extras));
+
         // ---- Native execution ----
         if has_native || computed_fee_revenue > 0 {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
@@ -1686,6 +1729,7 @@ impl ExecutionContext {
                 parent.as_ref().map(|p| p.height())
             );
             let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+            overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
@@ -2130,6 +2174,8 @@ impl ExecutionContext {
                 Ok(stats) => {
                     if let Some(ref m) = self.metrics {
                         m.exec_root_seconds.observe(stats.root_seconds);
+                        m.state_hash_seconds.observe(stats.state_hash_seconds);
+                        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
                         m.exec_state_write_seconds.observe(stats.write_seconds);
                         // r7: build (serialize pending maps) vs db (WAL +
                         // memtable) — which half the ~380-400 ms/blk at 300m is.
@@ -2321,14 +2367,18 @@ impl ExecutionContext {
                 // batch on W (a direct put here would land before batch(N−1) and be
                 // overwritten by it), and must be visible through the next overlay's
                 // parent layer (design §2.1 step 10).
-                let pending = Arc::new(torus_state::FrozenPending::marker_only(height));
+                let pending = Arc::new(
+                    torus_state::FrozenPending::marker_only(height)
+                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
+                );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
                     return;
                 }
             } else {
                 flush_marker_only(
                     &self.state_db,
-                    torus_state::FrozenPending::marker_only(height),
+                    torus_state::FrozenPending::marker_only(height)
+                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
             }
             // r2 resident-books-stale-rebuild: this block never built a context,
@@ -3362,7 +3412,6 @@ impl TorusApp {
             state_db: state_db.clone(),
             validator: exec_validator,
             evm_executor: EvmExecutor::new(config.chain_id),
-            staking: StakingManager::new(state_db.clone()),
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
@@ -9944,7 +9993,6 @@ mod crash_recovery_tests {
                 config.dev_pool_address,
             ),
             evm_executor: EvmExecutor::new(config.chain_id),
-            staking: StakingManager::new(state_db.clone()),
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
@@ -13517,5 +13565,191 @@ mod crash_recovery_tests {
                 );
             }
         }
+    }
+
+    /// Fold the captured per-block write sets through the hash function.
+    fn fold_captured(w: &CapturedWrites) -> (u64, [u8; 32]) {
+        let mut h = [0u8; 32];
+        for (height, writes) in w {
+            h = torus_state::running_hash::next_running_hash(&h, *height, writes);
+        }
+        (w.last().map(|(height, _)| *height).unwrap_or(0), h)
+    }
+
+    /// Task 3: `META_RUNNING_STATE_HASH` after the book fixture is the chained
+    /// function over every block's captured write set, and it is byte-identical
+    /// serial vs pipelined, with and without restarts, in every BookMode.
+    #[test]
+    fn running_hash_identical_serial_pipelined_restart_every_book_mode() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            let mut finals = Vec::new();
+            for (on, restarts) in [
+                (false, &[][..]),
+                (true, &[][..]),
+                (false, &[2, 4, 7, 10][..]),
+                (true, &[1, 3, 6, 9, 12][..]),
+            ] {
+                let (_cfg, state_db) = make_test_config_and_db();
+                fund_book_fixture(&state_db);
+                torus_state::running_hash::capture_begin(&state_db);
+                let mut ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                for b in &book_fixture_blocks() {
+                    dispatch_and_execute(&ctx, &state_db, b);
+                    if restarts.contains(&b.header.height) {
+                        drop(ctx);
+                        ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                    }
+                }
+                drop(ctx);
+                let captured = torus_state::running_hash::capture_take(&state_db);
+                let stored = torus_state::running_hash::read_running_hash(&state_db);
+                assert_eq!(stored, Some(fold_captured(&captured)), "{mode:?} on={on} {restarts:?}");
+                finals.push(stored.unwrap());
+            }
+            assert!(finals.windows(2).all(|w| w[0] == w[1]), "{mode:?}: {finals:?}");
+        }
+    }
+
+    const KECCAK_EMPTY_CODE: B256 = B256::new([
+        0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
+        0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,
+        0xa4, 0x70,
+    ]);
+
+    /// A signed EIP-1559 contract creation whose init code stores 1 at slot 0
+    /// (`PUSH1 1 PUSH1 0 SSTORE`) — a bundle with an account, a storage slot
+    /// and fee revenue.
+    fn signed_sstore_create(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_rlp::Encodable;
+        let tx = TxEip1559 {
+            chain_id: TORUS_CHAIN_ID,
+            nonce,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 0,
+            gas_limit: 200_000,
+            to: alloy_primitives::TxKind::Create,
+            value: U256::ZERO,
+            input: alloy_primitives::Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x55]),
+            access_list: Default::default(),
+        };
+        let sig_hash = tx.signature_hash();
+        let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+        let signature = alloy_primitives::Signature::new(
+            U256::from_be_slice(sig.r().to_bytes().as_slice()),
+            U256::from_be_slice(sig.s().to_bytes().as_slice()),
+            recid.is_y_odd(),
+        );
+        let mut buf = Vec::new();
+        TxEnvelope::Eip1559(tx.into_signed(signature)).encode(&mut buf);
+        buf
+    }
+
+    /// Out-of-batch fixture (Task 0 (a)-(c)), epoch_length 4:
+    ///   1  EVM contract creation (bundle: accounts + storage)   serial
+    ///   2  empty + a buffered equivocation slash                 serial marker
+    ///   3  empty
+    ///   4  empty, epoch boundary (staking snapshot)               serial marker
+    fn out_of_batch_fixture() -> (Vec<TorusBlock>, k256::ecdsa::SigningKey, Address) {
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
+        blocks[0].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[0].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        (blocks, key, Address::repeat_byte(0x77))
+    }
+
+    fn run_out_of_batch_fixture(restart_after: &[u64]) -> (StateDb, CapturedWrites) {
+        let (blocks, key, validator) = out_of_batch_fixture();
+        let (mut config, state_db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        state_db
+            .put_account(
+                &sender,
+                &revm::state::AccountInfo {
+                    balance: U256::from(1_000_000_000_000_000_000u128),
+                    nonce: 0,
+                    code_hash: KECCAK_EMPTY_CODE,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        register_proposer(&state_db, validator);
+        torus_state::running_hash::capture_begin(&state_db);
+        let mut ctx = make_exec_ctx(&config, &state_db);
+        for b in &blocks {
+            let durable = persist_committed_block_durably(&state_db, b);
+            let slashes = if b.header.height == 2 {
+                vec![PendingSlash {
+                    validator,
+                    fraction_bps: 500,
+                    reason: SlashReason::DoubleSign,
+                    tombstone: true,
+                }]
+            } else {
+                vec![]
+            };
+            ctx.execute_committed_block_with(b, slashes, durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            if restart_after.contains(&b.header.height) {
+                drop(ctx);
+                ctx = make_exec_ctx(&config, &state_db);
+            }
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&state_db);
+        (state_db, captured)
+    }
+
+    /// Task 3: every out-of-batch consensus write of Task 0 enters `D(n)` of the
+    /// height whose execution made it durable — with the value the DB holds.
+    #[test]
+    fn running_hash_covers_out_of_batch_consensus_writes() {
+        use torus_state::cf::{CF_SLASH_RECORDS, CF_STAKING_VALIDATORS, CF_STORAGE};
+        use torus_state::running_hash::hashed_cf_id;
+        let (state_db, captured) = run_out_of_batch_fixture(&[]);
+        assert_eq!(captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        let at = |h: u64| &captured.iter().find(|(x, _)| *x == h).unwrap().1;
+        let in_db = |id: u8, cf: &str, w: &[torus_state::running_hash::WriteEntry]| {
+            let rows: Vec<_> = w.iter().filter(|e| e.0 == id).collect();
+            for (_, k, v) in &rows {
+                assert_eq!(&state_db.get_cf_raw(cf, k).unwrap(), v, "{cf} entry must equal the DB");
+            }
+            rows.len()
+        };
+        // (c) EVM bundle: the contract's storage slot (only reachable via the bundle).
+        let storage = hashed_cf_id(CF_STORAGE).unwrap();
+        assert_eq!(in_db(storage, CF_STORAGE, at(1)), 1, "slot 0 of the created contract");
+        // (a) slash at 2: validator row + slash record.
+        let vals = hashed_cf_id(CF_STAKING_VALIDATORS).unwrap();
+        assert_eq!(in_db(vals, CF_STAKING_VALIDATORS, at(2)), 1, "slashed validator row");
+        assert!(at(2).iter().any(|e| e.0 == hashed_cf_id(CF_SLASH_RECORDS).unwrap()), "slash record");
+        // 3 is empty: nothing hashed.
+        assert!(at(3).is_empty(), "{:?}", at(3));
+        // (b) epoch boundary 4: full staking-validators snapshot.
+        let all = StateBackend::iterate_cf(&state_db, CF_STAKING_VALIDATORS, None).unwrap();
+        assert!(!all.is_empty());
+        assert_eq!(in_db(vals, CF_STAKING_VALIDATORS, at(4)), all.len(), "snapshot = every row");
+        // Restarts do not change the hash.
+        let (db2, _) = run_out_of_batch_fixture(&[1, 2, 3]);
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&db2),
+            torus_state::running_hash::read_running_hash(&state_db)
+        );
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&state_db),
+            Some(fold_captured(&captured))
+        );
     }
 }

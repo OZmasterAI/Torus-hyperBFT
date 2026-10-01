@@ -283,6 +283,10 @@ struct PendingState {
     /// through this overlay (or any clone sharing the Arc) is an error — the
     /// block is closed and its writes are owned by the flush worker.
     frozen: bool,
+    /// Running state hash: consensus writes of this block that were made
+    /// durable OUTSIDE its atomic batch (see [`HashExtras`]). Hashed under this
+    /// set's own writes, never read through and never written by the flush.
+    hash_extras: Option<Box<PendingState>>,
 }
 
 impl PendingState {
@@ -292,6 +296,7 @@ impl PendingState {
             journal_log: Vec::new(),
             checkpoints: Vec::new(),
             frozen: false,
+            hash_extras: None,
         }
     }
 
@@ -360,6 +365,24 @@ impl PendingState {
         }
         self.journal_log.clear();
         self.checkpoints.clear();
+        self.hash_extras = None;
+    }
+
+    /// Running state hash: fold `other`'s hashed-CF mutations on top of this
+    /// set (later wins, as when `other` became durable after it).
+    fn absorb_hashed(&mut self, other: &PendingState) {
+        for &(_, id) in hashed_cf_order() {
+            let src = other.cf(id);
+            let dst = self.cf_mut(id);
+            for (k, v) in &src.writes {
+                dst.deletes.remove(k);
+                dst.writes.insert(k.clone(), v.clone());
+            }
+            for k in &src.deletes {
+                dst.writes.remove(k);
+                dst.deletes.insert(k.clone());
+            }
+        }
     }
 
     /// Record the pre-mutation state of `(cf, key)` so any open checkpoint can undo it.
@@ -532,6 +555,132 @@ fn for_each_consensus_write<'a>(
     }
 }
 
+/// Running state hash: a block's consensus writes that became durable OUTSIDE
+/// its atomic flush batch (Task 0: buffered slashes, EVM writer-precompile
+/// side effects, the EVM bundle commit, the epoch-boundary staking snapshot).
+/// Attached to the block's pending set ([`NativeStateOverlay::set_hash_extras`],
+/// [`FrozenPending::with_hash_extras`]) they enter `D(n)` UNDER the block's own
+/// overlay writes (the overlay is flushed later, so it wins per key). Hash-only:
+/// never written, never read through. Writes to CFs outside the hashed set are
+/// dropped on entry.
+pub struct HashExtras {
+    state: PendingState,
+}
+
+impl Default for HashExtras {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HashExtras {
+    pub fn new() -> Self {
+        Self {
+            state: PendingState::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    fn hashed_id(cf: &str) -> Option<CfId> {
+        intern_cf(cf).filter(|id| hashed_cf_order().iter().any(|(_, h)| h == id))
+    }
+
+    /// Record a put (later calls override earlier ones per key).
+    pub fn put(&mut self, cf: &str, key: &[u8], value: &[u8]) {
+        if let Some(id) = Self::hashed_id(cf) {
+            let c = self.state.cf_mut(id);
+            c.deletes.remove(key);
+            c.writes.insert(key.to_vec(), value.to_vec());
+        }
+    }
+
+    /// Record a deletion.
+    pub fn delete(&mut self, cf: &str, key: &[u8]) {
+        if let Some(id) = Self::hashed_id(cf) {
+            let c = self.state.cf_mut(id);
+            c.writes.remove(key);
+            c.deletes.insert(key.to_vec());
+        }
+    }
+
+    /// Fold `later` on top (its entries win per key).
+    pub fn extend(&mut self, later: HashExtras) {
+        self.state.absorb_hashed(&later.state);
+    }
+
+    /// The EVM bundle's plain-state change set — exactly the puts / deletes
+    /// [`crate::incremental::apply_bundle_plain`] (and the fallback
+    /// `commit_pending_bundle`) write to `cf_accounts` / `cf_storage` /
+    /// `cf_code` (pinned by `evm_bundle_extras_match_apply_bundle_plain`).
+    pub fn add_evm_bundle(&mut self, bundle: &revm::database::BundleState) {
+        use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
+        use crate::db::{encode_account_info, storage_key};
+        for (address, acct) in &bundle.state {
+            match &acct.info {
+                Some(info) => {
+                    self.put(CF_ACCOUNTS, address.as_slice(), &encode_account_info(info));
+                    for (slot, sv) in &acct.storage {
+                        let key = storage_key(address, slot);
+                        if sv.present_value.is_zero() {
+                            self.delete(CF_STORAGE, &key);
+                        } else {
+                            self.put(CF_STORAGE, &key, &sv.present_value.to_be_bytes::<32>());
+                        }
+                    }
+                }
+                None => {
+                    if acct.original_info.is_some() {
+                        self.delete(CF_ACCOUNTS, address.as_slice());
+                    }
+                    for slot in acct.storage.keys() {
+                        self.delete(CF_STORAGE, &storage_key(address, slot));
+                    }
+                }
+            }
+        }
+        for (code_hash, bytecode) in &bundle.contracts {
+            self.put(CF_CODE, code_hash.as_slice(), bytecode.bytes().as_ref());
+        }
+    }
+}
+
+thread_local! {
+    static OUT_OF_BATCH: std::cell::RefCell<Option<HashExtras>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Running state hash: while armed on a thread, every successful
+/// [`NativeStateOverlay::commit_tx`] on that thread (EVM writer-precompile
+/// side effects, the buffered-slash loop) is also recorded, in durable order,
+/// as [`HashExtras`]. The exec thread arms it around the block's EVM / slash
+/// section; other threads never record. Disarmed on drop.
+pub struct OutOfBatchRecorder {
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl OutOfBatchRecorder {
+    pub fn begin() -> Self {
+        OUT_OF_BATCH.with(|r| *r.borrow_mut() = Some(HashExtras::new()));
+        Self {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Stop recording and return what was recorded.
+    pub fn finish(self) -> HashExtras {
+        OUT_OF_BATCH.with(|r| r.borrow_mut().take()).unwrap_or_default()
+    }
+}
+
+impl Drop for OutOfBatchRecorder {
+    fn drop(&mut self) {
+        OUT_OF_BATCH.with(|r| *r.borrow_mut() = None);
+    }
+}
+
 /// bl2 exec pipeline (`TORUS_EXEC_PIPELINE`): the CLOSED pending set of one
 /// committed block, moved out of its [`NativeStateOverlay`] by
 /// [`NativeStateOverlay::freeze`] once the block's execution is complete.
@@ -572,6 +721,12 @@ impl FrozenPending {
             height.to_be_bytes().to_vec(),
         );
         Self { height, state }
+    }
+
+    /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]).
+    pub fn with_hash_extras(mut self, extras: HashExtras) -> Self {
+        self.state.hash_extras = (!extras.is_empty()).then(|| Box::new(extras.state));
+        self
     }
 
     /// Number of pending writes + tombstones in this set.
@@ -699,6 +854,14 @@ impl NativeStateOverlay {
         Arc::new(FrozenPending { height, state })
     }
 
+    /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]);
+    /// they travel with the pending set through [`Self::freeze`].
+    pub fn set_hash_extras(&self, extras: HashExtras) {
+        let mut state = self.pending.write().unwrap();
+        debug_assert!(!state.frozen, "hash extras set on a frozen overlay");
+        state.hash_extras = (!extras.is_empty()).then(|| Box::new(extras.state));
+    }
+
     pub fn flush(&self, target: &StateDb) -> Result<(), StateError> {
         let state = self.pending.read().unwrap();
         let mut batch = WriteBatch::default();
@@ -722,6 +885,11 @@ impl NativeStateOverlay {
         let mut batch = WriteBatch::default();
         state.append_to_batch(target.inner(), &mut batch)?;
         target.write(batch)?;
+        OUT_OF_BATCH.with(|r| {
+            if let Some(acc) = r.borrow_mut().as_mut() {
+                acc.state.absorb_hashed(&state);
+            }
+        });
         state.clear();
         Ok(())
     }
@@ -983,6 +1151,8 @@ fn flush_pending_with_native_trie_stats(
             member_evictions: 0,
             member_resident_buckets: 0,
             dirty_entries_by_cf: [0; 6],
+            state_hash_seconds: 0.0,
+            state_hash_entries: 0,
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
         for (tag, _) in dirty.keys() {
@@ -1045,18 +1215,33 @@ fn flush_pending_with_native_trie_stats(
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
         }
 
-        // Running state hash: the block's consensus write set (pending set,
-        // then the deferred-book sidecar on top).
+        // Running state hash: h_n over the block's consensus write set —
+        // out-of-batch extras, then the pending set, then the deferred-book
+        // sidecar on top — into the SAME batch as the applied-height marker.
+        // Computed from the pending maps, never from the batch, so trie
+        // maintenance (on / off / failed) cannot change it.
         if let Some(height) = applied_height {
-            if crate::running_hash::capture_active() {
-                let mut layers: Vec<&PendingState> = vec![state];
-                layers.extend(sidecar);
-                let mut writes = Vec::new();
-                for_each_consensus_write(&layers, |id, k, v| {
-                    writes.push((id, k.to_vec(), v.map(<[u8]>::to_vec)))
-                });
-                crate::running_hash::capture_record(target, height, writes);
+            let hash_timer = std::time::Instant::now();
+            let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
+            layers.extend(state.hash_extras.as_deref());
+            layers.push(state);
+            layers.extend(sidecar);
+            let mut digest = crate::running_hash::BlockDigest::new();
+            let mut capture = crate::running_hash::capture_active().then(Vec::new);
+            for_each_consensus_write(&layers, |id, k, v| {
+                digest.push(id, k, v);
+                if let Some(c) = capture.as_mut() {
+                    c.push((id, k.to_vec(), v.map(<[u8]>::to_vec)));
+                }
+            });
+            stats.state_hash_entries = digest.entries();
+            let (prev, activation) = crate::running_hash::prev_for(target, height);
+            let hash = digest.chain(&prev, height);
+            crate::running_hash::append_to_batch(target, &mut batch, height, &hash, activation)?;
+            if let Some(c) = capture {
+                crate::running_hash::capture_record(target, height, c);
             }
+            stats.state_hash_seconds = hash_timer.elapsed().as_secs_f64();
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were
@@ -1152,6 +1337,11 @@ pub struct NativeFlushStats {
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
     pub dirty_entries_by_cf: [usize; 6],
+    /// Running state hash: time to digest the block's consensus write set and
+    /// chain `h_n` (0 when the flush carries no applied height).
+    pub state_hash_seconds: f64,
+    /// Running state hash: hashed entries this flush.
+    pub state_hash_entries: usize,
 }
 
 impl StateBackend for NativeStateOverlay {
@@ -2556,5 +2746,264 @@ mod tests {
         crate::native_trie::build_native_trie_to_cf(&db).unwrap();
         assert!(!is_native_trie_stale(&db).unwrap());
         assert_eq!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
+    }
+
+    // ======================================================================
+    // Running state hash (Task 3)
+    // ======================================================================
+
+    use crate::running_hash::{
+        checkpoint_heights, hashed_cf_id, next_running_hash, read_checkpoint, read_running_hash,
+        WriteEntry, STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN,
+    };
+
+    /// The canonical hashed write set of `(cf, key, value)` triples (later wins).
+    fn rsh_expected(writes: &[(&str, Vec<u8>, Option<Vec<u8>>)]) -> Vec<WriteEntry> {
+        let mut m: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+        for (cf, k, v) in writes {
+            if let Some(id) = hashed_cf_id(cf) {
+                m.insert((id, k.clone()), v.clone());
+            }
+        }
+        m.into_iter().map(|((id, k), v)| (id, k, v)).collect()
+    }
+
+    /// Block `h`'s writes for the long-run test: native puts / deletes, an
+    /// EVM account, a derived-CF write and the applied-height marker (both
+    /// excluded), a node-local markets key (excluded).
+    fn rsh_block_writes(h: u64) -> Vec<(&'static str, Vec<u8>, Option<Vec<u8>>)> {
+        use crate::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_NATIVE_MARKETS, CF_NATIVE_NONCES};
+        if h % 10 != 1 {
+            return Vec::new(); // most blocks are empty (marker-only)
+        }
+        let mut w = vec![
+            (CF_NATIVE_BALANCES, vec![(h % 7) as u8], Some(h.to_be_bytes().to_vec())),
+            (CF_NATIVE_NONCES, h.to_be_bytes().to_vec(), Some(vec![1])),
+            (CF_BLOCK_HEADERS, h.to_be_bytes().to_vec(), Some(b"hdr".to_vec())),
+            (crate::cf::CF_CONSENSUS_META, crate::cf::META_NATIVE_APPLIED_HEIGHT.to_vec(), Some(h.to_be_bytes().to_vec())),
+            (CF_NATIVE_MARKETS, b"__book_mode__".to_vec(), Some(vec![0])),
+        ];
+        if h % 3 == 0 {
+            w.push((CF_ACCOUNTS, vec![0xab; 20], Some(h.to_le_bytes().to_vec())));
+        }
+        if h % 4 == 1 {
+            w.push((CF_NATIVE_BALANCES, vec![((h + 3) % 7) as u8], None));
+        }
+        w
+    }
+
+    fn rsh_overlay(db: &StateDb, writes: &[(&str, Vec<u8>, Option<Vec<u8>>)]) -> NativeStateOverlay {
+        let ov = NativeStateOverlay::new(db.clone());
+        for (cf, k, v) in writes {
+            match v {
+                Some(v) => ov.put_cf_raw(cf, k, v).unwrap(),
+                None => ov.delete_cf_raw(cf, k).unwrap(),
+            }
+        }
+        ov
+    }
+
+    /// Task 3: flushing N blocks stores `h_n` = the function over each block's
+    /// hashed writes, block by block (empty blocks included); checkpoints land at
+    /// every multiple of the interval and only the newest RETAIN survive.
+    #[test]
+    fn running_hash_flush_matches_function_block_by_block() {
+        let (db, _d) = temp_db();
+        let last = STATE_HASH_CHECKPOINT_INTERVAL * (STATE_HASH_CHECKPOINT_RETAIN + 2);
+        let mut expect = [0u8; 32];
+        let mut at_checkpoint = BTreeMap::new();
+        for h in 1..=last {
+            let writes = rsh_block_writes(h);
+            let ov = rsh_overlay(&db, &writes);
+            ov.flush_with_native_trie_stats(&db, Some(h), None, None).unwrap();
+            expect = next_running_hash(&expect, h, &rsh_expected(&writes));
+            assert_eq!(read_running_hash(&db), Some((h, expect)), "height {h}");
+            if h % STATE_HASH_CHECKPOINT_INTERVAL == 0 {
+                at_checkpoint.insert(h, expect);
+            }
+        }
+        let kept: Vec<u64> = at_checkpoint
+            .keys()
+            .copied()
+            .skip(at_checkpoint.len() - STATE_HASH_CHECKPOINT_RETAIN as usize)
+            .collect();
+        assert_eq!(checkpoint_heights(&db), kept, "newest {STATE_HASH_CHECKPOINT_RETAIN} checkpoints");
+        for (h, hash) in &at_checkpoint {
+            let want = kept.contains(h).then_some(*hash);
+            assert_eq!(read_checkpoint(&db, *h), want, "checkpoint {h}");
+        }
+    }
+
+    /// Task 3: the hash depends only on the hashed write set — not on trie
+    /// maintenance, not on how the writes are split between the frozen set and
+    /// the deferred-book sidecar, not on excluded CFs.
+    #[test]
+    fn running_hash_independent_of_trie_maintenance_sidecar_and_excluded_cfs() {
+        use crate::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_TRADES};
+        let blocks: Vec<Vec<(&str, Vec<u8>, Option<Vec<u8>>)>> = (1..=8u64)
+            .map(|h| {
+                let mut w = rsh_block_writes(h * 10 + 1);
+                w.push((CF_NATIVE_ORDER_BOOKS, vec![h as u8, 1], Some(vec![h as u8])));
+                w
+            })
+            .collect();
+        let run = |maintain: bool, split_sidecar: bool, extra_excluded: bool| {
+            let (db, d) = temp_db();
+            for (i, w) in blocks.iter().enumerate() {
+                let h = i as u64 + 1;
+                let (main, side): (Vec<_>, Vec<_>) = w
+                    .iter()
+                    .cloned()
+                    .partition(|(cf, _, _)| !split_sidecar || *cf != CF_NATIVE_ORDER_BOOKS);
+                let ov = rsh_overlay(&db, &main);
+                if extra_excluded {
+                    ov.put_cf_raw(CF_BOOK_ORDER_ROWS, &[h as u8], b"row").unwrap();
+                    ov.put_cf_raw(CF_NATIVE_TRADES, &[h as u8], b"t").unwrap();
+                }
+                let frozen = ov.freeze(h);
+                let sidecar = rsh_overlay(&db, &side).freeze(h);
+                flush_pending_with_native_trie_stats(
+                    &frozen.state,
+                    split_sidecar.then_some(&sidecar.state),
+                    &db,
+                    Some(h),
+                    None,
+                    None,
+                    maintain,
+                )
+                .unwrap();
+            }
+            let out = read_running_hash(&db).unwrap();
+            drop(d);
+            out
+        };
+        let base = run(true, false, false);
+        assert_eq!(base.0, 8);
+        assert_eq!(run(false, false, false), base, "trie maintenance off");
+        assert_eq!(run(true, true, false), base, "sidecar split");
+        assert_eq!(run(false, true, false), base, "sidecar split, maintenance off");
+        assert_eq!(run(true, false, true), base, "excluded CF writes");
+    }
+
+    /// Task 3: hash-only extras (consensus writes made durable OUTSIDE the
+    /// batch) enter the hash under the block's own writes; the overlay wins
+    /// per key; extras are never written by the flush.
+    #[test]
+    fn running_hash_extras_are_hashed_under_the_overlay_and_never_written() {
+        use crate::cf::{CF_ACCOUNTS, CF_STAKING_VALIDATORS, CF_STORAGE};
+        let (db, _d) = temp_db();
+        let mut extras = HashExtras::new();
+        extras.put(CF_STAKING_VALIDATORS, b"val", b"slashed");
+        extras.put(CF_ACCOUNTS, &[1; 20], b"evm-old");
+        extras.delete(CF_STORAGE, b"slot");
+        extras.put(crate::cf::CF_BLOCK_HEADERS, b"x", b"ignored");
+        let ov = rsh_overlay(&db, &[(CF_ACCOUNTS, vec![1; 20], Some(b"evm-new".to_vec()))]);
+        ov.set_hash_extras(extras);
+        ov.flush_with_native_trie_stats(&db, Some(1), None, None).unwrap();
+        let want = rsh_expected(&[
+            (CF_STAKING_VALIDATORS, b"val".to_vec(), Some(b"slashed".to_vec())),
+            (CF_STORAGE, b"slot".to_vec(), None),
+            (CF_ACCOUNTS, vec![1; 20], Some(b"evm-new".to_vec())),
+        ]);
+        assert_eq!(read_running_hash(&db), Some((1, next_running_hash(&[0; 32], 1, &want))));
+        assert_eq!(db.get_cf_raw(CF_STAKING_VALIDATORS, b"val").unwrap(), None, "extras are hash-only");
+        assert_eq!(db.get_cf_raw(CF_ACCOUNTS, &[1; 20]).unwrap(), Some(b"evm-new".to_vec()));
+
+        // Marker-only block with extras (EVM-only / empty boundary block).
+        let mut extras = HashExtras::new();
+        extras.put(CF_STAKING_VALIDATORS, b"val", b"v2");
+        FrozenPending::marker_only(2)
+            .with_hash_extras(extras)
+            .flush_with_native_trie_stats(&db, Some(2), None, None)
+            .unwrap();
+        let h1 = read_running_hash(&db).map(|_| ()).and(Some(next_running_hash(&[0; 32], 1, &want))).unwrap();
+        let want2 = rsh_expected(&[(CF_STAKING_VALIDATORS, b"val".to_vec(), Some(b"v2".to_vec()))]);
+        assert_eq!(read_running_hash(&db), Some((2, next_running_hash(&h1, 2, &want2))));
+    }
+
+    /// Task 3: per-tx `commit_tx` writes (EVM writer precompiles, slashes) made
+    /// while an [`OutOfBatchRecorder`] is armed on this thread are returned as
+    /// hash extras, in durable order; unarmed threads record nothing.
+    #[test]
+    fn out_of_batch_recorder_captures_commit_tx_writes() {
+        use crate::cf::{CF_CORE_WRITER_QUEUE, CF_NATIVE_TRADES};
+        let (db, _d) = temp_db();
+        let tx = |w: &[(&str, Vec<u8>, Option<Vec<u8>>)]| rsh_overlay(&db, w).commit_tx(&db).unwrap();
+        tx(&[(CF_CORE_WRITER_QUEUE, b"before".to_vec(), Some(b"x".to_vec()))]); // not armed
+        let rec = OutOfBatchRecorder::begin();
+        tx(&[
+            (CF_CORE_WRITER_QUEUE, b"q1".to_vec(), Some(b"a".to_vec())),
+            (CF_NATIVE_TRADES, b"t".to_vec(), Some(b"node-local".to_vec())),
+        ]);
+        tx(&[(CF_CORE_WRITER_QUEUE, b"q1".to_vec(), None)]); // later tx deletes it
+        tx(&[(CF_CORE_WRITER_QUEUE, b"q2".to_vec(), Some(b"b".to_vec()))]);
+        let extras = rec.finish();
+        tx(&[(CF_CORE_WRITER_QUEUE, b"after".to_vec(), Some(b"y".to_vec()))]); // disarmed
+        FrozenPending::marker_only(1)
+            .with_hash_extras(extras)
+            .flush_with_native_trie_stats(&db, Some(1), None, None)
+            .unwrap();
+        let want = rsh_expected(&[
+            (CF_CORE_WRITER_QUEUE, b"q1".to_vec(), None),
+            (CF_CORE_WRITER_QUEUE, b"q2".to_vec(), Some(b"b".to_vec())),
+        ]);
+        assert_eq!(read_running_hash(&db), Some((1, next_running_hash(&[0; 32], 1, &want))));
+    }
+
+    /// Task 3: the EVM bundle's plain-state change set as hash extras is exactly
+    /// what `apply_bundle_plain` writes (accounts, storage incl. zeroed slots,
+    /// code, destroyed accounts).
+    #[test]
+    fn evm_bundle_extras_match_apply_bundle_plain() {
+        use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
+        use revm::database::{BundleAccount, BundleState};
+        use revm::state::{AccountInfo, Bytecode};
+        let (db, _d) = temp_db();
+        // Pre-state so deletions are observable.
+        let gone = Address::repeat_byte(0x02);
+        db.put_cf_raw(CF_ACCOUNTS, gone.as_slice(), b"old").unwrap();
+        let code = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let live = Address::repeat_byte(0x01);
+        let mut bundle = BundleState::default();
+        let mut storage = revm::database::states::StorageWithOriginalValues::default();
+        storage.insert(alloy_primitives::U256::from(1), revm::database::states::StorageSlot::new_changed(alloy_primitives::U256::ZERO, alloy_primitives::U256::from(7)));
+        storage.insert(alloy_primitives::U256::from(2), revm::database::states::StorageSlot::new_changed(alloy_primitives::U256::from(5), alloy_primitives::U256::ZERO));
+        bundle.state.insert(
+            live,
+            BundleAccount::new(
+                None,
+                Some(AccountInfo { balance: alloy_primitives::U256::from(9), nonce: 1, code_hash: code.hash_slow(), code: Some(code.clone()), account_id: None }),
+                storage,
+                revm::database::AccountStatus::Changed,
+            ),
+        );
+        bundle.state.insert(
+            gone,
+            BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), revm::database::AccountStatus::Destroyed),
+        );
+        bundle.contracts.insert(code.hash_slow(), code.clone());
+
+        let mut extras = HashExtras::new();
+        extras.add_evm_bundle(&bundle);
+        let mut batch = WriteBatch::default();
+        crate::incremental::apply_bundle_plain(&db, &mut batch, &bundle).unwrap();
+        db.write(batch).unwrap();
+        // Every extras entry equals the DB after apply_bundle_plain, and every
+        // EVM key apply_bundle_plain touched is in extras.
+        let mut seen = 0;
+        for cf in [CF_ACCOUNTS, CF_STORAGE, CF_CODE] {
+            let id = intern_cf(cf).unwrap();
+            let c = extras.state.cf(id);
+            for (k, v) in &c.writes {
+                assert_eq!(db.get_cf_raw(cf, k).unwrap().as_deref(), Some(v.as_slice()), "{cf}");
+                seen += 1;
+            }
+            for k in &c.deletes {
+                assert_eq!(db.get_cf_raw(cf, k).unwrap(), None, "{cf} delete");
+                seen += 1;
+            }
+        }
+        // live account + 2 slots + code + destroyed account
+        assert_eq!(seen, 5);
     }
 }

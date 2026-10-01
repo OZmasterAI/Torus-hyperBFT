@@ -240,6 +240,21 @@ pub struct Metrics {
     /// rank-root: flush breakdown — native trie maintenance (bucket rehash +
     /// path propagation) inside the atomic flush.
     pub exec_root_seconds: Histogram,
+    /// Running state hash: digesting the block's consensus write set and
+    /// chaining `h_n`, inside the atomic flush.
+    pub state_hash_seconds: Histogram,
+    /// Running state hash: consensus write-set entries hashed.
+    pub state_hash_entries: Counter,
+    /// Running state hash: on-chain attestation (vote or quorum hash) that
+    /// differs from this node's checkpoint, by attesting validator
+    /// (`quorum` for the quorum hash).
+    pub state_hash_mismatch: Family<Vec<(String, String)>, Counter>,
+    /// Running state hash: checkpoints whose votes are all in without a quorum.
+    pub state_hash_no_quorum: Counter,
+    /// Running state hash: `AttestStateHash` actions this node submitted.
+    pub state_hash_attestations_submitted: Counter,
+    /// Running state hash: last hashed (applied) height.
+    pub state_hash_height: Gauge,
     /// rank-root: flush breakdown — WriteBatch build + RocksDB write
     /// (== build + db below; kept unsplit for series continuity).
     pub exec_state_write_seconds: Histogram,
@@ -1269,6 +1284,43 @@ impl Metrics {
             exec_root_seconds.clone(),
         );
 
+        let state_hash_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_state_hash_seconds",
+            "Running state hash: digest of the block's consensus writes + chain step",
+            state_hash_seconds.clone(),
+        );
+        let state_hash_entries = Counter::default();
+        registry.register(
+            "torus_state_hash_entries",
+            "Running state hash: consensus write-set entries hashed",
+            state_hash_entries.clone(),
+        );
+        let state_hash_mismatch = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_state_hash_mismatch",
+            "Running state hash: on-chain attestation differing from the local checkpoint, by validator",
+            state_hash_mismatch.clone(),
+        );
+        let state_hash_no_quorum = Counter::default();
+        registry.register(
+            "torus_state_hash_no_quorum",
+            "Running state hash: checkpoints with every vote in and no quorum hash",
+            state_hash_no_quorum.clone(),
+        );
+        let state_hash_attestations_submitted = Counter::default();
+        registry.register(
+            "torus_state_hash_attestations_submitted",
+            "Running state hash: AttestStateHash actions submitted by this node",
+            state_hash_attestations_submitted.clone(),
+        );
+        let state_hash_height = Gauge::default();
+        registry.register(
+            "torus_state_hash_height",
+            "Running state hash: last hashed (applied) height",
+            state_hash_height.clone(),
+        );
+
         let exec_state_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_state_write_seconds",
@@ -2020,6 +2072,12 @@ impl Metrics {
             exec_save_books_seconds,
             exec_flush_seconds,
             exec_root_seconds,
+            state_hash_seconds,
+            state_hash_entries,
+            state_hash_mismatch,
+            state_hash_no_quorum,
+            state_hash_attestations_submitted,
+            state_hash_height,
             exec_state_write_seconds,
             exec_state_write_build_seconds,
             exec_state_write_db_seconds,
@@ -2696,6 +2754,31 @@ mod tests {
         for name in [
             "torus_native_da_recovery_handoffs",
             "torus_native_da_recovery_timeouts",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// Running state hash metrics (docs/plans/running-state-hash-impl.md).
+    #[test]
+    fn state_hash_metrics_registered() {
+        let m = Metrics::new();
+        m.state_hash_seconds.observe(0.002);
+        m.state_hash_entries.inc_by(3);
+        m.state_hash_mismatch
+            .get_or_create(&vec![("validator".to_string(), "0xab".to_string())])
+            .inc();
+        m.state_hash_no_quorum.inc();
+        m.state_hash_attestations_submitted.inc();
+        m.state_hash_height.set(100);
+        let text = m.encode();
+        for name in [
+            "torus_state_hash_seconds",
+            "torus_state_hash_entries_total",
+            "torus_state_hash_mismatch_total{validator=\"0xab\"} 1",
+            "torus_state_hash_no_quorum_total 1",
+            "torus_state_hash_attestations_submitted_total 1",
+            "torus_state_hash_height 100",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
