@@ -7173,6 +7173,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "torus-price-feeder"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "borsh 1.6.1",
+ "clap",
+ "hex",
+ "k256",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "torus-core",
+ "torus-economics",
+ "torus-mempool",
+ "torus-rpc",
+ "torus-state",
+ "torus-types",
+ "torus-wallet",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "torus-rpc"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,44 @@
+# torus price feeder -- example config (docs/plans/oracle-feeder.md section 6).
+# One feeder per validator. It signs with the validator's HOT ORACLE SIGNER key
+# (never the validator key) and submits to the LOCAL node only.
+
+rpc_url = "http://127.0.0.1:8545"
+signer_keystore = "/etc/torus/price-feeder/signer.keystore"   # or: signer_key_file (hex, mode 0600)
+passphrase_file = "/etc/torus/price-feeder/passphrase"
+# The cold validator address that registered this signer
+# (torus-wallet ... validator set-oracle-signer --signer <signer address>). Replace.
+validator_address = "0x1111111111111111111111111111111111111111"
+interval_ms = 3000
+fetch_timeout_ms = 2000
+max_source_age_ms = 5000
+min_sources = 3
+min_weight_bps = 5000
+quote_mode = "par"                   # or "kraken_usdt"
+health_listen = "127.0.0.1:9466"
+
+# Optional per-venue overrides (defaults: weights binance 3, okx 2, bybit 2,
+# kraken/kucoin/gate/mexc 1; all enabled; public base URLs).
+# [exchanges.mexc]
+# enabled = false
+# [exchanges.okx]
+# weight = 2
+# base_url = "https://www.okx.com"
+
+[[markets]]
+market_id = 1
+base_asset = "BTC"
+symbols = { binance = "BTCUSDT", okx = "BTC-USDT", bybit = "BTCUSDT", kraken = "XXBTZUSD", kucoin = "BTC-USDT", gate = "BTC_USDT", mexc = "BTCUSDT" }
+
+[[markets]]
+market_id = 2
+base_asset = "ETH"
+symbols = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT", kraken = "XETHZUSD", kucoin = "ETH-USDT", gate = "ETH_USDT", mexc = "ETHUSDT" }
+
+# MATIC market: the venues list it as POL (decision 6). base_asset stays the
+# on-chain name "MATIC"; only the venue symbols are POL.
+[[markets]]
+market_id = 9
+base_asset = "MATIC"
+symbols = { binance = "POLUSDT", okx = "POL-USDT", bybit = "POLUSDT", kraken = "POLUSD", kucoin = "POL-USDT", gate = "POL_USDT", mexc = "POLUSDT" }
+# A symbol's quote defaults to USD on Kraken and USDT elsewhere; override with
+#   gate = { symbol = "POL_USDC", quote = "USDC" }
