@@ -496,7 +496,7 @@ fn liquidation_step_keeps_incremental_root_equal_to_full_scan() {
                 .iter()
                 .map(|&v| (addr(v), NativeAction::SubmitOraclePrices(OracleSubmission {
                     prices: vec![(1, fp(1_000 - 8 * block as i64))],
-                    timestamp: 0,
+                    timestamp: (1_700_000_000 + block) * 1_000, // sampled at block time (ms)
                 })))
                 .collect()
         } else {
