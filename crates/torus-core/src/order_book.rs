@@ -1544,6 +1544,12 @@ impl OrderBook {
         order.serialize(buf).expect("vec write");
     }
 
+    /// The trader address bytes of an order-row value (`seq(8) ‖ id(16) ‖
+    /// trader(20) ‖ …`) without decoding the row; `None` if it is too short.
+    pub fn order_row_trader(bytes: &[u8]) -> Option<&[u8]> {
+        bytes.get(24..44)
+    }
+
     /// Decode an order-row value into `(seq, order)`.
     pub fn decode_order_row(bytes: &[u8]) -> io::Result<(u64, Order)> {
         let mut r = bytes;
@@ -4540,6 +4546,17 @@ mod level_preimage_characterization {
     /// row AND inflate `buf.len()` — i.e. corrupt both the payload and the
     /// u32-LE framing length. A DIRTY buffer must produce exactly what a fresh
     /// one does, byte-for-byte and length-for-length, for every shape.
+    #[test]
+    fn order_row_trader_reads_the_trader_without_decoding() {
+        for (seq, o) in shape_spread() {
+            let row = OrderBook::encode_order_row_parts(seq, &o);
+            assert_eq!(OrderBook::order_row_trader(&row), Some(o.trader.as_slice()));
+            let (_, decoded) = OrderBook::decode_order_row(&row).unwrap();
+            assert_eq!(decoded.trader, o.trader);
+        }
+        assert_eq!(OrderBook::order_row_trader(&[0u8; 43]), None);
+    }
+
     #[test]
     fn encode_order_row_into_is_dirty_buffer_proof() {
         // Junk shapes: shorter than a row, exactly a row, far longer than a
