@@ -40,14 +40,24 @@ Design: `docs/plans/oracle-feeder.md`.
    with mode 0600 (`signer_key_file`) also works. Use a fresh, unfunded
    address.
 
-2. Register the signer once, with the validator's EVM keystore (cold):
+2. Register the signer once, with the validator's EVM keystore (cold). The
+   wallet also needs the signer key: it signs a proof of possession, which binds
+   the signer to this validator and this chain. Nobody can register an address
+   whose key they do not hold, and nobody can replay your proof for another
+   validator.
 
    ```
-   torus-wallet --keystore <validator EVM keystore> set-oracle-signer --signer <signer address>
+   torus-wallet --keystore <validator EVM keystore> set-oracle-signer \
+       --signer-keystore /etc/torus/price-feeder/signer.keystore \
+       [--signer-passphrase-file <file>]
    ```
 
-   `--clear` removes the signer. A signer can serve only one validator, and it
-   cannot itself be a validator.
+   * `--signer-key-file <hex, mode 0600>` can be used instead of
+     `--signer-keystore`.
+   * `--clear` removes the signer and needs no signer key. A tombstoned
+     validator may still clear its signer.
+   * A signer can serve only one validator. A serving signer cannot register as
+     a validator itself.
 
 3. Write the config from `feeder.example.toml`. The MATIC market uses the
    venues' POL tickers, but `base_asset` stays `"MATIC"`, the on-chain name.
@@ -93,7 +103,7 @@ Design: `docs/plans/oracle-feeder.md`.
 
 7. Rotate the signer:
    1. Create a new keystore (step 1).
-   2. Run `set-oracle-signer --signer <new>` (step 2).
+   2. Run `set-oracle-signer --signer-keystore <new keystore>` (step 2).
    3. Point the config at the new keystore and restart the feeder.
 
    Submissions from the old signer still count in the block that carries the
