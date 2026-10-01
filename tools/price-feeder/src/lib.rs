@@ -8,6 +8,7 @@ pub mod config;
 pub mod exchange;
 pub mod feeder;
 pub mod fetch;
+pub mod health;
 pub mod keyfile;
 pub mod node;
 pub mod price;
