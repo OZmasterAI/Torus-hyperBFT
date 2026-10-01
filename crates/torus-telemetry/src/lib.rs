@@ -69,9 +69,11 @@ pub struct Metrics {
     pub orders_resting: Counter,
     /// Orders rejected pre-book: available balance below the margin reserve.
     pub orders_rejected_margin: Counter,
+    /// Orders rejected pre-book: the sender is at its open-order limit.
+    pub orders_rejected_open_limit: Counter,
     /// Orders the matching engine returned OrderStatus::Rejected for (dust qty,
-    /// non-positive/off-tick limit price, per-trader order cap, invalid stop
-    /// trigger, PostOnly cross, FOK unfillable, market order into empty book).
+    /// non-positive/off-tick limit price, invalid stop trigger, PostOnly
+    /// cross, FOK unfillable, market order into empty book).
     pub orders_rejected_book: Counter,
     /// IOC/FOK/Market orders cancelled on arrival with zero fills.
     pub orders_rejected_cancelled: Counter,
@@ -887,10 +889,17 @@ impl Metrics {
             orders_rejected_margin.clone(),
         );
 
+        let orders_rejected_open_limit = Counter::default();
+        registry.register(
+            "torus_orders_rejected_open_limit",
+            "Orders rejected pre-book: the sender is at its open-order limit (all markets)",
+            orders_rejected_open_limit.clone(),
+        );
+
         let orders_rejected_book = Counter::default();
         registry.register(
             "torus_orders_rejected_book",
-            "Orders the matching engine rejected (dust, off-tick, order cap, PostOnly cross, FOK unfillable, market into empty book, bad stop trigger)",
+            "Orders the matching engine rejected (dust, off-tick, PostOnly cross, FOK unfillable, market into empty book, bad stop trigger)",
             orders_rejected_book.clone(),
         );
 
@@ -2025,6 +2034,7 @@ impl Metrics {
             orders_placed_accepted,
             orders_resting,
             orders_rejected_margin,
+            orders_rejected_open_limit,
             orders_rejected_book,
             orders_rejected_cancelled,
             orders_cancelled_partial_fill,
