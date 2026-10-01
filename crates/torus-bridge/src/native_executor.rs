@@ -3420,8 +3420,8 @@ impl NativeExecutor {
             NativeAction::RotateValidatorKey { new_pubkey } => {
                 Self::exec_rotate_key(ctx, sender, new_pubkey)
             }
-            NativeAction::SetOracleSigner { signer } => {
-                Self::exec_set_oracle_signer(ctx, sender, *signer)
+            NativeAction::SetOracleSigner { signer, proof } => {
+                Self::exec_set_oracle_signer(ctx, sender, *signer, proof.as_ref())
             }
 
             // ---- Session Keys ----
@@ -6623,6 +6623,7 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         signer: Address,
+        proof: Option<&torus_types::OracleSignerProof>,
     ) -> NativeActionResult {
         use torus_economics::types::ValidatorStatus;
         use torus_state::cf::{oracle_signer_key, CF_NATIVE_ORACLE};
@@ -6644,6 +6645,17 @@ impl NativeExecutor {
                 Ok(None) => {}
                 Ok(Some(_)) => return err(format!("signer {s} is a validator")),
                 Err(e) => return err(e.to_string()),
+            }
+            // Review M3: proof of possession — the signer key signed
+            // (this validator, chain id, nonce), so nobody can squat a signer
+            // address they do not hold, nor replay another validator's proof.
+            let proven = proof
+                .and_then(|p| torus_types::eip712::recover_oracle_signer_proof(sender, p).ok())
+                == Some(s);
+            if !proven {
+                return err(format!(
+                    "signer {s}: missing or invalid proof of possession for validator {sender}"
+                ));
             }
             match ctx.state.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s)) {
                 Ok(None) => {}

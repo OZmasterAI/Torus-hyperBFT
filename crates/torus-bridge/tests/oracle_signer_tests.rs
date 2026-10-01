@@ -13,9 +13,10 @@ use torus_state::cf::{
     CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
 use torus_state::{StateBackend, StateDb};
+use torus_types::eip712::sign_oracle_signer_proof;
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OracleSubmission, OrderType, PlaceOrderParams,
-    TimeInForce,
+    FixedPoint, MarketId, NativeAction, OracleSignerProof, OracleSubmission, OrderType,
+    PlaceOrderParams, TimeInForce,
 };
 
 // ---- helpers copied from oracle_block_tests.rs:17-96 (+ oracle_signer) ----
@@ -41,8 +42,25 @@ fn ctx_at<T: StateBackend>(state: T, height: u64) -> NativeExecContext<T> {
 const V1: u8 = 1;
 const V2: u8 = 2;
 const V3: u8 = 3; // 3x stake
-const S: Address = Address::new([50; 20]);
-const S2: Address = Address::new([51; 20]);
+/// Hot signers: the addresses of keys `[50; 32]` / `[51; 32]` (review M3: a
+/// signer is registered with its key's proof of possession).
+const S: Address = alloy_primitives::address!("94622cc2a5b64a58c25a129d48a2beec4b65b779");
+const S2: Address = alloy_primitives::address!("5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb");
+
+fn skey(n: u8) -> k256::ecdsa::SigningKey {
+    k256::ecdsa::SigningKey::from_slice(&[n; 32]).unwrap()
+}
+
+/// `signer`'s proof of possession for `validator` (a wrong key, `[99; 32]`, for
+/// an address with no known key).
+fn proof_for(validator: Address, signer: Address) -> OracleSignerProof {
+    let key = match signer {
+        S => skey(50),
+        S2 => skey(51),
+        _ => skey(99),
+    };
+    sign_oracle_signer_proof(&validator, 7, &key)
+}
 
 fn put_validator(db: &StateDb, n: u8, stake: U256, status: ValidatorStatus) {
     StakingManager::new(db.clone())
@@ -112,7 +130,8 @@ fn assert_rejected(r: &NativeActionResult, needle: &str) {
 }
 
 fn set(sender: u8, signer: Address) -> (Address, NativeAction) {
-    (addr(sender), NativeAction::SetOracleSigner { signer })
+    let proof = (signer != Address::ZERO).then(|| proof_for(addr(sender), signer));
+    (addr(sender), NativeAction::SetOracleSigner { signer, proof })
 }
 
 fn signer_of(db: &StateDb, v: u8) -> Option<Address> {
@@ -338,7 +357,8 @@ fn signer_cannot_act_for_its_validator() {
     }
     // A signer cannot rotate (or clear) the signer of its validator.
     for signer in [S2, Address::ZERO] {
-        let r = NativeExecutor::execute(&mut ctx, &S, &NativeAction::SetOracleSigner { signer });
+        let proof = (signer != Address::ZERO).then(|| proof_for(S, signer));
+        let r = NativeExecutor::execute(&mut ctx, &S, &NativeAction::SetOracleSigner { signer, proof });
         assert_rejected(&r, "not a registered validator");
     }
     assert_eq!(dump_validator_state(&ctx, addr(V1)), before, "validator state byte-identical");
@@ -378,4 +398,37 @@ fn tombstoned_validator_may_clear_its_signer() {
     assert!(exec(&db, 3, set(V1, Address::ZERO)).success);
     assert_eq!(signer_of(&db, V1), None);
     assert_eq!(index(&db, S), None, "the signer address is free again");
+}
+
+#[test]
+fn signer_constants_are_the_test_keys() {
+    let a = |k: &k256::ecdsa::SigningKey| key_address(k);
+    assert_eq!(a(&skey(50)), S);
+    assert_eq!(a(&skey(51)), S2);
+}
+
+fn key_address(k: &k256::ecdsa::SigningKey) -> Address {
+    torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 0, k).recover_sender().unwrap()
+}
+
+/// Review M3: registering a signer needs that signer key's proof of
+/// possession bound to the registering validator. Squatting (no proof or a
+/// proof from another key) and a proof replayed by another validator are
+/// rejected; clearing needs no proof.
+#[test]
+fn set_requires_the_signer_keys_proof_of_possession() {
+    let (_d, db) = oracle_db();
+    let squat = |v: u8, proof| (addr(v), NativeAction::SetOracleSigner { signer: S, proof });
+    assert_rejected(&exec(&db, 1, squat(V2, None)), "proof of possession");
+    let wrong_key = sign_oracle_signer_proof(&addr(V2), 1, &skey(99));
+    assert_rejected(&exec(&db, 2, squat(V2, Some(wrong_key))), "proof of possession");
+    assert_eq!(index(&db, S), None, "the squat wrote nothing");
+    assert_eq!(signer_of(&db, V2), None);
+
+    let v1_proof = sign_oracle_signer_proof(&addr(V1), 5, &skey(50));
+    assert!(exec(&db, 3, squat(V1, Some(v1_proof.clone()))).success, "valid proof accepted");
+    assert_eq!(signer_of(&db, V1), Some(S));
+    assert!(exec(&db, 4, set(V1, Address::ZERO)).success, "clearing needs no proof");
+    assert_rejected(&exec(&db, 5, squat(V3, Some(v1_proof))), "proof of possession");
+    assert_eq!(index(&db, S), None, "V1's proof replayed by V3 is rejected");
 }
