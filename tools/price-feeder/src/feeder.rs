@@ -234,7 +234,13 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
                         Readiness::Idle(m) => Some(m),
                     }
                 }
-                Err(e) => Some(e),
+                Err(e) => {
+                    // Review L6: an ERROR (node unreachable, signer not
+                    // registered) is re-checked on the next cycle instead of
+                    // idling a full RECHECK_MS; only "not active" waits.
+                    self.last_check_ms = None;
+                    Some(e)
+                }
             };
             if let Some(m) = &self.idle {
                 tracing::warn!("feeder idle: {m}");
@@ -579,5 +585,18 @@ mod tests {
         let mut f = feeder(cfg(""), &n, &http, &clock);
         assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::Submitted { ok: 1, .. }));
         assert_eq!(f.status().lock().unwrap().markets[&1].sources, 6, "OKX's 6 s old quote is stale");
+    }
+
+    /// Review L6: an ERROR from the registration check (node unreachable) is
+    /// retried on the next cycle, not after 60 s.
+    #[tokio::test]
+    async fn registration_check_error_is_retried_next_cycle() {
+        let (http, clock, n) = (Arc::new(FakeHttp::with_fixtures()), FakeClock::new(T0), node("active"));
+        n.set_validators_err("connection refused");
+        let mut f = feeder(cfg(""), &n, &http, &clock);
+        assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::Idle(ref m) if m.contains("connection refused")));
+        n.set_validators(vec![ValidatorInfo { address: V.parse().unwrap(), status: "active".into(), oracle_signer: Some(signer()) }]);
+        clock.set(T0 + 3_000);
+        assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::Submitted { ok: 1, .. }));
     }
 }
