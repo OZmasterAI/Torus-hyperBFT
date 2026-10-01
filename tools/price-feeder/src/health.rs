@@ -127,19 +127,32 @@ pub fn route(request: &str, st: &FeederStatus, now_ms: u64) -> (u16, &'static st
     }
 }
 
-/// Accept loop on `listener` (bind it to loopback). One request per connection.
+/// Review L4: a connection must deliver its request within this long, or it
+/// is closed (an idle client cannot pin a task forever).
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Accept loop on `listener` (bind it to loopback). One request per
+/// connection. Never returns: an accept error is logged and the loop goes on
+/// (review L4: it used to end the server silently).
 pub async fn serve<C: Clock + Clone + 'static>(
     listener: tokio::net::TcpListener,
     status: Arc<Mutex<FeederStatus>>,
     clock: C,
-) -> std::io::Result<()> {
+) {
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let mut stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                tracing::warn!("health server: accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let (status, clock) = (status.clone(), clock.clone());
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
+            let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => n,
                 _ => return,
             };
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -279,5 +292,25 @@ mod tests {
         s.read_to_string(&mut out).await.unwrap();
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
         assert!(out.contains("feeder_cycles_total 5"));
+    }
+
+    /// Review L4: a connection that never sends a request is closed after the
+    /// read timeout, and the server keeps serving others.
+    #[tokio::test]
+    async fn idle_connection_is_closed_after_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let status = std::sync::Arc::new(std::sync::Mutex::new(healthy()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, status, crate::fetch::FakeClock::new(NOW)));
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
+        assert!(closed.is_ok(), "idle connection still open after 5 s");
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
     }
 }

@@ -135,12 +135,21 @@ async fn run(cfg: Config) -> Result<(), String> {
         .map_err(|e| format!("health_listen {}: {e}", cfg.health_listen))?;
     tracing::info!(signer = %format!("{signer:#x}"), health = %cfg.health_listen, "price feeder starting");
     let feeder = Feeder::new(cfg, http, node, SystemClock, key);
-    tokio::spawn(health::serve(listener, feeder.status(), SystemClock));
+    // Review L4: the health task handle is checked — if the server ever
+    // stops (panic), the feeder stops with an error instead of running blind.
+    let mut health = tokio::spawn(health::serve(listener, feeder.status(), SystemClock));
     feeder
         .run(async {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                r = &mut health => tracing::error!("health server stopped: {r:?}"),
+            }
         })
         .await;
+    if health.is_finished() {
+        return Err("health server stopped".into());
+    }
+    health.abort();
     Ok(())
 }
 
