@@ -755,6 +755,40 @@ fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
     }
 }
 
+/// Pending stops in the books at block start hold slots: 998 resting + 2
+/// stops = 1000 open, so the next GTC is rejected; a cancel-all frees all.
+#[test]
+fn open_limit_counts_pending_stops_at_block_start() {
+    let (a, b) = (addr(1), addr(6));
+    let stop = |trigger: i64| PlaceOrderParams {
+        order_type: OrderType::StopMarket {
+            trigger: fp(trigger),
+        },
+        ..gtc(2, true, 0, 1)
+    };
+    let mut block1 = interleave(vec![resting(a, 998), resting(b, 10)]);
+    block1.push(place(a, stop(200)));
+    block1.push(place(a, stop(210)));
+    let blocks = vec![
+        block1,
+        vec![place(a, gtc(6, true, 50, 1)), place(b, gtc(6, true, 50, 1))],
+        vec![
+            (a, NativeAction::CancelAllOrders { market_id: None }),
+            place(a, gtc(6, true, 50, 1)),
+            place(b, gtc(6, true, 49, 1)),
+        ],
+    ];
+    let golden = run_with_volumes(&blocks, 0, &[]);
+    assert!(golden.0.results[0].iter().all(|r| r.0));
+    assert!(is_open_limit(&golden.0.results[1][0]), "{:?}", golden.0.results[1]);
+    assert!(golden.0.results[1][1].0);
+    assert!(golden.0.results[2].iter().all(|r| r.0), "{:?}", golden.0.results[2]);
+    assert_eq!(golden.1, 1);
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_with_volumes(&blocks, threads, &[]), "threads={threads}");
+    }
+}
+
 // ============================================================================
 // 6. cum_volume: maker and taker add price*qty on every fill
 // ============================================================================

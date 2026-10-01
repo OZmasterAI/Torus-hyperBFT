@@ -453,6 +453,18 @@ struct OpenSlots {
     limit: u32,
 }
 
+/// Whether `p` holds an open-order slot: everything but Market, IOC and FOK
+/// orders (they never rest); stops always do while pending.
+fn takes_open_slot(p: &PlaceOrderParams) -> bool {
+    let never_rests = matches!(p.order_type, OrderType::Market)
+        || matches!(p.time_in_force, TimeInForce::IOC | TimeInForce::FOK);
+    !never_rests
+        || matches!(
+            p.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        )
+}
+
 #[cfg(test)]
 mod parallel_engine_toggle_tests {
     use super::parse_parallel_engine_threads;
@@ -3666,6 +3678,16 @@ impl NativeExecutor {
         // instead of a per-order deep clone of `PlaceOrderParams`.
         let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
 
+        // Open orders after Phase 1 of every sender with an order that takes
+        // an open-order slot (read by the serial loop and the sharded workers).
+        let open_at_start = Self::open_order_counts(
+            &ctx.order_books,
+            place_order_indices.iter().filter_map(|&i| match &flat[i] {
+                (sender, FlatAction::Place(p)) if takes_open_slot(p) => Some(sender),
+                _ => None,
+            }),
+        );
+
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
         // re-hitting the overlay's lock + alloc + Borsh path.
@@ -3719,7 +3741,7 @@ impl NativeExecutor {
                 match Self::phase2_parallel_prepare(
                     &ctx.positions,
                     &ctx.margin_configs,
-                    &ctx.order_books,
+                    &open_at_start,
                     &groups,
                     engine_threads,
                     n,
@@ -3789,7 +3811,7 @@ impl NativeExecutor {
                 let taken = match Self::take_open_slot(
                     slots,
                     &ctx.positions,
-                    &ctx.order_books,
+                    &open_at_start,
                     sender,
                     params,
                 ) {
@@ -4045,7 +4067,7 @@ impl NativeExecutor {
     fn phase2_parallel_prepare<T: StateBackend>(
         positions: &PositionManager<T>,
         margin_configs: &HashMap<MarketId, MarketMarginConfig>,
-        books: &HashMap<MarketId, OrderBook>,
+        open_at_start: &HashMap<Address, u32>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -4068,7 +4090,11 @@ impl NativeExecutor {
                                 let mut slots = None;
                                 for &(i, params) in orders {
                                     let taken = match Self::take_open_slot(
-                                        &mut slots, positions, books, sender, params,
+                                        &mut slots,
+                                        positions,
+                                        open_at_start,
+                                        sender,
+                                        params,
                                     ) {
                                         Ok(taken) => taken,
                                         Err((reason, msg)) => {
@@ -5013,24 +5039,18 @@ impl NativeExecutor {
     /// PostOnly, a stop while pending) needs a free slot; as on Hyperliquid,
     /// reduce-only and stop orders also need fewer than
     /// `OPEN_ORDER_BASE_LIMIT` open orders. `slots` loads on the
-    /// sender's first such order: open orders summed over `books` (after
-    /// Phase 1) and the limit from the stored `cum_volume`. Returns the slots
-    /// with this order counted; the caller stores them only once the order
-    /// also passed its margin reserve, so a rejected order takes no slot.
+    /// sender's first such order: its open orders after Phase 1
+    /// (`open_at_start`) and the limit from the stored `cum_volume`. Returns
+    /// the slots with this order counted; the caller stores them only once the
+    /// order also passed its margin reserve, so a rejected order takes no slot.
     fn take_open_slot<T: StateBackend>(
         slots: &mut Option<OpenSlots>,
         positions: &PositionManager<T>,
-        books: &HashMap<MarketId, OrderBook>,
+        open_at_start: &HashMap<Address, u32>,
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> Result<Option<OpenSlots>, (RejectReason, String)> {
-        let is_stop = matches!(
-            params.order_type,
-            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
-        );
-        let never_rests = matches!(params.order_type, OrderType::Market)
-            || matches!(params.time_in_force, TimeInForce::IOC | TimeInForce::FOK);
-        if never_rests && !is_stop {
+        if !takes_open_slot(params) {
             return Ok(None);
         }
         let s = match *slots {
@@ -5039,13 +5059,16 @@ impl NativeExecutor {
                 let volume = positions
                     .get_cum_volume(sender)
                     .map_err(|e| (RejectReason::Other, e.to_string()))?;
-                let open: usize = books.values().map(|b| b.open_order_count(sender)).sum();
                 *slots.insert(OpenSlots {
-                    open: u32::try_from(open).unwrap_or(u32::MAX),
+                    open: open_at_start.get(sender).copied().unwrap_or(0),
                     limit: open_order_limit(volume),
                 })
             }
         };
+        let is_stop = matches!(
+            params.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        );
         if (params.reduce_only || is_stop) && s.open >= OPEN_ORDER_BASE_LIMIT {
             return Err((
                 RejectReason::OpenLimit,
@@ -5071,6 +5094,28 @@ impl NativeExecutor {
         }))
     }
 
+    /// Open orders (resting + pending stops) of each of `senders`, summed
+    /// over all books. Book-outer: each book's trader index stays hot while
+    /// every sender probes it, and its stops are walked once (a sender-outer
+    /// walk measured ~4-5x slower at 300 markets).
+    fn open_order_counts<'a>(
+        books: &HashMap<MarketId, OrderBook>,
+        senders: impl Iterator<Item = &'a Address>,
+    ) -> HashMap<Address, u32> {
+        let mut idx: HashMap<Address, usize> = HashMap::new();
+        for sender in senders {
+            let next = idx.len();
+            idx.entry(*sender).or_insert(next);
+        }
+        let mut counts = vec![0usize; idx.len()];
+        for book in books.values() {
+            book.add_open_order_counts(&idx, &mut counts);
+        }
+        idx.into_iter()
+            .map(|(sender, i)| (sender, u32::try_from(counts[i]).unwrap_or(u32::MAX)))
+            .collect()
+    }
+
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
     fn add_cum_volume<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -5086,10 +5131,11 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
             &ctx.positions,
-            &ctx.order_books,
+            &open_at_start,
             sender,
             params,
         ) {
