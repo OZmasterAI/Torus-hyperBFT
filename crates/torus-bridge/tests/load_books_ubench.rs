@@ -24,10 +24,10 @@ use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInF
 const N_MARKETS: u64 = 10;
 /// Distinct bid price levels per market.
 const LEVELS: u64 = 400;
-/// `MAX_ORDERS_PER_TRADER_PER_MARKET`.
-const PER_TRADER: u64 = 200;
-/// Traders placing per block (x 200 orders x 10 markets = 20k orders/block).
-const TRADERS_PER_BLOCK: u64 = 10;
+/// Orders per trader per market: x 10 markets = the 1000 open-order limit.
+const PER_TRADER: u64 = 100;
+/// Traders placing per block (x 100 orders x 10 markets = 20k orders/block).
+const TRADERS_PER_BLOCK: u64 = 20;
 
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
