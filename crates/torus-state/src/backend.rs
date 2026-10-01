@@ -827,7 +827,7 @@ impl NativeStateOverlay {
     }
 
     /// The native-root dirty `(cf_tag, key) -> Option<value>` set this overlay would flush — writes
-    /// (`Some`) and deletes (`None`) hitting the 6 native-root CFs only (mirrors `dirty_evm_accounts`).
+    /// (`Some`) and deletes (`None`) hitting the 7 native-root CFs only (mirrors `dirty_evm_accounts`).
     /// Fed to the bucketed native trie (A2.2) so it tracks the committed native state. Non-root CFs
     /// (nonces, governance, markets, …) are excluded — they are not part of the native root.
     pub fn dirty_native_keys(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
@@ -971,7 +971,7 @@ fn flush_pending_with_native_trie_stats(
             member_misses: 0,
             member_evictions: 0,
             member_resident_buckets: 0,
-            dirty_entries_by_cf: [0; 6],
+            dirty_entries_by_cf: [0; 7],
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
         for (tag, _) in dirty.keys() {
@@ -1115,7 +1115,7 @@ pub struct NativeFlushStats {
     /// 3c: native-root dirty entries per cf_tag this flush (frozen
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
-    pub dirty_entries_by_cf: [usize; 6],
+    pub dirty_entries_by_cf: [usize; 7],
 }
 
 /// A layer's pending-write keys starting with `prefix`, in key order.
