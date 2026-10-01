@@ -117,7 +117,7 @@ fn random_book(seed: u64, mode: usize, per_level: usize, traders: u64) -> OrderB
     let mut id = 1u64;
     for _ in 0..per_level * 4 {
         let trader = addr(1 + rng.below(traders) as u8);
-        if book.trader_orders.get(&trader).map_or(0, Vec::len) >= PER_TRADER {
+        if book.trader_orders.get(&trader).map_or(0, TraderOrders::len) >= PER_TRADER {
             continue;
         }
         let level = if rng.below(40) == 0 {
@@ -131,7 +131,7 @@ fn random_book(seed: u64, mode: usize, per_level: usize, traders: u64) -> OrderB
     }
     for _ in 0..24 {
         let trader = addr(1 + rng.below(traders) as u8);
-        let Some(ids) = book.trader_orders.get(&trader).cloned() else {
+        let Some(ids) = book.trader_orders.get(&trader).map(TraderOrders::to_vec) else {
             continue;
         };
         let target = ids[rng.below(ids.len() as u64) as usize];
@@ -313,7 +313,7 @@ fn cancel_all_many_falls_back_on_stale_or_shared_indexes() {
             let mut a = random_book(21, mode, 300, 6);
             let mut b = random_book(21, mode, 300, 6);
             for book in [&mut a, &mut b] {
-                let id = book.trader_orders[&addr(3)][2];
+                let id = book.trader_orders[&addr(3)].to_vec()[2];
                 match case {
                     0 => {
                         book.order_index.remove(&id);
@@ -330,7 +330,7 @@ fn cancel_all_many_falls_back_on_stale_or_shared_indexes() {
                         .trader_orders
                         .get_mut(&addr(4))
                         .unwrap()
-                        .insert(0, 777_777),
+                        .edit(|v| v.insert(0, 777_777)),
                 }
             }
             check(&mut a, &mut b, &[addr(4), addr(3), addr(1)]);
@@ -402,7 +402,7 @@ fn cancel_all_many_exhaustive_small_queues() {
                         // Reversed receipt order on one trader: output order
                         // must follow trader_orders, not FIFO.
                         if let Some(ids) = book.trader_orders.get_mut(&addr(2)) {
-                            ids.reverse();
+                            ids.edit(|v| v.reverse());
                         }
                         prime(&mut book);
                         book
@@ -485,7 +485,7 @@ fn cancel_all_many_timing_probe_deep_levels() {
         let mut book = new_book(mode);
         for id in 1..=300_000u64 {
             let t = trader(1 + rng.below(1_500));
-            if book.trader_orders.get(&t).map_or(0, Vec::len) >= PER_TRADER {
+            if book.trader_orders.get(&t).map_or(0, TraderOrders::len) >= PER_TRADER {
                 continue;
             }
             let (side, price) = LEVELS[rng.below(4) as usize];
