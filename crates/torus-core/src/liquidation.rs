@@ -48,6 +48,9 @@ const SCAN_PAGE: usize = 1_024;
 pub const COOLDOWN_TAG: u8 = 0x02;
 pub const PREV_MARK_TAG: u8 = 0x03;
 pub const CURSOR_KEY: [u8; 1] = [0x04];
+/// Review M2 (s517): `0x06 ‖ trader` — the account was still under MM after
+/// its last liquidation action (keeps the step due; 0x05 is reserved).
+pub const PENDING_TAG: u8 = 0x06;
 
 // ============================================================================
 // Pure parts
@@ -450,6 +453,26 @@ fn prev_mark_key(m: MarketId) -> [u8; 9] {
     k[0] = PREV_MARK_TAG;
     k[1..].copy_from_slice(&m.to_be_bytes());
     k
+}
+
+fn pending_key(t: &Address) -> [u8; 21] {
+    let mut k = [0u8; 21];
+    k[0] = PENDING_TAG;
+    k[1..].copy_from_slice(t.as_slice());
+    k
+}
+
+/// Review M2: mark (`true`) / clear (`false`) `t` as still under MM after its
+/// liquidation action — writes only when the row changes.
+pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<(), CoreError> {
+    let k = pending_key(t);
+    let exists = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some();
+    match (on, exists) {
+        (true, false) => state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &[1])?,
+        (false, true) => state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// D3: whether `t` chunked less than [`CHUNK_COOLDOWN_SECS`] of block time ago.

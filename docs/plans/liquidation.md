@@ -67,6 +67,11 @@ C5 recorded as known limitations.
   position — with more rows the HL ranking covers that window only and a partial close is
   retried by a later step (known limitation).
 
+* **M2 — pending row.** `0x06 ‖ trader` (value `[1]`) is written when an acted account (or the
+  vault) is still under MM after its action (thin book, cooldown, bounded ADL) and deleted when it
+  is healthy, flat or has no marked position; `liquidation_due` also checks it, so the step keeps
+  running without other activity until the account is done.
+
 ## Hyperliquid reference (docs, as summarized in research memory a054f368)
 
 * MM = half the initial margin at max leverage (per asset tier table).
@@ -203,6 +208,7 @@ For each position of the underwater account `U` (ascending market):
 | `0x03 ‖ market(8)` | i128 BE raw | previous mark (ADL price) |
 | `0x04` | trader(20) | scan cursor (only while a pass was cut) |
 | `0x05 ‖ …` | — | reserved: vault deposits / shares (later branch) |
+| `0x06 ‖ trader(20)` | `[1]` | still under MM after its last action — keeps the step due (review M2) |
 
 Appended as tag 6 to `NATIVE_ROOT_CFS` (tags 0-5 frozen and unchanged) and to
 `compute_native_state_root`. An empty CF contributes nothing to either root; rows exist only

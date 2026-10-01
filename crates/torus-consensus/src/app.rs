@@ -16384,4 +16384,53 @@ mod crash_recovery_tests {
         assert_eq!(root_s, root_p);
         assert_eq!(root_s, root_r);
     }
+
+    fn signed_stop_limit_buy(seed: u8, nonce: u64, trigger: i64, limit: i64, qty: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: true,
+                price: px(limit),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::StopLimit { trigger: px(trigger), limit: px(limit) },
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            nonce,
+            &oracle_key(seed),
+        )
+    }
+
+    /// Review M2 (s517): an account left under MM after its stage-1 action
+    /// keeps the step DUE (pending row) — without new actions, oracle rows,
+    /// cooldown or cursor. T long 10 @ 1,000, collateral 300, mark 990 (AV
+    /// 200, MM 247.5: stage 1, 9,900 < 100k: no chunk). Block 13 (oracle rows
+    /// pruned at 12): M bids 4 @ 966 and places a stop-limit buy 6 @ 966
+    /// (trigger 960). The step sells 4 into the bid; that trade fires M's stop,
+    /// which RESTS at 966 after T's IOC remainder is gone. T: AV 104 < MM
+    /// 148.5 -> still stage 1. Block 14 is empty: only the pending row makes
+    /// it run; T sells the last 6 into the stop's bid. Then nothing is due.
+    #[test]
+    fn liquidation_e2e_partial_stage1_keeps_the_step_due() {
+        let (config, db) = liq_fixture_db(10, 300);
+        let ctx = make_exec_ctx(&config, &db);
+        let (t, m) = (oracle_addr(71), oracle_addr(73));
+        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 11)); // 2..=12
+        rounds.push(vec![signed_bid(73, 13_073, 966, 4), signed_stop_limit_buy(73, 13_074, 960, 966, 6)]); // 13
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 14, 15
+        let blocks = liq_blocks(rounds);
+        for b in &blocks[..13] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: no oracle-due");
+        assert_eq!(signed_pos_of(&db, &t), px(6), "block 13: partial (4 sold)");
+        ctx.execute_committed_block(&blocks[13], vec![]); // 14: empty
+        assert_eq!(signed_pos_of(&db, &t), FixedPoint::ZERO, "block 14 re-ran the step");
+        assert_eq!(signed_pos_of(&db, &m), px(10));
+        assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "flat: nothing pending");
+        ctx.execute_committed_block(&blocks[14], vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
 }
