@@ -1,0 +1,141 @@
+{
+ "prp": "running-state-hash",
+ "created": "2026-10-01T11:02:21",
+ "tasks": [
+  {
+   "id": 0,
+   "name": "Classify every CF and its writer paths",
+   "status": "pending",
+   "files": [
+    "crates/torus-state/src/cf.rs",
+    "crates/torus-consensus/src/app.rs"
+   ],
+   "validate": "manual review: CF table in plan doc",
+   "depends_on": []
+  },
+  {
+   "id": 1,
+   "name": "Write-set determinism gate",
+   "status": "pending",
+   "files": [
+    "crates/torus-consensus/src/app.rs",
+    "crates/torus-bridge/src/native_executor.rs"
+   ],
+   "validate": "cargo test -p torus-consensus running_hash_write_set_determinism",
+   "depends_on": [
+    0
+   ]
+  },
+  {
+   "id": 2,
+   "name": "Hash function + frozen cf_id table",
+   "status": "pending",
+   "files": [
+    "crates/torus-state/src/backend.rs",
+    "crates/torus-state/Cargo.toml"
+   ],
+   "validate": "cargo test -p torus-state running_hash",
+   "depends_on": [
+    0
+   ]
+  },
+  {
+   "id": 3,
+   "name": "Capture all consensus writes and persist hash in batch",
+   "status": "pending",
+   "files": [
+    "crates/torus-state/src/backend.rs",
+    "crates/torus-consensus/src/exec_pipeline.rs",
+    "crates/torus-consensus/src/app.rs"
+   ],
+   "validate": "cargo test -p torus-state -p torus-consensus running_hash",
+   "depends_on": [
+    1,
+    2
+   ]
+  },
+  {
+   "id": 4,
+   "name": "Activation height + crash/replay",
+   "status": "pending",
+   "files": [
+    "crates/torus-consensus/src/app.rs"
+   ],
+   "validate": "cargo test -p torus-consensus running_hash_activation running_hash_crash_replay",
+   "depends_on": [
+    3
+   ]
+  },
+  {
+   "id": 5,
+   "name": "AttestStateHash action + tally",
+   "status": "pending",
+   "files": [
+    "crates/torus-types/src/lib.rs",
+    "crates/torus-types/src/eip712.rs",
+    "crates/torus-bridge/src/native_executor.rs",
+    "crates/torus-economics/src/staking.rs"
+   ],
+   "validate": "cargo test -p torus-types -p torus-bridge attest_state_hash",
+   "depends_on": [
+    3
+   ]
+  },
+  {
+   "id": 6,
+   "name": "Auto-submission by validators",
+   "status": "pending",
+   "files": [
+    "crates/torus-consensus/src/app.rs"
+   ],
+   "validate": "cargo test -p torus-consensus state_hash_autosubmit",
+   "depends_on": [
+    5
+   ]
+  },
+  {
+   "id": 7,
+   "name": "Mismatch detection + gated fail-stop",
+   "status": "pending",
+   "files": [
+    "crates/torus-consensus/src/app.rs",
+    "crates/torus-telemetry/src/lib.rs"
+   ],
+   "validate": "cargo test -p torus-consensus state_hash_mismatch",
+   "depends_on": [
+    5
+   ]
+  },
+  {
+   "id": 8,
+   "name": "RPC torus_getStateHash",
+   "status": "pending",
+   "files": [
+    "crates/torus-rpc/src/torus.rs"
+   ],
+   "validate": "cargo test -p torus-rpc state_hash",
+   "depends_on": [
+    5
+   ]
+  },
+  {
+   "id": 9,
+   "name": "Devnet drill + bench cost check",
+   "status": "pending",
+   "files": [
+    "~/bench-results-matched"
+   ],
+   "validate": "manual: mismatch metric + summary.json",
+   "depends_on": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+   ]
+  }
+ ]
+}
