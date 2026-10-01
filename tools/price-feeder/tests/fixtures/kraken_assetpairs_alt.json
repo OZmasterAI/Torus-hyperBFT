@@ -1,0 +1,11 @@
+{
+ "error": [],
+ "result": {
+  "XXBTZUSD": {
+   "altname": "XBTUSD",
+   "wsname": "XBT/USD",
+   "base": "XXBT",
+   "quote": "ZUSD"
+  }
+ }
+}

@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use torus_price_feeder::config::{Config, Exchange};
-use torus_price_feeder::exchange::ReqwestGet;
+use torus_price_feeder::exchange::{check_kraken_pairs, ReqwestGet};
 use torus_price_feeder::feeder::{self, Feeder};
-use torus_price_feeder::fetch::{requests, Clock, Fetcher, SystemClock};
+use torus_price_feeder::fetch::{kraken_pairs, requests, Clock, Fetcher, SystemClock};
 use torus_price_feeder::keyfile::{keygen, load_signer, read_passphrase};
 use torus_price_feeder::node::{startup_check, Readiness, RpcNode};
 use torus_price_feeder::{health, price};
@@ -78,9 +78,11 @@ async fn check(cfg: Config) -> Result<(), String> {
         println!("warning    {w}");
     }
     let http = Arc::new(ReqwestGet::new()?);
+    let timeout = std::time::Duration::from_millis(cfg.fetch_timeout_ms);
+    check_kraken_pairs(&*http, &cfg.base_url(Exchange::Kraken), &kraken_pairs(&cfg), timeout).await?;
+    println!("kraken     pairs ok");
     let mut fetcher = Fetcher::default();
     let clock = SystemClock;
-    let timeout = std::time::Duration::from_millis(cfg.fetch_timeout_ms);
     fetcher.fetch_all(&http, &clock, &requests(&cfg), timeout).await;
     let now = clock.now_ms();
     println!("\nvenues");
@@ -125,11 +127,14 @@ async fn run(cfg: Config) -> Result<(), String> {
     if let Readiness::Idle(m) = &report.readiness {
         tracing::warn!("validator not active, feeder idles until it is: {m}");
     }
+    let http = Arc::new(ReqwestGet::new()?);
+    let timeout = std::time::Duration::from_millis(cfg.fetch_timeout_ms);
+    check_kraken_pairs(&*http, &cfg.base_url(Exchange::Kraken), &kraken_pairs(&cfg), timeout).await?;
     let listener = tokio::net::TcpListener::bind(&cfg.health_listen)
         .await
         .map_err(|e| format!("health_listen {}: {e}", cfg.health_listen))?;
     tracing::info!(signer = %format!("{signer:#x}"), health = %cfg.health_listen, "price feeder starting");
-    let feeder = Feeder::new(cfg, Arc::new(ReqwestGet::new()?), node, SystemClock, key);
+    let feeder = Feeder::new(cfg, http, node, SystemClock, key);
     tokio::spawn(health::serve(listener, feeder.status(), SystemClock));
     feeder
         .run(async {
