@@ -3309,6 +3309,9 @@ impl NativeExecutor {
                 Self::exec_update_commission(ctx, sender, *new_rate)
             }
             NativeAction::JailVote { target } => Self::exec_jail_vote(ctx, sender, target),
+            NativeAction::AttestStateHash { height, hash } => {
+                Self::exec_attest_state_hash(ctx, sender, *height, hash)
+            }
             NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
             NativeAction::RotateValidatorKey { new_pubkey } => {
                 Self::exec_rotate_key(ctx, sender, new_pubkey)
@@ -5506,6 +5509,23 @@ impl NativeExecutor {
                 NativeActionResult::ok("jail_vote", gas)
             }
             Err(e) => NativeActionResult::err("jail_vote", e.to_string()),
+        }
+    }
+
+    /// Running state hash: validator-only attestation (see
+    /// `StakingManager::record_state_hash_attestation`).
+    fn exec_attest_state_hash<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        height: u64,
+        hash: &torus_types::B256,
+    ) -> NativeActionResult {
+        match ctx
+            .staking
+            .record_state_hash_attestation(*sender, height, hash.0, ctx.block_height)
+        {
+            Ok(_) => NativeActionResult::ok("attest_state_hash", 2000),
+            Err(e) => NativeActionResult::err("attest_state_hash", e.to_string()),
         }
     }
 

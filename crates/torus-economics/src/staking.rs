@@ -7,7 +7,7 @@ use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::{
     CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
-    CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
+    CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS, CF_STATE_HASH_VOTES,
 };
 use torus_state::{StateBackend, StateDb};
 
@@ -612,6 +612,111 @@ impl<T: StateBackend> StakingManager<T> {
             .fold(U256::ZERO, |acc, s| acc + s))
     }
 
+    // ========================================================================
+    // Running state hash attestations (docs/plans/running-state-hash-impl.md)
+    // ========================================================================
+
+    /// `AttestStateHash { height, hash }` from `voter` in block `current_block`.
+    ///
+    /// Rules (deterministic, never looks at any local hash): the voter must be an
+    /// ACTIVE validator; `height` must be a checkpoint height (`> 0`,
+    /// `% STATE_HASH_CHECKPOINT_INTERVAL == 0`) strictly below `current_block`
+    /// and inside the retained window; the FIRST vote of a validator for a
+    /// height wins (a second one is rejected, nothing written). After storing
+    /// the vote, if the current stake of the active validators that voted one
+    /// hash is > 2/3 of the total active stake, that hash is recorded as the
+    /// height's quorum hash (once; never overwritten). Votes and quorum records
+    /// of heights `<= height - INTERVAL * RETAIN` are pruned.
+    ///
+    /// Returns the quorum hash if THIS vote completed the quorum.
+    pub fn record_state_hash_attestation(
+        &self,
+        voter: Address,
+        height: u64,
+        hash: [u8; 32],
+        current_block: u64,
+    ) -> Result<Option<[u8; 32]>> {
+        use torus_state::running_hash::{
+            STATE_HASH_CHECKPOINT_INTERVAL as INTERVAL, STATE_HASH_CHECKPOINT_RETAIN as RETAIN,
+        };
+        let voter_val = self
+            .get_validator(&voter)?
+            .ok_or(EconomicsError::ValidatorNotFound(voter))?;
+        if voter_val.status != ValidatorStatus::Active {
+            return Err(EconomicsError::ValidatorNotFound(voter));
+        }
+        if height == 0 || height % INTERVAL != 0 || height >= current_block {
+            return Err(EconomicsError::InvalidStateHashAttestation(format!(
+                "state hash attestation height {height} is not a past checkpoint at block {current_block}"
+            )));
+        }
+        if height.saturating_add(INTERVAL * RETAIN) <= current_block {
+            return Err(EconomicsError::InvalidStateHashAttestation(format!(
+                "state hash attestation height {height} is outside the retained window at block {current_block}"
+            )));
+        }
+        let vkey = state_hash_vote_key(height, &voter);
+        if self.state.get_cf_raw(CF_STATE_HASH_VOTES, &vkey)?.is_some() {
+            return Err(EconomicsError::InvalidStateHashAttestation(format!(
+                "validator {voter} already attested height {height}"
+            )));
+        }
+        self.state.put_cf_raw(CF_STATE_HASH_VOTES, &vkey, &hash)?;
+
+        let mut quorum = None;
+        let qkey = state_hash_quorum_key(height);
+        if self.state.get_cf_raw(CF_STATE_HASH_VOTES, &qkey)?.is_none() {
+            let mut weight = U256::ZERO;
+            for (other, h) in self.state_hash_votes(height)? {
+                if h != hash {
+                    continue;
+                }
+                if let Some(v) = self.get_validator(&other)? {
+                    if v.status == ValidatorStatus::Active {
+                        weight += v.total_stake();
+                    }
+                }
+            }
+            let total = self.total_active_stake()?;
+            if weight * U256::from(3u64) > total * U256::from(2u64) {
+                self.state.put_cf_raw(CF_STATE_HASH_VOTES, &qkey, &hash)?;
+                quorum = Some(hash);
+            }
+        }
+
+        if let Some(cutoff) = height.checked_sub(INTERVAL * RETAIN) {
+            for (key, _) in self.state.iterate_cf(CF_STATE_HASH_VOTES, None)? {
+                let h = key.get(1..9).map(|b| u64::from_be_bytes(b.try_into().unwrap()));
+                if h.is_some_and(|h| h <= cutoff) {
+                    self.state.delete_cf_raw(CF_STATE_HASH_VOTES, &key)?;
+                }
+            }
+        }
+        Ok(quorum)
+    }
+
+    /// Recorded votes for checkpoint `height`, ascending by voter address.
+    pub fn state_hash_votes(&self, height: u64) -> Result<Vec<(Address, [u8; 32])>> {
+        let mut prefix = [0u8; 9];
+        prefix[0] = STATE_HASH_VOTE_TAG;
+        prefix[1..].copy_from_slice(&height.to_be_bytes());
+        let mut out = Vec::new();
+        for (key, value) in self.state.iterate_cf(CF_STATE_HASH_VOTES, Some(&prefix))? {
+            if let (Some(voter), Ok(hash)) = (key.get(9..29), <[u8; 32]>::try_from(value.as_slice())) {
+                out.push((Address::from_slice(voter), hash));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The quorum hash recorded for checkpoint `height`, if any.
+    pub fn state_hash_quorum(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .state
+            .get_cf_raw(CF_STATE_HASH_VOTES, &state_hash_quorum_key(height))?
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
+    }
+
     /// Clear all jail votes targeting a validator (called on unjail).
     pub fn clear_jail_votes(&self, target: &Address) -> Result<()> {
         let prefix = target.as_slice();
@@ -1055,6 +1160,26 @@ pub fn slash_record_key(validator: &Address, block_height: u64) -> [u8; 28] {
     let mut key = [0u8; 28];
     key[..20].copy_from_slice(validator.as_slice());
     key[20..28].copy_from_slice(&block_height.to_be_bytes());
+    key
+}
+
+const STATE_HASH_VOTE_TAG: u8 = 0x01;
+const STATE_HASH_QUORUM_TAG: u8 = 0x02;
+
+/// `CF_STATE_HASH_VOTES` vote key: `0x01 ‖ height(8 BE) ‖ voter(20)`.
+pub fn state_hash_vote_key(height: u64, voter: &Address) -> [u8; 29] {
+    let mut key = [0u8; 29];
+    key[0] = STATE_HASH_VOTE_TAG;
+    key[1..9].copy_from_slice(&height.to_be_bytes());
+    key[9..].copy_from_slice(voter.as_slice());
+    key
+}
+
+/// `CF_STATE_HASH_VOTES` quorum key: `0x02 ‖ height(8 BE)`.
+pub fn state_hash_quorum_key(height: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = STATE_HASH_QUORUM_TAG;
+    key[1..].copy_from_slice(&height.to_be_bytes());
     key
 }
 

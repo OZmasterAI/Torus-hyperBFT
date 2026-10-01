@@ -677,6 +677,15 @@ pub enum NativeAction {
     DelistMarket {
         market_id: MarketId,
     },
+
+    // === Running state hash (docs/plans/running-state-hash-impl.md) ===
+    /// Validator-only: the sender's running state hash `h_height` at checkpoint
+    /// `height` (`height % 100 == 0`). Appended LAST so every existing bincode
+    /// discriminant is unchanged.
+    AttestStateHash {
+        height: u64,
+        hash: B256,
+    },
 }
 
 impl NativeAction {
@@ -941,6 +950,11 @@ impl NativeAction {
             NativeAction::RevokeSession { session_pubkey } => {
                 buf.push(24);
                 buf.extend_from_slice(session_pubkey);
+            }
+            NativeAction::AttestStateHash { height, hash } => {
+                buf.push(26);
+                buf.extend_from_slice(&height.to_be_bytes());
+                buf.extend_from_slice(hash.as_slice());
             }
         }
     }

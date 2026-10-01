@@ -111,6 +111,10 @@ fn actions() -> Vec<NativeAction> {
             market_id: u64::MAX,
         },
         NativeAction::TopUpSelfStake { amount: U256::MAX },
+        NativeAction::AttestStateHash {
+            height: u64::MAX,
+            hash: B256::repeat_byte(11),
+        },
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
         for new_qty in [None, Some(FixedPoint::MAX)] {
@@ -199,7 +203,7 @@ fn append_canonical_bytes_matches_frozen_encoder_for_all_variants() {
     }
     assert_eq!(
         tags,
-        (0u8..=25).collect(),
+        (0u8..=26).collect(),
         "all action tags must be covered"
     );
 }
@@ -577,6 +581,11 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
         NativeAction::RevokeSession { session_pubkey } => {
             buf.push(24);
             buf.extend_from_slice(session_pubkey);
+        }
+        NativeAction::AttestStateHash { height, hash } => {
+            buf.push(26);
+            buf.extend_from_slice(&height.to_be_bytes());
+            buf.extend_from_slice(hash.as_slice());
         }
     }
     buf

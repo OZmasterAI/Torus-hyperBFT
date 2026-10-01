@@ -119,6 +119,12 @@ pub const CF_NATIVE_PENDING: &str = "cf_native_pending";
 /// layout ahead of the protocol landing.
 pub const CF_NATIVE_SHARDS: &str = "cf_native_shards";
 
+// Running state hash attestations (docs/plans/running-state-hash-impl.md)
+/// CONSENSUS state written by `AttestStateHash`: per-checkpoint validator votes
+/// `0x01 ‖ height(8 BE) ‖ voter(20)` -> hash(32) and quorum records
+/// `0x02 ‖ height(8 BE)` -> hash(32), pruned to the retained checkpoints.
+pub const CF_STATE_HASH_VOTES: &str = "cf_state_hash_votes";
+
 // Session keys
 /// Session key storage. Key: ed25519 pubkey (32 bytes). Value: JSON-encoded SessionData.
 pub const CF_SESSIONS: &str = "cf_sessions";
@@ -222,4 +228,5 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_NATIVE_TRIE,
     CF_NATIVE_HASHED,
     CF_BOOK_ORDER_ROWS,
+    CF_STATE_HASH_VOTES,
 ];

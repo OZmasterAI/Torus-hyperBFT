@@ -132,6 +132,9 @@ pub enum EconomicsError {
     #[error("validator whitelist entry expired for {0}")]
     WhitelistExpired(Address),
 
+    #[error("invalid state hash attestation: {0}")]
+    InvalidStateHashAttestation(String),
+
     #[error("validator {0} commission cooldown not expired")]
     CommissionCooldownNotExpired(Address),
 

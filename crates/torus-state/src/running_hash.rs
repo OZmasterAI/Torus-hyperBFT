@@ -47,6 +47,7 @@ pub const HASHED_CFS: &[(u8, &str)] = &[
     (19, CF_SESSIONS),
     (20, CF_CORE_WRITER_QUEUE),
     (21, CF_CONSENSUS_META),
+    (22, CF_STATE_HASH_VOTES),
     (0x80, CF_ACCOUNTS),
     (0x81, CF_STORAGE),
     (0x82, CF_CODE),
@@ -433,6 +434,7 @@ mod tests {
         let markets = hashed_cf_id(CF_NATIVE_MARKETS).unwrap();
         assert!(!key_is_hashed(markets, b"__book_mode__"));
         assert!(key_is_hashed(markets, b"__next_global_order_id__"));
+        assert_eq!(hashed_cf_id(CF_STATE_HASH_VOTES), Some(22), "attestation votes are consensus state");
         assert!(key_is_hashed(markets, &7u64.to_be_bytes()));
         let meta = hashed_cf_id(CF_CONSENSUS_META).unwrap();
         assert!(key_is_hashed(meta, b"pending_rotation:\x01"));

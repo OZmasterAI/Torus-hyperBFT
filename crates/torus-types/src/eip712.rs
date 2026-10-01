@@ -221,6 +221,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         }
         NativeAction::UpdateCommission { new_rate } => hash_update_commission(*new_rate, nonce),
         NativeAction::JailVote { target } => hash_jail_vote(target, nonce),
+        NativeAction::AttestStateHash { height, hash } => {
+            hash_attest_state_hash(*height, hash, nonce)
+        }
         NativeAction::UnjailSelf => hash_unjail_self(nonce),
         NativeAction::RotateValidatorKey { new_pubkey } => {
             hash_rotate_validator_key(new_pubkey, nonce)
@@ -504,6 +507,16 @@ fn hash_jail_vote(target: &Address, nonce: u64) -> B256 {
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(target));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+fn hash_attest_state_hash(height: u64, state_hash: &B256, nonce: u64) -> B256 {
+    let th = keccak256("AttestStateHash(uint64 height,bytes32 stateHash,uint64 nonce)");
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u64(height));
+    buf.extend_from_slice(&encode_bytes32(state_hash));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -2215,5 +2228,50 @@ mod tests {
                 println!("  {label:8} {per:8.3} ms/batch");
             }
         }
+    }
+
+    // --- AttestStateHash (running state hash, docs/plans/running-state-hash-impl.md) ---
+
+    #[test]
+    fn attest_state_hash_eip712_struct_hash_and_round_trip() {
+        let hash = B256::repeat_byte(0x5a);
+        let action = NativeAction::AttestStateHash { height: 200, hash };
+        // Struct hash = keccak(typehash ‖ height ‖ stateHash ‖ nonce), EIP-712 encoded.
+        let th = keccak256("AttestStateHash(uint64 height,bytes32 stateHash,uint64 nonce)");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&th.0);
+        buf.extend_from_slice(&encode_u64(200));
+        buf.extend_from_slice(hash.as_slice());
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        assert_eq!(eip712_struct_hash(&action, TEST_NONCE), keccak256(&buf));
+        // Every field is bound.
+        let other_h = NativeAction::AttestStateHash { height: 300, hash };
+        let other_x = NativeAction::AttestStateHash { height: 200, hash: B256::repeat_byte(1) };
+        assert_ne!(eip712_struct_hash(&other_h, TEST_NONCE), keccak256(&buf));
+        assert_ne!(eip712_struct_hash(&other_x, TEST_NONCE), keccak256(&buf));
+        // Signs / recovers like every other owner-signed action.
+        let key = test_key();
+        let signed = sign_native_action(action, TEST_NONCE, &key);
+        assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
+    }
+
+    #[test]
+    fn attest_state_hash_canonical_bytes_and_wire_compat() {
+        let hash = B256::repeat_byte(0x5a);
+        let action = NativeAction::AttestStateHash { height: 200, hash };
+        let mut want = vec![26u8];
+        want.extend_from_slice(&200u64.to_be_bytes());
+        want.extend_from_slice(hash.as_slice());
+        assert_eq!(action.canonical_bytes(), want);
+        // Appended as the LAST variant: existing bincode discriminants unchanged.
+        let delist = bincode::serialize(&NativeAction::DelistMarket { market_id: 1 }).unwrap();
+        assert_eq!(&delist[..4], &25u32.to_le_bytes());
+        let bytes = bincode::serialize(&action).unwrap();
+        assert_eq!(&bytes[..4], &26u32.to_le_bytes());
+        let back: NativeAction = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.canonical_bytes(), want);
+        // Not a trading action.
+        assert!(!SessionScope::Trading.allows(&action));
+        assert!(!SessionScope::TransfersOnly.allows(&action));
     }
 }
