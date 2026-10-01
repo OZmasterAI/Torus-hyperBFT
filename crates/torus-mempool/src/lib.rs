@@ -31,7 +31,7 @@ fn now_ms() -> u64 {
 
 pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
-pub use crate::native_pool::is_cancel;
+pub use crate::native_pool::{is_cancel, is_oracle_submission, is_priority};
 
 /// Timing of one [`Mempool::get_native_da_batch_timed`] call (s76).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -660,9 +660,34 @@ impl Mempool {
         action: SignedNativeAction,
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
-
+        // s517: oracle submissions get pool priority, so only an Active
+        // validator or its registered hot signer may pool one, at most
+        // ORACLE_PENDING_PER_VALIDATOR per validator (own address + signer).
+        // Every insert path (RPC, presigned, gossip recover/trusted) ends here.
+        let oracle_accounts = if crate::native_pool::is_oracle_submission(&action.action) {
+            match self.oracle_reporter(&sender) {
+                Some(accounts) => Some(accounts),
+                None => {
+                    return Err(MempoolError::NativeValidationFailed(format!(
+                        "oracle submission from {sender}: not an active validator or its signer"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         {
             let mut pool = self.native.write().unwrap();
+            if let Some(accounts) = &oracle_accounts {
+                // Count + insert under one write lock: the cap cannot be raced.
+                if pool.oracle_pending(accounts) >= crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR {
+                    return Err(MempoolError::NativeValidationFailed(format!(
+                        "oracle pending cap {} reached for validator {}",
+                        crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
+                        accounts[0]
+                    )));
+                }
+            }
             let result = pool.insert_with_restash_key(sender, action, cache_key);
             self.publish_native_pool_size(&pool);
             result?;
@@ -675,6 +700,34 @@ impl Mempool {
         }
         tracing::debug!(%sender, "native action added to mempool");
         Ok(())
+    }
+
+    /// The accounts whose pooled oracle submissions count against `sender`'s
+    /// validator: `[validator, signer?]` for an Active validator sender,
+    /// `[validator, sender]` for its registered hot signer, `None` otherwise.
+    /// At most 2 point reads; the signer index is cross-checked against the
+    /// validator record exactly like exec (`resolve_oracle_reporter`), so a
+    /// stale index entry never resolves.
+    fn oracle_reporter(&self, sender: &Address) -> Option<Vec<Address>> {
+        use torus_economics::ValidatorStatus;
+        let staking = torus_economics::StakingManager::new(self.state.clone());
+        if let Some(v) = staking.get_validator(sender).ok()? {
+            if v.status != ValidatorStatus::Active {
+                return None;
+            }
+            let mut accounts = vec![*sender];
+            accounts.extend(v.oracle_signer);
+            return Some(accounts);
+        }
+        let key = torus_state::cf::oracle_signer_key(sender);
+        let raw = self.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).ok()??;
+        if raw.len() != 20 {
+            return None;
+        }
+        let validator = Address::from_slice(&raw);
+        let rec = staking.get_validator(&validator).ok()??;
+        (rec.status == ValidatorStatus::Active && rec.oracle_signer == Some(*sender))
+            .then(|| vec![validator, *sender])
     }
 
     /// Drain native actions for a block proposal.
@@ -3234,5 +3287,169 @@ mod tests {
         pool.add_evm_tx(raw)
             .expect("pre-155 legacy tx must be admitted");
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----
+
+    fn put_oracle_validator(
+        state: &StateDb,
+        v: Address,
+        status: torus_economics::ValidatorStatus,
+        signer: Option<Address>,
+    ) {
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &v,
+                &torus_economics::ValidatorState {
+                    address: v,
+                    pubkey: [1; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: signer,
+                },
+            )
+            .unwrap();
+        if let Some(s) = signer {
+            state
+                .put_cf_raw(
+                    torus_state::cf::CF_NATIVE_ORACLE,
+                    &torus_state::cf::oracle_signer_key(&s),
+                    v.as_slice(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn oracle_from(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, torus_types::FixedPoint::ONE)],
+                timestamp: 0,
+            }),
+            nonce,
+            k,
+        )
+    }
+
+    const GATE_MSG: &str = "not an active validator or its signer";
+
+    fn assert_gate_rejects(r: Result<(), MempoolError>, who: &str) {
+        match r {
+            Err(MempoolError::NativeValidationFailed(m)) => {
+                assert!(m.contains(GATE_MSG), "{who}: {m}")
+            }
+            other => panic!("{who}: expected the oracle gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_admission_requires_active_validator_or_its_signer() {
+        use torus_economics::ValidatorStatus::{Active, Jailed};
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, ks) = (key(31), key(32));
+        let (v, s) = (address_from_key(&kv), address_from_key(&ks));
+        put_oracle_validator(&state, v, Active, Some(s));
+        let now = now_ms();
+
+        // Admitted: V itself (RPC path) and S through every insert path.
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now)).unwrap();
+        pool.add_native_action_presigned(s, oracle_from(&ks, now + 1)).unwrap();
+        assert_eq!(pool.drain_native(100).len(), 3, "stay under the per-validator cap");
+        pool.add_native_action_from_gossip(s, oracle_from(&ks, now + 2)).unwrap();
+        pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3)).unwrap();
+        assert_eq!(pool.native_pool_size(), 2);
+
+        // Rejected: a jailed validator and its signer.
+        let (kj, kjs) = (key(33), key(34));
+        let (j, js) = (address_from_key(&kj), address_from_key(&kjs));
+        put_oracle_validator(&state, j, Jailed, Some(js));
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kj, now)), "jailed validator");
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kjs, now)), "jailed validator's signer");
+        // A stranger, on every path.
+        let kx = key(35);
+        let x = address_from_key(&kx);
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kx, now)), "stranger");
+        assert_gate_rejects(pool.add_native_action_presigned(x, oracle_from(&kx, now)), "stranger presigned");
+        assert_gate_rejects(pool.add_native_action_from_gossip(x, oracle_from(&kx, now)), "stranger gossip");
+        assert_gate_rejects(pool.add_native_action_from_gossip_trusted(x, oracle_from(&kx, now)), "stranger trusted");
+        // A stale index entry: "sgn"||T -> V while V.oracle_signer == Some(S).
+        let kt = key(36);
+        let t = address_from_key(&kt);
+        state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .unwrap();
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kt, now)), "stale index entry");
+        assert_eq!(pool.native_pool_size(), 2);
+        // Non-oracle actions are not gated.
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kx))
+            .unwrap();
+    }
+
+    #[test]
+    fn oracle_cap_is_four_per_validator_across_its_signer() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, ks, kw) = (key(41), key(42), key(43));
+        let (v, s, w) = (address_from_key(&kv), address_from_key(&ks), address_from_key(&kw));
+        put_oracle_validator(&state, v, Active, Some(s));
+        put_oracle_validator(&state, w, Active, None);
+        let now = now_ms();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now + 1)).unwrap();
+        for (k, n) in [(&kv, now + 2), (&ks, now + 2)] {
+            match pool.add_native_action(oracle_from(k, n)) {
+                Err(MempoolError::NativeValidationFailed(m)) => {
+                    assert!(m.contains("oracle pending cap"), "{m}")
+                }
+                other => panic!("5th must hit the cap, got {other:?}"),
+            }
+        }
+        // Another validator is unaffected; V's non-oracle actions are not capped.
+        pool.add_native_action(oracle_from(&kw, now)).unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
+            .unwrap();
+        assert_eq!(pool.native_pool_size(), 6);
+    }
+
+    /// M4: the deepest pacing tier selects cancels, then oracle submissions;
+    /// everything else stays pooled.
+    #[test]
+    fn priority_only_tier_selects_cancels_then_oracle() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, kc) = (key(51), key(52));
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        let now = now_ms();
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
+            .unwrap();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::CancelOrder { order_id: 3 },
+            now + 1,
+            &kc,
+        ))
+        .unwrap();
+        let sel = pool.select_native_cancels_for_block_with_senders_excluding(
+            100,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 2);
+        assert!(is_cancel(&sel[0].1.action));
+        assert_eq!(sel[1].0, v);
+        assert!(crate::native_pool::is_oracle_submission(&sel[1].1.action));
+        assert_eq!(pool.native_pool_size(), 3, "the ClaimRewards stays pooled");
     }
 }

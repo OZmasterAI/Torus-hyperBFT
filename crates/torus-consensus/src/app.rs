@@ -294,9 +294,11 @@ enum PacedSelectionCaps {
         bytes_cap: usize,
         orders_cap: usize,
     },
-    /// Deepest tier: propose ONLY pooled cancels — zero new orders enter the
-    /// exec pipeline while it digests the backlog (risk-reducing actions keep
-    /// flowing; selection stays non-destructive so nothing is shed).
+    /// Deepest tier: propose ONLY pooled cancels, then oracle submissions
+    /// (s517) — zero new orders enter the exec pipeline while it digests the
+    /// backlog (risk-reducing actions and the mark keep flowing; selection
+    /// stays non-destructive so nothing is shed). Name kept from the
+    /// cancels-only era.
     CancelsOnly,
 }
 
@@ -5721,7 +5723,7 @@ impl TorusApp {
                 tracing::warn!(
                     exec_backlog,
                     tier,
-                    "exec-backlog pacing: deepest tier — proposing CANCELS ONLY \
+                    "exec-backlog pacing: deepest tier — proposing CANCELS + ORACLE ONLY \
                      (new orders stay pooled until execution catches up)"
                 );
                 mempool.select_native_cancels_for_block_with_senders_excluding(
