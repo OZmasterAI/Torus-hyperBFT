@@ -639,10 +639,20 @@ fn write_native_applied_height(state_db: &StateDb, height: u64) {
 /// flush: the same marker bytes as [`write_native_applied_height`], written
 /// through the one hashed flush so the running state hash advances with the
 /// marker in the same atomic batch.
+///
+/// A failure keeps the existing serial semantics (logged, not latched): if a
+/// later height's flush then lands first, that flush finds no `h(n-1)` and
+/// marks this node hash-unverified (no chaining over the gap, no attesting,
+/// no fail-stop decisions) — see `torus_state::running_hash::chain_step`.
 fn flush_marker_only(state_db: &StateDb, pending: torus_state::FrozenPending) {
     let height = pending.height();
     if let Err(e) = pending.flush_with_native_trie_stats(state_db, Some(height), None, None) {
-        tracing::error!(%e, height, "applied-height marker flush failed (restart will replay)");
+        tracing::error!(
+            %e,
+            height,
+            "applied-height marker flush failed (restart will replay; if a later height flushes \
+             first, the running state hash goes unverified)"
+        );
     }
 }
 
@@ -1436,33 +1446,24 @@ impl ExecutionContext {
         true
     }
 
-    /// Running state hash: block `height`'s consensus writes made durable
-    /// outside its flush batch (Task 0), lowest priority first: the epoch
-    /// boundary's snapshot of every `cf_staking_validators` row and pending
-    /// key rotation (the consensus thread rotates them at proposal time, which
-    /// no height owns — the boundary block's execution is the deterministic
-    /// point), then the recorded slash / writer-precompile commits, then the
-    /// EVM bundle. All three are read or recorded after they became durable,
-    /// so overlapping keys agree.
+    /// Running state hash: block's consensus writes made durable outside its
+    /// flush batch (Task 0), lowest priority first: the recorded slash /
+    /// writer-precompile commits, then the EVM bundle — both recorded on this
+    /// thread as they became durable, so overlapping keys agree.
+    ///
+    /// NOT hashed (review finding 2, tied to the pre-existing bug "epoch
+    /// rotation on the consensus thread"): the consensus thread's epoch
+    /// rotation writes (validator rows, deletion of applied `pending_rotation:`
+    /// rows) — they happen at proposal / validation time, which no executed
+    /// height owns, and the execution thread may lag by any number of blocks,
+    /// so any snapshot of them taken here would depend on timing. The
+    /// validator CF is excluded from the hash for the same reason
+    /// (`torus_state::running_hash::HASHED_CFS`).
     fn running_hash_extras(
-        &self,
-        height: u64,
         out_of_batch: torus_state::OutOfBatchRecorder,
         bundle_extras: torus_state::HashExtras,
     ) -> torus_state::HashExtras {
-        let mut extras = torus_state::HashExtras::new();
-        if EpochManager::is_epoch_boundary(height, self.epoch_length) {
-            for (cf, prefix) in [
-                (torus_state::cf::CF_STAKING_VALIDATORS, None),
-                (CF_CONSENSUS_META, Some(&b"pending_rotation:"[..])),
-            ] {
-                match StateBackend::iterate_cf(&self.state_db, cf, prefix) {
-                    Ok(rows) => rows.iter().for_each(|(k, v)| extras.put(cf, k, v)),
-                    Err(e) => tracing::error!(%e, height, cf, "running hash: epoch snapshot read failed"),
-                }
-            }
-        }
-        extras.extend(out_of_batch.finish());
+        let mut extras = out_of_batch.finish();
         extras.extend(bundle_extras);
         extras
     }
@@ -1707,7 +1708,7 @@ impl ExecutionContext {
                 .observe(evm_timer.elapsed().as_secs_f64());
         }
 
-        let mut hash_extras = Some(self.running_hash_extras(height, out_of_batch, bundle_extras));
+        let mut hash_extras = Some(Self::running_hash_extras(out_of_batch, bundle_extras));
 
         // ---- Native execution ----
         if has_native || computed_fee_revenue > 0 {
@@ -2201,7 +2202,7 @@ impl ExecutionContext {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay)");
+                    tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay; if a later height flushes first, the running state hash goes unverified)");
                     // r3: the folded header did not land with the batch; keep the
                     // pre-fold contract (header persisted at exec) via the
                     // standalone put so the committed height stays visible to
@@ -3499,7 +3500,17 @@ impl TorusApp {
         // fail-stop latch — execution parks at `h` and the live heal loop + backfill
         // get a bounded window to close it (see the `exec_next_height` /
         // `exec_hole_since` wiring in the struct literal below).
+        // Running state hash: the CHAIN-WIDE activation height (genesis) must
+        // be in place before the replay flushes any block.
+        if let Err(e) =
+            torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
+        {
+            tracing::error!(%e, "running state hash: failed to apply the activation config");
+        }
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
+        // Running state hash: a fail-stop latched before the restart stays
+        // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
+        state_hash.relatch_at_boot(&state_db, &exec_failed);
 
         // bl2 exec pipeline: the flush worker is constructed only NOW — after the
         // (serial) boot replay — so the durable marker equals the replayed top
@@ -3820,6 +3831,7 @@ impl TorusApp {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
+            state_hash_activation_height: None,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -6124,6 +6136,7 @@ mod exec_throttle_tests {
                 commit_lag_backoff_cap: 0,
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
+                state_hash_activation_height: None,
             };
             (config, state_db)
         };
@@ -6842,7 +6855,12 @@ mod crash_recovery_tests {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
+            // Running state hash on from height 1 (chain config), as a
+            // genesis-synced node of a chain with activation 1.
+            state_hash_activation_height: Some(1),
         };
+        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
+            .expect("configure running hash activation");
         (config, state_db)
     }
 
@@ -13651,6 +13669,21 @@ mod crash_recovery_tests {
     /// (`PUSH1 1 PUSH1 0 SSTORE`) — a bundle with an account, a storage slot
     /// and fee revenue.
     fn signed_sstore_create(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+        signed_eip1559(
+            key,
+            nonce,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        )
+    }
+
+    /// A signed EIP-1559 tx (`to` call or create, `input` calldata / init code).
+    fn signed_eip1559(
+        key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+    ) -> Vec<u8> {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
         use alloy_rlp::Encodable;
         let tx = TxEip1559 {
@@ -13658,10 +13691,10 @@ mod crash_recovery_tests {
             nonce,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 0,
-            gas_limit: 200_000,
-            to: alloy_primitives::TxKind::Create,
+            gas_limit: 300_000,
+            to,
             value: U256::ZERO,
-            input: alloy_primitives::Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x55]),
+            input: alloy_primitives::Bytes::from(input),
             access_list: Default::default(),
         };
         let sig_hash = tx.signature_hash();
@@ -13680,7 +13713,7 @@ mod crash_recovery_tests {
     ///   1  EVM contract creation (bundle: accounts + storage)   serial
     ///   2  empty + a buffered equivocation slash                 serial marker
     ///   3  empty
-    ///   4  empty, epoch boundary (staking snapshot)               serial marker
+    ///   4  empty, epoch boundary (nothing hashed: no snapshot)    serial marker
     fn out_of_batch_fixture() -> (Vec<TorusBlock>, k256::ecdsa::SigningKey, Address) {
         let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
@@ -13756,16 +13789,16 @@ mod crash_recovery_tests {
         // (c) EVM bundle: the contract's storage slot (only reachable via the bundle).
         let storage = hashed_cf_id(CF_STORAGE).unwrap();
         assert_eq!(in_db(storage, CF_STORAGE, at(1)), 1, "slot 0 of the created contract");
-        // (a) slash at 2: validator row + slash record.
-        let vals = hashed_cf_id(CF_STAKING_VALIDATORS).unwrap();
-        assert_eq!(in_db(vals, CF_STAKING_VALIDATORS, at(2)), 1, "slashed validator row");
-        assert!(at(2).iter().any(|e| e.0 == hashed_cf_id(CF_SLASH_RECORDS).unwrap()), "slash record");
+        // (a) slash at 2: the slash record (validator rows are excluded from
+        // the hash, review finding 2).
+        let slashes = hashed_cf_id(CF_SLASH_RECORDS).unwrap();
+        assert_eq!(in_db(slashes, CF_SLASH_RECORDS, at(2)), 1, "slash record");
+        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), None);
         // 3 is empty: nothing hashed.
         assert!(at(3).is_empty(), "{:?}", at(3));
-        // (b) epoch boundary 4: full staking-validators snapshot.
-        let all = StateBackend::iterate_cf(&state_db, CF_STAKING_VALIDATORS, None).unwrap();
-        assert!(!all.is_empty());
-        assert_eq!(in_db(vals, CF_STAKING_VALIDATORS, at(4)), all.len(), "snapshot = every row");
+        // (b) epoch boundary 4: no snapshot of consensus-thread state (review
+        // finding 2) — an empty boundary block hashes nothing.
+        assert!(at(4).is_empty(), "{:?}", at(4));
         // Restarts do not change the hash.
         let (db2, _) = run_out_of_batch_fixture(&[1, 2, 3]);
         assert_eq!(
@@ -13778,73 +13811,56 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Delete every running-hash META row: the DB of a node that ran a binary
-    /// without the running hash (pre-upgrade).
-    fn strip_running_hash_meta(state_db: &StateDb) {
-        use torus_state::cf::{
-            META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION,
-            META_STATE_HASH_CHECKPOINT_PREFIX,
-        };
-        for key in [META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION] {
-            state_db.delete_cf_raw(CF_CONSENSUS_META, key).unwrap();
-        }
-        for (k, _) in
-            StateBackend::iterate_cf(state_db, CF_CONSENSUS_META, Some(META_STATE_HASH_CHECKPOINT_PREFIX))
-                .unwrap()
-        {
-            state_db.delete_cf_raw(CF_CONSENSUS_META, &k).unwrap();
-        }
-    }
-
-    /// Task 4: a fresh chain activates at its first executed height from
-    /// `h_0` = zeros; an existing (pre-upgrade) DB activates at its next applied
-    /// height, and every node upgraded at that height agrees.
+    /// Review finding 1: the activation height is CHAIN-WIDE (chain config):
+    /// nodes that ran a pre-upgrade binary (no running hash) up to different
+    /// applied heights below it — serial or pipelined — and a node synced
+    /// from genesis all hold the identical hash from the activation height
+    /// on. A node whose DB is already above it is hash-unverified.
     #[test]
-    fn running_hash_activation_fresh_chain_and_existing_db() {
+    fn running_hash_chain_wide_activation_nodes_upgraded_at_different_heights_agree() {
         use torus_bridge::native_executor::BookMode;
-        use torus_state::running_hash::{read_activation_height, read_running_hash};
+        use torus_state::running_hash::{
+            configure_activation, read_activation_height, read_running_hash, read_unverified_since,
+        };
         let mode = BookMode::LevelAuthorityChunked;
-        // Fresh chain.
-        let (_c, fresh) = make_test_config_and_db();
-        fund_book_fixture(&fresh);
-        torus_state::running_hash::capture_begin(&fresh);
-        let ctx = book_pipeline_ctx(&fresh, false, None, mode);
-        for b in &book_fixture_blocks() {
-            dispatch_and_execute(&ctx, &fresh, b);
-        }
-        drop(ctx);
-        let captured = torus_state::running_hash::capture_take(&fresh);
-        assert_eq!(read_activation_height(&fresh), Some(1));
-        assert_eq!(read_running_hash(&fresh), Some(fold_captured(&captured)));
-
-        // Existing DB upgraded after height 5 (two independent nodes, one
-        // pipelined), compared with each other and with the from-genesis node.
-        let upgraded = |on: bool| {
+        let act = 6u64;
+        let blocks = book_fixture_blocks();
+        let node = |upgraded_at: usize, on: bool| {
             let (_c, db) = make_test_config_and_db();
+            configure_activation(&db, None).unwrap(); // pre-upgrade binary
             fund_book_fixture(&db);
-            let blocks = book_fixture_blocks();
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[..5] {
+            for b in &blocks[..upgraded_at] {
                 dispatch_and_execute(&ctx, &db, b);
             }
             drop(ctx);
-            strip_running_hash_meta(&db);
+            configure_activation(&db, Some(act)).unwrap(); // upgrade + restart
             torus_state::running_hash::capture_begin(&db);
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[5..] {
+            for b in &blocks[upgraded_at..] {
                 dispatch_and_execute(&ctx, &db, b);
             }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
             drop(ctx);
             let captured = torus_state::running_hash::capture_take(&db);
-            assert_eq!(captured.first().map(|(h, _)| *h), Some(6));
-            assert_eq!(read_activation_height(&db), Some(6), "on={on}");
-            assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)), "on={on}");
-            read_running_hash(&db).unwrap()
+            (db, captured)
         };
-        let a = upgraded(false);
-        let b = upgraded(true);
-        assert_eq!(a, b, "nodes upgraded at the same height agree");
-        assert_ne!(Some(a), read_running_hash(&fresh), "a different activation height is a different chain");
+        let (genesis_node, captured) = node(0, false);
+        assert_eq!(captured.first().map(|(h, _)| *h), Some(act), "first hashed height = activation");
+        assert_eq!(read_activation_height(&genesis_node), Some(act));
+        let reference = read_running_hash(&genesis_node).unwrap();
+        assert_eq!(reference, fold_captured(&captured), "h_act chains from zeros");
+        assert_eq!(reference.0, 13);
+        for (upgraded_at, on) in [(2, false), (3, true), (5, false), (5, true)] {
+            let (db, _) = node(upgraded_at, on);
+            assert_eq!(read_running_hash(&db), Some(reference), "upgraded at {upgraded_at} on={on}");
+            assert_eq!(read_unverified_since(&db), None);
+        }
+        // DB above the activation height at upgrade: no valid h_{act..}.
+        let (late, captured) = node(8, false);
+        assert!(captured.is_empty(), "never hashed");
+        assert_eq!(read_running_hash(&late), None);
+        assert_eq!(read_unverified_since(&late), Some(9));
     }
 
     /// Task 4: kill after flushing N (committed blocks N+1.. durable, not yet
@@ -14154,6 +14170,355 @@ mod crash_recovery_tests {
         run_votes(&ctx, &db, &[(0, local), (1, local), (2, local)]);
         assert_eq!(mismatch_count(&metrics, "quorum"), 0);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    // ---- Review fixes (s83 independent review of the running state hash) ----
+
+    /// Empty blocks `prev+1..=to` linked to the ACTUAL `prev` (after a block
+    /// that carried actions); returns the last block.
+    fn run_linked_empty(ctx: &ExecutionContext, db: &StateDb, prev: &TorusBlock, to: u64) -> TorusBlock {
+        let mut prev = prev.clone();
+        for h in prev.header.height + 1..=to {
+            let mut b = make_block(h, vec![]);
+            b.header.parent_hash = alloy_primitives::keccak256(prev.header.canonical_header_bytes());
+            dispatch_and_execute(ctx, db, &b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h}");
+            prev = b;
+        }
+        prev
+    }
+
+    fn mempool_for(db: &StateDb) -> Arc<Mempool> {
+        Arc::new(Mempool::new(db.clone(), torus_mempool::MempoolConfig::default()))
+    }
+
+    /// Review finding 1: a hash-unverified node (DB above the activation
+    /// height when it upgraded) never attests and reports itself unverified;
+    /// one upgraded below the activation height attests every checkpoint.
+    #[test]
+    fn state_hash_unverified_node_never_attests() {
+        use torus_state::running_hash::{configure_activation, read_unverified_since};
+        let key = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
+        for (upgraded_at, attests) in [(30u64, true), (60, false)] {
+            let (config, db) = make_test_config_and_db();
+            seed_active_validators(&db, &[&key]);
+            configure_activation(&db, None).unwrap();
+            let ctx = make_exec_ctx(&config, &db);
+            run_empty_blocks(&ctx, &db, 1, upgraded_at);
+            drop(ctx);
+            configure_activation(&db, Some(50)).unwrap();
+            let pool = mempool_for(&db);
+            let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(pool.clone()), false);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            ctx.metrics = Some(metrics.clone());
+            ctx.state_hash.set_attest_key(key.clone());
+            run_empty_blocks(&ctx, &db, upgraded_at + 1, 250);
+            let mut heights: Vec<u64> = pooled_attestations(&pool).iter().map(|(_, h, _)| *h).collect();
+            heights.sort();
+            let gauge = metric_value(&metrics.encode(), "torus_state_hash_unverified");
+            if attests {
+                assert_eq!(heights, vec![100, 200], "upgraded below the activation height: attests");
+                assert_eq!(gauge, 0.0);
+            } else {
+                assert_eq!(read_unverified_since(&db), Some(61));
+                assert!(heights.is_empty(), "hash-unverified: never attests ({heights:?})");
+                assert_eq!(gauge, 1.0, "unverified gauge");
+            }
+        }
+    }
+
+    /// Review findings 1 / 5: a node whose local chain broke — a block whose
+    /// hashed flush was lost while the applied marker moved past it (the
+    /// serial path after a failed flush) — is hash-unverified: it never
+    /// chains over the gap and never fail-stops, even on an on-chain quorum
+    /// that differs from a checkpoint it still holds (the mismatch is still
+    /// reported).
+    #[test]
+    fn state_hash_gap_marks_node_unverified_no_failstop() {
+        use torus_state::running_hash::{read_running_hash, read_unverified_since};
+        let (ctx, db, metrics, _local) = node_at_checkpoint(false, true);
+        let b101 = make_block(101, vec![]);
+        persist_committed_block_durably(&db, &b101);
+        write_native_applied_height(&db, 101); // 101's hashed batch lost
+        run_empty_blocks(&ctx, &db, 102, 105);
+        assert_eq!(read_unverified_since(&db), Some(102));
+        assert_eq!(read_running_hash(&db).map(|(h, _)| h), Some(100), "never chained over 101");
+        let x = B256::repeat_byte(0xee);
+        let keys = validator_keys();
+        let votes = (0..3)
+            .map(|v| {
+                torus_types::eip712::sign_native_action(
+                    NativeAction::AttestStateHash { height: 100, hash: x },
+                    2_000 + v as u64,
+                    &keys[v],
+                )
+            })
+            .collect();
+        let b106 = make_block(106, votes);
+        dispatch_and_execute(&ctx, &db, &b106);
+        run_linked_empty(&ctx, &db, &b106, 107);
+        assert_eq!(StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(), Some(x.0));
+        assert_eq!(mismatch_count(&metrics, "quorum"), 1, "mismatch still reported");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "hash-unverified: no fail-stop");
+        assert_eq!(torus_state::running_hash::read_divergence(&db), None);
+        assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_unverified"), 1.0);
+    }
+
+    /// Review finding 2: the consensus thread's epoch-boundary writes (a key
+    /// rotation applied to the validator row, its pending row deleted) land
+    /// at VALIDATION time of the boundary block while execution may lag any
+    /// number of blocks. Two nodes that see that write at different points of
+    /// their execution — before block 4 (lagging by an epoch) vs right before
+    /// block 8 — hold the same hash: the hash never reads state the consensus
+    /// thread writes (no epoch snapshot) and never hashes the validator rows
+    /// it read-modify-writes (UpdateCommission at 6 rewrites the row with or
+    /// without the rotated pubkey depending on that timing; the final state
+    /// is identical).
+    #[test]
+    fn running_hash_consensus_thread_epoch_write_vs_lagging_exec_equal_across_nodes() {
+        use torus_state::running_hash::read_running_hash;
+        let keys = validator_keys();
+        let v0 = k256_address(&keys[0]);
+        let commission = torus_types::eip712::sign_native_action(
+            NativeAction::UpdateCommission { new_rate: 600 },
+            1_000,
+            &keys[0],
+        );
+        let mut blocks: Vec<TorusBlock> = (1..=8)
+            .map(|h| make_block(h, if h == 6 { vec![commission.clone()] } else { vec![] }))
+            .collect();
+        link_blocks(&mut blocks);
+        let consensus_epoch_write = |db: &StateDb| {
+            let staking = StakingManager::new(db.clone());
+            let rot = staking.get_pending_rotation(&v0).unwrap().expect("rotation pending");
+            assert_eq!(staking.apply_pending_rotations(rot.effective_epoch).unwrap().len(), 1);
+        };
+        let node = |write_before: u64| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            seed_active_validators(&db, &[&keys[0], &keys[1], &keys[2]]);
+            StakingManager::new(db.clone()).submit_key_rotation(v0, [0x99; 32], 1, 0).unwrap();
+            let ctx = make_exec_ctx(&config, &db);
+            for b in &blocks {
+                if b.header.height == write_before {
+                    consensus_epoch_write(&db);
+                }
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {}", b.header.height);
+            }
+            drop(ctx);
+            db
+        };
+        let lagging = node(4);
+        let on_time = node(8);
+        let v = StakingManager::new(lagging.clone()).get_validator(&v0).unwrap().unwrap();
+        assert_eq!((v.commission_bps, v.pubkey), (600, [0x99; 32]), "both writes applied");
+        let vals = |db: &StateDb| {
+            StateBackend::iterate_cf(db, torus_state::cf::CF_STAKING_VALIDATORS, None).unwrap()
+        };
+        assert_eq!(vals(&lagging), vals(&on_time), "identical final validator state");
+        assert_eq!(read_running_hash(&lagging).map(|(h, _)| h), Some(8));
+        assert_eq!(
+            read_running_hash(&lagging),
+            read_running_hash(&on_time),
+            "the hash does not depend on when the consensus thread wrote"
+        );
+    }
+
+    /// Review finding 3: an attestation admitted to the mempool but dropped
+    /// before inclusion is re-signed with a fresh nonce and resubmitted —
+    /// only once the previous signature can no longer land (resubmit window;
+    /// 0 here) — until the vote is ON-CHAIN. A late landing of the dropped
+    /// one is rejected on-chain (first vote wins): never a second vote.
+    #[test]
+    fn state_hash_autosubmit_retries_until_on_chain_with_fresh_nonce() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
+        let me = k256_address(&key);
+        let node = |resubmit_after_ms: Option<u64>| {
+            let (config, db) = make_test_config_and_db();
+            seed_active_validators(&db, &[&key]);
+            let m1 = mempool_for(&db);
+            let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(m1.clone()), false);
+            let mut monitor = crate::state_hash::StateHashMonitor::with_failstop(false);
+            if let Some(ms) = resubmit_after_ms {
+                monitor = monitor.with_resubmit_after_ms(ms);
+            }
+            ctx.state_hash = Arc::new(monitor);
+            ctx.state_hash.set_attest_key(key.clone());
+            run_empty_blocks(&ctx, &db, 1, 100);
+            (ctx, db, m1)
+        };
+
+        // Default window: the dropped signature may still land — no resubmission yet.
+        let (mut ctx, db, m1) = node(None);
+        assert_eq!(pooled_attestations(&m1).len(), 1);
+        let m2 = mempool_for(&db);
+        ctx.mempool = Some(m2.clone()); // m1 dropped it
+        run_empty_blocks(&ctx, &db, 101, 105);
+        assert!(pooled_attestations(&m2).is_empty(), "previous nonce still live: no resubmission");
+        drop(ctx);
+
+        // Window elapsed: re-signed and resubmitted until on-chain.
+        let (mut ctx, db, m1) = node(Some(0));
+        let first = m1.select_native_for_block(1_000);
+        assert_eq!(first.len(), 1);
+        let m2 = mempool_for(&db);
+        ctx.mempool = Some(m2.clone()); // m1 dropped it
+        run_empty_blocks(&ctx, &db, 101, 101);
+        let second = m2.select_native_for_block(1_000);
+        assert_eq!(second.len(), 1, "resubmitted after the drop");
+        assert!(matches!(second[0].action, NativeAction::AttestStateHash { height: 100, .. }));
+        assert_ne!(second[0].nonce, first[0].nonce, "fresh nonce");
+        // The resubmitted one lands, and the dropped one lands late: one vote.
+        let local = torus_state::running_hash::read_checkpoint(&db, 100).unwrap();
+        let b102 = make_block(102, vec![second[0].clone(), first[0].clone()]);
+        ctx.mempool = Some(mempool_for(&db));
+        dispatch_and_execute(&ctx, &db, &b102);
+        assert_eq!(
+            StakingManager::new(db.clone()).state_hash_votes(100).unwrap(),
+            vec![(me, local)],
+            "exactly one on-chain vote"
+        );
+        // On-chain: never submitted again.
+        let m3 = mempool_for(&db);
+        ctx.mempool = Some(m3.clone());
+        run_linked_empty(&ctx, &db, &b102, 110);
+        assert!(pooled_attestations(&m3).is_empty(), "vote on-chain: done");
+    }
+
+    /// Review finding 4: the fail-stop survives a restart. With fail-stop on,
+    /// a quorum mismatch persists a node-local "diverged at checkpoint h"
+    /// record with the latch; at boot the record re-latches `exec_failed`
+    /// (so exit(70) + supervisor restart cannot resume voting). Fail-stop
+    /// off: nothing recorded, nothing re-latched.
+    #[test]
+    fn state_hash_failstop_record_persists_and_relatches_at_boot() {
+        use torus_state::running_hash::read_divergence;
+        let x = B256::repeat_byte(0xee);
+        let (ctx, db, _m, _local) = node_at_checkpoint(false, true);
+        run_votes(&ctx, &db, &[(0, x), (1, x), (2, x)]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_divergence(&db), Some(100), "record persisted");
+        let latch = AtomicBool::new(false);
+        crate::state_hash::StateHashMonitor::with_failstop(true).relatch_at_boot(&db, &latch);
+        assert!(latch.load(Ordering::SeqCst), "re-latched at boot");
+        let latch = AtomicBool::new(false);
+        crate::state_hash::StateHashMonitor::with_failstop(false).relatch_at_boot(&db, &latch);
+        assert!(!latch.load(Ordering::SeqCst), "fail-stop off at boot: not re-latched");
+
+        let (ctx, db, _m, _local) = node_at_checkpoint(false, false);
+        run_votes(&ctx, &db, &[(0, x), (1, x), (2, x)]);
+        drop(ctx);
+        assert_eq!(read_divergence(&db), None, "fail-stop off: nothing recorded");
+    }
+
+    /// Review test gap: under the exec pipeline a block's votes sit in the
+    /// parent layer (frozen, not durable: W is held) while the next block
+    /// executes over it; that block's vote must complete the quorum by
+    /// reading them through the parent layer.
+    #[test]
+    fn state_hash_pipelined_votes_in_parent_layer_complete_quorum_next_block() {
+        let keys = validator_keys();
+        let x = B256::repeat_byte(0x42);
+        let vote = |v: usize| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::AttestStateHash { height: 100, hash: x },
+                3_000 + v as u64,
+                &keys[v],
+            )
+        };
+        let (config, db) = make_test_config_and_db();
+        seed_active_validators(&db, &[&keys[0], &keys[1], &keys[2]]);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.attach_flush_worker(Some(gate.clone()));
+        run_empty_blocks(&ctx, &db, 1, 100);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        let b101 = make_block(101, vec![vote(0), vote(1)]);
+        let mut b102 = make_block(102, vec![vote(2)]);
+        b102.header.parent_hash = alloy_primitives::keccak256(b101.header.canonical_header_bytes());
+        let durable_votes = || StakingManager::new(db.clone()).state_hash_votes(100).unwrap().len();
+        gate.hold();
+        dispatch_and_execute(&ctx, &db, &b101);
+        assert!(gate.wait_received(101));
+        let (db_t, b) = (db.clone(), b102.clone());
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b); // executes over 101's frozen layer
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(durable_votes(), 0, "101's votes are not durable while 102 executes");
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(durable_votes(), 3);
+        assert_eq!(
+            StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(),
+            Some(x.0),
+            "102's vote completed the quorum over the parent layer's two"
+        );
+    }
+
+    /// Review test gap: an EVM tx that calls a WRITER precompile (CoreWriter,
+    /// 0x0810) through a contract, end to end on the committed-block path:
+    /// the precompile's native side effect (a core-writer queue row, made
+    /// durable per tx OUTSIDE the flush batch) enters `D(n)` of its height
+    /// with the value the DB holds.
+    #[test]
+    fn running_hash_captures_evm_writer_precompile_side_effects_end_to_end() {
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        use torus_state::running_hash::{hashed_cf_id, read_running_hash};
+        let key = k256::ecdsa::SigningKey::from_slice(&[62u8; 32]).unwrap();
+        let (config, db) = make_test_config_and_db();
+        let account = |code_hash: B256, balance: U256| revm::state::AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
+            .unwrap();
+        // Proxy: forward calldata to CoreWriter (0x0810), then STOP.
+        #[rustfmt::skip]
+        let code = vec![
+            0x36, 0x5f, 0x5f, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+            0x5f, 0x5f, 0x36, 0x5f, 0x5f, // retSize retOffset argsSize argsOffset value
+            0x61, 0x08, 0x10, 0x5a, 0xf1, 0x50, // PUSH2 0x0810 GAS CALL POP
+            0x00, // STOP
+        ];
+        let proxy = Address::repeat_byte(0xC0);
+        let code_hash = alloy_primitives::keccak256(&code);
+        db.put_code(&code_hash, &code).unwrap();
+        db.put_account(&proxy, &account(code_hash, U256::ZERO)).unwrap();
+        let mut calldata = alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&[0u8; 31]);
+        calldata.push(42);
+        let mut b1 = make_block(1, vec![]);
+        b1.evm_transactions = vec![signed_eip1559(&key, 0, alloy_primitives::TxKind::Call(proxy), calldata)];
+        b1.header.evm_tx_count = 1;
+
+        torus_state::running_hash::capture_begin(&db);
+        let ctx = make_exec_ctx(&config, &db);
+        let durable = persist_committed_block_durably(&db, &b1);
+        ctx.execute_committed_block_with(&b1, vec![], durable);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+
+        let queue_rows = StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None).unwrap();
+        assert_eq!(queue_rows.len(), 1, "the tx succeeded and the precompile enqueued");
+        let queue = hashed_cf_id(CF_CORE_WRITER_QUEUE).unwrap();
+        let hashed: Vec<_> = captured[0].1.iter().filter(|e| e.0 == queue).collect();
+        assert_eq!(captured[0].0, 1);
+        assert_eq!(
+            hashed,
+            vec![&(queue, queue_rows[0].0.clone(), Some(queue_rows[0].1.clone()))],
+            "the precompile's queue row is in D(1)"
+        );
+        assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
     }
 
     #[test]

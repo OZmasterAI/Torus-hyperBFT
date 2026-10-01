@@ -1291,6 +1291,13 @@ pub struct ChainConfig {
     /// and safe rollback.
     #[serde(default)]
     pub exec_trust_cache: bool,
+    /// Running state hash activation height (docs/plans/running-state-hash-impl.md):
+    /// the first height every node hashes, from `h_{activation-1}` = zeros.
+    /// CHAIN-WIDE (genesis `consensus.state_hash_activation_height`) so every
+    /// node's chain starts at the same height whatever its applied height at
+    /// upgrade. `None` (any genesis without the field) = running hash disabled.
+    #[serde(default)]
+    pub state_hash_activation_height: Option<u64>,
 }
 
 fn default_timeout_base_ms() -> u64 {
@@ -1313,6 +1320,9 @@ impl ChainConfig {
         }
         if self.max_validators == 0 {
             return Err("max_validators must be >= 1".to_string());
+        }
+        if self.state_hash_activation_height == Some(0) {
+            return Err("state_hash_activation_height must be >= 1".to_string());
         }
         Ok(())
     }

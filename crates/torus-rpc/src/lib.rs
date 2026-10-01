@@ -3619,6 +3619,7 @@ mod state_hash_rpc_tests {
     async fn state_hash_rpc_returns_local_votes_quorum_and_errors_for_pruned() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
+        torus_state::running_hash::configure_activation(&state, Some(1)).unwrap();
         // 66 checkpoints (100..=6600) through the hashed flush; 64 retained.
         for h in 1..=6600u64 {
             torus_state::FrozenPending::marker_only(h)

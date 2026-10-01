@@ -146,9 +146,26 @@ pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
 /// `META_NATIVE_APPLIED_HEIGHT` (docs/plans/running-state-hash-impl.md).
 pub const META_RUNNING_STATE_HASH: &[u8] = b"running_state_hash";
 
-/// Key in CF_CONSENSUS_META (node-local): the first height this DB hashed (`h_0` = zeros was its
-/// predecessor), 8 BE. Written once, in the batch of that height.
+/// Key in CF_CONSENSUS_META (node-local): the activation height the stored chain started at
+/// (`h_{activation-1}` = zeros), 8 BE. Written in the batch of that height; always equal to
+/// [`META_STATE_HASH_CONFIGURED_ACTIVATION`] (a configuration change resets the chain).
 pub const META_RUNNING_STATE_HASH_ACTIVATION: &[u8] = b"running_state_hash_activation";
+
+/// Key in CF_CONSENSUS_META (node-local copy of the chain config): the CHAIN-WIDE running hash
+/// activation height (genesis `consensus.state_hash_activation_height`), 8 BE. Absent = the
+/// running hash is disabled. Written at boot by `running_hash::configure_activation`.
+pub const META_STATE_HASH_CONFIGURED_ACTIVATION: &[u8] = b"state_hash_cfg_activation";
+
+/// Key in CF_CONSENSUS_META (node-local): the first height at which this node could not extend
+/// a valid chain (no stored `h_{n-1}`: upgraded above the activation height, or a skipped
+/// height after a failed flush), 8 BE. Sticky: the node stops hashing, attesting and making
+/// fail-stop decisions ("hash-unverified").
+pub const META_RUNNING_STATE_HASH_UNVERIFIED: &[u8] = b"running_state_hash_unverified";
+
+/// Key in CF_CONSENSUS_META (node-local): the fail-stop record — the checkpoint height whose
+/// on-chain quorum hash differed from the local checkpoint, 8 BE. Re-latches the fail-stop at
+/// boot (`TORUS_STATE_HASH_FAILSTOP=1`); gone with the DB (resync).
+pub const META_STATE_HASH_DIVERGED: &[u8] = b"state_hash_diverged";
 
 /// Key prefix in CF_CONSENSUS_META (node-local): running-hash checkpoint
 /// `prefix ‖ height(8 BE)` -> hash(32), every `STATE_HASH_CHECKPOINT_INTERVAL` heights.

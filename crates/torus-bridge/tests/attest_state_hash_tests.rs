@@ -2,17 +2,17 @@
 //! `AttestStateHash { height, hash }` — validator-only, checkpoint heights only,
 //! first vote per validator wins, stake-weighted > 2/3 records the quorum hash,
 //! votes / quorum pruned to the last `STATE_HASH_CHECKPOINT_RETAIN` checkpoints,
-//! and serial vs parallel engine land identical state.
+//! and attestations execute on the serial path (never parallel engine work).
 
 use alloy_primitives::{Address, B256, U256};
 
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{classify_action, ActionCategory, NativeExecContext, NativeExecutor};
 use torus_economics::types::{ValidatorState, ValidatorStatus};
 use torus_economics::StakingManager;
-use torus_state::cf::{CF_NATIVE_BALANCES, CF_STATE_HASH_VOTES};
+use torus_state::cf::CF_STATE_HASH_VOTES;
 use torus_state::running_hash::{STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN};
 use torus_state::{StateBackend, StateDb};
-use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+use torus_types::NativeAction;
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -171,46 +171,25 @@ fn attest_state_hash_prunes_to_retained_checkpoints() {
     assert_eq!(votes_dump(&db).len() as u64, STATE_HASH_CHECKPOINT_RETAIN * 4);
 }
 
+/// Attestations never reach the parallel order engine: `classify_action`
+/// files them with the other validator actions (`Other`, post-EVM), and the
+/// batch executes them in the serial Phase-1 loop — with 4 engine threads
+/// forced, a batch of attestations never enters Phases 2-4 (margin / match /
+/// settle stay 0) and still records the quorum. (Replaces a serial-vs-parallel
+/// engine differential that could not fail: attestations are never engine
+/// work, so both runs took the same serial path.)
 #[test]
-fn attest_state_hash_serial_vs_parallel_engine_identical() {
-    let order = |is_buy: bool, price: i64| PlaceOrderParams {
-        market_id: 1,
-        is_buy,
-        price: FixedPoint::from_raw(price as i128 * FixedPoint::SCALE),
-        quantity: FixedPoint::from_raw(FixedPoint::SCALE),
-        order_type: OrderType::Limit,
-        time_in_force: TimeInForce::GTC,
-        reduce_only: false,
-        client_order_id: None,
-    };
-    let run_mode = |threads: usize| {
-        let (_d, db) = open_test_db();
-        seed_validators(&db, 0);
-        let mut ctx = ctx_at(&db, 101);
-        for n in 10..=12u8 {
-            let bal = torus_core::position::NativeBalance {
-                available: FixedPoint::from_raw(1_000_000 * FixedPoint::SCALE),
-                order_margin: FixedPoint::ZERO,
-            };
-            ctx.positions.put_native_balance(&addr(n), &bal).unwrap();
-        }
-        let batch = vec![
-            (addr(10), NativeAction::PlaceOrder(order(false, 100))),
-            (addr(1), attest(100, 9)),
-            (addr(11), NativeAction::PlaceOrder(order(true, 100))),
-            (addr(2), attest(100, 9)),
-            (addr(12), NativeAction::PlaceOrder(order(true, 99))),
-            (addr(3), attest(100, 9)),
-        ];
-        let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
-        ctx.save_order_books();
-        let results: Vec<bool> = r.results.iter().map(|a| a.success).collect();
-        (results, votes_dump(&db), db.iterate_cf(CF_NATIVE_BALANCES, None).unwrap())
-    };
-    let serial = run_mode(0);
-    assert!(serial.0.iter().all(|ok| *ok), "{:?}", serial.0);
-    assert_eq!(serial.1.len(), 4, "3 votes + quorum");
-    for threads in [2, 4] {
-        assert_eq!(run_mode(threads), serial, "threads={threads}");
-    }
+fn attest_state_hash_takes_the_serial_path() {
+    assert_eq!(classify_action(&attest(100, 9)), ActionCategory::Other);
+    let (_d, db) = open_test_db();
+    seed_validators(&db, 0);
+    let mut ctx = ctx_at(&db, 101);
+    let batch: Vec<_> = (1..=3).map(|v| (addr(v), attest(100, 9))).collect();
+    let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, 4);
+    ctx.save_order_books();
+    assert!(r.results.iter().all(|a| a.success), "{:?}", r.results);
+    let p = ctx.phase_accum;
+    assert!(p.phase1_actions_ns > 0, "executed in the serial Phase-1 loop");
+    assert_eq!((p.margin_ns, p.match_ns, p.settle_ns), (0, 0, 0), "never engine work");
+    assert_eq!(staking(&db).state_hash_quorum(100).unwrap(), Some([9; 32]));
 }

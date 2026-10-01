@@ -492,64 +492,67 @@ fn hashed_cf_order() -> &'static [(u8, CfId)] {
 /// One CF's pending mutations as a single key-sorted stream. Writes and
 /// tombstones are disjoint by invariant; should a key ever be in both, the
 /// tombstone is reported (the batch appends deletes after puts, so it wins).
-fn stream_cf<'a>(c: &'a CfPending, mut f: impl FnMut(&'a [u8], Option<&'a [u8]>)) {
+fn cf_stream<'a>(c: &'a CfPending) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
     let mut w = c.writes.iter().peekable();
     let mut d = c.deletes.iter().peekable();
-    loop {
+    std::iter::from_fn(move || {
         let take_write = match (w.peek(), d.peek()) {
-            (None, None) => return,
+            (None, None) => return None,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (Some((wk, _)), Some(dk)) => wk.as_slice() < dk.as_slice(),
         };
         if take_write {
-            let (k, v) = w.next().unwrap();
-            f(k, Some(v));
+            let (k, v) = w.next()?;
+            Some((k.as_slice(), Some(v.as_slice())))
         } else {
-            let k = d.next().unwrap();
+            let k = d.next()?;
             if w.peek().is_some_and(|(wk, _)| *wk == k) {
                 w.next();
             }
-            f(k, None);
+            Some((k.as_slice(), None))
         }
-    }
+    })
 }
 
 /// Running state hash: visit the consensus write set of `layers` (lowest
 /// priority first — a later layer's entry for a key overrides an earlier
 /// one, the order the writes became durable in) in canonical
 /// `(cf_id, key)` order, key filters applied. Node-local / derived CFs and
-/// keys never reach `f`.
+/// keys never reach `f`. A CF written in several layers is a streaming k-way
+/// merge of the layers' sorted streams (k <= 3: extras, pending set,
+/// sidecar) — nothing is materialized.
 fn for_each_consensus_write<'a>(
     layers: &[&'a PendingState],
     mut f: impl FnMut(u8, &'a [u8], Option<&'a [u8]>),
 ) {
     use crate::running_hash::key_is_hashed;
     for &(cf_id, id) in hashed_cf_order() {
-        let active: Vec<&CfPending> = layers
+        let mut streams: Vec<_> = layers
             .iter()
             .map(|l| l.cf(id))
             .filter(|c| !c.is_empty())
+            .map(|c| cf_stream(c).peekable())
             .collect();
-        match active.as_slice() {
-            [] => {}
-            [one] => stream_cf(one, |k, v| {
-                if key_is_hashed(cf_id, k) {
-                    f(cf_id, k, v)
-                }
-            }),
-            many => {
-                let mut merged: BTreeMap<&'a [u8], Option<&'a [u8]>> = BTreeMap::new();
-                for c in many {
-                    stream_cf(c, |k, v| {
-                        merged.insert(k, v);
-                    });
-                }
-                for (k, v) in merged {
-                    if key_is_hashed(cf_id, k) {
-                        f(cf_id, k, v)
+        loop {
+            // Smallest head key; on ties the LAST (highest-priority) layer's
+            // entry wins and every layer holding the key advances.
+            let mut best: Option<(&'a [u8], Option<&'a [u8]>)> = None;
+            for s in streams.iter_mut() {
+                if let Some(&(k, v)) = s.peek() {
+                    if best.is_none_or(|(bk, _)| k <= bk) {
+                        best = Some((k, v));
                     }
                 }
+            }
+            let Some((k, v)) = best else { break };
+            for s in streams.iter_mut() {
+                if s.peek().is_some_and(|(sk, _)| *sk == k) {
+                    s.next();
+                }
+            }
+            if key_is_hashed(cf_id, k) {
+                f(cf_id, k, v);
             }
         }
     }
@@ -1128,7 +1131,14 @@ fn flush_pending_with_native_trie_stats(
         // it. Large blocks digest on a scoped thread while this one builds the
         // batch (both only read the maps); joined below, before the hash joins
         // the SAME batch as the applied-height marker.
-        let digest_job = applied_height.map(|_| {
+        // Chain-wide activation + validity (review findings 1 / 5): digest
+        // only when this height extends a valid chain.
+        let step = applied_height.map(|h| (h, crate::running_hash::chain_step(target, h)));
+        let hashing = matches!(
+            step,
+            Some((_, crate::running_hash::ChainStep::Start | crate::running_hash::ChainStep::Continue(_)))
+        );
+        let digest_job = hashing.then(|| {
             let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
             layers.extend(state.hash_extras.as_deref());
             layers.push(state);
@@ -1261,23 +1271,31 @@ fn flush_pending_with_native_trie_stats(
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
         }
 
-        // Running state hash: join the digest and append h_n (+ checkpoint)
-        // to the batch.
-        if let (Some(height), Some(job)) = (applied_height, digest_job) {
-            let (digest, capture, digest_secs) = match job {
-                Ok(done) => done,
-                Err(handle) => handle.join().map_err(|_| {
-                    StateError::InvalidData("running state hash digest thread panicked".into())
-                })?,
+        // Running state hash: join the digest and append h_n (+ checkpoint),
+        // or the unverified marker, to the batch.
+        if let Some((height, step)) = step {
+            let hash = match digest_job {
+                Some(job) => {
+                    let (digest, capture, digest_secs) = match job {
+                        Ok(done) => done,
+                        Err(handle) => handle.join().map_err(|_| {
+                            StateError::InvalidData("running state hash digest thread panicked".into())
+                        })?,
+                    };
+                    stats.state_hash_entries = digest.entries();
+                    stats.state_hash_seconds = digest_secs;
+                    let prev = match step {
+                        crate::running_hash::ChainStep::Continue(prev) => prev,
+                        _ => [0; 32],
+                    };
+                    if let Some(c) = capture {
+                        crate::running_hash::capture_record(target, height, c);
+                    }
+                    Some(digest.chain(&prev, height))
+                }
+                None => None,
             };
-            stats.state_hash_entries = digest.entries();
-            stats.state_hash_seconds = digest_secs;
-            let (prev, activation) = crate::running_hash::prev_for(target, height);
-            let hash = digest.chain(&prev, height);
-            crate::running_hash::append_to_batch(target, &mut batch, height, &hash, activation)?;
-            if let Some(c) = capture {
-                crate::running_hash::capture_record(target, height, c);
-            }
+            crate::running_hash::append_to_batch(target, &mut batch, height, step, hash.as_ref())?;
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were
@@ -2795,6 +2813,13 @@ mod tests {
         WriteEntry, STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN,
     };
 
+    /// A DB whose chain config enables the running hash from height 1.
+    fn rsh_db() -> (StateDb, tempfile::TempDir) {
+        let (db, d) = temp_db();
+        crate::running_hash::configure_activation(&db, Some(1)).unwrap();
+        (db, d)
+    }
+
     /// The canonical hashed write set of `(cf, key, value)` triples (later wins).
     fn rsh_expected(writes: &[(&str, Vec<u8>, Option<Vec<u8>>)]) -> Vec<WriteEntry> {
         let mut m: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
@@ -2846,7 +2871,7 @@ mod tests {
     /// every multiple of the interval and only the newest RETAIN survive.
     #[test]
     fn running_hash_flush_matches_function_block_by_block() {
-        let (db, _d) = temp_db();
+        let (db, _d) = rsh_db();
         let last = STATE_HASH_CHECKPOINT_INTERVAL * (STATE_HASH_CHECKPOINT_RETAIN + 2);
         let mut expect = [0u8; 32];
         let mut at_checkpoint = BTreeMap::new();
@@ -2886,7 +2911,7 @@ mod tests {
             })
             .collect();
         let run = |maintain: bool, split_sidecar: bool, extra_excluded: bool| {
-            let (db, d) = temp_db();
+            let (db, d) = rsh_db();
             for (i, w) in blocks.iter().enumerate() {
                 let h = i as u64 + 1;
                 let (main, side): (Vec<_>, Vec<_>) = w
@@ -2928,10 +2953,10 @@ mod tests {
     /// per key; extras are never written by the flush.
     #[test]
     fn running_hash_extras_are_hashed_under_the_overlay_and_never_written() {
-        use crate::cf::{CF_ACCOUNTS, CF_STAKING_VALIDATORS, CF_STORAGE};
-        let (db, _d) = temp_db();
+        use crate::cf::{CF_ACCOUNTS, CF_SLASH_RECORDS, CF_STORAGE};
+        let (db, _d) = rsh_db();
         let mut extras = HashExtras::new();
-        extras.put(CF_STAKING_VALIDATORS, b"val", b"slashed");
+        extras.put(CF_SLASH_RECORDS, b"val", b"slashed");
         extras.put(CF_ACCOUNTS, &[1; 20], b"evm-old");
         extras.delete(CF_STORAGE, b"slot");
         extras.put(crate::cf::CF_BLOCK_HEADERS, b"x", b"ignored");
@@ -2939,23 +2964,23 @@ mod tests {
         ov.set_hash_extras(extras);
         ov.flush_with_native_trie_stats(&db, Some(1), None, None).unwrap();
         let want = rsh_expected(&[
-            (CF_STAKING_VALIDATORS, b"val".to_vec(), Some(b"slashed".to_vec())),
+            (CF_SLASH_RECORDS, b"val".to_vec(), Some(b"slashed".to_vec())),
             (CF_STORAGE, b"slot".to_vec(), None),
             (CF_ACCOUNTS, vec![1; 20], Some(b"evm-new".to_vec())),
         ]);
         assert_eq!(read_running_hash(&db), Some((1, next_running_hash(&[0; 32], 1, &want))));
-        assert_eq!(db.get_cf_raw(CF_STAKING_VALIDATORS, b"val").unwrap(), None, "extras are hash-only");
+        assert_eq!(db.get_cf_raw(CF_SLASH_RECORDS, b"val").unwrap(), None, "extras are hash-only");
         assert_eq!(db.get_cf_raw(CF_ACCOUNTS, &[1; 20]).unwrap(), Some(b"evm-new".to_vec()));
 
         // Marker-only block with extras (EVM-only / empty boundary block).
         let mut extras = HashExtras::new();
-        extras.put(CF_STAKING_VALIDATORS, b"val", b"v2");
+        extras.put(CF_SLASH_RECORDS, b"val", b"v2");
         FrozenPending::marker_only(2)
             .with_hash_extras(extras)
             .flush_with_native_trie_stats(&db, Some(2), None, None)
             .unwrap();
         let h1 = read_running_hash(&db).map(|_| ()).and(Some(next_running_hash(&[0; 32], 1, &want))).unwrap();
-        let want2 = rsh_expected(&[(CF_STAKING_VALIDATORS, b"val".to_vec(), Some(b"v2".to_vec()))]);
+        let want2 = rsh_expected(&[(CF_SLASH_RECORDS, b"val".to_vec(), Some(b"v2".to_vec()))]);
         assert_eq!(read_running_hash(&db), Some((2, next_running_hash(&h1, 2, &want2))));
     }
 
@@ -2965,7 +2990,7 @@ mod tests {
     #[test]
     fn out_of_batch_recorder_captures_commit_tx_writes() {
         use crate::cf::{CF_CORE_WRITER_QUEUE, CF_NATIVE_TRADES};
-        let (db, _d) = temp_db();
+        let (db, _d) = rsh_db();
         let tx = |w: &[(&str, Vec<u8>, Option<Vec<u8>>)]| rsh_overlay(&db, w).commit_tx(&db).unwrap();
         tx(&[(CF_CORE_WRITER_QUEUE, b"before".to_vec(), Some(b"x".to_vec()))]); // not armed
         let rec = OutOfBatchRecorder::begin();
@@ -2996,7 +3021,7 @@ mod tests {
         use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
         use revm::database::{BundleAccount, BundleState};
         use revm::state::{AccountInfo, Bytecode};
-        let (db, _d) = temp_db();
+        let (db, _d) = rsh_db();
         // Pre-state so deletions are observable.
         let gone = Address::repeat_byte(0x02);
         db.put_cf_raw(CF_ACCOUNTS, gone.as_slice(), b"old").unwrap();
@@ -3045,12 +3070,174 @@ mod tests {
         assert_eq!(seen, 5);
     }
 
+    fn flush_block(db: &StateDb, h: u64) {
+        let writes = rsh_block_writes(h);
+        rsh_overlay(db, &writes).flush_with_native_trie_stats(db, Some(h), None, None).unwrap();
+    }
+
+    /// Review finding 5: a skipped height (a failed serial flush, after which
+    /// the next block's flush advanced the applied marker past it) must never
+    /// be chained over from the stale `h_{n-2}`: the stored hash stays at the
+    /// last valid height and no later checkpoint is ever written.
+    #[test]
+    fn running_hash_gap_is_never_chained_over() {
+        let (db, _d) = rsh_db();
+        for h in 1..=5 {
+            flush_block(&db, h);
+        }
+        let h5 = read_running_hash(&db).unwrap();
+        assert_eq!(h5.0, 5);
+        // Height 6's batch was lost; 7.. flush normally.
+        for h in 7..=STATE_HASH_CHECKPOINT_INTERVAL + 1 {
+            flush_block(&db, h);
+        }
+        assert_eq!(read_running_hash(&db), Some(h5), "no hash chained over the gap");
+        assert!(checkpoint_heights(&db).is_empty(), "no checkpoint after the gap");
+        assert_eq!(
+            crate::running_hash::read_unverified_since(&db),
+            Some(7),
+            "the node is hash-unverified from the first height it could not chain"
+        );
+    }
+
+    /// Review finding 1: the activation height is CHAIN-WIDE (chain config),
+    /// not "the first height this DB happened to flush": nodes upgraded at
+    /// different applied heights below it, and a node synced from genesis,
+    /// produce identical hashes from the activation height on. A node whose
+    /// DB is already ABOVE the activation height has no valid `h_{n-1}`: it is
+    /// hash-unverified and never writes a hash or checkpoint. No activation
+    /// configured = disabled (nothing hashed).
+    #[test]
+    fn running_hash_activation_is_chain_wide() {
+        use crate::running_hash::{configure_activation, read_activation_height, read_unverified_since};
+        let act = 21u64;
+        let last = 2 * STATE_HASH_CHECKPOINT_INTERVAL + 5;
+        let mut expect = [0u8; 32];
+        for h in act..=last {
+            expect = next_running_hash(&expect, h, &rsh_expected(&rsh_block_writes(h)));
+        }
+        // Disabled.
+        let (off, _d0) = temp_db();
+        for h in 1..=last {
+            flush_block(&off, h);
+        }
+        assert_eq!(read_running_hash(&off), None, "no activation configured: nothing hashed");
+        assert!(checkpoint_heights(&off).is_empty());
+        // Upgraded at applied 0 (synced from genesis), 7, act - 1.
+        for upgraded_at in [0, 7, act - 1] {
+            let (db, _d) = rsh_db();
+            for h in 1..=upgraded_at {
+                flush_block(&db, h);
+            }
+            configure_activation(&db, Some(act)).unwrap();
+            for h in upgraded_at + 1..=last {
+                flush_block(&db, h);
+            }
+            assert_eq!(read_running_hash(&db), Some((last, expect)), "upgraded at {upgraded_at}");
+            assert_eq!(read_activation_height(&db), Some(act));
+            assert_eq!(read_unverified_since(&db), None);
+            assert_eq!(checkpoint_heights(&db), vec![100, 200]);
+        }
+        // Upgraded above the activation height.
+        let (late, _d) = temp_db();
+        for h in 1..=act + 3 {
+            flush_block(&late, h);
+        }
+        configure_activation(&late, Some(act)).unwrap();
+        for h in act + 4..=last {
+            flush_block(&late, h);
+        }
+        assert_eq!(read_unverified_since(&late), Some(act + 4));
+        assert_eq!(read_running_hash(&late), None);
+        assert!(checkpoint_heights(&late).is_empty(), "never a checkpoint to attest");
+    }
+
+    /// A configuration change (another activation height, or disabling)
+    /// discards the stored chain — its hashes belong to another chain
+    /// definition — and an unchanged configuration keeps it.
+    #[test]
+    fn running_hash_configure_activation_resets_only_on_change() {
+        use crate::running_hash::{configure_activation, read_configured_activation, read_unverified_since};
+        let (db, _d) = rsh_db();
+        for h in 1..=STATE_HASH_CHECKPOINT_INTERVAL + 3 {
+            flush_block(&db, h);
+        }
+        let before = read_running_hash(&db);
+        configure_activation(&db, Some(1)).unwrap();
+        assert_eq!(read_running_hash(&db), before, "same config: chain kept");
+        assert_eq!(checkpoint_heights(&db), vec![100]);
+        configure_activation(&db, Some(150)).unwrap();
+        assert_eq!(read_configured_activation(&db), Some(150));
+        assert_eq!(read_running_hash(&db), None, "new activation: old chain discarded");
+        assert!(checkpoint_heights(&db).is_empty());
+        for h in STATE_HASH_CHECKPOINT_INTERVAL + 4..=160 {
+            flush_block(&db, h);
+        }
+        let mut expect = [0u8; 32];
+        for h in 150..=160 {
+            expect = next_running_hash(&expect, h, &rsh_expected(&rsh_block_writes(h)));
+        }
+        assert_eq!(read_running_hash(&db), Some((160, expect)));
+        assert_eq!(read_unverified_since(&db), None);
+        configure_activation(&db, None).unwrap();
+        assert_eq!(read_configured_activation(&db), None);
+        assert_eq!(read_running_hash(&db), None, "disabled: chain discarded");
+        flush_block(&db, 161);
+        assert_eq!(read_running_hash(&db), None, "disabled: nothing hashed");
+    }
+
+    /// Review finding 7: the multi-layer merge is a streaming k-way merge;
+    /// it must visit exactly what a full sorted map of all layers (later
+    /// layer wins per key, tombstones included) would.
+    #[test]
+    fn running_hash_k_way_merge_matches_sorted_map() {
+        use crate::cf::{CF_ACCOUNTS, CF_NATIVE_POSITIONS};
+        let layer = |seed: u64| {
+            let mut s = PendingState::new();
+            for cf in [CF_NATIVE_POSITIONS, CF_ACCOUNTS, CF_NATIVE_BALANCES] {
+                let id = intern_cf(cf).unwrap();
+                let c = s.cf_mut(id);
+                for i in 0..40u64 {
+                    let x = (i * 7 + seed * 13) % 23;
+                    let key = vec![(x % 11) as u8, (x / 11) as u8];
+                    if (i + seed) % 3 == 0 {
+                        c.writes.remove(&key);
+                        c.deletes.insert(key);
+                    } else {
+                        c.deletes.remove(&key);
+                        c.writes.insert(key, vec![seed as u8, i as u8]);
+                    }
+                }
+            }
+            s
+        };
+        let (a, b, c) = (layer(1), layer(2), layer(3));
+        for layers in [vec![&a], vec![&a, &b], vec![&b, &a], vec![&a, &b, &c], vec![&c, &a, &b]] {
+            let mut got = Vec::new();
+            for_each_consensus_write(&layers, |id, k, v| got.push((id, k.to_vec(), v.map(<[u8]>::to_vec))));
+            let mut want: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+            for l in &layers {
+                for &(cf_id, id) in hashed_cf_order() {
+                    let p = l.cf(id);
+                    for (k, v) in &p.writes {
+                        want.insert((cf_id, k.clone()), Some(v.clone()));
+                    }
+                    for k in &p.deletes {
+                        want.insert((cf_id, k.clone()), None);
+                    }
+                }
+            }
+            let want: Vec<_> = want.into_iter().map(|((id, k), v)| (id, k, v)).collect();
+            assert_eq!(got, want, "{} layers", layers.len());
+        }
+    }
+
     /// A block above `PARALLEL_DIGEST_MIN_ENTRIES` digests on the scoped
     /// thread: same hash as the function, same as the inline path.
     #[test]
     fn running_hash_parallel_digest_matches_function() {
         use crate::cf::{CF_ACCOUNTS, CF_NATIVE_POSITIONS};
-        let (db, _d) = temp_db();
+        let (db, _d) = rsh_db();
         let mut writes = Vec::new();
         for i in 0..(PARALLEL_DIGEST_MIN_ENTRIES as u32 + 100) {
             let cf = if i % 3 == 0 { CF_NATIVE_POSITIONS } else { CF_ACCOUNTS };
@@ -3078,7 +3265,11 @@ mod tests {
         };
         let cfs = [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_NONCES];
         for rows in [10_000usize, 60_000] {
-            let (db, _d) = temp_db();
+            let (db, _d) = rsh_db();
+            // Baseline flushes go to a DB without the running hash (no
+            // activation configured), so the hashed DB's heights stay
+            // consecutive (a skipped height would stop its chain).
+            let (base_db, _bd) = temp_db();
             let mut samples = Vec::new();
             let mut baseline = Vec::new();
             for h in 1..=24u64 {
@@ -3101,15 +3292,16 @@ mod tests {
                 // Root skip (TORUS_NATIVE_TRIE_MAINTENANCE=0): the configuration
                 // the running hash replaces the per-block root for.
                 // Odd heights hash (applied height set), even ones flush the
-                // same-sized set without any applied height: no hash, no
-                // marker — the baseline for the EXPOSED hashing cost.
+                // same-sized set without any applied height into the
+                // un-hashed DB: no hash, no marker — the baseline for the
+                // EXPOSED hashing cost.
                 let hashed = h % 2 == 1;
                 let state = ov.pending.read().unwrap();
                 let stats = flush_pending_with_native_trie_stats(
                     &state,
                     None,
-                    &db,
-                    hashed.then_some(h),
+                    if hashed { &db } else { &base_db },
+                    hashed.then_some(h.div_ceil(2)),
                     None,
                     None,
                     false,

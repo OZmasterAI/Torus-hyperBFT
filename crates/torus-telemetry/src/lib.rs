@@ -255,6 +255,10 @@ pub struct Metrics {
     pub state_hash_attestations_submitted: Counter,
     /// Running state hash: last hashed (applied) height.
     pub state_hash_height: Gauge,
+    /// Running state hash: 1 while this node is hash-unverified (no valid
+    /// local chain: upgraded above the activation height, or a skipped
+    /// height) — it neither attests nor fail-stops.
+    pub state_hash_unverified: Gauge,
     /// rank-root: flush breakdown — WriteBatch build + RocksDB write
     /// (== build + db below; kept unsplit for series continuity).
     pub exec_state_write_seconds: Histogram,
@@ -1320,6 +1324,12 @@ impl Metrics {
             "Running state hash: last hashed (applied) height",
             state_hash_height.clone(),
         );
+        let state_hash_unverified = Gauge::default();
+        registry.register(
+            "torus_state_hash_unverified",
+            "Running state hash: 1 while this node has no valid local hash chain (no attesting, no fail-stop)",
+            state_hash_unverified.clone(),
+        );
 
         let exec_state_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
@@ -2078,6 +2088,7 @@ impl Metrics {
             state_hash_no_quorum,
             state_hash_attestations_submitted,
             state_hash_height,
+            state_hash_unverified,
             exec_state_write_seconds,
             exec_state_write_build_seconds,
             exec_state_write_db_seconds,
@@ -2771,6 +2782,7 @@ mod tests {
         m.state_hash_no_quorum.inc();
         m.state_hash_attestations_submitted.inc();
         m.state_hash_height.set(100);
+        m.state_hash_unverified.set(1);
         let text = m.encode();
         for name in [
             "torus_state_hash_seconds",
@@ -2779,6 +2791,7 @@ mod tests {
             "torus_state_hash_no_quorum_total 1",
             "torus_state_hash_attestations_submitted_total 1",
             "torus_state_hash_height 100",
+            "torus_state_hash_unverified 1",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

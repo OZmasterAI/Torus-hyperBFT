@@ -25,6 +25,16 @@ pub type WriteEntry = (u8, Vec<u8>, Option<Vec<u8>>);
 /// hash index, commit manifest, receipts, logs, bloom, tx index,
 /// `cf_book_order_rows`, trade CFs, DA pending / shards, all trie / hashed
 /// CFs, and every `cf_consensus_meta` key outside [`META_CONSENSUS_PREFIXES`].
+///
+/// Also excluded (consensus state, but not deterministic per height — tied to
+/// the pre-existing bug "epoch rotation on the consensus thread"):
+/// `cf_staking_validators` (id 8, RESERVED — never reuse). The consensus
+/// thread read-modify-writes whole validator rows (status, rotated pubkey)
+/// at proposal / validation time of an epoch boundary block, while the
+/// execution thread may lag by any number of blocks; every execution-time
+/// write of a validator row (commission, stake, jail, slash) therefore
+/// carries consensus-thread fields whose visibility depends on timing. Re-add
+/// it (new id) once epoch rotation runs at execution of the boundary block.
 pub const HASHED_CFS: &[(u8, &str)] = &[
     (1, CF_NATIVE_POSITIONS),
     (2, CF_NATIVE_BALANCES),
@@ -33,7 +43,7 @@ pub const HASHED_CFS: &[(u8, &str)] = &[
     (5, CF_NATIVE_ORACLE),
     (6, CF_NATIVE_NONCES),
     (7, CF_NATIVE_ORDERS),
-    (8, CF_STAKING_VALIDATORS),
+    // 8: cf_staking_validators — excluded, id reserved (see above).
     (9, CF_STAKING_DELEGATIONS),
     (10, CF_STAKING_PERMANENT),
     (11, CF_STAKING_REWARDS),
@@ -67,7 +77,10 @@ pub const NODE_LOCAL_MARKET_KEYS: &[&[u8]] = &[b"__book_mode__"];
 /// The only consensus keys inside `cf_consensus_meta` (the rest is the
 /// hotstuff block tree and node-local markers): pending key rotations
 /// (`staking.rs` `pending_rotation_key`) and the validator whitelist
-/// (`governance.rs` `whitelist_key`).
+/// (`governance.rs` `whitelist_key`). Only EXECUTION writes of them are
+/// hashed: the consensus thread's epoch-boundary deletion of applied
+/// rotations is out of batch and timing-dependent (see [`HASHED_CFS`]), so
+/// it is not.
 pub const META_CONSENSUS_PREFIXES: &[&[u8]] = &[b"pending_rotation:", b"validator_whitelist:"];
 
 /// Hash `cf_id` of a column family, `None` if the CF is never hashed.
@@ -188,13 +201,94 @@ pub fn read_running_hash(db: &StateDb) -> Option<(u64, [u8; 32])> {
     })
 }
 
-/// First height this DB hashed (see `META_RUNNING_STATE_HASH_ACTIVATION`).
-pub fn read_activation_height(db: &StateDb) -> Option<u64> {
-    let v = db
-        .get_cf_raw(CF_CONSENSUS_META, META_RUNNING_STATE_HASH_ACTIVATION)
-        .ok()
-        .flatten()?;
+fn read_u64(db: &StateDb, key: &[u8]) -> Option<u64> {
+    let v = db.get_cf_raw(CF_CONSENSUS_META, key).ok().flatten()?;
     Some(u64::from_be_bytes(v.as_slice().try_into().ok()?))
+}
+
+/// The durable native applied height (`META_NATIVE_APPLIED_HEIGHT`, written
+/// in the same batch as the running hash).
+pub fn read_applied_height(db: &StateDb) -> Option<u64> {
+    read_u64(db, META_NATIVE_APPLIED_HEIGHT)
+}
+
+/// The activation height the stored chain started at (see
+/// `META_RUNNING_STATE_HASH_ACTIVATION`).
+pub fn read_activation_height(db: &StateDb) -> Option<u64> {
+    read_u64(db, META_RUNNING_STATE_HASH_ACTIVATION)
+}
+
+/// The CHAIN-WIDE activation height this node is configured with (genesis
+/// `consensus.state_hash_activation_height`); `None` = running hash disabled.
+pub fn read_configured_activation(db: &StateDb) -> Option<u64> {
+    read_u64(db, META_STATE_HASH_CONFIGURED_ACTIVATION)
+}
+
+/// First height this node could not extend a valid chain at (sticky; see
+/// `META_RUNNING_STATE_HASH_UNVERIFIED`). `Some` = hash-unverified: no new
+/// hashes or checkpoints, no attestations, no fail-stop decisions.
+pub fn read_unverified_since(db: &StateDb) -> Option<u64> {
+    read_u64(db, META_RUNNING_STATE_HASH_UNVERIFIED)
+}
+
+/// Fail-stop record (see `META_STATE_HASH_DIVERGED`): the checkpoint whose
+/// on-chain quorum hash differed from the local one.
+pub fn read_divergence(db: &StateDb) -> Option<u64> {
+    read_u64(db, META_STATE_HASH_DIVERGED)
+}
+
+/// Persist the fail-stop record (node-local META, never hashed). Keeps the
+/// first record.
+pub fn record_divergence(db: &StateDb, checkpoint: u64) -> Result<(), crate::StateError> {
+    if read_divergence(db).is_some() {
+        return Ok(());
+    }
+    db.put_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_DIVERGED, &checkpoint.to_be_bytes())
+}
+
+/// Apply the chain config at boot (before any block is flushed): store the
+/// CHAIN-WIDE activation height (`None` = disabled; `Some(0)` is treated as
+/// 1, the first executable height). When the configuration differs from the
+/// one the stored chain was built under, the stored chain (hash, activation
+/// record, unverified marker, checkpoints) is discarded: it belongs to
+/// another chain definition. Returns whether a stored chain was discarded.
+pub fn configure_activation(db: &StateDb, activation: Option<u64>) -> Result<bool, crate::StateError> {
+    let activation = activation.map(|a| a.max(1));
+    let previous = read_configured_activation(db);
+    let start = read_activation_height(db);
+    let checkpoints = checkpoint_heights(db);
+    let has_chain = start.is_some()
+        || read_running_hash(db).is_some()
+        || read_unverified_since(db).is_some()
+        || !checkpoints.is_empty();
+    let reset = has_chain && (previous != activation || start.is_some_and(|s| Some(s) != activation));
+    let cf = db.cf_handle(CF_CONSENSUS_META)?;
+    let mut batch = rocksdb::WriteBatch::default();
+    if reset {
+        for key in [
+            META_RUNNING_STATE_HASH,
+            META_RUNNING_STATE_HASH_ACTIVATION,
+            META_RUNNING_STATE_HASH_UNVERIFIED,
+        ] {
+            batch.delete_cf(cf, key);
+        }
+        for h in &checkpoints {
+            batch.delete_cf(cf, checkpoint_key(*h));
+        }
+        tracing::warn!(
+            ?previous,
+            ?activation,
+            stored_chain_start = ?start,
+            "running state hash: activation config changed, stored chain discarded"
+        );
+    }
+    match activation {
+        Some(a) => batch.put_cf(cf, META_STATE_HASH_CONFIGURED_ACTIVATION, a.to_be_bytes()),
+        None => batch.delete_cf(cf, META_STATE_HASH_CONFIGURED_ACTIVATION),
+    }
+    db.write(batch)?;
+    tracing::info!(?activation, "running state hash activation (chain config)");
+    Ok(reset)
 }
 
 fn checkpoint_key(height: u64) -> Vec<u8> {
@@ -222,51 +316,93 @@ pub fn checkpoint_heights(db: &StateDb) -> Vec<u64> {
         .collect()
 }
 
-/// The hash `height` chains from: the stored `h_{height-1}`, or `h_0` (zeros)
-/// on a DB that has never hashed (activation — recorded in the same batch by
-/// [`append_to_batch`]). A stored height other than `height - 1` means a
-/// hashed height was skipped or re-flushed: logged, and the chain continues
-/// from what is stored (the on-chain vote then exposes the gap).
-pub(crate) fn prev_for(db: &StateDb, height: u64) -> ([u8; 32], bool) {
+/// What the flush of a height does with the running hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainStep {
+    /// Disabled, or below the activation height: nothing hashed.
+    Off,
+    /// The activation height: chain from `h_{activation-1}` = zeros.
+    Start,
+    /// Extend the stored `h_{height-1}`.
+    Continue([u8; 32]),
+    /// No valid `h_{height-1}` (DB above the activation height without a
+    /// chain, or a skipped height): hash-unverified, nothing hashed.
+    /// `first`: the marker is not recorded yet (this batch records it).
+    Unverified { first: bool },
+}
+
+/// The chain step for flushing `height`. Never continues from anything but
+/// the stored hash of exactly `height - 1` of the configured chain.
+pub(crate) fn chain_step(db: &StateDb, height: u64) -> ChainStep {
+    let Some(activation) = read_configured_activation(db) else {
+        return ChainStep::Off;
+    };
+    if height < activation {
+        return ChainStep::Off;
+    }
+    if height == activation {
+        return ChainStep::Start;
+    }
+    if read_unverified_since(db).is_some() {
+        return ChainStep::Unverified { first: false };
+    }
+    let start = read_activation_height(db);
     match read_running_hash(db) {
-        Some((stored, hash)) => {
-            if stored + 1 != height {
-                tracing::error!(
-                    stored,
-                    height,
-                    "running state hash: chain gap (stored height is not the predecessor)"
-                );
-            }
-            (hash, false)
+        Some((stored, hash)) if start == Some(activation) && stored + 1 == height => {
+            ChainStep::Continue(hash)
         }
-        None => ([0; 32], true),
+        stored => {
+            tracing::error!(
+                height,
+                activation,
+                stored_height = ?stored.map(|(h, _)| h),
+                stored_chain_start = ?start,
+                "running state hash: no valid h(height-1) — node is HASH-UNVERIFIED from here on \
+                 (no hashes, checkpoints, attestations or fail-stop decisions)"
+            );
+            ChainStep::Unverified { first: true }
+        }
     }
 }
 
-/// Append `h_height` (+ activation record, checkpoint and checkpoint pruning)
-/// to the flush's atomic batch.
+/// Append the flush's running-hash rows to its atomic batch: `h_height` (+
+/// activation record and stale-row cleanup on [`ChainStep::Start`],
+/// checkpoint and checkpoint pruning), or the unverified marker.
 pub(crate) fn append_to_batch(
     db: &StateDb,
     batch: &mut rocksdb::WriteBatch,
     height: u64,
-    hash: &[u8; 32],
-    activation: bool,
+    step: ChainStep,
+    hash: Option<&[u8; 32]>,
 ) -> Result<(), crate::StateError> {
     let cf = db.cf_handle(CF_CONSENSUS_META)?;
-    let mut v = Vec::with_capacity(40);
-    v.extend_from_slice(&height.to_be_bytes());
-    v.extend_from_slice(hash);
-    batch.put_cf(cf, META_RUNNING_STATE_HASH, v);
-    if activation {
-        batch.put_cf(cf, META_RUNNING_STATE_HASH_ACTIVATION, height.to_be_bytes());
-    }
-    if height % STATE_HASH_CHECKPOINT_INTERVAL == 0 {
-        batch.put_cf(cf, checkpoint_key(height), hash);
-        if let Some(old) =
-            height.checked_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN)
-        {
-            batch.delete_cf(cf, checkpoint_key(old));
+    match (step, hash) {
+        (ChainStep::Unverified { first: true }, _) => {
+            batch.put_cf(cf, META_RUNNING_STATE_HASH_UNVERIFIED, height.to_be_bytes());
         }
+        (ChainStep::Start | ChainStep::Continue(_), Some(hash)) => {
+            if step == ChainStep::Start {
+                // A fresh chain: nothing stored belongs to it.
+                for h in checkpoint_heights(db) {
+                    batch.delete_cf(cf, checkpoint_key(h));
+                }
+                batch.delete_cf(cf, META_RUNNING_STATE_HASH_UNVERIFIED);
+                batch.put_cf(cf, META_RUNNING_STATE_HASH_ACTIVATION, height.to_be_bytes());
+            }
+            let mut v = Vec::with_capacity(40);
+            v.extend_from_slice(&height.to_be_bytes());
+            v.extend_from_slice(hash);
+            batch.put_cf(cf, META_RUNNING_STATE_HASH, v);
+            if height % STATE_HASH_CHECKPOINT_INTERVAL == 0 {
+                batch.put_cf(cf, checkpoint_key(height), hash);
+                if let Some(old) =
+                    height.checked_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN)
+                {
+                    batch.delete_cf(cf, checkpoint_key(old));
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -348,6 +484,11 @@ mod tests {
         ] {
             assert_eq!(hashed_cf_id(derived), None, "{derived} must not be hashed");
         }
+        // Review finding 2: validator rows are read-modify-written by the
+        // consensus thread at epoch boundaries (timing-dependent): excluded,
+        // and their id 8 is never reused.
+        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), None);
+        assert!(!ids.contains(&8), "cf_id 8 is reserved");
     }
 
     fn golden_writes() -> Vec<WriteEntry> {

@@ -105,6 +105,10 @@ pub struct ConsensusConfig {
     /// identical on all validators). Absent in genesis TOML → disabled.
     #[serde(default)]
     pub reputation_leader_selection: bool,
+    /// Running state hash activation height (CHAIN-WIDE: the first height
+    /// every node hashes). Absent = running hash disabled.
+    #[serde(default)]
+    pub state_hash_activation_height: Option<u64>,
 }
 
 fn default_backoff_factor() -> u32 {
@@ -523,6 +527,7 @@ impl Genesis {
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
+            state_hash_activation_height: self.consensus.state_hash_activation_height,
         }
     }
 
@@ -732,6 +737,23 @@ mod tests {
     /// `commit_lag_backoff_cap` (every genesis written before S470) must map
     /// to a ChainConfig with the commit-lag backoff OFF — the exact pre-S470
     /// deadline schedule.
+    /// Running state hash (review finding 1): the activation height is a
+    /// CHAIN-WIDE genesis field; absent (every existing genesis) = disabled.
+    #[test]
+    fn genesis_state_hash_activation_height_is_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(genesis.consensus.state_hash_activation_height, None);
+        assert_eq!(genesis.chain_config().state_hash_activation_height, None);
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["state_hash_activation_height"] = serde_json::json!(5000);
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().state_hash_activation_height, Some(5000));
+        let mut config = genesis.chain_config();
+        assert!(config.validate().is_ok());
+        config.state_hash_activation_height = Some(0);
+        assert!(config.validate().is_err(), "height 0 is never executed");
+    }
+
     #[test]
     fn genesis_without_commit_lag_backoff_cap_defaults_off() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
