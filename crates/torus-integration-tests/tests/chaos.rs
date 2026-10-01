@@ -420,7 +420,7 @@ fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
                 .iter()
                 .map(|&v| (addr(v), NativeAction::SubmitOraclePrices(OracleSubmission {
                     prices: vec![(1, fp(50_000 + block as i64 + v as i64)), (2, fp(10))],
-                    timestamp: 0,
+                    timestamp: (1_700_000_000 + block) * 1_000, // sampled at block time (ms)
                 })))
                 .collect()
         } else {

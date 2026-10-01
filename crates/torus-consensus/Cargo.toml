@@ -29,3 +29,6 @@ tracing-subscriber = { workspace = true }
 # s515 F1 crash-replay tests: signed EVM txs through the committed-block path.
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-rlp = { workspace = true }
+# s517 oracle feeder review M1(b): decode oracle submission rows in tests.
+torus-core = { workspace = true }
+borsh = { workspace = true }
