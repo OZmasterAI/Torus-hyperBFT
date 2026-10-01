@@ -1930,6 +1930,8 @@ impl ExecutionContext {
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
+        // Item 3: so is the liquidation step while a cooldown or cursor row
+        // exists (a pending chunk / a cut pass must not wait for activity).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
         let run_native = if has_native
@@ -1939,10 +1941,12 @@ impl ExecutionContext {
         {
             true
         } else {
-            match NativeExecutor::oracle_due(&overlay) {
+            match NativeExecutor::oracle_due(&overlay)
+                .and_then(|due| Ok(due || NativeExecutor::liquidation_due(&overlay)?))
+            {
                 Ok(due) => due,
                 Err(e) => {
-                    tracing::error!(%e, height, "FATAL: oracle due-check read failed — halting execution pipeline (fail-stop)");
+                    tracing::error!(%e, height, "FATAL: oracle / liquidation due-check read failed — halting execution pipeline (fail-stop)");
                     self.exec_failed.store(true, Ordering::SeqCst);
                     if fold_header {
                         persist_block_header(&self.state_db, torus_block);
@@ -2246,6 +2250,24 @@ impl ExecutionContext {
             // execute_batch phase timer — time it separately.
             let tail_timer = std::time::Instant::now();
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
+            // Item 3: the liquidation step — end of the block, on the block-start
+            // mark (`begin_block_oracle` above). The EVM ran before this phase:
+            // precompile readers see a block's liquidations from the next block.
+            let _ = NativeExecutor::run_liquidations(&mut ctx);
+            // F11: a storage fault in the step (or in CoreWriter) fail-stops
+            // exactly like the batches' check above.
+            if let Some(reason) = ctx.fatal_error.take() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native liquidation step failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
@@ -16220,5 +16242,96 @@ mod crash_recovery_tests {
         assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
         assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
         assert_eq!(root_s, root_p);
+    }
+
+    // ---- item 3: liquidation helpers ----
+
+    /// oracle_fixture_db + T (seed 71) long `size` @ 1,000 against S (72); T funded
+    /// `collateral`, S and maker M (73) funded 10^7. Seeded through PositionManager.
+    fn liq_fixture_db(size: i64, collateral: i64) -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, collateral), (72, 10_000_000), (73, 10_000_000)] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        pm.apply_fill(&oracle_addr(71), ORACLE_MARKET, true, px(size), px(1_000), MarginType::Cross).unwrap();
+        pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(size), px(1_000), MarginType::Cross).unwrap();
+        (config, db)
+    }
+
+    fn oracle_sub(seed: u8, h: u64, price: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(ORACLE_MARKET, px(price))],
+                timestamp: 0,
+            }),
+            h * 1_000 + seed as u64,
+            &oracle_key(seed),
+        )
+    }
+
+    fn signed_bid(seed: u8, nonce: u64, price: i64, qty: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: true,
+                price: px(price),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            nonce,
+            &oracle_key(seed),
+        )
+    }
+
+    /// Heights 1..=rounds.len() (ts = 1000 + h), linked.
+    fn liq_blocks(rounds: Vec<Vec<SignedNativeAction>>) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> =
+            rounds.into_iter().enumerate().map(|(i, a)| make_block(i as u64 + 1, a)).collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn signed_pos_of(db: &StateDb, who: &Address) -> FixedPoint {
+        match torus_core::position::PositionManager::new(db.clone()).get_position(who, ORACLE_MARKET).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        }
+    }
+
+    /// Item 3 T8: the step runs at the END of the block (block 2's own bid fills
+    /// the chunk) on the block-start mark; a cooldown row alone makes an EMPTY
+    /// block (no submission rows left) run the native phase.
+    /// T long 200 @ 1,000, collateral 5,500, mark 990: stage 1, 20% chunks.
+    #[test]
+    fn liquidation_e2e_chunks_at_block_end_and_cooldown_drives_empty_blocks() {
+        let (config, db) = liq_fixture_db(200, 5_500);
+        let ctx = make_exec_ctx(&config, &db);
+        let t = oracle_addr(71);
+        let mut rounds = vec![
+            vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)], // 1 (ts 1001)
+            vec![signed_bid(73, 2_073, 985, 100)],                                         // 2 (mark 990)
+        ];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 30)); // 3..=32 (ts 1003..=1032)
+        let blocks = liq_blocks(rounds);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(200), "block 1: no mark yet");
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(160), "block 2: chunk 1 filled by block 2's own bid");
+        for b in &blocks[2..31] {
+            ctx.execute_committed_block(b, vec![]); // 3..=31 (ts <= 1031)
+        }
+        assert_eq!(signed_pos_of(&db, &t), px(160), "cooldown: next chunk at ts >= 1032");
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: only the cooldown makes block 32 due");
+        ctx.execute_committed_block(&blocks[31], vec![]); // 32, ts 1032, empty
+        assert_eq!(signed_pos_of(&db, &t), px(128), "chunk 2 = 20% of 160");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(32));
     }
 }
