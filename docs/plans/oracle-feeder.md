@@ -14,6 +14,23 @@ deviation from the draft). Runbook: `tools/price-feeder/README.md`.
 | `55cb396` | 4. Wallet: lib + bin; `torus-wallet set-oracle-signer` (flat command, not `validator set-oracle-signer`). |
 | `1c4b164` | 5. `tools/price-feeder` library. |
 | `d20715b` | 6. Feeder CLI, `/health` + `/metrics`, end-to-end test against a real RPC server. |
+| `a994f73` | 7. Docs. |
+
+Review fixes (s517, user: fix all):
+
+| Commit | Fix |
+|--------|-----|
+| `bcc73a7` | M1(b), consensus: a submission's signed sample time must be within 5 s of the block; the newest sample per (market, validator) wins in any order. |
+| `035e5ed` | L2, consensus: a tombstoned validator may clear its signer. |
+| `a4b7545` | L1, consensus: an address serving as a signer cannot register as a validator. |
+| `f209ebc` | M3, consensus: `SetOracleSigner.proof`, the signer key's proof of possession bound to the validator and chain. |
+| `0e25519` | M3: wallet `set-oracle-signer --signer-keystore` / `--signer-key-file` / `--clear`; feeder hints. |
+| `ad5d7d3` | M1(a), mempool: at the 4-cap a newer submission evicts the validator's oldest. |
+| `2875e5c` | M2: Binance unfiltered; Kraken per-pair fallback plus pair validation at startup. |
+| `f83878a` | L3: quote age from the venue's own timestamp (OKX, Bybit, KuCoin). |
+| `13a5845` | L6: a failed registration check is retried on the next cycle. |
+| `da790e7` | L5: per-venue weight cap of 1000; u64 weight sums. |
+| `5d571fe` | L4: health server read timeout; accept errors logged; the task handle is checked. |
 
 Q-S1 is decided: the signer's own account is unrestricted (D-S1), with no per-action lookup.
 Q-S2: a Candidate may set its signer; a Tombstoned validator may not.
@@ -94,6 +111,8 @@ and liquidation cannot work.
     value there. Both CFs are in the native root.
 
 **Action:** `NativeAction::SetOracleSigner { signer: Address }`, appended after `ClaimUnbonded`.
+(Review M3: the shipped form is `SetOracleSigner { signer, proof: Option<OracleSignerProof> }` with
+EIP-712 `SetOracleSigner(address signer,bytes32 proofHash,uint64 nonce)`; see the review table above.)
 
 * `Address::ZERO` clears the signer.
 * EIP-712 type: `SetOracleSigner(address signer,uint64 nonce)`. Canonical tag 28 (rebase s87: 26 = main's AttestStateHash, 27 = ClaimUnbonded).
@@ -140,6 +159,7 @@ This is pinned by a test.
   actions on its own account. That costs one index read per native action on the hot exec path,
   across several dispatch paths. It is offered as Q-S1, not planned.
 * Operators should use a fresh, unfunded signer address.
+* L7 (review): A **session key** with scope `Full` of the validator OR of its signer can also submit `SubmitOraclePrices` (`Full` excludes only CreateSession, RevokeSession, Withdraw, Delegate, Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded and SetOracleSigner); it reports exactly as its owner would. Treat a Full-scope session of either like the signer key.
 
 ### 2. Mempool priority (own commit, node-local)
 

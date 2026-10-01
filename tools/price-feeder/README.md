@@ -111,6 +111,17 @@ Design: `docs/plans/oracle-feeder.md`.
 
 ## Behaviour
 
+* **Sample time.** Each submission carries its sample time. The chain rejects
+  a submission sampled more than 5 s before or after the block, and keeps the
+  newest sample per market. At the mempool's limit of 4 per validator, a newer
+  submission replaces the oldest one.
+* **Venue timestamps.** OKX, Bybit and KuCoin quotes are aged by the venue's
+  own timestamp.
+* **Bad symbols.** Binance is fetched unfiltered. Kraken retries pair by pair
+  when one pair is unknown. Kraken pairs must be the canonical AssetPairs keys:
+  `check` and `run` refuse to start otherwise.
+* **Session keys.** A **session key** with scope `Full` of the validator OR of its signer can also submit `SubmitOraclePrices` (`Full` excludes only CreateSession, RevokeSession, Withdraw, Delegate, Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded and SetOracleSigner); it reports exactly as its owner would. Treat a Full-scope session of either like the signer key.
+
 * **Validator not active.** The feeder idles and re-checks every 60 s.
 * **Signer not registered.** `run` and `check` fail at startup and print the
   registration command. While the feeder runs, it idles until the signer is

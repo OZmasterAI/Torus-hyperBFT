@@ -1067,6 +1067,29 @@ Each item notes a place where the plan draft was changed during implementation.
   the touched lines (`tools/price-feeder`, `tools/wallet`, and the changed
   mempool / rpc / bridge ranges).
 
+**Review fixes (s517)** — see the commit table in `oracle-feeder.md`.
+
+* Correction s517 (M1(b)). The executor never sees the action nonce, because
+  every exec path passes `(sender, action)`. The rule therefore uses the
+  EIP-712-signed `OracleSubmission.timestamp` as the sample time (ms). The
+  feeder sets it and the nonce from one clock.
+  * The row stores it as `sample_ms`, between price and block number, so the
+    header-timestamp field stays the last 8 bytes.
+  * Equal samples keep the first write in canonical order.
+  * Existing fixtures now sample at their block time; a test helper stamps a
+    `timestamp: 0`.
+* Correction s517 (M3). The proof nonce is free, and the wallet uses the
+  current ms. Replay across validators is prevented by the `validator` field;
+  across chains, by `chainId`, which is in both the struct and the domain.
+  Exec checks the proof after the "is a validator" check and before the
+  "already serves" check.
+* Correction s517 (M2). The Binance fixture is unchanged. The unfiltered
+  endpoint returns the same row shape, and keeping the fixture keeps the
+  medians pinned by the other tests.
+* Correction s517 (M1(a)). Eviction is skipped for a duplicate (a gossip echo
+  at the cap would otherwise evict for nothing) and for a submission older
+  than every pooled one.
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).
