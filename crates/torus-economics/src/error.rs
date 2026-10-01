@@ -18,6 +18,9 @@ pub enum EconomicsError {
     #[error("validator {0} already registered")]
     ValidatorAlreadyRegistered(Address),
 
+    #[error("{0} serves as a validator's oracle signer; that validator must clear it first")]
+    ServingOracleSigner(Address),
+
     #[error("delegation not found: {delegator} -> {validator}")]
     DelegationNotFound {
         delegator: Address,

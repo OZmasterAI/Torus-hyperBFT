@@ -6,8 +6,9 @@
 use alloy_primitives::{Address, U256};
 use borsh::BorshDeserialize;
 use torus_state::cf::{
-    CF_ACCOUNTS, CF_CONSENSUS_META, CF_JAIL_VOTES, CF_SLASH_RECORDS, CF_STAKING_DELEGATIONS,
-    CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS, CF_STATE_HASH_VOTES,
+    CF_ACCOUNTS, CF_CONSENSUS_META, CF_JAIL_VOTES, CF_NATIVE_ORACLE, CF_SLASH_RECORDS,
+    CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
+    CF_STATE_HASH_VOTES,
 };
 use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 
@@ -61,6 +62,17 @@ impl<T: StateBackend> StakingManager<T> {
         // Check not already registered.
         if self.get_validator(&sender)?.is_some() {
             return Err(EconomicsError::ValidatorAlreadyRegistered(sender));
+        }
+        // Review L1 (s517): an address serving as a validator's hot oracle
+        // signer cannot become a validator (its submissions would silently
+        // stop counting for that validator). The "sgn" index entry exists
+        // exactly while it serves; the validator clears it first.
+        if self
+            .state
+            .get_cf_raw(CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&sender))?
+            .is_some()
+        {
+            return Err(EconomicsError::ServingOracleSigner(sender));
         }
 
         // Debit balance.
@@ -2008,5 +2020,29 @@ mod tests {
         // Now we should be able to undelegate again
         mgr.undelegate(delegator, validator, small, release_block + 1)
             .unwrap();
+    }
+
+    /// Review L1 (s517): an address serving as a validator's hot oracle signer
+    /// cannot register as a validator (it would silently stop counting for
+    /// the validator it serves).
+    #[test]
+    fn register_validator_rejects_a_serving_oracle_signer() {
+        let (_dir, mgr) = setup();
+        let signer = addr(9);
+        fund_account(&mgr, &signer, MIN_SELF_DELEGATION * U256::from(2u8));
+        mgr.state()
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::oracle_signer_key(&signer),
+                addr(1).as_slice(),
+            )
+            .unwrap();
+        let err = mgr.register_validator(signer, [1u8; 32], 500, MIN_SELF_DELEGATION).unwrap_err();
+        assert!(err.to_string().contains("oracle signer"), "{err}");
+        assert!(mgr.get_validator(&signer).unwrap().is_none());
+        // Not serving: registers normally.
+        mgr.register_validator(addr(8), [2u8; 32], 500, MIN_SELF_DELEGATION).unwrap_err(); // unfunded
+        fund_account(&mgr, &addr(8), MIN_SELF_DELEGATION);
+        mgr.register_validator(addr(8), [2u8; 32], 500, MIN_SELF_DELEGATION).unwrap();
     }
 }
