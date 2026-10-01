@@ -37,3 +37,6 @@ Reply:
 | `openOrders` | number | Resting orders plus pending stops, all markets. |
 | `openOrderLimit` | number | The formula above for the stored `cumVolume`. |
 | `cumVolume` | decimal string | Lifetime traded notional, same format as `torus_getBalances` amounts. |
+
+`torus_getOpenOrders` returns up to 5000 resting orders (pending stops are not
+listed there).

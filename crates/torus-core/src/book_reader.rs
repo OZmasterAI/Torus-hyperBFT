@@ -438,7 +438,7 @@ pub fn read_last_trade_price<S: StateBackend>(
 /// Resting orders belonging to `trader`, as `(market_id, order)`.
 ///
 /// `market` restricts the scan to one market; `limit` caps the result (the RPC
-/// handlers cap at 500). Ordering is deterministic: ascending
+/// handlers cap at 5000). Ordering is deterministic: ascending
 /// `(market_id, order_id)`.
 ///
 /// Mode 2 reads the NODE-LOCAL `cf_book_order_rows`: the root CF commits only

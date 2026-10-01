@@ -13,7 +13,7 @@ use rocksdb::IteratorMode;
 use torus_core::book_reader::{self, BookLayout};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::OrderBook;
-use torus_core::position::{open_order_limit, PositionManager};
+use torus_core::position::{open_order_limit, PositionManager, OPEN_ORDER_MAX_LIMIT};
 use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
 use torus_economics::rewards::FeeSplitter;
@@ -740,8 +740,9 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
     ErrorObjectOwned::from(RpcError::Internal(e.to_string()))
 }
 
-/// Response cap for `torus_getOpenOrders` (unchanged from the classic path).
-const OPEN_ORDERS_LIMIT: usize = 500;
+/// Response cap for `torus_getOpenOrders`: the most open orders a user can
+/// hold, so a user at the cap still sees every resting order.
+const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 
 #[async_trait]
 impl TorusApiServer for RpcState {
@@ -1586,7 +1587,7 @@ impl TorusApiServer for RpcState {
                     .map_err(|e| RpcError::Internal(format!("borsh decode order book: {e}")))
                     .map_err(ErrorObjectOwned::from)?;
                 for order in book.orders_for_trader(&trader_addr) {
-                    if orders.len() >= 500 {
+                    if orders.len() >= OPEN_ORDERS_LIMIT {
                         break;
                     }
                     orders.push(order_to_rpc(order, mid));
@@ -1596,7 +1597,7 @@ impl TorusApiServer for RpcState {
             // All markets: iterate CF_NATIVE_ORDER_BOOKS
             let iter = db.iterator_cf(cf, IteratorMode::Start);
             for item in iter {
-                if orders.len() >= 500 {
+                if orders.len() >= OPEN_ORDERS_LIMIT {
                     break;
                 }
                 let (key, value) = item
@@ -1611,7 +1612,7 @@ impl TorusApiServer for RpcState {
                     Err(_) => continue,
                 };
                 for order in book.orders_for_trader(&trader_addr) {
-                    if orders.len() >= 500 {
+                    if orders.len() >= OPEN_ORDERS_LIMIT {
                         break;
                     }
                     orders.push(order_to_rpc(order, mid));
