@@ -399,6 +399,7 @@ fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             })
             .unwrap();
     }

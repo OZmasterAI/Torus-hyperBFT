@@ -75,6 +75,7 @@ impl<T: StateBackend> StakingManager<T> {
             status: ValidatorStatus::Candidate,
             jailed_until: None,
             last_commission_change_block: None,
+            oracle_signer: None,
         };
         self.put_validator(&sender, &state)?;
 

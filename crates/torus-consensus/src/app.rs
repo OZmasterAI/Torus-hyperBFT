@@ -14093,6 +14093,7 @@ mod crash_recovery_tests {
                     status: torus_economics::ValidatorStatus::Active,
                     jailed_until: None,
                     last_commission_change_block: None,
+                    oracle_signer: None,
                 })
                 .unwrap();
         }
@@ -14366,6 +14367,7 @@ mod crash_recovery_tests {
                     status,
                     jailed_until: None,
                     last_commission_change_block: None,
+                    oracle_signer: None,
                 },
             )
             .unwrap();
@@ -14629,5 +14631,157 @@ mod crash_recovery_tests {
         assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
         assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
         assert_eq!(root_s, root_p);
+    }
+
+    // ---- s517 oracle feeder S4: the hot oracle signer through whole blocks ----
+
+    /// The hot signer key of validator `seed` (a separate address).
+    fn signer_key(seed: u8) -> k256::ecdsa::SigningKey {
+        oracle_key(seed.wrapping_add(100))
+    }
+
+    fn key_addr(key: &k256::ecdsa::SigningKey) -> Address {
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 0, key)
+            .recover_sender()
+            .unwrap()
+    }
+
+    fn set_signer_action(h: u64, seed: u8, signer: Address) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::SetOracleSigner { signer },
+            h * 1_000 + 500 + seed as u64,
+            &oracle_key(seed),
+        )
+    }
+
+    fn signer_submit(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(ORACLE_MARKET, px(price))],
+                timestamp: 0,
+            }),
+            h * 1_000 + tag as u64,
+            key,
+        )
+    }
+
+    /// Heights 1..=n (ts = 1000 + h), linked to their actual parents.
+    fn blocks_of(rounds: Vec<Vec<SignedNativeAction>>) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> = rounds
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| make_block(i as u64 + 1, a))
+            .collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn signer_index_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_ORACLE, Some(b"sgn")).unwrap()
+    }
+
+    /// Block 1: every validator registers its signer (EIP-712, validator key).
+    /// Block 2: the SIGNERS submit 100 / 101 / 102. Block 3: the stake-weighted
+    /// mark (V3 = 3x) is 102 (simple median 101). Exercises batch signature
+    /// recovery -> sender = signer -> resolution to the validator.
+    #[test]
+    fn oracle_signer_signed_submissions_aggregate_through_whole_blocks() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let set: Vec<_> = ORACLE_VALIDATORS
+            .iter()
+            .map(|&(s, _)| set_signer_action(1, s, key_addr(&signer_key(s))))
+            .collect();
+        let subs: Vec<_> = [(61u8, 100i64), (62, 101), (63, 102)]
+            .iter()
+            .map(|&(s, p)| signer_submit(2, &signer_key(s), s, p))
+            .collect();
+        let blocks = blocks_of(vec![set, subs, vec![]]);
+        for b in &blocks {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(signer_index_rows(&db).len(), 3);
+        let rows = oracle_sub_rows(&db);
+        assert_eq!(rows.len(), 3, "one row per VALIDATOR");
+        for (seed, _) in ORACLE_VALIDATORS {
+            assert!(rows.iter().any(|(k, _)| &k[11..31] == oracle_addr(seed).as_slice()));
+        }
+        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "stake-weighted by the validators");
+    }
+
+    /// Block 2 carries V61's rotation AND a submission from its OLD signer: the
+    /// oracle category runs before `Other`, so the row is written. Block 3: the
+    /// old signer adds nothing; block 4: the new signer updates the row.
+    #[test]
+    fn oracle_signer_rotation_in_block_counts_old_signer_once_then_rejects_it() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let (old, new) = (signer_key(61), oracle_key(222));
+        let blocks = blocks_of(vec![
+            vec![set_signer_action(1, 61, key_addr(&old))],
+            vec![set_signer_action(2, 61, key_addr(&new)), signer_submit(2, &old, 1, 100)],
+            vec![signer_submit(3, &old, 1, 500)],
+            vec![signer_submit(4, &new, 2, 700)],
+        ]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        let after_rotation = oracle_sub_rows(&db);
+        assert_eq!(after_rotation.len(), 1, "same-block: the old signer still counts once");
+        assert_eq!(&after_rotation[0].0[11..31], oracle_addr(61).as_slice());
+        assert_eq!(
+            signer_index_rows(&db),
+            vec![(
+                torus_state::cf::oracle_signer_key(&key_addr(&new)).to_vec(),
+                oracle_addr(61).to_vec()
+            )]
+        );
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(oracle_sub_rows(&db), after_rotation, "old signer rejected from the next block");
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        let rows = oracle_sub_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows, after_rotation, "the new signer's submission replaces the row");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    /// Determinism: a chain with SetOracleSigner (set, rotate, clear) and signer
+    /// submissions gives identical CF dumps + native roots serially, pipelined
+    /// (parked) and through crash replay.
+    #[test]
+    fn oracle_signer_blocks_replay_identically() {
+        let new61 = oracle_key(222);
+        let set: Vec<_> = ORACLE_VALIDATORS
+            .iter()
+            .map(|&(s, _)| set_signer_action(1, s, key_addr(&signer_key(s))))
+            .collect();
+        let subs = |h: u64, p: i64| -> Vec<SignedNativeAction> {
+            ORACLE_VALIDATORS.iter().map(|&(s, _)| signer_submit(h, &signer_key(s), s, p)).collect()
+        };
+        let mut b4 = subs(4, 300);
+        b4.push(set_signer_action(4, 61, key_addr(&new61)));
+        let blocks = blocks_of(vec![
+            set,
+            subs(2, 100),
+            vec![],
+            b4,
+            vec![signer_submit(5, &signer_key(61), 61, 900), signer_submit(5, &new61, 1, 310)],
+            vec![set_signer_action(6, 62, Address::ZERO)],
+            subs(7, 400), // 62's cleared signer is rejected
+            vec![],
+        ]);
+        let (serial, root_s, db_s) = run_oracle_fixture(OracleRun::Serial, &blocks);
+        let (piped, root_p, _) = run_oracle_fixture(OracleRun::PipelinedParked, &blocks);
+        let (replay, root_r, _) = run_oracle_fixture(OracleRun::Replay, &blocks);
+        // Non-vacuous: 61 -> new signer, 62 cleared, 63 unchanged.
+        let idx = signer_index_rows(&db_s);
+        assert_eq!(idx.len(), 2, "{idx:?}");
+        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&new61).as_slice() && v[..] == *oracle_addr(61).as_slice()));
+        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&signer_key(63)).as_slice() && v[..] == *oracle_addr(63).as_slice()));
+        assert!(mark_at(&db_s, 1_008).is_some());
+        assert_dumps_equal(&serial, &piped, "oracle signer: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "oracle signer: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
     }
 }

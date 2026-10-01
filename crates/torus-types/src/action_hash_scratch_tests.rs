@@ -112,6 +112,9 @@ fn actions() -> Vec<NativeAction> {
         },
         NativeAction::TopUpSelfStake { amount: U256::MAX },
         NativeAction::ClaimUnbonded,
+        NativeAction::SetOracleSigner {
+            signer: Address::repeat_byte(11),
+        },
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
         for new_qty in [None, Some(FixedPoint::MAX)] {
@@ -200,8 +203,8 @@ fn append_canonical_bytes_matches_frozen_encoder_for_all_variants() {
     }
     assert_eq!(
         tags,
-        (0u8..=26).collect(),
-        "all action tags must be covered"
+        (0u8..=27).collect(),
+        "all action tags must be covered (27 = SetOracleSigner, s517)"
     );
 }
 
@@ -580,6 +583,10 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
             buf.extend_from_slice(session_pubkey);
         }
         NativeAction::ClaimUnbonded => buf.push(26),
+        NativeAction::SetOracleSigner { signer } => {
+            buf.push(27);
+            buf.extend_from_slice(signer.as_slice());
+        }
     }
     buf
 }
