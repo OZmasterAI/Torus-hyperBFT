@@ -43,10 +43,13 @@ impl NativeExecutor {
     }
 
     /// Item 3: whether the liquidation step has pending work without any new
-    /// action — a cooldown row (a chunk waits for its 30 s) or the cursor row
-    /// (a cut pass). Reads the block's overlay (DB + parent layer).
+    /// action — a cooldown row (a chunk waits for its 30 s), the cursor row
+    /// (a cut pass) or, review M2, a pending row (an account left under MM by
+    /// its last action, e.g. a thin book). Reads the block's overlay (DB +
+    /// parent layer).
     pub fn liquidation_due<T: StateBackend>(state: &T) -> Result<bool, CoreError> {
         Ok(state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::COOLDOWN_TAG])?
+            || state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::PENDING_TAG])?
             || state.get_cf_raw(CF_NATIVE_LIQUIDATION, &liq::CURSOR_KEY)?.is_some())
     }
 
@@ -82,6 +85,9 @@ impl NativeExecutor {
             let h = match Self::liq_view(ctx, &marks, &trader)?.map(|v| liq::classify(&v)) {
                 Some(Some(h)) => h,
                 _ => {
+                    // M2: nothing the step can do until a mark returns (the
+                    // oracle step makes those blocks due).
+                    liq::set_pending(&ctx.state, &trader, false)?;
                     results.push(NativeActionResult::err(
                         "liquidation",
                         format!("{trader}: skipped (no marked position / overflow / isolated)"),
@@ -91,6 +97,7 @@ impl NativeExecutor {
             };
             if h == Health::Healthy {
                 liq::clear_cooldown(&ctx.state, &trader)?;
+                liq::set_pending(&ctx.state, &trader, false)?;
                 continue;
             }
             acted += 1;
@@ -113,6 +120,9 @@ impl NativeExecutor {
             if ctx.positions.positions_for_trader(&trader)?.is_empty() {
                 liq::clear_cooldown(&ctx.state, &trader)?;
             }
+            // M2: still under MM (thin book, cooldown, bounded ADL) -> keep the
+            // step due until the account is healthy, flat or unvaluable.
+            Self::mark_pending(ctx, &marks, &trader)?;
             results.push(NativeActionResult::ok("liquidation", 3000));
         }
         // D8: the vault is exempt from stage 1 / backstop; ADL when its AV < 0.
@@ -122,6 +132,10 @@ impl NativeExecutor {
                 Self::adl_account(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
+        // M2 for the vault: pending while it stays ADL-able.
+        let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT)?
+            .is_some_and(|v| liq::classify(&v) == Some(Health::Adl));
+        liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
         liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
         Ok(results)
@@ -146,6 +160,19 @@ impl NativeExecutor {
         let bal = ctx.positions.get_native_balance(trader)?;
         let reader = AccountReader::of(ctx);
         Ok(AccountView::build(&bal, &ps, |m| marks.get(&m).copied(), |m| reader.tiers(m)).ok())
+    }
+
+    /// Review M2: the pending row of `trader` after its action — set iff it is
+    /// still valuable and not healthy.
+    fn mark_pending<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        marks: &Marks,
+        trader: &Address,
+    ) -> Result<(), CoreError> {
+        let under = Self::liq_view(ctx, marks, trader)?
+            .and_then(|v| liq::classify(&v))
+            .is_some_and(|h| h != Health::Healthy);
+        liq::set_pending(&ctx.state, trader, under)
     }
 
     /// Stage 1: reduce-only IOC market orders into the book, positions by

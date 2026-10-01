@@ -172,6 +172,8 @@ pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
 /// * `0x03 ‖ market(8 BE)` -> i128 BE raw: previous mark (ADL price)
 /// * `0x04` -> trader(20): round-robin scan cursor (only while a pass was cut)
 /// * `0x05 ‖ …` — reserved: vault deposits / shares (later branch)
+/// * `0x06 ‖ trader(20)` -> `[1]`: still under MM after its last liquidation action (keeps
+///   the step due, review M2)
 pub const CF_NATIVE_LIQUIDATION: &str = "cf_native_liquidation";
 
 /// All column family names. RocksDB requires these at open time.

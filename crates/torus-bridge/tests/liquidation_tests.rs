@@ -605,7 +605,10 @@ fn budgets_carry_over_through_the_cursor_round_robin() {
     NativeExecutor::run_liquidations_with(&mut ctx, 2, 2);
     assert_eq!(acted(&ctx), [true; 5]);
     assert_eq!(cursor(&ctx), None, "a5 then s (healthy) reached the end: cursor deleted");
-    assert!(!NativeExecutor::liquidation_due(&db).unwrap());
+    // Review M2 (s517): the five are still under MM (empty book), so their
+    // pending rows keep the step due (was: nothing due once the cursor went).
+    assert_eq!(liq_rows(&ctx, 0x06).len(), 5);
+    assert!(NativeExecutor::liquidation_due(&db).unwrap());
 }
 
 /// `liquidation_due`: false on an empty CF, true with a cooldown row.
