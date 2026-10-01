@@ -16286,7 +16286,7 @@ mod crash_recovery_tests {
         torus_types::eip712::sign_native_action(
             NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
                 prices: vec![(ORACLE_MARKET, px(price))],
-                timestamp: 0,
+                timestamp: (1_000 + h) * 1_000, // review M1(b): sampled at the block's time (ms)
             }),
             h * 1_000 + seed as u64,
             &oracle_key(seed),
