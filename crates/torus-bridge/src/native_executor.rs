@@ -5218,7 +5218,12 @@ impl NativeExecutor {
         match market_id {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
+                    let stops = book.pending_stop_count();
                     let cancelled = book.cancel_all(*sender, Some(mid));
+                    // A removed pending stop must be persisted too.
+                    if book.pending_stop_count() != stops {
+                        ctx.dirty_books.insert(mid);
+                    }
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
                         let cfg = ctx.margin_configs.get(&mid);
@@ -5237,7 +5242,11 @@ impl NativeExecutor {
                 let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
                 for mid in market_ids {
                     if let Some(book) = ctx.order_books.get_mut(&mid) {
+                        let stops = book.pending_stop_count();
                         let cancelled = book.cancel_all(*sender, None);
+                        if book.pending_stop_count() != stops {
+                            ctx.dirty_books.insert(mid);
+                        }
                         if !cancelled.is_empty() {
                             ctx.dirty_books.insert(mid);
                             let cfg = ctx.margin_configs.get(&mid);
@@ -5304,8 +5313,13 @@ impl NativeExecutor {
             let mut per_action = vec![Vec::new(); run.len()];
             if !senders.is_empty() {
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
+                let stops = book.pending_stop_count();
                 for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
                     per_action[k] = orders;
+                }
+                // Same dirty mark as `exec_cancel_all` for removed stops.
+                if book.pending_stop_count() != stops {
+                    ctx.dirty_books.insert(*mid);
                 }
             }
             cancelled.push(per_action);
