@@ -1378,6 +1378,27 @@ impl OrderBook {
         Ok(order)
     }
 
+    /// C4 (s517): remove `trader`'s PENDING STOPS (same mutation as
+    /// `cancel_all`'s `retain`: the survivors keep their relative order, so
+    /// `pending_stops` stays id-ascending) and return each removed stop's
+    /// reservation inputs `(price, quantity)` — the price its triggered order
+    /// would carry (the limit, else the cap; see `trigger_stops`). The caller
+    /// releases their reservations; `cancel_all` alone does not report stops.
+    pub fn take_pending_stops(&mut self, trader: &Address) -> Vec<(FixedPoint, FixedPoint)> {
+        if !self.pending_stops.iter().any(|s| s.trader == *trader) {
+            return Vec::new();
+        }
+        let (taken, kept): (Vec<StopOrder>, Vec<StopOrder>) =
+            std::mem::take(&mut self.pending_stops)
+                .into_iter()
+                .partition(|s| s.trader == *trader);
+        self.pending_stops = kept;
+        taken
+            .into_iter()
+            .map(|s| (s.limit_price.unwrap_or(s.price_cap), s.quantity))
+            .collect()
+    }
+
     /// Cancel all orders for a trader, pending stops included. Returns the
     /// cancelled resting orders.
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {

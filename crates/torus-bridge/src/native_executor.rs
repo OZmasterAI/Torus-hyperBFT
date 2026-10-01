@@ -6573,68 +6573,75 @@ impl NativeExecutor {
         sender: &Address,
         market_id: Option<MarketId>,
     ) -> NativeActionResult {
-        // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
-        let mut total_margin_release = FixedPoint::ZERO;
-
-        match market_id {
-            Some(mid) => {
-                if let Some(book) = ctx.order_books.get_mut(&mid) {
-                    let stops = book.pending_stop_count();
-                    let cancelled = book.cancel_all(*sender, Some(mid));
-                    // A removed pending stop must be persisted too.
-                    if book.pending_stop_count() != stops {
-                        ctx.dirty_books.insert(mid);
-                    }
-                    if !cancelled.is_empty() {
-                        ctx.dirty_books.insert(mid);
-                        let cfg = ctx.margin_configs.get(&mid);
-                        for order in &cancelled {
-                            let notional = order.price * order.remaining_qty;
-                            let max_lev = cfg
-                                .map(|c| effective_max_leverage(&c.tiers, notional))
-                                .unwrap_or(20);
-                            total_margin_release +=
-                                Self::margin_at_integer_leverage(notional, max_lev);
-                        }
-                    }
-                }
-            }
-            None => {
-                let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
-                for mid in market_ids {
-                    if let Some(book) = ctx.order_books.get_mut(&mid) {
-                        let stops = book.pending_stop_count();
-                        let cancelled = book.cancel_all(*sender, None);
-                        if book.pending_stop_count() != stops {
-                            ctx.dirty_books.insert(mid);
-                        }
-                        if !cancelled.is_empty() {
-                            ctx.dirty_books.insert(mid);
-                            let cfg = ctx.margin_configs.get(&mid);
-                            for order in &cancelled {
-                                let notional = order.price * order.remaining_qty;
-                                let max_lev = cfg
-                                    .map(|c| effective_max_leverage(&c.tiers, notional))
-                                    .unwrap_or(20);
-                                total_margin_release +=
-                                    Self::margin_at_integer_leverage(notional, max_lev);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if total_margin_release > FixedPoint::ZERO {
-            if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                let release = total_margin_release.min(bal.order_margin);
-                bal.order_margin -= release;
-                bal.available += release;
-                let _ = ctx.positions.put_native_balance(sender, &bal);
-            }
-        }
-
+        // FIX 2 (ECON-FIND-05) + C4 (s517): release what the cancelled orders
+        // AND pending stops reserved.
+        let total_margin_release = Self::cancel_orders_and_stops(ctx, sender, market_id);
+        Self::release_order_margin(ctx, sender, total_margin_release);
         NativeActionResult::ok("cancel_all", 500)
+    }
+
+    /// C4 (s517): cancel `trader`'s resting orders AND pending stops in
+    /// `market` (`None` = every market, ascending id) and return the margin
+    /// they reserved — orders at `price × remaining` (FIX 2), stops at
+    /// [`Self::stop_reservation`]. A market that lost anything is dirty. The
+    /// caller releases the sum (`min(order_margin)`). Shared by the user
+    /// `CancelAll` and the liquidation step.
+    fn cancel_orders_and_stops<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        trader: &Address,
+        market: Option<MarketId>,
+    ) -> FixedPoint {
+        let market_ids: Vec<MarketId> = match market {
+            Some(m) => vec![m],
+            None => {
+                let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+                v.sort_unstable();
+                v
+            }
+        };
+        let mut total = FixedPoint::ZERO;
+        for mid in market_ids {
+            let Some(book) = ctx.order_books.get_mut(&mid) else { continue };
+            let stops = book.take_pending_stops(trader);
+            let cancelled = book.cancel_all(*trader, market);
+            if stops.is_empty() && cancelled.is_empty() {
+                continue;
+            }
+            ctx.dirty_books.insert(mid);
+            let cfg = ctx.margin_configs.get(&mid);
+            total += Self::cancelled_orders_margin(cfg, &cancelled);
+            for &(price, qty) in &stops {
+                total += Self::stop_reservation(cfg, price, qty);
+            }
+        }
+        total
+    }
+
+    /// FIX 2 (ECON-FIND-05): the margin `cancelled` resting orders reserved.
+    fn cancelled_orders_margin(
+        cfg: Option<&MarketMarginConfig>,
+        cancelled: &[torus_core::order_book::Order],
+    ) -> FixedPoint {
+        let mut total = FixedPoint::ZERO;
+        for order in cancelled {
+            let notional = order.price * order.remaining_qty;
+            let max_lev = cfg
+                .map(|c| effective_max_leverage(&c.tiers, notional))
+                .unwrap_or(20);
+            total += Self::margin_at_integer_leverage(notional, max_lev);
+        }
+        total
+    }
+
+    /// C4 (s517): a pending stop's reservation at its `(price, qty)` from
+    /// `take_pending_stops` — exactly what [`Self::run_triggered_stops`]
+    /// releases when it fires; an overflowing legacy row reserved nothing.
+    fn stop_reservation(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
+        Self::try_reserve_for_qty_cfg(cfg, price, qty).unwrap_or(FixedPoint::ZERO)
     }
 
     /// s63: a run of consecutive `CancelAllOrders` (`run` = flat index,
@@ -6660,6 +6667,8 @@ impl NativeExecutor {
         // cancelled[m][k]: the orders action k removed from market_ids[m].
         let mut cancelled: Vec<Vec<Vec<torus_core::order_book::Order>>> =
             Vec::with_capacity(market_ids.len());
+        // C4 (s517): (took a stop?, their reservations) of action k in market_ids[m].
+        let mut stop_release: Vec<Vec<(bool, FixedPoint)>> = Vec::with_capacity(market_ids.len());
         let mut members: Vec<usize> = Vec::with_capacity(run.len());
         let mut senders: Vec<Address> = Vec::with_capacity(run.len());
         for mid in &market_ids {
@@ -6672,18 +6681,24 @@ impl NativeExecutor {
                 }
             }
             let mut per_action = vec![Vec::new(); run.len()];
+            let mut stops_k = vec![(false, FixedPoint::ZERO); run.len()];
             if !senders.is_empty() {
+                let cfg = ctx.margin_configs.get(mid);
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
-                let stops = book.pending_stop_count();
+                // C4: each member's stops first, in run order (a repeated
+                // sender finds none, as its sequential second call would).
+                for &k in &members {
+                    for (price, qty) in book.take_pending_stops(&run[k].1) {
+                        stops_k[k].0 = true;
+                        stops_k[k].1 += Self::stop_reservation(cfg, price, qty);
+                    }
+                }
                 for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
                     per_action[k] = orders;
                 }
-                // Same dirty mark as `exec_cancel_all` for removed stops.
-                if book.pending_stop_count() != stops {
-                    ctx.dirty_books.insert(*mid);
-                }
             }
             cancelled.push(per_action);
+            stop_release.push(stops_k);
         }
 
         let mut results = Vec::with_capacity(run.len());
@@ -6692,27 +6707,16 @@ impl NativeExecutor {
             let mut total_margin_release = FixedPoint::ZERO;
             for (m, mid) in market_ids.iter().enumerate() {
                 let orders = &cancelled[m][k];
-                if orders.is_empty() {
+                let (took_stops, stops) = stop_release[m][k];
+                if orders.is_empty() && !took_stops {
                     continue;
                 }
                 ctx.dirty_books.insert(*mid);
                 let cfg = ctx.margin_configs.get(mid);
-                for order in orders {
-                    let notional = order.price * order.remaining_qty;
-                    let max_lev = cfg
-                        .map(|c| effective_max_leverage(&c.tiers, notional))
-                        .unwrap_or(20);
-                    total_margin_release += Self::margin_at_integer_leverage(notional, max_lev);
-                }
+                total_margin_release += Self::cancelled_orders_margin(cfg, orders);
+                total_margin_release += stops;
             }
-            if total_margin_release > FixedPoint::ZERO {
-                if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                    let release = total_margin_release.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    let _ = ctx.positions.put_native_balance(sender, &bal);
-                }
-            }
+            Self::release_order_margin(ctx, sender, total_margin_release);
             results.push(NativeActionResult::ok("cancel_all", 500));
         }
         results

@@ -1082,3 +1082,46 @@ fn batch_second_sell_beyond_the_allowance_is_charged() {
         assert_bal(&ctx, &taker, fp(5), fp(95), &what);
     }
 }
+
+/// C4 (s517, liquidation plan T3): CancelAll also cancels the sender's PENDING
+/// STOPS and releases their reservation — without a resting order (the book
+/// returned early: stops survived) and with one (stops dropped, margin leaked).
+/// Two consecutive CancelAlls = the batched `exec_cancel_all_run` path. The
+/// removal survives save + reload.
+#[test]
+fn cancel_all_cancels_pending_stops_and_releases_their_margin() {
+    for path in PATHS {
+        for with_resting in [false, true] {
+            for target in [None, Some(1)] {
+                let t = addr(1);
+                let what = format!("{path:?} resting={with_resting} target={target:?}");
+                let (_d, mut ctx) = fresh(path, &[t, addr(2)]);
+                // stop buy 1, trigger 110, cap 120 -> reserves 6 (20x); bid 1 @ 90 -> 4.5
+                let mut acts = vec![place(t, stop_market(1, true, 110, fp(120), 1))];
+                if with_resting {
+                    acts.push(place(t, limit(1, true, 90, 1)));
+                }
+                assert!(run(&mut ctx, path, &acts).iter().all(|r| r.success), "{what}");
+                assert!(bal(&ctx, &t).order_margin > FixedPoint::ZERO, "{what}: reserved");
+                let r = run(
+                    &mut ctx,
+                    path,
+                    &[
+                        (t, NativeAction::CancelAllOrders { market_id: target }),
+                        (addr(2), NativeAction::CancelAllOrders { market_id: None }),
+                    ],
+                );
+                assert!(r.iter().all(|r| r.success), "{what}");
+                assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{what}");
+                assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, &what);
+                ctx.save_order_books();
+                let reloaded = make_ctx(ctx.state.clone());
+                assert_eq!(
+                    reloaded.order_books.get(&1).map_or(0, |b| b.pending_stop_count()),
+                    0,
+                    "{what}: persisted"
+                );
+            }
+        }
+    }
+}
