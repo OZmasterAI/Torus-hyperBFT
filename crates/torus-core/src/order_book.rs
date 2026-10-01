@@ -640,15 +640,18 @@ impl OrderBook {
         Ok(order)
     }
 
-    /// Cancel all orders for a trader. Returns cancelled orders.
+    /// Cancel all orders for a trader, pending stops included. Returns the
+    /// cancelled resting orders.
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+        // Stops hold open-order slots, so they go even when the trader has
+        // no resting order.
+        self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids,
             None => return vec![],
         };
 
         if let Some(cancelled) = self.try_cancel_all_batch(&order_ids) {
-            self.pending_stops.retain(|s| s.trader != trader);
             return cancelled;
         }
 
@@ -690,9 +693,6 @@ impl OrderBook {
                 }
             }
         }
-
-        // Also remove pending stops for this trader
-        self.pending_stops.retain(|s| s.trader != trader);
 
         cancelled
     }
@@ -3295,6 +3295,19 @@ mod tests {
         assert_eq!(ob.pending_stop_count(), 1);
         assert_eq!(ob.orders_for_trader(&a).len(), 3);
         assert_eq!(ob.open_order_count(&a), 4);
+    }
+
+    #[test]
+    fn cancel_all_removes_stops_of_trader_without_resting_orders() {
+        let mut ob = book();
+        let a = addr(1);
+        ob.place_order(stop(false, OrderType::StopMarket { trigger: fp(80) }), a, 1);
+        ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(120) }), a, 2);
+        ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(130) }), addr(2), 3);
+        assert_eq!(ob.open_order_count(&a), 2);
+        assert!(ob.cancel_all(a, None).is_empty());
+        assert_eq!(ob.open_order_count(&a), 0);
+        assert_eq!(ob.open_order_count(&addr(2)), 1);
     }
 
     #[test]
