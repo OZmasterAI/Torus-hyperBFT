@@ -85,7 +85,19 @@ fn oracle_db() -> (tempfile::TempDir, StateDb) {
     (dir, db)
 }
 
-fn exec(db: &StateDb, height: u64, (sender, action): (Address, NativeAction)) -> NativeActionResult {
+/// Submissions built with `timestamp: 0` get block `height`'s time (ms):
+/// review M1(b) bounds a sample to 5 s around the block.
+fn stamp(height: u64, (sender, mut action): (Address, NativeAction)) -> (Address, NativeAction) {
+    if let NativeAction::SubmitOraclePrices(sub) = &mut action {
+        if sub.timestamp == 0 {
+            sub.timestamp = (1_000 + height) * 1_000;
+        }
+    }
+    (sender, action)
+}
+
+fn exec(db: &StateDb, height: u64, a: (Address, NativeAction)) -> NativeActionResult {
+    let (sender, action) = stamp(height, a);
     NativeExecutor::execute(&mut ctx_at(db.clone(), height), &sender, &action)
 }
 
@@ -129,7 +141,8 @@ fn mark<T: StateBackend>(ctx: &NativeExecContext<T>, m: MarketId) -> Option<Fixe
 fn run_block(db: &StateDb, height: u64, actions: &[(Address, NativeAction)]) -> Vec<NativeActionResult> {
     let mut ctx = ctx_at(db.clone(), height);
     NativeExecutor::begin_block_oracle(&mut ctx);
-    let res = NativeExecutor::execute_batch(&mut ctx, actions).results;
+    let actions: Vec<_> = actions.iter().cloned().map(|a| stamp(height, a)).collect();
+    let res = NativeExecutor::execute_batch(&mut ctx, &actions).results;
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
     res
 }
@@ -331,4 +344,24 @@ fn signer_cannot_act_for_its_validator() {
     assert_eq!(dump_validator_state(&ctx, addr(V1)), before, "validator state byte-identical");
     assert_eq!(signer_of(&db, V1), Some(S));
     assert_eq!(index(&db, S).as_deref(), Some(addr(V1).as_slice()));
+}
+
+/// Review M1(b): the validator's direct submission and its signer's share one
+/// row; the newest sample wins whichever executes last.
+#[test]
+fn newest_sample_wins_across_validator_and_signer() {
+    for flip in [false, true] {
+        let (_d, db) = oracle_db();
+        assert!(exec(&db, 1, set(V1, S)).success);
+        let direct = (addr(V1), NativeAction::SubmitOraclePrices(OracleSubmission { prices: vec![(1, fp(100))], timestamp: 1_005_000 }));
+        let signer = (S, NativeAction::SubmitOraclePrices(OracleSubmission { prices: vec![(1, fp(200))], timestamp: 1_004_000 }));
+        let acts = if flip { vec![signer, direct] } else { vec![direct, signer] };
+        let r = run_block(&db, 5, &acts);
+        assert!(r.iter().all(|x| x.success), "{r:?}");
+        let rows = db.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub")).unwrap();
+        assert_eq!(rows.len(), 1);
+        use borsh::BorshDeserialize;
+        let row = torus_core::oracle::OracleSubmission::try_from_slice(&rows[0].1).unwrap();
+        assert_eq!((row.validator, row.price), (addr(V1), fp(100)), "flip={flip}: newest (direct) wins");
+    }
 }

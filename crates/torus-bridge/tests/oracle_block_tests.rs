@@ -79,8 +79,21 @@ fn submit(sender: u8, prices: &[(MarketId, FixedPoint)]) -> (Address, NativeActi
     )
 }
 
+/// Review M1(b): a submission's `timestamp` is its sample time (ms) and must be
+/// within 5 s of the block. Helpers build submissions with `timestamp: 0`;
+/// this stamps those with block `height`'s time (`ctx_at`: 1000 + height s).
+fn stamp(height: u64, (sender, mut action): (Address, NativeAction)) -> (Address, NativeAction) {
+    if let NativeAction::SubmitOraclePrices(sub) = &mut action {
+        if sub.timestamp == 0 {
+            sub.timestamp = (1_000 + height) * 1_000;
+        }
+    }
+    (sender, action)
+}
+
 /// One action through the single-action path at block `height`.
-fn exec(db: &StateDb, height: u64, (sender, action): (Address, NativeAction)) -> NativeActionResult {
+fn exec(db: &StateDb, height: u64, a: (Address, NativeAction)) -> NativeActionResult {
+    let (sender, action) = stamp(height, a);
     NativeExecutor::execute(&mut ctx_at(db.clone(), height), &sender, &action)
 }
 
@@ -156,7 +169,8 @@ fn run_block(
 ) -> (Vec<NativeActionResult>, Vec<NativeActionResult>) {
     let mut ctx = ctx_at(db.clone(), height);
     let agg = NativeExecutor::begin_block_oracle(&mut ctx);
-    let res = NativeExecutor::execute_batch(&mut ctx, actions).results;
+    let actions: Vec<_> = actions.iter().cloned().map(|a| stamp(height, a)).collect();
+    let res = NativeExecutor::execute_batch(&mut ctx, &actions).results;
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
     (agg, res)
 }
@@ -238,7 +252,7 @@ fn every_reader_in_a_block_sees_the_block_start_mark() {
         reduce_only: false,
         client_order_id: None,
     };
-    let mut actions = round(300);
+    let mut actions: Vec<_> = round(300).into_iter().map(|a| stamp(6, a)).collect();
     actions.push((taker, NativeAction::PlaceOrder(market_buy)));
     let r = NativeExecutor::execute_batch(&mut ctx, &actions).results;
     assert!(r[..3].iter().all(|x| x.success), "{r:?}");
@@ -337,9 +351,59 @@ fn oracle_due_reads_through_the_parent_layer() {
     let (_d, db) = oracle_db();
     assert!(!NativeExecutor::oracle_due(&db).unwrap());
     let o1 = NativeStateOverlay::new(db.clone());
-    let (s, a) = submit(V1, &[(1, fp(100))]);
+    let (s, a) = stamp(1, submit(V1, &[(1, fp(100))]));
     assert!(NativeExecutor::execute(&mut ctx_at(o1.clone(), 1), &s, &a).success);
     let o2 = NativeStateOverlay::with_parent(db.clone(), Some(o1.freeze(1)));
     assert!(NativeExecutor::oracle_due(&o2).unwrap(), "parent-layer rows count");
     assert!(!NativeExecutor::oracle_due(&db).unwrap(), "the DB alone does not have them yet");
+}
+
+// ---- review M1(b): sample time bound + newest sample wins ----
+
+fn sub_at(v: u8, sample_ms: u64, price: i64) -> (Address, NativeAction) {
+    (addr(v), NativeAction::SubmitOraclePrices(OracleSubmission { prices: vec![(1, fp(price))], timestamp: sample_ms }))
+}
+
+/// The stored price of `v`'s market-1 row.
+fn row_price(db: &StateDb, v: u8) -> Option<FixedPoint> {
+    use borsh::BorshDeserialize;
+    db.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, val)| torus_core::oracle::OracleSubmission::try_from_slice(&val).unwrap())
+        .find(|r| r.validator == addr(v) && r.market_id == 1)
+        .map(|r| r.price)
+}
+
+/// Block 5 is at 1_005_000 ms: a sample more than 5 s before (or after) it is
+/// rejected as a whole; exactly 5 s either way is accepted.
+#[test]
+fn delayed_or_future_samples_are_rejected() {
+    let (_d, db) = oracle_db();
+    for ts in [1_005_000 - 5_001, 1_005_000 + 5_001, 1] {
+        assert_rejected(&exec(&db, 5, sub_at(V1, ts, 100)), "sampled");
+    }
+    assert_eq!(sub_rows(&db), 0);
+    assert!(exec(&db, 5, sub_at(V1, 1_005_000 - 5_000, 100)).success);
+    assert!(exec(&db, 5, sub_at(V2, 1_005_000 + 5_000, 100)).success);
+}
+
+/// Two submissions of one validator in one block: the NEWEST sample is stored
+/// whatever the execution order; a later-arriving older sample never
+/// overwrites a newer stored one.
+#[test]
+fn newest_sample_wins_in_either_order() {
+    for flip in [false, true] {
+        let (_d, db) = oracle_db();
+        let (old, new) = (sub_at(V1, 1_004_000, 100), sub_at(V1, 1_005_000, 200));
+        let acts = if flip { vec![new, old] } else { vec![old, new] };
+        let (_, r) = run_block(&db, 5, &acts);
+        assert!(r.iter().all(|x| x.success), "{r:?}");
+        assert_eq!(row_price(&db, V1), Some(fp(200)), "flip={flip}");
+        let (_, r) = run_block(&db, 6, &[sub_at(V1, 1_004_500, 300)]);
+        assert!(r[0].success, "a skipped older sample is not an error");
+        assert_eq!(row_price(&db, V1), Some(fp(200)), "older sample does not overwrite");
+        run_block(&db, 7, &[sub_at(V1, 1_006_000, 400)]);
+        assert_eq!(row_price(&db, V1), Some(fp(400)));
+    }
 }
