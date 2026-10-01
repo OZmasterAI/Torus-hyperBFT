@@ -498,6 +498,32 @@ impl NativePool {
             .sum()
     }
 
+    /// Whether this exact `(sender, action)` is already pooled (the dedup identity).
+    pub fn contains(&self, sender: &Address, action: &SignedNativeAction) -> bool {
+        self.seen.contains(&(*sender, compute_action_hash(action)))
+    }
+
+    /// Review M1(a): evict the OLDEST pooled oracle submission of `accounts`
+    /// (lowest nonce, then insertion order) if it is older than `nonce`.
+    /// Returns whether one was evicted.
+    pub fn evict_oldest_oracle_older_than(&mut self, accounts: &[Address], nonce: u64) -> bool {
+        let oldest = accounts
+            .iter()
+            .flat_map(|a| {
+                self.entries
+                    .range((PRIO_ORACLE, *a, 0, 0)..=(PRIO_ORACLE, *a, u64::MAX, u64::MAX))
+                    .map(|(k, _)| *k)
+            })
+            .min_by_key(|&(_, _, n, seq)| (n, seq));
+        match oldest {
+            Some(key) if key.2 < nonce => {
+                self.remove_entry_by_key(&key);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Remove actions that were included in a committed block.
     ///
     /// O(k log n) in committed actions via `hash_index` — no pool scan (the
