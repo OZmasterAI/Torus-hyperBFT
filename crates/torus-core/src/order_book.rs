@@ -886,6 +886,13 @@ impl OrderBook {
         }
     }
 
+    /// Orders of `trader` that hold an open-order slot: resting orders plus
+    /// pending stops (stops are rare, so a scan is fine).
+    pub fn open_order_count(&self, trader: &Address) -> usize {
+        self.trader_orders.get(trader).map_or(0, Vec::len)
+            + self.pending_stops.iter().filter(|s| s.trader == *trader).count()
+    }
+
     /// Number of pending stop orders.
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()
@@ -3241,6 +3248,53 @@ mod tests {
         let mut ob = book();
         let cancelled = ob.cancel_all(addr(1), None);
         assert!(cancelled.is_empty());
+    }
+
+    fn stop(is_buy: bool, order_type: OrderType) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn open_order_count_counts_resting_and_pending_stops() {
+        let mut ob = book();
+        let a = addr(1);
+        ob.place_order(limit_sell(fp(105), fp(1)), addr(2), 1);
+        let first = ob.place_order(limit_buy(fp(90), fp(1)), a, 2).order_id;
+        ob.place_order(limit_buy(fp(91), fp(1)), a, 3);
+        ob.place_order(limit_buy(fp(92), fp(1)), a, 4);
+        ob.place_order(stop(false, OrderType::StopMarket { trigger: fp(80) }), a, 5);
+        let stop_limit = OrderType::StopLimit {
+            trigger: fp(100),
+            limit: fp(101),
+        };
+        ob.place_order(stop(true, stop_limit), a, 6);
+        let ioc = PlaceOrderParams {
+            time_in_force: TimeInForce::IOC,
+            ..limit_buy(fp(50), fp(1))
+        };
+        assert_eq!(ob.place_order(ioc, a, 7).status, OrderStatus::Cancelled);
+        assert_eq!(ob.open_order_count(&a), 5);
+        assert_eq!(ob.open_order_count(&addr(2)), 1);
+        assert_eq!(ob.open_order_count(&addr(9)), 0);
+
+        ob.cancel_order(first).unwrap();
+        assert_eq!(ob.open_order_count(&a), 4);
+
+        // A trade at 105 triggers the buy stop; its limit 101 finds no ask,
+        // so it rests: one pending stop became one resting order.
+        ob.place_order(limit_buy(fp(105), fp(1)), addr(3), 8);
+        assert_eq!(ob.pending_stop_count(), 1);
+        assert_eq!(ob.orders_for_trader(&a).len(), 3);
+        assert_eq!(ob.open_order_count(&a), 4);
     }
 
     #[test]
