@@ -195,14 +195,23 @@ pub const CF_HASHED_STORAGE: &str = "cf_hashed_storage";
 // Native incremental state root — bucketed Merkle tree (Phase A, Stage A2).
 /// Persisted native bucketed-Merkle tree nodes. Keys: leaf `0x00 ++ bucket(2 BE)`, internal
 /// `0x01 ++ level(1) ++ index(2 BE)`, root marker `0x02`. Only non-default nodes are stored.
-/// Replaces the O(total) flat keccak over the 6 native CFs with an O(changed)/block root.
+/// Replaces the O(total) flat keccak over the 7 native CFs with an O(changed)/block root.
 pub const CF_NATIVE_TRIE: &str = "cf_native_trie";
-/// Bucket-ordered mirror of the 6 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
+/// Bucket-ordered mirror of the 7 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
 /// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> `keccak256(native value)` (32 B —
 /// hash-only mirror, 3c preimage round). A prefix-scan on a 2-byte bucket id yields that bucket's
 /// members in `(cf_tag, key)` order, so a changed bucket re-hashes in O(bucket) instead of
 /// O(total). Phase A.
 pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
+
+/// Item 3 (liquidation, s517): native-root CF (tag 6) of the liquidation step's state.
+/// Rows exist only once the step has run (ordinary trading writes none):
+/// * `0x01` — unused / reserved (no account index, C1)
+/// * `0x02 ‖ trader(20)` -> u64 BE: last stage-1 chunk block timestamp (cooldown)
+/// * `0x03 ‖ market(8 BE)` -> i128 BE raw: previous mark (ADL price)
+/// * `0x04` -> trader(20): round-robin scan cursor (only while a pass was cut)
+/// * `0x05 ‖ …` — reserved: vault deposits / shares (later branch)
+pub const CF_NATIVE_LIQUIDATION: &str = "cf_native_liquidation";
 
 /// All column family names. RocksDB requires these at open time.
 pub const ALL_CF_NAMES: &[&str] = &[
@@ -252,4 +261,5 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_BOOK_ORDER_ROWS,
     CF_STATE_HASH_VOTES,
     CF_BLOCK_ACTION_STATUS,
+    CF_NATIVE_LIQUIDATION,
 ];

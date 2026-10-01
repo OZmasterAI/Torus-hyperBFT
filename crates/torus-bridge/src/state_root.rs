@@ -167,7 +167,7 @@ pub fn compute_native_state_root(
 ) -> Result<B256, torus_state::error::StateError> {
     use torus_state::cf::{
         CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
-        CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
+        CF_NATIVE_LIQUIDATION, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
     };
 
     let db = state_db.inner();
@@ -181,6 +181,7 @@ pub fn compute_native_state_root(
         CF_NATIVE_ORACLE,
         CF_STAKING_DELEGATIONS,
         CF_STAKING_VALIDATORS,
+        CF_NATIVE_LIQUIDATION, // item 3: tag 6 (tag order)
     ] {
         if let Some(cf) = db.cf_handle(cf_name) {
             let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -307,6 +308,17 @@ mod tests {
     use revm::state::AccountInfo;
     use torus_state::db::{StateDb, KECCAK_EMPTY};
     use torus_state::incremental::build_trie_to_cf;
+
+    /// Item 3: the consensus full-scan root covers the liquidation CF.
+    #[test]
+    fn full_native_root_covers_the_liquidation_cf() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = torus_state::StateDb::open(dir.path()).unwrap();
+        let before = super::compute_native_state_root(&db).unwrap();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_LIQUIDATION, &[0x02; 21], &1_001u64.to_be_bytes())
+            .unwrap();
+        assert_ne!(super::compute_native_state_root(&db).unwrap(), before);
+    }
 
     /// The bridge-level routing must produce the same EVM root via the incremental engine as via
     /// the full scan (the determinism gate, exercised through state_root.rs's own dispatch).

@@ -253,6 +253,12 @@ module's other tests):
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-state --lib native_trie && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --lib state_root && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets` · depends_on: []
 
+**Correction s517 (T2):** `native_trie.rs`'s CHAR-PIN test (`charpin_corpus`) builds its
+corpus over every `NATIVE_ROOT_CFS` entry and asserts `6 × …` entries plus pinned roots; with
+tag 6 appended its shape changed. The corpus is now `NATIVE_ROOT_CFS.iter().take(6)` (tags 0-5)
+so the pins still prove that the 0-5 preimages did not move; tag 6 is covered by
+`liquidation_cf_is_native_root_tag_6_incremental_equals_full`.
+
 `══ COMMIT 2 ══` `feat(state): native-root CF for liquidation state (tag 6)`
 
 ### T3 — book + exec: user `CancelAll` cancels pending stops and releases their margin (C4, own commit) · depends_on: []

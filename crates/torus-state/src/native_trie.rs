@@ -31,7 +31,7 @@ use rocksdb::WriteBatch;
 
 use crate::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_HASHED, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRIE, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
+    CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS, CF_NATIVE_TRIE, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
 };
 use crate::db::StateDb;
 use crate::error::StateError;
@@ -40,20 +40,22 @@ use crate::trie::EMPTY_ROOT_HASH;
 /// Tree depth in bits = number of buckets is `1 << TREE_DEPTH`. 16 bits → 65536 buckets.
 pub const TREE_DEPTH: usize = 16;
 
-/// The 6 authoritative native-root CFs and their **FROZEN** 1-byte tags. NEVER reorder or renumber:
+/// The 7 authoritative native-root CFs and their **FROZEN** 1-byte tags. NEVER reorder or renumber:
 /// the `cf_tag` is part of the consensus root preimage (bucket assignment + leaf framing). The set
 /// must stay equal to the CFs hashed by `compute_native_state_root` (the consensus-authoritative
 /// full scan).
-pub const NATIVE_ROOT_CFS: [(&str, u8); 6] = [
+pub const NATIVE_ROOT_CFS: [(&str, u8); 7] = [
     (CF_NATIVE_BALANCES, 0),
     (CF_NATIVE_ORDER_BOOKS, 1),
     (CF_NATIVE_POSITIONS, 2),
     (CF_NATIVE_ORACLE, 3),
     (CF_STAKING_DELEGATIONS, 4),
     (CF_STAKING_VALIDATORS, 5),
+    // Item 3 (s517): appended; tags 0-5 unchanged.
+    (CF_NATIVE_LIQUIDATION, 6),
 ];
 
-/// `cf_tag` for a CF name, or `None` if it is not one of the 6 native-root CFs.
+/// `cf_tag` for a CF name, or `None` if it is not one of the 7 native-root CFs.
 pub fn cf_tag(cf_name: &str) -> Option<u8> {
     NATIVE_ROOT_CFS
         .iter()
@@ -196,7 +198,7 @@ fn put_node(batch: &mut WriteBatch, trie_cf: &rocksdb::ColumnFamily, key: &[u8; 
     }
 }
 
-/// Collect the non-empty bucket leaf hashes from the live 6 native CFs (pure; no persisted trie).
+/// Collect the non-empty bucket leaf hashes from the live 7 native CFs (pure; no persisted trie).
 /// Entries accumulate in `(cf_tag, key)` order because the CFs are visited in tag order and each CF
 /// iterates in key order — the canonical bucket-hash input.
 fn leaves_from_db(db: &StateDb) -> Result<BTreeMap<u16, B256>, StateError> {
@@ -1534,6 +1536,33 @@ mod tests {
         }
     }
 
+    /// Item 3: the liquidation CF is native-root tag 6 (0-5 frozen and
+    /// unchanged); its rows move the incremental AND the full root, and an
+    /// empty CF contributes nothing.
+    #[test]
+    fn liquidation_cf_is_native_root_tag_6_incremental_equals_full() {
+        use crate::cf::CF_NATIVE_LIQUIDATION;
+        assert_eq!(cf_tag(CF_NATIVE_LIQUIDATION), Some(6));
+        let tags: Vec<u8> = NATIVE_ROOT_CFS.iter().map(|(_, t)| *t).collect();
+        assert_eq!(tags, vec![0, 1, 2, 3, 4, 5, 6]);
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        build_native_trie_to_cf(&db).unwrap();
+        let empty = persisted_native_root(&db).unwrap();
+        let key = [0x02u8; 21];
+        let ov = crate::NativeStateOverlay::new(db.clone());
+        crate::StateBackend::put_cf_raw(&ov, CF_NATIVE_LIQUIDATION, &key, &1_001u64.to_be_bytes()).unwrap();
+        ov.flush_with_native_trie(&db).unwrap();
+        let root = persisted_native_root(&db).unwrap();
+        assert_ne!(root, empty, "a liquidation row moves the native root");
+        assert_eq!(root, native_root_full(&db).unwrap());
+        let ov = crate::NativeStateOverlay::new(db.clone());
+        crate::StateBackend::delete_cf_raw(&ov, CF_NATIVE_LIQUIDATION, &key).unwrap();
+        ov.flush_with_native_trie(&db).unwrap();
+        assert_eq!(persisted_native_root(&db).unwrap(), empty);
+        assert_eq!(native_root_full(&db).unwrap(), empty);
+    }
+
     /// A2.1 determinism gate: the persisted bucketed root must equal the full-scan oracle over a
     /// corpus, be idempotent, and actually persist nodes.
     #[test]
@@ -2521,11 +2550,15 @@ mod tests {
     /// Dense buckets per CF in the char-pin corpus.
     const CHARPIN_BUCKETS_PER_CF: usize = 120;
 
-    /// Flat `(cf_index, key)` corpus over all 6 native-root CFs, every key living
-    /// in a bucket shared with `CHARPIN_PER_BUCKET - 1` others of the same CF.
+    /// Flat `(cf_index, key)` corpus over the 6 ORIGINAL native-root CFs (tags
+    /// 0-5), every key living in a bucket shared with `CHARPIN_PER_BUCKET - 1`
+    /// others of the same CF. Item 3 (s517) appended tag 6 (liquidation); the
+    /// corpus stays on tags 0-5 so these pins keep proving that the 0-5
+    /// preimages did not move (tag 6 is covered by
+    /// `liquidation_cf_is_native_root_tag_6_incremental_equals_full`).
     fn charpin_corpus() -> Vec<(usize, Vec<u8>)> {
         let mut out = Vec::new();
-        for (cfi, (_, tag)) in NATIVE_ROOT_CFS.iter().enumerate() {
+        for (cfi, (_, tag)) in NATIVE_ROOT_CFS.iter().take(6).enumerate() {
             for (_, keys) in dense_buckets(*tag, 100_000, CHARPIN_BUCKETS_PER_CF, CHARPIN_PER_BUCKET)
             {
                 for k in keys {

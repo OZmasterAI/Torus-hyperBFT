@@ -293,8 +293,8 @@ pub struct Metrics {
     /// 3c: per-cf-tag native-root dirty entries per flush (funnel attribution
     /// of the post-3c dirty-set composition). Indexed by the frozen cf_tag
     /// order: balances / order_books / positions / oracle / staking_delegations
-    /// / staking_validators.
-    pub exec_dirty_entries_by_cf: [Counter; 6],
+    /// / staking_validators / liquidation.
+    pub exec_dirty_entries_by_cf: [Counter; 7],
     /// 3c mode 2: node-local order-row store writes/deletes per block.
     pub exec_book_rows_written: Counter,
     pub exec_book_rows_deleted: Counter,
@@ -1418,7 +1418,7 @@ impl Metrics {
         );
 
         // 3c: per-cf-tag dirty-entry attribution (frozen NATIVE_ROOT_CFS order).
-        let exec_dirty_entries_by_cf: [Counter; 6] = Default::default();
+        let exec_dirty_entries_by_cf: [Counter; 7] = Default::default();
         for (i, suffix) in [
             "balances",
             "order_books",
@@ -1426,6 +1426,7 @@ impl Metrics {
             "oracle",
             "staking_delegations",
             "staking_validators",
+            "liquidation",
         ]
         .iter()
         .enumerate()

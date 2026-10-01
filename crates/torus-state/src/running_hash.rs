@@ -55,6 +55,8 @@ pub const HASHED_CFS: &[(u8, &str)] = &[
     (20, CF_CORE_WRITER_QUEUE),
     (21, CF_CONSENSUS_META),
     (22, CF_STATE_HASH_VOTES),
+    // Item 3 (s517, rebase s87): liquidation consensus state (native-root tag 6).
+    (23, CF_NATIVE_LIQUIDATION),
     (0x80, CF_ACCOUNTS),
     (0x81, CF_STORAGE),
     (0x82, CF_CODE),
@@ -484,6 +486,11 @@ mod tests {
         // Consensus bug (b) follow-up: validator rows are written only by
         // execution, inside the flush batch: hashed under id 8.
         assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), Some(8));
+        // Every native-root CF is consensus state: hashed (rebase s87).
+        for (cf, _) in crate::native_trie::NATIVE_ROOT_CFS {
+            assert!(hashed_cf_id(cf).is_some(), "native-root CF {cf} must be hashed");
+        }
+        assert_eq!(hashed_cf_id(CF_NATIVE_LIQUIDATION), Some(23));
     }
 
     fn golden_writes() -> Vec<WriteEntry> {

@@ -1110,7 +1110,7 @@ impl NativeStateOverlay {
     }
 
     /// The native-root dirty `(cf_tag, key) -> Option<value>` set this overlay would flush — writes
-    /// (`Some`) and deletes (`None`) hitting the 6 native-root CFs only (mirrors `dirty_evm_accounts`).
+    /// (`Some`) and deletes (`None`) hitting the 7 native-root CFs only (mirrors `dirty_evm_accounts`).
     /// Fed to the bucketed native trie (A2.2) so it tracks the committed native state. Non-root CFs
     /// (nonces, governance, markets, …) are excluded — they are not part of the native root.
     pub fn dirty_native_keys(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
@@ -1359,7 +1359,7 @@ fn flush_pending_after_batch(
             member_misses: 0,
             member_evictions: 0,
             member_resident_buckets: 0,
-            dirty_entries_by_cf: [0; 6],
+            dirty_entries_by_cf: [0; 7],
             state_hash_seconds: 0.0,
             state_hash_entries: 0,
         };
@@ -1543,7 +1543,7 @@ pub struct NativeFlushStats {
     /// 3c: native-root dirty entries per cf_tag this flush (frozen
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
-    pub dirty_entries_by_cf: [usize; 6],
+    pub dirty_entries_by_cf: [usize; 7],
     /// Running state hash: time to digest the block's consensus write set (0
     /// when the flush carries no applied height). Large blocks digest on a
     /// scoped thread overlapped with the batch build, so this is compute time,
