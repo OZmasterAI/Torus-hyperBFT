@@ -977,6 +977,20 @@ Each item notes a place where the plan draft was changed during implementation.
 * Q-S1 was decided by the user: the signer's own account is unrestricted. There is
   no per-action lookup.
 
+**Commit 2 (mempool priority)**
+
+* Correction s517 (M1). `PRIO_*` and `priority_class` are public next to
+  `is_cancel`, and `is_oracle_submission` / `is_priority` are re-exported.
+  Priority entries never evict each other: a cancel does not evict an oracle
+  submission, and an oracle submission does not evict a cancel. This is pinned
+  in `full_pool_of_priority_entries_rejects_oracle`.
+* Correction s517 (M2). `oracle_reporter` fails closed: a state read error
+  rejects the submission. The admission test drains the pool between insert
+  paths, so that it stays under the cap of 4 per validator, which the five
+  admitted submissions would otherwise exceed.
+* Correction s517 (M3). The single-submit endpoint has only the backlog screen
+  (no pool-full screen), as before. Only its predicate changes to `is_priority`.
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).

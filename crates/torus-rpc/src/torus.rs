@@ -440,10 +440,12 @@ impl RpcState {
                 .observe(permit_wait_t0.elapsed().as_secs_f64());
         }
 
-        // Sprint 5 (C): when the native pool is already full, non-cancel
+        // Sprint 5 (C): when the native pool is already full, normal
         // actions are doomed at admission — shed them after a decode-only
-        // pass instead of paying signature verification. Cancels proceed to
-        // full verification (admission evicts a non-cancel to make room).
+        // pass instead of paying signature verification. Priority actions
+        // (cancels; s517: oracle submissions) proceed to full verification
+        // (admission evicts a normal entry to make room; the mempool's oracle
+        // gate then admits only Active validators and their signers).
         // s65 item B: the same pre-verify shed when the pool already holds
         // more than the admission limit (recent commit rate x horizon), with a
         // retryable "busy" instead of "pool full".
@@ -463,7 +465,7 @@ impl RpcState {
                             .map_err(|e| format!("invalid hex: {e}"))
                             .and_then(|bytes| decode(&bytes));
                         match decoded {
-                            Ok(action) if torus_mempool::is_cancel(&action.action) => {
+                            Ok(action) if torus_mempool::is_priority(&action.action) => {
                                 SubmitSlot::Proceed(signed_action)
                             }
                             Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),
@@ -1274,13 +1276,14 @@ impl TorusApiServer for RpcState {
                 ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
             })?;
         // s65 item B: this endpoint honours the admission limit too, with the
-        // same decode-only screen as the batch pipeline (cancels still pass).
+        // same decode-only screen as the batch pipeline (priority actions —
+        // cancels and, s517, oracle submissions — still pass).
         if self.mempool.native_admission_backlogged() {
-            let is_cancel = parse_bytes(&signed_action)
+            let is_priority = parse_bytes(&signed_action)
                 .ok()
                 .and_then(|bytes| decode_action_json(&bytes).ok())
-                .is_some_and(|a| torus_mempool::is_cancel(&a.action));
-            if !is_cancel {
+                .is_some_and(|a| torus_mempool::is_priority(&a.action));
+            if !is_priority {
                 self.count_admit_reject("backlog_preverify");
                 return Err(ErrorObjectOwned::from(RpcError::Internal(
                     ADMISSION_BUSY_MSG.into(),
