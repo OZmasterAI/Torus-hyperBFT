@@ -652,6 +652,21 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn("crash_kill_list_ok", run_cell)
         self.assertNotIn("kill -9", run_cell, "run-cell.sh must never SIGKILL itself")
 
+    def test_workload_knobs_reach_the_bench_with_legacy_defaults(self):
+        """BAND / CROSS_FRACTION / CANCEL_FRACTION are runner env knobs (the
+        campaign run_cell.py forwards them); a hardcoded bench flag silently
+        ran an s83 CANCEL_FRACTION=0.2 cell at 0.05."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        for var, default in (("BAND", "5"), ("CROSS_FRACTION", "0.5"),
+                             ("CANCEL_FRACTION", "0.05")):
+            self.assertIn(f"{var}=${{{var}:-{default}}}", src)
+        bench = src[src.index("BENCH_CMD=("):]
+        bench = bench[: bench.index(")\n")]
+        self.assertIn('--cross-fraction "$CROSS_FRACTION"', bench)
+        self.assertIn('--cancel-fraction "$CANCEL_FRACTION"', bench)
+        self.assertIn('--band "$BAND"', bench)
+
     def test_restart_uses_the_same_argv_as_launch(self):
         """launch-3val.sh and crash-kill.sh must start a node through ONE
         implementation: a restart with different flags is not a crash gate."""

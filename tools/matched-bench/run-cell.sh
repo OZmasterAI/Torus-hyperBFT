@@ -26,6 +26,9 @@
 #                a fixed set of K markets instead of drawing uniformly over all
 #                of them). Unset (default) = flag omitted = today's uniform
 #                shape. Recorded as cell.markets_per_sender in summary.json.
+#   BAND / CROSS_FRACTION / CANCEL_FRACTION  econ shape (defaults 5 / 0.5 /
+#                0.05). MPS cells concentrate each sender's resting orders and
+#                can hit the 200 orders/trader/market cap; raise CANCEL_FRACTION.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -146,6 +149,9 @@ CONC=${CONC:-256}
 BATCH=${BATCH:-400}
 SUBMIT=${SUBMIT:-1}
 MPS=${MPS:-}
+BAND=${BAND:-5}
+CROSS_FRACTION=${CROSS_FRACTION:-0.5}
+CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -314,6 +320,10 @@ PYJ
 for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATAL: need $t" >&2; exit 1; }; done
 [[ "$MARKETS" =~ ^[0-9]+$ && "$DUR" =~ ^[0-9]+$ && "$RATE" =~ ^[0-9]+$ ]] || usage
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
+[[ "$BAND" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BAND must be a positive integer" >&2; exit 2; }
+for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
+    [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
+done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
@@ -378,7 +388,7 @@ PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
@@ -534,7 +544,7 @@ kill -0 "$SAMPLER_PID" 2>/dev/null || die "metrics sampler exited (see sampler.l
 # ---------------------------------------------------------------- 6. bench
 BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SENDERS" --sender-offset 60 \
     --markets "$MARKETS" --batch-size "$BATCH" --submit-batch "$SUBMIT" --format bin --concurrency "$CONC" \
-    --duration "$DUR" --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total "$RATE")
+    --duration "$DUR" --target-margin 1500 --cross-fraction "$CROSS_FRACTION" --cancel-fraction "$CANCEL_FRACTION" --band "$BAND" --rate-total "$RATE")
 # LOCALITY shape (unset = flag omitted = uniform draw over 1..=MARKETS, i.e. the
 # shape every campaign cell so far used). Needs a bench-throughput built at or
 # after cand/r6-harness-300m-digest-and-parity.
