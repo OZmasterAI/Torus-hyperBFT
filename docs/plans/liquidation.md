@@ -50,6 +50,16 @@ C5 recorded as known limitations.
   positions (the backstop still moves all collateral). An account with no marked position is
   not liquidated. Orders in unmarked markets are not blocked (devnet has no feeder).
 
+* **H1 — ADL at the bankruptcy price.** The ADL close price is the previous mark (or the mark)
+  CLAMPED to the account's bankruptcy price (`entry ∓ (collateral + other UPnL) / size`, other
+  positions marked at the mark, unmarked at entry) on the side unfavourable to the bankrupt
+  account; exact integer math, rounded against the trader (`ceil(rest × SCALE / size)` off the
+  entry), so a close never leaves it positive. A non-vault account without marked positions then
+  hands its remaining collateral (rounding dust, or the deficit when the previous mark was worse)
+  to the vault: it ends at exactly 0; the counterparties are paid the difference. A previous-mark
+  row is deleted whenever a step sees the market without a usable mark, so it is always the
+  immediately preceding usable mark.
+
 ## Hyperliquid reference (docs, as summarized in research memory a054f368)
 
 * MM = half the initial margin at max leverage (per asset tier table).

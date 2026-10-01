@@ -118,6 +118,65 @@ pub fn slippage_cap(
     })
 }
 
+/// `ceil(a / b)` for `b > 0` (Rust `/` truncates toward zero, which is
+/// already the ceiling for a negative quotient).
+fn ceil_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if a % b != 0 && a > 0 {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Review H1 (user decision s517): the BANKRUPTCY price of a position — the
+/// close price at which its account ends at exactly 0, given `rest` =
+/// collateral (available + order margin) + the UPnL of the account's OTHER
+/// positions. Long: `entry − rest / size`; short: `entry + rest / size`.
+/// Exact integer math, rounded AGAINST the bankrupt trader (a long's price
+/// down, a short's up: `ceil(rest × SCALE / size)` off the entry), so a close
+/// at this price never leaves the account positive (realized PnL truncates
+/// toward zero, i.e. up for a loss, and still stays `<= −rest`). `None` on
+/// overflow or a non-positive size.
+pub fn bankruptcy_price(
+    rest: FixedPoint,
+    is_long: bool,
+    size: FixedPoint,
+    entry: FixedPoint,
+) -> Option<FixedPoint> {
+    if size.raw() <= 0 {
+        return None;
+    }
+    let per = ceil_div(rest.raw().checked_mul(FixedPoint::SCALE)?, size.raw());
+    let p = if is_long {
+        entry.raw().checked_sub(per)?
+    } else {
+        entry.raw().checked_add(per)?
+    };
+    Some(FixedPoint::from_raw(p))
+}
+
+/// Review H1: the ADL close price — `px` (the previous mark, else the mark)
+/// CLAMPED to the bankruptcy price on the side unfavourable to the bankrupt
+/// account (a long sells at no more than it, a short buys at no less), so
+/// the account never keeps value its counterparties paid for; when `px` is
+/// already worse, the account ends negative and the deficit goes to the
+/// vault. Without a usable bankruptcy price (overflow, `<= 0`) the mark
+/// stands in for it.
+pub fn adl_price(
+    px: FixedPoint,
+    bankruptcy: Option<FixedPoint>,
+    mark: FixedPoint,
+    is_long: bool,
+) -> FixedPoint {
+    let b = bankruptcy.filter(|b| b.raw() > 0).unwrap_or(mark);
+    if is_long {
+        px.min(b)
+    } else {
+        px.max(b)
+    }
+}
+
 /// An ADL counterparty: an opposite-side position in the ADL market.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdlCandidate {
@@ -195,7 +254,7 @@ pub fn transfer<T: StateBackend>(
 /// Move `from`'s whole collateral (`available + order_margin`, any sign) to
 /// `to`'s available: afterwards `from.available + from.order_margin == 0`.
 /// Returns the amount moved.
-fn move_collateral<T: StateBackend>(
+pub fn move_collateral<T: StateBackend>(
     pm: &PositionManager<T>,
     from: &Address,
     to: &Address,
@@ -405,16 +464,28 @@ pub fn prev_marks<T: StateBackend>(
     Ok(out)
 }
 
-/// D10: store this step's marks as the next step's previous marks — only the
-/// rows whose value changed (markets without a mark keep their row).
+/// D10 + review H1: store this step's marks as the next step's previous
+/// marks (only rows whose value changed); a listed market WITHOUT a usable
+/// mark loses its row, so a previous mark is always the immediately
+/// preceding usable mark — never one from before an oracle outage.
 pub fn put_prev_marks<T: StateBackend>(
     state: &T,
+    listed: &[MarketId],
     marks: &BTreeMap<MarketId, FixedPoint>,
     prev: &BTreeMap<MarketId, FixedPoint>,
 ) -> Result<(), CoreError> {
-    for (m, p) in marks {
-        if prev.get(m) != Some(p) {
-            state.put_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(*m), &p.raw().to_be_bytes())?;
+    for m in listed {
+        let k = prev_mark_key(*m);
+        match marks.get(m) {
+            Some(p) if prev.get(m) != Some(p) => {
+                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &p.raw().to_be_bytes())?
+            }
+            Some(_) => {}
+            None => {
+                if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
+                    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+                }
+            }
         }
     }
     Ok(())
