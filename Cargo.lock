@@ -6939,6 +6939,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "torus-bridge",
+ "torus-core",
  "torus-economics",
  "torus-evm",
  "torus-mempool",

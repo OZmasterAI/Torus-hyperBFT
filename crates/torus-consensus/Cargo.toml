@@ -29,3 +29,5 @@ tracing-subscriber = { workspace = true }
 # s515 F1 crash-replay tests: signed EVM txs through the committed-block path.
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-rlp = { workspace = true }
+# Item 3 (s517) liquidation tests: seed positions / name the vault.
+torus-core = { workspace = true }

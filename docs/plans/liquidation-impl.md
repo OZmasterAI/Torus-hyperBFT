@@ -1635,6 +1635,10 @@ After chunk 1: AV 3,300 < MM 3,960, 3·3,300 ≥ 2·3,960 ⇒ still stage 1.)
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib liquidation_e2e && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle_ && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib exec_pipeline && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib crash` · depends_on: [7e]
 
+**Correction s517 (T8):** `torus-consensus` had no `torus-core` dependency, so the test
+helpers' `torus_core::position::…` / `torus_core::liquidation::LIQUIDATOR_VAULT` did not resolve;
+added `torus-core` as a DEV-dependency (tests only; production code unchanged).
+
 `══ COMMIT 7 ══` `feat(consensus): run liquidations at the end of each native block`
 
 ### T9 — determinism gates · depends_on: [8]
