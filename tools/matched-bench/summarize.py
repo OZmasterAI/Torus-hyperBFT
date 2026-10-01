@@ -107,7 +107,8 @@ for node, rs in rows.items():
     first = [r for r in rs if r["ts"] >= t0][0]
     last = rs[-1]
     for k in ["orders_matched_total", "orders_placed_accepted_total", "orders_resting_total",
-              "native_actions_processed_total", "orders_rejected_margin_total", "orders_rejected_book_total",
+              "native_actions_processed_total", "orders_rejected_margin_total",
+              "orders_rejected_open_limit_total", "orders_rejected_book_total",
               "orders_rejected_cancelled_total", "orders_rejected_other_total", "blocks_committed_total",
               "block_height", "consensus_timeout_total_total", "native_gossip_published_actions_total",
               "native_gossip_dropped_full_total", "member_cache_evictions_total"]:
