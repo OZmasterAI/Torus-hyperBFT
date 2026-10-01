@@ -96,6 +96,9 @@ pub enum QuoteMode {
     KrakenUsdt,
 }
 
+/// Review L5: the largest per-venue weight a config may set.
+pub const MAX_EXCHANGE_WEIGHT: u32 = 1_000;
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExchangeOverride {
@@ -286,8 +289,8 @@ impl Config {
             _ => return Err("set exactly one of signer_keystore or signer_key_file".into()),
         }
         for (ex, o) in &self.exchanges {
-            if o.weight == Some(0) {
-                return Err(format!("exchange {}: weight must be >= 1", ex.name()));
+            if o.weight.is_some_and(|w| w == 0 || w > MAX_EXCHANGE_WEIGHT) {
+                return Err(format!("exchange {}: weight must be in 1..={MAX_EXCHANGE_WEIGHT}", ex.name()));
             }
         }
         if self.markets.is_empty() {
@@ -435,6 +438,7 @@ symbols = {{ binance = "BTCUSDT", okx = "BTC-USDT", bybit = "BTCUSDT" }}
             (base.replace("okx = \"BTC-USDT\"", "okx = \"\""), "empty symbol"),
             (base.replace(", bybit = \"BTCUSDT\"", ""), "enabled symbols"),
             (minimal("[exchanges.okx]\nweight = 0\n"), "weight"),
+            (minimal("[exchanges.okx]\nweight = 1001\n"), "weight"), // review L5: capped
             (base.replace("signer_key_file = \"/tmp/k\"", "signer_key_file = \"/tmp/k\"\nsigner_keystore = \"/tmp/s\"\npassphrase_file = \"/tmp/p\""), "exactly one"),
             (base.replace("signer_key_file = \"/tmp/k\"", ""), "exactly one"),
             (base.replace("signer_key_file = \"/tmp/k\"", "signer_keystore = \"/tmp/s\""), "passphrase_file"),

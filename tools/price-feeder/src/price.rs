@@ -69,9 +69,9 @@ pub struct Rules {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Price { price: FixedPoint, sources: usize, weight: u32 },
+    Price { price: FixedPoint, sources: usize, weight: u64 },
     TooFewSources { have: usize, need: usize },
-    TooLittleWeight { have: u32, need: u32 },
+    TooLittleWeight { have: u64, need: u64 },
 }
 
 impl Outcome {
@@ -97,7 +97,8 @@ pub fn aggregate(
     rules: &Rules,
 ) -> Outcome {
     let total: u64 = weights.values().map(|w| u64::from(*w)).sum();
-    let need_w = (total * u64::from(rules.min_weight_bps)).div_ceil(10_000) as u32;
+    // Review L5: all weight sums are u64 (no overflow, even before the config cap).
+    let need_w = total.saturating_mul(u64::from(rules.min_weight_bps)).div_ceil(10_000);
     let mut pts: Vec<(FixedPoint, u32)> = Vec::new();
     for s in samples {
         let Some(&w) = weights.get(&s.exchange) else { continue };
@@ -113,7 +114,7 @@ pub fn aggregate(
         };
         pts.push((usd, w));
     }
-    let have_w: u32 = pts.iter().map(|p| p.1).sum();
+    let have_w: u64 = pts.iter().map(|p| u64::from(p.1)).sum();
     if pts.len() < rules.min_sources {
         return Outcome::TooFewSources { have: pts.len(), need: rules.min_sources };
     }
@@ -248,5 +249,14 @@ mod tests {
             aggregate(&huge, &weights(), Some(fp(3)), NOW, &rules(QuoteMode::KrakenUsdt)),
             Outcome::TooFewSources { have: 0, need: 3 }
         );
+    }
+
+    /// Review L5: weight sums are u64 — huge weights cannot overflow.
+    #[test]
+    fn huge_weights_do_not_overflow() {
+        use Exchange::*;
+        let w: BTreeMap<Exchange, u32> = Exchange::ALL.iter().map(|e| (*e, u32::MAX)).collect();
+        let v = [s(Binance, 100, Quote::Usdt, NOW), s(Okx, 101, Quote::Usdt, NOW), s(Bybit, 102, Quote::Usdt, NOW), s(Gate, 103, Quote::Usdt, NOW)];
+        assert!(matches!(aggregate(&v, &w, None, NOW, &rules(QuoteMode::Par)), Outcome::Price { .. }));
     }
 }
