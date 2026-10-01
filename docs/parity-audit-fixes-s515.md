@@ -39,8 +39,13 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
   previous-mark / cursor rows) changes the native root once the step writes
   a row; margin configs now come from market rows; the step moves positions,
   balances and books at the end of native blocks, and the native phase also
-  runs while cooldown / cursor rows exist. The vault can optionally be seeded
+  runs while cooldown / cursor / pending rows exist. The vault can optionally be seeded
   through genesis `native_balances` (no code needed).
+  **No activation height:** the step (and the CancelAll / margin-config
+  changes) apply from block 1, so this binary must start from a fresh genesis —
+  it cannot replay or sync a chain produced by an older build (the replay
+  would liquidate / cancel where the original did not and diverge from the
+  recorded roots).
 * F3 — legacy stop rows: `StopLimit` / `StopMarket` rows written before this
   branch carry no StopMarket cap and were reserved under the old formula; on
   trigger they would release the wrong amount of margin. Fresh genesis means
