@@ -4080,6 +4080,7 @@ mod state_hash_rpc_tests {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             staking.put_validator(&v.address, &v).unwrap();
         }

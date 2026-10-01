@@ -247,7 +247,7 @@ pub enum SessionScope {
     /// TransferToPerp, TransferToSpot only.
     TransfersOnly,
     /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded.
+    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded, SetOracleSigner.
     Full,
 }
 
@@ -283,6 +283,7 @@ impl SessionScope {
                     | NativeAction::PermanentStake { .. }
                     | NativeAction::ClaimRewards
                     | NativeAction::ClaimUnbonded
+                    | NativeAction::SetOracleSigner { .. }
             ),
         }
     }
@@ -692,6 +693,15 @@ pub enum NativeAction {
     /// Release every matured unbonding entry across all of the sender's
     /// delegations back to their balance (explicit claim, Hyperliquid-style).
     ClaimUnbonded,
+
+    // === Oracle (appended — s517 hot oracle signer) ===
+    /// Set the sender validator's hot oracle signer, or clear it with
+    /// `Address::ZERO`. EIP-712 only (never a session key). The signer may then
+    /// submit `SubmitOraclePrices` on the validator's behalf — nothing else
+    /// (docs/plans/oracle-feeder.md §1). Rotation replaces it.
+    SetOracleSigner {
+        signer: Address,
+    },
 }
 
 impl NativeAction {
@@ -964,6 +974,10 @@ impl NativeAction {
             }
             NativeAction::ClaimUnbonded => {
                 buf.push(27);
+            }
+            NativeAction::SetOracleSigner { signer } => {
+                buf.push(28);
+                buf.extend_from_slice(signer.as_slice());
             }
         }
     }
@@ -1392,6 +1406,23 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s517 oracle feeder S1: `SetOracleSigner` is canonical tag 28 (27 is
+    /// ClaimUnbonded after the s87 rebase; 26 is main's AttestStateHash) + the
+    /// 20-byte signer, and survives a serde JSON round trip.
+    #[test]
+    fn set_oracle_signer_canonical_bytes_and_json_roundtrip() {
+        let signer = Address::repeat_byte(0x5a);
+        let a = NativeAction::SetOracleSigner { signer };
+        let mut want = vec![28u8];
+        want.extend_from_slice(signer.as_slice());
+        assert_eq!(a.canonical_bytes(), want);
+        let json = serde_json::to_string(&a).unwrap();
+        let back: NativeAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.canonical_bytes(), want);
+        let clear = NativeAction::SetOracleSigner { signer: Address::ZERO };
+        assert_ne!(clear.canonical_bytes(), want);
+    }
 
     /// S470 knob default: a ChainConfig serialized before the field existed
     /// (no `commit_lag_backoff_cap` key) must deserialize with the commit-lag

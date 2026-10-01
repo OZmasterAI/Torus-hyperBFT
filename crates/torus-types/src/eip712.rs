@@ -243,6 +243,7 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
             hash_revoke_session(session_pubkey, nonce)
         }
         NativeAction::ClaimUnbonded => hash_claim_unbonded(nonce),
+        NativeAction::SetOracleSigner { signer } => hash_set_oracle_signer(signer, nonce),
     }
 }
 
@@ -441,6 +442,17 @@ fn hash_claim_unbonded(nonce: u64) -> B256 {
     let th = keccak256("ClaimUnbonded(uint64 nonce)");
     let mut buf = Vec::with_capacity(2 * 32);
     buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+// ---------- oracle ----------
+
+fn hash_set_oracle_signer(signer: &Address, nonce: u64) -> B256 {
+    let th = keccak256("SetOracleSigner(address signer,uint64 nonce)");
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_address(signer));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -778,6 +790,7 @@ pub fn requires_eip712(action: &NativeAction) -> bool {
             | NativeAction::PermanentStake { .. }
             | NativeAction::ClaimRewards
             | NativeAction::ClaimUnbonded
+            | NativeAction::SetOracleSigner { .. }
     )
 }
 
@@ -1232,6 +1245,50 @@ mod tests {
     }
 
     const TEST_NONCE: u64 = 1_700_000_000_000;
+
+    // --- s517 oracle feeder S1: SetOracleSigner ---
+
+    #[test]
+    fn set_oracle_signer_requires_eip712_and_is_outside_every_session_scope() {
+        let a = NativeAction::SetOracleSigner {
+            signer: Address::repeat_byte(7),
+        };
+        assert!(requires_eip712(&a));
+        for scope in [
+            SessionScope::Trading,
+            SessionScope::TransfersOnly,
+            SessionScope::Full,
+        ] {
+            assert!(!scope.allows(&a), "{scope:?} must not allow SetOracleSigner");
+        }
+    }
+
+    #[test]
+    fn set_oracle_signer_hash_binds_signer_and_nonce() {
+        let a = NativeAction::SetOracleSigner {
+            signer: Address::repeat_byte(7),
+        };
+        let b = NativeAction::SetOracleSigner {
+            signer: Address::repeat_byte(8),
+        };
+        let h = eip712_struct_hash(&a, TEST_NONCE);
+        assert_ne!(h, eip712_struct_hash(&b, TEST_NONCE));
+        assert_ne!(h, eip712_struct_hash(&a, TEST_NONCE + 1));
+        assert_ne!(h, eip712_struct_hash(&NativeAction::ClaimUnbonded, TEST_NONCE));
+    }
+
+    #[test]
+    fn set_oracle_signer_signed_recovers_the_signing_key() {
+        let key = test_key();
+        let signed = sign_native_action(
+            NativeAction::SetOracleSigner {
+                signer: Address::repeat_byte(7),
+            },
+            TEST_NONCE,
+            &key,
+        );
+        assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
+    }
 
     // --- determinism ---
 

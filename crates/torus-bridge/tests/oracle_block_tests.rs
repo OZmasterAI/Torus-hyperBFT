@@ -51,6 +51,7 @@ fn put_validator(db: &StateDb, n: u8, stake: U256, status: ValidatorStatus) {
                 status,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             },
         )
         .unwrap();

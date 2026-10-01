@@ -321,6 +321,7 @@ mod tests {
             status,
             jailed_until: None,
             last_commission_change_block: None,
+            oracle_signer: None,
         };
         mgr.put_validator(&addr, &row).unwrap();
         addr

@@ -83,7 +83,7 @@ and liquidation cannot work.
 **Action:** `NativeAction::SetOracleSigner { signer: Address }`, appended after `ClaimUnbonded`.
 
 * `Address::ZERO` clears the signer.
-* EIP-712 type: `SetOracleSigner(address signer,uint64 nonce)`. Canonical tag 27.
+* EIP-712 type: `SetOracleSigner(address signer,uint64 nonce)`. Canonical tag 28 (rebase s87: 26 = main's AttestStateHash, 27 = ClaimUnbonded).
 * It is added to `requires_eip712` and to the `SessionScope::Full` exclusion, so only the
   validator's EVM key can sign it.
 * `classify_action` maps it to `Other`.
