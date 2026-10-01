@@ -1,8 +1,8 @@
 //! Item 3: Hyperliquid-style liquidation, core — docs/plans/liquidation.md.
 
 use torus_core::liquidation::{
-    adl_close, adl_rank, backstop, classify, settle_flat_deficit, slippage_cap, stage1_qty,
-    traders_after, AdlCandidate, Health, LIQUIDATOR_VAULT,
+    adl_close, adl_rank, backstop, bankruptcy_price, classify, settle_flat_deficit,
+    slippage_cap, stage1_qty, traders_after, AdlCandidate, Health, LIQUIDATOR_VAULT,
 };
 use torus_core::margin::{AccountView, MarginTier};
 use torus_core::position::{MarginType, NativeBalance, PositionManager};
@@ -238,4 +238,34 @@ fn traders_after_walks_the_positions_cf_from_the_cursor() {
     assert_eq!(traders_after(st, Some(addr(3)), 10).unwrap(), vec![addr(5), addr(9)]);
     assert_eq!(traders_after(st, None, 2).unwrap(), vec![addr(3), addr(5)]);
     assert!(traders_after(st, Some(addr(9)), 10).unwrap().is_empty());
+}
+
+/// Review H1 (user decision s517): the bankruptcy price is the close price at
+/// which the account (collateral + other UPnL = `rest`) ends at 0. Rounded
+/// AGAINST the bankrupt trader (a long's price down, a short's up), so the
+/// close never leaves it positive: `rest + pnl` is in (-1 unit, 0].
+#[test]
+fn bankruptcy_price_rounds_against_the_trader() {
+    // long 4 @ 1,000, rest 200: exactly 950
+    assert_eq!(bankruptcy_price(fp(200), true, fp(4), fp(1_000)), Some(fp(950)));
+    // short 4 @ 1,000, rest 200: exactly 1,050
+    assert_eq!(bankruptcy_price(fp(200), false, fp(4), fp(1_000)), Some(fp(1_050)));
+    // inexact: long / short 3 @ 1,000, rest 100 -> 33.333.. per unit, rounded against the trader
+    let pnl = |is_long: bool, p: FixedPoint| {
+        let per = if is_long { p - fp(1_000) } else { fp(1_000) - p };
+        per * fp(3)
+    };
+    let l = bankruptcy_price(fp(100), true, fp(3), fp(1_000)).unwrap();
+    let s = bankruptcy_price(fp(100), false, fp(3), fp(1_000)).unwrap();
+    assert_eq!(l, FixedPoint::from_raw(fp(1_000).raw() - 3_333_333_334));
+    assert_eq!(s, FixedPoint::from_raw(fp(1_000).raw() + 3_333_333_334));
+    for (is_long, p) in [(true, l), (false, s)] {
+        let end = fp(100) + pnl(is_long, p);
+        assert!(end <= FixedPoint::ZERO && end > -FixedPoint::ONE, "{is_long}: {end:?}");
+    }
+    // negative rest (other positions losing): the price moves past entry
+    assert_eq!(bankruptcy_price(-fp(40), true, fp(4), fp(1_000)), Some(fp(1_010)));
+    // overflow / zero size -> None (caller falls back to the mark)
+    assert_eq!(bankruptcy_price(FixedPoint::MAX, true, FixedPoint::from_raw(1), fp(1)), None);
+    assert_eq!(bankruptcy_price(fp(1), true, FixedPoint::ZERO, fp(1)), None);
 }

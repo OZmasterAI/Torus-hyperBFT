@@ -55,14 +55,13 @@ impl NativeExecutor {
         scan: usize,
         act: usize,
     ) -> Result<Vec<NativeActionResult>, CoreError> {
+        let listed = ctx
+            .governance
+            .listed_market_ids()
+            .map_err(|e| CoreError::InvalidInput(format!("listed markets: {e}")))?;
         let marks: Marks = {
             let reader = AccountReader::of(ctx);
-            ctx.governance
-                .listed_market_ids()
-                .map_err(|e| CoreError::InvalidInput(format!("listed markets: {e}")))?
-                .into_iter()
-                .filter_map(|m| reader.mark(m).map(|p| (m, p)))
-                .collect()
+            listed.iter().filter_map(|&m| reader.mark(m).map(|p| (m, p))).collect()
         };
         let prev = liq::prev_marks(&ctx.state, marks.keys().copied())?;
         // C1 (decided, s517): no separate index — walk CF_NATIVE_POSITIONS
@@ -123,7 +122,7 @@ impl NativeExecutor {
                 Self::adl_account(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
-        liq::put_prev_marks(&ctx.state, &marks, &prev)?;
+        liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
         Ok(results)
     }
@@ -217,9 +216,13 @@ impl NativeExecutor {
             .map_err(|_| CoreError::Overflow("liquidation notional overflows i128".into()))
     }
 
-    /// Decision 5 + D10: close every position of `u` (ascending market)
-    /// against ranked opposite-side counterparties at the previous mark (the
-    /// current mark the first time).
+    /// Decision 5 + D10 + review H1: close every MARKED position of `u`
+    /// (ascending market) against ranked opposite-side counterparties at the
+    /// previous mark (the current mark without one) clamped to `u`'s
+    /// bankruptcy price ([`liq::adl_price`]). Afterwards a non-vault account
+    /// without marked positions hands its remaining collateral (rounding dust,
+    /// or the deficit when the previous mark was worse than bankruptcy) to
+    /// the vault: it ends at exactly 0.
     fn adl_account<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
@@ -230,6 +233,9 @@ impl NativeExecutor {
             let m = p.market_id;
             let Some(&mark) = marks.get(&m) else { continue };
             let px = prev.get(&m).copied().unwrap_or(mark);
+            let bankruptcy = Self::adl_rest(ctx, marks, u, m)?
+                .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
+            let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
             let reader = AccountReader::of(ctx);
             // C7: ranking AV with entry fallback for unmarked markets. An
             // overflowing valuation ranks last (AV 0) — ranking only; a
@@ -248,6 +254,41 @@ impl NativeExecutor {
             })?;
             liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
         }
+        if *u != LIQUIDATOR_VAULT
+            && !ctx
+                .positions
+                .positions_for_trader(u)?
+                .iter()
+                .any(|p| marks.contains_key(&p.market_id))
+        {
+            liq::move_collateral(&ctx.positions, u, &LIQUIDATOR_VAULT)?;
+        }
         Ok(())
+    }
+
+    /// Review H1: `u`'s collateral + the UPnL of its positions OTHER than in
+    /// `m` (marked at the mark, unmarked at entry = 0). `None` on overflow.
+    fn adl_rest<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        marks: &Marks,
+        u: &Address,
+        m: MarketId,
+    ) -> Result<Option<FixedPoint>, CoreError> {
+        let bal = ctx.positions.get_native_balance(u)?;
+        let others: Vec<Position> = ctx
+            .positions
+            .positions_for_trader(u)?
+            .into_iter()
+            .filter(|q| q.market_id != m)
+            .collect();
+        let v = match AccountView::build(&bal, &others, |x| marks.get(&x).copied(), |_| None) {
+            Ok(v) => v,
+            Err(CoreError::Overflow(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(v.available
+            .checked_add(v.order_margin)
+            .and_then(|x| x.checked_add(v.upnl))
+            .ok())
     }
 }

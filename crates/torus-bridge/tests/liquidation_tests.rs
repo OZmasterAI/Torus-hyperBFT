@@ -489,8 +489,8 @@ fn backstop_through_the_step_moves_everything_to_the_vault() {
 
 /// T long 4 @ 1,000 (200); L long 3 @ 1,100; S1 short 4 @ 1,000 (10,000);
 /// S2 short 3 @ 1,100 (1,000). Block 1 mark 990: all healthy (T: AV 160 >=
-/// MM 99), previous mark 990 stored. Block 2 mark 900: T's AV -200 -> ADL at
-/// 990 (previous mark): S2 ranked first (2.06 vs 0.38) closes 3, S1 closes 1.
+/// MM 99), previous mark 990 stored. Block 2 mark 900: T's AV -200 -> ADL:
+/// S2 ranked first (2.06 vs 0.38) closes 3, S1 closes 1.
 fn adl_fixture() -> (tempfile::TempDir, StateDb, [Address; 4]) {
     let (d, db) = liq_db(&[1]);
     let ctx = ctx_at(db.clone(), 1);
@@ -503,6 +503,10 @@ fn adl_fixture() -> (tempfile::TempDir, StateDb, [Address; 4]) {
     (d, db, w)
 }
 
+/// Review H1 (user decision s517): the ADL price is the previous mark CLAMPED
+/// to T's bankruptcy price (200 / 4 below entry = 950): closing at 990 left
+/// the bankrupt T with +160. T ends at exactly 0; the counterparties are paid
+/// the difference (S2 3 x (1,100 - 950), S1 1 x 50). Was: T kept 160.
 #[test]
 fn adl_closes_against_ranked_counterparties_at_the_previous_mark() {
     let (_d, db, [t, s1, s2, l]) = adl_fixture();
@@ -518,9 +522,10 @@ fn adl_closes_against_ranked_counterparties_at_the_previous_mark() {
     assert_eq!(pos(&c2, &s2, 1), FixedPoint::ZERO, "ranked first: fully closed");
     assert_eq!(pos(&c2, &s1, 1), -fp(3));
     assert_eq!(pos(&c2, &l, 1), fp(3));
-    assert_eq!(bal(&c2, &t).available, fp(160), "200 + 4 x (990 - 1,000): no deficit");
-    assert_eq!(bal(&c2, &s2).available, fp(1_330));
-    assert_eq!(bal(&c2, &s1).available, fp(10_010));
+    assert_eq!(ab(&c2, &t), (FixedPoint::ZERO, FixedPoint::ZERO), "bankrupt: ends at 0");
+    assert_eq!(bal(&c2, &s2).available, fp(1_450));
+    assert_eq!(bal(&c2, &s1).available, fp(10_050));
+    assert_eq!(bal(&c2, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "nothing left over");
     assert_eq!(oi(&c2, 1), (fp(3), fp(3)));
     assert_eq!(total_value(&c2, &marks(&[(1, 900)])), before);
 }
@@ -541,9 +546,10 @@ fn adl_without_a_previous_mark_uses_the_mark_and_the_deficit_goes_to_the_vault()
     assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
-/// D8: the vault (exempt from stage 1 / backstop) is ADL'd when its AV < 0, at
-/// the previous mark: backstop at 975 (block 1), mark 900 (block 2): vault AV
-/// 50 - 750 < 0 -> closes long 10 against S at 975.
+/// D8: the vault (exempt from stage 1 / backstop) is ADL'd when its AV < 0:
+/// backstop at 975 (block 1), mark 900 (block 2): vault AV 50 - 750 < 0 ->
+/// closes long 10 against S. Review H1: at the previous mark 975 clamped to
+/// the vault's bankruptcy price 975 - 50 / 10 = 970 (was 975: the vault kept 50).
 #[test]
 fn the_vault_is_adld_when_its_value_goes_negative() {
     let (_d, db) = liq_db(&[1]);
@@ -561,8 +567,9 @@ fn the_vault_is_adld_when_its_value_goes_negative() {
     NativeExecutor::run_liquidations(&mut c2);
     assert_eq!(pos(&c2, &LIQUIDATOR_VAULT, 1), FixedPoint::ZERO);
     assert_eq!(pos(&c2, &s, 1), FixedPoint::ZERO);
-    assert_eq!(bal(&c2, &LIQUIDATOR_VAULT).available, fp(50), "closed at its entry 975");
-    assert_eq!(bal(&c2, &s).available, fp(1_000_250), "10 x (1,000 - 975)");
+    assert_eq!(bal(&c2, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "closed at 970");
+    assert_eq!(bal(&c2, &s).available, fp(1_000_300), "10 x (1,000 - 970)");
+    assert_eq!(oi(&c2, 1), (FixedPoint::ZERO, FixedPoint::ZERO));
     assert_eq!(total_value(&c2, &marks(&[(1, 900)])), before);
 }
 
@@ -664,4 +671,34 @@ fn the_vault_in_the_window_does_not_end_a_pass_early() {
     assert_eq!(cursor, Some(b), "cut after b: the pass continues at c next block");
     NativeExecutor::run_liquidations_with(&mut ctx, 1, 1);
     assert!(ctx.order_books[&1].orders_for_trader(&c).is_empty(), "c acted next");
+}
+
+/// Review H1 (user decision s517): a previous-mark row counts only if the
+/// previous step had a USABLE mark — a step with a stale mark deletes it. Block
+/// 1 stores 990; block 62 (market 1's aggregate aged 61: stale) deletes it;
+/// block 63 marks 900: T's AV -200 -> ADL at the CURRENT mark 900 (worse for
+/// T than its bankruptcy price 950, so no clamp), the -200 deficit goes to
+/// the vault. With the old row T would have closed at 990 (-> 950). Value and
+/// OI conserved.
+#[test]
+fn a_prev_mark_older_than_the_previous_usable_mark_is_ignored() {
+    let (_d, db, [t, s1, s2, _l]) = adl_fixture();
+    let mut c1 = ctx_at(db.clone(), 1);
+    set_mark(&c1, 1, fp(990));
+    NativeExecutor::run_liquidations(&mut c1);
+    assert_eq!(liq_rows(&c1, 0x03).len(), 1);
+    let mut stale = ctx_at(db.clone(), 62);
+    NativeExecutor::run_liquidations(&mut stale);
+    assert!(liq_rows(&stale, 0x03).is_empty(), "unusable mark: the row is deleted");
+    let mut c3 = ctx_at(db.clone(), 63);
+    set_mark(&c3, 1, fp(900));
+    let before = total_value(&c3, &marks(&[(1, 900)]));
+    NativeExecutor::run_liquidations(&mut c3);
+    assert_eq!(pos(&c3, &t, 1), FixedPoint::ZERO);
+    assert_eq!(ab(&c3, &t), (FixedPoint::ZERO, FixedPoint::ZERO));
+    assert_eq!(bal(&c3, &LIQUIDATOR_VAULT).available, -fp(200));
+    assert_eq!(bal(&c3, &s2).available, fp(1_000) + fp(600), "3 x (1,100 - 900)");
+    assert_eq!(bal(&c3, &s1).available, fp(10_100));
+    assert_eq!(oi(&c3, 1), (fp(3), fp(3)));
+    assert_eq!(total_value(&c3, &marks(&[(1, 900)])), before);
 }
