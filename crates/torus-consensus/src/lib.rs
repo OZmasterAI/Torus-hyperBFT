@@ -14,6 +14,7 @@ pub mod kv_store;
 pub mod network;
 pub mod shard_recovery;
 pub mod slashing;
+pub mod state_hash;
 
 pub use app::{LeaderState, NativeDaFetcher, PreProposalBundle, TorusApp};
 pub use genesis::GenesisConfig;

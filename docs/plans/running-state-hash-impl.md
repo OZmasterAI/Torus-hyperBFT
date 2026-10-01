@@ -337,3 +337,14 @@ deletes the row at restart and fails unless the key is excluded.
    the applied-height marker through the hashed flush
    (`FrozenPending::marker_only` + `flush_with_native_trie_stats`) instead of a
    bare put: same bytes, plus the hash in the same batch.
+4. **New node option `--state-hash-attest-key <PATH>` (Task 6).** Validators had no
+   configured native ACCOUNT key: the node only holds the ed25519 consensus key
+   (`--keystore`), while `AttestStateHash` must be EIP-712-signed by the secp256k1
+   key of the validator's registered address. The flag points to a file with that
+   key (64 hex chars, optional `0x`; a file so it never shows in `ps`). Unset = the
+   node never attests. The submitter only submits when the key's address is an
+   ACTIVE validator.
+5. Attestation submission is exactly once per checkpoint per process (plus a retry
+   at the next checkpoint scan if mempool admission failed); after a restart a
+   checkpoint is re-submitted only if this validator's vote is not on-chain. A
+   pre-restart submission that still lands is rejected on-chain (first vote wins).

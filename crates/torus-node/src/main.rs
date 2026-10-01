@@ -187,6 +187,15 @@ struct Cli {
         default_missing_value = "true"
     )]
     exec_trust_cache: bool,
+
+    /// Running state hash: path to a file holding this validator's ACCOUNT key
+    /// (secp256k1, 64 hex chars, optional 0x — the address it is registered
+    /// under, NOT the ed25519 consensus key). When set, the node signs and
+    /// submits `AttestStateHash` for every durable checkpoint (every 100
+    /// blocks). A file, not a value, so the key never shows in `ps`. Unset:
+    /// the node never attests.
+    #[arg(long)]
+    state_hash_attest_key: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand)]
@@ -202,6 +211,17 @@ enum Command {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load `--state-hash-attest-key` (see the flag).
+fn load_state_hash_attest_key(
+    path: &std::path::Path,
+) -> Result<k256::ecdsa::SigningKey, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read --state-hash-attest-key {}: {e}", path.display()))?;
+    let bytes = decode_hex_key(text.trim())?;
+    Ok(k256::ecdsa::SigningKey::from_slice(&bytes)
+        .map_err(|e| format!("invalid --state-hash-attest-key: {e}"))?)
+}
 
 fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
@@ -818,6 +838,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // fills), not read back from the DB at commit; fills are recorded only
     // while a stream subscriber exists. Set before the replica starts.
     app.set_fill_sink(Arc::new(notifier.clone()));
+    if let Some(path) = &cli.state_hash_attest_key {
+        let addr = app.set_state_hash_attest_key(load_state_hash_attest_key(path)?);
+        info!(%addr, "running state hash: automatic AttestStateHash enabled");
+    }
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
@@ -1415,5 +1439,29 @@ mod tests {
             cli.metrics_addr,
             "127.0.0.1:9091".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn state_hash_attest_key_flag_and_key_file() {
+        let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
+        assert!(cli.state_hash_attest_key.is_none(), "off by default");
+        let cli = Cli::try_parse_from([
+            "torus-node",
+            "--keystore",
+            "k.keystore",
+            "--state-hash-attest-key",
+            "acct.key",
+        ])
+        .unwrap();
+        assert_eq!(cli.state_hash_attest_key, Some(PathBuf::from("acct.key")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acct.key");
+        std::fs::write(&path, format!("0x{}\n", "11".repeat(32))).unwrap();
+        let key = load_state_hash_attest_key(&path).unwrap();
+        assert_eq!(key.to_bytes().as_slice(), &[0x11; 32]);
+        std::fs::write(&path, "zz").unwrap();
+        assert!(load_state_hash_attest_key(&path).is_err());
+        assert!(load_state_hash_attest_key(&dir.path().join("missing")).is_err());
     }
 }

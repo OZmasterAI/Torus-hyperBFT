@@ -539,6 +539,8 @@ struct ExecutionContext {
     /// without streams. Set before consensus starts;
     /// boot replay runs before it can be set, so replayed blocks never reach it.
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// Running state hash: attestation submitter (shared with `TorusApp`).
+    state_hash: Arc<crate::state_hash::StateHashMonitor>,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -2450,6 +2452,14 @@ impl ExecutionContext {
             }
         }
 
+        // Running state hash: attest durable checkpoints (reads only).
+        self.state_hash.after_block(
+            torus_block,
+            &self.state_db,
+            self.mempool.as_deref(),
+            self.metrics.as_deref(),
+        );
+
         tracing::info!(height, "execution pipeline: block done");
     }
 }
@@ -2637,6 +2647,8 @@ pub struct TorusApp {
     exec_prepared_durable: DurableRows,
     /// s80: the execution thread's fill sink slot (see `set_fill_sink`).
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// Running state hash monitor, shared with the execution thread.
+    state_hash: Arc<crate::state_hash::StateHashMonitor>,
 }
 
 /// Actions the proposer pushes to validators via unicast before broadcasting CompactBlock.
@@ -3398,6 +3410,7 @@ impl TorusApp {
         // s80: fill-sink slot, shared with the exec thread (see `set_fill_sink`).
         let fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>> =
             Default::default();
+        let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
 
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
@@ -3423,6 +3436,7 @@ impl TorusApp {
             // execution thread (backpressure) instead of ballooning memory.
             trade_history: trade_history_enabled(),
             fill_sink: fill_sink.clone(),
+            state_hash: state_hash.clone(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -3556,6 +3570,7 @@ impl TorusApp {
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
             fill_sink,
+            state_hash,
         };
 
         // Item 3 (TORUS_ASYNC_VALIDATE): resolved ONCE here and LOGGED in both
@@ -3677,6 +3692,14 @@ impl TorusApp {
     /// (see `FillSink`). Must be called before consensus starts, so no
     /// executed block is missed; boot replay inside `new()` runs without a
     /// sink, by design. A second call is ignored (logged).
+    /// Running state hash: configure this validator's ACCOUNT key (secp256k1,
+    /// the address it is registered under) as the signer of its automatic
+    /// `AttestStateHash` actions. Returns the derived address. Unset: the node
+    /// never attests.
+    pub fn set_state_hash_attest_key(&self, key: k256::ecdsa::SigningKey) -> Address {
+        self.state_hash.set_attest_key(key)
+    }
+
     pub fn set_fill_sink(&self, sink: Arc<dyn torus_state::trade_rows::FillSink>) {
         if self.fill_sink.set(sink).is_err() {
             tracing::warn!("fill sink already set; ignoring the second one");
@@ -10005,6 +10028,7 @@ mod crash_recovery_tests {
             trade_writer: None,
             trade_history: true,
             fill_sink: Default::default(),
+            state_hash: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -13896,5 +13920,119 @@ mod crash_recovery_tests {
         assert_eq!(parked, None);
         drop(ctx);
         assert_eq!(read_running_hash(&db), Some(reference), "(b) replay after a lost batch");
+    }
+
+    // ---- Running state hash: auto-attestation (Task 6) ----
+
+    fn k256_address(key: &k256::ecdsa::SigningKey) -> Address {
+        let pubkey = key.verifying_key().to_encoded_point(false);
+        Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+    }
+
+    /// Register `keys` as ACTIVE validators with equal stake.
+    fn seed_active_validators(state_db: &StateDb, keys: &[&k256::ecdsa::SigningKey]) {
+        let staking = StakingManager::new(state_db.clone());
+        for (i, key) in keys.iter().enumerate() {
+            let addr = k256_address(key);
+            let v = torus_economics::types::ValidatorState {
+                address: addr,
+                pubkey: [i as u8 + 1; 32],
+                commission_bps: 500,
+                self_stake: U256::from(1_000u64),
+                total_delegated: U256::ZERO,
+                status: torus_economics::types::ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&addr, &v).unwrap();
+        }
+    }
+
+    /// Execute empty blocks `from..=to` through the live dispatch path.
+    fn run_empty_blocks(ctx: &ExecutionContext, state_db: &StateDb, from: u64, to: u64) {
+        for h in from..=to {
+            dispatch_and_execute(ctx, state_db, &make_block(h, vec![]));
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h}");
+        }
+    }
+
+    /// The attestations sitting in `mempool`, as `(sender, height, hash)`.
+    fn pooled_attestations(mempool: &Mempool) -> Vec<(Address, u64, B256)> {
+        mempool
+            .select_native_for_block(1_000)
+            .into_iter()
+            .filter_map(|a| match a.action {
+                NativeAction::AttestStateHash { height, hash } => {
+                    Some((a.recover_sender().unwrap(), height, hash))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Task 6: a validator node with a configured account key submits exactly
+    /// one attestation per checkpoint once the checkpoint is durable, through
+    /// the normal mempool path; after a restart it re-submits only when its
+    /// vote is not on-chain yet.
+    #[test]
+    fn state_hash_autosubmit_once_per_checkpoint_and_after_restart_only_if_missing() {
+        use torus_state::running_hash::read_checkpoint;
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let me = k256_address(&key);
+        let (config, state_db) = make_test_config_and_db();
+        seed_active_validators(&state_db, &[&key]);
+        let new_node = |mempool: &Arc<Mempool>| {
+            let ctx = make_exec_ctx_with_mempool(&config, &state_db, Some(mempool.clone()), false);
+            assert_eq!(ctx.state_hash.set_attest_key(key.clone()), me);
+            ctx
+        };
+        let pool = |_: ()| {
+            Arc::new(Mempool::new(state_db.clone(), torus_mempool::MempoolConfig::default()))
+        };
+
+        let m1 = pool(());
+        let ctx = new_node(&m1);
+        run_empty_blocks(&ctx, &state_db, 1, 99);
+        assert!(pooled_attestations(&m1).is_empty(), "no checkpoint before 100");
+        run_empty_blocks(&ctx, &state_db, 100, 100);
+        let local = B256::from(read_checkpoint(&state_db, 100).expect("checkpoint 100 durable"));
+        assert_eq!(pooled_attestations(&m1), vec![(me, 100, local)], "one attestation at 100");
+        run_empty_blocks(&ctx, &state_db, 101, 150);
+        assert_eq!(pooled_attestations(&m1).len(), 1, "never a second one for 100");
+        drop(ctx);
+
+        // Restart before inclusion: the vote is not on-chain -> re-submitted once.
+        let m2 = pool(());
+        let ctx = new_node(&m2);
+        run_empty_blocks(&ctx, &state_db, 151, 152);
+        let pooled = m2.select_native_for_block(1_000);
+        assert_eq!(pooled.len(), 1, "re-submitted after restart");
+        assert!(matches!(pooled[0].action, NativeAction::AttestStateHash { height: 100, .. }));
+
+        // Include it (block 153); restart again: on-chain -> nothing submitted.
+        let mut b153 = make_block(153, pooled);
+        b153.header.parent_hash =
+            alloy_primitives::keccak256(make_block(152, vec![]).header.canonical_header_bytes());
+        dispatch_and_execute(&ctx, &state_db, &b153);
+        let votes = StakingManager::new(state_db.clone()).state_hash_votes(100).unwrap();
+        assert_eq!(votes, vec![(me, local.0)], "vote on-chain");
+        drop(ctx);
+        let m3 = pool(());
+        let ctx = new_node(&m3);
+        let mut b154 = make_block(154, vec![]);
+        b154.header.parent_hash = alloy_primitives::keccak256(b153.header.canonical_header_bytes());
+        dispatch_and_execute(&ctx, &state_db, &b154);
+        assert!(pooled_attestations(&m3).is_empty(), "vote already on-chain: no re-submit");
+
+        // A node without a key never submits; a key that is not an active
+        // validator never submits.
+        let m4 = pool(());
+        let ctx = make_exec_ctx_with_mempool(&config, &state_db, Some(m4.clone()), false);
+        let stranger = k256::ecdsa::SigningKey::from_slice(&[72u8; 32]).unwrap();
+        ctx.state_hash.set_attest_key(stranger);
+        let mut b155 = make_block(155, vec![]);
+        b155.header.parent_hash = alloy_primitives::keccak256(b154.header.canonical_header_bytes());
+        dispatch_and_execute(&ctx, &state_db, &b155);
+        assert!(pooled_attestations(&m4).is_empty(), "non-validator key");
     }
 }

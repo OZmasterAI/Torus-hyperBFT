@@ -17,6 +17,8 @@ torus-mempool = { workspace = true }
 torus-economics = { workspace = true }
 torus-genesis = { workspace = true }
 torus-telemetry = { workspace = true }
+# Running state hash: the validator account key (--state-hash-attest-key).
+k256 = { workspace = true }
 
 # CLI
 clap = { workspace = true }
