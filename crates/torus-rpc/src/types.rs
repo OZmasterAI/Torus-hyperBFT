@@ -295,6 +295,18 @@ pub struct RpcBalances {
     pub permanent_stake: String,
 }
 
+/// `torus_getUserLimits`: the per-user open-order limit and its inputs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserLimits {
+    /// Resting orders plus pending stops, summed over all markets.
+    pub open_orders: u64,
+    /// `min(1000 + floor(cumVolume / 5,000,000), 5000)`.
+    pub open_order_limit: u32,
+    /// Lifetime traded notional (maker + taker), decimal string.
+    pub cum_volume: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcMarketInfo {
