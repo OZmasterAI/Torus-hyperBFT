@@ -130,6 +130,11 @@ pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
 /// Key in CF_CONSENSUS_META: last block height where native post-commit completed.
 pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 
+/// Key in CF_CONSENSUS_META: present (`[1]`) iff native state advanced without native-trie
+/// maintenance (`TORUS_NATIVE_TRIE_MAINTENANCE=0`), so CF_NATIVE_TRIE / CF_NATIVE_HASHED lag it.
+/// Written in the flush's atomic batch; cleared only by a full `build_native_trie_to_cf`.
+pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
+
 // Trie (MPT state root)
 pub const CF_TRIE_NODES: &str = "cf_trie_nodes";
 /// Account-trie branch nodes for reth's `StateRoot`. Key: path nibbles (1 byte/nibble),

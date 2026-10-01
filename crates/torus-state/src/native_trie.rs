@@ -279,19 +279,53 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     }
     let root = finalize_root(node00, &defaults);
     batch.put_cf(trie_cf, ROOT_KEY, root.as_slice());
+    // s83: the rebuilt trie + mirror are a pure function of current state, so the staleness
+    // sentinel clears in the SAME batch (rebuild-and-unstale is atomic).
+    batch.delete_cf(
+        db.cf_handle(crate::cf::CF_CONSENSUS_META)?,
+        crate::cf::META_NATIVE_TRIE_STALE,
+    );
     db.write(batch)?;
     Ok(root)
 }
 
-/// Ensure the native trie + mirror exist, building them once if absent (idempotent boot helper).
-/// Returns `true` iff a build was performed. The trie CF always holds at least the root marker once
-/// built (even for empty native state), so its emptiness is the reliable "not yet built" signal.
-pub fn ensure_native_trie_built(db: &StateDb) -> Result<bool, StateError> {
-    if is_native_trie_built(db)? {
+/// Ensure the native trie + mirror exist and are current, building them if absent OR marked stale
+/// (idempotent boot helper). Returns `true` iff a build was performed. The trie CF always holds at
+/// least the root marker once built (even for empty native state), so its emptiness is the reliable
+/// "not yet built" signal. `maintain == false` (`TORUS_NATIVE_TRIE_MAINTENANCE=0`) does no trie
+/// work at all: an absent or stale trie stays so (readers fall back to [`native_root_full`]).
+pub fn ensure_native_trie_built(db: &StateDb, maintain: bool) -> Result<bool, StateError> {
+    if !maintain || (is_native_trie_built(db)? && !is_native_trie_stale(db)?) {
         return Ok(false);
     }
     build_native_trie_to_cf(db)?;
     Ok(true)
+}
+
+/// s83 Option 0: `true` iff native state advanced without trie maintenance since the last full
+/// build (`META_NATIVE_TRIE_STALE` present) — the persisted trie/mirror/root then LAG state and
+/// must not be read or incrementally extended until [`build_native_trie_to_cf`] runs.
+pub fn is_native_trie_stale(db: &StateDb) -> Result<bool, StateError> {
+    let cf = db.cf_handle(crate::cf::CF_CONSENSUS_META)?;
+    Ok(db
+        .inner()
+        .get_pinned_cf(cf, crate::cf::META_NATIVE_TRIE_STALE)?
+        .is_some())
+}
+
+/// s83 Option 0: `TORUS_NATIVE_TRIE_MAINTENANCE=0` skips per-block native trie/mirror maintenance
+/// (the maintained root has no live consumer); unset / `"1"` / anything else maintains exactly as
+/// today. Read once per process — the mode cannot flip mid-run.
+pub fn native_trie_maintenance_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_native_trie_maintenance(std::env::var("TORUS_NATIVE_TRIE_MAINTENANCE").ok())
+    })
+}
+
+/// Pure parse: only `"0"` disables.
+fn parse_native_trie_maintenance(v: Option<String>) -> bool {
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// `true` if the native bucketed trie has been built (cheap probe: `CF_NATIVE_TRIE` is non-empty —
@@ -1559,9 +1593,12 @@ mod tests {
     fn ensure_native_trie_built_is_one_shot() {
         let (db, _dir) = temp_db();
         seed(&db);
-        assert!(ensure_native_trie_built(&db).unwrap(), "first call builds");
+        // s83: maintenance OFF at boot never builds (no trie work at all).
+        assert!(!ensure_native_trie_built(&db, false).unwrap());
+        assert!(!is_native_trie_built(&db).unwrap());
+        assert!(ensure_native_trie_built(&db, true).unwrap(), "first call builds");
         assert!(
-            !ensure_native_trie_built(&db).unwrap(),
+            !ensure_native_trie_built(&db, true).unwrap(),
             "second call is a no-op"
         );
         assert_eq!(
@@ -1752,6 +1789,18 @@ mod tests {
         assert!(parse_native_root_cache_toggle(Some(" 1 ".to_string())));
         for v in ["0", "true", "on", "", "yes", "2"] {
             assert!(!parse_native_root_cache_toggle(Some(v.to_string())), "{v}");
+        }
+    }
+
+    /// s83 Option 0: maintenance defaults ON (exact-today); only `"0"` skips it.
+    #[test]
+    fn native_trie_maintenance_default_on_only_zero_disables() {
+        assert!(parse_native_trie_maintenance(None));
+        assert!(parse_native_trie_maintenance(Some("1".to_string())));
+        assert!(!parse_native_trie_maintenance(Some("0".to_string())));
+        assert!(!parse_native_trie_maintenance(Some(" 0 ".to_string())));
+        for v in ["false", "off", "", "no", "2", "00"] {
+            assert!(parse_native_trie_maintenance(Some(v.to_string())), "{v}");
         }
     }
 

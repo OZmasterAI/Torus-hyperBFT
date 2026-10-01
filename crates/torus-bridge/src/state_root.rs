@@ -73,8 +73,12 @@ fn flagged_evm_root(
 /// `TORUS_INCREMENTAL_ORACLE`, cross-checks it against the full scan, failing loud on any divergence
 /// (a consensus-splitting bug) rather than voting it.
 fn native_root_routed(state_db: &StateDb, incremental: bool) -> Result<B256, StateError> {
-    // Same full-scan fallback as the EVM half when incremental is off or the native trie is unbuilt.
-    if !incremental || !torus_state::native_trie::is_native_trie_built(state_db)? {
+    // Same full-scan fallback as the EVM half when incremental is off or the native trie is unbuilt
+    // — or stale (s83: `TORUS_NATIVE_TRIE_MAINTENANCE=0` let state move on without it).
+    if !incremental
+        || !torus_state::native_trie::is_native_trie_built(state_db)?
+        || torus_state::native_trie::is_native_trie_stale(state_db)?
+    {
         return torus_state::native_trie::native_root_full(state_db);
     }
     let persisted = torus_state::native_trie::persisted_native_root(state_db)?;
@@ -354,5 +358,33 @@ mod tests {
             incr_updates.is_some(),
             "incremental path must surface TrieUpdates for reuse"
         );
+    }
+
+    /// s83 Option 0 fail-safe: a trie marked stale (maintenance skipped while native state moved
+    /// on) must route to the full-scan oracle — slow, never the lagged persisted root.
+    #[test]
+    fn stale_native_trie_routes_to_full_scan() {
+        use super::native_root_routed;
+        use torus_state::cf::{CF_CONSENSUS_META, CF_NATIVE_BALANCES, META_NATIVE_TRIE_STALE};
+        use torus_state::native_trie::{
+            build_native_trie_to_cf, native_root_full, persisted_native_root,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01a", b"1")
+            .unwrap();
+        build_native_trie_to_cf(&db).unwrap();
+        // Skip-mode flush shape: state advances, trie does not, sentinel set.
+        db.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01b", b"2")
+            .unwrap();
+        db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_TRIE_STALE, &[1])
+            .unwrap();
+        let full = native_root_full(&db).unwrap();
+        assert_ne!(
+            full,
+            persisted_native_root(&db).unwrap(),
+            "trie really lags"
+        );
+        assert_eq!(native_root_routed(&db, true).unwrap(), full);
     }
 }

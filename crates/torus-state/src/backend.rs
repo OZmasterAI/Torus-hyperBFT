@@ -550,6 +550,7 @@ impl FrozenPending {
             applied_height,
             trie_cache,
             member_cache,
+            crate::native_trie::native_trie_maintenance_enabled(),
         )
     }
 }
@@ -830,6 +831,7 @@ impl NativeStateOverlay {
             applied_height,
             trie_cache,
             member_cache,
+            crate::native_trie::native_trie_maintenance_enabled(),
         )
     }
 }
@@ -844,6 +846,7 @@ fn flush_pending_with_native_trie_stats(
     applied_height: Option<u64>,
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    maintain_trie: bool,
 ) -> Result<NativeFlushStats, StateError> {
     {
         let raw = target.inner();
@@ -908,6 +911,17 @@ fn flush_pending_with_native_trie_stats(
             }
         }
         let trie_result = if dirty.is_empty() {
+            Ok(())
+        } else if !maintain_trie {
+            // s83 Option 0 (`TORUS_NATIVE_TRIE_MAINTENANCE=0`): no trie/mirror ops; instead mark
+            // the trie stale in the SAME batch, so state, marker and sentinel commit together. The
+            // caches are left untouched — they are only reachable through `apply_native_dirty`,
+            // which the once-per-process mode never calls, and a boot rebuild moves the persisted
+            // root they self-authenticate against.
+            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
+                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
+            })?;
+            batch.put_cf(cf, crate::cf::META_NATIVE_TRIE_STALE, [1u8]);
             Ok(())
         } else {
             match crate::native_trie::apply_native_dirty(
@@ -979,7 +993,7 @@ fn flush_pending_with_native_trie_stats(
                                 c.commit_finals(apply.member_finals, apply.root);
                         }
                     }
-                    (Ok(()), None) => {} // empty dirty set — trie untouched
+                    (Ok(()), None) => {} // empty dirty set / maintenance skipped — trie untouched
                     (Err(_), _) => {
                         if let Some(c) = trie_cache.as_deref_mut() {
                             c.invalidate();
@@ -2307,5 +2321,146 @@ mod tests {
             crate::native_trie::persisted_native_root(&db_c).unwrap(),
             "book rows must be root-visible"
         );
+    }
+
+    // ---- s83 Option 0: `TORUS_NATIVE_TRIE_MAINTENANCE` (mode passed explicitly, env-free) ----
+
+    fn s83_dump(db: &StateDb, cf: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, cf, None).unwrap()
+    }
+
+    /// Pre-block native state + a built trie (the boot state `ensure_native_trie_built` leaves).
+    fn s83_seed(db: &StateDb) {
+        use crate::cf::CF_NATIVE_POSITIONS;
+        db.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01base", b"b0").unwrap();
+        db.put_cf_raw(CF_NATIVE_POSITIONS, b"\x00\x02gone", b"p0").unwrap();
+        assert!(crate::native_trie::ensure_native_trie_built(db, true).unwrap());
+    }
+
+    /// Blocks `from..=to` (root-CF puts + a delete + a non-root nonce) flushed through the one
+    /// flush implementation with an EXPLICIT maintenance mode.
+    fn s83_blocks(db: &StateDb, from: u64, to: u64, maintain: bool) -> Vec<NativeFlushStats> {
+        use crate::cf::{CF_NATIVE_NONCES, CF_NATIVE_POSITIONS};
+        (from..=to)
+            .map(|h| {
+                let ov = NativeStateOverlay::new(db.clone());
+                ov.put_cf_raw(CF_NATIVE_BALANCES, &[0, h as u8, b'a'], &h.to_be_bytes())
+                    .unwrap();
+                ov.put_cf_raw(CF_NATIVE_POSITIONS, &[1, h as u8], b"pos").unwrap();
+                ov.put_cf_raw(CF_NATIVE_NONCES, &[h as u8], b"n").unwrap();
+                if h == 2 {
+                    ov.delete_cf_raw(CF_NATIVE_POSITIONS, b"\x00\x02gone").unwrap();
+                }
+                let state = ov.pending.read().unwrap();
+                flush_pending_with_native_trie_stats(&state, None, db, Some(h), None, None, maintain)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Skip mode writes NO trie/mirror rows, sets the stale sentinel in the same batch, and leaves
+    /// every other byte (native state, nonces, applied-height marker) identical to maintain mode.
+    #[test]
+    fn s83_maintenance_off_skips_trie_sets_sentinel_state_identical() {
+        use crate::cf::{
+            CF_CONSENSUS_META, CF_NATIVE_HASHED, CF_NATIVE_TRIE, META_NATIVE_APPLIED_HEIGHT,
+            META_NATIVE_TRIE_STALE,
+        };
+        use crate::native_trie::is_native_trie_stale;
+        let (db_on, _a) = temp_db();
+        let (db_off, _b) = temp_db();
+        s83_seed(&db_on);
+        s83_seed(&db_off);
+        let base_trie = s83_dump(&db_off, CF_NATIVE_TRIE);
+        let base_mirror = s83_dump(&db_off, CF_NATIVE_HASHED);
+
+        let on = s83_blocks(&db_on, 1, 3, true);
+        let off = s83_blocks(&db_off, 1, 3, false);
+
+        assert!(!is_native_trie_stale(&db_on).unwrap(), "maintain mode never marks stale");
+        assert!(is_native_trie_stale(&db_off).unwrap(), "skip mode marks the trie stale");
+        assert_ne!(s83_dump(&db_on, CF_NATIVE_TRIE), base_trie, "control: maintain mode wrote");
+        assert_eq!(s83_dump(&db_off, CF_NATIVE_TRIE), base_trie, "skip: no trie writes");
+        assert_eq!(s83_dump(&db_off, CF_NATIVE_HASHED), base_mirror, "skip: no mirror writes");
+
+        for cf in crate::cf::ALL_CF_NAMES {
+            if [CF_NATIVE_TRIE, CF_NATIVE_HASHED, CF_CONSENSUS_META].contains(cf) {
+                continue;
+            }
+            assert_eq!(s83_dump(&db_on, cf), s83_dump(&db_off, cf), "CF {cf}");
+        }
+        // Meta: identical except for the sentinel (applied-height marker included).
+        let meta_off: Vec<_> = s83_dump(&db_off, CF_CONSENSUS_META)
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() != META_NATIVE_TRIE_STALE)
+            .collect();
+        assert_eq!(s83_dump(&db_on, CF_CONSENSUS_META), meta_off);
+        assert_eq!(
+            StateDb::get_cf_raw(&db_off, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
+            Some(3u64.to_be_bytes().to_vec())
+        );
+
+        // Stats stay sane: no bucket work, dirty-set attribution unchanged.
+        for (a, b) in on.iter().zip(&off) {
+            assert!(a.dirty_buckets > 0);
+            assert_eq!((b.dirty_buckets, b.bucket_scans, b.member_hits), (0, 0, 0));
+            assert_eq!(a.dirty_entries_by_cf, b.dirty_entries_by_cf);
+        }
+    }
+
+    /// Restart with maintenance ON after a skip run: the boot helper rebuilds, clears the sentinel,
+    /// and lands on exactly the maintained arm's root AND bytes (trie + mirror included). With
+    /// maintenance still OFF at boot nothing is rebuilt.
+    #[test]
+    fn s83_boot_rebuild_after_skip_matches_maintained_run() {
+        use crate::native_trie::{
+            ensure_native_trie_built, is_native_trie_stale, native_root_full, persisted_native_root,
+        };
+        let (db_on, _a) = temp_db();
+        let (db_off, _b) = temp_db();
+        s83_seed(&db_on);
+        s83_seed(&db_off);
+        s83_blocks(&db_on, 1, 3, true);
+        s83_blocks(&db_off, 1, 3, false);
+
+        assert!(!ensure_native_trie_built(&db_off, false).unwrap(), "OFF at boot: no rebuild");
+        assert!(is_native_trie_stale(&db_off).unwrap());
+        assert!(!ensure_native_trie_built(&db_on, true).unwrap(), "fresh trie: no-op");
+
+        assert!(ensure_native_trie_built(&db_off, true).unwrap(), "stale + ON: rebuild");
+        assert!(!is_native_trie_stale(&db_off).unwrap(), "rebuild clears the sentinel");
+        let root = persisted_native_root(&db_off).unwrap();
+        assert_eq!(root, native_root_full(&db_off).unwrap());
+        assert_eq!(root, persisted_native_root(&db_on).unwrap());
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(s83_dump(&db_on, cf), s83_dump(&db_off, cf), "CF {cf}");
+        }
+
+        // Incremental maintenance resumes cleanly on the rebuilt trie.
+        s83_blocks(&db_on, 4, 5, true);
+        s83_blocks(&db_off, 4, 5, true);
+        assert_eq!(
+            persisted_native_root(&db_off).unwrap(),
+            native_root_full(&db_off).unwrap()
+        );
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(s83_dump(&db_on, cf), s83_dump(&db_off, cf), "CF {cf}");
+        }
+    }
+
+    /// A stale trie can never pass as fresh: an incremental apply on top of it (maintain mode
+    /// without the boot rebuild) leaves the sentinel set; only a full rebuild clears it.
+    #[test]
+    fn s83_stale_sentinel_survives_maintained_flush_until_rebuild() {
+        use crate::native_trie::{is_native_trie_stale, native_root_full, persisted_native_root};
+        let (db, _d) = temp_db();
+        s83_seed(&db);
+        s83_blocks(&db, 1, 2, false);
+        s83_blocks(&db, 3, 3, true);
+        assert!(is_native_trie_stale(&db).unwrap(), "sentinel is sticky across applies");
+        assert_ne!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
+        crate::native_trie::build_native_trie_to_cf(&db).unwrap();
+        assert!(!is_native_trie_stale(&db).unwrap());
+        assert_eq!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
     }
 }

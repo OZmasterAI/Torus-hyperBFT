@@ -3397,7 +3397,13 @@ impl TorusApp {
         // Phase A A2.2: same for the native bucketed-Merkle trie. No-op after first boot; keeps the
         // incremental native root's base ready while the full-scan native root stays primary until
         // TORUS_INCREMENTAL_STATE_ROOT is enabled.
-        if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db) {
+        // s83 Option 0: also rebuilds a trie left stale by a `TORUS_NATIVE_TRIE_MAINTENANCE=0` run;
+        // with maintenance off it does nothing (stale => readers take the full-scan root).
+        let maintain_trie = torus_state::native_trie::native_trie_maintenance_enabled();
+        if !maintain_trie {
+            tracing::info!("native trie maintenance DISABLED (TORUS_NATIVE_TRIE_MAINTENANCE=0): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
+        }
+        if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db, maintain_trie) {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
         }
         // s77 packed trade rows: node-local trade history in the old per-fill
