@@ -212,27 +212,49 @@ enum Command {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Load `--state-hash-attest-key` (see the flag).
+/// Load `--state-hash-attest-key` (see the flag). The file must be
+/// owner-only (no group/other permission bits, i.e. 0600 or stricter); the
+/// file text and the decoded bytes are zeroized after the key is built (the
+/// `SigningKey` zeroizes itself on drop).
 fn load_state_hash_attest_key(
     path: &std::path::Path,
 ) -> Result<k256::ecdsa::SigningKey, Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read --state-hash-attest-key {}: {e}", path.display()))?;
-    let bytes = decode_hex_key(text.trim())?;
-    Ok(k256::ecdsa::SigningKey::from_slice(&bytes)
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read --state-hash-attest-key {}: {e}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "--state-hash-attest-key {} is accessible by group/other (mode {:o}); \
+             restrict it to the owner: chmod 0600 {}",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        )
+        .into());
+    }
+    let text = zeroize::Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --state-hash-attest-key {}: {e}", path.display()))?,
+    );
+    let bytes = zeroize::Zeroizing::new(decode_hex_key(text.trim())?);
+    Ok(k256::ecdsa::SigningKey::from_slice(bytes.as_slice())
         .map_err(|e| format!("invalid --state-hash-attest-key: {e}"))?)
 }
 
 fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    if !hex_str.is_ascii() {
+        return Err("validator key must be 64 hex chars (non-ASCII input)".into());
+    }
     if hex_str.len() != 64 {
         return Err(format!("validator key must be 64 hex chars, got {}", hex_str.len()).into());
     }
-    let bytes: Vec<u8> = (0..hex_str.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
-        .collect::<Result<Vec<_>, _>>()?;
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| "key must be 32 bytes")?;
+    let mut arr = [0u8; 32];
+    for (i, byte) in arr.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_str[2 * i..2 * i + 2], 16)?;
+    }
     Ok(arr)
 }
 
@@ -1458,10 +1480,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acct.key");
         std::fs::write(&path, format!("0x{}\n", "11".repeat(32))).unwrap();
+        set_mode(&path, 0o600);
         let key = load_state_hash_attest_key(&path).unwrap();
         assert_eq!(key.to_bytes().as_slice(), &[0x11; 32]);
         std::fs::write(&path, "zz").unwrap();
         assert!(load_state_hash_attest_key(&path).is_err());
         assert!(load_state_hash_attest_key(&dir.path().join("missing")).is_err());
+    }
+
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Review finding 6: the attest key file must be owner-only (0600 or
+    /// stricter); anything group/other-accessible is refused with a clear
+    /// error naming the path and the required mode.
+    #[test]
+    fn state_hash_attest_key_requires_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acct.key");
+        std::fs::write(&path, "22".repeat(32)).unwrap();
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o777] {
+            set_mode(&path, mode);
+            let err = load_state_hash_attest_key(&path).expect_err("group/other access must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("0600") && msg.contains("acct.key"), "{mode:o}: {msg}");
+        }
+        for mode in [0o600, 0o400] {
+            set_mode(&path, mode);
+            assert!(load_state_hash_attest_key(&path).is_ok(), "{mode:o}");
+        }
+    }
+
+    /// Review finding 6: non-ASCII input of the right byte length must be an
+    /// error, never a panic (byte slicing inside a multi-byte char).
+    #[test]
+    fn decode_hex_key_rejects_non_ascii_without_panicking() {
+        let tricky = format!("a{}b", "\u{e9}".repeat(31)); // 64 bytes, not 64 chars
+        assert_eq!(tricky.len(), 64);
+        let out = std::panic::catch_unwind(|| decode_hex_key(&tricky).map_err(|e| e.to_string()));
+        let err = out.expect("must not panic").expect_err("non-ASCII must be rejected");
+        assert!(err.contains("hex"), "{err}");
+        assert!(decode_hex_key(&"\u{0661}".repeat(32)).is_err(), "non-ASCII digits");
+        assert!(decode_hex_key(&"ab".repeat(32)).is_ok());
     }
 }
