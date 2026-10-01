@@ -235,6 +235,18 @@ pub struct Signature {
     pub s: [u8; 32],
 }
 
+/// Review M3 (s517): proof that whoever registers a hot oracle signer holds
+/// its key — the signer's EIP-712 signature over
+/// `OracleSignerProof(address validator,uint64 chainId,uint64 nonce)`
+/// (`eip712::sign_oracle_signer_proof`). The validator field stops another
+/// validator replaying the proof; chain id (struct + domain) binds the chain;
+/// `nonce` makes each proof distinct (the wallet uses the action's nonce).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleSignerProof {
+    pub nonce: u64,
+    pub signature: Signature,
+}
+
 /// Ed25519 public key (32 bytes) for validator consensus signing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PublicKey(pub [u8; 32]);
@@ -699,8 +711,12 @@ pub enum NativeAction {
     /// `Address::ZERO`. EIP-712 only (never a session key). The signer may then
     /// submit `SubmitOraclePrices` on the validator's behalf — nothing else
     /// (docs/plans/oracle-feeder.md §1). Rotation replaces it.
+    ///
+    /// `proof` (review M3) is required to set a signer and ignored when
+    /// clearing: without it, another validator could squat a signer address.
     SetOracleSigner {
         signer: Address,
+        proof: Option<OracleSignerProof>,
     },
 }
 
@@ -975,9 +991,19 @@ impl NativeAction {
             NativeAction::ClaimUnbonded => {
                 buf.push(27);
             }
-            NativeAction::SetOracleSigner { signer } => {
+            NativeAction::SetOracleSigner { signer, proof } => {
                 buf.push(28);
                 buf.extend_from_slice(signer.as_slice());
+                match proof {
+                    None => buf.push(0),
+                    Some(p) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&p.nonce.to_be_bytes());
+                        buf.push(p.signature.v);
+                        buf.extend_from_slice(&p.signature.r);
+                        buf.extend_from_slice(&p.signature.s);
+                    }
+                }
             }
         }
     }
@@ -1413,15 +1439,28 @@ mod tests {
     #[test]
     fn set_oracle_signer_canonical_bytes_and_json_roundtrip() {
         let signer = Address::repeat_byte(0x5a);
-        let a = NativeAction::SetOracleSigner { signer };
+        let a = NativeAction::SetOracleSigner { signer, proof: None };
         let mut want = vec![28u8];
         want.extend_from_slice(signer.as_slice());
+        want.push(0); // review M3: no proof
         assert_eq!(a.canonical_bytes(), want);
         let json = serde_json::to_string(&a).unwrap();
         let back: NativeAction = serde_json::from_str(&json).unwrap();
         assert_eq!(back.canonical_bytes(), want);
-        let clear = NativeAction::SetOracleSigner { signer: Address::ZERO };
+        let clear = NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None };
         assert_ne!(clear.canonical_bytes(), want);
+        // With a proof: 1 ‖ nonce(8 BE) ‖ v ‖ r ‖ s.
+        let sig = Signature { v: 27, r: [1; 32], s: [2; 32] };
+        let p = NativeAction::SetOracleSigner {
+            signer,
+            proof: Some(OracleSignerProof { nonce: 5, signature: sig }),
+        };
+        let b = p.canonical_bytes();
+        assert_eq!(b.len(), 1 + 20 + 1 + 8 + 65);
+        assert_eq!(&b[21..30], &[1, 0, 0, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(b[30], 27);
+        let back: NativeAction = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.canonical_bytes(), b);
     }
 
     /// S470 knob default: a ChainConfig serialized before the field existed

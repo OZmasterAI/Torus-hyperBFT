@@ -118,6 +118,14 @@ fn actions() -> Vec<NativeAction> {
         NativeAction::ClaimUnbonded,
         NativeAction::SetOracleSigner {
             signer: Address::repeat_byte(11),
+            proof: None,
+        },
+        NativeAction::SetOracleSigner {
+            signer: Address::repeat_byte(12),
+            proof: Some(crate::OracleSignerProof {
+                nonce: u64::MAX,
+                signature: Signature { v: 28, r: [3; 32], s: [4; 32] },
+            }),
         },
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
@@ -592,9 +600,19 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
             buf.extend_from_slice(hash.as_slice());
         }
         NativeAction::ClaimUnbonded => buf.push(27),
-        NativeAction::SetOracleSigner { signer } => {
+        NativeAction::SetOracleSigner { signer, proof } => {
             buf.push(28);
             buf.extend_from_slice(signer.as_slice());
+            match proof {
+                None => buf.push(0),
+                Some(p) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&p.nonce.to_be_bytes());
+                    buf.push(p.signature.v);
+                    buf.extend_from_slice(&p.signature.r);
+                    buf.extend_from_slice(&p.signature.s);
+                }
+            }
         }
     }
     buf

@@ -243,7 +243,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
             hash_revoke_session(session_pubkey, nonce)
         }
         NativeAction::ClaimUnbonded => hash_claim_unbonded(nonce),
-        NativeAction::SetOracleSigner { signer } => hash_set_oracle_signer(signer, nonce),
+        NativeAction::SetOracleSigner { signer, proof } => {
+            hash_set_oracle_signer(signer, proof.as_ref(), nonce)
+        }
     }
 }
 
@@ -448,13 +450,56 @@ fn hash_claim_unbonded(nonce: u64) -> B256 {
 
 // ---------- oracle ----------
 
-fn hash_set_oracle_signer(signer: &Address, nonce: u64) -> B256 {
-    let th = keccak256("SetOracleSigner(address signer,uint64 nonce)");
-    let mut buf = Vec::with_capacity(3 * 32);
+fn hash_set_oracle_signer(signer: &Address, proof: Option<&crate::OracleSignerProof>, nonce: u64) -> B256 {
+    let th = keccak256("SetOracleSigner(address signer,bytes32 proofHash,uint64 nonce)");
+    // proofHash = keccak(nonce(8 BE) || v || r || s), zero without a proof.
+    let proof_hash = proof.map_or(B256::ZERO, |p| {
+        let mut b = Vec::with_capacity(8 + 65);
+        b.extend_from_slice(&p.nonce.to_be_bytes());
+        b.push(p.signature.v);
+        b.extend_from_slice(&p.signature.r);
+        b.extend_from_slice(&p.signature.s);
+        keccak256(&b)
+    });
+    let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(signer));
+    buf.extend_from_slice(&encode_bytes32(&proof_hash));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
+}
+
+/// EIP-712 signing hash of the oracle-signer proof of possession (review M3).
+fn oracle_signer_proof_hash(validator: &Address, nonce: u64) -> B256 {
+    let th = keccak256("OracleSignerProof(address validator,uint64 chainId,uint64 nonce)");
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_address(validator));
+    buf.extend_from_slice(&encode_u64(TORUS_CHAIN_ID));
+    buf.extend_from_slice(&encode_u64(nonce));
+    eip712_signing_hash(eip712_domain_separator(), keccak256(&buf))
+}
+
+/// The signer key's proof of possession for registering it as `validator`'s
+/// hot oracle signer (`NativeAction::SetOracleSigner::proof`).
+pub fn sign_oracle_signer_proof(
+    validator: &Address,
+    nonce: u64,
+    signer_key: &SigningKey,
+) -> crate::OracleSignerProof {
+    crate::OracleSignerProof {
+        nonce,
+        signature: sign_prehash(&oracle_signer_proof_hash(validator, nonce), signer_key),
+    }
+}
+
+/// The address whose key produced `proof` for `validator` (exec compares it
+/// with the signer being registered).
+pub fn recover_oracle_signer_proof(
+    validator: &Address,
+    proof: &crate::OracleSignerProof,
+) -> Result<Address, Eip712Error> {
+    ecrecover(&oracle_signer_proof_hash(validator, proof.nonce), &proof.signature)
 }
 
 // ---------- governance ----------
@@ -720,26 +765,24 @@ pub fn sign_native_action(
     let domain = eip712_domain_separator();
     let struct_hash = eip712_struct_hash(&action, nonce);
     let signing_hash = eip712_signing_hash(domain, struct_hash);
+    SignedNativeAction {
+        action,
+        nonce,
+        signature: ActionSignature::Eip712(sign_prehash(&signing_hash, key)),
+    }
+}
 
+/// Recoverable secp256k1 signature of a 32-byte signing hash (v = 27/28).
+fn sign_prehash(signing_hash: &B256, key: &SigningKey) -> Signature {
     let (k256_sig, recid) = key
         .sign_prehash_recoverable(signing_hash.as_slice())
         .expect("signing with a valid key cannot fail");
-
     let sig_bytes = k256_sig.to_bytes();
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
     r.copy_from_slice(&sig_bytes[..32]);
     s.copy_from_slice(&sig_bytes[32..]);
-
-    SignedNativeAction {
-        action,
-        nonce,
-        signature: ActionSignature::Eip712(Signature {
-            v: recid.to_byte() + 27,
-            r,
-            s,
-        }),
-    }
+    Signature { v: recid.to_byte() + 27, r, s }
 }
 
 /// Sign a native action with an ed25519 **session key** instead of the owner's
@@ -1252,6 +1295,7 @@ mod tests {
     fn set_oracle_signer_requires_eip712_and_is_outside_every_session_scope() {
         let a = NativeAction::SetOracleSigner {
             signer: Address::repeat_byte(7),
+            proof: None,
         };
         assert!(requires_eip712(&a));
         for scope in [
@@ -1267,14 +1311,38 @@ mod tests {
     fn set_oracle_signer_hash_binds_signer_and_nonce() {
         let a = NativeAction::SetOracleSigner {
             signer: Address::repeat_byte(7),
+            proof: None,
         };
         let b = NativeAction::SetOracleSigner {
             signer: Address::repeat_byte(8),
+            proof: None,
         };
         let h = eip712_struct_hash(&a, TEST_NONCE);
         assert_ne!(h, eip712_struct_hash(&b, TEST_NONCE));
         assert_ne!(h, eip712_struct_hash(&a, TEST_NONCE + 1));
         assert_ne!(h, eip712_struct_hash(&NativeAction::ClaimUnbonded, TEST_NONCE));
+        // Review M3: the validator's signature also binds the proof.
+        let v = Address::repeat_byte(1);
+        let with = |p| NativeAction::SetOracleSigner { signer: Address::repeat_byte(7), proof: Some(p) };
+        let p1 = sign_oracle_signer_proof(&v, 1, &test_key_2());
+        let p2 = sign_oracle_signer_proof(&v, 2, &test_key_2());
+        assert_ne!(h, eip712_struct_hash(&with(p1.clone()), TEST_NONCE));
+        assert_ne!(eip712_struct_hash(&with(p1), TEST_NONCE), eip712_struct_hash(&with(p2), TEST_NONCE));
+    }
+
+    /// Review M3: the proof recovers to the signer key only for the validator
+    /// (and nonce) it was made for.
+    #[test]
+    fn oracle_signer_proof_binds_validator_and_nonce() {
+        let signer = test_key_2();
+        let (v1, v2) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let p = sign_oracle_signer_proof(&v1, 9, &signer);
+        assert_eq!(p.nonce, 9);
+        assert_eq!(recover_oracle_signer_proof(&v1, &p).unwrap(), signer_address(&signer));
+        assert_ne!(recover_oracle_signer_proof(&v2, &p).ok(), Some(signer_address(&signer)));
+        let mut other_nonce = p.clone();
+        other_nonce.nonce = 10;
+        assert_ne!(recover_oracle_signer_proof(&v1, &other_nonce).ok(), Some(signer_address(&signer)));
     }
 
     #[test]
@@ -1283,6 +1351,7 @@ mod tests {
         let signed = sign_native_action(
             NativeAction::SetOracleSigner {
                 signer: Address::repeat_byte(7),
+                proof: Some(sign_oracle_signer_proof(&signer_address(&key), 3, &test_key_2())),
             },
             TEST_NONCE,
             &key,
