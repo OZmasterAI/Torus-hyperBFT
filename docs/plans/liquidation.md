@@ -1,8 +1,10 @@
 # Design: Hyperliquid-style liquidation (item 3)
 
-**Status (s517):** design + TDD plan only (`docs/plans/liquidation-impl.md`,
-`PRPs/liquidation.tasks.json`). Branch `feat/liquidation` @ `d4fe69c`, stacked on
-`feat/oracle-aggregation` (the mark this design consumes). Nothing implemented.
+**Status (s517):** **implemented** on `feat/liquidation` (d16f9ec..6d5645d + this docs commit, plan
+`docs/plans/liquidation-impl.md` with its "Correction s517" notes), stacked on
+`feat/oracle-aggregation` (the mark this design consumes). Not merged / pushed.
+User answers (s517): D1-D11, C1 (no separate index) and C4 (CancelAll cancels stops) decided
+as proposed; C3 / C5 recorded as known limitations.
 Consensus-visible: lockstep upgrade + fresh genesis (new native-root CF, margin configs,
 liquidation step, CancelAll also cancels stops).
 
