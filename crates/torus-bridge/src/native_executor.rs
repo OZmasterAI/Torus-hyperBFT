@@ -17,6 +17,7 @@ use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+    OPEN_ORDER_BASE_LIMIT,
 };
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
@@ -4970,7 +4971,9 @@ impl NativeExecutor {
     /// Per-user open-order limit, one rule for the serial Phase-2 loop, the
     /// sharded workers and `exec_place_order`. Market, IOC and FOK orders
     /// never rest: they pass and take no slot. Any other order (GTC,
-    /// PostOnly, a stop while pending) needs a free slot. `slots` loads on the
+    /// PostOnly, a stop while pending) needs a free slot; as on Hyperliquid,
+    /// reduce-only and stop orders also need fewer than
+    /// `OPEN_ORDER_BASE_LIMIT` open orders. `slots` loads on the
     /// sender's first such order: open orders summed over `books` (after
     /// Phase 1) and the limit from the stored `cum_volume`. Returns the slots
     /// with this order counted; the caller stores them only once the order
@@ -5004,6 +5007,16 @@ impl NativeExecutor {
                 })
             }
         };
+        if (params.reduce_only || is_stop) && s.open >= OPEN_ORDER_BASE_LIMIT {
+            return Err((
+                RejectReason::OpenLimit,
+                format!(
+                    "open order limit: reduce-only and stop orders need fewer than \
+                     {OPEN_ORDER_BASE_LIMIT} open orders, have {}",
+                    s.open
+                ),
+            ));
+        }
         if s.open >= s.limit {
             return Err((
                 RejectReason::OpenLimit,

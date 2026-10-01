@@ -711,3 +711,46 @@ fn open_limit_serial_and_sharded_prepare_identical() {
         assert_eq!(golden, run_with_volumes(&blocks, threads, &volumes), "threads={threads}");
     }
 }
+
+/// HL rule: at >= 1000 open orders, reduce-only and trigger orders are
+/// rejected even when the volume-scaled limit (here 1200) has room.
+#[test]
+fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
+    let (a, b) = (addr(1), addr(6));
+    let stop = PlaceOrderParams {
+        order_type: OrderType::StopMarket { trigger: fp(200) },
+        ..gtc(1, true, 0, 1)
+    };
+    let reduce_only = PlaceOrderParams {
+        reduce_only: true,
+        ..gtc(2, true, 45, 1)
+    };
+    let reduce_only_ioc = PlaceOrderParams {
+        reduce_only: true,
+        ..order(1, true, fp(40), fp(1), TimeInForce::IOC)
+    };
+    let blocks = vec![
+        interleave(vec![resting(a, 1000), resting(b, 999)]),
+        vec![
+            place(a, reduce_only.clone()),
+            place(a, stop.clone()),
+            place(a, gtc(3, true, 45, 1)),
+            place(a, reduce_only_ioc),
+            place(b, stop),
+            place(b, reduce_only),
+        ],
+    ];
+    let volumes = [(a, 1_000_000_000), (b, 1_000_000_000)];
+    let golden = run_with_volumes(&blocks, 0, &volumes);
+    let r = &golden.0.results[1];
+    assert!(is_open_limit(&r[0]), "reduce-only GTC: {:?}", r[0]);
+    assert!(is_open_limit(&r[1]), "stop: {:?}", r[1]);
+    assert!(r[2].0, "plain GTC under the 1200 limit: {:?}", r[2]);
+    assert!(!is_open_limit(&r[3]), "reduce-only IOC is exempt: {:?}", r[3]);
+    assert!(r[4].0, "stop at 999 open: {:?}", r[4]);
+    assert!(is_open_limit(&r[5]), "reduce-only once the stop made 1000: {:?}", r[5]);
+    assert_eq!(golden.1, 3);
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_with_volumes(&blocks, threads, &volumes), "threads={threads}");
+    }
+}
