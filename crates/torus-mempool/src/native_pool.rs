@@ -10,7 +10,11 @@ use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
 
 use crate::error::MempoolError;
 
-/// Selection-order key (T2.3): `(cancel-priority, sender, nonce, seq)`.
+/// Selection-order key (T2.3): `(priority class, sender, nonce, seq)`.
+///
+/// Priority classes (s517 oracle feeder): [`PRIO_CANCEL`] (0) <
+/// [`PRIO_ORACLE`] (1) < [`PRIO_NORMAL`] (2) — cancels first, then oracle
+/// submissions, then everything else. Node-local: only the proposer selects.
 ///
 /// A `BTreeMap` over this key IS the pool's selection order, maintained
 /// incrementally at insert/remove instead of a full `sort_by` plus
@@ -27,6 +31,13 @@ use crate::error::MempoolError;
 /// was reverted; the same binary with this key ran 56k (s66-bisect-noarr-r1).
 type SortKey = (u8, Address, u64, u64);
 
+/// Priority class of a cancel ([`is_cancel`]).
+pub const PRIO_CANCEL: u8 = 0;
+/// Priority class of an oracle submission ([`is_oracle_submission`]).
+pub const PRIO_ORACLE: u8 = 1;
+/// Priority class of every other action.
+pub const PRIO_NORMAL: u8 = 2;
+
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
 /// No stale heap entries: every insert/remove maintains this exact live index.
 type ExpiryKey = (u64, u8, Address, u64);
@@ -40,7 +51,8 @@ pub(crate) struct NativePoolEntry {
     pub sender: Address,
     pub action: SignedNativeAction,
     pub action_hash: B256,
-    pub is_cancel: bool,
+    /// [`priority_class`] of the action (the first [`SortKey`] field).
+    pub priority: u8,
     /// bincode-encoded size of `action` — the bytes this entry contributes to a
     /// block body (bodies are bincode, app.rs `block_bytes`). Computed once at
     /// insert so byte-capped selection is O(1) per entry.
@@ -178,7 +190,7 @@ impl NativePool {
         restash_key: Option<B256>,
     ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
-        let is_cancel = is_cancel(&action.action);
+        let priority = priority_class(&action.action);
         // Serialization of a serde struct cannot realistically fail; if it ever
         // does, a half-cap sentinel keeps the entry out of byte-capped blocks
         // without overflowing the selection sum.
@@ -199,12 +211,13 @@ impl NativePool {
 
         // Pool size cap with priority-based eviction.
         if self.entries.len() >= self.max_size {
-            if is_cancel {
-                // High-priority: evict the lowest-priority non-cancel — the
-                // LAST entry in selection order (cancels sort first, so if any
-                // non-cancel exists it sits at the back of the map).
+            if priority != PRIO_NORMAL {
+                // High-priority (cancel or oracle): evict the lowest-priority
+                // normal entry — the LAST entry in selection order (priority
+                // classes sort first, so if any normal entry exists it sits at
+                // the back of the map). Priority entries never evict each other.
                 let evict_key = match self.entries.iter().next_back() {
-                    Some((key, entry)) if !entry.is_cancel => *key,
+                    Some((key, entry)) if entry.priority == PRIO_NORMAL => *key,
                     _ => return Err(MempoolError::NativePoolFull),
                 };
                 self.remove_entry_by_key(&evict_key);
@@ -217,7 +230,7 @@ impl NativePool {
         self.seen.insert((sender, action_hash));
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
+        let key: SortKey = (priority, sender, action.nonce, seq);
         self.hash_index.entry(action_hash).or_default().push(key);
         self.expiry_index.insert(expiry_key(&key));
         self.entries.insert(
@@ -226,7 +239,7 @@ impl NativePool {
                 sender,
                 action,
                 action_hash,
-                is_cancel,
+                priority,
                 encoded_len,
                 restash_key,
             },
@@ -387,12 +400,13 @@ impl NativePool {
         selected
     }
 
-    /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
-    /// tier): the same walk, budgets, and per-sender cap as
-    /// [`Self::select_for_block_with_senders_excluding`], but the scan stops at
-    /// the first non-cancel entry. Cancels sort FIRST in [`SortKey`] (priority
-    /// byte 0), so this touches exactly the pooled cancel prefix and never
-    /// walks the (possibly huge) non-cancel tail. Non-destructive like every
+    /// Priority-ONLY selection (Package D rank 1, deepest exec-backlog pacing
+    /// tier; s517: cancels, then oracle submissions): the same walk, budgets,
+    /// and per-sender cap as [`Self::select_for_block_with_senders_excluding`],
+    /// but the scan stops at the first [`PRIO_NORMAL`] entry. Priority classes
+    /// sort FIRST in [`SortKey`], so this touches exactly the pooled priority
+    /// prefix and never walks the (possibly huge) normal tail. The name is
+    /// kept from the cancels-only era. Non-destructive like every
     /// selection: paced-out non-cancels stay pooled and remain fully
     /// selectable by the normal path — pacing defers, never sheds.
     pub fn select_cancels_for_block_with_senders_excluding(
@@ -411,9 +425,9 @@ impl NativePool {
         let mut orders_used: usize = 0;
 
         for entry in self.entries.values() {
-            if !entry.is_cancel {
-                // Cancels sort first: the first non-cancel ends the cancel
-                // prefix — nothing selectable remains beyond it in this mode.
+            if entry.priority == PRIO_NORMAL {
+                // Priority classes sort first: the first normal entry ends the
+                // priority prefix — nothing selectable remains beyond it here.
                 break;
             }
             if selected.len() >= limit {
@@ -468,6 +482,20 @@ impl NativePool {
             removed += 1;
         }
         removed
+    }
+
+    /// Pooled oracle submissions whose sender is any of `accounts` (a
+    /// validator and its hot signer). The per-validator cap (M2) reads this
+    /// under the same pool write lock as the insert.
+    pub fn oracle_pending(&self, accounts: &[Address]) -> usize {
+        accounts
+            .iter()
+            .map(|a| {
+                self.entries
+                    .range((PRIO_ORACLE, *a, 0, 0)..=(PRIO_ORACLE, *a, u64::MAX, u64::MAX))
+                    .count()
+            })
+            .sum()
     }
 
     /// Remove actions that were included in a committed block.
@@ -544,6 +572,28 @@ pub fn is_cancel(action: &NativeAction) -> bool {
         action,
         NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. }
     )
+}
+
+/// A validator's (or its hot signer's) oracle price submission (s517).
+pub fn is_oracle_submission(action: &NativeAction) -> bool {
+    matches!(action, NativeAction::SubmitOraclePrices(_))
+}
+
+/// Cancels and oracle submissions: pool-eviction priority, the RPC
+/// backlog / pool-full bypass, and the priority-only pacing tier.
+pub fn is_priority(action: &NativeAction) -> bool {
+    is_cancel(action) || is_oracle_submission(action)
+}
+
+/// The [`SortKey`] priority class of `action`.
+pub fn priority_class(action: &NativeAction) -> u8 {
+    if is_cancel(action) {
+        PRIO_CANCEL
+    } else if is_oracle_submission(action) {
+        PRIO_ORACLE
+    } else {
+        PRIO_NORMAL
+    }
 }
 
 #[cfg(test)]
@@ -1492,5 +1542,96 @@ mod tests {
         pool.insert(Address::repeat_byte(2), stale).unwrap();
         assert_eq!(pool.size(), 2);
         pool.assert_index_consistent();
+    }
+
+    // ---- s517 oracle feeder M1: classes cancel(0) < oracle(1) < rest(2) ----
+
+    fn oracle(nonce: u64) -> SignedNativeAction {
+        make_action(
+            nonce,
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, torus_types::FixedPoint::ONE)],
+                timestamp: nonce,
+            }),
+        )
+    }
+
+    #[test]
+    fn selection_order_is_cancels_then_oracle_then_rest() {
+        let mut pool = NativePool::new(100, 64, 64);
+        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(Address::repeat_byte(5), make_action(2, NativeAction::CancelOrder { order_id: 9 })).unwrap();
+        pool.insert(Address::repeat_byte(9), oracle(3)).unwrap();
+        let sel = pool.select_for_block(10);
+        let kinds: Vec<u8> = sel.iter().map(|a| priority_class(&a.action)).collect();
+        assert_eq!(kinds, vec![PRIO_CANCEL, PRIO_ORACLE, PRIO_NORMAL]);
+        assert!(is_cancel(&sel[0].action));
+        assert!(is_oracle_submission(&sel[1].action));
+        assert!(matches!(sel[2].action, NativeAction::ClaimRewards));
+        assert!(is_priority(&sel[0].action) && is_priority(&sel[1].action) && !is_priority(&sel[2].action));
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn full_pool_oracle_submission_evicts_a_normal_entry() {
+        let mut pool = NativePool::new(2, 64, 64);
+        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(Address::repeat_byte(2), make_action(2, NativeAction::ClaimRewards)).unwrap();
+        assert!(matches!(
+            pool.insert(Address::repeat_byte(3), make_action(3, NativeAction::ClaimRewards)),
+            Err(MempoolError::NativePoolFull)
+        ));
+        pool.insert(Address::repeat_byte(4), oracle(4)).unwrap();
+        assert_eq!(pool.size(), 2);
+        assert_eq!(pool.oracle_pending(&[Address::repeat_byte(4)]), 1);
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn full_pool_of_priority_entries_rejects_oracle() {
+        let mut pool = NativePool::new(1, 64, 64);
+        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::CancelOrder { order_id: 1 })).unwrap();
+        assert!(matches!(pool.insert(Address::repeat_byte(2), oracle(2)), Err(MempoolError::NativePoolFull)));
+        // ...and a cancel never evicts an oracle submission either.
+        let mut pool = NativePool::new(1, 64, 64);
+        pool.insert(Address::repeat_byte(2), oracle(2)).unwrap();
+        assert!(matches!(
+            pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::CancelOrder { order_id: 1 })),
+            Err(MempoolError::NativePoolFull)
+        ));
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn oracle_pending_counts_across_validator_and_signer() {
+        let (v, s, other) = (Address::repeat_byte(7), Address::repeat_byte(8), Address::repeat_byte(9));
+        let mut pool = NativePool::new(100, 64, 64);
+        let first = oracle(1);
+        let first_hash = compute_action_hash(&first);
+        pool.insert(v, first).unwrap();
+        pool.insert(v, oracle(2)).unwrap();
+        pool.insert(s, oracle(3)).unwrap();
+        pool.insert(other, oracle(4)).unwrap();
+        pool.insert(v, make_action(5, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(v, make_action(6, NativeAction::CancelOrder { order_id: 1 })).unwrap();
+        assert_eq!(pool.oracle_pending(&[v, s]), 3);
+        assert_eq!(pool.oracle_pending(&[v]), 2);
+        assert_eq!(pool.oracle_pending(&[]), 0);
+        pool.remove_committed(&[first_hash]);
+        assert_eq!(pool.oracle_pending(&[v, s]), 2);
+        pool.assert_index_consistent();
+    }
+
+    #[test]
+    fn priority_only_selection_takes_cancels_and_oracle() {
+        let mut pool = NativePool::new(100, 64, 64);
+        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(Address::repeat_byte(5), make_action(2, NativeAction::CancelOrder { order_id: 9 })).unwrap();
+        pool.insert(Address::repeat_byte(9), oracle(3)).unwrap();
+        let sel = pool.select_cancels_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(sel.len(), 2);
+        assert!(is_cancel(&sel[0].1.action));
+        assert!(is_oracle_submission(&sel[1].1.action));
+        assert_eq!(pool.size(), 3, "non-destructive");
     }
 }

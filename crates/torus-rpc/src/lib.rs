@@ -1501,6 +1501,132 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    // ---- s517 oracle feeder M3: priority screens let oracle submissions through ----
+
+    /// Active validator V (key `ac09…ff80`) with hot signer S (key `[21; 32]`),
+    /// market 1 listed. Returns (V key, S key).
+    fn oracle_fixture(state: &StateDb) -> (k256::ecdsa::SigningKey, k256::ecdsa::SigningKey) {
+        let vk = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap(),
+        )
+        .unwrap();
+        let sk = k256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+        let addr = |k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, 0, k)
+                .recover_sender()
+                .unwrap()
+        };
+        let (v, s) = (addr(&vk), addr(&sk));
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &v,
+                &torus_economics::ValidatorState {
+                    address: v,
+                    pubkey: [3; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: Some(s),
+                },
+            )
+            .unwrap();
+        state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&s), v.as_slice())
+            .unwrap();
+        store_market(state, 1, "BTC", "USD");
+        (vk, sk)
+    }
+
+    fn oracle_payload(k: &k256::ecdsa::SigningKey, nonce: u64) -> String {
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, fp(100))],
+                timestamp: 0,
+            }),
+            nonce,
+            k,
+        );
+        format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+    }
+
+    fn unix_ms() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn admission_backlog_lets_validator_and_signer_oracle_through() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, sk) = oracle_fixture(&state);
+        let cfg = MempoolConfig { native_admission_horizon_ms: 1, native_admission_floor: 0, ..Default::default() };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        assert!(mempool.native_admission_backlogged());
+        let server = RpcServer::new(
+            state,
+            mempool.clone(),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{addr}")).unwrap();
+        let now = unix_ms();
+        let stranger = k256::ecdsa::SigningKey::from_slice(&[22u8; 32]).unwrap();
+        let batch = vec![oracle_payload(&vk, now), oracle_payload(&sk, now), oracle_payload(&stranger, now)];
+        let results: Vec<RpcSubmitResult> =
+            client.request("torus_submitNativeActions", jsonrpsee::rpc_params![batch]).await.unwrap();
+        assert!(results[0].error.is_none(), "{:?}", results[0]);
+        assert!(results[1].error.is_none(), "{:?}", results[1]);
+        let e = results[2].error.as_deref().unwrap_or("");
+        assert!(e.contains("active validator or its signer") && !e.contains("busy"), "{e}");
+        // The single endpoint admits S too.
+        let r: Result<String, _> =
+            client.request("torus_submitNativeAction", jsonrpsee::rpc_params![oracle_payload(&sk, now + 1)]).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(mempool.native_pool_size(), 3);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_full_lets_validator_oracle_through() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, _) = oracle_fixture(&state);
+        let cfg = MempoolConfig { native_pool_max_size: 1, ..Default::default() };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let now = unix_ms();
+        let other = k256::ecdsa::SigningKey::from_slice(&[23u8; 32]).unwrap();
+        mempool
+            .add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &other))
+            .unwrap();
+        assert!(mempool.native_pool_is_full());
+        let server = RpcServer::new(
+            state,
+            mempool.clone(),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{addr}")).unwrap();
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![vec![oracle_payload(&vk, now)]])
+            .await
+            .unwrap();
+        assert!(results[0].error.is_none(), "{:?}", results[0]);
+        assert_eq!(mempool.native_pool_size(), 1, "the oracle submission evicted the ClaimRewards");
+        let pooled = mempool.drain_native(10);
+        assert!(matches!(pooled[0].action, torus_types::NativeAction::SubmitOraclePrices(_)));
+        handle.stop().unwrap();
+    }
+
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
     /// are shed after a decode-only pass (no signature verification spent),
     /// while cancels still travel the full verify path so pool eviction

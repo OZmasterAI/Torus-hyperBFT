@@ -175,6 +175,10 @@ pub fn admission_limit(
     Some(by_rate.max(floor))
 }
 
+/// s517: at most this many pooled oracle submissions per validator, counted
+/// over the validator's own address plus its hot oracle signer.
+pub const ORACLE_PENDING_PER_VALIDATOR: usize = 4;
+
 /// Max pending native actions per sender in the pool. With non-destructive
 /// selection (actions stay until commit), this must cover burst submissions.
 pub const NATIVE_PER_SENDER_CAP: usize = 512;
