@@ -15,7 +15,9 @@ use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
-use torus_core::position::{FillEffect, MarginType, NativeBalance, PositionCache, PositionManager};
+use torus_core::position::{
+    open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
@@ -412,10 +414,36 @@ enum PrepOutcome {
     /// Margin reserved (possibly ZERO for market orders) — the stitch assigns
     /// the global order id and builds the `PreparedOrder`.
     Pass(FixedPoint),
-    /// Rejected pre-book. `margin` selects the funnel counter
-    /// (`orders_rejected_margin` vs `orders_rejected_other`); `msg` is the
+    /// Rejected pre-book. `reason` selects the funnel counter; `msg` is the
     /// exact serial-path error string.
-    Reject { margin: bool, msg: String },
+    Reject { reason: RejectReason, msg: String },
+}
+
+/// Why an order died pre-book (selects its funnel counter).
+#[derive(Clone, Copy)]
+enum RejectReason {
+    Margin,
+    OpenLimit,
+    Other,
+}
+
+impl RejectReason {
+    fn count(self, m: &torus_telemetry::Metrics) {
+        match self {
+            RejectReason::Margin => m.orders_rejected_margin.inc(),
+            RejectReason::OpenLimit => m.orders_rejected_open_limit.inc(),
+            RejectReason::Other => m.orders_rejected_other.inc(),
+        };
+    }
+}
+
+/// One sender's open-order slots while its orders are prepared: orders open
+/// now (books at load + this block's accepted orders that can rest) and the
+/// sender's limit.
+#[derive(Clone, Copy)]
+struct OpenSlots {
+    open: u32,
+    limit: u32,
 }
 
 #[cfg(test)]
@@ -3683,6 +3711,7 @@ impl NativeExecutor {
                 match Self::phase2_parallel_prepare(
                     &ctx.positions,
                     &ctx.margin_configs,
+                    &ctx.order_books,
                     &groups,
                     engine_threads,
                     n,
@@ -3729,25 +3758,41 @@ impl NativeExecutor {
                                 margin_reserved,
                             });
                     }
-                    PrepOutcome::Reject { margin, msg } => {
+                    PrepOutcome::Reject { reason, msg } => {
                         // Funnel (perf A1): same counters as the serial loop.
                         if let Some(ref m) = ctx.metrics {
-                            if margin {
-                                m.orders_rejected_margin.inc();
-                            } else {
-                                m.orders_rejected_other.inc();
-                            }
+                            reason.count(m);
                         }
                         results[i] = NativeActionResult::err("place_order", msg);
                     }
                 }
             }
         } else {
+            let mut open_slots: HashMap<Address, Option<OpenSlots>> = HashMap::new();
             for &i in &place_order_indices {
                 let (sender, entry) = &flat[i];
                 let params: &PlaceOrderParams = match entry {
                     FlatAction::Place(p) => p,
                     FlatAction::Other(_) => unreachable!(),
+                };
+
+                // Open-order limit first: a rejected order reserves nothing.
+                let slots = open_slots.entry(*sender).or_default();
+                let taken = match Self::take_open_slot(
+                    slots,
+                    &ctx.positions,
+                    &ctx.order_books,
+                    sender,
+                    params,
+                ) {
+                    Ok(taken) => taken,
+                    Err((reason, msg)) => {
+                        if let Some(ref m) = ctx.metrics {
+                            reason.count(m);
+                        }
+                        results[i] = NativeActionResult::err("place_order", msg);
+                        continue;
+                    }
                 };
 
                 let market_id = params.market_id;
@@ -3791,6 +3836,10 @@ impl NativeExecutor {
                             continue;
                         }
                     }
+                }
+
+                if taken.is_some() {
+                    *slots = taken;
                 }
 
                 // Assign global order ID (monotonic, pre-matching)
@@ -3979,6 +4028,7 @@ impl NativeExecutor {
     fn phase2_parallel_prepare<T: StateBackend>(
         positions: &PositionManager<T>,
         margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        books: &HashMap<MarketId, OrderBook>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -3998,7 +4048,17 @@ impl NativeExecutor {
                                 shard_groups.iter().map(|(_, o)| o.len()).sum(),
                             );
                             for (sender, orders) in shard_groups {
+                                let mut slots = None;
                                 for &(i, params) in orders {
+                                    let taken = match Self::take_open_slot(
+                                        &mut slots, positions, books, sender, params,
+                                    ) {
+                                        Ok(taken) => taken,
+                                        Err((reason, msg)) => {
+                                            out.push((i, PrepOutcome::Reject { reason, msg }));
+                                            continue;
+                                        }
+                                    };
                                     let is_market =
                                         matches!(params.order_type, OrderType::Market);
                                     // Same formula as the serial loop / exec_place_order.
@@ -4018,7 +4078,7 @@ impl NativeExecutor {
                                                     out.push((
                                                         i,
                                                         PrepOutcome::Reject {
-                                                            margin: true,
+                                                            reason: RejectReason::Margin,
                                                             msg: format!(
                                                                 "insufficient margin: need {required}, have {}",
                                                                 bal.available
@@ -4035,13 +4095,16 @@ impl NativeExecutor {
                                                 out.push((
                                                     i,
                                                     PrepOutcome::Reject {
-                                                        margin: false,
+                                                        reason: RejectReason::Other,
                                                         msg: e.to_string(),
                                                     },
                                                 ));
                                                 continue;
                                             }
                                         }
+                                    }
+                                    if taken.is_some() {
+                                        slots = taken;
                                     }
                                     out.push((i, PrepOutcome::Pass(required)));
                                 }
@@ -4904,11 +4967,75 @@ impl NativeExecutor {
         out
     }
 
+    /// Per-user open-order limit, one rule for the serial Phase-2 loop, the
+    /// sharded workers and `exec_place_order`. Market, IOC and FOK orders
+    /// never rest: they pass and take no slot. Any other order (GTC,
+    /// PostOnly, a stop while pending) needs a free slot. `slots` loads on the
+    /// sender's first such order: open orders summed over `books` (after
+    /// Phase 1) and the limit from the stored `cum_volume`. Returns the slots
+    /// with this order counted; the caller stores them only once the order
+    /// also passed its margin reserve, so a rejected order takes no slot.
+    fn take_open_slot<T: StateBackend>(
+        slots: &mut Option<OpenSlots>,
+        positions: &PositionManager<T>,
+        books: &HashMap<MarketId, OrderBook>,
+        sender: &Address,
+        params: &PlaceOrderParams,
+    ) -> Result<Option<OpenSlots>, (RejectReason, String)> {
+        let is_stop = matches!(
+            params.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        );
+        let never_rests = matches!(params.order_type, OrderType::Market)
+            || matches!(params.time_in_force, TimeInForce::IOC | TimeInForce::FOK);
+        if never_rests && !is_stop {
+            return Ok(None);
+        }
+        let s = match *slots {
+            Some(s) => s,
+            None => {
+                let volume = positions
+                    .get_cum_volume(sender)
+                    .map_err(|e| (RejectReason::Other, e.to_string()))?;
+                let open: usize = books.values().map(|b| b.open_order_count(sender)).sum();
+                *slots.insert(OpenSlots {
+                    open: u32::try_from(open).unwrap_or(u32::MAX),
+                    limit: open_order_limit(volume),
+                })
+            }
+        };
+        if s.open >= s.limit {
+            return Err((
+                RejectReason::OpenLimit,
+                format!(
+                    "open order limit reached: {} open orders, limit {}",
+                    s.open, s.limit
+                ),
+            ));
+        }
+        Ok(Some(OpenSlots {
+            open: s.open + 1,
+            ..s
+        }))
+    }
+
     fn exec_place_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        if let Err((reason, msg)) = Self::take_open_slot(
+            &mut None,
+            &ctx.positions,
+            &ctx.order_books,
+            sender,
+            params,
+        ) {
+            if let Some(ref m) = ctx.metrics {
+                reason.count(m);
+            }
+            return NativeActionResult::err("place_order", msg);
+        }
         let market_id = params.market_id;
         let is_market = matches!(params.order_type, OrderType::Market);
 

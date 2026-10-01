@@ -9,6 +9,8 @@
 //! shared-balance couplings the design isolates (Phase-2 per-sender folds,
 //! Phase-4 canonical apply). See docs/design-parallel-engine.md.
 
+use std::sync::Arc;
+
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor, ResidentBooks};
@@ -19,6 +21,7 @@ use torus_state::cf::{
     CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
 };
 use torus_state::{StateBackend, StateDb};
+use torus_telemetry::Metrics;
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 // ---- Helpers (same idiom as parallel_settle_tests.rs) ----
@@ -126,10 +129,25 @@ fn state_dump(ctx: &NativeExecContext) -> Vec<(String, Vec<u8>, Vec<u8>)> {
 /// Run `batches` through one context (fresh DB) at the given engine thread
 /// count, then fingerprint the world.
 fn run_batches(batches: &[Vec<(Address, NativeAction)>], threads: usize) -> RunFingerprint {
+    run_with_volumes(batches, threads, &[]).0
+}
+
+/// `run_batches` with block-start `cum_volume` rows preset; also returns the
+/// `orders_rejected_open_limit` funnel counter.
+fn run_with_volumes(
+    batches: &[Vec<(Address, NativeAction)>],
+    threads: usize,
+    volumes: &[(Address, i64)],
+) -> (RunFingerprint, u64) {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
+    let metrics = Arc::new(Metrics::new());
+    ctx.metrics = Some(metrics.clone());
     for n in 1..=48u8 {
         fund_native(&ctx, &addr(n), fp(1_000_000));
+    }
+    for (trader, volume) in volumes {
+        ctx.positions.put_cum_volume(trader, fp(*volume)).unwrap();
     }
 
     let mut results = Vec::new();
@@ -151,14 +169,15 @@ fn run_batches(batches: &[Vec<(Address, NativeAction)>], threads: usize) -> RunF
     }
     ctx.save_order_books();
 
-    RunFingerprint {
+    let run = RunFingerprint {
         cf_dump: state_dump(&ctx),
         results,
         total_gas,
         trade_index: ctx.trade_index,
         next_global_order_id: ctx.next_global_order_id,
         state_root: compute_native_state_root(&ctx.state).expect("state root"),
-    }
+    };
+    (run, metrics.orders_rejected_open_limit.get())
 }
 
 /// Tiny deterministic LCG so the fuzz scenario is reproducible with no deps.
@@ -558,4 +577,137 @@ fn default_mode_matches_serial() {
     assert_eq!(golden.total_gas, total_gas, "default-mode gas diverged");
     assert_eq!(golden.trade_index, ctx.trade_index);
     assert_eq!(golden.next_global_order_id, ctx.next_global_order_id);
+}
+
+// ============================================================================
+// 5. Per-user open-order limit (Phase-2 prepare, serial + sharded)
+// ============================================================================
+
+/// `n` non-crossing GTC buys from `sender`, round-robin over markets 1..=5.
+fn resting(sender: Address, n: usize) -> Vec<(Address, NativeAction)> {
+    (0..n)
+        .map(|k| {
+            let price = 41 + (k / 5 % 10) as i64;
+            place(sender, gtc(1 + (k % 5) as u64, true, price, 1))
+        })
+        .collect()
+}
+
+/// Round-robin merge, so the flat order alternates senders.
+fn interleave(lists: Vec<Vec<(Address, NativeAction)>>) -> Vec<(Address, NativeAction)> {
+    let mut iters: Vec<_> = lists.into_iter().map(Vec::into_iter).collect();
+    let mut out = Vec::new();
+    loop {
+        let before = out.len();
+        out.extend(iters.iter_mut().filter_map(Iterator::next));
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+fn market_buy(market_id: MarketId, qty: i64) -> PlaceOrderParams {
+    PlaceOrderParams {
+        price: FixedPoint::ZERO,
+        order_type: OrderType::Market,
+        ..order(market_id, true, FixedPoint::ZERO, fp(qty), TimeInForce::IOC)
+    }
+}
+
+fn is_open_limit(r: &(bool, Option<String>)) -> bool {
+    !r.0 && r.1.as_deref().is_some_and(|e| e.contains("open order limit"))
+}
+
+#[test]
+fn open_limit_rejects_the_1001st_restable_order_across_markets() {
+    let a = addr(1);
+    let mut block1 = resting(a, 1000);
+    block1.push(place(addr(2), gtc(1, false, 60, 5)));
+    let block2 = vec![
+        place(a, gtc(6, true, 50, 1)),
+        place(a, order(1, true, fp(40), fp(1), TimeInForce::IOC)),
+        place(a, market_buy(1, 1)),
+    ];
+    let (run, rejected) = run_with_volumes(&[block1, block2], 0, &[]);
+    assert!(run.results[0].iter().all(|r| r.0), "all 1000 must rest");
+    let b2 = &run.results[1];
+    assert!(is_open_limit(&b2[0]), "1001st: {:?}", b2[0]);
+    assert!(!is_open_limit(&b2[1]), "IOC is exempt: {:?}", b2[1]);
+    assert!(b2[2].0, "market order is exempt: {:?}", b2[2]);
+    assert!(run.trade_index >= 1, "the market order filled");
+    assert_eq!(rejected, 1);
+}
+
+#[test]
+fn open_limit_counts_this_blocks_accepted_orders() {
+    let d = addr(4);
+    let batch = vec![gtc(6, true, 50, 1), gtc(6, true, 49, 1), gtc(1, true, 48, 1)];
+    let blocks = vec![
+        resting(d, 999),
+        vec![(d, NativeAction::PlaceOrderBatch(batch))],
+    ];
+    let (run, rejected) = run_with_volumes(&blocks, 0, &[]);
+    assert!(run.results[0].iter().all(|r| r.0));
+    let b2 = &run.results[1];
+    assert!(b2[0].0, "{:?}", b2[0]);
+    assert!(is_open_limit(&b2[1]) && is_open_limit(&b2[2]), "{b2:?}");
+    assert_eq!(rejected, 2);
+}
+
+#[test]
+fn open_limit_grows_with_block_start_cum_volume() {
+    let (c, e) = (addr(3), addr(5));
+    let blocks = vec![interleave(vec![resting(c, 1002), resting(e, 1001)])];
+    let volumes = [(c, 5_000_000), (e, 4_999_999)];
+    let (run, rejected) = run_with_volumes(&blocks, 0, &volumes);
+    let rejects: Vec<_> = run.results[0]
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.0)
+        .map(|(i, r)| (i, is_open_limit(r)))
+        .collect();
+    // Flat order: c,e,c,e,...,c (2003 entries); c's 1002nd = index 2002,
+    // e's 1001st = index 2001.
+    assert_eq!(rejects, vec![(2001, true), (2002, true)]);
+    assert_eq!(rejected, 2);
+}
+
+/// Serial and sharded Phase-2 prepare (and sequential / parallel settle)
+/// must agree byte for byte with the limit active for several senders.
+#[test]
+fn open_limit_serial_and_sharded_prepare_identical() {
+    let (a, c, d) = (addr(1), addr(3), addr(4));
+    let mut liquidity = Vec::new();
+    for m in 1..=5u64 {
+        liquidity.push(place(addr(2), gtc(m, false, 60, 5)));
+    }
+    let block1 = interleave(vec![
+        resting(a, 1000),
+        resting(c, 1002),
+        resting(d, 999),
+        liquidity,
+    ]);
+    let mut block2 = vec![
+        place(a, gtc(6, true, 50, 1)),
+        (
+            d,
+            NativeAction::PlaceOrderBatch(vec![gtc(6, true, 50, 1), gtc(2, true, 49, 1)]),
+        ),
+        place(a, market_buy(2, 1)),
+        place(c, gtc(3, true, 45, 1)),
+        place(d, market_buy(3, 1)),
+    ];
+    for k in 0..8u8 {
+        block2.push(place(addr(10 + k), gtc(1 + k as u64 % 5, true, 60, 1)));
+    }
+    let blocks = vec![block1, block2];
+    let volumes = [(c, 5_000_000)];
+    let golden = run_with_volumes(&blocks, 0, &volumes);
+    // c's 1002nd (block 1); a's GTC, d's second batch order and c's GTC
+    // (c is at its 1001 limit) in block 2.
+    assert_eq!(golden.1, 4);
+    assert!(golden.0.trade_index >= 2);
+    for threads in [2usize, 4, 8] {
+        assert_eq!(golden, run_with_volumes(&blocks, threads, &volumes), "threads={threads}");
+    }
 }
