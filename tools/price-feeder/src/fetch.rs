@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Exchange};
-use crate::exchange::{parse_quotes, url_for, HttpGet, Quotes};
+use crate::exchange::{parse_quotes, url_for, HttpGet, Quotes, KRAKEN_UNKNOWN_PAIR};
 
 /// Wall clock in unix ms (the only time source of a cycle).
 pub trait Clock: Send + Sync {
@@ -122,10 +122,11 @@ impl Fetcher {
             let (ex, url, h) = (*ex, url.clone(), http.clone());
             set.spawn(async move {
                 let t0 = Instant::now();
-                let r = match tokio::time::timeout(timeout, h.get(url, timeout)).await {
-                    Ok(Ok(body)) => parse_quotes(ex, &body),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(format!("timeout after {} ms", timeout.as_millis())),
+                let r = match get_quotes(&h, ex, url.clone(), timeout).await {
+                    Err(e) if ex == Exchange::Kraken && e.contains(KRAKEN_UNKNOWN_PAIR) => {
+                        kraken_per_pair(&h, &url, timeout).await.ok_or(e)
+                    }
+                    r => r,
                 };
                 (ex, r, t0.elapsed().as_millis() as u64)
             });
@@ -150,6 +151,59 @@ impl Fetcher {
             }
         }
     }
+}
+
+async fn get_quotes<H: HttpGet>(h: &Arc<H>, ex: Exchange, url: String, timeout: Duration) -> Result<Quotes, String> {
+    match tokio::time::timeout(timeout, h.get(url, timeout)).await {
+        Ok(Ok(body)) => parse_quotes(ex, &body),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!("timeout after {} ms", timeout.as_millis())),
+    }
+}
+
+/// Review M2: Kraken fails a whole batch for ONE unknown pair; retry each pair
+/// of `batch_url` (`…?pair=A,B,C`) concurrently and merge the good ones.
+/// `None` if no pair succeeds (or the batch had a single pair).
+async fn kraken_per_pair<H: HttpGet + 'static>(h: &Arc<H>, batch_url: &str, timeout: Duration) -> Option<Quotes> {
+    let (prefix, list) = batch_url.split_once("pair=")?;
+    let pairs: Vec<&str> = list.split(',').collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for p in pairs {
+        let (h, url) = (h.clone(), format!("{prefix}pair={p}"));
+        set.spawn(async move { get_quotes(&h, Exchange::Kraken, url, timeout).await });
+    }
+    let mut merged = Quotes::new();
+    let mut any = false;
+    while let Some(r) = set.join_next().await {
+        if let Ok(Ok(q)) = r {
+            merged.extend(q);
+            any = true;
+        }
+    }
+    any.then_some(merged)
+}
+
+/// The enabled Kraken pairs of `cfg` (plus `USDTZUSD` in `kraken_usdt` mode):
+/// what `check_kraken_pairs` validates at startup.
+pub fn kraken_pairs(cfg: &Config) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if !cfg.enabled(Exchange::Kraken) {
+        return v;
+    }
+    for m in &cfg.markets {
+        if let Some((sym, _)) = m.symbol(Exchange::Kraken) {
+            if !v.iter().any(|s| s == sym) {
+                v.push(sym.to_string());
+            }
+        }
+    }
+    if cfg.quote_mode == crate::config::QuoteMode::KrakenUsdt && !v.iter().any(|s| s == crate::exchange::KRAKEN_USDT_USD) {
+        v.push(crate::exchange::KRAKEN_USDT_USD.to_string());
+    }
+    v
 }
 
 /// This cycle's requests: one per enabled venue that has a configured symbol
@@ -293,5 +347,34 @@ mod tests {
         f.fetch_all(&http, &clock, &[req(Exchange::Binance), req(Exchange::Mexc)], Duration::from_secs(2)).await;
         assert!(started.elapsed() < Duration::from_millis(390), "{:?}", started.elapsed());
         assert!(f.venue(Exchange::Mexc).unwrap().fetched_at_ms.is_some());
+    }
+
+    /// Review M2: Kraken answers a batch with ONE unknown pair by failing the
+    /// whole request; the venue then falls back to one request per pair and
+    /// keeps the good ones (recorded fixtures).
+    #[tokio::test]
+    async fn kraken_unknown_pair_falls_back_per_pair() {
+        let unknown = include_str!("../tests/fixtures/kraken_unknown_pair.json");
+        let one = include_str!("../tests/fixtures/kraken_ticker_one.json");
+        let http = Arc::new(FakeHttp::default());
+        let base = "fake://kraken/0/public/Ticker?pair=";
+        http.route(&format!("{base}XXBTZUSD,NOPEUSD"), Ok(unknown.to_string()));
+        http.route(&format!("{base}XXBTZUSD"), Ok(one.to_string()));
+        http.route(&format!("{base}NOPEUSD"), Ok(unknown.to_string()));
+        let clock = FakeClock::new(1_000);
+        let mut f = Fetcher::default();
+        let req = (Exchange::Kraken, format!("{base}XXBTZUSD,NOPEUSD"));
+        f.fetch_all(&http, &clock, &[req], Duration::from_secs(2)).await;
+        let v = f.venue(Exchange::Kraken).unwrap();
+        assert!(v.quotes.contains_key("XXBTZUSD"), "{:?}", v.last_error);
+        assert_eq!(v.backoff.failures, 0, "a partial success is a success");
+        assert_eq!(v.fetched_at_ms, Some(1_000));
+        assert_eq!(http.calls().len(), 3, "batch + one per pair");
+        // Every pair unknown: still a failure.
+        let http = Arc::new(FakeHttp::default());
+        http.route(&format!("{base}NOPEUSD"), Ok(unknown.to_string()));
+        let mut f = Fetcher::default();
+        f.fetch_all(&http, &clock, &[(Exchange::Kraken, format!("{base}NOPEUSD"))], Duration::from_secs(2)).await;
+        assert_eq!(f.venue(Exchange::Kraken).unwrap().backoff.failures, 1);
     }
 }
