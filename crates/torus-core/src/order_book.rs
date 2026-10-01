@@ -25,8 +25,6 @@ mod cancel_batch;
 #[cfg(test)]
 mod matching_entry_tests;
 
-const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
-
 // ============================================================================
 // Types
 // ============================================================================
@@ -406,16 +404,9 @@ impl OrderBook {
             };
         }
 
-        // FIX 10 (ECON-FIND-17): Limit orders per trader per market
-        let trader_order_count = self.trader_orders.get(&trader).map_or(0, |ids| ids.len());
-        if trader_order_count >= MAX_ORDERS_PER_TRADER_PER_MARKET {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
-        }
+        // FIX 10 (ECON-FIND-17): open orders are limited per user across all
+        // markets, enforced by the executor before matching
+        // (`crate::position::open_order_limit`), not per book.
 
         // Stop orders → store in pending_stops
         match params.order_type {
@@ -3975,20 +3966,20 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn reject_excess_orders_per_trader() {
+    fn no_per_market_cap_on_one_traders_orders() {
+        // The open-order limit is per user across all markets and enforced
+        // by the executor; the book itself has no per-trader cap.
         let mut ob = book();
-        // Place MAX_ORDERS_PER_TRADER_PER_MARKET orders
-        for i in 0..MAX_ORDERS_PER_TRADER_PER_MARKET {
+        for i in 0..250 {
             let price = fp(100) + FixedPoint::from_raw(i as i128 * FixedPoint::SCALE);
             let r = ob.place_order(limit_sell(price, fp(1)), addr(1), i as u64);
             assert_eq!(r.status, OrderStatus::Resting, "order {i} should rest");
         }
-        // Next order should be rejected
-        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(1), 999);
-        assert_eq!(r.status, OrderStatus::Rejected);
-        // Different trader can still place
-        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(2), 999);
-        assert_eq!(r.status, OrderStatus::Resting);
+        assert_eq!(ob.open_order_count(&addr(1)), 250);
+        // An aggressive order from the same trader still trades (STP aside).
+        ob.place_order(limit_buy(fp(90), fp(1)), addr(2), 998);
+        let r = ob.place_order(market_sell(fp(1)), addr(1), 999);
+        assert_eq!(r.status, OrderStatus::Filled);
     }
 
     // ====================================================================
@@ -4629,8 +4620,8 @@ mod queue_lookup_tests {
     fn addr(n: u8) -> Address {
         Address::from([n; 20])
     }
-    /// Distinct trader per `i` modulo 4096 (the book caps resting orders per
-    /// trader at `MAX_ORDERS_PER_TRADER_PER_MARKET`).
+    /// Distinct trader per `i` modulo 4096 (keeps each trader's resting
+    /// orders far below the per-user open-order limit).
     fn trader(i: usize) -> Address {
         let mut b = [0u8; 20];
         b[0] = 0xAA;

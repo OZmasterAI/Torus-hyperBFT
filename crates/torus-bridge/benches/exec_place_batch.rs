@@ -3,7 +3,7 @@
 //! Phase-3 verify (`batch_verify_native_actions`: 400 ecrecovers vs 1) plus
 //! `execute_batch` (flatten + margin + match + settle) over a prod-shaped
 //! NativeStateOverlay. Non-crossing resting buys spread over 4 markets
-//! (100/market, under MAX_ORDERS_PER_TRADER_PER_MARKET=200) isolate the
+//! (100/market, under the 1000 per-user open-order limit) isolate the
 //! placement path — no fills, so the delta is pure per-action overhead.
 
 use std::hint::black_box;

@@ -194,10 +194,11 @@ impl OrderBook {
     }
 
     /// Return `None` without changing the book when batching is ineligible.
-    /// All planning/storage is bounded by the ordinary 200-order trader cap;
+    /// All planning/storage is bounded by the per-user open-order limit;
     /// recovered above-limit states keep the original loop too.
     pub(super) fn try_cancel_all_batch(&mut self, order_ids: &[OrderId]) -> Option<Vec<Order>> {
-        if !(32..=MAX_ORDERS_PER_TRADER_PER_MARKET).contains(&order_ids.len())
+        let max = crate::position::OPEN_ORDER_MAX_LIMIT as usize;
+        if !(32..=max).contains(&order_ids.len())
             || self.order_index.len() < 1_024
             || !self.cancel_batch_has_concentrated_prefix(order_ids)
         {
@@ -767,13 +768,14 @@ mod tests {
     #[test]
     fn cancel_batch_falls_back_for_small_large_and_stale_indexes() {
         for case in 0..7 {
-            let per_level = match case {
-                0 => 8,
-                1 => 101,
-                _ => 40,
+            let (depth, per_level) = match case {
+                0 => (1024, 8),
+                // 2 x 2501 orders: above the OPEN_ORDER_MAX_LIMIT bound.
+                1 => (2600, 2501),
+                _ => (1024, 40),
             };
-            let mut a = fixture(1024, per_level, 0, 0);
-            let mut b = fixture(1024, per_level, 0, 0);
+            let mut a = fixture(depth, per_level, 0, 0);
+            let mut b = fixture(depth, per_level, 0, 0);
             for book in [&mut a, &mut b] {
                 let id = book.trader_orders[&addr(1)][3];
                 match case {

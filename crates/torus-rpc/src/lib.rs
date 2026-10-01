@@ -3404,15 +3404,14 @@ mod tests {
     // The endpoint must not return more than 500 orders regardless of how many
     // are in the book.
     //
-    // The order book enforces MAX_ORDERS_PER_TRADER_PER_MARKET = 200, so we
-    // spread orders across three markets (200 + 200 + 101 = 501) to produce
-    // more than 500 total and verify the RPC cap fires.
+    // Orders are spread across three markets (200 + 200 + 101 = 501) to
+    // produce more than 500 total and verify the RPC cap fires.
     #[tokio::test]
     async fn get_open_orders_limit_500() {
         let (_dir, state, mempool, executor) = setup();
         let trader = Address::from([0x55; 20]);
 
-        // Markets 1 and 2: 200 buy orders each (hits per-market trader cap).
+        // Markets 1 and 2: 200 buy orders each.
         for market_id in [1u64, 2u64] {
             let mut book = OrderBook::new(market_id, fp(1), fp(1));
             for i in 1u32..=200 {
