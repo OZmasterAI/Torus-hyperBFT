@@ -754,3 +754,129 @@ fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
         assert_eq!(golden, run_with_volumes(&blocks, threads, &volumes), "threads={threads}");
     }
 }
+
+// ============================================================================
+// 6. cum_volume: maker and taker add price*qty on every fill
+// ============================================================================
+
+/// Runs `blocks` at `threads` (0 = serial prepare + sequential settle, >=2 =
+/// sharded prepare + parallel settle). `before_last` runs ahead of the last
+/// block. Returns cum_volume of addr(1..=5), every result, the state dump
+/// and the native root.
+#[allow(clippy::type_complexity)]
+fn run_volumes(
+    blocks: &[Vec<(Address, NativeAction)>],
+    threads: usize,
+    before_last: impl Fn(&NativeExecContext),
+) -> (
+    Vec<FixedPoint>,
+    Vec<Vec<(bool, Option<String>)>>,
+    Vec<(String, Vec<u8>, Vec<u8>)>,
+    B256,
+) {
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    for n in 1..=5u8 {
+        fund_native(&ctx, &addr(n), fp(1_000_000));
+    }
+    ctx.positions.put_cum_volume(&addr(1), fp(5_000_000)).unwrap();
+    let mut results = Vec::new();
+    for (k, block) in blocks.iter().enumerate() {
+        if k + 1 == blocks.len() {
+            before_last(&ctx);
+        }
+        let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, block, threads);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+    }
+    ctx.save_order_books();
+    let volumes = (1..=5u8)
+        .map(|n| ctx.positions.get_cum_volume(&addr(n)).unwrap())
+        .collect();
+    let root = compute_native_state_root(&ctx.state).expect("state root");
+    (volumes, results, state_dump(&ctx), root)
+}
+
+#[test]
+fn cum_volume_adds_price_times_qty_for_maker_and_taker() {
+    let (maker, taker) = (addr(1), addr(2));
+    let blocks = vec![
+        vec![
+            place(maker, gtc(1, false, 30_000, 2)),
+            place(addr(3), gtc(2, false, 100, 1)),
+        ],
+        vec![
+            place(taker, gtc(1, true, 30_000, 2)),
+            place(addr(4), gtc(2, true, 100, 1)),
+        ],
+    ];
+    let golden = run_volumes(&blocks, 0, |_| {});
+    // maker started at 5M; one fill 2 @ 30000 adds 60000 to both sides.
+    assert_eq!(
+        golden.0,
+        vec![fp(5_060_000), fp(60_000), fp(100), fp(100), FixedPoint::ZERO]
+    );
+    assert!(golden.2.iter().any(|(_, k, _)| k.starts_with(b"cvlm")));
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_volumes(&blocks, threads, |_| {}), "threads={threads}");
+    }
+}
+
+/// A fill-application failure stops the order where the position effects
+/// stop: the taker side of the failing fill counts, its maker side does not.
+#[test]
+fn cum_volume_stops_at_the_failed_fill_like_positions() {
+    let (m1, m2, taker) = (addr(1), addr(2), addr(3));
+    let blocks = vec![
+        vec![
+            place(m1, gtc(1, false, 100, 1)),
+            place(m2, gtc(1, false, 101, 1)),
+            place(addr(4), gtc(2, false, 100, 1)),
+        ],
+        vec![
+            place(taker, gtc(1, true, 101, 2)),
+            place(addr(5), gtc(2, true, 100, 1)),
+        ],
+    ];
+    // m2's position row is unreadable, so the second fill's maker side fails.
+    let corrupt = |ctx: &NativeExecContext| {
+        let key = torus_core::position::position_key(&m2, 1);
+        ctx.state.put_cf_raw(CF_NATIVE_POSITIONS, &key, b"\xff").unwrap();
+    };
+    let golden = run_volumes(&blocks, 0, corrupt);
+    let failed = &golden.1[1][0];
+    assert!(
+        failed.1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        golden.0,
+        vec![fp(5_000_100), FixedPoint::ZERO, fp(201), fp(100), fp(100)]
+    );
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_volumes(&blocks, threads, corrupt), "threads={threads}");
+    }
+}
+
+/// The single-action path (`execute`, used by the CoreWriter drain) applies
+/// the same limit and volume rules as `execute_batch`.
+#[test]
+fn open_limit_and_cum_volume_on_the_single_action_path() {
+    let (a, b) = (addr(1), addr(2));
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    fund_native(&ctx, &a, fp(1_000_000));
+    fund_native(&ctx, &b, fp(1_000_000));
+    let mut block = resting(a, 1000);
+    block.push(place(b, gtc(1, false, 60, 2)));
+    NativeExecutor::execute_batch_engine_mode(&mut ctx, &block, 0);
+
+    let gtc_6 = NativeAction::PlaceOrder(gtc(6, true, 50, 1));
+    let r = NativeExecutor::execute(&mut ctx, &a, &gtc_6);
+    assert!(is_open_limit(&(r.success, r.error.clone())), "{r:?}");
+    let buy = NativeAction::PlaceOrder(market_buy(1, 2));
+    let r = NativeExecutor::execute(&mut ctx, &a, &buy);
+    assert!(r.success, "{r:?}");
+    assert_eq!(ctx.positions.get_cum_volume(&a).unwrap(), fp(120));
+    assert_eq!(ctx.positions.get_cum_volume(&b).unwrap(), fp(120));
+}

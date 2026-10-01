@@ -113,6 +113,11 @@ struct BalanceCache {
     dirty: Vec<Address>,
 }
 
+/// Per-call `cum_volume` increments: maker and taker each add `price * qty`
+/// for every fill side whose position effect applied. Flushed with the
+/// balance cache, in sorted-address order.
+type VolumeCache = HashMap<Address, FixedPoint>;
+
 struct CachedBalance {
     balance: NativeBalance,
     dirty: bool,
@@ -234,9 +239,10 @@ struct OrderSettlePlan {
     /// Taker-side order-margin release amount (pre-clamp; ZERO = none).
     margin_release: FixedPoint,
     /// Realized-PnL events in exact fill-application order: (side label for
-    /// error text, trader, pnl). Emitted precisely when `apply_fill_cached`
-    /// returns `Some` — including `Some(ZERO)` (still materializes the row).
-    pnl_events: Vec<(&'static str, Address, FixedPoint)>,
+    /// error text, trader, pnl, fill side index `2 * fill + {0 taker, 1
+    /// maker}`). Emitted precisely when `apply_fill_cached` returns `Some` —
+    /// including `Some(ZERO)` (still materializes the row).
+    pnl_events: Vec<(&'static str, Address, FixedPoint, usize)>,
     /// s80: `[taker, maker]` position effect of each applied fill, in fill
     /// order (output-only, for the fills' `FillExtras`). Only filled while a
     /// stream wants fills (`record_fills`); otherwise empty, never allocated.
@@ -3670,6 +3676,7 @@ impl NativeExecutor {
         // read-modify-writes per fill; they hit this map and flush once
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
+        let mut vol_cache = VolumeCache::new();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
         let engine_threads = match engine_mode {
@@ -3972,6 +3979,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                &mut vol_cache,
                 settle_workers,
             );
         } else {
@@ -3983,6 +3991,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                &mut vol_cache,
             );
         }
 
@@ -4000,6 +4009,13 @@ impl NativeExecutor {
         }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        }
+        let mut volumes: Vec<_> = vol_cache.into_iter().collect();
+        volumes.sort_unstable_by_key(|(trader, _)| *trader);
+        for (trader, add) in volumes {
+            if let Err(e) = Self::add_cum_volume(&ctx.positions, &trader, add) {
+                ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+            }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
 
@@ -4153,6 +4169,7 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
     ) {
         // r6: the canonical loop IS the apply pass — attribute it to pass B so
         // the sequential and parallel paths land in the same histogram (the
@@ -4244,6 +4261,7 @@ impl NativeExecutor {
                 }
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
+                    let notional = fill.price * fill.quantity;
                     let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
@@ -4264,6 +4282,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
+                    *vol_cache.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
                     let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
@@ -4284,6 +4303,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
+                    *vol_cache.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
                     if record_fills {
                         ctx.fill_effects_scratch.push([taker, maker]);
                     }
@@ -4400,6 +4420,7 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
         max_workers: usize,
     ) {
         // ---- Pass A: pure per-market plans on CAPPED chunk workers ----
@@ -4540,6 +4561,7 @@ impl NativeExecutor {
                 total_gas,
                 bal_cache,
                 pos_cache,
+                vol_cache,
             );
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
@@ -4600,7 +4622,8 @@ impl NativeExecutor {
                 // exactly; if no balance error occurs, the worker's position
                 // failure (if any) stands.
                 let mut fill_failed: Option<String> = None;
-                for (side, trader, pnl) in &oplan.pnl_events {
+                let mut sides_applied = 2 * result.fills.len();
+                for (side, trader, pnl, at) in &oplan.pnl_events {
                     match bal_cache.load(&ctx.positions, trader) {
                         Ok(mut bal) => {
                             bal.available += *pnl;
@@ -4608,12 +4631,24 @@ impl NativeExecutor {
                         }
                         Err(e) => {
                             fill_failed = Some(format!("{side} fill failed: {e}"));
+                            sides_applied = *at;
                             break;
                         }
                     }
                 }
                 if fill_failed.is_none() {
                     fill_failed = oplan.fill_error;
+                }
+                // cum_volume of every fill side the sequential loop completes
+                // before its stop (a failed side adds nothing). Any worker
+                // position failure already fell back to sequential above.
+                let sides = result
+                    .fills
+                    .iter()
+                    .flat_map(|f| [(f.taker, f), (f.maker, f)]);
+                for (trader, fill) in sides.take(sides_applied) {
+                    *vol_cache.entry(trader).or_insert(FixedPoint::ZERO) +=
+                        fill.price * fill.quantity;
                 }
 
                 if let Some(err) = fill_failed {
@@ -4710,16 +4745,20 @@ impl NativeExecutor {
             // Fill application: position transitions into the market-local
             // cache; PnL events recorded in exact order; first POSITION-side
             // failure stops the order like sequential (its message matches).
-            let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
+            let mut pnl_events: Vec<(&'static str, Address, FixedPoint, usize)> = Vec::new();
             let mut fill_effects = Vec::new();
             let mut fill_error: Option<String> = None;
-            'fills: for fill in &result.fills {
+            'fills: for (k, fill) in result.fills.iter().enumerate() {
                 let taker_is_buy = fill.maker_side != Side::Buy;
                 let mut pair = [FillEffect::default(); 2];
-                for (slot, (side, trader, is_buy)) in pair.iter_mut().zip([
-                    ("taker", &fill.taker, taker_is_buy),
-                    ("maker", &fill.maker, fill.maker_side == Side::Buy),
-                ]) {
+                for (s, (slot, (side, trader, is_buy))) in pair
+                    .iter_mut()
+                    .zip([
+                        ("taker", &fill.taker, taker_is_buy),
+                        ("maker", &fill.maker, fill.maker_side == Side::Buy),
+                    ])
+                    .enumerate()
+                {
                     match positions.apply_fill_cached_effect(
                         &mut pos_cache,
                         trader,
@@ -4731,7 +4770,7 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => {
                             if let Some(pnl) = effect.closed_pnl {
-                                pnl_events.push((side, *trader, pnl));
+                                pnl_events.push((side, *trader, pnl, 2 * k + s));
                             }
                             *slot = effect;
                         }
@@ -5034,6 +5073,16 @@ impl NativeExecutor {
         }))
     }
 
+    /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
+    fn add_cum_volume<T: StateBackend>(
+        positions: &PositionManager<T>,
+        trader: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), CoreError> {
+        let volume = positions.get_cum_volume(trader)?;
+        positions.put_cum_volume(trader, volume + amount)
+    }
+
     fn exec_place_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
@@ -5182,14 +5231,21 @@ impl NativeExecutor {
         }
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
-            let taker = match ctx.positions.apply_fill(
-                &fill.taker,
-                market_id,
-                taker_is_buy,
-                fill.quantity,
-                fill.price,
-                MarginType::Cross,
-            ) {
+            let notional = fill.price * fill.quantity;
+            let taker = match ctx
+                .positions
+                .apply_fill(
+                    &fill.taker,
+                    market_id,
+                    taker_is_buy,
+                    fill.quantity,
+                    fill.price,
+                    MarginType::Cross,
+                )
+                .and_then(|effect| {
+                    Self::add_cum_volume(&ctx.positions, &fill.taker, notional)?;
+                    Ok(effect)
+                }) {
                 Ok(effect) => effect,
                 Err(e) => {
                     // Funnel (perf A1): died on fill application, not on the book.
@@ -5202,14 +5258,20 @@ impl NativeExecutor {
                     );
                 }
             };
-            let maker = match ctx.positions.apply_fill(
-                &fill.maker,
-                market_id,
-                fill.maker_side == Side::Buy,
-                fill.quantity,
-                fill.price,
-                MarginType::Cross,
-            ) {
+            let maker = match ctx
+                .positions
+                .apply_fill(
+                    &fill.maker,
+                    market_id,
+                    fill.maker_side == Side::Buy,
+                    fill.quantity,
+                    fill.price,
+                    MarginType::Cross,
+                )
+                .and_then(|effect| {
+                    Self::add_cum_volume(&ctx.positions, &fill.maker, notional)?;
+                    Ok(effect)
+                }) {
                 Ok(effect) => effect,
                 Err(e) => {
                     // Funnel (perf A1): died on fill application, not on the book.
