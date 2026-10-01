@@ -1049,6 +1049,24 @@ Each item notes a place where the plan draft was changed during implementation.
 * The `[[bin]]` target is added in commit 6 together with `main.rs`, so that
   commit 5 builds on its own.
 
+**Commit 6 (feeder binary)**
+
+* Correction s517 (F8). `health::serve` takes a bound `TcpListener`. `run`
+  binds `health_listen`; the tests bind `127.0.0.1:0`.
+  * `route()` is pure and table-tested.
+  * `serves_over_tcp` also exercises the real loop.
+  * Down includes "no accepted submission yet". A stalled or idle feeder
+    therefore shows down after 3 x interval, and immediately before its first
+    submission.
+* Correction s517 (F9). The workspace pins `rpassword` 5, so `keygen` prompts
+  twice with `read_password_from_tty`. `rand` is a dev-dependency only (the
+  property test).
+* Correction s517 (V8). `clippy -p torus-price-feeder -- -D warnings` fails on
+  pre-existing lints in path dependencies (`torus-telemetry`, `torus-state`).
+  Verification therefore runs clippy without `-D` and requires zero findings in
+  the touched lines (`tools/price-feeder`, `tools/wallet`, and the changed
+  mempool / rpc / bridge ranges).
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).
