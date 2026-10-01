@@ -115,6 +115,7 @@ impl HttpGet for FakeHttp {
 struct NodeInner {
     markets: Option<Result<Vec<MarketInfo>, String>>,
     validators: Vec<ValidatorInfo>,
+    validators_err: Option<String>,
     submit_results: VecDeque<Result<String, String>>,
     submitted: Vec<SignedNativeAction>,
     market_calls: usize,
@@ -132,7 +133,13 @@ impl FakeNode {
         self.inner.lock().unwrap().markets = Some(m);
     }
     pub fn set_validators(&self, v: Vec<ValidatorInfo>) {
-        self.inner.lock().unwrap().validators = v;
+        let mut g = self.inner.lock().unwrap();
+        g.validators = v;
+        g.validators_err = None;
+    }
+    /// `getValidators` fails (node unreachable) until the next `set_validators`.
+    pub fn set_validators_err(&self, e: &str) {
+        self.inner.lock().unwrap().validators_err = Some(e.to_string());
     }
     pub fn push_submit_result(&self, r: Result<String, String>) {
         self.inner.lock().unwrap().submit_results.push_back(r);
@@ -154,7 +161,11 @@ impl NodeApi for FakeNode {
     }
 
     async fn validators(&self) -> Result<Vec<ValidatorInfo>, String> {
-        Ok(self.inner.lock().unwrap().validators.clone())
+        let g = self.inner.lock().unwrap();
+        match &g.validators_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(g.validators.clone()),
+        }
     }
 
     async fn submit(&self, signed: &SignedNativeAction) -> Result<String, String> {
