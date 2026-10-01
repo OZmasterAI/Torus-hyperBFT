@@ -1011,6 +1011,44 @@ Each item notes a place where the plan draft was changed during implementation.
 * Correction s517 (W1). The lib target also carries `#[cfg(test)] mod
   test_utils`, because the keystore tests moved with `keystore.rs` into the lib.
 
+**Commit 5 (feeder core)**
+
+* Correction s517 (F3). The fixtures were recorded once with curl on
+  2026-10-01 and trimmed to BTC, ETH and POL, keeping each venue's real
+  envelope. Kraken also includes `USDTZUSD`.
+  * The tests never fetch.
+  * `testing::fixture` is the single loader. Unit tests and the e2e test
+    both use it.
+* Correction s517 (F4/F7). The fakes are public:
+  * `testing::{FakeHttp, FakeNode}`;
+  * `fetch::FakeClock`, next to `Clock`.
+
+  The integration test (`tests/rpc_e2e.rs`) cannot see `cfg(test)` items.
+  The fakes contain no network code.
+* Correction s517 (F6/F9). `keyfile.rs`, with its tests, lands in this commit
+  instead of F9, because key loading (`load_signer`) belongs to the startup
+  path.
+  * The "key file mode 0644 -> Err" row is tested there (`load_key_file`), not
+    in the `startup_check` table.
+  * `startup_check(cfg, node, signer_address)` takes the address, not the key.
+* Correction s517 (F7). Re-check failures behave differently in the two
+  places:
+  * At `run` startup, a failed check is fatal.
+  * Inside `run_cycle`, a failed re-check (every 60 s), such as the signer
+    being deregistered, makes the feeder idle with the error text (which
+    contains the registration command). It is not fatal.
+* Correction s517 (F7). The per-cycle listed set uses the same listing rule as
+  the startup check (`check_listing`: same base, USD quote). A listing that
+  changes under a running feeder is skipped silently.
+* Correction s517 (F7). `FeederStatus` (counters, per-market and per-venue
+  state, `not_authorized`, `idle`) lives in `feeder.rs`. `health.rs` (commit 6)
+  only renders it.
+* Correction s517 (F7). `rules`, `usdt_usd` and `market_samples` are free
+  functions shared by `run_cycle` and `price-feeder check`, its two call
+  sites.
+* The `[[bin]]` target is added in commit 6 together with `main.rs`, so that
+  commit 5 builds on its own.
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).
