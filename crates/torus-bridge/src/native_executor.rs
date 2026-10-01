@@ -3689,6 +3689,8 @@ impl NativeExecutor {
 
         // Open orders after Phase 1 of every sender with an order that takes
         // an open-order slot (read by the serial loop and the sharded workers).
+        // Taken per call: a block's post-EVM call sees its pre-EVM call's
+        // orders and, through cum_volume, its fills.
         let open_at_start = Self::open_order_counts(
             &ctx.order_books,
             place_order_indices.iter().filter_map(|&i| match &flat[i] {
@@ -5052,8 +5054,10 @@ impl NativeExecutor {
     /// PostOnly, a stop while pending) needs a free slot; as on Hyperliquid,
     /// reduce-only and stop orders also need fewer than
     /// `OPEN_ORDER_BASE_LIMIT` open orders. `slots` loads on the
-    /// sender's first such order: its open orders after Phase 1
-    /// (`open_at_start`) and the limit from the stored `cum_volume`. Returns
+    /// sender's first such order in this `execute_batch` call: its open orders
+    /// after Phase 1 (`open_at_start`) and the limit from the stored
+    /// `cum_volume`. A slot is taken before matching, so an order the book
+    /// then rejects (PostOnly cross, dust, off-tick) keeps it for the call. Returns
     /// the slots with this order counted; the caller stores them only once the
     /// order also passed its margin reserve, so a rejected order takes no slot.
     fn take_open_slot<T: StateBackend>(

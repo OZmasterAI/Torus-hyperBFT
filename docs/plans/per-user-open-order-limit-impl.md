@@ -23,11 +23,15 @@ of volume, capped at a total of 5000"):
 - **No per-market limit.**
 - Enforced in the Phase-2 per-sender fold (the only deterministic place: a
   sender's orders are processed in flat order there, and markets match in
-  parallel later). Count = open orders at block start (after Phase-1 cancels)
-  + this block's already-accepted restable orders. Conservative within a
-  block: a GTC order that fully fills still uses its slot until the next block.
-- The limit uses `cum_volume` as of block start; this block's fills raise it
-  for the next block.
+  parallel later). Count = open orders at the start of each `execute_batch`
+  call (after its Phase-1 cancels) + this call's already-accepted restable
+  orders. A block runs two calls (pre-EVM, then post-EVM; `app.rs`), so the
+  second call sees the first one's orders. Conservative within a call: a
+  GTC order that fully fills, or that the book then rejects (PostOnly cross,
+  dust, off-tick), still uses its slot until the call ends.
+- The limit uses `cum_volume` as of the start of each `execute_batch` call;
+  fills raise it from the next call on (the post-EVM call of the same block
+  sees the pre-EVM call's fills).
 - Open-order count is **derived from the books** (no new committed state).
   `cum_volume` is **new committed state**: one row per user in
   `CF_NATIVE_BALANCES` under key `b"cvlm" ‖ address` (24 bytes, value =
@@ -316,7 +320,7 @@ No fix needed; the 24-byte `cvlm` rows are covered by the native root.
     traders/block (20k orders/block kept); `l3_savebooks_ubench` rotates the
     seed trader every 100 orders and uses one append trader per block.
 
-### Cost of the block-start count (release probe, not a cell)
+### Cost of the batch-start count (release probe, not a cell)
 
 300 books x 5000 traders x 3 resting orders each, host shared (load 10-47 on
 18 cores): `add_open_order_counts` over all books = ~35 ms for 400 senders,
