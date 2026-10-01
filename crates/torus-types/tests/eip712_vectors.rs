@@ -291,6 +291,13 @@ fn all_vectors() -> Vec<Vector> {
             NativeAction::UpdateCommission { new_rate: 300 },
         ),
         build_vector("JailVote", NativeAction::JailVote { target: addr1 }),
+        build_vector(
+            "AttestStateHash",
+            NativeAction::AttestStateHash {
+                height: 100,
+                hash: alloy_primitives::B256::repeat_byte(0x5a),
+            },
+        ),
         build_vector("UnjailSelf", NativeAction::UnjailSelf),
         build_vector(
             "RotateValidatorKey",
