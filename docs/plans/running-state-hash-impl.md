@@ -442,3 +442,34 @@ Task 3 (the hashed flush needs it); its tests were verified by mutation.
   (harmless: first vote wins on-chain, the second action fails).
 - 3 validators: a > 2/3 quorum needs all three; one diverged or silent validator
   means no quorum hash; fail-stop (off) would halt the chain.
+
+## Task 9 part 1: devnet drill result (s83, e612be0, binary sha256 335e8a0c)
+
+Setup: `devnet/drill/statehash/drill.sh` on the WSL 3-validator topology, genesis
+from `gen-3val-genesis.sh` with `MARKETS=10 STATE_HASH_ACTIVATION=1`; the devnet
+validator addresses (0x1000..01 etc., no known key) are replaced in the genesis by
+the addresses of three fresh secp256k1 keys (`cast`), one 0600 key file per node
+(`--state-hash-attest-key`). Load: bench-throughput econ, 200 senders (offset 60),
+300 actions/s x 5 orders, ~1.1k fills/s. Corruption: stopped node, one
+`cf_native_balances` row +1.0 TRS via `crates/torus-state/examples/drill_corrupt_row.rs`
+(applied height, running hash, checkpoints untouched).
+
+- Run A (equal stakes): checkpoints 100..4200 (42) identical on all nodes, 3 votes,
+  quorum recorded; no mismatch, no-quorum or unverified. Corrupting an account that
+  never trades: never detected (5 later checkpoints identical while
+  `torus_getBalances` shows val2 +1.0). Corrupting a trading account at applied
+  height 5401: detected at checkpoint 5500 on all three nodes (ERROR with both
+  hashes, `torus_state_hash_mismatch_total{validator}` 1, no-quorum 1, no quorum
+  hash) and at every later checkpoint.
+- Fail-stop needs an on-chain quorum hash; with three equal validators a diverged
+  node prevents it, so `TORUS_STATE_HASH_FAILSTOP=1` never latches there.
+- Run B (stakes 2:2:1, val2 minority, fail-stop on): divergence at checkpoint 1900 →
+  quorum recorded by val0+val1, val2 logs the quorum mismatch, persists
+  `state_hash_diverged`=1900, latches, refuses to vote and exits; restarted with
+  fail-stop on it re-latches at boot and exits; restarted with it off it warns and
+  keeps running (`mismatch_total{validator="quorum"}` counts each checkpoint).
+- Liveness (pre-existing, not state-hash code): the chain stops committing while
+  any one of the three validators is down, even with 2:2:1 stakes (proposals every
+  third view get 2 votes, nothing commits); fail-stop on this net therefore halts
+  the chain. In run A a SIGTERM of val2 mid-view wedged all nodes at height 5630
+  (`justify fetch exhausted`, block_sync "made no progress") past a clean restart.
