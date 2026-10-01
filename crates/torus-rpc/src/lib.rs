@@ -3596,3 +3596,110 @@ mod submit_queue_tests {
         assert!(start.elapsed() < SUBMIT_QUEUE_TIMEOUT * 4);
     }
 }
+
+/// Running state hash (docs/plans/running-state-hash-impl.md, Task 8):
+/// `torus_getStateHash`.
+#[cfg(test)]
+mod state_hash_rpc_tests {
+    use super::*;
+    use crate::types::{hex_address, RpcStateHash};
+    use alloy_primitives::{Address, U256};
+    use jsonrpsee::core::client::ClientT;
+    use torus_economics::types::{ValidatorState, ValidatorStatus};
+    use torus_economics::StakingManager;
+    use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
+    use torus_mempool::{Mempool, MempoolConfig};
+    use torus_state::running_hash::read_checkpoint;
+
+    fn hex32(b: &[u8; 32]) -> String {
+        format!("0x{}", hex::encode(b))
+    }
+
+    #[tokio::test]
+    async fn state_hash_rpc_returns_local_votes_quorum_and_errors_for_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        // 66 checkpoints (100..=6600) through the hashed flush; 64 retained.
+        for h in 1..=6600u64 {
+            torus_state::FrozenPending::marker_only(h)
+                .flush_with_native_trie_stats(&state, Some(h), None, None)
+                .unwrap();
+        }
+        let staking = StakingManager::new(state.clone());
+        for n in 1..=3u8 {
+            let v = ValidatorState {
+                address: Address::repeat_byte(n),
+                pubkey: [n; 32],
+                commission_bps: 500,
+                self_stake: U256::from(1_000u64),
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&v.address, &v).unwrap();
+        }
+        let l6500 = read_checkpoint(&state, 6500).unwrap();
+        let l6600 = read_checkpoint(&state, 6600).unwrap();
+        for n in 1..=3u8 {
+            staking
+                .record_state_hash_attestation(Address::repeat_byte(n), 6500, l6500, 6601)
+                .unwrap();
+        }
+        staking
+            .record_state_hash_attestation(Address::repeat_byte(1), 6600, l6600, 6601)
+            .unwrap();
+        staking
+            .record_state_hash_attestation(Address::repeat_byte(2), 6600, [0xee; 32], 6601)
+            .unwrap();
+
+        let pool_dir = tempfile::TempDir::new().unwrap();
+        let (handle, addr) = RpcServer::new(
+            state,
+            Arc::new(Mempool::new(
+                StateDb::open(pool_dir.path()).unwrap(),
+                MempoolConfig::default(),
+            )),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        )
+        .start("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let get = |h: Option<u64>| {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<RpcStateHash, _>("torus_getStateHash", jsonrpsee::rpc_params![h])
+                    .await
+            }
+        };
+
+        let r = get(Some(6500)).await.unwrap();
+        assert_eq!(r.height, "0x1964");
+        assert_eq!(r.local_hash, hex32(&l6500));
+        assert_eq!(r.quorum_hash, Some(hex32(&l6500)));
+        assert_eq!(r.votes.len(), 3);
+        assert!(r.votes.iter().all(|v| v.hash == hex32(&l6500) && v.matches_local));
+
+        let r = get(Some(6600)).await.unwrap();
+        assert_eq!(r.quorum_hash, None, "split votes: no quorum");
+        assert_eq!(r.votes.len(), 2);
+        let bad = r.votes.iter().find(|v| !v.matches_local).unwrap();
+        assert_eq!(bad.validator, hex_address(Address::repeat_byte(2)));
+        assert_eq!(bad.hash, hex32(&[0xee; 32]));
+
+        let latest = get(None).await.unwrap();
+        assert_eq!(latest.height, "0x19c8", "no height = latest retained checkpoint");
+
+        for gone in [100u64, 200, 6650, 6700, 0] {
+            assert!(get(Some(gone)).await.is_err(), "height {gone} must be an error");
+        }
+        handle.stop().unwrap();
+    }
+}

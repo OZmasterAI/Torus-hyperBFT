@@ -410,6 +410,27 @@ pub struct RpcStakingInfo {
     pub unbonding: Vec<RpcUnbonding>,
 }
 
+/// Running state hash (`torus_getStateHash`): this node's checkpoint at
+/// `height`, the on-chain validator attestations and the quorum hash (`null`
+/// until > 2/3 of active stake agreed on one hash).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcStateHash {
+    pub height: String,
+    pub local_hash: String,
+    pub votes: Vec<RpcStateHashVote>,
+    pub quorum_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcStateHashVote {
+    pub validator: String,
+    pub hash: String,
+    /// `hash` equals this node's local checkpoint.
+    pub matches_local: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcDelegation {

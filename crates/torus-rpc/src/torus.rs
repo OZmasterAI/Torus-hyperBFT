@@ -132,6 +132,12 @@ pub trait TorusApi {
     #[method(name = "getValidators")]
     async fn get_validators(&self) -> RpcResult<Vec<RpcValidatorInfo>>;
 
+    /// Running state hash: this node's checkpoint at `height` (default: the
+    /// latest retained one) with the on-chain attestations and quorum hash.
+    /// Error for heights that are not a retained checkpoint.
+    #[method(name = "getStateHash")]
+    async fn get_state_hash(&self, height: Option<u64>) -> RpcResult<RpcStateHash>;
+
     #[method(name = "getEpoch")]
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo>;
 
@@ -1024,6 +1030,50 @@ impl TorusApiServer for RpcState {
             permanent_stake: hex_u256(info.permanent_stake),
             pending_rewards: hex_u256(info.pending_rewards),
             unbonding,
+        })
+    }
+
+    async fn get_state_hash(&self, height: Option<u64>) -> RpcResult<RpcStateHash> {
+        use torus_state::running_hash::{checkpoint_heights, read_checkpoint};
+        let retained = checkpoint_heights(&self.state);
+        let height = match height.or_else(|| retained.last().copied()) {
+            Some(h) => h,
+            None => {
+                return Err(ErrorObjectOwned::from(RpcError::InvalidParams(
+                    "no state hash checkpoint retained yet".into(),
+                )))
+            }
+        };
+        let local = read_checkpoint(&self.state, height).ok_or_else(|| {
+            ErrorObjectOwned::from(RpcError::InvalidParams(format!(
+                "height {height} is not a retained state hash checkpoint (retained {:?}..={:?})",
+                retained.first(),
+                retained.last()
+            )))
+        })?;
+        let staking = StakingManager::new(self.state.clone());
+        let internal = |e: torus_economics::EconomicsError| {
+            ErrorObjectOwned::from(RpcError::Internal(e.to_string()))
+        };
+        let votes = staking
+            .state_hash_votes(height)
+            .map_err(internal)?
+            .into_iter()
+            .map(|(validator, hash)| RpcStateHashVote {
+                validator: hex_address(validator),
+                hash: hex_b256(alloy_primitives::B256::from(hash)),
+                matches_local: hash == local,
+            })
+            .collect();
+        let quorum_hash = staking
+            .state_hash_quorum(height)
+            .map_err(internal)?
+            .map(|q| hex_b256(alloy_primitives::B256::from(q)));
+        Ok(RpcStateHash {
+            height: hex_u64(height),
+            local_hash: hex_b256(alloy_primitives::B256::from(local)),
+            votes,
+            quorum_hash,
         })
     }
 
