@@ -426,6 +426,12 @@ enum PrepOutcome {
     Reject { reason: RejectReason, msg: String },
 }
 
+/// Open-order count work (trader probes + stops) per worker thread: below
+/// 2x this it stays on the exec thread (release probe: 300 dense books x 400
+/// senders = 120k probes, ~34 ms serial, ~15 ms on 8 workers; 300 books of 50
+/// traders = 15k probes, 1 ms serial, slower when split).
+const OPEN_COUNT_WORK_PER_THREAD: usize = 25_000;
+
 /// Why an order died pre-book (selects its funnel counter).
 #[derive(Clone, Copy)]
 enum RejectReason {
@@ -5102,9 +5108,9 @@ impl NativeExecutor {
     }
 
     /// Open orders (resting + pending stops) of each of `senders`, summed
-    /// over all books. Book-outer: each book's trader index stays hot while
-    /// every sender probes it, and its stops are walked once (a sender-outer
-    /// walk measured ~4-5x slower at 300 markets).
+    /// over all books (`torus_core::order_book::open_order_counts`: book-outer,
+    /// smaller side per book, stops walked once). Split by book over up to the
+    /// match worker cap once the walk is big enough to pay for the threads.
     fn open_order_counts<'a>(
         books: &HashMap<MarketId, OrderBook>,
         senders: impl Iterator<Item = &'a Address>,
@@ -5114,10 +5120,13 @@ impl NativeExecutor {
             let next = idx.len();
             idx.entry(*sender).or_insert(next);
         }
-        let mut counts = vec![0usize; idx.len()];
-        for book in books.values() {
-            book.add_open_order_counts(&idx, &mut counts);
-        }
+        let refs: Vec<&OrderBook> = books.values().collect();
+        let counts = torus_core::order_book::open_order_counts(
+            &refs,
+            &idx,
+            MarketWorkerPool::resolve_worker_cap_named(None),
+            OPEN_COUNT_WORK_PER_THREAD,
+        );
         idx.into_iter()
             .map(|(sender, i)| (sender, u32::try_from(counts[i]).unwrap_or(u32::MAX)))
             .collect()

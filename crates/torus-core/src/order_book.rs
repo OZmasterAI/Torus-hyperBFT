@@ -28,6 +28,52 @@ use trader_orders::TraderOrders;
 #[cfg(test)]
 mod matching_entry_tests;
 
+/// Open orders (resting + pending stops) of each sender in `senders` (value =
+/// its index in the result), summed over `books`. The walk costs, per book,
+/// min(its traders, senders) probes plus its stops; it runs on scoped
+/// workers, one per `min_work_per_thread` of that (0 = always `max_threads`),
+/// at most `max_threads`, each on a chunk of books. The chunk counts are
+/// added: an integer sum, so the split never changes a count.
+pub fn open_order_counts(
+    books: &[&OrderBook],
+    senders: &HashMap<Address, usize>,
+    max_threads: usize,
+    min_work_per_thread: usize,
+) -> Vec<usize> {
+    let count = |chunk: &[&OrderBook]| {
+        let mut counts = vec![0usize; senders.len()];
+        for book in chunk {
+            book.add_open_order_counts(senders, &mut counts);
+        }
+        counts
+    };
+    let work: usize = books
+        .iter()
+        .map(|b| b.trader_orders.len().min(senders.len()) + b.pending_stops.len())
+        .sum();
+    let threads = match work.checked_div(min_work_per_thread) {
+        Some(n) => n.min(max_threads),
+        None => max_threads,
+    };
+    if threads < 2 || books.len() < 2 {
+        return count(books);
+    }
+    std::thread::scope(|s| {
+        let workers: Vec<_> = books
+            .chunks(books.len().div_ceil(threads))
+            .map(|chunk| s.spawn(move || count(chunk)))
+            .collect();
+        let mut total = vec![0usize; senders.len()];
+        for worker in workers {
+            let counts = worker.join().expect("open-order count worker panicked");
+            for (t, n) in total.iter_mut().zip(counts) {
+                *t += n;
+            }
+        }
+        total
+    })
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -887,11 +933,20 @@ impl OrderBook {
             + self.pending_stops.iter().filter(|s| s.trader == *trader).count()
     }
 
-    /// Adds every indexed trader's `open_order_count` to `counts[idx[trader]]`
-    /// with one pass over the pending stops (not one per trader).
+    /// Adds every indexed trader's `open_order_count` to `counts[idx[trader]]`.
+    /// Walks the smaller of this book's traders and `idx` (an empty book costs
+    /// nothing), plus one pass over the pending stops (not one per trader).
     pub fn add_open_order_counts(&self, idx: &HashMap<Address, usize>, counts: &mut [usize]) {
-        for (trader, &i) in idx {
-            counts[i] += self.trader_orders.get(trader).map_or(0, TraderOrders::len);
+        if self.trader_orders.len() < idx.len() {
+            for (trader, ids) in &self.trader_orders {
+                if let Some(&i) = idx.get(trader) {
+                    counts[i] += ids.len();
+                }
+            }
+        } else {
+            for (trader, &i) in idx {
+                counts[i] += self.trader_orders.get(trader).map_or(0, TraderOrders::len);
+            }
         }
         for stop in &self.pending_stops {
             if let Some(&i) = idx.get(&stop.trader) {
@@ -3382,6 +3437,42 @@ mod tests {
         let want: Vec<usize> = traders.iter().map(|t| 10 + ob.open_order_count(t)).collect();
         assert_eq!(counts, want);
         assert_eq!(counts, [14, 11, 12, 11, 10]);
+        // Fewer senders than traders in the book (the other walk).
+        let one: HashMap<Address, usize> = [(addr(1), 0)].into();
+        let mut counts = vec![0];
+        ob.add_open_order_counts(&one, &mut counts);
+        assert_eq!(counts, [4]);
+        // An empty book adds nothing.
+        book().add_open_order_counts(&idx, &mut counts);
+        assert_eq!(counts, [4]);
+    }
+
+    #[test]
+    fn open_order_counts_match_per_sender_sums_for_any_thread_count() {
+        let mut books = Vec::new();
+        for m in 0..23u8 {
+            let mut ob = book();
+            for t in 0..(m % 9) {
+                for k in 0..=(t + m) % 4 {
+                    ob.place_order(limit_buy(fp(50 + k as i64), fp(1)), addr(1 + t), 0);
+                }
+            }
+            for t in 0..m % 3 {
+                let trigger = OrderType::StopMarket { trigger: fp(200) };
+                ob.place_order(stop(true, trigger), addr(3 + t), 0);
+            }
+            books.push(ob);
+        }
+        let refs: Vec<&OrderBook> = books.iter().collect();
+        let senders: HashMap<Address, usize> = (1..=12).map(|n| (addr(n), n as usize - 1)).collect();
+        let want: Vec<usize> = (1..=12)
+            .map(|n| books.iter().map(|b| b.open_order_count(&addr(n))).sum())
+            .collect();
+        assert!(want.iter().sum::<usize>() > 100);
+        for threads in [0, 1, 2, 3, 8, 64] {
+            assert_eq!(open_order_counts(&refs, &senders, threads, 0), want, "threads={threads}");
+            assert_eq!(open_order_counts(&refs, &senders, threads, 1 << 20), want);
+        }
     }
 
     #[test]
