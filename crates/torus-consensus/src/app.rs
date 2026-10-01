@@ -13752,4 +13752,149 @@ mod crash_recovery_tests {
             Some(fold_captured(&captured))
         );
     }
+
+    /// Delete every running-hash META row: the DB of a node that ran a binary
+    /// without the running hash (pre-upgrade).
+    fn strip_running_hash_meta(state_db: &StateDb) {
+        use torus_state::cf::{
+            META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION,
+            META_STATE_HASH_CHECKPOINT_PREFIX,
+        };
+        for key in [META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION] {
+            state_db.delete_cf_raw(CF_CONSENSUS_META, key).unwrap();
+        }
+        for (k, _) in
+            StateBackend::iterate_cf(state_db, CF_CONSENSUS_META, Some(META_STATE_HASH_CHECKPOINT_PREFIX))
+                .unwrap()
+        {
+            state_db.delete_cf_raw(CF_CONSENSUS_META, &k).unwrap();
+        }
+    }
+
+    /// Task 4: a fresh chain activates at its first executed height from
+    /// `h_0` = zeros; an existing (pre-upgrade) DB activates at its next applied
+    /// height, and every node upgraded at that height agrees.
+    #[test]
+    fn running_hash_activation_fresh_chain_and_existing_db() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::running_hash::{read_activation_height, read_running_hash};
+        let mode = BookMode::LevelAuthorityChunked;
+        // Fresh chain.
+        let (_c, fresh) = make_test_config_and_db();
+        fund_book_fixture(&fresh);
+        torus_state::running_hash::capture_begin(&fresh);
+        let ctx = book_pipeline_ctx(&fresh, false, None, mode);
+        for b in &book_fixture_blocks() {
+            dispatch_and_execute(&ctx, &fresh, b);
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&fresh);
+        assert_eq!(read_activation_height(&fresh), Some(1));
+        assert_eq!(read_running_hash(&fresh), Some(fold_captured(&captured)));
+
+        // Existing DB upgraded after height 5 (two independent nodes, one
+        // pipelined), compared with each other and with the from-genesis node.
+        let upgraded = |on: bool| {
+            let (_c, db) = make_test_config_and_db();
+            fund_book_fixture(&db);
+            let blocks = book_fixture_blocks();
+            let ctx = book_pipeline_ctx(&db, on, None, mode);
+            for b in &blocks[..5] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            strip_running_hash_meta(&db);
+            torus_state::running_hash::capture_begin(&db);
+            let ctx = book_pipeline_ctx(&db, on, None, mode);
+            for b in &blocks[5..] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            let captured = torus_state::running_hash::capture_take(&db);
+            assert_eq!(captured.first().map(|(h, _)| *h), Some(6));
+            assert_eq!(read_activation_height(&db), Some(6), "on={on}");
+            assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)), "on={on}");
+            read_running_hash(&db).unwrap()
+        };
+        let a = upgraded(false);
+        let b = upgraded(true);
+        assert_eq!(a, b, "nodes upgraded at the same height agree");
+        assert_ne!(Some(a), read_running_hash(&fresh), "a different activation height is a different chain");
+    }
+
+    /// Task 4: kill after flushing N (committed blocks N+1.. durable, not yet
+    /// executed), and kill between exec and flush (pipelined: batch(k) lost on
+    /// W after E executed k+1) — the restart replay lands the uncrashed hash.
+    #[test]
+    fn running_hash_crash_replay_matches_uncrashed_run() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::running_hash::read_running_hash;
+        let mode = BookMode::LevelAuthorityChunked;
+        let blocks = book_fixture_blocks();
+        let reference = {
+            let (_c, db) = make_test_config_and_db();
+            fund_book_fixture(&db);
+            let ctx = book_pipeline_ctx(&db, false, None, mode);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            read_running_hash(&db).unwrap()
+        };
+        assert_eq!(reference.0, 13);
+
+        // (a) kill after flushing 5: 6..=13 committed (dispatch-durable) only.
+        for on in [false, true] {
+            let (_c, db) = make_test_config_and_db();
+            fund_book_fixture(&db);
+            let ctx = book_pipeline_ctx(&db, on, None, mode);
+            for b in &blocks[..5] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            for b in &blocks[5..] {
+                let durable = persist_committed_block_durably(&db, b);
+                assert!(durable.header && durable.body);
+            }
+            let ctx = book_pipeline_ctx(&db, false, None, mode);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_running_hash(&db), Some(reference), "(a) on={on}");
+        }
+
+        // (b) kill between exec and flush: W's write of 6 fails after E ran 7.
+        let (_c, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = book_pipeline_ctx(&db, true, Some(gate.clone()), mode);
+        for b in &blocks[..5] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        gate.hold();
+        dispatch_and_execute(&ctx, &db, &blocks[5]);
+        assert!(gate.wait_received(6));
+        let (db_t, b7) = (db.clone(), blocks[6].clone());
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b7);
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        gate.fail_next();
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_running_hash(&db).map(|(h, _)| h), Some(5), "hash advances only with the batch");
+        for b in &blocks[7..] {
+            persist_committed_block_durably(&db, b);
+        }
+        let ctx = book_pipeline_ctx(&db, false, None, mode);
+        let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+        assert_eq!(parked, None);
+        drop(ctx);
+        assert_eq!(read_running_hash(&db), Some(reference), "(b) replay after a lost batch");
+    }
 }
