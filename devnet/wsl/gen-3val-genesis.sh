@@ -85,8 +85,17 @@ if [ -n "${TIMEOUT_BASE_MS:-}" ]; then
     tmp=$(mktemp) && jq --argjson t "$TIMEOUT_BASE_MS" '.consensus.timeout_base_ms = $t' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
+# 5. Optional running state hash activation (docs/plans/running-state-hash-impl.md).
+#    CHAIN-WIDE genesis field: every node hashes from this height; absent = off.
+if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
+    [[ "$STATE_HASH_ACTIVATION" =~ ^[0-9]+$ ]] && [ "$STATE_HASH_ACTIVATION" -ge 1 ] \
+        || { echo "FATAL: STATE_HASH_ACTIVATION must be an integer >= 1 (got '$STATE_HASH_ACTIVATION')" >&2; exit 1; }
+    tmp=$(mktemp) && jq --argjson h "$STATE_HASH_ACTIVATION" '.consensus.state_hash_activation_height = $h' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+
 echo "wrote $OUT"
 echo "  timeout_ms = $(jq '.consensus.timeout_base_ms' "$OUT")"
+echo "  state_hash_activation = $(jq '.consensus.state_hash_activation_height // "off"' "$OUT")"
 echo "  chain_id   = $(jq '.chain_id' "$OUT")"
 echo "  validators = $(jq '.validators|length' "$OUT")  ($(jq -r '.validators[].address' "$OUT" | tr '\n' ' '))"
 echo "  native_bal = $(jq '.native_balances|length' "$OUT")"

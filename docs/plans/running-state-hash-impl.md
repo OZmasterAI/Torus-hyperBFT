@@ -124,7 +124,9 @@ blocks (`periodic_abci_states`).
 
 `AttestStateHash` is a new action type and the vote state is consensus state
 => ships with the **coordinated testnet upgrade** (same as the per-user
-open-order limit and the trade-history wipe).
+open-order limit and the trade-history wipe). The hash's activation height is a
+chain-wide genesis field, `consensus.state_hash_activation_height` (Deviation 9):
+the upgrade sets it to a height above every node's applied height; absent = off.
 
 ## Decisions (owner, s83)
 
@@ -265,7 +267,7 @@ EXCEPT the rows marked **OUT** below.
 | cf_native_markets | consensus, except key `__book_mode__` (node-local wrong-flag marker, `native_executor.rs:2537`) | overlay (`save_order_books` tail `:2683-2703`, `save_order_books_deferred` `:2873-2891`, governance market params) | yes |
 | cf_native_orders | consensus (no live writer found) | — | — |
 | cf_native_nonces | consensus | overlay `app.rs:2038-2044` | yes |
-| cf_staking_validators, cf_staking_delegations, cf_staking_permanent, cf_staking_rewards, cf_slash_records, cf_jail_votes | consensus | overlay (StakingManager over the overlay inside `NativeExecContext`) | yes |
+| cf_staking_validators, cf_staking_delegations, cf_staking_permanent, cf_staking_rewards, cf_slash_records, cf_jail_votes | consensus (cf_staking_validators NOT hashed, see Deviation 8) | overlay (StakingManager over the overlay inside `NativeExecContext`) | yes |
 |  |  | **OUT (a)** buffered equivocation slashes: `StakingManager<StateDb>::slash` + `tombstone_validator` straight to the DB at exec start (`app.rs:1532-1567`) | **no** |
 |  |  | **OUT (b)** epoch rotation on the CONSENSUS thread: `apply_pending_rotations` (`app.rs:4094`) and `update_validator_statuses` (`app.rs:4138`, `epoch.rs:365`) from `build_proposal` / `finish_validate` (`app.rs:4722, 4845`), straight to the DB, at proposal/validation time of the boundary block, not at its execution | **no** |
 | cf_governance_proposals, cf_governance_votes, cf_fee_config, cf_treasury, cf_dev_pool | consensus | overlay (governance, fee split, rewards, dev pool) | yes |
@@ -296,13 +298,10 @@ flushed later, so this is the block's final value per key).
   block the node dispatches next, so nodes can disagree on whether and where it
   is applied. The hash will report that as a mismatch, which is correct.
 - **(b) Consensus-thread epoch rotation**: timing is not tied to execution, so
-  the writes themselves cannot be attributed to a height. Deterministic point:
-  executing the epoch-boundary block (already a pipeline barrier), the exec
-  thread adds a snapshot of the full `cf_staking_validators` CF and all
-  `pending_rotation:` META rows as puts to `D(n)` (O(validators), once per
-  epoch). *Pre-existing hazard, not fixed here:* if execution lags by more than
-  one epoch, the consensus thread's writes for the next boundary are visible to
-  execution early; the hash would flag it.
+  the writes themselves cannot be attributed to a height. ~~Snapshot at the
+  boundary block's execution~~ (superseded after the independent review, see
+  Deviation 8): these writes are NOT hashed, and `cf_staking_validators` is
+  excluded from the hash, until bug (b) is fixed on main.
 - **(c) EVM bundle**: deterministic (exec thread, serial path). The bundle's
   plain-state writes (same mapping as `apply_bundle_plain`) are added to the
   EVM domain of `D(n)`. Crash window (pre-existing): the EVM batch can be durable
@@ -344,7 +343,7 @@ deletes the row at restart and fails unless the key is excluded.
    key (64 hex chars, optional `0x`; a file so it never shows in `ps`). Unset = the
    node never attests. The submitter only submits when the key's address is an
    ACTIVE validator.
-5. Attestation submission is exactly once per checkpoint per process (plus a retry
+5. (Superseded by Deviation 10.) Attestation submission is exactly once per checkpoint per process (plus a retry
    at the next checkpoint scan if mempool admission failed); after a restart a
    checkpoint is re-submitted only if this validator's vote is not on-chain. A
    pre-restart submission that still lands is rejected on-chain (first vote wins).
@@ -360,11 +359,70 @@ deletes the row at restart and fails unless the key is excluded.
    bytes as the direct puts) so the out-of-batch recorder sees it;
    `ExecutionContext.staking` became unused and was removed.
 
+8. **Review finding 2 — epoch-boundary snapshot removed, `cf_staking_validators`
+   excluded (tied to pre-existing bug (b)).** The snapshot read the validator CF and
+   `pending_rotation:` rows at the boundary block's EXECUTION, while the consensus
+   thread writes them at proposal / validation time; with execution lag the
+   snapshot (and every execution-time write of a validator row, which carries the
+   consensus thread's `status` / rotated `pubkey` fields) depends on timing, with
+   identical final state. Minimal deterministic option: hash only what execution
+   writes, and drop the CF the consensus thread read-modify-writes. `cf_id` 8 is
+   reserved (never reused); `pending_rotation:` stays hashed (execution writes only
+   puts with action-determined values; the consensus thread's deletions are out of
+   batch and not hashed). Re-include the validator CF (new id, coordinated upgrade)
+   once epoch rotation runs at execution of the boundary block. Coverage lost:
+   validator self-stake / commission / jail fields (delegations, slash records,
+   jail votes, rewards stay covered). Test:
+   `running_hash_consensus_thread_epoch_write_vs_lagging_exec_equal_across_nodes`.
+9. **Review finding 1 — activation is a CHAIN-WIDE genesis field.** New genesis
+   `consensus.state_hash_activation_height` -> `ChainConfig.state_hash_activation_height`
+   (absent = running hash disabled; 0 rejected by `ChainConfig::validate`), copied at
+   boot (before replay) to node-local META `state_hash_cfg_activation` by
+   `running_hash::configure_activation`; a changed value discards the stored chain.
+   Every node hashes from that height with `h_{A-1}` = zeros, whatever its applied
+   height at upgrade (a node synced from genesis included). A node that flushes a
+   height `n > A` without a stored `h_{n-1}` of that chain (DB above `A` at upgrade,
+   or a skipped height) is **hash-unverified**: sticky META
+   `running_state_hash_unverified` (first such height), no further hashes or
+   checkpoints, never attests, no fail-stop decisions, ERROR log once, gauge
+   `torus_state_hash_unverified`. Devnet: `STATE_HASH_ACTIVATION=<h>` in
+   `devnet/wsl/gen-3val-genesis.sh`.
+10. **Review finding 3 — attestations retried until on-chain.** A checkpoint stays
+    pending until this validator's vote is read back from `cf_state_hash_votes`; an
+    unlanded submission is re-signed with a fresh nonce after
+    `DEFAULT_RESUBMIT_AFTER_MS` = `NONCE_WINDOW_MS` + 5 s (the old signature can no
+    longer be admitted anywhere); a failed admission waits for the same window. Two
+    landing signatures are harmless (first vote wins on-chain). Replaces Deviation 5.
+11. **Review finding 4 — persistent fail-stop.** With fail-stop on, a quorum
+    mismatch first persists node-local META `state_hash_diverged` = checkpoint, then
+    latches; `TorusApp::new` re-latches `exec_failed` from that record after the boot
+    replay when `TORUS_STATE_HASH_FAILSTOP=1` (warns otherwise). The record lives
+    with the DB (resync clears it).
+12. **Review finding 5 — flush failures.** Existing serial semantics kept (failed
+    flush is logged, not latched; the pipelined worker already latches
+    `exec_failed`). The chain never continues over a gap: the next flush finds no
+    `h_{n-1}` and the node goes hash-unverified (Deviation 9).
+13. **Review finding 6 — attest key file.** Refused unless owner-only (no group /
+    other bits: 0600 or stricter); file text and decoded bytes are zeroized
+    (`zeroize::Zeroizing`; `SigningKey` zeroizes on drop); `decode_hex_key` rejects
+    non-ASCII input instead of panicking on a byte slice.
+14. **Review finding 7 — streaming merge.** A CF written in several layers (extras,
+    pending set, sidecar) is now a streaming k-way merge of the layers' sorted
+    streams (no `BTreeMap` materialization); hash output unchanged (golden vector).
+15. **Test gaps closed.** `state_hash_pipelined_votes_in_parent_layer_complete_quorum_next_block`,
+    `running_hash_captures_evm_writer_precompile_side_effects_end_to_end` (EVM tx ->
+    proxy contract -> CoreWriter 0x0810, no devnet needed), and
+    `attest_state_hash_takes_the_serial_path` replaces the serial-vs-parallel engine
+    differential that could not fail. `AttestStateHash` added to the client EIP-712
+    fixture (`crates/torus-types/tests/fixtures/eip712_vectors.json`).
+
 ## Implementation status (s83)
 
-Tasks 0-8 done on `feat/running-state-hash`; Task 9 (devnet drill + bench cells)
-is open. Task 4's activation record landed with Task 3 (the hashed flush needs
-it); its tests were verified by mutation (activation record disabled -> fails).
+Tasks 0-8 done on `feat/running-state-hash`, plus the independent-review fixes
+(Deviations 8-15). Task 9 (devnet drill + bench cells) is open: the bench / devnet
+genesis must set `consensus.state_hash_activation_height` (e.g. 1), otherwise the
+running hash is disabled and costs nothing. Task 4's activation record landed with
+Task 3 (the hashed flush needs it); its tests were verified by mutation.
 
 ### Open risks
 
@@ -373,8 +431,14 @@ it); its tests were verified by mutation (activation record disabled -> fails).
   whichever block a node dispatches next; consensus-thread epoch rotation racing
   with execution lag > 1 epoch; EVM crash window (bundle durable, native batch
   not) re-executing EVM on its own post-state at replay.
-- Activation = first hashed height of a DB: all nodes must start hashing at the
-  same height (coordinated upgrade or fresh genesis); a node restored from a
-  snapshot keeps the META hash (snapshots copy every CF).
+- Activation is chain-wide (genesis). A node whose DB is above the activation
+  height when it upgrades (or that loses a hashed flush) stays hash-unverified
+  until resynced from genesis or from a snapshot of a verified node (snapshots
+  copy the META hash); it does not attest, so on a 3-validator net it prevents a
+  quorum hash while unverified.
+- Validator rows are not covered until bug (b) is fixed (Deviation 8).
+- The resubmit window uses the local wall clock; with clock skew beyond 5 s a
+  node may resubmit while its previous signature can still land elsewhere
+  (harmless: first vote wins on-chain, the second action fails).
 - 3 validators: a > 2/3 quorum needs all three; one diverged or silent validator
   means no quorum hash; fail-stop (off) would halt the chain.
