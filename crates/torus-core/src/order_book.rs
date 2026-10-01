@@ -884,6 +884,19 @@ impl OrderBook {
             + self.pending_stops.iter().filter(|s| s.trader == *trader).count()
     }
 
+    /// Adds every indexed trader's `open_order_count` to `counts[idx[trader]]`
+    /// with one pass over the pending stops (not one per trader).
+    pub fn add_open_order_counts(&self, idx: &HashMap<Address, usize>, counts: &mut [usize]) {
+        for (trader, &i) in idx {
+            counts[i] += self.trader_orders.get(trader).map_or(0, Vec::len);
+        }
+        for stop in &self.pending_stops {
+            if let Some(&i) = idx.get(&stop.trader) {
+                counts[i] += 1;
+            }
+        }
+    }
+
     /// Number of pending stop orders.
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()
@@ -3286,6 +3299,27 @@ mod tests {
         assert_eq!(ob.pending_stop_count(), 1);
         assert_eq!(ob.orders_for_trader(&a).len(), 3);
         assert_eq!(ob.open_order_count(&a), 4);
+    }
+
+    #[test]
+    fn add_open_order_counts_matches_open_order_count() {
+        let mut ob = book();
+        for (t, n) in [(1u8, 3usize), (2, 1), (3, 0)] {
+            for k in 0..n {
+                ob.place_order(limit_buy(fp(90 + k as i64), fp(1)), addr(t), 0);
+            }
+        }
+        for t in [1u8, 3, 3, 4] {
+            ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(200) }), addr(t), 0);
+        }
+        let traders: Vec<Address> = (1..=5).map(addr).collect();
+        let idx: HashMap<Address, usize> =
+            traders.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+        let mut counts = vec![10; traders.len()];
+        ob.add_open_order_counts(&idx, &mut counts);
+        let want: Vec<usize> = traders.iter().map(|t| 10 + ob.open_order_count(t)).collect();
+        assert_eq!(counts, want);
+        assert_eq!(counts, [14, 11, 12, 11, 10]);
     }
 
     #[test]
