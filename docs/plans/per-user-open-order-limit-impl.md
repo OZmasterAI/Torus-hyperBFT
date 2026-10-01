@@ -241,3 +241,85 @@ of volume, capped at a total of 5000"):
 Code-only revert restores the 200/market cap. `cvlm` rows written in the
 meantime are part of the native root, so a rollback after activation needs a
 coordinated revert on all validators; the rows are then inert (no reader).
+
+## Implementation notes (branch `feat/per-user-open-order-limit`)
+
+### Task 0 audit result
+
+`rg -n CF_NATIVE_BALANCES crates` reviewed. No production scan decodes
+`CF_NATIVE_BALANCES` values as `NativeBalance` or assumes 20-byte keys:
+
+- `state_root.rs::compute_native_state_root` and `native_trie.rs` (tag 0) hash
+  raw `(key, value)` bytes of any length (a native_trie test already writes a
+  non-address key).
+- `NativeBalance` decoders (`position.rs` `get_native_balance`, `lockbox.rs`,
+  `precompiles.rs`) read by the 20-byte trader key only.
+- Genesis seeds 20-byte rows; RPC `getBalances` reads by key; no RPC listing,
+  explorer or snapshot/sync path iterates this CF (the only `ALL_CF_NAMES`
+  loops are torus-state tests). Test dumps (`maker_margin_release_tests`,
+  `position_cache_tests`, `engine_parallel_tests`) compare raw bytes.
+
+No fix needed; the 24-byte `cvlm` rows are covered by the native root.
+
+### Deviations
+
+1. **Branch base**: the worktree was at a6917de; the branch starts at main
+   7d55675 as instructed.
+2. **Task 4 location**: `cum_volume_key`, `open_order_limit`, the
+   `OPEN_ORDER_*` constants and `PositionManager::{get,put}_cum_volume` live in
+   `position.rs` (owner of the balance rows), not `liquidation.rs`. A `cvlm`
+   row of the wrong length is an error, not zero.
+3. **Task 2**: the executor's `exec_cancel_all` / `exec_cancel_all_run` also
+   mark the book dirty when a cancel-all removed only stops; otherwise the
+   removal is never persisted. `cancel_all_many` drops the stops of every
+   sender in the run. The frozen test oracle `cancel_all_original` got the
+   same one-line change; `cancel_batch_falls_back_for_small_large_and_stale_indexes`
+   case 1 now needs > 5000 orders (eligibility bound is `OPEN_ORDER_MAX_LIMIT`).
+4. **Task 5 counting**: open orders are counted once before Phase 2 in a
+   book-outer pass (`OrderBook::add_open_order_counts`: one `trader_orders`
+   probe per sender and one pass over the stops per book), for every sender
+   with an order that takes a slot. Summing `open_order_count` per sender
+   scans every book's stops once per sender (senders x stops per book, which
+   stops can inflate) and was ~4-5x slower in a release probe. The limit is
+   read on a sender's first restable order. A slot is kept only when the
+   margin reserve also passed (a margin-rejected order takes no slot); orders
+   the book later rejects (PostOnly cross, dust, tick) keep their slot for
+   the block, like fully filled GTCs. `PrepOutcome::Reject` carries
+   `RejectReason { Margin, OpenLimit, Other }`.
+5. **CoreWriter path (not in the plan)**: `drain_core_writer` (app.rs) runs
+   queued EVM PlaceOrders through `execute` -> `exec_place_order`, a
+   production path outside Phase 2. It applies the same rule (counts from the
+   current books and the stored `cum_volume`) and adds `cum_volume` on its
+   fills; without this the removed per-market cap would leave it uncapped.
+6. **Task 7**: volume is added per fill side right after that side's position
+   effect applied (sequential), through a per-call `VolumeCache` flushed after
+   the balance cache in sorted-address order. Parallel pass B uses a fill-side
+   index carried on each PnL event to stop at the same side on a balance-read
+   failure. An order that fails mid-way keeps the volume of the sides already
+   applied, exactly like its position effects.
+7. **Task 8**: `openOrders` comes from a new `book_reader::read_open_order_count`
+   (resting + pending stops, all three book layouts). Test lives in
+   `tests/book_read_modes_rpc_tests.rs` (real executor fixtures per layout).
+   Doc: `docs/api/user-limits.md`.
+8. **Task 9**: the estimate counts every order since the last cancel-all, not
+   only passive ones: aggressive remainders rest too, and Phase 2 counts every
+   GTC of a block. `OPEN_ORDER_BUDGET` unset = flag omitted (older bench
+   binaries keep working). `torus_orders_rejected_open_limit_total` is sampled
+   (FUNNEL_COLS, WIDE_COLS) and reported as `delta_orders_rejected_open_limit_total`
+   in `funnel_by_node`. The campaign `run_cell.py` env allowlist lives outside
+   this repo and must forward `OPEN_ORDER_BUDGET`. Caveat: a cancel-all runs in
+   Phase 1, before every place of its block, so places of an earlier fire that
+   land in the same block survive it; 900 leaves 100 slots of headroom.
+9. **Task 10**: the classic-layout branch of `getOpenOrders` had its own
+   hard-coded `500`s; they use `OPEN_ORDERS_LIMIT` too.
+10. **Task 3 fixtures**: `load_books_ubench` now 100 orders/trader/market x 20
+    traders/block (20k orders/block kept); `l3_savebooks_ubench` rotates the
+    seed trader every 100 orders and uses one append trader per block.
+
+### Cost of the block-start count (release probe, not a cell)
+
+300 books x 5000 traders x 3 resting orders each, host shared (load 10-47 on
+18 cores): `add_open_order_counts` over all books = ~35 ms for 400 senders,
+~210 ms for 5000 senders, serial. It runs inside the Phase-2 margin timer
+(`exec_phase_margin_seconds`), so Task 11 cells show it there. If it is
+visible, the pass splits by book chunks across the engine workers.
