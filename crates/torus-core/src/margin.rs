@@ -224,6 +224,28 @@ impl MarketMarginConfig {
     }
 }
 
+/// Item 3 (F2, F8, D11, s517): the margin config of a `CF_NATIVE_MARKETS` row
+/// (borsh `(base, quote, lot raw, tick raw, initial_margin raw percent)`, the
+/// whole row): ONE flat tier at `max_leverage = max(1, floor(100 /
+/// initial_margin %))` (u32, saturating), `maintenance_factor_bps` 5000.
+/// An undecodable row (test fixtures) or `initial_margin <= 0` ⇒ `None` (the
+/// default 20x applies).
+pub fn market_margin_config(market_id: MarketId, row: &[u8]) -> Option<MarketMarginConfig> {
+    let (_, _, _, _, im) =
+        <(String, String, i128, i128, i128) as borsh::BorshDeserialize>::try_from_slice(row)
+            .ok()?;
+    if im <= 0 {
+        return None;
+    }
+    let lev = ((100 * FixedPoint::SCALE) / im).clamp(1, i128::from(u32::MAX)) as u32;
+    Some(MarketMarginConfig {
+        market_id,
+        max_leverage: lev,
+        maintenance_factor_bps: 5000,
+        tiers: vec![MarginTier { max_notional: FixedPoint::MAX, max_leverage: lev }],
+    })
+}
+
 // ============================================================================
 // MarginEngine
 // ============================================================================

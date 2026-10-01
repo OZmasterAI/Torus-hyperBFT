@@ -14,8 +14,8 @@ use torus_core::error::CoreError;
 use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
-    effective_max_leverage, order_initial_margin, placement_need, position_price, AccountView,
-    MarginTier, MarketMarginConfig,
+    effective_max_leverage, market_margin_config, order_initial_margin, placement_need,
+    position_price, AccountView, MarginTier, MarketMarginConfig,
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
@@ -2262,6 +2262,18 @@ impl<T: StateBackend> NativeExecContext<T> {
         let persisted_next_id = Self::load_next_global_order_id(&state);
         let next_global_order_id = scanned_next_id.max(persisted_next_id.unwrap_or(1));
 
+        // Item 3 (F2, F8, D11): margin configs from the market listings. A read
+        // error is a node fault (fatal, like the book load).
+        let margin_configs = match Self::load_margin_configs(&state) {
+            Ok(m) => m,
+            Err(e) => {
+                if load_error.is_none() {
+                    load_error = Some(format!("margin configs: {e}"));
+                }
+                HashMap::new()
+            }
+        };
+
         Self {
             positions,
             oracle,
@@ -2270,7 +2282,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             state,
             order_books,
             dirty_books: std::collections::HashSet::new(),
-            margin_configs: HashMap::new(),
+            margin_configs,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -2975,6 +2987,24 @@ impl<T: StateBackend> NativeExecContext<T> {
             .ok()
             .flatten()?;
         (bytes.len() == 1).then(|| bytes[0])
+    }
+
+    /// Item 3 (F2, F8, D11): one [`market_margin_config`] per listed market
+    /// (8-byte keys of `CF_NATIVE_MARKETS`; metadata rows skipped). Undecodable
+    /// / non-positive rows get none (default 20x). One scan of <= M rows.
+    fn load_margin_configs(
+        state: &T,
+    ) -> Result<HashMap<MarketId, MarketMarginConfig>, torus_state::error::StateError> {
+        use torus_state::cf::CF_NATIVE_MARKETS;
+        Ok(state
+            .iterate_cf(CF_NATIVE_MARKETS, None)?
+            .into_iter()
+            .filter(|(k, _)| k.len() == 8)
+            .filter_map(|(k, v)| {
+                let m = u64::from_be_bytes(k[..8].try_into().ok()?);
+                market_margin_config(m, &v).map(|c| (m, c))
+            })
+            .collect())
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
