@@ -248,3 +248,67 @@ Before activation: code revert, no state effect. After activation: the vote
 and quorum records are consensus state, so a revert needs a coordinated
 upgrade; the local hash and checkpoints are node-local META and inert without
 the code.
+
+## Task 0 output: CF classification and writer paths (s83, base 710dde7)
+
+Line numbers as of 710dde7. "Batch" = the one atomic `WriteBatch` that also
+carries `META_NATIVE_APPLIED_HEIGHT` (`flush_pending_with_native_trie_stats`,
+`backend.rs:643`; serial call `app.rs:2109`, flush worker `exec_pipeline.rs:372/426`).
+Every block-execution write to a consensus CF goes through the per-block
+`NativeStateOverlay` (native executor, core managers, staking, governance, nonces
+`app.rs:2038-2044`, EVM account seed `app.rs:1801`) and so lands in the batch,
+EXCEPT the rows marked **OUT** below.
+
+| CF | class | writers during block execution | in batch? |
+|---|---|---|---|
+| cf_native_positions, cf_native_balances, cf_native_order_books, cf_native_oracle | consensus | native executor via overlay; deferred book save via sidecar (`exec_pipeline.rs:398`, merged into the same batch) | yes |
+| cf_native_markets | consensus, except key `__book_mode__` (node-local wrong-flag marker, `native_executor.rs:2537`) | overlay (`save_order_books` tail `:2683-2703`, `save_order_books_deferred` `:2873-2891`, governance market params) | yes |
+| cf_native_orders | consensus (no live writer found) | — | — |
+| cf_native_nonces | consensus | overlay `app.rs:2038-2044` | yes |
+| cf_staking_validators, cf_staking_delegations, cf_staking_permanent, cf_staking_rewards, cf_slash_records, cf_jail_votes | consensus | overlay (StakingManager over the overlay inside `NativeExecContext`) | yes |
+|  |  | **OUT (a)** buffered equivocation slashes: `StakingManager<StateDb>::slash` + `tombstone_validator` straight to the DB at exec start (`app.rs:1532-1567`) | **no** |
+|  |  | **OUT (b)** epoch rotation on the CONSENSUS thread: `apply_pending_rotations` (`app.rs:4094`) and `update_validator_statuses` (`app.rs:4138`, `epoch.rs:365`) from `build_proposal` / `finish_validate` (`app.rs:4722, 4845`), straight to the DB, at proposal/validation time of the boundary block, not at its execution | **no** |
+| cf_governance_proposals, cf_governance_votes, cf_fee_config, cf_treasury, cf_dev_pool | consensus | overlay (governance, fee split, rewards, dev pool) | yes |
+| cf_sessions | consensus | overlay (CreateSession/RevokeSession) | yes |
+| cf_core_writer_queue | consensus | overlay (`drain_core_writer`) | yes |
+| cf_consensus_meta | node-local (hotstuff block tree, markers, trie sentinel, trade format), EXCEPT key prefixes `pending_rotation:` (`staking.rs:1070`) and `validator_whitelist:` (`governance.rs:1491`) = consensus | consensus prefixes: overlay for submit / whitelist; **OUT (b)** for `apply_pending_rotations` deletes | partly |
+| cf_accounts, cf_storage, cf_code (EVM) | consensus | **OUT (c)** EVM bundle: `commit_evm_bundle_incremental` (`app.rs:1599`, own batch, `incremental.rs:378`) or fallback `commit_pending_bundle` (`app.rs:1607`), on the exec thread BEFORE the native flush; accounts also re-put through the overlay (`seed_from_bundle`, `app.rs:1801`) + native fee/reward credits via overlay | accounts: overlay part yes, bundle part **no**; storage/code **no** |
+| cf_block_headers, cf_block_bodies, cf_block_hash_to_number, cf_commit_manifest, cf_receipts, cf_logs, cf_logs_bloom, cf_tx_hash_to_location | derived | dispatch (`app.rs:5606`), `commit_block_metadata` (`app.rs:1615`), header fold into overlay (`app.rs:1807`), body put (`app.rs:2275-2289`) | mixed (excluded) |
+| cf_native_trades, cf_native_user_trades | node-local | background trade writer / sync fallback (`app.rs:2229`) | no (excluded) |
+| cf_book_order_rows | node-local (deterministic materialization) | overlay / sidecar | yes (excluded) |
+| cf_native_pending, cf_native_shards | node-local (DA) | mempool / network | no (excluded) |
+| cf_trie_nodes, cf_trie_accounts, cf_trie_storage, cf_hashed_accounts, cf_hashed_storage, cf_native_trie, cf_native_hashed | derived | EVM incremental commit, `resync_evm_accounts` (`app.rs:2167`), native trie in the batch | mixed (excluded) |
+| cf_state_hash_votes (NEW, Task 5) | consensus | overlay (`AttestStateHash`) | yes |
+
+### Out-of-batch consensus writes (flagged) and how they enter the hash
+
+All three are applied before the block's flush, so the hash routes them into
+**the same height's** `D(n)` as hash-only entries carried by the block's pending
+set (never written by the flush; the DB write stays where it is). Merge rule:
+these entries first, the overlay's own writes override per key (the overlay is
+flushed later, so this is the block's final value per key).
+
+- **(a) Slashes** (exec thread, serial path; pipelining is already disabled for
+  blocks with slashes): the slash loop runs over a recording `StateBackend`
+  that writes through to the DB and records every put/delete. *Pre-existing
+  divergence source, not fixed here:* the slash comes from a local observation
+  (`on_speculative_rollback`, `app.rs:5124-5160`) and is attached to whichever
+  block the node dispatches next, so nodes can disagree on whether and where it
+  is applied. The hash will report that as a mismatch, which is correct.
+- **(b) Consensus-thread epoch rotation**: timing is not tied to execution, so
+  the writes themselves cannot be attributed to a height. Deterministic point:
+  executing the epoch-boundary block (already a pipeline barrier), the exec
+  thread adds a snapshot of the full `cf_staking_validators` CF and all
+  `pending_rotation:` META rows as puts to `D(n)` (O(validators), once per
+  epoch). *Pre-existing hazard, not fixed here:* if execution lags by more than
+  one epoch, the consensus thread's writes for the next boundary are visible to
+  execution early; the hash would flag it.
+- **(c) EVM bundle**: deterministic (exec thread, serial path). The bundle's
+  plain-state writes (same mapping as `apply_bundle_plain`) are added to the
+  EVM domain of `D(n)`. Crash window (pre-existing): the EVM batch can be durable
+  while the native batch is not; replay then re-executes the block's EVM part on
+  a base that already contains it.
+
+Consensus writes outside block execution: none found (RPC, network, mempool and
+node writes outside tests touch only DA / derived CFs). Genesis state is written
+before activation and is not part of the hash (identical by genesis file).
