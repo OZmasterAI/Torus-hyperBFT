@@ -201,7 +201,8 @@ fn savebooks_deep_book_accumulate() {
     }
 }
 
-/// Realistic-depth sweep (multi-trader, bypasses the 200/trader/market cap).
+/// Realistic-depth sweep (multi-trader: 100/trader/market x 10 markets = the
+/// 1000 per-user open-order limit).
 /// Seed DEPTH resting orders at each of 40 levels across all 10 markets (=
 /// 400·DEPTH total resting, mirroring the in-vivo 195k), then in the next block
 /// touch every level once and time the save. save_books re-hashes 400 levels ×
@@ -220,9 +221,9 @@ fn savebooks_depth_sweep() {
     for depth in [1usize, 5, 25, 50, 100, 200, 400] {
         let (_d, db) = open_db();
         let mut holder = ResidentBooks::default();
-        // Fund a trader pool big enough for the deepest seed (≤200/trader/market).
-        let n_traders = ((LEVELS as usize * depth).div_ceil(200)).max(1) as u16 + 1;
-        // Block 1: seed. trader index rotates every 200 orders within a market.
+        // Fund a trader pool big enough for the deepest seed (≤100/trader/market).
+        let n_traders = ((LEVELS as usize * depth).div_ceil(100)).max(1) as u16 + 1;
+        // Block 1: seed. trader index rotates every 100 orders within a market.
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
         for t in 1..=n_traders {
@@ -233,7 +234,7 @@ fn savebooks_depth_sweep() {
             let mut slot = 0usize;
             for lvl in 0..LEVELS {
                 for _ in 0..depth {
-                    let t = (slot / 200) as u16 + 1;
+                    let t = (slot / 100) as u16 + 1;
                     slot += 1;
                     seed.push(place(addr(t as u8), gtc(m, true, 300 + lvl, 1)));
                 }
@@ -288,8 +289,8 @@ fn savebooks_depth_sweep() {
 fn savebooks_levelcache_ab() {
     const LEVELS: i64 = 40;
     const DEPTH: usize = 5;
-    // 5 append blocks × 40 levels = 200 orders/market for the append trader —
-    // exactly the per-trader-per-market cap; a 6th block would be rejected.
+    // 5 append blocks × 40 levels × 10 markets; one append trader per block
+    // (400 orders each, under the 1000 per-user open-order limit).
     const MEASURED: u64 = 5;
 
     // One universe: seed depth-5 books, then MEASURED workload blocks.
@@ -301,16 +302,15 @@ fn savebooks_levelcache_ab() {
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), 1, &mut holder);
         ctx.level_hash_cache_bytes = cache_mb * 1024 * 1024;
-        for t in 1..=3u8 {
+        for t in (1..=3u8).chain(251..=255) {
             fund(&ctx, &addr(t), fp(1_000_000_000_000));
         }
-        fund(&ctx, &addr(255), fp(1_000_000_000_000));
         let mut seed = Vec::new();
         for m in 1..=N_MARKETS {
             let mut slot = 0usize;
             for lvl in 0..LEVELS {
                 for _ in 0..DEPTH {
-                    let t = (slot / 200) as u8 + 1;
+                    let t = (slot / 100) as u8 + 1;
                     slot += 1;
                     seed.push(place(addr(t), gtc(m, true, 300 + lvl, 10)));
                 }
@@ -352,7 +352,7 @@ fn savebooks_levelcache_ab() {
                 // Append one fresh resting order at every level.
                 for m in 1..=N_MARKETS {
                     for lvl in 0..LEVELS {
-                        batch.push(place(addr(255), gtc(m, true, 300 + lvl, 1)));
+                        batch.push(place(addr(250 + b as u8), gtc(m, true, 300 + lvl, 1)));
                     }
                 }
             }
