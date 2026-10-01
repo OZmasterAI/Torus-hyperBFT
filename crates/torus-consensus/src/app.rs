@@ -14870,12 +14870,18 @@ mod crash_recovery_tests {
             .unwrap()
     }
 
-    fn set_signer_action(h: u64, seed: u8, signer: Address) -> SignedNativeAction {
-        torus_types::eip712::sign_native_action(
-            NativeAction::SetOracleSigner { signer },
-            h * 1_000 + 500 + seed as u64,
-            &oracle_key(seed),
-        )
+    /// `SetOracleSigner` from validator `seed`; `signer` = the new signer's key
+    /// (its proof of possession, review M3) or `None` to clear.
+    fn set_signer_action(h: u64, seed: u8, signer: Option<&k256::ecdsa::SigningKey>) -> SignedNativeAction {
+        let nonce = h * 1_000 + 500 + seed as u64;
+        let action = match signer {
+            None => NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None },
+            Some(k) => NativeAction::SetOracleSigner {
+                signer: key_addr(k),
+                proof: Some(torus_types::eip712::sign_oracle_signer_proof(&oracle_addr(seed), nonce, k)),
+            },
+        };
+        torus_types::eip712::sign_native_action(action, nonce, &oracle_key(seed))
     }
 
     fn signer_submit(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64) -> SignedNativeAction {
@@ -14918,7 +14924,7 @@ mod crash_recovery_tests {
         let ctx = make_exec_ctx(&config, &db);
         let set: Vec<_> = ORACLE_VALIDATORS
             .iter()
-            .map(|&(s, _)| set_signer_action(1, s, key_addr(&signer_key(s))))
+            .map(|&(s, _)| set_signer_action(1, s, Some(&signer_key(s))))
             .collect();
         let subs: Vec<_> = [(61u8, 100i64), (62, 101), (63, 102)]
             .iter()
@@ -14947,8 +14953,8 @@ mod crash_recovery_tests {
         let ctx = make_exec_ctx(&config, &db);
         let (old, new) = (signer_key(61), oracle_key(222));
         let blocks = blocks_of(vec![
-            vec![set_signer_action(1, 61, key_addr(&old))],
-            vec![set_signer_action(2, 61, key_addr(&new)), signer_submit(2, &old, 1, 100)],
+            vec![set_signer_action(1, 61, Some(&old))],
+            vec![set_signer_action(2, 61, Some(&new)), signer_submit(2, &old, 1, 100)],
             vec![signer_submit(3, &old, 1, 500)],
             vec![signer_submit(4, &new, 2, 700)],
         ]);
@@ -14981,20 +14987,20 @@ mod crash_recovery_tests {
         let new61 = oracle_key(222);
         let set: Vec<_> = ORACLE_VALIDATORS
             .iter()
-            .map(|&(s, _)| set_signer_action(1, s, key_addr(&signer_key(s))))
+            .map(|&(s, _)| set_signer_action(1, s, Some(&signer_key(s))))
             .collect();
         let subs = |h: u64, p: i64| -> Vec<SignedNativeAction> {
             ORACLE_VALIDATORS.iter().map(|&(s, _)| signer_submit(h, &signer_key(s), s, p)).collect()
         };
         let mut b4 = subs(4, 300);
-        b4.push(set_signer_action(4, 61, key_addr(&new61)));
+        b4.push(set_signer_action(4, 61, Some(&new61)));
         let blocks = blocks_of(vec![
             set,
             subs(2, 100),
             vec![],
             b4,
             vec![signer_submit(5, &signer_key(61), 61, 900), signer_submit(5, &new61, 1, 310)],
-            vec![set_signer_action(6, 62, Address::ZERO)],
+            vec![set_signer_action(6, 62, None)],
             subs(7, 400), // 62's cleared signer is rejected
             // review M1(b): two samples of V63 in one block; the newer (450)
             // must win whatever the in-block order.
