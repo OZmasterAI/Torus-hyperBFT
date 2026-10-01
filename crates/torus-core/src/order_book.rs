@@ -21,6 +21,9 @@ use crate::error::CoreError;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
+mod trader_orders;
+
+use trader_orders::TraderOrders;
 
 #[cfg(test)]
 mod matching_entry_tests;
@@ -244,7 +247,7 @@ pub struct OrderBook {
     /// O(1) order lookup by ID → location.
     order_index: HashMap<OrderId, OrderLocation>,
     /// Per-trader order tracking for cancel-all.
-    trader_orders: HashMap<Address, Vec<OrderId>>,
+    trader_orders: HashMap<Address, TraderOrders>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
     pub tick_size: FixedPoint,
@@ -603,7 +606,7 @@ impl OrderBook {
         }
 
         if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
-            ids.retain(|&id| id != order_id);
+            ids.remove(order_id);
             if ids.is_empty() {
                 self.trader_orders.remove(&order.trader);
             }
@@ -638,7 +641,7 @@ impl OrderBook {
         // no resting order.
         self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
-            Some(ids) => ids,
+            Some(ids) => ids.to_vec(),
             None => return vec![],
         };
 
@@ -880,7 +883,7 @@ impl OrderBook {
     /// Orders of `trader` that hold an open-order slot: resting orders plus
     /// pending stops (stops are rare, so a scan is fine).
     pub fn open_order_count(&self, trader: &Address) -> usize {
-        self.trader_orders.get(trader).map_or(0, Vec::len)
+        self.trader_orders.get(trader).map_or(0, TraderOrders::len)
             + self.pending_stops.iter().filter(|s| s.trader == *trader).count()
     }
 
@@ -888,7 +891,7 @@ impl OrderBook {
     /// with one pass over the pending stops (not one per trader).
     pub fn add_open_order_counts(&self, idx: &HashMap<Address, usize>, counts: &mut [usize]) {
         for (trader, &i) in idx {
-            counts[i] += self.trader_orders.get(trader).map_or(0, Vec::len);
+            counts[i] += self.trader_orders.get(trader).map_or(0, TraderOrders::len);
         }
         for stop in &self.pending_stops {
             if let Some(&i) = idx.get(&stop.trader) {
@@ -1058,7 +1061,7 @@ impl OrderBook {
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
-        trader_orders: &mut HashMap<Address, Vec<OrderId>>,
+        trader_orders: &mut HashMap<Address, TraderOrders>,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
@@ -1091,7 +1094,7 @@ impl OrderBook {
                 let cancelled = queue.pop_front().unwrap();
                 order_index.remove(&cancelled.id);
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
-                    ids.retain(|&id| id != cancelled.id);
+                    ids.remove(cancelled.id);
                 }
                 let seq = order_seq.remove(&cancelled.id);
                 Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
@@ -1141,7 +1144,7 @@ impl OrderBook {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
-                    ids.retain(|&id| id != filled.id);
+                    ids.remove(filled.id);
                 }
                 order_seq.remove(&filled.id);
             }
@@ -3299,6 +3302,65 @@ mod tests {
         assert_eq!(ob.pending_stop_count(), 1);
         assert_eq!(ob.orders_for_trader(&a).len(), 3);
         assert_eq!(ob.open_order_count(&a), 4);
+    }
+
+    /// `cancel_all` returns a trader's orders in its `trader_orders` order:
+    /// arrival order for a live book, decode (level) order after a reload —
+    /// and mid-list removals (cancel, maker fill, STP) never reorder it.
+    #[test]
+    fn cancel_all_output_order_survives_mid_list_removals() {
+        let a = addr(1);
+        let scenario = |ob: &mut OrderBook, ids: &[OrderId]| {
+            for (k, id) in ids.iter().enumerate() {
+                if k % 3 == 0 {
+                    ob.cancel_order(*id).unwrap();
+                }
+            }
+            // Maker fills on a's best asks, then an STP walk of level 200 by
+            // a's own bid (which then rests: a new arrival at the end).
+            ob.place_order(market_buy(fp(4)), addr(2), 0);
+            ob.place_order(limit_buy(fp(201), fp(1)), a, 0);
+            for k in 0..5 {
+                ob.place_order(limit_sell(fp(300 + k), fp(1)), a, 0);
+            }
+        };
+
+        // Live book: arrival order = ascending id.
+        let mut ob = book();
+        let ids: Vec<OrderId> = (0..100)
+            .map(|k| ob.place_order(limit_sell(fp(200 + k % 7), fp(1)), a, 0).order_id)
+            .collect();
+        scenario(&mut ob, &ids);
+        let mut live: Vec<OrderId> = ob.orders_for_trader(&a).iter().map(|o| o.id).collect();
+        live.sort_unstable();
+        assert!(live.len() > 50);
+        let got: Vec<OrderId> = ob.cancel_all(a, None).iter().map(|o| o.id).collect();
+        assert_eq!(got, live);
+
+        // Reloaded book: decode order (bids, then asks by level), not ids.
+        let mut ob = book();
+        let ids: Vec<OrderId> = (0..100)
+            .map(|k| ob.place_order(limit_sell(fp(200 + k % 7), fp(1)), a, 0).order_id)
+            .collect();
+        let mut ob = OrderBook::try_from_slice(&borsh::to_vec(&ob).unwrap()).unwrap();
+        let decode_order: Vec<OrderId> = ob
+            .bid_queues()
+            .chain(ob.ask_queues())
+            .flat_map(|(_, q)| q.iter().map(|o| o.id))
+            .collect();
+        assert_ne!(decode_order, ids, "level order differs from arrival order");
+        scenario(&mut ob, &ids);
+        let want: Vec<OrderId> = decode_order
+            .iter()
+            .copied()
+            .filter(|id| ob.get_order(*id).is_some())
+            .chain(
+                (ids[99] + 1..ob.next_order_id())
+                    .filter(|id| ob.get_order(*id).is_some_and(|o| o.trader == a)),
+            )
+            .collect();
+        let got: Vec<OrderId> = ob.cancel_all(a, None).iter().map(|o| o.id).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
