@@ -327,3 +327,44 @@ No fix needed; the 24-byte `cvlm` rows are covered by the native root.
 ~210 ms for 5000 senders, serial. It runs inside the Phase-2 margin timer
 (`exec_phase_margin_seconds`), so Task 11 cells show it there. If it is
 visible, the pass splits by book chunks across the engine workers.
+
+### Review follow-up (s83 static review)
+
+1. **Pass B coverage**: `cum_volume_pass_b_balance_failure_stops_at_the_failed_side`
+   fails a maker's realized-PnL balance credit (corrupt balance row, not
+   cached by Phase 2), so parallel pass B itself stops the order; it asserts
+   no sequential fallback (`ExecPhaseAccum::settle_fallbacks`). Pass B
+   debug-asserts it never sees a worker `fill_error`.
+2. **Count cost**: `add_open_order_counts` walks the smaller of a book's
+   traders and the call's senders (empty books cost nothing);
+   `order_book::open_order_counts` splits books across scoped workers, one
+   per 25k probes of actual walk, capped at the match worker cap (integer
+   sums, split-independent). Release probe
+   (`crates/torus-core/tests/open_order_cost_probe.rs`, 300 books, shared host):
+
+   | shape | before | after serial | after, 8 workers |
+   |---|---|---|---|
+   | 5000 traders/book, 5000 senders | 229 ms | 271 ms | 38 ms |
+   | 5000 traders/book, 400 senders | 35 ms | 37 ms | 12 ms |
+   | 50 traders/book, 5000 senders | 54 ms | 0.8 ms | 0.8 ms (stays serial) |
+   | 290 of 300 books empty, 5000 senders | 9.6 ms | 9.1 ms | 11 ms |
+
+   It runs once per `execute_batch` call (twice per block) and once per
+   CoreWriter PlaceOrder (single sender: one probe per book).
+3. **Removal cost**: a trader's per-book id list is a `TraderOrders`
+   (holes + order-keeping compaction, O(1) amortized removal) instead of a
+   `Vec` with `retain`; `cancel_all` output order is unchanged
+   (`cancel_all_output_order_survives_mid_list_removals`). 5000 removals of
+   one trader's orders: cancel 18.6 -> 5.9 ms, maker fills 17.5 -> 3.5 ms,
+   STP 18.9 -> 4.1 ms.
+4. **`torus_getUserLimits`**: counts in torus-rpc with streamed RocksDB
+   iterators, decodes only the trader's own order rows
+   (`OrderBook::order_row_trader`), and seeks once per market for stop rows.
+   `book_reader::read_open_order_count` (Deviation 7) is gone. Unlike
+   `getOpenOrders`, it does not detect a stale mode-2 order store (it would
+   undercount rather than error).
+5. **Per call, not per block**: see Design Decision; pinned by
+   `open_limit_is_taken_at_each_execute_batch_start`.
+6. **Tests added**: reload vs resident books in all four book modes,
+   margin-rejected order takes no slot, book-rejected orders keep their slot
+   for the call, stop-only cancel-all persisted in all four modes.
