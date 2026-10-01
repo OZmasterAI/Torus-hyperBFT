@@ -1,9 +1,22 @@
 # Design: Validator price feeder (item 2, option B) — rev. 2
 
-**Status (s517):** design + plan only. Branch `feat/oracle-feeder` @ `d4fe69c`, stacked on
-`feat/oracle-aggregation` (option A: time-based on-chain aggregation, window 10 s, stale 60 s,
->= 3 reporters holding > 2/3 of Active stake). Plan: `docs/plans/oracle-feeder-impl.md`,
-tasks: `PRPs/oracle-feeder.tasks.json`.
+**Status (s517): implemented** on `feat/oracle-feeder` (local), stacked on
+`feat/oracle-aggregation` @ `d4fe69c` (option A: time-based on-chain aggregation, window 10 s,
+stale 60 s, >= 3 reporters holding > 2/3 of Active stake). Plan:
+`docs/plans/oracle-feeder-impl.md` (its "Implementation corrections" section lists every
+deviation from the draft). Runbook: `tools/price-feeder/README.md`.
+
+| Commit | Content |
+|--------|---------|
+| `6b33a7d` | 1. Oracle signer: `SetOracleSigner`, `ValidatorState.oracle_signer`, reverse index, reporter resolution. Consensus, lockstep, fresh genesis. |
+| `cbab523` | 2. Mempool priority: cancels, then oracle, then the rest. Active validator/signer gate, 4 per validator, RPC screens, pacing tier. Node-local. |
+| `5633829` | 3. RPC: `getValidators.oracleSigner`; ingress checks for oracle submissions. |
+| `55cb396` | 4. Wallet: lib + bin; `torus-wallet set-oracle-signer` (flat command, not `validator set-oracle-signer`). |
+| `1c4b164` | 5. `tools/price-feeder` library. |
+| `d20715b` | 6. Feeder CLI, `/health` + `/metrics`, end-to-end test against a real RPC server. |
+
+Q-S1 is decided: the signer's own account is unrestricted (D-S1), with no per-action lookup.
+Q-S2: a Candidate may set its signer; a Tombstoned validator may not.
 
 Rev. 2 applies the user decisions on rev. 1:
 
@@ -161,7 +174,7 @@ This is pinned by a test.
 
 * `tools/wallet` becomes lib + bin (`src/lib.rs` exports `keystore`). The feeder reuses the
   keystore code instead of copying it.
-* `torus-wallet --keystore <validator EVM keystore> validator set-oracle-signer --signer <addr>`
+* `torus-wallet --keystore <validator EVM keystore> set-oracle-signer --signer <addr>` (s517: flat command; the wallet has no `validator` group)
   (or `--clear`). The operator runs it once, and again only to rotate.
 * `price-feeder keygen --keystore <out>` creates the signer keystore with the wallet code. It
   prints the signer address and the exact `set-oracle-signer` command.
