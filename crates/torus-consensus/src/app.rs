@@ -2452,12 +2452,13 @@ impl ExecutionContext {
             }
         }
 
-        // Running state hash: attest durable checkpoints (reads only).
+        // Running state hash: mismatch detection + own attestations (reads only).
         self.state_hash.after_block(
             torus_block,
             &self.state_db,
             self.mempool.as_deref(),
             self.metrics.as_deref(),
+            &self.exec_failed,
         );
 
         tracing::info!(height, "execution pipeline: block done");
@@ -14034,5 +14035,135 @@ mod crash_recovery_tests {
         b155.header.parent_hash = alloy_primitives::keccak256(b154.header.canonical_header_bytes());
         dispatch_and_execute(&ctx, &state_db, &b155);
         assert!(pooled_attestations(&m4).is_empty(), "non-validator key");
+    }
+
+    // ---- Running state hash: mismatch detection + gated fail-stop (Task 7) ----
+
+    fn validator_keys() -> [k256::ecdsa::SigningKey; 3] {
+        [81u8, 82, 83].map(|b| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap())
+    }
+
+    /// A node (serial or pipelined) at height 100 with 3 active validators;
+    /// returns it with its metrics and its local checkpoint at 100.
+    fn node_at_checkpoint(
+        pipelined: bool,
+        failstop: bool,
+    ) -> (ExecutionContext, StateDb, Arc<torus_telemetry::Metrics>, B256) {
+        let (config, state_db) = make_test_config_and_db();
+        let keys = validator_keys();
+        seed_active_validators(&state_db, &[&keys[0], &keys[1], &keys[2]]);
+        let mut ctx = make_exec_ctx(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.state_hash = Arc::new(crate::state_hash::StateHashMonitor::with_failstop(failstop));
+        if pipelined {
+            ctx.attach_flush_worker(None);
+        }
+        run_empty_blocks(&ctx, &state_db, 1, 100);
+        let local = torus_state::running_hash::read_checkpoint(&state_db, 100).unwrap();
+        (ctx, state_db, metrics, B256::from(local))
+    }
+
+    /// Block 101 carrying `votes` (validator index, hash) for checkpoint 100,
+    /// then an empty 102 (lets a pipelined node make 101 durable).
+    fn run_votes(ctx: &ExecutionContext, state_db: &StateDb, votes: &[(usize, B256)]) -> TorusBlock {
+        let keys = validator_keys();
+        let actions = votes
+            .iter()
+            .enumerate()
+            .map(|(i, (v, hash))| {
+                torus_types::eip712::sign_native_action(
+                    NativeAction::AttestStateHash { height: 100, hash: *hash },
+                    1_000 + i as u64,
+                    &keys[*v],
+                )
+            })
+            .collect();
+        let b101 = make_block(101, actions);
+        dispatch_and_execute(ctx, state_db, &b101);
+        let mut b102 = make_block(102, vec![]);
+        b102.header.parent_hash = alloy_primitives::keccak256(b101.header.canonical_header_bytes());
+        dispatch_and_execute(ctx, state_db, &b102);
+        b101
+    }
+
+    fn mismatch_count(metrics: &torus_telemetry::Metrics, who: &str) -> u64 {
+        let text = metrics.encode();
+        let needle = format!("torus_state_hash_mismatch_total{{validator=\"{who}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&needle))
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    /// Task 7: a vote that differs from the local checkpoint raises the
+    /// mismatch metric for that validator on every node (serial and pipelined),
+    /// once; matching votes raise nothing; default (fail-stop unset) never
+    /// latches; detection never writes state.
+    #[test]
+    fn state_hash_mismatch_differing_vote_reported_on_every_node_and_never_writes() {
+        let addr_of = |i: usize| k256_address(&validator_keys()[i]).to_string();
+        for pipelined in [false, true] {
+            let (ctx, db, metrics, local) = node_at_checkpoint(pipelined, false);
+            let other = B256::repeat_byte(0xee);
+            let b101 = run_votes(&ctx, &db, &[(0, local), (1, other)]);
+            assert_eq!(mismatch_count(&metrics, &addr_of(1)), 1, "pipelined={pipelined}");
+            assert_eq!(mismatch_count(&metrics, &addr_of(0)), 0, "matching vote");
+            assert_eq!(mismatch_count(&metrics, "quorum"), 0);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop off by default");
+
+            // Re-running detection (fresh monitor, fail-stop on) writes nothing.
+            drop(ctx); // drains W
+            let before = dump_all_cfs(&db);
+            let monitor = crate::state_hash::StateHashMonitor::with_failstop(true);
+            let latch = AtomicBool::new(false);
+            for _ in 0..2 {
+                monitor.after_block(&b101, &db, None, Some(&metrics), &latch);
+            }
+            assert_dumps_equal(&before, &dump_all_cfs(&db), "detection is read-only");
+            assert!(!latch.load(Ordering::SeqCst), "no quorum -> nothing to fail-stop on");
+        }
+    }
+
+    /// Task 7: a quorum hash that differs from the local checkpoint is reported
+    /// (`validator="quorum"`); it latches `exec_failed` ONLY with fail-stop on.
+    /// All votes in without a quorum -> the no-quorum metric.
+    #[test]
+    fn state_hash_mismatch_quorum_failstop_gated_and_no_quorum_metric() {
+        let x = B256::repeat_byte(0xee);
+        for failstop in [false, true] {
+            let (ctx, db, metrics, _local) = node_at_checkpoint(false, failstop);
+            run_votes(&ctx, &db, &[(0, x), (1, x), (2, x)]);
+            assert_eq!(
+                StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(),
+                Some(x.0),
+                "quorum recorded on-chain"
+            );
+            assert_eq!(mismatch_count(&metrics, "quorum"), 1, "failstop={failstop}");
+            assert_eq!(ctx.exec_failed.load(Ordering::SeqCst), failstop, "latched iff fail-stop on");
+        }
+
+        let (ctx, db, metrics, local) = node_at_checkpoint(false, true);
+        run_votes(&ctx, &db, &[(0, local), (1, local), (2, x)]);
+        assert_eq!(StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(), None);
+        assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_no_quorum_total"), 1.0);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no quorum never latches");
+
+        // Matching quorum: no mismatch, no latch.
+        let (ctx, db, metrics, local) = node_at_checkpoint(false, true);
+        run_votes(&ctx, &db, &[(0, local), (1, local), (2, local)]);
+        assert_eq!(mismatch_count(&metrics, "quorum"), 0);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn state_hash_mismatch_failstop_env_is_off_unless_exactly_1() {
+        use crate::state_hash::parse_failstop;
+        assert!(!parse_failstop(None));
+        for off in ["0", "", "true", "yes", "2"] {
+            assert!(!parse_failstop(Some(off.to_string())), "{off:?}");
+        }
+        assert!(parse_failstop(Some("1".to_string())));
+        assert!(parse_failstop(Some(" 1 ".to_string())));
     }
 }
