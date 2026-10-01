@@ -444,12 +444,12 @@ impl OrderBook {
         let mut stop_owners = Vec::new();
         let mut out = Vec::with_capacity(senders.len());
         for (sender, range) in senders.iter().zip(ranges) {
+            stop_owners.push(*sender);
             let Some(range) = range else {
                 out.push(Vec::new());
                 continue;
             };
             self.trader_orders.remove(sender);
-            stop_owners.push(*sender);
             let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
             for order in &orders {
                 let loc = self
@@ -871,14 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_batch_preserves_stop_only_early_return() {
+    fn cancel_batch_stop_only_trader_loses_its_stops() {
         let mut a = fixture(1024, 40, 0, 0);
         let mut b = fixture(1024, 40, 0, 0);
         assert_eq!(
             a.cancel_all(addr(3), None),
             b.cancel_all_original(addr(3), None)
         );
-        assert_eq!(a.pending_stop_count(), 2);
+        assert_eq!(a.pending_stop_count(), 1);
         assert_same(&mut a, &mut b);
     }
 
@@ -909,9 +909,11 @@ mod tests {
 }
 
 // Frozen080c4fa oracle: keep the old loop independent of the batch helpers.
+// Only change since: stops go before the early return (open-order limit).
 #[cfg(test)]
 impl OrderBook {
     fn cancel_all_original(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+        self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids,
             None => return vec![],
@@ -955,9 +957,6 @@ impl OrderBook {
                 }
             }
         }
-
-        // Also remove pending stops for this trader
-        self.pending_stops.retain(|s| s.trader != trader);
 
         cancelled
     }
