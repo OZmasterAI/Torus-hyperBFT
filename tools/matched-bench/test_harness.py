@@ -667,6 +667,27 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('--cancel-fraction "$CANCEL_FRACTION"', bench)
         self.assertIn('--band "$BAND"', bench)
 
+    def test_panic_count_ignores_info_level_failstop_config_line(self):
+        """s83: every running-hash node logs `INFO ... fail-stop (...) on=false`
+        at startup; counting it made every hash cell DISAGREE. Real fail-stops
+        (ERROR/WARN) and raw `panicked` lines must still count."""
+        with open(RUN_CELL_SH) as f:
+            line = next(l for l in f if l.lstrip().startswith("panics=$(grep"))
+        esc = "\x1b"
+        sample = "\n".join([
+            f"{esc}[2m2026-10-01T22:25:23Z{esc}[0m {esc}[32m INFO{esc}[0m state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
+            "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
+            f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: STATE HASH FAIL-STOP latched at checkpoint 1900",
+            "thread 'torus-execution' panicked at crates/x.rs:1:1",
+            "2026-10-01T22:31:00Z  WARN app: Latching fail-stop: conflicting blocks",
+        ]) + "\n"
+        lg = os.path.join(tempfile.mkdtemp(prefix="panics-"), "val0.log")
+        with open(lg, "w") as f:
+            f.write(sample)
+        r = subprocess.run(["bash", "-c", line.strip() + '; echo "$panics"'],
+                           capture_output=True, text=True, env=dict(os.environ, lg=lg))
+        self.assertEqual(r.stdout.strip(), "3", r.stderr)
+
     def test_restart_uses_the_same_argv_as_launch(self):
         """launch-3val.sh and crash-kill.sh must start a node through ONE
         implementation: a restart with different flags is not a crash gate."""

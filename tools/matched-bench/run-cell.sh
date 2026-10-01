@@ -733,7 +733,8 @@ for i in 0 1 2; do
     # mid-run "resident books stale" stall — check val$i.log.excerpt for the reason.
     rebuilds=$(mval torus_exec_resident_rebuilds_total < "$OUT/metrics-after-val$i.txt")
     lg="$RUN_DIR/val$i.log"
-    panics=$(grep -c -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null); panics=${panics:-0}
+    # s83: INFO/DEBUG/TRACE lines are config echoes (e.g. "state hash fail-stop ... on=false"), not failures.
+    panics=$(grep -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null | grep -cvE ' (INFO|DEBUG|TRACE)[^A-Z]'); panics=${panics:-0}
     errors=$(grep -c ' ERROR ' "$lg" 2>/dev/null); errors=${errors:-0}
     printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","digest_height":%s,"digest_seconds":%s,"matched":%s,"placed":%s,"resting":%s,"actions":%s,"resident_rebuilds":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
         "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${DHGT[$i]}" "${DIGSECS[$i]}" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "${rebuilds%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
