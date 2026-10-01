@@ -9,8 +9,17 @@ use serde_json::Value;
 use crate::config::{Exchange, QuoteMode};
 use crate::price::{parse_price, FixedPoint};
 
-/// symbol -> (bid, ask) as quoted by the venue.
-pub type Quotes = HashMap<String, (FixedPoint, FixedPoint)>;
+/// One venue quote: best bid / ask and, review L3, the venue's own timestamp
+/// (unix ms) when it sends one (OKX per row, Bybit and KuCoin per response).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tick {
+    pub bid: FixedPoint,
+    pub ask: FixedPoint,
+    pub ts_ms: Option<u64>,
+}
+
+/// symbol -> tick as quoted by the venue.
+pub type Quotes = HashMap<String, Tick>;
 
 /// Kraken's USDT/USD pair, fetched in `kraken_usdt` mode.
 pub const KRAKEN_USDT_USD: &str = "USDTZUSD";
@@ -102,11 +111,15 @@ fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
 
-/// Collect `(symbol, bid, ask)` rows; a row with a missing or unparsable field
-/// is dropped alone.
-fn rows<'a>(items: impl Iterator<Item = (Option<&'a str>, Option<&'a str>, Option<&'a str>)>) -> Quotes {
+type Row<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<u64>);
+
+/// Collect `(symbol, bid, ask, ts)` rows; a row with a missing or unparsable
+/// price is dropped alone.
+fn rows<'a>(items: impl Iterator<Item = Row<'a>>) -> Quotes {
     items
-        .filter_map(|(sym, bid, ask)| Some((sym?.to_string(), (parse_price(bid?)?, parse_price(ask?)?))))
+        .filter_map(|(sym, bid, ask, ts_ms)| {
+            Some((sym?.to_string(), Tick { bid: parse_price(bid?)?, ask: parse_price(ask?)?, ts_ms }))
+        })
         .collect()
 }
 
@@ -127,21 +140,24 @@ pub fn parse_quotes(ex: Exchange, body: &str) -> Result<Quotes, String> {
     Ok(match ex {
         Exchange::Binance | Exchange::Mexc => {
             let a = array(&v, name)?;
-            rows(a.iter().map(|t| (s(t, "symbol"), s(t, "bidPrice"), s(t, "askPrice"))))
+            rows(a.iter().map(|t| (s(t, "symbol"), s(t, "bidPrice"), s(t, "askPrice"), None)))
         }
         Exchange::Okx => {
             if s(&v, "code") != Some("0") {
                 return Err(format!("okx: error {}", truncate(&v)));
             }
             let a = v.get("data").ok_or("okx: no data")?;
-            rows(array(a, name)?.iter().map(|t| (s(t, "instId"), s(t, "bidPx"), s(t, "askPx"))))
+            rows(array(a, name)?.iter().map(|t| {
+                (s(t, "instId"), s(t, "bidPx"), s(t, "askPx"), s(t, "ts").and_then(|x| x.parse().ok()))
+            }))
         }
         Exchange::Bybit => {
             if v.get("retCode").and_then(Value::as_i64) != Some(0) {
                 return Err(format!("bybit: error {}", truncate(&v)));
             }
             let a = v.pointer("/result/list").ok_or("bybit: no result.list")?;
-            rows(array(a, name)?.iter().map(|t| (s(t, "symbol"), s(t, "bid1Price"), s(t, "ask1Price"))))
+            let ts = v.get("time").and_then(Value::as_u64);
+            rows(array(a, name)?.iter().map(|t| (s(t, "symbol"), s(t, "bid1Price"), s(t, "ask1Price"), ts)))
         }
         Exchange::Kraken => {
             match v.get("error").and_then(Value::as_array) {
@@ -153,7 +169,7 @@ pub fn parse_quotes(ex: Exchange, body: &str) -> Result<Quotes, String> {
             r.iter()
                 .filter_map(|(k, t)| {
                     let (b, a) = (first(t, "b")?, first(t, "a")?);
-                    Some((k.clone(), (parse_price(&b)?, parse_price(&a)?)))
+                    Some((k.clone(), Tick { bid: parse_price(&b)?, ask: parse_price(&a)?, ts_ms: None }))
                 })
                 .collect()
         }
@@ -162,11 +178,12 @@ pub fn parse_quotes(ex: Exchange, body: &str) -> Result<Quotes, String> {
                 return Err(format!("kucoin: error {}", truncate(&v)));
             }
             let a = v.pointer("/data/ticker").ok_or("kucoin: no data.ticker")?;
-            rows(array(a, name)?.iter().map(|t| (s(t, "symbol"), s(t, "buy"), s(t, "sell"))))
+            let ts = v.pointer("/data/time").and_then(Value::as_u64);
+            rows(array(a, name)?.iter().map(|t| (s(t, "symbol"), s(t, "buy"), s(t, "sell"), ts)))
         }
         Exchange::Gate => {
             let a = array(&v, name)?;
-            rows(a.iter().map(|t| (s(t, "currency_pair"), s(t, "highest_bid"), s(t, "lowest_ask"))))
+            rows(a.iter().map(|t| (s(t, "currency_pair"), s(t, "highest_bid"), s(t, "lowest_ask"), None)))
         }
     })
 }
@@ -232,13 +249,13 @@ mod tests {
         ];
         for (ex, sym, bid, ask) in btc {
             let q = parse_quotes(ex, fx(ex)).unwrap_or_else(|e| panic!("{ex:?}: {e}"));
-            assert_eq!(q.get(sym), Some(&(p(bid), p(ask))), "{ex:?}");
+            assert_eq!(q.get(sym).map(|t| (t.bid, t.ask)), Some((p(bid), p(ask))), "{ex:?}");
             assert!(q.len() >= 3, "{ex:?}: {q:?}");
         }
         let k = parse_quotes(Exchange::Kraken, fx(Exchange::Kraken)).unwrap();
-        assert_eq!(k.get(KRAKEN_USDT_USD), Some(&(p("0.99943"), p("0.99944"))));
+        assert_eq!(k.get(KRAKEN_USDT_USD).map(|t| (t.bid, t.ask)), Some((p("0.99943"), p("0.99944"))));
         let b = parse_quotes(Exchange::Binance, fx(Exchange::Binance)).unwrap();
-        assert_eq!(b.get("POLUSDT"), Some(&(p("0.11164"), p("0.11165"))));
+        assert_eq!(b.get("POLUSDT").map(|t| (t.bid, t.ask)), Some((p("0.11164"), p("0.11165"))));
     }
 
     #[test]
@@ -267,7 +284,7 @@ mod tests {
                        {"symbol":"CUSDT","bidPrice":null,"askPrice":"2.1"}]"#;
         let q = parse_quotes(Exchange::Mexc, body).unwrap();
         assert_eq!(q.len(), 1);
-        assert_eq!(q.get("BUSDT"), Some(&(p("2"), p("2.1"))));
+        assert_eq!(q.get("BUSDT").map(|t| (t.bid, t.ask)), Some((p("2"), p("2.1"))));
     }
 
     #[test]
@@ -334,5 +351,18 @@ mod tests {
         let none = crate::testing::FakeHttp::default();
         check_kraken_pairs(&none, "fake://kraken", &[], t).await.unwrap();
         assert!(none.calls().is_empty());
+    }
+
+    /// Review L3: venue timestamps (OKX per row, Bybit and KuCoin per
+    /// response) are kept with each quote; the others have none.
+    #[test]
+    fn venue_timestamps_are_parsed() {
+        let ts = |ex: Exchange, sym: &str| parse_quotes(ex, fx(ex)).unwrap()[sym].ts_ms;
+        assert_eq!(ts(Exchange::Okx, "BTC-USDT"), Some(1_790_844_872_077));
+        assert_eq!(ts(Exchange::Bybit, "BTCUSDT"), Some(1_790_844_873_040));
+        assert_eq!(ts(Exchange::Kucoin, "BTC-USDT"), Some(1_790_844_874_092));
+        for (ex, sym) in [(Exchange::Binance, "BTCUSDT"), (Exchange::Kraken, "XXBTZUSD"), (Exchange::Gate, "BTC_USDT"), (Exchange::Mexc, "BTCUSDT")] {
+            assert_eq!(ts(ex, sym), None, "{ex:?}");
+        }
     }
 }

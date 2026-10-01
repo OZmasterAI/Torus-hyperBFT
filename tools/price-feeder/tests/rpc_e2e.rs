@@ -11,7 +11,7 @@ use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_price_feeder::config::{Config, Exchange};
 use torus_price_feeder::feeder::{CycleOutcome, Feeder};
-use torus_price_feeder::fetch::SystemClock;
+use torus_price_feeder::fetch::{Clock, SystemClock};
 use torus_price_feeder::node::{startup_check, RpcNode};
 use torus_price_feeder::price::parse_price;
 use torus_price_feeder::testing::FakeHttp;
@@ -105,7 +105,7 @@ async fn one_cycle_admits_signer_submission(mcfg: MempoolConfig) {
     let c = cfg(&url);
     startup_check(&c, &node, signer()).await.expect("registered signer passes the startup check");
 
-    let mut f = Feeder::new(c, Arc::new(FakeHttp::with_fixtures()), node, SystemClock, signer_key());
+    let mut f = Feeder::new(c, Arc::new(FakeHttp::with_fixtures_at(SystemClock.now_ms())), node, SystemClock, signer_key());
     let r = f.run_cycle().await;
     assert_eq!(r.outcome, CycleOutcome::Submitted { ok: 1, failed: 0 }, "{r:?}");
     assert_eq!(mempool.native_pool_size(), 1);
@@ -142,7 +142,7 @@ async fn unregistered_signer_fails_the_startup_check_and_sends_nothing() {
     let node = RpcNode::new(&url).unwrap();
     let e = startup_check(&cfg(&url), &node, signer()).await.unwrap_err();
     assert!(e.contains("set-oracle-signer --signer"), "{e}");
-    let mut f = Feeder::new(cfg(&url), Arc::new(FakeHttp::with_fixtures()), node, SystemClock, signer_key());
+    let mut f = Feeder::new(cfg(&url), Arc::new(FakeHttp::with_fixtures_at(SystemClock.now_ms())), node, SystemClock, signer_key());
     assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::Idle(_)));
     assert_eq!(mempool.native_pool_size(), 0);
     handle.stop().unwrap();
