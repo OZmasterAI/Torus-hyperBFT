@@ -42,6 +42,14 @@ C5 recorded as known limitations.
     on the block-start mark (`begin_block_oracle`, app.rs:2227). EVM runs before the native
     phase, so the EVM sees a block's liquidations in the next block.
 
+## Review fixes (user decisions, s517 review)
+
+* **H2 — no dust shield.** Replaces decision 9's "skip the account": a position whose market
+  has no usable mark is valued at its ENTRY price (UPnL 0; its IM / MM still count) when the
+  account is classified, and is never acted on — stage 1 / backstop / ADL use only the marked
+  positions (the backstop still moves all collateral). An account with no marked position is
+  not liquidated. Orders in unmarked markets are not blocked (devnet has no feeder).
+
 ## Hyperliquid reference (docs, as summarized in research memory a054f368)
 
 * MM = half the initial margin at max leverage (per asset tier table).

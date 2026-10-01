@@ -214,9 +214,9 @@ fn move_collateral<T: StateBackend>(
     Ok(c)
 }
 
-/// Decision 4 (backstop): every position (ascending market) moves to `vault`
-/// at its mark, then the remaining collateral. A missing mark is an error
-/// (the caller checked every market has one).
+/// Decision 4 (backstop): every MARKED position (ascending market) moves to
+/// `vault` at its mark, then the remaining collateral. Review H2 (user
+/// decision s517): a position whose market has no mark stays with the trader.
 pub fn backstop<T: StateBackend>(
     pm: &PositionManager<T>,
     trader: &Address,
@@ -224,7 +224,7 @@ pub fn backstop<T: StateBackend>(
     mark: impl Fn(MarketId) -> Option<FixedPoint>,
 ) -> Result<(), CoreError> {
     for p in pm.positions_for_trader(trader)? {
-        let px = mark(p.market_id).ok_or(CoreError::NoOraclePrice(p.market_id))?;
+        let Some(px) = mark(p.market_id) else { continue };
         transfer(pm, trader, vault, p.market_id, p.size, px)?;
     }
     move_collateral(pm, trader, vault)?;
