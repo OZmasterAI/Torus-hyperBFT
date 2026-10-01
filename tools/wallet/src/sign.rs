@@ -135,8 +135,19 @@ pub(crate) async fn submit_native_action(
     action: NativeAction,
 ) -> Result<(), String> {
     let key = load_signing_key(cli)?;
+    submit_native_action_with_key(cli, rpc, action, &key).await
+}
+
+/// [`submit_native_action`] with an already loaded key (the caller needed the
+/// key's address to build the action, e.g. `set-oracle-signer`).
+pub(crate) async fn submit_native_action_with_key(
+    cli: &Cli,
+    rpc: &RpcClient,
+    action: NativeAction,
+    key: &SigningKey,
+) -> Result<(), String> {
     let nonce = now_ms();
-    let signed = sign_native_action(action, nonce, &key);
+    let signed = sign_native_action(action, nonce, key);
 
     if cli.dry_run {
         println!(

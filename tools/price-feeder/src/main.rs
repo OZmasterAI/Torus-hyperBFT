@@ -10,7 +10,7 @@ use torus_price_feeder::exchange::ReqwestGet;
 use torus_price_feeder::feeder::{self, Feeder};
 use torus_price_feeder::fetch::{requests, Clock, Fetcher, SystemClock};
 use torus_price_feeder::keyfile::{keygen, load_signer, read_passphrase};
-use torus_price_feeder::node::{register_hint, startup_check, Readiness, RpcNode};
+use torus_price_feeder::node::{startup_check, Readiness, RpcNode};
 use torus_price_feeder::{health, price};
 
 #[derive(Parser)]
@@ -154,7 +154,12 @@ async fn main() -> ExitCode {
             .map(|addr| {
                 println!("signer address: {addr:#x}");
                 println!("keystore:       {}", keystore.display());
-                println!("\nRegister it once with the VALIDATOR's EVM keystore:\n  {}", register_hint(addr));
+                println!(
+                    "\nRegister it once with the VALIDATOR's EVM keystore (the wallet also signs this\n\
+                     signer's proof of possession, so it needs the signer keystore):\n  \
+                     torus-wallet --keystore <validator EVM keystore> set-oracle-signer --signer-keystore {}",
+                    keystore.display()
+                );
             }),
         Command::Address { config } => Config::load(&config)
             .and_then(|c| load_signer(&c))

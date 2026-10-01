@@ -160,9 +160,13 @@ pub struct CheckReport {
     pub warnings: Vec<String>,
 }
 
-/// The exact registration command for an operator.
+/// The registration command for an operator (review M3: the wallet signs the
+/// signer key's proof of possession, so it needs the signer keystore too).
 pub fn register_hint(signer: Address) -> String {
-    format!("torus-wallet --keystore <validator EVM keystore> set-oracle-signer --signer {signer:#x}")
+    format!(
+        "torus-wallet --keystore <validator EVM keystore> set-oracle-signer \
+         --signer-keystore <keystore of signer {signer:#x}>"
+    )
 }
 
 /// Validator + signer registration, then every configured market's listing.
@@ -324,7 +328,8 @@ symbols = {{ binance = "POLUSDT", okx = "POL-USDT", bybit = "POLUSDT" }}
         // Signer not registered / a different signer: fatal, with the command.
         for reg in [None, Some("0x4444444444444444444444444444444444444444")] {
             let e = startup_check(&cfg(), &node("active", reg, ok_markets()), a(S)).await.unwrap_err();
-            assert!(e.contains(&format!("set-oracle-signer --signer {S}")), "{e}");
+            assert!(e.contains("set-oracle-signer --signer-keystore"), "{e}");
+            assert!(e.contains(&format!("signer {S}")), "{e}");
             assert!(e.contains("torus-wallet"), "{e}");
         }
 
