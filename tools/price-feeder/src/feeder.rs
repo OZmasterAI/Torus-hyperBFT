@@ -24,7 +24,7 @@ pub const RECHECK_MS: u64 = 60_000;
 pub struct MarketStatus {
     pub last_price: Option<FixedPoint>,
     pub sources: usize,
-    pub weight: u32,
+    pub weight: u64,
     /// Why the market was left out of the last cycle (`None` = submitted).
     pub omitted: Option<String>,
 }
@@ -141,7 +141,7 @@ pub struct Feeder<H, N, C> {
 struct Omission {
     reason: String,
     sources: usize,
-    weight: u32,
+    weight: u64,
 }
 
 fn omit_label(reason: &str) -> String {
