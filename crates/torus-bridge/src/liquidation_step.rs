@@ -85,7 +85,7 @@ impl NativeExecutor {
                 _ => {
                     results.push(NativeActionResult::err(
                         "liquidation",
-                        format!("{trader}: skipped (no mark / overflow / isolated)"),
+                        format!("{trader}: skipped (no marked position / overflow / isolated)"),
                     ));
                     continue;
                 }
@@ -128,18 +128,19 @@ impl NativeExecutor {
         Ok(results)
     }
 
-    /// Decision 9: `None` unless the account has positions, all Cross, every
-    /// one with a usable mark; overflow -> `None` (skip).
+    /// Review H2 (user decision s517): the account is valued with its marked
+    /// positions at the mark and its UNMARKED ones at their entry price (UPnL 0,
+    /// IM / MM still count — `AccountView::build`'s fallback). `None` (skip)
+    /// when it has no position in a marked market, holds an Isolated position,
+    /// or the valuation overflows. Only marked positions are ever acted on.
     fn liq_view<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
         trader: &Address,
     ) -> Result<Option<AccountView>, CoreError> {
         let ps = ctx.positions.positions_for_trader(trader)?;
-        if ps.is_empty()
-            || ps
-                .iter()
-                .any(|p| p.margin_type != MarginType::Cross || !marks.contains_key(&p.market_id))
+        if ps.iter().any(|p| p.margin_type != MarginType::Cross)
+            || !ps.iter().any(|p| marks.contains_key(&p.market_id))
         {
             return Ok(None);
         }
@@ -161,7 +162,11 @@ impl NativeExecutor {
             return Ok(());
         }
         let mut order: Vec<(Reverse<FixedPoint>, MarketId)> = Vec::new();
+        // Review H2: only marked positions are sold; unmarked ones stay.
         for p in ctx.positions.positions_for_trader(trader)? {
+            if !marks.contains_key(&p.market_id) {
+                continue;
+            }
             let tiers = ctx.margin_configs.get(&p.market_id).map(|c| c.tiers.as_slice());
             let n = Self::liq_notional(&p, marks)?;
             order.push((Reverse(maintenance_margin(tiers, n)), p.market_id));

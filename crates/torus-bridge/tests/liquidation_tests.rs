@@ -282,12 +282,17 @@ fn stage1_stops_once_maintenance_is_met() {
     assert_eq!(bal(&ctx, &t).available, fp(150));
 }
 
-/// Decision 9: a stale / absent mark in ANY of the account's markets skips the
-/// whole account — even though market 1 alone is underwater. Nothing moves.
+/// Review H2 (user decision s517, replaces the old "decision 9" skip): a
+/// position in a market WITHOUT a usable mark is valued at its entry price
+/// (UPnL 0, its IM / MM still count) and is NOT acted on; the account is
+/// liquidated through its MARKED positions. Was: one unmarked dust position
+/// shielded the whole account forever. Here: m1 long 10 (mark 990) + dust long
+/// 1 in m2 (no mark): AV 300 - 100 + 0 = 200 < MM 247.5 + 25, 3 x 200 >= 2 x
+/// 272.5 -> stage 1 sells m1 into the book; the m2 position stays.
 #[test]
-fn a_missing_mark_in_any_market_skips_the_account() {
+fn an_unmarked_position_does_not_shield_the_account() {
     let (_d, db) = liq_db(&[1, 2]);
-    let mut ctx = ctx_at(db.clone(), 1);
+    let mut ctx = ctx_at(db, 1);
     let (t, s, m) = (addr(1), addr(2), addr(3));
     fund(&ctx, &t, fp(300));
     fund(&ctx, &s, fp(1_000_000));
@@ -296,16 +301,57 @@ fn a_missing_mark_in_any_market_skips_the_account() {
     open_pair(&ctx, &t, &s, 2, 1, 1_000);
     place(&mut ctx, &m, limit(1, true, 985, 10));
     set_mark(&ctx, 1, fp(990)); // market 2: no mark
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert!(ctx.fatal_error.is_none());
+    assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO, "the marked position is liquidated");
+    assert_eq!(pos(&ctx, &t, 2), fp(1), "the unmarked position stays");
+    assert_eq!(pos(&ctx, &m, 1), fp(10));
+    assert_eq!(bal(&ctx, &t).available, fp(150));
+    assert_eq!(oi(&ctx, 1), (fp(10), fp(10)));
+    assert_eq!(oi(&ctx, 2), (fp(1), fp(1)));
+}
+
+/// Review H2: the backstop moves only the MARKED positions (and the
+/// collateral) to the vault; the unmarked one stays with the trader.
+/// Collateral 100: AV 100 - 100 + 0 = 0 < 2/3 x 272.5 -> backstop.
+#[test]
+fn backstop_moves_only_marked_positions() {
+    let (_d, db) = liq_db(&[1, 2]);
+    let mut ctx = ctx_at(db, 1);
+    let (t, s) = (addr(1), addr(2));
+    fund(&ctx, &t, fp(100));
+    fund(&ctx, &s, fp(1_000_000));
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    open_pair(&ctx, &t, &s, 2, 1, 1_000);
+    set_mark(&ctx, 1, fp(990));
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO);
+    assert_eq!(pos(&ctx, &LIQUIDATOR_VAULT, 1), fp(10));
+    assert_eq!(pos(&ctx, &t, 2), fp(1), "unmarked: stays with the trader");
+    assert_eq!(pos(&ctx, &LIQUIDATOR_VAULT, 2), FixedPoint::ZERO);
+    assert_eq!(oi(&ctx, 1), (fp(10), fp(10)));
+    assert_eq!(oi(&ctx, 2), (fp(1), fp(1)));
+}
+
+/// Review H2: an account whose ONLY positions are unmarked (stale / absent
+/// mark) is not liquidated — nothing moves, even far under water at entry.
+/// Market 1's aggregate (ts 1001) is stale at block 62 (age 61).
+#[test]
+fn an_account_with_only_unmarked_positions_is_not_liquidated() {
+    let (_d, db) = liq_db(&[1, 2]);
+    let ctx = ctx_at(db.clone(), 1);
+    let (t, s) = (addr(1), addr(2));
+    fund(&ctx, &t, fp(1));
+    fund(&ctx, &s, fp(1_000_000));
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    set_mark(&ctx, 1, fp(990));
+    let mut late = ctx_at(db.clone(), 62);
+    set_mark(&late, 2, fp(990)); // only market 2 (where t has nothing) is marked
     let snap = |db: &StateDb| (db.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap(), db.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
     let before = snap(&db);
-    NativeExecutor::run_liquidations(&mut ctx);
-    assert_eq!(snap(&db), before);
-    assert_eq!(ctx.order_books[&1].orders_for_trader(&m).len(), 1, "maker's bid untouched");
-    // a stale mark is the same: block 62 (ts 1062) sees market 1's aggregate (ts 1001) aged 61
-    let mut late = ctx_at(db.clone(), 62);
-    set_mark(&late, 2, fp(990));
     NativeExecutor::run_liquidations(&mut late);
-    assert_eq!(snap(&db).0, before.0, "market 1 mark stale -> skipped");
+    assert!(late.fatal_error.is_none());
+    assert_eq!(snap(&db), before);
 }
 
 /// D4 + F9: before stage 1, ALL the account's orders go — resting orders AND
