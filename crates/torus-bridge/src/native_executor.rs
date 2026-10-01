@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use torus_core::error::CoreError;
-use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
     effective_max_leverage, market_margin_config, order_initial_margin, placement_need,
@@ -7615,74 +7614,6 @@ impl NativeExecutor {
             {
                 Ok(_) => results.push(NativeActionResult::ok("oracle_aggregate", 500)),
                 Err(e) => results.push(NativeActionResult::err("oracle_aggregate", e.to_string())),
-            }
-        }
-        results
-    }
-
-    /// Run liquidation checks across all configured markets.
-    pub fn run_liquidation_checks<T: StateBackend>(
-        ctx: &mut NativeExecContext<T>,
-        traders: &[Address],
-        oracle_prices: &[(MarketId, FixedPoint)],
-    ) -> Vec<NativeActionResult> {
-        let mut results = Vec::new();
-
-        // Iterate over a snapshot of config keys to avoid borrow conflict.
-        let market_configs: Vec<(MarketId, MarketMarginConfig)> = ctx
-            .margin_configs
-            .iter()
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-
-        for (market_id, config) in &market_configs {
-            let liquidations = match LiquidationEngine::check_liquidations(
-                &ctx.positions,
-                traders,
-                config,
-                oracle_prices,
-            ) {
-                Ok(liqs) => liqs,
-                Err(e) => {
-                    results.push(NativeActionResult::err("liquidation_check", e.to_string()));
-                    continue;
-                }
-            };
-
-            // FIX 5 (ECON-PF-06): Skip liquidation if no valid oracle price.
-            let oracle_price = match oracle_prices
-                .iter()
-                .find(|(mid, _)| *mid == *market_id)
-                .map(|(_, p)| *p)
-            {
-                Some(p) if p > FixedPoint::ZERO => p,
-                _ => {
-                    tracing::warn!(market_id, "skipping liquidations: no valid oracle price");
-                    continue;
-                }
-            };
-
-            for liq in &liquidations {
-                match LiquidationEngine::execute_liquidation(&ctx.positions, liq, oracle_price) {
-                    Ok(lr) => {
-                        if let Some(ref m) = ctx.metrics {
-                            m.liquidations_triggered.inc();
-                        }
-                        results.push(NativeActionResult::ok("liquidation", 3000));
-                        if lr.remaining_deficit > FixedPoint::ZERO {
-                            let _ = LiquidationEngine::auto_deleverage(
-                                &ctx.positions,
-                                *market_id,
-                                lr.remaining_deficit,
-                                oracle_price,
-                                traders,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        results.push(NativeActionResult::err("liquidation", e.to_string()));
-                    }
-                }
             }
         }
         results

@@ -941,6 +941,17 @@ fn traders_after_walks_the_positions_cf_from_the_cursor() {
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test liquidation_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test margin_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets` · depends_on: [5]
 
+**Correction s517 (T5/T6):**
+* `adl_rank` compares in **U1024** (`alloy_primitives::aliases::U1024`), not U512: each side of the
+  cross-multiplication is `px × size × mark × px' × AV'` — five values of up to 127 bits = 635
+  bits, which U512 cannot hold for extreme inputs. A zero denominator (AV <= 0, or a zero
+  entry / mark) ranks last, so the comparator stays total.
+* `slippage_cap` saturates at the i128 bounds (returns `FixedPoint`, never panics).
+* T5's RED import list named T6 functions; for a strict T5 GREEN it was trimmed to the T5 items
+  and T6 restored the plan's list (+ `traders_after`).
+* `clear_cooldown` / `put_cursor` write only when the row changes (no tombstone writes into
+  the native root for healthy accounts).
+
 `══ COMMIT 5 ══` `feat(core)!: HL liquidation primitives; drop penalty, insurance fund, socialized loss`
 (the commit also deletes NE `run_liquidation_checks` and its import NE:14 — dead, and it no
 longer compiles; liquidation is unwired between commits 5 and 7, as it is today).

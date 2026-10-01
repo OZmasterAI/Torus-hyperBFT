@@ -1,666 +1,443 @@
-//! Liquidation engine — continuous liquidation checks, force close, ADL, socialized loss.
+//! Item 3: Hyperliquid-style liquidation — the pure parts and the state
+//! primitives (`docs/plans/liquidation.md`). The block step that drives them
+//! lives in the bridge (`liquidation_step.rs`).
 //!
-//! Tasks 2.3.1–2.3.4: check_liquidations, execute_liquidation, auto_deleverage, socialize_loss.
+//! No liquidation penalty, no insurance fund, no socialized loss (decision 6):
+//! size only ever moves through a fill between two accounts ([`transfer`]), so
+//! Σ long size == Σ short size per market after every step, and collateral
+//! only ever moves between accounts (value is conserved).
 
-use torus_state::cf::CF_NATIVE_BALANCES;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+use alloy_primitives::aliases::U1024;
+use torus_state::cf::{CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS};
 use torus_state::StateBackend;
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
-use crate::margin::{effective_max_leverage, MarginEngine, MarketMarginConfig};
+use crate::margin::{effective_max_leverage, AccountView, MarginTier, DEFAULT_ORDER_MAX_LEVERAGE};
 use crate::position::{MarginType, Position, PositionManager};
 
 // ============================================================================
-// Types
+// Constants
 // ============================================================================
 
-/// A position flagged for liquidation.
-#[derive(Clone, Debug)]
-pub struct Liquidation {
-    pub trader: Address,
-    pub market_id: MarketId,
-    pub position: Position,
-    pub shortfall: FixedPoint,
-    pub margin_type: MarginType,
-}
+/// Item 3 (decision 7): the liquidator vault — a fixed protocol account (no
+/// known key: no signed action can come from it). Deposits: later branch.
+pub const LIQUIDATOR_VAULT: Address = Address::new(*b"torus-liquidator-vlt");
+/// HL: positions above this notional (at the mark) are liquidated in chunks.
+/// Raw units (`FixedPoint::from_raw` is not `const`).
+pub const CHUNK_NOTIONAL_THRESHOLD_RAW: i128 = 100_000 * FixedPoint::SCALE;
+/// HL: 20% of the position per chunk = size / 5.
+pub const CHUNK_DIVISOR: i128 = 5;
+/// HL: seconds of block time after a chunk during which only backstop / ADL act.
+pub const CHUNK_COOLDOWN_SECS: u64 = 30;
+/// D5 (decided, user s517): accounts valued per block.
+pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
+/// D5 (decided, user s517): accounts acted on per block.
+pub const LIQ_ACT_PER_BLOCK: usize = 64;
+/// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
+pub const COOLDOWN_TAG: u8 = 0x02;
+pub const PREV_MARK_TAG: u8 = 0x03;
+pub const CURSOR_KEY: [u8; 1] = [0x04];
 
-/// Result of executing a liquidation.
-#[derive(Clone, Debug)]
-pub struct LiquidationResult {
-    pub trader: Address,
-    pub market_id: MarketId,
-    pub size: FixedPoint,
-    pub price: FixedPoint,
-    pub pnl: FixedPoint,
-    pub method: LiquidationMethod,
-    pub remaining_deficit: FixedPoint,
-}
+// ============================================================================
+// Pure parts
+// ============================================================================
 
+/// The class of an account (design *Classification*).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LiquidationMethod {
-    ForceClose,
+pub enum Health {
+    /// `AV >= MM`.
+    Healthy,
+    /// `2/3 MM <= AV < MM`: reduce-only market orders into the book.
+    Stage1,
+    /// `0 <= AV < 2/3 MM`: positions + collateral to the vault at the mark.
+    Backstop,
+    /// `AV < 0`: auto-deleverage against ranked counterparties.
     Adl,
-    SocializedLoss,
 }
 
-/// Result of auto-deleveraging one counterparty.
-#[derive(Clone, Debug)]
-pub struct AdlResult {
+/// Decisions 2, 4, 5: classify on exact raw units. `None` on overflow (the
+/// caller skips the account — never a panic).
+pub fn classify(v: &AccountView) -> Option<Health> {
+    let av = v
+        .available
+        .checked_add(v.order_margin)
+        .ok()?
+        .checked_add(v.upnl)
+        .ok()?;
+    let mm = v.maintenance;
+    Some(if av >= mm {
+        Health::Healthy
+    } else if av < FixedPoint::ZERO {
+        Health::Adl
+    } else if av.raw().checked_mul(3)? < mm.raw().checked_mul(2)? {
+        Health::Backstop
+    } else {
+        Health::Stage1
+    })
+}
+
+/// D2: the stage-1 order size and whether it is a chunk. Notional at the mark
+/// above 100,000 (or overflowing) ⇒ 20% of the size (`raw / 5`), unless that
+/// is below the book's lot (then the whole size).
+pub fn stage1_qty(size: FixedPoint, mark: FixedPoint, lot: FixedPoint) -> (FixedPoint, bool) {
+    let big = size
+        .checked_mul(mark)
+        .map_or(true, |n| n.raw() > CHUNK_NOTIONAL_THRESHOLD_RAW);
+    if !big {
+        return (size, false);
+    }
+    let q = FixedPoint::from_raw(size.raw() / CHUNK_DIVISOR);
+    if q < lot {
+        (size, false)
+    } else {
+        (q, true)
+    }
+}
+
+/// D1: the price cap of a liquidation order = `mark ∓ mark / (2 × lev)`, `lev`
+/// = the max leverage of the position's tier (the position's MM rate).
+/// Saturating at the i128 bounds (no panic on any input).
+pub fn slippage_cap(
+    tiers: Option<&[MarginTier]>,
+    mark: FixedPoint,
+    notional: FixedPoint,
+    is_buy: bool,
+) -> FixedPoint {
+    let lev = tiers
+        .map_or(DEFAULT_ORDER_MAX_LEVERAGE, |t| effective_max_leverage(t, notional))
+        .max(1);
+    let d = mark.raw() / (2 * i128::from(lev));
+    FixedPoint::from_raw(if is_buy {
+        mark.raw().saturating_add(d)
+    } else {
+        mark.raw().saturating_sub(d)
+    })
+}
+
+/// An ADL counterparty: an opposite-side position in the ADL market.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdlCandidate {
     pub trader: Address,
-    pub size_reduced: FixedPoint,
-    pub price: FixedPoint,
-    pub realized_pnl: FixedPoint,
+    pub is_long: bool,
+    pub size: FixedPoint,
+    pub entry_price: FixedPoint,
+    /// The counterparty's account value (ranking only — C7).
+    pub account_value: FixedPoint,
 }
 
-// ============================================================================
-// Insurance fund key
-// ============================================================================
+/// `|x|` of a raw value clamped at 0, widened.
+fn wide(x: i128) -> U1024 {
+    U1024::from(x.max(0) as u128)
+}
 
-const INSURANCE_FUND_KEY: &[u8] = b"insurance_fund";
-
-/// Liquidation penalty rate in basis points (e.g., 250 = 2.5%)
-const DEFAULT_LIQUIDATION_PENALTY_BPS: i128 = 250;
-
-// ============================================================================
-// LiquidationEngine
-// ============================================================================
-
-pub struct LiquidationEngine;
-
-impl LiquidationEngine {
-    // 2.3.1: Scan all positions for liquidation candidates.
-    pub fn check_liquidations(
-        positions: &PositionManager<impl StateBackend>,
-        traders: &[Address],
-        config: &MarketMarginConfig,
-        oracle_prices: &[(MarketId, FixedPoint)],
-    ) -> Result<Vec<Liquidation>, CoreError> {
-        let mut liquidations = Vec::new();
-
-        for trader in traders {
-            let all_pos = positions.positions_for_trader(trader)?;
-            if all_pos.is_empty() {
-                continue;
-            }
-
-            // Check cross-margin positions as a group
-            let has_cross = all_pos.iter().any(|p| p.margin_type == MarginType::Cross);
-            if has_cross {
-                if let Some(liq) = Self::check_cross_liquidation(
-                    positions,
-                    trader,
-                    &all_pos,
-                    config,
-                    oracle_prices,
-                )? {
-                    liquidations.extend(liq);
-                }
-            }
-
-            // Check isolated positions individually
-            for pos in &all_pos {
-                if pos.margin_type == MarginType::Isolated {
-                    if let Some(liq) = Self::check_isolated_liquidation(pos, config, oracle_prices)?
-                    {
-                        liquidations.push(liq);
-                    }
-                }
-            }
-        }
-
-        Ok(liquidations)
-    }
-
-    /// Check cross-margin account for liquidation.
-    fn check_cross_liquidation(
-        positions: &PositionManager<impl StateBackend>,
-        trader: &Address,
-        all_pos: &[Position],
-        config: &MarketMarginConfig,
-        oracle_prices: &[(MarketId, FixedPoint)],
-    ) -> Result<Option<Vec<Liquidation>>, CoreError> {
-        let equity = MarginEngine::cross_margin_equity(positions, trader, oracle_prices)?;
-        let maintenance = MarginEngine::total_maintenance_margin(
-            positions,
-            trader,
-            |_| Some(config.tiers.as_slice()),
-            oracle_prices,
-        )?;
-
-        if equity >= maintenance {
-            return Ok(None);
-        }
-
-        let shortfall = maintenance - equity;
-        let mut liquidations = Vec::new();
-
-        // Flag all cross-margin positions for liquidation
-        for pos in all_pos {
-            if pos.margin_type == MarginType::Cross {
-                liquidations.push(Liquidation {
-                    trader: *trader,
-                    market_id: pos.market_id,
-                    position: pos.clone(),
-                    shortfall,
-                    margin_type: MarginType::Cross,
-                });
-            }
-        }
-
-        Ok(Some(liquidations))
-    }
-
-    /// Check a single isolated position for liquidation.
-    fn check_isolated_liquidation(
-        pos: &Position,
-        config: &MarketMarginConfig,
-        oracle_prices: &[(MarketId, FixedPoint)],
-    ) -> Result<Option<Liquidation>, CoreError> {
-        let mark = oracle_prices
-            .iter()
-            .find(|(mid, _)| *mid == pos.market_id)
-            .map(|(_, p)| *p);
-
-        // FIX 5: Reject zero/negative oracle prices (ECON-PF-06)
-        let mark = match mark {
-            Some(p) if p > FixedPoint::ZERO => p,
-            _ => return Ok(None), // No valid oracle price, skip
-        };
-
-        if MarginEngine::check_isolated_maintenance(pos, mark, config) {
-            return Ok(None); // Healthy
-        }
-
-        // Equity for isolated = isolated_margin + unrealized_pnl
-        let equity = pos.isolated_margin + pos.unrealized_pnl(mark);
-        let notional = pos.notional(mark);
-        let max_lev = effective_max_leverage(&config.tiers, notional);
-        let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-        let initial_margin = notional / lev_fp;
-        let maint_num =
-            FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
-        let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-        let maintenance = initial_margin * maint_num / bps_denom;
-
-        let shortfall = maintenance - equity;
-
-        Ok(Some(Liquidation {
-            trader: pos.trader,
-            market_id: pos.market_id,
-            position: pos.clone(),
-            shortfall,
-            margin_type: MarginType::Isolated,
-        }))
-    }
-
-    // 2.3.2: Force close a position at oracle price.
-    pub fn execute_liquidation(
-        positions: &PositionManager<impl StateBackend>,
-        liquidation: &Liquidation,
-        oracle_price: FixedPoint,
-    ) -> Result<LiquidationResult, CoreError> {
-        // FIX 5: Reject zero/negative oracle prices (ECON-PF-06)
-        if oracle_price <= FixedPoint::ZERO {
-            return Err(CoreError::InvalidOraclePrice {
-                market_id: liquidation.market_id,
-            });
-        }
-
-        let pos = &liquidation.position;
-        let pnl = pos.unrealized_pnl(oracle_price);
-        let notional = pos.notional(oracle_price);
-
-        // FIX 11: Compute and credit liquidation penalty to insurance fund (ECON-FIND-04)
-        let penalty_bps = FixedPoint::from_raw(DEFAULT_LIQUIDATION_PENALTY_BPS * FixedPoint::SCALE);
-        let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-        let liquidation_penalty = notional * penalty_bps / bps_denom;
-
-        // Credit insurance fund
-        let state = positions.state();
-        let mut fund_balance = Self::get_insurance_fund(state)?;
-        fund_balance += liquidation_penalty;
-        Self::set_insurance_fund(state, fund_balance)?;
-
-        // Credit/debit PnL to trader balance, minus the penalty
-        let mut bal = positions.get_native_balance(&pos.trader)?;
-        bal.available = bal.available + pnl - liquidation_penalty;
-
-        // For isolated margin, return isolated_margin to balance before accounting
-        if pos.margin_type == MarginType::Isolated {
-            bal.available += pos.isolated_margin;
-        }
-
-        // Remove the position
-        positions.delete_position(&pos.trader, pos.market_id)?;
-
-        // Check if remaining equity covers the loss. F1/D1 (s517): collateral
-        // is available + order_margin — available alone may be negative while
-        // resting orders hold UPnL-funded reservations; those release later.
-        let collateral = bal.available + bal.order_margin;
-        let remaining_deficit = if collateral < FixedPoint::ZERO {
-            bal.available = -bal.order_margin;
-            -collateral
+/// Decision 5 (HL): rank = (mark/entry for a long, entry/mark for a short) ×
+/// (notional at the mark / account value), DESCENDING, exact — compared by
+/// cross-multiplication in U1024 (each side is a product of <= 5 values of
+/// <= 127 bits: never overflows). Candidates with AV <= 0 (or a zero
+/// denominator) rank last; ties by address ascending. Stable and total.
+pub fn adl_rank(mark: FixedPoint, mut cands: Vec<AdlCandidate>) -> Vec<AdlCandidate> {
+    // (num, den) with den == 0 meaning "rank last".
+    let key = |c: &AdlCandidate| -> (U1024, U1024) {
+        let notional = wide(c.size.raw()) * wide(mark.raw());
+        let (px_num, px_den) = if c.is_long {
+            (mark.raw(), c.entry_price.raw())
         } else {
-            FixedPoint::ZERO
+            (c.entry_price.raw(), mark.raw())
         };
+        let den = if c.account_value.raw() <= 0 {
+            U1024::ZERO
+        } else {
+            wide(px_den) * wide(c.account_value.raw())
+        };
+        (wide(px_num) * notional, den)
+    };
+    let mut keyed: Vec<((U1024, U1024), AdlCandidate)> =
+        cands.drain(..).map(|c| (key(&c), c)).collect();
+    keyed.sort_by(|((an, ad), a), ((bn, bd), b)| {
+        let by_rank = match (ad.is_zero(), bd.is_zero()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            // descending a = an/ad: b·… vs a·…
+            (false, false) => (*bn * *ad).cmp(&(*an * *bd)),
+        };
+        by_rank.then_with(|| a.trader.cmp(&b.trader))
+    });
+    keyed.into_iter().map(|(_, c)| c).collect()
+}
 
-        positions.put_native_balance(&pos.trader, &bal)?;
+// ============================================================================
+// Transfer primitives (the only ways liquidation moves size / collateral)
+// ============================================================================
 
-        Ok(LiquidationResult {
-            trader: pos.trader,
-            market_id: pos.market_id,
-            size: pos.size,
-            price: oracle_price,
-            pnl,
-            method: LiquidationMethod::ForceClose,
-            remaining_deficit,
-        })
+/// One fill between two accounts: `from` closes `qty` of its position in `m`
+/// at `price`, `to` takes the same side. Σ long == Σ short is preserved.
+pub fn transfer<T: StateBackend>(
+    pm: &PositionManager<T>,
+    from: &Address,
+    to: &Address,
+    m: MarketId,
+    qty: FixedPoint,
+    price: FixedPoint,
+) -> Result<(), CoreError> {
+    let from_long = pm
+        .get_position(from, m)?
+        .ok_or_else(|| CoreError::InvalidInput(format!("liquidation: {from} has no position in {m}")))?
+        .is_long;
+    pm.apply_fill(from, m, !from_long, qty, price, MarginType::Cross)?;
+    pm.apply_fill(to, m, from_long, qty, price, MarginType::Cross)?;
+    Ok(())
+}
+
+/// Move `from`'s whole collateral (`available + order_margin`, any sign) to
+/// `to`'s available: afterwards `from.available + from.order_margin == 0`.
+/// Returns the amount moved.
+fn move_collateral<T: StateBackend>(
+    pm: &PositionManager<T>,
+    from: &Address,
+    to: &Address,
+) -> Result<FixedPoint, CoreError> {
+    let of = |_| CoreError::Overflow("liquidation collateral overflows i128".into());
+    let mut fb = pm.get_native_balance(from)?;
+    let c = fb.available.checked_add(fb.order_margin).map_err(of)?;
+    if c == FixedPoint::ZERO {
+        return Ok(c);
     }
+    let mut tb = pm.get_native_balance(to)?;
+    fb.available = fb.available.checked_sub(c).map_err(of)?;
+    tb.available = tb.available.checked_add(c).map_err(of)?;
+    pm.put_native_balance(from, &fb)?;
+    pm.put_native_balance(to, &tb)?;
+    Ok(c)
+}
 
-    // 2.3.3: Auto-deleverage — rank profitable traders, reduce their positions.
-    pub fn auto_deleverage(
-        positions: &PositionManager<impl StateBackend>,
-        market_id: MarketId,
-        mut loss_amount: FixedPoint,
-        oracle_price: FixedPoint,
-        traders: &[Address],
-    ) -> Result<Vec<AdlResult>, CoreError> {
-        if loss_amount <= FixedPoint::ZERO {
-            return Ok(Vec::new());
-        }
-
-        // Collect profitable traders in this market with their unrealized PnL
-        let mut profitable: Vec<(Address, Position, FixedPoint)> = Vec::new();
-        for trader in traders {
-            if let Some(pos) = positions.get_position(trader, market_id)? {
-                let upnl = pos.unrealized_pnl(oracle_price);
-                if upnl > FixedPoint::ZERO {
-                    profitable.push((*trader, pos, upnl));
-                }
-            }
-        }
-
-        // Sort by unrealized PnL descending (most profitable first)
-        profitable.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let mut results = Vec::new();
-
-        for (trader, pos, upnl) in &profitable {
-            if loss_amount <= FixedPoint::ZERO {
-                break;
-            }
-
-            // Determine how much to reduce: proportional to their share of total profit
-            // or the remaining loss, whichever is smaller.
-            let reduce_amount = if *upnl >= loss_amount {
-                // This trader's profit covers the remaining loss
-                // Calculate position size to close: loss / price_diff_per_unit
-                let price_diff = if pos.is_long {
-                    oracle_price - pos.entry_price
-                } else {
-                    pos.entry_price - oracle_price
-                };
-                if price_diff > FixedPoint::ZERO {
-                    let size_to_close = loss_amount / price_diff;
-                    if size_to_close > pos.size {
-                        pos.size
-                    } else {
-                        size_to_close
-                    }
-                } else {
-                    pos.size
-                }
-            } else {
-                // Close entire position
-                pos.size
-            };
-
-            let realized_pnl = pos.unrealized_pnl(oracle_price) * reduce_amount / pos.size;
-
-            // Update the position
-            if reduce_amount >= pos.size {
-                // Full close
-                positions.delete_position(trader, market_id)?;
-            } else {
-                // Partial close: reduce size, keep entry price
-                let mut updated = pos.clone();
-                updated.size = pos.size - reduce_amount;
-                updated.realized_pnl = pos.realized_pnl + realized_pnl;
-                positions.put_position(&updated)?;
-            }
-
-            // Credit realized PnL to the deleveraged trader
-            let mut bal = positions.get_native_balance(trader)?;
-            bal.available += realized_pnl;
-            positions.put_native_balance(trader, &bal)?;
-
-            loss_amount -= realized_pnl;
-
-            results.push(AdlResult {
-                trader: *trader,
-                size_reduced: reduce_amount,
-                price: oracle_price,
-                realized_pnl,
-            });
-        }
-
-        Ok(results)
+/// Decision 4 (backstop): every position (ascending market) moves to `vault`
+/// at its mark, then the remaining collateral. A missing mark is an error
+/// (the caller checked every market has one).
+pub fn backstop<T: StateBackend>(
+    pm: &PositionManager<T>,
+    trader: &Address,
+    vault: &Address,
+    mark: impl Fn(MarketId) -> Option<FixedPoint>,
+) -> Result<(), CoreError> {
+    for p in pm.positions_for_trader(trader)? {
+        let px = mark(p.market_id).ok_or(CoreError::NoOraclePrice(p.market_id))?;
+        transfer(pm, trader, vault, p.market_id, p.size, px)?;
     }
+    move_collateral(pm, trader, vault)?;
+    Ok(())
+}
 
-    // 2.3.4: Socialized loss — insurance fund first, then spread across all traders.
-    pub fn socialize_loss(
-        positions: &PositionManager<impl StateBackend>,
-        market_id: MarketId,
-        mut remaining_loss: FixedPoint,
-        traders: &[Address],
-    ) -> Result<(), CoreError> {
-        if remaining_loss <= FixedPoint::ZERO {
-            return Ok(());
+/// Decision 5 (ADL): close `u`'s position in `m` at `price` against `ranked`
+/// in order, `q = min(remaining, candidate size)` each (a candidate whose
+/// position vanished or changed side is skipped). Returns the closed size.
+pub fn adl_close<T: StateBackend>(
+    pm: &PositionManager<T>,
+    u: &Address,
+    m: MarketId,
+    price: FixedPoint,
+    ranked: &[AdlCandidate],
+) -> Result<FixedPoint, CoreError> {
+    let Some(up) = pm.get_position(u, m)? else {
+        return Ok(FixedPoint::ZERO);
+    };
+    let mut remaining = up.size;
+    for c in ranked {
+        if remaining <= FixedPoint::ZERO {
+            break;
         }
-
-        let state = positions.state();
-
-        // First: deduct from insurance fund
-        let fund_balance = Self::get_insurance_fund(state)?;
-        if fund_balance > FixedPoint::ZERO {
-            if fund_balance >= remaining_loss {
-                Self::set_insurance_fund(state, fund_balance - remaining_loss)?;
-                return Ok(());
-            }
-            remaining_loss -= fund_balance;
-            Self::set_insurance_fund(state, FixedPoint::ZERO)?;
+        if c.trader == *u {
+            continue;
         }
-
-        if remaining_loss <= FixedPoint::ZERO {
-            return Ok(());
+        let Some(cp) = pm.get_position(&c.trader, m)? else { continue };
+        if cp.is_long == up.is_long || cp.size <= FixedPoint::ZERO {
+            continue;
         }
-
-        // Spread remaining loss across all traders in market proportional to position size
-        let mut traders_with_size: Vec<(Address, FixedPoint)> = Vec::new();
-        let mut total_size = FixedPoint::ZERO;
-
-        for trader in traders {
-            if let Some(pos) = positions.get_position(trader, market_id)? {
-                traders_with_size.push((*trader, pos.size));
-                total_size += pos.size;
-            }
-        }
-
-        if total_size <= FixedPoint::ZERO || traders_with_size.is_empty() {
-            return Ok(()); // No traders to spread across
-        }
-
-        // FIX 12: Filter out traders with insufficient balance (ECON-FIND-13)
-        // Only include traders whose available balance covers at least 2x their
-        // share of the loss, preventing cascading into already-underwater accounts.
-        let two = FixedPoint::from_raw(2 * FixedPoint::SCALE);
-        let eligible_traders: Vec<(Address, FixedPoint)> = traders_with_size
-            .into_iter()
-            .filter(|(trader, size)| {
-                let share = *size / total_size;
-                let deduction = remaining_loss * share;
-                if let Ok(bal) = positions.get_native_balance(trader) {
-                    bal.available >= deduction * two
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        // Recalculate total_size for eligible traders only
-        let mut eligible_total_size = FixedPoint::ZERO;
-        for (_, size) in &eligible_traders {
-            eligible_total_size += *size;
-        }
-
-        if eligible_total_size <= FixedPoint::ZERO || eligible_traders.is_empty() {
-            // FIX MED-NEW-18: Log unrecoverable deficit instead of silently absorbing.
-            tracing::warn!(
-                %market_id,
-                %remaining_loss,
-                "unrecoverable socialized loss — no eligible traders, protocol deficit"
-            );
-            return Ok(());
-        }
-
-        for (trader, size) in &eligible_traders {
-            let share = *size / eligible_total_size;
-            let deduction = remaining_loss * share;
-            let mut bal = positions.get_native_balance(trader)?;
-            bal.available -= deduction;
-            positions.put_native_balance(trader, &bal)?;
-        }
-
-        Ok(())
+        let q = remaining.min(cp.size);
+        transfer(pm, u, &c.trader, m, q, price)?;
+        remaining -= q;
     }
+    Ok(up.size - remaining)
+}
 
-    /// Get insurance fund balance from state.
-    fn get_insurance_fund(state: &impl StateBackend) -> Result<FixedPoint, CoreError> {
-        match state.get_cf_raw(CF_NATIVE_BALANCES, INSURANCE_FUND_KEY)? {
-            Some(data) if data.len() == 16 => Ok(FixedPoint::from_raw(i128::from_be_bytes(
-                data.try_into().unwrap(),
-            ))),
-            _ => Ok(FixedPoint::ZERO),
+/// ADL counterparties in `m`: every position on side `want_long`, `exclude`
+/// skipped, in `CF_NATIVE_POSITIONS` key order (one CF pass); `av` values each.
+pub fn adl_candidates<T: StateBackend>(
+    pm: &PositionManager<T>,
+    m: MarketId,
+    exclude: &Address,
+    want_long: bool,
+    av: impl Fn(&Address) -> Result<FixedPoint, CoreError>,
+) -> Result<Vec<AdlCandidate>, CoreError> {
+    let mut out = Vec::new();
+    for (k, v) in pm.state().iterate_cf(CF_NATIVE_POSITIONS, None)? {
+        if k.len() != 28 || k[20..28] != m.to_be_bytes() {
+            continue;
+        }
+        let p: Position = borsh::from_slice(&v).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        if p.is_long != want_long || p.trader == *exclude || p.size <= FixedPoint::ZERO {
+            continue;
+        }
+        out.push(AdlCandidate {
+            trader: p.trader,
+            is_long: p.is_long,
+            size: p.size,
+            entry_price: p.entry_price,
+            account_value: av(&p.trader)?,
+        });
+    }
+    Ok(out)
+}
+
+/// D9: a FLAT account's negative collateral moves to `vault` (conserved, never
+/// written off). Returns the moved amount (ZERO when nothing moved: the
+/// account holds positions, its collateral is >= 0, or it is the vault).
+pub fn settle_flat_deficit<T: StateBackend>(
+    pm: &PositionManager<T>,
+    t: &Address,
+    vault: &Address,
+) -> Result<FixedPoint, CoreError> {
+    if t == vault || !pm.positions_for_trader(t)?.is_empty() {
+        return Ok(FixedPoint::ZERO);
+    }
+    let b = pm.get_native_balance(t)?;
+    let c = b
+        .available
+        .checked_add(b.order_margin)
+        .map_err(|_| CoreError::Overflow("liquidation collateral overflows i128".into()))?;
+    if c >= FixedPoint::ZERO {
+        return Ok(FixedPoint::ZERO);
+    }
+    move_collateral(pm, t, vault)
+}
+
+// ============================================================================
+// Candidate walk (C1) and CF_NATIVE_LIQUIDATION rows
+// ============================================================================
+
+/// C1: candidates = distinct traders of `CF_NATIVE_POSITIONS` (keys `trader ‖
+/// market`, sorted by trader), ascending, strictly after `after`, at most
+/// `limit` (the caller passes SCAN + 1 to detect a cut).
+pub fn traders_after<T: StateBackend>(
+    state: &T,
+    after: Option<Address>,
+    limit: usize,
+) -> Result<Vec<Address>, CoreError> {
+    let mut out: Vec<Address> = Vec::new();
+    if limit == 0 {
+        return Ok(out);
+    }
+    for (k, _) in state.iterate_cf(CF_NATIVE_POSITIONS, None)? {
+        if k.len() != 28 {
+            continue;
+        }
+        let t = Address::from_slice(&k[..20]);
+        if after.is_some_and(|a| t <= a) || out.last() == Some(&t) {
+            continue;
+        }
+        out.push(t);
+        if out.len() == limit {
+            break;
         }
     }
+    Ok(out)
+}
 
-    /// Set insurance fund balance in state.
-    fn set_insurance_fund(state: &impl StateBackend, amount: FixedPoint) -> Result<(), CoreError> {
-        state.put_cf_raw(
-            CF_NATIVE_BALANCES,
-            INSURANCE_FUND_KEY,
-            &amount.raw().to_be_bytes(),
-        )?;
-        Ok(())
+fn malformed(what: &str) -> CoreError {
+    CoreError::InvalidInput(format!("malformed liquidation row: {what}"))
+}
+
+fn cooldown_key(t: &Address) -> [u8; 21] {
+    let mut k = [0u8; 21];
+    k[0] = COOLDOWN_TAG;
+    k[1..].copy_from_slice(t.as_slice());
+    k
+}
+
+fn prev_mark_key(m: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = PREV_MARK_TAG;
+    k[1..].copy_from_slice(&m.to_be_bytes());
+    k
+}
+
+/// D3: whether `t` chunked less than [`CHUNK_COOLDOWN_SECS`] of block time ago.
+pub fn in_cooldown<T: StateBackend>(state: &T, t: &Address, now: u64) -> Result<bool, CoreError> {
+    match state.get_cf_raw(CF_NATIVE_LIQUIDATION, &cooldown_key(t))? {
+        None => Ok(false),
+        Some(v) => {
+            let ts = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| malformed("cooldown"))?);
+            Ok(now.saturating_sub(ts) < CHUNK_COOLDOWN_SECS)
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::position::NativeBalance;
-    use torus_state::StateDb;
+/// D3: `t` chunked at block time `now`.
+pub fn set_cooldown<T: StateBackend>(state: &T, t: &Address, now: u64) -> Result<(), CoreError> {
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &cooldown_key(t), &now.to_be_bytes())?;
+    Ok(())
+}
 
-    fn setup() -> (tempfile::TempDir, PositionManager) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = StateDb::open(dir.path()).unwrap();
-        (dir, PositionManager::new(db))
+/// Delete `t`'s cooldown row if it exists (no write otherwise).
+pub fn clear_cooldown<T: StateBackend>(state: &T, t: &Address) -> Result<(), CoreError> {
+    let k = cooldown_key(t);
+    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
     }
+    Ok(())
+}
 
-    fn addr(n: u8) -> Address {
-        Address::new([n; 20])
+/// D10: the previous mark rows of `markets` (absent rows omitted).
+pub fn prev_marks<T: StateBackend>(
+    state: &T,
+    markets: impl IntoIterator<Item = MarketId>,
+) -> Result<BTreeMap<MarketId, FixedPoint>, CoreError> {
+    let mut out = BTreeMap::new();
+    for m in markets {
+        if let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? {
+            let raw = i128::from_be_bytes(v.as_slice().try_into().map_err(|_| malformed("prev mark"))?);
+            out.insert(m, FixedPoint::from_raw(raw));
+        }
     }
+    Ok(out)
+}
 
-    fn fp(v: i64) -> FixedPoint {
-        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+/// D10: store this step's marks as the next step's previous marks — only the
+/// rows whose value changed (markets without a mark keep their row).
+pub fn put_prev_marks<T: StateBackend>(
+    state: &T,
+    marks: &BTreeMap<MarketId, FixedPoint>,
+    prev: &BTreeMap<MarketId, FixedPoint>,
+) -> Result<(), CoreError> {
+    for (m, p) in marks {
+        if prev.get(m) != Some(p) {
+            state.put_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(*m), &p.raw().to_be_bytes())?;
+        }
     }
+    Ok(())
+}
 
-    #[test]
-    fn reject_zero_oracle_price_liquidation() {
-        let (_dir, pm) = setup();
-        let liq = Liquidation {
-            trader: addr(1),
-            market_id: 1,
-            position: Position {
-                trader: addr(1),
-                market_id: 1,
-                is_long: true,
-                size: fp(1),
-                entry_price: fp(50000),
-                realized_pnl: FixedPoint::ZERO,
-                isolated_margin: FixedPoint::ZERO,
-                margin_type: MarginType::Cross,
-            },
-            shortfall: fp(100),
-            margin_type: MarginType::Cross,
-        };
-        let result = LiquidationEngine::execute_liquidation(&pm, &liq, FixedPoint::ZERO);
-        assert!(result.is_err());
+/// D5: the round-robin scan cursor (the last trader scanned by a cut pass).
+pub fn cursor<T: StateBackend>(state: &T) -> Result<Option<Address>, CoreError> {
+    match state.get_cf_raw(CF_NATIVE_LIQUIDATION, &CURSOR_KEY)? {
+        None => Ok(None),
+        Some(v) if v.len() == 20 => Ok(Some(Address::from_slice(&v))),
+        Some(_) => Err(malformed("cursor")),
     }
+}
 
-    #[test]
-    fn reject_negative_oracle_price_liquidation() {
-        let (_dir, pm) = setup();
-        let liq = Liquidation {
-            trader: addr(1),
-            market_id: 1,
-            position: Position {
-                trader: addr(1),
-                market_id: 1,
-                is_long: true,
-                size: fp(1),
-                entry_price: fp(50000),
-                realized_pnl: FixedPoint::ZERO,
-                isolated_margin: FixedPoint::ZERO,
-                margin_type: MarginType::Cross,
-            },
-            shortfall: fp(100),
-            margin_type: MarginType::Cross,
-        };
-        let neg_price = FixedPoint::from_raw(-1 * FixedPoint::SCALE);
-        let result = LiquidationEngine::execute_liquidation(&pm, &liq, neg_price);
-        assert!(result.is_err());
+/// D5: set (`Some`) or delete (`None`) the cursor — no write when unchanged.
+pub fn put_cursor<T: StateBackend>(state: &T, c: Option<Address>) -> Result<(), CoreError> {
+    if cursor(state)? == c {
+        return Ok(());
     }
-
-    #[test]
-    fn insurance_fund_credited_on_liquidation() {
-        let (_dir, pm) = setup();
-        let trader = addr(1);
-        // Setup: trader has a losing long position
-        pm.put_native_balance(
-            &trader,
-            &NativeBalance {
-                available: fp(10000),
-                order_margin: FixedPoint::ZERO,
-            },
-        )
-        .unwrap();
-        pm.put_position(&Position {
-            trader,
-            market_id: 1,
-            is_long: true,
-            size: fp(1),
-            entry_price: fp(50000),
-            realized_pnl: FixedPoint::ZERO,
-            isolated_margin: FixedPoint::ZERO,
-            margin_type: MarginType::Cross,
-        })
-        .unwrap();
-
-        let liq = Liquidation {
-            trader,
-            market_id: 1,
-            position: Position {
-                trader,
-                market_id: 1,
-                is_long: true,
-                size: fp(1),
-                entry_price: fp(50000),
-                realized_pnl: FixedPoint::ZERO,
-                isolated_margin: FixedPoint::ZERO,
-                margin_type: MarginType::Cross,
-            },
-            shortfall: fp(100),
-            margin_type: MarginType::Cross,
-        };
-
-        // Liquidate at 49000 (loss of 1000)
-        let _result = LiquidationEngine::execute_liquidation(&pm, &liq, fp(49000)).unwrap();
-
-        // Insurance fund should have been credited with penalty
-        let fund = LiquidationEngine::get_insurance_fund(pm.state()).unwrap();
-        assert!(fund > FixedPoint::ZERO, "insurance fund should be credited");
-
-        // Penalty = notional * 250 / 10000 = 49000 * 0.025 = 1225
-        let expected_penalty = fp(1225);
-        assert_eq!(fund, expected_penalty);
+    match c {
+        Some(a) => state.put_cf_raw(CF_NATIVE_LIQUIDATION, &CURSOR_KEY, a.as_slice())?,
+        None => state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &CURSOR_KEY)?,
     }
-
-    #[test]
-    fn socialized_loss_excludes_low_balance_traders() {
-        let (_dir, pm) = setup();
-        let t1 = addr(1);
-        let t2 = addr(2);
-        let t3 = addr(3);
-
-        // t1: healthy balance
-        pm.put_native_balance(
-            &t1,
-            &NativeBalance {
-                available: fp(10000),
-                order_margin: FixedPoint::ZERO,
-            },
-        )
-        .unwrap();
-        pm.put_position(&Position {
-            trader: t1,
-            market_id: 1,
-            is_long: true,
-            size: fp(1),
-            entry_price: fp(50000),
-            realized_pnl: FixedPoint::ZERO,
-            isolated_margin: FixedPoint::ZERO,
-            margin_type: MarginType::Cross,
-        })
-        .unwrap();
-
-        // t2: very low balance (should be excluded)
-        pm.put_native_balance(
-            &t2,
-            &NativeBalance {
-                available: fp(10),
-                order_margin: FixedPoint::ZERO,
-            },
-        )
-        .unwrap();
-        pm.put_position(&Position {
-            trader: t2,
-            market_id: 1,
-            is_long: true,
-            size: fp(1),
-            entry_price: fp(50000),
-            realized_pnl: FixedPoint::ZERO,
-            isolated_margin: FixedPoint::ZERO,
-            margin_type: MarginType::Cross,
-        })
-        .unwrap();
-
-        // t3: healthy balance
-        pm.put_native_balance(
-            &t3,
-            &NativeBalance {
-                available: fp(10000),
-                order_margin: FixedPoint::ZERO,
-            },
-        )
-        .unwrap();
-        pm.put_position(&Position {
-            trader: t3,
-            market_id: 1,
-            is_long: true,
-            size: fp(1),
-            entry_price: fp(50000),
-            realized_pnl: FixedPoint::ZERO,
-            isolated_margin: FixedPoint::ZERO,
-            margin_type: MarginType::Cross,
-        })
-        .unwrap();
-
-        // Socialize a loss of 1000
-        LiquidationEngine::socialize_loss(&pm, 1, fp(1000), &[t1, t2, t3]).unwrap();
-
-        // t2 should NOT have been debited (low balance excluded)
-        let bal_t2 = pm.get_native_balance(&t2).unwrap();
-        assert_eq!(
-            bal_t2.available,
-            fp(10),
-            "low-balance trader should be excluded from socialized loss"
-        );
-
-        // t1 and t3 should share the loss
-        let bal_t1 = pm.get_native_balance(&t1).unwrap();
-        let bal_t3 = pm.get_native_balance(&t3).unwrap();
-        assert!(bal_t1.available < fp(10000));
-        assert!(bal_t3.available < fp(10000));
-    }
+    Ok(())
 }
