@@ -159,10 +159,16 @@ enum Command {
         #[arg(long, default_value_t = 0.5)]
         cross_fraction: f64,
         /// econ: per-action probability of a CancelAllOrders (all markets)
-        /// instead of a PlaceOrderBatch — recycles resting GTC margin and keeps
-        /// per-(sender,market) resting counts under the book's 200-order cap.
+        /// instead of a PlaceOrderBatch — recycles resting GTC margin.
         #[arg(long, default_value_t = 0.05)]
         cancel_fraction: f64,
+        /// econ: keep each sender's estimated open orders (every order since
+        /// its last cancel-all) at or below N by sending a CancelAllOrders
+        /// whenever the next batch would cross N — stays under the chain's
+        /// per-user open-order limit (1000+). 0 (default) = off, so prior
+        /// cells stay reproducible.
+        #[arg(long, default_value_t = 0)]
+        open_order_budget: u64,
         /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
         /// so a 1-lot order's margin lands exactly on target.
         #[arg(long, default_value_t = 0)]
@@ -501,8 +507,8 @@ mod ammo_plan_tests {
 //   * taker fills and cancels round-trip their margin: net 0.
 //   * resting (not yet filled/cancelled) margin is bounded by the cancel-all
 //     cadence: <= batch_size * (1/cancel_fraction) * m expected, and hard-capped
-//     by the book's 200-orders/trader/market limit at 200 * markets * m
-//     (200 * 10 * 1.5k = 3M TRS with defaults — well under B).
+//     by the chain's per-user open-order limit (1000 + 1 per 5M volume, max
+//     5000) at 5000 * m (7.5M TRS with defaults — well under B).
 //   * maker fills leak m each: leak_rate/sender = (fills/s ÷ senders) * m.
 //     Horizon T = (B - locked) / leak_rate. With B = 100M TRS (bumped genesis),
 //     m = 1.5k, 150k fills/s: s=5,000 -> T ~= 37 min; s=100,000 -> T ~= 12 h.
@@ -539,6 +545,9 @@ struct EconShape {
     /// Per-action probability of a CancelAllOrders (all markets) instead of a
     /// PlaceOrderBatch — recycles resting GTC margin back to `available`.
     cancel_fraction: f64,
+    /// Max estimated open orders per sender (0 = off); see
+    /// `econ_action_budgeted`.
+    open_order_budget: u64,
 }
 
 impl EconShape {
@@ -564,6 +573,7 @@ impl EconShape {
             band: band.clamp(1, mid.saturating_sub(1).max(1)),
             cross_fraction: cross_fraction.clamp(0.0, 1.0),
             cancel_fraction: cancel_fraction.clamp(0.0, 1.0),
+            open_order_budget: 0,
         }
     }
 }
@@ -644,6 +654,36 @@ fn econ_action(
         })
         .collect();
     NativeAction::PlaceOrderBatch(orders)
+}
+
+/// `econ_action` under the chain's per-user open-order limit. `open` is the
+/// sender's estimate of its open orders: every order placed since its last
+/// cancel-all (an upper bound — fills are ignored, and the executor counts
+/// every GTC of a block, filled or not). When the next action could take it
+/// past `open_order_budget`, the sender sends a cancel-all instead. Budget 0
+/// = off: byte-identical to `econ_action`. Caveat: a cancel-all runs before
+/// every place of its block, so places from earlier fires landing in the same
+/// block survive it; the budget leaves headroom below the 1000 limit for that.
+fn econ_action_budgeted(
+    rng: &mut impl Rng,
+    sender_idx: usize,
+    plan: MarketPlan,
+    batch_size: usize,
+    shape: &EconShape,
+    open: &mut u64,
+) -> NativeAction {
+    let budget = shape.open_order_budget;
+    if budget > 0 && *open + batch_size.max(1) as u64 > budget {
+        *open = 0;
+        return NativeAction::CancelAllOrders { market_id: None };
+    }
+    let action = econ_action(rng, sender_idx, plan, batch_size, shape);
+    *open = match &action {
+        NativeAction::PlaceOrderBatch(orders) => *open + orders.len() as u64,
+        NativeAction::PlaceOrder(_) => *open + 1,
+        _ => 0,
+    };
+    action
 }
 
 #[cfg(test)]
@@ -815,6 +855,77 @@ mod econ_shape_tests {
         match econ_action(&mut rng, 4, MarketPlan::uniform(10), 1, &shape) {
             NativeAction::PlaceOrder(_) => {}
             other => panic!("batch_size 1 must emit a plain PlaceOrder, got {other:?}"),
+        }
+    }
+
+    // --open-order-budget N: a sender's estimated open orders (every order
+    // since its last cancel-all) never exceed N; when the next batch would
+    // cross it, the sender sends a cancel-all instead.
+    #[test]
+    fn open_order_budget_forces_cancel_all_before_crossing_it() {
+        for (batch, cancel_fraction) in [(400usize, 0.0), (400, 0.05), (32, 0.05), (1, 0.0)] {
+            let mut shape = EconShape::new(1500, 0, 5, 0.5, cancel_fraction);
+            shape.open_order_budget = 900;
+            let mut rng = StdRng::seed_from_u64(31);
+            let mut open = 0u64;
+            let (mut estimate, mut forced) = (0u64, 0usize);
+            for _ in 0..2000 {
+                let action =
+                    econ_action_budgeted(&mut rng, 7, MarketPlan::uniform(10), batch, &shape, &mut open);
+                match action {
+                    NativeAction::CancelAllOrders { .. } => {
+                        forced += usize::from(estimate + batch as u64 > 900);
+                        estimate = 0;
+                    }
+                    NativeAction::PlaceOrderBatch(orders) => estimate += orders.len() as u64,
+                    NativeAction::PlaceOrder(_) => estimate += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+                assert!(estimate <= 900, "batch {batch}: estimate {estimate}");
+                assert_eq!(open, estimate);
+            }
+            assert!(forced > 0, "batch {batch}: the budget must force cancel-alls");
+        }
+        // 400-order batches with no random cancels: place, place, cancel, ...
+        let mut shape = EconShape::new(1500, 0, 5, 0.5, 0.0);
+        shape.open_order_budget = 900;
+        let mut rng = StdRng::seed_from_u64(32);
+        let mut open = 0;
+        let kinds: Vec<bool> = (0..6)
+            .map(|_| {
+                matches!(
+                    econ_action_budgeted(&mut rng, 7, MarketPlan::uniform(10), 400, &shape, &mut open),
+                    NativeAction::CancelAllOrders { .. }
+                )
+            })
+            .collect();
+        assert_eq!(kinds, [false, false, true, false, false, true]);
+    }
+
+    // Budget 0 (default) = off: byte-identical to the unbudgeted generator.
+    #[test]
+    fn open_order_budget_zero_is_byte_identical() {
+        let shape = default_shape();
+        assert_eq!(shape.open_order_budget, 0);
+        for batch in [1, 400] {
+            let mut a = StdRng::seed_from_u64(33);
+            let mut b = a.clone();
+            let mut open = 0;
+            for _ in 0..200 {
+                assert_eq!(
+                    bincode::serialize(&econ_action_budgeted(
+                        &mut a,
+                        5,
+                        MarketPlan::uniform(10),
+                        batch,
+                        &shape,
+                        &mut open
+                    ))
+                    .unwrap(),
+                    bincode::serialize(&econ_action(&mut b, 5, MarketPlan::uniform(10), batch, &shape))
+                        .unwrap(),
+                );
+            }
         }
     }
 }
@@ -2674,6 +2785,7 @@ async fn run_consensus(
                     tokio::time::sleep(jitter.min(left)).await;
                 }
                 let mut last_nonce = 0u64;
+                let mut open_orders = 0u64;
                 let mut next_fire = Instant::now();
                 while Instant::now() < deadline {
                     if let Some(iv) = econ_pace {
@@ -2688,8 +2800,14 @@ async fn run_consensus(
                     // ms, strictly increasing per sender.
                     let mut batch_actions = Vec::with_capacity(submit_batch);
                     for _ in 0..submit_batch {
-                        let action =
-                            econ_action(&mut rng, sender_idx, plan, batch_size, &shape);
+                        let action = econ_action_budgeted(
+                            &mut rng,
+                            sender_idx,
+                            plan,
+                            batch_size,
+                            &shape,
+                            &mut open_orders,
+                        );
                         let base = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -3237,6 +3355,7 @@ async fn main() {
             target_margin,
             cross_fraction,
             cancel_fraction,
+            open_order_budget,
             econ_mid,
             band,
             rate_total,
@@ -3259,8 +3378,9 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            let econ_shape = econ.then(|| {
-                EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
+            let econ_shape = econ.then(|| EconShape {
+                open_order_budget,
+                ..EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
             });
             run_consensus(
                 &rpc_urls,
