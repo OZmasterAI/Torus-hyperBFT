@@ -624,12 +624,25 @@ fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
         })
 }
 
+/// Test fixture: a bare marker write (simulates a DB at a given applied height).
+#[cfg(test)]
 fn write_native_applied_height(state_db: &StateDb, height: u64) {
     let _ = state_db.put_cf_raw(
         CF_CONSENSUS_META,
         META_NATIVE_APPLIED_HEIGHT,
         &height.to_be_bytes(),
     );
+}
+
+/// Serial-path applied-height advance for a block that skipped the native
+/// flush: the same marker bytes as [`write_native_applied_height`], written
+/// through the one hashed flush so the running state hash advances with the
+/// marker in the same atomic batch.
+fn flush_marker_only(state_db: &StateDb, pending: torus_state::FrozenPending) {
+    let height = pending.height();
+    if let Err(e) = pending.flush_with_native_trie_stats(state_db, Some(height), None, None) {
+        tracing::error!(%e, height, "applied-height marker flush failed (restart will replay)");
+    }
 }
 
 fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
@@ -2313,7 +2326,10 @@ impl ExecutionContext {
                     return;
                 }
             } else {
-                write_native_applied_height(&self.state_db, height);
+                flush_marker_only(
+                    &self.state_db,
+                    torus_state::FrozenPending::marker_only(height),
+                );
             }
             // r2 resident-books-stale-rebuild: this block never built a context,
             // so the order books are untouched — the rank8 resident holder is
@@ -13381,5 +13397,125 @@ mod crash_recovery_tests {
         assert!(ctx.flush_worker.is_none());
         assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(Some("0".to_string())));
         assert!(crate::exec_pipeline::parse_exec_pipeline_toggle(None));
+    }
+
+    // ======================================================================
+    // Running state hash (docs/plans/running-state-hash-impl.md)
+    // ======================================================================
+
+    type CapturedWrites = Vec<(u64, Vec<torus_state::running_hash::WriteEntry>)>;
+
+    /// Run the book fixture (every block through the live dispatch path),
+    /// "restarting" (fresh `ExecutionContext`: empty resident holder, caches,
+    /// flush worker) after each height in `restart_after`, and return the
+    /// per-block consensus write sets the flush saw.
+    fn run_book_fixture_capturing(
+        on: bool,
+        mode: torus_bridge::native_executor::BookMode,
+        restart_after: &[u64],
+    ) -> CapturedWrites {
+        run_book_fixture_capturing_with(on, mode, restart_after, false)
+    }
+
+    /// `drop_book_mode_marker`: at each restart delete the node-local
+    /// `__book_mode__` row first — a DB from before that marker existed (or a
+    /// node whose history differs only in node-local rows) re-writes it on the
+    /// first save after the restart.
+    fn run_book_fixture_capturing_with(
+        on: bool,
+        mode: torus_bridge::native_executor::BookMode,
+        restart_after: &[u64],
+        drop_book_mode_marker: bool,
+    ) -> CapturedWrites {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        torus_state::running_hash::capture_begin(&state_db);
+        let mut ctx = book_pipeline_ctx(&state_db, on, None, mode);
+        for b in &book_fixture_blocks() {
+            dispatch_and_execute(&ctx, &state_db, b);
+            assert!(
+                !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+                "fixture must not fail-stop (on={on} {mode:?} restarts={restart_after:?})"
+            );
+            if restart_after.contains(&b.header.height) {
+                drop(ctx); // drains + joins W
+                if drop_book_mode_marker {
+                    state_db
+                        .delete_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, b"__book_mode__")
+                        .unwrap();
+                }
+                ctx = book_pipeline_ctx(&state_db, on, None, mode);
+            }
+        }
+        drop(ctx);
+        torus_state::running_hash::capture_take(&state_db)
+    }
+
+    fn assert_write_sets_equal(a: &CapturedWrites, b: &CapturedWrites, what: &str) {
+        let heights = |w: &CapturedWrites| w.iter().map(|(h, _)| *h).collect::<Vec<_>>();
+        assert_eq!(heights(a), heights(b), "{what}: flushed heights differ");
+        for ((h, x), (_, y)) in a.iter().zip(b.iter()) {
+            if x != y {
+                let only_a: Vec<_> = x.iter().filter(|e| !y.contains(e)).collect();
+                let only_b: Vec<_> = y.iter().filter(|e| !x.contains(e)).collect();
+                panic!("{what}: write set of height {h} differs\n  only in first: {only_a:?}\n  only in second: {only_b:?}");
+            }
+        }
+    }
+
+    /// Task 1 GATE: the consensus write set of every block is a function of the
+    /// committed blocks alone — identical straight through vs with restarts in
+    /// the middle (resident books vs reloaded books), for every BookMode, and
+    /// identical serial vs pipelined (deferred book save included).
+    #[test]
+    fn running_hash_write_set_determinism() {
+        use torus_bridge::native_executor::BookMode;
+        let restart_patterns: [&[u64]; 3] = [&[1], &[3, 6, 10], &[2, 4, 5, 7, 8, 9, 11, 12]];
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            let serial = run_book_fixture_capturing(false, mode, &[]);
+            assert_eq!(
+                serial.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+                (1..=13).collect::<Vec<u64>>(),
+                "{mode:?}: every height (native and empty) must pass through the hashed flush"
+            );
+            let total: usize = serial.iter().map(|(_, w)| w.len()).sum();
+            assert!(total > 40, "{mode:?}: fixture write set is not vacuous ({total})");
+            for on in [false, true] {
+                let straight = run_book_fixture_capturing(on, mode, &[]);
+                assert_write_sets_equal(&serial, &straight, &format!("{mode:?} serial vs on={on}"));
+                for restarts in restart_patterns {
+                    let restarted = run_book_fixture_capturing(on, mode, restarts);
+                    assert_write_sets_equal(
+                        &straight,
+                        &restarted,
+                        &format!("{mode:?} on={on} straight vs restarts {restarts:?}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Task 1: the node-local `__book_mode__` row is re-written after a restart
+    /// on a DB that lacks it (pre-marker history). That write is excluded from
+    /// the hashed set, so the consensus write sets still agree.
+    #[test]
+    fn running_hash_write_set_determinism_ignores_book_mode_marker_rewrite() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+            for on in [false, true] {
+                let straight = run_book_fixture_capturing(on, mode, &[]);
+                let rewritten = run_book_fixture_capturing_with(on, mode, &[3, 9], true);
+                assert_write_sets_equal(
+                    &straight,
+                    &rewritten,
+                    &format!("{mode:?} on={on} marker re-written after restart"),
+                );
+            }
+        }
     }
 }

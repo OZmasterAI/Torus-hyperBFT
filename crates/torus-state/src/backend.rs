@@ -452,6 +452,86 @@ impl PendingState {
     }
 }
 
+/// Running state hash: the hashed CFs as `(frozen hash cf_id, CfId)`, in
+/// ascending `cf_id` order — the canonical iteration order of the hash.
+fn hashed_cf_order() -> &'static [(u8, CfId)] {
+    static ORDER: OnceLock<Vec<(u8, CfId)>> = OnceLock::new();
+    ORDER.get_or_init(|| {
+        let mut v: Vec<(u8, CfId)> = crate::running_hash::HASHED_CFS
+            .iter()
+            .map(|(id, name)| (*id, intern_cf(name).expect("hashed CF is registered")))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    })
+}
+
+/// One CF's pending mutations as a single key-sorted stream. Writes and
+/// tombstones are disjoint by invariant; should a key ever be in both, the
+/// tombstone is reported (the batch appends deletes after puts, so it wins).
+fn stream_cf<'a>(c: &'a CfPending, mut f: impl FnMut(&'a [u8], Option<&'a [u8]>)) {
+    let mut w = c.writes.iter().peekable();
+    let mut d = c.deletes.iter().peekable();
+    loop {
+        let take_write = match (w.peek(), d.peek()) {
+            (None, None) => return,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some((wk, _)), Some(dk)) => wk.as_slice() < dk.as_slice(),
+        };
+        if take_write {
+            let (k, v) = w.next().unwrap();
+            f(k, Some(v));
+        } else {
+            let k = d.next().unwrap();
+            if w.peek().is_some_and(|(wk, _)| *wk == k) {
+                w.next();
+            }
+            f(k, None);
+        }
+    }
+}
+
+/// Running state hash: visit the consensus write set of `layers` (lowest
+/// priority first — a later layer's entry for a key overrides an earlier
+/// one, the order the writes became durable in) in canonical
+/// `(cf_id, key)` order, key filters applied. Node-local / derived CFs and
+/// keys never reach `f`.
+fn for_each_consensus_write<'a>(
+    layers: &[&'a PendingState],
+    mut f: impl FnMut(u8, &'a [u8], Option<&'a [u8]>),
+) {
+    use crate::running_hash::key_is_hashed;
+    for &(cf_id, id) in hashed_cf_order() {
+        let active: Vec<&CfPending> = layers
+            .iter()
+            .map(|l| l.cf(id))
+            .filter(|c| !c.is_empty())
+            .collect();
+        match active.as_slice() {
+            [] => {}
+            [one] => stream_cf(one, |k, v| {
+                if key_is_hashed(cf_id, k) {
+                    f(cf_id, k, v)
+                }
+            }),
+            many => {
+                let mut merged: BTreeMap<&'a [u8], Option<&'a [u8]>> = BTreeMap::new();
+                for c in many {
+                    stream_cf(c, |k, v| {
+                        merged.insert(k, v);
+                    });
+                }
+                for (k, v) in merged {
+                    if key_is_hashed(cf_id, k) {
+                        f(cf_id, k, v)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// bl2 exec pipeline (`TORUS_EXEC_PIPELINE`): the CLOSED pending set of one
 /// committed block, moved out of its [`NativeStateOverlay`] by
 /// [`NativeStateOverlay::freeze`] once the block's execution is complete.
@@ -963,6 +1043,20 @@ fn flush_pending_with_native_trie_stats(
             })?;
             let marker = height.to_be_bytes();
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
+        }
+
+        // Running state hash: the block's consensus write set (pending set,
+        // then the deferred-book sidecar on top).
+        if let Some(height) = applied_height {
+            if crate::running_hash::capture_active() {
+                let mut layers: Vec<&PendingState> = vec![state];
+                layers.extend(sidecar);
+                let mut writes = Vec::new();
+                for_each_consensus_write(&layers, |id, k, v| {
+                    writes.push((id, k.to_vec(), v.map(<[u8]>::to_vec)))
+                });
+                crate::running_hash::capture_record(target, height, writes);
+            }
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were

@@ -312,3 +312,28 @@ flushed later, so this is the block's final value per key).
 Consensus writes outside block execution: none found (RPC, network, mempool and
 node writes outside tests touch only DA / derived CFs). Genesis state is written
 before activation and is not part of the hash (identical by genesis file).
+
+## Task 1 result
+
+`running_hash_write_set_determinism` (book fixture, 13 blocks incl. fills, stops,
+cancel-alls, empties and epoch-boundary barriers; all 4 BookModes; serial and
+pipelined with deferred book save; restarts after {1}, {3,6,10} and
+{2,4,5,7,8,9,11,12}) passed without any code change: no consensus CF writes
+differently across restart. The `__book_mode__` re-put happens only on a DB that
+lacks that row (pre-marker history); `..._ignores_book_mode_marker_rewrite`
+deletes the row at restart and fails unless the key is excluded.
+
+## Deviations
+
+1. `cf_native_markets` key `__book_mode__` is excluded from the hash (key filter in
+   `torus_state::running_hash`), not rewritten-on-change: it is node-local by its
+   own definition (wrong-flag restart marker) and no executor reads it for a
+   consensus decision. `__next_global_order_id__` stays hashed (it decides order
+   ids).
+2. `cf_consensus_meta` is hashed only for the consensus key prefixes
+   `pending_rotation:` and `validator_whitelist:` (Task 0); the rest of the CF is
+   the hotstuff block tree and node-local markers.
+3. The serial marker-only path (`app.rs`, block without native flush) now writes
+   the applied-height marker through the hashed flush
+   (`FrozenPending::marker_only` + `flush_with_native_trie_stats`) instead of a
+   bare put: same bytes, plus the hash in the same batch.

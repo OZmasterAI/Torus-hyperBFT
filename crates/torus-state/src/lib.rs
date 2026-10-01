@@ -12,6 +12,7 @@ pub mod native_da;
 pub mod native_trie;
 pub mod overlay;
 pub mod pruner;
+pub mod running_hash;
 pub mod shard_store;
 pub mod snapshot;
 pub mod trade_rows;
