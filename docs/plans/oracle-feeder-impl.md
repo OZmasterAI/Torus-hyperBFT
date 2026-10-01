@@ -991,6 +991,26 @@ Each item notes a place where the plan draft was changed during implementation.
 * Correction s517 (M3). The single-submit endpoint has only the backlog screen
   (no pool-full screen), as before. Only its predicate changes to `is_priority`.
 
+**Commit 3 (rpc)**
+
+* Correction s517 (R1). `oracleSigner` also gets `#[serde(default)]`, so older
+  clients that deserialize `RpcValidatorInfo` keep working. The test lives in
+  `torus-rpc/src/lib.rs` (a real server plus `torus_getValidators`) and covers
+  both the present case and the omitted case.
+
+**Commit 4 (wallet)**
+
+* Correction s517 (W1). The wallet's commands are flat (`register-validator`,
+  `unjail`, `rotate-key`); there is no `validator` subcommand group. The new
+  command is therefore `torus-wallet --keystore <validator keystore>
+  set-oracle-signer --signer <addr> | --clear`.
+  * clap rejects `--signer` together with `--clear`.
+  * `build_set_oracle_signer` rejects neither, and rejects
+    `--signer 0x000…0` (use `--clear`).
+  * The feeder's registration hint and the docs use the flat form.
+* Correction s517 (W1). The lib target also carries `#[cfg(test)] mod
+  test_utils`, because the keystore tests moved with `keystore.rs` into the lib.
+
 ## Open questions (user)
 
 * **Q-S1:** read "nothing else" strictly and hard-block every non-oracle native action sent from a registered signer address? That costs one index read per action on the hot path. The default plan scopes authority instead (D-S1).
