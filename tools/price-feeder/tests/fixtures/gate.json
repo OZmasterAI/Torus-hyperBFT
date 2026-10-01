@@ -1,0 +1,35 @@
+[
+ {
+  "currency_pair": "ETH_USDT",
+  "last": "2683.13",
+  "lowest_ask": "2683.62",
+  "highest_bid": "2683.61",
+  "change_percentage": "0.48",
+  "base_volume": "144856.2422",
+  "quote_volume": "390647766.624025",
+  "high_24h": "2738.51",
+  "low_24h": "2667.84"
+ },
+ {
+  "currency_pair": "BTC_USDT",
+  "last": "83500.4",
+  "lowest_ask": "83500.2",
+  "highest_bid": "83500.1",
+  "change_percentage": "0.52",
+  "base_volume": "9968.042335",
+  "quote_volume": "838467501.0034702",
+  "high_24h": "85632.2",
+  "low_24h": "83031.1"
+ },
+ {
+  "currency_pair": "POL_USDT",
+  "last": "0.11172",
+  "lowest_ask": "0.11165",
+  "highest_bid": "0.11163",
+  "change_percentage": "-3.38",
+  "base_volume": "3099944",
+  "quote_volume": "353614.10272",
+  "high_24h": "0.12064",
+  "low_24h": "0.1109"
+ }
+]
