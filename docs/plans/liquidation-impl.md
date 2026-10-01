@@ -334,6 +334,14 @@ fn cancel_all_cancels_pending_stops_and_releases_their_margin() {
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test market_order_margin_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --lib cancel_batch && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --lib order_book` · depends_on: []
 
+**Correction s517 (T3):** `StopOrder` and its fields are private to `order_book.rs`, so
+`take_pending_stops` returns each removed stop's reservation inputs `(price, quantity)` (price =
+limit, else cap — what `trigger_stops` hands to the placement) instead of `Vec<StopOrder>`;
+`stop_reservation(cfg, price, qty)` takes them. `cancel_orders_and_stops(ctx, trader, None)`
+always visits the markets SORTED (the user path's sum was order-independent anyway — one code
+path for the user and the liquidation step). In the run path a market is dirty when an action
+took a stop even if its reservation was 0 (overflowing legacy row), so the removal persists.
+
 `══ COMMIT 3 ══` `fix(exec): CancelAll also cancels pending stops and releases their margin`
 
 ### T4 — bridge: margin configs from market rows (F2, F8, D11) · depends_on: [1]
