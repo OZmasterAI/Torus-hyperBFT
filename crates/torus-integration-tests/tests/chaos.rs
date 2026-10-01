@@ -440,6 +440,83 @@ fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
     assert!(StateBackend::iterate_cf(&state_db, CF_NATIVE_ORACLE, Some(b"sub")).unwrap().is_empty());
 }
 
+/// Item 3: the liquidation step (cooldown / prev-mark / cursor rows,
+/// vault positions) keeps the incremental native root equal to the full scan.
+#[test]
+fn liquidation_step_keeps_incremental_root_equal_to_full_scan() {
+    use torus_core::liquidation::LIQUIDATOR_VAULT;
+    use torus_core::position::{MarginType, PositionManager};
+    use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
+    use torus_state::cf::CF_NATIVE_MARKETS;
+    use torus_state::native_trie::{build_native_trie_to_cf, native_root_full, persisted_native_root};
+    use torus_state::NativeStateOverlay;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_db = StateDb::open(tmp.path()).unwrap();
+    let staking = StakingManager::new(state_db.clone());
+    for (v, mult) in [(21u8, 1u64), (22, 1), (23, 3)] {
+        staking
+            .put_validator(&addr(v), &ValidatorState {
+                address: addr(v),
+                pubkey: [v; 32],
+                commission_bps: 0,
+                self_stake: MIN_SELF_DELEGATION * U256::from(mult),
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            })
+            .unwrap();
+    }
+    state_db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"listed").unwrap();
+    let pm = PositionManager::new(state_db.clone());
+    for i in 1..=8u8 {
+        let mut b = pm.get_native_balance(&addr(i)).unwrap();
+        b.available = b.available + fp(40 * i as i64);
+        pm.put_native_balance(&addr(i), &b).unwrap();
+        pm.apply_fill(&addr(i), 1, true, fp(10), fp(1_000), MarginType::Cross).unwrap();
+        pm.apply_fill(&addr(9), 1, false, fp(10), fp(1_000), MarginType::Cross).unwrap();
+    }
+    let mut b = pm.get_native_balance(&addr(9)).unwrap();
+    b.available = b.available + fp(10_000_000);
+    pm.put_native_balance(&addr(9), &b).unwrap();
+    build_native_trie_to_cf(&state_db).unwrap();
+
+    for block in 1..=30u64 {
+        let overlay = NativeStateOverlay::new(state_db.clone());
+        let mut ctx = NativeExecContext::new(
+            overlay.clone(), block, 1_700_000_000 + block, 0, 1_000, 100,
+            Address::ZERO, Address::ZERO, Address::ZERO,
+        );
+        NativeExecutor::begin_block_oracle(&mut ctx);
+        let actions: Vec<_> = if block <= 12 {
+            [21u8, 22, 23]
+                .iter()
+                .map(|&v| (addr(v), NativeAction::SubmitOraclePrices(OracleSubmission {
+                    prices: vec![(1, fp(1_000 - 8 * block as i64))],
+                    timestamp: 0,
+                })))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        NativeExecutor::execute_batch(&mut ctx, &actions);
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "block {block}");
+        overlay.flush_with_native_trie(&state_db).unwrap();
+        assert_eq!(
+            persisted_native_root(&state_db).unwrap(),
+            native_root_full(&state_db).unwrap(),
+            "block {block}: incremental native root != full scan (liquidation step)"
+        );
+    }
+    // Non-vacuous: trader 1 (collateral 40) is underwater at the first mark
+    // (992: AV 40 - 80 = -40) and ADL'd flat (its deficit moves to the vault);
+    // later traders are backstopped / sold as the mark falls.
+    assert!(pm.get_position(&addr(1), 1).unwrap().is_none(), "non-vacuous: liquidations ran");
+    let _ = LIQUIDATOR_VAULT;
+}
+
 /// Execution ordering: verify tech-req section 2.2 ordering is enforced.
 /// Cancels before new orders, non-GTC before GTC.
 #[test]

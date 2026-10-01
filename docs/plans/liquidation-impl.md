@@ -1790,6 +1790,11 @@ fn liquidation_step_keeps_incremental_root_equal_to_full_scan() {
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib liquidation_determinism && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle_determinism && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-integration-tests --test chaos` · depends_on: [8]
 
+**Correction s517 (T9):** the chaos test's non-vacuous comment said trader 1 is "backstopped"
+at the first mark; at 992 its AV is 40 − 80 = −40, so it is ADL'd (deficit to the vault). The
+assertion (trader 1 flat) is unchanged; comment fixed. Both gates passed on the first run (no
+implementation change needed).
+
 `══ COMMIT 8 ══` `test(liquidation): serial = pipelined = replay; incremental root = full`
 
 ### T10 — docs · depends_on: [8, 9]

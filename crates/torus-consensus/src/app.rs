@@ -14568,11 +14568,14 @@ mod crash_recovery_tests {
         Replay,
     }
 
-    fn run_oracle_fixture(
+    /// Item 3 (T9): `fixture` builds the starting DB (oracle tests:
+    /// `oracle_fixture_db`; liquidation: `liq_det_fixture`).
+    fn run_fixture(
         mode: OracleRun,
         blocks: &[TorusBlock],
+        fixture: fn() -> (ChainConfig, StateDb),
     ) -> (Vec<CfDump>, torus_types::B256, StateDb) {
-        let (config, db) = oracle_fixture_db();
+        let (config, db) = fixture();
         match mode {
             OracleRun::Serial => {
                 let ctx = make_exec_ctx(&config, &db);
@@ -14622,9 +14625,9 @@ mod crash_recovery_tests {
     #[test]
     fn oracle_determinism_serial_pipelined_and_replay_are_identical() {
         let blocks = oracle_determinism_blocks();
-        let (serial, root_s, db_s) = run_oracle_fixture(OracleRun::Serial, &blocks);
-        let (piped, root_p, _) = run_oracle_fixture(OracleRun::PipelinedParked, &blocks);
-        let (replay, root_r, _) = run_oracle_fixture(OracleRun::Replay, &blocks);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, oracle_fixture_db);
         // Non-vacuous: 8..=13: V1 300, V2 310 (ts 1007), V3 200 (ts 1003, 3x) in the
         // window through ts 1013 -> stake-weighted 200, re-stamped; 14: V3's row
         // (age 11) pruned -> 2 reporters, stamp stays 13; block 7's 2 rows remain.
@@ -14645,8 +14648,8 @@ mod crash_recovery_tests {
     fn oracle_determinism_parent_layer_due_check_is_observable() {
         let mut blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[], &[]]);
         blocks[2].header.timestamp = 1_012; // last block: no child to relink
-        let (serial, root_s, db_s) = run_oracle_fixture(OracleRun::Serial, &blocks);
-        let (piped, root_p, _) = run_oracle_fixture(OracleRun::PipelinedParked, &blocks);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
         assert_eq!(mark_at(&db_s, 1_012), Some((px(100), 2)), "block 2's aggregate survives");
         assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
         assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
@@ -14742,5 +14745,52 @@ mod crash_recovery_tests {
         assert_eq!(signed_pos_of(&db, &t), px(128), "chunk 2 = 20% of 160");
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(32));
+    }
+
+    /// T1 (71) long 10 @ 100, collateral 40; T2 (74) long 10 @ 100, collateral 50;
+    /// S (72) short 20 @ 100; maker M (73). 1: V @100 + M bid 10 @ 95;
+    /// 3: V @97 -> block 4: T1 backstop (AV 10 < 16.17), T2 stage 1 (AV 20) into
+    /// M's bid; 5: V @80 -> block 6: vault AV 10 - 170 < 0 -> ADL vs S at 97.
+    fn liq_det_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, 40), (74, 50), (72, 1_000_000), (73, 1_000_000)] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        for long in [71u8, 74] {
+            pm.apply_fill(&oracle_addr(long), ORACLE_MARKET, true, px(10), px(100), MarginType::Cross).unwrap();
+            pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(10), px(100), MarginType::Cross).unwrap();
+        }
+        (config, db)
+    }
+
+    fn liq_det_blocks() -> Vec<TorusBlock> {
+        let subs = |h: u64, p: i64| vec![oracle_sub(61, h, p), oracle_sub(62, h, p), oracle_sub(63, h, p)];
+        let mut r1 = subs(1, 100);
+        r1.push(signed_bid(73, 1_073, 95, 10));
+        let mut rounds = vec![r1, vec![], subs(3, 97), vec![], subs(5, 80)];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 9)); // 6..=14
+        liq_blocks(rounds)
+    }
+
+    #[test]
+    fn liquidation_determinism_serial_pipelined_and_replay_are_identical() {
+        use torus_core::liquidation::LIQUIDATOR_VAULT;
+        let blocks = liq_det_blocks();
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, liq_det_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, liq_det_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, liq_det_fixture);
+        // Non-vacuous: all three mechanisms ran.
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(71)), FixedPoint::ZERO, "T1 backstopped");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(74)), FixedPoint::ZERO, "T2 sold into the book");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(73)), px(10), "M bought T2's 10 @ 95");
+        assert_eq!(signed_pos_of(&db_s, &LIQUIDATOR_VAULT), FixedPoint::ZERO, "vault ADL'd");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(72)), -px(10));
+        assert_dumps_equal(&serial, &piped, "liquidation: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "liquidation: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
     }
 }
