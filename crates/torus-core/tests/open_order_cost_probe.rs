@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use torus_core::order_book::OrderBook;
+use torus_core::order_book::{open_order_counts, OrderBook};
 use torus_types::{Address, FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
 
 fn fp(v: i64) -> FixedPoint {
@@ -55,18 +55,18 @@ fn books(markets: u64, per: u64, owners: impl Fn(u64) -> Vec<u64>) -> Vec<OrderB
 
 fn time_counts(label: &str, books: &[OrderBook], senders: u64) {
     let idx: HashMap<Address, usize> = (0..senders).map(|s| (trader(s), s as usize)).collect();
-    let mut best = f64::MAX;
-    let mut total = 0;
-    for _ in 0..5 {
-        let t0 = Instant::now();
-        let mut counts = vec![0usize; idx.len()];
-        for b in books {
-            b.add_open_order_counts(&idx, &mut counts);
+    let refs: Vec<&OrderBook> = books.iter().collect();
+    for threads in [0, 8] {
+        let mut best = f64::MAX;
+        let mut total = 0;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let counts = open_order_counts(&refs, &idx, threads, 25_000);
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+            total = counts.iter().sum::<usize>();
         }
-        best = best.min(t0.elapsed().as_secs_f64() * 1e3);
-        total = counts.iter().sum::<usize>();
+        println!("{label}: {senders} senders, {threads} threads -> {best:.1} ms (sum {total})");
     }
-    println!("{label}: {senders} senders -> {best:.1} ms (sum {total})");
 }
 
 #[test]
