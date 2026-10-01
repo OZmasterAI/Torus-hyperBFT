@@ -1502,6 +1502,25 @@ fn stops_fired_by_liquidation_fills_run_in_the_step() {
 
 **validate:** `/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests` · depends_on: [7a]
 
+**Correction s517 (T7):**
+* **Candidate fetch = `SCAN + 2`** (draft: `SCAN + 1`). The vault is filtered AFTER the fetch, so
+  with `+ 1` a window `[vault, b]` (scan 1) ends "naturally" after `b` and deletes the cursor
+  although later traders were never scanned. The vault is at most one of the fetched traders, so
+  `+ 2` keeps "consumed everything without a budget stop" ⇔ "end of the CF". New regression test
+  `the_vault_in_the_window_does_not_end_a_pass_early` (RED with `+ 1`: cursor `None`).
+* `liquidation_due` lives in `liquidation_step.rs` (same `impl NativeExecutor`, pub) and uses
+  `StateBackend::prefix_exists` for the cooldown rows.
+* `cancel_account_orders` = T3's `cancel_orders_and_stops(ctx, trader, None)` (sorted markets)
+  followed by `release_order_margin` (the helper returns the amount).
+* Vault ADL test: `classify(&v) == Some(Health::Adl)` (overflow-checked) instead of
+  `v.equity() < 0` (`equity` uses panicking `+`).
+* ADL ranking AV: an `Overflow` valuation ranks the counterparty last (AV 0) instead of failing
+  the step (a fail-stop for an arithmetic corner); storage errors still fail-stop.
+* `listed_market_ids` errors map to `CoreError::InvalidInput` (there is no `Internal` variant) ⇒
+  `fatal_error`.
+* Stage 1: a rejected liquidation order is pushed as a result; a re-valuation of `None` (the
+  account went flat) ends stage 1.
+
 `══ COMMIT 6 ══` `feat(exec): HL liquidation step — book, backstop vault, ADL (not wired)`
 
 ### T8 — consensus: wire the step, gate, fatal check · depends_on: [7e]
