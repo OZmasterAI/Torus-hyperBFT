@@ -1627,6 +1627,61 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// s517 oracle feeder R1: `getValidators` reports `oracleSigner` when set
+    /// and omits the field otherwise.
+    #[tokio::test]
+    async fn get_validators_reports_oracle_signer() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, sk) = oracle_fixture(&state); // V with signer S
+        let addr = |k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, 0, k)
+                .recover_sender()
+                .unwrap()
+        };
+        let w = Address::repeat_byte(0x77);
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &w,
+                &torus_economics::ValidatorState {
+                    address: w,
+                    pubkey: [4; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Jailed,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: None,
+                },
+            )
+            .unwrap();
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let server = RpcServer::new(
+            state,
+            mempool,
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, sock) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{sock}")).unwrap();
+        let vals: serde_json::Value =
+            client.request("torus_getValidators", jsonrpsee::rpc_params![]).await.unwrap();
+        let find = |a: Address| {
+            vals.as_array().unwrap().iter().find(|x| x["address"] == format!("{a:#x}")).cloned().unwrap()
+        };
+        let v = find(addr(&vk));
+        assert_eq!(v["oracleSigner"], format!("{:#x}", addr(&sk)));
+        assert_eq!(v["status"], "active");
+        let j = find(w);
+        assert!(j.get("oracleSigner").is_none(), "absent signer omits the field: {j}");
+        assert_eq!(j["status"], "jailed");
+        handle.stop().unwrap();
+    }
+
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
     /// are shed after a decode-only pass (no signature verification spent),
     /// while cancels still travel the full verify path so pool eviction

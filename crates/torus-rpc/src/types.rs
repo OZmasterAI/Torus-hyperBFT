@@ -419,6 +419,10 @@ pub struct RpcValidatorInfo {
     pub power: String,
     pub commission_bps: u16,
     pub status: String,
+    /// s517: the registered hot oracle signer (`SetOracleSigner`); omitted
+    /// when none is set. The price feeder checks its registration here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_signer: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
