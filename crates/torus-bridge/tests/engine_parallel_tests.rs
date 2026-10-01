@@ -132,7 +132,7 @@ fn run_batches(batches: &[Vec<(Address, NativeAction)>], threads: usize) -> RunF
     run_with_volumes(batches, threads, &[]).0
 }
 
-/// `run_batches` with block-start `cum_volume` rows preset; also returns the
+/// `run_batches` with `cum_volume` rows preset before the first batch; also returns the
 /// `orders_rejected_open_limit` funnel counter.
 fn run_with_volumes(
     batches: &[Vec<(Address, NativeAction)>],
@@ -755,7 +755,7 @@ fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
     }
 }
 
-/// Pending stops in the books at block start hold slots: 998 resting + 2
+/// Pending stops in the books at batch start hold slots: 998 resting + 2
 /// stops = 1000 open, so the next GTC is rejected; a cancel-all frees all.
 #[test]
 fn open_limit_counts_pending_stops_at_block_start() {
@@ -981,4 +981,32 @@ fn open_limit_and_cum_volume_on_the_single_action_path() {
     assert!(r.success, "{r:?}");
     assert_eq!(ctx.positions.get_cum_volume(&a).unwrap(), fp(120));
     assert_eq!(ctx.positions.get_cum_volume(&b).unwrap(), fp(120));
+}
+
+/// A block runs `execute_batch` twice (app.rs: pre-EVM, then post-EVM). The
+/// count and the limit are taken at the start of EACH batch, so the second
+/// batch sees the first one's resting orders and its fills' cum_volume.
+#[test]
+fn open_limit_is_taken_at_each_execute_batch_start() {
+    let (a, b, c) = (addr(1), addr(6), addr(7));
+    let mut pre_evm = interleave(vec![resting(a, 1000), resting(b, 1000)]);
+    // b sells 100 @ 50000 into c's bid (IOC: exempt) = 5M of volume for b.
+    pre_evm.push(place(c, gtc(7, true, 50_000, 100)));
+    pre_evm.push(place(b, order(7, false, fp(50_000), fp(100), TimeInForce::IOC)));
+    let post_evm = vec![
+        place(a, gtc(6, true, 50, 1)),
+        place(b, gtc(6, true, 50, 1)),
+        place(b, gtc(6, true, 49, 1)),
+    ];
+    let batches = vec![pre_evm, post_evm];
+    let golden = run_with_volumes(&batches, 0, &[]);
+    assert!(golden.0.results[0].iter().all(|r| r.0));
+    let r = &golden.0.results[1];
+    assert!(is_open_limit(&r[0]), "a: 1000 resting from the first batch: {:?}", r[0]);
+    assert!(r[1].0, "b: limit 1001 from the first batch's fill: {:?}", r[1]);
+    assert!(is_open_limit(&r[2]), "b at 1001: {:?}", r[2]);
+    assert_eq!(golden.1, 2);
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_with_volumes(&batches, threads, &[]), "threads={threads}");
+    }
 }
