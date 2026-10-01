@@ -249,8 +249,8 @@ fn cancel_all_many_empty_book_and_empty_run() {
 }
 
 /// Duplicates get empty results (as the second sequential call does), the
-/// stop-only trader keeps its stop (sequential early return), and orderless
-/// senders are no-ops.
+/// stop-only trader loses its stop (as its sequential call does), and
+/// orderless senders are no-ops.
 #[test]
 fn cancel_all_many_duplicate_absent_and_stop_only_senders() {
     for mode in [0, 2, 3] {
@@ -271,7 +271,7 @@ fn cancel_all_many_duplicate_absent_and_stop_only_senders() {
         assert!(got[1].is_empty() && got[2].is_empty() && got[3].is_empty());
         assert!(got[5].is_empty() && got[6].is_empty());
         assert_eq!(got, sequential(&mut b, &senders));
-        assert!(a.pending_stops.iter().any(|s| s.trader == stop_only));
+        assert!(!a.pending_stops.iter().any(|s| s.trader == stop_only));
         assert_books_equal(&mut a, &mut b);
     }
 }

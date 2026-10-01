@@ -298,3 +298,65 @@ fn cancel_batch_flag_on_matches_off_long_run_emptying_books() {
         assert_eq!(off, on);
     }
 }
+
+/// A cancel-all from a sender with only pending stops removes the stops and
+/// marks the book dirty, so the removal is persisted (a reload has no stop).
+#[test]
+fn cancel_all_of_stop_only_senders_persists_stop_removal() {
+    let stop = |trigger: i64| {
+        NativeAction::PlaceOrder(PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type: OrderType::StopMarket {
+                trigger: fp(trigger),
+            },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        })
+    };
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        for batch in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut ctx = new_ctx(&dir, mode);
+            let setup = vec![
+                (addr(1), stop(200)),
+                (addr(1), stop(210)),
+                (addr(2), stop(220)),
+                (addr(3), gtc(1, true, 99, 1)),
+            ];
+            NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, batch);
+            ctx.save_order_books();
+            ctx.dirty_books.clear();
+            assert_eq!(ctx.order_books[&1].open_order_count(&addr(1)), 2);
+
+            let block = vec![
+                (addr(1), cancel_all(None)),
+                (addr(2), cancel_all(Some(1))),
+            ];
+            NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, batch);
+            assert!(ctx.dirty_books.contains(&1), "{mode:?} batch={batch}");
+            assert_eq!(ctx.order_books[&1].pending_stop_count(), 0);
+            ctx.save_order_books();
+
+            let reloaded = NativeExecContext::new_with_mode(
+                ctx.state.clone(),
+                3,
+                1000,
+                0,
+                100,
+                10,
+                addr(99),
+                addr(100),
+                addr(101),
+                mode,
+                None,
+            );
+            let book = &reloaded.order_books[&1];
+            assert_eq!(book.pending_stop_count(), 0, "{mode:?} batch={batch}");
+            assert_eq!(book.open_order_count(&addr(3)), 1);
+        }
+    }
+}
