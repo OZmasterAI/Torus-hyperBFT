@@ -365,3 +365,17 @@ fn newest_sample_wins_across_validator_and_signer() {
         assert_eq!((row.validator, row.price), (addr(V1), fp(100)), "flip={flip}: newest (direct) wins");
     }
 }
+
+/// Review L2: a tombstoned validator may still CLEAR its signer (freeing the
+/// signer address), but not set or rotate one.
+#[test]
+fn tombstoned_validator_may_clear_its_signer() {
+    let (_d, db) = oracle_db();
+    assert!(exec(&db, 1, set(V1, S)).success);
+    put_validator_status(&db, V1, ValidatorStatus::Tombstoned);
+    assert_rejected(&exec(&db, 2, set(V1, S2)), "tombstoned");
+    assert_eq!(signer_of(&db, V1), Some(S));
+    assert!(exec(&db, 3, set(V1, Address::ZERO)).success);
+    assert_eq!(signer_of(&db, V1), None);
+    assert_eq!(index(&db, S), None, "the signer address is free again");
+}

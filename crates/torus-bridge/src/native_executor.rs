@@ -6627,13 +6627,15 @@ impl NativeExecutor {
         use torus_economics::types::ValidatorStatus;
         use torus_state::cf::{oracle_signer_key, CF_NATIVE_ORACLE};
         let err = |m: String| NativeActionResult::err("set_oracle_signer", m);
+        let new = (signer != Address::ZERO).then_some(signer);
+        // Review L2: a tombstoned validator may still CLEAR its signer (so the
+        // signer address is freed), but never set or rotate one.
         let mut v = match ctx.staking.get_validator(sender) {
-            Ok(Some(v)) if v.status != ValidatorStatus::Tombstoned => v,
+            Ok(Some(v)) if v.status != ValidatorStatus::Tombstoned || new.is_none() => v,
             Ok(Some(_)) => return err(format!("validator {sender} is tombstoned")),
             Ok(None) => return err(format!("{sender} is not a registered validator")),
             Err(e) => return err(e.to_string()),
         };
-        let new = (signer != Address::ZERO).then_some(signer);
         if v.oracle_signer == new {
             return NativeActionResult::ok("set_oracle_signer", 1000);
         }
