@@ -6568,7 +6568,7 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         prices: &[(MarketId, FixedPoint)],
-        _submission_timestamp: u64,
+        sample_ms: u64,
     ) -> NativeActionResult {
         // FIX 18 (ECON-FIND-19): the REPORTER must be an active, non-jailed
         // validator. s517: the reporter is the sender itself (direct submission)
@@ -6584,8 +6584,19 @@ impl NativeExecutor {
             );
         }
 
-        use torus_core::oracle::{valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP};
+        use torus_core::oracle::{
+            valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP, MAX_ORACLE_SAMPLE_SKEW_MS as SKEW,
+        };
         let err = |m: String| NativeActionResult::err("submit_oracle_prices", m);
+        // Review M1(b): the signed sample time must be within SKEW of the
+        // block's header time (seconds), so a delayed submission never lands
+        // as a fresh price.
+        let block_ms = ctx.timestamp.saturating_mul(1_000);
+        if sample_ms.saturating_add(SKEW) < block_ms || sample_ms > block_ms.saturating_add(SKEW) {
+            return err(format!(
+                "submission sampled at {sample_ms} ms, more than {SKEW} ms from the block time {block_ms} ms"
+            ));
+        }
         // Item 2: validate EVERY entry before writing any (no per-action rollback)
         // — the action is all-or-nothing.
         if prices.is_empty() || prices.len() > CAP {
@@ -6606,11 +6617,26 @@ impl NativeExecutor {
             }
         }
 
+        // Review M1(b): newest sample wins per (market, validator), whatever
+        // the in-block order: a sample not newer than the stored one is
+        // skipped (an equal one keeps the first in canonical order).
+        let mut newer = Vec::with_capacity(prices.len());
         for &(market_id, price) in prices {
-            if let Err(e) =
-                ctx.oracle
-                    .submit_price(&reporter, market_id, price, ctx.block_height, ctx.timestamp)
-            {
+            match ctx.oracle.stored_sample_ms(market_id, &reporter) {
+                Ok(Some(stored)) if stored >= sample_ms => {}
+                Ok(_) => newer.push((market_id, price)),
+                Err(e) => return err(e.to_string()),
+            }
+        }
+        for (market_id, price) in newer {
+            if let Err(e) = ctx.oracle.submit_sampled(
+                &reporter,
+                market_id,
+                price,
+                sample_ms,
+                ctx.block_height,
+                ctx.timestamp,
+            ) {
                 return NativeActionResult::err("submit_oracle_prices", e.to_string());
             }
         }

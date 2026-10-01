@@ -14427,7 +14427,8 @@ mod crash_recovery_tests {
                         torus_types::eip712::sign_native_action(
                             NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
                                 prices: vec![(ORACLE_MARKET, px(price))],
-                                timestamp: 0,
+                                // review M1(b): sampled at the block's time (ms)
+                                timestamp: (1_000 + h) * 1_000,
                             }),
                             h * 1_000 + seed as u64,
                             &oracle_key(seed),
@@ -14453,7 +14454,16 @@ mod crash_recovery_tests {
         for path in ["serial", "dispatch", "replay"] {
             let (config, db) = oracle_fixture_db();
             let ctx = make_exec_ctx(&config, &db);
-            let mut blocks = oracle_blocks(&[&[(61, 100)]]);
+            // review M1(b): the sample must be within 5 s of the block time.
+            let sub = torus_types::eip712::sign_native_action(
+                NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                    prices: vec![(ORACLE_MARKET, px(100))],
+                    timestamp: 777_777_000,
+                }),
+                1_061,
+                &oracle_key(61),
+            );
+            let mut blocks = vec![make_block(1, vec![sub])];
             blocks[0].header.timestamp = 777_777; // height 1: parent is the genesis header
             match path {
                 "serial" => ctx.execute_committed_block(&blocks[0], vec![]),
@@ -14869,10 +14879,14 @@ mod crash_recovery_tests {
     }
 
     fn signer_submit(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64) -> SignedNativeAction {
+        signer_submit_at(h, key, tag, price, (1_000 + h) * 1_000)
+    }
+
+    fn signer_submit_at(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64, sample_ms: u64) -> SignedNativeAction {
         torus_types::eip712::sign_native_action(
             NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
                 prices: vec![(ORACLE_MARKET, px(price))],
-                timestamp: 0,
+                timestamp: sample_ms,
             }),
             h * 1_000 + tag as u64,
             key,
@@ -14982,7 +14996,12 @@ mod crash_recovery_tests {
             vec![signer_submit(5, &signer_key(61), 61, 900), signer_submit(5, &new61, 1, 310)],
             vec![set_signer_action(6, 62, Address::ZERO)],
             subs(7, 400), // 62's cleared signer is rejected
-            vec![],
+            // review M1(b): two samples of V63 in one block; the newer (450)
+            // must win whatever the in-block order.
+            vec![
+                signer_submit_at(8, &signer_key(63), 1, 450, 1_008_000),
+                signer_submit_at(8, &signer_key(63), 2, 999, 1_007_500),
+            ],
         ]);
         let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
         let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
@@ -14993,6 +15012,12 @@ mod crash_recovery_tests {
         assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&new61).as_slice() && v[..] == *oracle_addr(61).as_slice()));
         assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&signer_key(63)).as_slice() && v[..] == *oracle_addr(63).as_slice()));
         assert!(mark_at(&db_s, 1_008).is_some());
+        let v63 = oracle_sub_rows(&db_s)
+            .into_iter()
+            .map(|(_, v)| <torus_core::oracle::OracleSubmission as borsh::BorshDeserialize>::try_from_slice(&v).unwrap())
+            .find(|r| r.validator == oracle_addr(63))
+            .unwrap();
+        assert_eq!(v63.price, px(450), "newest sample of the block wins");
         assert_dumps_equal(&serial, &piped, "oracle signer: serial vs pipelined (parked)");
         assert_dumps_equal(&serial, &replay, "oracle signer: serial vs crash replay");
         assert_eq!(root_s, root_p);

@@ -35,6 +35,13 @@ pub const MAX_ORACLE_PRICES_PER_SUBMISSION: usize = 256;
 /// (its `FixedPoint` operators panic on overflow).
 pub const MAX_ORACLE_PRICE_RAW: i128 = 1_000_000_000_000 * FixedPoint::SCALE;
 
+/// Review M1(b) (s517): a submission's `timestamp` is its SAMPLE time (unix
+/// ms, signed with the action). Exec rejects a submission sampled more than
+/// this long before (or after) the block's header time, so a submission that
+/// sat in a mempool cannot land as a fresh price. Within that window the row
+/// keeps the NEWEST sample per (market, validator).
+pub const MAX_ORACLE_SAMPLE_SKEW_MS: u64 = 5_000;
+
 /// Accepted range of one oracle price: `0 < price <= MAX_ORACLE_PRICE_RAW`.
 pub fn valid_oracle_price(price: FixedPoint) -> bool {
     price > FixedPoint::ZERO && price.raw() <= MAX_ORACLE_PRICE_RAW
@@ -51,6 +58,8 @@ pub struct OracleSubmission {
     pub validator: Address,
     pub market_id: MarketId,
     pub price: FixedPoint,
+    /// Sample time (unix ms) the reporter signed (review M1(b)).
+    pub sample_ms: u64,
     pub block_number: u64,
     pub timestamp: u64,
 }
@@ -60,6 +69,7 @@ impl BorshSerialize for OracleSubmission {
         borsh_write_address(&self.validator, w)?;
         w.write_all(&self.market_id.to_be_bytes())?;
         borsh_write_fp(&self.price, w)?;
+        w.write_all(&self.sample_ms.to_be_bytes())?;
         w.write_all(&self.block_number.to_be_bytes())?;
         w.write_all(&self.timestamp.to_be_bytes())?;
         Ok(())
@@ -73,6 +83,9 @@ impl BorshDeserialize for OracleSubmission {
         r.read_exact(&mut mb)?;
         let market_id = u64::from_be_bytes(mb);
         let price = borsh_read_fp(r)?;
+        let mut sb = [0u8; 8];
+        r.read_exact(&mut sb)?;
+        let sample_ms = u64::from_be_bytes(sb);
         let mut bb = [0u8; 8];
         r.read_exact(&mut bb)?;
         let block_number = u64::from_be_bytes(bb);
@@ -83,6 +96,7 @@ impl BorshDeserialize for OracleSubmission {
             validator,
             market_id,
             price,
+            sample_ms,
             block_number,
             timestamp,
         })
@@ -216,7 +230,7 @@ impl<T: StateBackend> OracleManager<T> {
         Self { state, config }
     }
 
-    // 2.8b.1: Submit a price from a validator.
+    // 2.8b.1: Submit a price from a validator (sampled at the block time).
     pub fn submit_price(
         &self,
         validator: &Address,
@@ -225,10 +239,24 @@ impl<T: StateBackend> OracleManager<T> {
         block_number: u64,
         timestamp: u64,
     ) -> Result<(), CoreError> {
+        self.submit_sampled(validator, market_id, price, timestamp.saturating_mul(1_000), block_number, timestamp)
+    }
+
+    /// Write the (market, validator) row with the reporter's sample time.
+    pub fn submit_sampled(
+        &self,
+        validator: &Address,
+        market_id: MarketId,
+        price: FixedPoint,
+        sample_ms: u64,
+        block_number: u64,
+        timestamp: u64,
+    ) -> Result<(), CoreError> {
         let submission = OracleSubmission {
             validator: *validator,
             market_id,
             price,
+            sample_ms,
             block_number,
             timestamp,
         };
@@ -236,6 +264,16 @@ impl<T: StateBackend> OracleManager<T> {
         let data = borsh::to_vec(&submission).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &data)?;
         Ok(())
+    }
+
+    /// The sample time of `validator`'s stored row for `market_id`, if any.
+    pub fn stored_sample_ms(&self, market_id: MarketId, validator: &Address) -> Result<Option<u64>, CoreError> {
+        match self.state.get_cf_raw(CF_NATIVE_ORACLE, &submission_key(market_id, validator))? {
+            None => Ok(None),
+            Some(v) => OracleSubmission::try_from_slice(&v)
+                .map(|s| Some(s.sample_ms))
+                .map_err(|e| CoreError::Borsh(e.to_string())),
+        }
     }
 
     // 2.8b.2 + 2.8b.4: Aggregate prices using stake-weighted median with outlier rejection.

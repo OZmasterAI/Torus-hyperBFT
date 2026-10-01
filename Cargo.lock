@@ -6930,6 +6930,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "borsh 1.6.1",
  "ed25519-dalek",
  "hotstuff_rs",
  "k256",
