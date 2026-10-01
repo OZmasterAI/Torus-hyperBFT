@@ -3251,7 +3251,7 @@ impl NativeExecutor {
                 order_id,
                 new_price,
                 new_qty,
-            } => Self::exec_modify_order(ctx, *order_id, *new_price, *new_qty),
+            } => Self::exec_modify_order(ctx, sender, *order_id, *new_price, *new_qty),
 
             // ---- Staking ----
             NativeAction::Delegate { validator, amount } => {
@@ -5358,10 +5358,26 @@ impl NativeExecutor {
 
     fn exec_modify_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
+        sender: &Address,
         order_id: u128,
         new_price: Option<FixedPoint>,
         new_qty: Option<FixedPoint>,
     ) -> NativeActionResult {
+        // Only the order's owner may modify it (same check as `exec_cancel_order`).
+        for book in ctx.order_books.values() {
+            if let Some(order) = book.get_order(order_id) {
+                if order.trader != *sender {
+                    return NativeActionResult::err(
+                        "modify_order",
+                        format!(
+                            "order {order_id} belongs to {}, not sender {sender}",
+                            order.trader
+                        ),
+                    );
+                }
+                break;
+            }
+        }
         for book in ctx.order_books.values_mut() {
             // Capture old order state for margin delta calculation.
             let old_order = book.get_order(order_id).cloned();
