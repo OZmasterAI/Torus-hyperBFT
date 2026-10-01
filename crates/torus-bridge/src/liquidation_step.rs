@@ -240,7 +240,7 @@ impl NativeExecutor {
             // C7: ranking AV with entry fallback for unmarked markets. An
             // overflowing valuation ranks last (AV 0) — ranking only; a
             // storage error stays an error (fail-stop).
-            let cands = liq::adl_candidates(&ctx.positions, m, u, !p.is_long, |t| {
+            let cands = liq::adl_candidates(&ctx.positions, m, u, !p.is_long, liq::ADL_MAX_SCAN_ROWS, |t| {
                 let bal = ctx.positions.get_native_balance(t)?;
                 let v = match reader.view(t, &bal) {
                     Ok(v) => v,

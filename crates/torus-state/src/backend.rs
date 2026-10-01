@@ -42,6 +42,25 @@ pub trait StateBackend: Clone + Send + Sync {
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError>;
 
+    /// Review H3 (s517): the first `limit` live entries with key `>= start`, in
+    /// key order — a bounded seek (`StateDb` and `NativeStateOverlay` never
+    /// materialise the CF). Equals `iterate_cf(cf, None)` filtered to
+    /// `k >= start`, truncated to `limit`.
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        Ok(self
+            .iterate_cf(cf, None)?
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() >= start)
+            .take(limit)
+            .collect())
+    }
+
     /// Whether any key starting with `prefix` exists — `!iterate_cf(prefix)
     /// .is_empty()`. `StateDb` and `NativeStateOverlay` stop at the first live
     /// key instead of loading every row.
@@ -150,6 +169,32 @@ impl StateBackend for StateDb {
             }
         }
         Ok(results)
+    }
+
+    /// Review H3: RocksDB seek to `start`, at most `limit` rows read.
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        for item in db.iterator_cf(cf_handle, mode) {
+            let (key, value) = item?;
+            out.push((key.to_vec(), value.to_vec()));
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// First key at/after `prefix` only (keys are sorted: if it does not
@@ -1654,6 +1699,77 @@ impl StateBackend for NativeStateOverlay {
         Ok(merged.into_iter().collect())
     }
 
+    /// Review H3: the merged `iterate_cf` from `start`, without materialising
+    /// it — a k-way merge of the DB iterator (seeked to `start`) and the
+    /// parent / pending write ranges; each candidate key resolves by the
+    /// layered point-read rule (pending, then parent, then DB), so tombstones
+    /// in either layer hide it. Reads at most `limit` live rows plus the
+    /// tombstoned DB keys in between.
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            return StateBackend::iterate_cf_from(&self.db, cf, start, limit);
+        };
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+        let pending = self.pending.read().unwrap();
+        let parent = self.parent.as_ref().map(|p| &p.state);
+        let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
+        let mut aw = parent
+            .into_iter()
+            .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
+            .peekable();
+        let db = self.db.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mut dbi = db.iterator_cf(
+            cf_handle,
+            rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+        );
+        let mut dbh = dbi.next().transpose()?;
+        while out.len() < limit {
+            let heads = [
+                pw.peek().map(|(k, _)| k.as_slice()),
+                aw.peek().map(|(k, _)| k.as_slice()),
+                dbh.as_ref().map(|(k, _)| &**k),
+            ];
+            let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
+                break;
+            };
+            let value = match pending.lookup(id, &key) {
+                Some(hit) => hit.map(<[u8]>::to_vec),
+                None => match parent.and_then(|s| s.lookup(id, &key)) {
+                    Some(hit) => hit.map(<[u8]>::to_vec),
+                    None => dbh
+                        .as_ref()
+                        .filter(|(k, _)| **k == *key)
+                        .map(|(_, v)| v.to_vec()),
+                },
+            };
+            if pw.peek().is_some_and(|(k, _)| **k == key) {
+                pw.next();
+            }
+            if aw.peek().is_some_and(|(k, _)| **k == key) {
+                aw.next();
+            }
+            if dbh.as_ref().is_some_and(|(k, _)| **k == *key) {
+                dbh = dbi.next().transpose()?;
+            }
+            if let Some(v) = value {
+                out.push((key, v));
+            }
+        }
+        Ok(out)
+    }
+
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
     /// is live per the layered point-read rule (pending, then parent, then DB).
     /// Checks pending / parent writes under `prefix`, then walks DB keys and
@@ -1788,6 +1904,70 @@ mod tests {
         }
         assert!(yes > 0 && no > 0, "non-vacuous: {yes} / {no}");
         assert!(!overlay.prefix_exists(cf, b"q").unwrap(), "no key under the prefix");
+    }
+
+    /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`
+    /// entries of the merged `iterate_cf` with key >= `start`, for every
+    /// layering of two keys over DB / parent (frozen) / pending (absent, write,
+    /// tombstone), many starts (before / on / between / after keys) and
+    /// limits — on the overlay and on the bare DB.
+    #[test]
+    fn iterate_cf_from_matches_iterate_cf_over_every_layering() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let states: Vec<(bool, u8, u8)> = (0..18u8).map(|i| (i % 2 == 1, (i / 2) % 3, i / 6)).collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k * 2 + 1]].concat();
+        let combos: Vec<[(bool, u8, u8); 2]> =
+            states.iter().flat_map(|&a| states.iter().map(move |&b| [a, b])).collect();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), &[b'd', c as u8, k as u8]).unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: u8| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &key(c, k as u8), &[b'w', layer, c as u8, k as u8]).unwrap(),
+                        2 => ov.delete_cf_raw(cf, &key(c, k as u8)).unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        apply(&parent, 0);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+        apply(&overlay, 1);
+        let all = overlay.iterate_cf(cf, None).unwrap();
+        let all_db = StateBackend::iterate_cf(&db, cf, None).unwrap();
+        assert!(!all.is_empty() && all.len() < combos.len() * 2, "non-vacuous");
+        let expect = |rows: &[(Vec<u8>, Vec<u8>)], start: &[u8], limit: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+            rows.iter().filter(|(k, _)| k.as_slice() >= start).take(limit).cloned().collect()
+        };
+        let mut starts: Vec<Vec<u8>> = vec![Vec::new(), b"q".to_vec()];
+        for c in (0..combos.len()).step_by(7) {
+            for k in 0..5u8 {
+                starts.push([prefix(c), vec![k]].concat()); // before / on / between keys
+            }
+        }
+        for start in &starts {
+            for limit in [0usize, 1, 2, 3, 17, usize::MAX] {
+                assert_eq!(
+                    overlay.iterate_cf_from(cf, start, limit).unwrap(),
+                    expect(&all, start, limit),
+                    "overlay start {start:?} limit {limit}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_from(&db, cf, start, limit).unwrap(),
+                    expect(&all_db, start, limit),
+                    "db start {start:?} limit {limit}"
+                );
+            }
+        }
     }
 
     #[test]
