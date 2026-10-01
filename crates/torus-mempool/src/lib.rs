@@ -679,10 +679,17 @@ impl Mempool {
         {
             let mut pool = self.native.write().unwrap();
             if let Some(accounts) = &oracle_accounts {
-                // Count + insert under one write lock: the cap cannot be raced.
-                if pool.oracle_pending(accounts) >= crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR {
+                // Count + evict + insert under one write lock: the cap cannot
+                // be raced. Review M1(a): at the cap the NEWEST submissions are
+                // kept — a newer one evicts the validator's oldest pooled one.
+                // A duplicate (gossip echo) evicts nothing (the insert reports
+                // it); one older than every pooled one is rejected.
+                if pool.oracle_pending(accounts) >= crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR
+                    && !pool.contains(&sender, &action)
+                    && !pool.evict_oldest_oracle_older_than(accounts, action.nonce)
+                {
                     return Err(MempoolError::NativeValidationFailed(format!(
-                        "oracle pending cap {} reached for validator {}",
+                        "oracle pending cap {} reached for validator {} (all pooled submissions are newer)",
                         crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
                         accounts[0]
                     )));
@@ -3391,8 +3398,12 @@ mod tests {
             .unwrap();
     }
 
+    /// Review M1(a): at the cap of 4 per validator (own address + signer), a
+    /// NEWER submission evicts the validator's OLDEST pooled one instead of
+    /// being rejected. A duplicate (gossip echo) or a submission older than
+    /// all pooled ones evicts nothing.
     #[test]
-    fn oracle_cap_is_four_per_validator_across_its_signer() {
+    fn oracle_cap_evicts_the_validators_oldest_submission() {
         use torus_economics::ValidatorStatus::Active;
         let (_dir, state) = setup();
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
@@ -3403,21 +3414,35 @@ mod tests {
         let now = now_ms();
         pool.add_native_action(oracle_from(&kv, now)).unwrap();
         pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
-        pool.add_native_action(oracle_from(&ks, now)).unwrap();
-        pool.add_native_action(oracle_from(&ks, now + 1)).unwrap();
-        for (k, n) in [(&kv, now + 2), (&ks, now + 2)] {
-            match pool.add_native_action(oracle_from(k, n)) {
-                Err(MempoolError::NativeValidationFailed(m)) => {
-                    assert!(m.contains("oracle pending cap"), "{m}")
-                }
-                other => panic!("5th must hit the cap, got {other:?}"),
-            }
+        pool.add_native_action(oracle_from(&ks, now + 2)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now + 3)).unwrap();
+        assert_eq!(pool.native_pool_size(), 4);
+        // A gossip echo of a pooled submission: duplicate, nothing evicted.
+        assert!(matches!(
+            pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3)),
+            Err(MempoolError::DuplicateNativeAction)
+        ));
+        // Older than everything pooled: rejected, nothing evicted.
+        match pool.add_native_action(oracle_from(&kv, now - 5)) {
+            Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("oracle pending cap"), "{m}"),
+            other => panic!("expected the cap, got {other:?}"),
         }
+        // Newer: evicts V's oldest (nonce `now`), admitted.
+        pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
+        assert_eq!(pool.native_pool_size(), 4);
         // Another validator is unaffected; V's non-oracle actions are not capped.
         pool.add_native_action(oracle_from(&kw, now)).unwrap();
         pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
             .unwrap();
-        assert_eq!(pool.native_pool_size(), 6);
+        let mut vs: Vec<u64> = pool
+            .drain_native(100)
+            .into_iter()
+            .filter(|a| crate::native_pool::is_oracle_submission(&a.action))
+            .filter(|a| a.recover_sender().map(|x| x == v || x == s).unwrap_or(false))
+            .map(|a| a.nonce)
+            .collect();
+        vs.sort_unstable();
+        assert_eq!(vs, vec![now + 1, now + 2, now + 3, now + 10], "the oldest (now) was evicted");
     }
 
     /// M4: the deepest pacing tier selects cancels, then oracle submissions;
