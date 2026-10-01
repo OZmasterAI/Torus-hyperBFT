@@ -1010,3 +1010,140 @@ fn open_limit_is_taken_at_each_execute_batch_start() {
         assert_eq!(golden, run_with_volumes(&batches, threads, &[]), "threads={threads}");
     }
 }
+
+/// The count must not depend on where the books come from: the block after
+/// the one that filled a's 1000 slots (998 resting + 2 stops) rejects a's
+/// next GTC whether the books were kept resident or reloaded from disk, in
+/// every book persistence mode.
+#[test]
+fn open_limit_same_after_reload_or_resident_in_every_book_mode() {
+    let (a, b) = (addr(1), addr(6));
+    let stop = |trigger: i64| PlaceOrderParams {
+        order_type: OrderType::StopMarket {
+            trigger: fp(trigger),
+        },
+        ..gtc(2, true, 0, 1)
+    };
+    let mut block1 = interleave(vec![resting(a, 998), resting(b, 5)]);
+    block1.push(place(a, stop(200)));
+    block1.push(place(a, stop(210)));
+    let block2 = vec![place(a, gtc(6, true, 50, 1)), place(b, gtc(6, true, 50, 1))];
+    let modes = [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ];
+    for mode in modes {
+        let mut runs = Vec::new();
+        for resident in [false, true] {
+            let (_dir, db) = open_test_db();
+            let mut holder = ResidentBooks::default();
+            let ctx_at = |height: u64, holder: Option<&mut ResidentBooks>| {
+                NativeExecContext::new_with_mode(
+                    db.clone(),
+                    height,
+                    1000 + height,
+                    0,
+                    100,
+                    10,
+                    addr(99),
+                    addr(100),
+                    addr(101),
+                    mode,
+                    holder,
+                )
+            };
+            let mut ctx = ctx_at(1, resident.then_some(&mut holder));
+            fund_native(&ctx, &a, fp(1_000_000));
+            fund_native(&ctx, &b, fp(1_000_000));
+            let r1 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, 0);
+            assert!(r1.results.iter().all(|r| r.success), "{mode:?}");
+            ctx.save_order_books();
+            ctx.stash_resident(&mut holder);
+            drop(ctx);
+
+            let mut ctx = ctx_at(2, resident.then_some(&mut holder));
+            assert!(ctx.fatal_error.is_none(), "{mode:?}: {:?}", ctx.fatal_error);
+            assert_eq!(ctx.resident_reused(), resident, "{mode:?}");
+            let r2 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, 0);
+            let results: Vec<_> = r2.results.iter().map(|r| (r.success, r.error.clone())).collect();
+            assert!(is_open_limit(&results[0]), "{mode:?} resident={resident}: {results:?}");
+            assert!(results[1].0, "{mode:?} resident={resident}");
+            ctx.save_order_books();
+            let root = compute_native_state_root(&ctx.state).expect("root");
+            runs.push((results, state_dump(&ctx), root));
+        }
+        assert_eq!(runs[0], runs[1], "{mode:?}: resident vs reloaded");
+    }
+}
+
+/// An order rejected on its margin reserve takes no open-order slot.
+#[test]
+fn open_limit_margin_rejected_order_takes_no_slot() {
+    let p = addr(1);
+    let blocks = vec![
+        resting(p, 999),
+        vec![
+            // 100 @ 1,000,000 needs 5M of margin: rejected on margin.
+            place(p, gtc(6, true, 1_000_000, 100)),
+            place(p, gtc(6, true, 50, 1)),
+            place(p, gtc(6, true, 49, 1)),
+            place(addr(2), gtc(6, true, 48, 1)),
+        ],
+    ];
+    let golden = run_with_volumes(&blocks, 0, &[]);
+    let r = &golden.0.results[1];
+    assert!(
+        r[0].1.as_deref().is_some_and(|e| e.starts_with("insufficient margin")),
+        "{:?}",
+        r[0]
+    );
+    assert!(r[1].0, "the 1000th slot is still free: {:?}", r[1]);
+    assert!(is_open_limit(&r[2]), "{:?}", r[2]);
+    assert_eq!(golden.1, 1);
+    for threads in [2usize, 4] {
+        assert_eq!(golden, run_with_volumes(&blocks, threads, &[]), "threads={threads}");
+    }
+}
+
+/// Conservative by design: the slot is taken before matching, so an order
+/// the book then rejects (PostOnly would cross, dust quantity, off-tick
+/// price) keeps its slot until the batch ends.
+#[test]
+fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
+    let (q, maker) = (addr(1), addr(2));
+    let half = FixedPoint::from_raw(FixedPoint::SCALE / 2);
+    let post_only = order(6, true, fp(60), fp(1), TimeInForce::PostOnly);
+    let dust = order(6, true, fp(40), half, TimeInForce::GTC);
+    let off_tick = order(6, true, fp(40) + half, fp(1), TimeInForce::GTC);
+    let mut block1 = resting(q, 997);
+    block1.push(place(maker, gtc(6, false, 60, 1)));
+    let block2 = vec![
+        place(q, post_only),
+        place(q, dust),
+        place(q, off_tick),
+        place(q, gtc(6, true, 50, 1)),
+    ];
+    let mut runs = Vec::new();
+    for threads in [0usize, 2, 4] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        let metrics = Arc::new(Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        fund_native(&ctx, &q, fp(1_000_000));
+        fund_native(&ctx, &maker, fp(1_000_000));
+        NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
+        let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
+        let results: Vec<_> = r.results.iter().map(|r| (r.success, r.error.clone())).collect();
+        assert!(results[..3].iter().all(|r| r.0), "book rejects report ok: {results:?}");
+        assert!(is_open_limit(&results[3]), "{results:?}");
+        assert_eq!(metrics.orders_rejected_book.get(), 3);
+        assert_eq!(metrics.orders_rejected_open_limit.get(), 1);
+        let open: usize = ctx.order_books.values().map(|b| b.open_order_count(&q)).sum();
+        assert_eq!(open, 997, "nothing rested from the second batch");
+        ctx.save_order_books();
+        runs.push((results, state_dump(&ctx)));
+    }
+    assert!(runs.windows(2).all(|w| w[0] == w[1]));
+}
