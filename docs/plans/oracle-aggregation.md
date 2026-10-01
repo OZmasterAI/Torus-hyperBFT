@@ -8,8 +8,8 @@ block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
 Review follow-ups (s517): fresh price needs >= 3 reporters holding
 > 2/3 of the Active stake (see *Decisions* 4–5, *Notes* below). The
 timestamp lower bound (M2) is NOT implemented — open, see Decision 5.
-Not merged / pushed. Next: liquidation, then B (feeder),
-then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
+Not merged / pushed. Liquidation (item 3): done on `feat/liquidation`
+(`docs/plans/liquidation.md`). Next: B (feeder), then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
 
 Branch `fix/parity-audit-bugs` (s517), after F1 (`3e9365e`). Liquidation (item 3)
 depends on this.
