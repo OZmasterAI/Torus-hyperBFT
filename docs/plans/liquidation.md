@@ -67,6 +67,9 @@ C5 recorded as known limitations.
   position — with more rows the HL ranking covers that window only and a partial close is
   retried by a later step (known limitation).
 
+* **M1 — no activation height.** Liquidation, the CancelAll change and the margin configs apply
+  from block 1: a node with this binary needs a fresh genesis and cannot replay / sync a chain
+  produced by an older build (it would diverge from the recorded roots).
 * **M2 — pending row.** `0x06 ‖ trader` (value `[1]`) is written when an acted account (or the
   vault) is still under MM after its action (thin book, cooldown, bounded ADL) and deleted when it
   is healthy, flat or has no marked position; `liquidation_due` also checks it, so the step keeps
