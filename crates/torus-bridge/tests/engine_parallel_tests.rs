@@ -808,6 +808,25 @@ fn run_volumes(
     Vec<(String, Vec<u8>, Vec<u8>)>,
     B256,
 ) {
+    run_volumes_counted(blocks, threads, before_last).0
+}
+
+/// `run_volumes` plus the number of parallel settles that fell back to the
+/// sequential loop.
+#[allow(clippy::type_complexity)]
+fn run_volumes_counted(
+    blocks: &[Vec<(Address, NativeAction)>],
+    threads: usize,
+    before_last: impl Fn(&NativeExecContext),
+) -> (
+    (
+        Vec<FixedPoint>,
+        Vec<Vec<(bool, Option<String>)>>,
+        Vec<(String, Vec<u8>, Vec<u8>)>,
+        B256,
+    ),
+    u64,
+) {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
     for n in 1..=5u8 {
@@ -828,7 +847,8 @@ fn run_volumes(
         .map(|n| ctx.positions.get_cum_volume(&addr(n)).unwrap())
         .collect();
     let root = compute_native_state_root(&ctx.state).expect("state root");
-    (volumes, results, state_dump(&ctx), root)
+    let fallbacks = ctx.phase_accum.settle_fallbacks;
+    ((volumes, results, state_dump(&ctx), root), fallbacks)
 }
 
 #[test]
@@ -889,6 +909,54 @@ fn cum_volume_stops_at_the_failed_fill_like_positions() {
     );
     for threads in [2usize, 4] {
         assert_eq!(golden, run_volumes(&blocks, threads, corrupt), "threads={threads}");
+    }
+}
+
+/// A BALANCE-row read failure on a maker's realized-PnL credit fails the
+/// order in parallel pass B itself (no sequential fallback): volume stops at
+/// the failing side exactly as in the sequential loop.
+#[test]
+fn cum_volume_pass_b_balance_failure_stops_at_the_failed_side() {
+    let (m, t1, t2) = (addr(1), addr(2), addr(3));
+    let blocks = vec![
+        vec![
+            place(m, gtc(1, true, 100, 1)),
+            place(addr(4), gtc(2, false, 100, 1)),
+        ],
+        // m goes long 1 @ 100.
+        vec![
+            place(t1, gtc(1, false, 100, 1)),
+            place(addr(5), gtc(2, true, 100, 1)),
+        ],
+        // m's closing ask rests; m sends nothing in the last block, so its
+        // balance is never loaded by Phase 2 there.
+        vec![place(m, gtc(1, false, 101, 1))],
+        vec![
+            place(t2, gtc(1, true, 101, 1)),
+            place(addr(5), gtc(2, false, 99, 1)),
+        ],
+    ];
+    // m's fill closes its long (closed_pnl = 1): crediting it reads m's
+    // balance row, which is unreadable.
+    let corrupt = |ctx: &NativeExecContext| {
+        ctx.state.put_cf_raw(CF_NATIVE_BALANCES, m.as_slice(), b"\xff").unwrap();
+    };
+    let (golden, serial_fallbacks) = run_volumes_counted(&blocks, 0, corrupt);
+    assert_eq!(serial_fallbacks, 0);
+    let failed = &golden.1[3][0];
+    assert!(
+        failed.1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+        "{failed:?}"
+    );
+    // t2's taker side counts, m's maker side of that fill does not.
+    assert_eq!(
+        golden.0,
+        vec![fp(5_000_100), fp(100), fp(101), fp(100), fp(100)]
+    );
+    for threads in [2usize, 4] {
+        let (run, fallbacks) = run_volumes_counted(&blocks, threads, corrupt);
+        assert_eq!(fallbacks, 0, "threads={threads}: pass B must handle it");
+        assert_eq!(golden, run, "threads={threads}");
     }
 }
 

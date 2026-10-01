@@ -1573,6 +1573,9 @@ pub struct ExecPhaseAccum {
     pub settle_pass_b_ns: u128,
     /// Nested in `settle_ns`: `pos_cache.flush_all` + `bal_cache.flush_all`.
     pub cache_flush_ns: u128,
+    /// Parallel settles that fell back to the sequential loop (worker panic
+    /// or a position-side fill failure).
+    pub settle_fallbacks: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4577,6 +4580,7 @@ impl NativeExecutor {
                 error = %msg,
                 "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
             );
+            ctx.phase_accum.settle_fallbacks += 1;
             return Self::settle_market_results_sequential(
                 ctx,
                 market_results,
@@ -4660,12 +4664,15 @@ impl NativeExecutor {
                         }
                     }
                 }
+                // Any worker position failure fell back to sequential above,
+                // so the only failure here is a balance read: `sides_applied`
+                // is the whole stop point.
+                debug_assert!(oplan.fill_error.is_none());
                 if fill_failed.is_none() {
                     fill_failed = oplan.fill_error;
                 }
                 // cum_volume of every fill side the sequential loop completes
-                // before its stop (a failed side adds nothing). Any worker
-                // position failure already fell back to sequential above.
+                // before its stop (a failed side adds nothing).
                 let sides = result
                     .fills
                     .iter()
