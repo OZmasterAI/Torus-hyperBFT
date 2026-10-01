@@ -317,7 +317,12 @@ fn cancel_all_of_stop_only_senders_persists_stop_removal() {
             client_order_id: None,
         })
     };
-    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+    for mode in [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ] {
         for batch in [false, true] {
             let dir = tempfile::tempdir().expect("tempdir");
             let mut ctx = new_ctx(&dir, mode);
