@@ -1,7 +1,6 @@
 //! Torus CLI wallet — key management, queries, and transactions.
 
 mod commands;
-mod keystore;
 mod parse;
 mod rpc;
 mod sign;
@@ -11,6 +10,7 @@ mod test_utils;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use torus_wallet::keystore;
 
 use crate::rpc::RpcClient;
 
@@ -309,6 +309,17 @@ pub(crate) enum Command {
         #[arg(long)]
         new_pubkey: String,
     },
+    /// Set, rotate or clear this validator's hot oracle signer (sign with the
+    /// VALIDATOR keystore). The signer may only submit oracle prices for this
+    /// validator; run once, and again only to rotate.
+    SetOracleSigner {
+        /// Signer address (e.g. from `price-feeder keygen`)
+        #[arg(long, conflicts_with = "clear")]
+        signer: Option<String>,
+        /// Remove the signer
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 // ============================================================================
@@ -497,6 +508,9 @@ async fn main() {
         Command::Unjail => commands::validator::cmd_unjail(&cli, &rpc).await,
         Command::RotateKey { new_pubkey } => {
             commands::validator::cmd_rotate_key(&cli, &rpc, new_pubkey).await
+        }
+        Command::SetOracleSigner { signer, clear } => {
+            commands::validator::cmd_set_oracle_signer(&cli, &rpc, signer.as_deref(), *clear).await
         }
     };
 
