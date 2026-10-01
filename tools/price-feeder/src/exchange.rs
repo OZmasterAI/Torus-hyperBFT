@@ -24,15 +24,14 @@ pub trait HttpGet: Send + Sync {
     fn get(&self, url: String, timeout: Duration) -> impl Future<Output = Result<String, String>> + Send;
 }
 
-/// The one bulk request for `ex` this cycle. Binance and Kraken take the
-/// symbol list; the other venues return all spot tickers.
+/// The one bulk request for `ex` this cycle. Kraken takes the pair list
+/// (with a per-pair fallback, `fetch`); every other venue returns all spot
+/// tickers. Review M2: Binance is unfiltered too — a `symbols=[..]` filter
+/// fails the whole request when one symbol is unknown or delisted.
 pub fn url_for(ex: Exchange, base_url: &str, symbols: &[String], mode: QuoteMode) -> String {
     let base = base_url.trim_end_matches('/');
     match ex {
-        Exchange::Binance => {
-            let list = symbols.iter().map(|s| format!("%22{s}%22")).collect::<Vec<_>>().join("%2C");
-            format!("{base}/api/v3/ticker/bookTicker?symbols=%5B{list}%5D")
-        }
+        Exchange::Binance => format!("{base}/api/v3/ticker/bookTicker"),
         Exchange::Kraken => {
             let mut pairs: Vec<&str> = symbols.iter().map(String::as_str).collect();
             if mode == QuoteMode::KrakenUsdt && !pairs.contains(&KRAKEN_USDT_USD) {
@@ -45,6 +44,57 @@ pub fn url_for(ex: Exchange, base_url: &str, symbols: &[String], mode: QuoteMode
         Exchange::Kucoin => format!("{base}/api/v1/market/allTickers"),
         Exchange::Gate => format!("{base}/api/v4/spot/tickers"),
         Exchange::Mexc => format!("{base}/api/v3/ticker/bookTicker"),
+    }
+}
+
+/// Kraken's error for a request naming an unknown pair (the whole batch fails).
+pub const KRAKEN_UNKNOWN_PAIR: &str = "Unknown asset pair";
+
+/// Review M2: every configured Kraken pair must exist under its CANONICAL
+/// AssetPairs key — the Ticker response is keyed by it, so an altname
+/// (`XBTUSD`) would silently never match. Fatal at startup (`check` / `run`).
+pub async fn check_kraken_pairs<H: HttpGet>(
+    http: &H,
+    base_url: &str,
+    pairs: &[String],
+    timeout: Duration,
+) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let base = base_url.trim_end_matches('/');
+    let keys = |body: Result<String, String>| -> Result<Vec<String>, String> {
+        let v: Value = serde_json::from_str(&body?).map_err(|e| format!("bad json: {e}"))?;
+        match v.get("error").and_then(Value::as_array) {
+            Some(e) if e.is_empty() => {}
+            _ => return Err(format!("error {}", truncate(&v))),
+        }
+        let r = v.get("result").and_then(Value::as_object).ok_or("no result")?;
+        Ok(r.keys().cloned().collect())
+    };
+    let url = |p: &str| format!("{base}/0/public/AssetPairs?pair={p}");
+    match keys(http.get(url(&pairs.join(",")), timeout).await) {
+        Ok(found) => {
+            let bad: Vec<&String> = pairs.iter().filter(|p| !found.contains(p)).collect();
+            if bad.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "kraken pairs {bad:?} are not canonical AssetPairs keys (Kraken returned {found:?}); \
+                     configure the canonical names"
+                ))
+            }
+        }
+        Err(e) if e.contains(KRAKEN_UNKNOWN_PAIR) => {
+            let mut unknown = Vec::new();
+            for p in pairs {
+                if keys(http.get(url(p), timeout).await).is_err() {
+                    unknown.push(p.clone());
+                }
+            }
+            Err(format!("kraken: unknown pair(s) {unknown:?} in the config"))
+        }
+        Err(e) => Err(format!("kraken AssetPairs: {e}")),
     }
 }
 
@@ -225,7 +275,8 @@ mod tests {
         let syms = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
         assert_eq!(
             url_for(Exchange::Binance, "https://api.binance.com", &syms, QuoteMode::Par),
-            "https://api.binance.com/api/v3/ticker/bookTicker?symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D"
+            "https://api.binance.com/api/v3/ticker/bookTicker",
+            "review M2: unfiltered (one unknown symbol must not fail the venue)"
         );
         let k = vec!["XXBTZUSD".to_string(), "POLUSD".to_string()];
         assert_eq!(
@@ -246,5 +297,42 @@ mod tests {
         assert_eq!(url_for(Exchange::Kucoin, "fake://kucoin", &syms, QuoteMode::Par), "fake://kucoin/api/v1/market/allTickers");
         assert_eq!(url_for(Exchange::Gate, "fake://gate", &syms, QuoteMode::Par), "fake://gate/api/v4/spot/tickers");
         assert_eq!(url_for(Exchange::Mexc, "fake://mexc", &syms, QuoteMode::Par), "fake://mexc/api/v3/ticker/bookTicker");
+    }
+
+    fn fake_kraken(routes: &[(&str, &str)]) -> crate::testing::FakeHttp {
+        let h = crate::testing::FakeHttp::default();
+        for (q, body) in routes {
+            h.route(&format!("fake://kraken/0/public/AssetPairs?pair={q}"), Ok(body.to_string()));
+        }
+        h
+    }
+
+    const KAP: &str = include_str!("../tests/fixtures/kraken_assetpairs.json");
+    const KAP_ALT: &str = include_str!("../tests/fixtures/kraken_assetpairs_alt.json");
+    const KUNKNOWN: &str = include_str!("../tests/fixtures/kraken_unknown_pair.json");
+
+    /// Review M2: configured Kraken pairs are validated at startup against
+    /// AssetPairs (recorded fixtures): every pair must exist under its
+    /// canonical key (the Ticker response is keyed by it).
+    #[tokio::test]
+    async fn kraken_pairs_are_validated_at_startup() {
+        let t = std::time::Duration::from_secs(2);
+        let pairs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ok = fake_kraken(&[("XXBTZUSD,XETHZUSD,POLUSD,USDTZUSD", KAP)]);
+        check_kraken_pairs(&ok, "fake://kraken", &pairs(&["XXBTZUSD", "XETHZUSD", "POLUSD", "USDTZUSD"]), t)
+            .await
+            .unwrap();
+        // An altname works for AssetPairs but the ticker is keyed canonically.
+        let alt = fake_kraken(&[("XBTUSD", KAP_ALT)]);
+        let e = check_kraken_pairs(&alt, "fake://kraken", &pairs(&["XBTUSD"]), t).await.unwrap_err();
+        assert!(e.contains("XBTUSD") && e.contains("XXBTZUSD"), "{e}");
+        // Unknown pair: named precisely (per-pair probe after the batch error).
+        let bad = fake_kraken(&[("XXBTZUSD,NOPEUSD", KUNKNOWN), ("XXBTZUSD", KAP_ALT), ("NOPEUSD", KUNKNOWN)]);
+        let e = check_kraken_pairs(&bad, "fake://kraken", &pairs(&["XXBTZUSD", "NOPEUSD"]), t).await.unwrap_err();
+        assert!(e.contains("NOPEUSD") && !e.contains("XXBTZUSD"), "{e}");
+        // No Kraken pairs configured: nothing to check, no request.
+        let none = crate::testing::FakeHttp::default();
+        check_kraken_pairs(&none, "fake://kraken", &[], t).await.unwrap();
+        assert!(none.calls().is_empty());
     }
 }
