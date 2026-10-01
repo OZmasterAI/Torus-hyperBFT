@@ -1,8 +1,8 @@
-# Torus-hyperBFT — Performance & Correctness Roadmap to Hyperliquid Parity
+# Torus-hyperBFT — Performance, Correctness & Product Roadmap to Hyperliquid Parity
 
 **Author:** architecture review synthesis
 **Status:** proposal for sequencing — not yet accepted
-**Companion doc:** `Torus-hyperBFT-review.md` (full architecture + critical findings)
+**Companion docs:** `Torus-hyperBFT-review.md` (full architecture + critical findings) · `reports/hl-parity-2026-10-01/` (product-parity sprint: 220-agent gap analysis behind the Product-parity track)
 
 ---
 
@@ -206,6 +206,88 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 
 ---
 
+## Product-parity track — P0 to P5 *(runs alongside Tiers 1–4)*
+
+> **Why a separate track:** Tiers 0–4 make the chain fast and live. They do not make it an exchange. The 2026-10-01 product-parity sprint (`reports/hl-parity-2026-10-01/`) found that the matching engine is sound, but liquidation, oracle aggregation, margin configs, fees, funding, the market registry and unbonding release are missing, stubbed or **never called**. It also found several money-losing bugs. 200k orders/s of an exchange that cannot liquidate is not parity. Almost every P item changes the state transition, so most are **[LOCKSTEP]**. That is why P0.0 comes first.
+>
+> **Interaction with the perf tiers:** P0 runs in parallel with Tier 1 and is a hard gate before any public trading. P1–P2 add per-block work (oracle aggregation, liquidation sweep, funding, fee debits), so **T0.3's harness must gain a trading-semantics mix** (stops, modifies, liquidations, multi-market) before Tier 4 numbers are trusted. Today's benches send only GTC limits, which is why the P0 bugs went unseen.
+
+### P0.0 — Activation-height gating for state-transition changes [LOCKSTEP]
+- **Problem:** No protocol-upgrade mechanism exists: no app/protocol version, no feature activation by height, no hl-visor equivalent. Every P item changes execution results, so today each one would need a flag day plus a coordinated restart.
+- **Plan:** Add `ChainConfig.activations: BTreeMap<Feature, u64>` and an `is_active(feature, height)` helper read by the executor. Ship binaries ahead of the height and flip behaviour at the height. Add an `app_version` field to the block header (or derive it from activations) so mixed-version validators fail loudly instead of forking silently.
+- **Acceptance:** A test chain runs old behaviour below height H and new behaviour at H and above, with identical state roots across nodes. A validator missing a scheduled feature halts with a clear error at H.
+- **Effort:** medium. **Risk:** low. **Impact:** unblocks every item below without a relaunch.
+
+### P0 — Fix the safety bugs before any trading feature [LOCKSTEP]
+- **Problem:** Both models confirmed these. A1, A2, A3 and A9 were also re-checked by hand. Details and evidence are in `reports/hl-parity-2026-10-01/README.md` §3.
+  - **A1:** `ModifyOrder` has no ownership check and skips matching, tick, lot and ALO, so it can cross the book or leave a zero-qty order. It mutates the book before the margin check, with no rollback.
+  - **A2:** fills from triggered stop orders are dropped (`trigger_stops` discards them).
+  - **A4:** positions hold zero collateral, and withdraw and transfer ignore open positions.
+  - **A5:** market orders reserve no margin.
+  - **A7:** the lockbox has an 8- vs 18-decimal mismatch, and its writes may be clobbered by the revm cache.
+  - **A8:** session-key expiry is checked in seconds against milliseconds, so expired sessions are never rejected in blocks.
+  - **A9:** unbonded funds are never released.
+  - **Others:** EVM gas fees are credited twice; inflation pays the self-stake share to delegators; CoreWriter returns a fake order id and runs stop types as plain limits; read precompiles charge flat gas for unbounded output; the nonce window is enforced only at the mempool; unknown market ids auto-create books outside RPC; stop orders bypass the order cap; block timestamps are never validated; Full-scope session keys can perform validator and governance actions; the EIP-712 domain has no network field, so actions replay across networks.
+- **Plan:** One PR per bug, each RED-first through the **real executor**. Today no test runs modify or a triggered stop end to end. Use the round-4 fix designs in `findings.md` (e.g. modify becomes ownership check, then validate, then margin pre-check, then `exec_cancel_order` + `exec_place_order`). Gate behaviour changes behind P0.0. Close the open Astra round-2 audit findings in the same pass.
+- **Acceptance:** Each bug has a failing-first executor-level test. A trading-semantics proptest checks book invariants (`verify_invariants`), margin conservation and position/fill agreement after random place, modify, cancel and stop sequences.
+- **Effort:** mostly S–M each, ~1.5–3k LOC total including tests. **Risk:** low per item. **Impact:** without it the exchange loses user funds.
+
+### P1 — The per-block driver: make the written-but-uncalled code run [LOCKSTEP]
+- **Problem:** `aggregate_oracle_prices` and `run_liquidation_checks` have no callers. `margin_configs` is never populated, so every market falls back to a flat 20x. List, Delist and UpdateMarketParams are no-op stubs, and governance `ListMarket` always writes id 0. Nothing publishes oracle prices.
+- **Plan:**
+  1. Extend the existing deterministic per-block tail (`app.rs` ~1937–1940: `drain_core_writer` → `process_governance` → `distribute_fees` → `process_epoch_boundary`). Add, in this order: oracle aggregation, then the margin-config load, then the liquidation sweep, then the matured-unbonding sweep. Bound the work per block and sort every iteration.
+  2. Build a real market registry: List, Delist and UpdateMarketParams write per-market tick, lot, max leverage, margin tiers and status. Reject unknown market ids **in consensus**, not only at RPC. Fix governance id assignment and the dead `ParameterChange` write.
+  3. Build a validator oracle publisher sidecar: fetch CEX prices, publish one vote per validator per block, and cap and prune submissions. Fix cross liquidation applying one market's config to every position.
+- **Acceptance:** A devnet scenario covers oracle move → under-margined account → liquidation in the same block on every node, with identical state roots. A listed market's per-asset leverage is enforced. Orders on an unlisted market are rejected by validators.
+- **Effort:** large (~1.5–2.5k LOC). **Risk:** medium (new per-block work; determinism tests are mandatory). **Impact:** the exchange can enforce risk.
+
+### P2 — Exchange economics [LOCKSTEP]
+- **Plan, in order:**
+  1. Flat maker/taker fees debited at settlement, credited to a treasury, and shown on fills (200–400 LOC).
+  2. Mark price: HL-style median of oracle+basis, book and external. Use it for margin, liquidation and stop triggers (450–900 LOC).
+  3. Price bands, market-order slippage cap, per-market OI cap and max order notional (250–650 LOC).
+  4. `reduce_only` enforcement at placement, a match-time clamp, auto-cancel and a stop-trigger re-check (350–650 LOC).
+  5. Funding engine: premium sampling from impact prices, hourly settlement, a cumulative index per market and a snapshot per position (600–850 LOC).
+  6. Isolated margin plus `updateLeverage` and `updateIsolatedMargin` actions on the existing `MarginType` model (650–1000 LOC).
+- **Acceptance:** Per item: an executor-level conservation test (fees, funding and PnL sum to zero across all accounts plus treasury), and an RPC field exposing the new state.
+- **Effort:** XL in total (~2.5–4.5k LOC). **Impact:** this is what makes it a perps exchange rather than a matching engine.
+
+### P3 — Order surface [LOCKSTEP]
+- **Plan:**
+  - TP/SL on mark price with `normalTpsl`/`positionTpsl` grouping.
+  - 128-bit `cloid` with a unique per-trader index, `cancelByCloid`, `batchModify` and `expiresAfter`.
+  - The `scheduleCancel` dead-man switch.
+  - TWAP and scale orders as per-block slices on the P1 driver.
+- **Acceptance:** Each order type has an executor-level test and an RPC/WS lifecycle event.
+- **Effort:** XL (~2–3.5k LOC).
+
+### P4 — Data and API surface [mostly LOCAL]
+- **Plan:**
+  - Persist order lifecycle events: placed, filled, cancelled, rejected, triggered.
+  - WebSocket `l2Book`, `bbo`, `allMids`, `orderUpdates` and `userEvents`.
+  - `clearinghouseState` and `metaAndAssetCtxs` RPCs.
+  - Synchronous order responses (resting, filled or error).
+  - Address-level rate limits earned by trading volume.
+  - An HL-compatible `/info` + `/exchange` shim, so HL SDKs and bots work unmodified.
+  - Wire `SnapshotManager` into commit and add P2P state sync for new nodes.
+- **Acceptance:** An HL Python SDK script runs place, query, WS and cancel against devnet through the shim.
+- **Effort:** L–XL. **Risk:** low (node-local apart from snapshot formats).
+
+### P5 — Accounts, assets and decentralisation [LOCKSTEP]
+- **Plan:**
+  - Decide on stablecoin collateral and quote currency (today TRS). This is a product decision, so make it before building P5 assets.
+  - Subaccounts.
+  - A backstop/HLP vault that takes liquidations before ADL, plus user vaults.
+  - Native spot (token registry, spot book, `spotSend`) and an external-chain bridge with validator-signed withdrawals.
+  - Multisig accounts.
+  - Permissionless validator entry with automated downtime jailing, once T1.4 has landed.
+- **Effort:** XL each. Sequence by product priority.
+
+### Trading UI *(parallel, not on the critical path)*
+- The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` was never created. Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3.
+
+---
+
 ## Dependency graph (the ordering *is* the deliverable)
 
 ```mermaid
@@ -227,6 +309,15 @@ graph TD
     T4_3[T4.3 margin/settle cache]
     T4_4[T4.4 sandbox precompiles<br/>then Block-STM]
     T1 --> T4_1 & T4_3 & T4_4
+    P00[P0.0 activation-height gating] --> P0[P0 safety bugs<br/>money-losing]
+    P0 --> P1[P1 per-block driver<br/>oracle, liquidation, registry]
+    P1 --> P2[P2 fees, mark, bands,<br/>reduce-only, funding, isolated]
+    P2 --> P3[P3 TP/SL, cloid, scheduleCancel, TWAP]
+    P1 --> P4[P4 data/API, HL shim, state sync]
+    P2 --> P5[P5 vaults, subaccounts, spot, bridge]
+    T1_4 --> P5
+    P0 --> UI[Trading UI phase 1]
+    P2 --> T0_3x[T0.3 harness gains<br/>trading-semantics mix]
 ```
 
 **Critical path to the two headline numbers:**
@@ -246,3 +337,11 @@ graph TD
 ## One-paragraph executive summary
 
 The architecture is already correct and matches Hyperliquid's (2-chain MonadBFT, commit-then-execute, hash-only proposals, one-signature batching). The gap to parity is, in order: **(0) run on isolated, co-located hardware** — this alone closes a large fraction of both gaps and must precede any measurement; **(1) make the chain survive load** by landing the disabled S430 fix, settling the 2-chain lock-depth safety question *before* adding fault tolerance, and killing the zombie-execution mode; **(2) unblock ingress** with parallel verification and incremental pool ordering; **(3) scale dissemination** by enabling the already-built zstd protocols and building erasure coding (which only pays off once the validator set is large); and **(4) grind execution** — compute the state root once, finish the incremental native root, cache margin/settlement, and journal the writer precompiles (a correctness fix that also unblocks eventual parallel execution). No consensus redesign is required. The single highest-leverage action is Tier 0, and the single most important *not-yet-answered* question is T1.2.
+
+**Product parity is a separate track and it is further behind than performance.** The matching engine is sound, but the exchange around it is not. The track runs in this order:
+- **P0.0** — activation-height gating, so state-transition changes can ship without relaunching.
+- **P0** — fix the money-losing bugs: unowned modifies, dropped stop fills, positions with no collateral, unmargined market orders, the lockbox decimal mismatch, unenforced session expiry, locked unbonding.
+- **P1** — actually call the written-but-uncalled oracle, liquidation and margin-config code from the per-block tail, and build a real market registry.
+- **P2–P5** — then fees, mark price, bands, reduce-only, funding and isolated margin; then the order surface, data/API, and accounts/assets.
+
+P0 is a hard gate before any public trading, whatever the perf numbers say.
