@@ -1084,6 +1084,28 @@ impl NativeStateOverlay {
     }
 }
 
+/// Running state hash: blocks with at least this many pending entries digest
+/// on a scoped thread, overlapped with the batch build (below it, inline).
+const PARALLEL_DIGEST_MIN_ENTRIES: usize = 4096;
+
+/// Running state hash: digest of a block's consensus write set over `layers`
+/// (see [`for_each_consensus_write`]) and its compute seconds; with the test
+/// capture armed, also the materialized write set.
+fn block_digest(
+    layers: &[&PendingState],
+) -> (crate::running_hash::BlockDigest, Option<Vec<crate::running_hash::WriteEntry>>, f64) {
+    let timer = std::time::Instant::now();
+    let mut digest = crate::running_hash::BlockDigest::new();
+    let mut capture = crate::running_hash::capture_active().then(Vec::new);
+    for_each_consensus_write(layers, |id, k, v| {
+        digest.push(id, k, v);
+        if let Some(c) = capture.as_mut() {
+            c.push((id, k.to_vec(), v.map(<[u8]>::to_vec)));
+        }
+    });
+    (digest, capture, timer.elapsed().as_secs_f64())
+}
+
 /// The one flush implementation, over a borrowed pending set: shared by the live
 /// overlay (serial path, read guard held by the caller) and by [`FrozenPending`]
 /// (flush worker). Byte-identical batch content either way.
@@ -1096,8 +1118,32 @@ fn flush_pending_with_native_trie_stats(
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     maintain_trie: bool,
 ) -> Result<NativeFlushStats, StateError> {
-    {
+    std::thread::scope(|scope| {
         let raw = target.inner();
+
+        // Running state hash: h_n is a digest of the block's consensus write
+        // set — out-of-batch extras, then the pending set, then the
+        // deferred-book sidecar on top — computed from the pending maps, never
+        // from the batch, so trie maintenance (on / off / failed) cannot change
+        // it. Large blocks digest on a scoped thread while this one builds the
+        // batch (both only read the maps); joined below, before the hash joins
+        // the SAME batch as the applied-height marker.
+        let digest_job = applied_height.map(|_| {
+            let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
+            layers.extend(state.hash_extras.as_deref());
+            layers.push(state);
+            layers.extend(sidecar);
+            let entries: usize = layers
+                .iter()
+                .flat_map(|l| l.cfs.iter())
+                .map(|c| c.writes.len() + c.deletes.len())
+                .sum();
+            if entries >= PARALLEL_DIGEST_MIN_ENTRIES {
+                Err(scope.spawn(move || block_digest(&layers)))
+            } else {
+                Ok(block_digest(&layers))
+            }
+        });
 
         let build_timer = std::time::Instant::now();
         let mut batch = WriteBatch::default();
@@ -1215,33 +1261,23 @@ fn flush_pending_with_native_trie_stats(
             batch.put_cf(cf, crate::cf::META_NATIVE_APPLIED_HEIGHT, marker);
         }
 
-        // Running state hash: h_n over the block's consensus write set —
-        // out-of-batch extras, then the pending set, then the deferred-book
-        // sidecar on top — into the SAME batch as the applied-height marker.
-        // Computed from the pending maps, never from the batch, so trie
-        // maintenance (on / off / failed) cannot change it.
-        if let Some(height) = applied_height {
-            let hash_timer = std::time::Instant::now();
-            let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
-            layers.extend(state.hash_extras.as_deref());
-            layers.push(state);
-            layers.extend(sidecar);
-            let mut digest = crate::running_hash::BlockDigest::new();
-            let mut capture = crate::running_hash::capture_active().then(Vec::new);
-            for_each_consensus_write(&layers, |id, k, v| {
-                digest.push(id, k, v);
-                if let Some(c) = capture.as_mut() {
-                    c.push((id, k.to_vec(), v.map(<[u8]>::to_vec)));
-                }
-            });
+        // Running state hash: join the digest and append h_n (+ checkpoint)
+        // to the batch.
+        if let (Some(height), Some(job)) = (applied_height, digest_job) {
+            let (digest, capture, digest_secs) = match job {
+                Ok(done) => done,
+                Err(handle) => handle.join().map_err(|_| {
+                    StateError::InvalidData("running state hash digest thread panicked".into())
+                })?,
+            };
             stats.state_hash_entries = digest.entries();
+            stats.state_hash_seconds = digest_secs;
             let (prev, activation) = crate::running_hash::prev_for(target, height);
             let hash = digest.chain(&prev, height);
             crate::running_hash::append_to_batch(target, &mut batch, height, &hash, activation)?;
             if let Some(c) = capture {
                 crate::running_hash::capture_record(target, height, c);
             }
-            stats.state_hash_seconds = hash_timer.elapsed().as_secs_f64();
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were
@@ -1299,7 +1335,7 @@ fn flush_pending_with_native_trie_stats(
         }
         trie_result?;
         Ok(stats)
-    }
+    })
 }
 
 /// rank-root: flush-phase breakdown surfaced to the exec metrics
@@ -1337,8 +1373,10 @@ pub struct NativeFlushStats {
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
     pub dirty_entries_by_cf: [usize; 6],
-    /// Running state hash: time to digest the block's consensus write set and
-    /// chain `h_n` (0 when the flush carries no applied height).
+    /// Running state hash: time to digest the block's consensus write set (0
+    /// when the flush carries no applied height). Large blocks digest on a
+    /// scoped thread overlapped with the batch build, so this is compute time,
+    /// not necessarily added flush wall time.
     pub state_hash_seconds: f64,
     /// Running state hash: hashed entries this flush.
     pub state_hash_entries: usize,
@@ -3005,5 +3043,100 @@ mod tests {
         }
         // live account + 2 slots + code + destroyed account
         assert_eq!(seen, 5);
+    }
+
+    /// A block above `PARALLEL_DIGEST_MIN_ENTRIES` digests on the scoped
+    /// thread: same hash as the function, same as the inline path.
+    #[test]
+    fn running_hash_parallel_digest_matches_function() {
+        use crate::cf::{CF_ACCOUNTS, CF_NATIVE_POSITIONS};
+        let (db, _d) = temp_db();
+        let mut writes = Vec::new();
+        for i in 0..(PARALLEL_DIGEST_MIN_ENTRIES as u32 + 100) {
+            let cf = if i % 3 == 0 { CF_NATIVE_POSITIONS } else { CF_ACCOUNTS };
+            let v = (i % 5 != 0).then(|| i.to_be_bytes().to_vec());
+            writes.push((cf, i.to_le_bytes().to_vec(), v));
+        }
+        let ov = rsh_overlay(&db, &writes);
+        let stats = ov.flush_with_native_trie_stats(&db, Some(1), None, None).unwrap();
+        assert_eq!(stats.state_hash_entries, writes.len());
+        let want = next_running_hash(&[0; 32], 1, &rsh_expected(&writes));
+        assert_eq!(read_running_hash(&db), Some((1, want)));
+    }
+
+    /// Running state hash cost per block (Task 9 input). Release only:
+    /// `cargo test --release -p torus-state --lib running_hash_cost -- --ignored --nocapture`.
+    /// N consensus rows per block spread over the native CFs (32-byte keys,
+    /// 96-byte values, 1 in 8 a tombstone) plus derived-CF noise; reports the
+    /// flush's own `state_hash_seconds` (stream + digest + chain + META puts)
+    /// and the whole flush wall under root skip.
+    #[test]
+    #[ignore]
+    fn running_hash_cost_per_block_release() {
+        use crate::cf::{
+            CF_BOOK_ORDER_ROWS, CF_NATIVE_NONCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
+        };
+        let cfs = [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_NONCES];
+        for rows in [10_000usize, 60_000] {
+            let (db, _d) = temp_db();
+            let mut samples = Vec::new();
+            let mut baseline = Vec::new();
+            for h in 1..=24u64 {
+                let ov = NativeStateOverlay::new(db.clone());
+                for i in 0..rows {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    key[8..16].copy_from_slice(&h.to_be_bytes());
+                    let cf = cfs[i % cfs.len()];
+                    if i % 8 == 7 {
+                        ov.delete_cf_raw(cf, &key).unwrap();
+                    } else {
+                        ov.put_cf_raw(cf, &key, &[(i % 251) as u8; 96]).unwrap();
+                    }
+                    if i % 4 == 0 {
+                        ov.put_cf_raw(CF_BOOK_ORDER_ROWS, &key, &[1; 96]).unwrap();
+                    }
+                }
+                let t = std::time::Instant::now();
+                // Root skip (TORUS_NATIVE_TRIE_MAINTENANCE=0): the configuration
+                // the running hash replaces the per-block root for.
+                // Odd heights hash (applied height set), even ones flush the
+                // same-sized set without any applied height: no hash, no
+                // marker — the baseline for the EXPOSED hashing cost.
+                let hashed = h % 2 == 1;
+                let state = ov.pending.read().unwrap();
+                let stats = flush_pending_with_native_trie_stats(
+                    &state,
+                    None,
+                    &db,
+                    hashed.then_some(h),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                let wall = t.elapsed().as_secs_f64() * 1e3;
+                if h > 4 && hashed {
+                    assert_eq!(stats.state_hash_entries, rows);
+                    samples.push((stats.state_hash_seconds * 1e3, wall));
+                } else if h > 4 {
+                    baseline.push(wall);
+                }
+            }
+            let median = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            println!(
+                "running_hash_cost rows={rows}: digest median {:.2} ms (min {:.2}, max {:.2}); \
+                 flush wall (root skip) median {:.2} ms with hash vs {:.2} ms without ({} samples each)",
+                median(samples.iter().map(|s| s.0).collect()),
+                samples.iter().map(|s| s.0).fold(f64::MAX, f64::min),
+                samples.iter().map(|s| s.0).fold(0.0, f64::max),
+                median(samples.iter().map(|s| s.1).collect()),
+                median(baseline.clone()),
+                samples.len()
+            );
+        }
     }
 }
