@@ -1,0 +1,245 @@
+{
+ "prp": "liquidation",
+ "revision": 2,
+ "created": "2026-10-01T00:00:00Z",
+ "plan": "docs/plans/liquidation-impl.md",
+ "design": "docs/plans/liquidation.md",
+ "branch": "feat/liquidation",
+ "base": "feat/oracle-aggregation@d4fe69c",
+ "wrapper": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh — every cargo command uses it (flock-serialized); never plain cargo",
+ "decisions": "option B full HL in one release; trigger AV < MM (MM = IM/2 at max leverage, position-size tier, per market, AccountView); stage 1 reduce-only market orders via place_order_inner (+run_triggered_stops), >100k notional in 20% chunks with 30 s block-time cooldown, trader keeps the rest once MM met; backstop AV < 2/3 MM -> positions + collateral to fixed vault address at mark; ADL on negative AV (account or vault), HL rank (mark/entry)x(notional/AV), at previous mark, pairwise transfers only (OI symmetric); no penalty, no insurance fund, no socialize_loss; candidates = round-robin walk of CF_NATIVE_POSITIONS (sorted by trader) from a cursor in CF_NATIVE_LIQUIDATION, 2048 checks / 64 actions per block, carry-over (C1, no separate index); user CancelAll also cancels pending stops and releases their margin (C4, own commit); stale/absent mark -> skip account; step after drain_core_writer before process_governance on the block-start mark",
+ "baseline": "12-crate run: 1684 pass / 2 known torus-core fails; expected after: ~1701 pass (-17 removed, +34 new) / same 2 fails (recount at T11)",
+ "tasks": [
+  {
+   "id": 1,
+   "name": "core margin: maintenance_margin = IM/2 (position-size tier), AccountView.maintenance, total_maintenance_margin with per-market tiers (F6)",
+   "files": [
+    "crates/torus-core/src/margin.rs",
+    "crates/torus-core/tests/margin_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test margin_tests",
+   "depends_on": [],
+   "commit": 1,
+   "status": "pending"
+  },
+  {
+   "id": 2,
+   "name": "state: CF_NATIVE_LIQUIDATION appended as native-root tag 6 (NATIVE_ROOT_CFS, compute_native_state_root, ALL_CF_NAMES, [_;7] stat/telemetry arrays); tags 0-5 unchanged; rows only from the liquidation step (no index)",
+   "files": [
+    "crates/torus-state/src/cf.rs",
+    "crates/torus-state/src/native_trie.rs",
+    "crates/torus-state/src/backend.rs",
+    "crates/torus-telemetry/src/lib.rs",
+    "crates/torus-bridge/src/state_root.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-state --lib native_trie && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --lib state_root && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets",
+   "depends_on": [],
+   "commit": 2,
+   "status": "pending"
+  },
+  {
+   "id": 3,
+   "name": "OWN COMMIT (C4): user CancelAll / cancel-all runs also cancel pending stops (OrderBook::take_pending_stops before cancel_all; fixes early return order_book.rs:1337-1342) and release their reservation (stop_reservation = run_triggered_stops formula); shared helper cancel_orders_and_stops for the liquidation step; failing test first (all PATHS, with/without resting, save+reload)",
+   "files": [
+    "crates/torus-core/src/order_book.rs",
+    "crates/torus-bridge/src/native_executor.rs",
+    "crates/torus-bridge/tests/market_order_margin_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test market_order_margin_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --lib cancel_batch && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --lib order_book",
+   "depends_on": [],
+   "commit": 3,
+   "status": "pending",
+   "own_commit": true
+  },
+  {
+   "id": 4,
+   "name": "bridge: margin_configs loaded from CF_NATIVE_MARKETS rows in new_with_mode (flat tier at floor(100/initial_margin), min 1x; undecodable -> none; read error -> fatal); 20x row byte-identical to no config (D11)",
+   "files": [
+    "crates/torus-core/src/margin.rs",
+    "crates/torus-bridge/src/native_executor.rs",
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests margin_config && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test account_margin_tests --test market_order_margin_tests --test modify_order_tests --test maker_margin_release_tests",
+   "depends_on": [
+    1
+   ],
+   "commit": 4,
+   "status": "pending"
+  },
+  {
+   "id": 5,
+   "name": "core: rewrite liquidation.rs pure parts — delete LiquidationEngine/penalty/insurance fund/socialize_loss (+13 old integration tests, 4 module tests); LIQUIDATOR_VAULT, constants, Health/classify, stage1_qty, slippage_cap, AdlCandidate/adl_rank (U512 exact)",
+   "files": [
+    "crates/torus-core/src/liquidation.rs",
+    "crates/torus-core/tests/liquidation_tests.rs",
+    "crates/torus-bridge/src/native_executor.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test liquidation_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --lib liquidation",
+   "depends_on": [
+    1
+   ],
+   "commit": 5,
+   "status": "pending"
+  },
+  {
+   "id": 6,
+   "name": "core: transfer primitives — transfer (fill pair), backstop (vault at mark + collateral), adl_candidates, adl_close (pairwise at given price), settle_flat_deficit (to vault), cooldown/prev-mark/cursor rows, traders_after (C1 candidate walk of CF_NATIVE_POSITIONS from the cursor); delete NE run_liquidation_checks",
+   "files": [
+    "crates/torus-core/src/liquidation.rs",
+    "crates/torus-core/tests/liquidation_tests.rs",
+    "crates/torus-bridge/src/native_executor.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test liquidation_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --test margin_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets",
+   "depends_on": [
+    5
+   ],
+   "commit": 5,
+   "status": "pending"
+  },
+  {
+   "id": "7a",
+   "name": "bridge: run_liquidations / run_liquidations_with in child module liquidation_step.rs — listed-market marks (BTreeMap), candidates = traders_after(cursor, SCAN+1) over CF_NATIVE_POSITIONS (vault excluded), skip unless every position has a mark, cancel resting orders AND pending stops via T3 helper (sorted markets), stage 1 reduce-only market orders via place_order_inner + run_triggered_stops, stop once AV >= MM",
+   "files": [
+    "crates/torus-bridge/src/liquidation_step.rs",
+    "crates/torus-bridge/src/native_executor.rs",
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-core --lib order_book",
+   "depends_on": [
+    3,
+    4,
+    6
+   ],
+   "commit": 6,
+   "status": "pending"
+  },
+  {
+   "id": "7b",
+   "name": "bridge: 20% chunks above 100k notional at mark, 30 s block-time cooldown per account, backstop during cooldown",
+   "files": [
+    "crates/torus-bridge/src/liquidation_step.rs",
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests chunk && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests cooldown",
+   "depends_on": [
+    "7a"
+   ],
+   "commit": 6,
+   "status": "pending"
+  },
+  {
+   "id": "7c",
+   "name": "bridge: backstop through the step (orders cancelled, vault in index, value conserved)",
+   "files": [
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests backstop",
+   "depends_on": [
+    "7a"
+   ],
+   "commit": 6,
+   "status": "pending"
+  },
+  {
+   "id": "7d",
+   "name": "bridge: ADL at the previous mark (current if none), HL ranking, flat deficit to vault, vault ADL when its AV < 0",
+   "files": [
+    "crates/torus-bridge/src/liquidation_step.rs",
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests adl",
+   "depends_on": [
+    "7a"
+   ],
+   "commit": 6,
+   "status": "pending"
+  },
+  {
+   "id": "7e",
+   "name": "bridge: SCAN 2048 / ACT 64 budgets, round-robin cursor over CF_NATIVE_POSITIONS (no wrap; deleted at end of CF), carry-over, liquidation_due (cooldown or cursor row), stops fired by liquidation fills run in the step",
+   "files": [
+    "crates/torus-bridge/src/liquidation_step.rs",
+    "crates/torus-bridge/src/native_executor.rs",
+    "crates/torus-bridge/tests/liquidation_tests.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test liquidation_tests",
+   "depends_on": [
+    "7a"
+   ],
+   "commit": 6,
+   "status": "pending"
+  },
+  {
+   "id": 8,
+   "name": "consensus: run_liquidations after drain_core_writer, before process_governance; fatal check after the step (F11); run_native gate also on liquidation_due(&overlay)",
+   "files": [
+    "crates/torus-consensus/src/app.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib liquidation_e2e && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle_ && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib exec_pipeline && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib crash",
+   "depends_on": [
+    "7e"
+   ],
+   "commit": 7,
+   "status": "pending"
+  },
+  {
+   "id": 9,
+   "name": "determinism gates: serial = pipelined (parked) = crash replay with stage 1 + backstop + vault ADL (run_oracle_fixture generalized); chaos incremental root = full with the liquidation step",
+   "files": [
+    "crates/torus-consensus/src/app.rs",
+    "crates/torus-integration-tests/tests/chaos.rs"
+   ],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib liquidation_determinism && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle_determinism && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-integration-tests --test chaos",
+   "depends_on": [
+    8
+   ],
+   "commit": 8,
+   "status": "pending"
+  },
+  {
+   "id": 10,
+   "name": "docs: parity-audit behaviour row + deployment, liquidation.md status + user answers to D1-D11/C4/C5, oracle doc next-item",
+   "files": [
+    "docs/parity-audit-fixes-s515.md",
+    "docs/plans/liquidation.md",
+    "docs/plans/oracle-aggregation.md"
+   ],
+   "validate": "true",
+   "depends_on": [
+    8,
+    9
+   ],
+   "commit": 9,
+   "status": "pending"
+  },
+  {
+   "id": 11,
+   "name": "end-to-end verification (lead): suites, 12-crate run, check, clippy, perf sanity",
+   "files": [],
+   "validate": "/tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 --no-fail-fast -p torus-types -p torus-state -p torus-evm -p torus-core -p torus-consensus -p torus-bridge -p torus-rpc -p torus-mempool -p torus-economics -p torus-genesis -p torus-telemetry -p torus-integration-tests && /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets",
+   "depends_on": [
+    9,
+    10
+   ],
+   "commit": null,
+   "status": "pending"
+  }
+ ],
+ "defaults_decided_user_s517": {
+  "D1": "slippage cap mark -/+ mark/(2*lev) (position MM rate, 2.5% at 20x)",
+  "D2": "chunk basis notional at mark > 100,000 -> size/5",
+  "D3": "cooldown per account, 0x02||trader -> header ts, 30 s",
+  "D4": "cancel all resting orders + pending stops first",
+  "D5": "SCAN 2048 / ACT 64 per block, round-robin cursor",
+  "D6": "isolated unsupported -> skip",
+  "D7": "stops fired by liquidation fills run in the step",
+  "D8": "vault exempt from stage 1/backstop, ADL when AV < 0",
+  "D9": "flat residual deficit moves to the vault",
+  "D10": "previous mark = per-market row written by the previous step; current mark if none",
+  "D11": "margin configs = flat tier at listing max leverage; MM = IM/2"
+ },
+ "known_limitations": [
+  "C3 listing maintenance_margin_bps ignored; MM = 1/2 IM at max leverage (HL)",
+  "C5 vault cannot unwind until the deposits branch; can go negative -> ADL"
+ ]
+}
