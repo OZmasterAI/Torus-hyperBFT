@@ -95,6 +95,7 @@ impl TraderOrders {
         self.slots.iter().filter(|&&id| id != HOLE)
     }
 
+    #[cfg(test)]
     pub(super) fn to_vec(&self) -> Vec<OrderId> {
         self.iter().copied().collect()
     }
