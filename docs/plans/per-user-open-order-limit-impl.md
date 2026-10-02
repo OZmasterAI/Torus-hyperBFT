@@ -368,3 +368,64 @@ visible, the pass splits by book chunks across the engine workers.
 6. **Tests added**: reload vs resident books in all four book modes,
    margin-rejected order takes no slot, book-rejected orders keep their slot
    for the call, stop-only cancel-all persisted in all four modes.
+
+### Cost fixes after the s83 lean A/B
+
+The lean A/B (`s83-ordlimit-20261001`, 300 markets, budget 900) measured
+the branch at -7% matched/s and +8% CPU against main 710dde7. The branch
+was rebased onto main d623d3c first (running state hash, AttestStateHash);
+the only conflict was `tools/matched-bench/test_harness.py` (both sides
+added tests, both kept).
+
+1. **`TraderOrders` without a map for small lists**: up to 32 slots it is a
+   plain `Vec` (removal = `rposition` + order-keeping shift, no holes). The
+   position map and live count are built past 32 slots (map pre-sized to 64)
+   and dropped when compaction gets back to 32 live ids. The struct is 32
+   bytes (was 80); `cancel_all` takes the list with `into_vec`. The bench
+   shape rests ~3 orders per trader per book, so it never builds a map.
+2. **`cum_volume` in parallel settle**: pass A computes each fill's
+   `price * qty` once and sums a market's volume per trader on its worker.
+   Pass B merges that sum (one entry per distinct trader per market), or,
+   if an order of the market stopped early on a balance failure, adds the
+   market per fill side up to each order's stop. Pass B no longer does an
+   i256 multiply and a map entry per fill side. Sequential settle is
+   unchanged (it already computed the notional once).
+3. **Upper-bound gate for the open count: not done.** A sender's count
+   needs every book it may rest in; a cheap upper bound needs a global
+   per-trader counter kept in step on every place, fill, cancel, STP,
+   trigger and book load (resident and reloaded books, parallel match
+   workers). That is more state and more ways to diverge than the count's
+   cost (~15-30 ms per call by static estimate) justifies before a quiet
+   re-measure shows the count in `exec_phase_margin_seconds`.
+4. **Load generator rejects (2.6-3.8% at budget 900): no generator change.**
+   The rejects come from the chain's ordering, not from a loose estimate:
+   - Native pool selection order is `(cancel priority, sender, nonce)`. A
+     cancel-all is selected ahead of the same sender's places that are
+     still pending, so places sent before it commit after it and survive.
+   - Selection is sender-sorted, so a sender's pending places are taken
+     together. High-address senders wait (commit age averages 16 s;
+     ~22k nonce-expired evictions per node per cell) and their surviving
+     places then land in one call.
+   - The cells submit ~466 actions/s for 5000 senders, one fire per sender
+     every ~10.7 s, inside a 60 s nonce window. The reject rate climbs over
+     the run (0% in the first 30 s, 3-6% per 30 s later).
+
+   A safe generator rule must count every place sent up to 60 s before a
+   cancel-all. With one fire per ~10.7 s, the sender then sends cancel-alls
+   until those places age out, and the place share drops from ~63% to
+   ~30%. A lower budget (< 800 with `BATCH=400`) gives one place per
+   cancel-all (~48% places) and still leaves the stale bunches. Either one
+   changes the workload against every earlier cell. The A/B below keeps
+   budget 900; both arms get the same load, and the limit arm's rejects are
+   reported as `delta_orders_rejected_open_limit_total`.
+5. **Tests**: `trader_orders` unit tests (no map up to 32, map dropped
+   after compaction, `into_vec`, repeated id, size <= 32 bytes) and
+   `cum_volume_pass_b_stop_mid_market_keeps_later_orders_and_other_markets`.
+   `cancel_all_many_falls_back_on_stale_or_shared_indexes` and
+   `id_lookup_agrees_with_linear_scan_under_mutation` fail in debug builds
+   on main d623d3c too (debug asserts); they are not from this branch.
+6. **Probe (unreliable, host load 37-40 on 18 vCPUs)**: `trader_churn_cost`
+   (300 books x 200 senders x 3 orders, best of 5) place 164-172 -> 151-161
+   ms, `cancel_all_many` 258-281 -> 238-260 ms. Re-run on a quiet host:
+   `cargo test --release -p torus-core --test open_order_cost_probe --
+   --ignored --nocapture trader_churn_cost`.
