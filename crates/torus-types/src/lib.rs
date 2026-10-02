@@ -1298,13 +1298,6 @@ pub struct ChainConfig {
     /// upgrade. `None` (any genesis without the field) = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
-    /// Epoch-rotation activation height (consensus bug (b),
-    /// docs/plans/consensus-bug-b-epoch-race.md): from the first epoch boundary
-    /// at or above it, execution decides the validator set one epoch ahead and
-    /// the consensus thread only reads that decision. CHAIN-WIDE (genesis
-    /// `consensus.epoch_rotation_activation_height`). `None` = the old rules.
-    #[serde(default)]
-    pub epoch_rotation_activation_height: Option<u64>,
 }
 
 fn default_timeout_base_ms() -> u64 {
@@ -1330,9 +1323,6 @@ impl ChainConfig {
         }
         if self.state_hash_activation_height == Some(0) {
             return Err("state_hash_activation_height must be >= 1".to_string());
-        }
-        if self.epoch_rotation_activation_height == Some(0) {
-            return Err("epoch_rotation_activation_height must be >= 1".to_string());
         }
         Ok(())
     }

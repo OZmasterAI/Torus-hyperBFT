@@ -1,10 +1,7 @@
 //! Epoch rotation decided at EXECUTION (consensus bug (b),
 //! `docs/plans/consensus-bug-b-epoch-race.md`).
 //!
-//! Before the chain-wide activation height the consensus thread rotated the
-//! validator set at proposal / validation time of a boundary block, reading and
-//! writing staking rows while execution lagged by a variable number of blocks.
-//! From the activation height on:
+//! The consensus thread never reads or writes timing-dependent staking state:
 //!
 //! * execution of boundary `H` applies the plan stored for `H` (key rotations +
 //!   statuses) and computes the plan for the next boundary `H + L` from its own
@@ -14,7 +11,9 @@
 //!
 //! Both rows live in `CF_CONSENSUS_META` under [`EPOCH_VSET_PREFIX`] (hashed by
 //! the running state hash) and are written only by execution, inside the
-//! boundary block's flush batch.
+//! boundary block's flush batch. Genesis records the hotstuff genesis set as
+//! the installed set ([`StakingManager::record_genesis_epoch_set`]); the first
+//! boundary `L` has no plan (no change), its execution plans `2L`.
 
 use alloy_primitives::Address;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -25,8 +24,6 @@ use torus_types::{PublicKey, ValidatorInfo, ValidatorSet};
 use crate::epoch::EpochManager;
 use crate::error::EconomicsError;
 use crate::staking::StakingManager;
-use crate::types::ValidatorStatus;
-
 type Result<T> = std::result::Result<T, EconomicsError>;
 
 /// Key prefix of every epoch-rotation row (consensus state).
@@ -140,23 +137,14 @@ impl<T: StateBackend> StakingManager<T> {
     pub fn current_epoch_validator_set(&self) -> Result<Option<ValidatorSet>> {
         Ok(self.current_epoch_set()?.map(|m| members_to_set(&m, 0)))
     }
-}
 
-/// Rows with status Active, ranked like a computed set (bootstrap of the first
-/// plan: no set was recorded by a plan yet).
-fn active_rows_set<T: StateBackend>(
-    staking: &StakingManager<T>,
-    epoch: u64,
-) -> Result<ValidatorSet> {
-    let mut set = EpochManager::compute_new_validator_set(staking, u32::MAX, epoch)?;
-    let active: std::collections::BTreeSet<Address> = staking
-        .all_validators()?
-        .into_iter()
-        .filter(|v| v.status == ValidatorStatus::Active)
-        .map(|v| v.address)
-        .collect();
-    set.validators.retain(|v| active.contains(&v.address));
-    Ok(set)
+    /// Genesis: record `set` (the hotstuff genesis set) as the installed set,
+    /// the base the first plan is computed against.
+    pub fn record_genesis_epoch_set(&self, set: &ValidatorSet) -> Result<()> {
+        self.state()
+            .put_cf_raw(CF_CONSENSUS_META, CURRENT_KEY, &encode(&set_to_members(set))?)?;
+        Ok(())
+    }
 }
 
 impl EpochManager {
@@ -187,11 +175,10 @@ impl EpochManager {
             }
         };
 
+        // No recorded set only on a DB not built from a genesis: diff against
+        // nothing (install the computed set).
         let current = staking.current_epoch_set()?;
-        let old_set = match &current {
-            Some(members) => members_to_set(members, epoch),
-            None => active_rows_set(staking, epoch)?,
-        };
+        let old_set = members_to_set(current.as_deref().unwrap_or_default(), epoch);
 
         let mut new_set = Self::compute_new_validator_set(staking, max_validators, epoch)?;
         rotated(&mut new_set);
@@ -270,7 +257,7 @@ impl EpochManager {
         Ok(())
     }
 
-    /// Execution of boundary `height` (activation reached): apply the plan for
+    /// Execution of boundary `height`: apply the plan for
     /// `height` if one exists, then store the plan for `height + epoch_length`.
     /// The plan of the PREVIOUS boundary is pruned here, not the one just
     /// applied: consensus may still re-read `plan(height)` (re-validation of
@@ -313,7 +300,7 @@ impl EpochManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ValidatorState;
+    use crate::types::{ValidatorState, ValidatorStatus};
     use alloy_primitives::U256;
     use torus_state::StateDb;
 
@@ -353,8 +340,10 @@ mod tests {
         assert!(key_is_hashed(meta, CURRENT_KEY));
     }
 
+    /// A DB not built from a genesis has no recorded set: the plan installs
+    /// the computed set.
     #[test]
-    fn bootstrap_plan_reads_active_rows_and_is_a_change() {
+    fn plan_without_a_recorded_set_installs_the_computed_set() {
         let (_d, mgr) = setup();
         for n in 1..=4 {
             put(&mgr, n, 100, ValidatorStatus::Active);
@@ -362,9 +351,34 @@ mod tests {
         put(&mgr, 5, 50, ValidatorStatus::Candidate);
         let plan = EpochManager::plan_rotation(&mgr, 4, 8, 4).unwrap();
         assert_eq!(plan.boundary, 8);
-        assert!(plan.changed, "no installed set recorded yet");
+        assert!(plan.changed, "no installed set recorded");
         assert_eq!(keys(&plan), vec![[1; 32], [2; 32], [3; 32], [4; 32]]);
         assert_eq!(plan.deletes, vec![[5; 32]], "registered non-member key");
+    }
+
+    /// The first plan is computed against the set hotstuff runs from genesis
+    /// (recorded by `Genesis::initialize`), not the rows' statuses at the
+    /// first boundary: nothing moved = no change (a spurious update would
+    /// switch hotstuff to its 4-phase set-change protocol), and a validator
+    /// jailed in epoch 0 is re-seated by the BFT floor of that 4-validator set.
+    #[test]
+    fn first_plan_diffs_against_the_recorded_genesis_set() {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
+        mgr.record_genesis_epoch_set(&genesis).unwrap();
+        let plan = EpochManager::plan_rotation(&mgr, 4, 8, 4).unwrap();
+        assert!(!plan.changed, "nothing moved since genesis");
+
+        let v4 = Address::new([4; 20]);
+        let mut row = mgr.get_validator(&v4).unwrap().unwrap();
+        row.status = ValidatorStatus::Jailed;
+        mgr.put_validator(&v4, &row).unwrap();
+        let plan = EpochManager::plan_rotation(&mgr, 4, 8, 4).unwrap();
+        assert_eq!(keys(&plan).len(), 4, "floor of the genesis set: {plan:?}");
+        assert!(!plan.changed);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use tracing::info;
 
 use torus_core::position::NativeBalance;
 use torus_economics::types::{ValidatorState, ValidatorStatus};
-use torus_economics::{GovernanceManager, GovernanceParams};
+use torus_economics::{EpochManager, GovernanceManager, GovernanceParams, StakingManager};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_STAKING_VALIDATORS};
 use torus_state::db::KECCAK_EMPTY;
 use torus_state::trie::compute_state_root_from_db;
@@ -109,10 +109,6 @@ pub struct ConsensusConfig {
     /// every node hashes). Absent = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
-    /// Epoch-rotation activation height (CHAIN-WIDE, consensus bug (b)).
-    /// Absent = the old consensus-thread rotation.
-    #[serde(default)]
-    pub epoch_rotation_activation_height: Option<u64>,
 }
 
 fn default_backoff_factor() -> u32 {
@@ -411,6 +407,13 @@ impl Genesis {
             state_db.put_cf_raw(CF_STAKING_VALIDATORS, address.as_slice(), &data)?;
             info!(%address, stake = %validator.stake, "seeded genesis validator");
         }
+        // The hotstuff genesis set is the installed epoch set (all genesis
+        // validators, ranked like every execution-computed plan): the base of
+        // the first plan (consensus bug (b), torus_economics::epoch_plan).
+        let staking = StakingManager::new(state_db.clone());
+        EpochManager::compute_new_validator_set(&staking, u32::MAX, 0)
+            .and_then(|set| staking.record_genesis_epoch_set(&set))
+            .map_err(|e| GenesisError::InvalidHex(format!("genesis epoch set: {e}")))?;
 
         // 4. Seed permanent stakes into CF_STAKING_PERMANENT
         for ps in &self.permanent_stakes {
@@ -532,7 +535,6 @@ impl Genesis {
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
             state_hash_activation_height: self.consensus.state_hash_activation_height,
-            epoch_rotation_activation_height: self.consensus.epoch_rotation_activation_height,
         }
     }
 
@@ -759,20 +761,34 @@ mod tests {
         assert!(config.validate().is_err(), "height 0 is never executed");
     }
 
-    /// Consensus bug (b): the epoch-rotation activation height is a CHAIN-WIDE
-    /// genesis field; absent (every existing genesis) = the old rules.
+    /// Consensus bug (b): genesis records the hotstuff genesis set as the
+    /// installed epoch set, ranked exactly like a computed plan, so the first
+    /// plan diffs against it (an unchanged set is no hotstuff update).
     #[test]
-    fn genesis_epoch_rotation_activation_height_is_chain_config() {
-        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
-        assert_eq!(genesis.chain_config().epoch_rotation_activation_height, None);
-        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
-        json["consensus"]["epoch_rotation_activation_height"] = serde_json::json!(7000);
-        let genesis = Genesis::from_json(&json.to_string()).unwrap();
-        let mut config = genesis.chain_config();
-        assert_eq!(config.epoch_rotation_activation_height, Some(7000));
-        assert!(config.validate().is_ok());
-        config.epoch_rotation_activation_height = Some(0);
-        assert!(config.validate().is_err(), "height 0 is never executed");
+    fn initialize_records_the_genesis_set_as_the_installed_epoch_set() {
+        use torus_economics::{EpochManager, StakingManager};
+        let json = include_str!("../../../testnet/genesis-weighted-base.json");
+        let genesis = Genesis::from_json(json).unwrap();
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        genesis.initialize(&db).unwrap();
+        let staking = StakingManager::new(db);
+        let config = genesis.chain_config();
+        let plan = EpochManager::plan_rotation(
+            &staking,
+            config.max_validators,
+            2 * config.epoch_length,
+            config.epoch_length,
+        )
+        .unwrap();
+        assert!(!plan.changed, "nothing moved since genesis: no hotstuff update");
+        let installed = staking.current_epoch_validator_set().unwrap().expect("recorded at genesis");
+        let hotstuff = genesis.validator_set().unwrap();
+        let mut keys: Vec<_> = installed.validators.iter().map(|v| (v.pubkey.0, v.power)).collect();
+        let mut expected: Vec<_> = hotstuff.validators.iter().map(|v| (v.pubkey.0, v.power)).collect();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected, "the hotstuff genesis set");
     }
 
     #[test]
