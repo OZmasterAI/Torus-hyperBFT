@@ -113,39 +113,82 @@ pub(crate) fn is_proposer_with_reputation(
     }
 }
 
-/// MonadBFT B3: Reputation-aware phase vote recipient selection.
+/// The leader `phase_vote` is sent to: the leader of `phase_vote.view + 1` (see [`phase_vote_leader`]
+/// for the validator set). MonadBFT B3: reputation-aware.
 pub(crate) fn phase_vote_recipient_with_reputation(
     phase_vote: &PhaseVote,
     validator_set_state: &ValidatorSetState,
     reputation: Option<&crate::hotstuff::types::LeaderReputation>,
 ) -> VerifyingKey {
+    phase_vote_leader(
+        phase_vote,
+        phase_vote.view + 1,
+        validator_set_state,
+        reputation,
+    )
+}
+
+/// s84 liveness: the BACKUP recipient of `phase_vote`, i.e. the leader of `phase_vote.view + 2` in
+/// the same validator set [`phase_vote_recipient_with_reputation`] picks from; `None` when that is
+/// the primary recipient itself.
+///
+/// Votes for view `w` are aggregated by `leader(w + 1)`. If that leader is down, the block of view
+/// `w` is never certified; with three round-robin validators and one down that is every third
+/// block, so two consecutive-view QCs (the 2-chain commit rule) never form and nothing commits even
+/// though the live validators hold a quorum. Also sending the vote to `leader(w + 2)` lets the next
+/// live leader certify the block (it is still in view `w` when the votes arrive: view `w` cannot
+/// end without that QC or a timeout), so the chain commits with one leader down. A QC is valid
+/// whoever assembles it, so no safety rule changes; with every leader up the backup assembles the
+/// same QC as the primary and the later copy is ignored.
+///
+/// Rolling upgrade: no activation gate is needed. Only the SEND side changed; the receive side
+/// already collects a correctly signed vote for the current view from any validator, whoever the
+/// intended collector was (`on_receive_phase_vote` and `PhaseVoteCollector::collect` check chain,
+/// view, signature and validator-set membership only), and the network layer does not penalise an
+/// extra well-formed direct message. Old nodes therefore act as backups too; they just never send
+/// backup votes, so the backup forms a QC only once a quorum of the voting power has upgraded.
+pub(crate) fn phase_vote_backup_recipient_with_reputation(
+    phase_vote: &PhaseVote,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> Option<VerifyingKey> {
+    let primary = phase_vote_recipient_with_reputation(phase_vote, validator_set_state, reputation);
+    let backup = phase_vote_leader(
+        phase_vote,
+        phase_vote.view + 2,
+        validator_set_state,
+        reputation,
+    );
+    (backup != primary).then_some(backup)
+}
+
+/// Leader of `leader_view` in the validator set whose quorum `phase_vote` counts towards, which is
+/// either the committed validator set (CVS) or the previous validator set (PVS) depending on whether
+/// `validator_set_state.update_decided()` and on `phase_vote.phase`:
+///
+/// ||Validator Set Update Decided|Validator Set Update Not Decided|
+/// |---|---|---|
+/// |Phase == `Generic`, `Prepare`, `Precommit`, or `Commit`|CVS|PVS|
+/// |Phase == `Decide`|CVS|CVS|
+///
+/// Reputation-weighted when `reputation` is `Some` (which respects the reputation kill switch), plain
+/// [`select_leader`] otherwise.
+fn phase_vote_leader(
+    phase_vote: &PhaseVote,
+    leader_view: ViewNumber,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&crate::hotstuff::types::LeaderReputation>,
+) -> VerifyingKey {
     use crate::pacemaker::implementation::select_leader_with_reputation;
+    let validator_set = if validator_set_state.update_decided() || phase_vote.phase == Phase::Decide
+    {
+        validator_set_state.committed_validator_set()
+    } else {
+        validator_set_state.previous_validator_set()
+    };
     match reputation {
-        Some(rep) => {
-            if validator_set_state.update_decided() {
-                select_leader_with_reputation(
-                    phase_vote.view + 1,
-                    validator_set_state.committed_validator_set(),
-                    rep,
-                )
-            } else {
-                match phase_vote.phase {
-                    Phase::Generic | Phase::Prepare | Phase::Precommit | Phase::Commit => {
-                        select_leader_with_reputation(
-                            phase_vote.view + 1,
-                            validator_set_state.previous_validator_set(),
-                            rep,
-                        )
-                    }
-                    Phase::Decide => select_leader_with_reputation(
-                        phase_vote.view + 1,
-                        validator_set_state.committed_validator_set(),
-                        rep,
-                    ),
-                }
-            }
-        }
-        None => phase_vote_recipient(phase_vote, validator_set_state),
+        Some(rep) => select_leader_with_reputation(leader_view, validator_set, rep),
+        None => select_leader(leader_view, validator_set),
     }
 }
 
@@ -198,43 +241,6 @@ pub(crate) fn is_phase_voter(
             Phase::Commit => validator_set_state
                 .committed_validator_set()
                 .contains(replica),
-        }
-    }
-}
-
-/// Identify the leader that `phase_vote` should be sent to, given the current `validator_set_state`.
-///
-/// ## `phase_vote_recipient` Logic
-///
-/// The leader that `phase_vote` should be sent to is the leader of `phase_vote.view + 1` in the appropriate
-/// validator set in `validator_set_state`, which is either the committed validator set (CVS) or the
-/// previous validator set (PVS). Which of the CVS and the PVS is the appropriate validator set depends
-/// on two factors: 1. Whether or not `validator_set_update.update_decided`, and 2. What `justify.phase`
-/// is:
-///
-/// ||Validator Set Update Decided|Validator Set Update Not Decided|
-/// |---|---|---|
-/// |Phase == `Generic`, `Prepare`, `Precommit`, or `Commit`|CVS|PVS|
-/// |Phase == `Decide`|CVS|CVS|
-pub(crate) fn phase_vote_recipient(
-    phase_vote: &PhaseVote,
-    validator_set_state: &ValidatorSetState,
-) -> VerifyingKey {
-    if validator_set_state.update_decided() {
-        select_leader(
-            phase_vote.view + 1,
-            validator_set_state.committed_validator_set(),
-        )
-    } else {
-        match phase_vote.phase {
-            Phase::Generic | Phase::Prepare | Phase::Precommit | Phase::Commit => select_leader(
-                phase_vote.view + 1,
-                validator_set_state.previous_validator_set(),
-            ),
-            Phase::Decide => select_leader(
-                phase_vote.view + 1,
-                validator_set_state.committed_validator_set(),
-            ),
         }
     }
 }
@@ -373,5 +379,48 @@ mod view_leader_tests {
                 "view {v}: None must delegate to plain select_leader"
             );
         }
+    }
+
+    /// s84: a phase vote for view `w` goes to `leader(w + 1)` and, as backup, to
+    /// `leader(w + 2)`; no backup when both views have the same leader.
+    #[test]
+    fn backup_vote_recipient_is_the_leader_two_views_ahead() {
+        use crate::hotstuff::messages::PhaseVote;
+        use crate::types::{
+            crypto_primitives::Keypair,
+            data_types::{ChainID, CryptoHash},
+        };
+        let (vs, _) = make_validator_set(3);
+        let vss = ValidatorSetState::new(vs.clone(), vs.clone(), None, true);
+        let kp = Keypair::new(SigningKey::from_bytes(&[1; 32]));
+        let vote_at = |v: u64| {
+            PhaseVote::new(
+                &kp,
+                ChainID::new(0),
+                ViewNumber::new(v),
+                CryptoHash::new([0; 32]),
+                Phase::Generic,
+            )
+        };
+        for v in 0..12u64 {
+            let vote = vote_at(v);
+            assert_eq!(
+                phase_vote_recipient_with_reputation(&vote, &vss, None),
+                select_leader(ViewNumber::new(v + 1), &vs)
+            );
+            assert_eq!(
+                phase_vote_backup_recipient_with_reputation(&vote, &vss, None),
+                Some(select_leader(ViewNumber::new(v + 2), &vs)),
+                "view {v}: three round-robin leaders, backup is leader(v + 2)"
+            );
+        }
+
+        // A single validator leads every view: the backup would be the primary.
+        let (solo, _) = make_validator_set(1);
+        let solo_vss = ValidatorSetState::new(solo.clone(), solo, None, true);
+        assert_eq!(
+            phase_vote_backup_recipient_with_reputation(&vote_at(5), &solo_vss, None),
+            None
+        );
     }
 }

@@ -11,6 +11,7 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::{
+    block_sync::messages::BlockSyncMessage,
     hotstuff::messages::{BlockDataRequest, HotStuffMessage},
     networking::{
         messages::{Message, ProgressMessage},
@@ -42,6 +43,10 @@ pub(crate) struct MessageFilter {
     /// sync. When `false`, only block bodies are dropped (the node still sees headers, votes on them,
     /// and re-fetches bodies via `body_fetch_tracker`).
     pub(crate) drop_headers: bool,
+    /// s84: senders whose block data (`BlockDataResponse`, full `Proposal`, `BlockSyncResponse`) is
+    /// dropped for EVERY recipient — a proposer whose data never becomes available (withheld, or
+    /// lost in a crash).
+    pub(crate) withheld_bodies_from: Vec<VerifyingKey>,
 }
 
 impl MessageFilter {
@@ -55,8 +60,20 @@ impl MessageFilter {
     ///
     /// Everything else — crucially `ProposalHeader` and `PhaseVote` — passes through, so the starved
     /// node still votes on the header (helping a QC form) yet never obtains the block itself.
-    fn should_drop(&self, recipient: &VerifyingKey, message: &Message) -> bool {
-        if !self.enabled || !self.starved.contains(recipient) {
+    fn should_drop(&self, sender: &VerifyingKey, recipient: &VerifyingKey, message: &Message) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let is_body = matches!(
+            message,
+            Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                HotStuffMessage::BlockDataResponse(_) | HotStuffMessage::Proposal(_)
+            )) | Message::BlockSyncMessage(BlockSyncMessage::BlockSyncResponse(_))
+        );
+        if is_body && self.withheld_bodies_from.contains(sender) {
+            return true;
+        }
+        if !self.starved.contains(recipient) {
             return false;
         }
         match message {
@@ -113,7 +130,7 @@ impl Network for NetworkStub {
 
     fn send(&mut self, peer: VerifyingKey, message: Message) {
         if self.filter_enabled.load(Ordering::Relaxed)
-            && self.filter.lock().unwrap().should_drop(&peer, &message)
+            && self.filter.lock().unwrap().should_drop(&self.my_verifying_key, &peer, &message)
         {
             return;
         }
@@ -130,7 +147,7 @@ impl Network for NetworkStub {
     fn broadcast(&mut self, message: Message) {
         let active = self.filter_enabled.load(Ordering::Relaxed);
         for (recipient, peer_tx) in &self.all_peers {
-            if active && self.filter.lock().unwrap().should_drop(recipient, &message) {
+            if active && self.filter.lock().unwrap().should_drop(&self.my_verifying_key, recipient, &message) {
                 continue;
             }
             deliver(
@@ -219,6 +236,17 @@ impl FilterHandle {
             enabled: true,
             starved,
             drop_headers,
+            withheld_bodies_from: Vec::new(),
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s84: drop every block body sent BY `senders`, to every recipient, from now on.
+    pub(crate) fn withhold_bodies_from(&self, senders: Vec<VerifyingKey>) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            withheld_bodies_from: senders,
+            ..MessageFilter::default()
         };
         self.enabled.store(true, Ordering::Relaxed);
     }

@@ -54,7 +54,10 @@ use crate::{
     },
 };
 
-use super::roles::{is_proposer_with_reputation, phase_vote_recipient_with_reputation};
+use super::roles::{
+    is_proposer_with_reputation, phase_vote_backup_recipient_with_reputation,
+    phase_vote_recipient_with_reputation,
+};
 
 /// A single participant in the HotStuff subprotocol.
 ///
@@ -1183,6 +1186,31 @@ impl<N: Network> HotStuff<N> {
         }
     }
 
+    /// Send `vote` to its aggregator, `leader(vote.view + 1)` (FIX CONS-FIND-13:
+    /// reputation-weighted), and (s84 liveness) to the backup aggregator
+    /// `leader(vote.view + 2)`, so a down next leader does not stop the block from
+    /// being certified (see [`phase_vote_backup_recipient_with_reputation`]).
+    fn send_phase_vote<K: KVStore>(
+        &mut self,
+        vote: &PhaseVote,
+        validator_set_state: &ValidatorSetState,
+        block_tree: &BlockTreeSingleton<K>,
+    ) {
+        let reputation = block_tree.leader_reputation().ok();
+        let primary =
+            phase_vote_recipient_with_reputation(vote, validator_set_state, reputation.as_ref());
+        self.sender_handle
+            .send::<HotStuffMessage>(primary, vote.clone().into());
+        if let Some(backup) = phase_vote_backup_recipient_with_reputation(
+            vote,
+            validator_set_state,
+            reputation.as_ref(),
+        ) {
+            self.sender_handle
+                .send::<HotStuffMessage>(backup, vote.clone().into());
+        }
+    }
+
     /// Process a newly received `proposal`.
     ///
     /// # Preconditions
@@ -1442,20 +1470,12 @@ impl<N: Network> HotStuff<N> {
                     proposal.block.hash,
                     vote_phase,
                 );
-                // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
-                let reputation = block_tree.leader_reputation().ok();
-                let vote_recipient = phase_vote_recipient_with_reputation(
-                    &phase_vote,
-                    &validator_set_state,
-                    reputation.as_ref(),
-                );
                 // FIX CONS-FIND-16: Atomic write of vote state to prevent crash inconsistency.
                 // s65: persist BEFORE sending. If the process dies between the two, a vote that
                 // left the node but was never recorded would let the restarted replica vote
                 // again in this view (possibly for another block).
                 block_tree.set_vote_state_atomic(self.view_info.view, proposal.block.hash)?;
-                self.sender_handle
-                    .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+                self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
 
                 // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
                 // For fresh proposals: tip is the proposal itself.
@@ -1599,19 +1619,11 @@ impl<N: Network> HotStuff<N> {
                 nudge.justify.block,
                 vote_phase,
             );
-            // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
-            let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(
-                &vote,
-                &validator_set_state,
-                reputation.as_ref(),
-            );
             // s65: persist BEFORE sending. If the process dies between the two, a vote that
             // left the node but was never recorded would let the restarted replica vote
             // again in this view (possibly for another block).
             block_tree.set_highest_view_phase_voted(self.view_info.view)?;
-            self.sender_handle
-                .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
+            self.send_phase_vote(&vote, &validator_set_state, block_tree);
             Event::PhaseVote(PhaseVoteEvent {
                 timestamp: SystemTime::now(),
                 vote: vote.clone(),
@@ -2365,18 +2377,11 @@ impl<N: Network> HotStuff<N> {
                 header.block_hash,
                 vote_phase,
             );
-            let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(
-                &phase_vote,
-                &validator_set_state,
-                reputation.as_ref(),
-            );
             // s65: persist BEFORE sending. If the process dies between the two, a vote that
             // left the node but was never recorded would let the restarted replica vote
             // again in this view (possibly for another block).
             block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
-            self.sender_handle
-                .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+            self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
             // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
             // (unless the block is already in the tree, in which case it was validated on
             // insertion). If the body later turns out app-invalid, `try_insert_body` increments
@@ -2405,18 +2410,23 @@ impl<N: Network> HotStuff<N> {
             let block_hash = header.block_hash;
             let chain_id = header.chain_id;
             let view = header.view;
+            let pushed = self.take_pushed_body(&block_hash);
+            // A pushed body is not tied to the proposer, so an app-invalid copy
+            // must not cost the header (s84): restore it for the fetch below.
+            let header_for_fetch = pushed.as_ref().map(|_| header.clone());
             self.pending_headers.insert(block_hash, header);
-            let inserted_from_push = match self.take_pushed_body(&block_hash) {
+            let inserted_from_push = match pushed {
                 Some(block) => {
                     // Any non-insert (incl. MissingData) falls through to the
                     // normal fetch, whose response re-validates the body.
-                    let inserted =
-                        self.try_insert_body(block, block_tree, app)? == BodyInsert::Inserted;
-                    if inserted {
+                    let outcome = self.try_insert_body(block, block_tree, app)?;
+                    if outcome == BodyInsert::Inserted {
                         self.pending_headers.remove(&block_hash);
                         self.drain_deferred_bodies(block_tree, app)?;
+                    } else if let Some(header) = header_for_fetch {
+                        self.pending_headers.insert(block_hash, header);
                     }
-                    inserted
+                    outcome == BodyInsert::Inserted
                 }
                 None => false,
             };
@@ -2794,6 +2804,15 @@ impl<N: Network> HotStuff<N> {
                     block.hash,
                     self.header_vote_invalid_count
                 );
+            }
+            // s84: a header in `pending_headers` counts as already validated (the
+            // justify bypass in `on_receive_proposal_header`, `pc_block_pending` in
+            // QC collection). Once our app rejected the body that no longer holds,
+            // so drop it: children of this block now take the full `safe_pc` path,
+            // which needs the block in the tree, and get no vote. `MissingData` is
+            // not a rejection and keeps the header.
+            if app_invalid {
+                self.pending_headers.remove(&block.hash);
             }
             if let (Some(start), Some(validated)) = (trace_start, trace_validated) {
                 log::info!("body_fetch_diag insert: {} validated_mono_us={} hash={} height={} result={}",
@@ -4798,6 +4817,61 @@ mod s63_body_fetch_tests {
         assert_eq!(f.hotstuff.missing_data_retries.len(), MISSING_DATA_RETRY_CAP);
         assert!(!f.hotstuff.missing_data_retries.contains_key(&parent.hash));
         assert!(f.hotstuff.take_sync_needed());
+    }
+
+    /// s84: a follower header-votes the parent (view 1), its fetched body is
+    /// validated by `app`, then the child header (view 2, justify = QC on the
+    /// parent) arrives. Returns (parent header still pending, voted the child).
+    fn child_vote_after_parent_body(app: &mut ScriptedApp) -> (bool, bool) {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let (v1, v2) = (ViewNumber::new(1), ViewNumber::new(2));
+        let o1 = proposer_for(v1, &keys, &vss, &tree);
+        let o2 = proposer_for(v2, &keys, &vss, &tree);
+        let local = keys.iter()
+            .find(|k| k.verifying_key() != o1 && k.verifying_key() != o2).unwrap().clone();
+        let mut hotstuff = hotstuff_at(v1, local, vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([41; 32]), Data::new(vec![]));
+        let child = Block::new(BlockHeight::new(1), generic_pc(v1, parent.hash, &keys, &set),
+            CryptoHash::new([42; 32]), Data::new(vec![]));
+        let header = |block: &Block, view| ProposalHeader {
+            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
+            data_hash: block.data_hash, justify: block.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        };
+        hotstuff.on_receive_msg(header(&parent, v1).into(), &o1, &mut tree, app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), Some(v1), "header-first vote on the parent");
+        hotstuff.on_receive_msg(BlockDataResponse { view: v1, block: parent.clone() }.into(),
+            &o1, &mut tree, app).unwrap();
+        assert_eq!(app.calls, 1);
+        assert!(!tree.contains(&parent.hash));
+        hotstuff.view_info = ViewInfo::new(v2, Instant::now() + Duration::from_secs(60));
+        hotstuff.on_receive_msg(header(&child, v2).into(), &o2, &mut tree, app).unwrap();
+        (hotstuff.pending_headers.contains_key(&parent.hash),
+            tree.highest_view_voted().unwrap() == Some(v2))
+    }
+
+    /// s84 (e686e70 wedge): once this replica's app rejects a body, the block's
+    /// header must stop counting as "previously validated", so the replica never
+    /// votes for its children.
+    #[test]
+    fn app_rejected_body_is_not_treated_as_validated_for_child_votes() {
+        let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: true };
+        let (parent_pending, voted_child) = child_vote_after_parent_body(&mut app);
+        assert!(!voted_child, "no vote for a child of a block our app rejected");
+        assert!(!parent_pending, "rejected block's header leaves pending_headers");
+    }
+
+    /// MissingData is not a rejection: the header stays pending and the
+    /// child is voted exactly as before.
+    #[test]
+    fn missing_data_body_still_counts_as_validated_for_child_votes() {
+        let mut app = ScriptedApp { calls: 0, missing_left: usize::MAX, invalid: false };
+        let (parent_pending, voted_child) = child_vote_after_parent_body(&mut app);
+        assert!(parent_pending);
+        assert!(voted_child);
     }
 }
 

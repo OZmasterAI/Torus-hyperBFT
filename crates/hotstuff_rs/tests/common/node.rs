@@ -26,7 +26,7 @@ use hotstuff_rs::{
 use crate::common::{
     mem_db::MemDB,
     network::NetworkStub,
-    number_app::{NumberApp, NumberAppTransaction, QueuedTransaction},
+    number_app::{NumberApp, NumberAppTransaction, PoisonedBlock, QueuedTransaction},
     verifying_key_bytes::VerifyingKeyBytes,
 };
 
@@ -109,6 +109,7 @@ impl Node {
             max_view_time,
             true,
             WedgeOptions::default(),
+            None,
         )
     }
 
@@ -135,6 +136,7 @@ impl Node {
             max_view_time,
             true,
             wedge_options,
+            None,
         )
     }
 
@@ -164,6 +166,29 @@ impl Node {
             max_view_time,
             false,
             WedgeOptions::default(),
+            None,
+        )
+    }
+
+    /// s84 wedge repro: like [`new_with_max_view_time`](Self::new_with_max_view_time), but the app
+    /// shares `poison` (see [`PoisonedBlock`]).
+    pub(crate) fn new_with_poison(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+        poison: Arc<Mutex<PoisonedBlock>>,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+            WedgeOptions::default(),
+            Some(poison),
         )
     }
 
@@ -178,6 +203,7 @@ impl Node {
         max_view_time: Duration,
         block_sync_enabled: bool,
         wedge_options: WedgeOptions,
+        poison: Option<Arc<Mutex<PoisonedBlock>>>,
     ) -> Node {
         let kv_store = MemDB::new();
 
@@ -222,7 +248,8 @@ impl Node {
                 tx_queue.clone(),
                 wedge_options.produce_delay,
                 wedge_options.validate_delay,
-            ))
+            )
+            .with_poison(poison))
             .network(network_stub)
             .kv_store(kv_store)
             .configuration(configuration)

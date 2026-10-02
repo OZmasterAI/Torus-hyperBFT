@@ -55,12 +55,15 @@ for i in 0 1 2; do
 done
 
 echo "=== error scan (node logs) ==="
+# Node logs are ANSI colour-coded (the level is written as ESC[31mERROR ESC[0m),
+# so ' ERROR ' only matches after the escapes are stripped.
+error_lines() { sed 's/\x1b\[[0-9;]*m//g' "$1" | grep -E ' ERROR | panicked'; }
 for i in 0 1 2; do
     log="$RUN_DIR/val$i.log"
     [ -f "$log" ] || continue
-    n=$(grep -c -E ' ERROR | panicked' "$log" 2>/dev/null); n=${n:-0}
+    n=$(error_lines "$log" | wc -l)
     printf "  %-5s ERROR/panic lines=%s\n" "${labels[$i]}" "$n"
-    [ "$n" -eq 0 ] || echo "    (last error) $(grep -E ' ERROR | panicked' "$log" | tail -1)"
+    [ "$n" -eq 0 ] || echo "    (last error) $(error_lines "$log" | tail -1)"
 done
 
 echo
