@@ -12,7 +12,10 @@ use hotstuff_rs::{
         App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
         ValidateBlockResponse,
     },
-    block_tree::{accessors::public::BlockTreeSnapshot, pluggables::KVGet},
+    block_tree::{
+        accessors::{app::AppBlockTreeView, public::BlockTreeSnapshot},
+        pluggables::KVGet,
+    },
     types::{
         block::Block,
         crypto_primitives::{CryptoHasher, Digest, VerifyingKey},
@@ -253,7 +256,11 @@ impl App<MemDB> for NumberApp {
 
     /// s84 (vote after body): the body is held once its one datum matches
     /// `data_hash` and decodes as a transaction list.
-    fn check_block_data(&mut self, block: &Block) -> BlockDataCheck {
+    fn check_block_data(
+        &mut self,
+        block: &Block,
+        _block_tree: &AppBlockTreeView<'_, MemDB>,
+    ) -> BlockDataCheck {
         let datums = block.data.vec();
         let well_formed = datums.len() == 1
             && datum_hash(datums[0].bytes()) == block.data_hash

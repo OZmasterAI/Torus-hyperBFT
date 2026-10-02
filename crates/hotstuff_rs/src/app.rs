@@ -197,9 +197,19 @@ pub trait App<K: KVStore>: Send {
     /// Otherwise the block is certified and the replicas that voted for it
     /// cannot insert it, which wedges the chain.
     ///
+    /// `block_tree` serves lookups of other blocks, e.g. the parent
+    /// `block.justify.block` to check the block's link to it before the vote
+    /// (s84 decision 2): return [`BlockDataCheck::Missing`] while it is not in
+    /// the tree. Its app state is the committed app state, not the state the
+    /// block executes on.
+    ///
     /// The default accepts every body: it is only correct for apps whose
     /// `validate_block` never rejects a body this replica has received.
-    fn check_block_data(&mut self, _block: &Block) -> BlockDataCheck {
+    fn check_block_data(
+        &mut self,
+        _block: &Block,
+        _block_tree: &AppBlockTreeView<'_, K>,
+    ) -> BlockDataCheck {
         BlockDataCheck::Held
     }
 

@@ -22,7 +22,8 @@ use hotstuff_rs::app::{
     App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
     ValidateBlockResponse,
 };
-use hotstuff_rs::hotstuff::types::EquivocationEvidence;
+use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
+use hotstuff_rs::hotstuff::types::{EquivocationEvidence, PhaseCertificate};
 use hotstuff_rs::types::block::Block;
 use hotstuff_rs::types::data_types::{CryptoHash, Data, Datum, Power};
 use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
@@ -1339,6 +1340,12 @@ where
 ///
 /// On a genuine mismatch this SCREAMS with both hashes and latches the fail-stop
 /// (`exec_failed`), returning `true` so the caller aborts.
+///
+/// s84 decision 2: a replica votes for (and inserts) a block only if its
+/// header links to the header of its hotstuff parent ([`check_parent_link`]),
+/// and the committed chain is that parent chain, so a certified block cannot
+/// trip this. It stays as a safety latch: a mismatch here means local
+/// corruption or conflicting commits, never a Byzantine proposal.
 fn detect_parent_link_violation(
     state_db: &StateDb,
     height: u64,
@@ -1370,6 +1377,78 @@ fn detect_parent_link_violation(
     );
     exec_failed.store(true, Ordering::SeqCst);
     true
+}
+
+/// A proposal's parent as this replica's block tree shows it (s84 decision 2).
+enum ParentHeader {
+    /// The torus header at the front of the parent's datum.
+    Header(Box<TorusBlockHeader>),
+    /// The parent block is not in the tree (yet).
+    NotInTree,
+    /// The parent is in the tree but its datum carries no torus header.
+    Undecodable,
+}
+
+/// The torus header at the front of a proposal datum: `TorusBlock` and
+/// `CompactBlock` both start with it, and bincode reads only that prefix.
+fn datum_header(bytes: &[u8]) -> Option<TorusBlockHeader> {
+    bincode::deserialize(bytes).ok()
+}
+
+/// [`ParentHeader`] of the block `hash` read from the block tree.
+fn tree_parent_header(
+    tree: &AppBlockTreeView<'_, RocksKVStore>,
+    hash: &CryptoHash,
+) -> ParentHeader {
+    if !matches!(tree.block_height(hash), Ok(Some(_))) {
+        return ParentHeader::NotInTree;
+    }
+    match tree
+        .block_datum(hash, 0)
+        .and_then(|datum| datum_header(datum.bytes()))
+    {
+        Some(header) => ParentHeader::Header(Box::new(header)),
+        None => ParentHeader::Undecodable,
+    }
+}
+
+/// s84 decision 2: the link a block's torus header must have to its parent's
+/// before a replica votes for the block or inserts it: `height` = parent
+/// height + 1 and `parent_hash` = keccak of the parent's canonical header
+/// bytes. The parent is the hotstuff parent `justify.block` (the synthetic
+/// genesis parent header for a genesis justify), so the verdict depends on the
+/// two blocks only, never on how far local execution got. `Missing` while the
+/// parent is not in the tree (the vote waits, like a missing body).
+///
+/// Execution checks the same link against the committed header at height − 1
+/// (`detect_parent_link_violation`); the committed chain follows the justify
+/// links, so a certified block always passes it there.
+fn check_parent_link(
+    header: &TorusBlockHeader,
+    justify: &PhaseCertificate,
+    parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+) -> BlockDataCheck {
+    let parent = if justify.is_genesis_pc() {
+        torus_bridge::genesis_parent_header()
+    } else {
+        match parent(&justify.block) {
+            ParentHeader::Header(header) => *header,
+            ParentHeader::NotInTree => return BlockDataCheck::Missing,
+            ParentHeader::Undecodable => return BlockDataCheck::Invalid,
+        }
+    };
+    let expected = alloy_primitives::keccak256(parent.canonical_header_bytes());
+    if header.height == parent.height + 1 && header.parent_hash == expected {
+        return BlockDataCheck::Held;
+    }
+    tracing::warn!(
+        height = header.height,
+        parent_height = parent.height,
+        claimed_parent = %header.parent_hash,
+        expected_parent = %expected,
+        "REJECTED -- header does not link to its parent block's header (ancestry violation)"
+    );
+    BlockDataCheck::Invalid
 }
 
 // ---- Execution pipeline ----
@@ -4701,8 +4780,8 @@ impl TorusApp {
         // sha256 recomputed and bound to `data_hash` just above, so a hit can
         // never cover different bytes, and different forks necessarily miss each
         // other's entries. Consume-once. The algo-thread-only checks (fail-stop
-        // in the caller; ancestry + bookkeeping in `finish_validate`) run on
-        // EVERY path.
+        // and ancestry in `validate_block`; bookkeeping in `finish_validate`)
+        // run on EVERY path.
         if let Some(ref av) = self.async_validate {
             if let Some(verdict) = av.take_verdict(&computed) {
                 for (height, hashes) in verdict.notes {
@@ -4734,38 +4813,11 @@ impl TorusApp {
     }
 
     /// Algo-thread tail of `validate_block`, shared by the sync path and the
-    /// TORUS_ASYNC_VALIDATE hit path: ancestry check against the LIVE
-    /// `last_header` (never cached — it mutates as commits apply), pending
-    /// bookkeeping, epoch validator-set updates.
+    /// TORUS_ASYNC_VALIDATE hit path: pending bookkeeping, epoch validator-set
+    /// updates. (The ancestry check runs in `validate_block`, against the
+    /// parent block in the tree, s84 decision 2.)
     fn finish_validate(&mut self, torus_block: TorusBlock) -> ValidateBlockResponse {
-        // Ancestry check (best-effort, voting time): if our latest committed
-        // header IS the claimed parent (its height is H-1), the proposal's
-        // `parent_hash` MUST equal the keccak canonical hash of that header. A
-        // mismatch means the proposer built on a DIFFERENT height-(H-1) block than
-        // we finalized — the exact fork/equivocation the hash-level fork checker
-        // exists to catch — so refuse to vote.
-        //
-        // When our `last_header` is NOT the parent (we are behind, or the parent
-        // is still pending in the header-first fast path) we cannot cheaply
-        // resolve the parent here, so we DEFER rather than reject (preserving
-        // liveness): the hotstuff justify QC still constrains ancestry at the
-        // consensus level, and the commit-time check in `execute_committed_block`
-        // re-verifies the link authoritatively once the parent is applied.
         let height = torus_block.header.height;
-        if height > 0 && self.last_header.height + 1 == height {
-            let expected_parent =
-                alloy_primitives::keccak256(self.last_header.canonical_header_bytes());
-            if torus_block.header.parent_hash != expected_parent {
-                tracing::warn!(
-                    height,
-                    claimed_parent = %torus_block.header.parent_hash,
-                    expected_parent = %expected_parent,
-                    "validate_block: REJECTED -- parent_hash does not match locally-known parent (ancestry violation)"
-                );
-                return ValidateBlockResponse::Invalid;
-            }
-        }
-
         self.pending_proposals
             .insert(height, PendingProposal::new(torus_block));
         self.pending_proposals.retain(|&h, _| h + 10 > height);
@@ -4784,6 +4836,74 @@ impl TorusApp {
 }
 
 impl TorusApp {
+    /// s84 (vote after body): a QC implies a quorum holds the block AND its
+    /// out-of-band native-action bodies (compact proposals carry only hashes).
+    /// Cheap: fail-stop, the one datum, its hash, decode, the header's action
+    /// count against the body, the header's link to its parent (s84 decision
+    /// 2, [`check_parent_link`], `parent` looks the parent up), then a
+    /// presence-only DA read. No wait and no network pull here:
+    /// `validate_block` (run right after on the same body) and its retries
+    /// hand misses to the recovery worker.
+    fn check_proposal_data(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
+        if self.is_exec_failed() {
+            return BlockDataCheck::Invalid;
+        }
+        let datums = block.data.vec();
+        if datums.len() != 1
+            || block.data_hash != CryptoHash::new(Self::hash_datum(datums[0].bytes()))
+        {
+            return BlockDataCheck::Invalid;
+        }
+        let bytes = datums[0].bytes();
+        // Same decode order as `decode_proposal_and_ensure_durable_core`.
+        // Execution fail-stops on an action-count mismatch (T1.2), so such a
+        // block must never be certified.
+        let (header, compact) = match bincode::deserialize::<TorusBlock>(bytes) {
+            Ok(full) => {
+                if full.native_actions.len() != full.header.native_action_count as usize {
+                    return BlockDataCheck::Invalid;
+                }
+                (full.header, None)
+            }
+            Err(_) => {
+                let Ok(compact) = bincode::deserialize::<CompactBlock>(bytes) else {
+                    return BlockDataCheck::Invalid;
+                };
+                if compact.native_action_hashes.len() != compact.header.native_action_count as usize
+                {
+                    return BlockDataCheck::Invalid;
+                }
+                (compact.header.clone(), Some(compact))
+            }
+        };
+        let link = check_parent_link(&header, &block.justify, parent);
+        if link != BlockDataCheck::Held {
+            return link;
+        }
+        let Some(compact) = compact.filter(|c| !c.native_action_hashes.is_empty()) else {
+            return BlockDataCheck::Held;
+        };
+        let Some(mempool) = self.mempool.as_ref() else {
+            return BlockDataCheck::Missing; // no DA store (consensus-only observer)
+        };
+        if let Some(fetcher) = self.da_fetcher.as_ref() {
+            Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
+        }
+        if mempool
+            .native_da_missing(&compact.native_action_hashes)
+            .is_empty()
+        {
+            BlockDataCheck::Held
+        } else {
+            BlockDataCheck::Missing
+        }
+    }
+
     /// Everything `produce_block` does after resolving the parent header, split
     /// out so tests can drive it (`ProduceBlockRequest::new` is crate-private to
     /// hotstuff_rs). Each phase has its own `torus_block_build_*_seconds` timer
@@ -5015,6 +5135,22 @@ impl App<RocksKVStore> for TorusApp {
             return ValidateBlockResponse::Invalid;
         }
 
+        // s84 decision 2: the same parent link the pre-vote check enforces,
+        // read from the tree (hotstuff validates a block only once its parent
+        // is inserted), so a block inserted by any path (full proposal, sync,
+        // header + body) links to its parent's header.
+        let link = match datum_header(datums[0].bytes()) {
+            Some(header) => check_parent_link(&header, &block.justify, |hash| {
+                tree_parent_header(request.block_tree(), hash)
+            }),
+            None => BlockDataCheck::Invalid,
+        };
+        match link {
+            BlockDataCheck::Held => {}
+            BlockDataCheck::Missing => return ValidateBlockResponse::MissingData,
+            BlockDataCheck::Invalid => return ValidateBlockResponse::Invalid,
+        }
+
         self.validate_datum_after_fail_stop(datums[0].bytes(), &block.data_hash)
     }
 
@@ -5054,54 +5190,13 @@ impl App<RocksKVStore> for TorusApp {
     }
 
     /// s84 (vote after body): this replica votes for a proposal only once this
-    /// returns `Held`, so a QC implies a quorum holds the block AND its
-    /// out-of-band native-action bodies (compact proposals carry only hashes).
-    /// Cheap and stateless: fail-stop, the one datum, its hash, decode, the
-    /// header's action count against the body, then a presence-only DA read.
-    /// No wait and no network pull here: `validate_block` (run right after on
-    /// the same body) and its retries hand misses to the recovery worker.
-    fn check_block_data(&mut self, block: &Block) -> BlockDataCheck {
-        // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
-        if self.is_exec_failed() {
-            return BlockDataCheck::Invalid;
-        }
-        let datums = block.data.vec();
-        if datums.len() != 1
-            || block.data_hash != CryptoHash::new(Self::hash_datum(datums[0].bytes()))
-        {
-            return BlockDataCheck::Invalid;
-        }
-        let bytes = datums[0].bytes();
-        // Same decode order as `decode_proposal_and_ensure_durable_core`.
-        // Execution fail-stops on an action-count mismatch (T1.2), so such a
-        // block must never be certified.
-        if let Ok(full) = bincode::deserialize::<TorusBlock>(bytes) {
-            return if full.native_actions.len() == full.header.native_action_count as usize {
-                BlockDataCheck::Held
-            } else {
-                BlockDataCheck::Invalid
-            };
-        }
-        let Ok(compact) = bincode::deserialize::<CompactBlock>(bytes) else {
-            return BlockDataCheck::Invalid;
-        };
-        if compact.native_action_hashes.len() != compact.header.native_action_count as usize {
-            return BlockDataCheck::Invalid;
-        }
-        if compact.native_action_hashes.is_empty() {
-            return BlockDataCheck::Held;
-        }
-        let Some(mempool) = self.mempool.as_ref() else {
-            return BlockDataCheck::Missing; // no DA store (consensus-only observer)
-        };
-        if let Some(fetcher) = self.da_fetcher.as_ref() {
-            Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
-        }
-        if mempool.native_da_missing(&compact.native_action_hashes).is_empty() {
-            BlockDataCheck::Held
-        } else {
-            BlockDataCheck::Missing
-        }
+    /// returns `Held`. See [`TorusApp::check_proposal_data`].
+    fn check_block_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, RocksKVStore>,
+    ) -> BlockDataCheck {
+        self.check_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
     }
 
     /// Send committed block to the execution pipeline thread.
@@ -9460,79 +9555,9 @@ mod crash_recovery_tests {
             "fail-stop must never be bypassed by the async path"
         );
 
-        // (b) the ancestry check runs on the algo thread EVERY time — a cached
-        // heavy-stage verdict for a block whose parent_hash contradicts our
-        // applied parent is still rejected (a cached ancestry verdict would be
-        // stale by construction: last_header mutates as commits apply).
-        let (mut app2, _mempool2, _metrics2) = make_async_validate_app();
-        let mut bad = make_block(1, vec![sign_claim_rewards(3)]);
-        bad.header.parent_hash = B256::from([9u8; 32]);
-        let bad_datum = bincode::serialize(&bad).unwrap();
-        assert!(app2.async_validate_handle().unwrap().submit(bad_datum.clone()));
-        wait_for_cached(&app2, 1);
-        assert_eq!(
-            app2.last_header.height, 0,
-            "precondition: our applied header is the claimed parent height"
-        );
-        let resp = app2.validate_datum(&bad_datum, &data_hash_of(&bad_datum));
-        assert!(
-            matches!(resp, ValidateBlockResponse::Invalid),
-            "ancestry violation must reject despite a cached Valid heavy-stage verdict"
-        );
-    }
-
-    /// s84 decision 1: a session-signed action whose session exec revokes
-    /// after the worker cached its verdict no longer flips the vote — the
-    /// block is valid either way and execution skips the action. The verdict
-    /// reads no exec-written state, so it survives exec catching up (the
-    /// exec-frontier basis rail is gone) and is served from the cache.
-    #[test]
-    fn async_validate_verdict_survives_exec_state_change() {
-        let (mut app, _mempool, metrics) = make_async_validate_app();
-
-        let session_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let pubkey = session_key.verifying_key().to_bytes();
-        app.state_db
-            .put_session(
-                &pubkey,
-                &torus_types::SessionData {
-                    owner: Address::new([0xCD; 20]),
-                    expiry: 10_000_000,
-                    scope: torus_types::SessionScope::Trading,
-                    created_at: 0,
-                },
-            )
-            .unwrap();
-        let action = torus_types::eip712::sign_native_action_with_session(
-            NativeAction::CancelOrder { order_id: 1 },
-            1,
-            &session_key,
-        );
-        let block = make_block(5, vec![action]);
-        let datum = encode_proposal_datum(&block, false);
-        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
-        wait_for_cached(&app, 1);
-
-        // Exec catches up (no new commit): it revokes the session and advances
-        // the applied marker.
-        app.state_db.delete_session(&pubkey).unwrap();
-        write_native_applied_height(&app.state_db, 1);
-
-        let decode_before = metric_count(
-            &metrics.encode(),
-            "torus_validate_block_decode_seconds_count",
-        );
-        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
-        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
-        assert_eq!(
-            metric_count(
-                &metrics.encode(),
-                "torus_validate_block_decode_seconds_count"
-            ),
-            decode_before,
-            "the cached verdict is served (hit)"
-        );
-        assert_eq!(async_cache_len(&app), 0, "consumed");
+        // (b) the ancestry check runs in `validate_block` against the parent
+        // block in the tree, before any cached verdict is consulted (s84
+        // decision 2, `vote_requires_the_header_to_link_to_its_parent`).
     }
 
     /// A commit landing WITHOUT exec catching up changes nothing the heavy
@@ -9910,38 +9935,54 @@ mod crash_recovery_tests {
             let hash = TorusApp::hash_datum(&datum);
             hs_block(vec![datum], hash)
         };
+        // Every block here sits on the genesis justify: no parent lookup.
+        let genesis_only = |_: &CryptoHash| -> ParentHeader { unreachable!() };
         let action = sign_claim_rewards(2);
         let torus_block = make_block(1, vec![action.clone()]);
         let compact = bound(encode_proposal_datum(&torus_block, true));
 
         // Body referenced out of band and not local yet: not held.
-        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Missing);
-        mempool.mirror_native_to_da(&[action]).expect("mirror body into DA store");
-        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Held);
+        assert_eq!(
+            app.check_proposal_data(&compact, genesis_only),
+            BlockDataCheck::Missing
+        );
+        mempool
+            .mirror_native_to_da(&[action])
+            .expect("mirror body into DA store");
+        assert_eq!(
+            app.check_proposal_data(&compact, genesis_only),
+            BlockDataCheck::Held
+        );
         // A full block carries its bodies; an empty one references none.
         assert_eq!(
-            app.check_block_data(&bound(encode_proposal_datum(&torus_block, false))),
+            app.check_proposal_data(
+                &bound(encode_proposal_datum(&torus_block, false)),
+                genesis_only
+            ),
             BlockDataCheck::Held
         );
         assert_eq!(
-            app.check_block_data(&bound(encode_proposal_datum(&make_block(2, vec![]), true))),
+            app.check_proposal_data(
+                &bound(encode_proposal_datum(&make_block(1, vec![]), true)),
+                genesis_only
+            ),
             BlockDataCheck::Held
         );
 
         // Structural failures: never held, whatever is in the DA store.
         let datum = encode_proposal_datum(&torus_block, true);
         assert_eq!(
-            app.check_block_data(&hs_block(vec![datum], [7; 32])),
+            app.check_proposal_data(&hs_block(vec![datum], [7; 32]), genesis_only),
             BlockDataCheck::Invalid,
             "data does not match data_hash"
         );
         assert_eq!(
-            app.check_block_data(&hs_block(vec![], TorusApp::hash_datum(&[]))),
+            app.check_proposal_data(&hs_block(vec![], TorusApp::hash_datum(&[])), genesis_only),
             BlockDataCheck::Invalid,
             "no datum"
         );
         assert_eq!(
-            app.check_block_data(&bound(vec![0xff; 3])),
+            app.check_proposal_data(&bound(vec![0xff; 3]), genesis_only),
             BlockDataCheck::Invalid,
             "undecodable datum"
         );
@@ -9949,7 +9990,10 @@ mod crash_recovery_tests {
         miscounted.header.native_action_count = 2;
         for compact in [true, false] {
             assert_eq!(
-                app.check_block_data(&bound(encode_proposal_datum(&miscounted, compact))),
+                app.check_proposal_data(
+                    &bound(encode_proposal_datum(&miscounted, compact)),
+                    genesis_only
+                ),
                 BlockDataCheck::Invalid,
                 "header action count != body (compact={compact}): execution would fail-stop"
             );
@@ -9957,7 +10001,10 @@ mod crash_recovery_tests {
 
         // T1.5 fail-stop: never vote for blocks this node will not execute.
         app.exec_failed.store(true, Ordering::SeqCst);
-        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Invalid);
+        assert_eq!(
+            app.check_proposal_data(&compact, genesis_only),
+            BlockDataCheck::Invalid
+        );
     }
 
     /// FIX 1 (S443): the catch-up gate. A leader whose local committed frontier
@@ -10587,17 +10634,16 @@ mod crash_recovery_tests {
                 .unwrap();
             let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
             let ctx = make_exec_ctx(&config, &state_db);
-            for block in [&block1, &block2] {
-                let datum = encode_proposal_datum(block, false);
-                let data_hash = CryptoHash::new(TorusApp::hash_datum(&datum));
-                let hs_block = hotstuff_rs::types::block::Block::new(
-                    hotstuff_rs::types::data_types::BlockHeight::new(block.header.height),
-                    hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
-                    data_hash,
-                    Data::new(vec![Datum::new(datum.clone())]),
-                );
+            let hs1 = hs_block(&block1, PhaseCertificate::genesis_pc());
+            let hs2 = hs_block(&block2, justify_for(&hs1));
+            for (block, hs) in [(&block1, &hs1), (&block2, &hs2)] {
+                let datum = hs.data.vec()[0].bytes().clone();
+                let data_hash = hs.data_hash;
                 assert_eq!(
-                    app.check_block_data(&hs_block),
+                    app.check_proposal_data(hs, |hash| {
+                        assert_eq!(*hash, hs1.hash);
+                        ParentHeader::Header(Box::new(block1.header.clone()))
+                    }),
                     BlockDataCheck::Held,
                     "replica {replica} votes for height {}",
                     block.header.height
@@ -10658,6 +10704,197 @@ mod crash_recovery_tests {
         }
         assert_dumps_equal(&dumps[0], &dumps[1], "replica 0 vs 1");
         assert_dumps_equal(&dumps[0], &dumps[2], "replica 0 vs 2");
+    }
+
+    // ---- s84 decision 2: the parent link is checked before the vote ----
+
+    /// A hotstuff block carrying `block`'s full datum under `justify`.
+    fn hs_block(block: &TorusBlock, justify: PhaseCertificate) -> Block {
+        let datum = encode_proposal_datum(block, false);
+        Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(block.header.height),
+            justify,
+            CryptoHash::new(TorusApp::hash_datum(&datum)),
+            Data::new(vec![Datum::new(datum)]),
+        )
+    }
+
+    /// A (non-genesis) justify certifying `parent`.
+    fn justify_for(parent: &Block) -> PhaseCertificate {
+        PhaseCertificate {
+            block: parent.hash,
+            view: hotstuff_rs::types::data_types::ViewNumber::new(parent.height.int() + 1),
+            ..PhaseCertificate::genesis_pc()
+        }
+    }
+
+    /// s84 decision 2: a replica votes only for a block whose header links to
+    /// its parent block's header (`height` + 1, `parent_hash` = keccak of the
+    /// parent header). A wrong link is `Invalid` (never certified); a parent
+    /// not in the tree yet is `Missing` (the vote waits); the verdict does
+    /// not depend on how far local execution got (`last_header`).
+    ///
+    /// RED before decision 2: the data check ignored the parent, so it voted
+    /// `Held` for the wrong `parent_hash`, the wrong height and the
+    /// undecodable / missing parent.
+    #[test]
+    fn vote_requires_the_header_to_link_to_its_parent() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut app = TorusApp::new(state_db, &config, None, None, None);
+        let no_lookup =
+            |_: &CryptoHash| -> ParentHeader { panic!("genesis justify needs no lookup") };
+
+        // Height 1 on the genesis justify links to the synthetic genesis parent.
+        let parent = make_block(1, vec![sign_claim_rewards(1)]);
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        assert_eq!(
+            app.check_proposal_data(&hs_parent, no_lookup),
+            BlockDataCheck::Held
+        );
+        let mut bad_genesis = parent.clone();
+        bad_genesis.header.parent_hash = B256::ZERO;
+        assert_eq!(
+            app.check_proposal_data(
+                &hs_block(&bad_genesis, PhaseCertificate::genesis_pc()),
+                no_lookup
+            ),
+            BlockDataCheck::Invalid
+        );
+
+        let mut child = make_block(2, vec![]);
+        child.header.parent_hash =
+            alloy_primitives::keccak256(parent.header.canonical_header_bytes());
+        let justify = justify_for(&hs_parent);
+        let held_parent = |hash: &CryptoHash| {
+            assert_eq!(*hash, hs_parent.hash, "the parent is the justify block");
+            ParentHeader::Header(Box::new(parent.header.clone()))
+        };
+        let check = |app: &mut TorusApp,
+                     block: &TorusBlock,
+                     parent: &dyn Fn(&CryptoHash) -> ParentHeader| {
+            app.check_proposal_data(&hs_block(block, justify.clone()), parent)
+        };
+        let mut wrong_hash = child.clone();
+        wrong_hash.header.parent_hash = B256::repeat_byte(0xEE);
+        let mut wrong_height = child.clone();
+        wrong_height.header.height = 3;
+
+        for last_header_height in [0, 1, 7] {
+            // Execution progress must not matter.
+            app.last_header = make_block(last_header_height, vec![]).header;
+            assert_eq!(
+                check(&mut app, &child, &held_parent),
+                BlockDataCheck::Held,
+                "correct parent votes"
+            );
+            assert_eq!(
+                check(&mut app, &wrong_hash, &held_parent),
+                BlockDataCheck::Invalid,
+                "wrong parent_hash"
+            );
+            assert_eq!(
+                check(&mut app, &wrong_height, &held_parent),
+                BlockDataCheck::Invalid,
+                "wrong height"
+            );
+            assert_eq!(
+                check(&mut app, &child, &|_| ParentHeader::NotInTree),
+                BlockDataCheck::Missing,
+                "parent not in the tree yet: wait"
+            );
+            assert_eq!(
+                check(&mut app, &child, &|_| ParentHeader::Undecodable),
+                BlockDataCheck::Invalid,
+                "a parent without a torus header cannot be linked to"
+            );
+        }
+    }
+
+    /// s84 decision 2: the pre-vote rule and execution's parent link agree.
+    /// An honest leader's proposals (built on the parent header) pass the
+    /// pre-vote check and then execute without tripping
+    /// `detect_parent_link_violation`; the only blocks that would trip it are
+    /// refused before the vote, so a certified block cannot fail-stop
+    /// execution on a parent mismatch.
+    #[test]
+    fn pre_vote_parent_rule_implies_execution_parent_link() {
+        use std::sync::atomic::AtomicBool;
+        let (config, state_db) = make_test_config_and_db();
+        let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
+        let ctx = make_exec_ctx(&config, &state_db);
+        let decode = |resp: &ProduceBlockResponse| -> TorusBlock {
+            let bytes = resp.data.vec()[0].bytes();
+            bincode::deserialize::<TorusBlock>(bytes).unwrap_or_else(|_| {
+                let compact: CompactBlock = bincode::deserialize(bytes).unwrap();
+                assert!(compact.native_action_hashes.is_empty());
+                TorusBlock {
+                    header: compact.header,
+                    native_actions: vec![],
+                    evm_transactions: compact.evm_transactions,
+                    core_writer_actions: compact.core_writer_actions,
+                }
+            })
+        };
+
+        let resp1 = app.build_proposal(torus_bridge::genesis_parent_header());
+        let hs1 = Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            resp1.data_hash,
+            resp1.data.clone(),
+        );
+        assert_eq!(
+            app.check_proposal_data(&hs1, |_| unreachable!()),
+            BlockDataCheck::Held
+        );
+        let block1 = decode(&resp1);
+        ctx.execute_committed_block(&block1, vec![]);
+
+        let resp2 = app.build_proposal(block1.header.clone());
+        let hs2 = Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(1),
+            justify_for(&hs1),
+            resp2.data_hash,
+            resp2.data.clone(),
+        );
+        let parent1 = |_: &CryptoHash| ParentHeader::Header(Box::new(block1.header.clone()));
+        assert_eq!(app.check_proposal_data(&hs2, parent1), BlockDataCheck::Held);
+        let block2 = decode(&resp2);
+        let latch = AtomicBool::new(false);
+        assert!(!detect_parent_link_violation(
+            &state_db,
+            2,
+            &block2.header.parent_hash,
+            &latch
+        ));
+        ctx.execute_committed_block(&block2, vec![]);
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "certified chain executes"
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(2));
+
+        // The block that WOULD trip execution's link check is refused pre-vote.
+        let mut forged = block2.clone();
+        forged.header.height = 3;
+        forged.header.parent_hash = B256::repeat_byte(0xEE);
+        assert!(detect_parent_link_violation(
+            &state_db,
+            3,
+            &forged.header.parent_hash,
+            &AtomicBool::new(false)
+        ));
+        let hs2_block = Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(1),
+            justify_for(&hs1),
+            resp2.data_hash,
+            resp2.data.clone(),
+        );
+        let parent2 = |_: &CryptoHash| ParentHeader::Header(Box::new(block2.header.clone()));
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&forged, justify_for(&hs2_block)), parent2),
+            BlockDataCheck::Invalid
+        );
     }
 
     /// s84: an EVM-only block (no native phase: zero fee revenue) records its

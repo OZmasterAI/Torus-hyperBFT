@@ -2656,7 +2656,8 @@ impl<N: Network> HotStuff<N> {
         let held = if block_tree.contains(&hash) || self.pending_bodies.contains_key(&hash) {
             true
         } else if let Some(block) = body.filter(|block| block.hash == hash) {
-            match app.check_block_data(block) {
+            let check = app.check_block_data(block, &block_tree.app_view(None)?);
+            match check {
                 BlockDataCheck::Held => true,
                 BlockDataCheck::Missing => {
                     if let Some((_, recheck)) = self.awaiting_body_vote.as_mut() {
@@ -5052,7 +5053,11 @@ mod vote_after_body_tests {
         fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
             unreachable!()
         }
-        fn check_block_data(&mut self, _: &Block) -> BlockDataCheck {
+        fn check_block_data(
+            &mut self,
+            _: &Block,
+            _: &crate::block_tree::accessors::app::AppBlockTreeView<'_, MemKV>,
+        ) -> BlockDataCheck {
             self.check_calls += 1;
             self.checks.pop_front().unwrap_or(BlockDataCheck::Held)
         }
