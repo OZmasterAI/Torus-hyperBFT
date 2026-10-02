@@ -687,7 +687,7 @@ impl OrderBook {
         // no resting order.
         self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
-            Some(ids) => ids.to_vec(),
+            Some(ids) => ids.into_vec(),
             None => return vec![],
         };
 
