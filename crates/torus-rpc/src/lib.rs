@@ -2018,6 +2018,15 @@ mod tests {
         for i in 0..5u64 {
             store_header(&state, &test_header(i, 0, 1_000_000_000));
         }
+        // s84: the eth view's head is the executed head (applied-height
+        // marker), not the last committed header (4).
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &3u64.to_be_bytes(),
+            )
+            .unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -2028,7 +2037,7 @@ mod tests {
                 .request::<String, _>("eth_blockNumber", jsonrpsee::rpc_params![])
                 .await
                 .unwrap(),
-            "0x4"
+            "0x3"
         );
         handle.stop().unwrap();
     }
@@ -2267,6 +2276,236 @@ mod tests {
         let empty = get(3).await;
         assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
         assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
+        handle.stop().unwrap();
+    }
+
+    /// s84 option (ii), HL-style: Ethereum-shaped responses list only the
+    /// EVM txs that executed (have a receipt, reverted included); a skipped tx
+    /// is visible only through `torus_getBlockBody`. Height 1 holds [success,
+    /// skipped (unfunded sender), reverted (create whose initcode reverts)],
+    /// executed through the real bridge path. Height 2 is committed but not
+    /// executed on this node: the eth view does not serve it yet.
+    #[tokio::test]
+    async fn eth_views_list_only_executed_evm_txs() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use alloy_rlp::Encodable;
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::rpc_params;
+        use serde_json::{json, Value};
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed(
+            key: &k256::ecdsa::SigningKey,
+            to: TxKind,
+            input: &[u8],
+            gas: u64,
+        ) -> (Vec<u8>, B256) {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce: 0,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 0,
+                gas_limit: gas,
+                to,
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(input),
+                access_list: Default::default(),
+            };
+            let (sig, recid) = key
+                .sign_prehash_recoverable(tx.signature_hash().as_slice())
+                .unwrap();
+            let signature = AlloySig::new(
+                U256::from_be_slice(sig.r().to_bytes().as_slice()),
+                U256::from_be_slice(sig.s().to_bytes().as_slice()),
+                recid.is_y_odd(),
+            );
+            let envelope = TxEnvelope::Eip1559(tx.into_signed(signature));
+            let mut buf = Vec::new();
+            envelope.encode(&mut buf);
+            (buf, *envelope.tx_hash())
+        }
+
+        let (_dir, state, mempool, executor) = setup();
+        let alice = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let mallory = k256::ecdsa::SigningKey::from_slice(&[0x33; 32]).unwrap(); // unfunded
+        let bob = k256::ecdsa::SigningKey::from_slice(&[0x22; 32]).unwrap();
+        for key in [&alice, &bob] {
+            state
+                .put_account(
+                    &evm_addr(key),
+                    &AccountInfo {
+                        balance: U256::from(10u128.pow(18)),
+                        nonce: 0,
+                        code_hash: alloy_primitives::KECCAK256_EMPTY,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let to = TxKind::Call(Address::repeat_byte(0x42));
+        let (t_ok, h_ok) = signed(&alice, to, &[], 21_000);
+        let (t_skip, h_skip) = signed(&mallory, to, &[], 21_000);
+        // PUSH1 0 PUSH1 0 REVERT: the create executes and reverts (status 0).
+        let (t_rev, h_rev) = signed(
+            &bob,
+            TxKind::Create,
+            &[0x60, 0x00, 0x60, 0x00, 0xfd],
+            100_000,
+        );
+
+        let block = |height: u64, evm_transactions: Vec<Vec<u8>>| torus_types::TorusBlock {
+            header: TorusBlockHeader {
+                evm_tx_count: evm_transactions.len() as u32,
+                ..test_header(height, 0, 1_000_000_000)
+            },
+            native_actions: vec![],
+            evm_transactions,
+            core_writer_actions: vec![],
+        };
+        let b1 = block(1, vec![t_ok, t_skip.clone(), t_rev]);
+        let validated =
+            torus_bridge::BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO)
+                .validate_block_for_catchup(&b1, &state, &executor)
+                .unwrap();
+        assert_eq!(validated.receipts.len(), 2, "the unfunded tx is skipped");
+        assert!(!validated.receipts[1].status, "the create reverted");
+        torus_bridge::BlockCommitter::commit_block_metadata(&state, &b1, &validated.receipts)
+            .unwrap();
+        // What execution writes in the block's flush batch: the record and the
+        // applied-height marker.
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                &1u64.to_be_bytes(),
+                &torus_state::action_status::BlockActionStatus {
+                    evm_skipped: vec![false, true, false],
+                    native_skipped: vec![],
+                }
+                .encode(),
+            )
+            .unwrap();
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &1u64.to_be_bytes(),
+            )
+            .unwrap();
+        // Height 2: committed (header + body at commit time), not executed.
+        let b2 = block(2, vec![t_skip]);
+        let b2_hash = store_header(&state, &b2.header);
+        store_body(
+            &state,
+            2,
+            &TorusBlockBody {
+                native_actions: vec![],
+                evm_transactions: b2.evm_transactions.clone(),
+                core_writer_actions: vec![],
+            },
+        );
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let call = |method: &'static str, params: jsonrpsee::core::params::ArrayParams| {
+            let client = client.clone();
+            async move { client.request::<Value, _>(method, params).await.unwrap() }
+        };
+        let hex = |h: B256| json!(hex_b256(h));
+
+        let by_number = call("eth_getBlockByNumber", rpc_params!["0x1", false]).await;
+        assert_eq!(by_number["transactions"], json!([hex(h_ok), hex(h_rev)]));
+        let block_hash = by_number["hash"].as_str().unwrap().to_string();
+        let full = call("eth_getBlockByHash", rpc_params![block_hash.clone(), true]).await;
+        let full_txs = full["transactions"].as_array().unwrap();
+        assert_eq!(full_txs.len(), 2);
+        assert_eq!(full_txs[1]["hash"], hex(h_rev));
+        assert_eq!(
+            full_txs[1]["transactionIndex"],
+            json!("0x1"),
+            "index in the listed txs"
+        );
+        assert_eq!(
+            call("eth_getBlockByNumber", rpc_params!["latest", false]).await["number"],
+            json!("0x1")
+        );
+
+        for (method, block_id) in [
+            ("eth_getBlockTransactionCountByNumber", json!("0x1")),
+            ("eth_getBlockTransactionCountByHash", json!(block_hash)),
+        ] {
+            assert_eq!(
+                call(method, rpc_params![block_id]).await,
+                json!("0x2"),
+                "{method}"
+            );
+        }
+        for (method, block_id) in [
+            ("eth_getTransactionByBlockNumberAndIndex", json!("0x1")),
+            ("eth_getTransactionByBlockHashAndIndex", json!(block_hash)),
+        ] {
+            let tx = call(method, rpc_params![block_id.clone(), "0x1"]).await;
+            assert_eq!(tx["hash"], hex(h_rev), "{method}");
+            assert_eq!(tx["transactionIndex"], json!("0x1"), "{method}");
+            assert!(
+                call(method, rpc_params![block_id, "0x2"]).await.is_null(),
+                "{method}"
+            );
+        }
+
+        // The reverted tx: listed, with a status-0 receipt, at index 1.
+        let rev_tx = call("eth_getTransactionByHash", rpc_params![hex_b256(h_rev)]).await;
+        assert_eq!(rev_tx["transactionIndex"], json!("0x1"));
+        let rev_receipt = call("eth_getTransactionReceipt", rpc_params![hex_b256(h_rev)]).await;
+        assert_eq!(rev_receipt["status"], json!("0x0"));
+        assert_eq!(rev_receipt["transactionIndex"], json!("0x1"));
+        // The skipped tx: not in the block, as Ethereum reports a tx never included.
+        assert!(
+            call("eth_getTransactionByHash", rpc_params![hex_b256(h_skip)])
+                .await
+                .is_null()
+        );
+        assert!(
+            call("eth_getTransactionReceipt", rpc_params![hex_b256(h_skip)])
+                .await
+                .is_null()
+        );
+
+        // torus_getBlockBody keeps every EVM tx, with its status.
+        let body = call("torus_getBlockBody", rpc_params![1u64]).await;
+        assert_eq!(
+            body["evmTransactionStatus"],
+            json!(["executed", "skipped", "executed"])
+        );
+        let body_hashes: Vec<Value> = body["evmTransactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["hash"].clone())
+            .collect();
+        assert_eq!(body_hashes, vec![hex(h_ok), hex(h_skip), hex(h_rev)]);
+
+        // Not executed yet: outside the eth view (no tx list that could change).
+        assert_eq!(call("eth_blockNumber", rpc_params![]).await, json!("0x1"));
+        assert!(call("eth_getBlockByNumber", rpc_params!["0x2", false])
+            .await
+            .is_null());
+        assert!(
+            call("eth_getBlockByHash", rpc_params![hex_b256(b2_hash), false])
+                .await
+                .is_null()
+        );
+        assert!(
+            call("eth_getBlockTransactionCountByNumber", rpc_params!["0x2"])
+                .await
+                .is_null()
+        );
         handle.stop().unwrap();
     }
 

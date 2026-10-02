@@ -557,7 +557,14 @@ pub struct RpcBlockBody {
     /// record existed.
     #[serde(default)]
     pub native_action_status: Option<Vec<String>>,
-    /// s84: per EVM transaction (same order as the block's eth transactions),
+    /// s84: every EVM transaction of the body, in body order, executed or
+    /// skipped (the eth methods list only the executed ones). Each is the eth
+    /// transaction object with `transactionIndex` = body position (NOT the eth
+    /// index), or only `{"hash"}` (keccak of the raw bytes) for a tx that does
+    /// not decode or whose signer does not recover.
+    #[serde(default)]
+    pub evm_transactions: Vec<serde_json::Value>,
+    /// s84: per EVM transaction (same order as `evm_transactions`),
     /// `"executed"` (has a receipt, reverted or not) or `"skipped"`
     /// (undecodable or refused by the EVM; no receipt, no state change).
     /// `null` like `native_action_status`.

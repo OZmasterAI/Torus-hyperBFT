@@ -1425,11 +1425,22 @@ impl TorusApiServer for RpcState {
                 .map(|s| if *s { "skipped" } else { "executed" }.to_string())
                 .collect()
         };
+        let block_hash = crate::eth::get_header_with_hash(self, block_number)
+            .map_err(ErrorObjectOwned::from)?
+            .map(|(_, hash, _)| hash)
+            .unwrap_or_default();
+        let evm_transactions = body
+            .evm_transactions
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| crate::eth::body_evm_tx_json(raw, block_hash, block_number, i as u32))
+            .collect();
         Ok(Some(RpcBlockBody {
             block_number: hex_u64(block_number),
             native_actions,
             native_action_count: body.native_actions.len() as u32,
             native_action_status: status.as_ref().map(|s| labels(&s.native_skipped)),
+            evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
         }))
     }
