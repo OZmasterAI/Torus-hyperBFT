@@ -12,6 +12,7 @@
 
 pub mod dev_pool;
 pub mod epoch;
+pub mod epoch_plan;
 pub mod error;
 pub mod governance;
 pub mod queries;
@@ -21,6 +22,7 @@ pub mod types;
 
 pub use dev_pool::DevPool;
 pub use epoch::EpochManager;
+pub use epoch_plan::{EpochRotationPlan, PlanMember, EPOCH_VSET_PREFIX};
 pub use error::EconomicsError;
 pub use governance::{GovernanceManager, GovernanceParams};
 pub use queries::*;

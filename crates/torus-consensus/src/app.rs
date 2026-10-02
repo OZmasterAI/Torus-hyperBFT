@@ -47,6 +47,23 @@ use torus_types::{
     Address, ChainConfig, CompactBlock, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
 
+/// Consensus bug (b): this node's execution has not yet applied the epoch
+/// boundary whose plan the boundary being proposed / validated needs.
+#[derive(Debug)]
+struct EpochPlanNotReady;
+
+/// A datum-less proposal every honest `validate_block` rejects (`datums.len()
+/// != 1`): the `App` trait has no "refuse" variant, so this is how a leader
+/// that must not build a block now lets its view time out.
+fn refused_proposal() -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data_hash: CryptoHash::new(TorusApp::hash_datum(&[])),
+        data: Data::new(vec![]),
+        app_state_updates: None,
+        validator_set_updates: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingSlash {
     validator: Address,
@@ -511,6 +528,9 @@ struct ExecutionContext {
     evm_executor: EvmExecutor,
     epoch_length: u64,
     max_validators: u32,
+    /// Chain-wide epoch-rotation activation (consensus bug (b)); see
+    /// `ChainConfig::epoch_rotation_activation_height`.
+    epoch_rotation_activation: Option<u64>,
     treasury_address: Address,
     dev_pool_address: Address,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
@@ -1737,8 +1757,15 @@ impl ExecutionContext {
 
         let mut hash_extras = Some(Self::running_hash_extras(out_of_batch, bundle_extras));
 
+        // Bug (b): from the epoch-rotation activation on, every boundary block
+        // runs the native phase (even when empty) — it applies / computes the
+        // validator-set plans (`process_epoch_boundary`).
+        let planned_boundary = self.epoch_rotation_activation.is_some_and(|a| height >= a)
+            && EpochManager::is_epoch_boundary(height, self.epoch_length);
+        let run_native = has_native || computed_fee_revenue > 0 || planned_boundary;
+
         // ---- Native execution ----
-        if has_native || computed_fee_revenue > 0 {
+        if run_native {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
@@ -1973,6 +2000,7 @@ impl ExecutionContext {
                 }
             }
             ctx.metrics = self.metrics.clone();
+            ctx.epoch_rotation_activation = self.epoch_rotation_activation;
             // O3 + s77: exec only records the block's fills; their packed
             // trade-history rows (node-local, non-root CFs) are encoded and
             // written after the flush below (background writer, or inline).
@@ -2402,7 +2430,7 @@ impl ExecutionContext {
         // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
         // empty or pure-EVM blocks) still need a standalone marker write here; a pure-EVM block's
         // EVM batch rides that marker write (bug (c)).
-        if !(has_native || computed_fee_revenue > 0) {
+        if !run_native {
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
                 // batch on W (a direct put here would land before batch(N−1) and be
@@ -2495,7 +2523,7 @@ impl ExecutionContext {
             // Gated on the SAME predicate as the native section above, so
             // `exec_chain_seconds_count == exec_engine_seconds_count` and
             // `_sum / _count` is directly ms-per-native-block.
-            if has_native || computed_fee_revenue > 0 {
+            if run_native {
                 m.exec_chain_seconds.observe(block_secs);
                 // bl2: on the fast path the REAL rendezvous wait was observed in
                 // `pipeline_handoff`; only the serial path records the 0.
@@ -2620,6 +2648,9 @@ pub struct TorusApp {
     staking: StakingManager,
     epoch_length: u64,
     max_validators: u32,
+    /// Chain-wide epoch-rotation activation (consensus bug (b)): boundaries at
+    /// or above it read the execution-computed plan instead of rotating here.
+    epoch_rotation_activation: Option<u64>,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
@@ -3483,6 +3514,7 @@ impl TorusApp {
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
+            epoch_rotation_activation: config.epoch_rotation_activation_height,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             metrics: metrics.clone(),
@@ -3588,6 +3620,17 @@ impl TorusApp {
             .expect("spawn execution pipeline thread");
 
         let leader_state = Arc::new(LeaderState::new());
+        // Bug (b): under the execution-planned rotation the set hotstuff runs is
+        // the last applied plan (read after the boot replay applied it), not
+        // the staking rows of whatever height this DB is at.
+        let genesis_validator_set = match config.epoch_rotation_activation_height {
+            Some(_) => staking
+                .current_epoch_validator_set()
+                .ok()
+                .flatten()
+                .unwrap_or(genesis_validator_set),
+            None => genesis_validator_set,
+        };
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
 
@@ -3610,6 +3653,7 @@ impl TorusApp {
             staking,
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
+            epoch_rotation_activation: config.epoch_rotation_activation_height,
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
@@ -3888,6 +3932,7 @@ impl TorusApp {
             reputation_leader_selection: false,
             exec_trust_cache: false,
             state_hash_activation_height: None,
+            epoch_rotation_activation_height: None,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -4233,8 +4278,94 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    /// Compute validator set updates at epoch boundary.
-    fn epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
+    /// Validator-set updates for block `height` (`None` off-boundary).
+    ///
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
+    /// boundary at or above the epoch-rotation activation they are READ from
+    /// the plan this boundary's predecessor stored at execution — no DB write,
+    /// no read of timing-dependent state. `Err` = this node's execution has not
+    /// applied the previous boundary yet: refuse (validate -> `MissingData`,
+    /// propose -> no block) and retry, never guess.
+    fn epoch_validator_set_updates(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
+        if self.is_planned_boundary(height) {
+            self.planned_validator_set_updates(height)
+        } else {
+            Ok(self.legacy_epoch_validator_set_updates(height))
+        }
+    }
+
+    /// Bug (b): `height` is an epoch boundary under the execution-planned rules.
+    fn is_planned_boundary(&self, height: u64) -> bool {
+        self.epoch_rotation_activation.is_some_and(|a| height >= a)
+            && EpochManager::is_epoch_boundary(height, self.epoch_length)
+    }
+
+    /// Bug (b): the hotstuff updates of the plan stored for boundary `height`
+    /// by the execution of `height - epoch_length` (`None`: no plan — the first
+    /// boundary after activation — or an unchanged set).
+    fn planned_validator_set_updates(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
+        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
+            if cached_height == height {
+                return Ok(cached_result.clone());
+            }
+        }
+        let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+        let needed = height.saturating_sub(self.epoch_length);
+        if applied < needed {
+            tracing::warn!(
+                height,
+                applied,
+                needed,
+                "epoch boundary: execution has not applied the previous boundary yet — \
+                 validator-set plan not ready, refusing this boundary block for now"
+            );
+            return Err(EpochPlanNotReady);
+        }
+        let plan = self.staking.epoch_rotation_plan(height).map_err(|e| {
+            tracing::error!(%e, height, "failed to read the epoch rotation plan");
+            EpochPlanNotReady
+        })?;
+        let updates = match plan {
+            Some(plan) if plan.changed => {
+                let mut updates = ValidatorSetUpdates::new();
+                for m in &plan.members {
+                    if let Ok(vk) = VerifyingKey::from_bytes(&m.pubkey) {
+                        updates.insert(vk, Power::new(m.power));
+                    }
+                }
+                for pk in &plan.deletes {
+                    if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                        updates.delete(vk);
+                    }
+                }
+                let epoch = EpochManager::epoch_for_block(height, self.epoch_length);
+                self.last_validator_set = plan.validator_set(epoch);
+                self.leader_state.sync_validators(&self.last_validator_set);
+                self.refresh_async_validate_validator_count();
+                tracing::info!(
+                    height,
+                    members = plan.members.len(),
+                    deletes = plan.deletes.len(),
+                    rotations = plan.rotations.len(),
+                    "epoch boundary: validator set from the execution plan"
+                );
+                Some(updates)
+            }
+            _ => None,
+        };
+        self.cached_vs_updates = Some((height, updates.clone()));
+        Ok(updates)
+    }
+
+    /// Pre-activation rules: rotate on the consensus thread (bug (b) — kept
+    /// byte-identical for heights below the activation).
+    fn legacy_epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
         if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
             if cached_height == height {
                 return cached_result.clone();
@@ -4876,7 +5007,12 @@ impl TorusApp {
             .insert(height, PendingProposal::new(torus_block));
         self.pending_proposals.retain(|&h, _| h + 10 > height);
 
-        let validator_set_updates = self.epoch_validator_set_updates(height);
+        let validator_set_updates = match self.epoch_validator_set_updates(height) {
+            Ok(updates) => updates,
+            // Bug (b): retry once execution applied the previous boundary
+            // (never blacklists a sync peer, never votes on a guess).
+            Err(EpochPlanNotReady) => return ValidateBlockResponse::MissingData,
+        };
         ValidateBlockResponse::Valid {
             app_state_updates: None,
             validator_set_updates,
@@ -4890,6 +5026,14 @@ impl TorusApp {
     /// hotstuff_rs). Each phase has its own `torus_block_build_*_seconds` timer
     /// nested inside `block_build_seconds` (s68).
     fn build_proposal(&mut self, parent_header: TorusBlockHeader) -> ProduceBlockResponse {
+        // Bug (b): a planned boundary block needs this node's execution at the
+        // previous boundary — check before touching the mempool.
+        let next_height = parent_header.height + 1;
+        if self.is_planned_boundary(next_height)
+            && self.epoch_validator_set_updates(next_height).is_err()
+        {
+            return refused_proposal();
+        }
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
         // covers mempool selection, DA mirror, attestation, construction, encode.
         let build_timer = std::time::Instant::now();
@@ -4999,7 +5143,9 @@ impl TorusApp {
         let hash = Self::hash_datum(&encoded);
         drop(encode_span);
 
-        let validator_set_updates = self.epoch_validator_set_updates(height);
+        let Ok(validator_set_updates) = self.epoch_validator_set_updates(height) else {
+            return refused_proposal();
+        };
 
         if let Some(ref m) = self.metrics {
             m.block_build_seconds
@@ -6188,6 +6334,7 @@ mod exec_throttle_tests {
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
                 state_hash_activation_height: None,
+                epoch_rotation_activation_height: None,
             };
             (config, state_db)
         };
@@ -6909,6 +7056,7 @@ mod crash_recovery_tests {
             // Running state hash on from height 1 (chain config), as a
             // genesis-synced node of a chain with activation 1.
             state_hash_activation_height: Some(1),
+            epoch_rotation_activation_height: None,
         };
         torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
             .expect("configure running hash activation");
@@ -8250,6 +8398,148 @@ mod crash_recovery_tests {
             torus_state::running_hash::read_running_hash(&did_not),
             "running state hash"
         );
+    }
+
+    /// Hotstuff updates in canonical order: (sorted inserts, sorted deletes).
+    type CanonicalUpdates = Option<(Vec<([u8; 32], u64)>, Vec<[u8; 32]>)>;
+
+    fn canonical_updates(updates: Option<ValidatorSetUpdates>) -> CanonicalUpdates {
+        updates.map(|u| {
+            let mut ins: Vec<_> = u.inserts().map(|(k, p)| (k.to_bytes(), p.int())).collect();
+            let mut del: Vec<_> = u.deletes().map(|k| k.to_bytes()).collect();
+            ins.sort();
+            del.sort();
+            (ins, del)
+        })
+    }
+
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: two
+    /// replicas validate the same epoch-boundary blocks (4 and 8, epoch length
+    /// 4) while their execution lags by a different number of blocks; a
+    /// validator rotates its consensus key in block 2 (effective at epoch 1).
+    /// Both must hand hotstuff the same validator-set updates at every
+    /// boundary and end with the same staking rows, and the consensus thread
+    /// must write nothing.
+    ///
+    /// RED on main @ d623d3c: the consensus thread rotated the set from
+    /// whatever its execution had applied — the replica 1 block behind saw the
+    /// rotation at boundary 4, the one 3 blocks behind never did. GREEN with
+    /// the epoch-rotation activation (1): boundary 4 has no plan (none), the
+    /// execution of 4 plans 8 with the rotated key, both replicas read it.
+    #[test]
+    fn epoch_rotation_identical_across_exec_lag() {
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+        let consensus_keys: Vec<[u8; 32]> = (1..=4u8)
+            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0x40 + i; 32]).verifying_key().to_bytes())
+            .collect();
+        let accounts: Vec<k256::ecdsa::SigningKey> = (1..=4u8)
+            .map(|i| k256::ecdsa::SigningKey::from_slice(&[0x50 + i; 32]).unwrap())
+            .collect();
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32]).verifying_key().to_bytes();
+        let rotate = torus_types::eip712::sign_native_action(
+            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            1,
+            &accounts[0],
+        );
+        let mut blocks: Vec<TorusBlock> = (1..=8)
+            .map(|h| make_block(h, if h == 2 { vec![rotate.clone()] } else { vec![] }))
+            .collect();
+        link_blocks(&mut blocks);
+
+        let node = |lag: u64| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            config.epoch_rotation_activation_height = Some(1);
+            let staking = StakingManager::new(db.clone());
+            for (key, pubkey) in accounts.iter().zip(&consensus_keys) {
+                let addr = k256_address(key);
+                let row = ValidatorState {
+                    address: addr,
+                    pubkey: *pubkey,
+                    commission_bps: 500,
+                    self_stake: U256::from(1_000u64) * U256::from(10u64).pow(U256::from(18u64)),
+                    total_delegated: U256::ZERO,
+                    status: ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                };
+                staking.put_validator(&addr, &row).unwrap();
+            }
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            let ctx = make_exec_ctx(&config, &db);
+            let mut next = 1u64;
+            let mut seen = Vec::new();
+            for boundary in [4u64, 8] {
+                while next + lag <= boundary {
+                    dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                    next += 1;
+                }
+                let before = dump_all_cfs(&db);
+                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
+                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                seen.push(canonical_updates(updates));
+            }
+            while next <= 8 {
+                dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                next += 1;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            drop(app);
+            let rows = StateBackend::iterate_cf(&db, torus_state::cf::CF_STAKING_VALIDATORS, None)
+                .unwrap();
+            let rotations = StateBackend::iterate_cf(
+                &db,
+                torus_state::cf::CF_CONSENSUS_META,
+                Some(b"pending_rotation:"),
+            )
+            .unwrap();
+            let pubkey0 = StakingManager::new(db.clone())
+                .get_validator(&k256_address(&accounts[0]))
+                .unwrap()
+                .unwrap()
+                .pubkey;
+            (seen, rows, rotations, pubkey0)
+        };
+        let (near, far) = (node(1), node(3));
+        assert_eq!(near.0, far.0, "hotstuff validator-set updates per boundary");
+        assert_eq!(near.1, far.1, "staking validator rows");
+        assert_eq!(near.2, far.2, "pending key rotations");
+
+        // The rotation really happened: none at 4 (first planned boundary, no
+        // plan), the rotated key installed / the old one removed at 8, the row
+        // carries it and the pending rotation is consumed.
+        assert_eq!(near.0[0], None);
+        let (ins, del) = near.0[1].clone().expect("plan for 8 changes the set");
+        assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
+        assert!(del.contains(&consensus_keys[0]), "{del:?}");
+        assert_eq!(near.3, rotated_key, "validator 0 row carries the rotated key");
+        assert!(near.2.is_empty(), "pending rotation consumed");
+    }
+
+    /// Bug (b): a replica whose execution has not applied the previous boundary
+    /// refuses the boundary block (validate -> `MissingData`, propose -> no
+    /// block) instead of answering from a different state; it answers once
+    /// execution catches up.
+    #[test]
+    fn epoch_rotation_plan_not_ready_until_previous_boundary_applied() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.epoch_rotation_activation_height = Some(1);
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        let ctx = make_exec_ctx(&config, &db);
+        let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        for b in &blocks[..3] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(app.epoch_validator_set_updates(4).is_ok(), "boundary 4 needs applied >= 0");
+        assert!(app.epoch_validator_set_updates(8).is_err(), "applied 3 < 4");
+        let parent7 = make_block(7, vec![]).header;
+        assert!(app.build_proposal(parent7).data.vec().is_empty(), "leader refuses block 8");
+        dispatch_and_execute(&ctx, &db, &blocks[3]);
+        assert!(app.epoch_validator_set_updates(8).is_ok(), "applied 4: plan for 8 readable");
+        drop(ctx);
     }
 
     /// PART 2 (P0 SAFETY, "commit means commit"): a SECOND, DIFFERENT block
@@ -10168,6 +10458,7 @@ mod crash_recovery_tests {
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
             max_validators: config.max_validators,
+            epoch_rotation_activation: config.epoch_rotation_activation_height,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             metrics: None,

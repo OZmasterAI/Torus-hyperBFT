@@ -1116,13 +1116,13 @@ impl<T: StateBackend> StakingManager<T> {
         Ok(())
     }
 
-    fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
+    pub(crate) fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
         let key = pending_rotation_key(addr);
         self.state.delete_cf_raw(CF_CONSENSUS_META, &key)?;
         Ok(())
     }
 
-    fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
+    pub(crate) fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
         let prefix = b"pending_rotation:";
         let entries = self.state.iterate_cf(CF_CONSENSUS_META, Some(prefix))?;
         let mut rotations = Vec::new();

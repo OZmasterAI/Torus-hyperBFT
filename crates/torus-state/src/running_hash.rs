@@ -80,8 +80,11 @@ pub const NODE_LOCAL_MARKET_KEYS: &[&[u8]] = &[b"__book_mode__"];
 /// (`governance.rs` `whitelist_key`). Only EXECUTION writes of them are
 /// hashed: the consensus thread's epoch-boundary deletion of applied
 /// rotations is out of batch and timing-dependent (see [`HASHED_CFS`]), so
-/// it is not.
-pub const META_CONSENSUS_PREFIXES: &[&[u8]] = &[b"pending_rotation:", b"validator_whitelist:"];
+/// it is not. `epoch_vset:` (consensus bug (b): execution-computed validator
+/// set plans, `torus_economics::EPOCH_VSET_PREFIX`) exists only from the
+/// chain-wide epoch-rotation activation on, so earlier hashes are unchanged.
+pub const META_CONSENSUS_PREFIXES: &[&[u8]] =
+    &[b"pending_rotation:", b"validator_whitelist:", b"epoch_vset:"];
 
 /// Hash `cf_id` of a column family, `None` if the CF is never hashed.
 pub fn hashed_cf_id(cf: &str) -> Option<u8> {

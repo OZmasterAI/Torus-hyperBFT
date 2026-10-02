@@ -90,15 +90,18 @@ unchanged):
 
 - `epoch_vset:plan:` ++ H (8 BE): borsh `EpochRotationPlan { boundary, members
   [(address, pubkey, power, commission)], deletes [pubkey], rotations
-  [(address, new_pubkey)], changed }` - written at exec of H-L, consumed
-  (deleted) at exec of H.
+  [(address, new_pubkey)], changed }` - written at exec of H-L, applied at
+  exec of H, pruned at exec of H+L (kept one boundary longer so a late
+  re-validation of H still reads it).
 - `epoch_vset:current`: borsh member list of the set installed in hotstuff by
   the last applied plan.
 
-Execution of boundary H (>= activation), after rewards:
+Execution of boundary H (>= activation), after rewards. Every boundary block
+>= activation runs the native phase, even when empty (on `main` an empty block
+skips it, so a boundary could silently skip its epoch processing):
 1. if `plan(H)` exists: apply its key rotations (pubkey + delete the pending
    row), set statuses (members Active, others Candidate, Jailed / Tombstoned
-   untouched), write `current`, delete `plan(H)`.
+   untouched), write `current`; prune `plan(H-L)`.
 2. compute `plan(H+L)`: due rotations (`effective_epoch <= epoch(H+L)`)
    substituted in a scratch copy; `compute_new_validator_set`; rotation cap +
    BFT floor vs `current` (bootstrap: rows with status Active); minimum-set
@@ -151,12 +154,18 @@ pre-activation heights must keep hashing without it.
 
 ## Tests
 
-- RED on main / GREEN after (torus-consensus): two replicas with different
-  exec lag at a boundary compute the same hotstuff updates and the same
-  staking rows (`epoch_rotation_plan_identical_across_exec_lag`); the
-  consensus thread writes nothing at a boundary after activation
-  (`epoch_boundary_consensus_thread_writes_nothing_after_activation`).
-- torus-economics unit tests: plan computation (cap / floor / rotations /
-  deletes / unchanged), plan apply.
-- Not-ready path: validate returns `MissingData` while applied < H-L.
-- Pre-activation: existing epoch tests unchanged.
+- RED on main / GREEN after (torus-consensus
+  `epoch_rotation_identical_across_exec_lag`): two replicas whose execution
+  lags 1 and 3 blocks behind boundaries 4 and 8 (a key rotation in block 2)
+  hand hotstuff the same updates, end with the same staking rows and pending
+  rotations, the rotation is installed at 8, and the consensus thread writes
+  nothing (full-CF dump before / after each boundary call). RED on main: lag 1
+  rotated at 4, lag 3 never.
+- `epoch_rotation_plan_not_ready_until_previous_boundary_applied`: applied <
+  H-L -> `Err` (validate `MissingData`), the leader refuses to build H, ready
+  once execution applies H-L.
+- torus-economics `epoch_plan` unit tests: bootstrap plan, unchanged plan,
+  due / late rotations, statuses (jailed untouched), plan rows hashed.
+- torus-genesis: `genesis_epoch_rotation_activation_height_is_chain_config`.
+- Pre-activation: all existing epoch / running-hash tests unchanged (byte-
+  identical legacy path).

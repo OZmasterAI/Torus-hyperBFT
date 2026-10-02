@@ -76,6 +76,7 @@ fn test_config() -> ChainConfig {
         reputation_leader_selection: false,
         exec_trust_cache: false,
         state_hash_activation_height: None,
+        epoch_rotation_activation_height: None,
     }
 }
 

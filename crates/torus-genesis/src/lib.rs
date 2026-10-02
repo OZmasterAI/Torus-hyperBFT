@@ -109,6 +109,10 @@ pub struct ConsensusConfig {
     /// every node hashes). Absent = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+    /// Epoch-rotation activation height (CHAIN-WIDE, consensus bug (b)).
+    /// Absent = the old consensus-thread rotation.
+    #[serde(default)]
+    pub epoch_rotation_activation_height: Option<u64>,
 }
 
 fn default_backoff_factor() -> u32 {
@@ -528,6 +532,7 @@ impl Genesis {
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
             state_hash_activation_height: self.consensus.state_hash_activation_height,
+            epoch_rotation_activation_height: self.consensus.epoch_rotation_activation_height,
         }
     }
 
@@ -751,6 +756,22 @@ mod tests {
         let mut config = genesis.chain_config();
         assert!(config.validate().is_ok());
         config.state_hash_activation_height = Some(0);
+        assert!(config.validate().is_err(), "height 0 is never executed");
+    }
+
+    /// Consensus bug (b): the epoch-rotation activation height is a CHAIN-WIDE
+    /// genesis field; absent (every existing genesis) = the old rules.
+    #[test]
+    fn genesis_epoch_rotation_activation_height_is_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(genesis.chain_config().epoch_rotation_activation_height, None);
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["epoch_rotation_activation_height"] = serde_json::json!(7000);
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        let mut config = genesis.chain_config();
+        assert_eq!(config.epoch_rotation_activation_height, Some(7000));
+        assert!(config.validate().is_ok());
+        config.epoch_rotation_activation_height = Some(0);
         assert!(config.validate().is_err(), "height 0 is never executed");
     }
 

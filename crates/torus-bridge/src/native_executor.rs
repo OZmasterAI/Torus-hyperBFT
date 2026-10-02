@@ -1419,6 +1419,13 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// fatal (fail-stop the node), never flush state or mark the block applied.
     pub fatal_error: Option<String>,
 
+    /// Chain-wide epoch-rotation activation height (genesis
+    /// `consensus.epoch_rotation_activation_height`, consensus bug (b)). From
+    /// it on, boundary blocks apply / compute [`torus_economics::EpochRotationPlan`]s
+    /// instead of recomputing statuses ([`NativeExecutor::process_epoch_boundary`]).
+    /// `None` (default) = the pre-activation rules.
+    pub epoch_rotation_activation: Option<u64>,
+
     /// Book persistence mode (`TORUS_BOOK_ROWS`). CONSENSUS-VISIBLE — see the
     /// module-level schema comment: fleet-uniform, fresh genesis required,
     /// mixed on-disk content fail-stops at load.
@@ -1862,6 +1869,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             fill_effects_scratch: Vec::new(),
             metrics: None,
             fatal_error: load_error,
+            epoch_rotation_activation: None,
             book_mode,
             book_mode_marker_present,
             resident: resident_mode,
@@ -6080,6 +6088,37 @@ impl NativeExecutor {
         }
 
         // --- Phase B: Validator set rotation ---
+
+        // Consensus bug (b): from the activation height on, the rotation is the
+        // plan stored by the previous boundary (the set consensus installs at
+        // this height), and this boundary stores the plan for the next one.
+        if ctx
+            .epoch_rotation_activation
+            .is_some_and(|a| ctx.block_height >= a)
+        {
+            return Some(
+                match EpochManager::execute_planned_rotation(
+                    &ctx.staking,
+                    ctx.max_validators,
+                    ctx.block_height,
+                    ctx.epoch_length,
+                ) {
+                    Ok(new_set) => EpochBoundaryResult {
+                        action: NativeActionResult::ok("epoch_boundary", 5000),
+                        new_set,
+                        diff: None,
+                    },
+                    Err(e) => {
+                        tracing::error!(%e, height = ctx.block_height, "planned epoch rotation failed");
+                        EpochBoundaryResult {
+                            action: NativeActionResult::err("epoch_rotation", e.to_string()),
+                            new_set: None,
+                            diff: None,
+                        }
+                    }
+                },
+            );
+        }
 
         // B1: Build old set from current Active validators
         let old_set = build_current_validator_set(&ctx.staking, ctx.epoch);
