@@ -299,12 +299,14 @@ impl<CL: Collector> ActiveCollectorPair<CL> {
             is_updated = true;
         }
 
-        // If the latest validator set update **has** been decided, and the current **PVS** collector is
-        //`Some`, then set the PVS collector to `None`.
-        if latest_vss.update_decided() && self.pvs_collector.is_some() {
-            self.pvs_collector = None;
-
-            is_updated = true;
+        // If the latest validator set update **has** been decided, the PVS is no longer active: drop
+        // its collector if there is one. s84: a decided update must never reach the branch below,
+        // which used to re-create the PVS collector on every call with a decided state.
+        if latest_vss.update_decided() {
+            if self.pvs_collector.is_some() {
+                self.pvs_collector = None;
+                is_updated = true;
+            }
         }
 
         // Else, if the latest validator set update has **not** been decided, and the latest VSS' **PVS** is
@@ -327,5 +329,59 @@ impl<CL: Collector> ActiveCollectorPair<CL> {
         }
 
         is_updated
+    }
+}
+
+#[cfg(test)]
+mod active_collector_pair_tests {
+    use super::*;
+    use crate::hotstuff::{
+        messages::PhaseVote,
+        types::{Phase, PhaseVoteCollector},
+    };
+    use crate::types::{
+        crypto_primitives::{Keypair, SigningKey},
+        data_types::{BlockHeight, CryptoHash, Power},
+    };
+
+    fn set(keys: &[SigningKey]) -> ValidatorSet {
+        let mut set = ValidatorSet::new();
+        for key in keys {
+            set.put(&key.verifying_key(), Power::new(1));
+        }
+        set
+    }
+
+    /// s84: once the latest validator-set update is decided only the committed
+    /// set may vote. Re-applying the same decided state (every body insert does)
+    /// must not bring back a previous-set collector: with it, one vote of the
+    /// old one-validator set formed a "QC" in a three-validator chain (the
+    /// `progress_and_validator_set_update_test` debug_assert).
+    #[test]
+    fn decided_update_never_revives_the_previous_set_collector() {
+        let keys: Vec<SigningKey> = (1..=3u8).map(|i| SigningKey::from_bytes(&[i; 32])).collect();
+        let decided = ValidatorSetState::new(
+            set(&keys),
+            set(&keys[..1]),
+            Some(BlockHeight::new(4)),
+            true,
+        );
+        let (chain, view) = (ChainID::new(0), ViewNumber::new(9));
+        let mut pair = <ActiveCollectorPair<PhaseVoteCollector>>::new(chain, view, &decided);
+        assert!(pair.pvs_collector.is_none());
+        assert!(!pair.update_validator_sets(&decided), "same state: no-op");
+        assert!(pair.pvs_collector.is_none());
+
+        let vote = PhaseVote::new(
+            &Keypair::new(keys[0].clone()),
+            chain,
+            view,
+            CryptoHash::new([5; 32]),
+            Phase::Generic,
+        );
+        assert!(
+            pair.collect(&keys[0].verifying_key(), vote).is_none(),
+            "one vote of three is not a quorum"
+        );
     }
 }
