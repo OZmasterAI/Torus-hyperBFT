@@ -164,9 +164,42 @@ pub struct TxRow {
     pub gas_price: String,
     pub input_data: String,
     pub nonce: i64,
-    pub status: bool,
+    pub status: TxStatus,
     pub contract_address: Option<String>,
     pub tx_type: i32,
+}
+
+/// An EVM tx's outcome; `transactions.status` stores 1 / 0 / 2 (rows written
+/// before s84 hold 1 / 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxStatus {
+    /// Executed, receipt status 1.
+    Success,
+    /// Executed and reverted, receipt status 0.
+    Failed,
+    /// s84: in the block body but skipped at execution (undecodable or
+    /// refused by the EVM): no receipt, no state change. Not listed by the
+    /// node's eth methods; known from `torus_getBlockBody`.
+    Skipped,
+}
+
+impl TxStatus {
+    fn to_db(self) -> i32 {
+        match self {
+            TxStatus::Failed => 0,
+            TxStatus::Success => 1,
+            TxStatus::Skipped => 2,
+        }
+    }
+
+    fn from_db(v: i32) -> Self {
+        match v {
+            0 => TxStatus::Failed,
+            2 => TxStatus::Skipped,
+            _ => TxStatus::Success,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -322,13 +355,23 @@ impl ExplorerDb {
         Ok(())
     }
 
+    /// Rows are keyed by hash. A skipped tx never replaces an existing row (a
+    /// skipped replay of an executed tx keeps the executed one); an executed
+    /// tx replaces a skipped row (a tx skipped once, then executed later).
     pub fn insert_transaction(&self, t: &TxRow) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+        let on_conflict = if t.status == TxStatus::Skipped {
+            "IGNORE"
+        } else {
+            "REPLACE"
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO transactions
-             (hash, block_height, tx_index, from_addr, to_addr, value, gas_limit,
-              gas_used, gas_price, input_data, nonce, status, contract_address, tx_type)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            &format!(
+                "INSERT OR {on_conflict} INTO transactions
+                 (hash, block_height, tx_index, from_addr, to_addr, value, gas_limit,
+                  gas_used, gas_price, input_data, nonce, status, contract_address, tx_type)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+            ),
             params![
                 t.hash,
                 t.block_height,
@@ -341,7 +384,7 @@ impl ExplorerDb {
                 t.gas_price,
                 t.input_data,
                 t.nonce,
-                t.status as i32,
+                t.status.to_db(),
                 t.contract_address,
                 t.tx_type,
             ],
@@ -848,7 +891,7 @@ fn row_to_tx(row: &rusqlite::Row) -> Result<TxRow, rusqlite::Error> {
         gas_price: row.get(8)?,
         input_data: row.get(9)?,
         nonce: row.get(10)?,
-        status: row.get::<_, i32>(11)? != 0,
+        status: TxStatus::from_db(row.get(11)?),
         contract_address: row.get(12)?,
         tx_type: row.get(13)?,
     })
@@ -934,7 +977,7 @@ mod tests {
             gas_price: "0x3b9aca00".into(),
             input_data: "0x".into(),
             nonce: 0,
-            status: true,
+            status: TxStatus::Success,
             contract_address: None,
             tx_type: 2,
         }
@@ -990,7 +1033,7 @@ mod tests {
         db.insert_transaction(&tx).unwrap();
         let found = db.get_transaction("0xabc").unwrap().unwrap();
         assert_eq!(found.from_addr, tx.from_addr);
-        assert!(found.status);
+        assert_eq!(found.status, TxStatus::Success);
     }
 
     #[test]

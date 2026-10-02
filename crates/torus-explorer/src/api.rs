@@ -292,7 +292,7 @@ mod tests {
             gas_price: "0x3b9aca00".into(),
             input_data: "0x".into(),
             nonce: 0,
-            status: true,
+            status: TxStatus::Success,
             contract_address: None,
             tx_type: 2,
         })
