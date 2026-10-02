@@ -3100,6 +3100,31 @@ mod tests {
         }
     }
 
+    /// Consensus bug (b) follow-up: validator rows are written only by
+    /// execution (inside the flush batch), so they are hashed — a stake /
+    /// status change of a validator row at a height alters that height's
+    /// hash. RED while `cf_staking_validators` was excluded.
+    #[test]
+    fn running_hash_covers_validator_rows() {
+        use crate::cf::CF_STAKING_VALIDATORS;
+        let flush = |row: Option<&[u8]>| {
+            let (db, _d) = rsh_db();
+            let writes = match row {
+                Some(r) => vec![(CF_STAKING_VALIDATORS, vec![0x11; 20], Some(r.to_vec()))],
+                None => vec![],
+            };
+            rsh_overlay(&db, &writes)
+                .flush_with_native_trie_stats(&db, Some(1), None, None)
+                .unwrap();
+            read_running_hash(&db).unwrap()
+        };
+        let none = flush(None);
+        let stake = flush(Some(b"stake=1000,status=Active"));
+        assert_ne!(stake, none, "a validator row write is hashed");
+        assert_ne!(flush(Some(b"stake=1001,status=Active")), stake, "stake change");
+        assert_ne!(flush(Some(b"stake=1000,status=Candid")), stake, "status change");
+    }
+
     /// Task 3: the hash depends only on the hashed write set — not on trie
     /// maintenance, not on how the writes are split between the frozen set and
     /// the deferred-book sidecar, not on excluded CFs.

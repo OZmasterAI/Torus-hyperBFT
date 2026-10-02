@@ -1470,16 +1470,8 @@ impl ExecutionContext {
     /// Running state hash: block's consensus writes NOT in its overlay (Task 0),
     /// lowest priority first: the recorded slash commits, then the EVM bundle
     /// and its writer-precompile rows (since bug (c) the prefix of the flush
-    /// batch) — overlapping keys agree with what lands.
-    ///
-    /// NOT hashed (review finding 2, tied to the pre-existing bug "epoch
-    /// rotation on the consensus thread"): the consensus thread's epoch
-    /// rotation writes (validator rows, deletion of applied `pending_rotation:`
-    /// rows) — they happen at proposal / validation time, which no executed
-    /// height owns, and the execution thread may lag by any number of blocks,
-    /// so any snapshot of them taken here would depend on timing. The
-    /// validator CF is excluded from the hash for the same reason
-    /// (`torus_state::running_hash::HASHED_CFS`).
+    /// batch) — overlapping keys agree with what lands. The consensus thread
+    /// writes no consensus state (epoch rotation runs at execution, bug (b)).
     fn running_hash_extras(
         out_of_batch: torus_state::OutOfBatchRecorder,
         bundle_extras: torus_state::HashExtras,
@@ -14060,11 +14052,12 @@ mod crash_recovery_tests {
         // (c) EVM bundle: the contract's storage slot (only reachable via the bundle).
         let storage = hashed_cf_id(CF_STORAGE).unwrap();
         assert_eq!(in_db(storage, CF_STORAGE, at(1)), 1, "slot 0 of the created contract");
-        // (a) slash at 2: the slash record (validator rows are excluded from
-        // the hash, review finding 2).
+        // (a) slash at 2: the slash record and the slashed / tombstoned
+        // validator row.
         let slashes = hashed_cf_id(CF_SLASH_RECORDS).unwrap();
         assert_eq!(in_db(slashes, CF_SLASH_RECORDS, at(2)), 1, "slash record");
-        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), None);
+        let validators = hashed_cf_id(CF_STAKING_VALIDATORS).unwrap();
+        assert_eq!(in_db(validators, CF_STAKING_VALIDATORS, at(2)), 1, "validator row");
         // 3 is empty: nothing hashed.
         assert!(at(3).is_empty(), "{:?}", at(3));
         // (b) epoch boundary 4 (empty block): only what its execution wrote,
@@ -14539,6 +14532,197 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst), "hash-unverified: no fail-stop");
         assert_eq!(torus_state::running_hash::read_divergence(&db), None);
         assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_unverified"), 1.0);
+    }
+
+    /// Epoch / running-hash fixture validators: (account key, consensus key);
+    /// the 5th has half the stake (it leaves a 4-seat set).
+    fn epoch_fixture_validators() -> Vec<(k256::ecdsa::SigningKey, [u8; 32])> {
+        (1..=5u8)
+            .map(|i| {
+                (
+                    k256::ecdsa::SigningKey::from_slice(&[0x70 + i; 32]).unwrap(),
+                    ed25519_dalek::SigningKey::from_bytes(&[0x30 + i; 32]).verifying_key().to_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    /// Seed the fixture validators like a genesis: Active rows + the recorded
+    /// installed set.
+    fn seed_epoch_fixture(db: &StateDb, vals: &[(k256::ecdsa::SigningKey, [u8; 32])]) {
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+        let staking = StakingManager::new(db.clone());
+        for (i, (key, pubkey)) in vals.iter().enumerate() {
+            let addr = k256_address(key);
+            let tokens = if i == 4 { 500u64 } else { 1_000 };
+            let row = ValidatorState {
+                address: addr,
+                pubkey: *pubkey,
+                commission_bps: 500,
+                self_stake: U256::from(tokens) * U256::from(10u64).pow(U256::from(18u64)),
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&addr, &row).unwrap();
+        }
+        let set = EpochManager::compute_new_validator_set(&staking, u32::MAX, 0).unwrap();
+        staking.record_genesis_epoch_set(&set).unwrap();
+    }
+
+    /// Blocks 1..=8 (epoch length 4): validator 0 rotates its consensus key at
+    /// 2 (planned at 4, installed at 8), validator 1 changes its commission at
+    /// 6. Returns the blocks and the rotated key.
+    fn epoch_fixture_blocks(vals: &[(k256::ecdsa::SigningKey, [u8; 32])]) -> (Vec<TorusBlock>, [u8; 32]) {
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x3f; 32]).verifying_key().to_bytes();
+        let rotate = torus_types::eip712::sign_native_action(
+            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            1,
+            &vals[0].0,
+        );
+        let commission = torus_types::eip712::sign_native_action(
+            NativeAction::UpdateCommission { new_rate: 600 },
+            1,
+            &vals[1].0,
+        );
+        let mut blocks: Vec<TorusBlock> = (1..=8)
+            .map(|h| {
+                make_block(
+                    h,
+                    match h {
+                        2 => vec![rotate.clone()],
+                        6 => vec![commission.clone()],
+                        _ => vec![],
+                    },
+                )
+            })
+            .collect();
+        link_blocks(&mut blocks);
+        (blocks, rotated_key)
+    }
+
+    /// Consensus bug (b) follow-up: `cf_staking_validators` is hashed. Three
+    /// replicas whose execution lags the consensus thread by 1, 2 and 4 blocks
+    /// at the boundaries 4 and 8 (key rotation installed at 8, validator 4
+    /// Active -> Candidate at 8, a commission change at 6) hand hotstuff the
+    /// same updates and record the identical per-height write sets and hash —
+    /// and those write sets carry the validator rows exactly as the DB holds
+    /// them. Replaces the consensus-thread-write test of review finding 2.
+    ///
+    /// RED before the re-inclusion: no validator-row entry in any write set.
+    #[test]
+    fn running_hash_epoch_rotation_identical_across_exec_lag_with_validator_rows() {
+        use torus_economics::types::ValidatorStatus;
+        use torus_state::cf::CF_STAKING_VALIDATORS;
+        use torus_state::running_hash::{hashed_cf_id, read_running_hash};
+        let vals = epoch_fixture_validators();
+        let (blocks, rotated_key) = epoch_fixture_blocks(&vals);
+        let node = |lag: u64| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            config.max_validators = 4;
+            seed_epoch_fixture(&db, &vals);
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            torus_state::running_hash::capture_begin(&db);
+            let ctx = make_exec_ctx(&config, &db);
+            let mut next = 1u64;
+            let mut seen = Vec::new();
+            for boundary in [4u64, 8] {
+                while next + lag <= boundary {
+                    dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                    next += 1;
+                }
+                let before = dump_all_cfs(&db);
+                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
+                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                seen.push(canonical_updates(updates));
+            }
+            while next <= 8 {
+                dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                next += 1;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            drop(app);
+            let captured = torus_state::running_hash::capture_take(&db);
+            (seen, captured, read_running_hash(&db), db)
+        };
+        let nodes: Vec<_> = [1u64, 2, 4].into_iter().map(node).collect();
+        for (i, n) in nodes.iter().enumerate().skip(1) {
+            assert_eq!(n.0, nodes[0].0, "node {i}: hotstuff updates per boundary");
+            assert_eq!(n.1, nodes[0].1, "node {i}: per-height hashed write sets");
+            assert_eq!(n.2, nodes[0].2, "node {i}: running hash");
+        }
+        let (seen, captured, hash, db) = &nodes[0];
+        assert_eq!(*hash, Some(fold_captured(captured)));
+        assert_eq!(seen[0], None, "first boundary: no plan");
+        let (ins, del) = seen[1].clone().expect("plan for 8 changes the set");
+        assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
+        assert!(del.contains(&vals[0].1) && del.contains(&vals[4].1), "{del:?}");
+
+        let staking = StakingManager::new(db.clone());
+        let row = |i: usize| staking.get_validator(&k256_address(&vals[i].0)).unwrap().unwrap();
+        assert_eq!(row(0).pubkey, rotated_key);
+        assert_eq!(row(1).commission_bps, 600);
+        assert_eq!(row(4).status, ValidatorStatus::Candidate);
+        // The validator rows each height's execution wrote are hashed with the
+        // bytes the DB holds.
+        let id = hashed_cf_id(CF_STAKING_VALIDATORS).expect("validator rows are hashed");
+        let rows_at = |h: u64| -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+            captured
+                .iter()
+                .find(|(x, _)| *x == h)
+                .unwrap()
+                .1
+                .iter()
+                .filter(|e| e.0 == id)
+                .map(|(_, k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let db_row = |i: usize| {
+            let key = k256_address(&vals[i].0).to_vec();
+            let v = db.get_cf_raw(CF_STAKING_VALIDATORS, &key).unwrap();
+            (key, v)
+        };
+        assert!(rows_at(6).contains(&db_row(1)), "commission change at 6: {:?}", rows_at(6));
+        let at8 = rows_at(8);
+        assert!(at8.contains(&db_row(0)), "rotated key at 8: {at8:?}");
+        assert!(at8.contains(&db_row(4)), "status change at 8: {at8:?}");
+    }
+
+    /// Consensus bug (b) follow-up: a validator row corrupted on one node (1
+    /// wei of self-stake, below any power / plan effect) diverges its running
+    /// hash at the next execution write of that row (the commission change at
+    /// 6). RED before the re-inclusion: identical hashes.
+    #[test]
+    fn running_hash_corrupted_validator_row_diverges() {
+        use torus_state::running_hash::read_running_hash;
+        let vals = epoch_fixture_validators();
+        let (blocks, _) = epoch_fixture_blocks(&vals);
+        let node = |corrupt: bool| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            config.max_validators = 4;
+            seed_epoch_fixture(&db, &vals);
+            let ctx = make_exec_ctx(&config, &db);
+            for b in &blocks[..7] {
+                if corrupt && b.header.height == 6 {
+                    let staking = StakingManager::new(db.clone());
+                    let addr = k256_address(&vals[1].0);
+                    let mut v = staking.get_validator(&addr).unwrap().unwrap();
+                    v.self_stake += U256::from(1u64);
+                    staking.put_validator(&addr, &v).unwrap();
+                }
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            }
+            drop(ctx);
+            read_running_hash(&db)
+        };
+        let (clean, corrupted) = (node(false), node(true));
+        assert_eq!(clean.map(|(h, _)| h), Some(7));
+        assert_ne!(clean, corrupted, "a corrupted validator row must change the hash");
     }
 
     /// Review finding 3: an attestation admitted to the mempool but dropped
