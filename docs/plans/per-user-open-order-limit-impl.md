@@ -351,6 +351,19 @@ visible, the pass splits by book chunks across the engine workers.
 
    It runs once per `execute_batch` call (twice per block) and once per
    CoreWriter PlaceOrder (single sender: one probe per book).
+
+   s84 follow-up (branch `perf/ol-count-no-spawn`): the s84 profile found
+   the per-count worker spawn costly on the loaded bench host (28% of the
+   count's CPU in thread clone/exit, margin phase +43 ms per block against
+   ~31 ms of count CPU), so `OPEN_COUNT_WORK_PER_THREAD` is now 100k: every
+   count a 300-market block can carry (at most 400 senders x 300 books =
+   120k probes) runs serially on the exec thread; only counts of 200k+
+   probes split. Bench-shape probe (`open_order_count_bench_shape`, 300
+   books of ~900-1650 traders, 250-400 senders): 8-16 ms serial, 4-6 ms on
+   the old 3-4 workers on an idle host; under emulated bursty load (9
+   steady + 2 18-thread fan-out hogs) both slow down and the split takes
+   0.5-1.04x (median ~0.87x) the serial time. The probe cannot reproduce
+   the in-bench spawn wait; the bench decides whether serial pays.
 3. **Removal cost**: a trader's per-book id list is a `TraderOrders`
    (holes + order-keeping compaction, O(1) amortized removal) instead of a
    `Vec` with `retain`; `cancel_all` output order is unchanged

@@ -442,10 +442,124 @@ enum PrepOutcome {
 }
 
 /// Open-order count work (trader probes + stops) per worker thread: below
-/// 2x this it stays on the exec thread (release probe: 300 dense books x 400
-/// senders = 120k probes, ~34 ms serial, ~15 ms on 8 workers; 300 books of 50
-/// traders = 15k probes, 1 ms serial, slower when split).
-const OPEN_COUNT_WORK_PER_THREAD: usize = 25_000;
+/// 2x this the count stays on the exec thread. Every count a 300-market block
+/// can carry (at most 400 senders x 300 books = 120k probes) stays serial:
+/// spawning workers per count (s84 profile: 25k per worker, 3-4 workers per
+/// block) cost ~28% of the count's CPU in thread clone/exit, and on the
+/// loaded bench host the exec thread waited longer for them than the whole
+/// count's CPU (margin phase +43 ms per block vs ~31 ms of count CPU). In
+/// the release probe (`open_order_count_bench_shape`, bench-sized counts)
+/// the split takes 0.33-0.47x the serial time on an idle host but 0.5-1.04x
+/// (median ~0.87x) under emulated bursty load, which still leaves out the
+/// bench's spawn waits. Larger counts (e.g. 1000 books x 400 senders: 38 ms
+/// serial, ~12 ms on 4 workers on an idle host) still split.
+const OPEN_COUNT_WORK_PER_THREAD: usize = 100_000;
+
+#[cfg(test)]
+mod open_order_count_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn trader(n: u64) -> Address {
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&n.to_be_bytes());
+        Address::from(b)
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn params(market_id: MarketId, price: i64, order_type: OrderType) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id,
+            is_buy: true,
+            price: fp(price),
+            quantity: fp(1),
+            order_type,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// `NativeExecutor::open_order_counts` gives exactly the counts of the
+    /// pre-change split (25k probes per worker, up to 18 workers, the s84
+    /// host) and of a per-sender sum, on randomized books: empty books,
+    /// resting bids and pending stops, senders repeated, senders absent from
+    /// every book, and a call big enough (40 books x 1600 traders x 1600
+    /// senders = 64k probes) that the old split ran on workers.
+    #[test]
+    fn counts_match_pre_change_split_on_random_books() {
+        for seed in 1..=8u64 {
+            let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let big = seed == 8;
+            let (n_books, universe) = if big { (40, 1600) } else { (1 + rng.below(30), 400) };
+            let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
+            for m in 1..=n_books {
+                let mut book = OrderBook::new(m, fp(1), fp(1));
+                let traders = match (big, rng.below(4)) {
+                    (true, _) => universe,
+                    (false, 0) => 0,
+                    _ => rng.below(universe),
+                };
+                for t in 0..traders {
+                    let who = if big { t } else { rng.below(universe) };
+                    for _ in 0..=rng.below(3) {
+                        let price = 1 + rng.below(400) as i64;
+                        book.place_order(params(m, price, OrderType::Limit), trader(who), 0);
+                    }
+                    if rng.below(16) == 0 {
+                        let stop = OrderType::StopMarket { trigger: fp(1000) };
+                        book.place_order(params(m, 0, stop), trader(who), 0);
+                    }
+                }
+                books.insert(m, book);
+            }
+            // Senders: some of the universe (some twice) plus some never seen.
+            let senders: Vec<Address> = if big {
+                (0..universe).map(trader).collect()
+            } else {
+                (0..1 + rng.below(600)).map(|_| trader(rng.below(universe + 50))).collect()
+            };
+            let got = NativeExecutor::open_order_counts(&books, senders.iter());
+
+            let mut idx: HashMap<Address, usize> = HashMap::new();
+            for s in &senders {
+                let next = idx.len();
+                idx.entry(*s).or_insert(next);
+            }
+            let refs: Vec<&OrderBook> = books.values().collect();
+            let old = torus_core::order_book::open_order_counts(&refs, &idx, 18, 25_000);
+            let distinct: HashSet<Address> = senders.iter().copied().collect();
+            assert_eq!(got.len(), distinct.len(), "seed {seed}");
+            for (sender, &i) in &idx {
+                let naive: usize = books.values().map(|b| b.open_order_count(sender)).sum();
+                assert_eq!(got[sender] as usize, old[i], "seed {seed}");
+                assert_eq!(old[i], naive, "seed {seed}");
+            }
+            if big {
+                // Lower bound of the old walk: senders present in each book.
+                let work: usize = refs
+                    .iter()
+                    .map(|b| idx.keys().filter(|s| b.open_order_count(s) > 0).count())
+                    .sum();
+                assert!(work >= 2 * 25_000, "the old split must have used workers");
+                assert!(old.iter().sum::<usize>() > 100_000);
+            }
+        }
+    }
+}
 
 /// Why an order died pre-book (selects its funnel counter).
 #[derive(Clone, Copy)]
