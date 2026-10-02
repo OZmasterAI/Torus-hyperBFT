@@ -140,6 +140,13 @@ pub(crate) fn phase_vote_recipient_with_reputation(
 /// end without that QC or a timeout), so the chain commits with one leader down. A QC is valid
 /// whoever assembles it, so no safety rule changes; with every leader up the backup assembles the
 /// same QC as the primary and the later copy is ignored.
+///
+/// Rolling upgrade: no activation gate is needed. Only the SEND side changed; the receive side
+/// already collects a correctly signed vote for the current view from any validator, whoever the
+/// intended collector was (`on_receive_phase_vote` and `PhaseVoteCollector::collect` check chain,
+/// view, signature and validator-set membership only), and the network layer does not penalise an
+/// extra well-formed direct message. Old nodes therefore act as backups too; they just never send
+/// backup votes, so the backup forms a QC only once a quorum of the voting power has upgraded.
 pub(crate) fn phase_vote_backup_recipient_with_reputation(
     phase_vote: &PhaseVote,
     validator_set_state: &ValidatorSetState,
