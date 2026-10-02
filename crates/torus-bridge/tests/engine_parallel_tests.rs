@@ -960,6 +960,58 @@ fn cum_volume_pass_b_balance_failure_stops_at_the_failed_side() {
     }
 }
 
+/// Pass B adds a market's worker-summed volume only when no order of that
+/// market stopped early. Here market 1 has a stopped order followed by a
+/// filled one (per-side path), and market 2 fills in the same call (summed
+/// path); both match the sequential loop.
+#[test]
+fn cum_volume_pass_b_stop_mid_market_keeps_later_orders_and_other_markets() {
+    let (m, t1, t2) = (addr(1), addr(2), addr(3));
+    let blocks = vec![
+        vec![
+            place(m, gtc(1, true, 100, 1)),
+            place(addr(4), gtc(2, false, 100, 1)),
+        ],
+        vec![
+            place(t1, gtc(1, false, 100, 1)),
+            place(addr(5), gtc(2, true, 100, 1)),
+        ],
+        vec![
+            place(m, gtc(1, false, 101, 1)),
+            place(addr(4), gtc(1, false, 102, 1)),
+            place(t1, gtc(2, true, 98, 1)),
+        ],
+        vec![
+            // Fails on m's maker side (unreadable balance row).
+            place(t2, gtc(1, true, 101, 1)),
+            // Same market, after the stop: fills addr(4)'s ask at 102.
+            place(addr(5), gtc(1, true, 102, 1)),
+            // Other market: fills t1's bid at 98.
+            place(addr(4), gtc(2, false, 98, 1)),
+        ],
+    ];
+    let corrupt = |ctx: &NativeExecContext| {
+        ctx.state.put_cf_raw(CF_NATIVE_BALANCES, m.as_slice(), b"\xff").unwrap();
+    };
+    let (golden, serial_fallbacks) = run_volumes_counted(&blocks, 0, corrupt);
+    assert_eq!(serial_fallbacks, 0);
+    let last = &golden.1[3];
+    assert!(
+        last[0].1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+        "{last:?}"
+    );
+    assert!(last[1].0 && last[2].0, "{last:?}");
+    assert_eq!(
+        golden.0,
+        vec![fp(5_000_100), fp(198), fp(101), fp(300), fp(202)]
+    );
+    for threads in [2usize, 4] {
+        let (run, fallbacks) = run_volumes_counted(&blocks, threads, corrupt);
+        assert_eq!(fallbacks, 0, "threads={threads}: pass B must handle it");
+        assert_eq!(golden, run, "threads={threads}");
+    }
+}
+
 /// The single-action path (`execute`, used by the CoreWriter drain) applies
 /// the same limit and volume rules as `execute_batch`.
 #[test]

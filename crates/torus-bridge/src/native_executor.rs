@@ -14,7 +14,7 @@ use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
+use torus_core::order_book::{Fill, OrderBook, OrderStatus, PlaceResult};
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
     OPEN_ORDER_BASE_LIMIT,
@@ -115,6 +115,18 @@ struct BalanceCache {
 /// for every fill side whose position effect applied. Flushed with the
 /// balance cache, in sorted-address order.
 type VolumeCache = HashMap<Address, FixedPoint>;
+
+/// Adds the first `sides` fill sides of `fills` (in order: fill 0 taker, fill
+/// 0 maker, fill 1 taker, ...) to `volumes`, one `price * qty` per fill.
+fn add_fill_volumes(volumes: &mut VolumeCache, fills: &[Fill], sides: usize) {
+    for (k, fill) in fills.iter().enumerate().take(sides.div_ceil(2)) {
+        let notional = fill.price * fill.quantity;
+        *volumes.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
+        if 2 * k + 1 < sides {
+            *volumes.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
+        }
+    }
+}
 
 struct CachedBalance {
     balance: NativeBalance,
@@ -261,6 +273,9 @@ struct MarketSettlePlan {
     /// A5 maker/STP release amounts, in the deterministic order
     /// `maker_margin_releases` has always produced.
     maker_releases: Vec<(Address, FixedPoint)>,
+    /// `cum_volume` of every fill side of this market (summed per trader on
+    /// the worker). Pass B adds it whole unless an order stops early there.
+    volumes: VolumeCache,
 }
 
 /// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
@@ -4625,8 +4640,15 @@ impl NativeExecutor {
                 None => continue,
             };
 
-            for ((match_result, prep), oplan) in
-                mbr.results.iter().zip(prepared.iter()).zip(plan.orders)
+            // Orders of this market that stopped before their last fill side:
+            // (order index, sides applied).
+            let mut stops: Vec<(usize, usize)> = Vec::new();
+            for (k, ((match_result, prep), oplan)) in mbr
+                .results
+                .iter()
+                .zip(prepared.iter())
+                .zip(plan.orders)
+                .enumerate()
             {
                 let result = &match_result.result;
 
@@ -4679,15 +4701,10 @@ impl NativeExecutor {
                 if fill_failed.is_none() {
                     fill_failed = oplan.fill_error;
                 }
-                // cum_volume of every fill side the sequential loop completes
-                // before its stop (a failed side adds nothing).
-                let sides = result
-                    .fills
-                    .iter()
-                    .flat_map(|f| [(f.taker, f), (f.maker, f)]);
-                for (trader, fill) in sides.take(sides_applied) {
-                    *vol_cache.entry(trader).or_insert(FixedPoint::ZERO) +=
-                        fill.price * fill.quantity;
+                // cum_volume counts every fill side the sequential loop
+                // completes before its stop (a failed side adds nothing).
+                if sides_applied < 2 * result.fills.len() {
+                    stops.push((k, sides_applied));
                 }
 
                 if let Some(err) = fill_failed {
@@ -4719,6 +4736,23 @@ impl NativeExecutor {
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
 
+            // cum_volume: the worker's per-trader sums when every order ran
+            // to its last fill side; otherwise per side, up to each stop.
+            if stops.is_empty() {
+                for (trader, add) in plan.volumes {
+                    *vol_cache.entry(trader).or_insert(FixedPoint::ZERO) += add;
+                }
+            } else {
+                for (k, match_result) in mbr.results.iter().take(prepared.len()).enumerate() {
+                    let fills = &match_result.result.fills;
+                    let sides = stops
+                        .iter()
+                        .find(|stop| stop.0 == k)
+                        .map_or(2 * fills.len(), |stop| stop.1);
+                    add_fill_volumes(vol_cache, fills, sides);
+                }
+            }
+
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
             for (trader, amount) in plan.maker_releases {
@@ -4748,6 +4782,7 @@ impl NativeExecutor {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
         let mut orders = Vec::with_capacity(prepared.len());
+        let mut volumes = VolumeCache::new();
 
         for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
             let result = &match_result.result;
@@ -4823,6 +4858,11 @@ impl NativeExecutor {
                     fill_effects.push(pair);
                 }
             }
+            // A position failure sends the whole call to the sequential loop,
+            // so these sums are only used when every side applied.
+            if fill_error.is_none() {
+                add_fill_volumes(&mut volumes, &result.fills, 2 * result.fills.len());
+            }
 
             orders.push(OrderSettlePlan {
                 margin_release,
@@ -4844,6 +4884,7 @@ impl NativeExecutor {
             orders,
             pos_cache,
             maker_releases,
+            volumes,
         }
     }
 
