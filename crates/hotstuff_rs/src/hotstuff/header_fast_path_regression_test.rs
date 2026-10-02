@@ -1064,6 +1064,47 @@ fn body_push_small_block_delivers_body_without_request() {
     assert_eq!(follower_net.body_fetch_count(), 0);
 }
 
+/// s84: an app-rejected body drops its header from `pending_headers`, but a
+/// PUSHED copy is not tied to the proposer. Rejecting it must keep the header,
+/// so the normal fetch still runs and its response is still admitted.
+#[test]
+fn body_push_rejected_copy_keeps_header_for_fetch() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let (mut leader_tree, vss) = steady_block_tree(&set);
+    let view1 = ViewNumber::new(1);
+    let leader_net = propose_as_leader(
+        view1, &keys, &vss, &mut leader_tree, vec![], Some(BODY_PUSH_HARD_CAP_BYTES),
+    );
+    let header = leader_net.headers().into_iter().next().unwrap();
+    let leader_vk = proposer_for(view1, &keys, &vss, &leader_tree);
+    let (_, pushed) = leader_net.pushed_body_responses().into_iter().next().unwrap();
+
+    let (mut follower_tree, _) = steady_block_tree(&set);
+    let follower_key = keys.iter().find(|k| k.verifying_key() != leader_vk).unwrap().clone();
+    let (mut follower, follower_net) = hotstuff_recording_at(view1, follower_key, vss.clone());
+    let mut rejecting = RejectingApp { validate_calls: 0 };
+    follower
+        .on_receive_msg(HotStuffMessage::BlockDataResponse(pushed.clone()), &leader_vk,
+            &mut follower_tree, &mut rejecting)
+        .unwrap();
+    follower
+        .on_receive_msg(HotStuffMessage::ProposalHeader(header.clone()), &leader_vk,
+            &mut follower_tree, &mut rejecting)
+        .unwrap();
+    assert_eq!(rejecting.validate_calls, 1, "the pushed copy was validated and rejected");
+    assert!(!follower_tree.contains(&header.block_hash));
+    assert_eq!(follower_net.body_fetch_count(), 1, "falls through to the normal fetch");
+
+    let mut valid = FixedBodyApp { datums: vec![] };
+    follower
+        .on_receive_msg(HotStuffMessage::BlockDataResponse(pushed), &leader_vk,
+            &mut follower_tree, &mut valid)
+        .unwrap();
+    assert!(follower_tree.contains(&header.block_hash),
+        "the fetched copy is admitted against the kept header and inserted");
+}
+
 /// L3 v2 default: threshold unset/0 keeps BOTH sides byte-identical to today —
 /// the leader broadcasts a header and pushes nothing; the follower issues
 /// exactly one solicited `BlockDataRequest` at header processing and inserts

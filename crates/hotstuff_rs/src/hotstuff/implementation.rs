@@ -2410,18 +2410,23 @@ impl<N: Network> HotStuff<N> {
             let block_hash = header.block_hash;
             let chain_id = header.chain_id;
             let view = header.view;
+            let pushed = self.take_pushed_body(&block_hash);
+            // A pushed body is not tied to the proposer, so an app-invalid copy
+            // must not cost the header (s84): restore it for the fetch below.
+            let header_for_fetch = pushed.as_ref().map(|_| header.clone());
             self.pending_headers.insert(block_hash, header);
-            let inserted_from_push = match self.take_pushed_body(&block_hash) {
+            let inserted_from_push = match pushed {
                 Some(block) => {
                     // Any non-insert (incl. MissingData) falls through to the
                     // normal fetch, whose response re-validates the body.
-                    let inserted =
-                        self.try_insert_body(block, block_tree, app)? == BodyInsert::Inserted;
-                    if inserted {
+                    let outcome = self.try_insert_body(block, block_tree, app)?;
+                    if outcome == BodyInsert::Inserted {
                         self.pending_headers.remove(&block_hash);
                         self.drain_deferred_bodies(block_tree, app)?;
+                    } else if let Some(header) = header_for_fetch {
+                        self.pending_headers.insert(block_hash, header);
                     }
-                    inserted
+                    outcome == BodyInsert::Inserted
                 }
                 None => false,
             };
@@ -2799,6 +2804,15 @@ impl<N: Network> HotStuff<N> {
                     block.hash,
                     self.header_vote_invalid_count
                 );
+            }
+            // s84: a header in `pending_headers` counts as already validated (the
+            // justify bypass in `on_receive_proposal_header`, `pc_block_pending` in
+            // QC collection). Once our app rejected the body that no longer holds,
+            // so drop it: children of this block now take the full `safe_pc` path,
+            // which needs the block in the tree, and get no vote. `MissingData` is
+            // not a rejection and keeps the header.
+            if app_invalid {
+                self.pending_headers.remove(&block.hash);
             }
             if let (Some(start), Some(validated)) = (trace_start, trace_validated) {
                 log::info!("body_fetch_diag insert: {} validated_mono_us={} hash={} height={} result={}",
@@ -4803,6 +4817,61 @@ mod s63_body_fetch_tests {
         assert_eq!(f.hotstuff.missing_data_retries.len(), MISSING_DATA_RETRY_CAP);
         assert!(!f.hotstuff.missing_data_retries.contains_key(&parent.hash));
         assert!(f.hotstuff.take_sync_needed());
+    }
+
+    /// s84: a follower header-votes the parent (view 1), its fetched body is
+    /// validated by `app`, then the child header (view 2, justify = QC on the
+    /// parent) arrives. Returns (parent header still pending, voted the child).
+    fn child_vote_after_parent_body(app: &mut ScriptedApp) -> (bool, bool) {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (mut tree, vss) = steady_block_tree(&set);
+        let (v1, v2) = (ViewNumber::new(1), ViewNumber::new(2));
+        let o1 = proposer_for(v1, &keys, &vss, &tree);
+        let o2 = proposer_for(v2, &keys, &vss, &tree);
+        let local = keys.iter()
+            .find(|k| k.verifying_key() != o1 && k.verifying_key() != o2).unwrap().clone();
+        let mut hotstuff = hotstuff_at(v1, local, vss);
+        let parent = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([41; 32]), Data::new(vec![]));
+        let child = Block::new(BlockHeight::new(1), generic_pc(v1, parent.hash, &keys, &set),
+            CryptoHash::new([42; 32]), Data::new(vec![]));
+        let header = |block: &Block, view| ProposalHeader {
+            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
+            data_hash: block.data_hash, justify: block.justify.clone(),
+            tc: None, nec: None, has_validator_set_updates: false,
+        };
+        hotstuff.on_receive_msg(header(&parent, v1).into(), &o1, &mut tree, app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), Some(v1), "header-first vote on the parent");
+        hotstuff.on_receive_msg(BlockDataResponse { view: v1, block: parent.clone() }.into(),
+            &o1, &mut tree, app).unwrap();
+        assert_eq!(app.calls, 1);
+        assert!(!tree.contains(&parent.hash));
+        hotstuff.view_info = ViewInfo::new(v2, Instant::now() + Duration::from_secs(60));
+        hotstuff.on_receive_msg(header(&child, v2).into(), &o2, &mut tree, app).unwrap();
+        (hotstuff.pending_headers.contains_key(&parent.hash),
+            tree.highest_view_voted().unwrap() == Some(v2))
+    }
+
+    /// s84 (e686e70 wedge): once this replica's app rejects a body, the block's
+    /// header must stop counting as "previously validated", so the replica never
+    /// votes for its children.
+    #[test]
+    fn app_rejected_body_is_not_treated_as_validated_for_child_votes() {
+        let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: true };
+        let (parent_pending, voted_child) = child_vote_after_parent_body(&mut app);
+        assert!(!voted_child, "no vote for a child of a block our app rejected");
+        assert!(!parent_pending, "rejected block's header leaves pending_headers");
+    }
+
+    /// MissingData is not a rejection: the header stays pending and the
+    /// child is voted exactly as before.
+    #[test]
+    fn missing_data_body_still_counts_as_validated_for_child_votes() {
+        let mut app = ScriptedApp { calls: 0, missing_left: usize::MAX, invalid: false };
+        let (parent_pending, voted_child) = child_vote_after_parent_body(&mut app);
+        assert!(parent_pending);
+        assert!(voted_child);
     }
 }
 
