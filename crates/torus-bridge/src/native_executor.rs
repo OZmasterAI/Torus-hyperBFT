@@ -17,15 +17,14 @@ use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
 use torus_core::position::{FillEffect, MarginType, NativeBalance, PositionCache, PositionManager};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
-use torus_economics::epoch::ValidatorSetDiff;
 use torus_economics::{
-    EpochManager, GovernanceManager, RewardDistributor, StakingManager, ValidatorStatus,
+    EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, PublicKey,
-    SessionScope, Side, TimeInForce, ValidatorInfo, ValidatorSet, VoteOption, U256,
+    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
+    SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
 };
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
@@ -70,12 +69,11 @@ pub struct NativeBatchResult {
     pub total_gas: u64,
 }
 
-/// Result of epoch boundary processing. Carries the validator set diff
-/// for future hotstuff_rs ValidatorSetUpdates integration.
+/// Result of epoch boundary processing: the validator set installed at this
+/// boundary (`None` = unchanged), from the plan the previous boundary stored.
 pub struct EpochBoundaryResult {
     pub action: NativeActionResult,
     pub new_set: Option<ValidatorSet>,
-    pub diff: Option<ValidatorSetDiff>,
 }
 
 // ============================================================================
@@ -6055,9 +6053,10 @@ impl NativeExecutor {
     /// inflation to the CURRENT active set. Errors log-and-continue (reward
     /// bugs should not block rotation).
     ///
-    /// Phase B — Rotation: computes new validator set, applies rotation cap,
-    /// updates statuses, logs changes. Errors on compute_new_validator_set
-    /// early-return (broken validator set is a consensus-safety issue).
+    /// Phase B — Rotation (consensus bug (b), torus_economics::epoch_plan):
+    /// applies the plan the previous boundary stored (the set consensus installs
+    /// at this height: key rotations + statuses) and stores the plan for the
+    /// next boundary. The only writer of epoch statuses / rotated keys.
     pub fn process_epoch_boundary<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Option<EpochBoundaryResult> {
@@ -6081,62 +6080,36 @@ impl NativeExecutor {
 
         // --- Phase B: Validator set rotation ---
 
-        // B1: Build old set from current Active validators
-        let old_set = build_current_validator_set(&ctx.staking, ctx.epoch);
-
-        // B2: Compute new set
-        let new_set = match EpochManager::compute_new_validator_set(
-            &ctx.staking,
-            ctx.max_validators,
-            ctx.epoch + 1,
-        ) {
-            Ok(set) => set,
-            Err(e) => {
-                return Some(EpochBoundaryResult {
-                    action: NativeActionResult::err("epoch_rotation", e.to_string()),
-                    new_set: None,
-                    diff: None,
-                });
-            }
-        };
-
-        // B3: Apply rotation cap
-        let cap = EpochManager::safe_rotation_cap(old_set.validators.len());
-        let new_set = EpochManager::apply_rotation_cap(&old_set, new_set, cap);
-
-        // B3.5 (FIX 4, S443): enforce the BFT-minimum floor. If the capped rotation
-        // would drop the active set below MIN_ACTIVE_VALIDATORS while the old set met
-        // it, re-seat the highest-priority departed validator(s) so the cluster keeps
-        // a viable quorum (t15: a wrongful deposition dropped 4 → 3 and stalled).
-        let new_set = EpochManager::enforce_minimum_floor(&old_set, new_set);
-
-        // B4: Check minimum set (post-condition; floor guard above should keep this
-        // green whenever the old set met the minimum).
-        if let Err(e) = EpochManager::check_minimum_set(&new_set) {
-            tracing::error!(%e, "validator set below minimum");
-        }
-
-        // B5: Compute diff
-        let diff = EpochManager::compute_validator_set_diff(&old_set, &new_set);
-
-        // B6: Update statuses
-        if let Err(e) = EpochManager::update_validator_statuses(&ctx.staking, &new_set) {
-            tracing::error!(%e, "validator status update failed");
-        }
-
-        // B7: Log rotation
-        EpochManager::log_rotation(&old_set, &new_set, &diff, ctx.epoch + 1);
-
-        if let Some(ref m) = ctx.metrics {
-            m.epoch_number.set((ctx.epoch + 1) as i64);
-            m.validator_set_size.set(new_set.validators.len() as i64);
-        }
-
-        Some(EpochBoundaryResult {
-            action: NativeActionResult::ok("epoch_boundary", 5000),
-            new_set: Some(new_set),
-            diff: Some(diff),
-        })
+        Some(
+            match EpochManager::execute_planned_rotation(
+                &ctx.staking,
+                ctx.max_validators,
+                ctx.block_height,
+                ctx.epoch_length,
+            ) {
+                Ok(new_set) => {
+                    if let Some(ref m) = ctx.metrics {
+                        m.epoch_number.set(
+                            EpochManager::epoch_for_block(ctx.block_height, ctx.epoch_length) as i64,
+                        );
+                        if let Some(ref set) = new_set {
+                            m.validator_set_size.set(set.validators.len() as i64);
+                        }
+                    }
+                    EpochBoundaryResult {
+                        action: NativeActionResult::ok("epoch_boundary", 5000),
+                        new_set,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, height = ctx.block_height, "planned epoch rotation failed");
+                    EpochBoundaryResult {
+                        action: NativeActionResult::err("epoch_rotation", e.to_string()),
+                        new_set: None,
+                    }
+                }
+            },
+        )
     }
 
     /// Process pending governance proposals.
@@ -6151,32 +6124,6 @@ impl NativeExecutor {
             Err(e) => vec![NativeActionResult::err("governance_process", e.to_string())],
         }
     }
-}
-
-/// Build a ValidatorSet from current Active validators in staking state.
-/// Uses the same power conversion as `EpochManager::compute_new_validator_set`.
-fn build_current_validator_set(
-    staking: &StakingManager<impl StateBackend>,
-    epoch: u64,
-) -> ValidatorSet {
-    let wei = U256::from(10u64).pow(U256::from(18u64));
-    let validators: Vec<ValidatorInfo> = match staking.all_validators() {
-        Ok(all) => all
-            .into_iter()
-            .filter(|v| v.status == ValidatorStatus::Active)
-            .map(|v| ValidatorInfo {
-                address: v.address,
-                pubkey: PublicKey(v.pubkey),
-                power: (v.total_stake() / wei).try_into().unwrap_or(u64::MAX),
-                commission_bps: v.commission_bps,
-            })
-            .collect(),
-        Err(e) => {
-            tracing::error!(%e, "failed to read validators for old set");
-            Vec::new()
-        }
-    };
-    ValidatorSet { validators, epoch }
 }
 
 // ============================================================================

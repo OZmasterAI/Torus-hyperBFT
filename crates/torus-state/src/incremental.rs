@@ -380,6 +380,22 @@ pub fn commit_evm_bundle_incremental(
     bundle: &BundleState,
     precomputed: Option<(B256, TrieUpdates)>,
 ) -> Result<B256, StateError> {
+    let (root, batch) = evm_block_batch_incremental(db, bundle, precomputed, None)?;
+    db.write(batch)?;
+    Ok(root)
+}
+
+/// The batch [`commit_evm_bundle_incremental`] writes, plus the block's
+/// writer-precompile side effects (`native_writes`, the block-scoped journal
+/// the EVM executor returns), BUILT but not written: consensus bug (c) — the
+/// caller makes it the prefix of the block's flush batch, so the EVM block is
+/// durable iff its native phase and applied-height marker are.
+pub fn evm_block_batch_incremental(
+    db: &StateDb,
+    bundle: &BundleState,
+    precomputed: Option<(B256, TrieUpdates)>,
+    native_writes: Option<&crate::NativeStateOverlay>,
+) -> Result<(B256, WriteBatch), StateError> {
     let (root, trie_updates) = match precomputed {
         Some(pair) => pair,
         None => incremental_evm_root(db, bundle)?,
@@ -388,8 +404,10 @@ pub fn commit_evm_bundle_incremental(
     apply_bundle_plain(db, &mut batch, bundle)?;
     apply_bundle_hashed(db, &mut batch, bundle)?;
     write_trie_updates(db, &mut batch, &trie_updates)?;
-    db.write(batch)?;
-    Ok(root)
+    if let Some(native) = native_writes {
+        native.append_pending_to_batch(db, &mut batch)?;
+    }
+    Ok((root, batch))
 }
 
 /// Re-sync the incremental EVM trie (`CF_HASHED_ACCOUNTS` + `CF_TRIE_*`) for accounts whose

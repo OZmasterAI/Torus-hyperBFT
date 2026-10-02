@@ -47,6 +47,23 @@ use torus_types::{
     Address, ChainConfig, CompactBlock, TorusBlock, TorusBlockBody, TorusBlockHeader, ValidatorSet,
 };
 
+/// Consensus bug (b): this node's execution has not yet applied the epoch
+/// boundary whose plan the boundary being proposed / validated needs.
+#[derive(Debug)]
+struct EpochPlanNotReady;
+
+/// A datum-less proposal every honest `validate_block` rejects (`datums.len()
+/// != 1`): the `App` trait has no "refuse" variant, so this is how a leader
+/// that must not build a block now lets its view time out.
+fn refused_proposal() -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data_hash: CryptoHash::new(TorusApp::hash_datum(&[])),
+        data: Data::new(vec![]),
+        app_state_updates: None,
+        validator_set_updates: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingSlash {
     validator: Address,
@@ -607,6 +624,10 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only crash injection (consensus bug (c)): return right after the
+    /// EVM section, where a hard crash before the native flush would stop.
+    #[cfg(test)]
+    test_crash_after_evm_section: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1446,19 +1467,11 @@ impl ExecutionContext {
         true
     }
 
-    /// Running state hash: block's consensus writes made durable outside its
-    /// flush batch (Task 0), lowest priority first: the recorded slash /
-    /// writer-precompile commits, then the EVM bundle — both recorded on this
-    /// thread as they became durable, so overlapping keys agree.
-    ///
-    /// NOT hashed (review finding 2, tied to the pre-existing bug "epoch
-    /// rotation on the consensus thread"): the consensus thread's epoch
-    /// rotation writes (validator rows, deletion of applied `pending_rotation:`
-    /// rows) — they happen at proposal / validation time, which no executed
-    /// height owns, and the execution thread may lag by any number of blocks,
-    /// so any snapshot of them taken here would depend on timing. The
-    /// validator CF is excluded from the hash for the same reason
-    /// (`torus_state::running_hash::HASHED_CFS`).
+    /// Running state hash: block's consensus writes NOT in its overlay (Task 0),
+    /// lowest priority first: the recorded slash commits, then the EVM bundle
+    /// and its writer-precompile rows (since bug (c) the prefix of the flush
+    /// batch) — overlapping keys agree with what lands. The consensus thread
+    /// writes no consensus state (epoch rotation runs at execution, bug (b)).
     fn running_hash_extras(
         out_of_batch: torus_state::OutOfBatchRecorder,
         bundle_extras: torus_state::HashExtras,
@@ -1560,7 +1573,7 @@ impl ExecutionContext {
         // only when every reader/writer that bypasses the overlay is known to be
         // absent: dispatch-durable header+body (never `fold_header`, F9), no EVM,
         // no pending slashes (direct DB writes), not an epoch boundary (epoch
-        // inflation + consensus-thread staking writes, F2/F8). Anything else is
+        // inflation + validator-set plan, F2/F8). Anything else is
         // a BARRIER: wait for W to drain, then today's serial path verbatim.
         // Replay (`DurableRows::default()`) is therefore always serial, and W
         // does not even exist at replay time (F4).
@@ -1576,7 +1589,7 @@ impl ExecutionContext {
         }
 
         // Running state hash: record this block's consensus writes that become
-        // durable OUTSIDE its flush batch (slashes, EVM writer precompiles) — see
+        // durable OUTSIDE its flush batch (slashes) — see
         // `hash_extras` below. The slashes go through a per-block overlay and ONE
         // `commit_tx` (same bytes as the direct puts) so the recorder sees them.
         let out_of_batch = torus_state::OutOfBatchRecorder::begin();
@@ -1632,6 +1645,14 @@ impl ExecutionContext {
         let mut bundle = BundleState::default();
         let mut bundle_extras = torus_state::HashExtras::new();
         let mut computed_fee_revenue: u128 = 0;
+        // Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
+        // the EVM block's consensus writes (bundle, hashed mirror, incremental
+        // trie nodes, writer-precompile queue rows) are BUILT here and written
+        // as the PREFIX of this block's one flush batch below (with the native
+        // state and the applied-height marker): a crash before that write leaves
+        // nothing of the block durable, so the replay re-executes it from the
+        // same base.
+        let mut evm_batch: Option<rocksdb::WriteBatch> = None;
         if has_evm {
             match self.validator.validate_block_for_catchup(
                 torus_block,
@@ -1645,28 +1666,39 @@ impl ExecutionContext {
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
                     let precomputed_root = validated.evm_root_updates;
-                    // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
-                    // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
-                    // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
-                    // Falls back to the plain commit if the incremental path errors, so a trie bug
+                    // Phase A: EVM plain state + the hashed mirror + the incremental trie nodes
+                    // in ONE batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with CF_ACCOUNTS
+                    // (keeps the incremental root's base correct across restarts/replay).
+                    // Falls back to the plain batch if the incremental path errors, so a trie bug
                     // can never halt the chain (the full-scan root stays primary unless the flag is on).
-                    match torus_state::incremental::commit_evm_bundle_incremental(
+                    let built = match torus_state::incremental::evm_block_batch_incremental(
                         &self.state_db,
                         &validated.bundle,
                         precomputed_root,
+                        Some(&validated.native_writes),
                     ) {
-                        Ok(_root) => bundle_extras.add_evm_bundle(&validated.bundle),
+                        Ok((_root, batch)) => Ok(batch),
                         Err(e) => {
-                            tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
-                            match BlockCommitter::commit_pending_bundle(
+                            tracing::error!(%e, height, "incremental EVM batch failed; falling back to the plain EVM batch");
+                            BlockCommitter::pending_bundle_batch(
                                 &self.state_db,
                                 &validated.bundle,
-                            ) {
-                                Ok(()) => bundle_extras.add_evm_bundle(&validated.bundle),
-                                Err(e2) => {
-                                    tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)")
-                                }
-                            }
+                                Some(&validated.native_writes),
+                            )
+                        }
+                    };
+                    match built {
+                        Ok(batch) => {
+                            bundle_extras.add_evm_bundle(&validated.bundle);
+                            bundle_extras.add_overlay_pending(&validated.native_writes);
+                            evm_batch = Some(batch);
+                        }
+                        Err(e2) => {
+                            // Executing the native phase without the block's EVM
+                            // writes would make a partial block durable.
+                            tracing::error!(%e2, height, "FATAL: could not build the EVM batch (fallback) — fail-stop");
+                            self.exec_failed.store(true, Ordering::SeqCst);
+                            return;
                         }
                     }
                     if let Err(e) = BlockCommitter::commit_block_metadata(
@@ -1707,11 +1739,21 @@ impl ExecutionContext {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
         }
+        #[cfg(test)]
+        if self.test_crash_after_evm_section {
+            return;
+        }
 
         let mut hash_extras = Some(Self::running_hash_extras(out_of_batch, bundle_extras));
 
+        // Bug (b): every boundary block runs the native phase (even when empty)
+        // — it applies / computes the validator-set plans (`process_epoch_boundary`).
+        let run_native = has_native
+            || computed_fee_revenue > 0
+            || EpochManager::is_epoch_boundary(height, self.epoch_length);
+
         // ---- Native execution ----
-        if has_native || computed_fee_revenue > 0 {
+        if run_native {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
@@ -2111,6 +2153,7 @@ impl ExecutionContext {
             let (fills, extras) = ctx.take_pending_fills_and_extras();
 
             if pipelined {
+                debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
                 // the overlay too (CF_CONSENSUS_META is a non-root CF — root-
                 // neutral; the flush appends the same key/bytes again, so the
@@ -2166,7 +2209,10 @@ impl ExecutionContext {
                 } else {
                     None
                 };
-                overlay.flush_with_native_trie_stats(
+                // Bug (c): the block's EVM batch (if any) is the prefix of this
+                // ONE atomic write.
+                overlay.flush_after_batch_with_native_trie_stats(
+                    evm_batch.take().unwrap_or_default(),
                     &self.state_db,
                     Some(height),
                     cache_opt,
@@ -2209,6 +2255,13 @@ impl ExecutionContext {
                     // `find_last_committed_height` for the replay.
                     if header_folded {
                         persist_block_header(&self.state_db, torus_block);
+                    }
+                    if has_evm {
+                        // Bug (c): the EVM writes were in the failed batch. Do not
+                        // execute the next block on a base without them.
+                        tracing::error!(height, "FATAL: EVM block flush failed — fail-stop (restart replays it)");
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return;
                     }
                 }
             }
@@ -2362,9 +2415,9 @@ impl ExecutionContext {
         // applied-height marker was already folded into that path's atomic flush batch above
         // (flush_with_native_trie_and_marker), so native state and the marker committed together.
         // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
-        // empty or pure-EVM blocks, whose re-execution is idempotent) still need a standalone marker
-        // write here.
-        if !(has_native || computed_fee_revenue > 0) {
+        // empty or pure-EVM blocks) still need a standalone marker write here; a pure-EVM block's
+        // EVM batch rides that marker write (bug (c)).
+        if !run_native {
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
                 // batch on W (a direct put here would land before batch(N−1) and be
@@ -2375,6 +2428,22 @@ impl ExecutionContext {
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                    return;
+                }
+            } else if let Some(prefix) = evm_batch.take() {
+                // Bug (c): an EVM block without a native phase (no fee revenue):
+                // its EVM batch rides the marker flush — one atomic write.
+                let pending = torus_state::FrozenPending::marker_only(height)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                if let Err(e) = pending.flush_after_batch_with_native_trie_stats(
+                    prefix,
+                    &self.state_db,
+                    Some(height),
+                    None,
+                    None,
+                ) {
+                    tracing::error!(%e, height, "FATAL: EVM block marker flush failed — fail-stop (restart replays it)");
+                    self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
             } else {
@@ -2441,7 +2510,7 @@ impl ExecutionContext {
             // Gated on the SAME predicate as the native section above, so
             // `exec_chain_seconds_count == exec_engine_seconds_count` and
             // `_sum / _count` is directly ms-per-native-block.
-            if has_native || computed_fee_revenue > 0 {
+            if run_native {
                 m.exec_chain_seconds.observe(block_secs);
                 // bl2: on the fast path the REAL rendezvous wait was observed in
                 // `pipeline_handoff`; only the serial path records the 0.
@@ -2565,7 +2634,6 @@ pub struct TorusApp {
     last_header: TorusBlockHeader,
     staking: StakingManager,
     epoch_length: u64,
-    max_validators: u32,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
     pending_slashes: Vec<PendingSlash>,
@@ -3467,6 +3535,8 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_section: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -3532,6 +3602,15 @@ impl TorusApp {
             .expect("spawn execution pipeline thread");
 
         let leader_state = Arc::new(LeaderState::new());
+        // Bug (b): the set hotstuff runs is the last installed one (genesis or
+        // the last applied plan, read after the boot replay applied it), not the
+        // staking rows of whatever height this DB is at. Rows only on a DB not
+        // built from a genesis.
+        let genesis_validator_set = staking
+            .current_epoch_validator_set()
+            .ok()
+            .flatten()
+            .unwrap_or(genesis_validator_set);
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
 
@@ -3553,7 +3632,6 @@ impl TorusApp {
             last_header,
             staking,
             epoch_length: config.epoch_length,
-            max_validators: config.max_validators,
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
             pending_slashes: Vec::new(),
@@ -4177,119 +4255,72 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    /// Compute validator set updates at epoch boundary.
-    fn epoch_validator_set_updates(&mut self, height: u64) -> Option<ValidatorSetUpdates> {
+    /// Validator-set updates for block `height` (`None` off-boundary).
+    ///
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
+    /// boundary they are READ from the plan the previous boundary stored at
+    /// execution (`None`: no plan — the first boundary — or an unchanged set);
+    /// no DB write, no read of timing-dependent state. `Err` = this node's
+    /// execution has not applied the previous boundary yet: refuse (validate ->
+    /// `MissingData`, propose -> no block) and retry, never guess.
+    fn epoch_validator_set_updates(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return Ok(None);
+        }
         if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
             if cached_height == height {
-                return cached_result.clone();
+                return Ok(cached_result.clone());
             }
         }
-
-        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
-            self.cached_vs_updates = Some((height, None));
-            return None;
+        let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+        let needed = height.saturating_sub(self.epoch_length);
+        if applied < needed {
+            tracing::warn!(
+                height,
+                applied,
+                needed,
+                "epoch boundary: execution has not applied the previous boundary yet — \
+                 validator-set plan not ready, refusing this boundary block for now"
+            );
+            return Err(EpochPlanNotReady);
         }
-
-        let epoch = EpochManager::epoch_for_block(height, self.epoch_length);
-
-        if let Err(e) = self.staking.apply_pending_rotations(epoch) {
-            tracing::error!(%e, "failed to apply pending key rotations");
-        }
-
-        let new_set = match EpochManager::compute_new_validator_set(
-            &self.staking,
-            self.max_validators,
-            epoch,
-        ) {
-            Ok(set) => set,
-            Err(e) => {
-                tracing::error!(%e, "failed to compute validator set at epoch boundary");
-                return None;
-            }
-        };
-
-        if let Err(e) = EpochManager::check_minimum_set(&new_set) {
-            tracing::error!(%e, "epoch rotation aborted: set too small");
-            return None;
-        }
-
-        let cap = EpochManager::safe_rotation_cap(self.last_validator_set.validators.len());
-        let capped_set = if cap > 0 {
-            EpochManager::apply_rotation_cap(&self.last_validator_set, new_set.clone(), cap)
-        } else {
-            new_set.clone()
-        };
-
-        // FIX 4 (S443): keep the rotation quorum-viable. If it would drop the active
-        // set below the BFT minimum while the previous set met it, re-seat the
-        // highest-priority departed validator(s) for quorum math (t15 suicide chain).
-        let capped_set =
-            EpochManager::enforce_minimum_floor(&self.last_validator_set, capped_set);
-
-        let diff = EpochManager::compute_validator_set_diff(&self.last_validator_set, &capped_set);
-        if diff.is_empty() {
-            self.last_validator_set = capped_set;
-            self.refresh_async_validate_validator_count();
-            self.cached_vs_updates = Some((height, None));
-            return None;
-        }
-
-        EpochManager::log_rotation(&self.last_validator_set, &capped_set, &diff, epoch);
-
-        if let Err(e) = EpochManager::update_validator_statuses(&self.staking, &capped_set) {
-            tracing::error!(%e, "failed to update validator statuses");
-        }
-
-        let mut updates = ValidatorSetUpdates::new();
-
-        for v in &diff.inserts {
-            if let Ok(vk) = VerifyingKey::from_bytes(&v.pubkey.0) {
-                updates.insert(vk, Power::new(v.power));
-            }
-        }
-
-        for addr in &diff.deletes {
-            if let Ok(Some(val)) = self.staking.get_validator(addr) {
-                if let Ok(vk) = VerifyingKey::from_bytes(&val.pubkey) {
-                    updates.delete(vk);
+        let plan = self.staking.epoch_rotation_plan(height).map_err(|e| {
+            tracing::error!(%e, height, "failed to read the epoch rotation plan");
+            EpochPlanNotReady
+        })?;
+        let updates = match plan {
+            Some(plan) if plan.changed => {
+                let mut updates = ValidatorSetUpdates::new();
+                for m in &plan.members {
+                    if let Ok(vk) = VerifyingKey::from_bytes(&m.pubkey) {
+                        updates.insert(vk, Power::new(m.power));
+                    }
                 }
-            }
-        }
-
-        for old_pk in &diff.rotated_out_pubkeys {
-            if let Ok(vk) = VerifyingKey::from_bytes(old_pk) {
-                updates.delete(vk);
-            }
-        }
-
-        for v in &diff.inserts {
-            let is_new = !self
-                .last_validator_set
-                .validators
-                .iter()
-                .any(|old| old.address == v.address);
-            if is_new {
-                tracing::warn!(
-                    epoch,
-                    validator = %v.address,
-                    "new active validator -- ensure peer connectivity for consensus messages"
+                for pk in &plan.deletes {
+                    if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                        updates.delete(vk);
+                    }
+                }
+                let epoch = EpochManager::epoch_for_block(height, self.epoch_length);
+                self.last_validator_set = plan.validator_set(epoch);
+                self.leader_state.sync_validators(&self.last_validator_set);
+                self.refresh_async_validate_validator_count();
+                tracing::info!(
+                    height,
+                    members = plan.members.len(),
+                    deletes = plan.deletes.len(),
+                    rotations = plan.rotations.len(),
+                    "epoch boundary: validator set from the execution plan"
                 );
+                Some(updates)
             }
-        }
-
-        tracing::info!(
-            epoch,
-            inserts = diff.inserts.len(),
-            deletes = diff.deletes.len(),
-            key_rotations = diff.rotated_out_pubkeys.len(),
-            active_set_size = capped_set.validators.len(),
-            "epoch boundary: validator set updated"
-        );
-        self.last_validator_set = capped_set;
-        self.leader_state.sync_validators(&self.last_validator_set);
-        self.refresh_async_validate_validator_count();
-        self.cached_vs_updates = Some((height, Some(updates.clone())));
-        Some(updates)
+            _ => None,
+        };
+        self.cached_vs_updates = Some((height, updates.clone()));
+        Ok(updates)
     }
 }
 
@@ -4820,7 +4851,12 @@ impl TorusApp {
             .insert(height, PendingProposal::new(torus_block));
         self.pending_proposals.retain(|&h, _| h + 10 > height);
 
-        let validator_set_updates = self.epoch_validator_set_updates(height);
+        let validator_set_updates = match self.epoch_validator_set_updates(height) {
+            Ok(updates) => updates,
+            // Bug (b): retry once execution applied the previous boundary
+            // (never blacklists a sync peer, never votes on a guess).
+            Err(EpochPlanNotReady) => return ValidateBlockResponse::MissingData,
+        };
         ValidateBlockResponse::Valid {
             app_state_updates: None,
             validator_set_updates,
@@ -4834,6 +4870,14 @@ impl TorusApp {
     /// hotstuff_rs). Each phase has its own `torus_block_build_*_seconds` timer
     /// nested inside `block_build_seconds` (s68).
     fn build_proposal(&mut self, parent_header: TorusBlockHeader) -> ProduceBlockResponse {
+        // Bug (b): a planned boundary block needs this node's execution at the
+        // previous boundary — check before touching the mempool.
+        let next_height = parent_header.height + 1;
+        if EpochManager::is_epoch_boundary(next_height, self.epoch_length)
+            && self.epoch_validator_set_updates(next_height).is_err()
+        {
+            return refused_proposal();
+        }
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
         // covers mempool selection, DA mirror, attestation, construction, encode.
         let build_timer = std::time::Instant::now();
@@ -4943,7 +4987,9 @@ impl TorusApp {
         let hash = Self::hash_datum(&encoded);
         drop(encode_span);
 
-        let validator_set_updates = self.epoch_validator_set_updates(height);
+        let Ok(validator_set_updates) = self.epoch_validator_set_updates(height) else {
+            return refused_proposal();
+        };
 
         if let Some(ref m) = self.metrics {
             m.block_build_seconds
@@ -5235,31 +5281,26 @@ impl App<RocksKVStore> for TorusApp {
             "SPECULATIVE ROLLBACK: leader equivocation detected"
         );
 
+        // Consensus bug (a), docs/plans/consensus-bug-a-equivocation.md: NO
+        // slash from local observation. Only replicas that received both
+        // proposals see this, and `evidence` (two hashes, no leader signatures)
+        // cannot be verified by anyone else — slashing here wrote different
+        // state on different replicas. The evidence stays persisted by
+        // hotstuff (`store_equivocation_evidence`); slashing needs on-chain,
+        // verifiable evidence (owner decision, see the plan).
         let leader_pubkey = evidence.leader.to_bytes();
-        let leader_addr = match self.staking.find_validator_by_pubkey(&leader_pubkey) {
-            Ok(Some(val)) => val.address,
-            Ok(None) => {
-                tracing::error!(
-                    leader_pubkey = ?leader_pubkey,
-                    "equivocation detected but validator not found -- cannot slash"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!(%e, "failed to look up validator for slashing");
-                return;
-            }
-        };
-
-        self.pending_slashes.push(PendingSlash {
-            validator: leader_addr,
-            fraction_bps: 500,
-            reason: SlashReason::DoubleSign,
-            tombstone: true,
-        });
-        tracing::info!(
-            %leader_addr,
-            "equivocation slash buffered (5% + tombstone) -- will apply on next committed block"
+        let leader_addr = self
+            .staking
+            .find_validator_by_pubkey(&leader_pubkey)
+            .ok()
+            .flatten()
+            .map(|v| v.address);
+        tracing::error!(
+            leader = ?leader_addr,
+            leader_pubkey = ?leader_pubkey,
+            view = %evidence.view.int(),
+            "leader equivocation observed locally -- NOT slashed (local evidence is not \
+             consensus state; needs on-chain evidence)"
         );
 
         tracing::info!(
@@ -8121,6 +8162,226 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Consensus bug (a), docs/plans/consensus-bug-a-equivocation.md: a leader
+    /// equivocation is seen only by replicas that received both proposals, and
+    /// the evidence carries no signatures (not verifiable by others). Two
+    /// replicas commit and execute the SAME block; only one observed the
+    /// equivocation first. Their consensus state must be identical.
+    ///
+    /// RED on main @ d623d3c: the observing replica buffered a 5% slash +
+    /// tombstone and wrote it while executing the next block it committed.
+    #[test]
+    fn equivocation_observed_by_one_node_does_not_change_its_state() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::{BlockHeight, ViewNumber};
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+
+        let leader_key = ed25519_dalek::SigningKey::from_bytes(&[91u8; 32]).verifying_key();
+        let leader = Address::repeat_byte(0x91);
+        let node = |observed: bool| {
+            let (config, db) = make_test_config_and_db();
+            let staking = StakingManager::new(db.clone());
+            let row = ValidatorState {
+                address: leader,
+                pubkey: leader_key.to_bytes(),
+                commission_bps: 500,
+                self_stake: torus_economics::MIN_SELF_DELEGATION,
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&leader, &row).unwrap();
+
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.exec_tx = Some(tx);
+            if observed {
+                let evidence = EquivocationEvidence {
+                    view: ViewNumber::new(7),
+                    leader: leader_key,
+                    block_a: CryptoHash::new([0xa1; 32]),
+                    block_b: CryptoHash::new([0xb2; 32]),
+                };
+                app.on_speculative_rollback(evidence.block_a, &evidence);
+            }
+            let datum = bincode::serialize(&make_block(1, vec![])).unwrap();
+            let committed = Block::new(
+                BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                CryptoHash::new(TorusApp::hash_datum(&datum)),
+                Data::new(vec![Datum::new(datum)]),
+            );
+            app.on_committed_block(&committed, committed.hash);
+            let msg = rx.try_recv().expect("committed block sent to execution");
+            drop(app);
+
+            let ctx = make_exec_ctx(&config, &db);
+            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, msg.durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            db
+        };
+        let (saw, did_not) = (node(true), node(false));
+
+        let row = |db: &StateDb| StakingManager::new(db.clone()).get_validator(&leader).unwrap();
+        assert_eq!(
+            format!("{:?}", row(&saw)),
+            format!("{:?}", row(&did_not)),
+            "validator row must not depend on what this replica observed"
+        );
+        let slash_records = |db: &StateDb| {
+            StateBackend::iterate_cf(db, torus_state::cf::CF_SLASH_RECORDS, None).unwrap()
+        };
+        assert_eq!(slash_records(&saw), slash_records(&did_not), "slash records");
+        assert!(slash_records(&saw).is_empty(), "no slash from local observation");
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&saw),
+            torus_state::running_hash::read_running_hash(&did_not),
+            "running state hash"
+        );
+    }
+
+    /// Hotstuff updates in canonical order: (sorted inserts, sorted deletes).
+    type CanonicalUpdates = Option<(Vec<([u8; 32], u64)>, Vec<[u8; 32]>)>;
+
+    fn canonical_updates(updates: Option<ValidatorSetUpdates>) -> CanonicalUpdates {
+        updates.map(|u| {
+            let mut ins: Vec<_> = u.inserts().map(|(k, p)| (k.to_bytes(), p.int())).collect();
+            let mut del: Vec<_> = u.deletes().map(|k| k.to_bytes()).collect();
+            ins.sort();
+            del.sort();
+            (ins, del)
+        })
+    }
+
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: two
+    /// replicas validate the same epoch-boundary blocks (4 and 8, epoch length
+    /// 4) while their execution lags by a different number of blocks; a
+    /// validator rotates its consensus key in block 2 (effective at epoch 1).
+    /// Both must hand hotstuff the same validator-set updates at every
+    /// boundary and end with the same staking rows, and the consensus thread
+    /// must write nothing.
+    ///
+    /// RED on main @ d623d3c: the consensus thread rotated the set from
+    /// whatever its execution had applied — the replica 1 block behind saw the
+    /// rotation at boundary 4, the one 3 blocks behind never did. GREEN:
+    /// boundary 4 has no plan (none), the execution of 4 plans 8 with the
+    /// rotated key, both replicas read it.
+    #[test]
+    fn epoch_rotation_identical_across_exec_lag() {
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+        let consensus_keys: Vec<[u8; 32]> = (1..=4u8)
+            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0x40 + i; 32]).verifying_key().to_bytes())
+            .collect();
+        let accounts: Vec<k256::ecdsa::SigningKey> = (1..=4u8)
+            .map(|i| k256::ecdsa::SigningKey::from_slice(&[0x50 + i; 32]).unwrap())
+            .collect();
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32]).verifying_key().to_bytes();
+        let rotate = torus_types::eip712::sign_native_action(
+            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            1,
+            &accounts[0],
+        );
+        let mut blocks: Vec<TorusBlock> = (1..=8)
+            .map(|h| make_block(h, if h == 2 { vec![rotate.clone()] } else { vec![] }))
+            .collect();
+        link_blocks(&mut blocks);
+
+        let node = |lag: u64| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let staking = StakingManager::new(db.clone());
+            for (key, pubkey) in accounts.iter().zip(&consensus_keys) {
+                let addr = k256_address(key);
+                let row = ValidatorState {
+                    address: addr,
+                    pubkey: *pubkey,
+                    commission_bps: 500,
+                    self_stake: U256::from(1_000u64) * U256::from(10u64).pow(U256::from(18u64)),
+                    total_delegated: U256::ZERO,
+                    status: ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                };
+                staking.put_validator(&addr, &row).unwrap();
+            }
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            let ctx = make_exec_ctx(&config, &db);
+            let mut next = 1u64;
+            let mut seen = Vec::new();
+            for boundary in [4u64, 8] {
+                while next + lag <= boundary {
+                    dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                    next += 1;
+                }
+                let before = dump_all_cfs(&db);
+                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
+                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                seen.push(canonical_updates(updates));
+            }
+            while next <= 8 {
+                dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                next += 1;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            drop(app);
+            let rows = StateBackend::iterate_cf(&db, torus_state::cf::CF_STAKING_VALIDATORS, None)
+                .unwrap();
+            let rotations = StateBackend::iterate_cf(
+                &db,
+                torus_state::cf::CF_CONSENSUS_META,
+                Some(b"pending_rotation:"),
+            )
+            .unwrap();
+            let pubkey0 = StakingManager::new(db.clone())
+                .get_validator(&k256_address(&accounts[0]))
+                .unwrap()
+                .unwrap()
+                .pubkey;
+            (seen, rows, rotations, pubkey0)
+        };
+        let (near, far) = (node(1), node(3));
+        assert_eq!(near.0, far.0, "hotstuff validator-set updates per boundary");
+        assert_eq!(near.1, far.1, "staking validator rows");
+        assert_eq!(near.2, far.2, "pending key rotations");
+
+        // The rotation really happened: none at 4 (first planned boundary, no
+        // plan), the rotated key installed / the old one removed at 8, the row
+        // carries it and the pending rotation is consumed.
+        assert_eq!(near.0[0], None);
+        let (ins, del) = near.0[1].clone().expect("plan for 8 changes the set");
+        assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
+        assert!(del.contains(&consensus_keys[0]), "{del:?}");
+        assert_eq!(near.3, rotated_key, "validator 0 row carries the rotated key");
+        assert!(near.2.is_empty(), "pending rotation consumed");
+    }
+
+    /// Bug (b): a replica whose execution has not applied the previous boundary
+    /// refuses the boundary block (validate -> `MissingData`, propose -> no
+    /// block) instead of answering from a different state; it answers once
+    /// execution catches up.
+    #[test]
+    fn epoch_rotation_plan_not_ready_until_previous_boundary_applied() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        let ctx = make_exec_ctx(&config, &db);
+        let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        for b in &blocks[..3] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(app.epoch_validator_set_updates(4).is_ok(), "boundary 4 needs applied >= 0");
+        assert!(app.epoch_validator_set_updates(8).is_err(), "applied 3 < 4");
+        let parent7 = make_block(7, vec![]).header;
+        assert!(app.build_proposal(parent7).data.vec().is_empty(), "leader refuses block 8");
+        dispatch_and_execute(&ctx, &db, &blocks[3]);
+        assert!(app.epoch_validator_set_updates(8).is_ok(), "applied 4: plan for 8 readable");
+        drop(ctx);
+    }
+
     /// PART 2 (P0 SAFETY, "commit means commit"): a SECOND, DIFFERENT block
     /// arriving at an already-applied height is a conflicting commit — it must
     /// latch the fail-stop, not be silently dropped by the `applied >= height`
@@ -10066,6 +10327,8 @@ mod crash_recovery_tests {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_section: false,
         }
     }
 
@@ -13789,16 +14052,23 @@ mod crash_recovery_tests {
         // (c) EVM bundle: the contract's storage slot (only reachable via the bundle).
         let storage = hashed_cf_id(CF_STORAGE).unwrap();
         assert_eq!(in_db(storage, CF_STORAGE, at(1)), 1, "slot 0 of the created contract");
-        // (a) slash at 2: the slash record (validator rows are excluded from
-        // the hash, review finding 2).
+        // (a) slash at 2: the slash record and the slashed / tombstoned
+        // validator row.
         let slashes = hashed_cf_id(CF_SLASH_RECORDS).unwrap();
         assert_eq!(in_db(slashes, CF_SLASH_RECORDS, at(2)), 1, "slash record");
-        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), None);
+        let validators = hashed_cf_id(CF_STAKING_VALIDATORS).unwrap();
+        assert_eq!(in_db(validators, CF_STAKING_VALIDATORS, at(2)), 1, "validator row");
         // 3 is empty: nothing hashed.
         assert!(at(3).is_empty(), "{:?}", at(3));
-        // (b) epoch boundary 4: no snapshot of consensus-thread state (review
-        // finding 2) — an empty boundary block hashes nothing.
-        assert!(at(4).is_empty(), "{:?}", at(4));
+        // (b) epoch boundary 4 (empty block): only what its execution wrote,
+        // which includes the validator-set plan for 8 (bug (b)); every entry
+        // equals the DB.
+        let plan8 = [b"epoch_vset:plan:".as_slice(), &8u64.to_be_bytes()].concat();
+        assert!(at(4).iter().any(|(_, k, _)| *k == plan8), "{:?}", at(4));
+        for (id, k, v) in at(4) {
+            let cf = torus_state::running_hash::HASHED_CFS.iter().find(|(i, _)| i == id).unwrap().1;
+            assert_eq!(&state_db.get_cf_raw(cf, k).unwrap(), v, "{cf} entry must equal the DB");
+        }
         // Restarts do not change the hash.
         let (db2, _) = run_out_of_batch_fixture(&[1, 2, 3]);
         assert_eq!(
@@ -14264,65 +14534,195 @@ mod crash_recovery_tests {
         assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_unverified"), 1.0);
     }
 
-    /// Review finding 2: the consensus thread's epoch-boundary writes (a key
-    /// rotation applied to the validator row, its pending row deleted) land
-    /// at VALIDATION time of the boundary block while execution may lag any
-    /// number of blocks. Two nodes that see that write at different points of
-    /// their execution — before block 4 (lagging by an epoch) vs right before
-    /// block 8 — hold the same hash: the hash never reads state the consensus
-    /// thread writes (no epoch snapshot) and never hashes the validator rows
-    /// it read-modify-writes (UpdateCommission at 6 rewrites the row with or
-    /// without the rotated pubkey depending on that timing; the final state
-    /// is identical).
-    #[test]
-    fn running_hash_consensus_thread_epoch_write_vs_lagging_exec_equal_across_nodes() {
-        use torus_state::running_hash::read_running_hash;
-        let keys = validator_keys();
-        let v0 = k256_address(&keys[0]);
+    /// Epoch / running-hash fixture validators: (account key, consensus key);
+    /// the 5th has half the stake (it leaves a 4-seat set).
+    fn epoch_fixture_validators() -> Vec<(k256::ecdsa::SigningKey, [u8; 32])> {
+        (1..=5u8)
+            .map(|i| {
+                (
+                    k256::ecdsa::SigningKey::from_slice(&[0x70 + i; 32]).unwrap(),
+                    ed25519_dalek::SigningKey::from_bytes(&[0x30 + i; 32]).verifying_key().to_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    /// Seed the fixture validators like a genesis: Active rows + the recorded
+    /// installed set.
+    fn seed_epoch_fixture(db: &StateDb, vals: &[(k256::ecdsa::SigningKey, [u8; 32])]) {
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+        let staking = StakingManager::new(db.clone());
+        for (i, (key, pubkey)) in vals.iter().enumerate() {
+            let addr = k256_address(key);
+            let tokens = if i == 4 { 500u64 } else { 1_000 };
+            let row = ValidatorState {
+                address: addr,
+                pubkey: *pubkey,
+                commission_bps: 500,
+                self_stake: U256::from(tokens) * U256::from(10u64).pow(U256::from(18u64)),
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&addr, &row).unwrap();
+        }
+        let set = EpochManager::compute_new_validator_set(&staking, u32::MAX, 0).unwrap();
+        staking.record_genesis_epoch_set(&set).unwrap();
+    }
+
+    /// Blocks 1..=8 (epoch length 4): validator 0 rotates its consensus key at
+    /// 2 (planned at 4, installed at 8), validator 1 changes its commission at
+    /// 6. Returns the blocks and the rotated key.
+    fn epoch_fixture_blocks(vals: &[(k256::ecdsa::SigningKey, [u8; 32])]) -> (Vec<TorusBlock>, [u8; 32]) {
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x3f; 32]).verifying_key().to_bytes();
+        let rotate = torus_types::eip712::sign_native_action(
+            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            1,
+            &vals[0].0,
+        );
         let commission = torus_types::eip712::sign_native_action(
             NativeAction::UpdateCommission { new_rate: 600 },
-            1_000,
-            &keys[0],
+            1,
+            &vals[1].0,
         );
         let mut blocks: Vec<TorusBlock> = (1..=8)
-            .map(|h| make_block(h, if h == 6 { vec![commission.clone()] } else { vec![] }))
+            .map(|h| {
+                make_block(
+                    h,
+                    match h {
+                        2 => vec![rotate.clone()],
+                        6 => vec![commission.clone()],
+                        _ => vec![],
+                    },
+                )
+            })
             .collect();
         link_blocks(&mut blocks);
-        let consensus_epoch_write = |db: &StateDb| {
-            let staking = StakingManager::new(db.clone());
-            let rot = staking.get_pending_rotation(&v0).unwrap().expect("rotation pending");
-            assert_eq!(staking.apply_pending_rotations(rot.effective_epoch).unwrap().len(), 1);
-        };
-        let node = |write_before: u64| {
+        (blocks, rotated_key)
+    }
+
+    /// Consensus bug (b) follow-up: `cf_staking_validators` is hashed. Three
+    /// replicas whose execution lags the consensus thread by 1, 2 and 4 blocks
+    /// at the boundaries 4 and 8 (key rotation installed at 8, validator 4
+    /// Active -> Candidate at 8, a commission change at 6) hand hotstuff the
+    /// same updates and record the identical per-height write sets and hash —
+    /// and those write sets carry the validator rows exactly as the DB holds
+    /// them. Replaces the consensus-thread-write test of review finding 2.
+    ///
+    /// RED before the re-inclusion: no validator-row entry in any write set.
+    #[test]
+    fn running_hash_epoch_rotation_identical_across_exec_lag_with_validator_rows() {
+        use torus_economics::types::ValidatorStatus;
+        use torus_state::cf::CF_STAKING_VALIDATORS;
+        use torus_state::running_hash::{hashed_cf_id, read_running_hash};
+        let vals = epoch_fixture_validators();
+        let (blocks, rotated_key) = epoch_fixture_blocks(&vals);
+        let node = |lag: u64| {
             let (mut config, db) = make_test_config_and_db();
             config.epoch_length = 4;
-            seed_active_validators(&db, &[&keys[0], &keys[1], &keys[2]]);
-            StakingManager::new(db.clone()).submit_key_rotation(v0, [0x99; 32], 1, 0).unwrap();
+            config.max_validators = 4;
+            seed_epoch_fixture(&db, &vals);
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            torus_state::running_hash::capture_begin(&db);
             let ctx = make_exec_ctx(&config, &db);
-            for b in &blocks {
-                if b.header.height == write_before {
-                    consensus_epoch_write(&db);
+            let mut next = 1u64;
+            let mut seen = Vec::new();
+            for boundary in [4u64, 8] {
+                while next + lag <= boundary {
+                    dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                    next += 1;
+                }
+                let before = dump_all_cfs(&db);
+                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
+                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                seen.push(canonical_updates(updates));
+            }
+            while next <= 8 {
+                dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
+                next += 1;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            drop(app);
+            let captured = torus_state::running_hash::capture_take(&db);
+            (seen, captured, read_running_hash(&db), db)
+        };
+        let nodes: Vec<_> = [1u64, 2, 4].into_iter().map(node).collect();
+        for (i, n) in nodes.iter().enumerate().skip(1) {
+            assert_eq!(n.0, nodes[0].0, "node {i}: hotstuff updates per boundary");
+            assert_eq!(n.1, nodes[0].1, "node {i}: per-height hashed write sets");
+            assert_eq!(n.2, nodes[0].2, "node {i}: running hash");
+        }
+        let (seen, captured, hash, db) = &nodes[0];
+        assert_eq!(*hash, Some(fold_captured(captured)));
+        assert_eq!(seen[0], None, "first boundary: no plan");
+        let (ins, del) = seen[1].clone().expect("plan for 8 changes the set");
+        assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
+        assert!(del.contains(&vals[0].1) && del.contains(&vals[4].1), "{del:?}");
+
+        let staking = StakingManager::new(db.clone());
+        let row = |i: usize| staking.get_validator(&k256_address(&vals[i].0)).unwrap().unwrap();
+        assert_eq!(row(0).pubkey, rotated_key);
+        assert_eq!(row(1).commission_bps, 600);
+        assert_eq!(row(4).status, ValidatorStatus::Candidate);
+        // The validator rows each height's execution wrote are hashed with the
+        // bytes the DB holds.
+        let id = hashed_cf_id(CF_STAKING_VALIDATORS).expect("validator rows are hashed");
+        let rows_at = |h: u64| -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+            captured
+                .iter()
+                .find(|(x, _)| *x == h)
+                .unwrap()
+                .1
+                .iter()
+                .filter(|e| e.0 == id)
+                .map(|(_, k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let db_row = |i: usize| {
+            let key = k256_address(&vals[i].0).to_vec();
+            let v = db.get_cf_raw(CF_STAKING_VALIDATORS, &key).unwrap();
+            (key, v)
+        };
+        assert!(rows_at(6).contains(&db_row(1)), "commission change at 6: {:?}", rows_at(6));
+        let at8 = rows_at(8);
+        assert!(at8.contains(&db_row(0)), "rotated key at 8: {at8:?}");
+        assert!(at8.contains(&db_row(4)), "status change at 8: {at8:?}");
+    }
+
+    /// Consensus bug (b) follow-up: a validator row corrupted on one node (1
+    /// wei of self-stake, below any power / plan effect) diverges its running
+    /// hash at the next execution write of that row (the commission change at
+    /// 6). RED before the re-inclusion: identical hashes.
+    #[test]
+    fn running_hash_corrupted_validator_row_diverges() {
+        use torus_state::running_hash::read_running_hash;
+        let vals = epoch_fixture_validators();
+        let (blocks, _) = epoch_fixture_blocks(&vals);
+        let node = |corrupt: bool| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            config.max_validators = 4;
+            seed_epoch_fixture(&db, &vals);
+            let ctx = make_exec_ctx(&config, &db);
+            for b in &blocks[..7] {
+                if corrupt && b.header.height == 6 {
+                    let staking = StakingManager::new(db.clone());
+                    let addr = k256_address(&vals[1].0);
+                    let mut v = staking.get_validator(&addr).unwrap().unwrap();
+                    v.self_stake += U256::from(1u64);
+                    staking.put_validator(&addr, &v).unwrap();
                 }
                 dispatch_and_execute(&ctx, &db, b);
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {}", b.header.height);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
             }
             drop(ctx);
-            db
+            read_running_hash(&db)
         };
-        let lagging = node(4);
-        let on_time = node(8);
-        let v = StakingManager::new(lagging.clone()).get_validator(&v0).unwrap().unwrap();
-        assert_eq!((v.commission_bps, v.pubkey), (600, [0x99; 32]), "both writes applied");
-        let vals = |db: &StateDb| {
-            StateBackend::iterate_cf(db, torus_state::cf::CF_STAKING_VALIDATORS, None).unwrap()
-        };
-        assert_eq!(vals(&lagging), vals(&on_time), "identical final validator state");
-        assert_eq!(read_running_hash(&lagging).map(|(h, _)| h), Some(8));
-        assert_eq!(
-            read_running_hash(&lagging),
-            read_running_hash(&on_time),
-            "the hash does not depend on when the consensus thread wrote"
-        );
+        let (clean, corrupted) = (node(false), node(true));
+        assert_eq!(clean.map(|(h, _)| h), Some(7));
+        assert_ne!(clean, corrupted, "a corrupted validator row must change the hash");
     }
 
     /// Review finding 3: an attestation admitted to the mempool but dropped
@@ -14463,9 +14863,9 @@ mod crash_recovery_tests {
 
     /// Review test gap: an EVM tx that calls a WRITER precompile (CoreWriter,
     /// 0x0810) through a contract, end to end on the committed-block path:
-    /// the precompile's native side effect (a core-writer queue row, made
-    /// durable per tx OUTSIDE the flush batch) enters `D(n)` of its height
-    /// with the value the DB holds.
+    /// the precompile's native side effect (a core-writer queue row, since bug
+    /// (c) the EVM prefix of the block's flush batch, not in its overlay)
+    /// enters `D(n)` of its height with the value the DB holds.
     #[test]
     fn running_hash_captures_evm_writer_precompile_side_effects_end_to_end() {
         use torus_state::cf::CF_CORE_WRITER_QUEUE;
@@ -14519,6 +14919,71 @@ mod crash_recovery_tests {
             "the precompile's queue row is in D(1)"
         );
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
+    }
+
+    /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
+    /// a node executes `block` once; another node stops right after the EVM
+    /// section of its first attempt (a hard crash before the native flush) and
+    /// re-executes the block after the restart (fresh exec context, durable
+    /// applied-height marker below the block). Every column family must end
+    /// identical. RED on main @ d623d3c: the EVM bundle was durable before the
+    /// native flush, so the replay re-ran the txs on top of their own result.
+    fn assert_crash_after_evm_section_replays_identically(
+        block: &TorusBlock,
+        key: &k256::ecdsa::SigningKey,
+    ) {
+        let node = |crash: bool| {
+            let (config, db) = make_test_config_and_db();
+            let funded = revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            };
+            db.put_account(&k256_address(key), &funded).unwrap();
+            let durable = persist_committed_block_durably(&db, block);
+            if crash {
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.test_crash_after_evm_section = true;
+                ctx.execute_committed_block_with(block, vec![], durable);
+                drop(ctx);
+                assert_eq!(read_native_applied_height(&db), None, "crashed before the flush");
+            }
+            let ctx = make_exec_ctx(&config, &db);
+            ctx.execute_committed_block_with(block, vec![], durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(block.header.height));
+            db
+        };
+        let (clean, crashed) = (node(false), node(true));
+        for ((cf, a), (_, b)) in dump_all_cfs(&clean).iter().zip(dump_all_cfs(&crashed).iter()) {
+            assert_eq!(a, b, "{cf} differs after the crash + replay");
+        }
+    }
+
+    /// Bug (c): the replay must not lose the block's fee revenue (treasury /
+    /// dev-pool credits) nor re-run a tx on its own committed nonce.
+    #[test]
+    fn evm_crash_between_evm_and_native_flush_replays_identically() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[63u8; 32]).unwrap();
+        let mut b1 = make_block(1, vec![]);
+        b1.evm_transactions = vec![signed_sstore_create(&key, 0)];
+        b1.header.evm_tx_count = 1;
+        assert_crash_after_evm_section_replays_identically(&b1, &key);
+    }
+
+    /// Bug (c): `[nonce 1, nonce 0]` — the first tx is skipped as nonce-too-high
+    /// on the real execution; on a replay over the committed bundle it would be
+    /// valid and run (a second contract, a second fee).
+    #[test]
+    fn evm_crash_after_evm_section_skipped_tx_not_revived() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[64u8; 32]).unwrap();
+        let mut b1 = make_block(1, vec![]);
+        b1.evm_transactions = vec![signed_sstore_create(&key, 1), signed_sstore_create(&key, 0)];
+        b1.header.evm_tx_count = 2;
+        assert_crash_after_evm_section_replays_identically(&b1, &key);
     }
 
     #[test]

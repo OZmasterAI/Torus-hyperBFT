@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, U256};
 use revm::state::AccountInfo;
 use tempfile::TempDir;
 
-use torus_economics::StakingManager;
+use torus_economics::{EpochManager, StakingManager};
 use torus_state::{SnapshotConfig, SnapshotManager, SnapshotMetadata, StateDb};
 use torus_types::{NativeAction, PublicKey};
 
@@ -311,11 +311,10 @@ fn key_rotation_submit_and_apply() {
     assert!(pending.is_some());
     assert_eq!(pending.unwrap().new_pubkey, new_pubkey);
 
-    // Apply at epoch 1
-    let applied = staking.apply_pending_rotations(1).unwrap();
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].0, validator);
-    assert_eq!(applied[0].1, new_pubkey);
+    // Planned for the epoch-1 boundary (epoch length 100), applied there.
+    let plan = EpochManager::plan_rotation(&staking, 21, 100, 100).unwrap();
+    assert_eq!(plan.rotations, vec![(validator.0 .0, new_pubkey)]);
+    EpochManager::apply_rotation_plan(&staking, &plan).unwrap();
 
     // Verify key changed
     let val = staking.get_validator(&validator).unwrap().unwrap();
@@ -410,9 +409,10 @@ fn key_rotation_not_applied_at_wrong_epoch() {
         .submit_key_rotation(validator, [2u8; 32], 0, 50)
         .unwrap();
 
-    // Apply at epoch 0 — should not apply
-    let applied = staking.apply_pending_rotations(0).unwrap();
-    assert!(applied.is_empty());
+    // A plan for an epoch-0 height does not apply it.
+    let plan = EpochManager::plan_rotation(&staking, 21, 50, 100).unwrap();
+    assert!(plan.rotations.is_empty());
+    EpochManager::apply_rotation_plan(&staking, &plan).unwrap();
 
     // Key should still be old
     let val = staking.get_validator(&validator).unwrap().unwrap();

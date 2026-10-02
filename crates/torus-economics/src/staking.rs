@@ -1057,46 +1057,6 @@ impl<T: StateBackend> StakingManager<T> {
         Ok(())
     }
 
-    /// Apply all pending key rotations for the given epoch. Called at epoch boundary.
-    /// Returns the list of validators whose keys were rotated.
-    /// Apply all pending key rotations for the given epoch. Called at epoch boundary.
-    ///
-    /// FIX CONS-FIND-09: This function deletes rotations from DB. The caller
-    /// (epoch_validator_set_updates) MUST cache results per height to prevent
-    /// double-application when called from both produce_block and validate_block.
-    pub fn apply_pending_rotations(&self, epoch: u64) -> Result<Vec<(Address, [u8; 32])>> {
-        let mut applied = Vec::new();
-
-        // Scan all pending rotations
-        let rotations = self.all_pending_rotations()?;
-
-        for rotation in rotations {
-            if rotation.effective_epoch == epoch {
-                // Apply: update the validator's pubkey
-                let mut val = match self.get_validator(&rotation.validator)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let old_pubkey = val.pubkey;
-                val.pubkey = rotation.new_pubkey;
-                self.put_validator(&rotation.validator, &val)?;
-
-                // Remove the pending rotation
-                self.delete_pending_rotation(&rotation.validator)?;
-
-                applied.push((rotation.validator, rotation.new_pubkey));
-                tracing::info!(
-                    validator = %rotation.validator,
-                    old_pubkey = hex::encode(old_pubkey),
-                    new_pubkey = hex::encode(rotation.new_pubkey),
-                    "key rotation applied at epoch {epoch}"
-                );
-            }
-        }
-
-        Ok(applied)
-    }
-
     /// Get a pending key rotation for a validator.
     pub fn get_pending_rotation(&self, addr: &Address) -> Result<Option<PendingKeyRotation>> {
         let key = pending_rotation_key(addr);
@@ -1116,13 +1076,13 @@ impl<T: StateBackend> StakingManager<T> {
         Ok(())
     }
 
-    fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
+    pub(crate) fn delete_pending_rotation(&self, addr: &Address) -> Result<()> {
         let key = pending_rotation_key(addr);
         self.state.delete_cf_raw(CF_CONSENSUS_META, &key)?;
         Ok(())
     }
 
-    fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
+    pub(crate) fn all_pending_rotations(&self) -> Result<Vec<PendingKeyRotation>> {
         let prefix = b"pending_rotation:";
         let entries = self.state.iterate_cf(CF_CONSENSUS_META, Some(prefix))?;
         let mut rotations = Vec::new();
@@ -1196,12 +1156,6 @@ fn pending_rotation_key(addr: &Address) -> Vec<u8> {
     let mut key = b"pending_rotation:".to_vec();
     key.extend_from_slice(addr.as_slice());
     key
-}
-
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-    }
 }
 
 // ============================================================================

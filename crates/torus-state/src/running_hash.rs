@@ -26,15 +26,12 @@ pub type WriteEntry = (u8, Vec<u8>, Option<Vec<u8>>);
 /// `cf_book_order_rows`, trade CFs, DA pending / shards, all trie / hashed
 /// CFs, and every `cf_consensus_meta` key outside [`META_CONSENSUS_PREFIXES`].
 ///
-/// Also excluded (consensus state, but not deterministic per height — tied to
-/// the pre-existing bug "epoch rotation on the consensus thread"):
-/// `cf_staking_validators` (id 8, RESERVED — never reuse). The consensus
-/// thread read-modify-writes whole validator rows (status, rotated pubkey)
-/// at proposal / validation time of an epoch boundary block, while the
-/// execution thread may lag by any number of blocks; every execution-time
-/// write of a validator row (commission, stake, jail, slash) therefore
-/// carries consensus-thread fields whose visibility depends on timing. Re-add
-/// it (new id) once epoch rotation runs at execution of the boundary block.
+/// `cf_staking_validators` (id 8): excluded while the consensus thread rotated
+/// the validator set at proposal / validation time (consensus bug (b)); since
+/// every validator-row write happens at execution, inside the block's flush
+/// (epoch rotation included: `torus_economics::epoch_plan`), it is hashed. Id
+/// 8 is reused for it rather than a new id: no chain ever hashed id 8 (no
+/// live chain; every chain starts from a fresh genesis).
 pub const HASHED_CFS: &[(u8, &str)] = &[
     (1, CF_NATIVE_POSITIONS),
     (2, CF_NATIVE_BALANCES),
@@ -43,7 +40,7 @@ pub const HASHED_CFS: &[(u8, &str)] = &[
     (5, CF_NATIVE_ORACLE),
     (6, CF_NATIVE_NONCES),
     (7, CF_NATIVE_ORDERS),
-    // 8: cf_staking_validators — excluded, id reserved (see above).
+    (8, CF_STAKING_VALIDATORS),
     (9, CF_STAKING_DELEGATIONS),
     (10, CF_STAKING_PERMANENT),
     (11, CF_STAKING_REWARDS),
@@ -77,11 +74,11 @@ pub const NODE_LOCAL_MARKET_KEYS: &[&[u8]] = &[b"__book_mode__"];
 /// The only consensus keys inside `cf_consensus_meta` (the rest is the
 /// hotstuff block tree and node-local markers): pending key rotations
 /// (`staking.rs` `pending_rotation_key`) and the validator whitelist
-/// (`governance.rs` `whitelist_key`). Only EXECUTION writes of them are
-/// hashed: the consensus thread's epoch-boundary deletion of applied
-/// rotations is out of batch and timing-dependent (see [`HASHED_CFS`]), so
-/// it is not.
-pub const META_CONSENSUS_PREFIXES: &[&[u8]] = &[b"pending_rotation:", b"validator_whitelist:"];
+/// (`governance.rs` `whitelist_key`), and the execution-computed
+/// validator-set plans `epoch_vset:` (consensus bug (b),
+/// `torus_economics::EPOCH_VSET_PREFIX`). All are written only by execution.
+pub const META_CONSENSUS_PREFIXES: &[&[u8]] =
+    &[b"pending_rotation:", b"validator_whitelist:", b"epoch_vset:"];
 
 /// Hash `cf_id` of a column family, `None` if the CF is never hashed.
 pub fn hashed_cf_id(cf: &str) -> Option<u8> {
@@ -484,11 +481,9 @@ mod tests {
         ] {
             assert_eq!(hashed_cf_id(derived), None, "{derived} must not be hashed");
         }
-        // Review finding 2: validator rows are read-modify-written by the
-        // consensus thread at epoch boundaries (timing-dependent): excluded,
-        // and their id 8 is never reused.
-        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), None);
-        assert!(!ids.contains(&8), "cf_id 8 is reserved");
+        // Consensus bug (b) follow-up: validator rows are written only by
+        // execution, inside the flush batch: hashed under id 8.
+        assert_eq!(hashed_cf_id(CF_STAKING_VALIDATORS), Some(8));
     }
 
     fn golden_writes() -> Vec<WriteEntry> {
