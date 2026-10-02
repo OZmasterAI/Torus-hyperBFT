@@ -267,7 +267,7 @@ EXCEPT the rows marked **OUT** below.
 | cf_native_markets | consensus, except key `__book_mode__` (node-local wrong-flag marker, `native_executor.rs:2537`) | overlay (`save_order_books` tail `:2683-2703`, `save_order_books_deferred` `:2873-2891`, governance market params) | yes |
 | cf_native_orders | consensus (no live writer found) | — | — |
 | cf_native_nonces | consensus | overlay `app.rs:2038-2044` | yes |
-| cf_staking_validators, cf_staking_delegations, cf_staking_permanent, cf_staking_rewards, cf_slash_records, cf_jail_votes | consensus (cf_staking_validators NOT hashed, see Deviation 8) | overlay (StakingManager over the overlay inside `NativeExecContext`) | yes |
+| cf_staking_validators, cf_staking_delegations, cf_staking_permanent, cf_staking_rewards, cf_slash_records, cf_jail_votes | consensus (cf_staking_validators hashed again since Deviation 16; excluded by Deviation 8 before) | overlay (StakingManager over the overlay inside `NativeExecContext`) | yes |
 |  |  | **OUT (a)** buffered equivocation slashes: `StakingManager<StateDb>::slash` + `tombstone_validator` straight to the DB at exec start (`app.rs:1532-1567`) | **no** |
 |  |  | **OUT (b)** epoch rotation on the CONSENSUS thread: `apply_pending_rotations` (`app.rs:4094`) and `update_validator_statuses` (`app.rs:4138`, `epoch.rs:365`) from `build_proposal` / `finish_validate` (`app.rs:4722, 4845`), straight to the DB, at proposal/validation time of the boundary block, not at its execution | **no** |
 | cf_governance_proposals, cf_governance_votes, cf_fee_config, cf_treasury, cf_dev_pool | consensus | overlay (governance, fee split, rewards, dev pool) | yes |
@@ -300,8 +300,9 @@ flushed later, so this is the block's final value per key).
 - **(b) Consensus-thread epoch rotation**: timing is not tied to execution, so
   the writes themselves cannot be attributed to a height. ~~Snapshot at the
   boundary block's execution~~ (superseded after the independent review, see
-  Deviation 8): these writes are NOT hashed, and `cf_staking_validators` is
-  excluded from the hash, until bug (b) is fixed on main.
+  Deviation 8): these writes were NOT hashed, and `cf_staking_validators` was
+  excluded from the hash. Gone since the bug (b) fix (Deviation 16): the
+  rotation runs at execution of the boundary block, inside its flush.
 - **(c) EVM bundle**: deterministic (exec thread, serial path). The bundle's
   plain-state writes (same mapping as `apply_bundle_plain`) are added to the
   EVM domain of `D(n)`. Crash window (pre-existing): the EVM batch can be durable
@@ -330,8 +331,9 @@ deletes the row at restart and fails unless the key is excluded.
    consensus decision. `__next_global_order_id__` stays hashed (it decides order
    ids).
 2. `cf_consensus_meta` is hashed only for the consensus key prefixes
-   `pending_rotation:` and `validator_whitelist:` (Task 0); the rest of the CF is
-   the hotstuff block tree and node-local markers.
+   `pending_rotation:`, `validator_whitelist:` (Task 0) and `epoch_vset:`
+   (bug (b) validator-set plans); the rest of the CF is the hotstuff block tree
+   and node-local markers.
 3. The serial marker-only path (`app.rs`, block without native flush) now writes
    the applied-height marker through the hashed flush
    (`FrozenPending::marker_only` + `flush_with_native_trie_stats`) instead of a
@@ -372,8 +374,7 @@ deletes the row at restart and fails unless the key is excluded.
    batch and not hashed). Re-include the validator CF (new id, coordinated upgrade)
    once epoch rotation runs at execution of the boundary block. Coverage lost:
    validator self-stake / commission / jail fields (delegations, slash records,
-   jail votes, rewards stay covered). Test:
-   `running_hash_consensus_thread_epoch_write_vs_lagging_exec_equal_across_nodes`.
+   jail votes, rewards stay covered). Superseded by Deviation 16.
 9. **Review finding 1 — activation is a CHAIN-WIDE genesis field.** New genesis
    `consensus.state_hash_activation_height` -> `ChainConfig.state_hash_activation_height`
    (absent = running hash disabled; 0 rejected by `ChainConfig::validate`), copied at
@@ -415,6 +416,16 @@ deletes the row at restart and fails unless the key is excluded.
     `attest_state_hash_takes_the_serial_path` replaces the serial-vs-parallel engine
     differential that could not fail. `AttestStateHash` added to the client EIP-712
     fixture (`crates/torus-types/tests/fixtures/eip712_vectors.json`).
+16. **`cf_staking_validators` hashed again (s84, after consensus bug (b)).** Epoch
+    rotation now runs at execution of the boundary block (execution-computed
+    plans, `docs/plans/consensus-bug-b-epoch-race.md`, always on from genesis);
+    the consensus thread writes no consensus state. Every validator-row write is
+    in the block's flush batch (slashes: out-of-batch recorder, same height), so
+    the CF is hashed whenever the running hash is active, under the reserved
+    `cf_id` 8 (no chain ever hashed id 8; no live chain to stay compatible
+    with). Tests: `running_hash_covers_validator_rows`,
+    `running_hash_epoch_rotation_identical_across_exec_lag_with_validator_rows`
+    (replaces the Deviation 8 test), `running_hash_corrupted_validator_row_diverges`.
 
 ## Implementation status (s83)
 
@@ -428,15 +439,15 @@ Task 3 (the hashed flush needs it); its tests were verified by mutation.
 
 - Pre-existing consensus divergence sources the hash will now report (correctly):
   locally observed equivocation slashes (`on_speculative_rollback`) applied to
-  whichever block a node dispatches next; consensus-thread epoch rotation racing
-  with execution lag > 1 epoch; EVM crash window (bundle durable, native batch
-  not) re-executing EVM on its own post-state at replay.
+  whichever block a node dispatches next (no producer since bug (a)); EVM crash
+  window (bundle durable, native batch not) re-executing EVM on its own
+  post-state at replay (closed by bug (c): one flush batch). Consensus-thread
+  epoch rotation: gone (bug (b)).
 - Activation is chain-wide (genesis). A node whose DB is above the activation
   height when it upgrades (or that loses a hashed flush) stays hash-unverified
   until resynced from genesis or from a snapshot of a verified node (snapshots
   copy the META hash); it does not attest, so on a 3-validator net it prevents a
   quorum hash while unverified.
-- Validator rows are not covered until bug (b) is fixed (Deviation 8).
 - The resubmit window uses the local wall clock; with clock skew beyond 5 s a
   node may resubmit while its previous signature can still land elsewhere
   (harmless: first vote wins on-chain, the second action fails).
