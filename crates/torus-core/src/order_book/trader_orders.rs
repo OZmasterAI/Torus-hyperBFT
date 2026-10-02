@@ -248,4 +248,52 @@ mod tests {
     fn small_footprint() {
         assert!(std::mem::size_of::<TraderOrders>() <= 32);
     }
+
+    /// Release probe: the s84 cell's lists between two cancel-alls (70k
+    /// (trader, book) lists of Poisson(~2.7) ids: 250 senders x 800 orders
+    /// over 300 books), filled by `push`, then emptied by `into_vec` as
+    /// `cancel_all` does.
+    ///   cargo test --release -p torus-core --lib trader_orders::tests::push_growth_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "release cost probe"]
+    fn push_growth_cost() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        const LISTS: u64 = 250 * 300;
+        let mut lens = vec![0usize; LISTS as usize];
+        for _ in 0..250 * 800 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            lens[(x % LISTS) as usize] += 1;
+        }
+        lens.retain(|&n| n > 0);
+        let mut ms = Vec::new();
+        for _ in 0..41 {
+            let t0 = std::time::Instant::now();
+            let mut lists: Vec<TraderOrders> = Vec::with_capacity(lens.len());
+            let mut id: OrderId = 1;
+            // Round-robin over the lists, as interleaved batches fill books.
+            let rounds = *lens.iter().max().unwrap();
+            lists.resize_with(lens.len(), TraderOrders::default);
+            for r in 0..rounds {
+                for (list, &n) in lists.iter_mut().zip(&lens) {
+                    if r < n {
+                        list.push(id);
+                        id += 1;
+                    }
+                }
+            }
+            let total: usize = lists.into_iter().map(|l| l.into_vec().len()).sum();
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(total, 250 * 800);
+        }
+        ms.sort_by(f64::total_cmp);
+        let over4 = lens.iter().filter(|&&n| n > 4).count();
+        println!(
+            "{} lists ({over4} over 4 ids), 200k pushes + into_vec: min {:.2} ms, median {:.2} ms",
+            lens.len(),
+            ms[0],
+            ms[20]
+        );
+    }
 }
