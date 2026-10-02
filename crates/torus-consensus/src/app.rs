@@ -5236,30 +5236,18 @@ impl App<RocksKVStore> for TorusApp {
         );
 
         let leader_pubkey = evidence.leader.to_bytes();
-        let leader_addr = match self.staking.find_validator_by_pubkey(&leader_pubkey) {
-            Ok(Some(val)) => val.address,
-            Ok(None) => {
-                tracing::error!(
-                    leader_pubkey = ?leader_pubkey,
-                    "equivocation detected but validator not found -- cannot slash"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!(%e, "failed to look up validator for slashing");
-                return;
-            }
-        };
-
-        self.pending_slashes.push(PendingSlash {
-            validator: leader_addr,
-            fraction_bps: 500,
-            reason: SlashReason::DoubleSign,
-            tombstone: true,
-        });
-        tracing::info!(
-            %leader_addr,
-            "equivocation slash buffered (5% + tombstone) -- will apply on next committed block"
+        let leader_addr = self
+            .staking
+            .find_validator_by_pubkey(&leader_pubkey)
+            .ok()
+            .flatten()
+            .map(|v| v.address);
+        tracing::error!(
+            leader = ?leader_addr,
+            leader_pubkey = ?leader_pubkey,
+            view = %evidence.view.int(),
+            "leader equivocation observed locally -- NOT slashed (local evidence is not \
+             consensus state; needs on-chain evidence)"
         );
 
         tracing::info!(
@@ -8118,6 +8106,86 @@ mod crash_recovery_tests {
         assert!(
             app.is_exec_failed(),
             "on_fatal_safety_violation must latch the fail-stop so the node halts"
+        );
+    }
+
+    /// Consensus bug (a), docs/plans/consensus-bug-a-equivocation.md: a leader
+    /// equivocation is seen only by replicas that received both proposals, and
+    /// the evidence carries no signatures (not verifiable by others). Two
+    /// replicas commit and execute the SAME block; only one observed the
+    /// equivocation first. Their consensus state must be identical.
+    ///
+    /// RED on main @ d623d3c: the observing replica buffered a 5% slash +
+    /// tombstone and wrote it while executing the next block it committed.
+    #[test]
+    fn equivocation_observed_by_one_node_does_not_change_its_state() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::{BlockHeight, ViewNumber};
+        use torus_economics::types::{ValidatorState, ValidatorStatus};
+
+        let leader_key = ed25519_dalek::SigningKey::from_bytes(&[91u8; 32]).verifying_key();
+        let leader = Address::repeat_byte(0x91);
+        let node = |observed: bool| {
+            let (config, db) = make_test_config_and_db();
+            let staking = StakingManager::new(db.clone());
+            let row = ValidatorState {
+                address: leader,
+                pubkey: leader_key.to_bytes(),
+                commission_bps: 500,
+                self_stake: torus_economics::MIN_SELF_DELEGATION,
+                total_delegated: U256::ZERO,
+                status: ValidatorStatus::Active,
+                jailed_until: None,
+                last_commission_change_block: None,
+            };
+            staking.put_validator(&leader, &row).unwrap();
+
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.exec_tx = Some(tx);
+            if observed {
+                let evidence = EquivocationEvidence {
+                    view: ViewNumber::new(7),
+                    leader: leader_key,
+                    block_a: CryptoHash::new([0xa1; 32]),
+                    block_b: CryptoHash::new([0xb2; 32]),
+                };
+                app.on_speculative_rollback(evidence.block_a, &evidence);
+            }
+            let datum = bincode::serialize(&make_block(1, vec![])).unwrap();
+            let committed = Block::new(
+                BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                CryptoHash::new(TorusApp::hash_datum(&datum)),
+                Data::new(vec![Datum::new(datum)]),
+            );
+            app.on_committed_block(&committed, committed.hash);
+            let msg = rx.try_recv().expect("committed block sent to execution");
+            drop(app);
+
+            let ctx = make_exec_ctx(&config, &db);
+            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, msg.durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            db
+        };
+        let (saw, did_not) = (node(true), node(false));
+
+        let row = |db: &StateDb| StakingManager::new(db.clone()).get_validator(&leader).unwrap();
+        assert_eq!(
+            format!("{:?}", row(&saw)),
+            format!("{:?}", row(&did_not)),
+            "validator row must not depend on what this replica observed"
+        );
+        let slash_records = |db: &StateDb| {
+            StateBackend::iterate_cf(db, torus_state::cf::CF_SLASH_RECORDS, None).unwrap()
+        };
+        assert_eq!(slash_records(&saw), slash_records(&did_not), "slash records");
+        assert!(slash_records(&saw).is_empty(), "no slash from local observation");
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&saw),
+            torus_state::running_hash::read_running_hash(&did_not),
+            "running state hash"
         );
     }
 
