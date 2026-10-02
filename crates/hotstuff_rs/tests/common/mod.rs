@@ -14,4 +14,6 @@ pub(crate) mod number_app;
 
 pub(crate) mod poll;
 
+pub(crate) mod signature_log;
+
 pub(crate) mod verifying_key_bytes;

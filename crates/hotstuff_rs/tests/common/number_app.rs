@@ -54,6 +54,29 @@ pub(crate) struct NumberApp {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     produce_delay: Duration,
     validate_delay: Duration,
+    poison: Option<Arc<Mutex<PoisonedBlock>>>,
+}
+
+/// s84 wedge repro: the FIRST block at `height` that any replica sharing this
+/// cell validates becomes poisoned, and every such replica then rejects that
+/// block (and only that block) as `Invalid` on every later validation. Its
+/// proposer self-inserts without validating, so it alone holds the block —
+/// a block that is certified (votes are cast on the header) yet invalid for
+/// the other validators.
+pub(crate) struct PoisonedBlock {
+    pub(crate) height: u64,
+    pub(crate) hash: Option<CryptoHash>,
+    pub(crate) rejections: u64,
+}
+
+impl PoisonedBlock {
+    pub(crate) fn at_height(height: u64) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            height,
+            hash: None,
+            rejections: 0,
+        }))
+    }
 }
 
 /// User-sent instructions that number app execute in [`produce_block`](App::produce_block) and
@@ -118,7 +141,31 @@ impl NumberApp {
             tx_queue,
             produce_delay,
             validate_delay,
+            poison: None,
         }
+    }
+
+    /// Share the s84 [`PoisonedBlock`] cell with this app.
+    pub(crate) fn with_poison(mut self, poison: Option<Arc<Mutex<PoisonedBlock>>>) -> Self {
+        self.poison = poison;
+        self
+    }
+
+    /// `true` if `block` is the poisoned block (claiming the poison on the first
+    /// block validated at the poisoned height).
+    fn is_poisoned(&self, block: &Block) -> bool {
+        let Some(poison) = &self.poison else {
+            return false;
+        };
+        let mut poison = poison.lock().unwrap();
+        if block.height.int() != poison.height {
+            return false;
+        }
+        let poisoned = *poison.hash.get_or_insert(block.hash) == block.hash;
+        if poisoned {
+            poison.rejections += 1;
+        }
+        poisoned
     }
 
     /// Return an `AppStateUpdates` that when applied on an empty app state will produce a good "initial"
@@ -198,7 +245,7 @@ impl App<MemDB> for NumberApp {
             CryptoHash::new(bytes)
         };
 
-        if request.proposed_block().data_hash != data_hash {
+        if request.proposed_block().data_hash != data_hash || self.is_poisoned(request.proposed_block()) {
             ValidateBlockResponse::Invalid
         } else {
             let initial_number = u32::from_le_bytes(
