@@ -1,6 +1,7 @@
 # Design: market scaling and Hyperliquid-style in-memory execution (item 6)
 
 Status: DESIGN, read-only research. No code changed, nothing built or benched.
+All 16 owner decisions are made (s84, 2026-10-03): see section 9.
 Base: `main` @ 199bdc9. All `file:line` references are for that commit.
 Owner requirements: memories item6 part 1/3, 2/3, 3/3 (s84). Hyperliquid
 facts: memory 8d03fdac (s82/s83 research), marked by source below.
@@ -121,7 +122,10 @@ write (`app.rs:2214-2220`). Empty blocks write only the marker
   (`app.rs:4774`); epoch-boundary validator-set plans need the durable
   applied height >= H-L (bug b design). Note: the session lookup reads
   whatever height execution has reached on that node, so its verdict depends
-  on execution progress; worth a separate look.
+  on execution progress. Already fixed on `fix/vote-after-body` (b6f6aca,
+  not yet on main): validate no longer checks signatures or sessions; they
+  are resolved at execution (`app.rs` ~1850-1872 there), and an invalid
+  action is skipped and recorded instead of rejecting the block.
 - `--rpc-only` nodes run the same `TorusApp` with execution
   (`main.rs:159-162`, `:601-612`); they differ only in not voting.
 - Pruner: deletes `cf_block_bodies` and `cf_receipts` below
@@ -670,6 +674,30 @@ D16. Rollout.
 - b) Direct switch.
 - Recommendation: a.
 
+## 9. Owner decisions (s84, 2026-10-03)
+
+| # | Decision |
+|---|---|
+| D1 | b: build order 1 -> 3 -> 4 -> 2 -> 5, re-profile after Phase 1 |
+| D2 | a: raw-bytes resident layer for Phase 1. HL's typed in-memory structure is the end state (Phase 5), not the next step |
+| D3 | a: complete residency, no LRU (as HL: whole state in RAM) |
+| D4 | a: one record per trader in memory only, timed with `feat/liquidation` |
+| D5 | b: coalesced checkpoints + replay by re-execution |
+| D6 | b: ~30 s of execution time, forced at EVM, epoch-boundary and slash blocks; revisit if needed |
+| D7 | c: RocksDB checkpoint now, own canonical format with Phase 5 |
+| D8 | a on devnet/testnet; b (attested full-state hash) before public bootstrap |
+| D9 | a: out-of-band distribution first |
+| D10 | a: RPC reads from a block-consistent memory view |
+| D11 | a: EVM state stays in RocksDB; EVM blocks force a checkpoint |
+| D12 | b: drop nonces older than block time - 60 s (consensus rule + hash change; fresh genesis), before Phase 5 |
+| D13 | a: keep packed trade-history rows + retention pruning. Hourly files would need a separate indexer, and validators run `TORUS_TRADE_HISTORY=0`, so neither option touches chain throughput |
+| D14 | b: 64 GB per testnet validator + a resting-order cap sized at ~400 B/order. The devnet needs no separate target (one 94 GB host for 3 nodes, ~30 GB each; ~5 GB/node used today) |
+| D15 | b: relative gates per phase, HL parity as end goal. "No regression at 10 markets" means extra 10-market cells in the SAME campaign (phase vs main), next to the primary 300-market cells, never against old benches |
+| D16 | a: each phase behind a default-off env flag, flipped after bench cells |
+
+Each phase is its own branch and implementation plan, built, benched against
+main, and merged before the next one is planned.
+
 ## Not building (YAGNI)
 
 - Async native trie maintenance: trie maintenance is off and has no
@@ -684,5 +712,6 @@ D16. Rollout.
   block, i.e. ~100-200 GB/day per node at bench rates)? Measure
   `torus_db_size_bytes` growth to size retention.
 - How HL bootstraps a new node and how fast it replays [?].
-- Whether the consensus-thread session lookup (`app.rs:4774`) depending on
-  execution progress needs its own fix (outside item 6).
+- ~~Whether the consensus-thread session lookup (`app.rs:4774`) depending on
+  execution progress needs its own fix (outside item 6).~~ Resolved: removed
+  by `fix/vote-after-body` (b6f6aca); arrives on main with that merge.
