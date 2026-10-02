@@ -95,7 +95,7 @@
 //!
 //! If the block is valid, then the replica will create a [`PhaseVote`](hotstuff::messages::PhaseVote)
 //! by signing a message with its  [`SigningKey`](types::crypto_primitives::SigningKey), and send this
-//! to the [`phase_vote_recipient`](hotstuff::roles::phase_vote_recipient). Then, it will insert the
+//! to the [next leader](hotstuff::roles::phase_vote_recipient_with_reputation). Then, it will insert the
 //! block to its [Block Tree](block_tree), which the library stores in the
 //! [`KVStore`](block_tree::pluggables::KVStore) provided by the user.
 //!

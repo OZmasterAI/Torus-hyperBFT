@@ -54,7 +54,10 @@ use crate::{
     },
 };
 
-use super::roles::{is_proposer_with_reputation, phase_vote_recipient_with_reputation};
+use super::roles::{
+    is_proposer_with_reputation, phase_vote_backup_recipient_with_reputation,
+    phase_vote_recipient_with_reputation,
+};
 
 /// A single participant in the HotStuff subprotocol.
 ///
@@ -1183,6 +1186,31 @@ impl<N: Network> HotStuff<N> {
         }
     }
 
+    /// Send `vote` to its aggregator, `leader(vote.view + 1)` (FIX CONS-FIND-13:
+    /// reputation-weighted), and (s84 liveness) to the backup aggregator
+    /// `leader(vote.view + 2)`, so a down next leader does not stop the block from
+    /// being certified (see [`phase_vote_backup_recipient_with_reputation`]).
+    fn send_phase_vote<K: KVStore>(
+        &mut self,
+        vote: &PhaseVote,
+        validator_set_state: &ValidatorSetState,
+        block_tree: &BlockTreeSingleton<K>,
+    ) {
+        let reputation = block_tree.leader_reputation().ok();
+        let primary =
+            phase_vote_recipient_with_reputation(vote, validator_set_state, reputation.as_ref());
+        self.sender_handle
+            .send::<HotStuffMessage>(primary, vote.clone().into());
+        if let Some(backup) = phase_vote_backup_recipient_with_reputation(
+            vote,
+            validator_set_state,
+            reputation.as_ref(),
+        ) {
+            self.sender_handle
+                .send::<HotStuffMessage>(backup, vote.clone().into());
+        }
+    }
+
     /// Process a newly received `proposal`.
     ///
     /// # Preconditions
@@ -1442,20 +1470,12 @@ impl<N: Network> HotStuff<N> {
                     proposal.block.hash,
                     vote_phase,
                 );
-                // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
-                let reputation = block_tree.leader_reputation().ok();
-                let vote_recipient = phase_vote_recipient_with_reputation(
-                    &phase_vote,
-                    &validator_set_state,
-                    reputation.as_ref(),
-                );
                 // FIX CONS-FIND-16: Atomic write of vote state to prevent crash inconsistency.
                 // s65: persist BEFORE sending. If the process dies between the two, a vote that
                 // left the node but was never recorded would let the restarted replica vote
                 // again in this view (possibly for another block).
                 block_tree.set_vote_state_atomic(self.view_info.view, proposal.block.hash)?;
-                self.sender_handle
-                    .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+                self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
 
                 // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
                 // For fresh proposals: tip is the proposal itself.
@@ -1599,19 +1619,11 @@ impl<N: Network> HotStuff<N> {
                 nudge.justify.block,
                 vote_phase,
             );
-            // FIX CONS-FIND-13: Use reputation-weighted vote recipient.
-            let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(
-                &vote,
-                &validator_set_state,
-                reputation.as_ref(),
-            );
             // s65: persist BEFORE sending. If the process dies between the two, a vote that
             // left the node but was never recorded would let the restarted replica vote
             // again in this view (possibly for another block).
             block_tree.set_highest_view_phase_voted(self.view_info.view)?;
-            self.sender_handle
-                .send::<HotStuffMessage>(vote_recipient, vote.clone().into());
+            self.send_phase_vote(&vote, &validator_set_state, block_tree);
             Event::PhaseVote(PhaseVoteEvent {
                 timestamp: SystemTime::now(),
                 vote: vote.clone(),
@@ -2365,18 +2377,11 @@ impl<N: Network> HotStuff<N> {
                 header.block_hash,
                 vote_phase,
             );
-            let reputation = block_tree.leader_reputation().ok();
-            let vote_recipient = phase_vote_recipient_with_reputation(
-                &phase_vote,
-                &validator_set_state,
-                reputation.as_ref(),
-            );
             // s65: persist BEFORE sending. If the process dies between the two, a vote that
             // left the node but was never recorded would let the restarted replica vote
             // again in this view (possibly for another block).
             block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
-            self.sender_handle
-                .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+            self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
             // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
             // (unless the block is already in the tree, in which case it was validated on
             // insertion). If the body later turns out app-invalid, `try_insert_body` increments

@@ -240,7 +240,7 @@ impl Nudge {
     }
 }
 
-/// Message sent by a validator to [a leader of `view + 1`](super::roles::phase_vote_recipient) to
+/// Message sent by a validator to [a leader of `view + 1`](super::roles::phase_vote_recipient_with_reputation) to
 /// indicate that the validator agrees to a specific [`Proposal`] or [`Nudge`].
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct PhaseVote {
