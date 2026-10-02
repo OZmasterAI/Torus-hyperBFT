@@ -178,6 +178,24 @@ pub trait App<K: KVStore>: Send {
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse;
 
+    /// s84 (vote after body): called when the replica holds the body of the
+    /// current view's proposal and wants to vote for it. A replica phase-votes
+    /// for a proposal only after this returns [`BlockDataCheck::Held`], so a
+    /// quorum certificate implies that a quorum holds the block's data and any
+    /// replica can fetch it.
+    ///
+    /// The check must be cheap and stateless (it runs on the algorithm thread
+    /// before the vote, and before `validate_block`): `block.data` matches
+    /// `block.data_hash`, decodes, is within hard size limits, and any data the
+    /// block references out of band is held locally. It must not depend on
+    /// state that differs between replicas beyond what this replica holds.
+    ///
+    /// The default accepts every body: it is only correct for apps whose
+    /// `validate_block` never rejects a body this replica has received.
+    fn check_block_data(&mut self, _block: &Block) -> BlockDataCheck {
+        BlockDataCheck::Held
+    }
+
     /// Called after a block is irrevocably committed by consensus (finalized via
     /// the commit rule -- 2-chain in MonadBFT pipelined mode).
     ///
@@ -328,6 +346,17 @@ impl<'a, 'b, K: KVStore> ValidateBlockRequest<'a, 'b, K> {
     pub fn block_tree(&self) -> &AppBlockTreeView<'_, K> {
         &self.block_tree_view
     }
+}
+
+/// Outcome of [`App::check_block_data`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockDataCheck {
+    /// The replica holds the block's data and it passes the integrity check: it may vote.
+    Held,
+    /// Data the block references out of band is not local yet: check again later.
+    Missing,
+    /// This copy of the data is unusable (does not match `data_hash`, does not decode, too big).
+    Invalid,
 }
 
 /// Response from an `App` upon receiving a [`ValidateBlockRequest`].

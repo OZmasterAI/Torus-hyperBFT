@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 
 use ed25519_dalek::VerifyingKey;
 use hotstuff_rs::app::{
-    App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
+    App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
+    ValidateBlockResponse,
 };
 use hotstuff_rs::hotstuff::types::EquivocationEvidence;
 use hotstuff_rs::types::block::Block;
@@ -5132,6 +5133,57 @@ impl App<RocksKVStore> for TorusApp {
         self.validate_block(request)
     }
 
+    /// s84 (vote after body): this replica votes for a proposal only once this
+    /// returns `Held`, so a QC implies a quorum holds the block AND its
+    /// out-of-band native-action bodies (compact proposals carry only hashes).
+    /// Cheap and stateless: fail-stop, the one datum, its hash, decode, the
+    /// header's action count against the body, then a presence-only DA read.
+    /// No wait and no network pull here: `validate_block` (run right after on
+    /// the same body) and its retries hand misses to the recovery worker.
+    fn check_block_data(&mut self, block: &Block) -> BlockDataCheck {
+        // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
+        if self.is_exec_failed() {
+            return BlockDataCheck::Invalid;
+        }
+        let datums = block.data.vec();
+        if datums.len() != 1
+            || block.data_hash != CryptoHash::new(Self::hash_datum(datums[0].bytes()))
+        {
+            return BlockDataCheck::Invalid;
+        }
+        let bytes = datums[0].bytes();
+        // Same decode order as `decode_proposal_and_ensure_durable_core`.
+        // Execution fail-stops on an action-count mismatch (T1.2), so such a
+        // block must never be certified.
+        if let Ok(full) = bincode::deserialize::<TorusBlock>(bytes) {
+            return if full.native_actions.len() == full.header.native_action_count as usize {
+                BlockDataCheck::Held
+            } else {
+                BlockDataCheck::Invalid
+            };
+        }
+        let Ok(compact) = bincode::deserialize::<CompactBlock>(bytes) else {
+            return BlockDataCheck::Invalid;
+        };
+        if compact.native_action_hashes.len() != compact.header.native_action_count as usize {
+            return BlockDataCheck::Invalid;
+        }
+        if compact.native_action_hashes.is_empty() {
+            return BlockDataCheck::Held;
+        }
+        let Some(mempool) = self.mempool.as_ref() else {
+            return BlockDataCheck::Missing; // no DA store (consensus-only observer)
+        };
+        if let Some(fetcher) = self.da_fetcher.as_ref() {
+            Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
+        }
+        if mempool.native_da_missing(&compact.native_action_hashes).is_empty() {
+            BlockDataCheck::Held
+        } else {
+            BlockDataCheck::Missing
+        }
+    }
+
     /// Send committed block to the execution pipeline thread.
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
         let _commit_span =
@@ -9991,6 +10043,81 @@ mod crash_recovery_tests {
                 "validator (compact path) must custody shard {i} after validate"
             );
         }
+    }
+
+    /// s84 (vote after body): the pre-vote data check. A replica votes only on
+    /// `Held`: the datum matches `data_hash`, decodes, its header's action count
+    /// matches the body, and every referenced native body is in the DA store.
+    #[test]
+    fn check_block_data_holds_only_a_complete_well_formed_body() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let hs_block = |datums: Vec<Vec<u8>>, data_hash: [u8; 32]| {
+            Block::new(
+                BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                CryptoHash::new(data_hash),
+                Data::new(datums.into_iter().map(Datum::new).collect()),
+            )
+        };
+        let bound = |datum: Vec<u8>| {
+            let hash = TorusApp::hash_datum(&datum);
+            hs_block(vec![datum], hash)
+        };
+        let action = sign_claim_rewards(2);
+        let torus_block = make_block(1, vec![action.clone()]);
+        let compact = bound(encode_proposal_datum(&torus_block, true));
+
+        // Body referenced out of band and not local yet: not held.
+        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Missing);
+        mempool.mirror_native_to_da(&[action]).expect("mirror body into DA store");
+        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Held);
+        // A full block carries its bodies; an empty one references none.
+        assert_eq!(
+            app.check_block_data(&bound(encode_proposal_datum(&torus_block, false))),
+            BlockDataCheck::Held
+        );
+        assert_eq!(
+            app.check_block_data(&bound(encode_proposal_datum(&make_block(2, vec![]), true))),
+            BlockDataCheck::Held
+        );
+
+        // Structural failures: never held, whatever is in the DA store.
+        let datum = encode_proposal_datum(&torus_block, true);
+        assert_eq!(
+            app.check_block_data(&hs_block(vec![datum], [7; 32])),
+            BlockDataCheck::Invalid,
+            "data does not match data_hash"
+        );
+        assert_eq!(
+            app.check_block_data(&hs_block(vec![], TorusApp::hash_datum(&[]))),
+            BlockDataCheck::Invalid,
+            "no datum"
+        );
+        assert_eq!(
+            app.check_block_data(&bound(vec![0xff; 3])),
+            BlockDataCheck::Invalid,
+            "undecodable datum"
+        );
+        let mut miscounted = torus_block.clone();
+        miscounted.header.native_action_count = 2;
+        for compact in [true, false] {
+            assert_eq!(
+                app.check_block_data(&bound(encode_proposal_datum(&miscounted, compact))),
+                BlockDataCheck::Invalid,
+                "header action count != body (compact={compact}): execution would fail-stop"
+            );
+        }
+
+        // T1.5 fail-stop: never vote for blocks this node will not execute.
+        app.exec_failed.store(true, Ordering::SeqCst);
+        assert_eq!(app.check_block_data(&compact), BlockDataCheck::Invalid);
     }
 
     /// FIX 1 (S443): the catch-up gate. A leader whose local committed frontier

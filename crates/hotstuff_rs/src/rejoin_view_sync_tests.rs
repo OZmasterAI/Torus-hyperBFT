@@ -111,6 +111,17 @@ impl Rejoin {
         self.poll();
     }
 
+    /// s84: a replica votes once it holds the body; deliver it (as a fetch
+    /// response or push) from `origin`.
+    fn deliver_body(&mut self, origin: VerifyingKey, block: Block, view: ViewNumber) {
+        let resp = crate::hotstuff::messages::BlockDataResponse { view, block };
+        self.f
+            .messages
+            .send((origin, ProgressMessage::HotStuffMessage(resp.into())))
+            .unwrap();
+        self.poll();
+    }
+
     fn votes(&self) -> Vec<PhaseVote> {
         self.events
             .try_iter()
@@ -134,6 +145,10 @@ fn rejoining_replica_skips_to_leader_header_and_votes_once() {
         !r.f.algorithm.hotstuff.is_view_outdated(r.f.algorithm.pacemaker.query()),
         "HotStuff entered it too"
     );
+    assert!(r.votes().is_empty(), "s84: no vote before the body is held");
+    // The first poll drains the receive buffer's cached copy of the header.
+    r.poll();
+    r.deliver_body(origin, body(95), w);
     let votes = r.votes();
     assert_eq!(votes.len(), 1, "exactly one vote");
     assert_eq!((votes[0].view, votes[0].block), (w, header.block_hash));
@@ -149,7 +164,10 @@ fn rejoining_replica_skips_to_leader_header_and_votes_once() {
     let stale = ViewNumber::new(w.int() - 1);
     let stale_origin = leader(stale, &r.f);
     r.deliver(stale_origin, header_for(&body(96), stale));
+    r.deliver_body(stale_origin, body(96), stale);
     r.deliver(origin, header_for(&body(97), w));
+    r.deliver_body(origin, body(97), w);
+    r.poll();
     assert!(r.votes().is_empty(), "no second vote at or below w");
     assert_eq!(r.view(), w);
     assert_eq!(
@@ -162,7 +180,9 @@ fn rejoining_replica_skips_to_leader_header_and_votes_once() {
 fn round_skip_off_keeps_view_and_withholds_vote() {
     let mut r = rejoin(false);
     let (origin, header) = (r.origin, r.header.clone());
+    let w = header.view;
     r.deliver(origin, header);
+    r.deliver_body(origin, body(95), w);
     assert_eq!(r.view(), ViewNumber::new(LOCAL_VIEW));
     assert!(r.votes().is_empty());
     assert_eq!(r.f.algorithm.block_tree.highest_view_voted().unwrap(), None);

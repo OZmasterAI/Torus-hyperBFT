@@ -145,24 +145,6 @@ impl Network for NullNetwork {
     }
 }
 
-/// The header handlers never call the app; only body insertion does.
-struct NullApp;
-
-impl App<MemKV> for NullApp {
-    fn produce_block(&mut self, _request: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
-        unreachable!("produce_block is not reached on the header paths under test")
-    }
-    fn validate_block(&mut self, _request: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
-        unreachable!("validate_block is not reached on the header paths under test")
-    }
-    fn validate_block_for_sync(
-        &mut self,
-        _request: ValidateBlockRequest<MemKV>,
-    ) -> ValidateBlockResponse {
-        unreachable!("validate_block_for_sync is not reached on the header paths under test")
-    }
-}
-
 /// Rejects every body: models an app that finds a header-voted block invalid.
 struct RejectingApp {
     validate_calls: u32,
@@ -182,6 +164,42 @@ impl App<MemKV> for RejectingApp {
     ) -> ValidateBlockResponse {
         unreachable!("validate_block_for_sync is not reached on the body-insertion path under test")
     }
+}
+
+/// s84: holds every body without inserting it (`MissingData`), so the
+/// block's header stays in `pending_headers` (body "in flight" for the
+/// pending-justify bypass) while the replica, holding the body, may vote.
+struct ParkingApp;
+
+impl App<MemKV> for ParkingApp {
+    fn produce_block(&mut self, _request: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+        unreachable!("produce_block is not reached on the header paths under test")
+    }
+    fn validate_block(&mut self, _request: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+        ValidateBlockResponse::MissingData
+    }
+    fn validate_block_for_sync(
+        &mut self,
+        _request: ValidateBlockRequest<MemKV>,
+    ) -> ValidateBlockResponse {
+        unreachable!("validate_block_for_sync is not reached on the header paths under test")
+    }
+}
+
+/// s84 (vote after body): a replica votes once it holds the body. Deliver
+/// `block`'s body from `origin`, as the fetch response for its header.
+fn deliver_body<N: Network>(
+    hotstuff: &mut HotStuff<N>,
+    block_tree: &mut BlockTreeSingleton<MemKV>,
+    app: &mut impl App<MemKV>,
+    block: &Block,
+    view: ViewNumber,
+    origin: &VerifyingKey,
+) {
+    let resp = BlockDataResponse { view, block: block.clone() };
+    hotstuff
+        .on_receive_msg(HotStuffMessage::BlockDataResponse(resp), origin, block_tree, app)
+        .expect("processing a body must not error");
 }
 
 // ---------------------------------------------------------------------------
@@ -347,10 +365,11 @@ fn pending_justify_bypass_enforces_lock_clause() {
 
     let view1 = ViewNumber::new(1);
     let mut hotstuff = hotstuff_at(view1, keys[0].clone(), vss.clone());
-    let mut app = NullApp;
+    let mut app = ParkingApp;
 
     // Header 1: genesis-justified block. Passes the full safe_pc path, is
-    // phase-voted, and is parked in pending_headers awaiting its body.
+    // phase-voted once its body is held (s84), and stays in pending_headers
+    // (the app parks the body: not yet inserted).
     let b1 = Block::new(
         BlockHeight::new(0),
         PhaseCertificate::genesis_pc(),
@@ -362,6 +381,7 @@ fn pending_justify_bypass_enforces_lock_clause() {
     hotstuff
         .on_receive_msg(HotStuffMessage::ProposalHeader(h1), &p1, &mut block_tree, &mut app)
         .expect("processing a safe header must not error");
+    deliver_body(&mut hotstuff, &mut block_tree, &mut app, &b1, view1, &p1);
     assert_eq!(
         block_tree
             .highest_view_voted()
@@ -422,7 +442,7 @@ fn header_vote_on_app_invalid_body_increments_metric() {
     let mut hotstuff = hotstuff_at(view1, keys[0].clone(), vss.clone());
     let mut app = RejectingApp { validate_calls: 0 };
 
-    // Vote on the header first (body still in flight).
+    // s84: the vote waits for the body, then precedes its app validation.
     let b1 = Block::new(
         BlockHeight::new(0),
         PhaseCertificate::genesis_pc(),
@@ -438,8 +458,8 @@ fn header_vote_on_app_invalid_body_increments_metric() {
         block_tree
             .highest_view_voted()
             .expect("highest_view_voted read"),
-        Some(view1),
-        "precondition: the vote must have been cast before the body arrived"
+        None,
+        "precondition: no vote before the body is held"
     );
     assert_eq!(
         hotstuff.header_vote_invalid_count(),
@@ -447,8 +467,9 @@ fn header_vote_on_app_invalid_body_increments_metric() {
         "the metric must not move before the body's validation outcome is known"
     );
 
-    // The body arrives and the app finds it invalid: the already-sent vote is
-    // now known to have endorsed an app-invalid block. The metric must record it.
+    // The body arrives: the replica votes (body held), then the app finds it
+    // invalid, so the vote is known to have endorsed an app-invalid block.
+    // The metric must record it.
     let resp = BlockDataResponse {
         view: view1,
         block: b1.clone(),
@@ -461,6 +482,11 @@ fn header_vote_on_app_invalid_body_increments_metric() {
             &mut app,
         )
         .expect("processing an invalid body must not error");
+    assert_eq!(
+        block_tree.highest_view_voted().expect("highest_view_voted read"),
+        Some(view1),
+        "precondition: the vote was cast once the body was held, before validation"
+    );
     assert_eq!(app.validate_calls, 1, "precondition: the app validated the body");
     assert_eq!(
         hotstuff.header_vote_invalid_count(),
@@ -577,7 +603,7 @@ fn header_vote_locks_before_vote() {
     let h2 = header_for(&b2, view2);
 
     let (mut hotstuff, events) = hotstuff_at_with_events(view2, keys[0].clone(), vss.clone());
-    let mut app = NullApp;
+    let mut app = ParkingApp;
     let p2 = proposer_for(view2, &keys, &vss, &block_tree);
     hotstuff
         .on_receive_msg(
@@ -587,6 +613,7 @@ fn header_vote_locks_before_vote() {
             &mut app,
         )
         .expect("processing a safe header must not error");
+    deliver_body(&mut hotstuff, &mut block_tree, &mut app, &b2, view2, &p2);
 
     // The replica voted...
     assert_eq!(
@@ -668,7 +695,7 @@ fn header_double_vote_window_refused() {
     let view_c = ViewNumber::new(3);
     let hc = header_for(&c, view_c);
     let mut hs1 = hotstuff_at(view_c, keys[0].clone(), vss.clone());
-    let mut app = NullApp;
+    let mut app = ParkingApp;
     let prop_c = proposer_for(view_c, &keys, &vss, &block_tree);
     hs1.on_receive_msg(
         HotStuffMessage::ProposalHeader(hc),
@@ -677,6 +704,7 @@ fn header_double_vote_window_refused() {
         &mut app,
     )
     .expect("processing C header must not error");
+    deliver_body(&mut hs1, &mut block_tree, &mut app, &c, view_c, &prop_c);
     assert_eq!(
         block_tree.highest_view_voted().expect("highest_view_voted"),
         Some(view_c),
@@ -714,6 +742,7 @@ fn header_double_vote_window_refused() {
         &mut app,
     )
     .expect("processing B' header must not error");
+    deliver_body(&mut hs2, &mut block_tree, &mut app, &b_prime, view_bp, &prop_bp);
 
     assert_eq!(
         block_tree.highest_view_voted().expect("highest_view_voted"),

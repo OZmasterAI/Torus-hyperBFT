@@ -9,7 +9,8 @@ use std::{
 use borsh::{BorshDeserialize, BorshSerialize};
 use hotstuff_rs::{
     app::{
-        App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
+        App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
+        ValidateBlockResponse,
     },
     block_tree::{accessors::public::BlockTreeSnapshot, pluggables::KVGet},
     types::{
@@ -205,12 +206,7 @@ impl App<MemDB> for NumberApp {
                     .is_some()
             });
         let data = Data::new(vec![Datum::new(tx_queue.try_to_vec().unwrap())]);
-        let data_hash = {
-            let mut hasher = CryptoHasher::new();
-            hasher.update(&data.vec()[0].bytes());
-            let bytes = hasher.finalize().into();
-            CryptoHash::new(bytes)
-        };
+        let data_hash = datum_hash(data.vec()[0].bytes());
 
         // Intentionally do NOT clear the queue here. A transaction is removed
         // only once a block containing it COMMITS (see `on_committed_block`), so
@@ -238,12 +234,7 @@ impl App<MemDB> for NumberApp {
         request: ValidateBlockRequest<MemDB>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
-        let data_hash: CryptoHash = {
-            let mut hasher = CryptoHasher::new();
-            hasher.update(&data.vec()[0].bytes());
-            let bytes = hasher.finalize().into();
-            CryptoHash::new(bytes)
-        };
+        let data_hash = datum_hash(data.vec()[0].bytes());
 
         if request.proposed_block().data_hash != data_hash || self.is_poisoned(request.proposed_block()) {
             ValidateBlockResponse::Invalid
@@ -277,6 +268,20 @@ impl App<MemDB> for NumberApp {
         }
     }
 
+    /// s84 (vote after body): the body is held once its one datum matches
+    /// `data_hash` and decodes as a transaction list.
+    fn check_block_data(&mut self, block: &Block) -> BlockDataCheck {
+        let datums = block.data.vec();
+        let well_formed = datums.len() == 1
+            && datum_hash(datums[0].bytes()) == block.data_hash
+            && Vec::<QueuedTransaction>::deserialize(&mut datums[0].bytes().as_slice()).is_ok();
+        if well_formed {
+            BlockDataCheck::Held
+        } else {
+            BlockDataCheck::Invalid
+        }
+    }
+
     /// Once a block irrevocably commits, drop the transactions it contains from
     /// the local queue so they are no longer re-proposed. Exactly-once
     /// application does not depend on this (the applied-markers guarantee it) —
@@ -300,6 +305,13 @@ impl App<MemDB> for NumberApp {
             tx_queue.retain(|(id, _)| !committed_ids.contains(id));
         }
     }
+}
+
+/// `data_hash` of a NumberApp block: the hash of its one datum.
+fn datum_hash(datum: &[u8]) -> CryptoHash {
+    let mut hasher = CryptoHasher::new();
+    hasher.update(datum);
+    CryptoHash::new(hasher.finalize().into())
 }
 
 impl NumberApp {
