@@ -128,6 +128,111 @@ fn add_fill_volumes(volumes: &mut VolumeCache, fills: &[Fill], sides: usize) {
     }
 }
 
+#[cfg(test)]
+mod volume_cache_probe {
+    use super::*;
+    use std::time::Instant;
+
+    fn trader(n: u64) -> Address {
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&n.to_be_bytes());
+        Address::from(b)
+    }
+
+    /// The s84 cell per native block: ~58k fills over 300 markets (~195 per
+    /// market); takers among the call's ~250 senders, makers among ~900 of
+    /// the 5000 traders resting in each book.
+    fn bench_fills() -> Vec<Vec<Fill>> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        (0..300u64)
+            .map(|m| {
+                (0..195)
+                    .map(|_| Fill {
+                        maker_order_id: 1,
+                        taker_order_id: 2,
+                        price: FixedPoint::from_raw(30_000 * FixedPoint::SCALE),
+                        quantity: FixedPoint::from_raw(FixedPoint::SCALE / 20),
+                        maker: trader((m * 17 + next(900)) % 5000),
+                        taker: trader(next(250) * 20),
+                        maker_side: Side::Buy,
+                        timestamp: 0,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn median_ms(mut f: impl FnMut()) -> (f64, f64) {
+        let mut ms: Vec<f64> = (0..41)
+            .map(|_| {
+                let t0 = Instant::now();
+                f();
+                t0.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        (ms[0], ms[20])
+    }
+
+    /// Release probe: per-market plan maps (`compute_market_settle_plan`,
+    /// on the settle workers; summed over the 300 markets here) and the
+    /// call's merge map (pass B), unsized vs pre-sized.
+    ///   cargo test --release -p torus-bridge --lib volume_cache_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "release cost probe"]
+    fn volume_cache_sizing_cost() {
+        let fills = bench_fills();
+        let plans = |sized: bool| -> Vec<VolumeCache> {
+            fills
+                .iter()
+                .map(|f| {
+                    let mut v = if sized {
+                        VolumeCache::with_capacity(2 * f.len())
+                    } else {
+                        VolumeCache::new()
+                    };
+                    add_fill_volumes(&mut v, f, 2 * f.len());
+                    v
+                })
+                .collect()
+        };
+        for sized in [false, true] {
+            let (min, med) = median_ms(|| drop(std::hint::black_box(plans(sized))));
+            println!("300 plan maps, with_capacity={sized}: min {min:.3} ms, median {med:.3} ms");
+        }
+        let built = plans(true);
+        let distinct = {
+            let mut all = VolumeCache::new();
+            for p in &built {
+                all.extend(p.iter().map(|(t, v)| (*t, *v)));
+            }
+            all.len()
+        };
+        let max_plan = built.iter().map(VolumeCache::len).max().unwrap_or(0);
+        for (name, cap) in [("new", 0), ("max plan len", max_plan), ("distinct", distinct)] {
+            let (min, med) = median_ms(|| {
+                let mut merged = VolumeCache::with_capacity(cap);
+                for p in &built {
+                    for (t, add) in p {
+                        *merged.entry(*t).or_insert(FixedPoint::ZERO) += *add;
+                    }
+                }
+                std::hint::black_box(merged);
+            });
+            println!(
+                "merge into one map ({distinct} distinct traders), capacity {name} ({cap}): \
+                 min {min:.3} ms, median {med:.3} ms"
+            );
+        }
+    }
+}
+
 struct CachedBalance {
     balance: NativeBalance,
     dirty: bool,
@@ -4896,7 +5001,10 @@ impl NativeExecutor {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
         let mut orders = Vec::with_capacity(prepared.len());
-        let mut volumes = VolumeCache::new();
+        // At most two traders per fill: sized up front, the map never
+        // regrows (s84: regrowth was a third of the cum_volume time).
+        let fill_sides: usize = mbr.results.iter().map(|m| 2 * m.result.fills.len()).sum();
+        let mut volumes = VolumeCache::with_capacity(fill_sides);
 
         for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
             let result = &match_result.result;
