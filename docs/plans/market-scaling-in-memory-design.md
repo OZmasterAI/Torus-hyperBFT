@@ -695,8 +695,10 @@ D16. Rollout.
 | D15 | b: relative gates per phase, HL parity as end goal. "No regression at 10 markets" means extra 10-market cells in the SAME campaign (phase vs main), next to the primary 300-market cells, never against old benches |
 | D16 | a: each phase behind a default-off env flag, flipped after bench cells |
 
-Each phase is its own branch and implementation plan, built, benched against
-main, and merged before the next one is planned.
+Branching: a linear stack of branches (each phase on top of the previous one);
+each phase is benched against main and against the previous phase; the merge
+decision comes at the end (the whole stack or a prefix of it). The stack is
+rebased onto main whenever main moves.
 
 ## Not building (YAGNI)
 
