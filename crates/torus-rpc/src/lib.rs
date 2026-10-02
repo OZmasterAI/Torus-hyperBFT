@@ -2184,6 +2184,92 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// s84 decision 1: `torus_getBlockBody` reports each native action's and
+    /// EVM tx's executed/skipped status from the block's record; `null` until
+    /// the block executed (no record yet); empty lists for a block without
+    /// actions.
+    #[tokio::test]
+    async fn torus_get_block_body_reports_executed_and_skipped_status() {
+        let (_dir, state, mempool, executor) = setup();
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let actions: Vec<_> = (1..=3)
+            .map(|nonce| {
+                torus_types::eip712::sign_native_action(
+                    torus_types::NativeAction::ClaimRewards,
+                    nonce,
+                    &key,
+                )
+            })
+            .collect();
+        let body = TorusBlockBody {
+            native_actions: actions,
+            evm_transactions: vec![vec![0xde, 0xad]],
+            core_writer_actions: vec![],
+        };
+        // Height 1 executed (record present), height 2 not yet, height 3 empty.
+        for height in 1..=2 {
+            store_header(&state, &test_header(height, 0, 1_000_000_000));
+            store_body(&state, height, &body);
+        }
+        store_header(&state, &test_header(3, 0, 1_000_000_000));
+        store_body(
+            &state,
+            3,
+            &TorusBlockBody {
+                native_actions: vec![],
+                evm_transactions: vec![],
+                core_writer_actions: vec![],
+            },
+        );
+        let record = torus_state::action_status::BlockActionStatus {
+            evm_skipped: vec![true],
+            native_skipped: vec![false, true, false],
+        };
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                &1u64.to_be_bytes(),
+                &record.encode(),
+            )
+            .unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let get = |height: u64| {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<Option<serde_json::Value>, _>(
+                        "torus_getBlockBody",
+                        jsonrpsee::rpc_params![height],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let executed = get(1).await;
+        assert_eq!(
+            executed["nativeActionStatus"],
+            serde_json::json!(["executed", "skipped", "executed"])
+        );
+        assert_eq!(
+            executed["evmTransactionStatus"],
+            serde_json::json!(["skipped"])
+        );
+        assert_eq!(executed["nativeActions"].as_array().unwrap().len(), 3);
+        let pending = get(2).await;
+        assert!(pending["nativeActionStatus"].is_null());
+        assert!(pending["evmTransactionStatus"].is_null());
+        let empty = get(3).await;
+        assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
+        assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn eth_get_transaction_receipt() {
         let (_dir, state, mempool, executor) = setup();

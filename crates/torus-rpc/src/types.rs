@@ -550,4 +550,17 @@ pub struct RpcBlockBody {
     pub block_number: String,
     pub native_actions: Vec<serde_json::Value>,
     pub native_action_count: u32,
+    /// s84: per native action (same order as `native_actions`), `"executed"`
+    /// or `"skipped"` (failed its validity check at execution: bad signature
+    /// or session, replayed nonce; no state change). `null` while the block
+    /// has not executed on this node, or for a block executed before the
+    /// record existed.
+    #[serde(default)]
+    pub native_action_status: Option<Vec<String>>,
+    /// s84: per EVM transaction (same order as the block's eth transactions),
+    /// `"executed"` (has a receipt, reverted or not) or `"skipped"`
+    /// (undecodable or refused by the EVM; no receipt, no state change).
+    /// `null` like `native_action_status`.
+    #[serde(default)]
+    pub evm_transaction_status: Option<Vec<String>>,
 }

@@ -190,6 +190,13 @@ pub trait App<K: KVStore>: Send {
     /// block references out of band is held locally. It must not depend on
     /// state that differs between replicas beyond what this replica holds.
     ///
+    /// Since a quorum may vote before `validate_block` runs, `validate_block`
+    /// must not reject a block that passes this check for anything inside its
+    /// data, such as one invalid transaction: the app executes the block and
+    /// skips that transaction deterministically instead (s84 decision 1).
+    /// Otherwise the block is certified and the replicas that voted for it
+    /// cannot insert it, which wedges the chain.
+    ///
     /// The default accepts every body: it is only correct for apps whose
     /// `validate_block` never rejects a body this replica has received.
     fn check_block_data(&mut self, _block: &Block) -> BlockDataCheck {

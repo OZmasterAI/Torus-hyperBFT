@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS native_actions (
     target       TEXT,
     amount       TEXT,
     proposal_id  INTEGER,
-    payload      TEXT NOT NULL
+    payload      TEXT NOT NULL,
+    status       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS validator_snapshots (
@@ -114,6 +115,20 @@ CREATE TABLE IF NOT EXISTS candles (
 );
 CREATE INDEX IF NOT EXISTS idx_candles_market_interval ON candles(market_id, interval, open_time);
 ";
+
+/// Bring a database created by an older binary up to [`SCHEMA`]
+/// (`CREATE TABLE IF NOT EXISTS` never adds columns).
+fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_status: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('native_actions') WHERE name = 'status'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has_status {
+        conn.execute_batch("ALTER TABLE native_actions ADD COLUMN status TEXT;")?;
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Row types
@@ -179,6 +194,9 @@ pub struct NativeActionRow {
     pub amount: Option<String>,
     pub proposal_id: Option<i64>,
     pub payload: String,
+    /// s84: `"executed"` or `"skipped"` (`torus_getBlockBody`
+    /// `nativeActionStatus`); `None` until the block executed on the node.
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -234,6 +252,7 @@ impl ExplorerDb {
              PRAGMA busy_timeout=5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -243,6 +262,7 @@ impl ExplorerDb {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -355,8 +375,8 @@ impl ExplorerDb {
         conn.execute(
             "INSERT INTO native_actions
              (block_height, action_index, action_type, market_id, order_id,
-              validator, target, amount, proposal_id, payload)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+              validator, target, amount, proposal_id, payload, status)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 a.block_height,
                 a.action_index,
@@ -368,9 +388,39 @@ impl ExplorerDb {
                 a.amount,
                 a.proposal_id,
                 a.payload,
+                a.status,
             ],
         )?;
         Ok(())
+    }
+
+    /// s84: set the executed/skipped status of a block's native actions,
+    /// `statuses[i]` for `action_index` i.
+    pub fn set_native_action_status(
+        &self,
+        height: i64,
+        statuses: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        for (i, status) in statuses.iter().enumerate() {
+            conn.execute(
+                "UPDATE native_actions SET status = ?3 WHERE block_height = ?1 AND action_index = ?2",
+                params![height, i as i64, status],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// s84: heights at or above `from` with a native action whose status is
+    /// still unknown (indexed before the block executed on the node).
+    pub fn heights_with_unknown_status(&self, from: i64) -> Result<Vec<i64>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT block_height FROM native_actions
+             WHERE status IS NULL AND block_height >= ?1 ORDER BY block_height",
+        )?;
+        let rows = stmt.query_map(params![from], |r| r.get(0))?;
+        rows.collect()
     }
 
     pub fn insert_validator_snapshot(
@@ -590,7 +640,7 @@ impl ExplorerDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT block_height,action_index,action_type,market_id,order_id,
-                    validator,target,amount,proposal_id,payload
+                    validator,target,amount,proposal_id,payload,status
              FROM native_actions WHERE block_height = ?1 ORDER BY action_index",
         )?;
         let rows = stmt.query_map(params![height], row_to_native_action)?;
@@ -635,7 +685,7 @@ impl ExplorerDb {
         let offset = (page.saturating_sub(1) * limit) as i64;
         let mut stmt = conn.prepare(
             "SELECT block_height,action_index,action_type,market_id,order_id,
-                    validator,target,amount,proposal_id,payload
+                    validator,target,amount,proposal_id,payload,status
              FROM native_actions WHERE validator = ?1 OR target = ?1
              ORDER BY block_height DESC, action_index DESC LIMIT ?2 OFFSET ?3",
         )?;
@@ -830,6 +880,7 @@ fn row_to_native_action(row: &rusqlite::Row) -> Result<NativeActionRow, rusqlite
         amount: row.get(7)?,
         proposal_id: row.get(8)?,
         payload: row.get(9)?,
+        status: row.get(10)?,
     })
 }
 
@@ -901,6 +952,7 @@ mod tests {
             amount: Some("0x1000".into()),
             proposal_id: None,
             payload: r#"{"Delegate":{"validator":"0xdd","amount":"0x1000"}}"#.into(),
+            status: None,
         }
     }
 
@@ -968,6 +1020,45 @@ mod tests {
             .unwrap();
         assert_eq!(total, 2);
         assert_eq!(actions[0].action_type, "Delegate");
+    }
+
+    #[test]
+    fn native_action_status_set_after_execution() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        db.insert_block(&test_block(1)).unwrap();
+        db.insert_block(&test_block(2)).unwrap();
+        db.insert_native_action(&test_native_action(1, 0)).unwrap();
+        db.insert_native_action(&test_native_action(1, 1)).unwrap();
+        let mut known = test_native_action(2, 0);
+        known.status = Some("executed".into());
+        db.insert_native_action(&known).unwrap();
+        assert_eq!(db.heights_with_unknown_status(0).unwrap(), vec![1]);
+        assert!(db.heights_with_unknown_status(2).unwrap().is_empty());
+
+        db.set_native_action_status(1, &["executed".into(), "skipped".into()])
+            .unwrap();
+        let actions = db.get_block_native_actions(1).unwrap();
+        assert_eq!(actions[0].status.as_deref(), Some("executed"));
+        assert_eq!(actions[1].status.as_deref(), Some("skipped"));
+        assert!(db.heights_with_unknown_status(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_adds_status_column_to_an_old_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace(",\n    status       TEXT\n);", "\n);");
+        assert_ne!(old_schema, SCHEMA, "fixture strips the status column");
+        conn.execute_batch(&old_schema).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let has_status: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('native_actions') WHERE name = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_status, 1);
     }
 
     #[test]

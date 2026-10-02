@@ -55,29 +55,6 @@ pub(crate) struct NumberApp {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     produce_delay: Duration,
     validate_delay: Duration,
-    poison: Option<Arc<Mutex<PoisonedBlock>>>,
-}
-
-/// s84 wedge repro: the FIRST block at `height` that any replica sharing this
-/// cell validates becomes poisoned, and every such replica then rejects that
-/// block (and only that block) as `Invalid` on every later validation. Its
-/// proposer self-inserts without validating, so it alone holds the block —
-/// a block that is certified (votes are cast on the header) yet invalid for
-/// the other validators.
-pub(crate) struct PoisonedBlock {
-    pub(crate) height: u64,
-    pub(crate) hash: Option<CryptoHash>,
-    pub(crate) rejections: u64,
-}
-
-impl PoisonedBlock {
-    pub(crate) fn at_height(height: u64) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            height,
-            hash: None,
-            rejections: 0,
-        }))
-    }
 }
 
 /// User-sent instructions that number app execute in [`produce_block`](App::produce_block) and
@@ -94,6 +71,10 @@ pub enum NumberAppTransaction {
     /// Delete an existing validator. If the specified validator does not exist, this transaction is a no-
     /// op.
     DeleteValidator(VerifyingKeyBytes),
+
+    /// s84: a transaction that always fails its validity check (a forged
+    /// signature, say). The app skips it at execution.
+    Invalid,
 }
 
 // The key in the app state where the "number" is stored.
@@ -109,6 +90,16 @@ fn applied_marker_key(id: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(9);
     key.push(1u8);
     key.extend_from_slice(&id.to_le_bytes());
+    key
+}
+
+/// s84 executed/skipped record: app-state key holding the ids of the
+/// transactions the block at `height` skipped (borsh `Vec<u64>`), one key per
+/// block. Prefixed with `2` (see [`applied_marker_key`]).
+pub(crate) fn skip_record_key(height: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    key.push(2u8);
+    key.extend_from_slice(&height.to_le_bytes());
     key
 }
 
@@ -142,31 +133,7 @@ impl NumberApp {
             tx_queue,
             produce_delay,
             validate_delay,
-            poison: None,
         }
-    }
-
-    /// Share the s84 [`PoisonedBlock`] cell with this app.
-    pub(crate) fn with_poison(mut self, poison: Option<Arc<Mutex<PoisonedBlock>>>) -> Self {
-        self.poison = poison;
-        self
-    }
-
-    /// `true` if `block` is the poisoned block (claiming the poison on the first
-    /// block validated at the poisoned height).
-    fn is_poisoned(&self, block: &Block) -> bool {
-        let Some(poison) = &self.poison else {
-            return false;
-        };
-        let mut poison = poison.lock().unwrap();
-        if block.height.int() != poison.height {
-            return false;
-        }
-        let poisoned = *poison.hash.get_or_insert(block.hash) == block.hash;
-        if poisoned {
-            poison.rejections += 1;
-        }
-        poisoned
     }
 
     /// Return an `AppStateUpdates` that when applied on an empty app state will produce a good "initial"
@@ -198,8 +165,18 @@ impl App<MemDB> for NumberApp {
 
         let tx_queue = self.tx_queue.lock().unwrap();
 
+        // The produced block's height (genesis justify: height 0).
+        let height = request.parent_block().map_or(0, |parent| {
+            request
+                .block_tree()
+                .block_height(&parent)
+                .unwrap()
+                .expect("parent block in the tree")
+                .int()
+                + 1
+        });
         let (app_state_updates, validator_set_updates) =
-            self.execute(initial_number, &tx_queue, |id| {
+            self.execute(height, initial_number, &tx_queue, |id| {
                 request
                     .block_tree()
                     .app_state(&applied_marker_key(id))
@@ -236,7 +213,7 @@ impl App<MemDB> for NumberApp {
         let data = &request.proposed_block().data;
         let data_hash = datum_hash(data.vec()[0].bytes());
 
-        if request.proposed_block().data_hash != data_hash || self.is_poisoned(request.proposed_block()) {
+        if request.proposed_block().data_hash != data_hash {
             ValidateBlockResponse::Invalid
         } else {
             let initial_number = u32::from_le_bytes(
@@ -251,13 +228,19 @@ impl App<MemDB> for NumberApp {
             if let Ok(transactions) = Vec::<QueuedTransaction>::deserialize(
                 &mut &*request.proposed_block().data.vec()[0].bytes().as_slice(),
             ) {
-                let (app_state_updates, validator_set_updates) =
-                    self.execute(initial_number, &transactions, |id| {
+                // s84 decision 1: an invalid transaction never makes the block
+                // invalid; `execute` skips it and records it as skipped.
+                let (app_state_updates, validator_set_updates) = self.execute(
+                    request.proposed_block().height.int(),
+                    initial_number,
+                    &transactions,
+                    |id| {
                         request
                             .block_tree()
                             .app_state(&applied_marker_key(id))
                             .is_some()
-                    });
+                    },
+                );
                 ValidateBlockResponse::Valid {
                     app_state_updates,
                     validator_set_updates,
@@ -326,8 +309,13 @@ impl NumberApp {
     /// pipelined descendant before its first block commits, is not double-applied.
     /// Every transaction this call *does* apply records its own applied-marker in
     /// the returned `AppStateUpdates`, which commits atomically with the block.
+    ///
+    /// s84 decision 1: an [`Invalid`](NumberAppTransaction::Invalid)
+    /// transaction is skipped (no state change, no applied-marker) and its id
+    /// is recorded under [`skip_record_key`]`(height)`, one key per block.
     fn execute(
         &self,
+        height: u64,
         current_number: u32,
         transactions: &[QueuedTransaction],
         is_applied: impl Fn(u64) -> bool,
@@ -336,6 +324,7 @@ impl NumberApp {
         let mut validator_set_updates: Option<ValidatorSetUpdates> = None;
         let mut app_state_updates = AppStateUpdates::new();
         let mut any_applied = false;
+        let mut skipped: Vec<u64> = Vec::new();
 
         for (id, transaction) in transactions {
             // Exactly-once: skip a transaction already applied by an ancestor.
@@ -356,6 +345,10 @@ impl NumberApp {
                         .get_or_insert(ValidatorSetUpdates::new())
                         .delete(VerifyingKey::from_bytes(validator).unwrap());
                 }
+                NumberAppTransaction::Invalid => {
+                    skipped.push(*id);
+                    continue;
+                }
             }
             // Record that this transaction has now been applied so any later
             // re-proposal / re-embedding of it is a no-op.
@@ -365,6 +358,10 @@ impl NumberApp {
 
         if number != current_number {
             app_state_updates.insert(NUMBER_KEY.to_vec(), number.try_to_vec().unwrap());
+        }
+        if !skipped.is_empty() {
+            app_state_updates.insert(skip_record_key(height), skipped.try_to_vec().unwrap());
+            any_applied = true;
         }
 
         let app_state_updates = if any_applied {

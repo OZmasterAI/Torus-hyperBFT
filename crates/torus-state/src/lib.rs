@@ -1,5 +1,6 @@
 //! RocksDB storage, revm Database trait, and MPT state root computation.
 
+pub mod action_status;
 pub mod backend;
 pub mod bg_writer;
 pub mod block_body;

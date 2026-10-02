@@ -106,15 +106,18 @@ impl Indexer {
 
         // Index native actions
         if let Ok(Some(body)) = self.rpc.get_block_body(height).await {
+            let statuses = native_action_status(&body);
             if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
                 for (i, action) in actions.iter().enumerate() {
-                    let action_row = parse_native_action_row(action, h, i as i32);
+                    let mut action_row = parse_native_action_row(action, h, i as i32);
+                    action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
                     self.db
                         .insert_native_action(&action_row)
                         .map_err(|e| -> RpcError { e.to_string().into() })?;
                 }
             }
         }
+        self.fill_unknown_status(h).await;
 
         // Index trades into OHLCV candles (Phase 7B)
         if let Ok(trades) = self.rpc.get_block_trades(height).await {
@@ -133,6 +136,27 @@ impl Indexer {
             .map_err(|e| -> RpcError { e.to_string().into() })?;
 
         Ok(())
+    }
+
+    /// s84: a block is indexed at commit, usually before the node executed it,
+    /// so its native actions' executed/skipped status is still unknown. Fill it
+    /// in for the recent blocks (execution trails commit by a few blocks) once
+    /// the node reports it. Best-effort: a failure leaves the status unknown.
+    async fn fill_unknown_status(&self, height: i64) {
+        const STATUS_WINDOW: i64 = 64;
+        let Ok(heights) = self.db.heights_with_unknown_status(height - STATUS_WINDOW) else {
+            return;
+        };
+        for h in heights {
+            let Ok(Some(body)) = self.rpc.get_block_body(h as u64).await else {
+                continue;
+            };
+            if let Some(statuses) = native_action_status(&body) {
+                if let Err(e) = self.db.set_native_action_status(h, &statuses) {
+                    warn!("Failed to store native action status at height {h}: {e}");
+                }
+            }
+        }
     }
 
     async fn snapshot_validators(&self, height: i64) -> Result<(), RpcError> {
@@ -270,6 +294,15 @@ fn parse_log_row(log: &Value, block_height: i64) -> LogRow {
     }
 }
 
+/// s84: `torus_getBlockBody` `nativeActionStatus`, `None` while unknown.
+fn native_action_status(body: &Value) -> Option<Vec<String>> {
+    body.get("nativeActionStatus")?
+        .as_array()?
+        .iter()
+        .map(|s| s.as_str().map(str::to_string))
+        .collect()
+}
+
 pub fn parse_native_action_row(
     action: &Value,
     block_height: i64,
@@ -332,6 +365,7 @@ pub fn parse_native_action_row(
         ),
         proposal_id: extract_i64(&action_type, inner_ref, "proposal_id", &["Vote"]),
         payload: serde_json::to_string(action).unwrap_or_default(),
+        status: None,
     }
 }
 

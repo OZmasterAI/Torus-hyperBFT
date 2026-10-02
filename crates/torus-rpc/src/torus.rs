@@ -25,8 +25,9 @@ use torus_economics::types::{
 };
 use torus_economics::{lerp_bps, PermanentStakeInfo};
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
+    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS,
+    CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
+    CF_STAKING_PERMANENT,
 };
 use torus_state::trade_rows::{
     decode_trade_row, decode_user_row, parse_trade_key, parse_user_trade_key, trade_key,
@@ -1404,10 +1405,32 @@ impl TorusApiServer for RpcState {
             .iter()
             .map(|a| serde_json::to_value(a).unwrap_or_default())
             .collect();
+        // s84 executed/skipped record (written by execution; a block with no
+        // actions has none and reports empty lists).
+        let status = if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
+            Some(torus_state::action_status::BlockActionStatus::default())
+        } else {
+            self.state
+                .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
+                .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
+                .and_then(|bytes| torus_state::action_status::BlockActionStatus::decode(&bytes))
+                .filter(|s| {
+                    s.native_skipped.len() == body.native_actions.len()
+                        && s.evm_skipped.len() == body.evm_transactions.len()
+                })
+        };
+        let labels = |skipped: &[bool]| -> Vec<String> {
+            skipped
+                .iter()
+                .map(|s| if *s { "skipped" } else { "executed" }.to_string())
+                .collect()
+        };
         Ok(Some(RpcBlockBody {
             block_number: hex_u64(block_number),
             native_actions,
             native_action_count: body.native_actions.len() as u32,
+            native_action_status: status.as_ref().map(|s| labels(&s.native_skipped)),
+            evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
         }))
     }
 

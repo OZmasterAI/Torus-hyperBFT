@@ -32,8 +32,8 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    decode_all_txs, sort_native_actions, BlockCommitter, BlockProposer, BlockValidator,
-    BundleState, NativeExecContext, NativeExecutor,
+    sort_native_actions, BlockCommitter, BlockProposer, BlockValidator, BundleState,
+    NativeExecContext, NativeExecutor,
 };
 use torus_economics::{EpochManager, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
@@ -1654,6 +1654,10 @@ impl ExecutionContext {
         // nothing of the block durable, so the replay re-executes it from the
         // same base.
         let mut evm_batch: Option<rocksdb::WriteBatch> = None;
+        // s84 executed/skipped record: an EVM tx is executed iff it has a
+        // receipt (an undecodable tx or one revm refuses gets none; a reverted
+        // tx has one). A failed EVM section executes none of them.
+        let mut evm_skipped = vec![true; torus_block.evm_transactions.len()];
         if has_evm {
             match self.validator.validate_block_for_catchup(
                 torus_block,
@@ -1661,6 +1665,11 @@ impl ExecutionContext {
                 &self.evm_executor,
             ) {
                 Ok(validated) => {
+                    for receipt in &validated.receipts {
+                        if let Some(skipped) = evm_skipped.get_mut(receipt.tx_index as usize) {
+                            *skipped = false;
+                        }
+                    }
                     computed_fee_revenue =
                         torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
@@ -1853,11 +1862,14 @@ impl ExecutionContext {
             // at most once even when included 2-3x. `seen_in_block` also dedups a
             // (sender, nonce) repeated within a single block.
             let mut seen_in_block = std::collections::HashSet::new();
+            // s84 executed/skipped record, by body position.
+            let mut native_skipped = vec![false; torus_block.native_actions.len()];
             for (i, signed) in torus_block.native_actions.iter().enumerate() {
                 // FIX 2b: resolution failure (bad sig OR missing/revoked/expired/out-of-
                 // scope session) => DROP this action. Deterministic at the executed
                 // height; the proposer is never punished here (see the block above).
                 let Some(sender) = resolved_senders.get(i).copied().flatten() else {
+                    native_skipped[i] = true;
                     dropped_invalid += 1;
                     tracing::warn!(
                         index = i,
@@ -1878,6 +1890,7 @@ impl ExecutionContext {
                         height,
                         "skipping duplicate/replayed native action on live commit path"
                     );
+                    native_skipped[i] = true;
                     continue;
                 }
                 consumed_nonces.push((sender, signed.nonce));
@@ -1899,6 +1912,23 @@ impl ExecutionContext {
                     .observe(replay_guard_timer.elapsed().as_secs_f64());
                 m.native_actions_processed
                     .inc_by(sender_actions.len() as u64);
+            }
+
+            // s84: the executed/skipped record rides this block's flush batch
+            // (or its frozen set on the pipelined path). Not a hashed or
+            // native-root CF, so state hash and root are untouched.
+            if has_native || has_evm {
+                let status = torus_state::action_status::BlockActionStatus {
+                    evm_skipped: std::mem::take(&mut evm_skipped),
+                    native_skipped,
+                };
+                if let Err(e) = overlay.put_cf_raw(
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &status.encode(),
+                ) {
+                    tracing::error!(%e, height, "failed to stage the executed/skipped record");
+                }
             }
 
             overlay.seed_from_bundle(&bundle);
@@ -2418,6 +2448,28 @@ impl ExecutionContext {
         // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
         // empty or pure-EVM blocks) still need a standalone marker write here; a pure-EVM block's
         // EVM batch rides that marker write (bug (c)).
+        // s84: an EVM block without a native phase: its executed/skipped
+        // record rides the EVM marker flush below (an empty batch when the EVM
+        // section failed and executed nothing). EVM blocks are never pipelined.
+        if !run_native && has_evm {
+            let status = torus_state::action_status::BlockActionStatus {
+                evm_skipped: std::mem::take(&mut evm_skipped),
+                native_skipped: vec![],
+            };
+            match self
+                .state_db
+                .cf_handle(torus_state::cf::CF_BLOCK_ACTION_STATUS)
+            {
+                Ok(cf) => evm_batch.get_or_insert_with(Default::default).put_cf(
+                    cf,
+                    height.to_be_bytes(),
+                    status.encode(),
+                ),
+                Err(e) => {
+                    tracing::error!(%e, height, "failed to stage the executed/skipped record")
+                }
+            }
+        }
         if !run_native {
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
@@ -3237,8 +3289,13 @@ impl Drop for DaRecoveryWorker {
 
 /// A heavy-stage verdict the `torus-async-validate` worker produced for one EXACT
 /// datum byte-string. Only fully-Valid heavy stages are cached — any failure
-/// (decode, durability, EVM, signatures) caches NOTHING, so the sync path always
-/// re-derives negative verdicts itself (no negative caching, no stale rejects).
+/// (decode, durability) caches NOTHING, so the sync path always re-derives
+/// negative verdicts itself (no negative caching, no stale rejects).
+///
+/// s84 decision 1: the heavy stage reads no exec-written state any more (the
+/// signature / session / attestation checks it ran moved to execution, where a
+/// failing action is skipped), so a verdict depends on the datum bytes and the
+/// local DA store only and needs no exec-frontier basis.
 struct CachedVerdict {
     /// The decoded (and, for compact proposals, reconstructed) block. Its bodies
     /// are durable in the DA store — the worker met the S459 bar before caching.
@@ -3246,17 +3303,6 @@ struct CachedVerdict {
     /// In-flight hash notes from the compact path, applied on the algo thread at
     /// hit time (`InFlightHashLedger` is algo-thread state; s355 guard).
     notes: Vec<(u64, Vec<torus_types::B256>)>,
-    /// The EXEC-APPLIED frontier (`read_native_applied_height`, the marker
-    /// written in / sequenced behind the same atomic batch as native state)
-    /// when the worker read applied state (sessions / validator registry) for
-    /// signature verification. A hit whose basis no longer equals the CURRENT
-    /// applied frontier is DISCARDED (sync fallback): the async path must never
-    /// vote differently than the sync path would NOW. The COMMIT frontier is
-    /// the WRONG basis here — `validate_body_checks_core` reads state written
-    /// by the exec thread, which lags commit arbitrarily and catches up (e.g.
-    /// revoking a session a later proposal's actions use) WITHOUT any new
-    /// commit (review finding, perf/matched-200k item 3).
-    basis_height: u64,
 }
 
 /// Bound on cached verdicts. Entries also age out under the same `h + 10`
@@ -3326,8 +3372,6 @@ impl AsyncValidateWorker {
         mempool: Arc<Mempool>,
         da_fetcher: Option<Arc<dyn NativeDaFetcher>>,
         metrics: Option<Arc<torus_telemetry::Metrics>>,
-        state_db: StateDb,
-        staking: StakingManager,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WORKER_QUEUE_CAP);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3349,14 +3393,6 @@ impl AsyncValidateWorker {
                     if worker_shared.cache.lock().unwrap().contains_key(&key) {
                         continue; // duplicate delivery (loopback + gossip + direct)
                     }
-                    // Record the exec-applied basis BEFORE reading state for
-                    // verification; re-checked after, so an exec apply landing
-                    // mid-validation discards the verdict instead of caching a
-                    // reply the sync path might no longer give. Read through the
-                    // DB (not an atomic mirror): the marker shares (or is
-                    // sequenced behind) the state batch, so a snapshot showing
-                    // marker A also shows every session/staking write of <= A.
-                    let basis = read_native_applied_height(&state_db).unwrap_or(0);
                     let mut notes = Vec::new();
                     let block = match TorusApp::decode_proposal_and_ensure_durable_core(
                         Some(&mempool),
@@ -3371,25 +3407,7 @@ impl AsyncValidateWorker {
                         Ok(block) => block,
                         Err(_) => continue, // no negative caching — sync path decides
                     };
-                    if !TorusApp::validate_body_checks_core(
-                        &block,
-                        &state_db,
-                        &staking,
-                        &metrics,
-                    ) {
-                        continue; // no negative caching — sync path decides
-                    }
-                    if read_native_applied_height(&state_db).unwrap_or(0) != basis {
-                        continue; // exec applied state mid-validation — discard
-                    }
-                    worker_shared.insert_bounded(
-                        key,
-                        CachedVerdict {
-                            block,
-                            notes,
-                            basis_height: basis,
-                        },
-                    );
+                    worker_shared.insert_bounded(key, CachedVerdict { block, notes });
                 }
             })
             .expect("spawn torus-async-validate thread");
@@ -3849,8 +3867,6 @@ impl TorusApp {
             mempool.clone(),
             self.da_fetcher.clone(),
             self.metrics.clone(),
-            self.state_db.clone(),
-            self.staking.clone(),
         ));
     }
 
@@ -4681,31 +4697,18 @@ impl TorusApp {
         }
 
         // TORUS_ASYNC_VALIDATE hit path: the worker already ran the heavy stage
-        // (decode + DA durability + EVM decode + sig/attest verify) for these
-        // EXACT bytes — the cache key IS the sha256 recomputed and bound to
-        // `data_hash` just above, so a hit can never cover different bytes, and
-        // different forks necessarily miss each other's entries. Consume-once; a
-        // verdict whose exec-applied basis moved (the exec thread applied a
-        // block — session/staking writes — since the worker read them) is
-        // DISCARDED in favor of the full sync path below. The COMMIT frontier
-        // is NOT the basis: exec lags commit arbitrarily and advances without
-        // new commits. The algo-thread-only checks (fail-stop in the caller;
-        // ancestry + bookkeeping in `finish_validate`) run on EVERY path.
+        // (decode + DA durability) for these EXACT bytes — the cache key IS the
+        // sha256 recomputed and bound to `data_hash` just above, so a hit can
+        // never cover different bytes, and different forks necessarily miss each
+        // other's entries. Consume-once. The algo-thread-only checks (fail-stop
+        // in the caller; ancestry + bookkeeping in `finish_validate`) run on
+        // EVERY path.
         if let Some(ref av) = self.async_validate {
             if let Some(verdict) = av.take_verdict(&computed) {
-                let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
-                if verdict.basis_height == applied {
-                    for (height, hashes) in verdict.notes {
-                        self.in_flight_hashes.note(height, hashes);
-                    }
-                    return self.finish_validate(verdict.block);
+                for (height, hashes) in verdict.notes {
+                    self.in_flight_hashes.note(height, hashes);
                 }
-                tracing::debug!(
-                    height = verdict.block.header.height,
-                    basis = verdict.basis_height,
-                    applied,
-                    "async-validate verdict stale (exec-applied state moved) — sync fallback"
-                );
+                return self.finish_validate(verdict.block);
             }
         }
 
@@ -4714,105 +4717,20 @@ impl TorusApp {
         // every referenced native body is durable in THIS node's DA store, or we
         // short-circuit (MissingData / Invalid). See
         // `decode_proposal_and_ensure_durable`.
+        //
+        // s84 decision 1: nothing INSIDE the body makes the block invalid. An
+        // undecodable EVM tx, a bad native signature or session, a proposer
+        // attestation that does not verify: execution skips the affected
+        // actions deterministically and records them as skipped
+        // (`CF_BLOCK_ACTION_STATUS`). Rejecting here instead would let a block
+        // the replicas already voted for (s84 option A votes once the body is
+        // held) be certified yet uninsertable — the s83 wedge.
         let torus_block = match self.decode_proposal_and_ensure_durable(datum_bytes) {
             Ok(block) => block,
             Err(response) => return response,
         };
 
-        if !Self::validate_body_checks_core(
-            &torus_block,
-            &self.state_db,
-            &self.staking,
-            &self.metrics,
-        ) {
-            return ValidateBlockResponse::Invalid;
-        }
-
         self.finish_validate(torus_block)
-    }
-
-    /// Body validity checks shared by the sync path and the
-    /// `torus-async-validate` worker: EVM tx decode + native
-    /// signature/attestation verification. Pure reads of committed state
-    /// (`state_db` sessions, `staking` validator registry); records
-    /// `torus_validate_block_attest_seconds` on the CALLING thread — the thread
-    /// where the work actually runs.
-    fn validate_body_checks_core(
-        torus_block: &TorusBlock,
-        state_db: &StateDb,
-        staking: &StakingManager,
-        metrics: &Option<Arc<torus_telemetry::Metrics>>,
-    ) -> bool {
-        if !torus_block.evm_transactions.is_empty()
-            && decode_all_txs(&torus_block.evm_transactions).is_err()
-        {
-            tracing::warn!("validate_block: REJECTED -- invalid EVM transactions");
-            return false;
-        }
-
-        if !torus_block.native_actions.is_empty() {
-            let _attest_span =
-                ObserveOnDrop::new(metrics.clone(), |m| &m.validate_block_attest_seconds);
-            if torus_block.header.sig_attestation == [0u8; 64] {
-                // Non-attested proposer: we must verify every action ourselves. Use the
-                // SAME session-aware resolver as the execution path (see ~L300) so BOTH
-                // EIP-712 and ed25519 *session* signatures are checked against committed
-                // session state. The old code called `recover_sender`, which returns Err
-                // for every `ActionSignature::Session` (eip712.rs:765) and thus blanket-
-                // rejected all session actions on non-attested blocks — the deterministic
-                // root cause of the reject-loop (mem 41e06912). `None` == bad sig /
-                // missing / expired / out-of-scope session.
-                //
-                // Reads committed state (identical across validators at this height) so
-                // the verdict is deterministic and cannot fork WITHIN a block. NOTE:
-                // this is a CONSENSUS VALIDITY CHANGE — deploy to ALL validators
-                // together; a mixed old/new set disagrees on these blocks and forks.
-                // Same-block CreateSession+order still rejects here (defect A, tracked
-                // separately) — strictly better than rejecting all session blocks.
-                let resolved = torus_types::eip712::batch_verify_native_actions(
-                    &torus_block.native_actions,
-                    torus_block.header.timestamp,
-                    |pubkey| state_db.get_session(pubkey).ok().flatten(),
-                );
-                if let Some(i) = resolved.iter().position(|s| s.is_none()) {
-                    tracing::warn!(
-                        index = i,
-                        "validate_block: REJECTED -- invalid native action signature"
-                    );
-                    return false;
-                }
-            } else {
-                let proposer_addr = torus_block.header.proposer;
-                let lookup_timer = std::time::Instant::now();
-                let proposer_record = staking.get_validator(&proposer_addr);
-                if let Some(m) = metrics.as_ref() {
-                    m.validate_block_attest_lookup_seconds
-                        .observe(lookup_timer.elapsed().as_secs_f64());
-                }
-                let proposer_pubkey = match proposer_record {
-                    Ok(Some(val)) => match ed25519_dalek::VerifyingKey::from_bytes(&val.pubkey) {
-                        Ok(vk) => vk,
-                        Err(_) => {
-                            tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid proposer pubkey");
-                            return false;
-                        }
-                    },
-                    _ => {
-                        tracing::warn!(%proposer_addr, "validate_block: REJECTED -- proposer not in validator set");
-                        return false;
-                    }
-                };
-                if !torus_bridge::proposer::verify_sig_attestation(
-                    &torus_block.native_actions,
-                    &torus_block.header.sig_attestation,
-                    &proposer_pubkey,
-                ) {
-                    tracing::warn!(%proposer_addr, "validate_block: REJECTED -- invalid sig attestation");
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     /// Algo-thread tail of `validate_block`, shared by the sync path and the
@@ -5065,7 +4983,9 @@ impl App<RocksKVStore> for TorusApp {
         self.build_proposal(parent_header)
     }
 
-    /// Validate a proposed block: structural + signature checks only, NO execution.
+    /// Validate a proposed block: structure, body availability (DA) and
+    /// ancestry only, NO execution and no per-action checks (s84 decision 1:
+    /// execution skips and records an invalid action).
     fn validate_block(
         &mut self,
         request: ValidateBlockRequest<RocksKVStore>,
@@ -5303,10 +5223,9 @@ impl App<RocksKVStore> for TorusApp {
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
-            // Item 3: no async-validate invalidation here — the stale-basis rail
-            // is keyed to the EXEC-APPLIED frontier (the only state
-            // `validate_body_checks_core` reads); a commit alone changes nothing
-            // a cached verdict depends on (ancestry re-runs live at hit time).
+            // Item 3: no async-validate invalidation here — a cached verdict
+            // depends only on the datum bytes and the DA store (ancestry
+            // re-runs live at hit time).
         }
 
         // Slashes detected during THIS commit ride with THIS block into the
@@ -9274,7 +9193,6 @@ mod crash_recovery_tests {
             "torus_validate_block_decode_seconds_count",
             "torus_validate_block_da_reconstruct_seconds_count",
             "torus_validate_block_custody_seconds_count",
-            "torus_validate_block_attest_seconds_count",
         ] {
             assert_eq!(
                 metric_count(&text, name),
@@ -9327,26 +9245,6 @@ mod crash_recovery_tests {
                 "torus_validate_block_decode_seconds_count"
             ),
             decode_before
-        );
-    }
-
-    #[test]
-    fn validate_empty_body_has_no_attestation_observation() {
-        let (config, state_db) = make_test_config_and_db();
-        let metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
-        let app = TorusApp::new(state_db, &config, metrics.clone(), None, None);
-        assert!(TorusApp::validate_body_checks_core(
-            &make_block(5, vec![]),
-            &app.state_db,
-            &app.staking,
-            &metrics,
-        ));
-        assert_eq!(
-            metric_count(
-                &metrics.as_ref().unwrap().encode(),
-                "torus_validate_block_attest_seconds_count"
-            ),
-            0
         );
     }
 
@@ -9412,31 +9310,6 @@ mod crash_recovery_tests {
         assert_eq!(metric_count(&text, "torus_validate_block_da_wait_seconds_count"), 1);
     }
 
-    /// s76 item 6: the attested path's validator lookup is timed apart from
-    /// the digest + signature verify.
-    #[test]
-    fn validate_attest_lookup_observes() {
-        let (config, state_db) = make_test_config_and_db();
-        let metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
-        let app = TorusApp::new(state_db, &config, metrics.clone(), None, None);
-        let mut block = make_block(5, vec![sign_claim_rewards(1)]);
-        block.header.sig_attestation = [1u8; 64];
-        // Unregistered proposer: rejected, but only after the lookup ran.
-        assert!(!TorusApp::validate_body_checks_core(
-            &block,
-            &app.state_db,
-            &app.staking,
-            &metrics,
-        ));
-        assert_eq!(
-            metric_count(
-                &metrics.as_ref().unwrap().encode(),
-                "torus_validate_block_attest_lookup_seconds_count"
-            ),
-            1
-        );
-    }
-
     #[test]
     fn async_validate_cache_hit_skips_heavy_path() {
         let (mut app, _mempool, metrics) = make_async_validate_app();
@@ -9456,7 +9329,6 @@ mod crash_recovery_tests {
             metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
             1
         );
-        assert_eq!(metric_count(&text, "torus_validate_block_attest_seconds_count"), 1);
 
         let resp = app.validate_datum(&datum, &data_hash_of(&datum));
         assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
@@ -9468,7 +9340,6 @@ mod crash_recovery_tests {
             metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
             1
         );
-        assert_eq!(metric_count(&text, "torus_validate_block_attest_seconds_count"), 1);
         assert_eq!(async_cache_len(&app), 0, "verdicts are consume-once");
         assert!(
             app.pending_proposals.contains_key(&5),
@@ -9501,16 +9372,17 @@ mod crash_recovery_tests {
         assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
         wait_for_cached(&app, 1);
 
-        // Attacker hands us DIFFERENT bytes (a forged attestation) with a
-        // self-consistent data_hash. The recomputed key must MISS the cached Valid
-        // verdict and the sync path must reject.
+        // Attacker hands us DIFFERENT bytes (the same block as a compact datum
+        // whose body this node does not hold) with a self-consistent data_hash.
+        // The recomputed key must MISS the cached Valid verdict and the sync
+        // path must decide on its own (here: MissingData).
         let mut tampered_block = block.clone();
-        tampered_block.header.sig_attestation = [1u8; 64];
-        let tampered = bincode::serialize(&tampered_block).unwrap();
+        tampered_block.native_actions = vec![sign_claim_rewards(2)];
+        let tampered = encode_proposal_datum(&tampered_block, true);
         assert_ne!(tampered, datum);
         let resp = app.validate_datum(&tampered, &data_hash_of(&tampered));
         assert!(
-            matches!(resp, ValidateBlockResponse::Invalid),
+            matches!(resp, ValidateBlockResponse::MissingData),
             "Valid must never be served for bytes that were not themselves validated"
         );
         assert_eq!(
@@ -9609,22 +9481,15 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Review finding (perf/matched-200k item 3): the stale-basis rail must key
-    /// off the EXEC-APPLIED frontier, not the commit frontier.
-    /// `validate_body_checks_core` reads state the EXEC thread writes
-    /// (sessions, staking), and exec lags commit arbitrarily — it catches up
-    /// WITHOUT any new commit. Scenario pinned here: the worker caches a Valid
-    /// verdict for a session-signed action; exec then applies blocks that
-    /// revoke that session (delete_session + applied-marker advance) while
-    /// `last_header.height` never moves; the sync path NOW rejects, so the
-    /// cached Valid must be discarded — serving it is a vote-safety divergence.
-    /// RED on the committed-frontier rail: basis==last_header.height still
-    /// holds, the cached Valid is served, and this test sees Valid.
+    /// s84 decision 1: a session-signed action whose session exec revokes
+    /// after the worker cached its verdict no longer flips the vote — the
+    /// block is valid either way and execution skips the action. The verdict
+    /// reads no exec-written state, so it survives exec catching up (the
+    /// exec-frontier basis rail is gone) and is served from the cache.
     #[test]
-    fn async_validate_exec_frontier_basis_invalidation_vote_flip() {
-        let (mut app, _mempool, _metrics) = make_async_validate_app();
+    fn async_validate_verdict_survives_exec_state_change() {
+        let (mut app, _mempool, metrics) = make_async_validate_app();
 
-        // Register a session and build a proposal whose only action it signs.
         let session_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let pubkey = session_key.verifying_key().to_bytes();
         app.state_db
@@ -9648,25 +9513,32 @@ mod crash_recovery_tests {
         assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
         wait_for_cached(&app, 1);
 
-        // Exec catches up (no new commit): the block apply revokes the session
-        // and advances the applied marker. The commit frontier is untouched.
+        // Exec catches up (no new commit): it revokes the session and advances
+        // the applied marker.
         app.state_db.delete_session(&pubkey).unwrap();
         write_native_applied_height(&app.state_db, 1);
 
-        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
-        assert!(
-            matches!(resp, ValidateBlockResponse::Invalid),
-            "exec-applied frontier moved (session revoked) — the cached Valid \
-             must NOT be served; the sync path NOW rejects"
+        let decode_before = metric_count(
+            &metrics.encode(),
+            "torus_validate_block_decode_seconds_count",
         );
-        assert_eq!(async_cache_len(&app), 0, "stale entry is discarded");
+        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
+        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
+        assert_eq!(
+            metric_count(
+                &metrics.encode(),
+                "torus_validate_block_decode_seconds_count"
+            ),
+            decode_before,
+            "the cached verdict is served (hit)"
+        );
+        assert_eq!(async_cache_len(&app), 0, "consumed");
     }
 
-    /// Converse of the exec-frontier rail: a commit landing WITHOUT exec
-    /// catching up changes nothing `validate_body_checks_core` reads (ancestry
-    /// and fail-stop re-run live at hit time), so the verdict basis still holds
-    /// and the hit path must survive — the deep-exec-queue regime this branch
-    /// targets is exactly where commits outrun exec.
+    /// A commit landing WITHOUT exec catching up changes nothing the heavy
+    /// stage reads (ancestry and fail-stop re-run live at hit time), so the hit
+    /// path must survive — the deep-exec-queue regime this branch targets is
+    /// exactly where commits outrun exec.
     #[test]
     fn async_validate_commit_without_exec_still_hits() {
         let (mut app, _mempool, metrics) = make_async_validate_app();
@@ -9693,38 +9565,6 @@ mod crash_recovery_tests {
             decode_before,
             "applied frontier unchanged — the cached verdict must be served (hit)"
         );
-    }
-
-    /// The applied marker moving WITHOUT any semantic state change still forces
-    /// the sync fallback (conservative direction of the rail): a discarded
-    /// verdict only costs the inline re-validation, never a wrong vote.
-    #[test]
-    fn async_validate_stale_state_basis_invalidation() {
-        let (mut app, _mempool, metrics) = make_async_validate_app();
-        let block = make_block(5, vec![sign_claim_rewards(1)]);
-        let datum = encode_proposal_datum(&block, false);
-        assert!(app.async_validate_handle().unwrap().submit(datum.clone()));
-        wait_for_cached(&app, 1);
-
-        // Exec applies a block: the applied frontier (and the session/validator
-        // state the worker verified against) moves. The verdict's basis is stale.
-        write_native_applied_height(&app.state_db, 1);
-
-        let decode_before = metric_count(
-            &metrics.encode(),
-            "torus_validate_block_decode_seconds_count",
-        );
-        let resp = app.validate_datum(&datum, &data_hash_of(&datum));
-        assert!(matches!(resp, ValidateBlockResponse::Valid { .. }));
-        assert_eq!(
-            metric_count(
-                &metrics.encode(),
-                "torus_validate_block_decode_seconds_count"
-            ),
-            decode_before + 1,
-            "stale-basis entry must NOT be served — full sync fallback"
-        );
-        assert_eq!(async_cache_len(&app), 0, "stale entry is discarded");
     }
 
     #[test]
@@ -10650,6 +10490,201 @@ mod crash_recovery_tests {
             torus_economics::MIN_SELF_DELEGATION,
             "exec-time structural sig failure must NOT slash the proposer"
         );
+    }
+
+    // ---- s84 decision 1: skip invalid actions, record executed/skipped ----
+
+    /// The block's executed/skipped record, if execution wrote one.
+    fn action_status(
+        state_db: &StateDb,
+        height: u64,
+    ) -> Option<torus_state::action_status::BlockActionStatus> {
+        state_db
+            .get_cf_raw(
+                torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                &height.to_be_bytes(),
+            )
+            .unwrap()
+            .map(|bytes| {
+                torus_state::action_status::BlockActionStatus::decode(&bytes)
+                    .expect("record decodes")
+            })
+    }
+
+    fn nonce_consumed(state_db: &StateDb, sender: Address, nonce: u64) -> bool {
+        state_db
+            .get_cf_raw(
+                torus_state::cf::CF_NATIVE_NONCES,
+                &torus_state::cf::native_nonce_key(&sender, nonce),
+            )
+            .unwrap()
+            .is_some()
+    }
+
+    /// s84 decision 1 (a): a block carrying a forged-signature action, a
+    /// replayed nonce, an expired session and an undecodable EVM tx is
+    /// certified (every replica's data check holds and `validate_block` is
+    /// Valid) and committed on 3 replicas with identical state. Execution
+    /// skips exactly those actions and records them as skipped; the valid
+    /// native action and the valid EVM tx in the same block execute.
+    ///
+    /// RED before decision 1: `validate_block` rejects block 2 (non-attested
+    /// path: the forged signature and the expired session fail
+    /// `batch_verify_native_actions`; `decode_all_txs` fails on the garbage
+    /// EVM tx), and execution writes no record.
+    #[test]
+    fn invalid_actions_are_skipped_and_recorded_identically_on_three_replicas() {
+        use torus_types::ActionSignature;
+        let key_a = k256::ecdsa::SigningKey::from_slice(&[31u8; 32]).unwrap();
+        let key_c = k256::ecdsa::SigningKey::from_slice(&[33u8; 32]).unwrap();
+        let evm_key = k256::ecdsa::SigningKey::from_slice(&[34u8; 32]).unwrap();
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[35u8; 32]);
+
+        let first = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 1, &key_a);
+        let block1 = make_block(1, vec![first.clone()]);
+
+        let mut forged = torus_types::eip712::sign_native_action(
+            NativeAction::ClaimRewards,
+            7,
+            &k256::ecdsa::SigningKey::from_slice(&[32u8; 32]).unwrap(),
+        );
+        if let ActionSignature::Eip712(ref mut sig) = forged.signature {
+            sig.r = [0xff; 32];
+            sig.s = [0xff; 32];
+        }
+        let expired = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 1 },
+            8,
+            &session_key,
+        );
+        let valid = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 9, &key_c);
+        // Positions: 0 replay of block 1's action, 1 forged, 2 expired, 3 valid.
+        let mut block2 = make_block(2, vec![first, forged, expired, valid]);
+        block2.header.parent_hash =
+            alloy_primitives::keccak256(block1.header.canonical_header_bytes());
+        // EVM positions: 0 undecodable, 1 a valid contract creation.
+        block2.evm_transactions = vec![vec![0xde, 0xad], signed_sstore_create(&evm_key, 0)];
+        block2.header.evm_tx_count = 2;
+
+        let mut dumps = Vec::new();
+        for replica in 0..3 {
+            let (config, state_db) = make_test_config_and_db();
+            fund_evm_balance(
+                &state_db,
+                k256_address(&evm_key),
+                U256::from(10u128.pow(18)),
+            );
+            state_db
+                .put_session(
+                    &session_key.verifying_key().to_bytes(),
+                    &torus_types::SessionData {
+                        owner: k256_address(&key_c),
+                        expiry: 1, // before block 2's timestamp
+                        scope: torus_types::SessionScope::Trading,
+                        created_at: 0,
+                    },
+                )
+                .unwrap();
+            let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
+            let ctx = make_exec_ctx(&config, &state_db);
+            for block in [&block1, &block2] {
+                let datum = encode_proposal_datum(block, false);
+                let data_hash = CryptoHash::new(TorusApp::hash_datum(&datum));
+                let hs_block = hotstuff_rs::types::block::Block::new(
+                    hotstuff_rs::types::data_types::BlockHeight::new(block.header.height),
+                    hotstuff_rs::hotstuff::types::PhaseCertificate::genesis_pc(),
+                    data_hash,
+                    Data::new(vec![Datum::new(datum.clone())]),
+                );
+                assert_eq!(
+                    app.check_block_data(&hs_block),
+                    BlockDataCheck::Held,
+                    "replica {replica} votes for height {}",
+                    block.header.height
+                );
+                assert!(
+                    matches!(
+                        app.validate_datum(&datum, &data_hash),
+                        ValidateBlockResponse::Valid { .. }
+                    ),
+                    "replica {replica} must accept height {} (nothing inside a body makes it invalid)",
+                    block.header.height
+                );
+                ctx.execute_committed_block(block, vec![]);
+            }
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "replica {replica} fail-stopped"
+            );
+
+            assert_eq!(
+                action_status(&state_db, 1),
+                Some(torus_state::action_status::BlockActionStatus {
+                    evm_skipped: vec![],
+                    native_skipped: vec![false],
+                })
+            );
+            assert_eq!(
+                action_status(&state_db, 2),
+                Some(torus_state::action_status::BlockActionStatus {
+                    evm_skipped: vec![true, false],
+                    native_skipped: vec![true, true, true, false],
+                }),
+                "replica {replica}: replay, forged and expired skipped; valid executed"
+            );
+            assert!(nonce_consumed(&state_db, k256_address(&key_a), 1));
+            assert!(
+                nonce_consumed(&state_db, k256_address(&key_c), 9),
+                "valid action executed"
+            );
+            assert!(
+                !nonce_consumed(&state_db, k256_address(&key_c), 8),
+                "expired-session action consumed nothing"
+            );
+            let evm_account = state_db
+                .get_cf_raw(
+                    torus_state::cf::CF_ACCOUNTS,
+                    k256_address(&evm_key).as_slice(),
+                )
+                .unwrap()
+                .expect("EVM sender account");
+            assert_eq!(
+                u64::from_be_bytes(evm_account[32..40].try_into().unwrap()),
+                1,
+                "the valid EVM tx executed (sender nonce 0 -> 1)"
+            );
+            drop(app);
+            dumps.push(dump_all_cfs(&state_db));
+        }
+        assert_dumps_equal(&dumps[0], &dumps[1], "replica 0 vs 1");
+        assert_dumps_equal(&dumps[0], &dumps[2], "replica 0 vs 2");
+    }
+
+    /// s84: an EVM-only block (no native phase: zero fee revenue) records its
+    /// EVM statuses through the marker flush, and an empty block records none.
+    #[test]
+    fn evm_only_block_records_status_and_empty_block_records_none() {
+        let (config, state_db) = make_test_config_and_db();
+        let ctx = make_exec_ctx(&config, &state_db);
+        let mut block1 = make_block(1, vec![]);
+        block1.evm_transactions = vec![vec![0x01, 0x02, 0x03]];
+        block1.header.evm_tx_count = 1;
+        ctx.execute_committed_block(&block1, vec![]);
+        let mut block2 = make_block(2, vec![]);
+        block2.header.parent_hash =
+            alloy_primitives::keccak256(block1.header.canonical_header_bytes());
+        ctx.execute_committed_block(&block2, vec![]);
+
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&state_db), Some(2));
+        assert_eq!(
+            action_status(&state_db, 1),
+            Some(torus_state::action_status::BlockActionStatus {
+                evm_skipped: vec![true],
+                native_skipped: vec![],
+            })
+        );
+        assert_eq!(action_status(&state_db, 2), None);
     }
 
     /// GATE (T5, state level): executing the SAME block with the trust-cache warm
