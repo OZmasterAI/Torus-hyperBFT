@@ -132,3 +132,41 @@ fn one_traders_order_removal_cost() {
     assert_eq!(b.open_order_count(&maker), 0);
     println!("STP cancels x{N} (one order): {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
 }
+
+#[test]
+#[ignore = "release cost probe; run with --release -- --ignored --nocapture"]
+fn trader_churn_cost() {
+    // Bench shape per block: ~200 senders each rest ~3 orders in each of 300
+    // books, then cancel-all (Phase 1, `cancel_all_many`) clears them.
+    const BOOKS: u64 = 300;
+    const SENDERS: u64 = 200;
+    const PER: u64 = 3;
+    let senders: Vec<Address> = (0..SENDERS).map(trader).collect();
+    let mut best_place = f64::MAX;
+    let mut best_cancel = f64::MAX;
+    for _ in 0..5 {
+        let mut books: Vec<OrderBook> =
+            (1..=BOOKS).map(|m| OrderBook::new(m, fp(1), fp(1))).collect();
+        let t0 = Instant::now();
+        for (m, b) in books.iter_mut().enumerate() {
+            for (s, t) in senders.iter().enumerate() {
+                for k in 0..PER {
+                    let price = 1 + ((s as u64 * PER + k + m as u64) % 400) as i64;
+                    b.place_order(order(m as u64 + 1, true, price, TimeInForce::GTC), *t, 0);
+                }
+            }
+        }
+        best_place = best_place.min(t0.elapsed().as_secs_f64() * 1e3);
+        let t0 = Instant::now();
+        let mut cancelled = 0;
+        for b in books.iter_mut() {
+            cancelled += b.cancel_all_many(&senders).iter().map(Vec::len).sum::<usize>();
+        }
+        best_cancel = best_cancel.min(t0.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(cancelled as u64, BOOKS * SENDERS * PER);
+    }
+    println!(
+        "churn {BOOKS} books x {SENDERS} senders x {PER}: place {best_place:.1} ms, \
+         cancel_all_many {best_cancel:.1} ms"
+    );
+}
