@@ -100,7 +100,15 @@ not repair it (resync from a snapshot or a peer).
     `[nonce 1, nonce 0]` (first skipped as nonce-too-high) must not run the
     nonce-1 tx on replay.
 - Ported from b5ef142: `block_journal_tx_scopes_keep_and_revert` (torus-state),
-  evm block path writes nothing before the commit (torus-evm).
+  `block_execution_journals_writer_precompiles_per_tx` now asserts the block
+  path writes nothing before the batch is written (torus-evm).
+- `flush_after_batch_lands_prefix_with_overlay_and_marker` (torus-state): the
+  prefix lands in the same write as the overlay and the marker; the overlay
+  wins on a shared key.
+- Fail-stop (new): an EVM block whose batch cannot be built, or whose flush
+  fails, latches the fail-stop instead of executing the next block on a base
+  without its EVM writes (not unit-injectable; the flush error path is the
+  existing one).
 - Existing running-hash tests (`running_hash_captures_evm_writer_precompile_side_effects_end_to_end`,
   `running_hash_covers_out_of_batch_consensus_writes`) must stay green
   unchanged.

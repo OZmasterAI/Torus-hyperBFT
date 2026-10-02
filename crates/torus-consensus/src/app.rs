@@ -607,6 +607,10 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only crash injection (consensus bug (c)): return right after the
+    /// EVM section, where a hard crash before the native flush would stop.
+    #[cfg(test)]
+    test_crash_after_evm_section: bool,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1446,10 +1450,10 @@ impl ExecutionContext {
         true
     }
 
-    /// Running state hash: block's consensus writes made durable outside its
-    /// flush batch (Task 0), lowest priority first: the recorded slash /
-    /// writer-precompile commits, then the EVM bundle — both recorded on this
-    /// thread as they became durable, so overlapping keys agree.
+    /// Running state hash: block's consensus writes NOT in its overlay (Task 0),
+    /// lowest priority first: the recorded slash commits, then the EVM bundle
+    /// and its writer-precompile rows (since bug (c) the prefix of the flush
+    /// batch) — overlapping keys agree with what lands.
     ///
     /// NOT hashed (review finding 2, tied to the pre-existing bug "epoch
     /// rotation on the consensus thread"): the consensus thread's epoch
@@ -1576,7 +1580,7 @@ impl ExecutionContext {
         }
 
         // Running state hash: record this block's consensus writes that become
-        // durable OUTSIDE its flush batch (slashes, EVM writer precompiles) — see
+        // durable OUTSIDE its flush batch (slashes) — see
         // `hash_extras` below. The slashes go through a per-block overlay and ONE
         // `commit_tx` (same bytes as the direct puts) so the recorder sees them.
         let out_of_batch = torus_state::OutOfBatchRecorder::begin();
@@ -1632,6 +1636,14 @@ impl ExecutionContext {
         let mut bundle = BundleState::default();
         let mut bundle_extras = torus_state::HashExtras::new();
         let mut computed_fee_revenue: u128 = 0;
+        // Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
+        // the EVM block's consensus writes (bundle, hashed mirror, incremental
+        // trie nodes, writer-precompile queue rows) are BUILT here and written
+        // as the PREFIX of this block's one flush batch below (with the native
+        // state and the applied-height marker): a crash before that write leaves
+        // nothing of the block durable, so the replay re-executes it from the
+        // same base.
+        let mut evm_batch: Option<rocksdb::WriteBatch> = None;
         if has_evm {
             match self.validator.validate_block_for_catchup(
                 torus_block,
@@ -1645,28 +1657,39 @@ impl ExecutionContext {
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
                     let precomputed_root = validated.evm_root_updates;
-                    // Phase A: commit EVM plain state + the hashed mirror + the incremental trie
-                    // nodes in ONE atomic batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
-                    // CF_ACCOUNTS (keeps the incremental root's base correct across restarts/replay).
-                    // Falls back to the plain commit if the incremental path errors, so a trie bug
+                    // Phase A: EVM plain state + the hashed mirror + the incremental trie nodes
+                    // in ONE batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with CF_ACCOUNTS
+                    // (keeps the incremental root's base correct across restarts/replay).
+                    // Falls back to the plain batch if the incremental path errors, so a trie bug
                     // can never halt the chain (the full-scan root stays primary unless the flag is on).
-                    match torus_state::incremental::commit_evm_bundle_incremental(
+                    let built = match torus_state::incremental::evm_block_batch_incremental(
                         &self.state_db,
                         &validated.bundle,
                         precomputed_root,
+                        Some(&validated.native_writes),
                     ) {
-                        Ok(_root) => bundle_extras.add_evm_bundle(&validated.bundle),
+                        Ok((_root, batch)) => Ok(batch),
                         Err(e) => {
-                            tracing::error!(%e, height, "incremental commit failed; falling back to plain EVM commit");
-                            match BlockCommitter::commit_pending_bundle(
+                            tracing::error!(%e, height, "incremental EVM batch failed; falling back to the plain EVM batch");
+                            BlockCommitter::pending_bundle_batch(
                                 &self.state_db,
                                 &validated.bundle,
-                            ) {
-                                Ok(()) => bundle_extras.add_evm_bundle(&validated.bundle),
-                                Err(e2) => {
-                                    tracing::error!(%e2, height, "failed to commit EVM bundle (fallback)")
-                                }
-                            }
+                                Some(&validated.native_writes),
+                            )
+                        }
+                    };
+                    match built {
+                        Ok(batch) => {
+                            bundle_extras.add_evm_bundle(&validated.bundle);
+                            bundle_extras.add_overlay_pending(&validated.native_writes);
+                            evm_batch = Some(batch);
+                        }
+                        Err(e2) => {
+                            // Executing the native phase without the block's EVM
+                            // writes would make a partial block durable.
+                            tracing::error!(%e2, height, "FATAL: could not build the EVM batch (fallback) — fail-stop");
+                            self.exec_failed.store(true, Ordering::SeqCst);
+                            return;
                         }
                     }
                     if let Err(e) = BlockCommitter::commit_block_metadata(
@@ -1706,6 +1729,10 @@ impl ExecutionContext {
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
+        }
+        #[cfg(test)]
+        if self.test_crash_after_evm_section {
+            return;
         }
 
         let mut hash_extras = Some(Self::running_hash_extras(out_of_batch, bundle_extras));
@@ -2111,6 +2138,7 @@ impl ExecutionContext {
             let (fills, extras) = ctx.take_pending_fills_and_extras();
 
             if pipelined {
+                debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
                 // the overlay too (CF_CONSENSUS_META is a non-root CF — root-
                 // neutral; the flush appends the same key/bytes again, so the
@@ -2166,7 +2194,10 @@ impl ExecutionContext {
                 } else {
                     None
                 };
-                overlay.flush_with_native_trie_stats(
+                // Bug (c): the block's EVM batch (if any) is the prefix of this
+                // ONE atomic write.
+                overlay.flush_after_batch_with_native_trie_stats(
+                    evm_batch.take().unwrap_or_default(),
                     &self.state_db,
                     Some(height),
                     cache_opt,
@@ -2209,6 +2240,13 @@ impl ExecutionContext {
                     // `find_last_committed_height` for the replay.
                     if header_folded {
                         persist_block_header(&self.state_db, torus_block);
+                    }
+                    if has_evm {
+                        // Bug (c): the EVM writes were in the failed batch. Do not
+                        // execute the next block on a base without them.
+                        tracing::error!(height, "FATAL: EVM block flush failed — fail-stop (restart replays it)");
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return;
                     }
                 }
             }
@@ -2362,8 +2400,8 @@ impl ExecutionContext {
         // applied-height marker was already folded into that path's atomic flush batch above
         // (flush_with_native_trie_and_marker), so native state and the marker committed together.
         // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
-        // empty or pure-EVM blocks, whose re-execution is idempotent) still need a standalone marker
-        // write here.
+        // empty or pure-EVM blocks) still need a standalone marker write here; a pure-EVM block's
+        // EVM batch rides that marker write (bug (c)).
         if !(has_native || computed_fee_revenue > 0) {
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
@@ -2375,6 +2413,22 @@ impl ExecutionContext {
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                    return;
+                }
+            } else if let Some(prefix) = evm_batch.take() {
+                // Bug (c): an EVM block without a native phase (no fee revenue):
+                // its EVM batch rides the marker flush — one atomic write.
+                let pending = torus_state::FrozenPending::marker_only(height)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                if let Err(e) = pending.flush_after_batch_with_native_trie_stats(
+                    prefix,
+                    &self.state_db,
+                    Some(height),
+                    None,
+                    None,
+                ) {
+                    tracing::error!(%e, height, "FATAL: EVM block marker flush failed — fail-stop (restart replays it)");
+                    self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
             } else {
@@ -3467,6 +3521,8 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_section: false,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -5235,6 +5291,13 @@ impl App<RocksKVStore> for TorusApp {
             "SPECULATIVE ROLLBACK: leader equivocation detected"
         );
 
+        // Consensus bug (a), docs/plans/consensus-bug-a-equivocation.md: NO
+        // slash from local observation. Only replicas that received both
+        // proposals see this, and `evidence` (two hashes, no leader signatures)
+        // cannot be verified by anyone else — slashing here wrote different
+        // state on different replicas. The evidence stays persisted by
+        // hotstuff (`store_equivocation_evidence`); slashing needs on-chain,
+        // verifiable evidence (owner decision, see the plan).
         let leader_pubkey = evidence.leader.to_bytes();
         let leader_addr = self
             .staking
@@ -10134,6 +10197,8 @@ mod crash_recovery_tests {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_crash_after_evm_section: false,
         }
     }
 
@@ -14531,9 +14596,9 @@ mod crash_recovery_tests {
 
     /// Review test gap: an EVM tx that calls a WRITER precompile (CoreWriter,
     /// 0x0810) through a contract, end to end on the committed-block path:
-    /// the precompile's native side effect (a core-writer queue row, made
-    /// durable per tx OUTSIDE the flush batch) enters `D(n)` of its height
-    /// with the value the DB holds.
+    /// the precompile's native side effect (a core-writer queue row, since bug
+    /// (c) the EVM prefix of the block's flush batch, not in its overlay)
+    /// enters `D(n)` of its height with the value the DB holds.
     #[test]
     fn running_hash_captures_evm_writer_precompile_side_effects_end_to_end() {
         use torus_state::cf::CF_CORE_WRITER_QUEUE;
@@ -14587,6 +14652,71 @@ mod crash_recovery_tests {
             "the precompile's queue row is in D(1)"
         );
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
+    }
+
+    /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
+    /// a node executes `block` once; another node stops right after the EVM
+    /// section of its first attempt (a hard crash before the native flush) and
+    /// re-executes the block after the restart (fresh exec context, durable
+    /// applied-height marker below the block). Every column family must end
+    /// identical. RED on main @ d623d3c: the EVM bundle was durable before the
+    /// native flush, so the replay re-ran the txs on top of their own result.
+    fn assert_crash_after_evm_section_replays_identically(
+        block: &TorusBlock,
+        key: &k256::ecdsa::SigningKey,
+    ) {
+        let node = |crash: bool| {
+            let (config, db) = make_test_config_and_db();
+            let funded = revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            };
+            db.put_account(&k256_address(key), &funded).unwrap();
+            let durable = persist_committed_block_durably(&db, block);
+            if crash {
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.test_crash_after_evm_section = true;
+                ctx.execute_committed_block_with(block, vec![], durable);
+                drop(ctx);
+                assert_eq!(read_native_applied_height(&db), None, "crashed before the flush");
+            }
+            let ctx = make_exec_ctx(&config, &db);
+            ctx.execute_committed_block_with(block, vec![], durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(block.header.height));
+            db
+        };
+        let (clean, crashed) = (node(false), node(true));
+        for ((cf, a), (_, b)) in dump_all_cfs(&clean).iter().zip(dump_all_cfs(&crashed).iter()) {
+            assert_eq!(a, b, "{cf} differs after the crash + replay");
+        }
+    }
+
+    /// Bug (c): the replay must not lose the block's fee revenue (treasury /
+    /// dev-pool credits) nor re-run a tx on its own committed nonce.
+    #[test]
+    fn evm_crash_between_evm_and_native_flush_replays_identically() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[63u8; 32]).unwrap();
+        let mut b1 = make_block(1, vec![]);
+        b1.evm_transactions = vec![signed_sstore_create(&key, 0)];
+        b1.header.evm_tx_count = 1;
+        assert_crash_after_evm_section_replays_identically(&b1, &key);
+    }
+
+    /// Bug (c): `[nonce 1, nonce 0]` — the first tx is skipped as nonce-too-high
+    /// on the real execution; on a replay over the committed bundle it would be
+    /// valid and run (a second contract, a second fee).
+    #[test]
+    fn evm_crash_after_evm_section_skipped_tx_not_revived() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[64u8; 32]).unwrap();
+        let mut b1 = make_block(1, vec![]);
+        b1.evm_transactions = vec![signed_sstore_create(&key, 1), signed_sstore_create(&key, 0)];
+        b1.header.evm_tx_count = 2;
+        assert_crash_after_evm_section_replays_identically(&b1, &key);
     }
 
     #[test]

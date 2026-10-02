@@ -205,6 +205,21 @@ impl BlockCommitter {
         state_db: &StateDb,
         bundle: &BundleState,
     ) -> Result<(), BridgeError> {
+        let batch = Self::pending_bundle_batch(state_db, bundle, None)?;
+        state_db.write(batch)?;
+        Ok(())
+    }
+
+    /// The batch [`commit_pending_bundle`](Self::commit_pending_bundle) writes,
+    /// plus the block's writer-precompile side effects (`native_writes`), BUILT
+    /// but not written: consensus bug (c) — the plain fallback of
+    /// `torus_state::incremental::evm_block_batch_incremental`, made the prefix
+    /// of the block's flush batch by the caller.
+    pub fn pending_bundle_batch(
+        state_db: &StateDb,
+        bundle: &BundleState,
+        native_writes: Option<&torus_state::NativeStateOverlay>,
+    ) -> Result<rocksdb::WriteBatch, BridgeError> {
         let mut batch = rocksdb::WriteBatch::default();
 
         let cf_accounts = state_db.cf_handle(CF_ACCOUNTS)?;
@@ -243,8 +258,9 @@ impl BlockCommitter {
             let raw = bytecode.bytes();
             batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
         }
-
-        state_db.write(batch)?;
-        Ok(())
+        if let Some(native) = native_writes {
+            native.append_pending_to_batch(state_db, &mut batch)?;
+        }
+        Ok(batch)
     }
 }

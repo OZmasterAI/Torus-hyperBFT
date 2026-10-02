@@ -614,6 +614,14 @@ impl HashExtras {
         self.state.absorb_hashed(&later.state);
     }
 
+    /// Fold `overlay`'s pending writes on top: an EVM block's block-scoped
+    /// writer-precompile journal (consensus bug (c)) — the same entries the
+    /// per-tx `commit_tx` used to record while armed.
+    pub fn add_overlay_pending(&mut self, overlay: &NativeStateOverlay) {
+        let pending = overlay.pending.read().unwrap();
+        self.state.absorb_hashed(&pending);
+    }
+
     /// The EVM bundle's plain-state change set — exactly the puts / deletes
     /// [`crate::incremental::apply_bundle_plain`] (and the fallback
     /// `commit_pending_bundle`) write to `cf_accounts` / `cf_storage` /
@@ -764,6 +772,28 @@ impl FrozenPending {
         )
     }
 
+    /// Mirror of [`NativeStateOverlay::flush_after_batch_with_native_trie_stats`]
+    /// (consensus bug (c): an EVM-only block's bundle rides its marker flush).
+    pub fn flush_after_batch_with_native_trie_stats(
+        &self,
+        prefix: WriteBatch,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_after_batch(
+            prefix,
+            &self.state,
+            None,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            crate::native_trie::native_trie_maintenance_enabled(),
+        )
+    }
+
     /// Deferred book save (port of item 6a): [`Self::flush_with_native_trie_stats`]
     /// with an optional SIDECAR pending set folded in — the flush worker's
     /// worker-side book writes. The sidecar's entries join the SAME atomic batch
@@ -818,6 +848,15 @@ pub struct NativeStateOverlay {
     /// between this overlay's own pending set and the DB on every read. `None`
     /// on the serial path (exact-today: own pending -> DB).
     parent: Option<Arc<FrozenPending>>,
+}
+
+impl std::fmt::Debug for NativeStateOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeStateOverlay")
+            .field("pending_writes", &self.pending_write_count())
+            .field("parent_height", &self.parent_height())
+            .finish()
+    }
 }
 
 impl NativeStateOverlay {
@@ -902,6 +941,50 @@ impl NativeStateOverlay {
     pub fn discard_tx(&self) {
         let mut state = self.pending.write().unwrap();
         state.clear();
+    }
+
+    /// F1 (s515, ported from `fix/parity-audit-bugs` b5ef142): open a transaction
+    /// scope inside a BLOCK-scoped journal. Pending writes of earlier transactions
+    /// stay; everything written from here on is undo-logged so
+    /// [`revert_tx`](Self::revert_tx) can drop exactly this tx's writes. Resets the
+    /// frame checkpoint stack (it must not leak across txs).
+    pub fn begin_tx(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.journal_log.clear();
+        state.checkpoints.clear();
+        state.checkpoints.push(0);
+    }
+
+    /// F1 (s515): close the transaction scope KEEPING its writes pending in the
+    /// block journal (nothing is persisted — the block commit writes them).
+    pub fn keep_tx(&self) {
+        let mut state = self.pending.write().unwrap();
+        state.journal_log.clear();
+        state.checkpoints.clear();
+    }
+
+    /// F1 (s515): close the transaction scope DROPPING its writes; earlier
+    /// transactions' pending writes are untouched.
+    pub fn revert_tx(&self) {
+        {
+            let mut state = self.pending.write().unwrap();
+            state.checkpoints.clear();
+            state.checkpoints.push(0);
+        }
+        self.revert_to_checkpoint();
+    }
+
+    /// F1 (s515): append every pending write/delete to `batch` WITHOUT writing or
+    /// clearing — lets a caller persist this overlay in the same atomic
+    /// `WriteBatch` as other state (an EVM block's writer-precompile queue rows
+    /// ride the block's batch, consensus bug (c)).
+    pub fn append_pending_to_batch(
+        &self,
+        target: &StateDb,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StateError> {
+        let state = self.pending.read().unwrap();
+        state.append_to_batch(target.inner(), batch)
     }
 
     /// T4.4 revert-safety: open a call-frame checkpoint over the writer-precompile journal.
@@ -1074,8 +1157,33 @@ impl NativeStateOverlay {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
+        self.flush_after_batch_with_native_trie_stats(
+            WriteBatch::default(),
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+        )
+    }
+
+    /// [`Self::flush_with_native_trie_stats`] whose ONE atomic write starts
+    /// with `prefix` (consensus bug (c): the block's EVM bundle + writer rows),
+    /// so the prefix is durable iff this block's native state and applied-height
+    /// marker are. The overlay's writes follow the prefix in the batch (a later
+    /// op on the same key wins), exactly as when the prefix was written first.
+    /// Not hashed: the caller records the prefix's consensus writes as
+    /// [`HashExtras`].
+    pub fn flush_after_batch_with_native_trie_stats(
+        &self,
+        prefix: WriteBatch,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<NativeFlushStats, StateError> {
         let state = self.pending.read().unwrap();
-        flush_pending_with_native_trie_stats(
+        flush_pending_after_batch(
+            prefix,
             &state,
             None,
             target,
@@ -1121,6 +1229,31 @@ fn flush_pending_with_native_trie_stats(
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     maintain_trie: bool,
 ) -> Result<NativeFlushStats, StateError> {
+    flush_pending_after_batch(
+        WriteBatch::default(),
+        state,
+        sidecar,
+        target,
+        applied_height,
+        trie_cache,
+        member_cache,
+        maintain_trie,
+    )
+}
+
+/// [`flush_pending_with_native_trie_stats`] whose batch starts with `prefix`
+/// (see [`NativeStateOverlay::flush_after_batch_with_native_trie_stats`]).
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_after_batch(
+    prefix: WriteBatch,
+    state: &PendingState,
+    sidecar: Option<&PendingState>,
+    target: &StateDb,
+    applied_height: Option<u64>,
+    trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    maintain_trie: bool,
+) -> Result<NativeFlushStats, StateError> {
     std::thread::scope(|scope| {
         let raw = target.inner();
 
@@ -1156,7 +1289,7 @@ fn flush_pending_with_native_trie_stats(
         });
 
         let build_timer = std::time::Instant::now();
-        let mut batch = WriteBatch::default();
+        let mut batch = prefix;
         state.append_to_batch(raw, &mut batch)?;
         // Deferred book save: the sidecar (worker-side book writes) joins the
         // SAME atomic batch, appended after the main set (last-wins on the — in
@@ -1915,6 +2048,76 @@ mod tests {
         overlay.discard_tx();
         assert_eq!(overlay.pending_write_count(), 0);
         assert!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().is_none());
+    }
+
+    /// F1 (s515, ported from b5ef142): block-scoped journal — a reverted tx
+    /// drops only its own writes (including overwrites of an earlier tx's key);
+    /// kept txs stay pending and nothing reaches the DB until the caller
+    /// batches them.
+    #[test]
+    fn block_journal_tx_scopes_keep_and_revert() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let overlay = NativeStateOverlay::new(db.clone());
+
+        overlay.begin_tx();
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"a").unwrap();
+        overlay.keep_tx();
+
+        overlay.begin_tx();
+        StateBackend::put_cf_raw(&overlay, cf, b"k1", b"b").unwrap();
+        StateBackend::put_cf_raw(&overlay, cf, b"k2", b"c").unwrap();
+        overlay.checkpoint(); // an inner frame left open must not leak
+        overlay.revert_tx();
+
+        let k1 = StateBackend::get_cf_raw(&overlay, cf, b"k1").unwrap();
+        assert_eq!(k1.as_deref(), Some(&b"a"[..]));
+        assert!(StateBackend::get_cf_raw(&overlay, cf, b"k2").unwrap().is_none());
+        assert!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().is_none(), "nothing durable yet");
+
+        let mut batch = WriteBatch::default();
+        overlay.append_pending_to_batch(&db, &mut batch).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(StateDb::get_cf_raw(&db, cf, b"k1").unwrap().as_deref(), Some(&b"a"[..]));
+        assert!(StateDb::get_cf_raw(&db, cf, b"k2").unwrap().is_none());
+    }
+
+    /// Consensus bug (c): a prefix batch rides the flush's ONE write — the
+    /// overlay's writes win on a shared key (as when the prefix was written
+    /// first) and the applied-height marker lands with it.
+    #[test]
+    fn flush_after_batch_lands_prefix_with_overlay_and_marker() {
+        use crate::cf::{CF_ACCOUNTS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+        let (db, _dir) = temp_db();
+        let prefix_with = |k: &[u8], v: &[u8]| {
+            let mut b = WriteBatch::default();
+            b.put_cf(db.cf_handle(CF_ACCOUNTS).unwrap(), k, v);
+            b
+        };
+        let overlay = NativeStateOverlay::new(db.clone());
+        StateBackend::put_cf_raw(&overlay, CF_ACCOUNTS, b"shared", b"native").unwrap();
+        let mut prefix = prefix_with(b"shared", b"evm");
+        prefix.put_cf(db.cf_handle(CF_ACCOUNTS).unwrap(), b"evm-only", b"x");
+        overlay
+            .flush_after_batch_with_native_trie_stats(prefix, &db, Some(7), None, None)
+            .unwrap();
+        let get = |cf, k: &[u8]| StateDb::get_cf_raw(&db, cf, k).unwrap();
+        assert_eq!(get(CF_ACCOUNTS, b"shared").as_deref(), Some(&b"native"[..]));
+        assert_eq!(get(CF_ACCOUNTS, b"evm-only").as_deref(), Some(&b"x"[..]));
+        assert_eq!(
+            get(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT),
+            Some(7u64.to_be_bytes().to_vec())
+        );
+
+        // Marker-only frozen set: same contract.
+        FrozenPending::marker_only(8)
+            .flush_after_batch_with_native_trie_stats(prefix_with(b"m", b"y"), &db, Some(8), None, None)
+            .unwrap();
+        assert_eq!(get(CF_ACCOUNTS, b"m").as_deref(), Some(&b"y"[..]));
+        assert_eq!(
+            get(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT),
+            Some(8u64.to_be_bytes().to_vec())
+        );
     }
 
     #[test]

@@ -885,6 +885,21 @@ fn block_execution_journals_writer_precompiles_per_tx() {
     assert!(!result.receipts[0].status, "first tx reverts");
     assert!(result.receipts[1].status, "second tx succeeds");
 
+    // F1 (s515, ported b5ef142) / consensus bug (c): nothing is durable until
+    // the block's batch is written, which carries the queue rows with the bundle.
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
+        0,
+        "queue rows must not be durable before the block's batch is written"
+    );
+    let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(
+        &db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
+    db.write(batch).unwrap();
     assert_eq!(
         CoreWriterQueue::pending_count(&db, block_cfg.number + 1).unwrap(),
         1,
