@@ -17,7 +17,9 @@ use hotstuff_rs::{
         messages::{Message, ProgressMessage},
         network::Network,
     },
-    types::{update_sets::ValidatorSetUpdates, validator_set::ValidatorSet},
+    types::{
+        data_types::ViewNumber, update_sets::ValidatorSetUpdates, validator_set::ValidatorSet,
+    },
 };
 
 /// A runtime-toggleable message filter shared by every [`NetworkStub`] in a cluster.
@@ -47,6 +49,23 @@ pub(crate) struct MessageFilter {
     /// dropped for EVERY recipient — a proposer whose data never becomes available (withheld, or
     /// lost in a crash).
     pub(crate) withheld_bodies_from: Vec<VerifyingKey>,
+    /// s85: `(sender, view)`: drop every progress message (HotStuff or pacemaker) that `sender`
+    /// sends for `view` or a later view, to every recipient. The sender still enters `view` and
+    /// acts there, but nothing it does from `view` on leaves the node, as with a node stopped
+    /// in `view` before its vote went out.
+    pub(crate) silenced_from_view: Option<(VerifyingKey, ViewNumber)>,
+    /// s85: `(node, view)`: drop what `node` sends to OTHERS that could carry a certificate for
+    /// `view` or later: at `view` its phase votes, NewViews, TimeoutVotes and AdvanceViews,
+    /// above `view` every progress message. Its block-data traffic for `view` and everything it
+    /// sends to itself still flow, so as leader(view + 1) it can collect QC(view) alone while
+    /// nobody else hears of it.
+    pub(crate) certifies_alone: Option<(VerifyingKey, ViewNumber)>,
+    /// s85: `(node, view)`: once `node` sends a phase vote for `view` (which is delivered), drop
+    /// every message addressed to `node`, from anyone including itself. Its vote can certify
+    /// `view` on the others, but nothing that would tell `node` about it ever arrives.
+    pub(crate) isolated_after_vote: Option<(VerifyingKey, ViewNumber)>,
+    /// Latch of `isolated_after_vote`: set when that vote is sent.
+    pub(crate) isolated: bool,
 }
 
 impl MessageFilter {
@@ -60,9 +79,54 @@ impl MessageFilter {
     ///
     /// Everything else — crucially `ProposalHeader` and `PhaseVote` — passes through, so the starved
     /// node still votes on the header (helping a QC form) yet never obtains the block itself.
-    fn should_drop(&self, sender: &VerifyingKey, recipient: &VerifyingKey, message: &Message) -> bool {
+    fn should_drop(
+        &mut self,
+        sender: &VerifyingKey,
+        recipient: &VerifyingKey,
+        message: &Message,
+    ) -> bool {
         if !self.enabled {
             return false;
+        }
+        if let (Some((silenced, from)), Message::ProgressMessage(progress)) =
+            (&self.silenced_from_view, message)
+        {
+            if silenced == sender && progress.view().is_some_and(|view| view >= *from) {
+                return true;
+            }
+        }
+        if let (Some((node, view)), Message::ProgressMessage(progress)) =
+            (&self.certifies_alone, message)
+        {
+            if node == sender && recipient != sender {
+                let may_certify = match progress {
+                    ProgressMessage::HotStuffMessage(
+                        HotStuffMessage::PhaseVote(_) | HotStuffMessage::NewView(_),
+                    )
+                    | ProgressMessage::PacemakerMessage(_) => {
+                        progress.view().is_some_and(|v| v >= *view)
+                    }
+                    _ => progress.view().is_some_and(|v| v > *view),
+                };
+                if may_certify {
+                    return true;
+                }
+            }
+        }
+        if let Some((node, view)) = self.isolated_after_vote {
+            if self.isolated && *recipient == node {
+                return true;
+            }
+            if *sender == node
+                && matches!(
+                    message,
+                    Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                        HotStuffMessage::PhaseVote(vote)
+                    )) if vote.view == view
+                )
+            {
+                self.isolated = true;
+            }
         }
         let is_body = matches!(
             message,
@@ -236,7 +300,7 @@ impl FilterHandle {
             enabled: true,
             starved,
             drop_headers,
-            withheld_bodies_from: Vec::new(),
+            ..MessageFilter::default()
         };
         self.enabled.store(true, Ordering::Relaxed);
     }
@@ -249,6 +313,48 @@ impl FilterHandle {
             ..MessageFilter::default()
         };
         self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s85: drop every progress message `sender` sends for `view` or later, to every recipient,
+    /// from now on (see [`MessageFilter::silenced_from_view`]).
+    #[allow(dead_code)]
+    pub(crate) fn silence_from_view(&self, sender: VerifyingKey, view: ViewNumber) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            silenced_from_view: Some((sender, view)),
+            ..MessageFilter::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s85: let `node` certify `view` alone (see [`MessageFilter::certifies_alone`]).
+    #[allow(dead_code)]
+    pub(crate) fn certify_alone(&self, node: VerifyingKey, view: ViewNumber) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            certifies_alone: Some((node, view)),
+            ..MessageFilter::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s85: once `node` sends its phase vote for `view`, deliver nothing more to it (see
+    /// [`MessageFilter::isolated_after_vote`]).
+    #[allow(dead_code)]
+    pub(crate) fn isolate_after_vote(&self, node: VerifyingKey, view: ViewNumber) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            isolated_after_vote: Some((node, view)),
+            ..MessageFilter::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s85: whether the node of [`isolate_after_vote`](Self::isolate_after_vote) has sent that
+    /// vote (and is now cut off).
+    #[allow(dead_code)]
+    pub(crate) fn is_isolated(&self) -> bool {
+        self.filter.lock().unwrap().isolated
     }
 
     /// Fully heal the network: nothing is dropped and the message hot path takes no lock again.

@@ -29,7 +29,7 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{Pacemaker, PacemakerConfiguration, ViewInfo},
+    pacemaker::implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -71,14 +71,21 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         let msg_sender: SenderHandle<N> = SenderHandle::new(network.clone());
         let validator_set_update_handle = ValidatorSetUpdateHandle::new(network);
 
-        let init_view = match block_tree
-            .highest_view_with_progress()
-            .expect("Cannot retrieve the highest view with progress!")
-            .int()
-        {
-            0 => ViewNumber::new(0),
-            v => ViewNumber::new(v + 1),
-        };
+        let highest_view_entered = block_tree
+            .highest_view_entered()
+            .expect("Cannot retrieve the highest view entered!");
+        let init_view = boot_view(
+            highest_view_entered,
+            block_tree
+                .highest_pc()
+                .expect("Cannot retrieve the highest PC!")
+                .view,
+            block_tree
+                .highest_tc()
+                .expect("Cannot retrieve the highest TC!")
+                .map(|tc| tc.view),
+            pacemaker_config.epoch_length,
+        );
 
         let pacemaker = Pacemaker::new(
             pacemaker_config,
@@ -96,8 +103,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         // the first loop pass runs the ordinary enter_view(init_view): the
         // replica proposes there if it leads it, and sends the NewView for
         // init_view - 1. A fresh chain (init view 0) starts as before.
+        // s85: a replica booting back into the epoch-change view it entered
+        // last (see `boot_view`) starts HotStuff IN that view: enter_view
+        // already ran there before the restart, and running it again would
+        // let a leader of that view propose a second, conflicting block.
         let hotstuff_view_info = match init_view.int() {
             0 => init_view_info.clone(),
+            _ if init_view == highest_view_entered => init_view_info.clone(),
             v => ViewInfo::new(ViewNumber::new(v - 1), init_view_info.deadline),
         };
 

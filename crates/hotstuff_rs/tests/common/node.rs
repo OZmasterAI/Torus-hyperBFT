@@ -53,6 +53,9 @@ impl Default for WedgeOptions {
     }
 }
 
+/// The epoch length of every constructor except [`Node::new_with_epoch_length`].
+const DEFAULT_EPOCH_LENGTH: u32 = 50;
+
 /// A single "node" in an integration test cluster built around number app.
 ///
 /// Users can do two sets of things with a `Node` by calling its methods:
@@ -63,6 +66,7 @@ pub(crate) struct Node {
     verifying_key: VerifyingKeyBytes,
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     replica: Replica<MemDB>,
+    kv_store: MemDB,
 }
 
 impl Node {
@@ -109,6 +113,8 @@ impl Node {
             max_view_time,
             true,
             WedgeOptions::default(),
+            DEFAULT_EPOCH_LENGTH,
+            None,
         )
     }
 
@@ -135,6 +141,8 @@ impl Node {
             max_view_time,
             true,
             wedge_options,
+            DEFAULT_EPOCH_LENGTH,
+            None,
         )
     }
 
@@ -164,12 +172,43 @@ impl Node {
             max_view_time,
             false,
             WedgeOptions::default(),
+            DEFAULT_EPOCH_LENGTH,
+            None,
+        )
+    }
+
+    /// s85 epoch-boundary rejoin: like [`new_with_max_view_time`](Self::new_with_max_view_time),
+    /// with a caller-chosen `epoch_length`, on `kv_store` if given. A store taken from a stopped
+    /// node ([`kv_store`](Self::kv_store)) already holds that node's block tree and is reused as
+    /// is: the replica restarts from its persisted state, as a restarted process does.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_epoch_length(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+        epoch_length: u32,
+        kv_store: Option<MemDB>,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+            WedgeOptions::default(),
+            epoch_length,
+            kv_store,
         )
     }
 
     /// Shared constructor. When `block_sync_enabled` is `false`, the height-range block sync trigger
     /// thresholds are set so high that sync never fires within a test — see
     /// [`new_with_max_view_time_sync_disabled`](Self::new_with_max_view_time_sync_disabled).
+    /// `kv_store: None` starts on a fresh, initialized store; `Some` restarts on an existing one.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         keypair: SigningKey,
         network_stub: NetworkStub,
@@ -178,14 +217,17 @@ impl Node {
         max_view_time: Duration,
         block_sync_enabled: bool,
         wedge_options: WedgeOptions,
+        epoch_length: u32,
+        kv_store: Option<MemDB>,
     ) -> Node {
-        let kv_store = MemDB::new();
-
-        let mut init_vs = ValidatorSet::new();
-        init_vs.apply_updates(&init_vs_updates);
-        let init_vs_state = ValidatorSetState::new(init_vs.clone(), init_vs, None, true);
-
-        Replica::initialize(kv_store.clone(), init_as_updates, init_vs_state);
+        let kv_store = kv_store.unwrap_or_else(|| {
+            let kv_store = MemDB::new();
+            let mut init_vs = ValidatorSet::new();
+            init_vs.apply_updates(&init_vs_updates);
+            let init_vs_state = ValidatorSetState::new(init_vs.clone(), init_vs, None, true);
+            Replica::initialize(kv_store.clone(), init_as_updates, init_vs_state);
+            kv_store
+        });
 
         let verifying_key = keypair.verifying_key().to_bytes();
         let tx_queue = Arc::new(Mutex::new(Vec::new()));
@@ -208,7 +250,7 @@ impl Node {
             .block_sync_trigger_min_view_difference(sync_min_view_diff)
             .block_sync_trigger_timeout(sync_trigger_timeout)
             .progress_msg_buffer_capacity(BufferSize::new(1024))
-            .epoch_length(EpochLength::new(50))
+            .epoch_length(EpochLength::new(epoch_length))
             // `max_view_time` must be **at least** 500 milliseconds, since `NumberApp`'s `produce_block` and
             // `validate_block` each take a minimum of 250 milliseconds to complete.
             .max_view_time(max_view_time)
@@ -224,7 +266,7 @@ impl Node {
                 wedge_options.validate_delay,
             ))
             .network(network_stub)
-            .kv_store(kv_store)
+            .kv_store(kv_store.clone())
             .configuration(configuration)
             .on_insert_block(insert_block_handler(verifying_key))
             .on_receive_proposal(receive_proposal_handler(verifying_key))
@@ -238,7 +280,14 @@ impl Node {
             verifying_key,
             replica,
             tx_queue,
+            kv_store,
         }
+    }
+
+    /// s85: the node's store, to restart the node on it after it is dropped (stopped).
+    #[allow(dead_code)]
+    pub(crate) fn kv_store(&self) -> MemDB {
+        self.kv_store.clone()
     }
 
     /// Push the transaction `txn` to the node's local number app transaction queue.
