@@ -13,6 +13,10 @@ use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKE
 use torus_state::{StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
+#[path = "common/counting_backend.rs"]
+mod counting_backend;
+use counting_backend::CountingBackend;
+
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -704,4 +708,107 @@ fn a_prev_mark_older_than_the_previous_usable_mark_is_ignored() {
     assert_eq!(bal(&c3, &s1).available, fp(10_100));
     assert_eq!(oi(&c3, 1), (fp(3), fp(3)));
     assert_eq!(total_value(&c3, &marks(&[(1, 900)])), before);
+}
+
+// ---- s87 Fix 2a: a step with no usable mark in any listed market ----
+
+/// Trader `i` of the unmarked fixture (ascending in `i`).
+fn ut(i: u32) -> Address {
+    let mut b = [0x20u8; 20];
+    b[16..].copy_from_slice(&i.to_be_bytes());
+    Address::new(b)
+}
+
+const UNMARKED_PENDING: [u32; 5] = [0, 50, 150, 250, 299];
+
+/// 300 traders with positions in the 3 listed markets, none marked; pending
+/// rows for 5 of them, a cooldown row for one, previous-mark rows of markets 1-2.
+fn unmarked_fixture() -> (tempfile::TempDir, StateDb) {
+    let (d, db) = liq_db(&[1, 2, 3]);
+    let ctx = ctx_at(db.clone(), 1);
+    for i in 0..300 {
+        fund(&ctx, &ut(i), fp(1_000));
+    }
+    for k in 0..150 {
+        for m in 1..=3 {
+            open_pair(&ctx, &ut(2 * k), &ut(2 * k + 1), m, 1, 1_000);
+        }
+    }
+    for i in UNMARKED_PENDING {
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x06u8].as_slice(), ut(i).as_slice()].concat(), &[1]).unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x02u8].as_slice(), ut(10).as_slice()].concat(), &1_000u64.to_be_bytes())
+        .unwrap();
+    for m in [1u64, 2] {
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x03u8].as_slice(), &m.to_be_bytes()].concat(), &fp(990).raw().to_be_bytes())
+            .unwrap();
+    }
+    (d, db)
+}
+
+fn cursor_row<T: StateBackend>(state: &T) -> Option<Address> {
+    state.get_cf_raw(CF_NATIVE_LIQUIDATION, &[0x04]).unwrap().map(|v| Address::from_slice(&v))
+}
+
+/// Fix 2a (s87) RED: with no usable mark in any listed market every account
+/// is unvaluable, so the step reads nobody's positions — and still walks the
+/// same window (cursor after each step of 100: the 100th, the 200th, none —
+/// the third pass consumed the last trader —, the 100th again).
+/// c93c579: one positions scan per scanned trader + the vault, twice (400+).
+#[test]
+fn an_unmarked_step_reads_no_positions() {
+    let (_d, db) = unmarked_fixture();
+    let state = CountingBackend::new(db);
+    let mut ctx = NativeExecContext::new(state.clone(), 2, 1_002, 0, 1_000, 10, addr(99), addr(100), addr(101));
+    let mut cursors = Vec::new();
+    state.arm();
+    for _ in 0..4 {
+        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        cursors.push(cursor_row(&state));
+    }
+    state.disarm();
+    assert_eq!(cursors, vec![Some(ut(99)), Some(ut(199)), None, Some(ut(99))]);
+    assert_eq!(state.all_position_scans(), 0, "positions scans during 4 unmarked steps");
+}
+
+/// Fix 2a (s87) guard (green before and after): an unmarked step deletes the
+/// pending rows of exactly the traders it scanned and the previous-mark rows
+/// of the listed markets, keeps the cooldown row, moves the cursor, and writes
+/// nothing else — no tombstone for an absent key (the frozen set's entry
+/// count is exactly the rows that changed).
+#[test]
+fn unmarked_step_rows_equal_the_full_scan_rules() {
+    let (_d, db) = unmarked_fixture();
+    let pending = |db: &StateDb| -> Vec<u32> {
+        UNMARKED_PENDING
+            .into_iter()
+            .filter(|&i| db.get_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x06u8].as_slice(), ut(i).as_slice()].concat()).unwrap().is_some())
+            .collect()
+    };
+    // (pending rows left, frozen entries: pending deletes + prev-mark deletes + cursor)
+    let want: [(Vec<u32>, usize); 4] = [
+        (vec![150, 250, 299], 2 + 2 + 1),
+        (vec![250, 299], 1 + 1),
+        (vec![], 2 + 1),
+        (vec![], 1),
+    ];
+    for (step, (left, entries)) in want.into_iter().enumerate() {
+        let h = step as u64 + 2;
+        let overlay = torus_state::NativeStateOverlay::new(db.clone());
+        let mut ctx = NativeExecContext::new(overlay.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        drop(ctx);
+        let frozen = overlay.freeze(h);
+        assert_eq!(frozen.entry_count(), entries, "step {}: changed rows", step + 1);
+        frozen.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        assert_eq!(pending(&db), left, "step {}: pending rows", step + 1);
+        assert_eq!(liq_rows_db(&db, 0x02).len(), 1, "step {}: the cooldown row is kept", step + 1);
+        assert!(liq_rows_db(&db, 0x03).is_empty(), "step {}: previous marks deleted", step + 1);
+    }
+}
+
+fn liq_rows_db(db: &StateDb, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
+    db.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap()
 }

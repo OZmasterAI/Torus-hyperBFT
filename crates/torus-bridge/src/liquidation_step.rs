@@ -151,6 +151,12 @@ impl NativeExecutor {
         marks: &Marks,
         trader: &Address,
     ) -> Result<Option<AccountView>, CoreError> {
+        // Fix 2a (s87): with no usable mark in any listed market no position
+        // is marked, so every account is `None` below — skip the reads. The
+        // step's cursor / pending / prev-mark writes do not depend on them.
+        if marks.is_empty() {
+            return Ok(None);
+        }
         let ps = ctx.positions.positions_for_trader(trader)?;
         if ps.iter().any(|p| p.margin_type != MarginType::Cross)
             || !ps.iter().any(|p| marks.contains_key(&p.market_id))
