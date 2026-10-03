@@ -315,6 +315,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             || self.hotstuff.has_deferred_sync_retries()
             || self.hotstuff.has_missing_data_retries()
             || self.hotstuff.has_parked_header()
+            || self.hotstuff.has_body_vote_recheck()
         {
             std::cmp::min(
                 view_info.deadline,
@@ -496,6 +497,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             .tick_missing_data_retries(&mut self.block_tree, &mut self.app)
         {
             log::error!("HotStuff tick_missing_data_retries error: {:?}", e);
+        }
+        // 6g. s84: this view's vote waits for its body; vote once another
+        // path inserted the block, or re-check missing out-of-band data.
+        if let Err(e) = self.hotstuff.tick_body_vote(&mut self.block_tree, &mut self.app) {
+            log::error!("HotStuff tick_body_vote error: {:?}", e);
         }
         if self.hotstuff.take_sync_needed() {
             if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {

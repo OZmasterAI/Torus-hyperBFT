@@ -116,6 +116,15 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
             &data,
         )
         .unwrap();
+    // s84: the eth view's head is the executed head; mark height 1 executed so
+    // `latest` is the 1-gwei header.
+    state
+        .put_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            &1u64.to_be_bytes(),
+        )
+        .unwrap();
 
     let (handle, addr) = start_server(state, mempool, executor).await;
     let client = HttpClientBuilder::default()

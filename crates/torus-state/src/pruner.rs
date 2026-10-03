@@ -29,11 +29,12 @@
 //! | `cf_consensus_meta` | opaque (hotstuff_rs) | Block tree, PCs, TCs — consensus safety critical |
 //! | `cf_core_writer_queue` | varies | Core writer queue state |
 //!
-//! ## PRUNABLE — IMPLEMENTED (2 CFs — height is leading key prefix)
+//! ## PRUNABLE — IMPLEMENTED (3 CFs — height is leading key prefix)
 //!
 //! | CF | Key Format | Delete Strategy |
 //! |---|---|---|
 //! | `cf_block_bodies` | height(8 BE) | `delete_range_cf` on [0, cutoff) |
+//! | `cf_block_action_status` | height(8 BE) | `delete_range_cf` on [0, cutoff) |
 //! | `cf_receipts` | height(8 BE) + tx_index(4 BE) | `delete_range_cf` on [0, cutoff‖0×4) |
 //!
 //! These are the largest disk consumers (block bodies contain full transaction
@@ -69,7 +70,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 
-use crate::cf::{CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_RECEIPTS};
+use crate::cf::{CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_RECEIPTS};
 use crate::db::StateDb;
 use crate::error::StateError;
 
@@ -212,6 +213,12 @@ impl StatePruner {
             let from_key = from_height.to_be_bytes();
             let to_key = to_height.to_be_bytes();
             db.delete_range_cf(&cf, from_key, to_key)?;
+        }
+
+        // --- Prune cf_block_action_status (s84 executed/skipped record) ---
+        // Key format: height(8 BE), same range as the bodies it describes.
+        if let Some(cf) = db.cf_handle(CF_BLOCK_ACTION_STATUS) {
+            db.delete_range_cf(&cf, from_height.to_be_bytes(), to_height.to_be_bytes())?;
         }
 
         // --- Prune cf_receipts ---

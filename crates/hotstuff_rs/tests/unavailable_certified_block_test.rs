@@ -1,27 +1,29 @@
 //! s84 wedge theory, data-availability variant: a CERTIFIED block whose body no
 //! other validator can obtain.
 //!
-//! Replicas phase-vote on a proposal HEADER and fetch the body afterwards, so a
-//! QC can form on a block only its proposer holds. If the proposer never serves
-//! that body (withheld by a faulty leader, or lost in a crash before it was
-//! served), every later proposal must still extend the QC, and the other
-//! validators can neither fetch the block by hash ("justify fetch exhausted"
-//! after the retry budget) nor sync it (block sync serves committed blocks
-//! only, "made no progress") — the s83 drill wedge signature.
+//! Replicas used to phase-vote on a proposal HEADER and fetch the body
+//! afterwards, so a QC could form on a block only its proposer holds. If the
+//! proposer never serves that body (withheld by a faulty leader, or lost in a
+//! crash before it was served), every later proposal had to extend the QC, and
+//! the other validators could neither fetch the block by hash ("justify fetch
+//! exhausted" after the retry budget) nor sync it (block sync serves committed
+//! blocks only, "made no progress"): the s83 drill wedge signature.
 //!
 //! 4 validators (quorum 3); once the cluster commits, every body sent by node 0
 //! is dropped. Three correct validators hold a quorum, so the chain must stay
 //! live.
 //!
-//! # Status: RED (ignored until a protocol decision)
+//! # Status: GREEN since s84 "vote after body"
 //!
-//! On main d623d3c and on fix/liveness-3val nodes 1-3 stop at committed 5 with
-//! an unknown highest-PC block for 120 s, logging the s83 lines (about 320
-//! "justify fetch exhausted", 290 "made no progress", 320 header drops with
-//! `justify_block_known=false`). Node 0 commits 7: blocks no other validator
-//! holds were committed, so simply abandoning an unavailable certified block
-//! would not be safe; a QC must imply that a quorum holds the body.
-//! Run: `cargo test -p hotstuff_rs --test unavailable_certified_block_test -- --ignored`.
+//! A replica now phase-votes only once it holds the body (`App::check_block_data`),
+//! so node 0's blocks get no QC (only node 0 holds them) and its views time out,
+//! while nodes 1-3 keep certifying and committing their own blocks.
+//!
+//! Before (main abac292): nodes 1-3 stopped at committed 5 with an unknown
+//! highest-PC block for 120 s, logging the s83 lines (about 320 "justify fetch
+//! exhausted", 290 "made no progress", 320 header drops with
+//! `justify_block_known=false`), while node 0 committed 7: blocks no other
+//! validator held were committed.
 
 use std::time::Duration;
 
@@ -68,7 +70,6 @@ fn others_min_committed(nodes: &[Node]) -> u64 {
 }
 
 #[test]
-#[ignore = "s84 RED: certified block the voters cannot insert wedges the chain; needs a protocol decision (vote timing)"]
 fn certified_block_with_unavailable_body_does_not_wedge_the_chain() {
     signature_log::install();
 

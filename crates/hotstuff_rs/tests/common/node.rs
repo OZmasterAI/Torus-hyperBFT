@@ -26,7 +26,7 @@ use hotstuff_rs::{
 use crate::common::{
     mem_db::MemDB,
     network::NetworkStub,
-    number_app::{NumberApp, NumberAppTransaction, PoisonedBlock, QueuedTransaction},
+    number_app::{skip_record_key, NumberApp, NumberAppTransaction, QueuedTransaction},
     verifying_key_bytes::VerifyingKeyBytes,
 };
 
@@ -109,7 +109,6 @@ impl Node {
             max_view_time,
             true,
             WedgeOptions::default(),
-            None,
         )
     }
 
@@ -136,7 +135,6 @@ impl Node {
             max_view_time,
             true,
             wedge_options,
-            None,
         )
     }
 
@@ -166,29 +164,6 @@ impl Node {
             max_view_time,
             false,
             WedgeOptions::default(),
-            None,
-        )
-    }
-
-    /// s84 wedge repro: like [`new_with_max_view_time`](Self::new_with_max_view_time), but the app
-    /// shares `poison` (see [`PoisonedBlock`]).
-    pub(crate) fn new_with_poison(
-        keypair: SigningKey,
-        network_stub: NetworkStub,
-        init_as_updates: AppStateUpdates,
-        init_vs_updates: ValidatorSetUpdates,
-        max_view_time: Duration,
-        poison: Arc<Mutex<PoisonedBlock>>,
-    ) -> Node {
-        Self::build(
-            keypair,
-            network_stub,
-            init_as_updates,
-            init_vs_updates,
-            max_view_time,
-            true,
-            WedgeOptions::default(),
-            Some(poison),
         )
     }
 
@@ -203,7 +178,6 @@ impl Node {
         max_view_time: Duration,
         block_sync_enabled: bool,
         wedge_options: WedgeOptions,
-        poison: Option<Arc<Mutex<PoisonedBlock>>>,
     ) -> Node {
         let kv_store = MemDB::new();
 
@@ -248,8 +222,7 @@ impl Node {
                 tx_queue.clone(),
                 wedge_options.produce_delay,
                 wedge_options.validate_delay,
-            )
-            .with_poison(poison))
+            ))
             .network(network_stub)
             .kv_store(kv_store)
             .configuration(configuration)
@@ -275,16 +248,31 @@ impl Node {
     /// unique across nodes). The id rides with the transaction inside the block's
     /// `Data`, letting `NumberApp` apply each logical transaction exactly once —
     /// even if the same transaction is re-proposed after an orphaned proposal.
-    pub(crate) fn submit_transaction(&mut self, txn: NumberAppTransaction) {
+    pub(crate) fn submit_transaction(&mut self, txn: NumberAppTransaction) -> u64 {
         static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
         let tx: QueuedTransaction = (id, txn);
         self.tx_queue.lock().unwrap().push(tx);
+        id
     }
 
     /// Query the number in the node's local app state.
     pub(crate) fn number(&self) -> u32 {
         NumberApp::number(self.replica.block_tree_camera().snapshot())
+    }
+
+    /// s84: the ids of every transaction a committed block recorded as skipped
+    /// (see [`skip_record_key`]), heights 0 up to the committed height.
+    pub(crate) fn skipped_transactions(&self) -> Vec<u64> {
+        // Read the height before taking the snapshot: two live snapshots on
+        // this thread nest the store's read lock and can deadlock against the
+        // algorithm thread's writer.
+        let committed = self.committed_height().unwrap_or(0);
+        let snapshot = self.replica.block_tree_camera().snapshot();
+        (0..=committed)
+            .filter_map(|height| snapshot.committed_app_state(&skip_record_key(height)))
+            .flat_map(|bytes| Vec::<u64>::deserialize(&mut bytes.as_slice()).unwrap())
+            .collect()
     }
 
     /// Query the committed validator set in the node's local block tree.
@@ -394,6 +382,7 @@ fn receive_proposal_handler(
                     NumberAppTransaction::Increment => String::from("Increment"),
                     NumberAppTransaction::SetValidator(_, _) => String::from("Set Validator"),
                     NumberAppTransaction::DeleteValidator(_) => String::from("Delete Validator"),
+                    NumberAppTransaction::Invalid => String::from("Invalid"),
                 })
                 .collect();
             all.join(", ")

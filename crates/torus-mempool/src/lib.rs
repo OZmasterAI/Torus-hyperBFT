@@ -848,6 +848,28 @@ impl Mempool {
         Ok(())
     }
 
+    /// s84 (vote after body): the hashes in `hashes` whose body is not in the
+    /// durable DA store. Presence only ([`NativeDaStore::missing`], no decode);
+    /// buffered ingress mirrors are flushed only on a miss, as in
+    /// [`Self::get_native_da_batch_timed`]. A store error counts every hash as
+    /// missing (the caller then does not vote yet, never wrongly).
+    pub fn native_da_missing(&self, hashes: &[B256]) -> Vec<B256> {
+        let missing = |hashes: &[B256]| -> Vec<B256> {
+            match self.da_store.missing(hashes) {
+                Ok(positions) => positions.into_iter().map(|i| hashes[i]).collect(),
+                Err(e) => {
+                    tracing::error!("native DA presence check failed: {e}");
+                    hashes.to_vec()
+                }
+            }
+        };
+        let absent = missing(hashes);
+        if absent.is_empty() || self.flush_da_mirrors() == 0 {
+            return absent;
+        }
+        missing(&absent)
+    }
+
     /// Proposer variant of [`Self::mirror_native_to_da`] (s68): write only the
     /// bodies the DA store does not already hold. `hashes[i]` must be the action
     /// hash of `actions[i]`. Ingest normally stored them already; a body still

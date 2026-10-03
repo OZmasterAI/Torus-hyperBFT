@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use jsonrpsee::rpc_params;
 use serde_json::Value;
 use torus_types::FixedPoint;
@@ -23,15 +25,7 @@ impl Indexer {
 
     /// Backfill from last indexed height to current chain tip.
     pub async fn backfill(&self) -> Result<(), RpcError> {
-        let chain_height = self.rpc.get_block_number().await?;
-        let last_indexed = self
-            .db
-            .get_last_indexed_height()
-            .map_err(|e| -> RpcError { e.to_string().into() })?;
-        let start = match last_indexed {
-            Some(h) => (h + 1) as u64,
-            None => 0,
-        };
+        let (start, chain_height) = self.pending_range().await?;
 
         if start > chain_height {
             info!("Already up to date at block {chain_height}");
@@ -48,6 +42,18 @@ impl Indexer {
             }
         }
         Ok(())
+    }
+
+    /// The next height to index and the node's head. The head is
+    /// `eth_blockNumber`: the node's EXECUTED head (s84), so every block up to
+    /// it is final, with its executed/skipped status known.
+    async fn pending_range(&self) -> Result<(u64, u64), RpcError> {
+        let head = self.rpc.get_block_number().await?;
+        let last_indexed = self
+            .db
+            .get_last_indexed_height()
+            .map_err(|e| -> RpcError { e.to_string().into() })?;
+        Ok((last_indexed.map_or(0, |h| (h + 1) as u64), head))
     }
 
     /// Index a single block. Handles reorgs by checking hash.
@@ -81,12 +87,27 @@ impl Indexer {
             .insert_block(&block_row)
             .map_err(|e| -> RpcError { e.to_string().into() })?;
 
+        // s84: the body lists every EVM tx, executed or skipped, with its
+        // status; the eth block lists only the executed ones. Rows use the
+        // body position as `tx_index` (first occurrence of a hash).
+        let body = self.rpc.get_block_body(height).await.ok().flatten();
+        let mut body_position: HashMap<String, i32> = HashMap::new();
+        if let Some(txs) = body
+            .as_ref()
+            .and_then(|b| b.get("evmTransactions")?.as_array())
+        {
+            for (i, tx) in txs.iter().enumerate() {
+                body_position.entry(val_str(tx, "hash")).or_insert(i as i32);
+            }
+        }
+
         // Index EVM transactions + receipts
         if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
             for (i, tx) in txs.iter().enumerate() {
                 let tx_hash = val_str(tx, "hash");
                 let receipt = self.rpc.get_receipt(&tx_hash).await?;
-                let tx_row = parse_tx_row(tx, h, i as i32, receipt.as_ref());
+                let tx_index = body_position.get(&tx_hash).copied().unwrap_or(i as i32);
+                let tx_row = parse_tx_row(tx, h, tx_index, receipt.as_ref());
                 self.db
                     .insert_transaction(&tx_row)
                     .map_err(|e| -> RpcError { e.to_string().into() })?;
@@ -105,16 +126,21 @@ impl Indexer {
         }
 
         // Index native actions
-        if let Ok(Some(body)) = self.rpc.get_block_body(height).await {
+        if let Some(body) = &body {
+            self.record_skipped_evm_txs(h, body)
+                .map_err(|e| -> RpcError { e.to_string().into() })?;
+            let statuses = native_action_status(body);
             if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
                 for (i, action) in actions.iter().enumerate() {
-                    let action_row = parse_native_action_row(action, h, i as i32);
+                    let mut action_row = parse_native_action_row(action, h, i as i32);
+                    action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
                     self.db
                         .insert_native_action(&action_row)
                         .map_err(|e| -> RpcError { e.to_string().into() })?;
                 }
             }
         }
+        self.fill_unknown_status(h).await;
 
         // Index trades into OHLCV candles (Phase 7B)
         if let Ok(trades) = self.rpc.get_block_trades(height).await {
@@ -132,6 +158,51 @@ impl Indexer {
             .set_indexer_state("last_indexed_height", &height.to_string())
             .map_err(|e| -> RpcError { e.to_string().into() })?;
 
+        Ok(())
+    }
+
+    /// s84: a block is indexed at commit, usually before the node executed it,
+    /// so its native actions' executed/skipped status is still unknown. Fill it
+    /// in for the recent blocks (execution trails commit by a few blocks) once
+    /// the node reports it. Best-effort: a failure leaves the status unknown.
+    async fn fill_unknown_status(&self, height: i64) {
+        const STATUS_WINDOW: i64 = 64;
+        let Ok(heights) = self.db.heights_with_unknown_status(height - STATUS_WINDOW) else {
+            return;
+        };
+        for h in heights {
+            let Ok(Some(body)) = self.rpc.get_block_body(h as u64).await else {
+                continue;
+            };
+            if let Some(statuses) = native_action_status(&body) {
+                if let Err(e) = self.db.set_native_action_status(h, &statuses) {
+                    warn!("Failed to store native action status at height {h}: {e}");
+                }
+            }
+            if let Err(e) = self.record_skipped_evm_txs(h, &body) {
+                warn!("Failed to store skipped EVM txs at height {h}: {e}");
+            }
+        }
+    }
+
+    /// s84: store a block's skipped EVM txs (listed by `torus_getBlockBody`,
+    /// not by the eth block) as [`TxStatus::Skipped`], `tx_index` = body
+    /// position. Nothing while the status is unknown (`null`). Never replaces
+    /// an existing row of the same hash ([`ExplorerDb::insert_transaction`]).
+    fn record_skipped_evm_txs(&self, height: i64, body: &Value) -> Result<(), rusqlite::Error> {
+        let (Some(txs), Some(status)) = (
+            body.get("evmTransactions").and_then(Value::as_array),
+            body.get("evmTransactionStatus").and_then(Value::as_array),
+        ) else {
+            return Ok(());
+        };
+        for (i, (tx, status)) in txs.iter().zip(status).enumerate() {
+            if status.as_str() == Some("skipped") {
+                let mut row = parse_tx_row(tx, height, i as i32, None);
+                row.status = TxStatus::Skipped;
+                self.db.insert_transaction(&row)?;
+            }
+        }
         Ok(())
     }
 
@@ -167,12 +238,20 @@ impl Indexer {
 
         while let Some(head) = sub.next().await {
             match head {
-                Ok(head) => {
-                    let height = val_hex_u64(&head, "number");
-                    if let Err(e) = self.index_block(height).await {
-                        warn!("Failed to index new block {height}: {e}");
+                // s84: a head is announced at commit, but the node serves a
+                // block's eth view only once it executed it. Index up to the
+                // node's eth head instead of the announced height, so a block
+                // not executed yet is picked up on a later head.
+                Ok(_) => match self.pending_range().await {
+                    Ok((start, head)) => {
+                        for height in start..=head {
+                            if let Err(e) = self.index_block(height).await {
+                                warn!("Failed to index new block {height}: {e}");
+                            }
+                        }
                     }
-                }
+                    Err(e) => warn!("Failed to read the node's head: {e}"),
+                },
                 Err(e) => {
                     warn!("Subscription error: {e}");
                     break;
@@ -217,8 +296,9 @@ fn parse_block_row(block: &Value, height: i64) -> BlockRow {
 
 fn parse_tx_row(tx: &Value, block_height: i64, tx_index: i32, receipt: Option<&Value>) -> TxRow {
     let (gas_used, status) = match receipt {
-        Some(r) => (val_hex_i64(r, "gasUsed"), val_hex_u64(r, "status") == 1),
-        None => (0, false),
+        Some(r) if val_hex_u64(r, "status") == 1 => (val_hex_i64(r, "gasUsed"), TxStatus::Success),
+        Some(r) => (val_hex_i64(r, "gasUsed"), TxStatus::Failed),
+        None => (0, TxStatus::Failed),
     };
     let contract_address = receipt
         .and_then(|r| r.get("contractAddress"))
@@ -268,6 +348,15 @@ fn parse_log_row(log: &Value, block_height: i64) -> LogRow {
         topic3: topic(3),
         data: val_str(log, "data"),
     }
+}
+
+/// s84: `torus_getBlockBody` `nativeActionStatus`, `None` while unknown.
+fn native_action_status(body: &Value) -> Option<Vec<String>> {
+    body.get("nativeActionStatus")?
+        .as_array()?
+        .iter()
+        .map(|s| s.as_str().map(str::to_string))
+        .collect()
 }
 
 pub fn parse_native_action_row(
@@ -332,6 +421,7 @@ pub fn parse_native_action_row(
         ),
         proposal_id: extract_i64(&action_type, inner_ref, "proposal_id", &["Vote"]),
         payload: serde_json::to_string(action).unwrap_or_default(),
+        status: None,
     }
 }
 
@@ -392,6 +482,128 @@ fn extract_val_str(at: &str, inner: Option<&Value>, field: &str, types: &[&str])
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A node stub: `(method, first param, result)`; any other call is `null`.
+    async fn mock_node(
+        responses: Vec<(&'static str, Value, Value)>,
+    ) -> (jsonrpsee::server::ServerHandle, String) {
+        let server = jsonrpsee::server::Server::builder()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let mut module = jsonrpsee::RpcModule::new(());
+        let mut methods: Vec<&'static str> = responses.iter().map(|r| r.0).collect();
+        methods.dedup();
+        for method in methods {
+            let table: Vec<(Value, Value)> = responses
+                .iter()
+                .filter(|r| r.0 == method)
+                .map(|r| (r.1.clone(), r.2.clone()))
+                .collect();
+            module
+                .register_method(method, move |params, _, _| {
+                    let first = params
+                        .parse::<Vec<Value>>()
+                        .ok()
+                        .and_then(|p| p.first().cloned());
+                    table
+                        .iter()
+                        .find(|(key, _)| Some(key) == first.as_ref())
+                        .map_or(Value::Null, |(_, result)| result.clone())
+                })
+                .unwrap();
+        }
+        (server.start(module), url)
+    }
+
+    /// s84 option (ii): `eth_getBlockByNumber` lists only the executed EVM
+    /// txs; the skipped one comes from `torus_getBlockBody` and is stored as
+    /// "skipped", not "failed". Every row's `tx_index` is its body position.
+    /// A skipped replay of an already-executed tx never overwrites its row.
+    #[tokio::test]
+    async fn skipped_evm_tx_is_stored_as_skipped() {
+        let tx = |hash: &str| {
+            json!({"hash": hash, "from": "0xa1", "to": "0xb2", "value": "0x0", "gas": "0x5208",
+                   "gasPrice": "0x3b9aca00", "input": "0x", "nonce": "0x0", "type": "0x2"})
+        };
+        let block = |n: &str, hash: &str, txs: Vec<Value>| {
+            json!({"number": n, "hash": hash, "parentHash": "0x00", "timestamp": "0x1",
+                   "miner": "0xm", "gasUsed": "0x0", "gasLimit": "0x1", "baseFeePerGas": "0x1",
+                   "stateRoot": "0x0", "transactions": txs})
+        };
+        let body = |txs: Vec<Value>, status: Vec<&str>| {
+            json!({"blockNumber": "0x0", "nativeActions": [], "nativeActionCount": 0,
+                   "nativeActionStatus": [], "evmTransactions": txs, "evmTransactionStatus": status})
+        };
+        let receipt = |status: &str| json!({"gasUsed": "0x5208", "status": status, "contractAddress": null, "logs": []});
+        let (ok, skip, rev) = ("0x0a", "0x0b", "0x0c");
+        let (handle, url) = mock_node(vec![
+            (
+                "eth_getBlockByNumber",
+                json!("0x1"),
+                block("0x1", "0xb1", vec![tx(ok), tx(rev)]),
+            ),
+            (
+                "eth_getBlockByNumber",
+                json!("0x2"),
+                block("0x2", "0xb2", vec![]),
+            ),
+            ("eth_getTransactionReceipt", json!(ok), receipt("0x1")),
+            ("eth_getTransactionReceipt", json!(rev), receipt("0x0")),
+            (
+                "torus_getBlockBody",
+                json!(1),
+                body(
+                    vec![tx(ok), tx(skip), tx(rev)],
+                    vec!["executed", "skipped", "executed"],
+                ),
+            ),
+            // Height 2 re-includes `ok` (a replay): skipped.
+            (
+                "torus_getBlockBody",
+                json!(2),
+                body(vec![tx(ok)], vec!["skipped"]),
+            ),
+        ])
+        .await;
+        let indexer = Indexer::new(
+            NodeRpcClient::new(&url).unwrap(),
+            ExplorerDb::open_in_memory().unwrap(),
+            10,
+        );
+        indexer.index_block(1).await.unwrap();
+        indexer.index_block(2).await.unwrap();
+
+        let rows: Vec<Value> = indexer
+            .db
+            .get_block_transactions(1)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let v = serde_json::to_value(r).unwrap();
+                json!([v["hash"], v["tx_index"], v["status"]])
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                json!([ok, 0, "success"]),
+                json!([skip, 1, "skipped"]),
+                json!([rev, 2, "failed"]),
+            ]
+        );
+        assert_eq!(
+            indexer.db.get_block(1).unwrap().unwrap().tx_count,
+            2,
+            "the block's tx count is the eth (executed) count"
+        );
+        assert!(
+            indexer.db.get_block_transactions(2).unwrap().is_empty(),
+            "a skipped replay does not move the executed tx's row"
+        );
+        handle.stop().unwrap();
+    }
 
     #[test]
     fn parse_dec_fp_reads_decimal_trade_fields() {
@@ -475,7 +687,7 @@ mod tests {
             "gasUsed": "0x5208", "status": "0x1", "contractAddress": null, "logs": []
         });
         let row = parse_tx_row(&tx, 10, 0, Some(&receipt));
-        assert!(row.status);
+        assert_eq!(row.status, TxStatus::Success);
         assert_eq!(row.gas_used, 21000);
         assert_eq!(row.nonce, 5);
     }
@@ -527,7 +739,7 @@ mod tests {
             gas_price: "0x0".into(),
             input_data: "0x".into(),
             nonce: 0,
-            status: true,
+            status: TxStatus::Success,
             contract_address: None,
             tx_type: 0,
         })

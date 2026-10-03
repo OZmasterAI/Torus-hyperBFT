@@ -33,7 +33,9 @@ use crate::hotstuff::header_fast_path_regression_test::{
     generic_pc, proposer_for, signing_keys, validator_set,
 };
 use crate::hotstuff::implementation::{HotStuff, HotStuffConfiguration};
-use crate::hotstuff::messages::{HotStuffMessage, Nudge, Proposal, ProposalHeader};
+use crate::hotstuff::messages::{
+    BlockDataResponse, HotStuffMessage, Nudge, Proposal, ProposalHeader,
+};
 use crate::hotstuff::types::{Phase, PhaseCertificate};
 use crate::networking::messages::{Message, ProgressMessage};
 use crate::networking::network::{Network, ValidatorSetUpdateHandle};
@@ -322,6 +324,15 @@ fn header_path_persists_vote_state_before_sending_vote() {
             &mut ValidApp,
         )
         .expect("processing a safe header must not error");
+    // s84: the vote waits for the body.
+    hotstuff
+        .on_receive_msg(
+            HotStuffMessage::BlockDataResponse(BlockDataResponse { view: f.view, block: f.b2.clone() }),
+            &proposer,
+            &mut f.block_tree,
+            &mut ValidApp,
+        )
+        .expect("processing the body must not error");
     assert_persist_before_send(&f.log, "header path");
 }
 

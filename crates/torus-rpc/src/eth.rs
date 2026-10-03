@@ -7,6 +7,24 @@
 //! - `eth_feeHistory` — implemented but reward percentiles are stubbed
 //! - `debug_traceTransaction` — execution tracing
 //! - `eth_createAccessList` — EIP-2930 access list generation
+//!
+//! ## Executed EVM txs only (s84 option (ii), HL-style)
+//! A committed block can carry EVM txs that execution skips (undecodable, or
+//! refused by revm: bad signature, nonce, cannot pay gas). They have no
+//! receipt and change nothing. Every Ethereum-shaped response lists ONLY the
+//! executed txs (those with a receipt, reverted included), in body order, so
+//! every listed tx has a receipt as in Ethereum: the block `transactions`
+//! array, the tx counts, tx-by-index (indexes over that list), and every
+//! `transactionIndex` (txs, receipts, logs). A skipped tx is not indexed by
+//! hash, so `eth_getTransactionByHash` / `eth_getTransactionReceipt` return
+//! null, as for a tx never included. `torus_getBlockBody` lists every EVM tx
+//! with its executed/skipped status.
+//!
+//! The eth view only serves EXECUTED blocks: its head ([`eth_head`]) is the
+//! node's applied height, not the last committed header. A block that is
+//! committed but not yet executed here is outside the view (null, as a future
+//! block), so a listed tx never disappears later; `eth_blockNumber`, the
+//! `latest` tag and log ranges follow the same head.
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -61,6 +79,25 @@ pub trait EthApi {
     ) -> RpcResult<Option<RpcBlock>>;
     #[method(name = "getBlockByHash")]
     async fn get_block_by_hash(&self, hash: String, full_txs: bool) -> RpcResult<Option<RpcBlock>>;
+    #[method(name = "getBlockTransactionCountByNumber")]
+    async fn get_block_transaction_count_by_number(
+        &self,
+        number: String,
+    ) -> RpcResult<Option<String>>;
+    #[method(name = "getBlockTransactionCountByHash")]
+    async fn get_block_transaction_count_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
+    #[method(name = "getTransactionByBlockNumberAndIndex")]
+    async fn get_transaction_by_block_number_and_index(
+        &self,
+        number: String,
+        index: String,
+    ) -> RpcResult<Option<RpcTransaction>>;
+    #[method(name = "getTransactionByBlockHashAndIndex")]
+    async fn get_transaction_by_block_hash_and_index(
+        &self,
+        hash: String,
+        index: String,
+    ) -> RpcResult<Option<RpcTransaction>>;
     #[method(name = "call")]
     async fn call(&self, tx: CallRequest, block: String) -> RpcResult<String>;
     #[method(name = "estimateGas")]
@@ -131,6 +168,60 @@ fn get_body(state: &RpcState, height: u64) -> Result<Option<TorusBlockBody>, Rpc
     }
 }
 
+/// Head of the eth view (s84 option (ii), see the module docs): the highest
+/// block this node has EXECUTED, capped by the last committed header. The
+/// applied-height marker lands in the block's flush batch, with its
+/// executed/skipped record and after its receipts and tx-hash index. 0 on a
+/// DB that never executed a block.
+pub(crate) fn eth_head(state: &RpcState) -> u64 {
+    let committed = state.latest_height.load(Relaxed);
+    torus_state::running_hash::read_applied_height(&state.state).map_or(0, |h| h.min(committed))
+}
+
+/// Block `height` as the eth view sees it: header and hash, or `None` when it
+/// is not stored or not yet executed on this node.
+fn eth_header(state: &RpcState, height: u64) -> Result<Option<(TorusBlockHeader, B256)>, RpcError> {
+    if height > eth_head(state) {
+        return Ok(None);
+    }
+    Ok(get_header_with_hash(state, height)?.map(|(header, hash, _)| (header, hash)))
+}
+
+fn block_height_by_hash(state: &RpcState, hash: &str) -> Result<Option<u64>, RpcError> {
+    let block_hash = parse_b256(hash)?;
+    match state
+        .state
+        .get_cf_raw(CF_BLOCK_HASH_TO_NUMBER, block_hash.as_slice())?
+    {
+        Some(d) if d.len() == 8 => Ok(Some(u64::from_be_bytes(d[..8].try_into().unwrap()))),
+        Some(_) => Err(RpcError::Internal("invalid block hash index".into())),
+        None => Ok(None),
+    }
+}
+
+/// `torus_getBlockBody`'s view of one body EVM tx (s84): the eth tx object
+/// with `transactionIndex` = body position, or only `hash` (keccak of the raw
+/// bytes) for a tx that does not decode or whose signer does not recover.
+pub(crate) fn body_evm_tx_json(
+    raw: &[u8],
+    block_hash: B256,
+    height: u64,
+    position: u32,
+) -> serde_json::Value {
+    match decode_envelope_and_sender(raw) {
+        Ok((envelope, sender)) => serde_json::to_value(build_rpc_tx(
+            &envelope, sender, block_hash, height, position,
+        ))
+        .unwrap_or_default(),
+        Err(_) => serde_json::json!({ "hash": hex_b256(alloy_primitives::keccak256(raw)) }),
+    }
+}
+
+/// Receipts of the block's EVM txs at body positions `0..tx_count`, in body
+/// order. Only an executed tx has one (s84), so with `tx_count` = the body's
+/// EVM tx count this is the eth view's tx list: item `i` is the tx at eth
+/// `transactionIndex` i, and its `tx_index` is the body position. With
+/// `tx_count` = a body position, `len()` is that tx's eth index.
 fn get_block_receipts(
     state: &RpcState,
     height: u64,
@@ -351,52 +442,45 @@ fn build_rpc_tx(
 /// Empty trie root: keccak256(rlp("")) = keccak256(0x80).
 const EMPTY_TRIE_ROOT: &str = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
 
+/// `receipts`: the block's executed txs ([`get_block_receipts`]); only these
+/// are listed (s84 option (ii)), `transactionIndex` = position in that list.
 fn build_rpc_block(
     header: &TorusBlockHeader,
     hash: B256,
     body_opt: Option<&TorusBlockBody>,
+    receipts: &[Receipt],
     full_txs: bool,
-    state: &RpcState,
 ) -> Result<RpcBlock, RpcError> {
-    let transactions = match (full_txs, body_opt) {
-        (true, Some(body)) => {
-            let mut txs = Vec::new();
-            for (i, raw) in body.evm_transactions.iter().enumerate() {
-                if let Ok((envelope, sender)) = decode_envelope_and_sender(raw) {
-                    txs.push(
-                        serde_json::to_value(build_rpc_tx(
-                            &envelope,
-                            sender,
-                            hash,
-                            header.height,
-                            i as u32,
-                        ))
-                        .unwrap_or_default(),
-                    );
-                }
-            }
-            serde_json::Value::Array(txs)
-        }
-        (false, Some(body)) => {
-            let mut hashes = Vec::new();
-            for raw in &body.evm_transactions {
-                if let Ok((envelope, _)) = decode_envelope_and_sender(raw) {
-                    hashes.push(serde_json::Value::String(hex_b256(*envelope.tx_hash())));
-                }
-            }
-            serde_json::Value::Array(hashes)
-        }
-        _ => serde_json::Value::Array(vec![]),
-    };
-    let size_estimate = 256u64
-        + body_opt
-            .map(|b| {
-                b.evm_transactions
-                    .iter()
-                    .map(|tx| tx.len() as u64)
-                    .sum::<u64>()
+    let raw_of = |r: &Receipt| body_opt.and_then(|b| b.evm_transactions.get(r.tx_index as usize));
+    let transactions = if full_txs {
+        receipts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let (envelope, sender) = decode_envelope_and_sender(raw_of(r)?).ok()?;
+                serde_json::to_value(build_rpc_tx(
+                    &envelope,
+                    sender,
+                    hash,
+                    header.height,
+                    i as u32,
+                ))
+                .ok()
             })
-            .unwrap_or(0);
+            .collect()
+    } else {
+        receipts
+            .iter()
+            .map(|r| serde_json::Value::String(hex_b256(r.tx_hash)))
+            .collect()
+    };
+    let transactions = serde_json::Value::Array(transactions);
+    let size_estimate = 256u64
+        + receipts
+            .iter()
+            .filter_map(raw_of)
+            .map(|tx| tx.len() as u64)
+            .sum::<u64>();
     // Serve the header's own ancestry field. Previously this was SYNTHESIZED by
     // looking up this node's stored hash of block height-1, which meant parentHash
     // was a per-node reconstruction rather than a committed part of the block.
@@ -415,17 +499,12 @@ fn build_rpc_block(
         // FIX 11 (EVM-PF-17): Compute transactions root from tx hashes.
         // Uses keccak256(concat(tx_hashes)) as an approximation — not a full
         // Merkle Patricia Trie, but sufficient for non-light-client verification.
-        transactions_root: match body_opt {
-            Some(body) if !body.evm_transactions.is_empty() => {
-                let mut buf = Vec::new();
-                for raw in &body.evm_transactions {
-                    if let Ok((env, _)) = decode_envelope_and_sender(raw) {
-                        buf.extend_from_slice(env.tx_hash().as_slice());
-                    }
-                }
-                hex_b256(alloy_primitives::keccak256(&buf))
-            }
-            _ => EMPTY_TRIE_ROOT.into(),
+        // s84: over the listed (executed) txs.
+        transactions_root: if receipts.is_empty() {
+            EMPTY_TRIE_ROOT.into()
+        } else {
+            let buf: Vec<u8> = receipts.iter().flat_map(|r| r.tx_hash.0).collect();
+            hex_b256(alloy_primitives::keccak256(&buf))
         },
         state_root: hex_b256(header.state_root),
         receipts_root: hex_b256(header.receipts_root),
@@ -533,7 +612,7 @@ impl EthApiServer for RpcState {
         Ok(hex_u64(self.chain_id))
     }
     async fn block_number(&self) -> RpcResult<String> {
-        Ok(hex_u64(self.latest_height.load(Relaxed)))
+        Ok(hex_u64(eth_head(self)))
     }
 
     async fn get_balance(&self, addr: String, block: String) -> RpcResult<String> {
@@ -657,6 +736,9 @@ impl EthApiServer for RpcState {
             return Err(err(RpcError::Internal("invalid tx location".into())));
         }
         let height = u64::from_be_bytes(location[..8].try_into().unwrap());
+        if height > eth_head(self) {
+            return Ok(None);
+        }
         check_pruned(self, height)?;
         let tx_index = u32::from_be_bytes(location[8..12].try_into().unwrap());
         let body = match get_body(self, height).map_err(err)? {
@@ -672,8 +754,12 @@ impl EthApiServer for RpcState {
             Some((_, bh, _)) => bh,
             None => B256::ZERO,
         };
+        // s84: the eth index = executed txs before this body position.
+        let eth_index = get_block_receipts(self, height, tx_index)
+            .map_err(err)?
+            .len() as u32;
         Ok(Some(build_rpc_tx(
-            &envelope, sender, block_hash, height, tx_index,
+            &envelope, sender, block_hash, height, eth_index,
         )))
     }
 
@@ -692,6 +778,9 @@ impl EthApiServer for RpcState {
             return Err(err(RpcError::Internal("invalid tx location".into())));
         }
         let height = u64::from_be_bytes(location[..8].try_into().unwrap());
+        if height > eth_head(self) {
+            return Ok(None);
+        }
         check_pruned(self, height)?;
         let tx_index = u32::from_be_bytes(location[8..12].try_into().unwrap());
         let mut receipt_key = [0u8; 12];
@@ -730,12 +819,10 @@ impl EthApiServer for RpcState {
             Some((_, bh, _)) => bh,
             None => B256::ZERO,
         };
-        let mut log_index_offset: u32 = 0;
-        if tx_index > 0 {
-            for r in &get_block_receipts(self, height, tx_index).map_err(err)? {
-                log_index_offset += r.logs.len() as u32;
-            }
-        }
+        // s84: the executed txs before this one give its eth index and log offset.
+        let prior = get_block_receipts(self, height, tx_index).map_err(err)?;
+        let eth_index = prior.len() as u32;
+        let log_index_offset: u32 = prior.iter().map(|r| r.logs.len() as u32).sum();
         let logs: Vec<RpcLog> = receipt
             .logs
             .iter()
@@ -746,14 +833,14 @@ impl EthApiServer for RpcState {
                     height,
                     block_hash,
                     receipt.tx_hash,
-                    tx_index,
+                    eth_index,
                     log_index_offset + i as u32,
                 )
             })
             .collect();
         Ok(Some(RpcReceipt {
             transaction_hash: hex_b256(receipt.tx_hash),
-            transaction_index: hex_u64(tx_index as u64),
+            transaction_index: hex_u64(eth_index as u64),
             block_hash: hex_b256(block_hash),
             block_number: hex_u64(height),
             from: hex_address(sender),
@@ -774,9 +861,8 @@ impl EthApiServer for RpcState {
         number: String,
         full_txs: bool,
     ) -> RpcResult<Option<RpcBlock>> {
-        let latest = self.latest_height.load(Relaxed);
-        let height = resolve_block_tag(&number, latest).map_err(err)?;
-        let (header, hash, _) = match get_header_with_hash(self, height).map_err(err)? {
+        let height = resolve_block_tag(&number, eth_head(self)).map_err(err)?;
+        let (header, hash) = match eth_header(self, height).map_err(err)? {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -784,39 +870,100 @@ impl EthApiServer for RpcState {
         if header.evm_tx_count > 0 {
             check_pruned(self, height)?;
         }
-        let body = if full_txs || header.evm_tx_count > 0 {
+        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        let body = if header.evm_tx_count > 0 {
             get_body(self, height).map_err(err)?
         } else {
             None
         };
         Ok(Some(
-            build_rpc_block(&header, hash, body.as_ref(), full_txs, self).map_err(err)?,
+            build_rpc_block(&header, hash, body.as_ref(), &receipts, full_txs).map_err(err)?,
         ))
     }
 
     async fn get_block_by_hash(&self, hash: String, full_txs: bool) -> RpcResult<Option<RpcBlock>> {
-        let block_hash = parse_b256(&hash).map_err(err)?;
-        let height_data = match self
-            .state
-            .get_cf_raw(CF_BLOCK_HASH_TO_NUMBER, block_hash.as_slice())
-            .map_err(RpcError::from)
-            .map_err(err)?
-        {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        if height_data.len() != 8 {
-            return Err(err(RpcError::Internal("invalid block hash index".into())));
+        match block_height_by_hash(self, &hash).map_err(err)? {
+            Some(height) => self.get_block_by_number(hex_u64(height), full_txs).await,
+            None => Ok(None),
         }
-        self.get_block_by_number(
-            hex_u64(u64::from_be_bytes(height_data[..8].try_into().unwrap())),
-            full_txs,
-        )
-        .await
+    }
+
+    async fn get_block_transaction_count_by_number(
+        &self,
+        number: String,
+    ) -> RpcResult<Option<String>> {
+        let height = resolve_block_tag(&number, eth_head(self)).map_err(err)?;
+        let Some((header, _)) = eth_header(self, height).map_err(err)? else {
+            return Ok(None);
+        };
+        if header.evm_tx_count > 0 {
+            check_pruned(self, height)?;
+        }
+        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        Ok(Some(hex_u64(receipts.len() as u64)))
+    }
+
+    async fn get_block_transaction_count_by_hash(&self, hash: String) -> RpcResult<Option<String>> {
+        match block_height_by_hash(self, &hash).map_err(err)? {
+            Some(height) => {
+                self.get_block_transaction_count_by_number(hex_u64(height))
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_transaction_by_block_number_and_index(
+        &self,
+        number: String,
+        index: String,
+    ) -> RpcResult<Option<RpcTransaction>> {
+        let height = resolve_block_tag(&number, eth_head(self)).map_err(err)?;
+        let index = parse_u64(&index).map_err(err)?;
+        let Some((header, hash)) = eth_header(self, height).map_err(err)? else {
+            return Ok(None);
+        };
+        if header.evm_tx_count == 0 {
+            return Ok(None);
+        }
+        check_pruned(self, height)?;
+        // s84: `index` is over the executed txs (the listed ones).
+        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        let Some(receipt) = usize::try_from(index).ok().and_then(|i| receipts.get(i)) else {
+            return Ok(None);
+        };
+        let Some(body) = get_body(self, height).map_err(err)? else {
+            return Ok(None);
+        };
+        let Some(raw) = body.evm_transactions.get(receipt.tx_index as usize) else {
+            return Ok(None);
+        };
+        let (envelope, sender) = decode_envelope_and_sender(raw).map_err(err)?;
+        Ok(Some(build_rpc_tx(
+            &envelope,
+            sender,
+            hash,
+            height,
+            index as u32,
+        )))
+    }
+
+    async fn get_transaction_by_block_hash_and_index(
+        &self,
+        hash: String,
+        index: String,
+    ) -> RpcResult<Option<RpcTransaction>> {
+        match block_height_by_hash(self, &hash).map_err(err)? {
+            Some(height) => {
+                self.get_transaction_by_block_number_and_index(hex_u64(height), index)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn call(&self, tx: CallRequest, block: String) -> RpcResult<String> {
-        let latest = self.latest_height.load(Relaxed);
+        let latest = eth_head(self);
         let height = resolve_block_tag(&block, latest).map_err(err)?;
         // FIX 7 (EVM-PF-14): Use the resolved block height, not always latest.
         // We only support latest state — return a clear error for historical queries.
@@ -863,7 +1010,7 @@ impl EthApiServer for RpcState {
     }
 
     async fn estimate_gas(&self, tx: CallRequest, block: Option<String>) -> RpcResult<String> {
-        let latest = self.latest_height.load(Relaxed);
+        let latest = eth_head(self);
         let height = match block {
             Some(b) => resolve_block_tag(&b, latest).map_err(err)?,
             None => latest,
@@ -924,7 +1071,7 @@ impl EthApiServer for RpcState {
     }
 
     async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<RpcLog>> {
-        let latest = self.latest_height.load(Relaxed);
+        let latest = eth_head(self);
         let from = match &filter.from_block {
             Some(b) => resolve_block_tag(b, latest).map_err(err)?,
             None => latest,
@@ -946,7 +1093,10 @@ impl EthApiServer for RpcState {
         check_pruned(self, from)?;
         const MAX_LOGS: usize = 10_000;
         let mut all_logs = Vec::new();
-        for height in from..=to {
+        // s84: blocks past the eth head are not executed here (their logs do
+        // not exist yet) and are never scanned, so a range never comes back
+        // short and later fills in.
+        for height in from..=to.min(latest) {
             let (header, block_hash, _) = match get_header_with_hash(self, height).map_err(err)? {
                 Some(h) => h,
                 None => continue,
@@ -956,7 +1106,7 @@ impl EthApiServer for RpcState {
             }
             let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
             let mut global_log_index: u32 = 0;
-            for receipt in &receipts {
+            for (eth_index, receipt) in receipts.iter().enumerate() {
                 for log in &receipt.logs {
                     if !matches_address(&log.address, &filter.address) {
                         global_log_index += 1;
@@ -971,7 +1121,7 @@ impl EthApiServer for RpcState {
                         height,
                         block_hash,
                         receipt.tx_hash,
-                        receipt.tx_index,
+                        eth_index as u32,
                         global_log_index,
                     ));
                     if all_logs.len() > MAX_LOGS {
@@ -995,7 +1145,7 @@ impl EthApiServer for RpcState {
     ) -> RpcResult<FeeHistory> {
         const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
 
-        let latest = self.latest_height.load(Relaxed);
+        let latest = eth_head(self);
         let count = parse_u64(&block_count)
             .map_err(err)?
             .min(MAX_FEE_HISTORY_BLOCKS);

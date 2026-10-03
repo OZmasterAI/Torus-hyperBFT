@@ -19,7 +19,8 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::{
     app::{
-        App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
+        App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
+        ValidateBlockResponse,
     },
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
@@ -140,6 +141,11 @@ pub(crate) struct HotStuff<N: Network> {
     /// validation outcome is known, or when the body fetch is abandoned, so the set is bounded by
     /// the number of in-flight header votes.
     header_voted: HashSet<CryptoHash>,
+    /// s84 (vote after body): the current view's checked proposal header whose
+    /// phase vote waits until this replica holds the block's body (see
+    /// [`vote_if_body_held`](Self::vote_if_body_held)), and when to re-check a
+    /// body whose out-of-band data was missing (`None`: no body to re-check).
+    awaiting_body_vote: Option<(ProposalHeader, Option<Instant>)>,
     /// T1.3 metric: number of header-fast-path votes cast on blocks whose bodies
     /// `app.validate_block` later found invalid. Monotone; each block is counted at most once
     /// (the removal from [`header_voted`](Self::header_voted) is the increment guard).
@@ -240,6 +246,7 @@ impl<N: Network> HotStuff<N> {
             body_fetch_tracker: std::collections::HashMap::new(),
             missing_data_retries: std::collections::HashMap::new(),
             header_voted: HashSet::new(),
+            awaiting_body_vote: None,
             header_vote_invalid_count: 0,
             justify_fetch_tracker: std::collections::HashMap::new(),
             deferred_bodies: PendingBodies::new(),
@@ -678,6 +685,7 @@ impl<N: Network> HotStuff<N> {
         //    votes for the new view.
         self.view_info = new_view_info;
         self.proposal_status = ProposalStatus::WaitingForProposal;
+        self.awaiting_body_vote = None;
         // MonadBFT B2: Cancel any pending recovery when entering a new view.
         self.recovery_state = RecoveryState::None;
         self.phase_vote_collectors = <ActiveCollectorPair<PhaseVoteCollector>>::new(
@@ -2364,48 +2372,22 @@ impl<N: Network> HotStuff<N> {
         ) && (block_tree.highest_view_voted()?.is_none()
             || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
         {
-            let vote_phase = if header.has_validator_set_updates {
-                Phase::Prepare
-            } else {
-                Phase::Generic
-            };
-
-            let phase_vote = PhaseVote::new(
-                &self.config.keypair,
-                self.config.chain_id,
-                header.view,
-                header.block_hash,
-                vote_phase,
-            );
-            // s65: persist BEFORE sending. If the process dies between the two, a vote that
-            // left the node but was never recorded would let the restarted replica vote
-            // again in this view (possibly for another block).
-            block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
-            self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
-            // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
-            // (unless the block is already in the tree, in which case it was validated on
-            // insertion). If the body later turns out app-invalid, `try_insert_body` increments
-            // `header_vote_invalid_count`.
-            if !block_already_in_tree {
-                self.header_voted.insert(header.block_hash);
-            }
-            Event::PhaseVote(PhaseVoteEvent {
-                timestamp: SystemTime::now(),
-                vote: phase_vote,
-            })
-            .publish(&self.event_publisher);
+            // s84: the vote waits until this replica holds the body, so a QC
+            // implies a quorum holds it. Votes now if the block is already in
+            // the tree, is our own proposal, or its body is parked here.
+            self.awaiting_body_vote = Some((header.clone(), None));
+            let parked = self.deferred_bodies.get(&header.block_hash).cloned();
+            self.vote_if_body_held(parked.as_ref(), block_tree, app)?;
         }
 
         // Obtain the body (skip if already self-inserted).
         //
         // L3 v2 (body push): if the leader's unsolicited push already delivered
         // this body — it arrived before the header and was parked in
-        // `pushed_bodies` — consume it NOW and insert with zero fetch round
-        // trips. The phase-vote above has already been sent, so the
-        // header-first vote-before-DA order is untouched. Any non-success
-        // (no push arrived, parent missing, app-invalid) falls through to
-        // today's request + retry machinery unchanged: the push is an
-        // accelerator, never a load-bearing delivery path.
+        // `pushed_bodies` — consume it NOW: vote (s84) and insert with zero
+        // fetch round trips. Any non-success (no push arrived, parent missing,
+        // app-invalid) falls through to the request + retry machinery: the
+        // push is an accelerator, never a load-bearing delivery path.
         if !block_already_in_tree {
             let block_hash = header.block_hash;
             let chain_id = header.chain_id;
@@ -2417,6 +2399,7 @@ impl<N: Network> HotStuff<N> {
             self.pending_headers.insert(block_hash, header);
             let inserted_from_push = match pushed {
                 Some(block) => {
+                    self.vote_if_body_held(Some(&block), block_tree, app)?;
                     // Any non-insert (incl. MissingData) falls through to the
                     // normal fetch, whose response re-validates the body.
                     let outcome = self.try_insert_body(block, block_tree, app)?;
@@ -2561,6 +2544,9 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
+        // s84: holding the body is what this view's vote waits for; vote before
+        // the (heavier) app validation, whatever its outcome.
+        self.vote_if_body_held(Some(&block), block_tree, app)?;
         let outcome = self.try_insert_body(block.clone(), block_tree, app)?;
         if outcome == BodyInsert::Inserted {
             self.pending_headers.remove(&block_hash);
@@ -2645,6 +2631,140 @@ impl<N: Network> HotStuff<N> {
     fn take_pushed_body(&mut self, hash: &CryptoHash) -> Option<Block> {
         let idx = self.pushed_bodies.iter().position(|(h, _)| h == hash)?;
         self.pushed_bodies.remove(idx).map(|(_, block)| block)
+    }
+
+    /// s84 (vote after body): cast the vote waiting in
+    /// [`awaiting_body_vote`](Self::awaiting_body_vote) once this replica holds
+    /// the block's body: the block is in the tree (validated on insertion) or is
+    /// our own proposal, or `body` is its body (bound to the checked header by
+    /// its hash) and passes [`App::check_block_data`]. A QC then implies that a
+    /// quorum holds the body, so a certified block can always be fetched.
+    fn vote_if_body_held<K: KVStore>(
+        &mut self,
+        body: Option<&Block>,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let Some((header, _)) = &self.awaiting_body_vote else {
+            return Ok(());
+        };
+        if header.view != self.view_info.view {
+            self.awaiting_body_vote = None;
+            return Ok(());
+        }
+        let hash = header.block_hash;
+        let held = if block_tree.contains(&hash) || self.pending_bodies.contains_key(&hash) {
+            true
+        } else if let Some(block) = body.filter(|block| block.hash == hash) {
+            let check = app.check_block_data(block, &block_tree.app_view(None)?);
+            match check {
+                BlockDataCheck::Held => true,
+                BlockDataCheck::Missing => {
+                    if let Some((_, recheck)) = self.awaiting_body_vote.as_mut() {
+                        *recheck = Some(Instant::now() + BODY_VOTE_RECHECK_INTERVAL);
+                    }
+                    false
+                }
+                BlockDataCheck::Invalid => {
+                    log::warn!("not voting: body of {} fails the data check",
+                        crate::logging::block_prefix(&hash));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if held {
+            if let Some((header, _)) = self.awaiting_body_vote.take() {
+                self.cast_header_vote(&header, block_tree)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase-vote for `header`, the current view's checked proposal header
+    /// (leader, integrity, safe justify; lock already updated), whose body this
+    /// replica holds. Re-checks that it may still vote in this view, and the
+    /// lock clause, since the lock may have moved while the body was in flight.
+    fn cast_header_vote<K: KVStore>(
+        &mut self,
+        header: &ProposalHeader,
+        block_tree: &mut BlockTreeSingleton<K>,
+    ) -> Result<(), HotStuffError> {
+        let validator_set_state = block_tree.validator_set_state()?;
+        if header.view != self.view_info.view
+            || !is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
+            || block_tree.highest_view_voted()?.is_some_and(|voted| voted >= header.view)
+            || !safe_pc_lock_clause(&header.justify, block_tree)?
+        {
+            return Ok(());
+        }
+        let vote_phase = if header.has_validator_set_updates {
+            Phase::Prepare
+        } else {
+            Phase::Generic
+        };
+        let phase_vote = PhaseVote::new(
+            &self.config.keypair,
+            self.config.chain_id,
+            header.view,
+            header.block_hash,
+            vote_phase,
+        );
+        // s65: persist BEFORE sending. If the process dies between the two, a vote that
+        // left the node but was never recorded would let the restarted replica vote
+        // again in this view (possibly for another block).
+        block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
+        self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
+        // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
+        // (unless the block is already in the tree, in which case it was validated on
+        // insertion). If the body later turns out app-invalid, `try_insert_body` increments
+        // `header_vote_invalid_count`.
+        if !block_tree.contains(&header.block_hash) {
+            self.header_voted.insert(header.block_hash);
+        }
+        Event::PhaseVote(PhaseVoteEvent {
+            timestamp: SystemTime::now(),
+            vote: phase_vote,
+        })
+        .publish(&self.event_publisher);
+        Ok(())
+    }
+
+    /// s84: algorithm-loop tick for [`awaiting_body_vote`](Self::awaiting_body_vote).
+    /// Votes once another path (sync, a drained deferred body, a MissingData
+    /// retry) inserted the block, and re-checks a parked body whose
+    /// out-of-band data was missing every [`BODY_VOTE_RECHECK_INTERVAL`].
+    pub(crate) fn tick_body_vote<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let Some((header, recheck)) = &self.awaiting_body_vote else {
+            return Ok(());
+        };
+        let hash = header.block_hash;
+        let due = recheck.is_some_and(|due| Instant::now() >= due);
+        if header.view != self.view_info.view || block_tree.contains(&hash) {
+            return self.vote_if_body_held(None, block_tree, app);
+        }
+        if due {
+            match self.deferred_bodies.get(&hash).cloned() {
+                Some(body) => self.vote_if_body_held(Some(&body), block_tree, app)?,
+                // The parked copy is gone: wait for the next copy to arrive.
+                None => {
+                    if let Some((_, recheck)) = self.awaiting_body_vote.as_mut() {
+                        *recheck = None;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// s84: a vote waits on a re-check of out-of-band body data.
+    pub(crate) fn has_body_vote_recheck(&self) -> bool {
+        matches!(self.awaiting_body_vote, Some((_, Some(_))))
     }
 
     /// Bind metadata to the requested hash or an already authenticated header.
@@ -3414,6 +3534,9 @@ pub(crate) const BODY_RETRY_SLOW_INTERVAL: Duration = Duration::from_millis(500)
 pub(crate) const BODY_FETCH_DEADLINE: Duration = Duration::from_secs(4);
 /// s63: re-validation cadence for parked `MissingData` bodies.
 pub(crate) const MISSING_DATA_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// s84: re-check cadence of a held body whose out-of-band data was missing
+/// while this view's vote waits for it (short: the view is still running).
+pub(crate) const BODY_VOTE_RECHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// s63: how long a parked body may keep returning `MissingData` before this
 /// replica stops re-validating it and falls back to block sync.
 pub(crate) const MISSING_DATA_RETRY_DEADLINE: Duration = Duration::from_secs(3);
@@ -3743,6 +3866,7 @@ mod sync_recovery_tests {
         tree: BlockTreeSingleton<MemKV>,
         origin: VerifyingKey,
         header: ProposalHeader,
+        block: Block,
         events: std::sync::mpsc::Receiver<Event>,
     }
 
@@ -3760,13 +3884,19 @@ mod sync_recovery_tests {
         hotstuff.event_publisher = Some(tx);
         let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
             CryptoHash::new([94; 32]), Data::new(vec![]));
-        SkipCase { hotstuff, tree, origin, header: recovery_header(&block, future), events }
+        SkipCase { hotstuff, tree, origin, header: recovery_header(&block, future), block, events }
     }
 
     impl SkipCase {
         fn receive(&mut self, header: ProposalHeader) {
             let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
             self.hotstuff.on_receive_msg(header.into(), &self.origin, &mut self.tree, &mut app).unwrap();
+        }
+        /// s84: the vote waits for the body.
+        fn deliver_body(&mut self) {
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            let resp = BlockDataResponse { view: self.header.view, block: self.block.clone() };
+            self.hotstuff.on_receive_msg(resp.into(), &self.origin, &mut self.tree, &mut app).unwrap();
         }
         fn phase_votes(&self) -> Vec<PhaseVote> {
             self.events.try_iter().filter_map(|event| match event {
@@ -3824,6 +3954,7 @@ mod sync_recovery_tests {
         let mut c = skip_case(5, 5);
         c.receive(c.header.clone());
         assert!(c.hotstuff.take_view_skip().is_none(), "current-view header");
+        c.deliver_body();
         assert_eq!(c.phase_votes().len(), 1);
 
         // Kill switch off.
@@ -3997,6 +4128,7 @@ mod sync_recovery_tests {
         tree: BlockTreeSingleton<MemKV>,
         origin: VerifyingKey,
         header: ProposalHeader,
+        block: Block,
         justify_block: Block,
         events: std::sync::mpsc::Receiver<Event>,
     }
@@ -4018,7 +4150,7 @@ mod sync_recovery_tests {
             generic_pc(ViewNumber::new(2), justify_block.hash, &keys[..signers], &set),
             CryptoHash::new([95; 32]), Data::new(vec![]));
         let header = recovery_header(&block, view);
-        ParkCase { hotstuff, tree, origin, header, justify_block, events }
+        ParkCase { hotstuff, tree, origin, header, block, justify_block, events }
     }
 
     impl ParkCase {
@@ -4030,6 +4162,12 @@ mod sync_recovery_tests {
         fn redispatch(&mut self) {
             let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
             self.hotstuff.redispatch_parked_header(&mut self.tree, &mut app).unwrap();
+        }
+        /// s84: the vote waits for the body.
+        fn deliver_body(&mut self) {
+            let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
+            let resp = BlockDataResponse { view: self.header.view, block: self.block.clone() };
+            self.hotstuff.on_receive_msg(resp.into(), &self.origin, &mut self.tree, &mut app).unwrap();
         }
         fn phase_votes(&self) -> Vec<PhaseVote> {
             self.events.try_iter().filter_map(|event| match event {
@@ -4055,6 +4193,8 @@ mod sync_recovery_tests {
 
         c.tree.insert(&c.justify_block, None, None).unwrap();
         c.redispatch();
+        assert_eq!(c.tree.highest_view_voted().unwrap(), None, "s84: no vote before the body");
+        c.deliver_body();
         assert_eq!(c.tree.last_voted_proposal().unwrap(),
             Some((c.header.view, c.header.block_hash)));
         assert_eq!(c.tree.highest_pc().unwrap().view, ViewNumber::new(2),
@@ -4072,7 +4212,8 @@ mod sync_recovery_tests {
         c.receive();
         c.tree.insert(&c.justify_block, None, None).unwrap();
         c.receive();
-        assert_eq!(c.phase_votes().len(), 1, "the retransmission votes");
+        c.deliver_body();
+        assert_eq!(c.phase_votes().len(), 1, "the retransmission votes once the body is held");
         c.redispatch();
         assert!(c.hotstuff.parked_header.is_none());
         let redispatched = c.events.try_iter()
@@ -4140,6 +4281,10 @@ mod sync_recovery_tests {
 
         hotstuff.on_receive_msg(recovery_header(&current, view).into(),
             &current_origin, &mut tree, &mut app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), None, "s84: no vote before the body");
+        hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(BlockDataResponse {
+            view, block: current.clone(),
+        }), &current_origin, &mut tree, &mut app).unwrap();
         assert_eq!(tree.last_voted_proposal().unwrap(), Some((view, current.hash)));
         let votes: Vec<_> = rx.try_iter().filter_map(|event| match event {
             Event::PhaseVote(event) => Some(event.vote), _ => None,
@@ -4819,9 +4964,10 @@ mod s63_body_fetch_tests {
         assert!(f.hotstuff.take_sync_needed());
     }
 
-    /// s84: a follower header-votes the parent (view 1), its fetched body is
-    /// validated by `app`, then the child header (view 2, justify = QC on the
-    /// parent) arrives. Returns (parent header still pending, voted the child).
+    /// s84: a follower votes the parent (view 1) once its fetched body is held,
+    /// the body is validated by `app`, then the child header (view 2, justify =
+    /// QC on the parent) and its body arrive. Returns (parent header still
+    /// pending, voted the child).
     fn child_vote_after_parent_body(app: &mut ScriptedApp) -> (bool, bool) {
         let keys = signing_keys(&[1, 2, 3, 4]);
         let set = validator_set(&keys);
@@ -4842,13 +4988,16 @@ mod s63_body_fetch_tests {
             tc: None, nec: None, has_validator_set_updates: false,
         };
         hotstuff.on_receive_msg(header(&parent, v1).into(), &o1, &mut tree, app).unwrap();
-        assert_eq!(tree.highest_view_voted().unwrap(), Some(v1), "header-first vote on the parent");
+        assert_eq!(tree.highest_view_voted().unwrap(), None, "s84: no vote before the body");
         hotstuff.on_receive_msg(BlockDataResponse { view: v1, block: parent.clone() }.into(),
             &o1, &mut tree, app).unwrap();
+        assert_eq!(tree.highest_view_voted().unwrap(), Some(v1), "voted once the body is held");
         assert_eq!(app.calls, 1);
         assert!(!tree.contains(&parent.hash));
         hotstuff.view_info = ViewInfo::new(v2, Instant::now() + Duration::from_secs(60));
         hotstuff.on_receive_msg(header(&child, v2).into(), &o2, &mut tree, app).unwrap();
+        hotstuff.on_receive_msg(BlockDataResponse { view: v2, block: child.clone() }.into(),
+            &o2, &mut tree, app).unwrap();
         (hotstuff.pending_headers.contains_key(&parent.hash),
             tree.highest_view_voted().unwrap() == Some(v2))
     }
@@ -4872,6 +5021,211 @@ mod s63_body_fetch_tests {
         let (parent_pending, voted_child) = child_vote_after_parent_body(&mut app);
         assert!(parent_pending);
         assert!(voted_child);
+    }
+}
+
+/// s84 "vote after body": a replica phase-votes for the current view's proposal
+/// only once it holds the body and the body passes `App::check_block_data`.
+#[cfg(test)]
+mod vote_after_body_tests {
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::{
+        hotstuff_at, proposer_for, signing_keys, steady_block_tree, validator_set, MemKV,
+        NullNetwork,
+    };
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::data_types::Data;
+
+    /// `check_block_data` answers from `checks` in order (then `Held`);
+    /// `validate_block` answers `validate()`.
+    struct CheckApp {
+        checks: VecDeque<BlockDataCheck>,
+        check_calls: usize,
+        validate: fn() -> ValidateBlockResponse,
+    }
+    impl App<MemKV> for CheckApp {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!()
+        }
+        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            (self.validate)()
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!()
+        }
+        fn check_block_data(
+            &mut self,
+            _: &Block,
+            _: &crate::block_tree::accessors::app::AppBlockTreeView<'_, MemKV>,
+        ) -> BlockDataCheck {
+            self.check_calls += 1;
+            self.checks.pop_front().unwrap_or(BlockDataCheck::Held)
+        }
+    }
+
+    fn valid() -> ValidateBlockResponse {
+        ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+    }
+
+    /// A follower (not the view-1 proposer) of a 4-validator set at view 1.
+    struct Follower {
+        hotstuff: HotStuff<NullNetwork>,
+        tree: BlockTreeSingleton<MemKV>,
+        app: CheckApp,
+        block: Block,
+        header: ProposalHeader,
+        origin: VerifyingKey,
+        view: ViewNumber,
+    }
+
+    impl Follower {
+        fn new(checks: &[BlockDataCheck], validate: fn() -> ValidateBlockResponse) -> Self {
+            let keys = signing_keys(&[1, 2, 3, 4]);
+            let (tree, vss) = steady_block_tree(&validator_set(&keys));
+            let view = ViewNumber::new(1);
+            let origin = proposer_for(view, &keys, &vss, &tree);
+            let local = keys.iter().find(|k| k.verifying_key() != origin).unwrap().clone();
+            let hotstuff = hotstuff_at(view, local, vss);
+            let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([51; 32]), Data::new(vec![]));
+            let header = ProposalHeader {
+                chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
+                data_hash: block.data_hash, justify: block.justify.clone(),
+                tc: None, nec: None, has_validator_set_updates: false,
+            };
+            let app = CheckApp { checks: checks.iter().copied().collect(), check_calls: 0, validate };
+            Follower { hotstuff, tree, app, block, header, origin, view }
+        }
+        fn receive(&mut self, msg: HotStuffMessage) {
+            self.hotstuff.on_receive_msg(msg, &self.origin, &mut self.tree, &mut self.app).unwrap();
+        }
+        fn header(&mut self) {
+            self.receive(self.header.clone().into());
+        }
+        fn body(&mut self) {
+            self.receive(BlockDataResponse { view: self.view, block: self.block.clone() }.into());
+        }
+        fn tick(&mut self) {
+            self.hotstuff.tick_body_vote(&mut self.tree, &mut self.app).unwrap();
+        }
+        /// Make a scheduled re-check due now.
+        fn recheck_now(&mut self) {
+            let (_, recheck) = self.hotstuff.awaiting_body_vote.as_mut().expect("vote awaits");
+            *recheck = Some(Instant::now());
+        }
+        fn voted(&self) -> bool {
+            self.tree.highest_view_voted().unwrap() == Some(self.view)
+        }
+    }
+
+    #[test]
+    fn no_vote_before_the_body_is_held() {
+        let mut f = Follower::new(&[], valid);
+        f.header();
+        assert!(!f.voted(), "a header alone must not be voted");
+        assert_eq!(f.app.check_calls, 0);
+        f.tick();
+        assert!(!f.voted());
+        f.body();
+        assert!(f.voted(), "the vote follows the body");
+        assert_eq!(f.app.check_calls, 1);
+        assert!(f.hotstuff.awaiting_body_vote.is_none());
+    }
+
+    #[test]
+    fn body_is_voted_before_app_validation_even_if_validation_rejects_it() {
+        // "Held" (data check) is what the vote waits for, not validation.
+        let mut f = Follower::new(&[], || ValidateBlockResponse::Invalid);
+        f.header();
+        f.body();
+        assert!(f.voted());
+        assert!(!f.tree.contains(&f.block.hash));
+    }
+
+    #[test]
+    fn pushed_body_that_beat_its_header_is_voted_on_header_arrival() {
+        let mut f = Follower::new(&[], valid);
+        f.body();
+        assert!(!f.voted(), "an unclaimed pushed body is only parked");
+        f.header();
+        assert!(f.voted());
+        assert!(f.tree.contains(&f.block.hash));
+    }
+
+    #[test]
+    fn body_failing_the_data_check_is_not_voted() {
+        let mut f = Follower::new(&[BlockDataCheck::Invalid], || ValidateBlockResponse::Invalid);
+        f.header();
+        f.body();
+        assert!(!f.voted(), "no vote for a body that fails the data check");
+        assert!(!f.hotstuff.has_body_vote_recheck(), "an Invalid copy is not re-checked");
+        f.tick();
+        assert!(!f.voted());
+        assert_eq!(f.app.check_calls, 1);
+        assert!(f.hotstuff.awaiting_body_vote.is_some(), "another copy may still arrive");
+    }
+
+    #[test]
+    fn missing_out_of_band_data_is_rechecked_until_held() {
+        let mut f = Follower::new(
+            &[BlockDataCheck::Missing, BlockDataCheck::Missing],
+            || ValidateBlockResponse::MissingData,
+        );
+        f.header();
+        f.body();
+        assert!(!f.voted());
+        assert!(f.hotstuff.deferred_bodies.contains_key(&f.block.hash), "parked as MissingData");
+        assert!(f.hotstuff.has_body_vote_recheck());
+        f.tick();
+        assert_eq!(f.app.check_calls, 1, "re-check waits for its interval");
+        f.recheck_now();
+        f.tick();
+        assert_eq!(f.app.check_calls, 2);
+        assert!(!f.voted(), "still missing");
+        f.recheck_now();
+        f.tick();
+        assert_eq!(f.app.check_calls, 3);
+        assert!(f.voted(), "held on the third check");
+        assert!(!f.hotstuff.has_body_vote_recheck());
+    }
+
+    #[test]
+    fn block_inserted_by_another_path_is_voted_by_the_tick() {
+        let mut f = Follower::new(&[], valid);
+        f.header();
+        f.tree.insert(&f.block, None, None).unwrap();
+        f.tick();
+        assert!(f.voted());
+        assert_eq!(f.app.check_calls, 0, "a block in the tree was validated on insertion");
+    }
+
+    /// The deferred vote re-checks the lock clause: a lock that moved to a
+    /// conflicting branch while the body was in flight withholds the vote.
+    #[test]
+    fn vote_is_withheld_if_the_lock_moved_to_a_conflicting_branch_meanwhile() {
+        use crate::block_tree::accessors::internal::BlockTreeWriteBatch;
+        use crate::hotstuff::header_fast_path_regression_test::{generic_pc, MemWb};
+        let mut f = Follower::new(&[], valid);
+        f.header();
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let conflicting = generic_pc(ViewNumber::new(5), CryptoHash::new([9; 32]), &keys[..3],
+            &validator_set(&keys));
+        let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
+        wb.set_locked_pc(&conflicting).unwrap();
+        f.tree.write(wb);
+        f.body();
+        assert!(!f.voted());
+    }
+
+    #[test]
+    fn body_arriving_after_the_view_ended_is_not_voted() {
+        let mut f = Follower::new(&[], valid);
+        f.header();
+        f.hotstuff.view_info =
+            ViewInfo::new(ViewNumber::new(2), Instant::now() + Duration::from_secs(60));
+        f.body();
+        assert_eq!(f.tree.highest_view_voted().unwrap(), None);
+        assert!(f.hotstuff.awaiting_body_vote.is_none());
     }
 }
 
