@@ -395,3 +395,17 @@ same stack, in the same campaign (D15: same-campaign cells only).
    stopgap (L2 on the storage path) or wait for Phase 1?
 8. **Missing baselines.** Measure main at 30 and 100 markets, main's
    `rejected_cancelled`, and CPU-s per 1M for both arms in the next campaign?
+
+## Stage gates (owner, s87, PROPOSED)
+
+All against main d995f68 on the devnet, oracle on for the stack. Each gate also needs
+AGREE/PASS, a normal drain, and the differential tests passing.
+
+| Gate | When | Proposed target |
+|---|---|---|
+| 1 (merge) | after fixes 3/2a/1 + B | >= 0.6x main matched/s; ubench_econ <= 25 ms per 1k fills |
+| 2 | after item 6 Phase 1 + margin summary + event-driven liquidation | >= 0.9x main (crab cost <= +15% per fill, fail above +30%) |
+| 3 (final) | after all item 6 phases | >= 1.4x today's main at 300 markets |
+
+These are guidance, not automatic rules. After the Gate 1 measurements the owner reviews
+the results and decides whether to merge, and whether Gates 2 and 3 should change.
