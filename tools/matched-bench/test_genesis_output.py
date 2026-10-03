@@ -15,13 +15,20 @@ class GenesisOutputTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         source = Path(__file__).resolve().parents[2]
-        for name in ('devnet/wsl/gen-3val-genesis.sh', 'testnet/gen-weighted-genesis.sh',
-                     'testnet/lib/cargo-bin.sh'):
+        for name in ('devnet/wsl/gen-3val-genesis.sh', 'devnet/wsl/bench-validator-keys.json',
+                     'testnet/gen-weighted-genesis.sh', 'testnet/lib/cargo-bin.sh'):
             destination = self.root / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / name, destination)
-        self.validators = [{'address': f'devnet-{i}', 'pubkey': str(i)} for i in range(3)]
+        self.validators = [{'address': f'devnet-{i}', 'pubkey': str(i)} for i in range(4)]
         (self.root / 'devnet/genesis.json').write_text(json.dumps({'validators': self.validators}))
+        self.keys_file = self.root / 'devnet/wsl/bench-validator-keys.json'
+        keys = json.loads(self.keys_file.read_text())['validators']
+        # The bench validators: the first 3 devnet entries, each under the
+        # address of the key file entry with the same index.
+        self.expected_validators = [
+            {**self.validators[i], 'address': next(k['address'] for k in keys if k['index'] == i)}
+            for i in range(3)]
         self.base = {
             'chain_id': 1, 'consensus': {'timeout_base_ms': 500},
             'validators': [{'address': 'weighted-' + str(i)} for i in range(4)],
@@ -45,7 +52,7 @@ printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000
 ''')
         self.binary.chmod(0o755)
 
-    def generate(self, force=False):
+    def run_script(self, force=False):
         environment = dict(os.environ)
         for name in ('BASE', 'BIN', 'OUT', 'FORCE', 'MARKETS', 'TIMEOUT_BASE_MS',
                      'BULK_OFFSET', 'BULK_COUNT', 'NATIVE_AVAIL', 'EVM_WEI'):
@@ -53,14 +60,17 @@ printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000
         environment.update(OUT=str(self.output), BENCH_BIN=str(self.binary), MARKETS='3',
                            FORCE='1' if force else '0', BULK_OFFSET='60', BULK_COUNT='2',
                            CALL_LOG=str(self.calls))
-        result = subprocess.run(['bash', str(self.root / 'devnet/wsl/gen-3val-genesis.sh')],
-                                env=environment, capture_output=True, text=True, timeout=10)
+        return subprocess.run(['bash', str(self.root / 'devnet/wsl/gen-3val-genesis.sh')],
+                              env=environment, capture_output=True, text=True, timeout=10)
+
+    def generate(self, force=False):
+        result = self.run_script(force)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(self.full.read_text()), json.loads(self.output.read_text())
 
     def assert_artifacts(self, full, final):
         self.assertEqual(full['validators'], self.base['validators'])
-        self.assertEqual(final['validators'], self.validators)
+        self.assertEqual(final['validators'], self.expected_validators)
         self.assertEqual(len(full['markets']), 2)
         self.assertEqual([market['market_id'] for market in final['markets']], [1, 2, 3])
         self.assertEqual(full['native_balances'], final['native_balances'])
@@ -87,6 +97,23 @@ printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000
         self.assert_artifacts(full, final)
         self.assertTrue(final['reused'])
         self.assertFalse(self.calls.exists())
+
+    def test_key_file_holds_three_distinct_test_keys_in_validator_order(self):
+        keys = json.loads(self.keys_file.read_text())
+        self.assertIn('TEST-ONLY', keys['note'])
+        self.assertEqual([k['index'] for k in keys['validators']], [0, 1, 2])
+        for k in keys['validators']:
+            self.assertRegex(k['address'], r'^0x[0-9a-f]{40}$')
+            self.assertRegex(k['private_key'], r'^0x[0-9a-f]{64}$')
+        self.assertEqual(len({k['address'] for k in keys['validators']}), 3)
+
+    def test_key_file_missing_a_validator_index_fails(self):
+        keys = json.loads(self.keys_file.read_text())
+        keys['validators'] = [k for k in keys['validators'] if k['index'] != 2]
+        self.keys_file.write_text(json.dumps(keys))
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('index 2', result.stderr)
 
 
 if __name__ == '__main__':

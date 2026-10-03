@@ -5,7 +5,8 @@
 # The genesis = the WEIGHTED 100k-account testnet genesis (bench-reproducible
 # funded senders, pre-seeded markets, hardhat governance stakers) but with the
 # consensus validator set REPLACED by the 3 deterministic devnet validator keys
-# (0x01.. / 0x02.. / 0x03..) whose private keys we actually hold. permanent_stakes
+# (0x01.. / 0x02.. / 0x03..) whose private keys we actually hold, each under a
+# test-only EVM address from devnet/wsl/bench-validator-keys.json. permanent_stakes
 # are governance-only (CF_STAKING_PERMANENT) and carry NO consensus voting power
 # (torus-genesis to_hotstuff_genesis builds the validator set solely from
 # .validators), so they are kept untouched.
@@ -46,8 +47,20 @@ else
 fi
 
 # 2. The 3 devnet validators (pubkeys == ed25519 pubkeys of keys 01/02/03),
-#    lifted verbatim from devnet/genesis.json so stake/commission match.
-VALS=$(jq '[.validators[0:3][]]' "$REPO/devnet/genesis.json")
+#    lifted from devnet/genesis.json so pubkey/stake/commission match, with the
+#    made-up EVM addresses (0x1000..01/0x2000..02/0x3000..03) swapped for the
+#    test-only addresses in bench-validator-keys.json, whose private keys we
+#    hold, so each validator can sign oracle price submissions. Consensus uses
+#    the ed25519 pubkeys only; the address is the validator's account identity.
+KEYS="$REPO/devnet/wsl/bench-validator-keys.json"
+[ -f "$KEYS" ] || { echo "FATAL: missing $KEYS" >&2; exit 1; }
+VALS=$(jq --slurpfile k "$KEYS" '
+    [.validators[0:3] | to_entries[] | .key as $i
+        | ([$k[0].validators[] | select(.index == $i) | .address]) as $a
+        | if ($a|length) != 1 then error("bench-validator-keys.json: need exactly one entry with index \($i)")
+          else .value | .address = ($a[0] | ascii_downcase) end]' "$REPO/devnet/genesis.json")
+[ "$(jq '[.[].address | select(test("^0x[0-9a-f]{40}$"))] | unique | length' <<<"$VALS")" = 3 ] \
+    || { echo "FATAL: bench-validator-keys.json must give 3 distinct 20-byte addresses" >&2; exit 1; }
 
 # 3. Weighted accounts + 3-val consensus set (+ optional market count).
 if [ -n "${MARKETS:-}" ]; then
