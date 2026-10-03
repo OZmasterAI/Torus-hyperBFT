@@ -26,8 +26,8 @@ facts: memory 8d03fdac (s82/s83 research), marked by source below.
   a disk-format change it would rewrite large records more often until
   writes are coalesced (Phase 3).
 - Phases 1, 2 and 3 change no consensus rule, no state format and no
-  running state hash. Each runs behind a node-local flag and can be A/B
-  benched against main.
+  running state hash. Each is its own branch in a linear stack and is A/B
+  benched against main and the previous phase (no runtime flags, D16).
 - Expected gains (estimates, to be confirmed by benches): Phase 1 +15-30%
   matched/s at 300 markets uniform, ~0 at 10 markets; Phase 2 another
   +7-15%; Phase 3 about -10% node CPU and much less disk write, no throughput
@@ -254,7 +254,7 @@ What changes
   prefix's native writes, already enumerated by `HashExtras`,
   `app.rs:1692-1693`) to R after the freeze and before the next block's
   overlay is built: O(changed rows).
-- Flag `TORUS_RESIDENT_ROWS=1` (proposed name), default off, kill switch.
+- No runtime flag (D16): the phase branch always uses R.
 - Files: `torus-state/src/backend.rs` (layer), new `torus-state/src/resident_rows.rs`,
   `torus-bridge/src/native_executor.rs` (holder), `torus-consensus/src/app.rs`
   (apply after freeze, metrics), `torus-telemetry` (rows, bytes, rebuilds).
@@ -284,8 +284,9 @@ Risks
   rebuild scan at first block after boot (~1 s per 1M rows, estimate).
 
 Tests
-- Differential: same block sequence with R on/off, all four BookModes,
-  serial vs pipelined: identical CF dumps and identical `h_n` per block.
+- Differential: same block sequence with and without R (a test-only
+  constructor, not a runtime flag), all four BookModes, serial vs pipelined:
+  identical CF dumps and identical `h_n` per block.
 - Crash/replay: kill between the R update and W's write, and between W's write
   and the next block: restarted node ends identical (state + `h_n`).
 - Guard: marker mismatch, skipped height, fatal block -> R rebuilt, never used.
@@ -293,8 +294,7 @@ Tests
 - 3 replicas with different exec lag: identical state.
 - Property test of the lookup chain (pending/parent/R/DB) vs DB after flush.
 
-Bench: recipe above, `TORUS_RESIDENT_ROWS=0` vs `1` on one binary (env A/B)
-plus main. Mechanism metrics: `exec_settle_pass_a_seconds`, engine ms per
+Bench: recipe above, the phase-1 branch binary vs main. Mechanism metrics: `exec_settle_pass_a_seconds`, engine ms per
 native block, RSS, R rebuild count.
 
 ### Phase 2: per-block work in proportion to fills on E (size M)
@@ -324,11 +324,14 @@ Risks: error strings and result order of cancel/modify must not change
 (they are action results); worker-panic containment (T1.5) must be kept with
 a pool; pool threads must not outlive a fatal block.
 
-Tests: flag on/off differential (CF dumps + `h_n`), cancel of unknown /
+Tests: differential vs the previous phase's code path in tests (CF dumps +
+`h_n`), cancel of unknown /
 foreign / already-filled ids, cancel-all runs, worker panic -> fail-stop as
 today, 300-market fixture.
 
-Bench: recipe above, one A/B per item where the item has its own flag.
+Bench: recipe above, the phase-2 branch binary vs main and vs the phase-1
+binary. If one item's effect must be isolated, bench an intermediate commit
+of the branch.
 
 ### Phase 3: block log + coalesced state checkpoints instead of per-block state writes (size L)
 
@@ -693,7 +696,7 @@ D16. Rollout.
 | D13 | a: keep packed trade-history rows + retention pruning. Hourly files would need a separate indexer, and validators run `TORUS_TRADE_HISTORY=0`, so neither option touches chain throughput |
 | D14 | b: 64 GB per testnet validator + a resting-order cap sized at ~400 B/order. The devnet needs no separate target (one 94 GB host for 3 nodes, ~30 GB each; ~5 GB/node used today) |
 | D15 | b: relative gates per phase, HL parity as end goal. "No regression at 10 markets" means extra 10-market cells in the SAME campaign (phase vs main), next to the primary 300-market cells, never against old benches |
-| D16 | a: each phase behind a default-off env flag, flipped after bench cells |
+| D16 | No switches by default: the linear stack provides the per-phase A/B (each branch tip is its own binary); rollback = redeploy the previous binary. Overrides the recommendation in D16 above |
 
 Branching: a linear stack of branches (each phase on top of the previous one);
 each phase is benched against main and against the previous phase; the merge
