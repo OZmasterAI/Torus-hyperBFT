@@ -276,7 +276,7 @@ fn scenario_a(db: &StateDb) -> Vec<Block> {
                     .map(|_| {
                         let m = 1 + rng.below(A_MARKETS);
                         let mid = px[m as usize] as i128;
-                        let mut is_buy = (s + m) % 2 == 0;
+                        let mut is_buy = (s + m).is_multiple_of(2);
                         let aggressive = rng.chance(500);
                         let d = 1 + rng.below(5) as i128;
                         let units = if is_buy == aggressive { mid + d } else { mid - d };

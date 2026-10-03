@@ -19,7 +19,7 @@ use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::NativeBalance;
 use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
 use torus_state::cf::CF_NATIVE_MARKETS;
-use torus_state::{NativeStateOverlay, StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, StateDb};
 use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 fn env(k: &str, d: u64) -> u64 {
@@ -84,7 +84,7 @@ fn feed_setup(db: &StateDb, markets: u64) {
 }
 
 fn econ_order(rng: &mut Lcg, s: u64, market_id: u64) -> PlaceOrderParams {
-    let is_buy = s.wrapping_add(market_id) % 2 == 0;
+    let is_buy = s.wrapping_add(market_id).is_multiple_of(2);
     let aggressive = rng.chance(500);
     let d = 1 + rng.below(BAND) as i128;
     let mid = TARGET * LEV;

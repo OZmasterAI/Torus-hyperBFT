@@ -1,7 +1,12 @@
 # Implementation Plan: crab-stack perf fixes 1-3 (s87)
 
 Branch: new commits on top of `rebase/s85-oracle-feeder` (tip `c93c579`). Worktree
-`/home/18c/projects/wt/s87-ubench` (detached at `c93c579`). Status: PLAN, nothing implemented.
+`/home/18c/projects/wt/s87-ubench` (detached at `c93c579`). Status: fixes 3, 2a and 1 IMPLEMENTED
+on `perf/s87-crab-fixes` (C0 `d0d722b`, C1 `6cbd812`, C2 `473a037`, C3 `4d81f4a`). Golden digests
+unchanged. ubench_econ (ms/1k fills, median of 3): ~135-169 → 105 (Fix 3) → 95, tail 1.3 (Fix 2a)
+→ 41 (Fix 1): Fix 1 misses its ≤ 25 target. Remaining cost is per-(sender, market) position point
+reads in Phase 2 and the Phase-3 policing (outside this plan; see the commit message of C3).
+Fix 1 implements the mark table lazily (one `OnceLock` per market, no eager reads). 1c not done.
 Scope: fixes 1-3 only. Fix 4 (sharing free margin across markets) is a separate design
 discussion. Nothing here changes it, and the F1 D2/D8 rules (exclusive pool, start-of-batch
 maker snapshot) stay byte-identical.
