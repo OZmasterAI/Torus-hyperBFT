@@ -4920,6 +4920,9 @@ mod queue_lookup_tests {
             .map(|o| (ob.order_seq_of(o.id).unwrap(), o.clone()))
             .collect();
         rows.sort_by_key(|(s, o)| (o.price.raw(), *s));
+        // Restore meta.next_seq first, as the real loaders do (native_executor
+        // book load, book_reader): loaded seqs must be below it.
+        loaded.set_next_seq(ob.next_seq());
         for (seq, o) in rows {
             loaded.insert_loaded_order(o, seq);
         }
