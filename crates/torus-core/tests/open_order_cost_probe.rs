@@ -85,6 +85,121 @@ fn open_order_count_cost() {
     time_counts("idle 290 of 300 books empty", &idle, 5000);
 }
 
+fn loadavg() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+/// `books` books; each of `traders` traders rests `per_trader` bids spread
+/// over the books by a fixed xorshift. Returns the books and the mean number
+/// of distinct traders per book.
+fn spread_books(books: u64, traders: u64, per_trader: u64) -> (Vec<OrderBook>, usize) {
+    let mut out: Vec<OrderBook> = (1..=books).map(|m| OrderBook::new(m, fp(1), fp(1))).collect();
+    let mut present = vec![std::collections::HashSet::new(); books as usize];
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for t in 0..traders {
+        for k in 0..per_trader {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let m = x % books;
+            let price = 1 + ((t + k) % 400) as i64;
+            out[m as usize].place_order(order(m + 1, true, price, TimeInForce::GTC), trader(t), 0);
+            present[m as usize].insert(t);
+        }
+    }
+    let per_book = present.iter().map(|p| p.len()).sum::<usize>() / books as usize;
+    (out, per_book)
+}
+
+/// Times each `(name, max_threads, work_per_thread)` candidate `reps` times,
+/// round-robin (so a load change hits every candidate alike), and prints
+/// min / median / p90 ms; all candidates must give the same counts.
+fn compare_splits(label: &str, refs: &[&OrderBook], senders: u64, every: u64) {
+    let cap = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let idx: HashMap<Address, usize> =
+        (0..senders).map(|s| (trader(s * every), s as usize)).collect();
+    let candidates = [
+        ("serial", 0usize, usize::MAX),
+        ("pre-fix 25k", cap, 25_000),
+        ("100k", cap, 100_000),
+        ("8 workers", 8, 1),
+    ];
+    let reps = 41;
+    let mut ms = vec![Vec::with_capacity(reps); candidates.len()];
+    let want = open_order_counts(refs, &idx, 0, 0);
+    for _ in 0..reps {
+        for (c, &(_, threads, per)) in candidates.iter().enumerate() {
+            let t0 = Instant::now();
+            let counts = open_order_counts(refs, &idx, threads, per);
+            ms[c].push(t0.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(counts, want);
+        }
+    }
+    let sum: usize = want.iter().sum();
+    for (c, (name, _, _)) in candidates.iter().enumerate() {
+        ms[c].sort_by(f64::total_cmp);
+        println!(
+            "{label}, {senders} senders (sum {sum}), {name:>11}: min {:6.2}  median {:6.2}  \
+             p90 {:6.2} ms  load {}",
+            ms[c][0],
+            ms[c][reps / 2],
+            ms[c][reps * 9 / 10],
+            loadavg()
+        );
+    }
+}
+
+/// The s84 bench cell's count (300 markets, 5000 senders, batches of 400
+/// orders spread uniformly over the markets, budget 900): the
+/// `torus_exec_resting_orders` gauge sits at ~300k (median) to ~600k (peak),
+/// so each of the 5000 traders rests ~60-120 orders spread over the 300
+/// books. A native block carries ~365 actions, about a third of them
+/// cancel-alls, so a count sees ~250 distinct GTC senders (at most 400, the
+/// block's action cap). Candidates: serial, the pre-fix split (25k probes
+/// per worker, up to available_parallelism workers), a 100k split and 8
+/// workers regardless of work; plus a 1000-market shape (400k probes) and
+/// the bare spawn/join on empty books.
+#[test]
+#[ignore = "release cost probe; run with --release -- --ignored --nocapture"]
+fn open_order_count_bench_shape() {
+    for (label, per_trader) in [("median", 60u64), ("peak", 120)] {
+        let (books, traders) = spread_books(300, 5000, per_trader);
+        let orders = books.iter().map(OrderBook::order_count).sum::<usize>() / 300;
+        let refs: Vec<&OrderBook> = books.iter().collect();
+        let label = format!("bench {label} ({orders} orders, {traders} traders/book)");
+        compare_splits(&label, &refs, 250, 20);
+        compare_splits(&label, &refs, 400, 12);
+    }
+    let (books, traders) = spread_books(1000, 5000, 200);
+    let refs: Vec<&OrderBook> = books.iter().collect();
+    compare_splits(&format!("1000 books ({traders} traders/book)"), &refs, 400, 12);
+    drop(books);
+    let empty: Vec<OrderBook> = (1..=300).map(|m| OrderBook::new(m, fp(1), fp(1))).collect();
+    let refs: Vec<&OrderBook> = empty.iter().collect();
+    let idx: HashMap<Address, usize> = (0..250).map(|s| (trader(s), s as usize)).collect();
+    let cap = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for threads in [3, cap] {
+        let mut ms: Vec<f64> = (0..41)
+            .map(|_| {
+                let t0 = Instant::now();
+                open_order_counts(&refs, &idx, threads, 0);
+                t0.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        println!(
+            "bare spawn/join of {threads} workers (empty books): min {:.3}  median {:.3}  \
+             p90 {:.3} ms  load {}",
+            ms[0],
+            ms[20],
+            ms[36],
+            loadavg()
+        );
+    }
+}
+
 #[test]
 #[ignore = "release cost probe; run with --release -- --ignored --nocapture"]
 fn one_traders_order_removal_cost() {
