@@ -17,7 +17,9 @@ use hotstuff_rs::{
         messages::{Message, ProgressMessage},
         network::Network,
     },
-    types::{update_sets::ValidatorSetUpdates, validator_set::ValidatorSet},
+    types::{
+        data_types::ViewNumber, update_sets::ValidatorSetUpdates, validator_set::ValidatorSet,
+    },
 };
 
 /// A runtime-toggleable message filter shared by every [`NetworkStub`] in a cluster.
@@ -47,6 +49,11 @@ pub(crate) struct MessageFilter {
     /// dropped for EVERY recipient — a proposer whose data never becomes available (withheld, or
     /// lost in a crash).
     pub(crate) withheld_bodies_from: Vec<VerifyingKey>,
+    /// s85: `(sender, view)`: drop every progress message (HotStuff or pacemaker) that `sender`
+    /// sends for `view` or a later view, to every recipient. The sender still enters `view` and
+    /// acts there, but nothing it does from `view` on leaves the node, as with a node stopped
+    /// in `view` before its vote went out.
+    pub(crate) silenced_from_view: Option<(VerifyingKey, ViewNumber)>,
 }
 
 impl MessageFilter {
@@ -63,6 +70,13 @@ impl MessageFilter {
     fn should_drop(&self, sender: &VerifyingKey, recipient: &VerifyingKey, message: &Message) -> bool {
         if !self.enabled {
             return false;
+        }
+        if let (Some((silenced, from)), Message::ProgressMessage(progress)) =
+            (&self.silenced_from_view, message)
+        {
+            if silenced == sender && progress.view().is_some_and(|view| view >= *from) {
+                return true;
+            }
         }
         let is_body = matches!(
             message,
@@ -237,6 +251,7 @@ impl FilterHandle {
             starved,
             drop_headers,
             withheld_bodies_from: Vec::new(),
+            silenced_from_view: None,
         };
         self.enabled.store(true, Ordering::Relaxed);
     }
@@ -246,6 +261,18 @@ impl FilterHandle {
         *self.filter.lock().unwrap() = MessageFilter {
             enabled: true,
             withheld_bodies_from: senders,
+            ..MessageFilter::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// s85: drop every progress message `sender` sends for `view` or later, to every recipient,
+    /// from now on (see [`MessageFilter::silenced_from_view`]).
+    #[allow(dead_code)]
+    pub(crate) fn silence_from_view(&self, sender: VerifyingKey, view: ViewNumber) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            silenced_from_view: Some((sender, view)),
             ..MessageFilter::default()
         };
         self.enabled.store(true, Ordering::Relaxed);

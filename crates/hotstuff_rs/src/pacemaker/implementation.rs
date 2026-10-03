@@ -1295,6 +1295,24 @@ fn epoch(view: ViewNumber, epoch_length: EpochLength) -> u64 {
     view.int().div_ceil(el)
 }
 
+/// The view a replica boots into, from its persisted progress: the view after
+/// the highest view with progress (entered, or certified by its Highest PC or
+/// Highest TC), or view 0 on a fresh chain.
+pub(crate) fn boot_view(
+    highest_view_entered: ViewNumber,
+    highest_pc_view: ViewNumber,
+    highest_tc_view: Option<ViewNumber>,
+    _epoch_length: EpochLength,
+) -> ViewNumber {
+    let progress = highest_view_entered
+        .max(highest_pc_view)
+        .max(highest_tc_view.unwrap_or(ViewNumber::init()));
+    match progress.int() {
+        0 => ViewNumber::new(0),
+        v => ViewNumber::new(v + 1),
+    }
+}
+
 /// Reputation-weighted selection must be opt-in: a replica that never calls
 /// `set_reputation_leader_selection(true)` selects leaders with plain IWRR.
 /// (Nothing else in the lib test binary toggles the switch, so this genuinely
@@ -1574,6 +1592,53 @@ fn skip_to_view_refuses_non_increasing_and_cross_epoch() {
         .skip_to_view(ViewNumber::new(100_000), &vss, ViewNumber::new(99_989), ViewNumber::new(99_989))
         .unwrap());
     assert_eq!(pacemaker.query().view, ViewNumber::new(100_000));
+}
+
+/// s85 epoch-boundary rejoin: a replica that entered an epoch-change view E
+/// and holds no QC or TC for it boots back INTO E. Booting at E + 1 (the next
+/// epoch) without a certificate left the replicas still in E unable to form
+/// TC(E): it needs every vote at n = 3 equal stakes, and the restarted
+/// replica drops messages for views below its own.
+#[test]
+fn boot_view_reenters_uncertified_epoch_change_view() {
+    let v = ViewNumber::new;
+    let el = EpochLength::new(100);
+    // Entered E = 100, Highest PC 99, no TC: re-enter 100.
+    assert_eq!(boot_view(v(100), v(99), None, el), v(100));
+    // Same with an older TC and an older (backed-off) QC frontier.
+    assert_eq!(boot_view(v(100), v(93), Some(v(97)), el), v(100));
+    // An epoch-change view that is not the first one (12400, the drill).
+    assert_eq!(boot_view(v(12_400), v(12_399), None, el), v(12_400));
+    // The live epoch length (100k-view epochs).
+    assert_eq!(
+        boot_view(v(100_000), v(99_999), None, EpochLength::new(100_000)),
+        v(100_000)
+    );
+}
+
+/// The re-entry rule is narrow: everything except an entered, uncertified
+/// epoch-change view keeps the "view after the highest view with progress"
+/// boot, a fresh chain still boots at 0, and `epoch_length = 0` (no epochs)
+/// never re-enters.
+#[test]
+fn boot_view_keeps_next_view_outside_uncertified_epoch_change_view() {
+    let v = ViewNumber::new;
+    let el = EpochLength::new(100);
+    // A certificate for E is held: leaving E is justified.
+    assert_eq!(boot_view(v(100), v(100), None, el), v(101), "QC for E");
+    assert_eq!(boot_view(v(100), v(98), Some(v(100)), el), v(101), "TC for E");
+    // A certificate above the entered view sets the progress, as before.
+    assert_eq!(boot_view(v(100), v(150), None, el), v(151));
+    assert_eq!(boot_view(v(99), v(98), Some(v(100)), el), v(101));
+    // Not an epoch-change view: a normal view can be left by a local timeout.
+    assert_eq!(boot_view(v(99), v(98), None, el), v(100), "boots INTO E");
+    assert_eq!(boot_view(v(150), v(120), None, el), v(151));
+    // Already past E (the restart before this one skipped it): no move back.
+    assert_eq!(boot_view(v(101), v(99), None, el), v(102));
+    // Fresh chain.
+    assert_eq!(boot_view(v(0), v(0), None, el), v(0));
+    // No epochs at all.
+    assert_eq!(boot_view(v(100), v(99), None, EpochLength::new(0)), v(101));
 }
 
 /// A fast QC run (advancing far ahead of the wall-clock schedule) must not

@@ -309,6 +309,67 @@ fn restarted_replica_enters_its_init_view_on_the_first_pass() {
     );
 }
 
+/// s85 epoch-boundary rejoin: a replica restarted after entering the
+/// epoch-change view 100 (epoch length 100) with no QC or TC for it boots back
+/// into 100, not 101, and HotStuff starts in 100 so the first loop pass does
+/// not run enter_view(100) again (a leader of 100 must not propose a second
+/// block there). The survivors' TimeoutVotes for 100, which they re-broadcast
+/// on every extension of the view, then form TC(100) here, and AdvanceView(TC)
+/// moves the replica forward to 101.
+#[test]
+fn restarted_replica_reenters_uncertified_epoch_change_view() {
+    use crate::pacemaker::messages::{PacemakerMessage, ProgressCertificate};
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let (mut tree, _) = steady_block_tree(&set);
+    let epoch_change_view = ViewNumber::new(100);
+    tree.set_highest_view_entered(epoch_change_view).unwrap();
+    let (mut algorithm, messages, _) = new_algorithm(tree);
+    assert_eq!(
+        algorithm.pacemaker.query().view,
+        epoch_change_view,
+        "boots back into the epoch-change view it has no certificate for"
+    );
+    assert!(
+        !algorithm.hotstuff.is_view_outdated(algorithm.pacemaker.query()),
+        "no second enter_view(100): HotStuff starts in it"
+    );
+
+    for key in &keys[1..4] {
+        let timeout_vote = PacemakerMessage::timeout_vote(
+            &Keypair::new(key.clone()),
+            ChainID::new(0),
+            epoch_change_view,
+            None,
+            None,
+            None,
+        );
+        messages
+            .send((key.verifying_key(), ProgressMessage::PacemakerMessage(timeout_vote)))
+            .unwrap();
+        let view_info = ViewInfo::new(
+            algorithm.pacemaker.query().view,
+            Instant::now() + Duration::from_millis(50),
+        );
+        algorithm.poll_progress_and_retry(view_info, false);
+    }
+    let tc = algorithm
+        .block_tree
+        .highest_tc()
+        .unwrap()
+        .expect("the survivors' TimeoutVotes formed TC(100)");
+    assert_eq!(tc.view, epoch_change_view);
+
+    // Its own AdvanceView(TC) (looped back by a real network) moves it on.
+    let advance_view = PacemakerMessage::advance_view(ProgressCertificate::TimeoutCertificate(tc));
+    messages
+        .send((keys[1].verifying_key(), ProgressMessage::PacemakerMessage(advance_view)))
+        .unwrap();
+    let view_info = ViewInfo::new(epoch_change_view, Instant::now() + Duration::from_millis(50));
+    algorithm.poll_progress_and_retry(view_info, false);
+    assert_eq!(algorithm.pacemaker.query().view, ViewNumber::new(101));
+}
+
 /// s75 fix D: a leader in a long (backed-off) view must wake for its header
 /// re-send instead of sleeping in the receive until the view deadline.
 #[test]

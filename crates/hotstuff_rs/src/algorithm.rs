@@ -29,7 +29,7 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{Pacemaker, PacemakerConfiguration, ViewInfo},
+    pacemaker::implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -71,14 +71,21 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         let msg_sender: SenderHandle<N> = SenderHandle::new(network.clone());
         let validator_set_update_handle = ValidatorSetUpdateHandle::new(network);
 
-        let init_view = match block_tree
-            .highest_view_with_progress()
-            .expect("Cannot retrieve the highest view with progress!")
-            .int()
-        {
-            0 => ViewNumber::new(0),
-            v => ViewNumber::new(v + 1),
-        };
+        let highest_view_entered = block_tree
+            .highest_view_entered()
+            .expect("Cannot retrieve the highest view entered!");
+        let init_view = boot_view(
+            highest_view_entered,
+            block_tree
+                .highest_pc()
+                .expect("Cannot retrieve the highest PC!")
+                .view,
+            block_tree
+                .highest_tc()
+                .expect("Cannot retrieve the highest TC!")
+                .map(|tc| tc.view),
+            pacemaker_config.epoch_length,
+        );
 
         let pacemaker = Pacemaker::new(
             pacemaker_config,
