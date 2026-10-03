@@ -335,6 +335,18 @@ impl CfPending {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fix 3 (s87) work count: layer keys `PendingState::overlay_into` visited.
+    static OVERLAY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn overlay_visit() {
+    #[cfg(test)]
+    OVERLAY_VISITS.with(|c| c.set(c.get() + 1));
+}
+
 struct PendingState {
     /// Indexed by [`CfId`] — one bucket per registered CF.
     cfs: [CfPending; NUM_CFS],
@@ -379,25 +391,41 @@ impl PendingState {
         None
     }
 
+    /// Fix 3 (s87): this layer's tombstones under `prefix`, in key order — a
+    /// `range` from the prefix cut at the first key without it (the empty
+    /// prefix is the whole CF), never a walk over the layer's other keys.
+    fn deletes_under<'a>(&'a self, id: CfId, prefix: &'a [u8]) -> impl Iterator<Item = &'a Vec<u8>> {
+        self.cf(id)
+            .deletes
+            .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .take_while(move |k| k.starts_with(prefix))
+    }
+
+    /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
+    fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
+        writes_under(&self.cf(id).writes, prefix).next().is_some()
+            || self.deletes_under(id, prefix).next().is_some()
+    }
+
     /// Apply this layer's writes/tombstones (under `prefix`) on top of `merged`.
+    /// Fix 3 (s87): visits only the layer's keys under `prefix` (range lookup).
     fn overlay_into(
         &self,
         id: CfId,
         prefix: Option<&[u8]>,
         merged: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     ) {
-        let cfp = self.cf(id);
-        for key in cfp
-            .deletes
-            .iter()
-            .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
-        {
+        let prefix = prefix.unwrap_or(&[]);
+        for key in self.deletes_under(id, prefix).inspect(|_| overlay_visit()) {
             merged.remove(key);
         }
-        for (key, value) in cfp
+        let range = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
+        for (key, value) in self
+            .cf(id)
             .writes
-            .iter()
-            .filter(|(k, _)| prefix.is_none_or(|p| k.starts_with(p)))
+            .range::<[u8], _>(range)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .inspect(|_| overlay_visit())
         {
             merged.insert(key.clone(), value.clone());
         }
@@ -1689,11 +1717,18 @@ impl StateBackend for NativeStateOverlay {
         // overlay's own pending set — each layer's tombstones remove and its
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
-        if let Some(parent) = &self.parent {
-            parent.state.overlay_into(id, prefix, &mut merged);
-        }
+        let parent = self.parent.as_ref().map(|f| &f.state);
         let state = self.pending.read().unwrap();
+        // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
+        // as they are (already sorted and unique under the bytewise comparator).
+        let p = prefix.unwrap_or(&[]);
+        if !state.touches(id, p) && !parent.is_some_and(|s| s.touches(id, p)) {
+            return Ok(db_entries);
+        }
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
+        if let Some(parent) = parent {
+            parent.overlay_into(id, prefix, &mut merged);
+        }
         state.overlay_into(id, prefix, &mut merged);
         drop(state);
         Ok(merged.into_iter().collect())
@@ -1968,6 +2003,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fix 3 (s87) RED: a prefix scan through the overlay visits only the
+    /// layer keys under the prefix — not every write and tombstone of the CF
+    /// in the parent and pending layers (c93c579: ~102k visits).
+    #[test]
+    fn overlay_prefix_scan_visits_only_the_prefix() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        db.put_cf_raw(cf, b"p\x03", b"db").unwrap();
+        db.put_cf_raw(cf, b"p\x04", b"db").unwrap();
+        let shape = |ov: &NativeStateOverlay, v: &[u8]| {
+            for i in 0..25_000u32 {
+                ov.put_cf_raw(cf, &[b"a".as_slice(), &i.to_be_bytes()].concat(), v).unwrap();
+                ov.put_cf_raw(cf, &[b"z".as_slice(), &i.to_be_bytes()].concat(), v).unwrap();
+            }
+            for i in 0..500u32 {
+                ov.delete_cf_raw(cf, &[b"b".as_slice(), &i.to_be_bytes()].concat()).unwrap();
+                ov.delete_cf_raw(cf, &[b"y".as_slice(), &i.to_be_bytes()].concat()).unwrap();
+            }
+            ov.put_cf_raw(cf, b"p\x01", v).unwrap();
+            ov.put_cf_raw(cf, b"p\x02", v).unwrap();
+            ov.delete_cf_raw(cf, b"p\x03").unwrap();
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        shape(&parent, b"parent");
+        let overlay = NativeStateOverlay::with_parent(db, Some(parent.freeze(1)));
+        shape(&overlay, b"pending");
+        OVERLAY_VISITS.with(|c| c.set(0));
+        let rows = overlay.iterate_cf(cf, Some(b"p")).unwrap();
+        let visits = OVERLAY_VISITS.with(|c| c.get());
+        assert_eq!(
+            rows,
+            vec![
+                (b"p\x01".to_vec(), b"pending".to_vec()),
+                (b"p\x02".to_vec(), b"pending".to_vec()),
+                (b"p\x04".to_vec(), b"db".to_vec()),
+            ]
+        );
+        assert!(visits <= 6 + 6, "overlay_into visited {visits} layer keys for 3 + 3 under the prefix");
+    }
+
+    /// Fix 3 (s87) guard: the overlay's `iterate_cf` equals a reference model
+    /// (DB, then parent, then pending; tombstones remove, writes override) over
+    /// random layerings of keys from a small alphabet — keys equal to the
+    /// prefix, `prefix ‖ ff`, successor prefixes, keys shorter than the
+    /// prefix — for `None`, the empty prefix and every prefix of every key;
+    /// and agrees with `iterate_cf_from` (cut at the prefix) and `prefix_exists`.
+    #[test]
+    fn overlay_iterate_cf_equals_reference_over_random_layers() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let mut seed: u64 = 0x5EED_F1C3;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        const ALPHABET: [u8; 5] = [0x00, 0x01, 0x7f, 0xfe, 0xff];
+        let (mut checked, mut non_empty) = (0usize, 0usize);
+        for round in 0..500 {
+            let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for _ in 0..1 + rnd(16) {
+                let len = 1 + rnd(4) as usize;
+                keys.insert((0..len).map(|_| ALPHABET[rnd(5) as usize]).collect());
+            }
+            // (key, in DB, parent op, pending op); op 0 none, 1 put, 2 delete
+            let ops: Vec<(Vec<u8>, bool, u64, u64)> =
+                keys.iter().map(|k| (k.clone(), rnd(2) == 1, rnd(3), rnd(3))).collect();
+            let mut reference: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for (k, in_db, _, _) in &ops {
+                if *in_db {
+                    db.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                    reference.insert(k.clone(), [b"db".as_slice(), k].concat());
+                }
+            }
+            let with_parent = round % 4 != 0;
+            let apply = |ov: &NativeStateOverlay, reference: &mut BTreeMap<Vec<u8>, Vec<u8>>, layer: u8| {
+                for (k, _, pa, pe) in &ops {
+                    let v = [&[layer], k.as_slice()].concat();
+                    match if layer == 0 { *pa } else { *pe } {
+                        1 => {
+                            ov.put_cf_raw(cf, k, &v).unwrap();
+                            reference.insert(k.clone(), v);
+                        }
+                        2 => {
+                            ov.delete_cf_raw(cf, k).unwrap();
+                            reference.remove(k);
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let parent = with_parent.then(|| {
+                let p = NativeStateOverlay::new(db.clone());
+                apply(&p, &mut reference, 0);
+                p.freeze(1)
+            });
+            let overlay = NativeStateOverlay::with_parent(db.clone(), parent);
+            apply(&overlay, &mut reference, 1);
+            let mut prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+            prefixes.insert(Vec::new());
+            for k in &keys {
+                for l in 1..=k.len() {
+                    prefixes.insert(k[..l].to_vec());
+                }
+                prefixes.insert([k.as_slice(), &[0xff]].concat());
+                if let Some(last) = k.iter().rposition(|&b| b != 0xff) {
+                    let mut succ = k[..=last].to_vec();
+                    succ[last] += 1;
+                    prefixes.insert(succ);
+                }
+            }
+            for _ in 0..4 {
+                let len = rnd(5) as usize;
+                prefixes.insert((0..len).map(|_| ALPHABET[rnd(5) as usize]).collect());
+            }
+            let all: Vec<(Vec<u8>, Vec<u8>)> = reference.clone().into_iter().collect();
+            assert_eq!(overlay.iterate_cf(cf, None).unwrap(), all, "round {round}: None");
+            for p in &prefixes {
+                let want: Vec<(Vec<u8>, Vec<u8>)> =
+                    all.iter().filter(|(k, _)| k.starts_with(p)).cloned().collect();
+                let got = overlay.iterate_cf(cf, Some(p)).unwrap();
+                assert_eq!(got, want, "round {round}: prefix {p:?} ops {ops:?}");
+                let from: Vec<(Vec<u8>, Vec<u8>)> = overlay
+                    .iterate_cf_from(cf, p, usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .collect();
+                assert_eq!(from, want, "round {round}: iterate_cf_from {p:?}");
+                assert_eq!(overlay.prefix_exists(cf, p).unwrap(), !want.is_empty(), "round {round}: exists {p:?}");
+                checked += 1;
+                non_empty += usize::from(!want.is_empty());
+            }
+            for (k, in_db, _, _) in &ops {
+                if *in_db {
+                    db.delete_cf_raw(cf, k).unwrap();
+                }
+            }
+        }
+        assert!(non_empty > checked / 4 && non_empty < checked, "non-vacuous: {non_empty} / {checked}");
     }
 
     #[test]
