@@ -186,8 +186,9 @@ def write_cell(d, matched_first120_rate, matched_tail_rate, dur=300):
         f.write("Submitted (load-gen accepted): 1,000\n")
 
 
-def write_agreement(d, digests, hashes=None, counters_equal=True, counters=None,
-                    roots=None):
+def write_agreement(
+    d, digests, hashes=None, counters_equal=True, counters=None, roots=None
+):
     """`counters` (3 dicts, merged over the equal baseline) writes a per-node
     funnel — the shape a SIGKILLed-and-restarted node leaves behind, whose
     Prometheus counters are process-lifetime and start again from 0."""
@@ -362,32 +363,42 @@ class SummarizeTest(unittest.TestCase):
         taken 2 blocks apart: a sampling artifact, not a fork. Not proof of
         agreement either -> DIGEST_UNVERIFIED."""
         write_cell(self.d, 1_000, 1_000)
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[{"actions": 21688}, {"actions": 21688},
-                                  {"actions": 21702}])
-        s, _ = run_summarize(self.d, extra=["--digest-quiescent", "1",
-                                            "--digest-heights", "280 280 282"])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[{"actions": 21688}, {"actions": 21688}, {"actions": 21702}],
+        )
+        s, _ = run_summarize(
+            self.d, extra=["--digest-quiescent", "1", "--digest-heights", "280 280 282"]
+        )
         self.assertEqual(s["agreement"]["agreement_verdict"], "DIGEST_UNVERIFIED")
         self.assertIsNone(s["headline"]["validators_agree"])
 
     def test_action_counter_skew_far_apart_is_still_a_fork(self):
         """60 blocks apart is not a scrape skew, it is two different chains."""
         write_cell(self.d, 1_000, 1_000)
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[{"actions": 21688}, {"actions": 21688},
-                                  {"actions": 41702}])
-        s, _ = run_summarize(self.d, extra=["--digest-quiescent", "1",
-                                            "--digest-heights", "280 280 340"])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[{"actions": 21688}, {"actions": 21688}, {"actions": 41702}],
+        )
+        s, _ = run_summarize(
+            self.d, extra=["--digest-quiescent", "1", "--digest-heights", "280 280 340"]
+        )
         self.assertEqual(s["agreement"]["agreement_verdict"], "DISAGREE")
 
     def test_resting_mismatch_is_a_fork_even_at_skewed_heights(self):
         """The skew escape hatch is for the ACTION counter only: a settled-state
         counter apart is divergence whatever the digest heights were."""
         write_cell(self.d, 1_000, 1_000)
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[{"resting": 5}, {"resting": 5}, {"resting": 6}])
-        s, _ = run_summarize(self.d, extra=["--digest-quiescent", "1",
-                                            "--digest-heights", "280 280 282"])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[{"resting": 5}, {"resting": 5}, {"resting": 6}],
+        )
+        s, _ = run_summarize(
+            self.d, extra=["--digest-quiescent", "1", "--digest-heights", "280 280 282"]
+        )
         self.assertEqual(s["agreement"]["agreement_verdict"], "DISAGREE")
 
 
@@ -666,10 +677,13 @@ class CrashKillGuardTest(unittest.TestCase):
         ran an s83 CANCEL_FRACTION=0.2 cell at 0.05."""
         with open(RUN_CELL_SH) as f:
             src = f.read()
-        for var, default in (("BAND", "5"), ("CROSS_FRACTION", "0.5"),
-                             ("CANCEL_FRACTION", "0.05")):
+        for var, default in (
+            ("BAND", "5"),
+            ("CROSS_FRACTION", "0.5"),
+            ("CANCEL_FRACTION", "0.05"),
+        ):
             self.assertIn(f"{var}=${{{var}:-{default}}}", src)
-        bench = src[src.index("BENCH_CMD=("):]
+        bench = src[src.index("BENCH_CMD=(") :]
         bench = bench[: bench.index(")\n")]
         self.assertIn('--cross-fraction "$CROSS_FRACTION"', bench)
         self.assertIn('--cancel-fraction "$CANCEL_FRACTION"', bench)
@@ -682,18 +696,27 @@ class CrashKillGuardTest(unittest.TestCase):
         with open(RUN_CELL_SH) as f:
             line = next(l for l in f if l.lstrip().startswith("panics=$(grep"))
         esc = "\x1b"
-        sample = "\n".join([
-            f"{esc}[2m2026-10-01T22:25:23Z{esc}[0m {esc}[32m INFO{esc}[0m state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
-            "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
-            f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: STATE HASH FAIL-STOP latched at checkpoint 1900",
-            "thread 'torus-execution' panicked at crates/x.rs:1:1",
-            "2026-10-01T22:31:00Z  WARN app: Latching fail-stop: conflicting blocks",
-        ]) + "\n"
+        sample = (
+            "\n".join(
+                [
+                    f"{esc}[2m2026-10-01T22:25:23Z{esc}[0m {esc}[32m INFO{esc}[0m state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
+                    "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
+                    f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: STATE HASH FAIL-STOP latched at checkpoint 1900",
+                    "thread 'torus-execution' panicked at crates/x.rs:1:1",
+                    "2026-10-01T22:31:00Z  WARN app: Latching fail-stop: conflicting blocks",
+                ]
+            )
+            + "\n"
+        )
         lg = os.path.join(tempfile.mkdtemp(prefix="panics-"), "val0.log")
         with open(lg, "w") as f:
             f.write(sample)
-        r = subprocess.run(["bash", "-c", line.strip() + '; echo "$panics"'],
-                           capture_output=True, text=True, env=dict(os.environ, lg=lg))
+        r = subprocess.run(
+            ["bash", "-c", line.strip() + '; echo "$panics"'],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, lg=lg),
+        )
         self.assertEqual(r.stdout.strip(), "3", r.stderr)
 
     def test_open_order_budget_reaches_the_bench_only_when_set(self):
@@ -703,8 +726,11 @@ class CrashKillGuardTest(unittest.TestCase):
         with open(RUN_CELL_SH) as f:
             src = f.read()
         self.assertIn("OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}", src)
-        self.assertIn('[ -n "$OPEN_ORDER_BUDGET" ] && '
-                      'BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")', src)
+        self.assertIn(
+            '[ -n "$OPEN_ORDER_BUDGET" ] && '
+            'BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")',
+            src,
+        )
         self.assertIn('[[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]]', src)
         self.assertIn("open_order_budget='${OPEN_ORDER_BUDGET:-unset}'", src)
 
@@ -713,7 +739,7 @@ class CrashKillGuardTest(unittest.TestCase):
         with open(RUN_CELL_SH) as f:
             src = f.read()
         for cols in ("FUNNEL_COLS=", "WIDE_COLS="):
-            line = src[src.index(cols):].split("\n", 1)[0]
+            line = src[src.index(cols) :].split("\n", 1)[0]
             self.assertIn("torus_orders_rejected_open_limit_total", line, cols)
 
     def test_restart_uses_the_same_argv_as_launch(self):
@@ -749,26 +775,32 @@ class ToolsDirResolutionTest(unittest.TestCase):
         if with_tools:
             t = os.path.join(wt, "tools", "matched-bench")
             os.makedirs(t, exist_ok=True)
-            for f in ("summarize.py", "digest-node.sh", "crash-kill.sh",
-                      "win60.awk", "phase60.awk"):
+            for f in (
+                "summarize.py",
+                "digest-node.sh",
+                "crash-kill.sh",
+                "win60.awk",
+                "phase60.awk",
+            ):
                 open(os.path.join(t, f), "w").close()
         return wt
 
     def paths(self, wt, env=None):
         r = subprocess.run(
             ["bash", RUN_CELL_SH, wt, "probe-label"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
             env=dict(os.environ, RUN_CELL_PRINT_PATHS="1", **(env or {})),
         )
         self.assertEqual(r.returncode, 0, r.stderr)
-        return dict(
-            line.split("=", 1) for line in r.stdout.split() if "=" in line
-        )
+        return dict(line.split("=", 1) for line in r.stdout.split() if "=" in line)
 
     def test_scoring_scripts_come_from_the_worktree_under_test(self):
         wt = self.make_wt()
-        self.assertEqual(self.paths(wt)["TOOLS_DIR"],
-                         os.path.join(wt, "tools", "matched-bench"))
+        self.assertEqual(
+            self.paths(wt)["TOOLS_DIR"], os.path.join(wt, "tools", "matched-bench")
+        )
 
     def test_falls_back_to_its_own_dir_when_the_worktree_has_no_tools(self):
         wt = self.make_wt(with_tools=False)
@@ -786,10 +818,18 @@ class ToolsDirResolutionTest(unittest.TestCase):
 # The real bl3-...-crash-on-r1 funnel: val1 was SIGKILLed at t=50 s, so its
 # process-lifetime Prometheus counters restart from 0 and land at ~76 % of the
 # two survivors even though all three ended on the same state digest.
-SURVIVOR_COUNTERS = {"matched": 5495893, "placed": 6890235,
-                     "resting": 4087861, "actions": 21688}
-RESTARTED_COUNTERS = {"matched": 4213249, "placed": 5269835,
-                      "resting": 3121631, "actions": 16712}
+SURVIVOR_COUNTERS = {
+    "matched": 5495893,
+    "placed": 6890235,
+    "resting": 4087861,
+    "actions": 21688,
+}
+RESTARTED_COUNTERS = {
+    "matched": 4213249,
+    "placed": 5269835,
+    "resting": 3121631,
+    "actions": 16712,
+}
 
 
 def write_crash(
@@ -851,7 +891,12 @@ class CrashGateSummaryTest(unittest.TestCase):
     TORUS_EXEC_PIPELINE on by default, so it must never read PASS for a cell
     that did not actually crash-and-replay a pipelined node."""
 
-    ON = ["--node-env", json.dumps({"TORUS_EXEC_PIPELINE": "1"}), "--digest-quiescent", "1"]
+    ON = [
+        "--node-env",
+        json.dumps({"TORUS_EXEC_PIPELINE": "1"}),
+        "--digest-quiescent",
+        "1",
+    ]
 
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix="crash-summ-")
@@ -913,8 +958,12 @@ class CrashGateSummaryTest(unittest.TestCase):
         s, _ = run_summarize(
             self.d,
             drained="0",
-            extra=["--node-env", json.dumps({"TORUS_EXEC_PIPELINE": "1"}),
-                   "--digest-quiescent", "0"],
+            extra=[
+                "--node-env",
+                json.dumps({"TORUS_EXEC_PIPELINE": "1"}),
+                "--digest-quiescent",
+                "0",
+            ],
         )
         self.assertEqual(s["agreement"]["agreement_verdict"], "DIGEST_UNVERIFIED")
         self.assertEqual(s["crash"]["verdict"], "FAIL")
@@ -947,12 +996,15 @@ class CrashGateSummaryTest(unittest.TestCase):
     # while all three agreed on block hash, header root and state digest. The
     # old gate read that as a fork and could therefore NEVER pass.
     def test_killed_node_counters_are_scored_against_survivors_only(self):
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         write_crash(self.d, gap=1, queue=1)
-        s, _ = run_summarize(self.d, extra=self.ON + ["--digest-heights",
-                                                      "280 280 282"])
+        s, _ = run_summarize(
+            self.d, extra=self.ON + ["--digest-heights", "280 280 282"]
+        )
         a = s["agreement"]
         self.assertFalse(a["counters_equal_all_nodes"])
         self.assertTrue(a["counters_equal"])
@@ -964,46 +1016,59 @@ class CrashGateSummaryTest(unittest.TestCase):
 
     def test_a_forked_killed_node_still_fails_the_gate(self):
         """Counters are excused for the killed node. Its STATE is not."""
-        write_agreement(self.d, ["same", "forked", "same"],
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same", "forked", "same"],
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         write_crash(self.d)
         s, _ = run_summarize(self.d, extra=self.ON)
         self.assertEqual(s["agreement"]["agreement_verdict"], "DISAGREE")
         c = s["crash"]
         self.assertEqual(c["verdict"], "FAIL")
-        self.assertTrue(any("state digest" in r for r in c["fail_reasons"]),
-                        c["fail_reasons"])
+        self.assertTrue(
+            any("state digest" in r for r in c["fail_reasons"]), c["fail_reasons"]
+        )
 
     def test_a_killed_node_with_a_different_block_hash_fails(self):
-        write_agreement(self.d, ["same"] * 3, hashes=["0xa", "0xb", "0xa"],
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            hashes=["0xa", "0xb", "0xa"],
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         write_crash(self.d)
         s, _ = run_summarize(self.d, extra=self.ON)
         c = s["crash"]
         self.assertEqual(c["verdict"], "FAIL")
-        self.assertTrue(any("block hash" in r for r in c["fail_reasons"]),
-                        c["fail_reasons"])
+        self.assertTrue(
+            any("block hash" in r for r in c["fail_reasons"]), c["fail_reasons"]
+        )
 
     def test_a_killed_node_with_a_different_header_root_fails(self):
-        write_agreement(self.d, ["same"] * 3, roots=["0x0", "0x1", "0x0"],
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            roots=["0x0", "0x1", "0x0"],
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         write_crash(self.d)
         s, _ = run_summarize(self.d, extra=self.ON)
         c = s["crash"]
         self.assertEqual(c["verdict"], "FAIL")
-        self.assertTrue(any("header state root" in r for r in c["fail_reasons"]),
-                        c["fail_reasons"])
+        self.assertTrue(
+            any("header state root" in r for r in c["fail_reasons"]), c["fail_reasons"]
+        )
 
     def test_survivors_that_disagree_still_fail_the_gate(self):
         """Excluding the killed node must not excuse the other two."""
         forked_survivor = dict(SURVIVOR_COUNTERS)
         forked_survivor["matched"] += 7
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  forked_survivor])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, forked_survivor],
+        )
         write_crash(self.d)
         s, _ = run_summarize(self.d, extra=self.ON)
         self.assertFalse(s["agreement"]["counters_equal"])
@@ -1012,24 +1077,35 @@ class CrashGateSummaryTest(unittest.TestCase):
 
     def test_crash_cell_needs_a_quiescent_digest(self):
         """An unpinned digest cannot prove the restarted node reconverged."""
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         write_crash(self.d)
         s, _ = run_summarize(
-            self.d, drained="0",
-            extra=["--node-env", json.dumps({"TORUS_EXEC_PIPELINE": "1"}),
-                   "--digest-quiescent", "0"])
+            self.d,
+            drained="0",
+            extra=[
+                "--node-env",
+                json.dumps({"TORUS_EXEC_PIPELINE": "1"}),
+                "--digest-quiescent",
+                "0",
+            ],
+        )
         c = s["crash"]
         self.assertEqual(c["verdict"], "FAIL")
-        self.assertTrue(any("quiescent" in r for r in c["fail_reasons"]),
-                        c["fail_reasons"])
+        self.assertTrue(
+            any("quiescent" in r for r in c["fail_reasons"]), c["fail_reasons"]
+        )
 
     def test_non_crash_cell_compares_all_three_nodes(self):
         """No crash.json => nothing is excused; the old semantics exactly."""
-        write_agreement(self.d, ["same"] * 3,
-                        counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS,
-                                  SURVIVOR_COUNTERS])
+        write_agreement(
+            self.d,
+            ["same"] * 3,
+            counters=[SURVIVOR_COUNTERS, RESTARTED_COUNTERS, SURVIVOR_COUNTERS],
+        )
         s, _ = run_summarize(self.d, extra=self.ON)
         a = s["agreement"]
         self.assertIsNone(a["counters_excluded_node"])
@@ -1049,15 +1125,23 @@ class BenchRpcUrlsTest(unittest.TestCase):
         with open(RUN_CELL_SH) as f:
             src = f.read()
         a = src.index("bench_rpc_urls() {")
-        self.fn = src[a:src.index("\n}\n", a) + 3]
+        self.fn = src[a : src.index("\n}\n", a) + 3]
 
     def urls(self, value=None):
         env = {k: v for k, v in os.environ.items() if k != "BENCH_RPCS"}
         if value is not None:
             env["BENCH_RPCS"] = value
         r = subprocess.run(
-            ["bash", "-c", self.fn + "\nRPCS=(http://a:1 http://b:2 http://c:3); bench_rpc_urls"],
-            capture_output=True, text=True, env=env, timeout=30)
+            [
+                "bash",
+                "-c",
+                self.fn + "\nRPCS=(http://a:1 http://b:2 http://c:3); bench_rpc_urls",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
         return r.returncode, r.stdout.strip()
 
     def test_zero_keeps_val0_only(self):
@@ -1097,18 +1181,33 @@ class CrashSequenceTest(unittest.TestCase):
         with open(RUN_CELL_SH) as f:
             src = f.read()
         a = src.index("crash_sequence() {")
-        self.fn = src[a:src.index("\n}\n", a) + 3]
+        self.fn = src[a : src.index("\n}\n", a) + 3]
         with open(os.path.join(self.d, "crash-kill.sh"), "w") as f:
             f.write(STUB_CRASH_KILL)
         os.chmod(os.path.join(self.d, "crash-kill.sh"), 0o755)
 
     def run_seq(self, at, min_up, **env):
-        script = ('source "$1"; ' + self.fn +
-                  '\nCRASH_AT=(%s); CRASH_KILL_MIN_UP_S=%s; crash_sequence' % (" ".join(at), min_up))
+        script = (
+            'source "$1"; '
+            + self.fn
+            + "\nCRASH_AT=(%s); CRASH_KILL_MIN_UP_S=%s; crash_sequence"
+            % (" ".join(at), min_up)
+        )
         r = subprocess.run(
-            ["bash", "-c", script, "_", CRASH_KILL_SH], capture_output=True, text=True,
-            env=dict(os.environ, CRASH_KILL_LIB="1", TOOLS_DIR=self.d, OUT=self.d,
-                     WT=self.d, KILL_IDX="1", **env), timeout=60)
+            ["bash", "-c", script, "_", CRASH_KILL_SH],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                CRASH_KILL_LIB="1",
+                TOOLS_DIR=self.d,
+                OUT=self.d,
+                WT=self.d,
+                KILL_IDX="1",
+                **env,
+            ),
+            timeout=60,
+        )
         try:
             with open(os.path.join(self.d, "calls")) as f:
                 calls = f.read().split()
@@ -1119,7 +1218,9 @@ class CrashSequenceTest(unittest.TestCase):
     def test_kills_run_in_order_with_their_record_names(self):
         rc, calls, _ = self.run_seq(["0", "0.2", "0.4"], 0)
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, ["crash-kill.json", "crash-kill-2.json", "crash-kill-3.json"])
+        self.assertEqual(
+            calls, ["crash-kill.json", "crash-kill-2.json", "crash-kill-3.json"]
+        )
 
     def test_a_failed_kill_stops_the_sequence(self):
         rc, calls, out = self.run_seq(["0", "0.2", "0.4"], 0, STUB_FAIL_AT="2")
@@ -1156,8 +1257,14 @@ class MultiCrashSummaryTest(unittest.TestCase):
 
     def kill(self, k, **kw):
         at = 60 + 120 * (k - 1)
-        write_crash(self.d, name="crash-%d.json" % k, seq=k, kill_at=at,
-                    kill_ts=BENCH_START + at + 0.25, **kw)
+        write_crash(
+            self.d,
+            name="crash-%d.json" % k,
+            seq=k,
+            kill_at=at,
+            kill_ts=BENCH_START + at + 0.25,
+            **kw,
+        )
 
     def test_single_kill_cell_has_no_per_kill_list(self):
         s, _ = run_summarize(self.d, extra=self.ON)
@@ -1172,9 +1279,18 @@ class MultiCrashSummaryTest(unittest.TestCase):
         self.assertEqual([k["kill_seq"] for k in ks], [1, 2, 3])
         self.assertEqual([k["kill_at_s"] for k in ks], [60, 180, 300])
         for k in ks:
-            for key in ("kill_ts", "restart_ts", "down_s", "rewind_blocks",
-                        "rewind_beyond_exec_queue", "panic_or_failstop_lines",
-                        "error_lines", "hole_lines", "verdict", "fail_reasons"):
+            for key in (
+                "kill_ts",
+                "restart_ts",
+                "down_s",
+                "rewind_blocks",
+                "rewind_beyond_exec_queue",
+                "panic_or_failstop_lines",
+                "error_lines",
+                "hole_lines",
+                "verdict",
+                "fail_reasons",
+            ):
                 self.assertIn(key, k)
             self.assertEqual(k["verdict"], "PASS", k)
         self.assertEqual(ks[1]["kill_ts"], BENCH_START + 180.25)
@@ -1199,9 +1315,10 @@ class MultiCrashSummaryTest(unittest.TestCase):
         self.assertEqual(ks[1]["panic_or_failstop_lines"], 1)
         self.assertEqual(s["crash"]["verdict"], "FAIL")
         self.assertEqual(s["headline"]["crash_gate"], "FAIL")
-        self.assertTrue(any("kill 2" in r and "panic" in r
-                            for r in s["crash"]["fail_reasons"]),
-                        s["crash"]["fail_reasons"])
+        self.assertTrue(
+            any("kill 2" in r and "panic" in r for r in s["crash"]["fail_reasons"]),
+            s["crash"]["fail_reasons"],
+        )
         self.assertFalse(s["validity"]["accepted"])
 
     def test_a_later_kill_that_never_restarted_fails(self):
@@ -1226,8 +1343,10 @@ class MultiCrashSummaryTest(unittest.TestCase):
         never produced crash-2.json: that kill is unverified, never silently
         dropped from the list."""
         self.kill(2)
-        os.rename(os.path.join(self.d, "crash-2.json"),
-                  os.path.join(self.d, "crash-kill-2.json"))
+        os.rename(
+            os.path.join(self.d, "crash-2.json"),
+            os.path.join(self.d, "crash-kill-2.json"),
+        )
         s, _ = run_summarize(self.d, extra=self.ON)
         ks = s["crash_kills"]
         self.assertEqual([k["kill_seq"] for k in ks], [1, 2])
@@ -1242,14 +1361,19 @@ CRASH_FREEZE = os.path.join(HERE, "crash-freeze.py")
 def commit_line(t, h, ansi=True):
     """The val0 line crash-freeze.py reads, in the devnet's ANSI fmt::layer()."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + (
-        ".%06dZ" % round((t % 1) * 1e6))
+        ".%06dZ" % round((t % 1) * 1e6)
+    )
     if not ansi:
-        return ("%s  INFO torus_consensus::app: on_committed_block: sending to "
-                "execution pipeline height=%d evm_txs=0 native=200\n" % (stamp, h))
-    return ("\x1b[2m%s\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mtorus_consensus::app"
-            "\x1b[0m\x1b[2m:\x1b[0m on_committed_block: sending to execution "
-            "pipeline \x1b[3mheight\x1b[0m\x1b[2m=\x1b[0m%d \x1b[3mevm_txs\x1b[0m"
-            "\x1b[2m=\x1b[0m0\n" % (stamp, h))
+        return (
+            "%s  INFO torus_consensus::app: on_committed_block: sending to "
+            "execution pipeline height=%d evm_txs=0 native=200\n" % (stamp, h)
+        )
+    return (
+        "\x1b[2m%s\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mtorus_consensus::app"
+        "\x1b[0m\x1b[2m:\x1b[0m on_committed_block: sending to execution "
+        "pipeline \x1b[3mheight\x1b[0m\x1b[2m=\x1b[0m%d \x1b[3mevm_txs\x1b[0m"
+        "\x1b[2m=\x1b[0m0\n" % (stamp, h)
+    )
 
 
 class CrashFreezeTest(unittest.TestCase):
@@ -1263,8 +1387,11 @@ class CrashFreezeTest(unittest.TestCase):
         T = BENCH_START
         # commits every 0.5 s, frozen (t0+60.2, t0+95.2) and (t0+180.1, t0+200.1)
         ts = [T + i * 0.5 for i in range(0, 601)]
-        ts = [t for t in ts if not (T + 60.2 < t < T + 95.2)
-              and not (T + 180.1 < t < T + 200.1)]
+        ts = [
+            t
+            for t in ts
+            if not (T + 60.2 < t < T + 95.2) and not (T + 180.1 < t < T + 200.1)
+        ]
         ts = sorted(set(ts) | {T + 60.2, T + 95.2, T + 180.1, T + 200.1})
         with gzip.open(os.path.join(self.d, "val0.log.gz"), "wt") as f:
             for h, t in enumerate(ts, start=100):
@@ -1273,14 +1400,23 @@ class CrashFreezeTest(unittest.TestCase):
                     f.write(commit_line(t + 0.001, h))
         with open(os.path.join(self.d, "summary.json"), "w") as f:
             json.dump({"timing": {"t_bench0": T, "t_bench1": T + 300}}, f)
-        write_crash(self.d, seq=1, kill_at=60, kill_ts=T + 60.0,
-                    restart_ts=T + 61.0)
-        write_crash(self.d, name="crash-2.json", seq=2, kill_at=180,
-                    kill_ts=T + 180.0, restart_ts=T + 181.5)
+        write_crash(self.d, seq=1, kill_at=60, kill_ts=T + 60.0, restart_ts=T + 61.0)
+        write_crash(
+            self.d,
+            name="crash-2.json",
+            seq=2,
+            kill_at=180,
+            kill_ts=T + 180.0,
+            restart_ts=T + 181.5,
+        )
 
     def run_freeze(self):
-        r = subprocess.run([sys.executable, CRASH_FREEZE, self.d, "--json"],
-                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [sys.executable, CRASH_FREEZE, self.d, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
 
@@ -1305,8 +1441,12 @@ class CrashFreezeTest(unittest.TestCase):
         self.assertEqual([k["max_commit_gap_s"] for k in j["kills"]], [1, 1])
 
     def test_tsv_output(self):
-        r = subprocess.run([sys.executable, CRASH_FREEZE, self.d],
-                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [sys.executable, CRASH_FREEZE, self.d],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         rows = [l.split("\t") for l in r.stdout.splitlines() if not l.startswith("#")]
         self.assertEqual(rows[0][0], "kill_seq")
@@ -1337,10 +1477,18 @@ class CrashScanTest(unittest.TestCase):
         with open(f, "w") as fh:
             fh.write(text)
         r = subprocess.run(
-            ["bash", "-c", 'source "$1"; shift; crash_scan_restart_tail "$@"', "_",
-             CRASH_KILL_SH, f],
-            capture_output=True, text=True,
-            env=dict(os.environ, CRASH_KILL_LIB="1"), timeout=60,
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; crash_scan_restart_tail "$@"',
+                "_",
+                CRASH_KILL_SH,
+                f,
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1"),
+            timeout=60,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
@@ -1376,15 +1524,218 @@ class CrashScanTest(unittest.TestCase):
         j = self.scan(
             REPLAY_TAIL
             + "ERROR torus_consensus::app: crash recovery: execution gap could not be "
-              "fully replayed LOCALLY hole_height=85\n"
-              "thread 'torus-execution' panicked at src/app.rs:1\n"
-              " ERROR something else\n"
+            "fully replayed LOCALLY hole_height=85\n"
+            "thread 'torus-execution' panicked at src/app.rs:1\n"
+            " ERROR something else\n"
         )
         self.assertEqual(j["panic_or_failstop_lines"], 1)
         self.assertGreaterEqual(j["hole_lines"], 1)
         self.assertGreaterEqual(j["error_lines"], 1)
         # the replay numbers survive the noise
         self.assertEqual(j["gap"], 11)
+
+
+class MarkStub(BaseHTTPRequestHandler):
+    """val0 stand-in for the oracle freshness probe: head 100; market 1 fresh
+    (aggregate at block 150), market 2 usable but written before the feed
+    (block 90), market 3 no usable mark (RPC reports 0), market 4 an RPC error."""
+
+    protocol_version = "HTTP/1.1"
+    MARKS = {"0x1": ("30000", 150), "0x2": ("30000", 90), "0x3": ("0", 0)}
+
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if req["method"] == "eth_blockNumber":
+            resp = {"jsonrpc": "2.0", "id": 1, "result": "0x64"}
+        elif req["params"][0] in self.MARKS:
+            price, blk = self.MARKS[req["params"][0]]
+            resp = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "marketId": req["params"][0],
+                    "markPrice": price,
+                    "indexPrice": price,
+                    "lastTradePrice": "0",
+                    "timestamp": blk,
+                },
+            }
+        else:
+            resp = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32602, "message": "x"},
+            }
+        body = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class OracleFeedHarnessTest(unittest.TestCase):
+    """s87 ORACLE_FEED=1: run-cell.sh runs `bench-throughput oracle-feed`
+    around the load. Pinned: the freshness probe, the feed is stopped on every
+    exit path (even while SIGSTOPped for the drain), and ORACLE_FEED unset
+    leaves the cell untouched."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def fn(self, start, end_marker):
+        i = self.src.index(start)
+        return self.src[i : self.src.index(end_marker, i)]
+
+    def test_oracle_marks_counts_usable_and_fresh_since_the_feed_start(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), MarkStub)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = "http://127.0.0.1:%d" % srv.server_address[1]
+            script = (
+                self.fn("oracle_marks() {", "\nORACLE_FRESH_S=")
+                + '\nRPCS=("%s"); MARKETS=4; oracle_marks 100\n' % url
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            srv.shutdown()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(
+            (
+                out["markets"],
+                out["checked"],
+                out["usable"],
+                out["fresh"],
+                out["errors"],
+            ),
+            (4, 4, 2, 1, 1),
+        )
+        self.assertEqual(out["head"], 100)
+        self.assertEqual(out["not_fresh_ids"], [2, 3, 4])
+        self.assertEqual(out["max_agg_age_blocks"], 10)
+
+    def test_stop_oracle_feed_terminates_a_paused_feed_and_is_idempotent(self):
+        script = (
+            self.fn("alive() {", "\nstop_sampler() {")
+            + '\nlog() { echo "LOG $*"; }\n'
+            + 'sleep 300 & ORACLE_PID=$!; p=$ORACLE_PID; kill -STOP "$p"\n'
+            + "stop_oracle_feed; stop_oracle_feed\n"
+            + 'alive "$p" && echo STILL_ALIVE; echo "rc=$ORACLE_RC pid=[$ORACLE_PID]"\n'
+        )
+        t0 = time.monotonic()
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        )
+        self.assertLess(
+            time.monotonic() - t0,
+            8,
+            "a TERM'd paused feed must not wait for the KILL grace",
+        )
+        self.assertNotIn("STILL_ALIVE", r.stdout)
+        self.assertIn("rc=143 pid=[]", r.stdout)
+        self.assertEqual(r.stdout.count("stopped rc="), 1, r.stdout)
+
+    def test_feed_is_stopped_on_every_exit_path_before_the_nodes(self):
+        ff = self.fn("finish_fail() {", "\n}\n")
+        self.assertLess(ff.index("stop_oracle_feed"), ff.index("stop-3val.sh"))
+        self.assertIn("then trap 'stop_oracle_feed' EXIT", self.src)
+        # stopped after the digest, before the nodes go down
+        dig = self.src.index('log "state digest done')
+        stop = self.src.index("    stop_oracle_feed\n", dig)
+        self.assertLess(
+            stop, self.src.index('"$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1\n', dig)
+        )
+
+    def test_feed_paused_for_drain_and_digest_never_waited_on(self):
+        pause = self.src.index('kill -STOP "$ORACLE_PID"')
+        self.assertLess(
+            pause,
+            self.src.index(
+                "# ---------------------------------------------------------------- 7. drain"
+            ),
+        )
+        self.assertGreater(pause, self.src.index('log "bench exited rc='))
+        self.assertNotIn(
+            "\nwait\n", self.src, "a bare wait blocks forever on the paused feed"
+        )
+        self.assertIn('wait "${DIG_PIDS[@]}"', self.src)
+
+    def test_feed_starts_after_health_and_before_the_load(self):
+        start = self.src.index('"${ORACLE_CMD[@]}" >')
+        self.assertGreater(start, self.src.index('log "idle blk/s'))
+        self.assertLess(start, self.src.index('"${BENCH_CMD[@]}" >'))
+        cmd = self.fn("ORACLE_CMD=(", ")\n")
+        for flag in (
+            "oracle-feed",
+            "--rpc-urls",
+            '--validator-keys "$ORACLE_KEYS"',
+            '--markets "$MARKETS"',
+            '--price "$ORACLE_PRICE"',
+            '--interval-ms "$ORACLE_INTERVAL_MS"',
+            "--stats-file",
+        ):
+            self.assertIn(flag, cmd)
+        self.assertNotIn("cargo build", cmd)
+        self.assertNotIn("consensus", cmd)
+
+    def test_every_oracle_step_is_gated_and_defaults_off(self):
+        self.assertIn("ORACLE_FEED=${ORACLE_FEED:-0}", self.src)
+        self.assertIn(
+            'ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"', self.src
+        )
+        # every cell-flow oracle step sits inside an `if [ "$ORACLE_FEED" = 1 ]` block
+        for marker in (
+            "ORACLE_M=$(oracle_marks 0)",
+            'kill -STOP "$ORACLE_PID"',
+            '    stop_oracle_feed\n    log "oracle feed: oracle_feed=1',
+            "d['oracle_feed'] = o",
+        ):
+            i = self.src.index(marker)
+            gate = self.src.rindex('if [ "$ORACLE_FEED" = 1 ]', 0, i)
+            self.assertNotIn("\nfi\n", self.src[gate:i], marker)
+
+    def test_bad_oracle_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="oracle-pre-")
+        try:
+            tgt = os.path.join(tmp, "release")
+            os.makedirs(tgt)
+            for b in ("torus-node", "bench-throughput"):
+                p = os.path.join(tgt, b)
+                with open(p, "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(p, 0o755)
+            wt = os.path.dirname(os.path.dirname(HERE))
+            for env, msg in (
+                (dict(ORACLE_FEED="yes"), "ORACLE_FEED must be"),
+                (dict(ORACLE_FEED="1", ORACLE_PRICE="-5"), "ORACLE_PRICE must be"),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_INTERVAL_MS="10000"),
+                    "ORACLE_INTERVAL_MS must be",
+                ),
+            ):
+                r = subprocess.run(
+                    [RUN_CELL_SH, wt, "oracle-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                )
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "oracle-pre-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":
