@@ -16,6 +16,7 @@ torus-telemetry = { workspace = true }
 torus-state = { workspace = true }
 torus-genesis = { workspace = true }
 torus-economics = { workspace = true }
+torus-price-feeder = { path = "../price-feeder" }
 alloy-primitives = { workspace = true }
 revm = { workspace = true }
 k256 = { workspace = true }

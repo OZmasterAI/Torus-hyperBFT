@@ -15,6 +15,8 @@ use torus_types::{
     TimeInForce,
 };
 
+mod oracle_feed;
+
 const HARDHAT_KEYS: [&str; 20] = [
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -239,6 +241,28 @@ enum Command {
         /// These are deterministic bench keys — NEVER use on a real network.
         #[arg(long, default_value_t = false)]
         secret_keys: bool,
+    },
+    /// Keep oracle MARK prices fresh on the bench devnet: every --interval-ms
+    /// each validator signs --price for markets 1..=--markets (ceil(N/256)
+    /// `SubmitOraclePrices` chunks, sample time = now) and sends them to its
+    /// own node. Runs until SIGTERM/SIGINT; stats every ~10 s to --stats-file.
+    OracleFeed {
+        /// Comma-separated node RPC urls; validator i sends to url i.
+        #[arg(long)]
+        rpc_urls: String,
+        /// `{"validators":[{"index":0,"address":"0x..","private_key":"0x.."},..]}`.
+        #[arg(long, default_value = "devnet/wsl/bench-validator-keys.json")]
+        validator_keys: std::path::PathBuf,
+        /// Feed markets 1..=N (the ids `consensus --markets N` trades).
+        #[arg(long)]
+        markets: u64,
+        /// Mark price in whole TRS (bench econ mid 20 * 1500 = 30000).
+        #[arg(long, default_value_t = 30_000)]
+        price: u64,
+        #[arg(long, default_value_t = 2_000)]
+        interval_ms: u64,
+        #[arg(long, default_value = "oracle-feed-stats.json")]
+        stats_file: std::path::PathBuf,
     },
 }
 
@@ -3305,14 +3329,18 @@ fn run_state_root_scaling(sizes_str: &str, changed: usize, blocks: usize) {
 /// bench uses, so genesis funding provably matches the senders. Mirrors the chain's
 /// `pubkey_to_address`: keccak256 of the 64-byte uncompressed pubkey, last 20 bytes.
 /// Emits `<idx> 0x<address>` per line for downstream genesis tooling.
+/// The EVM address of a secp256k1 key (keccak of the uncompressed pubkey).
+fn key_address(key: &SigningKey) -> Address {
+    let uncompressed = key.verifying_key().to_encoded_point(false);
+    let hash = alloy_primitives::keccak256(&uncompressed.as_bytes()[1..]);
+    Address::from_slice(&hash[12..])
+}
+
 fn run_gen_accounts(offset: usize, count: usize, secret_keys: bool) {
     let keys = load_sender_keys(count, offset);
     for (i, sk) in keys.iter().enumerate() {
         let idx = offset + i;
-        let vk = sk.signing_key.verifying_key();
-        let uncompressed = vk.to_encoded_point(false);
-        let hash = alloy_primitives::keccak256(&uncompressed.as_bytes()[1..]);
-        let addr = Address::from_slice(&hash[12..]);
+        let addr = key_address(&sk.signing_key);
         if secret_keys {
             // 32-byte scalar as 0x-prefixed hex — the same form cast/tx-loop expect.
             let sk_hex = hex::encode(sk.signing_key.to_bytes());
@@ -3414,6 +3442,27 @@ async fn main() {
             count,
             secret_keys,
         } => run_gen_accounts(offset, count, secret_keys),
+        Command::OracleFeed {
+            rpc_urls,
+            validator_keys,
+            markets,
+            price,
+            interval_ms,
+            stats_file,
+        } => {
+            let args = oracle_feed::FeedArgs {
+                rpc_urls: &rpc_urls,
+                validator_keys: &validator_keys,
+                markets,
+                price,
+                interval_ms,
+                stats_file: &stats_file,
+            };
+            if let Err(e) = oracle_feed::run(args).await {
+                eprintln!("oracle-feed: {e}");
+                std::process::exit(2);
+            }
+        }
     }
 }
 

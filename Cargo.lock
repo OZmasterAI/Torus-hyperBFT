@@ -1094,6 +1094,7 @@ dependencies = [
  "torus-core",
  "torus-economics",
  "torus-genesis",
+ "torus-price-feeder",
  "torus-state",
  "torus-telemetry",
  "torus-types",
