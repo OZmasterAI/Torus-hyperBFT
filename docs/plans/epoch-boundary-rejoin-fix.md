@@ -117,10 +117,23 @@ yet, because it needs this replica's own vote.
   a tree with `highest_view_entered = 100` boots at 100 with HotStuff not
   outdated (no second `enter_view`). The survivors' TimeoutVotes(100) form
   TC(100), and AdvanceView(TC) moves it to 101.
-- `tests/epoch_boundary_rejoin_test.rs` (3 equal-stake nodes, epoch_length 10):
-  1. silence val2 for views >= 20 (filter), so it enters 20 but nothing it
-     sends from 20 on leaves;
-  2. wait until all 3 are in 20, then stop val2 and restart it on the same
-     MemDB with the queued inbox;
-  3. commits must resume within 60 s. On the current code val2 boots at 21
-     and the cluster stays in 20 for about 19 min (backoff).
+- `tests/epoch_boundary_rejoin_test.rs` (3 equal-stake nodes, epoch_length 10,
+  E = 20). In each case one node C is stopped around E and restarted on its
+  MemDB (inbox kept). Every node must then leave E and commit 2 more blocks
+  within 90 s.
+  1. `restart_inside_an_epoch_change_view_...` (the drill): C is silenced for
+     views >= 20, so it enters 20 but nothing it sends from 20 on leaves. The
+     pre-fix code fails: C boots at 21 and the others stay in 20 for about
+     19 min (backoff).
+  2. `restart_after_the_vote_for_an_epoch_change_view_left` (review): C is
+     leader(22), the backup collector. Its vote for 20 reaches the collectors,
+     and from then on nothing reaches C (`isolate_after_vote`). The others
+     certify 20 and enter 21; C stops with entered = 20 and Highest PC < 20.
+     With the fix C re-enters 20 and catches up through the next header's
+     justify, then an AdvanceView. Green before and after the fix.
+  3. `restart_after_collecting_the_qc_for_an_epoch_change_view_alone`
+     (review): C is leader(21). Its messages that could carry a certificate
+     for 20 or later are withheld from the others; block data and loopback
+     still flow (`certify_alone`). C forms and persists QC(20) alone and moves
+     on while the others stay in 20. It boots past 20, the boot rule is
+     unchanged, and the others learn QC(20). Green before and after the fix.
