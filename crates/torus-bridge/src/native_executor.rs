@@ -737,6 +737,22 @@ struct AccountReader<'a, T: StateBackend> {
     /// The block's header timestamp (s): the clock of the oracle mark rule.
     now: u64,
     margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
+    /// Fix 1 (s87): the batch's mark memo (`None`: every `mark` reads the oracle).
+    marks: Option<&'a BatchMarks>,
+}
+
+/// Fix 1 (s87): each market's mark read at most ONCE per `execute_batch` call
+/// (Phases 2 and 3) instead of once per position per account view. Sound
+/// because only `begin_block_oracle` writes the aggregate row, before any
+/// action of the block, and `now` is the block's: every read of the block
+/// returns the same value. Keys are fixed at construction (lock-free reads
+/// once a cell is set); a market outside them reads the oracle directly.
+struct BatchMarks(HashMap<MarketId, std::sync::OnceLock<Option<FixedPoint>>>);
+
+impl BatchMarks {
+    fn new(markets: impl IntoIterator<Item = MarketId>) -> Self {
+        Self(markets.into_iter().map(|m| (m, std::sync::OnceLock::new())).collect())
+    }
 }
 
 impl<'a, T: StateBackend> AccountReader<'a, T> {
@@ -746,6 +762,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
+            marks: None,
         }
     }
 
@@ -757,7 +774,11 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// placement of a block (single, batch serial, batch sharded) reads the
     /// same value on every validator.
     fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
-        self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable())
+        let read = || self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable());
+        match self.marks.and_then(|t| t.0.get(&market_id)) {
+            Some(cell) => *cell.get_or_init(read),
+            None => read(),
+        }
     }
 
     fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
@@ -794,20 +815,67 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     }
 }
 
+impl<T: StateBackend> AccountReader<'_, T> {
+    /// F1 (s517 #4): a maker's snapshot free margin — balance and positions
+    /// from the backend. A read error snapshots as 0 (deterministic).
+    fn maker_free(&self, maker: &Address) -> FixedPoint {
+        self.positions
+            .get_native_balance(maker)
+            .and_then(|b| self.view(maker, &b))
+            .map_or(FixedPoint::ZERO, |v| v.free())
+    }
+
+    /// F1: `maker`'s signed position in `market_id` and its valuation price;
+    /// a read error snapshots as flat (deterministic).
+    fn maker_position_px(&self, maker: &Address, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+        self.position_px(maker, market_id)
+            .unwrap_or((FixedPoint::ZERO, FixedPoint::ZERO))
+    }
+}
+
 impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
     /// F1 (s517 #4): a maker's account as the book first sees it — balance
     /// and positions from the backend (Phase 3: the frozen post-Phase-1
     /// state; single path: current state). A read error snapshots as free 0
     /// / flat (deterministic).
     fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
-        let free = self
-            .positions
-            .get_native_balance(maker)
-            .and_then(|b| self.view(maker, &b))
-            .map_or(FixedPoint::ZERO, |v| v.free());
-        let (signed_pos, px) = self
-            .position_px(maker, market_id)
-            .unwrap_or((FixedPoint::ZERO, FixedPoint::ZERO));
+        let (signed_pos, px) = self.maker_position_px(maker, market_id);
+        MakerAccount { free: self.maker_free(maker), signed_pos, px }
+    }
+}
+
+/// Fix 1 (s87): the makers' start-of-batch free margin (F1 D8 snapshot),
+/// computed ONCE per `execute_batch` call and shared by every market worker
+/// (was: once per maker per market). Sound because nothing writes the backend
+/// between the end of Phase 2 and the end of Phase 4 (reservations and fills
+/// sit in the write-back caches), so `free` is the same in every market. Only
+/// the START value is shared: each book still runs its own copy (D8). Lives on
+/// the stack of one Phase 3; never used on the single path.
+struct BatchMakerAccounts<'r, 'a, T: StateBackend> {
+    reader: &'r AccountReader<'a, T>,
+    free: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<FixedPoint>>>>,
+}
+
+impl<'r, 'a, T: StateBackend> BatchMakerAccounts<'r, 'a, T> {
+    fn new(reader: &'r AccountReader<'a, T>) -> Self {
+        Self { reader, free: std::sync::Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<T: StateBackend> MakerAccountSource for BatchMakerAccounts<'_, '_, T> {
+    fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
+        // The map lock covers the lookup only; workers needing the same maker
+        // wait on its cell for ONE computation (a pure function of the frozen
+        // backend: which worker computes it does not matter).
+        let cell = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*maker)
+            .or_default()
+            .clone();
+        let free = *cell.get_or_init(|| self.reader.maker_free(maker));
+        let (signed_pos, px) = self.reader.maker_position_px(maker, market_id);
         MakerAccount { free, signed_pos, px }
     }
 }
@@ -4160,6 +4228,15 @@ impl NativeExecutor {
             })
             .collect();
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
+        // Fix 1 (s87): one mark read per market for Phases 2-3 — the markets
+        // of this call's orders, of the resident books and of the configs.
+        let batch_marks = BatchMarks::new(
+            place_orders
+                .iter()
+                .map(|(_, _, p)| p.market_id)
+                .chain(ctx.order_books.keys().copied())
+                .chain(ctx.margin_configs.keys().copied()),
+        );
         // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
         // coexists with the stitch's `&mut ctx.next_global_order_id`.
         let reader = AccountReader {
@@ -4167,6 +4244,7 @@ impl NativeExecutor {
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
+            marks: Some(&batch_marks),
         };
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
@@ -4362,10 +4440,12 @@ impl NativeExecutor {
         }
 
         // F1 (s517 #4): workers only READ the backend through `reader`.
+        // Fix 1 (s87): each maker's snapshot free margin once per call.
+        let makers = BatchMakerAccounts::new(&reader);
         let mut market_results = match MarketWorkerPool::match_parallel_with(
             worker_batches,
             ctx.timestamp,
-            Some(&reader),
+            Some(&makers),
         ) {
             Ok(r) => r,
             Err(panic) => {
@@ -6261,6 +6341,7 @@ impl NativeExecutor {
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
+            marks: None,
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
@@ -8207,5 +8288,139 @@ mod integer_margin_tests {
             assert!(old.starts_with("FixedPoint division error"));
             assert_eq!(text(new), old);
         }
+    }
+}
+
+/// Fix 1 (s87): the batch memos return exactly what the per-call reads do.
+#[cfg(test)]
+mod batch_maker_accounts_tests {
+    use super::*;
+    use torus_core::position::Position;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// 200 seeded rounds: 1-12 traders with positions in 1-25 markets (long /
+    /// short, random entry, sometimes isolated, one overflow-sized), balances
+    /// with negative `available`, marks fresh / stale / absent per market.
+    /// Every (trader, market) pair, queried in a shuffled order from 4 threads
+    /// through one `BatchMakerAccounts` (marks memoized), equals
+    /// `AccountReader::maker_account` without memos; a reader with the mark
+    /// memo gives the same `mark` / `view` / `pos_net` / `position_px`.
+    #[test]
+    fn batch_maker_accounts_equal_reader_on_random_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let now = 10_000u64;
+        let ctx = NativeExecContext::new(db, 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let reporters: Vec<(Address, FixedPoint)> = (0..3u8).map(|i| (Address::new([200 + i; 20]), fp(1))).collect();
+        let mut rng = Lcg(0x5EED_0001);
+        let (mut pairs_checked, mut marked, mut overflowed) = (0usize, 0usize, 0usize);
+        for round in 0..200u64 {
+            let n_traders = 1 + rng.below(12);
+            let n_markets = 1 + rng.below(25);
+            let markets: Vec<MarketId> = (0..n_markets).map(|i| round * 100 + 1 + i).collect();
+            for &m in &markets {
+                let ts = match rng.below(3) {
+                    0 => continue,  // absent
+                    1 => now - 120, // stale
+                    _ => now - 5,   // fresh
+                };
+                let px = fp(1 + rng.below(50_000) as i64);
+                for (v, _) in &reporters {
+                    ctx.oracle.submit_price(v, m, px, 8, ts).unwrap();
+                }
+                ctx.oracle.aggregate_price(m, 8, ts, &reporters).unwrap();
+            }
+            let traders: Vec<Address> = (0..n_traders)
+                .map(|t| {
+                    let mut b = [0x31u8; 20];
+                    b[12..].copy_from_slice(&(round * 1_000 + t).to_be_bytes());
+                    Address::new(b)
+                })
+                .collect();
+            for (ti, t) in traders.iter().enumerate() {
+                let available = fp(rng.below(2_000_000) as i64 - 500_000);
+                ctx.positions
+                    .put_native_balance(t, &NativeBalance { available, order_margin: fp(rng.below(1_000) as i64) })
+                    .unwrap();
+                for &m in &markets {
+                    if rng.below(4) == 0 {
+                        continue; // flat here
+                    }
+                    let huge = round % 17 == 0 && ti == 0 && m == markets[0];
+                    let size = if huge {
+                        FixedPoint::from_raw(i128::MAX / 3)
+                    } else {
+                        FixedPoint::from_raw(1 + rng.below(500 * FixedPoint::SCALE as u64) as i128)
+                    };
+                    ctx.positions
+                        .put_position(&Position {
+                            trader: *t,
+                            market_id: m,
+                            is_long: rng.below(2) == 0,
+                            size,
+                            entry_price: fp(1 + rng.below(50_000) as i64),
+                            realized_pnl: FixedPoint::ZERO,
+                            isolated_margin: FixedPoint::ZERO,
+                            margin_type: if rng.below(40) == 0 { MarginType::Isolated } else { MarginType::Cross },
+                        })
+                        .unwrap();
+                }
+            }
+            let plain = AccountReader::of(&ctx);
+            let memo = BatchMarks::new(markets.iter().copied());
+            let reader = AccountReader { marks: Some(&memo), ..AccountReader::of(&ctx) };
+            for &m in &markets {
+                assert_eq!(reader.mark(m), plain.mark(m), "round {round}: mark {m}");
+                marked += usize::from(plain.mark(m).is_some());
+            }
+            assert_eq!(reader.mark(u64::MAX), plain.mark(u64::MAX), "outside the memo keys");
+            let pairs: Vec<(Address, MarketId)> =
+                traders.iter().flat_map(|t| markets.iter().map(move |m| (*t, *m))).collect();
+            let want: HashMap<(Address, MarketId), MakerAccount> =
+                pairs.iter().map(|&(t, m)| ((t, m), plain.maker_account(&t, m))).collect();
+            for t in &traders {
+                let bal = ctx.positions.get_native_balance(t).unwrap();
+                let (a, b) = (reader.view(t, &bal), plain.view(t, &bal));
+                overflowed += usize::from(b.is_err());
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "round {round}: view");
+                assert_eq!(format!("{:?}", reader.pos_net(t)), format!("{:?}", plain.pos_net(t)), "round {round}: pos_net");
+                for &m in &markets {
+                    assert_eq!(
+                        format!("{:?}", reader.position_px(t, m)),
+                        format!("{:?}", plain.position_px(t, m)),
+                        "round {round}: position_px"
+                    );
+                }
+            }
+            let batch = BatchMakerAccounts::new(&reader);
+            std::thread::scope(|s| {
+                for w in 0..4u64 {
+                    let mut order = pairs.clone();
+                    let mut shuffle = Lcg(round * 4 + w + 1);
+                    for i in (1..order.len()).rev() {
+                        order.swap(i, shuffle.below(i as u64 + 1) as usize);
+                    }
+                    let (batch, want) = (&batch, &want);
+                    s.spawn(move || {
+                        for (t, m) in order {
+                            assert_eq!(batch.maker_account(&t, m), want[&(t, m)], "round {round}: {t} market {m}");
+                        }
+                    });
+                }
+            });
+            pairs_checked += pairs.len();
+        }
+        assert!(pairs_checked > 1_000 && marked > 100 && overflowed > 0, "non-vacuous: {pairs_checked} {marked} {overflowed}");
     }
 }
