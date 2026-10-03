@@ -14,8 +14,11 @@ use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{effective_max_leverage, MarketMarginConfig};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::order_book::{OrderBook, OrderStatus, PlaceResult};
-use torus_core::position::{FillEffect, MarginType, NativeBalance, PositionCache, PositionManager};
+use torus_core::order_book::{Fill, OrderBook, OrderStatus, PlaceResult};
+use torus_core::position::{
+    open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+    OPEN_ORDER_BASE_LIMIT,
+};
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
@@ -106,6 +109,23 @@ pub struct EpochBoundaryResult {
 struct BalanceCache {
     map: HashMap<Address, CachedBalance>,
     dirty: Vec<Address>,
+}
+
+/// Per-call `cum_volume` increments: maker and taker each add `price * qty`
+/// for every fill side whose position effect applied. Flushed with the
+/// balance cache, in sorted-address order.
+type VolumeCache = HashMap<Address, FixedPoint>;
+
+/// Adds the first `sides` fill sides of `fills` (in order: fill 0 taker, fill
+/// 0 maker, fill 1 taker, ...) to `volumes`, one `price * qty` per fill.
+fn add_fill_volumes(volumes: &mut VolumeCache, fills: &[Fill], sides: usize) {
+    for (k, fill) in fills.iter().enumerate().take(sides.div_ceil(2)) {
+        let notional = fill.price * fill.quantity;
+        *volumes.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
+        if 2 * k + 1 < sides {
+            *volumes.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
+        }
+    }
 }
 
 struct CachedBalance {
@@ -229,9 +249,10 @@ struct OrderSettlePlan {
     /// Taker-side order-margin release amount (pre-clamp; ZERO = none).
     margin_release: FixedPoint,
     /// Realized-PnL events in exact fill-application order: (side label for
-    /// error text, trader, pnl). Emitted precisely when `apply_fill_cached`
-    /// returns `Some` — including `Some(ZERO)` (still materializes the row).
-    pnl_events: Vec<(&'static str, Address, FixedPoint)>,
+    /// error text, trader, pnl, fill side index `2 * fill + {0 taker, 1
+    /// maker}`). Emitted precisely when `apply_fill_cached` returns `Some` —
+    /// including `Some(ZERO)` (still materializes the row).
+    pnl_events: Vec<(&'static str, Address, FixedPoint, usize)>,
     /// s80: `[taker, maker]` position effect of each applied fill, in fill
     /// order (output-only, for the fills' `FillExtras`). Only filled while a
     /// stream wants fills (`record_fills`); otherwise empty, never allocated.
@@ -252,6 +273,9 @@ struct MarketSettlePlan {
     /// A5 maker/STP release amounts, in the deterministic order
     /// `maker_margin_releases` has always produced.
     maker_releases: Vec<(Address, FixedPoint)>,
+    /// `cum_volume` of every fill side of this market (summed per trader on
+    /// the worker). Pass B adds it whole unless an order stops early there.
+    volumes: VolumeCache,
 }
 
 /// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
@@ -412,10 +436,54 @@ enum PrepOutcome {
     /// Margin reserved (possibly ZERO for market orders) — the stitch assigns
     /// the global order id and builds the `PreparedOrder`.
     Pass(FixedPoint),
-    /// Rejected pre-book. `margin` selects the funnel counter
-    /// (`orders_rejected_margin` vs `orders_rejected_other`); `msg` is the
+    /// Rejected pre-book. `reason` selects the funnel counter; `msg` is the
     /// exact serial-path error string.
-    Reject { margin: bool, msg: String },
+    Reject { reason: RejectReason, msg: String },
+}
+
+/// Open-order count work (trader probes + stops) per worker thread: below
+/// 2x this it stays on the exec thread (release probe: 300 dense books x 400
+/// senders = 120k probes, ~34 ms serial, ~15 ms on 8 workers; 300 books of 50
+/// traders = 15k probes, 1 ms serial, slower when split).
+const OPEN_COUNT_WORK_PER_THREAD: usize = 25_000;
+
+/// Why an order died pre-book (selects its funnel counter).
+#[derive(Clone, Copy)]
+enum RejectReason {
+    Margin,
+    OpenLimit,
+    Other,
+}
+
+impl RejectReason {
+    fn count(self, m: &torus_telemetry::Metrics) {
+        match self {
+            RejectReason::Margin => m.orders_rejected_margin.inc(),
+            RejectReason::OpenLimit => m.orders_rejected_open_limit.inc(),
+            RejectReason::Other => m.orders_rejected_other.inc(),
+        };
+    }
+}
+
+/// One sender's open-order slots while its orders are prepared: orders open
+/// now (books at load + this block's accepted orders that can rest) and the
+/// sender's limit.
+#[derive(Clone, Copy)]
+struct OpenSlots {
+    open: u32,
+    limit: u32,
+}
+
+/// Whether `p` holds an open-order slot: everything but Market, IOC and FOK
+/// orders (they never rest); stops always do while pending.
+fn takes_open_slot(p: &PlaceOrderParams) -> bool {
+    let never_rests = matches!(p.order_type, OrderType::Market)
+        || matches!(p.time_in_force, TimeInForce::IOC | TimeInForce::FOK);
+    !never_rests
+        || matches!(
+            p.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        )
 }
 
 #[cfg(test)]
@@ -1526,6 +1594,9 @@ pub struct ExecPhaseAccum {
     pub settle_pass_b_ns: u128,
     /// Nested in `settle_ns`: `pos_cache.flush_all` + `bal_cache.flush_all`.
     pub cache_flush_ns: u128,
+    /// Parallel settles that fell back to the sequential loop (worker panic
+    /// or a position-side fill failure).
+    pub settle_fallbacks: u64,
 }
 
 impl ExecPhaseAccum {
@@ -3631,6 +3702,18 @@ impl NativeExecutor {
         // instead of a per-order deep clone of `PlaceOrderParams`.
         let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
 
+        // Open orders after Phase 1 of every sender with an order that takes
+        // an open-order slot (read by the serial loop and the sharded workers).
+        // Taken per call: a block's post-EVM call sees its pre-EVM call's
+        // orders and, through cum_volume, its fills.
+        let open_at_start = Self::open_order_counts(
+            &ctx.order_books,
+            place_order_indices.iter().filter_map(|&i| match &flat[i] {
+                (sender, FlatAction::Place(p)) if takes_open_slot(p) => Some(sender),
+                _ => None,
+            }),
+        );
+
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
         // re-hitting the overlay's lock + alloc + Borsh path.
@@ -3639,6 +3722,7 @@ impl NativeExecutor {
         // read-modify-writes per fill; they hit this map and flush once
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
+        let mut vol_cache = VolumeCache::new();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
         let engine_threads = match engine_mode {
@@ -3683,6 +3767,7 @@ impl NativeExecutor {
                 match Self::phase2_parallel_prepare(
                     &ctx.positions,
                     &ctx.margin_configs,
+                    &open_at_start,
                     &groups,
                     engine_threads,
                     n,
@@ -3729,25 +3814,41 @@ impl NativeExecutor {
                                 margin_reserved,
                             });
                     }
-                    PrepOutcome::Reject { margin, msg } => {
+                    PrepOutcome::Reject { reason, msg } => {
                         // Funnel (perf A1): same counters as the serial loop.
                         if let Some(ref m) = ctx.metrics {
-                            if margin {
-                                m.orders_rejected_margin.inc();
-                            } else {
-                                m.orders_rejected_other.inc();
-                            }
+                            reason.count(m);
                         }
                         results[i] = NativeActionResult::err("place_order", msg);
                     }
                 }
             }
         } else {
+            let mut open_slots: HashMap<Address, Option<OpenSlots>> = HashMap::new();
             for &i in &place_order_indices {
                 let (sender, entry) = &flat[i];
                 let params: &PlaceOrderParams = match entry {
                     FlatAction::Place(p) => p,
                     FlatAction::Other(_) => unreachable!(),
+                };
+
+                // Open-order limit first: a rejected order reserves nothing.
+                let slots = open_slots.entry(*sender).or_default();
+                let taken = match Self::take_open_slot(
+                    slots,
+                    &ctx.positions,
+                    &open_at_start,
+                    sender,
+                    params,
+                ) {
+                    Ok(taken) => taken,
+                    Err((reason, msg)) => {
+                        if let Some(ref m) = ctx.metrics {
+                            reason.count(m);
+                        }
+                        results[i] = NativeActionResult::err("place_order", msg);
+                        continue;
+                    }
                 };
 
                 let market_id = params.market_id;
@@ -3791,6 +3892,10 @@ impl NativeExecutor {
                             continue;
                         }
                     }
+                }
+
+                if taken.is_some() {
+                    *slots = taken;
                 }
 
                 // Assign global order ID (monotonic, pre-matching)
@@ -3920,6 +4025,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                &mut vol_cache,
                 settle_workers,
             );
         } else {
@@ -3931,6 +4037,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                &mut vol_cache,
             );
         }
 
@@ -3948,6 +4055,13 @@ impl NativeExecutor {
         }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+        }
+        let mut volumes: Vec<_> = vol_cache.into_iter().collect();
+        volumes.sort_unstable_by_key(|(trader, _)| *trader);
+        for (trader, add) in volumes {
+            if let Err(e) = Self::add_cum_volume(&ctx.positions, &trader, add) {
+                ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+            }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
 
@@ -3979,6 +4093,7 @@ impl NativeExecutor {
     fn phase2_parallel_prepare<T: StateBackend>(
         positions: &PositionManager<T>,
         margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        open_at_start: &HashMap<Address, u32>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -3998,7 +4113,21 @@ impl NativeExecutor {
                                 shard_groups.iter().map(|(_, o)| o.len()).sum(),
                             );
                             for (sender, orders) in shard_groups {
+                                let mut slots = None;
                                 for &(i, params) in orders {
+                                    let taken = match Self::take_open_slot(
+                                        &mut slots,
+                                        positions,
+                                        open_at_start,
+                                        sender,
+                                        params,
+                                    ) {
+                                        Ok(taken) => taken,
+                                        Err((reason, msg)) => {
+                                            out.push((i, PrepOutcome::Reject { reason, msg }));
+                                            continue;
+                                        }
+                                    };
                                     let is_market =
                                         matches!(params.order_type, OrderType::Market);
                                     // Same formula as the serial loop / exec_place_order.
@@ -4018,7 +4147,7 @@ impl NativeExecutor {
                                                     out.push((
                                                         i,
                                                         PrepOutcome::Reject {
-                                                            margin: true,
+                                                            reason: RejectReason::Margin,
                                                             msg: format!(
                                                                 "insufficient margin: need {required}, have {}",
                                                                 bal.available
@@ -4035,13 +4164,16 @@ impl NativeExecutor {
                                                 out.push((
                                                     i,
                                                     PrepOutcome::Reject {
-                                                        margin: false,
+                                                        reason: RejectReason::Other,
                                                         msg: e.to_string(),
                                                     },
                                                 ));
                                                 continue;
                                             }
                                         }
+                                    }
+                                    if taken.is_some() {
+                                        slots = taken;
                                     }
                                     out.push((i, PrepOutcome::Pass(required)));
                                 }
@@ -4087,6 +4219,7 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
     ) {
         // r6: the canonical loop IS the apply pass — attribute it to pass B so
         // the sequential and parallel paths land in the same histogram (the
@@ -4178,6 +4311,7 @@ impl NativeExecutor {
                 }
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
+                    let notional = fill.price * fill.quantity;
                     let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
@@ -4198,6 +4332,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
+                    *vol_cache.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
                     let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         pos_cache,
@@ -4218,6 +4353,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
+                    *vol_cache.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
                     if record_fills {
                         ctx.fill_effects_scratch.push([taker, maker]);
                     }
@@ -4334,6 +4470,7 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
         max_workers: usize,
     ) {
         // ---- Pass A: pure per-market plans on CAPPED chunk workers ----
@@ -4466,6 +4603,7 @@ impl NativeExecutor {
                 error = %msg,
                 "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
             );
+            ctx.phase_accum.settle_fallbacks += 1;
             return Self::settle_market_results_sequential(
                 ctx,
                 market_results,
@@ -4474,6 +4612,7 @@ impl NativeExecutor {
                 total_gas,
                 bal_cache,
                 pos_cache,
+                vol_cache,
             );
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
@@ -4501,8 +4640,15 @@ impl NativeExecutor {
                 None => continue,
             };
 
-            for ((match_result, prep), oplan) in
-                mbr.results.iter().zip(prepared.iter()).zip(plan.orders)
+            // Orders of this market that stopped before their last fill side:
+            // (order index, sides applied).
+            let mut stops: Vec<(usize, usize)> = Vec::new();
+            for (k, ((match_result, prep), oplan)) in mbr
+                .results
+                .iter()
+                .zip(prepared.iter())
+                .zip(plan.orders)
+                .enumerate()
             {
                 let result = &match_result.result;
 
@@ -4534,7 +4680,8 @@ impl NativeExecutor {
                 // exactly; if no balance error occurs, the worker's position
                 // failure (if any) stands.
                 let mut fill_failed: Option<String> = None;
-                for (side, trader, pnl) in &oplan.pnl_events {
+                let mut sides_applied = 2 * result.fills.len();
+                for (side, trader, pnl, at) in &oplan.pnl_events {
                     match bal_cache.load(&ctx.positions, trader) {
                         Ok(mut bal) => {
                             bal.available += *pnl;
@@ -4542,12 +4689,22 @@ impl NativeExecutor {
                         }
                         Err(e) => {
                             fill_failed = Some(format!("{side} fill failed: {e}"));
+                            sides_applied = *at;
                             break;
                         }
                     }
                 }
+                // Any worker position failure fell back to sequential above,
+                // so the only failure here is a balance read: `sides_applied`
+                // is the whole stop point.
+                debug_assert!(oplan.fill_error.is_none());
                 if fill_failed.is_none() {
                     fill_failed = oplan.fill_error;
+                }
+                // cum_volume counts every fill side the sequential loop
+                // completes before its stop (a failed side adds nothing).
+                if sides_applied < 2 * result.fills.len() {
+                    stops.push((k, sides_applied));
                 }
 
                 if let Some(err) = fill_failed {
@@ -4579,6 +4736,23 @@ impl NativeExecutor {
                 results[prep.index] = NativeActionResult::ok("place_order", 1000);
             }
 
+            // cum_volume: the worker's per-trader sums when every order ran
+            // to its last fill side; otherwise per side, up to each stop.
+            if stops.is_empty() {
+                for (trader, add) in plan.volumes {
+                    *vol_cache.entry(trader).or_insert(FixedPoint::ZERO) += add;
+                }
+            } else {
+                for (k, match_result) in mbr.results.iter().take(prepared.len()).enumerate() {
+                    let fills = &match_result.result.fills;
+                    let sides = stops
+                        .iter()
+                        .find(|stop| stop.0 == k)
+                        .map_or(2 * fills.len(), |stop| stop.1);
+                    add_fill_volumes(vol_cache, fills, sides);
+                }
+            }
+
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
             for (trader, amount) in plan.maker_releases {
@@ -4608,6 +4782,7 @@ impl NativeExecutor {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
         let mut orders = Vec::with_capacity(prepared.len());
+        let mut volumes = VolumeCache::new();
 
         for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
             let result = &match_result.result;
@@ -4644,16 +4819,20 @@ impl NativeExecutor {
             // Fill application: position transitions into the market-local
             // cache; PnL events recorded in exact order; first POSITION-side
             // failure stops the order like sequential (its message matches).
-            let mut pnl_events: Vec<(&'static str, Address, FixedPoint)> = Vec::new();
+            let mut pnl_events: Vec<(&'static str, Address, FixedPoint, usize)> = Vec::new();
             let mut fill_effects = Vec::new();
             let mut fill_error: Option<String> = None;
-            'fills: for fill in &result.fills {
+            'fills: for (k, fill) in result.fills.iter().enumerate() {
                 let taker_is_buy = fill.maker_side != Side::Buy;
                 let mut pair = [FillEffect::default(); 2];
-                for (slot, (side, trader, is_buy)) in pair.iter_mut().zip([
-                    ("taker", &fill.taker, taker_is_buy),
-                    ("maker", &fill.maker, fill.maker_side == Side::Buy),
-                ]) {
+                for (s, (slot, (side, trader, is_buy))) in pair
+                    .iter_mut()
+                    .zip([
+                        ("taker", &fill.taker, taker_is_buy),
+                        ("maker", &fill.maker, fill.maker_side == Side::Buy),
+                    ])
+                    .enumerate()
+                {
                     match positions.apply_fill_cached_effect(
                         &mut pos_cache,
                         trader,
@@ -4665,7 +4844,7 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => {
                             if let Some(pnl) = effect.closed_pnl {
-                                pnl_events.push((side, *trader, pnl));
+                                pnl_events.push((side, *trader, pnl, 2 * k + s));
                             }
                             *slot = effect;
                         }
@@ -4678,6 +4857,11 @@ impl NativeExecutor {
                 if record_fills {
                     fill_effects.push(pair);
                 }
+            }
+            // A position failure sends the whole call to the sequential loop,
+            // so these sums are only used when every side applied.
+            if fill_error.is_none() {
+                add_fill_volumes(&mut volumes, &result.fills, 2 * result.fills.len());
             }
 
             orders.push(OrderSettlePlan {
@@ -4700,6 +4884,7 @@ impl NativeExecutor {
             orders,
             pos_cache,
             maker_releases,
+            volumes,
         }
     }
 
@@ -4904,11 +5089,122 @@ impl NativeExecutor {
         out
     }
 
+    /// Per-user open-order limit, one rule for the serial Phase-2 loop, the
+    /// sharded workers and `exec_place_order`. Market, IOC and FOK orders
+    /// never rest: they pass and take no slot. Any other order (GTC,
+    /// PostOnly, a stop while pending) needs a free slot; as on Hyperliquid,
+    /// reduce-only and stop orders also need fewer than
+    /// `OPEN_ORDER_BASE_LIMIT` open orders. `slots` loads on the
+    /// sender's first such order in this `execute_batch` call: its open orders
+    /// after Phase 1 (`open_at_start`) and the limit from the stored
+    /// `cum_volume`. A slot is taken before matching, so an order the book
+    /// then rejects (PostOnly cross, dust, off-tick) keeps it for the call. Returns
+    /// the slots with this order counted; the caller stores them only once the
+    /// order also passed its margin reserve, so a rejected order takes no slot.
+    fn take_open_slot<T: StateBackend>(
+        slots: &mut Option<OpenSlots>,
+        positions: &PositionManager<T>,
+        open_at_start: &HashMap<Address, u32>,
+        sender: &Address,
+        params: &PlaceOrderParams,
+    ) -> Result<Option<OpenSlots>, (RejectReason, String)> {
+        if !takes_open_slot(params) {
+            return Ok(None);
+        }
+        let s = match *slots {
+            Some(s) => s,
+            None => {
+                let volume = positions
+                    .get_cum_volume(sender)
+                    .map_err(|e| (RejectReason::Other, e.to_string()))?;
+                *slots.insert(OpenSlots {
+                    open: open_at_start.get(sender).copied().unwrap_or(0),
+                    limit: open_order_limit(volume),
+                })
+            }
+        };
+        let is_stop = matches!(
+            params.order_type,
+            OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
+        );
+        if (params.reduce_only || is_stop) && s.open >= OPEN_ORDER_BASE_LIMIT {
+            return Err((
+                RejectReason::OpenLimit,
+                format!(
+                    "open order limit: reduce-only and stop orders need fewer than \
+                     {OPEN_ORDER_BASE_LIMIT} open orders, have {}",
+                    s.open
+                ),
+            ));
+        }
+        if s.open >= s.limit {
+            return Err((
+                RejectReason::OpenLimit,
+                format!(
+                    "open order limit reached: {} open orders, limit {}",
+                    s.open, s.limit
+                ),
+            ));
+        }
+        Ok(Some(OpenSlots {
+            open: s.open + 1,
+            ..s
+        }))
+    }
+
+    /// Open orders (resting + pending stops) of each of `senders`, summed
+    /// over all books (`torus_core::order_book::open_order_counts`: book-outer,
+    /// smaller side per book, stops walked once). Split by book over up to the
+    /// match worker cap once the walk is big enough to pay for the threads.
+    fn open_order_counts<'a>(
+        books: &HashMap<MarketId, OrderBook>,
+        senders: impl Iterator<Item = &'a Address>,
+    ) -> HashMap<Address, u32> {
+        let mut idx: HashMap<Address, usize> = HashMap::new();
+        for sender in senders {
+            let next = idx.len();
+            idx.entry(*sender).or_insert(next);
+        }
+        let refs: Vec<&OrderBook> = books.values().collect();
+        let counts = torus_core::order_book::open_order_counts(
+            &refs,
+            &idx,
+            MarketWorkerPool::resolve_worker_cap_named(None),
+            OPEN_COUNT_WORK_PER_THREAD,
+        );
+        idx.into_iter()
+            .map(|(sender, i)| (sender, u32::try_from(counts[i]).unwrap_or(u32::MAX)))
+            .collect()
+    }
+
+    /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
+    fn add_cum_volume<T: StateBackend>(
+        positions: &PositionManager<T>,
+        trader: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), CoreError> {
+        let volume = positions.get_cum_volume(trader)?;
+        positions.put_cum_volume(trader, volume + amount)
+    }
+
     fn exec_place_order<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
+        if let Err((reason, msg)) = Self::take_open_slot(
+            &mut None,
+            &ctx.positions,
+            &open_at_start,
+            sender,
+            params,
+        ) {
+            if let Some(ref m) = ctx.metrics {
+                reason.count(m);
+            }
+            return NativeActionResult::err("place_order", msg);
+        }
         let market_id = params.market_id;
         let is_market = matches!(params.order_type, OrderType::Market);
 
@@ -5040,14 +5336,21 @@ impl NativeExecutor {
         }
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
-            let taker = match ctx.positions.apply_fill(
-                &fill.taker,
-                market_id,
-                taker_is_buy,
-                fill.quantity,
-                fill.price,
-                MarginType::Cross,
-            ) {
+            let notional = fill.price * fill.quantity;
+            let taker = match ctx
+                .positions
+                .apply_fill(
+                    &fill.taker,
+                    market_id,
+                    taker_is_buy,
+                    fill.quantity,
+                    fill.price,
+                    MarginType::Cross,
+                )
+                .and_then(|effect| {
+                    Self::add_cum_volume(&ctx.positions, &fill.taker, notional)?;
+                    Ok(effect)
+                }) {
                 Ok(effect) => effect,
                 Err(e) => {
                     // Funnel (perf A1): died on fill application, not on the book.
@@ -5060,14 +5363,20 @@ impl NativeExecutor {
                     );
                 }
             };
-            let maker = match ctx.positions.apply_fill(
-                &fill.maker,
-                market_id,
-                fill.maker_side == Side::Buy,
-                fill.quantity,
-                fill.price,
-                MarginType::Cross,
-            ) {
+            let maker = match ctx
+                .positions
+                .apply_fill(
+                    &fill.maker,
+                    market_id,
+                    fill.maker_side == Side::Buy,
+                    fill.quantity,
+                    fill.price,
+                    MarginType::Cross,
+                )
+                .and_then(|effect| {
+                    Self::add_cum_volume(&ctx.positions, &fill.maker, notional)?;
+                    Ok(effect)
+                }) {
                 Ok(effect) => effect,
                 Err(e) => {
                     // Funnel (perf A1): died on fill application, not on the book.
@@ -5218,7 +5527,12 @@ impl NativeExecutor {
         match market_id {
             Some(mid) => {
                 if let Some(book) = ctx.order_books.get_mut(&mid) {
+                    let stops = book.pending_stop_count();
                     let cancelled = book.cancel_all(*sender, Some(mid));
+                    // A removed pending stop must be persisted too.
+                    if book.pending_stop_count() != stops {
+                        ctx.dirty_books.insert(mid);
+                    }
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
                         let cfg = ctx.margin_configs.get(&mid);
@@ -5237,7 +5551,11 @@ impl NativeExecutor {
                 let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
                 for mid in market_ids {
                     if let Some(book) = ctx.order_books.get_mut(&mid) {
+                        let stops = book.pending_stop_count();
                         let cancelled = book.cancel_all(*sender, None);
+                        if book.pending_stop_count() != stops {
+                            ctx.dirty_books.insert(mid);
+                        }
                         if !cancelled.is_empty() {
                             ctx.dirty_books.insert(mid);
                             let cfg = ctx.margin_configs.get(&mid);
@@ -5304,8 +5622,13 @@ impl NativeExecutor {
             let mut per_action = vec![Vec::new(); run.len()];
             if !senders.is_empty() {
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
+                let stops = book.pending_stop_count();
                 for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
                     per_action[k] = orders;
+                }
+                // Same dirty mark as `exec_cancel_all` for removed stops.
+                if book.pending_stop_count() != stops {
+                    ctx.dirty_books.insert(*mid);
                 }
             }
             cancelled.push(per_action);

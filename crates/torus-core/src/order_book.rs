@@ -21,11 +21,58 @@ use crate::error::CoreError;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
+mod trader_orders;
+
+use trader_orders::TraderOrders;
 
 #[cfg(test)]
 mod matching_entry_tests;
 
-const MAX_ORDERS_PER_TRADER_PER_MARKET: usize = 200;
+/// Open orders (resting + pending stops) of each sender in `senders` (value =
+/// its index in the result), summed over `books`. The walk costs, per book,
+/// min(its traders, senders) probes plus its stops; it runs on scoped
+/// workers, one per `min_work_per_thread` of that (0 = always `max_threads`),
+/// at most `max_threads`, each on a chunk of books. The chunk counts are
+/// added: an integer sum, so the split never changes a count.
+pub fn open_order_counts(
+    books: &[&OrderBook],
+    senders: &HashMap<Address, usize>,
+    max_threads: usize,
+    min_work_per_thread: usize,
+) -> Vec<usize> {
+    let count = |chunk: &[&OrderBook]| {
+        let mut counts = vec![0usize; senders.len()];
+        for book in chunk {
+            book.add_open_order_counts(senders, &mut counts);
+        }
+        counts
+    };
+    let work: usize = books
+        .iter()
+        .map(|b| b.trader_orders.len().min(senders.len()) + b.pending_stops.len())
+        .sum();
+    let threads = match work.checked_div(min_work_per_thread) {
+        Some(n) => n.min(max_threads),
+        None => max_threads,
+    };
+    if threads < 2 || books.len() < 2 {
+        return count(books);
+    }
+    std::thread::scope(|s| {
+        let workers: Vec<_> = books
+            .chunks(books.len().div_ceil(threads))
+            .map(|chunk| s.spawn(move || count(chunk)))
+            .collect();
+        let mut total = vec![0usize; senders.len()];
+        for worker in workers {
+            let counts = worker.join().expect("open-order count worker panicked");
+            for (t, n) in total.iter_mut().zip(counts) {
+                *t += n;
+            }
+        }
+        total
+    })
+}
 
 // ============================================================================
 // Types
@@ -246,7 +293,7 @@ pub struct OrderBook {
     /// O(1) order lookup by ID → location.
     order_index: HashMap<OrderId, OrderLocation>,
     /// Per-trader order tracking for cancel-all.
-    trader_orders: HashMap<Address, Vec<OrderId>>,
+    trader_orders: HashMap<Address, TraderOrders>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
     pub tick_size: FixedPoint,
@@ -406,16 +453,9 @@ impl OrderBook {
             };
         }
 
-        // FIX 10 (ECON-FIND-17): Limit orders per trader per market
-        let trader_order_count = self.trader_orders.get(&trader).map_or(0, |ids| ids.len());
-        if trader_order_count >= MAX_ORDERS_PER_TRADER_PER_MARKET {
-            return PlaceResult {
-                order_id,
-                status: OrderStatus::Rejected,
-                fills: vec![],
-                self_trade_cancels: vec![],
-            };
-        }
+        // FIX 10 (ECON-FIND-17): open orders are limited per user across all
+        // markets, enforced by the executor before matching
+        // (`crate::position::open_order_limit`), not per book.
 
         // Stop orders → store in pending_stops
         match params.order_type {
@@ -612,7 +652,7 @@ impl OrderBook {
         }
 
         if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
-            ids.retain(|&id| id != order_id);
+            ids.remove(order_id);
             if ids.is_empty() {
                 self.trader_orders.remove(&order.trader);
             }
@@ -640,15 +680,18 @@ impl OrderBook {
         Ok(order)
     }
 
-    /// Cancel all orders for a trader. Returns cancelled orders.
+    /// Cancel all orders for a trader, pending stops included. Returns the
+    /// cancelled resting orders.
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+        // Stops hold open-order slots, so they go even when the trader has
+        // no resting order.
+        self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
-            Some(ids) => ids,
+            Some(ids) => ids.into_vec(),
             None => return vec![],
         };
 
         if let Some(cancelled) = self.try_cancel_all_batch(&order_ids) {
-            self.pending_stops.retain(|s| s.trader != trader);
             return cancelled;
         }
 
@@ -690,9 +733,6 @@ impl OrderBook {
                 }
             }
         }
-
-        // Also remove pending stops for this trader
-        self.pending_stops.retain(|s| s.trader != trader);
 
         cancelled
     }
@@ -886,6 +926,35 @@ impl OrderBook {
         }
     }
 
+    /// Orders of `trader` that hold an open-order slot: resting orders plus
+    /// pending stops (stops are rare, so a scan is fine).
+    pub fn open_order_count(&self, trader: &Address) -> usize {
+        self.trader_orders.get(trader).map_or(0, TraderOrders::len)
+            + self.pending_stops.iter().filter(|s| s.trader == *trader).count()
+    }
+
+    /// Adds every indexed trader's `open_order_count` to `counts[idx[trader]]`.
+    /// Walks the smaller of this book's traders and `idx` (an empty book costs
+    /// nothing), plus one pass over the pending stops (not one per trader).
+    pub fn add_open_order_counts(&self, idx: &HashMap<Address, usize>, counts: &mut [usize]) {
+        if self.trader_orders.len() < idx.len() {
+            for (trader, ids) in &self.trader_orders {
+                if let Some(&i) = idx.get(trader) {
+                    counts[i] += ids.len();
+                }
+            }
+        } else {
+            for (trader, &i) in idx {
+                counts[i] += self.trader_orders.get(trader).map_or(0, TraderOrders::len);
+            }
+        }
+        for stop in &self.pending_stops {
+            if let Some(&i) = idx.get(&stop.trader) {
+                counts[i] += 1;
+            }
+        }
+    }
+
     /// Number of pending stop orders.
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()
@@ -1047,7 +1116,7 @@ impl OrderBook {
         fills: &mut Vec<Fill>,
         self_trade_cancels: &mut Vec<Order>,
         order_index: &mut HashMap<OrderId, OrderLocation>,
-        trader_orders: &mut HashMap<Address, Vec<OrderId>>,
+        trader_orders: &mut HashMap<Address, TraderOrders>,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
@@ -1080,7 +1149,7 @@ impl OrderBook {
                 let cancelled = queue.pop_front().unwrap();
                 order_index.remove(&cancelled.id);
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
-                    ids.retain(|&id| id != cancelled.id);
+                    ids.remove(cancelled.id);
                 }
                 let seq = order_seq.remove(&cancelled.id);
                 Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
@@ -1130,7 +1199,7 @@ impl OrderBook {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
-                    ids.retain(|&id| id != filled.id);
+                    ids.remove(filled.id);
                 }
                 order_seq.remove(&filled.id);
             }
@@ -1473,6 +1542,12 @@ impl OrderBook {
         buf.clear();
         buf.extend_from_slice(&seq.to_be_bytes());
         order.serialize(buf).expect("vec write");
+    }
+
+    /// The trader address bytes of an order-row value (`seq(8) ‖ id(16) ‖
+    /// trader(20) ‖ …`) without decoding the row; `None` if it is too short.
+    pub fn order_row_trader(bytes: &[u8]) -> Option<&[u8]> {
+        bytes.get(24..44)
     }
 
     /// Decode an order-row value into `(seq, order)`.
@@ -3243,6 +3318,182 @@ mod tests {
         assert!(cancelled.is_empty());
     }
 
+    fn stop(is_buy: bool, order_type: OrderType) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::ZERO,
+            quantity: fp(1),
+            order_type,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn open_order_count_counts_resting_and_pending_stops() {
+        let mut ob = book();
+        let a = addr(1);
+        ob.place_order(limit_sell(fp(105), fp(1)), addr(2), 1);
+        let first = ob.place_order(limit_buy(fp(90), fp(1)), a, 2).order_id;
+        ob.place_order(limit_buy(fp(91), fp(1)), a, 3);
+        ob.place_order(limit_buy(fp(92), fp(1)), a, 4);
+        ob.place_order(stop(false, OrderType::StopMarket { trigger: fp(80) }), a, 5);
+        let stop_limit = OrderType::StopLimit {
+            trigger: fp(100),
+            limit: fp(101),
+        };
+        ob.place_order(stop(true, stop_limit), a, 6);
+        let ioc = PlaceOrderParams {
+            time_in_force: TimeInForce::IOC,
+            ..limit_buy(fp(50), fp(1))
+        };
+        assert_eq!(ob.place_order(ioc, a, 7).status, OrderStatus::Cancelled);
+        assert_eq!(ob.open_order_count(&a), 5);
+        assert_eq!(ob.open_order_count(&addr(2)), 1);
+        assert_eq!(ob.open_order_count(&addr(9)), 0);
+
+        ob.cancel_order(first).unwrap();
+        assert_eq!(ob.open_order_count(&a), 4);
+
+        // A trade at 105 triggers the buy stop; its limit 101 finds no ask,
+        // so it rests: one pending stop became one resting order.
+        ob.place_order(limit_buy(fp(105), fp(1)), addr(3), 8);
+        assert_eq!(ob.pending_stop_count(), 1);
+        assert_eq!(ob.orders_for_trader(&a).len(), 3);
+        assert_eq!(ob.open_order_count(&a), 4);
+    }
+
+    /// `cancel_all` returns a trader's orders in its `trader_orders` order:
+    /// arrival order for a live book, decode (level) order after a reload —
+    /// and mid-list removals (cancel, maker fill, STP) never reorder it.
+    #[test]
+    fn cancel_all_output_order_survives_mid_list_removals() {
+        let a = addr(1);
+        let scenario = |ob: &mut OrderBook, ids: &[OrderId]| {
+            for (k, id) in ids.iter().enumerate() {
+                if k % 3 == 0 {
+                    ob.cancel_order(*id).unwrap();
+                }
+            }
+            // Maker fills on a's best asks, then an STP walk of level 200 by
+            // a's own bid (which then rests: a new arrival at the end).
+            ob.place_order(market_buy(fp(4)), addr(2), 0);
+            ob.place_order(limit_buy(fp(201), fp(1)), a, 0);
+            for k in 0..5 {
+                ob.place_order(limit_sell(fp(300 + k), fp(1)), a, 0);
+            }
+        };
+
+        // Live book: arrival order = ascending id.
+        let mut ob = book();
+        let ids: Vec<OrderId> = (0..100)
+            .map(|k| ob.place_order(limit_sell(fp(200 + k % 7), fp(1)), a, 0).order_id)
+            .collect();
+        scenario(&mut ob, &ids);
+        let mut live: Vec<OrderId> = ob.orders_for_trader(&a).iter().map(|o| o.id).collect();
+        live.sort_unstable();
+        assert!(live.len() > 50);
+        let got: Vec<OrderId> = ob.cancel_all(a, None).iter().map(|o| o.id).collect();
+        assert_eq!(got, live);
+
+        // Reloaded book: decode order (bids, then asks by level), not ids.
+        let mut ob = book();
+        let ids: Vec<OrderId> = (0..100)
+            .map(|k| ob.place_order(limit_sell(fp(200 + k % 7), fp(1)), a, 0).order_id)
+            .collect();
+        let mut ob = OrderBook::try_from_slice(&borsh::to_vec(&ob).unwrap()).unwrap();
+        let decode_order: Vec<OrderId> = ob
+            .bid_queues()
+            .chain(ob.ask_queues())
+            .flat_map(|(_, q)| q.iter().map(|o| o.id))
+            .collect();
+        assert_ne!(decode_order, ids, "level order differs from arrival order");
+        scenario(&mut ob, &ids);
+        let want: Vec<OrderId> = decode_order
+            .iter()
+            .copied()
+            .filter(|id| ob.get_order(*id).is_some())
+            .chain(
+                (ids[99] + 1..ob.next_order_id())
+                    .filter(|id| ob.get_order(*id).is_some_and(|o| o.trader == a)),
+            )
+            .collect();
+        let got: Vec<OrderId> = ob.cancel_all(a, None).iter().map(|o| o.id).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn add_open_order_counts_matches_open_order_count() {
+        let mut ob = book();
+        for (t, n) in [(1u8, 3usize), (2, 1), (3, 0)] {
+            for k in 0..n {
+                ob.place_order(limit_buy(fp(90 + k as i64), fp(1)), addr(t), 0);
+            }
+        }
+        for t in [1u8, 3, 3, 4] {
+            ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(200) }), addr(t), 0);
+        }
+        let traders: Vec<Address> = (1..=5).map(addr).collect();
+        let idx: HashMap<Address, usize> =
+            traders.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+        let mut counts = vec![10; traders.len()];
+        ob.add_open_order_counts(&idx, &mut counts);
+        let want: Vec<usize> = traders.iter().map(|t| 10 + ob.open_order_count(t)).collect();
+        assert_eq!(counts, want);
+        assert_eq!(counts, [14, 11, 12, 11, 10]);
+        // Fewer senders than traders in the book (the other walk).
+        let one: HashMap<Address, usize> = [(addr(1), 0)].into();
+        let mut counts = vec![0];
+        ob.add_open_order_counts(&one, &mut counts);
+        assert_eq!(counts, [4]);
+        // An empty book adds nothing.
+        book().add_open_order_counts(&idx, &mut counts);
+        assert_eq!(counts, [4]);
+    }
+
+    #[test]
+    fn open_order_counts_match_per_sender_sums_for_any_thread_count() {
+        let mut books = Vec::new();
+        for m in 0..23u8 {
+            let mut ob = book();
+            for t in 0..(m % 9) {
+                for k in 0..=(t + m) % 4 {
+                    ob.place_order(limit_buy(fp(50 + k as i64), fp(1)), addr(1 + t), 0);
+                }
+            }
+            for t in 0..m % 3 {
+                let trigger = OrderType::StopMarket { trigger: fp(200) };
+                ob.place_order(stop(true, trigger), addr(3 + t), 0);
+            }
+            books.push(ob);
+        }
+        let refs: Vec<&OrderBook> = books.iter().collect();
+        let senders: HashMap<Address, usize> = (1..=12).map(|n| (addr(n), n as usize - 1)).collect();
+        let want: Vec<usize> = (1..=12)
+            .map(|n| books.iter().map(|b| b.open_order_count(&addr(n))).sum())
+            .collect();
+        assert!(want.iter().sum::<usize>() > 100);
+        for threads in [0, 1, 2, 3, 8, 64] {
+            assert_eq!(open_order_counts(&refs, &senders, threads, 0), want, "threads={threads}");
+            assert_eq!(open_order_counts(&refs, &senders, threads, 1 << 20), want);
+        }
+    }
+
+    #[test]
+    fn cancel_all_removes_stops_of_trader_without_resting_orders() {
+        let mut ob = book();
+        let a = addr(1);
+        ob.place_order(stop(false, OrderType::StopMarket { trigger: fp(80) }), a, 1);
+        ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(120) }), a, 2);
+        ob.place_order(stop(true, OrderType::StopMarket { trigger: fp(130) }), addr(2), 3);
+        assert_eq!(ob.open_order_count(&a), 2);
+        assert!(ob.cancel_all(a, None).is_empty());
+        assert_eq!(ob.open_order_count(&a), 0);
+        assert_eq!(ob.open_order_count(&addr(2)), 1);
+    }
+
     #[test]
     fn modify_qty_decrease_keeps_priority() {
         let mut ob = book();
@@ -3908,20 +4159,20 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn reject_excess_orders_per_trader() {
+    fn no_per_market_cap_on_one_traders_orders() {
+        // The open-order limit is per user across all markets and enforced
+        // by the executor; the book itself has no per-trader cap.
         let mut ob = book();
-        // Place MAX_ORDERS_PER_TRADER_PER_MARKET orders
-        for i in 0..MAX_ORDERS_PER_TRADER_PER_MARKET {
+        for i in 0..250 {
             let price = fp(100) + FixedPoint::from_raw(i as i128 * FixedPoint::SCALE);
             let r = ob.place_order(limit_sell(price, fp(1)), addr(1), i as u64);
             assert_eq!(r.status, OrderStatus::Resting, "order {i} should rest");
         }
-        // Next order should be rejected
-        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(1), 999);
-        assert_eq!(r.status, OrderStatus::Rejected);
-        // Different trader can still place
-        let r = ob.place_order(limit_sell(fp(500), fp(1)), addr(2), 999);
-        assert_eq!(r.status, OrderStatus::Resting);
+        assert_eq!(ob.open_order_count(&addr(1)), 250);
+        // An aggressive order from the same trader still trades (STP aside).
+        ob.place_order(limit_buy(fp(90), fp(1)), addr(2), 998);
+        let r = ob.place_order(market_sell(fp(1)), addr(1), 999);
+        assert_eq!(r.status, OrderStatus::Filled);
     }
 
     // ====================================================================
@@ -4296,6 +4547,17 @@ mod level_preimage_characterization {
     /// u32-LE framing length. A DIRTY buffer must produce exactly what a fresh
     /// one does, byte-for-byte and length-for-length, for every shape.
     #[test]
+    fn order_row_trader_reads_the_trader_without_decoding() {
+        for (seq, o) in shape_spread() {
+            let row = OrderBook::encode_order_row_parts(seq, &o);
+            assert_eq!(OrderBook::order_row_trader(&row), Some(o.trader.as_slice()));
+            let (_, decoded) = OrderBook::decode_order_row(&row).unwrap();
+            assert_eq!(decoded.trader, o.trader);
+        }
+        assert_eq!(OrderBook::order_row_trader(&[0u8; 43]), None);
+    }
+
+    #[test]
     fn encode_order_row_into_is_dirty_buffer_proof() {
         // Junk shapes: shorter than a row, exactly a row, far longer than a
         // row, and a buffer with a big spare capacity but zero length.
@@ -4562,8 +4824,8 @@ mod queue_lookup_tests {
     fn addr(n: u8) -> Address {
         Address::from([n; 20])
     }
-    /// Distinct trader per `i` modulo 4096 (the book caps resting orders per
-    /// trader at `MAX_ORDERS_PER_TRADER_PER_MARKET`).
+    /// Distinct trader per `i` modulo 4096 (keeps each trader's resting
+    /// orders far below the per-user open-order limit).
     fn trader(i: usize) -> Address {
         let mut b = [0u8; 20];
         b[0] = 0xAA;

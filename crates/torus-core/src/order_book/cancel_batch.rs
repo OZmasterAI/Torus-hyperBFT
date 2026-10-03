@@ -194,10 +194,11 @@ impl OrderBook {
     }
 
     /// Return `None` without changing the book when batching is ineligible.
-    /// All planning/storage is bounded by the ordinary 200-order trader cap;
+    /// All planning/storage is bounded by the per-user open-order limit;
     /// recovered above-limit states keep the original loop too.
     pub(super) fn try_cancel_all_batch(&mut self, order_ids: &[OrderId]) -> Option<Vec<Order>> {
-        if !(32..=MAX_ORDERS_PER_TRADER_PER_MARKET).contains(&order_ids.len())
+        let max = crate::position::OPEN_ORDER_MAX_LIMIT as usize;
+        if !(32..=max).contains(&order_ids.len())
             || self.order_index.len() < 1_024
             || !self.cancel_batch_has_concentrated_prefix(order_ids)
         {
@@ -348,7 +349,7 @@ impl OrderBook {
         let mut by_id: Vec<(OrderId, usize)> = Vec::with_capacity(total);
         for (sender, range) in senders.iter().zip(&ranges) {
             let Some(range) = range else { continue };
-            for (output, id) in (range.start..).zip(&self.trader_orders[sender]) {
+            for (output, id) in (range.start..).zip(self.trader_orders[sender].iter()) {
                 let loc = self.order_index.get(id)?;
                 let queue = match loc.side {
                     Side::Buy => self.bids.get(&loc.price),
@@ -444,12 +445,12 @@ impl OrderBook {
         let mut stop_owners = Vec::new();
         let mut out = Vec::with_capacity(senders.len());
         for (sender, range) in senders.iter().zip(ranges) {
+            stop_owners.push(*sender);
             let Some(range) = range else {
                 out.push(Vec::new());
                 continue;
             };
             self.trader_orders.remove(sender);
-            stop_owners.push(*sender);
             let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
             for order in &orders {
                 let loc = self
@@ -622,7 +623,7 @@ mod tests {
         }
         // Make receipt order neither level order nor FIFO order. Recovery may
         // restore trader order lists differently; cancellation must honor it.
-        book.trader_orders.get_mut(&addr(1)).unwrap().reverse();
+        book.trader_orders.get_mut(&addr(1)).unwrap().edit(|v| v.reverse());
         book.pending_stops.push(StopOrder {
             id: 900_000,
             trader: addr(1),
@@ -689,7 +690,7 @@ mod tests {
             for shape in 0..5 {
                 let mut a = fixture(2048, 40, shape, mode);
                 let mut b = fixture(2048, 40, shape, mode);
-                let expected = a.trader_orders[&addr(1)].clone();
+                let expected = a.trader_orders[&addr(1)].to_vec();
                 assert!(a.cancel_batch_has_concentrated_prefix(&expected));
                 let got = a.cancel_all(addr(1), Some(999));
                 assert_eq!(got, b.cancel_all_original(addr(1), Some(999)));
@@ -716,7 +717,7 @@ mod tests {
         let mut a = fixture(2048, 40, 0, 3);
         let mut b = fixture(2048, 40, 0, 3);
         for book in [&mut a, &mut b] {
-            let ids = book.trader_orders[&addr(1)].clone();
+            let ids = book.trader_orders[&addr(1)].to_vec();
             book.modify_order(ids[0], None, Some(fp(2))).unwrap();
             book.modify_order(ids[1], None, Some(fp(7))).unwrap();
             book.modify_order(ids[2], Some(fp(111)), None).unwrap();
@@ -767,15 +768,16 @@ mod tests {
     #[test]
     fn cancel_batch_falls_back_for_small_large_and_stale_indexes() {
         for case in 0..7 {
-            let per_level = match case {
-                0 => 8,
-                1 => 101,
-                _ => 40,
+            let (depth, per_level) = match case {
+                0 => (1024, 8),
+                // 2 x 2501 orders: above the OPEN_ORDER_MAX_LIMIT bound.
+                1 => (2600, 2501),
+                _ => (1024, 40),
             };
-            let mut a = fixture(1024, per_level, 0, 0);
-            let mut b = fixture(1024, per_level, 0, 0);
+            let mut a = fixture(depth, per_level, 0, 0);
+            let mut b = fixture(depth, per_level, 0, 0);
             for book in [&mut a, &mut b] {
-                let id = book.trader_orders[&addr(1)][3];
+                let id = book.trader_orders[&addr(1)].to_vec()[3];
                 match case {
                     2 => {
                         book.order_index.remove(&id);
@@ -793,11 +795,11 @@ mod tests {
                         book.trader_orders
                             .get_mut(&addr(1))
                             .unwrap()
-                            .insert(0, 999_999);
+                            .edit(|v| v.insert(0, 999_999));
                     }
                     _ => {}
                 }
-                let ids = book.trader_orders[&addr(1)].clone();
+                let ids = book.trader_orders[&addr(1)].to_vec();
                 assert!(book.try_cancel_all_batch(&ids).is_none());
             }
             assert_eq!(
@@ -834,7 +836,7 @@ mod tests {
         for depth in [1, 32, 1024] {
             let mut a = scattered(depth);
             let mut b = scattered(depth);
-            let ids = a.trader_orders[&addr(1)].clone();
+            let ids = a.trader_orders[&addr(1)].to_vec();
             assert_eq!(ids.len(), 32);
             assert!(a.order_count() >= 1024);
             assert!(!a.cancel_batch_has_concentrated_prefix(&ids));
@@ -857,9 +859,9 @@ mod tests {
             book.trader_orders
                 .get_mut(&addr(1))
                 .unwrap()
-                .rotate_right(1);
+                .edit(|v| v.rotate_right(1));
         }
-        let ids = a.trader_orders[&addr(1)].clone();
+        let ids = a.trader_orders[&addr(1)].to_vec();
         assert!(!a.cancel_batch_has_concentrated_prefix(&ids));
         assert!(a.try_cancel_all_batch(&ids).is_none());
         assert_same(&mut a, &mut b);
@@ -871,14 +873,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_batch_preserves_stop_only_early_return() {
+    fn cancel_batch_stop_only_trader_loses_its_stops() {
         let mut a = fixture(1024, 40, 0, 0);
         let mut b = fixture(1024, 40, 0, 0);
         assert_eq!(
             a.cancel_all(addr(3), None),
             b.cancel_all_original(addr(3), None)
         );
-        assert_eq!(a.pending_stop_count(), 2);
+        assert_eq!(a.pending_stop_count(), 1);
         assert_same(&mut a, &mut b);
     }
 
@@ -891,7 +893,7 @@ mod tests {
                 (crate::book_rows::SIDE_TAG_ASK, fp(110).raw()),
                 u64::MAX - 1,
             );
-            let ids = book.trader_orders[&addr(1)].clone();
+            let ids = book.trader_orders[&addr(1)].to_vec();
             assert!(book.try_cancel_all_batch(&ids).is_none());
         }
         let got =
@@ -909,11 +911,13 @@ mod tests {
 }
 
 // Frozen080c4fa oracle: keep the old loop independent of the batch helpers.
+// Only change since: stops go before the early return (open-order limit).
 #[cfg(test)]
 impl OrderBook {
     fn cancel_all_original(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+        self.pending_stops.retain(|s| s.trader != trader);
         let order_ids = match self.trader_orders.remove(&trader) {
-            Some(ids) => ids,
+            Some(ids) => ids.to_vec(),
             None => return vec![],
         };
 
@@ -955,9 +959,6 @@ impl OrderBook {
                 }
             }
         }
-
-        // Also remove pending stops for this trader
-        self.pending_stops.retain(|s| s.trader != trader);
 
         cancelled
     }

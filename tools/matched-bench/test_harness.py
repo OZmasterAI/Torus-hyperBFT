@@ -265,6 +265,14 @@ class SummarizeTest(unittest.TestCase):
             s["funnel_by_node"]["val1"]["matched_s_first120"], 50_000, delta=500
         )
 
+    def test_open_limit_rejects_are_in_the_node_funnel(self):
+        write_cell(self.d, 50_000, 10_000, dur=300)
+        write_agreement(self.d, ["same"] * 3)
+        s, _ = run_summarize(self.d)
+        for node in ("val0", "val1", "val2"):
+            funnel = s["funnel_by_node"][node]
+            self.assertEqual(funnel["delta_orders_rejected_open_limit_total"], 0)
+
     def test_first120_equals_avg_on_a_120s_cell(self):
         write_cell(self.d, 40_000, 0, dur=120)
         write_agreement(self.d, ["same"] * 3)
@@ -687,6 +695,26 @@ class CrashKillGuardTest(unittest.TestCase):
         r = subprocess.run(["bash", "-c", line.strip() + '; echo "$panics"'],
                            capture_output=True, text=True, env=dict(os.environ, lg=lg))
         self.assertEqual(r.stdout.strip(), "3", r.stderr)
+
+    def test_open_order_budget_reaches_the_bench_only_when_set(self):
+        """OPEN_ORDER_BUDGET=N -> bench --open-order-budget N (keeps senders
+        under the chain's per-user open-order limit). Unset = flag omitted,
+        so older bench binaries and prior cells are unchanged."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}", src)
+        self.assertIn('[ -n "$OPEN_ORDER_BUDGET" ] && '
+                      'BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")', src)
+        self.assertIn('[[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]]', src)
+        self.assertIn("open_order_budget='${OPEN_ORDER_BUDGET:-unset}'", src)
+
+    def test_open_limit_rejects_are_sampled(self):
+        """The open-limit funnel counter is in both sampler column sets."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        for cols in ("FUNNEL_COLS=", "WIDE_COLS="):
+            line = src[src.index(cols):].split("\n", 1)[0]
+            self.assertIn("torus_orders_rejected_open_limit_total", line, cols)
 
     def test_restart_uses_the_same_argv_as_launch(self):
         """launch-3val.sh and crash-kill.sh must start a node through ONE

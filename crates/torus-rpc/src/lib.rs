@@ -3725,22 +3725,20 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    // --- get_open_orders_limit_500 ---
-    // The endpoint must not return more than 500 orders regardless of how many
-    // are in the book.
+    // --- get_open_orders_limit_5000 ---
+    // The endpoint returns every order up to the 5000 open-order maximum and
+    // never more, regardless of how many are in the book.
     //
-    // The order book enforces MAX_ORDERS_PER_TRADER_PER_MARKET = 200, so we
-    // spread orders across three markets (200 + 200 + 101 = 501) to produce
-    // more than 500 total and verify the RPC cap fires.
+    // Orders are spread across three markets (2500 + 2500 + 101 = 5101).
     #[tokio::test]
-    async fn get_open_orders_limit_500() {
+    async fn get_open_orders_limit_5000() {
         let (_dir, state, mempool, executor) = setup();
         let trader = Address::from([0x55; 20]);
 
-        // Markets 1 and 2: 200 buy orders each (hits per-market trader cap).
+        // Markets 1 and 2: 2500 buy orders each.
         for market_id in [1u64, 2u64] {
             let mut book = OrderBook::new(market_id, fp(1), fp(1));
-            for i in 1u32..=200 {
+            for i in 1u32..=2500 {
                 book.place_order(
                     PlaceOrderParams {
                         market_id,
@@ -3762,7 +3760,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Market 3: 101 sell orders — brings the total to 501.
+        // Market 3: 101 sell orders — brings the total to 5101.
         let mut book3 = OrderBook::new(3, fp(1), fp(1));
         for i in 1u32..=101 {
             book3.place_order(
@@ -3797,8 +3795,17 @@ mod tests {
             )
             .await
             .unwrap();
-        // Must be capped at 500 — never 501.
-        assert_eq!(orders.len(), 500);
+        // Must be capped at 5000 — never 5001.
+        assert_eq!(orders.len(), 5000);
+        // One market: all 2500, far past the old 500 cap.
+        let one: Vec<RpcOpenOrder> = client
+            .request(
+                "torus_getOpenOrders",
+                jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 2500);
         handle.stop().unwrap();
     }
 

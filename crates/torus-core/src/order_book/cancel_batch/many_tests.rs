@@ -5,6 +5,10 @@
 use super::tests::{addr, assert_same, fp, order};
 use super::*;
 
+/// Resting orders per trader in the fixtures (the old per-market cap; the
+/// book has none now).
+const PER_TRADER: usize = 200;
+
 /// Tiny deterministic LCG so every scenario is reproducible with no deps.
 struct Lcg(u64);
 impl Lcg {
@@ -113,7 +117,7 @@ fn random_book(seed: u64, mode: usize, per_level: usize, traders: u64) -> OrderB
     let mut id = 1u64;
     for _ in 0..per_level * 4 {
         let trader = addr(1 + rng.below(traders) as u8);
-        if book.trader_orders.get(&trader).map_or(0, Vec::len) >= MAX_ORDERS_PER_TRADER_PER_MARKET {
+        if book.trader_orders.get(&trader).map_or(0, TraderOrders::len) >= PER_TRADER {
             continue;
         }
         let level = if rng.below(40) == 0 {
@@ -127,7 +131,7 @@ fn random_book(seed: u64, mode: usize, per_level: usize, traders: u64) -> OrderB
     }
     for _ in 0..24 {
         let trader = addr(1 + rng.below(traders) as u8);
-        let Some(ids) = book.trader_orders.get(&trader).cloned() else {
+        let Some(ids) = book.trader_orders.get(&trader).map(TraderOrders::to_vec) else {
             continue;
         };
         let target = ids[rng.below(ids.len() as u64) as usize];
@@ -217,7 +221,7 @@ fn cancel_all_many_matches_sequential_randomized() {
 }
 
 /// The s63 shape at depth: ~99% of orders in two deep levels per side, many
-/// traders near the 200-order cap, a run of ten cancel-alls.
+/// traders near 200 orders each, a run of ten cancel-alls.
 #[test]
 fn cancel_all_many_matches_sequential_deep_levels() {
     for mode in [0, 2, 3] {
@@ -249,8 +253,8 @@ fn cancel_all_many_empty_book_and_empty_run() {
 }
 
 /// Duplicates get empty results (as the second sequential call does), the
-/// stop-only trader keeps its stop (sequential early return), and orderless
-/// senders are no-ops.
+/// stop-only trader loses its stop (as its sequential call does), and
+/// orderless senders are no-ops.
 #[test]
 fn cancel_all_many_duplicate_absent_and_stop_only_senders() {
     for mode in [0, 2, 3] {
@@ -271,7 +275,7 @@ fn cancel_all_many_duplicate_absent_and_stop_only_senders() {
         assert!(got[1].is_empty() && got[2].is_empty() && got[3].is_empty());
         assert!(got[5].is_empty() && got[6].is_empty());
         assert_eq!(got, sequential(&mut b, &senders));
-        assert!(a.pending_stops.iter().any(|s| s.trader == stop_only));
+        assert!(!a.pending_stops.iter().any(|s| s.trader == stop_only));
         assert_books_equal(&mut a, &mut b);
     }
 }
@@ -309,7 +313,7 @@ fn cancel_all_many_falls_back_on_stale_or_shared_indexes() {
             let mut a = random_book(21, mode, 300, 6);
             let mut b = random_book(21, mode, 300, 6);
             for book in [&mut a, &mut b] {
-                let id = book.trader_orders[&addr(3)][2];
+                let id = book.trader_orders[&addr(3)].to_vec()[2];
                 match case {
                     0 => {
                         book.order_index.remove(&id);
@@ -326,7 +330,7 @@ fn cancel_all_many_falls_back_on_stale_or_shared_indexes() {
                         .trader_orders
                         .get_mut(&addr(4))
                         .unwrap()
-                        .insert(0, 777_777),
+                        .edit(|v| v.insert(0, 777_777)),
                 }
             }
             check(&mut a, &mut b, &[addr(4), addr(3), addr(1)]);
@@ -398,7 +402,7 @@ fn cancel_all_many_exhaustive_small_queues() {
                         // Reversed receipt order on one trader: output order
                         // must follow trader_orders, not FIFO.
                         if let Some(ids) = book.trader_orders.get_mut(&addr(2)) {
-                            ids.reverse();
+                            ids.edit(|v| v.reverse());
                         }
                         prime(&mut book);
                         book
@@ -466,8 +470,8 @@ fn cancel_all_many_plan_compacts_deep_multi_owner_levels() {
 }
 
 /// Timing probe (run with `--ignored --nocapture`): the s63 market shape —
-/// ~300k resting orders in two deep levels per side, 1 500 traders near the
-/// 200-order cap — and a run of ten cancel-alls, sequential vs batched.
+/// ~300k resting orders in two deep levels per side, 1 500 traders near 200
+/// orders each — and a run of ten cancel-alls, sequential vs batched.
 #[test]
 #[ignore]
 fn cancel_all_many_timing_probe_deep_levels() {
@@ -481,7 +485,7 @@ fn cancel_all_many_timing_probe_deep_levels() {
         let mut book = new_book(mode);
         for id in 1..=300_000u64 {
             let t = trader(1 + rng.below(1_500));
-            if book.trader_orders.get(&t).map_or(0, Vec::len) >= MAX_ORDERS_PER_TRADER_PER_MARKET {
+            if book.trader_orders.get(&t).map_or(0, TraderOrders::len) >= PER_TRADER {
                 continue;
             }
             let (side, price) = LEVELS[rng.below(4) as usize];

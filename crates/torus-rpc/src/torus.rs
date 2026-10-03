@@ -13,7 +13,7 @@ use rocksdb::IteratorMode;
 use torus_core::book_reader::{self, BookLayout};
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::OrderBook;
-use torus_core::position::PositionManager;
+use torus_core::position::{open_order_limit, PositionManager, OPEN_ORDER_MAX_LIMIT};
 use torus_core::precompiles::OrderBookSnapshot;
 use torus_economics::governance::{GovernanceManager, ProposalStatus, ProposalType};
 use torus_economics::rewards::FeeSplitter;
@@ -110,6 +110,9 @@ pub trait TorusApi {
 
     #[method(name = "getBalances")]
     async fn get_balances(&self, trader: String) -> RpcResult<RpcBalances>;
+
+    #[method(name = "getUserLimits")]
+    async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
     // --- 2.9.2: Market info ---
     #[method(name = "getMarkets")]
@@ -738,8 +741,96 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
     ErrorObjectOwned::from(RpcError::Internal(e.to_string()))
 }
 
-/// Response cap for `torus_getOpenOrders` (unchanged from the classic path).
-const OPEN_ORDERS_LIMIT: usize = 500;
+/// `trader`'s open orders over all markets (resting + pending stops, as
+/// `OrderBook::open_order_count` counts them) for `torus_getUserLimits`,
+/// without materializing the book column families: rows are streamed, only
+/// the trader's own order rows are decoded (the trader sits at a fixed offset
+/// of every order row), and stop rows are reached with one seek per market
+/// in the root CF instead of walking every level row.
+fn count_open_orders(
+    state: &torus_state::StateDb,
+    trader: &alloy_primitives::Address,
+    layout: BookLayout,
+) -> Result<usize, String> {
+    use torus_core::book_rows::{ROW_TAG_ORDER, ROW_TAG_STOP};
+    let db = state.inner();
+    let Ok(root_cf) = state.cf_handle(CF_NATIVE_ORDER_BOOKS) else {
+        return Ok(0);
+    };
+    let mut root = db.raw_iterator_cf(root_cf);
+    let mut count = 0;
+    if layout == BookLayout::Classic {
+        root.seek_to_first();
+        while let (Some(key), Some(blob)) = (root.key(), root.value()) {
+            if key.len() == 8 {
+                let book = OrderBook::try_from_slice(blob)
+                    .map_err(|e| format!("borsh decode order book: {e}"))?;
+                count += book.open_order_count(trader);
+            }
+            root.next();
+        }
+        root.status().map_err(|e| format!("rocksdb: {e}"))?;
+        return Ok(count);
+    }
+
+    // Resting: order rows (mode 1: the root CF; mode 2: the node-local store).
+    let store_cf = match layout {
+        BookLayout::OrderRows => Some(root_cf),
+        _ => state.cf_handle(torus_state::cf::CF_BOOK_ORDER_ROWS).ok(),
+    };
+    if let Some(store_cf) = store_cf {
+        let mut rows = db.raw_iterator_cf(store_cf);
+        rows.seek_to_first();
+        while let (Some(key), Some(row)) = (rows.key(), rows.value()) {
+            if key.len() == 25
+                && key[8] == ROW_TAG_ORDER
+                && OrderBook::order_row_trader(row) == Some(trader.as_slice())
+            {
+                let (_, order) = OrderBook::decode_order_row(row)
+                    .map_err(|e| format!("book order row: {e}"))?;
+                count += usize::from(order.trader == *trader);
+            }
+            rows.next();
+        }
+        rows.status().map_err(|e| format!("rocksdb: {e}"))?;
+    }
+
+    // Pending stops: `market(8) ‖ 0x02 ‖ id(16)`, one seek per market.
+    root.seek_to_first();
+    while let Some(key) = root.key() {
+        let Some(market) = key.get(..8) else {
+            root.next();
+            continue;
+        };
+        let market = u64::from_be_bytes(market.try_into().expect("8 bytes"));
+        let mut prefix = [0u8; 9];
+        prefix[..8].copy_from_slice(&market.to_be_bytes());
+        prefix[8] = ROW_TAG_STOP;
+        root.seek(prefix);
+        while let (Some(key), Some(row)) = (root.key(), root.value()) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if key.len() == 25 {
+                let mut one = OrderBook::new(market, FixedPoint::ONE, FixedPoint::ONE);
+                one.restore_stop_row(row)
+                    .map_err(|e| format!("market {market}: {e}"))?;
+                count += one.open_order_count(trader);
+            }
+            root.next();
+        }
+        match market.checked_add(1) {
+            Some(next) => root.seek(next.to_be_bytes()),
+            None => break,
+        }
+    }
+    root.status().map_err(|e| format!("rocksdb: {e}"))?;
+    Ok(count)
+}
+
+/// Response cap for `torus_getOpenOrders`: the most open orders a user can
+/// hold, so a user at the cap still sees every resting order.
+const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 
 #[async_trait]
 impl TorusApiServer for RpcState {
@@ -879,6 +970,21 @@ impl TorusApiServer for RpcState {
             total_margin_used: dec_fp(total_margin),
             available_balance: dec_fp(native_bal.available),
             permanent_stake,
+        })
+    }
+
+    async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits> {
+        let addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        let cum_volume = PositionManager::new(self.state.clone())
+            .get_cum_volume(&addr)
+            .map_err(book_read_err)?;
+        let layout = book_layout(&self.state)?;
+        let open_orders = count_open_orders(&self.state, &addr, layout)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(e)))?;
+        Ok(RpcUserLimits {
+            open_orders: open_orders as u64,
+            open_order_limit: open_order_limit(cum_volume),
+            cum_volume: dec_fp(cum_volume),
         })
     }
 
@@ -1602,7 +1708,7 @@ impl TorusApiServer for RpcState {
                     .map_err(|e| RpcError::Internal(format!("borsh decode order book: {e}")))
                     .map_err(ErrorObjectOwned::from)?;
                 for order in book.orders_for_trader(&trader_addr) {
-                    if orders.len() >= 500 {
+                    if orders.len() >= OPEN_ORDERS_LIMIT {
                         break;
                     }
                     orders.push(order_to_rpc(order, mid));
@@ -1612,7 +1718,7 @@ impl TorusApiServer for RpcState {
             // All markets: iterate CF_NATIVE_ORDER_BOOKS
             let iter = db.iterator_cf(cf, IteratorMode::Start);
             for item in iter {
-                if orders.len() >= 500 {
+                if orders.len() >= OPEN_ORDERS_LIMIT {
                     break;
                 }
                 let (key, value) = item
@@ -1627,7 +1733,7 @@ impl TorusApiServer for RpcState {
                     Err(_) => continue,
                 };
                 for order in book.orders_for_trader(&trader_addr) {
-                    if orders.len() >= 500 {
+                    if orders.len() >= OPEN_ORDERS_LIMIT {
                         break;
                     }
                     orders.push(order_to_rpc(order, mid));

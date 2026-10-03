@@ -22,7 +22,7 @@ use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor}
 use torus_core::position::NativeBalance;
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::{Mempool, MempoolConfig};
-use torus_rpc::types::{dec_fp, RpcMarkPrice, RpcOpenOrder, RpcOrderBook};
+use torus_rpc::types::{dec_fp, RpcMarkPrice, RpcOpenOrder, RpcOrderBook, RpcUserLimits};
 use torus_rpc::{BlockNotifier, RpcServer};
 use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -187,6 +187,62 @@ async fn get_open_orders_serves_every_mode() {
             all.iter().any(|o| o.market_id == "0x2"),
             "{mode:?}: market 2 order missing"
         );
+
+        handle.stop().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn get_user_limits_serves_every_mode() {
+    for mode in MODES {
+        let (_dir, state, mempool, executor) = setup();
+        seed(&state, mode);
+        // One pending stop for the maker: it holds an open-order slot too.
+        let mut ctx = NativeExecContext::new_with_mode(
+            state.clone(),
+            2,
+            1_002,
+            0,
+            100,
+            10,
+            addr(99),
+            addr(100),
+            addr(101),
+            mode,
+            None,
+        );
+        let stop = PlaceOrderParams {
+            order_type: OrderType::StopMarket { trigger: fp(200) },
+            ..gtc(2, true, 0, 1)
+        };
+        let r = NativeExecutor::execute_batch(
+            &mut ctx,
+            &[(addr(MAKER), NativeAction::PlaceOrder(stop))],
+        );
+        assert!(r.results[0].success, "{mode:?}: {:?}", r.results[0]);
+        ctx.save_order_books();
+
+        let (handle, sock) = start_server(state, mempool, executor).await;
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{sock}"))
+            .unwrap();
+        let hex = |n: u8| format!("0x{}", hex::encode(addr(n).as_slice()));
+
+        // 4 resting + 1 stop; one fill of 2 @ 100 gave both sides 200.
+        let maker: RpcUserLimits = client
+            .request("torus_getUserLimits", rpc_params![hex(MAKER)])
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: getUserLimits failed: {e}"));
+        assert_eq!(maker.open_orders, 5, "{mode:?}");
+        assert_eq!(maker.open_order_limit, 1000, "{mode:?}");
+        assert_eq!(maker.cum_volume, dec_fp(fp(200)), "{mode:?}");
+
+        let taker: RpcUserLimits = client
+            .request("torus_getUserLimits", rpc_params![hex(TAKER)])
+            .await
+            .unwrap();
+        assert_eq!(taker.open_orders, 0, "{mode:?}");
+        assert_eq!(taker.cum_volume, dec_fp(fp(200)), "{mode:?}");
 
         handle.stop().unwrap();
     }
