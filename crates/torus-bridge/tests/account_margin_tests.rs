@@ -708,3 +708,443 @@ fn maker_in_its_pool_market_shares_the_pool(path: Path) {
     assert_bal(&ctx, &s, fp_cents(24_250), FixedPoint::ZERO, &format!("{path:?}"));
 }
 per_path!(maker_in_its_pool_market_shares_the_pool);
+
+// ============================================================================
+// Option B (s87): outside its D2 pool market a batch sell reserves for the
+// best bid of the start of Phase 2 (`max(limit | mark-or-cap, best bid)`);
+// the resting row and every release stay at the limit. B2: a taker-only
+// budget gets the makers' +1 raw rounding allowance.
+// ============================================================================
+
+/// `ctx` with funnel metrics on (`orders_rejected_cancelled` etc.).
+fn metered(ctx: &mut NativeExecContext) -> std::sync::Arc<torus_telemetry::Metrics> {
+    let m = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    ctx.metrics = Some(m.clone());
+    m
+}
+
+fn with_tif(mut p: PlaceOrderParams, tif: TimeInForce) -> PlaceOrderParams {
+    p.time_in_force = tif;
+    p
+}
+
+/// T's first checked order of the batch (so m1 is its D2 pool market): a
+/// GTC sell 1 @200 in m1, where nothing bids — it rests and keeps 10.
+fn pool_order() -> PlaceOrderParams {
+    limit(1, false, 200, 1)
+}
+
+fn is_margin_reject(r: &NativeActionResult) -> bool {
+    !r.success && r.error.as_deref().unwrap_or("").starts_with("insufficient margin")
+}
+
+/// Option B (bench repro, design §7.1 #1). M bids 10 @101 in m1 and m2; T
+/// (101) sells 10 @100 GTC in both in one run. Single path: both fill at 101
+/// (after the first, free 50.5 >= need 50; match need 50.5). Batch before B:
+/// m2 is taker-only with budget 50 < 50.5 → 0 fills, Cancelled. B: m2
+/// reserves 101 × 10 / 20 = 50.5 and fills 10; the pool (m1) keeps 0.5,
+/// exactly what the m1 sell needs beyond its own 50.
+fn non_pool_limit_sell_fills_at_a_better_bid(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    let metrics = metered(&mut ctx);
+    run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10))]);
+    fund_native(&ctx, &t, fp(101));
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(t, limit(2, false, 100, 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{path:?}");
+    assert!(resting_in(&ctx, &t, 1).is_empty() && resting_in(&ctx, &t, 2).is_empty(), "{path:?}");
+    assert_bal(&ctx, &t, fp(101), FixedPoint::ZERO, &format!("{path:?}"));
+    assert_eq!(metrics.orders_rejected_cancelled.get(), 0, "{path:?}");
+}
+per_path!(non_pool_limit_sell_fills_at_a_better_bid);
+
+/// Option B: the same shape with an IOC and a FOK sell in m2 (never rest:
+/// reserve the opening quantity). Before B the IOC filled 9 (lot 1: 45.45 <=
+/// 50) and the FOK was rejected whole; with B both fill 10 like the single path.
+fn non_pool_ioc_and_fok_sell_fill_at_a_better_bid(path: Path) {
+    for tif in [TimeInForce::IOC, TimeInForce::FOK] {
+        let (mk, t) = (addr(1), addr(2));
+        let (_d, mut ctx) = fresh(path, &[mk]);
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10))]);
+        fund_native(&ctx, &t, fp(101));
+        let r = run(
+            &mut ctx,
+            path,
+            &[place(t, limit(1, false, 100, 10)), place(t, with_tif(limit(2, false, 100, 10), tif))],
+        );
+        let what = format!("{path:?} {tif:?}");
+        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{what}");
+        assert_bal(&ctx, &t, fp(101), FixedPoint::ZERO, &what);
+    }
+}
+per_path!(non_pool_ioc_and_fok_sell_fill_at_a_better_bid);
+
+/// Option B for market sells: mark 100 in m2, M bids 10 @100 in m1 and 10
+/// @110 in m2; T (105) market-sells 10 (cap 1) in m1 (its pool; no mark:
+/// reserves at the cap, 0.5) and in m2. Before B the m2 sell reserved at
+/// the mark (50) and its fills @110 (55) were cut after 9. B: it reserves
+/// at max(mark, 110) = 55 and fills 10, exactly like the single path
+/// (free after m1: 105 − 50 = 55).
+fn non_pool_market_sell_reserves_at_the_start_best_bid_above_the_mark(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    set_mark(&ctx, 2, fp(100));
+    run(&mut ctx, path, &[place(mk, limit(1, true, 100, 10)), place(mk, limit(2, true, 110, 10))]);
+    fund_native(&ctx, &t, fp(105));
+    let r = run(&mut ctx, path, &[place(t, market(1, false, fp(1), 10)), place(t, market(2, false, fp(1), 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{path:?}");
+    assert_bal(&ctx, &t, fp(105), FixedPoint::ZERO, &format!("{path:?}"));
+}
+per_path!(non_pool_market_sell_reserves_at_the_start_best_bid_above_the_mark);
+
+/// Option B, partial fill: M bids 4 @101 in m2; T (200) = [pool order, GTC
+/// sell 10 @100 in m2]. B reserves 50.5, fills 4 @101 (need IM(404 + 600)
+/// = 50.2) and rests 6 @100 holding exactly reserve(100, 6) = 30 (release
+/// 50.5 − 30). Before B: 0 fills, Cancelled. A cancel-all then returns
+/// every reservation (no stranded margin).
+fn non_pool_sell_partial_fill_rests_at_its_limit_with_the_exact_reservation(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    run(&mut ctx, path, &[place(mk, limit(2, true, 101, 4))]);
+    fund_native(&ctx, &t, fp(200));
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(t, limit(2, false, 100, 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), -fp(4), "{path:?}");
+    assert_eq!(resting_in(&ctx, &t, 2), vec![fp(6)], "{path:?}");
+    assert_bal(&ctx, &t, fp(160), fp(40), &format!("{path:?}: 10 (m1) + reserve(100, 6)"));
+    run(&mut ctx, path, &[(t, NativeAction::CancelAllOrders { market_id: None })]);
+    assert_bal(&ctx, &t, fp(200), FixedPoint::ZERO, &format!("{path:?}: all released"));
+}
+per_path!(non_pool_sell_partial_fill_rests_at_its_limit_with_the_exact_reservation);
+
+/// Option B design §7.2 #5: test 1 with T funded 100.25. Single path: after
+/// the m1 fill free is 49.75 < 50 → the m2 sell is rejected. B: the m2 gate
+/// needs 50.5 > 50.25 → rejected at placement too, and the m1 sell keeps
+/// its pool (0.25 + 50 >= 50.5) and fills 10. Before B: m2 admitted, m1's
+/// pool 0.25 → m1 filled only 5 and m2 nothing.
+fn tight_non_pool_sell_is_rejected_at_placement_like_the_single_path(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10))]);
+    fund_native(&ctx, &t, fp_cents(10_025));
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(t, limit(2, false, 100, 10))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert!(is_margin_reject(&r[1]), "{path:?}: {:?}", r[1]);
+    assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), FixedPoint::ZERO), "{path:?}");
+    assert_bal(&ctx, &t, fp_cents(10_025), FixedPoint::ZERO, &format!("{path:?}"));
+}
+per_path!(tight_non_pool_sell_is_rejected_at_placement_like_the_single_path);
+
+/// Option B §7.2 #6: m2 tiers 20x <= 1,000, 5x above. Flat T sells 9.9 @100
+/// (990: 49.5 at 20x) into a bid @110 (1,089: 217.8 at 5x). B reserves
+/// IM(1,089) and fills 9.9 (before B: 1 — IM(990 + 10 q) crosses the tier
+/// for q > 1).
+fn non_pool_sell_tier_crossing_at_the_better_bid_is_covered(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk, t]);
+    tiered(&mut ctx, 2, tiers_20_then_5());
+    let q = fp_cents(990);
+    run(&mut ctx, path, &[place(mk, PlaceOrderParams { quantity: q, ..limit(2, true, 110, 1) })]);
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(t, PlaceOrderParams { quantity: q, ..limit(2, false, 100, 1) })]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), -q, "{path:?}");
+    assert_bal(&ctx, &t, fp(990), fp(10), &format!("{path:?}"));
+}
+per_path!(non_pool_sell_tier_crossing_at_the_better_bid_is_covered);
+
+/// Option B §7.2 #7 (review 4 F-1 shapes, not gameable): bids placed
+/// EARLIER IN THE BATCH never move a non-pool sell's reservation — only the
+/// start-of-batch best bid does. M bids 10 @101 in m2; T (61) = [pool order
+/// (10), <X's high bid>, sell 10 @100 in m2]. reserve(101, 10) = 50.5 <= 51
+/// is admitted and fills 10 @101; a bound at X's 120 (60 > 51) would reject
+/// it. X's bid is: unfunded (rejected), IOC (nothing to hit, cancelled),
+/// off-tick (book reject), or [deep low bid 100 @1, high 1 @1000] with
+/// margin for the first only.
+fn in_batch_high_bid_does_not_move_a_non_pool_sell_reservation(path: Path) {
+    for shape in ["unfunded", "ioc", "off_tick", "deep_low_then_high"] {
+        let (mk, t, x) = (addr(1), addr(2), addr(5));
+        let (_d, mut ctx) = fresh(path, &[mk]);
+        run(&mut ctx, path, &[place(mk, limit(2, true, 101, 10))]);
+        fund_native(&ctx, &t, fp(61));
+        let mut actions = vec![place(t, pool_order())];
+        match shape {
+            "unfunded" => actions.push(place(x, limit(2, true, 120, 10))),
+            "ioc" => {
+                fund_native(&ctx, &x, fp(FUNDING));
+                actions.push(place(x, with_tif(limit(2, true, 120, 10), TimeInForce::IOC)));
+            }
+            "off_tick" => {
+                fund_native(&ctx, &x, fp(FUNDING));
+                actions.push(place(x, PlaceOrderParams { price: fp_cents(12_050), ..limit(2, true, 120, 10) }));
+            }
+            _ => {
+                fund_native(&ctx, &x, fp(10));
+                actions.push(place(x, limit(2, true, 1, 100)));
+                actions.push(place(x, limit(2, true, 1_000, 1)));
+            }
+        }
+        actions.push(place(t, limit(2, false, 100, 10)));
+        let r = run(&mut ctx, path, &actions);
+        let what = format!("{path:?} {shape}");
+        assert!(r.last().unwrap().success, "{what}: {r:?}");
+        assert_eq!(pos_in(&ctx, &t, 2), -fp(10), "{what}");
+        assert_eq!(pos_in(&ctx, &x, 2), FixedPoint::ZERO, "{what}");
+        assert_bal(&ctx, &t, fp(51), fp(10), &what);
+    }
+}
+per_path!(in_batch_high_bid_does_not_move_a_non_pool_sell_reservation);
+
+/// Option B, unchanged: buys of a multi-market sender in non-pool markets
+/// (GTC, IOC, FOK limit buys @105 and a market buy cap 110 at mark 100, all
+/// into asks 10 @100) fill exactly as before.
+fn non_pool_buys_unchanged(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    set_mark(&ctx, 5, fp(100));
+    let asks: Vec<_> = (2..=5).map(|m| place(mk, limit(m, false, 100, 10))).collect();
+    run(&mut ctx, path, &asks);
+    fund_native(&ctx, &t, fp(250));
+    let r = run(
+        &mut ctx,
+        path,
+        &[
+            place(t, pool_order()),
+            place(t, limit(2, true, 105, 10)),
+            place(t, with_tif(limit(3, true, 105, 10), TimeInForce::IOC)),
+            place(t, with_tif(limit(4, true, 105, 10), TimeInForce::FOK)),
+            place(t, market(5, true, fp(110), 10)),
+        ],
+    );
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    for m in 2..=5 {
+        assert_eq!(pos_in(&ctx, &t, m), fp(10), "{path:?} m{m}");
+    }
+    assert_bal(&ctx, &t, fp(240), fp(10), &format!("{path:?}"));
+}
+per_path!(non_pool_buys_unchanged);
+
+/// Option B, unchanged: a sell in the sender's POOL market — the pool-
+/// defining order itself, and a later sell in the same market — still
+/// reserves at its limit and fills from its pool (M bids 10 @101 in m1):
+/// funded 50.25 (resp. 60.25 with a resting 1 @200 first), the 10 @100 sell
+/// is admitted (50 <= 50.25) and fills 5: need IM(101 q + 100 (10 − q)) <=
+/// 50.25 (the unfilled rest is held at the limit). B applied to it would
+/// reject it at placement (50.5 > 50.25).
+fn pool_market_sell_unchanged_when_it_is_the_first_checked_order(path: Path) {
+    for first in [false, true] {
+        let (mk, t) = (addr(1), addr(2));
+        let (_d, mut ctx) = fresh(path, &[mk]);
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10))]);
+        let mut actions = Vec::new();
+        if first {
+            fund_native(&ctx, &t, fp_cents(6_025));
+            actions.push(place(t, pool_order()));
+        } else {
+            fund_native(&ctx, &t, fp_cents(5_025));
+        }
+        actions.push(place(t, limit(1, false, 100, 10)));
+        let r = run(&mut ctx, path, &actions);
+        let what = format!("{path:?} after_pool_order={first}");
+        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert_eq!(pos_in(&ctx, &t, 1), -fp(5), "{what}");
+    }
+}
+per_path!(pool_market_sell_unchanged_when_it_is_the_first_checked_order);
+
+/// Option B, unchanged: no better bid (best bid 99 < limit, or no bid at
+/// all) — the non-pool sell rests at its limit holding reserve(100, 10).
+fn non_pool_sell_without_a_better_bid_reserves_at_its_limit(path: Path) {
+    for bid in [true, false] {
+        let (mk, t) = (addr(1), addr(2));
+        let (_d, mut ctx) = fresh(path, &[mk, t]);
+        if bid {
+            run(&mut ctx, path, &[place(mk, limit(2, true, 99, 10))]);
+        }
+        let r = run(&mut ctx, path, &[place(t, pool_order()), place(t, limit(2, false, 100, 10))]);
+        let what = format!("{path:?} bid={bid}");
+        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert_eq!(resting_in(&ctx, &t, 2), vec![fp(10)], "{what}");
+        assert_bal(&ctx, &t, fp(940), fp(60), &what);
+    }
+}
+per_path!(non_pool_sell_without_a_better_bid_reserves_at_its_limit);
+
+/// Option B, unchanged: a PostOnly sell at or below the best bid is still a
+/// BOOK reject (never a margin reject), and a reduce-only sell (T long 10
+/// in m2) still closes unchecked into the bid @101.
+fn non_pool_post_only_and_reduce_only_sells_unchanged(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk, t]);
+    run(&mut ctx, path, &[place(mk, limit(2, true, 101, 10))]);
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(t, with_tif(limit(2, false, 100, 10), TimeInForce::PostOnly))]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert!(!is_margin_reject(&r[1]), "{path:?}: {:?}", r[1]);
+    assert!(resting_in(&ctx, &t, 2).is_empty(), "{path:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), FixedPoint::ZERO, "{path:?}");
+    assert_bal(&ctx, &t, fp(990), fp(10), &format!("{path:?}: post-only"));
+    // Reduce-only: T long 10 in m2 (seeded), sells 10 reduce-only.
+    ctx.positions
+        .apply_fill(&t, 2, true, fp(10), fp(100), torus_core::position::MarginType::Cross)
+        .unwrap();
+    let ro = PlaceOrderParams { reduce_only: true, ..limit(2, false, 100, 10) };
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 200, 1)), place(t, ro)]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), FixedPoint::ZERO, "{path:?}: closed");
+}
+per_path!(non_pool_post_only_and_reduce_only_sells_unchanged);
+
+/// Option B, unchanged: a stop-limit sell in a non-pool market fired by the
+/// batch's fills is placed through the single path (budget = the account).
+/// M bids 5 @101 and 5 @99 in m2; T has a stop-limit sell 5 (trigger 101,
+/// limit 95; pending reservation 23.75). Batch [T pool order, Y market sell
+/// 5]: Y fills @101, the stop fires and sells 5 @99. The pending reservation
+/// is released exactly: T keeps only the pool order's 10.
+fn triggered_stop_limit_sell_in_a_non_pool_market_unchanged(path: Path) {
+    let (mk, t, y) = (addr(1), addr(2), addr(6));
+    let (_d, mut ctx) = fresh(path, &[mk, t, y]);
+    run(&mut ctx, path, &[place(mk, limit(2, true, 101, 5)), place(mk, limit(2, true, 99, 5))]);
+    let stop = PlaceOrderParams {
+        order_type: OrderType::StopLimit { trigger: fp(101), limit: fp(95) },
+        ..limit(2, false, 95, 5)
+    };
+    assert!(run(&mut ctx, path, &[place(t, stop)])[0].success, "{path:?}");
+    assert_bal(&ctx, &t, fp_cents(97_625), fp_cents(2_375), "pending stop");
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(y, market(2, false, fp(1), 5))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &y, 2), -fp(5), "{path:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), -fp(5), "{path:?}: the fired stop sold into the 99 bid");
+    assert_bal(&ctx, &t, fp(990), fp(10), &format!("{path:?}"));
+}
+per_path!(triggered_stop_limit_sell_in_a_non_pool_market_unchanged);
+
+/// Option B, unchanged A5 identity for modify: after the partial-fill case
+/// (6 @100 resting from a B-reserved sell), modify to 8 @102 → the order
+/// holds reserve(102, 8) = 40.8.
+fn modify_of_a_resting_non_pool_sell_keeps_the_a5_identity(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    run(&mut ctx, path, &[place(mk, limit(2, true, 101, 4))]);
+    fund_native(&ctx, &t, fp(200));
+    run(&mut ctx, path, &[place(t, pool_order()), place(t, limit(2, false, 100, 10))]);
+    let id = ctx.order_books[&2].orders_for_trader(&t)[0].id;
+    let r = run(&mut ctx, path, &[(t, NativeAction::ModifyOrder { order_id: id, new_price: Some(fp(102)), new_qty: Some(fp(8)) })]);
+    assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+    assert_eq!(resting_in(&ctx, &t, 2), vec![fp(8)], "{path:?}");
+    assert_bal(&ctx, &t, fp_cents(14_920), fp_cents(5_080), &format!("{path:?}: 10 + 40.8"));
+    run(&mut ctx, path, &[(t, NativeAction::CancelAllOrders { market_id: None })]);
+    assert_bal(&ctx, &t, fp(200), FixedPoint::ZERO, &format!("{path:?}: all released"));
+}
+per_path!(modify_of_a_resting_non_pool_sell_keeps_the_a5_identity);
+
+/// B2 (s87): a taker-only budget gets the makers' +1 raw rounding
+/// allowance. T short 1 in m2 at entry 100 + 19 raw (notional ≡ 19 mod 20
+/// raw, no mark); GTC sell (1 + 1 raw) @101 into a bid at exactly 101 (no
+/// better bid: B does not apply). Its need IM(A + x) − IM(A) is 1 raw
+/// above the floor(x/20) it reserved: before B2 it was Cancelled with 0
+/// fills at its own limit price (the bench's 158 at-limit cases).
+fn taker_only_rounding_does_not_cancel_a_sell_at_its_limit(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk, t]);
+    let metrics = metered(&mut ctx);
+    let one = FixedPoint::from_raw(1);
+    ctx.positions
+        .apply_fill(&t, 2, false, fp(1), fp(100) + FixedPoint::from_raw(19), torus_core::position::MarginType::Cross)
+        .unwrap();
+    let q = fp(1) + one;
+    run(&mut ctx, path, &[place(mk, PlaceOrderParams { quantity: q, ..limit(2, true, 101, 1) })]);
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(t, PlaceOrderParams { quantity: q, ..limit(2, false, 101, 1) })]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), -(fp(2) + one), "{path:?}");
+    assert!(resting_in(&ctx, &t, 2).is_empty(), "{path:?}");
+    assert_eq!(metrics.orders_rejected_cancelled.get(), 0, "{path:?}");
+}
+per_path!(taker_only_rounding_does_not_cancel_a_sell_at_its_limit);
+
+/// Option B §7.3 #15 (A5 telescoping under B): a seeded multi-market run
+/// shaped like golden scenario A (40 senders x 12 markets, thin to rich
+/// balances, aggressive GTC / IOC / market sells and buys, reduce-only
+/// orders, cancel-alls), 8 blocks, serial and engine-forced (4 threads).
+/// After every block each sender's `order_margin` equals Σ reserve(price,
+/// remaining) over its resting rows exactly — B raises a non-pool sell's
+/// reservation, but every release is computed at the limit, so none is
+/// stranded or over-released.
+#[test]
+fn order_margin_matches_resting_reservations_under_option_b() {
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 11) % n
+        }
+    }
+    let senders: Vec<Address> = (0..40u8).map(|i| addr(10 + i)).collect();
+    let mut totals = Vec::new();
+    for threads in [1usize, 4] {
+        let (_d, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        for (i, s) in senders.iter().enumerate() {
+            fund_native(&ctx, s, fp([1_600, 4_000, 12_000, 100_000_000][i % 4]));
+        }
+        let mut rng = Lcg(0x5EED_0087_0B0B);
+        let (mut fills, mut checked) = (0u32, 0usize);
+        for block in 0..8 {
+            let mut actions = Vec::new();
+            for _ in 0..30 {
+                let si = rng.below(senders.len() as u64);
+                let s = senders[si as usize];
+                if rng.below(100) < 4 {
+                    actions.push((s, NativeAction::CancelAllOrders { market_id: None }));
+                    continue;
+                }
+                let orders: Vec<PlaceOrderParams> = (0..1 + rng.below(24))
+                    .map(|_| {
+                        let m = 1 + rng.below(12);
+                        let mid = 30_000i64;
+                        let mut is_buy = (si + m).is_multiple_of(2);
+                        let aggressive = rng.below(2) == 0;
+                        let d = 1 + rng.below(5) as i64;
+                        let mut p = limit(m, is_buy, if is_buy == aggressive { mid + d } else { mid - d }, 1);
+                        p.quantity = fp(1) + FixedPoint::from_raw(rng.below(3) as i128 * FixedPoint::SCALE / 2);
+                        match rng.below(100) {
+                            0..=9 => {
+                                p.order_type = OrderType::Market;
+                                p.time_in_force = TimeInForce::IOC;
+                                p.price = fp(if is_buy { mid + 60 } else { mid - 60 });
+                            }
+                            10..=14 => p.time_in_force = TimeInForce::IOC,
+                            15..=17 => p.time_in_force = TimeInForce::FOK,
+                            18..=22 => {
+                                is_buy = !is_buy;
+                                p.is_buy = is_buy;
+                                p.reduce_only = true;
+                                p.price = fp(if is_buy { mid + 2 } else { mid - 2 });
+                            }
+                            _ => {}
+                        }
+                        p
+                    })
+                    .collect();
+                actions.push((s, NativeAction::PlaceOrderBatch(orders)));
+            }
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &actions, threads);
+            assert!(ctx.fatal_error.is_none(), "threads={threads} block={block}");
+            assert!(r.results.iter().any(|x| x.success), "threads={threads} block={block}");
+            fills = fills.max(ctx.trade_index);
+            for s in &senders {
+                let resting = ctx.order_books.values().flat_map(|b| b.orders_for_trader(s)).fold(FixedPoint::ZERO, |acc, o| {
+                    acc + torus_core::margin::order_initial_margin(None, o.price * o.remaining_qty)
+                });
+                assert_eq!(bal(&ctx, s).order_margin, resting, "threads={threads} block={block} sender {s}");
+                checked += 1;
+            }
+        }
+        assert!(fills > 0 && checked == 8 * senders.len(), "threads={threads}: non-vacuous");
+        let state: Vec<(FixedPoint, FixedPoint)> =
+            senders.iter().map(|s| bal(&ctx, s)).map(|b| (b.available, b.order_margin)).collect();
+        totals.push(state);
+    }
+    assert_eq!(totals[0], totals[1], "serial == engine");
+}

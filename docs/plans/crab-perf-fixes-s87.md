@@ -11,6 +11,15 @@ Scope: fixes 1-3 only. Fix 4 (sharing free margin across markets) is a separate 
 discussion. Nothing here changes it, and the F1 D2/D8 rules (exclusive pool, start-of-batch
 maker snapshot) stay byte-identical.
 
+Status (option B, s87, after C4): IMPLEMENTED as C5 (owner decisions: narrow B-N + B2). A
+batch sell outside the sender's D2 pool market reserves at max(limit | mark-or-cap, start-of-
+Phase-2 best bid); a taker-only budget gets the makers' +1 raw rounding allowance. GOLDEN_A
+re-pinned (accepted 1555 → 1686, rejected_cancelled 299 → 188, rejected_margin 2078 → 2079),
+GOLDEN_B unchanged. ubench_econ: rejected_cancelled ~17.5k → ~5.6k per run, fills/block 6.2k →
+9.9k, ms/1k fills ~37-41 → ~29-30 (UB_MARKS=1 ~59-69 → ~42-46). Every remaining zero-fill
+exhaustion hits a bid placed earlier in the same batch above the start best bid (probe; 25-28% of
+the pre-B 17.5k). The same-batch bound is NOT implemented; it needs owner approval.
+
 ## Design decision
 
 | Fix | Chosen design | Consensus impact |

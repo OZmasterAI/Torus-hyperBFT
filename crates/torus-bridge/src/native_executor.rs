@@ -905,6 +905,10 @@ struct SenderFold {
     /// Per-user open-order limit: each sender's slots in this
     /// `execute_batch` call (see [`NativeExecutor::take_open_slot`]).
     open_slots: HashMap<Address, Option<OpenSlots>>,
+    /// Option B (s87): F1 D2 mirror — the market of the sender's first
+    /// ACCEPTED match-checked order of this batch (flat order), i.e. the
+    /// market Phase 3 gives its pool ([`NativeExecutor::d2_pool_takers`]).
+    pool: HashMap<Address, MarketId>,
 }
 
 impl SenderFold {
@@ -916,6 +920,7 @@ impl SenderFold {
             released: HashMap::new(),
             committed: HashMap::new(),
             open_slots: HashMap::new(),
+            pool: HashMap::new(),
         }
     }
 }
@@ -4228,6 +4233,8 @@ impl NativeExecutor {
             })
             .collect();
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
+        // Option B (s87): each market's best bid at the start of Phase 2.
+        let bid_floors = Self::phase2_bid_floors(ctx, &place_orders);
         // Fix 1 (s87): one mark read per market for Phases 2-3 — the markets
         // of this call's orders, of the resident books and of the configs.
         let batch_marks = BatchMarks::new(
@@ -4270,7 +4277,7 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
-                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &groups, engine_threads, n) {
+                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &bid_floors, &groups, engine_threads, n) {
                     Some((outcomes, worker_cache)) => {
                         // Sender shards are disjoint, so the merged cache is
                         // exactly the serial loop's cache.
@@ -4317,7 +4324,8 @@ impl NativeExecutor {
                     (s, FlatAction::Place(p)) => (s, *p),
                     (_, FlatAction::Other(_)) => unreachable!(),
                 };
-                let outcome = Self::prepare_one(&reader, &open_at_start, &basis, &mut fold, i, sender, params);
+                let outcome =
+                    Self::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &mut fold, i, sender, params);
                 Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
@@ -4338,12 +4346,6 @@ impl NativeExecutor {
         // running budget; its other markets start at 0 — no two market
         // workers spend the same free margin. Sorted by flat index, never
         // HashMap order.
-        let mut checked_takers: Vec<(usize, Address, MarketId, FixedPoint)> = market_batches
-            .values()
-            .flatten()
-            .filter_map(|p| p.checked_pos_net.map(|n| (p.index, p.sender, p.params.market_id, n)))
-            .collect();
-        checked_takers.sort_unstable_by_key(|c| c.0);
         // Review fix 1 (s517): unchecked orders' committed-but-undebited
         // need comes off their sender's pool (exact integer sum).
         let mut excess_by_sender: HashMap<Address, FixedPoint> = HashMap::new();
@@ -4353,15 +4355,12 @@ impl NativeExecutor {
             }
         }
         let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
-        let mut pooled: BTreeSet<Address> = BTreeSet::new();
-        for (_, sender, market_id, pos_net) in checked_takers {
-            if pooled.insert(sender) {
-                let available = bal_cache
-                    .load(&ctx.positions, &sender)
-                    .map_or(FixedPoint::ZERO, |b| b.available);
-                let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
-                pools.insert((sender, market_id), available + pos_net - excess);
-            }
+        for (sender, market_id, pos_net) in Self::d2_pool_takers(&market_batches) {
+            let available = bal_cache
+                .load(&ctx.positions, &sender)
+                .map_or(FixedPoint::ZERO, |b| b.available);
+            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
+            pools.insert((sender, market_id), available + pos_net - excess);
         }
 
         let margin_elapsed = margin_timer.elapsed();
@@ -4601,10 +4600,13 @@ impl NativeExecutor {
     /// the available balance left after it, in this per-sender fold.
     /// Reduce-only is NOT pre-checked here: Phase 2 only sees pre-batch
     /// positions, so the book polices it at match time (Phase 3).
+    /// Option B (s87): `bid_floors` = [`phase2_bid_floors`].
+    #[allow(clippy::too_many_arguments)]
     fn prepare_one<T: StateBackend>(
         reader: &AccountReader<'_, T>,
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        bid_floors: &HashMap<MarketId, FixedPoint>,
         fold: &mut SenderFold,
         i: usize,
         sender: &Address,
@@ -4627,15 +4629,26 @@ impl NativeExecutor {
                 msg,
             };
         }
-        let (res_price, res_qty) = basis
+        let (base_price, res_qty) = basis
             .get(&i)
             .copied()
             .unwrap_or((Self::reserve_price(params), params.quantity));
-        let required = match Self::try_reserve_for_qty_cfg(
-            reader.margin_configs.get(&params.market_id),
-            res_price,
-            res_qty,
-        ) {
+        let cfg = reader.margin_configs.get(&params.market_id);
+        let mut res_price = base_price;
+        // Option B (s87): outside its D2 pool market a sell's match-time
+        // budget is only its own reservation (`insert_taker_only`), so it
+        // reserves — and is placement-checked — for the best bid it can hit
+        // at the start of Phase 2 (`max(base, best bid)`, quantity unchanged).
+        // Its hold, resting row and every release stay at the limit (A5).
+        // A best bid whose notional would overflow keeps `base`.
+        if Self::takes_bid_floor(params) && fold.pool.get(sender).is_some_and(|m| *m != params.market_id) {
+            if let Some(&bid) = bid_floors.get(&params.market_id) {
+                if bid > res_price && Self::try_reserve_for_qty_cfg(cfg, bid, res_qty).is_ok() {
+                    res_price = bid;
+                }
+            }
+        }
+        let required = match Self::try_reserve_for_qty_cfg(cfg, res_price, res_qty) {
             Ok(r) => r,
             Err(msg) => {
                 return PrepOutcome::Reject {
@@ -4755,13 +4768,16 @@ impl NativeExecutor {
                     e.0 - params.quantity
                 };
                 if e.1 == FixedPoint::ZERO {
-                    e.1 = res_price;
+                    e.1 = base_price;
                 }
             }
         }
         // The order passed: it now holds its open-order slot.
         if taken.is_some() {
             fold.open_slots.insert(*sender, taken);
+        }
+        if checked {
+            fold.pool.entry(*sender).or_insert(params.market_id);
         }
         PrepOutcome::Pass(
             required,
@@ -4827,10 +4843,12 @@ impl NativeExecutor {
     /// per-flat-index outcomes plus the merged (sender-disjoint) cache;
     /// `None` if any worker panicked (caller falls back to the serial loop —
     /// nothing shared has been mutated).
+    #[allow(clippy::too_many_arguments)]
     fn phase2_parallel_prepare<T: StateBackend>(
         reader: &AccountReader<'_, T>,
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        bid_floors: &HashMap<MarketId, FixedPoint>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -4854,7 +4872,16 @@ impl NativeExecutor {
                                     // L3-ENG: literally the serial loop's step.
                                     out.push((
                                         i,
-                                        Self::prepare_one(reader, open_at_start, basis, &mut fold, i, sender, params),
+                                        Self::prepare_one(
+                                            reader,
+                                            open_at_start,
+                                            basis,
+                                            bid_floors,
+                                            &mut fold,
+                                            i,
+                                            sender,
+                                            params,
+                                        ),
                                     ));
                                 }
                             }
@@ -5900,6 +5927,14 @@ impl NativeExecutor {
             }
     }
 
+    /// Option B (s87): a match-checked sell that can take (not PostOnly) —
+    /// the orders whose batch reservation, outside the sender's D2 pool
+    /// market, is raised to the start-of-batch best bid ([`prepare_one`]).
+    /// Reduce-only orders and stops are not match-checked.
+    fn takes_bid_floor(params: &PlaceOrderParams) -> bool {
+        !params.is_buy && Self::match_margin_checked(params) && params.time_in_force != TimeInForce::PostOnly
+    }
+
     /// s515 review 5 (F2): an order that can never rest — market, or an IOC /
     /// FOK limit. Its whole placement reservation is released after matching
     /// (`rested_qty` = 0), so it reserves only for the quantity beyond what
@@ -6081,6 +6116,48 @@ impl NativeExecutor {
             }
         }
         out
+    }
+
+    /// Option B (s87): the best bid of every market with a
+    /// [`takes_bid_floor`] order, read once after Phase 1 and before any
+    /// matching (Phase 2 does not touch the books), shared read-only by the
+    /// serial and sharded prepare paths. Books are consensus state, so every
+    /// node reads the same prices. A market without bids has no entry.
+    fn phase2_bid_floors<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> HashMap<MarketId, FixedPoint> {
+        let mut out = HashMap::new();
+        let mut seen: std::collections::HashSet<MarketId> = std::collections::HashSet::new();
+        for &(_, _, p) in orders {
+            if Self::takes_bid_floor(p) && seen.insert(p.market_id) {
+                if let Some(bid) = ctx.order_books.get(&p.market_id).and_then(OrderBook::best_bid) {
+                    out.insert(p.market_id, bid);
+                }
+            }
+        }
+        out
+    }
+
+    /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of
+    /// the batch in flat order — as `(sender, market, pos_net)`. Phase 3
+    /// gives the sender's free margin to that market only; Phase 2 mirrors
+    /// the market in `SenderFold::pool` (Option B).
+    fn d2_pool_takers(
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+    ) -> Vec<(Address, MarketId, FixedPoint)> {
+        let mut checked_takers: Vec<(usize, Address, MarketId, FixedPoint)> = market_batches
+            .values()
+            .flatten()
+            .filter_map(|p| p.checked_pos_net.map(|n| (p.index, p.sender, p.params.market_id, n)))
+            .collect();
+        checked_takers.sort_unstable_by_key(|c| c.0);
+        let mut pooled: BTreeSet<Address> = BTreeSet::new();
+        checked_takers
+            .into_iter()
+            .filter(|c| pooled.insert(c.1))
+            .map(|(_, sender, market_id, pos_net)| (sender, market_id, pos_net))
+            .collect()
     }
 
     /// s515 (BUG 1): Hyperliquid parity — a market order is an aggressive
@@ -8422,5 +8499,163 @@ mod batch_maker_accounts_tests {
             pairs_checked += pairs.len();
         }
         assert!(pairs_checked > 1_000 && marked > 100 && overflowed > 0, "non-vacuous: {pairs_checked} {marked} {overflowed}");
+    }
+}
+
+/// Option B (s87): Phase 2's `SenderFold::pool` must name exactly the market
+/// Phase 3 gives each sender's D2 pool — else B would raise a sell in the
+/// pool market or miss a taker-only one.
+#[cfg(test)]
+mod option_b_fold_pool_tests {
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// 100 seeded batches: 2-8 senders (unfunded / thin / rich), 1-5 markets
+    /// with or without resting bids, orders of every kind — limit / market /
+    /// IOC / FOK / PostOnly / reduce-only / stops, buys and sells, some
+    /// invalid (market price 0) — so senders' first checked orders are often
+    /// rejected (margin, validation). The serial fold's `pool` equals the
+    /// keys of Phase 3's pools ([`NativeExecutor::d2_pool_takers`]), and the
+    /// sharded prepare's outcomes give the same pools.
+    #[test]
+    fn fold_pool_equals_phase3_pool() {
+        let mut rng = Lcg(0x5EED_0B0B);
+        let (mut pooled, mut first_rejected, mut raised) = (0usize, 0usize, 0usize);
+        for round in 0..100u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let mut ctx = NativeExecContext::new(db, 9, 10_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            let n_senders = 2 + rng.below(7);
+            let n_markets = 1 + rng.below(5);
+            let senders: Vec<Address> = (0..n_senders).map(|i| Address::new([10 + i as u8; 20])).collect();
+            for s in &senders {
+                let available = fp([0, 30, 60, 1_000_000][rng.below(4) as usize]);
+                ctx.positions
+                    .put_native_balance(s, &NativeBalance { available, order_margin: FixedPoint::ZERO })
+                    .unwrap();
+            }
+            let maker = Address::new([200; 20]);
+            for m in 1..=n_markets {
+                if rng.below(3) > 0 {
+                    let mut b = OrderBook::new(m, FixedPoint::ONE, FixedPoint::ONE);
+                    let bid = PlaceOrderParams {
+                        market_id: m,
+                        is_buy: true,
+                        price: fp(95 + rng.below(15) as i64),
+                        quantity: fp(5),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    };
+                    b.place_order(bid, maker, 1);
+                    ctx.order_books.insert(m, b);
+                }
+            }
+            let orders: Vec<(Address, PlaceOrderParams)> = (0..2 + rng.below(30))
+                .map(|_| {
+                    let s = senders[rng.below(n_senders) as usize];
+                    let price = fp(90 + rng.below(20) as i64);
+                    let mut p = PlaceOrderParams {
+                        market_id: 1 + rng.below(n_markets),
+                        is_buy: rng.below(2) == 0,
+                        price,
+                        quantity: fp(1 + rng.below(10) as i64),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    };
+                    match rng.below(12) {
+                        0 => p.order_type = OrderType::Market,
+                        1 => {
+                            p.order_type = OrderType::Market;
+                            p.price = FixedPoint::ZERO; // validation reject
+                        }
+                        2 => p.time_in_force = TimeInForce::IOC,
+                        3 => p.time_in_force = TimeInForce::FOK,
+                        4 => p.time_in_force = TimeInForce::PostOnly,
+                        5 => p.reduce_only = true,
+                        6 => p.order_type = OrderType::StopLimit { trigger: price, limit: price },
+                        _ => {}
+                    }
+                    (s, p)
+                })
+                .collect();
+            let place_orders: Vec<(usize, Address, &PlaceOrderParams)> =
+                orders.iter().enumerate().map(|(i, (s, p))| (i, *s, p)).collect();
+            let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
+            let bid_floors = NativeExecutor::phase2_bid_floors(&ctx, &place_orders);
+            let open_at_start = HashMap::new();
+            let reader = AccountReader::of(&ctx);
+
+            let mut fold = SenderFold::new(BalanceCache::new());
+            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut results: Vec<NativeActionResult> =
+                (0..orders.len()).map(|_| NativeActionResult::ok("pending", 0)).collect();
+            let mut next_id = 1u128;
+            let mut first_seen: HashMap<Address, bool> = HashMap::new();
+            for (i, (s, p)) in orders.iter().enumerate() {
+                let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &mut fold, i, s, p);
+                if let PrepOutcome::Pass(r, _, _) = &outcome {
+                    let base = basis.get(&i).map_or(NativeExecutor::reserve_price(p), |b| b.0);
+                    let qty = basis.get(&i).map_or(p.quantity, |b| b.1);
+                    if *r > NativeExecutor::reserve_for_qty_cfg(None, base, qty) {
+                        raised += 1;
+                    }
+                }
+                if NativeExecutor::match_margin_checked(p) && !first_seen.contains_key(s) {
+                    first_seen.insert(*s, true);
+                    if matches!(outcome, PrepOutcome::Reject { .. }) {
+                        first_rejected += 1;
+                    }
+                }
+                NativeExecutor::stitch_outcome(&mut next_id, &None, &mut batches, &mut results, i, s, p, outcome);
+            }
+            let want: HashMap<Address, MarketId> =
+                NativeExecutor::d2_pool_takers(&batches).into_iter().map(|(s, m, _)| (s, m)).collect();
+            assert_eq!(fold.pool, want, "round {round}: serial fold");
+            pooled += want.len();
+
+            // Sharded prepare (2 workers): its outcomes stitched in flat order.
+            let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
+            for (i, (s, p)) in orders.iter().enumerate() {
+                match groups.iter_mut().find(|g| g.0 == *s) {
+                    Some(g) => g.1.push((i, p)),
+                    None => groups.push((*s, vec![(i, p)])),
+                }
+            }
+            let (mut outcomes, _) = NativeExecutor::phase2_parallel_prepare(
+                &reader,
+                &open_at_start,
+                &basis,
+                &bid_floors,
+                &groups,
+                2,
+                orders.len(),
+            )
+            .expect("no worker panic");
+            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut next_id = 1u128;
+            for (i, (s, p)) in orders.iter().enumerate() {
+                let o = outcomes[i].take().unwrap();
+                NativeExecutor::stitch_outcome(&mut next_id, &None, &mut sharded, &mut results, i, s, p, o);
+            }
+            let got: HashMap<Address, MarketId> =
+                NativeExecutor::d2_pool_takers(&sharded).into_iter().map(|(s, m, _)| (s, m)).collect();
+            assert_eq!(got, want, "round {round}: sharded");
+        }
+        assert!(pooled > 100 && first_rejected > 10 && raised > 10, "non-vacuous");
     }
 }

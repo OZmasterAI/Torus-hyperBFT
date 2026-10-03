@@ -119,7 +119,13 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
     behind it (bounded; nothing is withdrawable while it is).
   * D2 — batch pools: a sender's free margin is exclusive to the market of its
     first checked taker; its checked takers in other markets of the same batch
-    fill only within their own reservation (conservative).
+    fill only within their own reservation (conservative). Option B (s87): such
+    a non-pool SELL (limit, IOC / FOK, market; not PostOnly or reduce-only)
+    reserves — and is placement-checked — at max(its limit or mark-or-cap, the
+    market's best bid at the start of Phase 2); its resting row and every
+    release stay at the limit. A taker-only budget gets the makers' +1 raw
+    rounding allowance (B2). Bids placed earlier in the same batch above the
+    start best bid are still not covered (residual, item D).
   * D3 — withdrawals do not count resting orders' reservations as collateral
     (stricter than HL).
   * D4 — a resting closing quantity is free at match but still reserved at

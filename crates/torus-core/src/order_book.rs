@@ -264,10 +264,7 @@ impl TakerMarginLimit {
         left_before: FixedPoint,
     ) -> FixedPoint {
         let fits = |q: FixedPoint| {
-            q <= free
-                || self
-                    .need(m, price, q, free, left_before)
-                    .is_some_and(|n| n <= m.budget)
+            q <= free || self.need(m, price, q, free, left_before).is_some_and(|n| m.fits(n))
         };
         if fits(q) {
             return q;
@@ -301,6 +298,34 @@ struct MatchMargin<'a> {
     /// Notional of the charged (non-closing) part of the fills so far.
     charged: FixedPoint,
     exhausted: bool,
+    /// B2 (s87): the sender's entry here is a taker-only budget (D2
+    /// non-pool market), which gets the makers' rounding allowance.
+    taker_only: bool,
+}
+
+impl MatchMargin<'_> {
+    /// B2 (s87): what a need costs the sender's running free margin beyond
+    /// the order's own reservation. Each IM difference is floored, so a
+    /// taker adding to a same-side position can need its reservation + 1 raw
+    /// (floor(A + x) − floor(A) = floor(x) + 1) at no price improvement —
+    /// rounding, not cost. As for makers ([`maker_fill_fits`]), a taker-only
+    /// budget does not pay that unit: it was cancelled with 0 fills at its
+    /// own limit price for it. Shared accounts (single path, D2 pool market)
+    /// are unchanged.
+    fn over_reservation(&self, need: FixedPoint) -> FixedPoint {
+        let over = need - self.limit.budget;
+        if self.taker_only && over == FixedPoint::from_raw(1) {
+            FixedPoint::ZERO
+        } else {
+            over
+        }
+    }
+
+    /// Whether `need` fits: its part beyond the reservation must fit the
+    /// running free margin (`budget − limit.budget`).
+    fn fits(&self, need: FixedPoint) -> bool {
+        need <= self.budget || self.over_reservation(need) <= self.budget - self.limit.budget
+    }
 }
 
 /// s515: signed positions (+long / -short) in this book's market of the
@@ -1040,6 +1065,7 @@ impl OrderBook {
                 budget: limit.budget + acct.map_or(FixedPoint::ZERO, |a| a.free),
                 charged: FixedPoint::ZERO,
                 exhausted: false,
+                taker_only: self.account_margins.taker_only.contains(&trader),
             }
         });
         if params.time_in_force == TimeInForce::FOK {
@@ -1068,7 +1094,7 @@ impl OrderBook {
                                 .ok()
                                 .and_then(|x| x.checked_add(n).ok());
                             matches!((before, after), (Some(b), Some(a))
-                                if crate::margin::im_delta(m.limit.tiers.as_deref(), b, a) <= m.budget)
+                                if m.fits(crate::margin::im_delta(m.limit.tiers.as_deref(), b, a)))
                         })
                 }),
             };
@@ -1189,8 +1215,9 @@ impl OrderBook {
                         d.checked_add(kept).ok()
                     })
                     .unwrap_or(m.budget);
+                // B2 (s87): a forgiven rounding unit never reaches the free.
                 self.account_margins
-                    .set_free(&trader, a.free + m.limit.budget - spent);
+                    .set_free(&trader, a.free - m.over_reservation(spent));
             }
         }
 
@@ -6359,5 +6386,80 @@ mod taker_margin_limit_tests {
         let r = b.place_order_with_accounts(market_sell(fp(1)), addr(2), 2, None, Some(&src));
         assert_eq!(filled(&r), fp(1));
         assert!(r.margin_cancels.is_empty());
+    }
+
+    /// B2 (s87): the bench's at-limit case. T short 1 valued at 100 + 19
+    /// raw (notional ≡ 19 mod 20 raw) sells q = 1 + 1 raw @101 into a bid at
+    /// exactly 101: x = 101 q ≡ 1 mod 20 raw, so its need IM(A + x) − IM(A)
+    /// is floor(x/20) + 1 raw while its budget (its reservation) is
+    /// floor(x/20). `(taker_only, tif, account free)` → filled: a taker-only
+    /// budget (D2 non-pool market) gets the makers' +1 raw rounding
+    /// allowance (GTC and the FOK pre-check); a shared account at free 0 and
+    /// a taker-only one already below 0 do not.
+    #[test]
+    fn b2_taker_only_rounding_does_not_cancel_at_the_limit() {
+        let one = FixedPoint::from_raw(1);
+        let q = fp(1) + one;
+        let px = fp(101);
+        let reserve = FixedPoint::from_raw((px * q).raw() / 20);
+        for (taker_only, tif, free, fills) in [
+            (true, TimeInForce::GTC, FixedPoint::ZERO, true),
+            (true, TimeInForce::FOK, FixedPoint::ZERO, true),
+            (true, TimeInForce::GTC, -one, false),
+            (false, TimeInForce::GTC, FixedPoint::ZERO, false),
+            (false, TimeInForce::FOK, FixedPoint::ZERO, false),
+        ] {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            b.place_order(order(true, px, q), addr(1), 1);
+            let mut pos = ReduceOnlyPositions::new();
+            pos.insert(addr(2), -fp(1));
+            b.set_reduce_only_positions(pos);
+            let mut am = AccountMargins::new(None);
+            let entry = FixedPoint::from_raw(fp(100).raw() + 19);
+            if taker_only {
+                am.insert_taker_only(addr(2), entry);
+                am.set_free(&addr(2), free);
+            } else {
+                am.insert(addr(2), free, entry);
+            }
+            b.set_account_margins(am);
+            let p = PlaceOrderParams { time_in_force: tif, ..order(false, px, q) };
+            let hold = (tif == TimeInForce::GTC).then_some(px);
+            let r = b.place_order_with_margin(p, addr(2), 2, Some(&limit(reserve, hold)));
+            let what = format!("taker_only={taker_only} {tif:?} free={free}");
+            assert_eq!(filled(&r), if fills { q } else { FixedPoint::ZERO }, "{what}");
+            if fills {
+                // The forgiven raw unit does not leak into the running free.
+                assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, free, "{what}");
+            }
+        }
+    }
+
+    /// B2 (s87): the allowance is per taker, like the makers' per fill, and
+    /// the forgiven unit never leaks into the running free: a second such
+    /// sell of the same sender in the same taker-only book fills too.
+    #[test]
+    fn b2_taker_only_rounding_allowance_is_per_taker() {
+        let one = FixedPoint::from_raw(1);
+        let px = fp(101);
+        let entry = FixedPoint::from_raw(fp(100).raw() + 19);
+        let im = |n: FixedPoint| crate::margin::order_initial_margin(None, n);
+        let (q1, q2) = (fp(1) + one, fp(1) + one + one);
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        b.place_order(order(true, px, q1 + q2), addr(1), 1);
+        let mut pos = ReduceOnlyPositions::new();
+        pos.insert(addr(2), -fp(1));
+        b.set_reduce_only_positions(pos);
+        let mut am = AccountMargins::new(None);
+        am.insert_taker_only(addr(2), entry);
+        b.set_account_margins(am);
+        for (id, size0, q) in [(2u64, fp(1), q1), (3, fp(2) + one, q2)] {
+            // Precondition: each sell's need is exactly its reservation + 1 raw.
+            let (a, x) = (size0 * entry, px * q);
+            assert_eq!(im(a + x) - im(a), im(x) + one, "sell {id}");
+            let r = b.place_order_with_margin(order(false, px, q), addr(2), id, Some(&limit(im(x), Some(px))));
+            assert_eq!(filled(&r), q, "sell {id}");
+            assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, FixedPoint::ZERO, "sell {id}");
+        }
     }
 }

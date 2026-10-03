@@ -108,7 +108,10 @@ free     = equity − required
   what is left, later ones get what remains after it). Nothing is shared
   across market workers, so parallel matching stays deterministic. The
   book's `need` switches to the position-size tier (it already has the
-  sender's position via `ReduceOnlyPositions`).
+  sender's position via `ReduceOnlyPositions`). B (s87): a sell outside the
+  sender's pool market reserves at max(limit | mark-or-cap, start-of-batch
+  best bid), so its own budget covers the better bids it hits (see
+  `docs/parity-audit-fixes-s515.md` D2).
 * **Withdrawal (Phase 1 + CoreWriter):** allowed iff `amount <= min(available,
   free)` (unrealized profit is not withdrawable beyond collateral; HL rule to
   be confirmed during planning).

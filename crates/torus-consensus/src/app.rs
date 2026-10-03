@@ -16403,6 +16403,63 @@ mod crash_recovery_tests {
         assert_eq!(root_s, root_r);
     }
 
+    /// Option B (s87): GTC limits `(market, is_buy, price, qty)` as one
+    /// PlaceOrderBatch of `seed`.
+    fn signed_limits(seed: u8, nonce: u64, orders: &[(u64, bool, i64, i64)]) -> SignedNativeAction {
+        let orders = orders
+            .iter()
+            .map(|&(market_id, is_buy, price, qty)| torus_types::PlaceOrderParams {
+                market_id,
+                is_buy,
+                price: px(price),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            })
+            .collect();
+        torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &oracle_key(seed))
+    }
+
+    /// Option B: T (71) funded 101, maker M (73) rich.
+    fn option_b_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, 101), (73, 1_000_000)] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        (config, db)
+    }
+
+    /// Option B (s87): block 1: M bids 10 @101 in markets 1 and 2; block 5
+    /// (inside the replayed range): T sells 10 @100 in both in one batch —
+    /// the market-2 sell (T's non-pool market) reserves at the start-of-batch
+    /// best bid 101 and fills. Serial, pipelined (parked) and crash replay
+    /// give identical state.
+    #[test]
+    fn option_b_serial_pipelined_and_replay_are_identical() {
+        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10)])]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
+        rounds.push(vec![signed_limits(71, 5_071, &[(1, false, 100, 10), (2, false, 100, 10)])]); // 5
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
+        let blocks = liq_blocks(rounds);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, option_b_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, option_b_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, option_b_fixture);
+        let pm = torus_core::position::PositionManager::new(db_s.clone());
+        for m in [1u64, 2] {
+            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!((p.is_long, p.size), (false, px(10)), "market {m}: filled @101");
+        }
+        assert_dumps_equal(&serial, &piped, "option B: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "option B: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
     fn signed_stop_limit_buy(seed: u8, nonce: u64, trigger: i64, limit: i64, qty: i64) -> SignedNativeAction {
         torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(torus_types::PlaceOrderParams {

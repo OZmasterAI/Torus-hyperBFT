@@ -2,6 +2,8 @@
 //! per-block digests pinned on `c93c579`, before any of fixes 1-3. The fixes
 //! only change HOW MUCH work execution does, never what it writes or
 //! returns, so these digests must stay identical after every fix commit.
+//! Option B (s87) changes outcomes on purpose: it re-pinned scenario A only
+//! (scenario B — GTC bids and liquidation orders — is unchanged).
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
@@ -411,20 +413,23 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
     blocks
 }
 
-/// Scenario A on c93c579 — serial and engine-forced (4 threads) are identical.
+/// Scenario A — serial and engine-forced (4 threads) are identical. Pinned on
+/// c93c579; re-pinned at option B (s87): an intended outcome change (a
+/// non-pool batch sell reserves at the start-of-batch best bid; taker-only
+/// rounding allowance). Fixes 1-3 were proven against the c93c579 digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0xb7acfaf230bd80dda98a8f4f2f9ceb6746dfe55110ee0ec39c7189831ba0572f",
-    "0xb4064fa2697439bd6f3f36d1b356eed17c7ec6a0431964aa9ad6342eb6f753e7",
-    "0x97b97cbe4b7a6df386ff7f79a3159541c5f490c8093c75e71e51f607e3686922",
-    "0x20c906a7b6c3d982b29ef681cafc84d7d09100a7fec17cfa70ea50a940dbcfdd",
-    "0x671c77a82745d0dd3f10b9f279ea8833abc72100e8998df4dc396c1f57af6e69",
-    "0xfc74d323b3388c6b0cff11bfc688a7ce044820df4eb12c2de663da64cf33fe4e",
-    "0x14caf7a561ecefbab1d209cbb00f4582b8b625a635b4fe5f4f01048439da9f01",
-    "0x6731ae429d9e373e1ce51131f0e5a2810734dbbf1f1efb987583a0fa03862635",
-    "0x7becccbe28697fb1db3df5c08545a2e5e1d3af310ddd0fd3e389a532fbceef06",
-    "0x4a2769f5035ddff205a7a405eb8bba387b3161829351ea4933fa5351408d3ae7",
-    "0x82a5e541a5bcb3def1faf9217d828e08b0845f21b45c94279f8816cd3046f171",
+    "0x97a019f723fb8016a94c49312d448c7c8fa6d2e45748dcb4649138e0725700f2",
+    "0x97c1282cfdb652cfcfdbcf1f1155799cbb011e46d5daf7b151ba5ce83e9e6f8f",
+    "0x5c727dd6855271b0c44b65e0205cfe637095cc30ddee2ad3633161dd9714b005",
+    "0xb7742e49fd8eee2c6e0912c8b81db3a800eb73c3cf54736209ea37f2d33073cb",
+    "0xa3af2f57259b6a20e6bf7d0fd807ab296d1f3ea1c8b7d0d506b17f7e3ae83b5f",
+    "0x8d4c86b3a7754849b811dda505137c2a0b4909765c2a528c5fc1fa0e5f72c899",
+    "0x88c2d4f08eca760e7c390f0fe32312ebd7cdee7a06c5605800c3e3000506d870",
+    "0x2ee42dae75812922366fb9525300adb374a28476c4d17e08786371b3971dcac9",
+    "0x0d6557fb541fe9533c54f578d130f7388ce06ad4bc6a7a6c0514991e2fa78c7c",
+    "0xba4c045956410dc085a84c4e2cd14df1f4fc6cf348f6a9b4c2b23331974efac5",
+    "0x2de559f0e059e2f07c277f49b4c19452e9bd8729fa4d932b8812235f5d047ca3",
 ];
 /// Scenario B on c93c579.
 const GOLDEN_B: [&str; 18] = [
@@ -455,12 +460,12 @@ fn check(name: &str, got: &[String], want: &[&str]) {
     }
     assert_eq!(got.len(), want.len(), "{name}: block count");
     for (h, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(g, w, "{name}: block {} digest differs from c93c579", h + 1);
+        assert_eq!(g, w, "{name}: block {} digest differs from the pinned one", h + 1);
     }
 }
 
 #[test]
-fn scenario_a_serial_digests_equal_c93c579() {
+fn scenario_a_serial_digests_golden() {
     let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
     let (_d, db) = listed_db(&markets);
     let blocks = scenario_a(&db);
@@ -468,7 +473,7 @@ fn scenario_a_serial_digests_equal_c93c579() {
 }
 
 #[test]
-fn scenario_a_engine_digests_equal_c93c579() {
+fn scenario_a_engine_digests_golden() {
     let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
     let (_d, db) = listed_db(&markets);
     let blocks = scenario_a(&db);
