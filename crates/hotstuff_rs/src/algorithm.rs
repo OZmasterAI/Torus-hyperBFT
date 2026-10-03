@@ -103,8 +103,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         // the first loop pass runs the ordinary enter_view(init_view): the
         // replica proposes there if it leads it, and sends the NewView for
         // init_view - 1. A fresh chain (init view 0) starts as before.
+        // s85: a replica booting back into the epoch-change view it entered
+        // last (see `boot_view`) starts HotStuff IN that view: enter_view
+        // already ran there before the restart, and running it again would
+        // let a leader of that view propose a second, conflicting block.
         let hotstuff_view_info = match init_view.int() {
             0 => init_view_info.clone(),
+            _ if init_view == highest_view_entered => init_view_info.clone(),
             v => ViewInfo::new(ViewNumber::new(v - 1), init_view_info.deadline),
         };
 

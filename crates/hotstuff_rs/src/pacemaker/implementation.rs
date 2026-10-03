@@ -1298,17 +1298,31 @@ fn epoch(view: ViewNumber, epoch_length: EpochLength) -> u64 {
 /// The view a replica boots into, from its persisted progress: the view after
 /// the highest view with progress (entered, or certified by its Highest PC or
 /// Highest TC), or view 0 on a fresh chain.
+///
+/// s85 epoch-boundary rejoin: the one exception is an epoch-change view E that
+/// the replica ENTERED but holds no QC or TC for. A replica may leave E only
+/// with a certificate for it, so it boots back INTO E. Booting at E + 1 (the
+/// next epoch) left the replicas still in E unable to form TC(E) when they
+/// needed this replica's TimeoutVote (all of them at n = 3 equal stakes),
+/// since it drops messages for views below its own and round-skip never
+/// crosses an epoch. Re-entering E is safe: a second phase vote in E is
+/// refused by the persisted `highest_view_voted`, and the caller starts
+/// HotStuff in E without running `enter_view`, so it never proposes in E again.
 pub(crate) fn boot_view(
     highest_view_entered: ViewNumber,
     highest_pc_view: ViewNumber,
     highest_tc_view: Option<ViewNumber>,
-    _epoch_length: EpochLength,
+    epoch_length: EpochLength,
 ) -> ViewNumber {
-    let progress = highest_view_entered
-        .max(highest_pc_view)
-        .max(highest_tc_view.unwrap_or(ViewNumber::init()));
+    let highest_tc_view = highest_tc_view.unwrap_or(ViewNumber::init());
+    let progress = highest_view_entered.max(highest_pc_view).max(highest_tc_view);
+    let uncertified_epoch_change_view = progress == highest_view_entered
+        && is_epoch_change_view(&progress, epoch_length)
+        && highest_pc_view < progress
+        && highest_tc_view < progress;
     match progress.int() {
         0 => ViewNumber::new(0),
+        _ if uncertified_epoch_change_view => progress,
         v => ViewNumber::new(v + 1),
     }
 }
