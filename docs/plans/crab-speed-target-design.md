@@ -12,8 +12,8 @@ Sources (read-only):
 * perf fixes 3/2a/1: `perf/s87-crab-fixes` (`d0d722b`, `6cbd812`, `473a037`, `4d81f4a`),
   plan `wt/s87-ubench/docs/plans/crab-perf-fixes-s87.md`.
 * option B design (s87, owner decisions at its end; session scratchpad, not committed).
-* item 6: `docs/plans/market-scaling-in-memory-design.md` (this branch; D1-D16). It is
-  not edited here. Section 3 lists what its update has to take from this document.
+* item 6: `docs/plans/market-scaling-in-memory-design.md` (this branch; D1-D16). Section 3
+  lists what its update had to take from this document; the update was made in s89.
 
 ## 1. Summary (plain language)
 
@@ -253,7 +253,7 @@ Fork risks:
 
 ## 3. Mapping onto item 6 phases, and what gets deleted
 
-Build order per item 6 D1: 1 -> 3 -> 4 -> 2 -> 5 (owner numbering), each phase a branch
+Build order per item 6 D1: Phase 1 -> 2 -> 3 -> 4 -> 5 (numbered in build order), each phase a branch
 in the linear stack (D16), benched against main and the previous phase.
 
 | Step | Crab work | Deletes (no duplicate implementation may remain) |
@@ -261,10 +261,10 @@ in the linear stack (D16), benched against main and the previous phase.
 | now: perf fixes 3/2a/1 (done) | overlay range lookup, no-mark liquidation skip, one maker snapshot per batch | none |
 | now: B (+ taker +1 raw) | 2.4 | none |
 | interim 2b | only if the oracle-on devnet misses the 90% bar before Phase 1 lands | (would be replaced by Phase 1) |
-| item 6 Phase 1 | R for positions + balances, built so it can ALSO serve ordered prefix iteration (`positions_for_trader`, `traders_after`); `TraderSummary` side map updated when R is updated (O(changed rows)); per-block mark table; summary consumers (2.2); liquidation L1 (+ L2 if needed) | `AccountReader::view` / `maker_account` / `maker_free` / `maker_position_px` storage reads; fix 1 `BatchMakerAccounts` and `BatchMarks`; `AccountMargins::load`'s source read (O(1) from the summary); `liq_view`'s reads and fix 2a's `liq_view_if_marked` (subsumed); `traders_after` RocksDB seeks; storage reads in `reduce_only_positions_for` and Phase-2 `position_px`; withdrawal view reads |
+| item 6 Phase 1 | R for positions + balances, built so it can ALSO serve ordered prefix iteration (`positions_for_trader`, `traders_after`); `TraderSummary` side map updated when R is updated (O(changed rows)); per-block mark table; summary consumers (2.2); liquidation L1 (+ L2 if needed) | `AccountReader::view` / `maker_account` / `maker_free` / `maker_position_px` storage reads; fix 1 `BatchMakerAccounts` and `BatchMarks`; `AccountMargins::load`'s source read (O(1) from the summary); `liq_view`'s reads and fix 2a's no-mark guard inside `liq_view` (subsumed); `traders_after` RocksDB seeks; storage reads in `reduce_only_positions_for` and Phase-2 `position_px`; withdrawal view reads |
+| item 6 Phase 2 | persistent worker pool also used by match workers (no crab change) | none |
 | item 6 Phase 3 | none; the summary has no persistent form, so crash replay from a checkpoint rebuilds R and the summary cold | none |
 | item 6 Phase 4 | `UserState` holds the summary fields and per-position terms next to the positions | the side map; R's raw position rows on the hot path |
-| item 6 Phase 2 | persistent worker pool also used by match workers (no crab change) | none |
 | item 6 Phase 5 | executor mutates `UserState` directly; summary updated inline per fill | overlay reads on the margin/liquidation path |
 | D | sequential second pass (2.4) | D2 pool logic stays (D builds on it) unless the owner later replaces D2 by D entirely |
 | L3 (if chosen) | trigger index, rule SCAN = ∞ | the round-robin window code (cursor stays for ACT carry-over) |
@@ -363,9 +363,9 @@ restores them; per-1k it should stay near main.
 | Phase | item 6 target vs previous | crab-specific target |
 |---|---|---|
 | 1 | +15-30% matched/s, -8..-12% CPU-s/1M | margin + liquidation tail at target (5.2) with marks; P1-P7 green |
+| 2 | +7-15% | none |
 | 3 | ~0 throughput, ~-10% node CPU | warm == cold after checkpoint replay |
 | 4 | +0-10% | summary in `UserState`; side map deleted |
-| 2 | +7-15% | none |
 | 5 | up to +60-90% vs main | crab overhead still <= +15% vs the same phase without crab |
 | D | | rejected_cancelled ~0%; per-1k cost unchanged within noise |
 
