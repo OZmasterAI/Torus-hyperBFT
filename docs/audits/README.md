@@ -107,6 +107,7 @@ corrections; a repeated finding is not another defect.
 | 75 | [Developer gas tracking epoch reset](chain-5c756ff-pass75-dev-pool-epoch-reset-wiring-2026-10-04.md) |
 | 76 | [Treasury live balance and cumulative report](chain-5c756ff-pass76-treasury-balance-vs-cumulative-tracker-2026-10-04.md) |
 | 77 | [EVM receipt fee multiplication](chain-14236fa-pass77-evm-fee-product-overflow-2026-10-05.md) |
+| 78 | [EVM receipt fee aggregation](chain-14236fa-pass78-evm-fee-receipt-sum-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
