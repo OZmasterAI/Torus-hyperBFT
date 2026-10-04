@@ -17,9 +17,12 @@ slower per fill and nothing stopped it on the way. This plan is organised around
    differential harness, a storage-read counter that must reach zero, and the per-path
    cost split in the ubench.
 3. Every step after that is: change + correctness test (tests first) + **cost gate**
-   (expected, measured, go / stop). A missed gate stops the work and goes to the owner;
-   the next step does not start on a hope.
-4. Optional steps (section 5) start only when a measured gate says so.
+   (expected, measured, go / miss).
+4. Optional steps (section 5) start only when a measured gate says so. A missed cost
+   gate goes straight to the optional step its gate names (owner, s89), and the miss is
+   written into the review log (section 8) for the owner's review at the end. Two
+   exceptions stop the work instead: a failing correctness test (differential, golden,
+   P1-P7), and a missed gate that names no optional step.
 
 ## 1. Budget (ubench_econ, 300 markets, marks on, ms per 1k fills)
 
@@ -39,7 +42,10 @@ window); the numbers above are prelim and noisy.
 ## 2. Design decisions in this plan
 
 Two simplifications of the design doc. Both keep the owner's decisions (Q3: summary in
-Phase 1; Q5: bit-exact) and are smaller to build and to prove. **Owner: confirm or reject.**
+Phase 1; Q5: bit-exact) and are smaller to build and to prove. **Decided s89 (owner):
+start with S1 + S2; O1 is the switch if its gate triggers.** Switching does not discard
+S1: the cache, the dirty check, the per-block memo and every consumer stay; only how a
+stale entry is recomputed changes, and P1 checks both forms.
 
 - **S1. The summary caches sums, not per-position terms.** For each trader it caches the
   four position sums plus two counts, computed by `AccountView::build` itself over the
@@ -202,7 +208,8 @@ golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
   `_build_seconds`).
 - Gate 1: full suite and golden green; ubench `settle` down, total down (expected:
   pass-A point reads in memory); rebuild cost at bench size measured (< 1 s per 1M rows
-  expected). Stop if total is up.
+  expected). If settle or margin is up from R point lookups: O3. If total is up for
+  another reason: stop (no optional step).
 
 ### Step 2: block mark table (commit C2)
 
@@ -279,9 +286,19 @@ No consensus rule, state format or hash change: the previous binary runs on the 
 data. Each commit can be dropped from the top of the branch; the branch stack (D16) is
 the A/B.
 
-## 7. Owner decisions needed
+## 7. Owner decisions (s89)
 
-1. S1 and S2 (section 2): summary = cached sums + counts over R, no stored per-position
-   terms and no balance mirror until a gate needs them.
-2. Stop rule: a missed gate stops the work and comes back to you (proposed), or continue
-   with the optional step named in its gate.
+1. S1 + S2 (section 2): start with cached `build` sums over R and no balance mirror; O1
+   (stored per-position terms) is the switch if its gate triggers.
+2. Missed cost gate: go straight to the optional step it names, log it (section 8),
+   owner reviews the log when Phase 1 is done. Correctness failures and gates without an
+   optional step stop the work.
+
+## 8. Review log (filled during the build, reviewed by the owner at the end)
+
+One entry per missed gate or judgement call. Nothing here is decided until the owner
+reviews it.
+
+| # | step / gate | measured vs target | question for the owner | what was done (proposal) | commit |
+|---|---|---|---|---|---|
+| | | | | | |
