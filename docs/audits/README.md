@@ -69,6 +69,7 @@ corrections; a repeated finding is not another defect.
 | 37 | [Stage-1 cooldown full-position semantics](chain-5c756ff-pass37-liquidation-cooldown-full-orders-2026-10-04.md) |
 | 38 | [Cooldown begins after an unfilled chunk attempt](chain-5c756ff-pass38-liquidation-zero-fill-cooldown-2026-10-04.md) |
 | 39 | [Chunk quantity rounding and minimum-lot fallback](chain-5c756ff-pass39-liquidation-chunk-lot-rounding-2026-10-04.md) |
+| 40 | [Stage-1 cross-market liquidation priority](chain-5c756ff-pass40-liquidation-market-priority-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
