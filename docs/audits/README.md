@@ -92,6 +92,7 @@ corrections; a repeated finding is not another defect.
 | 60 | [Zero-amount undelegation](chain-5c756ff-pass60-zero-undelegate-2026-10-04.md) |
 | 61 | [Per-delegation unbonding queue cap](chain-5c756ff-pass61-unbonding-entry-cap-2026-10-04.md) |
 | 62 | [Permanent-stake entry-time reward proration](chain-5c756ff-pass62-permanent-stake-entry-proration-2026-10-04.md) |
+| 63 | [Delegation entry-time reward proration](chain-5c756ff-pass63-delegation-epoch-entry-proration-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
