@@ -6,7 +6,7 @@ obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
 command, tombstone fixes A/B + RPC staleness `3578199`/`a4c17e6`/`ac65f48`, then main merged
 in at sync point 1). The `file:line` references below were taken at `3d2dcd8`; Step 0
-re-checks them on the base (the s89 commits moved some lines in `native_executor.rs`,
+re-checked them on `9c4be2c` and they are updated below (the s89 commits moved some lines in `native_executor.rs`,
 `backend.rs`, `db.rs`). Integration with main (owner, s89): method A, merge main INTO the
 Phase 1 branch at sync points (after a gated commit at most, and before Gate 2); no rebase.
 
@@ -32,17 +32,19 @@ slower per fill and nothing stopped it on the way. This plan is organised around
 
 | path | today after fixes 3/2a/1 (prelim) | Phase 1 target | fail above | measured by |
 |---|---|---|---|---|
-| margin (Phase 2) | 11.3 | <= 1.5 | 3.0 | `margin_ms` split |
-| match (Phase 3, maker checks) | 18.0 | <= 2.0 | 4.0 | `match_ms` split |
-| settle | 13.1 | <= 9.5 | 12.0 | `settle_ms` split |
-| liquidation tail | 25.7 | <= 1.0 | 2.0 | `tail_ms` |
-| total | ~76 (prelim) | <= 14.7 | 16.6 | median of 3 |
+| margin (Phase 2) | 7.5 | <= 1.5 | 3.0 | `margin_ms` split |
+| match (Phase 3, maker checks) | 9.4 | <= 2.0 | 4.0 | `match_ms` split |
+| settle | 9.2 | <= 9.5 | 12.0 | `settle_ms` split |
+| liquidation tail | 16.1 | <= 1.0 | 2.0 | `tail_ms` |
+| total | 46.7 | <= 14.7 | 16.6 | median of 3 |
 | storage reads on margin + liquidation paths | thousands per block | **0** | > 0 | counting backend (test) |
-| empty block with live feed (liquidation walk, 2048 traders) | ~500 ms (s89 probe) | <= 20 ms | 75 ms (= 13 blocks/s) | `ubench_epoch` `UB_DRAIN=fresh` |
+| empty block with live feed (liquidation walk, 2048 traders) | 548 ms (walk 486) | <= 20 ms | 75 ms (= 13 blocks/s) | `ubench_epoch` `UB_DRAIN=fresh` |
 | devnet matched/s, oracle on (Gate 2) | (measure) | >= 0.9x main | < 0.9x | paired alternating cells |
 
-The first step re-measures the "today" column on the base commit (same box, same
-window); the numbers above are prelim and noisy.
+"Today" = Step 0 measurement on `9c4be2c` (s89): ubench_econ, marks on, walk 0, median of
+3; run-to-run noise about +-10-15% (marks off: total 27.7, margin 7.1, match 8.0, settle
+9.1, tail 0.7; marks on + walk 10: 48.0, within noise). The earlier prelim column
+(76 total) was too high. Empty block: `ubench_epoch` `UB_DRAIN=fresh`, 4937 holders.
 
 ## 2. Design decisions in this plan
 
@@ -64,20 +66,20 @@ stale entry is recomputed changes, and P1 checks both forms.
 
 Facts that shaped the design (verified at `3d2dcd8`):
 - The overlay is built at `app.rs:1931` before verify; the book holder is taken in
-  `new_with_mode` (`native_executor.rs:2252-2290`), stashed at `app.rs:2369`, then the
+  `new_with_mode` (`native_executor.rs:2260-2292`), stashed at `app.rs:2369`, then the
   nonce and marker puts, then `freeze` (`app.rs:2403`, pipelined) or the serial flush.
-- Overlay read methods: `get_cf_raw` (`backend.rs:1641`), `iterate_cf` (`:1705`),
-  `iterate_cf_from` (`:1743`), `prefix_exists` (`:1813`). Writes into pending only.
-- `margin_configs` are loaded once per context (`native_executor.rs:2344`), never mutated
+- Overlay read methods: `get_cf_raw` (`backend.rs:1657`), `iterate_cf` (`:1721`),
+  `iterate_cf_from` (`:1759`), `prefix_exists` (`:1829`). Writes into pending only.
+- `margin_configs` are loaded once per context (`native_executor.rs:2347`), never mutated
   mid-block. Marks: only `begin_block_oracle` writes the aggregate, before any action;
   `usable()` is time-based (stale after 60 s of block time).
 - Liquidation values with `Marks` = listed markets with a usable mark
   (`liquidation_step.rs:65-68`); `AccountReader::mark` = any market's usable mark. They
   differ for a delisted market whose last aggregate is still fresh (up to 60 s).
-- The golden test (`perf_equivalence_golden.rs:122`) and `ubench_econ.rs:200` drive the
+- The golden test (`perf_equivalence_golden.rs:122`) and `ubench_econ.rs:86` (generator now in `tests/common/econ_load.rs`) drive the
   pipelined block loop by hand (overlay with parent, freeze, flush), not through app.rs.
 - `BalanceCache` / `PositionCache` live for one `execute_batch_phases` call
-  (`:4201-4206`); during Phase 2-4 nothing writes the backend (caches).
+  (`:4204-4208`); during Phase 2-4 nothing writes the backend (caches).
 
 ### 2.1 R: resident rows (torus-state)
 
@@ -116,7 +118,7 @@ and `ubench_econ.rs` (three call sites, so the harnesses measure the real path):
   position keys, stash with `height`. A fatal block returns early (`app.rs:2226-2238`,
   `:2261-2271`) without calling it: the slot was taken, so the next block rebuilds.
 
-app.rs: `let mut overlay` at `:1931`; `begin_resident` at the top of `if run_native`
+app.rs: change `let overlay` to `let mut overlay` at `:1931`; `begin_resident` at the top of `if run_native`
 (only sessions, nonces and the oracle / liquidation due-checks read the overlay before
 that; none of them reads R's CFs); `own_pending_delta()` right before `freeze` / the
 serial flush; `end_resident` after the hand-off / flush. Non-native blocks: the existing
@@ -131,7 +133,7 @@ context, filled at the end of `begin_block_oracle` for every market in `margin_c
 plus the listed ones (`get_price(m, now).usable()`, the same call as today); a market
 outside the table reads the oracle directly, as `BatchMarks` does today. `version`
 increments when the table or `margin_configs` differ from the previous block's (kept in
-the slot). Replaces `BatchMarks` (`:750`, built `:4240-4246`). Liquidation's `Marks` =
+the slot). Replaces `BatchMarks` (`:750`, built `:4243-4249`). Liquidation's `Marks` =
 the table filtered to listed markets; `delisted_marked` = markets with a mark that are
 not listed (normally empty).
 
@@ -155,9 +157,9 @@ struct PosSums { upnl: FixedPoint, position_im: FixedPoint, notional: FixedPoint
   4. else memo `get_or_init(build over R rows)`.
   `Err(())` reproduces `CoreError::Overflow("account margin overflows i128")`.
 - Consumers: `view` / `pos_net` (Phase-2 `prepare_one` `:4684-4695`, maker `maker_free`
-  `:821-826`, withdrawals `check_withdrawal_margin` `:7829-7856`). `position_px` and
+  `:821-826`, withdrawals `check_withdrawal_margin` `:7881-7904`). `position_px` and
   `reduce_only_positions_for` stay point reads (now in memory through R).
-- `BatchMakerAccounts` (`:854-880`) is deleted: `free` = balance (frozen backend during
+- `BatchMakerAccounts` (`:854-881`) is deleted: `free` = balance (frozen backend during
   Phase 3) + memoised sums is already identical in every market.
 
 ### 2.5 Liquidation L1
@@ -172,7 +174,8 @@ struct PosSums { upnl: FixedPoint, position_im: FixedPoint, notional: FixedPoint
 ## 3. Steps
 
 Each step: tests first (they fail before the change), then the change, then the gate.
-Commands: full suite `cargo test --workspace` (base: 2571 pass / 0 fail / 38 ignored);
+Commands: full suite `cargo test --workspace` (base `9c4be2c`: 2601 pass / 0 fail / 39 ignored; after
+Step 0: 2607 / 0 / 40);
 golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
 `UB_MARKS=1 UB_MARKETS=300 cargo test -p torus-bridge --release --test ubench_econ -- --ignored --nocapture`
 (and `UB_MARKS=0`). Own worktree `wt/item6-phase1`, own `CARGO_TARGET_DIR`
@@ -185,7 +188,10 @@ golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
 - 0.2 Storage-read counter test (`torus-bridge/tests/`, using `common/counting_backend.rs`):
   run a fed 20-block sequence and count DB reads of `CF_NATIVE_POSITIONS` /
   `CF_NATIVE_BALANCES` per path (margin, match, liquidation). Today: > 0. The test
-  asserts `== 0` and is `#[ignore]`d until step 3; step 3 un-ignores it.
+  asserts `== 0` and is `#[ignore]`d until C1 (review log 1: R answers every read of both
+CFs, so DB reads reach 0 at C1; C3/C4 then add per-path asserts on overlay prefix scans).
+Built in Step 0: `tests/storage_reads_tests.rs` (`8814fc7`); today 20 fed blocks read
+margin 1308 / 264, match 2829 / 117, liquidation 1840 / 96 (positions / balances).
 - 0.3 Audit: every writer of R's two CFs outside the overlay (expected: genesis before
   boot, the bench-throughput seeding context); EVM batch / slash overlay / hash extras
   touching R's CFs; any reader of the two CFs that bypasses the overlay on the block path.
@@ -219,7 +225,7 @@ golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
     between hand-off and W's write -> restarted node identical (P6).
 - Change: 2.1, 2.2, metrics (`exec_resident_rows`, `_bytes`, `_rebuilds`,
   `_build_seconds`).
-- Gate 1: full suite and golden green; ubench `settle` down, total down (expected:
+- Gate 1: full suite and golden green; ubench `settle` not up (it already meets its target; review log 2), total down (expected:
   pass-A point reads in memory); rebuild cost at bench size measured (< 1 s per 1M rows
   expected). If settle or margin is up from R point lookups: O3. If total is up for
   another reason: stop (no optional step).
@@ -320,4 +326,8 @@ reviews it.
 
 | # | step / gate | measured vs target | question for the owner | what was done (proposal) | commit |
 |---|---|---|---|---|---|
-| | | | | | |
+| 1 | Step 0 / counter test | DB reads reach 0 at C1 already (R serves both CFs) | un-ignore the counter at C1 instead of C3/C4? | proposed: un-ignore at C1 (harness calls `begin_resident`; `CountingBackend` forwards new trait methods); C3/C4 add per-path asserts on overlay prefix scans | `8814fc7` |
+| 2 | Step 0 / budget | today 46.7 total vs prelim 76; settle 9.2 already <= 9.5 | keep absolute targets or rescale? | kept absolute targets; Gate 1 now "settle not up" instead of "settle down" | plan |
+| 3 | Step 0 / noise | +-10-15% per run | gates near a fail line need more runs | proposed: 5 runs or alternating A/B runs when a result is within 15% of a gate line | plan |
+| 4 | Step 0 / walk | the walk moves marks only; balances are so large that nobody is liquidated | is Gate 4 with walk representative? | noted: Gate 4 with walk measures valuation cost, not liquidation actions; a liquidation-heavy case stays in P3 tests | `3924b76` |
+| 5 | Step 0 / empty block | live-feed empty block 548 ms vs <= 20 ms target (bench shape 4.9k holders x ~250 positions) | none yet: the target stands; C1-C4 are expected to close it | tracked at Gate 4 | - |
