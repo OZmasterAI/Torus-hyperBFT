@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use torus_state::cf::CF_NATIVE_ORACLE;
+use torus_state::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
 use torus_state::{StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId};
 
@@ -194,7 +194,7 @@ impl Default for OracleConfig {
 /// validator's latest.
 fn submission_key(market_id: MarketId, validator: &Address) -> Vec<u8> {
     let mut key = Vec::with_capacity(31);
-    key.extend_from_slice(b"sub");
+    key.extend_from_slice(ORACLE_SUBMISSION_PREFIX);
     key.extend_from_slice(&market_id.to_be_bytes());
     key.extend_from_slice(validator.as_slice());
     key
@@ -203,7 +203,7 @@ fn submission_key(market_id: MarketId, validator: &Address) -> Vec<u8> {
 /// Prefix for all submissions for a market: "sub" + market_id(8).
 fn submission_market_prefix(market_id: MarketId) -> Vec<u8> {
     let mut key = Vec::with_capacity(11);
-    key.extend_from_slice(b"sub");
+    key.extend_from_slice(ORACLE_SUBMISSION_PREFIX);
     key.extend_from_slice(&market_id.to_be_bytes());
     key
 }
@@ -388,7 +388,7 @@ impl<T: StateBackend> OracleManager<T> {
     /// validators × markets. Errors propagate. Returns the number deleted.
     pub fn prune_submissions(&self, now: u64) -> Result<usize, CoreError> {
         let mut pruned = 0;
-        for (key, value) in self.state.iterate_cf(CF_NATIVE_ORACLE, Some(b"sub"))? {
+        for (key, value) in self.state.iterate_cf(CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))? {
             let old = match OracleSubmission::try_from_slice(&value) {
                 Ok(sub) => now.saturating_sub(sub.timestamp) > self.config.window_secs,
                 Err(_) => true,
@@ -404,7 +404,7 @@ impl<T: StateBackend> OracleManager<T> {
     /// Whether any submission row exists (the block's oracle step is due).
     /// Stops at the first row.
     pub fn has_submissions(&self) -> Result<bool, CoreError> {
-        Ok(self.state.prefix_exists(CF_NATIVE_ORACLE, b"sub")?)
+        Ok(self.state.prefix_exists(CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX)?)
     }
 
     /// The submissions of `market_id` that count at `now`: decodable, block

@@ -62,6 +62,64 @@ pub fn prefix_iter<'a>(
     )
 }
 
+/// s89 fix B: state of the background compaction of
+/// `[ORACLE_SUBMISSION_PREFIX, successor)` in `CF_NATIVE_ORACLE`
+/// (see [`StateDb::compact_pruned_submissions_in_background`]).
+#[derive(Default)]
+struct SubmissionCompaction {
+    /// `(running, requested again while running)`.
+    state: std::sync::Mutex<(bool, bool)>,
+    /// Signalled when `running` goes false.
+    idle: std::sync::Condvar,
+    /// Finished runs: `(done, failed)`.
+    runs: std::sync::Mutex<(u64, u64)>,
+    /// Test hook: every run fails (logged, counted) instead of compacting.
+    #[cfg(test)]
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl SubmissionCompaction {
+    fn run(&self, db: &std::sync::Weak<DB>) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("injected failure (test)".into());
+        }
+        // The DB closed since the request: nothing left to compact.
+        let Some(db) = db.upgrade() else {
+            return Ok(());
+        };
+        let cf = db
+            .cf_handle(CF_NATIVE_ORACLE)
+            .ok_or_else(|| format!("missing column family {CF_NATIVE_ORACLE}"))?;
+        let mut opts = rocksdb::CompactOptions::default();
+        // Do not hold back the automatic compactions while this one runs.
+        opts.set_exclusive_manual_compaction(false);
+        // Rewrite the bottommost files too: a file that reached the last level
+        // by a trivial move (no overlap, e.g. rows and their deletes flushed
+        // together) still carries its tombstones otherwise.
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        let end = prefix_successor(ORACLE_SUBMISSION_PREFIX);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.compact_range_cf_opt(cf, Some(ORACLE_SUBMISSION_PREFIX), end.as_deref(), &opts)
+        }))
+        .map_err(|_| "compact_range_cf panicked".to_string())
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, (bool, bool)> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_runs(&self) -> std::sync::MutexGuard<'_, (u64, u64)> {
+        self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark the job idle and wake [`StateDb::wait_background_compaction`].
+    fn finish(&self, state: &mut (bool, bool)) {
+        *state = (false, false);
+        self.idle.notify_all();
+    }
+}
+
 /// Central RocksDB database handle for the Torus node.
 ///
 /// Opens all column families defined in section 6.1. Provides typed accessors
@@ -77,6 +135,9 @@ pub struct StateDb {
     /// 2 = tickers + histograms). Decides which parts of `runtime_stats` are
     /// meaningful.
     stats_level: u8,
+    /// s89 fix B: the background compaction of the pruned oracle submission
+    /// range, shared by every clone of this handle (one in flight per DB).
+    submission_compaction: Arc<SubmissionCompaction>,
 }
 
 /// r3 exec-write-stall-attribution: node-local RocksDB tuning read once at DB
@@ -415,6 +476,7 @@ impl StateDb {
             db: Arc::new(db),
             opts: (tuning.stats_level >= 1).then(|| Arc::new(opts)),
             stats_level: tuning.stats_level,
+            submission_compaction: Arc::default(),
         })
     }
 
@@ -424,6 +486,7 @@ impl StateDb {
             db: Arc::new(db),
             opts: None,
             stats_level: 0,
+            submission_compaction: Arc::default(),
         }
     }
 
@@ -504,6 +567,7 @@ impl StateDb {
             db: Arc::new(db),
             opts: None,
             stats_level: 0,
+            submission_compaction: Arc::default(),
         })
     }
 
@@ -516,6 +580,82 @@ impl StateDb {
     /// Get a reference to the underlying RocksDB instance.
     pub fn inner(&self) -> &DB {
         &self.db
+    }
+
+    /// s89 fix B: compact `[ORACLE_SUBMISSION_PREFIX, successor)` of
+    /// `CF_NATIVE_ORACLE` on a background thread. Called after a flush whose
+    /// batch deleted submission rows (the prune when the oracle feed pauses):
+    /// RocksDB keeps the tombstones until a compaction drops them, and every
+    /// `sub` scan walks them meanwhile (`oracle_due` on every block).
+    ///
+    /// Never blocks the caller and never runs on it: at most one compaction is
+    /// in flight per DB, and a request while one runs makes it run once more
+    /// when it ends. A failure is logged and counted, never returned. Node-
+    /// local: a compaction changes no read result, state, root or hash.
+    pub fn compact_pruned_submissions_in_background(&self) {
+        let job = Arc::clone(&self.submission_compaction);
+        {
+            let mut state = job.lock_state();
+            if state.0 {
+                state.1 = true;
+                return;
+            }
+            *state = (true, false);
+        }
+        // Weak: a pending compaction never keeps a closed DB (and its LOCK) alive.
+        let db = Arc::downgrade(&self.db);
+        let worker = Arc::clone(&job);
+        let spawned = std::thread::Builder::new()
+            .name("torus-oracle-compact".into())
+            .spawn(move || loop {
+                let started = std::time::Instant::now();
+                match worker.run(&db) {
+                    Ok(()) => {
+                        worker.lock_runs().0 += 1;
+                        tracing::debug!(
+                            ms = started.elapsed().as_secs_f64() * 1e3,
+                            "compacted the pruned oracle submission range"
+                        );
+                    }
+                    Err(e) => {
+                        worker.lock_runs().1 += 1;
+                        tracing::warn!(error = %e, "oracle submission range compaction failed (ignored)");
+                    }
+                }
+                let mut state = worker.lock_state();
+                if state.1 {
+                    state.1 = false;
+                    continue;
+                }
+                worker.finish(&mut state);
+                break;
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "could not start the oracle submission compaction (ignored)");
+            job.lock_runs().1 += 1;
+            job.finish(&mut job.lock_state());
+        }
+    }
+
+    /// Wait until no background compaction of the submission range is in
+    /// flight; returns the finished runs `(done, failed)` so far. Tests and
+    /// benches only — the node never waits for it.
+    pub fn wait_background_compaction(&self) -> (u64, u64) {
+        let job = &self.submission_compaction;
+        let mut state = job.lock_state();
+        while state.0 {
+            state = job.idle.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        *job.lock_runs()
+    }
+
+    /// Test hook: make every following background compaction fail.
+    #[cfg(test)]
+    pub(crate) fn fail_background_compaction(&self, fail: bool) {
+        self.submission_compaction
+            .fail
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get a shared handle to the underlying RocksDB instance.

@@ -401,6 +401,15 @@ impl PendingState {
             .take_while(move |k| k.starts_with(prefix))
     }
 
+    /// s89 fix B: whether this set deletes oracle submission rows (the prune).
+    fn deletes_oracle_submissions(&self) -> bool {
+        intern_cf(crate::cf::CF_NATIVE_ORACLE).is_some_and(|id| {
+            self.deletes_under(id, crate::cf::ORACLE_SUBMISSION_PREFIX)
+                .next()
+                .is_some()
+        })
+    }
+
     /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
     fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
         writes_under(&self.cf(id).writes, prefix).next().is_some()
@@ -1572,6 +1581,13 @@ fn flush_pending_after_batch(
                 }
                 return Err(e.into());
             }
+        }
+        // s89 fix B: the batch is durable; if it pruned oracle submissions,
+        // compact their range off this thread (node-local, never fails here).
+        if state.deletes_oracle_submissions()
+            || sidecar.is_some_and(PendingState::deletes_oracle_submissions)
+        {
+            target.compact_pruned_submissions_in_background();
         }
         // L3 #2: record post-flush residency for the eviction-pressure gauge.
         if let Some(c) = member_cache.as_deref() {
@@ -4034,5 +4050,107 @@ mod tests {
                 samples.len()
             );
         }
+    }
+}
+
+/// s89 fix B: the background compaction of the pruned oracle submission range
+/// is node-local and can never fail a flush.
+#[cfg(test)]
+mod submission_compaction_tests {
+    use super::*;
+    use crate::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
+
+    fn temp_db() -> (StateDb, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        (db, dir)
+    }
+
+    fn sub_key(market: u64) -> Vec<u8> {
+        [ORACLE_SUBMISSION_PREFIX, &market.to_be_bytes(), &[7u8; 20]].concat()
+    }
+
+    fn seed(db: &StateDb, markets: u64) {
+        let ov = NativeStateOverlay::new(db.clone());
+        for m in 1..=markets {
+            ov.put_cf_raw(CF_NATIVE_ORACLE, &sub_key(m), b"price").unwrap();
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None).unwrap();
+    }
+
+    fn prune(db: &StateDb, markets: u64) {
+        let ov = NativeStateOverlay::new(db.clone());
+        for m in 1..=markets {
+            ov.delete_cf_raw(CF_NATIVE_ORACLE, &sub_key(m)).unwrap();
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None)
+            .expect("a prune flush succeeds whatever the compaction does");
+    }
+
+    fn sub_tombstones_walked(db: &StateDb) -> u64 {
+        use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut ctx = PerfContext::default();
+        ctx.reset();
+        assert!(!StateBackend::prefix_exists(db, CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX).unwrap());
+        let n = ctx.metric(PerfMetric::InternalDeleteSkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        n
+    }
+
+    #[test]
+    fn failed_compaction_does_not_affect_execution() {
+        let (db, _dir) = temp_db();
+        db.fail_background_compaction(true);
+        seed(&db, 50);
+        prune(&db, 50);
+        assert_eq!(db.wait_background_compaction(), (0, 1), "one run, failed");
+        // State and later blocks are untouched by the failure.
+        assert!(StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))
+            .unwrap()
+            .is_empty());
+        assert_eq!(sub_tombstones_walked(&db), 50, "nothing was compacted");
+        seed(&db, 10);
+        assert_eq!(
+            StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))
+                .unwrap()
+                .len(),
+            10
+        );
+        // The job is not wedged by the failure: the next prune compacts.
+        db.fail_background_compaction(false);
+        prune(&db, 10);
+        assert_eq!(db.wait_background_compaction(), (1, 1));
+        assert_eq!(sub_tombstones_walked(&db), 0);
+    }
+
+    #[test]
+    fn only_a_submission_prune_schedules_a_compaction() {
+        let (db, _dir) = temp_db();
+        seed(&db, 20);
+        // Writes, and deletes outside the submission prefix: no compaction.
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, b"agg-other").unwrap();
+        ov.put_cf_raw(CF_NATIVE_ORACLE, &sub_key(99), b"price").unwrap();
+        ov.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        assert_eq!(db.wait_background_compaction(), (0, 0));
+        // The pipelined path (frozen set) schedules like the serial one.
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, &sub_key(1)).unwrap();
+        ov.freeze(1)
+            .flush_with_native_trie_stats(&db, None, None, None)
+            .unwrap();
+        assert_eq!(db.wait_background_compaction(), (1, 0));
+    }
+
+    #[test]
+    fn requests_while_running_coalesce() {
+        let (db, _dir) = temp_db();
+        for _ in 0..20 {
+            db.compact_pruned_submissions_in_background();
+        }
+        let (done, failed) = db.wait_background_compaction();
+        assert_eq!(failed, 0);
+        assert!((1..=20).contains(&done), "{done} runs for 20 requests");
     }
 }

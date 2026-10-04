@@ -9,8 +9,9 @@
 //! Keeps the s89 cost measurable: when the feed pauses, `prune_submissions`
 //! deletes every `sub‖market‖validator` row; per-market submission scans then
 //! walked the tombstones of all later markets (fix A: prefix scans bounded by
-//! the prefix successor) and the `sub` existence check (`oracle_due`) walks
-//! all of them on every block.
+//! the prefix successor) and the `sub` existence check (`oracle_due`) walked
+//! all of them on every block (fix B: background compaction of the pruned
+//! range after the flush).
 //! The SUMMARY lines give x00/x01/x02/other ms per block class.
 //!
 //! UB_DRAIN = stale | fresh | none
@@ -413,8 +414,18 @@ fn run() {
         2 => "x02",
         _ => "other",
     };
-    for c in ["x00", "x01", "x02", "other"] {
-        let v: Vec<_> = rows.iter().filter(|r| class(r) == c).collect();
+    // The stale-drain prune rides block `first`'s frozen set, which marker-only
+    // blocks never flush: it reaches the DB at the first drain boundary.
+    // `other-late` = the `other` blocks after it (post-flush steady state).
+    let first_boundary = first.div_ceil(EPOCH) * EPOCH;
+    for c in ["x00", "x01", "x02", "other", "other-late"] {
+        let v: Vec<_> = rows
+            .iter()
+            .filter(|r| match c {
+                "other-late" => class(r) == "other" && r.0 > first_boundary,
+                _ => class(r) == c,
+            })
+            .collect();
         if v.is_empty() {
             continue;
         }

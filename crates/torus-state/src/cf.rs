@@ -77,6 +77,11 @@ pub const CF_DEV_POOL: &str = "cf_dev_pool";
 
 // Oracle
 pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
+/// Prefix of the oracle price-submission rows in [`CF_NATIVE_ORACLE`]:
+/// `"sub" ‖ market_id(8) ‖ validator(20)` (torus-core `oracle.rs`). A flush
+/// that deletes rows under it (the submission prune) schedules a background
+/// compaction of the range (s89 fix B, [`crate::StateDb::compact_pruned_submissions_in_background`]).
+pub const ORACLE_SUBMISSION_PREFIX: &[u8] = b"sub";
 /// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_NATIVE_USER_TRADES: &str = "cf_native_user_trades";
