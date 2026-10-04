@@ -67,6 +67,7 @@ corrections; a repeated finding is not another defect.
 | 35 | [Backstop with unmarked positions](chain-0a25560-pass35-backstop-unmarked-collateral-2026-10-04.md) |
 | 36 | [Fee split write failure atomicity](chain-0a25560-pass36-fee-split-error-atomicity-2026-10-04.md) |
 | 37 | [Stage-1 cooldown full-position semantics](chain-5c756ff-pass37-liquidation-cooldown-full-orders-2026-10-04.md) |
+| 38 | [Cooldown begins after an unfilled chunk attempt](chain-5c756ff-pass38-liquidation-zero-fill-cooldown-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
