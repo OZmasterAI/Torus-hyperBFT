@@ -79,8 +79,9 @@ C5 recorded as known limitations.
 
 * MM = half the initial margin at max leverage (per asset tier table).
 * Liquidation when account value < MM: market orders into the book first. Positions >
-  100k USDC: 20% of the position per order, then a 30 s cooldown during which only the
-  backstop can act on the user.
+  100k USDC: 20% of the position per order; after a block with such a partial liquidation a
+  30 s cooldown during which every market liquidation order of the user is for the entire
+  position (corrected s88; this line used to say "only the backstop can act").
 * Backstop when account value < 2/3 MM: positions + collateral transferred to the liquidator
   vault (HLP) at the mark. No clearance fee.
 * ADL when an account's value is negative: counterparties ranked by
@@ -132,7 +133,7 @@ C5 recorded as known limitations.
 | `AV >= MM` | Healthy (clears a cooldown row) |
 | `AV < 0` | **ADL** |
 | `3·AV < 2·MM` | **Backstop** |
-| otherwise (`2/3·MM <= AV < MM`) | **Stage 1** (skipped while in cooldown) |
+| otherwise (`2/3·MM <= AV < MM`) | **Stage 1** (whole-position orders while in cooldown, s88) |
 
 ### Block step `NativeExecutor::run_liquidations(ctx)` (after `drain_core_writer`)
 
@@ -167,8 +168,11 @@ C5 recorded as known limitations.
   :5636); fills are ordinary book fills (maker checks, STP, trade rows, stops).
 * After each order re-value; stop as soon as `AV >= MM` (the rest of the collateral and the
   remaining positions stay with the trader).
-* Cooldown (per account): while `now − last_chunk_ts < 30`, stage 1 is skipped; backstop and
-  ADL still apply (HL: "only backstop during cooldown").
+* Cooldown (per account): while `now − last_chunk_ts < 30`, every stage-1 order of the account
+  is for the ENTIRE position (no chunk; it does not write the cooldown row, so only a chunk
+  starts / restarts a cooldown); backstop and ADL still apply. HL parity fix s88 — this line
+  used to say "stage 1 is skipped" (a misreading of HL: "During this cooldown period, all
+  market liquidation orders for that user will be for the entire position").
 
 ### Stage 2 — backstop
 

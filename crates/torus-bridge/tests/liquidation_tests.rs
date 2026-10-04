@@ -404,40 +404,106 @@ fn healthy_accounts_are_untouched() {
 
 // ---- T7b: chunks, cooldown ----
 
-/// T long 200 @ 1,000 (198k notional at 990 > 100k), collateral 5,500:
-/// AV 3,500 < MM 4,950, 3 x 3,500 >= 2 x 4,950 -> stage 1 in 20% chunks.
-/// Chunk 1 at ts 1001; nothing until ts 1031 (age 30); chunk 2 = 20% of 160.
+/// The cooldown row of `t` (`0x02 ‖ t`): the block time of its last chunk.
+fn cooldown_ts(ctx: &NativeExecContext, t: &Address) -> Option<u64> {
+    let k = [[0x02u8].as_slice(), t.as_slice()].concat();
+    ctx.state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k).unwrap().map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+}
+
+/// HL parity (s88 owner item): "After a block where any position of a user is
+/// partially liquidated, there is a cooldown period of 30 seconds. During this
+/// cooldown period, all market liquidation orders for that user will be for
+/// the entire position." T long 400 @ 1,000 (396k notional at 990 > 100k),
+/// collateral 11,000: AV 7,000 < MM 9,900, 3 x 7,000 >= 2 x 9,900 -> stage 1.
+/// ts 1001: 20% chunk (80) into M's 985 bid -> 320, cooldown row 1001.
+/// ts 1002 (in cooldown): M bids 100 @ 970; the order is for all 320 (cap
+/// 965.25) and fills 100 -> 220 (a chunk would be 64; the old rule skipped).
+/// AV 4,600 < MM 5,445: still stage 1. The full order does NOT restart the
+/// cooldown (row stays 1001). ts 1030 (age 29, last cooldown second): bid
+/// 60 @ 970 -> full order fills 60 -> 160 (a chunk would be 44). ts 1031
+/// (age 30: expired): 20% chunk again (32 of 160) -> 128, cooldown row 1031.
 #[test]
-fn chunks_of_20_percent_with_a_30s_block_time_cooldown() {
+fn during_the_cooldown_stage1_orders_the_entire_position() {
     let (_d, db) = liq_db(&[1]);
     let (t, s, m) = (addr(1), addr(2), addr(3));
     let mut ctx = ctx_at(db.clone(), 1);
-    fund(&ctx, &t, fp(5_500));
+    fund(&ctx, &t, fp(11_000));
     fund(&ctx, &s, fp(10_000_000));
     fund(&ctx, &m, fp(10_000_000));
-    open_pair(&ctx, &t, &s, 1, 200, 1_000);
-    place(&mut ctx, &m, limit(1, true, 985, 100));
+    open_pair(&ctx, &t, &s, 1, 400, 1_000);
+    place(&mut ctx, &m, limit(1, true, 985, 80));
     set_mark(&ctx, 1, fp(990));
     NativeExecutor::run_liquidations(&mut ctx);
-    assert_eq!(pos(&ctx, &t, 1), fp(160), "chunk 1 = 40");
-    assert_eq!(liq_rows(&ctx, 0x02).len(), 1, "cooldown row");
-    NativeExecutor::run_liquidations(&mut ctx);
-    assert_eq!(pos(&ctx, &t, 1), fp(160), "same block: cooldown");
+    assert!(ctx.fatal_error.is_none());
+    assert_eq!(pos(&ctx, &t, 1), fp(320), "chunk 1 = 20% of 400");
+    assert_eq!(cooldown_ts(&ctx, &t), Some(1_001), "a chunk starts the cooldown");
     ctx.save_order_books();
-    for h in [2u64, 30] {
-        let mut c = ctx_at(db.clone(), h); // ts 1002 / 1030: still < 30 s
+    for (h, bid, left) in [(2u64, 100, 220), (30, 60, 160)] {
+        let mut c = ctx_at(db.clone(), h); // ts 1002 / 1030: age 1 / 29 < 30
+        place(&mut c, &m, limit(1, true, 970, bid));
         NativeExecutor::run_liquidations(&mut c);
-        assert_eq!(pos(&c, &t, 1), fp(160), "h {h}");
+        assert!(c.fatal_error.is_none());
+        assert_eq!(pos(&c, &t, 1), fp(left), "h {h}: in cooldown the order is for the entire position");
+        assert!(c.order_books[&1].orders_for_trader(&m).is_empty(), "h {h}: the whole bid was taken");
+        assert_eq!(cooldown_ts(&c, &t), Some(1_001), "h {h}: a full-position order does not restart the cooldown");
+        assert_eq!(liq_rows(&c, 0x06).len(), 1, "h {h}: still under MM -> pending");
         c.save_order_books();
     }
     let mut c = ctx_at(db.clone(), 31); // ts 1031: 30 s after 1001, mark age 30 (usable)
+    place(&mut c, &m, limit(1, true, 985, 100));
     NativeExecutor::run_liquidations(&mut c);
-    assert_eq!(pos(&c, &t, 1), fp(128), "chunk 2 = 20% of 160");
-    assert_eq!(oi(&c, 1), (fp(200), fp(200)));
+    assert_eq!(pos(&c, &t, 1), fp(128), "cooldown over: chunk 2 = 20% of 160");
+    assert_eq!(cooldown_ts(&c, &t), Some(1_031), "the new chunk starts a new cooldown");
+    assert_eq!(oi(&c, 1), (fp(400), fp(400)));
 }
 
-/// HL: during the cooldown only the backstop can act. Mark 975 at ts 1005:
-/// AV 4,900 - 4,000 = 900, 3 x 900 < 2 x 3,900 -> backstop; cooldown cleared.
+/// Other positions: the chunk block ends the account's stage 1 (one chunk
+/// per account per block, the cooldown starts after it); in the cooldown
+/// EVERY market liquidation order of the user is for the entire position,
+/// largest MM first, until AV >= MM. T long 200 (m1) + long 150 (m2) @ 1,000,
+/// collateral 11,000, marks 990: AV 7,500 < MM 8,662.5 (>= 2/3) -> stage 1.
+/// ts 1001: m1 (MM 4,950 first) chunk 40 -> 160; m2 untouched although M bids
+/// 200 @ 985 there. ts 1002: m1 full order fills M's 5 -> 155; AV 7,275 <
+/// MM 7,548.75 -> m2 full order (150, a chunk would be 30) closes m2 -> healthy.
+#[test]
+fn in_the_cooldown_every_position_is_ordered_whole() {
+    let (_d, db) = liq_db(&[1, 2]);
+    let (t, s, m) = (addr(1), addr(2), addr(3));
+    let mut ctx = ctx_at(db.clone(), 1);
+    fund(&ctx, &t, fp(11_000));
+    fund(&ctx, &s, fp(10_000_000));
+    fund(&ctx, &m, fp(10_000_000));
+    open_pair(&ctx, &t, &s, 1, 200, 1_000);
+    open_pair(&ctx, &t, &s, 2, 150, 1_000);
+    place(&mut ctx, &m, limit(1, true, 985, 40));
+    place(&mut ctx, &m, limit(2, true, 985, 200));
+    set_mark(&ctx, 1, fp(990));
+    set_mark(&ctx, 2, fp(990));
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert_eq!(pos(&ctx, &t, 1), fp(160), "m1 chunk 1 = 40");
+    assert_eq!(pos(&ctx, &t, 2), fp(150), "the chunk ends the account's stage 1 for the block");
+    assert_eq!(cooldown_ts(&ctx, &t), Some(1_001));
+    ctx.save_order_books();
+    let mut c = ctx_at(db.clone(), 2);
+    place(&mut c, &m, limit(1, true, 985, 5));
+    NativeExecutor::run_liquidations(&mut c);
+    assert!(c.fatal_error.is_none());
+    assert_eq!(pos(&c, &t, 1), fp(155), "m1: full order, the book had 5");
+    assert_eq!(pos(&c, &t, 2), FixedPoint::ZERO, "m2: the entire position, not a 20% chunk");
+    assert_eq!(bal(&c, &t).available, fp(8_075));
+    assert_eq!(cooldown_ts(&c, &t), Some(1_001), "no new cooldown");
+    assert!(liq_rows(&c, 0x06).is_empty(), "healthy after m2");
+    assert_eq!((oi(&c, 1), oi(&c, 2)), ((fp(200), fp(200)), (fp(150), fp(150))));
+    let mut c = ctx_at(db.clone(), 3);
+    NativeExecutor::run_liquidations(&mut c);
+    assert_eq!(cooldown_ts(&c, &t), None, "healthy -> cooldown cleared");
+}
+
+/// The backstop keeps its role in the cooldown. ts 1001: chunk 1 (40) takes
+/// the whole bid -> 160, available 4,900. ts 1002: the full-position order
+/// meets an empty book: nothing fills, still stage 1 -> pending. Mark 975 at
+/// ts 1005: AV 4,900 - 4,000 = 900, 3 x 900 < 2 x 3,900 -> backstop; the
+/// cooldown row goes with the last position.
 #[test]
 fn backstop_acts_during_the_cooldown() {
     let (_d, db) = liq_db(&[1]);
@@ -447,10 +513,18 @@ fn backstop_acts_during_the_cooldown() {
     fund(&ctx, &s, fp(10_000_000));
     fund(&ctx, &m, fp(10_000_000));
     open_pair(&ctx, &t, &s, 1, 200, 1_000);
-    place(&mut ctx, &m, limit(1, true, 985, 100));
+    place(&mut ctx, &m, limit(1, true, 985, 40));
     set_mark(&ctx, 1, fp(990));
     NativeExecutor::run_liquidations(&mut ctx); // chunk 1 -> 160 left, available 4,900
+    assert_eq!(pos(&ctx, &t, 1), fp(160));
     ctx.save_order_books();
+    let mut c = ctx_at(db.clone(), 2);
+    NativeExecutor::run_liquidations(&mut c);
+    assert!(c.fatal_error.is_none());
+    assert_eq!(pos(&c, &t, 1), fp(160), "empty book: the full-position order fills nothing");
+    assert_eq!(liq_rows(&c, 0x06).len(), 1, "still under MM -> pending");
+    assert_eq!(cooldown_ts(&c, &t), Some(1_001));
+    c.save_order_books();
     let mut c = ctx_at(db.clone(), 5);
     set_mark(&c, 1, fp(975));
     NativeExecutor::run_liquidations(&mut c);

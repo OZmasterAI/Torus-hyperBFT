@@ -31,7 +31,8 @@ pub const LIQUIDATOR_VAULT: Address = Address::new(*b"torus-liquidator-vlt");
 pub const CHUNK_NOTIONAL_THRESHOLD_RAW: i128 = 100_000 * FixedPoint::SCALE;
 /// HL: 20% of the position per chunk = size / 5.
 pub const CHUNK_DIVISOR: i128 = 5;
-/// HL: seconds of block time after a chunk during which only backstop / ADL act.
+/// HL: seconds of block time after a chunk during which every stage-1 order
+/// of the account is for the entire position (s88 parity fix).
 pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 /// D5 (decided, user s517): accounts valued per block.
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;

@@ -5,7 +5,8 @@
 //! one block later), run twice: with L1 (sums cache) and with the reference
 //! walk (`begin_resident(None, ..)`: no cache, `liq_view`'s `build` over the
 //! trader's rows). Accounts near maintenance, marks moving / jumping / stale
-//! / absent, big positions (stage-1 chunks and the cooldown), cursor cuts
+//! / absent, big positions (stage-1 chunks and the cooldown, in which stage
+//! 1 orders the entire position — HL parity, s88), cursor cuts
 //! (small budgets every third block), backstop, ADL of a trader and of the
 //! vault, Isolated positions, a listed market without a mark (positions at
 //! entry; an account only there is skipped), a delisted market whose
@@ -110,6 +111,8 @@ struct Stats {
     skipped: usize,
     cuts: usize,
     cooldowns: usize,
+    /// Stage-1 accounts met inside their 30 s cooldown (full-position orders).
+    cooldown_stage1: usize,
     l1: usize,
     l1_off: usize,
     shadow: usize,
@@ -263,7 +266,10 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.marks_off_blocks += usize::from(marks.is_empty());
             for t in (0..TRADERS).map(trader).chain([LIQUIDATOR_VAULT]) {
                 match NativeExecutor::liq_view_walk(&ctx, &marks, &t).unwrap().and_then(|v| liq::classify(&v)) {
-                    Some(Health::Stage1) => stats.stage1 += 1,
+                    Some(Health::Stage1) => {
+                        stats.stage1 += 1;
+                        stats.cooldown_stage1 += usize::from(liq::in_cooldown(&ctx.state, &t, now).unwrap());
+                    }
                     Some(Health::Backstop) => stats.backstop += 1,
                     Some(Health::Adl) if t == LIQUIDATOR_VAULT => stats.vault_adl += 1,
                     Some(Health::Adl) => stats.adl += 1,
@@ -342,6 +348,7 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     let s = &stats;
     assert!(s.stage1 > 20 && s.backstop > 20 && s.adl > 5 && s.vault_adl > 0, "every class met: {s:?}");
     assert!(s.skipped > 100 && s.cuts > 10 && s.cooldowns > 5, "skips, cursor cuts, chunks: {s:?}");
+    assert!(s.cooldown_stage1 > 5, "stage 1 inside the cooldown (entire-position orders): {s:?}");
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");

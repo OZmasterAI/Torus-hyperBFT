@@ -377,7 +377,7 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
     pair(&t(9), &s, 2, 10);
     pair(&t(9), &s, 3, 2);
     pair(&s, &t(10), 2, 50); // short: an ADL counterparty
-    pair(&t(11), &s, 1, 150); // seeded cooldown: only the backstop / ADL may act
+    pair(&t(11), &s, 1, 150); // seeded cooldown (no block reaches its stage 1 inside it)
     for n in [5, 6, 9] {
         liq::set_pending(db, &t(n), true).unwrap();
     }

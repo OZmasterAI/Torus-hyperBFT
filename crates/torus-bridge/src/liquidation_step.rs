@@ -43,7 +43,8 @@ impl NativeExecutor {
     }
 
     /// Item 3: whether the liquidation step has pending work without any new
-    /// action — a cooldown row (a chunk waits for its 30 s), the cursor row
+    /// action — a cooldown row (a chunked account: whole-position orders for
+    /// 30 s, then the next chunk), the cursor row
     /// (a cut pass) or, review M2, a pending row (an account left under MM by
     /// its last action, e.g. a thin book). Reads the block's overlay (DB +
     /// parent layer).
@@ -235,8 +236,24 @@ impl NativeExecutor {
     }
 
     /// Stage 1: reduce-only IOC market orders into the book, positions by
-    /// (MM desc, market asc); a chunk (D2) sets the cooldown and ends the
-    /// account's stage 1 for this block; stops as soon as `AV >= MM`.
+    /// (MM desc, market asc); stops as soon as `AV >= MM`.
+    ///
+    /// HL parity (s88; was: stage 1 skipped in the cooldown, a misreading of
+    /// HL): "After a block where any position of a user is partially
+    /// liquidated, there is a cooldown period of 30 seconds. During this
+    /// cooldown period, all market liquidation orders for that user will be
+    /// for the entire position."
+    /// * Outside the cooldown a position above 100,000 notional goes as a 20%
+    ///   chunk (D2): the chunk sets the cooldown (block time) and ends the
+    ///   account's stage 1 for this block — its other positions wait for the
+    ///   next block, where they are inside the cooldown.
+    /// * Inside the cooldown every order is for the ENTIRE position, in the
+    ///   same order, until `AV >= MM`. Such an order never writes the
+    ///   cooldown row: only a chunk starts a cooldown, so it is neither
+    ///   restarted nor extended (expiry stays chunk time + 30 s), also when
+    ///   the book fills the order only in part. What the book cannot take
+    ///   stays; the account remains pending and backstop / ADL act when it
+    ///   falls below 2/3 MM / 0. The order keeps the slippage cap.
     fn stage1<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
@@ -244,9 +261,7 @@ impl NativeExecutor {
         trader: &Address,
         results: &mut Vec<NativeActionResult>,
     ) -> Result<(), CoreError> {
-        if liq::in_cooldown(&ctx.state, trader, ctx.timestamp)? {
-            return Ok(());
-        }
+        let whole = liq::in_cooldown(&ctx.state, trader, ctx.timestamp)?;
         let mut order: Vec<(Reverse<FixedPoint>, MarketId)> = Vec::new();
         // Review H2: only marked positions are sold; unmarked ones stay.
         for p in ctx.positions.positions_for_trader(trader)? {
@@ -262,7 +277,7 @@ impl NativeExecutor {
             let Some(p) = ctx.positions.get_position(trader, m)? else { continue };
             let mark = marks[&m];
             let lot = ctx.order_books.get(&m).map_or(FixedPoint::ONE, |b| b.lot_size);
-            let (qty, chunked) = liq::stage1_qty(p.size, mark, lot);
+            let (qty, chunked) = if whole { (p.size, false) } else { liq::stage1_qty(p.size, mark, lot) };
             let tiers = ctx.margin_configs.get(&m).map(|c| c.tiers.as_slice());
             let cap = liq::slippage_cap(tiers, mark, Self::liq_notional(&p, marks)?, !p.is_long);
             let params = PlaceOrderParams {

@@ -16410,9 +16410,16 @@ mod crash_recovery_tests {
     }
 
     /// Item 3 T8: the step runs at the END of the block (block 2's own bid fills
-    /// the chunk) on the block-start mark; a cooldown row alone makes an EMPTY
-    /// block (no submission rows left) run the native phase.
+    /// the chunk) on the block-start mark; the cooldown / pending rows make an
+    /// EMPTY block (no submission rows left) run the native phase.
     /// T long 200 @ 1,000, collateral 5,500, mark 990: stage 1, 20% chunks.
+    /// HL parity (s88): in the 30 s cooldown after a chunk, stage 1 orders the
+    /// ENTIRE position. Block 2: M bids 40 @ 985 and 50 @ 970; the chunk (40)
+    /// takes the 985 bid -> 160, cooldown from ts 1002. Block 3 (empty, ts
+    /// 1003): the full-position order (cap 965.25) takes the 970 bid -> 110
+    /// (AV 2,300 < MM 2,722.5: still stage 1, still due). Blocks 4..=31: empty
+    /// book, nothing fills. Block 32 (ts 1032, cooldown over): a chunk again,
+    /// 20% of 110 = 22 -> 88.
     #[test]
     fn liquidation_e2e_chunks_at_block_end_and_cooldown_drives_empty_blocks() {
         let (config, db) = liq_fixture_db(200, 5_500);
@@ -16420,21 +16427,24 @@ mod crash_recovery_tests {
         let t = oracle_addr(71);
         let mut rounds = vec![
             vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)], // 1 (ts 1001)
-            vec![signed_bid(73, 2_073, 985, 100)],                                         // 2 (mark 990)
+            vec![signed_bid(73, 2_073, 985, 40), signed_bid(73, 2_074, 970, 50)],           // 2 (mark 990)
         ];
-        rounds.extend(std::iter::repeat_n(Vec::new(), 30)); // 3..=32 (ts 1003..=1032)
+        rounds.extend(std::iter::repeat_n(Vec::new(), 29)); // 3..=31 (ts 1003..=1031)
+        rounds.push(vec![signed_bid(73, 32_073, 985, 100)]); // 32 (ts 1032)
         let blocks = liq_blocks(rounds);
         ctx.execute_committed_block(&blocks[0], vec![]);
         assert_eq!(signed_pos_of(&db, &t), px(200), "block 1: no mark yet");
         ctx.execute_committed_block(&blocks[1], vec![]);
-        assert_eq!(signed_pos_of(&db, &t), px(160), "block 2: chunk 1 filled by block 2's own bid");
-        for b in &blocks[2..31] {
-            ctx.execute_committed_block(b, vec![]); // 3..=31 (ts <= 1031)
+        assert_eq!(signed_pos_of(&db, &t), px(160), "block 2: chunk 1 filled by block 2's own 985 bid");
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(110), "block 3 (empty, cooldown): the entire position is ordered");
+        for b in &blocks[3..31] {
+            ctx.execute_committed_block(b, vec![]); // 4..=31 (ts <= 1031)
         }
-        assert_eq!(signed_pos_of(&db, &t), px(160), "cooldown: next chunk at ts >= 1032");
-        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: only the cooldown makes block 32 due");
-        ctx.execute_committed_block(&blocks[31], vec![]); // 32, ts 1032, empty
-        assert_eq!(signed_pos_of(&db, &t), px(128), "chunk 2 = 20% of 160");
+        assert_eq!(signed_pos_of(&db, &t), px(110), "cooldown: empty book, nothing fills");
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned");
+        ctx.execute_committed_block(&blocks[31], vec![]); // 32, ts 1032
+        assert_eq!(signed_pos_of(&db, &t), px(88), "cooldown over: chunk 2 = 20% of 110");
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(32));
     }
