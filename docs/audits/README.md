@@ -59,6 +59,7 @@ corrections; a repeated finding is not another defect.
 | 27 | [Permanent-stake rewards and unlock](chain-0a25560-pass27-permanent-stake-rewards-2026-10-04.md) |
 | 28 | [Fee split allocation and rounding](chain-0a25560-pass28-fee-split-allocation-2026-10-04.md) |
 | 29 | [Fee burn and supply reporting](chain-0a25560-pass29-fee-burn-supply-tracker-2026-10-04.md) |
+| 30 | [EVM fee revenue and beneficiary accounting](chain-0a25560-pass30-evm-fee-revenue-double-credit-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
