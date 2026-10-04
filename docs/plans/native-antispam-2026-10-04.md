@@ -156,6 +156,40 @@ Options considered for that failure, and why:
 | Stricter cancel allowance in B | Rejected: departs from Hyperliquid and hurts market makers, who cancel a lot |
 | E, per-address block share | Deferred (section 6, d): reads trade history, overlaps item 6 Phase 3 |
 
+### Merge with the crab stack (item 6 sync point 2, 2026-10-04)
+
+`main` (this record, `92a02ed`) was merged into `perf/item6-phase1`
+(`81a9567`: crab stack s87/s89, oracle signer, price feeder, liquidation,
+item 6 C1) on `merge/item6-sync2`. The crab stack adds an oracle lane to the
+native pool: `SubmitOraclePrices` sorts between cancels and everything else
+(`PRIO_CANCEL` 0 < `PRIO_ORACLE` 1 < `PRIO_NORMAL` 2), only an Active
+validator or its registered hot signer may pool one
+(`Mempool::oracle_reporter`), at most `ORACLE_PENDING_PER_VALIDATOR` (4) per
+validator, and at that cap a newer submission evicts the validator's oldest.
+
+Where the oracle lane sits under A-D. Requirement: neither C nor B may crowd
+oracle submissions out, and neither the admission backlog nor a full pool
+may shed them.
+
+| Path | Rule after the merge | Why |
+|---|---|---|
+| Block selection (C) | Cancels up to `ceil(limit * pct / 100)`, then oracle submissions, then normal entries, then leftover cancels. Oracle submissions do not count against the cancel share | `FIRST_NON_CANCEL` is `(PRIO_ORACLE, ..)`, so C's phase 2 starts with the oracle lane. The lane is bounded by the per-validator cap (4 x validators), so it cannot crowd orders out either |
+| Priority-only pacing tier | Same three phases, phase 2 ending before the first normal key (`select_entries_before(.., Excluded(FIRST_NORMAL))`) | Was all cancels first, unbounded: cancel spam filling `limit` would have kept prices out of the deepest pacing tier. With no oracle submission pooled the result is identical to the old walk (work-conserving phase 3) |
+| Full pool | Cancels and normal entries are refused (C). An oracle submission evicts the last normal entry, or, with none left, the last pooled cancel. Oracle submissions never evict each other | Crab's design already let oracle submissions evict normals. A pool full of cancel spam would otherwise refuse prices until it drained. The churn is bounded: an insert at the per-validator cap evicts the validator's own oldest first, so only a validator below 4 pooled can displace a cancel |
+| RPC pre-verify screen | Full pool: only oracle submissions proceed to verify. Backlog: cancels and oracle submissions proceed | C sheds cancels at a full pool; crab's oracle bypass is kept |
+| Admission backlog | `native_admission_backlogged` compares `NativePool::normal_size()` (entries that are neither cancels nor oracle submissions) with the limit | Oracle submissions bypass the screen themselves; counting them could only let oracle traffic shed orders. Their bound (4 x validators) means they cannot hide a real backlog |
+| A and B | See "Oracle signers" below | |
+
+Tests: `oracle_lane_follows_the_capped_cancel_prefix`,
+`full_pool_of_cancels_oracle_evicts_the_last_cancel`,
+`normal_size_tracks_inserts_and_every_removal` (`native_pool.rs`);
+`oracle_selected_next_block_under_full_pool_of_cancel_spam` (pool of 40
+cancels from 40 keys, full, C at 25%: the validator's submission is admitted
+and is the 6th action of the next 20-slot block, on the normal and the pacing
+path) and `pooled_oracle_submissions_do_not_count_as_admission_backlog`
+(`lib.rs`). Crab's `full_pool_of_priority_entries_rejects_oracle` was
+replaced by the cancel-eviction test above.
+
 ## 5. Bench results so far
 
 ozarchy, 10 markets, rate 76000, `--retry-busy`, n=1 per cell, all cells

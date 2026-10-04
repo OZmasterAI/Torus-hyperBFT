@@ -47,6 +47,10 @@ pub const PRIO_NORMAL: u8 = 2;
 /// is exactly the pooled cancels, `range(FIRST_NON_CANCEL..)` the rest.
 const FIRST_NON_CANCEL: SortKey = (PRIO_ORACLE, Address::ZERO, 0, 0);
 
+/// The smallest possible normal key: `range(..FIRST_NORMAL)` is the pooled
+/// cancels and oracle submissions (the priority-only pacing tier's scope).
+const FIRST_NORMAL: SortKey = (PRIO_NORMAL, Address::ZERO, 0, 0);
+
 /// What [`SelectionWalk::offer`] did with one entry.
 #[derive(PartialEq)]
 enum Offer {
@@ -156,8 +160,9 @@ pub(crate) struct NativePool {
     hash_index: HashMap<B256, Vec<SortKey>>,
     /// Insertion counter feeding [`SortKey`] tie order.
     next_seq: u64,
-    /// Pooled cancels, so admission can measure the non-cancel backlog alone.
-    cancel_count: usize,
+    /// Pooled cancels and oracle submissions (every non-[`PRIO_NORMAL`]
+    /// entry), so admission can measure the normal backlog alone.
+    priority_count: usize,
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
@@ -175,7 +180,7 @@ impl NativePool {
             seen: HashSet::new(),
             hash_index: HashMap::new(),
             next_seq: 0,
-            cancel_count: 0,
+            priority_count: 0,
             max_size,
             max_per_sender,
             max_per_block,
@@ -192,10 +197,12 @@ impl NativePool {
         self.entries.len()
     }
 
-    /// Pooled actions that are not cancels: the backlog the admission limit
-    /// measures, so pooled cancels never make ingress shed orders.
-    pub fn non_cancel_size(&self) -> usize {
-        self.entries.len() - self.cancel_count
+    /// Pooled [`PRIO_NORMAL`] actions: the backlog the admission limit
+    /// measures, so pooled cancels (item C) and oracle submissions (bounded
+    /// per validator, merge with the crab stack) never make ingress shed
+    /// orders.
+    pub fn normal_size(&self) -> usize {
+        self.entries.len() - self.priority_count
     }
 
     /// True when the pool is at capacity — every insert but an oracle
@@ -310,11 +317,21 @@ impl NativePool {
             }
             // s517 x item C: an oracle submission (gated to Active validators
             // and their signers, capped per validator) evicts the lowest-
-            // priority normal entry — the LAST entry in selection order.
-            // Cancels and oracle submissions are never evicted here.
-            let evict_key = match self.entries.iter().next_back() {
-                Some((key, entry)) if entry.priority == PRIO_NORMAL => *key,
-                _ => return Err(MempoolError::NativePoolFull),
+            // priority normal entry — the LAST entry in selection order — or,
+            // with no normal entry left, the LAST pooled cancel, so a pool
+            // full of cancel spam cannot keep prices out. Bounded churn: the
+            // mempool's per-validator oracle cap limits how many cancels the
+            // whole validator set can displace. Oracle submissions never
+            // evict each other.
+            let last_normal = self
+                .entries
+                .iter()
+                .next_back()
+                .filter(|(_, entry)| entry.priority == PRIO_NORMAL);
+            let last_cancel = || self.entries.range(..FIRST_NON_CANCEL).next_back();
+            let evict_key = match last_normal.or_else(last_cancel) {
+                Some((key, _)) => *key,
+                None => return Err(MempoolError::NativePoolFull),
             };
             self.remove_entry_by_key(&evict_key);
         }
@@ -337,7 +354,7 @@ impl NativePool {
                 restash_key,
             },
         );
-        self.cancel_count += usize::from(priority == PRIO_CANCEL);
+        self.priority_count += usize::from(priority != PRIO_NORMAL);
 
         Ok(action_hash)
     }
@@ -348,7 +365,7 @@ impl NativePool {
     /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
-        self.cancel_count -= usize::from(entry.priority == PRIO_CANCEL);
+        self.priority_count -= usize::from(entry.priority != PRIO_NORMAL);
         self.expiry_index.remove(&expiry_key(key));
         self.seen.remove(&(entry.sender, entry.action_hash));
         self.dec_sender_count(&entry.sender);
@@ -367,7 +384,10 @@ impl NativePool {
     ///    `ceil(limit * cancel_share_pct / 100)` slots;
     /// 2. non-cancels in their unchanged [`SortKey`] order (sender, nonce) —
     ///    s66: an arrival-order walk here collapsed throughput, so this phase
-    ///    is exactly the old non-cancel walk;
+    ///    is exactly the old non-cancel walk. Oracle submissions
+    ///    ([`PRIO_ORACLE`]) sort before normal entries, so they lead this
+    ///    phase: cancels at the share never crowd them out (merge with the
+    ///    crab stack; their count is bounded by the per-validator cap);
     /// 3. work-conserving: if slots remain, the cancels after the last one
     ///    phase 1 examined.
     ///
@@ -383,6 +403,19 @@ impl NativePool {
         exclude: &'a HashSet<B256>,
         bytes_cap: usize,
         orders_cap: usize,
+    ) -> Vec<(&'a SortKey, &'a NativePoolEntry)> {
+        self.select_entries_before(limit, exclude, bytes_cap, orders_cap, Bound::Unbounded)
+    }
+
+    /// [`Self::select_entries`] with phase 2 ending before `end`
+    /// (`Excluded(FIRST_NORMAL)` = the priority-only pacing tier).
+    fn select_entries_before<'a>(
+        &'a self,
+        limit: usize,
+        exclude: &'a HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+        end: Bound<SortKey>,
     ) -> Vec<(&'a SortKey, &'a NativePoolEntry)> {
         if self.max_per_block == 0 {
             return Vec::new();
@@ -415,7 +448,7 @@ impl NativePool {
             resume_after = Some(key);
         }
         // Phase 2: non-cancels, unchanged order.
-        for (key, entry) in self.entries.range(FIRST_NON_CANCEL..) {
+        for (key, entry) in self.entries.range((Bound::Included(FIRST_NON_CANCEL), end)) {
             if walk.full() {
                 return walk.selected;
             }
@@ -512,18 +545,21 @@ impl NativePool {
     }
 
     /// Priority-ONLY selection (Package D rank 1, deepest exec-backlog pacing
-    /// tier; s517: cancels, then oracle submissions): the same walk, budgets,
-    /// and per-sender cap as [`Self::select_for_block_with_senders_excluding`],
-    /// but the scan stops at the first [`PRIO_NORMAL`] entry. Priority classes
-    /// sort FIRST in [`SortKey`], so this touches exactly the pooled priority
-    /// prefix and never walks the (possibly huge) normal tail. The name is
-    /// kept from the cancels-only era. Non-destructive like every
-    /// selection: paced-out non-cancels stay pooled and remain fully
-    /// selectable by the normal path — pacing defers, never sheds.
+    /// tier; s517: cancels and oracle submissions): the item-C walk of
+    /// [`Self::select_entries`] (same phases, budgets, per-sender cap and
+    /// in-flight exclusion) with phase 2 ending at the first [`PRIO_NORMAL`]
+    /// key. Priority classes sort FIRST in [`SortKey`], so this touches
+    /// exactly the pooled priority prefix and never walks the (possibly
+    /// huge) normal tail. The name is kept from the cancels-only era.
+    /// Non-destructive like every selection: paced-out normal entries stay
+    /// pooled and remain fully selectable by the normal path — pacing
+    /// defers, never sheds.
     ///
-    /// Item C: this is the ONE remaining selection path that is all cancels
-    /// (no `cancel_share_pct` bound). It runs only while the proposer's exec
-    /// backlog is deep, where non-cancels would be paced out anyway.
+    /// Merge with the crab stack: cancels take at most `cancel_share_pct`
+    /// ahead of the oracle submissions, then (work-conserving) the rest of
+    /// the block. Without oracle submissions pooled this is exactly the old
+    /// all-cancels walk; with them, cancel spam cannot crowd prices out of
+    /// the deepest pacing tier.
     pub fn select_cancels_for_block_with_senders_excluding(
         &self,
         limit: usize,
@@ -531,46 +567,10 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
-        if self.max_per_block == 0 {
-            return Vec::new();
-        }
-        let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut selected = Vec::new();
-        let mut bytes_used: usize = 0;
-        let mut orders_used: usize = 0;
-
-        for entry in self.entries.values() {
-            if entry.priority == PRIO_NORMAL {
-                // Priority classes sort first: the first normal entry ends the
-                // priority prefix — nothing selectable remains beyond it here.
-                break;
-            }
-            if selected.len() >= limit {
-                break;
-            }
-            // In-flight exclusion before the budget gates, exactly like the
-            // normal path: an excluded entry must neither charge nor trip them.
-            if exclude.contains(&entry.action_hash) {
-                continue;
-            }
-            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
-                // Deterministic prefix, same rule as the normal path.
-                break;
-            }
-            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
-            if orders_used.saturating_add(entry_orders) > orders_cap {
-                break;
-            }
-            let count = block_counts.entry(entry.sender).or_insert(0);
-            if *count < self.max_per_block {
-                *count += 1;
-                bytes_used = bytes_used.saturating_add(entry.encoded_len);
-                orders_used = orders_used.saturating_add(entry_orders);
-                selected.push((entry.sender, entry.action.clone()));
-            }
-        }
-
-        selected
+        self.select_entries_before(limit, exclude, bytes_cap, orders_cap, Bound::Excluded(FIRST_NORMAL))
+            .into_iter()
+            .map(|(_, entry)| (entry.sender, entry.action.clone()))
+            .collect()
     }
 
     /// Evict entries whose nonce has aged out of the protocol validity window.
@@ -675,8 +675,8 @@ impl NativePool {
     fn assert_index_consistent(&self) {
         assert_eq!(self.expiry_index.len(), self.entries.len());
         assert_eq!(
-            self.cancel_count,
-            self.entries.values().filter(|e| e.priority == PRIO_CANCEL).count()
+            self.priority_count,
+            self.entries.values().filter(|e| e.priority != PRIO_NORMAL).count()
         );
         for key in self.entries.keys() {
             assert!(self.expiry_index.contains(&expiry_key(key)), "missing expiry key");
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn non_cancel_size_tracks_inserts_and_every_removal() {
+    fn normal_size_tracks_inserts_and_every_removal() {
         let mut pool = NativePool::new(100, 64, 100);
         let cancel = |n| make_action(n, NativeAction::CancelAllOrders { market_id: None });
         let other = |n| make_action(n, NativeAction::ClaimRewards);
@@ -774,13 +774,17 @@ mod tests {
         let o1 = pool.insert(s, other(3)).unwrap();
         pool.insert(s, other(4)).unwrap();
         pool.insert(s, other(5)).unwrap();
-        assert_eq!((pool.size(), pool.non_cancel_size()), (5, 3));
-        pool.remove_committed(&[c1]);
-        assert_eq!((pool.size(), pool.non_cancel_size()), (4, 3));
+        assert_eq!((pool.size(), pool.normal_size()), (5, 3));
+        // Merge with the crab stack: oracle submissions are not backlog either.
+        let or1 = pool.insert(s, oracle(6)).unwrap();
+        assert_eq!((pool.size(), pool.normal_size()), (6, 3));
+        pool.remove_committed(&[c1, or1]);
+        assert_eq!((pool.size(), pool.normal_size()), (4, 3));
         pool.remove_committed(&[o1]);
-        assert_eq!((pool.size(), pool.non_cancel_size()), (3, 2));
+        assert_eq!((pool.size(), pool.normal_size()), (3, 2));
         pool.drain(100);
-        assert_eq!((pool.size(), pool.non_cancel_size()), (0, 0));
+        assert_eq!((pool.size(), pool.normal_size()), (0, 0));
+        pool.assert_index_consistent();
     }
 
     #[test]
@@ -1719,18 +1723,63 @@ mod tests {
         pool.assert_index_consistent();
     }
 
+    /// Merge with the crab stack: with no normal entry left, an oracle
+    /// submission evicts the LAST pooled cancel (cancel spam cannot keep
+    /// prices out). A cancel never evicts anything (item C), and oracle
+    /// submissions never evict each other.
     #[test]
-    fn full_pool_of_priority_entries_rejects_oracle() {
-        let mut pool = NativePool::new(1, 64, 64);
-        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::CancelOrder { order_id: 1 })).unwrap();
-        assert!(matches!(pool.insert(Address::repeat_byte(2), oracle(2)), Err(MempoolError::NativePoolFull)));
-        // ...and a cancel never evicts an oracle submission either.
-        let mut pool = NativePool::new(1, 64, 64);
-        pool.insert(Address::repeat_byte(2), oracle(2)).unwrap();
+    fn full_pool_of_cancels_oracle_evicts_the_last_cancel() {
+        let mut pool = NativePool::new(3, 64, 64);
+        let cancel = |n| make_action(n, NativeAction::CancelOrder { order_id: n as u128 });
+        for i in 1..=3u8 {
+            pool.insert(Address::repeat_byte(i), cancel(i as u64)).unwrap();
+        }
         assert!(matches!(
-            pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::CancelOrder { order_id: 1 })),
+            pool.insert(Address::repeat_byte(9), cancel(9)),
             Err(MempoolError::NativePoolFull)
         ));
+        pool.insert(Address::repeat_byte(0xEE), oracle(4)).unwrap();
+        assert_eq!(pool.size(), 3);
+        assert_eq!(pool.oracle_pending(&[Address::repeat_byte(0xEE)]), 1);
+        let senders: Vec<Address> = pool.entries.values().map(|e| e.sender).collect();
+        assert_eq!(
+            senders,
+            vec![Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(0xEE)],
+            "the last cancel in selection order was evicted"
+        );
+        // ...a cancel never evicts an oracle submission.
+        let mut pool = NativePool::new(1, 64, 64);
+        pool.insert(Address::repeat_byte(2), oracle(2)).unwrap();
+        assert!(matches!(pool.insert(Address::repeat_byte(1), cancel(1)), Err(MempoolError::NativePoolFull)));
+        // ...and oracle submissions never evict each other.
+        assert!(matches!(pool.insert(Address::repeat_byte(3), oracle(3)), Err(MempoolError::NativePoolFull)));
+        pool.assert_index_consistent();
+    }
+
+    /// Merge with the crab stack: cancels at the item-C cap do not crowd the
+    /// oracle lane out — it sits right after the bounded cancel prefix, on
+    /// every selection entry point, the priority-only pacing tier included.
+    #[test]
+    fn oracle_lane_follows_the_capped_cancel_prefix() {
+        let mut pool = mixed_pool(40, 30, 25);
+        let v = Address::repeat_byte(0xEE);
+        pool.insert(v, oracle(5_000)).unwrap();
+        let sel = pool.select_for_block_with_senders_excluding(20, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(sel.len(), 20);
+        assert!(cancel_flags(&sel)[..5].iter().all(|c| *c), "ceil(25% of 20) cancels first");
+        assert_eq!(sel[5].0, v);
+        assert!(is_oracle_submission(&sel[5].1.action));
+        assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
+        // The pacing tier: cancels alone would fill all 10 slots.
+        let paced = pool.select_cancels_for_block_with_senders_excluding(10, &HashSet::new(), usize::MAX, usize::MAX);
+        assert_eq!(paced.len(), 10);
+        assert!(cancel_flags(&paced)[..3].iter().all(|c| *c), "ceil(25% of 10)");
+        assert_eq!(paced[3].0, v, "the oracle lane follows the cancel share");
+        assert!(cancel_flags(&paced)[4..].iter().all(|c| *c), "work-conserving: cancels fill the rest");
+        assert!(paced.iter().all(|(_, a)| is_priority(&a.action)), "never a normal entry");
+        // drain takes the same block.
+        let drained = pool.drain(20);
+        assert!(is_oracle_submission(&drained[5].action));
         pool.assert_index_consistent();
     }
 

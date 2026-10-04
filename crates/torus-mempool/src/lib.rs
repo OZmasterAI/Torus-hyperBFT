@@ -294,13 +294,17 @@ impl Mempool {
     }
 
     /// True when the native pool already holds at least the admission limit
-    /// of NON-cancels: new non-cancels would likely expire before inclusion.
+    /// of NORMAL entries: new ones would likely expire before inclusion.
     /// Pooled cancels are not counted (anti-spam): item C caps them at a share
     /// of each block, so they never delay orders by more than that share, and
     /// counting them let funded cancel spam make ingress shed every order.
+    /// Pooled oracle submissions are not counted either (merge with the crab
+    /// stack): at most ORACLE_PENDING_PER_VALIDATOR per validator, and they
+    /// bypass this screen themselves, so counting them could only let oracle
+    /// traffic shed orders.
     pub fn native_admission_backlogged(&self) -> bool {
         self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().non_cancel_size() >= limit)
+            .is_some_and(|limit| self.native.read().unwrap().normal_size() >= limit)
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -3639,6 +3643,73 @@ mod tests {
         assert_eq!(sel[1].0, v);
         assert!(crate::native_pool::is_oracle_submission(&sel[1].1.action));
         assert_eq!(pool.native_pool_size(), 3, "the ClaimRewards stays pooled");
+    }
+
+    /// Merge with the crab stack (item 6 sync 2): with the pool FULL of cancel
+    /// spam and cancels at the item-C share, an Active validator's oracle
+    /// submission is still admitted (it evicts the last cancel) and is
+    /// selected into the next block, right after the capped cancel prefix.
+    #[test]
+    fn oracle_selected_next_block_under_full_pool_of_cancel_spam() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_pool_max_size: 40,
+            native_cancel_block_share_pct: 25,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), cfg);
+        let now = now_ms();
+        for i in 0..40u8 {
+            let k = key(100 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, now))
+                .unwrap();
+        }
+        assert!(pool.native_pool_is_full());
+        let kv = key(61);
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        pool.add_native_action(oracle_from(&kv, now)).expect("oracle admitted into a full pool");
+        assert_eq!(pool.native_pool_size(), 40);
+        let sel = pool.select_native_for_block(20);
+        assert!(sel[..5].iter().all(|a| is_cancel(&a.action)), "ceil(25% of 20) cancels");
+        assert!(crate::native_pool::is_oracle_submission(&sel[5].action), "oracle right after the cap");
+        let paced = pool.select_native_cancels_for_block_with_senders_excluding(
+            20,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(paced[5].0, v, "the pacing tier keeps the oracle lane too");
+    }
+
+    /// Merge with the crab stack: pooled oracle submissions (bounded per
+    /// validator) are not admission backlog, so they never make ingress shed
+    /// orders — only normal entries count.
+    #[test]
+    fn pooled_oracle_submissions_do_not_count_as_admission_backlog() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_admission_horizon_ms: 1,
+            native_admission_floor: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), cfg);
+        let kv = key(62);
+        put_oracle_validator(&state, address_from_key(&kv), Active, None);
+        let now = now_ms();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
+        let kc = key(63);
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
+            .unwrap();
+        assert_eq!(pool.native_pool_size(), 3);
+        assert!(!pool.native_admission_backlogged(), "1 normal entry < limit 2");
+        let kd = key(64);
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kd))
+            .unwrap();
+        assert!(pool.native_admission_backlogged(), "2 normal entries reach the limit");
     }
 
     // ---- Anti-spam item A: funded-account check ----
