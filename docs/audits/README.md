@@ -119,6 +119,7 @@ corrections; a repeated finding is not another defect.
 | 87 | [Validator inflation failure handling](chain-14236fa-pass87-validator-inflation-partial-epoch-2026-10-05.md) |
 | 88 | [Fee distribution failure atomicity](chain-14236fa-pass88-fee-distribution-partial-credit-recheck-2026-10-05.md) |
 | 89 | [Delegation operation write ordering](chain-14236fa-pass89-delegate-partial-write-2026-10-05.md) |
+| 90 | [Undelegation operation write ordering](chain-14236fa-pass90-undelegate-partial-write-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
