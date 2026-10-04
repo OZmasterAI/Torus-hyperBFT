@@ -95,6 +95,7 @@ corrections; a repeated finding is not another defect.
 | 63 | [Delegation entry-time reward proration](chain-5c756ff-pass63-delegation-epoch-entry-proration-2026-10-04.md) |
 | 64 | [Validator rotation versus boundary rewards](chain-5c756ff-pass64-validator-rotation-reward-snapshot-2026-10-04.md) |
 | 65 | [Pending unbonding principal in inflation base](chain-5c756ff-pass65-unbonding-in-inflation-base-2026-10-04.md) |
+| 66 | [Validator self-stake share of inflation](chain-5c756ff-pass66-validator-self-stake-reward-allocation-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
