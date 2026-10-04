@@ -14,7 +14,7 @@ use torus_core::error::CoreError;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
     effective_max_leverage, market_margin_config, order_initial_margin, placement_need,
-    position_price, AccountView, MarginTier, MarketMarginConfig,
+    position_price, position_terms, AccountView, MarginTier, MarketMarginConfig,
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
@@ -788,14 +788,27 @@ pub(crate) struct PosSums {
     position_im: FixedPoint,
     notional: FixedPoint,
     maintenance: FixedPoint,
-    /// Some position is not Cross (`build` skips it; liquidation does not
-    /// value such an account). Read by L1 (C4).
-    any_isolated: bool,
+    /// Positions that are not Cross (`build` skips them; liquidation does
+    /// not value such an account). A count (C6b) so a partial re-value can
+    /// add and remove. Read by L1 (C4).
+    isolated: u32,
     /// Cross positions valued at a mark (not at entry). Read by L1 (C4).
     marked: u32,
+    /// C6b magnitude guard: Σ |term| of each sum (upnl, position_im,
+    /// notional, maintenance; saturating). At most `i128::MAX` = no partial
+    /// sum of `build` can overflow, in any order of its positions.
+    abs: [u128; 4],
 }
 
+/// C6b: the guard's bound (see [`PosSums::abs`]).
+const ABS_GUARD: u128 = i128::MAX as u128;
+
 impl PosSums {
+    /// Some position is not Cross.
+    fn any_isolated(&self) -> bool {
+        self.isolated > 0
+    }
+
     /// `build`'s view with balance `bal`: `build` copies the two balance
     /// fields and adds the position sums, which never read the balance.
     fn view(&self, bal: &NativeBalance) -> AccountView {
@@ -861,6 +874,12 @@ struct SumsCounters {
     memo: std::sync::atomic::AtomicUsize,
     computed: std::sync::atomic::AtomicUsize,
     dirty: std::sync::atomic::AtomicUsize,
+    /// C6b: dirty valuations answered by the partial re-value / by a build.
+    delta: std::sync::atomic::AtomicUsize,
+    delta_fallback: std::sync::atomic::AtomicUsize,
+    /// Full valuations (`build` over a trader's rows: the memo's or a
+    /// direct one; not the shadow check's) per trader.
+    builds: std::sync::Mutex<HashMap<Address, usize>>,
     /// C4: liquidation valuations through L1 / through the walk (L1 off).
     l1: std::sync::atomic::AtomicUsize,
     l1_off: std::sync::atomic::AtomicUsize,
@@ -869,6 +888,18 @@ struct SumsCounters {
 #[cfg(test)]
 fn bump(c: &std::sync::atomic::AtomicUsize) {
     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+impl SumsCounters {
+    fn built(&self, trader: &Address) {
+        *self.builds.lock().unwrap().entry(*trader).or_insert(0) += 1;
+    }
+
+    /// Full valuations of `trader` so far.
+    pub(crate) fn builds_of(&self, trader: &Address) -> usize {
+        self.builds.lock().unwrap().get(trader).copied().unwrap_or(0)
+    }
 }
 
 impl BlockSums {
@@ -880,6 +911,20 @@ impl BlockSums {
     fn start(&mut self, version: Option<u64>) {
         self.memo.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         self.memo_version = version;
+    }
+
+    /// C6b: `trader`'s sums over R's rows, if already known: the slot's
+    /// entry at `version`, else the block's memo (not computed here). `None`
+    /// also for a build that overflowed (no terms to adjust).
+    fn base(&self, version: u64, trader: &Address) -> Option<PosSums> {
+        if self.cache.version == version {
+            if let Some(r) = self.cache.map.get(trader) {
+                return r.ok();
+            }
+        }
+        let cell = self.memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(trader).cloned()?;
+        let r = (*cell.get()?)?;
+        r.ok()
     }
 
     /// End of the block: the memo joins the cache (at the memo's version),
@@ -1041,17 +1086,34 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// 3. the slot's entry at the block's mark version;
     /// 4. else the block's memo, built once over R's rows (the overlay with
     ///    nothing of the trader pending reads exactly them).
+    ///
+    /// C6b (A-lite): path 2 first tries [`Self::delta_sums`] (the trader's
+    /// sums over R's rows adjusted by this block's changes of its rows).
     fn pos_sums(&self, trader: &Address) -> Result<PosSums, CoreError> {
         let r = match (self.sums, self.marks) {
             (Some(s), Some(table)) if s.memo_version == Some(table.version) => {
                 if self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()) {
                     #[cfg(test)]
                     bump(&s.counters.dirty);
-                    self.direct_sums(trader)?
+                    match self.delta_sums(s, table, trader) {
+                        Some(r) => {
+                            #[cfg(test)]
+                            {
+                                bump(&s.counters.delta);
+                                s.shadow_check(trader, &r, || self.reference_sums(trader));
+                            }
+                            r
+                        }
+                        None => {
+                            #[cfg(test)]
+                            bump(&s.counters.delta_fallback);
+                            self.direct_sums(trader)?
+                        }
+                    }
                 } else {
                     let r = self.cached_sums(s, table.version, trader)?;
                     #[cfg(test)]
-                    s.shadow_check(trader, &r, || self.direct_sums(trader));
+                    s.shadow_check(trader, &r, || self.reference_sums(trader));
                     r
                 }
             }
@@ -1062,7 +1124,74 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
 
     /// Paths 1 and 2: `build` over the trader's rows as the backend shows them.
     fn direct_sums(&self, trader: &Address) -> Result<SumsResult, CoreError> {
+        #[cfg(test)]
+        if let Some(s) = self.sums {
+            s.counters.built(trader);
+        }
+        self.reference_sums(trader)
+    }
+
+    /// `build` over the trader's rows (the shadow check's reference; not
+    /// counted as a valuation).
+    fn reference_sums(&self, trader: &Address) -> Result<SumsResult, CoreError> {
         Ok(self.sums_of(&self.positions.positions_for_trader(trader)?).0)
+    }
+
+    /// C6b (A-lite): `trader`'s sums now = its sums over R's rows (the slot's
+    /// entry or the block's memo, [`BlockSums::base`]) minus the terms of
+    /// each row the block changed under its prefix as R holds it, plus the
+    /// terms of the row now ([`torus_state::StateBackend::resident_changes`]).
+    /// Exact: the sums are integer sums of the same [`position_terms`] as
+    /// `build`, the order does not matter while nothing overflows, every
+    /// step is checked, and the guard (Σ |term| <= `i128::MAX`, see
+    /// [`PosSums::abs`]) proves `build` over the rows now cannot overflow
+    /// either. `None` (the caller builds): no base, no change list, a row
+    /// that does not decode, a Cross position in a market outside the mark
+    /// table, an overflow, or the guard.
+    fn delta_sums(&self, s: &BlockSums, table: &BlockMarks, trader: &Address) -> Option<SumsResult> {
+        use borsh::BorshDeserialize;
+        let base = s.base(table.version, trader)?;
+        if base.abs.iter().any(|a| *a > ABS_GUARD) {
+            return None;
+        }
+        let changes =
+            self.positions.state().resident_changes(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice())?;
+        let mut sums = [base.upnl.raw(), base.position_im.raw(), base.notional.raw(), base.maintenance.raw()];
+        let (mut abs, mut isolated, mut marked) = (base.abs, base.isolated, base.marked);
+        // Removals first (exact: `abs` holds no saturated value), then additions.
+        for add in [false, true] {
+            for c in &changes {
+                let Some(row) = (if add { &c.current } else { &c.resident }) else {
+                    continue;
+                };
+                let pos = torus_core::position::Position::try_from_slice(row).ok()?;
+                let step = |n: u32| if add { n.checked_add(1) } else { n.checked_sub(1) };
+                if pos.margin_type != MarginType::Cross {
+                    isolated = step(isolated)?;
+                    continue;
+                }
+                let mark = *table.marks.get(&pos.market_id)?;
+                if mark.is_some() {
+                    marked = step(marked)?;
+                }
+                let t = position_terms(&pos, mark, self.tiers(pos.market_id)).ok()?;
+                for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
+                    let x = x.raw();
+                    if add {
+                        *sum = sum.checked_add(x)?;
+                        *a = a.saturating_add(x.unsigned_abs());
+                    } else {
+                        *sum = sum.checked_sub(x)?;
+                        *a = a.checked_sub(x.unsigned_abs())?;
+                    }
+                }
+            }
+        }
+        if abs.iter().any(|a| *a > ABS_GUARD) {
+            return None;
+        }
+        let [upnl, position_im, notional, maintenance] = sums.map(FixedPoint::from_raw);
+        Some(Ok(PosSums { upnl, position_im, notional, maintenance, isolated, marked, abs }))
     }
 
     /// Paths 3 and 4 (the trader has nothing pending this block).
@@ -1085,7 +1214,10 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         let computed = std::cell::Cell::new(false);
         let memo = *cell.get_or_init(|| {
             #[cfg(test)]
-            computed.set(true);
+            {
+                computed.set(true);
+                s.counters.built(trader);
+            }
             let ps = self.positions.positions_for_trader(trader).ok()?;
             let (r, in_table) = self.sums_of(&ps);
             in_table.then_some(r)
@@ -1116,14 +1248,22 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             marked.set(marked.get().saturating_add(u32::from(mark.is_some())));
             mark
         };
-        let r = AccountView::build(&NativeBalance::default(), ps, mark, |m| self.tiers(m))
+        let mut abs = [0u128; 4];
+        let seen = |_: &torus_core::position::Position, t: &torus_core::margin::PositionTerms| {
+            for (a, x) in abs.iter_mut().zip(t.parts()) {
+                *a = a.saturating_add(x.raw().unsigned_abs());
+            }
+        };
+        let r = AccountView::build_with(&NativeBalance::default(), ps, mark, |m| self.tiers(m), seen)
             .map(|v| PosSums {
                 upnl: v.upnl,
                 position_im: v.position_im,
                 notional: v.notional,
                 maintenance: v.maintenance,
-                any_isolated: ps.iter().any(|p| p.margin_type != MarginType::Cross),
+                isolated: u32::try_from(ps.iter().filter(|p| p.margin_type != MarginType::Cross).count())
+                    .unwrap_or(u32::MAX),
                 marked: marked.get(),
+                abs,
             })
             .map_err(|_| ());
         (r, in_table.get())

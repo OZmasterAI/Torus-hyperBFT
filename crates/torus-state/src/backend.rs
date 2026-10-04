@@ -8,7 +8,7 @@ use rocksdb::WriteBatch;
 use crate::cf::{CF_ACCOUNTS, CF_SESSIONS};
 use crate::db::{decode_account_info, encode_account_info, StateDb};
 use crate::error::StateError;
-use crate::resident_rows::{ResidentDelta, ResidentRows, RESIDENT_CFS};
+use crate::resident_rows::{ResidentChange, ResidentDelta, ResidentRows, RESIDENT_CFS};
 
 pub enum AtomicWriteOp<'a> {
     Put {
@@ -75,6 +75,14 @@ pub trait StateBackend: Clone + Send + Sync {
     /// [`NativeStateOverlay`] with resident rows attached answers exactly.
     fn layer_touches(&self, _cf: &str, _prefix: &[u8]) -> bool {
         true
+    }
+
+    /// Item 6 C6b: with resident rows attached and `cf` one of their CFs,
+    /// every key under `prefix` that THIS block's own pending set writes or
+    /// deletes, with R's row and the current row (any order). Default
+    /// `None` = not available (callers recompute from the current rows).
+    fn resident_changes(&self, _cf: &str, _prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        None
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
@@ -2038,6 +2046,27 @@ impl StateBackend for NativeStateOverlay {
             }
             _ => true,
         }
+    }
+
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        let id = intern_cf(cf)?;
+        let rows = self.resident_rows(id)?;
+        let state = self.pending.read().unwrap();
+        let change = |key: &Vec<u8>, current: Option<&Vec<u8>>| ResidentChange {
+            key: key.clone(),
+            resident: rows.get(key).cloned(),
+            current: current.cloned(),
+        };
+        let cfp = state.cf(id);
+        let range = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
+        let mut out: Vec<ResidentChange> = cfp
+            .writes
+            .range::<[u8], _>(range)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| change(k, Some(v)))
+            .collect();
+        out.extend(state.deletes_under(id, prefix).map(|k| change(k, None)));
+        Some(out)
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {

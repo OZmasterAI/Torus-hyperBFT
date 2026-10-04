@@ -31,7 +31,7 @@ pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, PrunerConfig, StatePruner};
-pub use resident_rows::{ResidentDelta, ResidentRows};
+pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRows};
 pub use erasure::ErasureParams;
 pub use shard_store::{
     decode_stored_shard, encode_stored_shard, shard_key, StoredShard, SHARD_KEY_LEN,

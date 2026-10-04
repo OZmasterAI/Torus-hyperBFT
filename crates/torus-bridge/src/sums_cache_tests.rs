@@ -3,7 +3,8 @@
 //! Seeded block sequences through the node's lifecycle (R and the slot
 //! attached, pipelined overlay over the previous block's frozen set, flushed
 //! one block later): positions opened, increased, partly closed, flipped and
-//! fully closed (some Isolated, some overflow-sized), balance-only writes
+//! fully closed (some Isolated, some overflow-sized, some UPnL-heavy near
+//! the C6b guard), balance-only writes
 //! (negative `available` included), marks fresh / moved / stale by time /
 //! absent / reappearing, flat and multi-tier configs (a config change
 //! mid-run), a listing and a delisting mid-run, orders (Phase 2 / 3) and
@@ -91,6 +92,9 @@ struct Stats {
     memo_hits: usize,
     computed: usize,
     dirty: usize,
+    /// C6b: dirty valuations answered by the partial re-value / by a build.
+    delta: usize,
+    delta_fallback: usize,
     overflowed: usize,
     versions: BTreeSet<u64>,
 }
@@ -163,6 +167,12 @@ fn write_positions<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h
             5 => {
                 pos.margin_type = if pos.margin_type == MarginType::Cross { MarginType::Isolated } else { MarginType::Cross };
                 pos.size += size(rng);
+            }
+            // C6b: UPnL-heavy (entry far above the mark; ~0.4 x i128::MAX
+            // per position): mixed-sign sums near the guard (rare)
+            6 if h.is_multiple_of(4) => {
+                pos.entry_price = fp(1_000_000);
+                pos.size = FixedPoint::from_raw(i128::MAX / 999_000 * 4 / 10 / FixedPoint::SCALE * FixedPoint::SCALE);
             }
             // overflow-sized (rare)
             _ if h.is_multiple_of(9) => pos.size = FixedPoint::from_raw(i128::MAX / 3),
@@ -288,6 +298,8 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.memo_hits += c.memo.load(std::sync::atomic::Ordering::Relaxed);
             stats.computed += c.computed.load(std::sync::atomic::Ordering::Relaxed);
             stats.dirty += c.dirty.load(std::sync::atomic::Ordering::Relaxed);
+            stats.delta += c.delta.load(std::sync::atomic::Ordering::Relaxed);
+            stats.delta_fallback += c.delta_fallback.load(std::sync::atomic::Ordering::Relaxed);
         }
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
@@ -328,9 +340,12 @@ fn sums_cache_equals_reference_on_seeded_sequences() {
         }
     }
     println!(
-        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} overflowed={} versions={}",
-        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.overflowed, stats.versions.len()
+        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} delta={} delta_fallback={} overflowed={} versions={}",
+        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.delta, stats.delta_fallback, stats.overflowed, stats.versions.len()
     );
+    // C6b: dirty traders are re-valued from their memo sums (shadow-checked
+    // against `build` above); the guard / no-base paths still build.
+    assert!(stats.delta > 100 && stats.delta_fallback > 10, "both dirty paths used: {stats:?}");
     assert!(stats.explicit > 5_000 && stats.shadow > 5_000, "non-vacuous: {stats:?}");
     assert!(stats.persistent_hits > 100 && stats.memo_hits > 100, "every cache path used: {stats:?}");
     assert!(stats.computed > 100 && stats.dirty > 100, "every cache path used: {stats:?}");
@@ -394,4 +409,146 @@ fn end_resident_drops_dirtied_traders_and_rebuild_starts_empty() {
     assert_eq!(block(&mut holder, 4, false), (vec![a, b], 2), "both from the slot");
     assert_eq!(block(&mut holder, 6, false), (vec![a, b], 0), "skipped height: R rebuilt, cache starts empty");
     assert_eq!(holder.rows_builds(), 2);
+}
+
+/// C6b (the cliff): a maker filled by an IOC order in the block's first
+/// (pre-EVM) batch is dirty in the second (post-EVM) batch; each market it
+/// fills there asks for its account. It is built once (its memo, over R)
+/// and re-valued from it, never rebuilt per market. Every answer is
+/// shadow-checked against `build`.
+#[test]
+fn maker_dirtied_by_an_earlier_batch_is_not_rebuilt_per_market() {
+    const BOOKS: u64 = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let now = 10_000;
+    let maker = trader(0);
+    {
+        let pm = PositionManager::new(db.clone());
+        for m in 1..=BOOKS + 20 {
+            if m <= BOOKS {
+                db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+            }
+            db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(MID + m as i64), now - 1)).unwrap();
+            // The maker holds a position in every market (some never traded here).
+            pm.put_position(&Position {
+                trader: maker,
+                market_id: m,
+                is_long: m % 2 == 0,
+                size: fp(3),
+                entry_price: fp(MID - 7),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            })
+            .unwrap();
+        }
+        for i in 0..=BOOKS {
+            pm.put_native_balance(&trader(i), &NativeBalance { available: fp(10_000_000), order_margin: FixedPoint::ZERO }).unwrap();
+        }
+    }
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut overlay, 1, None);
+    let mut ctx = NativeExecContext::new(overlay.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    ctx.sums.as_mut().expect("slot sums attached").shadow = true;
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    let order = |m: MarketId, is_buy: bool, tif: TimeInForce| {
+        NativeAction::PlaceOrder(PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: fp(MID),
+            quantity: fp(if is_buy { 1 } else { 10 }),
+            order_type: OrderType::Limit,
+            time_in_force: tif,
+            reduce_only: false,
+            client_order_id: None,
+        })
+    };
+    let builds = |ctx: &NativeExecContext<NativeStateOverlay>| ctx.sums.as_ref().unwrap().counters.builds_of(&maker);
+    let ok = |r: &NativeBatchResult| assert!(r.results.iter().all(|x| x.success), "{:?}", r.results.iter().map(|x| &x.error).collect::<Vec<_>>());
+    // Resting asks of the maker in every book.
+    let asks: Vec<_> = (1..=BOOKS).map(|m| (maker, order(m, false, TimeInForce::GTC))).collect();
+    ok(&NativeExecutor::execute_batch_engine_mode(&mut ctx, &asks, 0));
+    let after_asks = builds(&ctx);
+    assert_eq!(after_asks, 1, "valued once (Phase 2)");
+    // Pre-EVM batch: an IOC buy fills the maker in market 1.
+    ok(&NativeExecutor::execute_batch_engine_mode(&mut ctx, &[(trader(1), order(1, true, TimeInForce::IOC))], 0));
+    assert!(ctx.positions.state().layer_touches(CF_NATIVE_POSITIONS, maker.as_slice()), "maker dirtied");
+    let after_ioc = builds(&ctx);
+    // Post-EVM batch: fills in every other book (serial and 4 workers).
+    for threads in [0usize, 4] {
+        let before = builds(&ctx);
+        let buys: Vec<_> = (2..=BOOKS).map(|m| (trader(m), order(m, true, TimeInForce::GTC))).collect();
+        ok(&NativeExecutor::execute_batch_engine_mode(&mut ctx, &buys, threads));
+        let built = builds(&ctx) - before;
+        assert!(built <= 1, "threads {threads}: maker built {built}x in one batch over {} markets", BOOKS - 1);
+    }
+    let sums = ctx.sums.as_ref().unwrap();
+    assert!(sums.counters.dirty.load(std::sync::atomic::Ordering::Relaxed) >= 2 * (BOOKS as usize - 1), "dirty maker valued per market");
+    let bad = sums.shadow_mismatches.lock().unwrap().clone();
+    assert!(bad.is_empty(), "{bad:?}");
+    assert!(after_ioc <= after_asks + 1);
+    // The maker's account after all of it == a reference build.
+    let reference = AccountReader { sums: None, ..AccountReader::of(&ctx) };
+    let cached = AccountReader::of(&ctx);
+    let bal = ctx.positions.get_native_balance(&maker).unwrap();
+    assert_eq!(cached.view(&maker, &bal).unwrap(), reference.view(&maker, &bal).unwrap());
+    let fills: usize = (2..=BOOKS).map(|m| ctx.positions.get_position(&trader(m), m).unwrap().map_or(0, |_| 1)).sum();
+    assert_eq!(fills, BOOKS as usize - 1, "every post-EVM buyer filled");
+}
+
+/// C6b magnitude guard: UPnL terms of mixed sign can cancel in a trader's
+/// sums while `build`, adding its positions in key order, overflows on the
+/// way. R: market 1 (+0.45 MAX UPnL) and market 3 (-0.45 MAX), Σ |UPnL|
+/// 0.9 MAX; the block adds market 2 (+0.6 MAX). `build` overflows at market
+/// 2; the partial re-value (0 + 0.6 MAX) would not — the guard (Σ |UPnL|
+/// now 1.5 MAX) sends it to `build`: both say overflow.
+#[test]
+fn delta_guard_falls_back_when_build_order_overflows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let now = 10_000;
+    let t = trader(0);
+    // |UPnL| = (1_000_000 - 1_000) x size ~ `tenths` / 10 x i128::MAX.
+    let size = |tenths: i128| FixedPoint::from_raw(i128::MAX / 999_000 * tenths / 10 / FixedPoint::SCALE * FixedPoint::SCALE);
+    let pos = |m: MarketId, is_long: bool, size: FixedPoint| Position {
+        trader: t,
+        market_id: m,
+        is_long,
+        size,
+        entry_price: fp(1_000_000),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    {
+        let pm = PositionManager::new(db.clone());
+        for m in 1..=3u64 {
+            db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+            db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(MID), now - 1)).unwrap();
+        }
+        let half = FixedPoint::from_raw(size(9).raw() / 2);
+        pm.put_position(&pos(1, false, half)).unwrap(); // short, mark far below entry: UPnL > 0
+        pm.put_position(&pos(3, true, half)).unwrap(); // long: UPnL < 0
+    }
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut overlay, 1, None);
+    let mut ctx = NativeExecContext::new(overlay.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    let reader = AccountReader::of(&ctx);
+    let base = reader.pos_sums(&t).expect("R's rows: no overflow");
+    assert!(base.abs[0] < ABS_GUARD && base.abs[0] > ABS_GUARD / 10 * 8, "Σ |UPnL| ~0.9 MAX: {:?}", base.abs);
+    ctx.positions.put_position(&pos(2, false, size(6))).unwrap();
+    let reader = AccountReader::of(&ctx);
+    let reference = AccountReader { sums: None, ..AccountReader::of(&ctx) };
+    let got = format!("{:?}", reader.pos_sums(&t));
+    assert_eq!(got, format!("{:?}", reference.pos_sums(&t)));
+    assert!(got.contains("Overflow"), "build order overflows: {got}");
+    let c = &ctx.sums.as_ref().unwrap().counters;
+    assert_eq!(c.delta.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(c.delta_fallback.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

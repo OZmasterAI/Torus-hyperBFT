@@ -467,3 +467,49 @@ fn parent_rows_of_resident_cfs_are_not_read() {
     assert!(!overlay.prefix_exists(p, &[2u8; 20]).unwrap());
     assert!(overlay.prefix_exists(p, &[1u8; 20]).unwrap());
 }
+
+/// C6b: `resident_changes` lists exactly the keys under the prefix that the
+/// overlay's OWN pending set writes or deletes, each with R's row and the
+/// current row (what `get_cf_raw` returns); the parent layer is in R. No R,
+/// or a CF outside R: `None` (the `StateBackend` default too).
+#[test]
+fn resident_changes_lists_own_pending_keys_with_r_and_current_rows() {
+    use super::ResidentChange;
+    let (db, _dir) = temp_db();
+    let p = CF_NATIVE_POSITIONS;
+    assert!(db.resident_changes(p, &[1u8; 20]).is_none(), "StateDb: not available");
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(p, &pos_key(1, 1), b"parent-1-1").unwrap();
+    parent.put_cf_raw(p, &pos_key(1, 2), b"parent-1-2").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    assert!(overlay.resident_changes(p, &[1u8; 20]).is_none(), "no R");
+    overlay.attach_resident(Arc::new(ResidentRows::build(&overlay).unwrap()));
+    assert_eq!(overlay.resident_changes(p, &[1u8; 20]), Some(vec![]), "parent writes are in R");
+    overlay.put_cf_raw(p, &pos_key(1, 2), b"own-1-2").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(1, 1)).unwrap();
+    overlay.put_cf_raw(p, &pos_key(1, 3), b"own-1-3").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(1, 4)).unwrap();
+    overlay.put_cf_raw(p, &pos_key(2, 1), b"other-trader").unwrap();
+    overlay.put_cf_raw(CF_NATIVE_BALANCES, &[1u8; 20], b"bal").unwrap();
+    let mut got = overlay.resident_changes(p, &[1u8; 20]).unwrap();
+    got.sort_by(|a, b| a.key.cmp(&b.key));
+    let ch = |m: u64, resident: Option<&[u8]>, current: Option<&[u8]>| ResidentChange {
+        key: pos_key(1, m),
+        resident: resident.map(<[u8]>::to_vec),
+        current: current.map(<[u8]>::to_vec),
+    };
+    assert_eq!(
+        got,
+        vec![
+            ch(1, Some(b"parent-1-1"), None),
+            ch(2, Some(b"parent-1-2"), Some(b"own-1-2")),
+            ch(3, None, Some(b"own-1-3")),
+            ch(4, None, None),
+        ]
+    );
+    for c in &got {
+        assert_eq!(overlay.get_cf_raw(p, &c.key).unwrap(), c.current, "current == get_cf_raw");
+    }
+    assert!(overlay.resident_changes(CF_NATIVE_ORDERS, &[1u8; 20]).is_none(), "not an R CF");
+    assert_eq!(overlay.resident_changes(CF_NATIVE_BALANCES, &[1u8; 20]).map(|v| v.len()), Some(1));
+}

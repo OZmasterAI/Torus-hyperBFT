@@ -239,6 +239,10 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         self.inner.layer_touches(cf, prefix)
     }
 
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<torus_state::ResidentChange>> {
+        self.inner.resident_changes(cf, prefix)
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
         self.inner.atomic_write(ops)
     }

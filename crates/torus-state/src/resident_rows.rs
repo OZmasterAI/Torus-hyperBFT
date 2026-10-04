@@ -63,6 +63,16 @@ impl ResidentDelta {
     }
 }
 
+/// Item 6 C6b: one key of an R CF that the block's own pending set writes
+/// (`current: Some`) or deletes (`current: None`), with R's row (the state
+/// at the start of the block, parent layer included).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentChange {
+    pub key: Vec<u8>,
+    pub resident: Option<Vec<u8>>,
+    pub current: Option<Vec<u8>>,
+}
+
 impl ResidentRows {
     /// Every row of R's two CFs as `backend` sees them (`iterate_cf(cf, None)`).
     /// Build it through an overlay WITHOUT R attached: DB + parent layer = the

@@ -185,7 +185,7 @@ impl NativeExecutor {
         let v = match AccountReader::of(ctx).pos_sums(trader) {
             // `build` skips a non-Cross position; the step does not value
             // such an account. `marked == 0`: no position at a mark.
-            Ok(s) if s.any_isolated || s.marked == 0 => None,
+            Ok(s) if s.any_isolated() || s.marked == 0 => None,
             Ok(s) => Some(s.view(&ctx.positions.get_native_balance(trader)?)),
             Err(CoreError::Overflow(_)) => None,
             Err(e) => return Err(e),

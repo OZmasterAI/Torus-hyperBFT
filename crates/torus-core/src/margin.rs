@@ -138,6 +138,46 @@ pub struct AccountView {
     pub maintenance: FixedPoint,
 }
 
+/// Item 6 C6b: one Cross position's contribution to each of
+/// [`AccountView`]'s position sums — THE formula of [`AccountView::build`]
+/// (also used by the executor's in-block partial re-value, which subtracts
+/// and adds these terms). Exact integers: the sums do not depend on the
+/// order the terms are added in, as long as no partial sum overflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionTerms {
+    pub upnl: FixedPoint,
+    pub notional: FixedPoint,
+    pub position_im: FixedPoint,
+    pub maintenance: FixedPoint,
+}
+
+impl PositionTerms {
+    /// The four terms, in [`AccountView`] field order (upnl, position_im,
+    /// notional, maintenance).
+    pub fn parts(&self) -> [FixedPoint; 4] {
+        [self.upnl, self.position_im, self.notional, self.maintenance]
+    }
+}
+
+/// [`PositionTerms`] of `pos` valued at `mark` (else entry, see
+/// [`position_price`]) with its market's `tiers`. `Err` = overflow.
+pub fn position_terms(
+    pos: &Position,
+    mark: Option<FixedPoint>,
+    tiers: Option<&[MarginTier]>,
+) -> Result<PositionTerms, CoreError> {
+    let of = |_| CoreError::Overflow("account margin overflows i128".into());
+    let px = position_price(pos, mark);
+    let n = pos.size.checked_mul(px).map_err(of)?;
+    let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
+    Ok(PositionTerms {
+        upnl: diff.checked_mul(pos.size).map_err(of)?,
+        notional: n,
+        position_im: order_initial_margin(tiers, n),
+        maintenance: maintenance_margin(tiers, n),
+    })
+}
+
 impl AccountView {
     /// Cross positions only (every production position is Cross).
     pub fn build<'t>(
@@ -145,6 +185,19 @@ impl AccountView {
         positions: &[Position],
         mark: impl Fn(MarketId) -> Option<FixedPoint>,
         tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+    ) -> Result<Self, CoreError> {
+        Self::build_with(bal, positions, mark, tiers, |_, _| {})
+    }
+
+    /// [`Self::build`], handing each Cross position's [`PositionTerms`] to
+    /// `seen` (in order, before they are added). Item 6 C6b: the executor's
+    /// sums cache records what its partial re-value needs through it.
+    pub fn build_with<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+        mut seen: impl FnMut(&Position, &PositionTerms),
     ) -> Result<Self, CoreError> {
         let of = |_| CoreError::Overflow("account margin overflows i128".into());
         let mut v = Self {
@@ -156,14 +209,12 @@ impl AccountView {
             maintenance: FixedPoint::ZERO,
         };
         for pos in positions.iter().filter(|p| p.margin_type == MarginType::Cross) {
-            let px = position_price(pos, mark(pos.market_id));
-            let n = pos.size.checked_mul(px).map_err(of)?;
-            let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
-            v.upnl = v.upnl.checked_add(diff.checked_mul(pos.size).map_err(of)?).map_err(of)?;
-            v.notional = v.notional.checked_add(n).map_err(of)?;
-            let t = tiers(pos.market_id);
-            v.position_im = v.position_im.checked_add(order_initial_margin(t, n)).map_err(of)?;
-            v.maintenance = v.maintenance.checked_add(maintenance_margin(t, n)).map_err(of)?;
+            let t = position_terms(pos, mark(pos.market_id), tiers(pos.market_id))?;
+            seen(pos, &t);
+            v.upnl = v.upnl.checked_add(t.upnl).map_err(of)?;
+            v.notional = v.notional.checked_add(t.notional).map_err(of)?;
+            v.position_im = v.position_im.checked_add(t.position_im).map_err(of)?;
+            v.maintenance = v.maintenance.checked_add(t.maintenance).map_err(of)?;
         }
         Ok(v)
     }
