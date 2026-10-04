@@ -37,6 +37,10 @@ services:
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
+      # Node anti-spam limits (items A, B, D) OFF on the devnet by default.
+      - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
+      - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
+      - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -73,6 +77,10 @@ services:
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
+      # Node anti-spam limits (items A, B, D) OFF on the devnet by default.
+      - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
+      - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
+      - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -108,6 +116,10 @@ services:
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
+      # Node anti-spam limits (items A, B, D) OFF on the devnet by default.
+      - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
+      - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
+      - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -143,6 +155,10 @@ services:
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
       - TORUS_NATIVE_TOTAL_BLOCK_CAP=${TORUS_NATIVE_TOTAL_BLOCK_CAP:-100}
+      # Node anti-spam limits (items A, B, D) OFF on the devnet by default.
+      - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
+      - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
+      - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -177,6 +193,10 @@ services:
       # Overridable per leg by sweep-o5-threshold-s415.sh; NOTE the node clamps
       # requests above the 4MB fleet direct-msg floor since O5 (WARN in log).
       - TORUS_HASH_ONLY_PUSH_THRESHOLD=${TORUS_PUSH_THRESHOLD:-6000000}
+      # Node anti-spam limits (items A, B, D) OFF on the devnet by default.
+      - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
+      - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
+      - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data

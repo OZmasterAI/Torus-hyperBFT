@@ -746,6 +746,49 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ]', src)
         self.assertIn("retry_busy='${RETRY_BUSY:-unset}'", src)
 
+    def test_antispam_off_on_devnet_and_switched_on_by_the_harness(self):
+        """Node anti-spam limits (items A, B, D) are OFF on the bench devnet
+        (devnet/wsl/env.sh defaults), ANTISPAM=1 turns them ON for a cell
+        (validated, logged), and EXTRA_ENV can still override any single
+        knob (it is exported after). Item C (cancel block share) is a
+        fairness fix and stays at the node default everywhere."""
+        wsl_env = os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "devnet", "wsl", "env.sh"
+        )
+        with open(wsl_env) as f:
+            env_src = f.read()
+        for knob in (
+            "TORUS_INGRESS_MIN_COLLATERAL",
+            "TORUS_ADDR_RATE_LIMIT",
+            "TORUS_RPC_IP_WEIGHT_PER_MIN",
+        ):
+            self.assertIn(f'export {knob}="${{{knob}:-0}}"', env_src)
+        self.assertNotIn("TORUS_CANCEL_BLOCK_SHARE_PCT=", env_src)
+        r = subprocess.run(
+            ["bash", "-c", f'source "{wsl_env}"; '
+             'echo "$TORUS_INGRESS_MIN_COLLATERAL $TORUS_ADDR_RATE_LIMIT $TORUS_RPC_IP_WEIGHT_PER_MIN"'],
+            capture_output=True, text=True,
+            env={k: v for k, v in os.environ.items() if not k.startswith("TORUS_")},
+        )
+        self.assertEqual(r.stdout.strip(), "0 0 0", r.stderr)
+
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("ANTISPAM=${ANTISPAM:-}", src)
+        self.assertIn('[ -z "$ANTISPAM" ] || [ "$ANTISPAM" = 1 ]', src)
+        self.assertIn("antispam='${ANTISPAM:-unset}'", src)
+        on = src.index('if [ "$ANTISPAM" = 1 ]; then')
+        block = src[on : src.index("fi", on)]
+        for kv in (
+            "TORUS_INGRESS_MIN_COLLATERAL=1",
+            "TORUS_ADDR_RATE_LIMIT=1",
+            "TORUS_RPC_IP_WEIGHT_PER_MIN=1200",
+        ):
+            self.assertIn(kv, block)
+        # exported after the env clean and before EXTRA_ENV
+        self.assertLess(src.index("for v in $(env | grep -oE '^TORUS_"), on)
+        self.assertLess(on, src.index('for kv in $EXTRA_ENV; do export "$kv"; done'))
+
     def test_open_limit_rejects_are_sampled(self):
         """The open-limit funnel counter is in both sampler column sets."""
         with open(RUN_CELL_SH) as f:
