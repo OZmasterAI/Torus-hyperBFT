@@ -382,7 +382,7 @@ fn ingress_verify_pool() -> &'static rayon::ThreadPool {
 /// `Proceed` payloads are consumed (`mem::take`) when handed to the verify
 /// closure; only the variant tag matters afterwards.
 enum SubmitSlot {
-    /// Pay full verification (normal path; cancels even when the pool is full).
+    /// Pay full verification (normal path; cancels past the admission limit).
     Proceed(String),
     /// Shed before crypto with this per-item error (reason already counted).
     Rejected(String),
@@ -427,19 +427,20 @@ impl RpcState {
                 .observe(permit_wait_t0.elapsed().as_secs_f64());
         }
 
-        // Sprint 5 (C): when the native pool is already full, non-cancel
-        // actions are doomed at admission — shed them after a decode-only
-        // pass instead of paying signature verification. Cancels proceed to
-        // full verification (admission evicts a non-cancel to make room).
+        // Sprint 5 (C): when the native pool is already full, every action
+        // is doomed at admission — shed it after a decode-only pass instead
+        // of paying signature verification. Anti-spam item C: cancels too,
+        // since a full pool no longer lets a cancel evict an order.
         // s65 item B: the same pre-verify shed when the pool already holds
         // more than the admission limit (recent commit rate x horizon), with a
-        // retryable "busy" instead of "pool full".
-        let shed_msg = if self.mempool.native_pool_is_full() {
-            Some(POOL_FULL_PREVERIFY_MSG)
+        // retryable "busy" instead of "pool full" — there cancels still pass
+        // (the admission limit never sheds cancels).
+        let (shed_msg, cancels_pass) = if self.mempool.native_pool_is_full() {
+            (Some(POOL_FULL_PREVERIFY_MSG), false)
         } else if self.mempool.native_admission_backlogged() {
-            Some(ADMISSION_BUSY_MSG)
+            (Some(ADMISSION_BUSY_MSG), true)
         } else {
-            None
+            (None, true)
         };
         let mut slots: Vec<SubmitSlot> = if let Some(shed_msg) = shed_msg {
             let screened = tokio::task::spawn_blocking(move || {
@@ -450,7 +451,9 @@ impl RpcState {
                             .map_err(|e| format!("invalid hex: {e}"))
                             .and_then(|bytes| decode(&bytes));
                         match decoded {
-                            Ok(action) if torus_mempool::is_cancel(&action.action) => {
+                            Ok(action)
+                                if cancels_pass && torus_mempool::is_cancel(&action.action) =>
+                            {
                                 SubmitSlot::Proceed(signed_action)
                             }
                             Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),

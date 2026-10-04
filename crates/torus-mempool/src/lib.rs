@@ -94,6 +94,12 @@ pub struct MempoolConfig {
     /// tests are unaffected; `torus-node` sets it from
     /// `TORUS_INGRESS_MIN_COLLATERAL` (default 1).
     pub ingress_min_collateral_trs: u64,
+    // ---- Anti-spam item C ----
+    /// Max percent of each selected native block that cancels may take ahead
+    /// of non-cancels (proposer-local). Default 25, ON everywhere (a fairness
+    /// fix, not a limit); 100 = the old unbounded cancel priority;
+    /// `TORUS_CANCEL_BLOCK_SHARE_PCT` env override.
+    pub native_cancel_block_share_pct: u8,
 }
 
 impl Default for MempoolConfig {
@@ -115,6 +121,7 @@ impl Default for MempoolConfig {
             native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
             native_admission_floor: rate_limit::admission_floor(),
             ingress_min_collateral_trs: 0,
+            native_cancel_block_share_pct: rate_limit::cancel_block_share_pct(),
         }
     }
 }
@@ -180,11 +187,12 @@ pub struct Mempool {
 impl Mempool {
     /// Create a new mempool backed by the given state database.
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
-        let native_pool = native_pool::NativePool::new(
+        let mut native_pool = native_pool::NativePool::new(
             config.native_pool_max_size,
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
+        native_pool.set_cancel_share_pct(config.native_cancel_block_share_pct);
         // DA store shares the same RocksDB handle; every native-action body the
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
@@ -715,7 +723,8 @@ impl Mempool {
     }
 
     /// Drain native actions for a block proposal.
-    /// Returns up to `limit` actions in priority order (cancels first).
+    /// Returns up to `limit` actions in selection order (a bounded cancel
+    /// share first, item C).
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
         // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
@@ -747,7 +756,7 @@ impl Mempool {
         self.native.read().unwrap().size()
     }
 
-    /// True when the native pool is at capacity (non-cancel admits will fail).
+    /// True when the native pool is at capacity (every admit will fail).
     pub fn native_pool_is_full(&self) -> bool {
         self.native.read().unwrap().is_full()
     }
@@ -3518,5 +3527,33 @@ mod tests {
         put_native(&state, &owner, ONE_TRS, 0);
         pool.add_native_action_from_gossip(owner, a)
             .expect("owner funded");
+    }
+
+    /// Item C: `native_cancel_block_share_pct` reaches the pool.
+    #[test]
+    fn cancel_share_config_reaches_pool_selection() {
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_cancel_block_share_pct: 25,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state, cfg);
+        let t0 = now_ms();
+        for i in 0..8u8 {
+            let k = key(60 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+            let k = key(80 + i);
+            let a = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                t0,
+                &k,
+            );
+            pool.add_native_action_presigned(address_from_key(&k), a)
+                .unwrap();
+        }
+        let sel = pool.select_native_for_block(8);
+        let cancels = sel.iter().filter(|a| is_cancel(&a.action)).count();
+        assert_eq!(cancels, 2, "ceil(25% of 8)");
     }
 }

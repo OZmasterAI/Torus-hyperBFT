@@ -1663,12 +1663,12 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
-    /// are shed after a decode-only pass (no signature verification spent),
-    /// while cancels still travel the full verify path so pool eviction
-    /// semantics are preserved.
+    /// Sprint 5 Task 4 / item C: with the native pool at capacity, every
+    /// action is shed after a decode-only pass (no signature verification
+    /// spent) — cancels included, since a full pool no longer lets a cancel
+    /// evict an order.
     #[tokio::test]
-    async fn pool_full_sheds_non_cancels_before_verify() {
+    async fn pool_full_sheds_every_action_before_verify() {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         // Capacity 0: the pool is permanently "full" from the first submit.
@@ -1719,34 +1719,26 @@ mod tests {
             .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
             .await
             .unwrap();
-        // Non-cancel: shed before signature verification.
-        assert_eq!(
-            results[0].error.as_deref(),
-            Some("mempool: pool full (pre-verify)"),
-            "non-cancel should be pre-verify shed: {:?}",
-            results[0]
-        );
-        // Cancel: full verify path, rejected at admission (nothing to evict).
-        assert!(
-            results[1]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("native action pool full"),
-            "cancel should reach real admission: {:?}",
-            results[1]
-        );
+        // Item C: a full pool admits nothing (cancels no longer evict an
+        // order), so both kinds are shed before signature verification.
+        for r in &results {
+            assert_eq!(
+                r.error.as_deref(),
+                Some("mempool: pool full (pre-verify)"),
+                "pre-verify shed expected: {r:?}"
+            );
+        }
 
         let text = metrics.encode();
         assert!(
             text.contains(
-                r#"torus_rpc_submit_admit_rejects_total{reason="pool_full_preverify"} 1"#
+                r#"torus_rpc_submit_admit_rejects_total{reason="pool_full_preverify"} 2"#
             ),
-            "pre-verify shed not counted; dump:\n{text}"
+            "pre-verify sheds not counted; dump:\n{text}"
         );
         assert!(
-            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="pool_full"} 1"#),
-            "cancel admission reject not counted; dump:\n{text}"
+            !text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="pool_full"}"#),
+            "no action should reach admission; dump:\n{text}"
         );
         handle.stop().unwrap();
     }

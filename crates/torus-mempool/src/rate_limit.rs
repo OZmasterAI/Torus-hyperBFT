@@ -175,6 +175,25 @@ pub fn admission_limit(
     Some(by_rate.max(floor))
 }
 
+// ---- Anti-spam item C: bounded cancel prefix ----
+
+/// Default share (percent) of each selected native block that cancels may
+/// take ahead of non-cancels. 100 = the pre-item-C unbounded cancel priority.
+pub const DEFAULT_CANCEL_BLOCK_SHARE_PCT: u8 = 25;
+
+/// Parse `TORUS_CANCEL_BLOCK_SHARE_PCT` (clamped to 100; unset/unparsable =>
+/// the default).
+pub fn parse_cancel_block_share_pct(raw: Option<String>) -> u8 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.min(100) as u8)
+        .unwrap_or(DEFAULT_CANCEL_BLOCK_SHARE_PCT)
+}
+
+/// The node's `TORUS_CANCEL_BLOCK_SHARE_PCT` (proposer-local selection policy).
+pub fn cancel_block_share_pct() -> u8 {
+    parse_cancel_block_share_pct(std::env::var("TORUS_CANCEL_BLOCK_SHARE_PCT").ok())
+}
+
 /// Max pending native actions per sender in the pool. With non-destructive
 /// selection (actions stay until commit), this must cover burst submissions.
 pub const NATIVE_PER_SENDER_CAP: usize = 512;

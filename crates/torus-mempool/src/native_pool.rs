@@ -4,6 +4,7 @@
 //! limits and no dedup. Adds pool size cap with priority-based eviction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 
 use alloy_primitives::{Address, B256};
 use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
@@ -25,7 +26,75 @@ use crate::error::MempoolError;
 /// meant to stop high-address senders starving) collapsed throughput under
 /// overload (s66-abcfix-abc-r1: 3.4k matched/s, 15 txs/blk, gossip flood) and
 /// was reverted; the same binary with this key ran 56k (s66-bisect-noarr-r1).
+///
+/// Anti-spam item C: the key is unchanged, but selection no longer takes the
+/// whole cancel range first — cancels get at most `cancel_share_pct` of each
+/// selected block ahead of non-cancels (see [`NativePool::select_entries`]).
 type SortKey = (u8, Address, u64, u64);
+
+/// The smallest possible non-cancel key: `entries.range(..FIRST_NON_CANCEL)`
+/// is exactly the pooled cancels, `range(FIRST_NON_CANCEL..)` the rest.
+const FIRST_NON_CANCEL: SortKey = (1, Address::ZERO, 0, 0);
+
+/// What [`SelectionWalk::offer`] did with one entry.
+#[derive(PartialEq)]
+enum Offer {
+    Taken,
+    Skipped,
+    /// A byte/order budget would be exceeded: selection ends here
+    /// (deterministic prefix).
+    Stop,
+}
+
+/// Per-block selection state shared by the cancel-share phases.
+struct SelectionWalk<'a> {
+    limit: usize,
+    exclude: &'a HashSet<B256>,
+    bytes_cap: usize,
+    orders_cap: usize,
+    max_per_block: usize,
+    block_counts: HashMap<Address, usize>,
+    bytes_used: usize,
+    orders_used: usize,
+    selected: Vec<(&'a SortKey, &'a NativePoolEntry)>,
+}
+
+impl<'a> SelectionWalk<'a> {
+    fn full(&self) -> bool {
+        self.selected.len() >= self.limit
+    }
+
+    fn offer(&mut self, key: &'a SortKey, entry: &'a NativePoolEntry) -> Offer {
+        // Skip in-flight (already-proposed) entries BEFORE the budget gates:
+        // an excluded entry is never selected, so it must neither charge nor
+        // trip the byte/order budget — otherwise a large in-flight batch
+        // sitting early in the sort would halt selection and under-fill the
+        // block with valid later entries.
+        if self.exclude.contains(&entry.action_hash) {
+            return Offer::Skipped;
+        }
+        if self.bytes_used.saturating_add(entry.encoded_len) > self.bytes_cap {
+            // Deterministic prefix: stop at the first entry that would blow
+            // the body-byte budget rather than skipping past it.
+            return Offer::Stop;
+        }
+        let entry_orders = crate::rate_limit::order_count(&entry.action.action);
+        if self.orders_used.saturating_add(entry_orders) > self.orders_cap {
+            // Deterministic prefix for the ORDER budget too (O2/G2) —
+            // bounds worst-case matching/exec time per block.
+            return Offer::Stop;
+        }
+        let count = self.block_counts.entry(entry.sender).or_insert(0);
+        if *count >= self.max_per_block {
+            return Offer::Skipped;
+        }
+        *count += 1;
+        self.bytes_used = self.bytes_used.saturating_add(entry.encoded_len);
+        self.orders_used = self.orders_used.saturating_add(entry_orders);
+        self.selected.push((key, entry));
+        Offer::Taken
+    }
+}
 
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
 /// No stale heap entries: every insert/remove maintains this exact live index.
@@ -78,6 +147,9 @@ pub(crate) struct NativePool {
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
+    /// Anti-spam item C: max share (percent) of a selected block that cancels
+    /// may take ahead of non-cancels. 100 = the old unbounded cancel priority.
+    cancel_share_pct: u8,
 }
 
 impl NativePool {
@@ -92,15 +164,21 @@ impl NativePool {
             max_size,
             max_per_sender,
             max_per_block,
+            cancel_share_pct: crate::rate_limit::DEFAULT_CANCEL_BLOCK_SHARE_PCT,
         }
+    }
+
+    /// Set the cancel share of each selected block (clamped to 100).
+    pub fn set_cancel_share_pct(&mut self, pct: u8) {
+        self.cancel_share_pct = pct.min(100);
     }
 
     pub fn size(&self) -> usize {
         self.entries.len()
     }
 
-    /// True when the pool is at capacity — non-cancel inserts are guaranteed
-    /// to fail (cancels may still evict their way in).
+    /// True when the pool is at capacity — every insert is guaranteed to fail
+    /// (item C: cancels no longer evict their way in).
     pub fn is_full(&self) -> bool {
         self.entries.len() >= self.max_size
     }
@@ -139,7 +217,9 @@ impl NativePool {
     /// Insert a native action with a known sender.
     ///
     /// Checks: dedup by (sender, action_hash), per-sender pool cap, total pool cap.
-    /// When pool is full and a cancel arrives, evicts a lowest-priority non-cancel.
+    /// A full pool rejects every action, cancels included (item C: a cancel
+    /// used to evict the last pending non-cancel, which let cancel spam push
+    /// every order out of the pool).
     /// Entries inserted via this 2-arg form are NOT marked locally-verified (the
     /// conservative default); the verified ingress/recover paths call
     /// [`NativePool::insert_verified`] so they can seed the exec trust-cache.
@@ -197,20 +277,13 @@ impl NativePool {
             return Err(MempoolError::NativeSenderQueueFull { sender });
         }
 
-        // Pool size cap with priority-based eviction.
+        // Pool size cap. Item C: no eviction — rejecting the newcomer is the
+        // same rule for every action kind. Evicting another cancel instead
+        // would let one spammer churn other users' cancels out; evicting an
+        // order was the starvation vector. A full pool is transient: the
+        // admission limit sheds non-cancels well before it.
         if self.entries.len() >= self.max_size {
-            if is_cancel {
-                // High-priority: evict the lowest-priority non-cancel — the
-                // LAST entry in selection order (cancels sort first, so if any
-                // non-cancel exists it sits at the back of the map).
-                let evict_key = match self.entries.iter().next_back() {
-                    Some((key, entry)) if !entry.is_cancel => *key,
-                    _ => return Err(MempoolError::NativePoolFull),
-                };
-                self.remove_entry_by_key(&evict_key);
-            } else {
-                return Err(MempoolError::NativePoolFull);
-            }
+            return Err(MempoolError::NativePoolFull);
         }
 
         *self.sender_counts.entry(sender).or_insert(0) += 1;
@@ -253,28 +326,93 @@ impl NativePool {
         Some(entry)
     }
 
-    /// Drain up to `limit` actions in priority order with per-sender-per-block caps.
+    /// Item C selection walk shared by every block-selection entry point.
     ///
-    /// Cancellations first (highest priority), then remaining actions.
-    /// Within each priority group, ordered by (sender, nonce) for determinism
-    /// — the incremental [`SortKey`] iteration order (T2.3), no re-sort.
-    /// Excess actions from rate-limited senders stay in pool for next block.
-    pub fn drain(&mut self, limit: usize) -> Vec<SignedNativeAction> {
+    /// 1. cancels, in [`SortKey`] order, until they hold
+    ///    `ceil(limit * cancel_share_pct / 100)` slots;
+    /// 2. non-cancels in their unchanged [`SortKey`] order (sender, nonce) —
+    ///    s66: an arrival-order walk here collapsed throughput, so this phase
+    ///    is exactly the old non-cancel walk;
+    /// 3. work-conserving: if slots remain, the cancels after the last one
+    ///    phase 1 examined.
+    ///
+    /// Each phase is a `BTreeMap::range` over the incrementally sorted pool —
+    /// no sort, no extra allocation beyond the result. Budgets, the
+    /// per-sender cap and the in-flight exclusion apply across all phases; a
+    /// budget stop ends the whole selection (deterministic prefix). At 100 %
+    /// phase 1 can take the whole block, which is exactly the old
+    /// cancels-first walk.
+    fn select_entries<'a>(
+        &'a self,
+        limit: usize,
+        exclude: &'a HashSet<B256>,
+        bytes_cap: usize,
+        orders_cap: usize,
+    ) -> Vec<(&'a SortKey, &'a NativePoolEntry)> {
         if self.max_per_block == 0 {
             return Vec::new();
         }
-        let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut take_keys: Vec<SortKey> = Vec::new();
-        for (key, entry) in &self.entries {
-            if take_keys.len() >= limit {
+        let cancel_cap = (limit as u128 * u128::from(self.cancel_share_pct)).div_ceil(100);
+        let cancel_cap = usize::try_from(cancel_cap).unwrap_or(usize::MAX).min(limit);
+        let mut walk = SelectionWalk {
+            limit,
+            exclude,
+            bytes_cap,
+            orders_cap,
+            max_per_block: self.max_per_block,
+            block_counts: HashMap::new(),
+            bytes_used: 0,
+            orders_used: 0,
+            selected: Vec::new(),
+        };
+
+        // Phase 1: the bounded cancel prefix.
+        let mut resume_after: Option<&SortKey> = None;
+        let mut cancels_left = false;
+        for (key, entry) in self.entries.range(..FIRST_NON_CANCEL) {
+            if walk.selected.len() >= cancel_cap {
+                cancels_left = true;
                 break;
             }
-            let count = block_counts.entry(entry.sender).or_insert(0);
-            if *count < self.max_per_block {
-                *count += 1;
-                take_keys.push(*key);
+            if walk.offer(key, entry) == Offer::Stop {
+                return walk.selected;
+            }
+            resume_after = Some(key);
+        }
+        // Phase 2: non-cancels, unchanged order.
+        for (key, entry) in self.entries.range(FIRST_NON_CANCEL..) {
+            if walk.full() {
+                return walk.selected;
+            }
+            if walk.offer(key, entry) == Offer::Stop {
+                return walk.selected;
             }
         }
+        // Phase 3: leftover slots go to the remaining cancels.
+        if cancels_left {
+            let from = resume_after.map_or(Bound::Unbounded, |k| Bound::Excluded(*k));
+            for (key, entry) in self
+                .entries
+                .range((from, Bound::Excluded(FIRST_NON_CANCEL)))
+            {
+                if walk.full() || walk.offer(key, entry) == Offer::Stop {
+                    break;
+                }
+            }
+        }
+        walk.selected
+    }
+
+    /// Drain up to `limit` actions in selection order (see
+    /// [`Self::select_entries`]) with per-sender-per-block caps.
+    /// Excess actions from rate-limited senders stay in pool for next block.
+    pub fn drain(&mut self, limit: usize) -> Vec<SignedNativeAction> {
+        let none = HashSet::new();
+        let take_keys: Vec<SortKey> = self
+            .select_entries(limit, &none, usize::MAX, usize::MAX)
+            .into_iter()
+            .map(|(key, _)| *key)
+            .collect();
 
         let mut taken = Vec::with_capacity(take_keys.len());
         for key in &take_keys {
@@ -288,27 +426,14 @@ impl NativePool {
 
     /// Select up to `limit` actions for a block WITHOUT removing them from the pool.
     /// Actions stay in the pool until `remove_committed` is called after commit.
-    /// Uses the same priority order as `drain`. Read-only (T2.3): callers select
+    /// Uses the same order as `drain`. Read-only (T2.3): callers select
     /// from a shared snapshot under the read lock — no sort, no index rebuild.
     pub fn select_for_block(&self, limit: usize) -> Vec<SignedNativeAction> {
-        if self.max_per_block == 0 {
-            return Vec::new();
-        }
-        let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut selected = Vec::new();
-
-        for entry in self.entries.values() {
-            if selected.len() >= limit {
-                break;
-            }
-            let count = block_counts.entry(entry.sender).or_insert(0);
-            if *count < self.max_per_block {
-                *count += 1;
-                selected.push(entry.action.clone());
-            }
-        }
-
-        selected
+        let none = HashSet::new();
+        self.select_entries(limit, &none, usize::MAX, usize::MAX)
+            .into_iter()
+            .map(|(_, entry)| entry.action.clone())
+            .collect()
     }
 
     pub fn select_for_block_with_senders(
@@ -336,6 +461,8 @@ impl NativePool {
     /// `orders_cap` bounds the summed `order_count` of selected actions (G2:
     /// without it, 100 actions × 1024-order batches = 102,400 orders vs the
     /// documented 50k ceiling). Same deterministic-prefix rule as `bytes_cap`.
+    /// Item C: cancels take at most `cancel_share_pct` of the block ahead of
+    /// non-cancels ([`Self::select_entries`]).
     pub fn select_for_block_with_senders_excluding(
         &self,
         limit: usize,
@@ -343,48 +470,10 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
-        if self.max_per_block == 0 {
-            return Vec::new();
-        }
-        let mut block_counts: HashMap<Address, usize> = HashMap::new();
-        let mut selected = Vec::new();
-        let mut bytes_used: usize = 0;
-        let mut orders_used: usize = 0;
-
-        for entry in self.entries.values() {
-            if selected.len() >= limit {
-                break;
-            }
-            // Skip in-flight (already-proposed) entries BEFORE the budget gates:
-            // an excluded entry is never selected, so it must neither charge nor
-            // trip the byte/order budget — otherwise a large in-flight batch
-            // sitting early in the sort would halt selection and under-fill the
-            // block with valid later entries.
-            if exclude.contains(&entry.action_hash) {
-                continue;
-            }
-            if bytes_used.saturating_add(entry.encoded_len) > bytes_cap {
-                // Deterministic prefix: stop at the first entry that would blow
-                // the body-byte budget rather than skipping past it.
-                break;
-            }
-            let entry_orders = crate::rate_limit::order_count(&entry.action.action);
-            if orders_used.saturating_add(entry_orders) > orders_cap {
-                // Deterministic prefix for the ORDER budget too (O2/G2) —
-                // bounds worst-case matching/exec time per block. Cancels sort
-                // first and count 1 each, so cancels-first is preserved.
-                break;
-            }
-            let count = block_counts.entry(entry.sender).or_insert(0);
-            if *count < self.max_per_block {
-                *count += 1;
-                bytes_used = bytes_used.saturating_add(entry.encoded_len);
-                orders_used = orders_used.saturating_add(entry_orders);
-                selected.push((entry.sender, entry.action.clone()));
-            }
-        }
-
-        selected
+        self.select_entries(limit, exclude, bytes_cap, orders_cap)
+            .into_iter()
+            .map(|(_, entry)| (entry.sender, entry.action.clone()))
+            .collect()
     }
 
     /// Cancels-ONLY selection (Package D rank 1, deepest exec-backlog pacing
@@ -395,6 +484,10 @@ impl NativePool {
     /// walks the (possibly huge) non-cancel tail. Non-destructive like every
     /// selection: paced-out non-cancels stay pooled and remain fully
     /// selectable by the normal path — pacing defers, never sheds.
+    ///
+    /// Item C: this is the ONE remaining selection path that is all cancels
+    /// (no `cancel_share_pct` bound). It runs only while the proposer's exec
+    /// backlog is deep, where non-cancels would be paced out anyway.
     pub fn select_cancels_for_block_with_senders_excluding(
         &self,
         limit: usize,
@@ -537,8 +630,9 @@ impl NativePool {
     }
 }
 
-/// Cancels get pool-eviction priority; exported so ingress can route them to
-/// full verification even when the pool is full (pre-verify shedding).
+/// Cancels sort first in the pool key and may take a bounded share of each
+/// block ahead of non-cancels (item C); ingress also uses this to keep cancels
+/// past the admission limit.
 pub fn is_cancel(action: &NativeAction) -> bool {
     matches!(
         action,
@@ -870,6 +964,9 @@ mod tests {
     #[test]
     fn selection_order_identical_to_reference_stable_sort() {
         let mut pool = NativePool::new(100, 64, 16);
+        // Item C: 100 % = the old unbounded cancel priority, which this
+        // reference pins byte-for-byte (the kill switch must restore it).
+        pool.set_cancel_share_pct(100);
         // Shuffled inserts across senders/nonces with cancels interleaved,
         // plus a deliberate tie: same sender + nonce, two distinct cancels.
         let inserts: Vec<(Address, SignedNativeAction)> = vec![
@@ -1029,20 +1126,36 @@ mod tests {
         assert!(matches!(err, MempoolError::NativePoolFull));
     }
 
+    /// Item C: a cancel arriving at a full pool is rejected like any other
+    /// action — it no longer evicts a pending order (the cancel-spam
+    /// starvation vector), and the pool is left untouched.
     #[test]
-    fn pool_size_cap_cancel_evicts_non_cancel() {
+    fn pool_size_cap_rejects_cancel_without_evicting() {
         let mut pool = NativePool::new(2, 64, 16);
         let a = Address::repeat_byte(1);
         let b = Address::repeat_byte(2);
         let c = Address::repeat_byte(3);
+        let action_a = make_action(1, NativeAction::ClaimRewards);
+        let action_b = make_action(2, NativeAction::ClaimRewards);
+        let ha = compute_action_hash(&action_a);
+        let hb = compute_action_hash(&action_b);
 
-        pool.insert(a, make_action(1, NativeAction::ClaimRewards))
-            .unwrap();
-        pool.insert(b, make_action(2, NativeAction::ClaimRewards))
-            .unwrap();
-        pool.insert(c, make_action(3, NativeAction::CancelOrder { order_id: 1 }))
-            .unwrap();
+        pool.insert(a, action_a).unwrap();
+        pool.insert(b, action_b).unwrap();
+        let err = pool
+            .insert(c, make_action(3, NativeAction::CancelOrder { order_id: 1 }))
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::NativePoolFull));
         assert_eq!(pool.size(), 2);
+        assert!(pool.get_by_hash(&ha).is_some() && pool.get_by_hash(&hb).is_some());
+        let err = pool
+            .insert(
+                c,
+                make_action(4, NativeAction::CancelAllOrders { market_id: None }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::NativePoolFull));
+        pool.assert_index_consistent();
     }
 
     #[test]
@@ -1135,27 +1248,6 @@ mod tests {
 
         let remaining = pool.get_by_hash(&action4_hash);
         assert!(remaining.is_some());
-    }
-
-    #[test]
-    fn hash_index_updated_on_eviction() {
-        let mut pool = NativePool::new(2, 64, 16);
-        let a = Address::repeat_byte(1);
-        let b = Address::repeat_byte(2);
-        let c = Address::repeat_byte(3);
-
-        let action_a = make_action(1, NativeAction::ClaimRewards);
-        let action_b = make_action(2, NativeAction::ClaimRewards);
-        let action_c = make_action(3, NativeAction::CancelOrder { order_id: 1 });
-        let hash_c = compute_action_hash(&action_c);
-
-        pool.insert(a, action_a).unwrap();
-        pool.insert(b, action_b).unwrap();
-        pool.insert(c, action_c).unwrap();
-        assert_eq!(pool.size(), 2);
-
-        let found = pool.get_by_hash(&hash_c);
-        assert!(found.is_some());
     }
 
     #[test]
@@ -1416,38 +1508,6 @@ mod tests {
     /// Cap-2 pool: an incoming cancel evicts the back non-cancel
     /// (`insert_verified` eviction branch). The evicted entry must leave the
     /// index; the survivors must stay removable by hash.
-    #[test]
-    fn eviction_path_keeps_index_consistent() {
-        let mut pool = NativePool::new(2, 64, 16);
-        let kept_action = make_action(1, NativeAction::ClaimRewards);
-        let kept_hash = compute_action_hash(&kept_action);
-        // Larger sender sorts to the back of the non-cancel range -> evicted.
-        let evicted_action = make_action(2, NativeAction::ClaimRewards);
-        let evicted_hash = compute_action_hash(&evicted_action);
-        let cancel = make_action(3, NativeAction::CancelOrder { order_id: 1 });
-        let cancel_hash = compute_action_hash(&cancel);
-
-        pool.insert(Address::repeat_byte(1), kept_action).unwrap();
-        pool.insert(Address::repeat_byte(2), evicted_action).unwrap();
-        pool.insert(Address::repeat_byte(3), cancel).unwrap();
-        assert_eq!(pool.size(), 2);
-        pool.assert_index_consistent();
-        assert!(
-            pool.get_by_hash(&evicted_hash).is_none(),
-            "evicted entry left the index"
-        );
-
-        // remove_committed on the evicted hash is a no-op.
-        pool.remove_committed(&[evicted_hash]);
-        assert_eq!(pool.size(), 2);
-        pool.assert_index_consistent();
-
-        // Remaining entries still removable by hash.
-        pool.remove_committed(&[kept_hash, cancel_hash]);
-        assert_eq!(pool.size(), 0);
-        pool.assert_index_consistent();
-    }
-
     /// After one same-hash duplicate is removed (drain), the survivor must
     /// remain findable and later removable — the guarantee
     /// `repoint_hash_survivors` used to provide under the single-slot index.
@@ -1492,5 +1552,130 @@ mod tests {
         pool.insert(Address::repeat_byte(2), stale).unwrap();
         assert_eq!(pool.size(), 2);
         pool.assert_index_consistent();
+    }
+
+    // ---- Anti-spam item C: bounded cancel prefix ----
+
+    /// `n` cancels then `m` non-cancels, each from its own sender.
+    fn mixed_pool(cancels: u8, others: u8, pct: u8) -> NativePool {
+        let mut pool = NativePool::new(1_000, 64, 16);
+        pool.set_cancel_share_pct(pct);
+        for i in 0..others {
+            pool.insert(
+                Address::repeat_byte(100 + i),
+                make_action(1_000 + i as u64, NativeAction::ClaimRewards),
+            )
+            .unwrap();
+        }
+        for i in 0..cancels {
+            pool.insert(
+                Address::repeat_byte(1 + i),
+                make_action(
+                    2_000 + i as u64,
+                    NativeAction::CancelAllOrders { market_id: None },
+                ),
+            )
+            .unwrap();
+        }
+        pool
+    }
+
+    fn cancel_flags(sel: &[(Address, SignedNativeAction)]) -> Vec<bool> {
+        sel.iter().map(|(_, a)| is_cancel(&a.action)).collect()
+    }
+
+    #[test]
+    fn cancel_share_bounds_cancels_when_orders_wait() {
+        let pool = mixed_pool(30, 30, 25);
+        let sel = pool.select_for_block_with_senders_excluding(
+            20,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 20);
+        let flags = cancel_flags(&sel);
+        assert_eq!(flags.iter().filter(|c| **c).count(), 5, "ceil(25% of 20)");
+        assert!(flags[..5].iter().all(|c| *c), "the cancel share goes first");
+        // Non-cancel order is unchanged: the lowest (sender, nonce) first.
+        let senders: Vec<Address> = sel[5..].iter().map(|(s, _)| *s).collect();
+        let want: Vec<Address> = (0..15u8).map(|i| Address::repeat_byte(100 + i)).collect();
+        assert_eq!(senders, want);
+        // The other selection entry points apply the same share.
+        let plain = pool.select_for_block(20);
+        assert_eq!(plain.iter().filter(|a| is_cancel(&a.action)).count(), 5);
+        let mut drained = mixed_pool(30, 30, 25);
+        let d = drained.drain(20);
+        assert_eq!(d.iter().filter(|a| is_cancel(&a.action)).count(), 5);
+        assert_eq!(drained.size(), 40);
+        drained.assert_index_consistent();
+    }
+
+    #[test]
+    fn cancel_share_is_work_conserving() {
+        // Only 3 orders waiting: cancels fill the rest of the block.
+        let pool = mixed_pool(30, 3, 25);
+        let sel = pool.select_for_block_with_senders(20);
+        assert_eq!(sel.len(), 20);
+        let flags = cancel_flags(&sel);
+        assert_eq!(flags.iter().filter(|c| **c).count(), 17);
+        assert!(flags[..5].iter().all(|c| *c));
+        assert!(flags[5..8].iter().all(|c| !*c));
+        // Every cancel is distinct (resumed after the share, not repeated).
+        let hashes: HashSet<B256> = sel.iter().map(|(_, a)| compute_action_hash(a)).collect();
+        assert_eq!(hashes.len(), 20);
+        // No orders at all: a block of cancels.
+        let only = mixed_pool(30, 0, 25);
+        assert_eq!(only.select_for_block_with_senders(20).len(), 20);
+    }
+
+    #[test]
+    fn cancel_share_100_is_old_priority_and_0_puts_orders_first() {
+        let old = mixed_pool(30, 30, 100);
+        let sel = old.select_for_block_with_senders(20);
+        assert!(
+            cancel_flags(&sel).iter().all(|c| *c),
+            "100 % = all cancels first"
+        );
+        let zero = mixed_pool(30, 10, 0);
+        let sel = zero.select_for_block_with_senders(20);
+        let flags = cancel_flags(&sel);
+        assert!(flags[..10].iter().all(|c| !*c) && flags[10..].iter().all(|c| *c));
+        assert_eq!(sel.len(), 20);
+    }
+
+    #[test]
+    fn cancel_share_ignores_excluded_cancels_and_keeps_budgets() {
+        let pool = mixed_pool(30, 30, 25);
+        // The first 5 cancels (lowest senders) are in flight: the share is
+        // still filled, by the next 5.
+        let in_flight: HashSet<B256> = pool
+            .entries
+            .values()
+            .filter(|e| e.is_cancel)
+            .take(5)
+            .map(|e| e.action_hash)
+            .collect();
+        let sel =
+            pool.select_for_block_with_senders_excluding(20, &in_flight, usize::MAX, usize::MAX);
+        assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
+        assert!(sel
+            .iter()
+            .all(|(_, a)| !in_flight.contains(&compute_action_hash(a))));
+        // Order budget still a deterministic prefix across the phases.
+        let sel = pool.select_for_block_with_senders_excluding(20, &HashSet::new(), usize::MAX, 8);
+        assert_eq!(sel.len(), 8);
+        assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
+    }
+
+    #[test]
+    fn parse_cancel_block_share_pct_default_clamp_and_off() {
+        use crate::rate_limit::parse_cancel_block_share_pct as p;
+        assert_eq!(p(None), 25);
+        assert_eq!(p(Some("100".into())), 100);
+        assert_eq!(p(Some(" 40 ".into())), 40);
+        assert_eq!(p(Some("250".into())), 100, "clamped");
+        assert_eq!(p(Some("0".into())), 0);
+        assert_eq!(p(Some("junk".into())), 25);
     }
 }
