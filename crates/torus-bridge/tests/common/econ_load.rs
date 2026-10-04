@@ -3,6 +3,9 @@
 //! mid = 20 x target, band 5, cross 0.5, cancel-all 5% + open-order budget,
 //! batches of `batch` orders per action. Plus the oracle feed of `UB_MARKS=1`
 //! (three Active validators, markets listed) and the item 6 step 0.5 mark walk.
+//! `UB_DEEP_LEVELS=<n>` (item 6 PF1): prices within `n` ticks of the mid instead
+//! of `BAND`, so the resting orders pile up on a few deep levels (the devnet
+//! cells' shape: ~50k orders at the best ask) and crossing bids meet them.
 
 #![allow(dead_code)]
 
@@ -79,10 +82,10 @@ pub fn feed_setup(db: &StateDb, markets: u64) {
     }
 }
 
-pub fn econ_order(rng: &mut Lcg, s: u64, market_id: u64) -> PlaceOrderParams {
+pub fn econ_order(rng: &mut Lcg, s: u64, market_id: u64, band: u64) -> PlaceOrderParams {
     let is_buy = s.wrapping_add(market_id).is_multiple_of(2);
     let aggressive = rng.chance(500);
-    let d = 1 + rng.below(BAND) as i128;
+    let d = 1 + rng.below(band) as i128;
     let mid = TARGET * LEV;
     let units = if is_buy == aggressive { mid + d } else { mid - d };
     let price = FixedPoint::from_raw(units * FixedPoint::SCALE);
@@ -116,6 +119,10 @@ pub struct Gen {
 impl Gen {
     pub fn block(&mut self, actions: u64) -> Vec<(Address, NativeAction)> {
         let mut out = Vec::with_capacity(actions as usize);
+        let band = match env("UB_DEEP_LEVELS", 0) {
+            0 => BAND,
+            n => n,
+        };
         for _ in 0..actions {
             let s = self.rng.below(self.senders);
             let open = self.open.entry(s).or_insert(0);
@@ -127,7 +134,7 @@ impl Gen {
                 let orders = (0..self.batch)
                     .map(|_| {
                         let m = 1 + self.rng.below(self.markets);
-                        econ_order(&mut self.rng, s, m)
+                        econ_order(&mut self.rng, s, m, band)
                     })
                     .collect();
                 NativeAction::PlaceOrderBatch(orders)
