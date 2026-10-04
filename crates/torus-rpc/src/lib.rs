@@ -719,6 +719,17 @@ mod tests {
         hash
     }
 
+    /// The node executed through `height` (the applied-height marker).
+    fn store_applied_height(state: &StateDb, height: u64) {
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &height.to_be_bytes(),
+            )
+            .unwrap();
+    }
+
     fn store_body(state: &StateDb, height: u64, body: &TorusBlockBody) {
         state
             .put_cf_raw(
@@ -3680,6 +3691,7 @@ mod tests {
                     ..test_header(20, 0, 0)
                 },
             );
+            store_applied_height(&state, 20);
             let (handle, addr) = start_server(state, mempool, executor).await;
             use jsonrpsee::core::client::ClientT;
             let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -3696,10 +3708,79 @@ mod tests {
             assert_eq!(
                 (mp.mark_price, mp.index_price, mp.timestamp),
                 (dec_fp(px), dec_fp(px), ts),
-                "latest header ts {latest_ts}"
+                "executed head's header ts {latest_ts}"
             );
             handle.stop().unwrap();
         }
+    }
+
+    /// s89: the oracle state the RPC reads is the EXECUTED state, so the mark's
+    /// staleness is judged at the executed height's header time (the eth
+    /// view's head, min(applied, committed)), not at the committed head's.
+    /// Under exec lag the committed head is minutes ahead and every mark read
+    /// stale. Aggregate at ts 5_000; executed height 20 at ts 5_030 (fresh);
+    /// committed head 30 at ts 5_200 (would be stale).
+    #[tokio::test]
+    async fn torus_mark_price_staleness_uses_the_executed_height() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x11; 20]);
+        PositionManager::new(state.clone())
+            .put_position(&Position {
+                trader,
+                market_id: 1,
+                is_long: true,
+                size: fp(5),
+                entry_price: fp(50000),
+                realized_pnl: fp(100),
+                isolated_margin: fp(2500),
+                margin_type: MarginType::Isolated,
+            })
+            .unwrap();
+        let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+        let reps = [
+            Address::from([0xA1; 20]),
+            Address::from([0xA2; 20]),
+            Address::from([0xA3; 20]),
+        ];
+        for v in &reps {
+            oracle.submit_price(v, 1, fp(51_000), 10, 5_000).unwrap();
+        }
+        let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+        oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+        for (h, ts) in [(20u64, 5_030u64), (30, 5_200)] {
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: ts,
+                    ..test_header(h, 0, 0)
+                },
+            );
+        }
+        store_applied_height(&state, 20);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let mp: RpcMarkPrice = client
+            .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x1"])
+            .await
+            .unwrap();
+        assert_eq!(
+            (mp.mark_price, mp.timestamp),
+            (dec_fp(fp(51_000)), 10),
+            "fresh at the executed height 20 although stale at the committed head 30"
+        );
+        let pos: Option<RpcPosition> = client
+            .request(
+                "torus_getPosition",
+                jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pos.unwrap().unrealized_pnl, dec_fp(fp(5_000)), "PnL at the usable mark");
+        handle.stop().unwrap();
     }
 
     /// Item 2: getPosition's unrealized PnL uses the oracle aggregate only
@@ -3740,6 +3821,7 @@ mod tests {
                     ..test_header(20, 0, 0)
                 },
             );
+            store_applied_height(&state, 20);
             let (handle, addr) = start_server(state, mempool, executor).await;
             use jsonrpsee::core::client::ClientT;
             let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -3755,7 +3837,7 @@ mod tests {
             assert_eq!(
                 pos.unwrap().unrealized_pnl,
                 dec_fp(want_pnl),
-                "latest header ts {latest_ts}"
+                "executed head's header ts {latest_ts}"
             );
             handle.stop().unwrap();
         }
@@ -4141,8 +4223,10 @@ mod tests {
         value.extend_from_slice(&3u32.to_be_bytes()); // num_reporters
         value.extend_from_slice(&latest.timestamp.to_be_bytes()); // fresh: age 0
         state.put_cf_raw(CF_NATIVE_ORACLE, &key, &value).unwrap();
-        // Item 2: the mark is time-based — "now" is the latest header's timestamp.
+        // Item 2: the mark is time-based — "now" is the executed head's
+        // header timestamp (s89).
         store_header(&state, &latest);
+        store_applied_height(&state, 1);
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;

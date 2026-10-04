@@ -414,11 +414,14 @@ enum SubmitSlot {
 impl RpcState {
     /// Item 2: the oracle aggregate of `mid` if USABLE ([`OraclePrice::usable`]:
     /// time-based, stale 60 s of block time after the last fresh aggregate)
-    /// at the latest committed block's header timestamp. No header (or an
-    /// unreadable one) ⇒ no mark.
+    /// at the header timestamp of the EXECUTED head (s89): the aggregate is
+    /// read from executed state, so its age is judged at the block that state
+    /// reflects — the eth view's head, min(applied, committed). The committed
+    /// head runs ahead under exec lag and made every mark read stale. No
+    /// header (or an unreadable one) ⇒ no mark.
     fn usable_oracle_price(&self, mid: u64) -> Option<torus_core::oracle::OraclePrice> {
-        let latest = self.latest_height.load(Ordering::Relaxed);
-        let (header, _, _) = crate::eth::get_header_with_hash(self, latest).ok().flatten()?;
+        let executed = crate::eth::eth_head(self);
+        let (header, _, _) = crate::eth::get_header_with_hash(self, executed).ok().flatten()?;
         OracleManager::new(self.state.clone(), OracleConfig::default())
             .get_price(mid, header.timestamp)
             .ok()
