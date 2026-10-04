@@ -243,10 +243,18 @@ impl NativeExecutor {
     /// liquidated, there is a cooldown period of 30 seconds. During this
     /// cooldown period, all market liquidation orders for that user will be
     /// for the entire position."
-    /// * Outside the cooldown a position above 100,000 notional goes as a 20%
-    ///   chunk (D2): the chunk sets the cooldown (block time) and ends the
-    ///   account's stage 1 for this block — its other positions wait for the
-    ///   next block, where they are inside the cooldown.
+    /// * Outside the cooldown every position goes by its own rule in the
+    ///   same block (rule B, owner decision s91): above 100,000 notional a
+    ///   20% chunk (D2), otherwise the entire position. A chunk does not end
+    ///   the account's stage 1 for the block; the next position is ordered
+    ///   unless `AV >= MM`. If the block placed a chunk, the cooldown row is
+    ///   written once, at the block time, after the loop. Evidence (s91, HL
+    ///   public API, 44 liquidated accounts, 270 orders, orderStatus
+    ///   origSz): one block (same hash) of account 0xb0fb held seven 20%
+    ///   orders (HYPE 1.25M, NEAR 285k, MNT 211k, ETH 206k, XPL 188k, LINK
+    ///   155k, MON 109k); in its next episode MON at 87.6k went whole with
+    ///   six others at 20%. Was rule A (2d03111): a chunk ended the
+    ///   account's stage 1 for the block.
     /// * Inside the cooldown every order is for the ENTIRE position, in the
     ///   same order, until `AV >= MM`. Such an order never writes the
     ///   cooldown row: only a chunk starts a cooldown, so it is neither
@@ -273,6 +281,7 @@ impl NativeExecutor {
             order.push((Reverse(maintenance_margin(tiers, n)), p.market_id));
         }
         order.sort();
+        let mut any_chunk = false;
         for (_, m) in order {
             let Some(p) = ctx.positions.get_position(trader, m)? else { continue };
             let mark = marks[&m];
@@ -297,15 +306,15 @@ impl NativeExecutor {
             if !r.success {
                 results.push(r);
             }
-            if chunked {
-                liq::set_cooldown(&ctx.state, trader, ctx.timestamp)?;
-                break;
-            }
+            any_chunk |= chunked;
             match Self::liq_view(ctx, marks, trader, l1)? {
                 Some(v) if liq::classify(&v) == Some(Health::Healthy) => break,
                 None => break, // flat (or no longer valuable): nothing left to do
                 _ => {}
             }
+        }
+        if any_chunk {
+            liq::set_cooldown(&ctx.state, trader, ctx.timestamp)?;
         }
         Ok(())
     }

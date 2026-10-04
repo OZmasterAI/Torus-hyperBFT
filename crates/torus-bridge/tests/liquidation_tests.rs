@@ -457,46 +457,111 @@ fn during_the_cooldown_stage1_orders_the_entire_position() {
     assert_eq!(oi(&c, 1), (fp(400), fp(400)));
 }
 
-/// Other positions: the chunk block ends the account's stage 1 (one chunk
-/// per account per block, the cooldown starts after it); in the cooldown
-/// EVERY market liquidation order of the user is for the entire position,
-/// largest MM first, until AV >= MM. T long 200 (m1) + long 150 (m2) @ 1,000,
-/// collateral 11,000, marks 990: AV 7,500 < MM 8,662.5 (>= 2/3) -> stage 1.
-/// ts 1001: m1 (MM 4,950 first) chunk 40 -> 160; m2 untouched although M bids
-/// 200 @ 985 there. ts 1002: m1 full order fills M's 5 -> 155; AV 7,275 <
-/// MM 7,548.75 -> m2 full order (150, a chunk would be 30) closes m2 -> healthy.
-#[test]
-fn in_the_cooldown_every_position_is_ordered_whole() {
-    let (_d, db) = liq_db(&[1, 2]);
+/// HL parity, rule B (owner decision s91; HL public API, 44 liquidated
+/// accounts, 270 orders, orderStatus origSz): in ONE block every position of
+/// the user is ordered by its own rule — above 100,000 notional a 20% chunk,
+/// otherwise the whole position — largest MM first, until AV >= MM; the
+/// cooldown starts after that block. (HL account 0xb0fb: HYPE 1.25M, NEAR
+/// 285k, MNT 211k, ETH 206k, XPL 188k, LINK 155k, MON 109k: seven 20% orders
+/// in one block.) Here: T long @ 1,000 in m1..m7 = 1,250 / 285 / 210 / 205 /
+/// 190 / 155 / 88 (m7: 87,120 notional at 990, <= 100k), marks 990.
+const SEVEN: [(MarketId, i64); 7] = [(1, 1_250), (2, 285), (3, 210), (4, 205), (5, 190), (6, 155), (7, 88)];
+
+/// [`SEVEN`] for T (collateral `collateral`) against S, every mark 990, M's
+/// bids `(market, price, qty)` resting; books saved (block 1, ts 1001).
+fn seven_positions(collateral: i64, bids: &[(MarketId, i64, i64)]) -> (tempfile::TempDir, StateDb) {
+    let ms: Vec<MarketId> = SEVEN.iter().map(|p| p.0).collect();
+    let (d, db) = liq_db(&ms);
     let (t, s, m) = (addr(1), addr(2), addr(3));
     let mut ctx = ctx_at(db.clone(), 1);
-    fund(&ctx, &t, fp(11_000));
-    fund(&ctx, &s, fp(10_000_000));
-    fund(&ctx, &m, fp(10_000_000));
-    open_pair(&ctx, &t, &s, 1, 200, 1_000);
-    open_pair(&ctx, &t, &s, 2, 150, 1_000);
-    place(&mut ctx, &m, limit(1, true, 985, 40));
-    place(&mut ctx, &m, limit(2, true, 985, 200));
-    set_mark(&ctx, 1, fp(990));
-    set_mark(&ctx, 2, fp(990));
-    NativeExecutor::run_liquidations(&mut ctx);
-    assert_eq!(pos(&ctx, &t, 1), fp(160), "m1 chunk 1 = 40");
-    assert_eq!(pos(&ctx, &t, 2), fp(150), "the chunk ends the account's stage 1 for the block");
-    assert_eq!(cooldown_ts(&ctx, &t), Some(1_001));
+    fund(&ctx, &t, fp(collateral));
+    fund(&ctx, &s, fp(100_000_000));
+    fund(&ctx, &m, fp(100_000_000));
+    for (mk, size) in SEVEN {
+        open_pair(&ctx, &t, &s, mk, size, 1_000);
+        set_mark(&ctx, mk, fp(990));
+    }
+    for &(mk, px, q) in bids {
+        place(&mut ctx, &m, limit(mk, true, px, q));
+    }
     ctx.save_order_books();
-    let mut c = ctx_at(db.clone(), 2);
-    place(&mut c, &m, limit(1, true, 985, 5));
-    NativeExecutor::run_liquidations(&mut c);
-    assert!(c.fatal_error.is_none());
-    assert_eq!(pos(&c, &t, 1), fp(155), "m1: full order, the book had 5");
-    assert_eq!(pos(&c, &t, 2), FixedPoint::ZERO, "m2: the entire position, not a 20% chunk");
-    assert_eq!(bal(&c, &t).available, fp(8_075));
-    assert_eq!(cooldown_ts(&c, &t), Some(1_001), "no new cooldown");
-    assert!(liq_rows(&c, 0x06).is_empty(), "healthy after m2");
-    assert_eq!((oi(&c, 1), oi(&c, 2)), ((fp(200), fp(200)), (fp(150), fp(150))));
-    let mut c = ctx_at(db.clone(), 3);
-    NativeExecutor::run_liquidations(&mut c);
-    assert_eq!(cooldown_ts(&c, &t), None, "healthy -> cooldown cleared");
+    (d, db)
+}
+
+/// One liquidation step at block `h` over a counting wrapper: the cooldown
+/// row puts it made (books saved afterwards).
+fn step_counting_cooldown_puts(db: &StateDb, h: u64) -> usize {
+    let state = CountingBackend::new(db.clone());
+    let mut ctx = NativeExecContext::new(state.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+    state.arm();
+    NativeExecutor::run_liquidations(&mut ctx);
+    state.disarm();
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    ctx.save_order_books();
+    state.cooldown_puts()
+}
+
+/// Rule B, no early stop. Collateral 70,000: AV 46,170 < MM 58,979.25
+/// (>= 2/3) -> stage 1; a sale at 985 closes AV - MM by 19.75 per unit, so
+/// it needs 649 units and block 1 sells 547 (never healthy in between).
+/// M bids, per market, the 20% chunk @ 985 (m7: all 88) and 40% of the
+/// size @ 966 (a whole order would reach those; cap 965.25).
+/// ts 1001: m1..m6 each a 20% chunk (250, 57, 42, 41, 38, 31), m7 whole
+/// (88); ONE cooldown write (1001) for the six chunks; available 70,000 -
+/// 15 x 547 = 61,795; AV 43,435 < MM 45,441 -> pending.
+/// ts 1002 (cooldown, rule A's "next block"): every remaining position is
+/// ordered whole in this one block and takes its 966 bid (40% of the size =
+/// 50% of what is left, above a 20% chunk of it); a 966 sale closes AV - MM
+/// by 0.75 per unit (918 units: 689 < 2,006), so no stop. Available 61,795
+/// - 34 x 918 = 30,583; AV 21,403 < MM 22,720.5 -> pending. No cooldown
+/// write: whole orders neither restart nor extend it.
+#[test]
+fn same_block_every_position_is_ordered_by_its_own_rule() {
+    let mut bids: Vec<(MarketId, i64, i64)> = SEVEN[..6].iter().map(|&(mk, size)| (mk, 985, size / 5)).collect();
+    bids.push((7, 985, 88));
+    bids.extend(SEVEN[..6].iter().map(|&(mk, size)| (mk, 966, size * 2 / 5)));
+    let (_d, db) = seven_positions(70_000, &bids);
+    let t = addr(1);
+    assert_eq!(step_counting_cooldown_puts(&db, 1), 1, "the cooldown is written once for the block, not per chunk");
+    let c = ctx_at(db.clone(), 1);
+    let left: Vec<FixedPoint> = SEVEN.iter().map(|&(mk, _)| pos(&c, &t, mk)).collect();
+    let want: Vec<FixedPoint> = [1_000, 228, 168, 164, 152, 124, 0].into_iter().map(fp).collect();
+    assert_eq!(left, want, "one block: every > 100k position a 20% chunk, the <= 100k one whole");
+    assert_eq!(bal(&c, &t).available, fp(61_795));
+    assert_eq!(cooldown_ts(&c, &t), Some(1_001), "the chunks start the cooldown at the block's time");
+    assert_eq!(liq_rows(&c, 0x06).len(), 1, "still under MM -> pending");
+    drop(c);
+    assert_eq!(step_counting_cooldown_puts(&db, 2), 0, "whole orders write no cooldown row");
+    let c = ctx_at(db.clone(), 2);
+    let left: Vec<FixedPoint> = SEVEN.iter().map(|&(mk, _)| pos(&c, &t, mk)).collect();
+    let want: Vec<FixedPoint> = [500, 114, 84, 82, 76, 62, 0].into_iter().map(fp).collect();
+    assert_eq!(left, want, "cooldown: every remaining position ordered whole in one block");
+    assert_eq!(bal(&c, &t).available, fp(30_583));
+    assert_eq!(cooldown_ts(&c, &t), Some(1_001), "not restarted");
+    assert_eq!(liq_rows(&c, 0x06).len(), 1, "still under MM -> pending");
+    for (mk, size) in SEVEN {
+        assert_eq!(oi(&c, mk), (fp(size), fp(size)), "m{mk}: OI unchanged (M bought what T sold)");
+    }
+}
+
+/// Rule B keeps the stop: positions largest MM first, the step stops once
+/// AV >= MM. Collateral 77,300: AV 53,470 < MM 58,979.25 (gap 5,509.25 =
+/// 279 units at 19.75). M bids every whole position @ 985. ts 1001: m1 chunk
+/// 250 (AV 52,220 < MM 52,791.75), m2 chunk 57 (AV 51,935 >= MM 51,381):
+/// healthy -> m3..m7 untouched; cooldown 1001; not pending.
+#[test]
+fn same_block_stage1_still_stops_once_maintenance_is_met() {
+    let bids: Vec<(MarketId, i64, i64)> = SEVEN.iter().map(|&(mk, size)| (mk, 985, size)).collect();
+    let (_d, db) = seven_positions(77_300, &bids);
+    let t = addr(1);
+    assert_eq!(step_counting_cooldown_puts(&db, 1), 1);
+    let c = ctx_at(db.clone(), 1);
+    let left: Vec<FixedPoint> = SEVEN.iter().map(|&(mk, _)| pos(&c, &t, mk)).collect();
+    let want: Vec<FixedPoint> = [1_000, 228, 210, 205, 190, 155, 88].into_iter().map(fp).collect();
+    assert_eq!(left, want, "m1, m2 chunked; MM met -> the rest untouched");
+    assert_eq!(bal(&c, &t).available, fp(77_300 - 15 * 307));
+    assert_eq!(cooldown_ts(&c, &t), Some(1_001));
+    assert!(liq_rows(&c, 0x06).is_empty(), "healthy -> not pending");
 }
 
 /// The backstop keeps its role in the cooldown. ts 1001: chunk 1 (40) takes

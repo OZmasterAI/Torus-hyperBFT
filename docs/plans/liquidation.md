@@ -81,7 +81,9 @@ C5 recorded as known limitations.
 * Liquidation when account value < MM: market orders into the book first. Positions >
   100k USDC: 20% of the position per order; after a block with such a partial liquidation a
   30 s cooldown during which every market liquidation order of the user is for the entire
-  position (corrected s88; this line used to say "only the backstop can act").
+  position (corrected s88; this line used to say "only the backstop can act"). In one block
+  every position gets its own order (s91, from HL's public API: one block with seven 20%
+  orders of one account).
 * Backstop when account value < 2/3 MM: positions + collateral transferred to the liquidator
   vault (HLP) at the mark. No clearance fee.
 * ADL when an account's value is negative: counterparties ranked by
@@ -159,8 +161,15 @@ C5 recorded as known limitations.
 
 * Positions ordered by `MM_pos` descending, ties market ascending (fewest orders to restore).
 * Per position: `qty = size` if notional at mark ≤ 100,000; else `qty = size.raw() / 5`
-  (whole size if that is below the book's lot) and the account's cooldown row is set to `now`
-  (block timestamp) — after a chunk no further stage-1 order for this account this block.
+  (whole size if that is below the book's lot). Every position of the account goes by its own
+  rule in the same block (rule B, owner decision s91): a chunk does not end the account's stage
+  1 for the block; the next position is ordered unless `AV >= MM`. If the block placed a chunk,
+  the account's cooldown row is set to `now` (block timestamp) once, after the loop. Was rule
+  A (2d03111): "after a chunk no further stage-1 order for this account this block". Evidence
+  (s91, HL public API, 44 liquidated accounts, 270 orders, `orderStatus` `origSz`): in one block
+  (same hash) account 0xb0fb had seven 20% orders (HYPE 1.25M, NEAR 285k, MNT 211k, ETH 206k,
+  XPL 188k, LINK 155k, MON 109k notional); in its next episode MON at 87.6k went whole with six
+  others at 20%; inside the cooldown all positions went whole in one block.
 * Order: `PlaceOrderParams { market, is_buy: !is_long, price: cap, quantity: qty,
   order_type: Market, time_in_force: IOC, reduce_only: true, client_order_id: None }` through
   `place_order_inner(ctx, trader, &p, None, &mut queue)`, then `run_triggered_stops(ctx, queue)`

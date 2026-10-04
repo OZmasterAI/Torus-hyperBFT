@@ -6,7 +6,8 @@
 //! walk (`begin_resident(None, ..)`: no cache, `liq_view`'s `build` over the
 //! trader's rows). Accounts near maintenance, marks moving / jumping / stale
 //! / absent, big positions (stage-1 chunks and the cooldown, in which stage
-//! 1 orders the entire position — HL parity, s88), cursor cuts
+//! 1 orders the entire position — HL parity, s88; two chunks of one account
+//! in one block, rule B — s91, the `MULTI` accounts), cursor cuts
 //! (small budgets every third block), backstop, ADL of a trader and of the
 //! vault, Isolated positions, a listed market without a mark (positions at
 //! entry; an account only there is skipped), a delisted market whose
@@ -88,6 +89,15 @@ const RELIST: u64 = 30;
 const MARKS_OFF: std::ops::RangeInclusive<u64> = 40..=43;
 const BLOCKS: u64 = 60;
 const MID: i64 = 1_000;
+/// Rule B (s91): `(block, trader)` — the trader opens long 150 in markets 1
+/// and 3 (two positions above 100,000 notional) against [`MULTI_SHORT`] at
+/// the block's prices, collateral 2.2% of the notional (MM 2.5%): stage 1,
+/// outside any cooldown. [`MULTI_SHORT`] bids 200 at about 2% under the
+/// price (whole units, the tick; inside the 2.5% cap; a stale maker ask it
+/// crosses is taken, the rest rests) in both markets in that block, so both 20% chunks (30 each) fill
+/// and the account is still under MM after the first.
+const MULTI: [(u64, u64); 2] = [(13, 30), (49, 31)];
+const MULTI_SHORT: u64 = 32;
 
 fn maker(i: u64) -> Address {
     trader(100 + i)
@@ -113,6 +123,10 @@ struct Stats {
     cooldowns: usize,
     /// Stage-1 accounts met inside their 30 s cooldown (full-position orders).
     cooldown_stage1: usize,
+    /// Rule B (s91): stage-1 accounts outside the cooldown whose step reduced
+    /// two or more positions in the block and started a cooldown (a chunk
+    /// plus at least one more order in the same block).
+    multi_same_block: usize,
     l1: usize,
     l1_off: usize,
     shadow: usize,
@@ -154,6 +168,22 @@ fn write_exposure<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, pr
     }
 }
 
+/// Rule B: the [`MULTI`] account of block `h`, if any.
+fn write_multi<T: StateBackend>(ctx: &NativeExecContext<T>, h: u64, prices: &[FixedPoint]) {
+    let Some(&(_, i)) = MULTI.iter().find(|(b, _)| *b == h) else { return };
+    let mut notional = FixedPoint::ZERO;
+    for m in [1, 3] {
+        let px = prices[m as usize];
+        ctx.positions.apply_fill(&trader(i), m, true, fp(150), px, MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&trader(MULTI_SHORT), m, false, fp(150), px, MarginType::Cross).unwrap();
+        notional += fp(150).checked_mul(px).unwrap();
+    }
+    let available = FixedPoint::from_raw(notional.raw() / 1_000 * 22);
+    ctx.positions.put_native_balance(&trader(i), &NativeBalance { available, order_margin: FixedPoint::ZERO }).unwrap();
+    let rich = NativeBalance { available: fp(1_000_000_000), order_margin: FixedPoint::ZERO };
+    ctx.positions.put_native_balance(&trader(MULTI_SHORT), &rich).unwrap();
+}
+
 /// Makers quote around each marked market's price (every third block);
 /// a few traders send crossing IOC orders (fills dirty them in the block).
 fn block_actions(rng: &mut Lcg, h: u64, prices: &[FixedPoint]) -> Vec<(Address, NativeAction)> {
@@ -168,6 +198,15 @@ fn block_actions(rng: &mut Lcg, h: u64, prices: &[FixedPoint]) -> Vec<(Address, 
         client_order_id: None,
     };
     let mut out = Vec::new();
+    if MULTI.iter().any(|x| x.0 == h) {
+        for m in [1, 3] {
+            let p = prices[m as usize];
+            // Whole units: the market row's tick is 1.
+            let px = fp((p.raw() / 50 * 49 / FixedPoint::SCALE) as i64);
+            let bid = order(m, true, px, 200, TimeInForce::GTC);
+            out.push((trader(MULTI_SHORT), NativeAction::PlaceOrder(bid)));
+        }
+    }
     if h % 3 == 1 {
         for m in 1..=MARKED {
             let p = prices[m as usize];
@@ -255,20 +294,28 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
         let _ = NativeExecutor::begin_block_oracle(&mut ctx);
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         write_exposure(&ctx, &mut rng, &prices);
+        write_multi(&ctx, h, &prices);
         let actions = block_actions(&mut rng, h, &prices);
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &actions, if h % 2 == 0 { 4 } else { 0 });
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        // Rule B: stage-1 accounts outside the cooldown, their sizes before the step.
+        let mut fresh_stage1: Vec<(Address, BTreeMap<MarketId, FixedPoint>)> = Vec::new();
         if l1 {
             // What the walk will meet (non-vacuous checks).
             let (listed, marks) = step_marks(&ctx);
             let table = ctx.block_marks.as_ref().unwrap();
             stats.delisted_marked_blocks += usize::from(!table.delisted_marked(&listed).is_empty());
             stats.marks_off_blocks += usize::from(marks.is_empty());
-            for t in (0..TRADERS).map(trader).chain([LIQUIDATOR_VAULT]) {
+            for t in (0..TRADERS).chain(MULTI.map(|x| x.1)).map(trader).chain([LIQUIDATOR_VAULT]) {
                 match NativeExecutor::liq_view_walk(&ctx, &marks, &t).unwrap().and_then(|v| liq::classify(&v)) {
                     Some(Health::Stage1) => {
                         stats.stage1 += 1;
-                        stats.cooldown_stage1 += usize::from(liq::in_cooldown(&ctx.state, &t, now).unwrap());
+                        let cooling = liq::in_cooldown(&ctx.state, &t, now).unwrap();
+                        stats.cooldown_stage1 += usize::from(cooling);
+                        if !cooling {
+                            let ps = ctx.positions.positions_for_trader(&t).unwrap();
+                            fresh_stage1.push((t, ps.iter().map(|p| (p.market_id, p.size)).collect()));
+                        }
                     }
                     Some(Health::Backstop) => stats.backstop += 1,
                     Some(Health::Adl) if t == LIQUIDATOR_VAULT => stats.vault_adl += 1,
@@ -288,6 +335,15 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
         if l1 {
             stats.cuts += usize::from(liq_rows.iter().any(|(k, _)| k.as_slice() == liq::CURSOR_KEY));
             stats.cooldowns += liq_rows.iter().filter(|(k, _)| k[0] == liq::COOLDOWN_TAG).count();
+            for (t, before) in &fresh_stage1 {
+                let after: BTreeMap<MarketId, FixedPoint> =
+                    ctx.positions.positions_for_trader(t).unwrap().iter().map(|p| (p.market_id, p.size)).collect();
+                let reduced = before.iter().filter(|(m, sz)| after.get(m).is_none_or(|a| a < sz)).count();
+                let key = [[liq::COOLDOWN_TAG].as_slice(), t.as_slice()].concat();
+                let chunked_now =
+                    ctx.state.get_cf_raw(CF_NATIVE_LIQUIDATION, &key).unwrap() == Some(now.to_be_bytes().to_vec());
+                stats.multi_same_block += usize::from(reduced >= 2 && chunked_now);
+            }
             let sums = ctx.sums.as_ref().unwrap();
             let bad = sums.shadow_mismatches.lock().unwrap().clone();
             assert!(bad.is_empty(), "seed {seed} block {h}: L1 != walk / cache != reference: {bad:?}");
@@ -349,6 +405,10 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     assert!(s.stage1 > 20 && s.backstop > 20 && s.adl > 5 && s.vault_adl > 0, "every class met: {s:?}");
     assert!(s.skipped > 100 && s.cuts > 10 && s.cooldowns > 5, "skips, cursor cuts, chunks: {s:?}");
     assert!(s.cooldown_stage1 > 5, "stage 1 inside the cooldown (entire-position orders): {s:?}");
+    assert!(
+        s.multi_same_block >= 6 * MULTI.len(),
+        "rule B: two chunks of one account in one block, every MULTI account: {s:?}"
+    );
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");

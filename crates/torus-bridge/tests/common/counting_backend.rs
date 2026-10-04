@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
-use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
+use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
 use torus_state::error::StateError;
 use torus_state::{AtomicWriteOp, StateBackend};
 
@@ -36,6 +36,8 @@ pub struct Counts {
     armed: AtomicBool,
     position_scans: Mutex<HashMap<Vec<u8>, usize>>,
     oracle_reads: AtomicUsize,
+    /// While armed: puts of a liquidation cooldown row (`0x02 ‖ trader`).
+    cooldown_puts: AtomicUsize,
     probe: AtomicBool,
     storage_reads: Mutex<Vec<StorageRead>>,
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
@@ -112,6 +114,7 @@ impl<T: StateBackend> CountingBackend<T> {
     pub fn arm(&self) {
         self.counts.position_scans.lock().unwrap().clear();
         self.counts.oracle_reads.store(0, Ordering::SeqCst);
+        self.counts.cooldown_puts.store(0, Ordering::SeqCst);
         self.counts.armed.store(true, Ordering::SeqCst);
     }
 
@@ -164,6 +167,10 @@ impl<T: StateBackend> CountingBackend<T> {
         self.counts.oracle_reads.load(Ordering::SeqCst)
     }
 
+    pub fn cooldown_puts(&self) -> usize {
+        self.counts.cooldown_puts.load(Ordering::SeqCst)
+    }
+
     fn armed(&self) -> bool {
         self.counts.armed.load(Ordering::SeqCst)
     }
@@ -195,6 +202,9 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
     }
 
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        if cf == CF_NATIVE_LIQUIDATION && key.first() == Some(&0x02) && self.armed() {
+            self.counts.cooldown_puts.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.put_cf_raw(cf, key, value)
     }
 
