@@ -30,7 +30,7 @@ use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
-use torus_state::{PackedCfBatch, StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
     SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
@@ -1672,6 +1672,22 @@ fn parse_advance_untouched_toggle(v: Option<String>) -> bool {
 #[derive(Default)]
 pub struct ResidentBooks {
     inner: Option<ResidentInner>,
+    /// Item 6 Phase 1: the resident rows R and the height whose post-state
+    /// they hold. Same guard as the books (take; reuse iff successor and the
+    /// applied marker agrees; `invalidate` drops; `advance_untouched`
+    /// advances), but NOT gated by `TORUS_RESIDENT_BOOKS`: every node keeps R.
+    /// See [`begin_resident`] / [`end_resident`].
+    rows: Option<RowsSlot>,
+    /// Item 6 Phase 1: R builds (cold start or guard trip) and
+    /// `end_resident` calls that found another clone of R alive (test /
+    /// ops introspection).
+    rows_builds: u64,
+    rows_shared_fallbacks: u64,
+}
+
+struct RowsSlot {
+    rows: Arc<torus_state::ResidentRows>,
+    height: u64,
 }
 
 struct ResidentInner {
@@ -1683,9 +1699,33 @@ struct ResidentInner {
 }
 
 impl ResidentBooks {
-    /// Drop any resident state — the next context rebuilds from the DB.
+    /// Drop any resident state (books and rows) — the next block rebuilds
+    /// from the DB.
     pub fn invalidate(&mut self) {
         self.inner = None;
+        self.rows = None;
+    }
+
+    /// Item 6 Phase 1: the resident rows R between blocks (None = drained or
+    /// taken by a block in progress).
+    pub fn rows(&self) -> Option<&torus_state::ResidentRows> {
+        self.rows.as_ref().map(|s| &*s.rows)
+    }
+
+    /// Item 6 Phase 1: the block height whose post-state R holds.
+    pub fn rows_height(&self) -> Option<u64> {
+        self.rows.as_ref().map(|s| s.height)
+    }
+
+    /// Item 6 Phase 1: R builds so far (1 per process in a normal sequence).
+    pub fn rows_builds(&self) -> u64 {
+        self.rows_builds
+    }
+
+    /// Item 6 Phase 1: `end_resident` calls that could not take R back
+    /// (`Arc::get_mut` failed: a clone was alive). 0 in the normal sequence.
+    pub fn rows_shared_fallbacks(&self) -> u64 {
+        self.rows_shared_fallbacks
     }
 
     /// Whether the holder currently carries state (test/ops introspection).
@@ -1720,6 +1760,21 @@ impl ResidentBooks {
     /// calls). `enabled == false` is a pure no-op: the holder is neither
     /// advanced nor drained, exactly the pre-candidate sequence.
     pub fn advance_untouched_with(&mut self, enabled: bool, block_height: u64) -> bool {
+        // Item 6 Phase 1: the rows slot advances (or drains) by the same rule,
+        // independent of the books' kill switch (R has no runtime switch).
+        match self.rows.as_mut() {
+            Some(slot) if slot.height + 1 == block_height => slot.height = block_height,
+            Some(slot) => {
+                tracing::warn!(
+                    rows_height = slot.height,
+                    block_height,
+                    "item 6: untouched block is not the resident rows' successor — draining R \
+                     (next native block rebuilds it)"
+                );
+                self.rows = None;
+            }
+            None => {}
+        }
         if !enabled {
             return false;
         }
@@ -1741,6 +1796,153 @@ impl ResidentBooks {
             None => false,
         }
     }
+}
+
+/// The DB's native applied-height marker as `state` sees it (through an
+/// overlay: own pending -> parent layer -> DB). Staleness-guard input for the
+/// resident books and the resident rows.
+fn applied_marker<B: StateBackend>(state: &B) -> Option<u64> {
+    use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+    let bytes = state
+        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+        .ok()
+        .flatten()?;
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+}
+
+/// Item 6 Phase 1: one block's handle on the resident rows R, from
+/// [`begin_resident`] to [`end_resident`].
+#[derive(Debug)]
+pub struct ResidentBlock {
+    height: u64,
+    attached: bool,
+    rebuilt: bool,
+}
+
+impl ResidentBlock {
+    /// R is attached to the block's overlay (false: no holder, or the build
+    /// failed — reads go to the DB, today's path).
+    pub fn attached(&self) -> bool {
+        self.attached
+    }
+
+    /// R was built for this block (cold start or staleness guard trip).
+    pub fn rebuilt(&self) -> bool {
+        self.rebuilt
+    }
+}
+
+/// Item 6 Phase 1: start of a native block. TAKE the holder's rows slot and
+/// reuse it iff it holds the post-state of `height - 1` (slot height + 1 ==
+/// `height`, and the applied marker — read through `overlay`, i.e. pending ->
+/// parent -> DB — equals the slot height when present); otherwise build R from
+/// `overlay` (DB + parent layer: the previous block's post-state). Attach R to
+/// `overlay`, which must not have been cloned yet. `holder: None` = today's
+/// path (nothing attached). Called by app.rs and the harnesses
+/// (`perf_equivalence_golden`, `ubench_econ`).
+///
+/// A block that never reaches [`end_resident`] (fatal, failed hand-off)
+/// leaves the slot empty: the next block rebuilds.
+pub fn begin_resident(
+    holder: Option<&mut ResidentBooks>,
+    overlay: &mut NativeStateOverlay,
+    height: u64,
+    metrics: Option<&torus_telemetry::Metrics>,
+) -> ResidentBlock {
+    let mut block = ResidentBlock { height, attached: false, rebuilt: false };
+    let Some(holder) = holder else {
+        return block;
+    };
+    debug_assert!(!overlay.has_resident(), "begin_resident on an overlay that already has R");
+    let reused = holder.rows.take().and_then(|slot| {
+        let marker = applied_marker(&*overlay);
+        let height_ok = slot.height + 1 == height;
+        let marker_ok = marker.is_none_or(|m| m == slot.height);
+        if height_ok && marker_ok {
+            return Some(slot.rows);
+        }
+        tracing::warn!(
+            rows_height = slot.height,
+            height,
+            applied_marker = marker,
+            "item 6: resident rows stale (height/marker mismatch) — rebuilding R"
+        );
+        None
+    });
+    let rows = match reused {
+        Some(rows) => rows,
+        None => {
+            let timer = std::time::Instant::now();
+            match torus_state::ResidentRows::build(&*overlay) {
+                Ok(rows) => {
+                    holder.rows_builds += 1;
+                    block.rebuilt = true;
+                    if let Some(m) = metrics {
+                        m.exec_resident_rows_rebuilds.inc();
+                        m.exec_resident_rows_build_seconds
+                            .observe(timer.elapsed().as_secs_f64());
+                    }
+                    tracing::info!(
+                        height,
+                        rows = rows.len(),
+                        bytes = rows.bytes(),
+                        build_ms = timer.elapsed().as_secs_f64() * 1e3,
+                        "item 6: resident rows built"
+                    );
+                    Arc::new(rows)
+                }
+                Err(e) => {
+                    // Reads fall through to the DB (today's path) for this block.
+                    tracing::error!(%e, height, "item 6: resident rows build failed — block reads the DB");
+                    return block;
+                }
+            }
+        }
+    };
+    if let Some(m) = metrics {
+        m.exec_resident_rows.set(rows.len() as i64);
+        m.exec_resident_rows_bytes.set(rows.bytes() as i64);
+    }
+    overlay.attach_resident(rows);
+    block.attached = true;
+    block
+}
+
+/// Item 6 Phase 1: end of a native block, after the hand-off (pipelined) or
+/// the flush (serial; `ok` = it succeeded) and after every clone of `overlay`
+/// (the context's managers) was dropped. `delta` = `overlay.own_pending_delta()`
+/// taken before `freeze` / the flush. Detaches R, takes it back with
+/// `Arc::get_mut`, applies `delta` and stashes it at `block`'s height. If a
+/// clone of R is still alive (never in the normal sequence) or `!ok`, the
+/// slot stays empty and the next block rebuilds.
+pub fn end_resident(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: torus_state::ResidentDelta,
+    ok: bool,
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
+    let Some(mut rows) = overlay.detach_resident() else {
+        return;
+    };
+    if !block.attached || !ok {
+        return;
+    }
+    let Some(r) = Arc::get_mut(&mut rows) else {
+        holder.rows_shared_fallbacks += 1;
+        tracing::warn!(
+            height = block.height,
+            "item 6: resident rows still shared at end of block — dropping R (next block rebuilds)"
+        );
+        return;
+    };
+    r.apply(&delta);
+    if let Some(m) = metrics {
+        m.exec_resident_rows.set(r.len() as i64);
+        m.exec_resident_rows_bytes.set(r.bytes() as i64);
+    }
+    holder.rows = Some(RowsSlot { rows, height: block.height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -2454,12 +2656,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// rank8 staleness guard input: the DB's native applied-height marker.
     fn read_applied_marker(state: &T) -> Option<u64> {
-        use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
-        let bytes = state
-            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-            .ok()
-            .flatten()?;
-        Some(u64::from_be_bytes(bytes.try_into().ok()?))
+        applied_marker(state)
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the

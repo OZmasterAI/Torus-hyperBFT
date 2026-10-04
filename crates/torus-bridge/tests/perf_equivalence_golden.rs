@@ -7,7 +7,10 @@
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
-//! `freeze` + `flush` with the running state hash on. A block's digest =
+//! `freeze` + `flush` with the running state hash on. Item 6 Phase 1 (C1):
+//! the resident rows R are attached exactly as app.rs does
+//! (`begin_resident` / `end_resident`); every scenario also runs without R
+//! (`begin_resident(None, ..)`, today's path) against the same digests. A block's digest =
 //! keccak256 over the DB after its flush (every `HASHED_CFS` CF, the native
 //! state root, the running hash — which also covers tombstones) ‖ its
 //! results ‖ funnel metrics ‖ `trade_index` ‖ `fatal_error`.
@@ -19,13 +22,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{keccak256, Address, U256};
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::liquidation as liq;
 use torus_core::order_book::OrderBook;
 use torus_core::position::{MarginType, NativeBalance};
 use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
-use torus_state::cf::{CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS};
+use torus_state::cf::{
+    CF_CONSENSUS_META, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
+    META_NATIVE_APPLIED_HEIGHT,
+};
 use torus_state::running_hash::{configure_activation, read_running_hash, HASHED_CFS};
 use torus_state::{FrozenPending, NativeStateOverlay, StateBackend, StateDb};
 use torus_telemetry::Metrics;
@@ -117,9 +123,11 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
 }
 
 /// Runs `blocks` on the pipelined overlay path; `threads` = `None` runs
-/// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`. Returns
-/// one hex digest per block.
-fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>) -> Vec<String> {
+/// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `resident`
+/// attaches the resident rows R (else today's path). Returns one hex digest
+/// per block.
+fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -> Vec<String> {
+    let mut holder = ResidentBooks::default();
     let metrics = Arc::new(Metrics::new());
     let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
     let mut next_id: u128 = 1;
@@ -135,7 +143,8 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>) -> Vec<String> {
     };
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
-        let overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, Some(&metrics));
         let mut ctx = NativeExecContext::new(
             overlay.clone(), h, b.ts, 0, 1_000_000, 100, addr(99), addr(100), addr(101),
         );
@@ -197,7 +206,12 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>) -> Vec<String> {
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
         drop(ctx);
+        // As app.rs on the pipelined path: the marker rides the frozen set (the
+        // next block's guard reads it through the parent layer).
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
+        end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
         if let Some(p) = parent.take() {
             flush(p, &outputs, &mut digests);
         }
@@ -205,6 +219,17 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>) -> Vec<String> {
     }
     if let Some(p) = parent.take() {
         flush(p, &outputs, &mut digests);
+    }
+    if resident {
+        assert_eq!(holder.rows_builds(), 1, "R built once, carried through every block");
+        assert_eq!(holder.rows_shared_fallbacks(), 0);
+        let r = holder.rows().expect("R stashed after the last block");
+        for cf in torus_state::resident_rows::RESIDENT_CFS {
+            let rows: Vec<_> = r.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert_eq!(rows, db.iterate_cf(cf, None).unwrap(), "R == DB after the last flush ({cf})");
+        }
+    } else {
+        assert_eq!(holder.rows_builds(), 0);
     }
     if std::env::var("GOLDEN_PRINT").is_ok() {
         println!(
@@ -469,23 +494,29 @@ fn check(name: &str, got: &[String], want: &[&str]) {
 
 #[test]
 fn scenario_a_serial_digests_golden() {
-    let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
-    let (_d, db) = listed_db(&markets);
-    let blocks = scenario_a(&db);
-    check("GOLDEN_A", &run(&db, &blocks, None), &GOLDEN_A);
+    for resident in [true, false] {
+        let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
+        let (_d, db) = listed_db(&markets);
+        let blocks = scenario_a(&db);
+        check("GOLDEN_A", &run(&db, &blocks, None, resident), &GOLDEN_A);
+    }
 }
 
 #[test]
 fn scenario_a_engine_digests_golden() {
-    let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
-    let (_d, db) = listed_db(&markets);
-    let blocks = scenario_a(&db);
-    check("GOLDEN_A", &run(&db, &blocks, Some(4)), &GOLDEN_A);
+    for resident in [true, false] {
+        let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
+        let (_d, db) = listed_db(&markets);
+        let blocks = scenario_a(&db);
+        check("GOLDEN_A", &run(&db, &blocks, Some(4), resident), &GOLDEN_A);
+    }
 }
 
 #[test]
 fn scenario_b_liquidation_digests_equal_c93c579() {
-    let (_d, db) = listed_db(&[1, 2, 3]);
-    let blocks = scenario_b(&db);
-    check("GOLDEN_B", &run(&db, &blocks, None), &GOLDEN_B);
+    for resident in [true, false] {
+        let (_d, db) = listed_db(&[1, 2, 3]);
+        let blocks = scenario_b(&db);
+        check("GOLDEN_B", &run(&db, &blocks, None, resident), &GOLDEN_B);
+    }
 }

@@ -8,6 +8,7 @@ use rocksdb::WriteBatch;
 use crate::cf::{CF_ACCOUNTS, CF_SESSIONS};
 use crate::db::{decode_account_info, encode_account_info, StateDb};
 use crate::error::StateError;
+use crate::resident_rows::{ResidentDelta, ResidentRows, RESIDENT_CFS};
 
 pub enum AtomicWriteOp<'a> {
     Put {
@@ -66,6 +67,14 @@ pub trait StateBackend: Clone + Send + Sync {
     /// key instead of loading every row.
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
         Ok(!self.iterate_cf(cf, Some(prefix))?.is_empty())
+    }
+
+    /// Item 6 Phase 1: whether THIS block's own writes or tombstones may touch
+    /// keys of `cf` starting with `prefix` (anything below them is already in
+    /// the resident rows). Default `true` = "assume dirty"; a
+    /// [`NativeStateOverlay`] with resident rows attached answers exactly.
+    fn layer_touches(&self, _cf: &str, _prefix: &[u8]) -> bool {
+        true
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
@@ -950,6 +959,12 @@ pub struct NativeStateOverlay {
     /// between this overlay's own pending set and the DB on every read. `None`
     /// on the serial path (exact-today: own pending -> DB).
     parent: Option<Arc<FrozenPending>>,
+    /// Item 6 Phase 1: resident rows R (the previous block's post-state of
+    /// `CF_NATIVE_POSITIONS` / `CF_NATIVE_BALANCES`). When set, every read of
+    /// those two CFs goes own pending -> parent -> R and never reaches the DB;
+    /// a key absent from R is absent. Set by [`Self::attach_resident`] BEFORE
+    /// the overlay is cloned (clones made earlier do not see it).
+    resident: Option<Arc<ResidentRows>>,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -957,8 +972,18 @@ impl std::fmt::Debug for NativeStateOverlay {
         f.debug_struct("NativeStateOverlay")
             .field("pending_writes", &self.pending_write_count())
             .field("parent_height", &self.parent_height())
+            .field("resident_rows", &self.resident.as_ref().map(|r| r.len()))
             .finish()
     }
+}
+
+/// [`CfId`] -> slot in [`crate::resident_rows::RESIDENT_CFS`].
+#[inline]
+fn resident_slot_of(id: CfId) -> Option<usize> {
+    static IDS: OnceLock<[CfId; 2]> = OnceLock::new();
+    IDS.get_or_init(|| RESIDENT_CFS.map(|cf| intern_cf(cf).expect("resident CF is registered")))
+        .iter()
+        .position(|x| *x == id)
 }
 
 impl NativeStateOverlay {
@@ -974,12 +999,53 @@ impl NativeStateOverlay {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
             parent,
+            resident: None,
         }
     }
 
     /// Height of the layered parent, if any (debug assertions / tests).
     pub fn parent_height(&self) -> Option<u64> {
         self.parent.as_ref().map(|p| p.height)
+    }
+
+    /// Item 6 Phase 1: read `CF_NATIVE_POSITIONS` / `CF_NATIVE_BALANCES` from
+    /// `rows` in place of the DB (see the `resident` field). Call before the
+    /// overlay is cloned into a context.
+    pub fn attach_resident(&mut self, rows: Arc<ResidentRows>) {
+        self.resident = Some(rows);
+    }
+
+    /// Drop this overlay's handle on the resident rows (the end of the block
+    /// takes R back with `Arc::get_mut`); reads fall back to the DB.
+    pub fn detach_resident(&mut self) -> Option<Arc<ResidentRows>> {
+        self.resident.take()
+    }
+
+    /// Whether resident rows are attached.
+    pub fn has_resident(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    /// The resident rows of `id`, if R is attached and `id` is one of its CFs.
+    #[inline]
+    fn resident_rows(&self, id: CfId) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
+        let rows = self.resident.as_ref()?;
+        resident_slot_of(id).map(|s| rows.slot(s))
+    }
+
+    /// Item 6 Phase 1: this overlay's OWN pending writes and tombstones of R's
+    /// two CFs (the parent layer is already in R), key-sorted. Take it before
+    /// [`Self::freeze`] (which moves the pending set out) or the flush.
+    pub fn own_pending_delta(&self) -> ResidentDelta {
+        let state = self.pending.read().unwrap();
+        let mut delta = ResidentDelta::default();
+        for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+            let id = intern_cf(cf).expect("resident CF is registered");
+            delta.cfs[slot] = cf_stream(state.cf(id))
+                .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+                .collect();
+        }
+        delta
     }
 
     /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged
@@ -1653,6 +1719,63 @@ fn writes_under<'a>(
         .take_while(move |k| k.starts_with(prefix))
 }
 
+/// Review H3: the merged `iterate_cf` from `start` — a k-way merge of `base`
+/// (the DB iterator seeked to `start`, or R's range) and the parent / pending
+/// write ranges; each candidate key resolves by the layered point-read rule
+/// (pending, then parent, then `base`), so tombstones in either layer hide it.
+/// Reads at most `limit` live rows plus the tombstoned base keys in between.
+#[allow(clippy::type_complexity)]
+fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+    pending: &PendingState,
+    parent: Option<&PendingState>,
+    id: CfId,
+    start: &[u8],
+    limit: usize,
+    mut base: impl Iterator<Item = Result<(K, V), StateError>>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+    let mut out = Vec::new();
+    let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+    let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
+    let mut aw = parent
+        .into_iter()
+        .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
+        .peekable();
+    let mut bh = base.next().transpose()?;
+    while out.len() < limit {
+        let heads = [
+            pw.peek().map(|(k, _)| k.as_slice()),
+            aw.peek().map(|(k, _)| k.as_slice()),
+            bh.as_ref().map(|(k, _)| k.as_ref()),
+        ];
+        let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
+            break;
+        };
+        let value = match pending.lookup(id, &key) {
+            Some(hit) => hit.map(<[u8]>::to_vec),
+            None => match parent.and_then(|s| s.lookup(id, &key)) {
+                Some(hit) => hit.map(<[u8]>::to_vec),
+                None => bh
+                    .as_ref()
+                    .filter(|(k, _)| k.as_ref() == key.as_slice())
+                    .map(|(_, v)| v.as_ref().to_vec()),
+            },
+        };
+        if pw.peek().is_some_and(|(k, _)| **k == key) {
+            pw.next();
+        }
+        if aw.peek().is_some_and(|(k, _)| **k == key) {
+            aw.next();
+        }
+        if bh.as_ref().is_some_and(|(k, _)| k.as_ref() == key.as_slice()) {
+            bh = base.next().transpose()?;
+        }
+        if let Some(v) = value {
+            out.push((key, v));
+        }
+    }
+    Ok(out)
+}
+
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         // C2: interned CF + borrowed key lookup — ZERO allocations on this path
@@ -1671,6 +1794,10 @@ impl StateBackend for NativeStateOverlay {
                 if let Some(hit) = parent.state.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
+            }
+            // Item 6 Phase 1: R replaces the DB for its two CFs.
+            if let Some(rows) = self.resident_rows(id) {
+                return Ok(rows.get(key).cloned());
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -1731,13 +1858,21 @@ impl StateBackend for NativeStateOverlay {
         // Merge RocksDB entries with pending: RocksDB first, then the parent
         // layer (bl2 exec pipeline; absent on the serial path), then this
         // overlay's own pending set — each layer's tombstones remove and its
-        // writes override what sits below.
-        let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
+        // writes override what sits below. Item 6 Phase 1: R's prefix range
+        // stands in for the DB rows of its two CFs.
+        let p = prefix.unwrap_or(&[]);
+        let db_entries = match self.resident_rows(id) {
+            Some(rows) => rows
+                .range::<[u8], _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(p))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => StateBackend::iterate_cf(&self.db, cf, prefix)?,
+        };
         let parent = self.parent.as_ref().map(|f| &f.state);
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
-        let p = prefix.unwrap_or(&[]);
         if !state.touches(id, p) && !parent.is_some_and(|s| s.touches(id, p)) {
             return Ok(db_entries);
         }
@@ -1765,60 +1900,30 @@ impl StateBackend for NativeStateOverlay {
         let Some(id) = intern_cf(cf) else {
             return StateBackend::iterate_cf_from(&self.db, cf, start, limit);
         };
-        let mut out = Vec::new();
         if limit == 0 {
-            return Ok(out);
+            return Ok(Vec::new());
         }
         let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
         let pending = self.pending.read().unwrap();
         let parent = self.parent.as_ref().map(|p| &p.state);
-        let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
-        let mut aw = parent
-            .into_iter()
-            .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
-            .peekable();
+        // Item 6 Phase 1: R's range stands in for the RocksDB iterator.
+        if let Some(rows) = self.resident_rows(id) {
+            let base = rows
+                .range::<[u8], _>(range)
+                .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
+            return merge_from(&pending, parent, id, start, limit, base);
+        }
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        let mut dbi = db.iterator_cf(
-            cf_handle,
-            rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
-        );
-        let mut dbh = dbi.next().transpose()?;
-        while out.len() < limit {
-            let heads = [
-                pw.peek().map(|(k, _)| k.as_slice()),
-                aw.peek().map(|(k, _)| k.as_slice()),
-                dbh.as_ref().map(|(k, _)| &**k),
-            ];
-            let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
-                break;
-            };
-            let value = match pending.lookup(id, &key) {
-                Some(hit) => hit.map(<[u8]>::to_vec),
-                None => match parent.and_then(|s| s.lookup(id, &key)) {
-                    Some(hit) => hit.map(<[u8]>::to_vec),
-                    None => dbh
-                        .as_ref()
-                        .filter(|(k, _)| **k == *key)
-                        .map(|(_, v)| v.to_vec()),
-                },
-            };
-            if pw.peek().is_some_and(|(k, _)| **k == key) {
-                pw.next();
-            }
-            if aw.peek().is_some_and(|(k, _)| **k == key) {
-                aw.next();
-            }
-            if dbh.as_ref().is_some_and(|(k, _)| **k == *key) {
-                dbh = dbi.next().transpose()?;
-            }
-            if let Some(v) = value {
-                out.push((key, v));
-            }
-        }
-        Ok(out)
+        let dbi = db
+            .iterator_cf(
+                cf_handle,
+                rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+            )
+            .map(|item| item.map_err(StateError::from));
+        merge_from(&pending, parent, id, start, limit, dbi)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
@@ -1847,6 +1952,13 @@ impl StateBackend for NativeStateOverlay {
                 return Ok(true);
             }
         }
+        // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
+        if let Some(rows) = self.resident_rows(id) {
+            return Ok(rows
+                .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .any(|(k, _)| live(k)));
+        }
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -1861,6 +1973,17 @@ impl StateBackend for NativeStateOverlay {
             }
         }
         Ok(false)
+    }
+
+    /// With R attached and `cf` one of its CFs: this overlay's own pending set
+    /// holds a write or tombstone under `prefix`. Otherwise "assume dirty".
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        match intern_cf(cf) {
+            Some(id) if self.resident_rows(id).is_some() => {
+                self.pending.read().unwrap().touches(id, prefix)
+            }
+            _ => true,
+        }
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {

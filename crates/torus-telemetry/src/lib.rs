@@ -382,6 +382,17 @@ pub struct Metrics {
     /// exec thread; the pipeline advances the holder across untouched blocks so
     /// this should stay at 1 (startup) per process under a normal sequence.
     pub exec_resident_rebuilds: Counter,
+    /// Item 6 Phase 1: rows in the resident rows R (`CF_NATIVE_POSITIONS` +
+    /// `CF_NATIVE_BALANCES` held in memory across blocks), set per native block.
+    pub exec_resident_rows: Gauge,
+    /// Item 6 Phase 1: key + value bytes in R.
+    pub exec_resident_rows_bytes: Gauge,
+    /// Item 6 Phase 1: native blocks that (re)built R from the DB + parent
+    /// layer (startup, staleness guard, a fatal / failed block before). One
+    /// per process in a normal sequence.
+    pub exec_resident_rows_rebuilds: Counter,
+    /// Item 6 Phase 1: time to build R (a full scan of both CFs).
+    pub exec_resident_rows_build_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -1611,6 +1622,31 @@ impl Metrics {
             exec_resident_rebuilds.clone(),
         );
 
+        let exec_resident_rows = Gauge::default();
+        registry.register(
+            "torus_exec_resident_rows",
+            "Item 6: rows of cf_native_positions + cf_native_balances resident in memory (R)",
+            exec_resident_rows.clone(),
+        );
+        let exec_resident_rows_bytes = Gauge::default();
+        registry.register(
+            "torus_exec_resident_rows_bytes",
+            "Item 6: key + value bytes of the resident rows R",
+            exec_resident_rows_bytes.clone(),
+        );
+        let exec_resident_rows_rebuilds = Counter::default();
+        registry.register(
+            "torus_exec_resident_rows_rebuilds",
+            "Item 6: native blocks that rebuilt the resident rows R from the DB + parent layer",
+            exec_resident_rows_rebuilds.clone(),
+        );
+        let exec_resident_rows_build_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_resident_rows_build_seconds",
+            "Item 6: time to build the resident rows R (full scan of both CFs)",
+            exec_resident_rows_build_seconds.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -2139,6 +2175,10 @@ impl Metrics {
             mempool_remove_committed_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
+            exec_resident_rows,
+            exec_resident_rows_bytes,
+            exec_resident_rows_rebuilds,
+            exec_resident_rows_build_seconds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2420,6 +2460,10 @@ mod tests {
             "torus_commit_persist_write_seconds",
             "torus_exec_resting_orders",
             "torus_exec_resident_rebuilds",
+            "torus_exec_resident_rows",
+            "torus_exec_resident_rows_bytes",
+            "torus_exec_resident_rows_rebuilds",
+            "torus_exec_resident_rows_build_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",

@@ -4,7 +4,10 @@
 //!
 //! A fed 20-block econ sequence (marks usable, moving 10 bp per block) runs
 //! through the ubench's block path: each block's `NativeStateOverlay` layered
-//! over the previous block's frozen set, which is flushed one block later.
+//! over the previous block's frozen set, which is flushed one block later,
+//! with the resident rows R attached (`begin_resident` / `end_resident`, as
+//! app.rs does). Review log 1: R answers every read of both CFs, so the DB
+//! reads of both CFs are 0 from C1 on (all paths).
 //! The context's backend wraps that overlay in the counting backend, whose
 //! storage probe records every read of the two CFs that reached RocksDB (no
 //! layer answered it) with its stack; the stack names the engine path.
@@ -21,9 +24,9 @@ use std::sync::Arc;
 
 use counting_backend::{CountingBackend, Counts, StorageRead};
 use econ_load::{base_mark, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
 use torus_core::position::NativeBalance;
-use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
+use torus_state::cf::{CF_CONSENSUS_META, CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{FrozenPending, NativeStateOverlay, StateBackend, StateDb};
 use torus_types::FixedPoint;
 
@@ -98,9 +101,10 @@ fn assert_memtable_only(db: &StateDb) {
 /// Path, CF and op of a storage read.
 type ReadKey = (&'static str, &'static str, &'static str);
 
-/// Runs the fed sequence; returns storage reads per (path, cf, op) and the
-/// overlay calls of the two CFs per (cf, op), over all blocks.
-fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'static str), usize>, u64) {
+/// Runs the fed sequence; returns storage reads per (path, cf, op), the
+/// overlay calls of the two CFs per (cf, op), over all blocks, the fills and
+/// the R builds.
+fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'static str), usize>, u64, u64) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     setup(&db);
@@ -113,9 +117,11 @@ fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'sta
     let mut per_path: BTreeMap<ReadKey, usize> = BTreeMap::new();
     let mut calls: HashMap<(&'static str, &'static str), usize> = HashMap::new();
     let mut fills = 0u64;
+    let mut holder = ResidentBooks::default();
     for h in 1..=BLOCKS {
         let block = gen.block(ACTIONS);
-        let overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let resident = begin_resident(Some(&mut holder), &mut overlay, h, None);
         let backend = CountingBackend::with_counts(overlay.clone(), counts.clone());
         let mut ctx = NativeExecContext::new(
             backend.clone(), h + 1, 1000 + h, 0, 1_000_000, 100, special(99), special(100), special(101),
@@ -145,14 +151,20 @@ fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'sta
         for (k, v) in backend.take_layer_calls() {
             *calls.entry(k).or_insert(0) += v;
         }
+        drop(backend);
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
+        end_resident(&mut holder, resident, &mut overlay, delta, true, None);
         if let Some(p) = parent.take() {
             p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
         }
         parent = Some(frozen);
     }
+    assert_eq!(holder.rows_shared_fallbacks(), 0);
+    assert_eq!(holder.rows_height(), Some(BLOCKS));
     assert_memtable_only(&db);
-    (per_path, calls, fills)
+    (per_path, calls, fills, holder.rows_builds())
 }
 
 /// The instrument itself: a DB-resident balance read through the overlay is a
@@ -209,10 +221,9 @@ fn storage_probe_sees_db_reads_and_not_layer_hits() {
 }
 
 #[test]
-#[ignore = "item 6 Phase 1: un-ignored by steps C3/C4"]
 fn fed_block_path_reads_positions_and_balances_from_memory_only() {
-    let (per_path, calls, fills) = run_fed_sequence();
-    println!("STORAGE_READS blocks={BLOCKS} senders={SENDERS} markets={MARKETS} fills={fills} walk_bp={WALK_BP}");
+    let (per_path, calls, fills, builds) = run_fed_sequence();
+    println!("STORAGE_READS blocks={BLOCKS} senders={SENDERS} markets={MARKETS} fills={fills} walk_bp={WALK_BP} r_builds={builds}");
     for ((path, cf, op), n) in &per_path {
         println!("STORAGE_READS path={path} cf={cf} op={op} reads={n}");
     }
@@ -222,14 +233,9 @@ fn fed_block_path_reads_positions_and_balances_from_memory_only() {
         println!("OVERLAY_CALLS cf={cf} op={op} calls={n}");
     }
     assert!(fills > 0, "the sequence must trade");
-    let mut bad = Vec::new();
-    for path in ["margin", "match", "liquidation"] {
-        for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
-            let n: usize = per_path.iter().filter(|((p, c, _), _)| *p == path && *c == cf).map(|(_, n)| n).sum();
-            if n != 0 {
-                bad.push(format!("{path}/{cf}={n}"));
-            }
-        }
-    }
-    assert!(bad.is_empty(), "storage reads on the in-memory paths: {}", bad.join(" "));
+    assert_eq!(builds, 1, "R built once, then carried block to block");
+    let calls_total: usize = calls.iter().map(|(_, n)| n).sum();
+    assert!(calls_total > 1000, "non-vacuous: {calls_total} reads of the two CFs");
+    let bad: Vec<String> = per_path.iter().map(|((p, c, o), n)| format!("{p}/{c}/{o}={n}")).collect();
+    assert!(bad.is_empty(), "storage reads of R's CFs (any path): {}", bad.join(" "));
 }

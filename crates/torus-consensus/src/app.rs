@@ -628,6 +628,12 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Item 6 Phase 1 (step 0.4): test-only reference switch — `true` runs
+    /// every native block without the resident rows R (`begin_resident(None,
+    /// ..)` = today's path: R's CFs are read from the DB). The node has no
+    /// runtime flag for R (D16).
+    #[cfg(test)]
+    test_no_resident_rows: bool,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
@@ -1928,7 +1934,7 @@ impl ExecutionContext {
             "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
             parent.as_ref().map(|p| p.height())
         );
-        let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        let mut overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
@@ -1960,6 +1966,29 @@ impl ExecutionContext {
 
         // ---- Native execution ----
         if run_native {
+            // Item 6 Phase 1: take (or build) the resident rows R — the
+            // previous block's post-state of CF_NATIVE_POSITIONS /
+            // CF_NATIVE_BALANCES — and attach them before the overlay is
+            // cloned into the context; every read of the two CFs in this block
+            // is then served from memory. Not gated by TORUS_RESIDENT_BOOKS.
+            // Only the oracle / liquidation due-checks read the overlay before
+            // this point, and neither reads R's CFs.
+            #[cfg(test)]
+            let no_resident_rows = self.test_no_resident_rows;
+            #[cfg(not(test))]
+            let no_resident_rows = false;
+            let resident_rows = {
+                let mut holder = self
+                    .resident_books
+                    .lock()
+                    .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+                torus_bridge::native_executor::begin_resident(
+                    (!no_resident_rows).then_some(&mut *holder),
+                    &mut overlay,
+                    height,
+                    self.metrics.as_deref(),
+                )
+            };
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
@@ -2385,6 +2414,15 @@ impl ExecutionContext {
             // s80: `extras` is empty unless a stream wanted this block's fills.
             let (fills, extras) = ctx.take_pending_fills_and_extras();
 
+            // Item 6 Phase 1: this block's own writes / tombstones of R's two
+            // CFs, taken before `freeze` moves the pending set out (pipelined)
+            // or the flush (serial). Nothing writes those CFs after this.
+            let resident_delta = if resident_rows.attached() {
+                overlay.own_pending_delta()
+            } else {
+                Default::default()
+            };
+            let resident_ok;
             if pipelined {
                 debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
@@ -2410,7 +2448,11 @@ impl ExecutionContext {
                 }) {
                     return;
                 }
+                resident_ok = true;
             } else {
+            // Item 6 Phase 1: the context's overlay clones hold R; drop them
+            // so `end_resident` can take R back.
+            drop(ctx);
             // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
             // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
             // marker fold is the crash-safety fix: native state and "this height is applied" now
@@ -2452,6 +2494,7 @@ impl ExecutionContext {
                     member_opt,
                 )
             };
+            resident_ok = flush_stats.is_ok();
             match &flush_stats {
                 Ok(stats) => {
                     if let Some(ref m) = self.metrics {
@@ -2526,6 +2569,25 @@ impl ExecutionContext {
                 m.observe_order_ages(OrderStage::Durable, order_nonces.iter().copied());
             }
             } // end serial flush
+
+            // Item 6 Phase 1: after the hand-off / the flush, R takes this
+            // block's delta and goes back to the holder at `height`. A failed
+            // flush (or an early return above: fatal block, failed hand-off)
+            // leaves the slot empty, so the next native block rebuilds R.
+            {
+                let mut holder = self
+                    .resident_books
+                    .lock()
+                    .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+                torus_bridge::native_executor::end_resident(
+                    &mut holder,
+                    resident_rows,
+                    &mut overlay,
+                    resident_delta,
+                    resident_ok,
+                    self.metrics.as_deref(),
+                );
+            }
 
             // O3: hand this block's fills to the background writer, which
             // encodes and writes their trade-history rows — off the execution thread, after the atomic state flush
@@ -3760,6 +3822,8 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_no_resident_rows: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
         };
@@ -10576,6 +10640,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
+            test_no_resident_rows: false,
+            #[cfg(test)]
             test_crash_after_evm_section: false,
         }
     }
@@ -14591,6 +14657,17 @@ mod crash_recovery_tests {
         to: alloy_primitives::TxKind,
         input: Vec<u8>,
     ) -> Vec<u8> {
+        signed_eip1559_with_value(key, nonce, to, input, U256::ZERO)
+    }
+
+    /// [`signed_eip1559`] carrying `value` wei.
+    fn signed_eip1559_with_value(
+        key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+        value: U256,
+    ) -> Vec<u8> {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
         use alloy_rlp::Encodable;
         let tx = TxEip1559 {
@@ -14600,7 +14677,7 @@ mod crash_recovery_tests {
             max_priority_fee_per_gas: 0,
             gas_limit: 300_000,
             to,
-            value: U256::ZERO,
+            value,
             input: alloy_primitives::Bytes::from(input),
             access_list: Default::default(),
         };
@@ -16725,5 +16802,346 @@ mod crash_recovery_tests {
         assert_dumps_equal(&serial, &replay, "oracle signer: serial vs crash replay");
         assert_eq!(root_s, root_p);
         assert_eq!(root_s, root_r);
+    }
+
+    // ======================================================================
+    // Item 6 Phase 1 (C1): resident rows R on the committed-block path
+    // ======================================================================
+
+    /// R between blocks (holder slot) as per-CF dumps; `None` = slot empty.
+    fn resident_rows_dump(ctx: &ExecutionContext) -> Option<Vec<CfDump>> {
+        let holder = ctx.resident_books.lock().unwrap();
+        holder.rows().map(|r| {
+            torus_state::resident_rows::RESIDENT_CFS
+                .iter()
+                .map(|cf| (*cf, r.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+                .collect()
+        })
+    }
+
+    /// R's two CFs scanned from the DB.
+    fn resident_cfs_in_db(db: &StateDb) -> Vec<CfDump> {
+        torus_state::resident_rows::RESIDENT_CFS
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+            .collect()
+    }
+
+    /// With R on: after block `h` (W drained when pipelined) the holder's R is
+    /// at `h` and equals the DB scan of both CFs.
+    fn assert_resident_rows_track_db(ctx: &ExecutionContext, db: &StateDb, h: u64, what: &str) {
+        if let Some(w) = ctx.flush_worker.as_ref() {
+            assert!(w.wait_idle(), "{what}: W failed");
+        }
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(h), "{what}: R height after {h}");
+        let rows = resident_rows_dump(ctx).expect("R stashed");
+        assert_dumps_equal(&rows, &resident_cfs_in_db(db), &format!("{what}: R vs DB after {h}"));
+    }
+
+    /// Run the book fixture in `mode`, serial or pipelined, with R
+    /// (`no_r = false`, checked against the DB after every block) or without
+    /// (`test_no_resident_rows`, today's path), restarting after the heights
+    /// in `restart_after`. Returns the full dump, the per-block consensus
+    /// write sets (`h_n` inputs), the stored running hash and R's builds.
+    #[allow(clippy::type_complexity)]
+    fn run_book_fixture_r(
+        on: bool,
+        mode: torus_bridge::native_executor::BookMode,
+        no_r: bool,
+        restart_after: &[u64],
+    ) -> (Vec<CfDump>, CapturedWrites, Option<(u64, [u8; 32])>, u64) {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        torus_state::running_hash::capture_begin(&state_db);
+        let new_ctx = || {
+            let mut c = book_pipeline_ctx(&state_db, on, None, mode);
+            c.test_no_resident_rows = no_r;
+            c
+        };
+        let mut ctx = new_ctx();
+        let mut builds = 0;
+        for b in &book_fixture_blocks() {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &state_db, b);
+            let what = format!("{mode:?} on={on} no_r={no_r} restarts={restart_after:?}");
+            assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "{what}: fail-stop at {h}");
+            if no_r {
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: no R");
+            } else {
+                assert_resident_rows_track_db(&ctx, &state_db, h, &what);
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}");
+            }
+            if restart_after.contains(&h) {
+                builds += ctx.resident_books.lock().unwrap().rows_builds();
+                drop(ctx);
+                ctx = new_ctx();
+            }
+        }
+        builds += ctx.resident_books.lock().unwrap().rows_builds();
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&state_db);
+        let stored = torus_state::running_hash::read_running_hash(&state_db);
+        (dump_all_cfs(&state_db), captured, stored, builds)
+    }
+
+    /// Item 6 C1: R == the DB scan of both CFs after every block, serial and
+    /// pipelined (sessions, claim rewards, empties advancing R, epoch
+    /// boundaries), built once, never shared at the end of a block.
+    #[test]
+    fn resident_rows_equal_db_scan_after_every_block_serial_and_pipelined() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let ctx = pipeline_ctx(&state_db, on, None);
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+                assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+                assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on}"));
+            }
+            let holder = ctx.resident_books.lock().unwrap();
+            assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
+            assert_eq!(holder.rows_shared_fallbacks(), 0, "on={on}: Arc::get_mut never fails");
+            assert!(holder.rows().unwrap().len() > 2, "non-vacuous");
+        }
+    }
+
+    /// Item 6 C1: the same block sequence with and without R lands identical
+    /// CF dumps, identical per-block consensus write sets (`h_n`) and the same
+    /// running hash, in all four BookModes, serial and pipelined; R also
+    /// survives restarts (rebuilt cold) with the same result.
+    #[test]
+    fn resident_rows_on_off_identical_state_and_running_hash_every_book_mode() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            for on in [false, true] {
+                let what = format!("{mode:?} on={on}");
+                let (dump_off, cap_off, hash_off, builds_off) = run_book_fixture_r(on, mode, true, &[]);
+                let (dump_on, cap_on, hash_on, builds_on) = run_book_fixture_r(on, mode, false, &[]);
+                assert_eq!((builds_off, builds_on), (0, 1), "{what}");
+                assert_dumps_equal(&dump_off, &dump_on, &format!("{what}: without vs with R"));
+                assert_write_sets_equal(&cap_off, &cap_on, &format!("{what}: without vs with R"));
+                assert!(hash_on.is_some());
+                assert_eq!(hash_off, hash_on, "{what}: running hash");
+                let (dump_rs, cap_rs, hash_rs, builds_rs) = run_book_fixture_r(on, mode, false, &[3, 7]);
+                assert_eq!(builds_rs, 3, "{what}: one build per (re)start");
+                assert_dumps_equal(&dump_off, &dump_rs, &format!("{what}: with R + restarts"));
+                assert_write_sets_equal(&cap_off, &cap_rs, &format!("{what}: with R + restarts"));
+                assert_eq!(hash_off, hash_rs, "{what}: running hash with restarts");
+            }
+        }
+    }
+
+    /// Item 6 C1, guard P7 on the committed-block path: a fatal block (wrong
+    /// book mode -> load error -> fail-stop before the flush) leaves R taken,
+    /// so its re-execution rebuilds; a height applied by another exec context
+    /// (the holder skipped it) rebuilds too. R is never stale: it equals the
+    /// DB after each step and the final state equals a run without R.
+    #[test]
+    fn resident_rows_guard_fatal_block_and_skipped_height_rebuild() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use torus_bridge::native_executor::BookMode;
+        let blocks = book_fixture_blocks();
+        let first5 = &blocks[..5];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_book_fixture(&db_ref);
+        let mut ctx_ref = book_pipeline_ctx(&db_ref, false, None, BookMode::Classic);
+        ctx_ref.test_no_resident_rows = true;
+        for b in first5 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let mut ctx = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        let builds = |ctx: &ExecutionContext| ctx.resident_books.lock().unwrap().rows_builds();
+        dispatch_and_execute(&ctx, &db, &first5[0]);
+        dispatch_and_execute(&ctx, &db, &first5[1]);
+        assert_resident_rows_track_db(&ctx, &db, 2, "after 2");
+        assert_eq!(builds(&ctx), 1);
+
+        // Fatal block 3: the context loads in a mode the DB was not written in.
+        ctx.test_book_mode = Some(BookMode::OrderRows);
+        dispatch_and_execute(&ctx, &db, &first5[2]);
+        assert!(ctx.exec_failed.load(SeqCst), "mode mismatch must fail-stop");
+        assert_eq!(read_native_applied_height(&db), Some(2), "nothing of 3 durable");
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "R taken by the fatal block");
+        assert_eq!(builds(&ctx), 1, "the fatal block reused R (successor of 2)");
+
+        // Re-execute 3 (latch cleared, right mode): R rebuilds from the DB.
+        ctx.test_book_mode = Some(BookMode::Classic);
+        ctx.exec_failed.store(false, SeqCst);
+        dispatch_and_execute(&ctx, &db, &first5[2]);
+        assert!(!ctx.exec_failed.load(SeqCst));
+        assert_eq!(builds(&ctx), 2, "re-executed 3 rebuilt R");
+        assert_resident_rows_track_db(&ctx, &db, 3, "after re-executed 3");
+
+        // Block 4 applied by another exec context: this holder skipped it.
+        let ctx2 = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        dispatch_and_execute(&ctx2, &db, &first5[3]);
+        assert!(!ctx2.exec_failed.load(SeqCst));
+        drop(ctx2);
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(3));
+        dispatch_and_execute(&ctx, &db, &first5[4]);
+        assert!(!ctx.exec_failed.load(SeqCst));
+        assert_eq!(builds(&ctx), 3, "R at 3 vs block 5: rebuilt");
+        assert_resident_rows_track_db(&ctx, &db, 5, "after 5");
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0);
+        drop(ctx);
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db), "guard sequence with R vs without R");
+    }
+
+    /// Item 6 C1: an EVM lockbox deposit (0x0820) in block 1 is credited by
+    /// block 2's CoreWriter drain (a write of `CF_NATIVE_BALANCES` through the
+    /// block overlay, so R takes it); orders in 2 (placed before the drain)
+    /// and 3 (on the credited balance) — identical state with and without R,
+    /// serial and pipelined.
+    #[test]
+    fn resident_rows_lockbox_deposit_then_orders_identical_without_r() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let trader = k256_address(&key);
+        let amount_wei: u128 = 1_000 * 10u128.pow(18); // 1000 native units
+        let mut calldata = alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&U256::from(amount_wei).to_be_bytes::<32>());
+        let lockbox = torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let order = |price: i128| {
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+                quantity: FixedPoint::ONE,
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            })
+        };
+        let mut blocks = vec![
+            make_block(1, vec![]),
+            make_block(2, vec![torus_types::eip712::sign_native_action(order(90), 1, &key)]),
+            make_block(3, vec![torus_types::eip712::sign_native_action(order(95), 2, &key)]),
+        ];
+        blocks[0].evm_transactions = vec![signed_eip1559_with_value(
+            &key,
+            0,
+            alloy_primitives::TxKind::Call(lockbox),
+            calldata,
+            U256::from(amount_wei),
+        )];
+        blocks[0].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            for no_r in [true, false] {
+                let (_cfg, db) = make_test_config_and_db();
+                db.put_account(
+                    &trader,
+                    &revm::state::AccountInfo {
+                        balance: U256::from(10u128.pow(22)),
+                        nonce: 0,
+                        code_hash: KECCAK_EMPTY_CODE,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+                let mut ctx = pipeline_ctx(&db, on, None);
+                ctx.test_no_resident_rows = no_r;
+                let pm = torus_core::position::PositionManager::new(db.clone());
+                let mut seen = Vec::new();
+                for b in &blocks {
+                    dispatch_and_execute(&ctx, &db, b);
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} no_r={no_r}");
+                    if let Some(w) = ctx.flush_worker.as_ref() {
+                        assert!(w.wait_idle());
+                    }
+                    let bal = pm.get_native_balance(&trader).unwrap();
+                    seen.push((bal.available + bal.order_margin, bal.order_margin));
+                    if !no_r {
+                        assert_resident_rows_track_db(&ctx, &db, b.header.height, "lockbox");
+                    }
+                }
+                let credit = FixedPoint::from_raw(1_000 * FixedPoint::SCALE);
+                assert_eq!(seen[0].0, FixedPoint::ZERO, "block 1: deposit queued, not credited");
+                assert_eq!(seen[1].0, credit, "block 2: credited by the drain");
+                assert_eq!(seen[1].1, FixedPoint::ZERO, "block 2's order ran before the drain: rejected");
+                assert!(seen[2].1 > FixedPoint::ZERO, "block 3's order rests on the credited balance");
+                drop(ctx);
+                dumps.push(dump_all_cfs(&db));
+            }
+        }
+        for d in &dumps[1..] {
+            assert_dumps_equal(&dumps[0], d, "lockbox sequence: with/without R, serial/pipelined");
+        }
+    }
+
+    /// Item 6 C1, P6: crash between E's hand-off and W's write with R on —
+    /// block 3 ran on R carried from block 1 (advanced over the empty 2) on
+    /// top of pending(2); W's write of 2 fails, nothing of 2/3 is durable,
+    /// R is not stashed. A restarted node (fresh holder: R rebuilt cold)
+    /// replays 2 and 3 and lands exactly the state of a run without R.
+    #[test]
+    fn resident_rows_crash_between_handoff_and_write_restart_identical() {
+        let blocks = pipeline_fixture_blocks();
+        let first3 = &blocks[..3];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_pipeline_fixture(&db_ref);
+        let mut ctx_ref = pipeline_ctx(&db_ref, false, None);
+        ctx_ref.test_no_resident_rows = true;
+        for b in first3 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+        dispatch_and_execute(&ctx, &state_db, &first3[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(1));
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &first3[1]); // empty: Marker(2) parked, R advanced
+        assert!(gate.wait_received(2));
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(2));
+        let db_t = state_db.clone();
+        let b3 = first3[2].clone();
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b3); // engine(3) on R + pending(2); hand-off blocks
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished());
+        gate.fail_next();
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        {
+            let holder = ctx.resident_books.lock().unwrap();
+            assert_eq!(holder.rows_builds(), 1, "block 3 reused R (no rebuild)");
+            assert_eq!(holder.rows_height(), None, "failed hand-off: R not stashed");
+        }
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+
+        let ctx2 = pipeline_ctx(&state_db, false, None);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
+        assert_eq!(parked, None);
+        assert!(!ctx2.exec_failed.load(Ordering::SeqCst));
+        assert_resident_rows_track_db(&ctx2, &state_db, 3, "after the replay");
+        assert_eq!(ctx2.resident_books.lock().unwrap().rows_builds(), 1, "restart: R built cold once");
+        drop(ctx2);
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "crash + restart with R vs serial without R");
     }
 }

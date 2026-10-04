@@ -1,0 +1,294 @@
+//! Item 6 Phase 1 (C1) tests: resident rows R (`build`, `apply`) and the
+//! overlay reading R's two CFs from R in place of the DB.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use super::{ResidentRows, RESIDENT_CFS};
+use crate::backend::{NativeStateOverlay, StateBackend};
+use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS};
+use crate::db::StateDb;
+
+fn temp_db() -> (StateDb, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db = StateDb::open(dir.path()).expect("open db");
+    (db, dir)
+}
+
+fn pos_key(trader: u8, market: u64) -> Vec<u8> {
+    [&[trader; 20][..], &market.to_be_bytes()].concat()
+}
+
+/// `cvlm` (24 bytes) and keys of other odd lengths, in both CFs.
+fn odd_keys() -> Vec<Vec<u8>> {
+    vec![
+        [b"cvlm".as_slice(), &[7u8; 20]].concat(),
+        [b"cvlm".as_slice(), &[9u8; 20]].concat(),
+        vec![0x01],
+        vec![0xff; 33],
+        [&[3u8; 20][..], &[0u8; 9]].concat(),
+    ]
+}
+
+fn rows_of(rows: &ResidentRows, cf: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    rows.rows(cf).expect("resident CF").iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+fn bytes_of(rows: &ResidentRows) -> usize {
+    RESIDENT_CFS
+        .iter()
+        .flat_map(|cf| rows.rows(cf).unwrap().iter())
+        .map(|(k, v)| k.len() + v.len())
+        .sum()
+}
+
+/// `build` over DB + parent layer == `iterate_cf(cf, None)` of both CFs through
+/// that overlay — `cvlm` and odd-length keys included; other CFs are not in R.
+#[test]
+fn build_equals_iterate_cf_of_both_cfs() {
+    let (db, _dir) = temp_db();
+    for t in 1..=6u8 {
+        for m in 1..=3u64 {
+            db.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, m), &[t, m as u8]).unwrap();
+        }
+        db.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'b', t]).unwrap();
+    }
+    for k in odd_keys() {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &k, b"odd-p").unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, &k, b"odd-b").unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_ORDERS, &[1u8; 44], b"order").unwrap();
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(9, 1), b"parent-new").unwrap();
+    parent.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(1, 1), b"parent-over").unwrap();
+    parent.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 2)).unwrap();
+    parent.delete_cf_raw(CF_NATIVE_BALANCES, &[3u8; 20]).unwrap();
+    parent.delete_cf_raw(CF_NATIVE_BALANCES, &odd_keys()[0]).unwrap();
+    parent.put_cf_raw(CF_NATIVE_BALANCES, &[0xEE; 20], b"parent-bal").unwrap();
+    let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+
+    let rows = ResidentRows::build(&overlay).unwrap();
+    let mut total = 0;
+    for cf in RESIDENT_CFS {
+        let want = overlay.iterate_cf(cf, None).unwrap();
+        assert!(!want.is_empty(), "{cf}: non-vacuous");
+        assert_eq!(rows_of(&rows, cf), want, "{cf}");
+        total += want.len();
+    }
+    assert_eq!(rows.len(), total);
+    assert_eq!(rows.bytes(), bytes_of(&rows));
+    assert!(rows.rows(CF_NATIVE_ORDERS).is_none(), "only R's two CFs are resident");
+    assert!(rows.rows(CF_NATIVE_POSITIONS).unwrap().contains_key(&odd_keys()[1]), "cvlm kept");
+    assert!(!rows.rows(CF_NATIVE_BALANCES).unwrap().contains_key(&odd_keys()[0]), "parent tombstone");
+}
+
+/// `apply(own_pending_delta)` == flushing the block's writes into a DB that
+/// held R: puts (new and overwrite), deletes (present and absent), a delete
+/// then re-put, a put then delete, cvlm / odd keys; other CFs never enter the
+/// delta. Re-applying the same delta changes nothing.
+#[test]
+fn apply_puts_deletes_and_re_puts() {
+    let (db, _dir) = temp_db();
+    for t in 1..=4u8 {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1), &[t]).unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[t, t]).unwrap();
+    }
+    for k in odd_keys() {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &k, b"odd").unwrap();
+    }
+    let rows = Arc::new(ResidentRows::build(&db).unwrap());
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    overlay.attach_resident(rows.clone());
+    let p = CF_NATIVE_POSITIONS;
+    let b = CF_NATIVE_BALANCES;
+    overlay.put_cf_raw(p, &pos_key(5, 1), b"new").unwrap();
+    overlay.put_cf_raw(p, &pos_key(1, 1), b"overwrite").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(2, 1)).unwrap();
+    overlay.delete_cf_raw(p, &pos_key(8, 8)).unwrap(); // absent
+    overlay.delete_cf_raw(p, &pos_key(3, 1)).unwrap();
+    overlay.put_cf_raw(p, &pos_key(3, 1), b"re-put").unwrap();
+    overlay.put_cf_raw(p, &pos_key(6, 1), b"gone").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(6, 1)).unwrap();
+    overlay.delete_cf_raw(p, &odd_keys()[0]).unwrap();
+    overlay.put_cf_raw(p, &odd_keys()[3], b"odd-new").unwrap();
+    overlay.put_cf_raw(b, &odd_keys()[1], b"cvlm-bal").unwrap();
+    overlay.put_cf_raw(b, &[4u8; 20], b"bal-over").unwrap();
+    overlay.delete_cf_raw(b, &[1u8; 20]).unwrap();
+    overlay.put_cf_raw(CF_NATIVE_ORDERS, &[2u8; 44], b"not-resident").unwrap();
+
+    let delta = overlay.own_pending_delta();
+    assert_eq!(delta.len(), 11, "R-CF keys only, one entry per key");
+    let mut applied = (*rows).clone();
+    applied.apply(&delta);
+    assert!(overlay.detach_resident().is_some());
+    overlay.flush(&db).unwrap();
+    for cf in RESIDENT_CFS {
+        assert_eq!(rows_of(&applied, cf), db.iterate_cf(cf, None).unwrap(), "{cf}");
+    }
+    assert_eq!(applied.bytes(), bytes_of(&applied));
+    assert_eq!(applied.len(), RESIDENT_CFS.iter().map(|cf| db.iterate_cf(cf, None).unwrap().len()).sum::<usize>());
+    let again = {
+        let mut r = applied.clone();
+        r.apply(&delta);
+        r
+    };
+    assert_eq!(again, applied, "apply is idempotent");
+}
+
+/// `layer_touches`: the default (`StateDb`, overlay without R) is "assume
+/// dirty"; with R attached only the overlay's OWN pending writes / tombstones
+/// count (the parent is already in R).
+#[test]
+fn layer_touches_own_pending_only_with_resident() {
+    let (db, _dir) = temp_db();
+    let p = CF_NATIVE_POSITIONS;
+    assert!(db.layer_touches(p, &[1u8; 20]), "StateDb: assume dirty");
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(p, &pos_key(1, 1), b"parent").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    assert!(overlay.layer_touches(p, &[9u8; 20]), "no R: assume dirty");
+    overlay.attach_resident(Arc::new(ResidentRows::build(&overlay).unwrap()));
+    overlay.put_cf_raw(p, &pos_key(2, 1), b"own").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(3, 1)).unwrap();
+    assert!(!overlay.layer_touches(p, &[1u8; 20]), "parent write: already in R");
+    assert!(overlay.layer_touches(p, &[2u8; 20]), "own write");
+    assert!(overlay.layer_touches(p, &[3u8; 20]), "own tombstone");
+    assert!(!overlay.layer_touches(p, &[4u8; 20]), "untouched");
+    assert!(!overlay.layer_touches(CF_NATIVE_BALANCES, &[2u8; 20]), "other CF");
+}
+
+/// Overlay with R: over random DB / R / parent / pending states, every read
+/// method on R's two CFs (`get_cf_raw`, `iterate_cf` with `None` and every
+/// prefix, `iterate_cf_from` over starts x limits, `prefix_exists`) equals the
+/// same read on a DB into which R (for its CFs; the DB rows for any other CF),
+/// then the parent, then the pending set were flushed. R is authoritative: a
+/// DB row of R's CFs that R lacks is invisible. A non-R CF reads the DB.
+#[test]
+fn overlay_with_resident_equals_flushed_db_over_random_layers() {
+    let mut seed: u64 = 0x5EED_00C1;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    const ALPHABET: [u8; 4] = [0x00, 0x01, 0xfe, 0xff];
+    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_ORDERS];
+    let (mut checked, mut hidden) = (0usize, 0usize);
+    for round in 0..40 {
+        let (db, _d1) = temp_db();
+        let (flushed, _d2) = temp_db();
+        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for _ in 0..4 + rnd(14) {
+            let len = 1 + rnd(4) as usize;
+            keys.insert((0..len).map(|_| ALPHABET[rnd(4) as usize]).collect());
+        }
+        // Per (cf, key): in DB, in R, parent op, pending op (0 none, 1 put, 2 delete).
+        let ops: Vec<(&str, Vec<u8>, bool, bool, u64, u64)> = cfs
+            .iter()
+            .flat_map(|cf| keys.iter().map(move |k| (*cf, k.clone())))
+            .map(|(cf, k)| (cf, k, rnd(2) == 1, rnd(2) == 1, rnd(3), rnd(3)))
+            .collect();
+        let mut r_rows = ResidentRows::default();
+        let seed_delta = NativeStateOverlay::new(flushed.clone());
+        for (cf, k, in_db, in_r, _, _) in &ops {
+            let resident = RESIDENT_CFS.contains(cf);
+            if *in_db {
+                db.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                if !resident {
+                    flushed.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                }
+            }
+            if resident && *in_r {
+                seed_delta.put_cf_raw(cf, k, &[b"r".as_slice(), k].concat()).unwrap();
+                flushed.put_cf_raw(cf, k, &[b"r".as_slice(), k].concat()).unwrap();
+            }
+            hidden += usize::from(resident && *in_db && !*in_r);
+        }
+        r_rows.apply(&seed_delta.own_pending_delta());
+        seed_delta.discard_tx();
+        let apply = |ov: &NativeStateOverlay, layer: u8| {
+            for (cf, k, _, _, pa, pe) in &ops {
+                let v = [&[layer], k.as_slice()].concat();
+                match if layer == 0 { *pa } else { *pe } {
+                    1 => {
+                        ov.put_cf_raw(cf, k, &v).unwrap();
+                        flushed.put_cf_raw(cf, k, &v).unwrap();
+                    }
+                    2 => {
+                        ov.delete_cf_raw(cf, k).unwrap();
+                        flushed.delete_cf_raw(cf, k).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let parent = (round % 4 != 0).then(|| {
+            let p = NativeStateOverlay::new(db.clone());
+            apply(&p, 0);
+            p.freeze(1)
+        });
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent);
+        overlay.attach_resident(Arc::new(r_rows));
+        apply(&overlay, 1);
+
+        let mut prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+        prefixes.insert(Vec::new());
+        for k in &keys {
+            for l in 1..=k.len() {
+                prefixes.insert(k[..l].to_vec());
+            }
+            prefixes.insert([k.as_slice(), &[0xff]].concat());
+            prefixes.insert([k.as_slice(), &[0x00]].concat());
+        }
+        for cf in cfs {
+            let want_all = StateBackend::iterate_cf(&flushed, cf, None).unwrap();
+            assert_eq!(overlay.iterate_cf(cf, None).unwrap(), want_all, "round {round} {cf}: None");
+            for k in keys.iter().chain(prefixes.iter()) {
+                assert_eq!(
+                    overlay.get_cf_raw(cf, k).unwrap(),
+                    StateBackend::get_cf_raw(&flushed, cf, k).unwrap(),
+                    "round {round} {cf}: get {k:?}"
+                );
+            }
+            for p in &prefixes {
+                let want = StateBackend::iterate_cf(&flushed, cf, Some(p)).unwrap();
+                assert_eq!(overlay.iterate_cf(cf, Some(p)).unwrap(), want, "round {round} {cf}: prefix {p:?}");
+                assert_eq!(
+                    overlay.prefix_exists(cf, p).unwrap(),
+                    StateBackend::prefix_exists(&flushed, cf, p).unwrap(),
+                    "round {round} {cf}: exists {p:?}"
+                );
+                for limit in [0usize, 1, 2, 5, usize::MAX] {
+                    assert_eq!(
+                        overlay.iterate_cf_from(cf, p, limit).unwrap(),
+                        StateBackend::iterate_cf_from(&flushed, cf, p, limit).unwrap(),
+                        "round {round} {cf}: from {p:?} limit {limit}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(hidden > 20, "DB rows absent from R exercised: {hidden}");
+    assert!(checked > 1000, "non-vacuous: {checked}");
+}
+
+/// The reads above on R's CFs never fall through to the DB: a DB holding a
+/// row R lacks returns nothing for it through every read method.
+#[test]
+fn db_row_absent_from_resident_is_invisible() {
+    let (db, _dir) = temp_db();
+    let k = pos_key(1, 1);
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &k, b"db-only").unwrap();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    overlay.attach_resident(Arc::new(ResidentRows::default()));
+    assert_eq!(overlay.get_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap(), None);
+    assert!(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap().is_empty());
+    assert!(overlay.iterate_cf(CF_NATIVE_POSITIONS, Some(&[1u8; 20])).unwrap().is_empty());
+    assert!(overlay.iterate_cf_from(CF_NATIVE_POSITIONS, &[], 10).unwrap().is_empty());
+    assert!(!overlay.prefix_exists(CF_NATIVE_POSITIONS, &[1u8; 20]).unwrap());
+    let rows: BTreeMap<Vec<u8>, Vec<u8>> = overlay.iterate_cf(CF_NATIVE_ORDERS, None).unwrap().into_iter().collect();
+    assert!(rows.is_empty());
+    let detached = overlay.detach_resident();
+    assert!(detached.is_some());
+    assert_eq!(overlay.get_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap(), Some(b"db-only".to_vec()), "detached: DB again");
+}

@@ -14,6 +14,12 @@
 //! reverting, deterministic: `common/econ_load.rs` `MarkWalk`), so the mark
 //! changes every block. Default 0: the mid every block, as before.
 //!
+//! Item 6 Phase 1 (C1): each block attaches the resident rows R like app.rs
+//! (`begin_resident` / `end_resident`, outside the timed window; their cost
+//! is printed as `r_end/blk`). `UB_NO_R=1` runs without R (today's path) for
+//! A/B pairs on one binary. Each run also times a cold R build over the final
+//! DB (`R rows / bytes / build_ms`).
+//!
 //!   cargo test -p torus-bridge --release --test ubench_econ -- --ignored --nocapture
 
 #[path = "common/econ_load.rs"]
@@ -22,9 +28,10 @@ mod econ_load;
 use econ_load::{base_mark, env, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
 use std::collections::HashMap;
 use std::sync::Arc;
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
 use torus_core::position::NativeBalance;
-use torus_state::{NativeStateOverlay, StateDb};
+use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+use torus_state::{NativeStateOverlay, ResidentRows, StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 struct Sample {
@@ -33,10 +40,19 @@ struct Sample {
     margin_ms: f64,
     match_ms: f64,
     settle_ms: f64,
+    /// `own_pending_delta` + `end_resident` (R's end-of-block upkeep).
+    r_end_ms: f64,
     fills: u64,
 }
 
-fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
+/// A cold R build over the final DB: rows, bytes, ms.
+struct RBuild {
+    rows: usize,
+    bytes: usize,
+    ms: f64,
+}
+
+fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild) {
     let senders = env("UB_SENDERS", 600);
     let markets = env("UB_MARKETS", 300);
     let actions = env("UB_ACTIONS", 60);
@@ -44,6 +60,8 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
     let measure = env("UB_MEASURE", 6);
     let fed = env("UB_MARKS", 0) == 1;
     let mut walk = MarkWalk::new(markets, env("UB_MARK_WALK", 0));
+    let resident = env("UB_NO_R", 0) != 1;
+    let mut holder = ResidentBooks::default();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -83,7 +101,8 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
     let mut placed_measured = 0u64;
     for h in 1..=(warm + measure) {
         let block = gen.block(actions);
-        let overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, None);
         let mut ctx = NativeExecContext::new(
             overlay.clone(),
             h + 1,
@@ -124,6 +143,12 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
         drop(ctx);
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let t2 = std::time::Instant::now();
+        let delta = if rows.attached() { overlay.own_pending_delta() } else { Default::default() };
+        let frozen = overlay.freeze(h);
+        end_resident(&mut holder, rows, &mut overlay, delta, true, None);
+        let r_end = t2.elapsed();
         if h > warm {
             rc_measured += metrics.orders_rejected_cancelled.get() - rc0;
             placed_measured += metrics.orders_placed_accepted.get() - pa0;
@@ -133,18 +158,31 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
                 margin_ms: pa.margin_ns as f64 / 1e6,
                 match_ms: pa.match_ns as f64 / 1e6,
                 settle_ms: pa.settle_ns as f64 / 1e6,
+                r_end_ms: r_end.as_secs_f64() * 1e3,
                 fills,
             });
         }
-        let frozen = overlay.freeze(h);
         if let Some(p) = parent.take() {
             let p: Arc<torus_state::FrozenPending> = p;
             p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
         }
         parent = Some(frozen);
     }
+    if resident {
+        assert_eq!(holder.rows_builds(), 1, "R built once");
+        assert_eq!(holder.rows_shared_fallbacks(), 0);
+    }
+    if let Some(p) = parent.take() {
+        p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
+    }
+    let t = std::time::Instant::now();
+    let r = ResidentRows::build(&db).expect("R build");
+    let r_build = RBuild { rows: r.len(), bytes: r.bytes(), ms: t.elapsed().as_secs_f64() * 1e3 };
+    if let Some(held) = holder.rows() {
+        assert_eq!(held, &r, "carried R == cold build over the final DB");
+    }
     let resting: usize = books.values().map(|b: &torus_core::order_book::OrderBook| b.order_count()).sum();
-    (samples, rc_measured, placed_measured, resting as u64)
+    (samples, rc_measured, placed_measured, resting as u64, r_build)
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -158,20 +196,22 @@ fn ubench_econ() {
     let runs = env("UB_RUNS", 3);
     let mut per_run = Vec::new();
     for r in 0..runs {
-        let (s, rc, placed, resting) = run_once(r);
+        let (s, rc, placed, resting, rb) = run_once(r);
         let fills: u64 = s.iter().map(|x| x.fills).sum();
         let exec: f64 = s.iter().map(|x| x.exec_ms).sum();
         let tail: f64 = s.iter().map(|x| x.tail_ms).sum();
         let margin: f64 = s.iter().map(|x| x.margin_ms).sum();
         let mtch: f64 = s.iter().map(|x| x.match_ms).sum();
         let settle: f64 = s.iter().map(|x| x.settle_ms).sum();
+        let r_end: f64 = s.iter().map(|x| x.r_end_ms).sum();
         let n = s.len() as f64;
         let k = fills as f64 / 1e3;
         let per1k = (exec + tail) / k;
         println!(
             "UB run={r} blocks={} fills/blk={:.0} engine_ms/blk={:.1} engine_ms/1k_fills={:.2} \
              [exec/1k={:.2} margin/1k={:.2} match/1k={:.2} settle/1k={:.2} tail(liq)/1k={:.2}] \
-             rejected_cancelled={} accepted={} resting_end={}",
+             rejected_cancelled={} accepted={} resting_end={} r_end/blk={:.2}ms \
+             R rows={} bytes={} build_ms={:.1} build_ms_per_1M_rows={:.0}",
             s.len(),
             fills as f64 / n,
             (exec + tail) / n,
@@ -183,14 +223,20 @@ fn ubench_econ() {
             tail / k,
             rc,
             placed,
-            resting
+            resting,
+            r_end / n,
+            rb.rows,
+            rb.bytes,
+            rb.ms,
+            rb.ms * 1e6 / rb.rows.max(1) as f64,
         );
         per_run.push(per1k);
     }
     println!(
-        "UB marks={} walk_bp={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
+        "UB marks={} walk_bp={} resident_rows={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
         env("UB_MARKS", 0) == 1,
         env("UB_MARK_WALK", 0),
+        env("UB_NO_R", 0) != 1,
         median(per_run.clone()),
         per_run
     );

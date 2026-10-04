@@ -197,6 +197,10 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         self.probe(cf, "prefix_exists", || self.inner.prefix_exists(cf, prefix))
     }
 
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        self.inner.layer_touches(cf, prefix)
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
         self.inner.atomic_write(ops)
     }

@@ -21,6 +21,11 @@
 //! UB_MARK_WALK=<bp> (item 6 step 0.5): each feed round moves every market's
 //! submitted mark `±bp` around the mid (`common/econ_load.rs` `MarkWalk`);
 //! default 0 = the mid every round, as before.
+//! Item 6 Phase 1 (C1): every native block attaches the resident rows R like
+//! app.rs (`begin_resident` / `end_resident`; R's upkeep is in `flush`), and
+//! a block without the native phase is a marker-only job as on the node (its
+//! 1-key marker set becomes the parent, the previous parent is flushed
+//! outside the block's timing, R advances). `UB_NO_R=1`: without R.
 //! UB_SEED_TRADERS>0 replaces the econ load with directly written positions
 //! (UB_SEED_POS per trader) for scaling runs. Sizes: UB_SENDERS (5000),
 //! UB_MARKETS (300), UB_ACTIONS (60), UB_LOAD (150), UB_DRAIN_TO (420).
@@ -35,11 +40,13 @@ use econ_load::MarkWalk;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{
+    begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBlock, ResidentBooks,
+};
 use torus_core::liquidation as liq;
 use torus_core::position::{MarginType, NativeBalance, Position};
 use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
-use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORACLE};
+use torus_state::cf::{CF_CONSENSUS_META, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{FrozenPending, NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
@@ -129,6 +136,8 @@ struct Chain {
     parent: Option<Arc<FrozenPending>>,
     books: HashMap<u64, torus_core::order_book::OrderBook>,
     next_id: u128,
+    holder: ResidentBooks,
+    resident: bool,
 }
 
 impl Chain {
@@ -140,18 +149,41 @@ impl Chain {
         ctx.next_global_order_id = self.next_id;
         ctx
     }
-    fn finish(&mut self, ctx: NativeExecContext<NativeStateOverlay>, overlay: NativeStateOverlay, h: u64) -> f64 {
+    /// Item 6 C1: attach R to the block's overlay (before `ctx`).
+    fn begin(&mut self, overlay: &mut NativeStateOverlay, h: u64) -> ResidentBlock {
+        begin_resident(self.resident.then_some(&mut self.holder), overlay, h, None)
+    }
+    fn finish(
+        &mut self,
+        ctx: NativeExecContext<NativeStateOverlay>,
+        mut overlay: NativeStateOverlay,
+        h: u64,
+        rows: ResidentBlock,
+    ) -> f64 {
         let mut ctx = ctx;
         self.books = std::mem::take(&mut ctx.order_books);
         self.next_id = ctx.next_global_order_id;
         drop(ctx);
         let t = Instant::now();
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = if rows.attached() { overlay.own_pending_delta() } else { Default::default() };
         let frozen = overlay.freeze(h);
+        end_resident(&mut self.holder, rows, &mut overlay, delta, true, None);
         if let Some(p) = self.parent.take() {
             p.flush_with_native_trie_stats(&self.db, None, None, None).expect("flush");
         }
         self.parent = Some(frozen);
         ms(t)
+    }
+    /// A block without the native phase (app.rs: `Job::Marker`): its 1-key
+    /// marker set becomes the parent behind the previous one, R advances.
+    fn marker_only(&mut self, h: u64) {
+        let frozen = Arc::new(FrozenPending::marker_only(h));
+        if let Some(p) = self.parent.take() {
+            p.flush_with_native_trie_stats(&self.db, None, None, None).expect("flush");
+        }
+        self.parent = Some(frozen);
+        self.holder.advance_untouched(h);
     }
     fn barrier(&mut self) {
         if let Some(p) = self.parent.take() {
@@ -234,7 +266,15 @@ fn run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     feed_setup(&db, markets); // markets listed in every mode (as on the cells)
-    let mut chain = Chain { db: db.clone(), parent: None, books: HashMap::new(), next_id: 1 };
+    let resident = env("UB_NO_R", 0) != 1;
+    let mut chain = Chain {
+        db: db.clone(),
+        parent: None,
+        books: HashMap::new(),
+        next_id: 1,
+        holder: ResidentBooks::default(),
+        resident,
+    };
     let mut ts: u64 = 1_000_000;
     let t_load = Instant::now();
     if seed_traders > 0 {
@@ -263,13 +303,14 @@ fn run() {
             }
         }
         // one fed block so marks exist
-        let ov = NativeStateOverlay::with_parent(db.clone(), None);
+        let mut ov = NativeStateOverlay::with_parent(db.clone(), None);
+        let rows = chain.begin(&mut ov, 1);
         let mut ctx = chain.ctx(&ov, 1, ts);
         if fed {
             submit_all(&ctx, markets, &mut walk);
         }
         let _ = NativeExecutor::begin_block_oracle(&mut ctx);
-        chain.finish(ctx, ov, 1);
+        chain.finish(ctx, ov, 1, rows);
         chain.barrier();
     } else {
         {
@@ -315,7 +356,8 @@ fn run() {
             if boundary {
                 chain.barrier();
             }
-            let ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
+            let mut ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
+            let rows = chain.begin(&mut ov, h);
             let mut ctx = chain.ctx(&ov, h, ts);
             if fed && h % env("UB_LOAD_FEED_EVERY", 8) == 1 % env("UB_LOAD_FEED_EVERY", 8) {
                 submit_all(&ctx, markets, &mut walk);
@@ -329,11 +371,17 @@ fn run() {
             if h % 25 == 0 {
                 eprintln!("load h={h} fills={} t={:.1}s", ctx.trade_index, t_load.elapsed().as_secs_f64());
             }
-            chain.finish(ctx, ov, h);
+            chain.finish(ctx, ov, h, rows);
         }
     }
     let holders = liq::traders_after(&db, None, usize::MAX).unwrap().len();
-    println!("UBENCH mode={mode} load={:.1}s position_holders={holders} markets={markets}", t_load.elapsed().as_secs_f64());
+    println!(
+        "UBENCH mode={mode} load={:.1}s position_holders={holders} markets={markets} resident_rows={resident} R rows={} bytes={} builds={}",
+        t_load.elapsed().as_secs_f64(),
+        chain.holder.rows().map_or(0, |r| r.len()),
+        chain.holder.rows().map_or(0, |r| r.bytes()),
+        chain.holder.rows_builds()
+    );
 
     // ---- drain: empty blocks ----
     let first = if seed_traders > 0 { 2 } else { load + 1 };
@@ -355,18 +403,21 @@ fn run() {
             chain.barrier();
         }
         let barrier_ms = ms(t);
-        let ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
+        let mut ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
         let feed_now = mode == "fresh" && h % feed_every == 0;
         let t = Instant::now();
         let due = NativeExecutor::oracle_due(&ov).unwrap() || NativeExecutor::liquidation_due(&ov).unwrap();
         let due_ms = ms(t);
         let run_native = boundary || due || feed_now;
         if !run_native {
-            // marker-only block: the overlay is dropped, parent stays
+            // marker-only block (the parent flush is W's work on the node)
             rows.push((h, false, due_ms, 0.0, 0.0, 0.0, 0.0, 0.0, ms(t_block)));
+            drop(ov);
+            chain.marker_only(h);
             continue;
         }
         let t = Instant::now();
+        let resident_block = chain.begin(&mut ov, h);
         let mut ctx = chain.ctx(&ov, h, ts);
         let ctx_ms = ms(t);
         if feed_now {
@@ -408,7 +459,7 @@ fn run() {
         let _ = NativeExecutor::process_epoch_boundary(&mut ctx);
         let epoch_ms = ms(t);
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-        let flush_ms = chain.finish(ctx, ov, h);
+        let flush_ms = chain.finish(ctx, ov, h, resident_block);
         let total = ms(t_block);
         if boundary || h % EPOCH <= 3 || h < first + 3 {
             println!(
@@ -417,6 +468,26 @@ fn run() {
             );
         }
         rows.push((h, true, due_ms, oracle_ms, liq_ms, gov_ms, epoch_ms, flush_ms, total));
+    }
+    println!(
+        "UBENCH R after drain: builds={} shared_fallbacks={} height={:?}",
+        chain.holder.rows_builds(),
+        chain.holder.rows_shared_fallbacks(),
+        chain.holder.rows_height()
+    );
+    // Cold R build at this size, as a node builds it (DB + parent layer).
+    let ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
+    let t = Instant::now();
+    let cold = torus_state::ResidentRows::build(&ov).expect("R build");
+    let build_ms = ms(t);
+    println!(
+        "UBENCH R cold build: rows={} bytes={} build_ms={build_ms:.1} ms_per_1M_rows={:.0}",
+        cold.len(),
+        cold.bytes(),
+        build_ms * 1e6 / cold.len().max(1) as f64
+    );
+    if let Some(carried) = chain.holder.rows() {
+        assert_eq!(carried, &cold, "R carried through the drain == cold build");
     }
     let class = |r: &(u64, bool, f64, f64, f64, f64, f64, f64, f64)| match r.0 % EPOCH {
         0 => "x00",
@@ -443,7 +514,7 @@ fn run() {
         let nat = v.iter().filter(|r| r.1).count();
         let avg = |f: fn(&&(u64, bool, f64, f64, f64, f64, f64, f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / n;
         println!(
-            "SUMMARY mode={mode} {c}: n={} native={nat} due={:.3} oracle={:.2} liq={:.2} gov={:.3} epoch={:.2} flush={:.2} total={:.2} ms (avg)",
+            "SUMMARY mode={mode} resident_rows={resident} {c}: n={} native={nat} due={:.3} oracle={:.2} liq={:.2} gov={:.3} epoch={:.2} flush={:.2} total={:.2} ms (avg)",
             v.len(),
             avg(|r| r.2),
             avg(|r| r.3),
