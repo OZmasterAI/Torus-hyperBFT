@@ -12,7 +12,11 @@
 //! storage probe records every read of the two CFs that reached RocksDB (no
 //! layer answered it) with its stack; the stack names the engine path.
 //!
-//!   cargo test -p torus-bridge --test storage_reads_tests -- --ignored --nocapture
+//! C2: the same sequence counts the oracle point reads per block: the block
+//! mark table reads each market's mark once (end of `begin_block_oracle`)
+//! and answers every later mark read of the block.
+//!
+//!   cargo test -p torus-bridge --test storage_reads_tests -- --nocapture
 
 #[path = "common/counting_backend.rs"]
 mod counting_backend;
@@ -101,10 +105,13 @@ fn assert_memtable_only(db: &StateDb) {
 /// Path, CF and op of a storage read.
 type ReadKey = (&'static str, &'static str, &'static str);
 
-/// Runs the fed sequence; returns storage reads per (path, cf, op), the
-/// overlay calls of the two CFs per (cf, op), over all blocks, the fills and
-/// the R builds.
-fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'static str), usize>, u64, u64) {
+/// Storage reads per (path, cf, op) and overlay calls of the two CFs per
+/// (cf, op) over all blocks, the fills, the R builds and the oracle point
+/// reads of each block (oracle step through liquidation).
+type FedRun = (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'static str), usize>, u64, u64, Vec<usize>);
+
+/// Runs the fed sequence.
+fn run_fed_sequence() -> FedRun {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     setup(&db);
@@ -118,14 +125,16 @@ fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'sta
     let mut calls: HashMap<(&'static str, &'static str), usize> = HashMap::new();
     let mut fills = 0u64;
     let mut holder = ResidentBooks::default();
+    let mut oracle_reads = Vec::new();
     for h in 1..=BLOCKS {
         let block = gen.block(ACTIONS);
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
-        let resident = begin_resident(Some(&mut holder), &mut overlay, h, None);
+        let mut resident = begin_resident(Some(&mut holder), &mut overlay, h, None);
         let backend = CountingBackend::with_counts(overlay.clone(), counts.clone());
         let mut ctx = NativeExecContext::new(
             backend.clone(), h + 1, 1000 + h, 0, 1_000_000, 100, special(99), special(100), special(101),
         );
+        ctx.attach_resident_block(&mut resident);
         ctx.order_books = std::mem::take(&mut books);
         ctx.next_global_order_id = next_id;
         walk.step();
@@ -135,15 +144,19 @@ fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'sta
             }
         }
         backend.arm_storage_probe();
+        backend.arm();
         let agg = NativeExecutor::begin_block_oracle(&mut ctx);
         assert!(agg.iter().all(|r| r.success), "mark aggregation: {agg:?}");
         NativeExecutor::execute_batch(&mut ctx, &block);
         let _ = NativeExecutor::run_liquidations(&mut ctx);
+        backend.disarm();
         backend.disarm_storage_probe();
+        oracle_reads.push(backend.oracle_reads());
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         fills += ctx.trade_index as u64;
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
+        ctx.detach_resident_block(&mut resident);
         drop(ctx);
         for r in backend.take_storage_reads() {
             *per_path.entry((path_of(&r), r.cf, r.op)).or_insert(0) += 1;
@@ -164,7 +177,7 @@ fn run_fed_sequence() -> (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'sta
     assert_eq!(holder.rows_shared_fallbacks(), 0);
     assert_eq!(holder.rows_height(), Some(BLOCKS));
     assert_memtable_only(&db);
-    (per_path, calls, fills, holder.rows_builds())
+    (per_path, calls, fills, holder.rows_builds(), oracle_reads)
 }
 
 /// The instrument itself: a DB-resident balance read through the overlay is a
@@ -222,7 +235,7 @@ fn storage_probe_sees_db_reads_and_not_layer_hits() {
 
 #[test]
 fn fed_block_path_reads_positions_and_balances_from_memory_only() {
-    let (per_path, calls, fills, builds) = run_fed_sequence();
+    let (per_path, calls, fills, builds, _) = run_fed_sequence();
     println!("STORAGE_READS blocks={BLOCKS} senders={SENDERS} markets={MARKETS} fills={fills} walk_bp={WALK_BP} r_builds={builds}");
     for ((path, cf, op), n) in &per_path {
         println!("STORAGE_READS path={path} cf={cf} op={op} reads={n}");
@@ -238,4 +251,18 @@ fn fed_block_path_reads_positions_and_balances_from_memory_only() {
     assert!(calls_total > 1000, "non-vacuous: {calls_total} reads of the two CFs");
     let bad: Vec<String> = per_path.iter().map(|((p, c, o), n)| format!("{p}/{c}/{o}={n}")).collect();
     assert!(bad.is_empty(), "storage reads of R's CFs (any path): {}", bad.join(" "));
+}
+
+/// C2 (plan Step 2, Gate 2a): the block reads each market's mark ONCE — the
+/// table fill at the end of `begin_block_oracle` (one point read of the
+/// aggregate row per market; a fed block's aggregation itself only scans the
+/// submissions) — and every later mark read of the block (Phases 2-3, the
+/// liquidation step) is answered by the table. Before C2: the per-batch memo
+/// plus the liquidation step read the rows again.
+#[test]
+fn fed_block_reads_each_mark_once() {
+    let (_, _, fills, _, oracle_reads) = run_fed_sequence();
+    println!("ORACLE_READS markets={MARKETS} per_block={oracle_reads:?}");
+    assert!(fills > 0, "the sequence must trade");
+    assert_eq!(oracle_reads, vec![MARKETS as usize; BLOCKS as usize], "oracle point reads per block");
 }

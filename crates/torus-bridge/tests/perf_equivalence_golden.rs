@@ -144,10 +144,11 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
-        let rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, Some(&metrics));
+        let mut rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, Some(&metrics));
         let mut ctx = NativeExecContext::new(
             overlay.clone(), h, b.ts, 0, 1_000_000, 100, addr(99), addr(100), addr(101),
         );
+        ctx.attach_resident_block(&mut rows);
         ctx.order_books = std::mem::take(&mut books);
         ctx.next_global_order_id = next_id;
         ctx.metrics = Some(metrics.clone());
@@ -205,6 +206,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -
         }
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
+        ctx.detach_resident_block(&mut rows);
         drop(ctx);
         // As app.rs on the pipelined path: the marker rides the frozen set (the
         // next block's guard reads it through the parent layer).

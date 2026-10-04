@@ -1977,7 +1977,7 @@ impl ExecutionContext {
             let no_resident_rows = self.test_no_resident_rows;
             #[cfg(not(test))]
             let no_resident_rows = false;
-            let resident_rows = {
+            let mut resident_rows = {
                 let mut holder = self
                     .resident_books
                     .lock()
@@ -2227,6 +2227,9 @@ impl ExecutionContext {
                 }
             }
             ctx.metrics = self.metrics.clone();
+            // Item 6 C2: the slot's previous mark table / configs decide the
+            // version of this block's table (filled by begin_block_oracle).
+            ctx.attach_resident_block(&mut resident_rows);
             // O3 + s77: exec only records the block's fills; their packed
             // trade-history rows (node-local, non-root CFs) are encoded and
             // written after the flush below (background writer, or inline).
@@ -2413,6 +2416,9 @@ impl ExecutionContext {
             let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
             // s80: `extras` is empty unless a stream wanted this block's fills.
             let (fills, extras) = ctx.take_pending_fills_and_extras();
+            // Item 6 C2: this block's mark table / configs ride the block's
+            // handle to `end_resident` (into the slot with R).
+            ctx.detach_resident_block(&mut resident_rows);
 
             // Item 6 Phase 1: this block's own writes / tombstones of R's two
             // CFs, taken before `freeze` moves the pending set out (pipelined)

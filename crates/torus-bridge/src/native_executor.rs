@@ -737,22 +737,78 @@ struct AccountReader<'a, T: StateBackend> {
     /// The block's header timestamp (s): the clock of the oracle mark rule.
     now: u64,
     margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
-    /// Fix 1 (s87): the batch's mark memo (`None`: every `mark` reads the oracle).
-    marks: Option<&'a BatchMarks>,
+    /// Item 6 C2: the block's mark table (`None`: every `mark` reads the oracle).
+    marks: Option<&'a BlockMarks>,
 }
 
-/// Fix 1 (s87): each market's mark read at most ONCE per `execute_batch` call
-/// (Phases 2 and 3) instead of once per position per account view. Sound
-/// because only `begin_block_oracle` writes the aggregate row, before any
-/// action of the block, and `now` is the block's: every read of the block
-/// returns the same value. Keys are fixed at construction (lock-free reads
-/// once a cell is set); a market outside them reads the oracle directly.
-struct BatchMarks(HashMap<MarketId, std::sync::OnceLock<Option<FixedPoint>>>);
+/// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
+/// read ONCE at the end of [`NativeExecutor::begin_block_oracle`] with the
+/// per-read rule ([`AccountReader::mark`]: `get_price(m, now).usable()`) for
+/// every listed market, every market with a margin config, every market with
+/// an aggregate row (so a delisted market whose last aggregate is still fresh
+/// is in the table too) and every market with a loaded book (as fix 1's memo:
+/// an unlisted market's `None` is not re-read per position). Sound because only `begin_block_oracle` writes
+/// the aggregate rows, before any action of the block, and `now` is the
+/// block's: every read of the block returns the same value. A market outside
+/// the table (no aggregate row at the block start) reads the oracle directly.
+/// Replaces fix 1's per-`execute_batch` memo (`BatchMarks`).
+#[derive(Debug)]
+pub(crate) struct BlockMarks {
+    marks: HashMap<MarketId, Option<FixedPoint>>,
+    /// Changes exactly when the table or `margin_configs` differ from the
+    /// previous block's ([`BlockMarksState`], kept in the resident rows slot);
+    /// a changed block takes a new process-wide value, never one used before
+    /// (slot absent or rebuilt = changed). Keys the sums cache (C3).
+    version: u64,
+}
 
-impl BatchMarks {
-    fn new(markets: impl IntoIterator<Item = MarketId>) -> Self {
-        Self(markets.into_iter().map(|m| (m, std::sync::OnceLock::new())).collect())
+/// Item 6 C2: source of new mark versions (process-wide, so a rebuilt or
+/// second holder never meets an old value).
+static MARK_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl BlockMarks {
+    /// The per-read mark rule for each of `markets`.
+    fn read<T: StateBackend>(
+        oracle: &OracleManager<T>,
+        now: u64,
+        markets: impl IntoIterator<Item = MarketId>,
+    ) -> HashMap<MarketId, Option<FixedPoint>> {
+        markets
+            .into_iter()
+            .map(|m| (m, oracle.get_price(m, now).ok().and_then(|p| p.usable())))
+            .collect()
     }
+
+    /// The table's version (see the field).
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Markets with a mark that are not in `listed`, ascending (normally
+    /// none). Liquidation values only listed markets at their mark
+    /// (`liquidation_step` `Marks` = the table filtered to `listed`), every
+    /// other reader any market with a mark: the two agree iff this is empty.
+    /// The liquidation step (L1, C4) is its first engine caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delisted_marked(&self, listed: &[MarketId]) -> Vec<MarketId> {
+        let mut out: Vec<MarketId> = self
+            .marks
+            .iter()
+            .filter(|(m, mark)| mark.is_some() && !listed.contains(m))
+            .map(|(m, _)| *m)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Item 6 C2: a block's mark table and the margin configs it was valued
+/// with, carried to the next block in the resident rows slot (via
+/// [`ResidentBlock`]) to decide whether the version changes.
+#[derive(Debug)]
+struct BlockMarksState {
+    marks: BlockMarks,
+    configs: HashMap<MarketId, MarketMarginConfig>,
 }
 
 impl<'a, T: StateBackend> AccountReader<'a, T> {
@@ -762,7 +818,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
-            marks: None,
+            marks: ctx.block_marks.as_ref(),
         }
     }
 
@@ -774,10 +830,9 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// placement of a block (single, batch serial, batch sharded) reads the
     /// same value on every validator.
     fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
-        let read = || self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable());
-        match self.marks.and_then(|t| t.0.get(&market_id)) {
-            Some(cell) => *cell.get_or_init(read),
-            None => read(),
+        match self.marks.and_then(|t| t.marks.get(&market_id)) {
+            Some(mark) => *mark,
+            None => self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable()),
         }
     }
 
@@ -1687,6 +1742,9 @@ pub struct ResidentBooks {
 
 struct RowsSlot {
     rows: Arc<torus_state::ResidentRows>,
+    /// C2: the mark table / configs of block `height` (None: that block had
+    /// no table — the next one takes a new version).
+    marks: Option<BlockMarksState>,
     height: u64,
 }
 
@@ -1817,6 +1875,12 @@ pub struct ResidentBlock {
     height: u64,
     attached: bool,
     rebuilt: bool,
+    /// C2: from `begin_resident`, the previous block's mark state when the
+    /// slot was reused (moved into the context by
+    /// [`NativeExecContext::attach_resident_block`]); from
+    /// [`NativeExecContext::detach_resident_block`], this block's (stashed
+    /// by `end_resident`).
+    marks: Option<BlockMarksState>,
 }
 
 impl ResidentBlock {
@@ -1849,7 +1913,7 @@ pub fn begin_resident(
     height: u64,
     metrics: Option<&torus_telemetry::Metrics>,
 ) -> ResidentBlock {
-    let mut block = ResidentBlock { height, attached: false, rebuilt: false };
+    let mut block = ResidentBlock { height, attached: false, rebuilt: false, marks: None };
     let Some(holder) = holder else {
         return block;
     };
@@ -1859,6 +1923,7 @@ pub fn begin_resident(
         let height_ok = slot.height + 1 == height;
         let marker_ok = marker.is_none_or(|m| m == slot.height);
         if height_ok && marker_ok {
+            block.marks = slot.marks;
             return Some(slot.rows);
         }
         tracing::warn!(
@@ -1942,7 +2007,7 @@ pub fn end_resident(
         m.exec_resident_rows.set(r.len() as i64);
         m.exec_resident_rows_bytes.set(r.bytes() as i64);
     }
-    holder.rows = Some(RowsSlot { rows, height: block.height });
+    holder.rows = Some(RowsSlot { rows, marks: block.marks, height: block.height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -1986,6 +2051,10 @@ mod cancel_batch_toggle_tests {
 #[cfg(test)]
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
+
+#[cfg(test)]
+#[path = "block_marks_tests.rs"]
+mod block_marks_tests;
 
 #[cfg(test)]
 mod resident_books_toggle_tests {
@@ -2061,6 +2130,12 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub dirty_books: std::collections::HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
+    /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
+    /// (`None` before it, or when it failed: marks read the oracle).
+    block_marks: Option<BlockMarks>,
+    /// Item 6 C2: the previous block's mark state from the resident rows slot
+    /// ([`Self::attach_resident_block`]), consumed by `begin_block_oracle`.
+    prev_marks: Option<BlockMarksState>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -2565,6 +2640,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             order_books,
             dirty_books: std::collections::HashSet::new(),
             margin_configs,
+            block_marks: None,
+            prev_marks: None,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -2603,6 +2680,30 @@ impl<T: StateBackend> NativeExecContext<T> {
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
         }
+    }
+
+    /// Item 6 C2: take the resident rows slot's mark state (the previous
+    /// block's table and configs) from `block` — call before
+    /// [`NativeExecutor::begin_block_oracle`]. Without it (reference path,
+    /// tests) every block's table takes a new version.
+    pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
+        self.prev_marks = block.marks.take();
+    }
+
+    /// Item 6 C2: hand this block's mark table and configs to `block` for
+    /// `end_resident` to stash in the slot — call after the block's last
+    /// action, before the context is dropped. Later mark reads of this
+    /// context go to the oracle.
+    pub fn detach_resident_block(&mut self, block: &mut ResidentBlock) {
+        block.marks = self
+            .block_marks
+            .take()
+            .map(|marks| BlockMarksState { marks, configs: self.margin_configs.clone() });
+    }
+
+    /// Item 6 C2: the version of the block's mark table (`None`: no table).
+    pub fn mark_version(&self) -> Option<u64> {
+        self.block_marks.as_ref().map(BlockMarks::version)
     }
 
     /// Worker threads the last `save_order_books` drained dirty books on
@@ -4435,23 +4536,15 @@ impl NativeExecutor {
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
         // Option B (s87): each market's best bid at the start of Phase 2.
         let bid_floors = Self::phase2_bid_floors(ctx, &place_orders);
-        // Fix 1 (s87): one mark read per market for Phases 2-3 — the markets
-        // of this call's orders, of the resident books and of the configs.
-        let batch_marks = BatchMarks::new(
-            place_orders
-                .iter()
-                .map(|(_, _, p)| p.market_id)
-                .chain(ctx.order_books.keys().copied())
-                .chain(ctx.margin_configs.keys().copied()),
-        );
         // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
-        // coexists with the stitch's `&mut ctx.next_global_order_id`.
+        // coexists with the stitch's `&mut ctx.next_global_order_id`. Item 6
+        // C2: marks from the block's table (fix 1's per-call memo is gone).
         let reader = AccountReader {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
-            marks: Some(&batch_marks),
+            marks: ctx.block_marks.as_ref(),
         };
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
@@ -6763,7 +6856,7 @@ impl NativeExecutor {
             oracle: &ctx.oracle,
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
-            marks: None,
+            marks: ctx.block_marks.as_ref(),
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
@@ -8194,7 +8287,11 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
         match Self::oracle_inputs(ctx) {
-            Ok((markets, stakes)) => Self::aggregate_oracle_prices(ctx, &markets, &stakes),
+            Ok((markets, stakes)) => {
+                let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
+                Self::fill_block_marks(ctx, &markets);
+                results
+            }
             Err(e) => {
                 ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
                 Vec::new()
@@ -8221,6 +8318,38 @@ impl NativeExecutor {
             })
             .collect();
         Ok((markets, stakes))
+    }
+
+    /// Item 6 C2: the end of [`Self::begin_block_oracle`] (after the
+    /// aggregation, before any action): fill the block's mark table for
+    /// `listed`, the margin-config markets, every market with an aggregate
+    /// row and every book market, and set its version against the previous block's state
+    /// ([`NativeExecContext::attach_resident_block`]). A storage error in the
+    /// aggregate-row scan leaves no table (every mark reads the oracle, as
+    /// before C2). Public for the harness that splits the oracle step.
+    pub fn fill_block_marks<T: StateBackend>(ctx: &mut NativeExecContext<T>, listed: &[MarketId]) {
+        let prev = ctx.prev_marks.take();
+        ctx.block_marks = None;
+        let aggregated = match ctx.oracle.aggregated_market_ids() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(%e, height = ctx.block_height, "item 6: mark table not built (aggregate scan failed) — marks read the oracle");
+                return;
+            }
+        };
+        let markets: BTreeSet<MarketId> = listed
+            .iter()
+            .copied()
+            .chain(ctx.margin_configs.keys().copied())
+            .chain(aggregated)
+            .chain(ctx.order_books.keys().copied())
+            .collect();
+        let marks = BlockMarks::read(&ctx.oracle, ctx.timestamp, markets);
+        let version = match prev {
+            Some(p) if p.marks.marks == marks && p.configs == ctx.margin_configs => p.marks.version,
+            _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        };
+        ctx.block_marks = Some(BlockMarks { marks, version });
     }
 
     /// Aggregate oracle prices for `markets` at the block timestamp — called by
@@ -8713,7 +8842,8 @@ mod integer_margin_tests {
     }
 }
 
-/// Fix 1 (s87): the batch memos return exactly what the per-call reads do.
+/// Fix 1 (s87) / item 6 C2: the batch memo and the block mark table return
+/// exactly what the per-call reads do.
 #[cfg(test)]
 mod batch_maker_accounts_tests {
     use super::*;
@@ -8735,9 +8865,10 @@ mod batch_maker_accounts_tests {
     /// short, random entry, sometimes isolated, one overflow-sized), balances
     /// with negative `available`, marks fresh / stale / absent per market.
     /// Every (trader, market) pair, queried in a shuffled order from 4 threads
-    /// through one `BatchMakerAccounts` (marks memoized), equals
-    /// `AccountReader::maker_account` without memos; a reader with the mark
-    /// memo gives the same `mark` / `view` / `pos_net` / `position_px`.
+    /// through one `BatchMakerAccounts` (marks from a block table, item 6
+    /// C2), equals `AccountReader::maker_account` without memos or table; a
+    /// reader with the table gives the same `mark` / `view` / `pos_net` /
+    /// `position_px`.
     #[test]
     fn batch_maker_accounts_equal_reader_on_random_states() {
         let dir = tempfile::tempdir().unwrap();
@@ -8800,13 +8931,13 @@ mod batch_maker_accounts_tests {
                 }
             }
             let plain = AccountReader::of(&ctx);
-            let memo = BatchMarks::new(markets.iter().copied());
-            let reader = AccountReader { marks: Some(&memo), ..AccountReader::of(&ctx) };
+            let table = BlockMarks { marks: BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), version: 0 };
+            let reader = AccountReader { marks: Some(&table), ..AccountReader::of(&ctx) };
             for &m in &markets {
                 assert_eq!(reader.mark(m), plain.mark(m), "round {round}: mark {m}");
                 marked += usize::from(plain.mark(m).is_some());
             }
-            assert_eq!(reader.mark(u64::MAX), plain.mark(u64::MAX), "outside the memo keys");
+            assert_eq!(reader.mark(u64::MAX), plain.mark(u64::MAX), "outside the table");
             let pairs: Vec<(Address, MarketId)> =
                 traders.iter().flat_map(|t| markets.iter().map(move |m| (*t, *m))).collect();
             let want: HashMap<(Address, MarketId), MakerAccount> =

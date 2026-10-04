@@ -14,7 +14,7 @@ use crate::position::{MarginType, NativeBalance, Position, PositionManager};
 // ============================================================================
 
 /// A single margin tier: positions with notional <= max_notional can use up to max_leverage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarginTier {
     pub max_notional: FixedPoint,
     pub max_leverage: u32,
@@ -203,7 +203,7 @@ impl AccountView {
 // ============================================================================
 
 /// Per-market margin configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketMarginConfig {
     pub market_id: MarketId,
     pub max_leverage: u32,

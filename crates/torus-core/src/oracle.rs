@@ -401,6 +401,17 @@ impl<T: StateBackend> OracleManager<T> {
         Ok(pruned)
     }
 
+    /// Item 6 Phase 1: the markets that have an aggregate row (fresh, stale
+    /// or undecodable), ascending. One prefix scan of the aggregate rows.
+    pub fn aggregated_market_ids(&self) -> Result<Vec<MarketId>, CoreError> {
+        Ok(self
+            .state
+            .iterate_cf(CF_NATIVE_ORACLE, Some(b"agg"))?
+            .into_iter()
+            .filter_map(|(k, _)| Some(u64::from_be_bytes(k.get(3..)?.try_into().ok()?)))
+            .collect())
+    }
+
     /// Whether any submission row exists (the block's oracle step is due).
     /// Stops at the first row.
     pub fn has_submissions(&self) -> Result<bool, CoreError> {

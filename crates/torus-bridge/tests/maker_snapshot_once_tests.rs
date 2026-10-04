@@ -4,6 +4,8 @@
 //! position) once per market; its start-of-batch free margin is the same in
 //! every market (nothing writes the backend during matching), so it is now
 //! computed once and shared, and each market's mark is read once per batch.
+//! Item 6 C2: the marks come from the block's mark table (read once per
+//! block at the end of `begin_block_oracle`), so the batch reads none.
 
 #[path = "common/counting_backend.rs"]
 mod counting_backend;
@@ -47,7 +49,8 @@ const BOOKS: u64 = 5;
 
 /// Maker M (addr 1) holds a long in each of 20 marked markets and rests a bid
 /// in markets 1-5; takers addr(11..=15) are funded. Returns the counting
-/// context (block 2, marks aggregated at block 1).
+/// context (block 2, marks aggregated at block 1, the block's oracle step
+/// run: no Active validator, so it only fills the mark table).
 fn fixture() -> (tempfile::TempDir, CountingBackend<StateDb>, NativeExecContext<CountingBackend<StateDb>>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -82,12 +85,15 @@ fn fixture() -> (tempfile::TempDir, CountingBackend<StateDb>, NativeExecContext<
         let r = NativeExecutor::execute(&mut ctx, &maker, &NativeAction::PlaceOrder(limit(m, true, 1_000, 10)));
         assert!(r.success, "{:?}", r.error);
     }
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
     (dir, state, ctx)
 }
 
 /// Fix 1 RED: five takers each sell into one of M's five bids in ONE batch:
 /// M's account is loaded once (one positions scan) and every market's mark
-/// is read at most once. c93c579: 5 scans and 100+ mark reads (20 per view).
+/// is read at most once (C2: never — the block's table answers).
+/// c93c579: 5 scans and 100+ mark reads (20 per view).
 #[test]
 fn a_maker_filling_in_five_markets_is_valued_once_per_batch() {
     for threads in [0usize, 4] {
@@ -110,10 +116,6 @@ fn a_maker_filling_in_five_markets_is_valued_once_per_batch() {
         );
         assert_eq!(ctx.trade_index, BOOKS as u32, "every taker filled against M");
         assert_eq!(state.position_scans(addr(1).as_slice()), 1, "threads {threads}: M's positions scans");
-        assert!(
-            state.oracle_reads() <= MARKETS as usize,
-            "threads {threads}: {} mark reads for {MARKETS} markets",
-            state.oracle_reads()
-        );
+        assert_eq!(state.oracle_reads(), 0, "threads {threads}: mark reads for {MARKETS} markets (block table)");
     }
 }

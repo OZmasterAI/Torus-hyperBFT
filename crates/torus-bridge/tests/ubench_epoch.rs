@@ -26,6 +26,8 @@
 //! a block without the native phase is a marker-only job as on the node (its
 //! 1-key marker set becomes the parent, the previous parent is flushed
 //! outside the block's timing, R advances). `UB_NO_R=1`: without R.
+//! C2: the split oracle step ends with `fill_block_marks` (the block mark
+//! table, `marks=` in the per-block line), and the slot carries its version.
 //! UB_SEED_TRADERS>0 replaces the econ load with directly written positions
 //! (UB_SEED_POS per trader) for scaling runs. Sizes: UB_SENDERS (5000),
 //! UB_MARKETS (300), UB_ACTIONS (60), UB_LOAD (150), UB_DRAIN_TO (420).
@@ -141,10 +143,11 @@ struct Chain {
 }
 
 impl Chain {
-    fn ctx(&mut self, overlay: &NativeStateOverlay, h: u64, ts: u64) -> NativeExecContext<NativeStateOverlay> {
+    fn ctx(&mut self, overlay: &NativeStateOverlay, h: u64, ts: u64, rows: &mut ResidentBlock) -> NativeExecContext<NativeStateOverlay> {
         let mut ctx = NativeExecContext::new(
             overlay.clone(), h, ts, h / EPOCH, EPOCH, 100, special(99), special(100), special(101),
         );
+        ctx.attach_resident_block(rows);
         ctx.order_books = std::mem::take(&mut self.books);
         ctx.next_global_order_id = self.next_id;
         ctx
@@ -158,11 +161,12 @@ impl Chain {
         ctx: NativeExecContext<NativeStateOverlay>,
         mut overlay: NativeStateOverlay,
         h: u64,
-        rows: ResidentBlock,
+        mut rows: ResidentBlock,
     ) -> f64 {
         let mut ctx = ctx;
         self.books = std::mem::take(&mut ctx.order_books);
         self.next_id = ctx.next_global_order_id;
+        ctx.detach_resident_block(&mut rows);
         drop(ctx);
         let t = Instant::now();
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
@@ -304,8 +308,8 @@ fn run() {
         }
         // one fed block so marks exist
         let mut ov = NativeStateOverlay::with_parent(db.clone(), None);
-        let rows = chain.begin(&mut ov, 1);
-        let mut ctx = chain.ctx(&ov, 1, ts);
+        let mut rows = chain.begin(&mut ov, 1);
+        let mut ctx = chain.ctx(&ov, 1, ts, &mut rows);
         if fed {
             submit_all(&ctx, markets, &mut walk);
         }
@@ -357,8 +361,8 @@ fn run() {
                 chain.barrier();
             }
             let mut ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
-            let rows = chain.begin(&mut ov, h);
-            let mut ctx = chain.ctx(&ov, h, ts);
+            let mut rows = chain.begin(&mut ov, h);
+            let mut ctx = chain.ctx(&ov, h, ts, &mut rows);
             if fed && h % env("UB_LOAD_FEED_EVERY", 8) == 1 % env("UB_LOAD_FEED_EVERY", 8) {
                 submit_all(&ctx, markets, &mut walk);
             }
@@ -417,14 +421,14 @@ fn run() {
             continue;
         }
         let t = Instant::now();
-        let resident_block = chain.begin(&mut ov, h);
-        let mut ctx = chain.ctx(&ov, h, ts);
+        let mut resident_block = chain.begin(&mut ov, h);
+        let mut ctx = chain.ctx(&ov, h, ts, &mut resident_block);
         let ctx_ms = ms(t);
         if feed_now {
             submit_all(&ctx, markets, &mut walk);
         }
         // begin_block_oracle, split (same calls in the same order as oracle_inputs +
-        // aggregate_oracle_prices)
+        // aggregate_oracle_prices + fill_block_marks)
         let t = Instant::now();
         let pruned = ctx.oracle.prune_submissions(ctx.timestamp).unwrap();
         let prune_ms = ms(t);
@@ -446,7 +450,10 @@ fn run() {
         let t = Instant::now();
         let agg = NativeExecutor::aggregate_oracle_prices(&mut ctx, &listed, &stakes);
         let agg_ms = ms(t);
-        let oracle_ms = prune_ms + inputs_ms + agg_ms;
+        let t = Instant::now();
+        NativeExecutor::fill_block_marks(&mut ctx, &listed);
+        let marks_ms = ms(t);
+        let oracle_ms = prune_ms + inputs_ms + agg_ms + marks_ms;
         let agg_ok = agg.iter().filter(|r| r.success).count();
         let t = Instant::now();
         let liq_res = NativeExecutor::run_liquidations(&mut ctx);
@@ -463,7 +470,7 @@ fn run() {
         let total = ms(t_block);
         if boundary || h % EPOCH <= 3 || h < first + 3 {
             println!(
-                "  h={h} native barrier={barrier_ms:.2} ctx={ctx_ms:.2} due={due_ms:.2} oracle={oracle_ms:.2}[prune={prune_ms:.2}({pruned}) inputs={inputs_ms:.2} agg={agg_ms:.2}(ok {agg_ok})] liq={liq_ms:.2}(results {}) gov={gov_ms:.2} epoch={epoch_ms:.2} flush={flush_ms:.2} total={total:.2}",
+                "  h={h} native barrier={barrier_ms:.2} ctx={ctx_ms:.2} due={due_ms:.2} oracle={oracle_ms:.2}[prune={prune_ms:.2}({pruned}) inputs={inputs_ms:.2} agg={agg_ms:.2}(ok {agg_ok}) marks={marks_ms:.2}] liq={liq_ms:.2}(results {}) gov={gov_ms:.2} epoch={epoch_ms:.2} flush={flush_ms:.2} total={total:.2}",
                 liq_res.len()
             );
         }
