@@ -248,6 +248,9 @@ impl Mempool {
         let Some(limiter) = self.addr_limiter.get() else {
             return Ok(());
         };
+        if funded::is_validator_duty_of_validator(&self.state, sender, action) {
+            return Ok(());
+        }
         // Traded volume via the same accessor the open-order limit uses; a
         // read error counts as no volume (only the buffer applies).
         let volume_trs = || {
@@ -730,6 +733,10 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         self.check_funded(&sender, &action.action)?;
         let weight = rate_limit::order_count(&action.action) as u64;
+        // A registered validator's duty actions are not counted by item B
+        // (the validator-table read happens only for duty kinds).
+        let charge_b = self.addr_limiter.get().is_some()
+            && !funded::is_validator_duty_of_validator(&self.state, &sender, &action.action);
         {
             let mut pool = self.native.write().unwrap();
             let result = pool.insert_with_restash_key(sender, action, cache_key);
@@ -739,7 +746,7 @@ impl Mempool {
         // Anti-spam item B: count every action that entered the pool, from
         // any source, once (the insert above dedups by hash). Never refuses;
         // RPC ingress enforces via `addr_rate_admits`. After the pool lock.
-        if let Some(limiter) = self.addr_limiter.get() {
+        if let Some(limiter) = self.addr_limiter.get().filter(|_| charge_b) {
             limiter.charge(&sender, weight, now_ms());
         }
 
@@ -765,6 +772,7 @@ impl Mempool {
         let min_trs = self.config.ingress_min_collateral_trs;
         if min_trs == 0
             || funded::is_exempt(action)
+            || funded::is_validator_duty_of_validator(&self.state, sender, action)
             || funded::is_funded(&self.state, sender, min_trs)
         {
             return Ok(());
@@ -3476,32 +3484,32 @@ mod tests {
     }
 
     #[test]
-    fn funded_check_exempts_validator_and_staking_exit_actions_and_can_be_off() {
+    fn funded_check_exempts_staking_exit_actions_and_can_be_off() {
         use torus_types::NativeAction as A;
         let (_dir, state) = setup();
         let pool = Mempool::new(state.clone(), funded_cfg(1));
         let k = key(47);
         let t0 = now_ms();
-        let exempt = [
-            A::ClaimRewards,
-            A::ClaimUnbonded,
-            A::UnjailSelf,
-            A::AttestStateHash {
-                height: 100,
-                hash: B256::repeat_byte(1),
-            },
-        ];
+        let exempt = [A::ClaimRewards, A::ClaimUnbonded];
         for (i, a) in exempt.into_iter().enumerate() {
             let s = torus_types::eip712::sign_native_action(a, t0 + i as u64, &k);
             pool.add_native_action_presigned(address_from_key(&k), s)
                 .expect("exempt kind admitted unfunded");
         }
-        // Gated kinds that a new user might try first are refused.
-        for (i, a) in [A::CreateSession {
-            session_pubkey: [3; 32],
-            expiry: t0 + 60_000,
-            scope: torus_types::SessionScope::Full,
-        }]
+        // Gated kinds that a new user might try first are refused, and so are
+        // validator duties from a key that is not a registered validator.
+        for (i, a) in [
+            A::CreateSession {
+                session_pubkey: [3; 32],
+                expiry: t0 + 60_000,
+                scope: torus_types::SessionScope::Full,
+            },
+            A::UnjailSelf,
+            A::AttestStateHash {
+                height: 100,
+                hash: B256::repeat_byte(1),
+            },
+        ]
         .into_iter()
         .enumerate()
         {
@@ -3608,6 +3616,71 @@ mod tests {
         let sel = pool.select_native_for_block(8);
         let cancels = sel.iter().filter(|a| is_cancel(&a.action)).count();
         assert_eq!(cancels, 2, "ceil(25% of 8)");
+    }
+
+    fn register_validator(state: &StateDb, who: &Address) {
+        // Only the row's presence is read at ingress.
+        state
+            .put_cf_raw(torus_state::cf::CF_STAKING_VALIDATORS, who.as_slice(), b"v")
+            .unwrap();
+    }
+
+    fn attest(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::AttestStateHash {
+                height: nonce,
+                hash: B256::repeat_byte(1),
+            },
+            nonce,
+            k,
+        )
+    }
+
+    #[test]
+    fn funded_check_admits_validator_duties_only_from_registered_validators() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        // A registered validator with 0 spot and 0 perp may attest.
+        let v = key(48);
+        register_validator(&state, &address_from_key(&v));
+        pool.add_native_action_presigned(address_from_key(&v), attest(&v, t0))
+            .expect("registered validator attests unfunded");
+        // A fresh key may not use the duty kinds to dodge the funded check.
+        let x = key(49);
+        assert!(matches!(
+            pool.add_native_action_presigned(address_from_key(&x), attest(&x, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+    }
+
+    #[test]
+    fn addr_rate_skips_validator_duties_of_registered_validators() {
+        let (_dir, pool) = limited_pool(2, 1_000);
+        let v = key(93);
+        let va = address_from_key(&v);
+        register_validator(&pool.state, &va);
+        let t0 = now_ms();
+        // Duty actions of a registered validator are neither charged at pool
+        // entry nor refused at RPC, however many it sends.
+        for i in 0..5 {
+            let a = attest(&v, t0 + i);
+            pool.addr_rate_admits(&va, &a.action)
+                .expect("validator duty never refused");
+            pool.add_native_action_from_gossip(va, a).unwrap();
+        }
+        assert_eq!(used(&pool, &v), 0);
+        // The same kind from a non-validator is counted like anything else.
+        let x = key(94);
+        let xa = address_from_key(&x);
+        for i in 0..2 {
+            pool.add_native_action_from_gossip(xa, attest(&x, t0 + i))
+                .unwrap();
+        }
+        assert_eq!(used(&pool, &x), 2);
+        assert!(pool
+            .addr_rate_admits(&xa, &attest(&x, t0 + 9).action)
+            .is_err());
     }
 
     // ---- Anti-spam item B: counted on pool entry, enforced at RPC ----

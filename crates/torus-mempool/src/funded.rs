@@ -29,14 +29,17 @@
 //! an account that just went to zero may still pass for a block. Both are fine
 //! for an anti-spam rule.
 //!
-//! Exempt action kinds (no check) — none of them can use perp collateral, and
-//! all are non-cancels, so they never get cancel priority and stay subject to
-//! the admission limit:
+//! Exempt action kinds — none of them can use perp collateral, and all are
+//! non-cancels, so they never get cancel priority and stay subject to the
+//! admission limit:
 //! - validator duties: `SubmitOraclePrices`, `AttestStateHash`, `JailVote`,
-//!   `UnjailSelf`, `RotateValidatorKey`, `UpdateCommission`. Registration
+//!   `UnjailSelf`, `RotateValidatorKey`, `UpdateCommission`, but ONLY from a
+//!   registered validator (one point read of the validator table). Registration
 //!   moves the validator's whole spot balance into self-stake, so a working
 //!   validator can hold 0 spot and 0 perp; refusing its oracle prices or state
-//!   attestations at gossip admission would hurt the chain.
+//!   attestations at gossip admission would hurt the chain. From any other key
+//!   the executor rejects these kinds, so they are not a free path past this
+//!   check. The same rule exempts them from the per-address limit (item B).
 //! - stake exit, claims and governance votes: `Undelegate`, `ClaimRewards`,
 //!   `ClaimUnbonded`, `Vote`. A staker's funds sit in staking, which this
 //!   check does not read; they must always be able to get them back or vote.
@@ -44,6 +47,7 @@
 use alloy_primitives::Address;
 use torus_core::lockbox::fp_to_wei;
 use torus_core::position::PositionManager;
+use torus_state::cf::CF_STAKING_VALIDATORS;
 use torus_state::StateDb;
 use torus_types::{FixedPoint, NativeAction};
 
@@ -64,8 +68,23 @@ pub fn ingress_min_collateral() -> u64 {
     parse_ingress_min_collateral(std::env::var("TORUS_INGRESS_MIN_COLLATERAL").ok())
 }
 
-/// Action kinds admitted without the funded check (see the module docs).
+/// Stake-exit, claim and vote kinds, admitted without the funded check (see
+/// the module docs).
 pub fn is_exempt(action: &NativeAction) -> bool {
+    matches!(
+        action,
+        NativeAction::Undelegate { .. }
+            | NativeAction::ClaimRewards
+            | NativeAction::ClaimUnbonded
+            | NativeAction::Vote { .. }
+    )
+}
+
+/// Validator-duty kinds. Exempt from the funded check and from the
+/// per-address limit (item B) only when the sender is a registered validator
+/// ([`is_registered_validator`]); from anyone else the executor rejects them,
+/// so they get no exemption.
+pub fn is_validator_duty(action: &NativeAction) -> bool {
     matches!(
         action,
         NativeAction::SubmitOraclePrices(_)
@@ -74,11 +93,26 @@ pub fn is_exempt(action: &NativeAction) -> bool {
             | NativeAction::UnjailSelf
             | NativeAction::RotateValidatorKey { .. }
             | NativeAction::UpdateCommission { .. }
-            | NativeAction::Undelegate { .. }
-            | NativeAction::ClaimRewards
-            | NativeAction::ClaimUnbonded
-            | NativeAction::Vote { .. }
     )
+}
+
+/// True when `sender` has a row in the validator table, in any status (a
+/// jailed validator must still be able to unjail). One point read. A read
+/// error counts as registered, as in [`is_funded`].
+pub fn is_registered_validator(state: &StateDb, sender: &Address) -> bool {
+    state
+        .get_cf_raw(CF_STAKING_VALIDATORS, sender.as_slice())
+        .map(|row| row.is_some())
+        .unwrap_or(true)
+}
+
+/// A validator duty sent by a registered validator: skips items A and B.
+pub fn is_validator_duty_of_validator(
+    state: &StateDb,
+    sender: &Address,
+    action: &NativeAction,
+) -> bool {
+    is_validator_duty(action) && is_registered_validator(state, sender)
 }
 
 /// True when `sender` holds at least `min_trs` whole TRS (see the module
