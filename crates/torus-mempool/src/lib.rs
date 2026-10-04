@@ -248,7 +248,7 @@ impl Mempool {
         let Some(limiter) = self.addr_limiter.get() else {
             return Ok(());
         };
-        if funded::is_validator_duty_of_validator(&self.state, sender, action) {
+        if self.is_duty_exempt(sender, action) {
             return Ok(());
         }
         // Traded volume via the same accessor the open-order limit uses; a
@@ -738,12 +738,13 @@ impl Mempool {
         action: SignedNativeAction,
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
-        self.check_funded(&sender, &action.action)?;
+        // A registered validator's duty actions (and its oracle signer's
+        // price submissions) skip item A and are not counted by item B (the
+        // state reads happen only for duty kinds).
+        let duty_exempt = self.is_duty_exempt(&sender, &action.action);
+        self.check_funded(&sender, &action.action, duty_exempt)?;
         let weight = rate_limit::order_count(&action.action) as u64;
-        // A registered validator's duty actions are not counted by item B
-        // (the validator-table read happens only for duty kinds).
-        let charge_b = self.addr_limiter.get().is_some()
-            && !funded::is_validator_duty_of_validator(&self.state, &sender, &action.action);
+        let charge_b = self.addr_limiter.get().is_some() && !duty_exempt;
         // s517: oracle submissions get pool priority, so only an Active
         // validator or its registered hot signer may pool one, at most
         // ORACLE_PENDING_PER_VALIDATOR per validator (own address + signer).
@@ -799,6 +800,19 @@ impl Mempool {
         Ok(())
     }
 
+    /// Validator duties that skip anti-spam items A and B: any duty kind from
+    /// a registered validator (any status, so a jailed one can unjail —
+    /// [`funded::is_validator_duty_of_validator`]), and a `SubmitOraclePrices`
+    /// from an Active validator's registered oracle signer
+    /// ([`Self::oracle_reporter`]; merge with the crab stack). A signer can
+    /// only act for its validator in oracle submissions (exec's
+    /// `resolve_oracle_reporter`), so its other duty kinds get no exemption.
+    fn is_duty_exempt(&self, sender: &Address, action: &torus_types::NativeAction) -> bool {
+        funded::is_validator_duty_of_validator(&self.state, sender, action)
+            || (crate::native_pool::is_oracle_submission(action)
+                && self.oracle_reporter(sender).is_some())
+    }
+
     /// The accounts whose pooled oracle submissions count against `sender`'s
     /// validator: `[validator, signer?]` for an Active validator sender,
     /// `[validator, sender]` for its registered hot signer, `None` otherwise.
@@ -836,11 +850,12 @@ impl Mempool {
         &self,
         sender: &Address,
         action: &torus_types::NativeAction,
+        duty_exempt: bool,
     ) -> Result<(), MempoolError> {
         let min_trs = self.config.ingress_min_collateral_trs;
         if min_trs == 0
             || funded::is_exempt(action)
-            || funded::is_validator_duty_of_validator(&self.state, sender, action)
+            || duty_exempt
             || funded::is_funded(&self.state, sender, min_trs)
         {
             return Ok(());
@@ -4028,6 +4043,111 @@ mod tests {
         assert!(pool
             .addr_rate_admits(&xa, &attest(&x, t0 + 9).action)
             .is_err());
+    }
+
+    /// A pool with the funded check (A, 1 TRS) and the per-address limit
+    /// (B, buffer 4) both on.
+    fn antispam_pool() -> (TempDir, Mempool) {
+        let (dir, state) = setup();
+        let pool = Mempool::new(state, funded_cfg(1));
+        pool.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            4,
+            std::collections::HashSet::new(),
+            1_000,
+        )));
+        (dir, pool)
+    }
+
+    /// Merge with the crab stack (sync 2 step 5): a SubmitOraclePrices signed
+    /// by an Active validator's registered oracle signer skips A and B like
+    /// the validator's own, even when the signer holds no TRS and has used
+    /// its whole allowance.
+    #[test]
+    fn oracle_signer_submission_skips_funded_check_and_addr_limit() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, pool) = antispam_pool();
+        let (kv, ks) = (key(71), key(72));
+        let (v, s) = (address_from_key(&kv), address_from_key(&ks));
+        put_oracle_validator(&pool.state, v, Active, Some(s));
+        let t0 = now_ms();
+        // S exhausts its allowance through gossip (B counts, never refuses there).
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&ks, t0, 4))
+            .unwrap_err(); // A refuses the unfunded signer's order batch...
+        put_native(&pool.state, &s, ONE_TRS, 0);
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&ks, t0, 4))
+            .unwrap();
+        put_native(&pool.state, &s, 0, 0); // ...so fund, exhaust, then unfund
+        assert_eq!(used(&pool, &ks), 4);
+        assert!(pool.addr_rate_admits(&s, &order_batch(&ks, t0 + 1, 1).action).is_err());
+        // The signer's oracle submissions: never refused by B at RPC, admitted
+        // unfunded by A on every path, and not charged.
+        for i in 0..3 {
+            let a = oracle_from(&ks, t0 + 10 + i);
+            pool.addr_rate_admits(&s, &a.action)
+                .expect("signer's oracle submission never refused by B");
+            pool.add_native_action_presigned(s, a)
+                .expect("signer's oracle submission skips A");
+        }
+        pool.add_native_action_from_gossip(s, oracle_from(&ks, t0 + 20))
+            .expect("gossip path too");
+        assert_eq!(used(&pool, &ks), 4, "oracle submissions are not charged");
+        // The exemption is for oracle submissions only: the signer's other
+        // duty kinds are not validator duties of a validator.
+        assert!(matches!(
+            pool.add_native_action_presigned(s, attest(&ks, t0 + 30)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+    }
+
+    /// The same action from a key that is neither a validator nor a
+    /// registered signer gets no exemption: A refuses it (unfunded), and B
+    /// counts it and refuses it at RPC once the allowance is used.
+    #[test]
+    fn oracle_submission_from_unregistered_key_gets_no_exemption() {
+        use torus_economics::ValidatorStatus::{Active, Jailed};
+        let (_dir, pool) = antispam_pool();
+        let kx = key(73);
+        let x = address_from_key(&kx);
+        let t0 = now_ms();
+        assert!(matches!(
+            pool.add_native_action_presigned(x, oracle_from(&kx, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // B: with A off, once the stranger has used its allowance (here on
+        // an order batch), RPC refuses its oracle submission too.
+        let (_dir2, state) = setup();
+        let b_only = Mempool::new(state, MempoolConfig::default());
+        b_only.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            1,
+            std::collections::HashSet::new(),
+            1_000,
+        )));
+        b_only
+            .add_native_action_from_gossip(x, order_batch(&kx, t0, 1))
+            .unwrap();
+        assert!(b_only
+            .addr_rate_admits(&x, &oracle_from(&kx, t0 + 1).action)
+            .is_err());
+        // A jailed validator's signer is not exempt either (the oracle gate
+        // and exec accept only Active validators' signers).
+        let (kj, kjs) = (key(74), key(75));
+        let (j, js) = (address_from_key(&kj), address_from_key(&kjs));
+        put_oracle_validator(&pool.state, j, Jailed, Some(js));
+        assert!(matches!(
+            pool.add_native_action_presigned(js, oracle_from(&kjs, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // A stale signer index entry resolves to nothing.
+        let (kv, ks, kt) = (key(76), key(77), key(78));
+        let (v, t) = (address_from_key(&kv), address_from_key(&kt));
+        put_oracle_validator(&pool.state, v, Active, Some(address_from_key(&ks)));
+        pool.state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .unwrap();
+        assert!(matches!(
+            pool.add_native_action_presigned(t, oracle_from(&kt, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
     }
 
     // ---- Anti-spam item B: counted on pool entry, enforced at RPC ----

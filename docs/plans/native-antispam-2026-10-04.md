@@ -190,6 +190,37 @@ path) and `pooled_oracle_submissions_do_not_count_as_admission_backlog`
 (`lib.rs`). Crab's `full_pool_of_priority_entries_rejects_oracle` was
 replaced by the cancel-eviction test above.
 
+Oracle signers (A and B). The round-3 exemption (validator duties skip A
+and B only for a sender with a validator row) now also accepts a
+`SubmitOraclePrices` whose sender is an Active validator's registered oracle
+signer (`SetOracleSigner`). `Mempool::is_duty_exempt` (`lib.rs`) =
+`funded::is_validator_duty_of_validator` OR (oracle submission AND crab's
+`Mempool::oracle_reporter` resolves the sender). It is used by A
+(`check_funded`), by B's pool-entry charge and by B's RPC check
+(`addr_rate_admits`). Decisions:
+
+- **Oracle submissions only.** A signer acts for its validator only in
+  `SubmitOraclePrices` (exec's `resolve_oracle_reporter`); its other duty
+  kinds execute as the signer's own account, which is not a validator, so
+  they keep A and B.
+- **Active validators' signers only.** `oracle_reporter` cross-checks the
+  signer index against the validator record and requires Active, as the
+  mempool's oracle gate and exec do. A jailed validator's signer could not
+  pool a submission anyway. Other duty kinds keep the any-status rule, so a
+  jailed validator can still unjail.
+- **A runs before the oracle gate.** A key that is neither validator nor
+  signer gets the non-retryable `unfunded` reply rather than the oracle
+  gate's message; a funded stranger still meets the gate.
+
+Tests: `oracle_signer_submission_skips_funded_check_and_addr_limit` (signer
+with 0 TRS and an exhausted allowance: admitted on the RPC/presigned and
+gossip paths, never refused by B, not charged; its `AttestStateHash` is
+still refused by A; failed before the change with
+`Requests { used: 4, allowance: 4 }`) and
+`oracle_submission_from_unregistered_key_gets_no_exemption` (stranger,
+jailed validator's signer and a stale signer index entry are refused by A;
+the stranger is refused by B at RPC once its allowance is used).
+
 ## 5. Bench results so far
 
 ozarchy, 10 markets, rate 76000, `--retry-busy`, n=1 per cell, all cells
@@ -333,12 +364,11 @@ environment variable has no effect.
    **Deploy note:** behind a reverse proxy on the same host every client
    looks like loopback, which is exempt by default, so D is off; set
    `TORUS_RPC_IP_EXEMPT=` (empty) and limit at the proxy.
-4. **Merge with the crab stack** (`perf/s87-crab-fixes`): it changes the same
-   files (`native_pool.rs` oracle lane, mempool `lib.rs`, `torus-rpc`
-   `lib.rs` and `torus.rs`), and it adds oracle signer addresses
-   (`SetOracleSigner`). After that merge, the validator-duty exemption must
-   also accept a validator's registered oracle signer; crab has an
-   active-validator-or-signer helper in `torus-mempool`.
+4. Done 2026-10-04: **merge with the crab stack** (`perf/item6-phase1` via
+   `merge/item6-sync2`; section 4, "Merge with the crab stack"). The oracle
+   lane sits after C's cancel share, a full pool or a backlog does not shed
+   oracle submissions, and the A/B validator-duty exemption accepts an
+   Active validator's registered oracle signer for `SubmitOraclePrices`.
 5. Coordinate deferred items a-c, d (E, after item 6; ask for a per-address
    maker-volume counter in item 6's per-trader state) and g (activation fee,
    with e) with 18c.
