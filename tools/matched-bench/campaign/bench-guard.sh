@@ -2,7 +2,9 @@
 # 1) One global lock: only one benchmark driver runs at a time; others queue.
 # 2) bench_wait_quiet: before each cell, wait until no node, generator, cargo
 #    or rustc process exists, so builds never overlap a measured cell.
-BENCH_GLOBAL_LOCK=/home/18c/bench-results-matched/.bench-global.lock
+# Lock file: $BENCH_GLOBAL_LOCK, default $RESULTS_ROOT/.bench-global.lock (RESULTS_ROOT
+#    default $HOME/bench-results-matched). Every driver on a host must use the same one.
+BENCH_GLOBAL_LOCK=${BENCH_GLOBAL_LOCK:-${RESULTS_ROOT:-$HOME/bench-results-matched}/.bench-global.lock}
 exec 8>"$BENCH_GLOBAL_LOCK"
 echo "$(date +%T) waiting for global bench lock" >&2
 flock 8

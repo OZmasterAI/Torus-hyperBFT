@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Delete a finished s63 cell's disposable devnet RocksDB (<campaign>/<label>/data)
 # after confirming its evidence is retained. User-authorized 2026-09-23 (s63).
+# Labels must be <PREFIX>-<arm>-rN / -wN / -loN (PREFIX env, default = basename of
+# CAMPAIGN_DIR minus -YYYYMMDD, as in ab-driver.sh). RESULTS_ROOT default
+# $HOME/bench-results-matched.
 # Retained: results dir (summary.json, CSVs, metrics, digests, val*.log.gz) and
 # the raw run/ logs. Writes <label>.retention.json.  Usage: prune-cell.sh LABEL...
 set -eu
-D=${CAMPAIGN_DIR:-/home/18c/bench-results-matched/s63-4build-20260923}
-R=/home/18c/bench-results-matched
+D=${CAMPAIGN_DIR:?CAMPAIGN_DIR required}
+R=${RESULTS_ROOT:-$HOME/bench-results-matched}
+PREFIX=${PREFIX:-$(basename "$D" | sed 's/-[0-9]\{8\}$//')}
 for l in "$@"; do
-  case "$l" in s63-*-r[0-9]*) ;; *) echo "refusing unexpected label: $l" >&2; exit 1 ;; esac
+  case "$l" in */*|*..*) echo "refusing unexpected label: $l" >&2; exit 1 ;; "$PREFIX"-*-[rw][0-9]*|"$PREFIX"-*-lo[0-9]*) ;; *) echo "refusing unexpected label: $l (expected $PREFIX-<arm>-rN)" >&2; exit 1 ;; esac
   t="$D/$l/data"
   if [ ! -d "$t" ]; then echo "$l: no data dir"; continue; fi
   for f in "$R/$l/summary.json" "$R/$l/val0.log.gz" "$R/$l/val1.log.gz" "$R/$l/val2.log.gz"; do

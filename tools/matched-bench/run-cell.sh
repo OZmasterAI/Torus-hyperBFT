@@ -4,7 +4,7 @@
 #   run-cell.sh <worktree> <label> [MARKETS=10] [DUR=120] [RATE=76000] [EXTRA_ENV='K=V ...']
 #
 # BUILDS NOTHING. It stages the binary that already sits in
-# $TARGET_DIR/release/torus-node (default /home/18c/.cargo-target-matched) into
+# $TARGET_DIR/release/torus-node (default $HOME/.cargo-target-matched) into
 # <worktree>/target/release/torus-node (devnet/wsl/env.sh hardcodes that path),
 # proves the copy with md5sums, generates a MARKETS-market 3-val genesis, launches
 # the bare-metal 3-validator devnet with the RE-PROOF5 record-cell env (+EXTRA_ENV
@@ -17,8 +17,8 @@
 #
 # Optional env overrides:
 #   TARGET_DIR   cargo target dir holding torus-node + bench-throughput
-#                (default /home/18c/.cargo-target-matched)
-#   RESULTS_ROOT (default /home/18c/bench-results-matched)
+#                (default $HOME/.cargo-target-matched)
+#   RESULTS_ROOT (default $HOME/bench-results-matched)
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
 #   BATCH        --batch-size (400)               SUBMIT --submit-batch (1)
@@ -163,8 +163,8 @@ if [ -n "${RUN_CELL_PRINT_PATHS:-}" ]; then
         "$WT" "$SELF_DIR" "$TOOLS_DIR" "$TOOLS_FROM_WORKTREE" "$MAINREPO"
     exit 0
 fi
-TARGET_DIR=${TARGET_DIR:-/home/18c/.cargo-target-matched}
-RESULTS_ROOT=${RESULTS_ROOT:-/home/18c/bench-results-matched}
+TARGET_DIR=${TARGET_DIR:-$HOME/.cargo-target-matched}
+RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}
 SENDERS=${SENDERS:-5000}
 CONC=${CONC:-256}
