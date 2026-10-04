@@ -164,8 +164,9 @@ Each valuation that classifies Healthy stores a certificate in node memory:
 
 **L3: Hyperliquid-style rule "every account, every block" (consensus change, owner
 decision).** Today's window finds an unhealthy account only when the cursor reaches
-it: up to `accounts / 2048` blocks late (100k accounts: ~49 blocks; 1M: ~490). HL
-checks accounts on every mark update. L3 defines the rule as SCAN = ∞: every account
+it: up to `accounts / 2048` blocks late (100k accounts: ~49 blocks; 1M: ~490). HL's
+docs do not say how often or which accounts are checked; from outside it shows no such
+delay (inferred, not documented). L3 defines the rule as SCAN = ∞: every account
 is classified every block, the unhealthy ones are acted on in address order from the
 cursor, up to 64, carry-over as today. The implementation never values all accounts:
 it keeps a node-local index of certificates keyed by trigger level `F(b0)·(1+ρ*)` in a
@@ -395,6 +396,16 @@ same stack, in the same campaign (D15: same-campaign cells only).
    stopgap (L2 on the storage path) or wait for Phase 1?
 8. **Missing baselines.** Measure main at 30 and 100 markets, main's
    `rejected_cancelled`, and CPU-s per 1M for both arms in the next campaign?
+
+### 6.1 Owner decisions (s88, 2026-10-04)
+
+| Q | Decision |
+|---|---|
+| 1 | L1: keep today's window (2048 valued / 64 acted per block) and serve it from memory; no consensus change in Phase 1. L3 stays a separate later decision, bundled with the D12 fresh genesis, before position holders approach 2048 (below that the window already covers every account every block). |
+| 2 | Build L1 first; add L2 only if the oracle-on liquidation tail exceeds 1.0 ms per 1k fills. |
+| 3 | Yes: R also serves ordered prefix and seek iteration, and the summary plus liquidation L1 land in Phase 1, not Phase 4. |
+| 5 | Bit-exact: the summary keeps per-position rounding; `AccountView::build` is the P1 reference. |
+| 4, 6, 7, 8 | Open; decided after measurements (Gate 1 review, B measured, oracle-on devnet). |
 
 ## Stage gates (owner, s87, PROPOSED)
 
