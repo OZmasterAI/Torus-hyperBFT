@@ -7,7 +7,7 @@
 #                 (default $HOME/bench-results-matched; the global bench lock
 #                 $RESULTS_ROOT/.bench-global.lock lives there too)
 #   HARNESS_WT    clean worktree whose tools/matched-bench/run-cell.sh and devnet/
-#                 run every cell (default $HOME/projects/wt/s87-harness). Do not
+#                 run every cell (default $HOME/projects/wt/harness). Do not
 #                 build, commit or switch branches there while the campaign runs.
 #   PREFIX        label prefix (default: basename of CAMPAIGN_DIR minus -YYYYMMDD)
 #   DRY_RUN=1     print each cell's resolved run_cell.py command and exit; takes no
@@ -51,7 +51,7 @@ C=$(cd "$C" && pwd) || exit 1
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)  # this tooling dir (run_cell.py, samplers, pruners)
 export RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 R=$RESULTS_ROOT
-WT=${HARNESS_WT:-$HOME/projects/wt/s87-harness}
+WT=${HARNESS_WT:-$HOME/projects/wt/harness}
 [ -x "$WT/tools/matched-bench/run-cell.sh" ] || { echo "HARNESS_WT=$WT has no tools/matched-bench/run-cell.sh; set HARNESS_WT" >&2; exit 1; }
 [ -f "$C/arms.conf" ] || { echo "no $C/arms.conf (see $D/arms.conf.example)" >&2; exit 1; }
 [ "${DRY_RUN:-0}" = 1 ] || source "$D/bench-guard.sh"

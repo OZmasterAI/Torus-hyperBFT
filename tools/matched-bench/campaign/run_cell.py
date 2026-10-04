@@ -47,9 +47,9 @@ p.add_argument("--cap", default=200, type=int)
 p.add_argument(
     "--worktree",
     default=os.environ.get(
-        "HARNESS_WT", os.path.expanduser("~/projects/wt/matched-200k-next")
+        "HARNESS_WT", os.path.expanduser("~/projects/wt/harness")
     ),
-    help="harness worktree (default $HARNESS_WT, else ~/projects/wt/matched-200k-next)",
+    help="harness worktree (default $HARNESS_WT, else ~/projects/wt/harness)",
 )
 p.add_argument(
     "--campaign-dir",

@@ -38,7 +38,7 @@ Defaults reproduce the original bench host's layout under `$HOME`.
 | Variable | Used by | Default | Meaning |
 | --- | --- | --- | --- |
 | `RESULTS_ROOT` | all | `$HOME/bench-results-matched` | Results go to `$RESULTS_ROOT/<label>/`. Keep campaign dirs under it too. |
-| `HARNESS_WT` | ab-driver.sh, run_cell.py | `$HOME/projects/wt/s87-harness` (run_cell.py called directly: `~/projects/wt/matched-200k-next`) | Clean worktree whose `tools/matched-bench/` and `devnet/` run every cell. |
+| `HARNESS_WT` | ab-driver.sh, run_cell.py | `$HOME/projects/wt/harness`: the one permanent harness worktree, detached at the main commit the campaign uses; move it forward only between campaigns | Clean worktree whose `tools/matched-bench/` and `devnet/` run every cell. |
 | `CAMPAIGN_DIR` | run_cell.py, pruners, score.py | required (run_cell.py, pruners); cwd (score.py) | The campaign dir. The driver sets it. |
 | `PREFIX` | ab-driver.sh, pruners | campaign dir name minus `-YYYYMMDD` | Label prefix: labels are `<PREFIX>-<arm>-<round>`. |
 | `BENCH_GLOBAL_LOCK` | bench-guard.sh | `$RESULTS_ROOT/.bench-global.lock` | Must be the same file for every driver on the host. |
@@ -264,7 +264,7 @@ only within a campaign.
 
 ## Host-specific defaults
 
-`$HOME/bench-results-matched`, `$HOME/projects/wt/s87-harness` and
+`$HOME/bench-results-matched`, `$HOME/projects/wt/harness` and
 `$HOME/.cargo-target-matched` are the original bench host's defaults. On another
 host set `RESULTS_ROOT` and `HARNESS_WT` (and `TARGET_DIR` when calling
 run-cell.sh directly).
