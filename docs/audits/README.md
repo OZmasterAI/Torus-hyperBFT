@@ -121,6 +121,7 @@ corrections; a repeated finding is not another defect.
 | 89 | [Delegation operation write ordering](chain-14236fa-pass89-delegate-partial-write-2026-10-05.md) |
 | 90 | [Undelegation operation write ordering](chain-14236fa-pass90-undelegate-partial-write-2026-10-05.md) |
 | 91 | [Permanent-stake principal debit ordering](chain-14236fa-pass91-permanent-stake-partial-write-2026-10-05.md) |
+| 92 | [Slashing state transition atomicity](chain-14236fa-pass92-slash-partial-state-transition-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
