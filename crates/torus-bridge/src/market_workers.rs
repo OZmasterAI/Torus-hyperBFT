@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use alloy_primitives::Address;
-use torus_core::order_book::{OrderBook, PlaceResult};
+use torus_core::order_book::{OrderBook, PlaceResult, TakerMarginLimit};
 use torus_types::{MarketId, OrderId, PlaceOrderParams};
 
 /// A single order to be matched by a worker thread.
@@ -19,6 +19,8 @@ pub struct MatchRequest<'a> {
     pub sender: Address,
     pub params: &'a PlaceOrderParams,
     pub order_id: OrderId,
+    /// s515 review 4: the taker's match-time margin limit (`None` = unchecked).
+    pub margin: Option<TakerMarginLimit>,
 }
 
 /// Result of matching a single order.
@@ -312,7 +314,12 @@ impl MarketWorkerPool {
         for req in requests {
             book.set_next_order_id(req.order_id);
             // C2: THE one params copy in the pipeline — the book takes ownership.
-            let place_result = book.place_order(req.params.clone(), req.sender, timestamp);
+            let place_result = book.place_order_with_margin(
+                req.params.clone(),
+                req.sender,
+                timestamp,
+                req.margin.as_ref(),
+            );
 
             results.push(MatchResult {
                 sender: req.sender,

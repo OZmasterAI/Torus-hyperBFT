@@ -213,7 +213,7 @@ async fn get_user_limits_serves_every_mode() {
         );
         let stop = PlaceOrderParams {
             order_type: OrderType::StopMarket { trigger: fp(200) },
-            ..gtc(2, true, 0, 1)
+            ..gtc(2, true, 210, 1) // s515: a stop-market needs a positive price cap
         };
         let r = NativeExecutor::execute_batch(
             &mut ctx,

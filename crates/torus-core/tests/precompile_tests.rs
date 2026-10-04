@@ -88,24 +88,25 @@ fn write_oracle_price(db: &StateDb, market_id: MarketId, price: FixedPoint, bloc
 // Lockbox Tests
 // ============================================================================
 
+/// `n` whole tokens in EVM wei (18 decimals; native FixedPoint is 8 decimals).
+fn wei(n: u64) -> U256 {
+    U256::from(n) * U256::from(1_000_000_000_000_000_000u128)
+}
+
 #[test]
 fn lockbox_deposit_to_native() {
     let (_dir, db) = setup();
     let trader = addr(1);
 
-    // Give trader 10,000 EVM balance (raw FixedPoint units)
-    set_evm_balance(
-        &db,
-        &trader,
-        U256::from(10_000u64 * FixedPoint::SCALE as u64),
-    );
+    // Give trader 10,000 tokens of EVM balance (18-decimal wei)
+    set_evm_balance(&db, &trader, wei(10_000));
 
     // Deposit 3,000 to native
     Lockbox::deposit_to_native(&db, &trader, fp(3_000)).unwrap();
 
-    // Verify EVM decreased
+    // Verify EVM decreased by 3,000 × 10^18 wei
     let evm = get_evm_balance(&db, &trader);
-    assert_eq!(evm, U256::from(7_000u64 * FixedPoint::SCALE as u64));
+    assert_eq!(evm, wei(7_000));
 
     // Verify native increased
     let pm = PositionManager::new(db);
@@ -136,9 +137,9 @@ fn lockbox_withdraw_from_native() {
     let bal = pm.get_native_balance(&trader).unwrap();
     assert_eq!(bal.available, fp(3_000));
 
-    // Verify EVM increased
+    // Verify EVM increased by 2,000 × 10^18 wei
     let evm = get_evm_balance(&db, &trader);
-    assert_eq!(evm, U256::from(2_000u64 * FixedPoint::SCALE as u64));
+    assert_eq!(evm, wei(2_000));
 }
 
 #[test]
@@ -690,33 +691,82 @@ fn abi_arrays_response_encoding() {
 // Lockbox via Precompile Interface
 // ============================================================================
 
+/// EVM-PF-05: the precompile never writes CF_ACCOUNTS / native balances — it only
+/// queues. `depositToNative` is payable (amount == msg.value, in wei); the queued
+/// native credit is floor(value / 10^10) and the dust is burned (by the EVM
+/// provider, together with the value — not visible at this layer).
 #[test]
 fn lockbox_precompile_deposit() {
     let (_dir, db) = setup();
     let trader = addr(5);
-
-    set_evm_balance(
-        &db,
-        &trader,
-        U256::from(10_000u64 * FixedPoint::SCALE as u64),
-    );
+    set_evm_balance(&db, &trader, wei(10_000));
 
     let address = precompile_address(ADDR_LOCKBOX);
+    let value = wei(3_000) + U256::from(123u64); // 123 wei of sub-unit dust
     let input = build_input(
         "depositToNative(uint128)",
-        &[abi::encode_u128(fp(3_000).raw() as u128)],
+        &[abi::encode_u128(value.to::<u128>())],
     );
 
-    let output = execute_precompile(&address, &input, &trader, &db, 100).unwrap();
-    assert_eq!(output[31], 1); // true
+    let output = execute_precompile_with_value(&address, &input, &trader, value, &db, 100).unwrap();
+    assert_eq!(output[31], 1); // true = queued
 
-    // Verify balances changed
-    let evm = get_evm_balance(&db, &trader);
-    assert_eq!(evm, U256::from(7_000u64 * FixedPoint::SCALE as u64));
+    // No direct balance writes at the precompile layer.
+    assert_eq!(get_evm_balance(&db, &trader), wei(10_000));
+    let pm = PositionManager::new(db.clone());
+    assert_eq!(pm.get_native_balance(&trader).unwrap().available, FixedPoint::ZERO);
 
-    let pm = PositionManager::new(db);
-    let bal = pm.get_native_balance(&trader).unwrap();
-    assert_eq!(bal.available, fp(3_000));
+    // Native credit queued for the next block, dust floored away.
+    let queued = CoreWriterQueue::drain(&db, 101).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].trader, trader);
+    assert!(matches!(
+        queued[0].kind,
+        QueuedActionKind::LockboxDeposit { amount } if amount == fp(3_000)
+    ));
+}
+
+#[test]
+fn lockbox_precompile_deposit_rejects_bad_value() {
+    let (_dir, db) = setup();
+    let trader = addr(5);
+    let address = precompile_address(ADDR_LOCKBOX);
+    let deposit = |amount: U256| {
+        build_input(
+            "depositToNative(uint128)",
+            &[abi::encode_u128(amount.to::<u128>())],
+        )
+    };
+
+    // amount argument != msg.value
+    assert!(
+        execute_precompile_with_value(&address, &deposit(wei(1)), &trader, U256::ZERO, &db, 100)
+            .is_err()
+    );
+    // all dust: < one native unit (10^10 wei) would credit nothing
+    let dust = U256::from(9_999_999_999u64);
+    assert!(execute_precompile_with_value(&address, &deposit(dust), &trader, dust, &db, 100)
+        .is_err());
+    // zero: no-op success, nothing queued
+    assert!(execute_precompile_with_value(
+        &address,
+        &deposit(U256::ZERO),
+        &trader,
+        U256::ZERO,
+        &db,
+        100
+    )
+    .is_ok());
+    // value to a non-payable precompile / selector
+    let withdraw = build_input("withdrawFromNative(uint128)", &[abi::encode_u128(0)]);
+    assert!(execute_precompile_with_value(&address, &withdraw, &trader, wei(1), &db, 100).is_err());
+    let core_writer = precompile_address(ADDR_CORE_WRITER);
+    let cancel = build_input("cancelOrder(bytes32)", &[abi::encode_u128(1)]);
+    assert!(
+        execute_precompile_with_value(&core_writer, &cancel, &trader, wei(1), &db, 100).is_err()
+    );
+
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0);
 }
 
 #[test]
@@ -738,19 +788,48 @@ fn lockbox_precompile_withdraw() {
     let address = precompile_address(ADDR_LOCKBOX);
     let input = build_input(
         "withdrawFromNative(uint128)",
-        &[abi::encode_u128(fp(2_000).raw() as u128)],
+        &[abi::encode_u128(wei(2_000).to::<u128>())],
     );
 
     let output = execute_precompile(&address, &input, &trader, &db, 100).unwrap();
-    assert_eq!(output[31], 1); // true
+    assert_eq!(output[31], 1); // true = queued
 
-    // Verify native decreased
-    let bal = pm.get_native_balance(&trader).unwrap();
-    assert_eq!(bal.available, fp(6_000));
+    // Nothing moves at the precompile layer (EVM-PF-05) ...
+    assert_eq!(pm.get_native_balance(&trader).unwrap().available, fp(8_000));
+    assert_eq!(get_evm_balance(&db, &trader), U256::ZERO);
 
-    // Verify EVM increased
-    let evm = get_evm_balance(&db, &trader);
-    assert_eq!(evm, U256::from(2_000u64 * FixedPoint::SCALE as u64));
+    // ... the native debit / EVM credit is queued for the next block.
+    let queued = CoreWriterQueue::drain(&db, 101).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(matches!(
+        queued[0].kind,
+        QueuedActionKind::LockboxWithdraw { amount } if amount == fp(2_000)
+    ));
+
+    // Non-round wei amounts cannot be debited from an 8-decimal ledger: rejected.
+    let odd = build_input(
+        "withdrawFromNative(uint128)",
+        &[abi::encode_u128(wei(1).to::<u128>() + 1)],
+    );
+    assert!(execute_precompile(&address, &odd, &trader, &db, 100).is_err());
+}
+
+#[test]
+fn lockbox_queued_kinds_borsh_round_trip() {
+    use borsh::BorshDeserialize;
+    for kind in [
+        QueuedActionKind::LockboxDeposit { amount: fp(7) },
+        QueuedActionKind::LockboxWithdraw { amount: fp(9) },
+    ] {
+        let qa = QueuedAction {
+            trader: addr(3),
+            kind,
+            block_queued: 42,
+        };
+        let bytes = borsh::to_vec(&qa).unwrap();
+        let back = QueuedAction::try_from_slice(&bytes).unwrap();
+        assert_eq!(format!("{qa:?}"), format!("{back:?}"));
+    }
 }
 
 // ============================================================================

@@ -606,11 +606,11 @@ fn interleave(lists: Vec<Vec<(Address, NativeAction)>>) -> Vec<(Address, NativeA
     }
 }
 
+/// s515: a market order needs a positive price cap; 60 is the test asks.
 fn market_buy(market_id: MarketId, qty: i64) -> PlaceOrderParams {
     PlaceOrderParams {
-        price: FixedPoint::ZERO,
         order_type: OrderType::Market,
-        ..order(market_id, true, FixedPoint::ZERO, fp(qty), TimeInForce::IOC)
+        ..order(market_id, true, fp(60), fp(qty), TimeInForce::IOC)
     }
 }
 
@@ -719,7 +719,7 @@ fn open_limit_reduce_only_and_stops_rejected_at_1000_open() {
     let (a, b) = (addr(1), addr(6));
     let stop = PlaceOrderParams {
         order_type: OrderType::StopMarket { trigger: fp(200) },
-        ..gtc(1, true, 0, 1)
+        ..gtc(1, true, 210, 1)
     };
     let reduce_only = PlaceOrderParams {
         reduce_only: true,
@@ -764,7 +764,7 @@ fn open_limit_counts_pending_stops_at_block_start() {
         order_type: OrderType::StopMarket {
             trigger: fp(trigger),
         },
-        ..gtc(2, true, 0, 1)
+        ..gtc(2, true, trigger + 10, 1)
     };
     let mut block1 = interleave(vec![resting(a, 998), resting(b, 10)]);
     block1.push(place(a, stop(200)));
@@ -786,6 +786,94 @@ fn open_limit_counts_pending_stops_at_block_start() {
     assert_eq!(golden.1, 1);
     for threads in [2usize, 4] {
         assert_eq!(golden, run_with_volumes(&blocks, threads, &[]), "threads={threads}");
+    }
+}
+
+/// Open orders of `trader` over every resident book.
+fn open_orders(ctx: &NativeExecContext, trader: &Address) -> usize {
+    ctx.order_books.values().map(|b| b.open_order_count(trader)).sum()
+}
+
+/// A stop fired by a trade becomes the order it stands for (s515: the book
+/// hands it back, the executor places it). It held its slot while pending,
+/// so the open-order limit must not reject it: `a` sits at the limit (1000,
+/// zero volume) or, with volume, at `OPEN_ORDER_BASE_LIMIT` (the stop /
+/// reduce-only rule; limit 1200), its pending StopLimit fires and must rest,
+/// and its open count stays 1000 (pending stop -> resting order). In the
+/// batch path the block-start count holds the stop once: with volume, a
+/// GTC of `a` in the firing block still fits under 1200.
+fn fired_stop_case(
+    volume: i64,
+    single_action: bool,
+    threads: usize,
+) -> Vec<(bool, Option<String>)> {
+    let (a, c, d) = (addr(1), addr(7), addr(8));
+    let (_dir, db) = open_test_db();
+    let mut ctx = make_ctx(db);
+    let metrics = Arc::new(Metrics::new());
+    ctx.metrics = Some(metrics.clone());
+    for n in 1..=48u8 {
+        fund_native(&ctx, &addr(n), fp(1_000_000));
+    }
+    ctx.positions.put_cum_volume(&a, fp(volume)).unwrap();
+    let stop = PlaceOrderParams {
+        order_type: OrderType::StopLimit {
+            trigger: fp(100),
+            limit: fp(90),
+        },
+        ..gtc(6, true, 90, 1)
+    };
+    let mut block1 = resting(a, 999);
+    block1.push(place(a, stop));
+    block1.push(place(c, gtc(6, false, 100, 1)));
+    let r1 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
+    assert!(r1.results.iter().all(|r| r.success), "setup");
+    assert_eq!(ctx.order_books[&6].pending_stop_count(), 1);
+    assert_eq!(open_orders(&ctx, &a), 1000, "999 resting + 1 pending stop");
+
+    // d's IOC buy trades at 100 against c and fires a's buy stop: a buy
+    // limit at 90 that crosses nothing, so it rests.
+    let fire = order(6, true, fp(100), fp(1), TimeInForce::IOC);
+    let results = if single_action {
+        let r = NativeExecutor::execute(&mut ctx, &d, &NativeAction::PlaceOrder(fire));
+        assert!(r.success, "{r:?}");
+        vec![]
+    } else {
+        let block2 = vec![place(d, fire), place(a, gtc(6, true, 80, 1))];
+        let r2 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
+        assert!(r2.results[0].success, "{:?}", r2.results[0]);
+        r2.results
+            .iter()
+            .map(|r| (r.success, r.error.clone()))
+            .collect()
+    };
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    let book = &ctx.order_books[&6];
+    assert_eq!(book.pending_stop_count(), 0, "the stop fired");
+    let a_on_6: Vec<_> = book.orders_for_trader(&a).iter().map(|o| o.price).collect();
+    assert!(a_on_6.contains(&fp(90)), "the fired stop rests at its limit: {a_on_6:?}");
+    let extra = usize::from(results.get(1).is_some_and(|r| r.0));
+    assert_eq!(open_orders(&ctx, &a), 1000 + extra, "pending stop -> resting order");
+    results
+}
+
+#[test]
+fn open_limit_fired_stop_is_not_rejected() {
+    for single_action in [true, false] {
+        for threads in [0usize, 4] {
+            // At the 1000 limit (no volume): the fired stop rests; a's GTC
+            // in the firing block is rejected on the limit (1000 open).
+            let r = fired_stop_case(0, single_action, threads);
+            if !single_action {
+                assert!(is_open_limit(&r[1]), "threads={threads}: {:?}", r[1]);
+            }
+            // Limit 1200, at OPEN_ORDER_BASE_LIMIT: the fired stop rests and
+            // a's GTC fits (the stop is counted once at batch start).
+            let r = fired_stop_case(1_000_000_000, single_action, threads);
+            if !single_action {
+                assert!(r[1].0, "threads={threads}: {:?}", r[1]);
+            }
+        }
     }
 }
 
@@ -1074,7 +1162,7 @@ fn open_limit_same_after_reload_or_resident_in_every_book_mode() {
         order_type: OrderType::StopMarket {
             trigger: fp(trigger),
         },
-        ..gtc(2, true, 0, 1)
+        ..gtc(2, true, trigger + 10, 1)
     };
     let mut block1 = interleave(vec![resting(a, 998), resting(b, 5)]);
     block1.push(place(a, stop(200)));

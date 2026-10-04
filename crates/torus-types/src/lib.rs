@@ -247,7 +247,7 @@ pub enum SessionScope {
     /// TransferToPerp, TransferToSpot only.
     TransfersOnly,
     /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards.
+    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded.
     Full,
 }
 
@@ -282,6 +282,7 @@ impl SessionScope {
                     | NativeAction::Undelegate { .. }
                     | NativeAction::PermanentStake { .. }
                     | NativeAction::ClaimRewards
+                    | NativeAction::ClaimUnbonded
             ),
         }
     }
@@ -686,6 +687,11 @@ pub enum NativeAction {
         height: u64,
         hash: B256,
     },
+
+    // === Staking (appended — keep existing serde variant indices stable) ===
+    /// Release every matured unbonding entry across all of the sender's
+    /// delegations back to their balance (explicit claim, Hyperliquid-style).
+    ClaimUnbonded,
 }
 
 impl NativeAction {
@@ -955,6 +961,9 @@ impl NativeAction {
                 buf.push(26);
                 buf.extend_from_slice(&height.to_be_bytes());
                 buf.extend_from_slice(hash.as_slice());
+            }
+            NativeAction::ClaimUnbonded => {
+                buf.push(27);
             }
         }
     }

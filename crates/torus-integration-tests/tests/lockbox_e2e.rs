@@ -7,7 +7,7 @@ mod common;
 
 use alloy_primitives::Address;
 use torus_bridge::native_executor::NativeExecutor;
-use torus_core::lockbox::{fp_to_u256, Lockbox};
+use torus_core::lockbox::{fp_to_wei, wei_to_fp_floor, Lockbox, WEI_PER_NATIVE_UNIT};
 use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, U256};
 
 use crate::common::TestHarness;
@@ -39,7 +39,7 @@ fn test_deposit_evm_to_native_and_trade() {
     let trader = TestHarness::addr(1);
     let deposit = TestHarness::fp(1_000_000);
 
-    h.fund_evm(&trader, fp_to_u256(deposit));
+    h.fund_evm(&trader, fp_to_wei(deposit));
     Lockbox::deposit_to_native(&h.state_db, &trader, deposit).unwrap();
 
     assert_eq!(evm_bal(&h, &trader), U256::ZERO);
@@ -85,7 +85,7 @@ fn test_withdraw_native_to_evm() {
     Lockbox::withdraw_from_native(&h.state_db, &trader, withdraw).unwrap();
 
     assert_eq!(native_bal(&h, &trader), TestHarness::fp(2000));
-    assert_eq!(evm_bal(&h, &trader), fp_to_u256(withdraw));
+    assert_eq!(evm_bal(&h, &trader), fp_to_wei(withdraw));
 }
 
 /// Insufficient EVM balance -> error, no partial transfer (atomic).
@@ -95,13 +95,13 @@ fn test_insufficient_evm_balance_atomic() {
     let trader = TestHarness::addr(3);
     let have = TestHarness::fp(100);
 
-    h.fund_evm(&trader, fp_to_u256(have));
+    h.fund_evm(&trader, fp_to_wei(have));
 
     let result = Lockbox::deposit_to_native(&h.state_db, &trader, TestHarness::fp(200));
     assert!(result.is_err(), "should fail with insufficient EVM balance");
 
     // Both balances unchanged.
-    assert_eq!(evm_bal(&h, &trader), fp_to_u256(have));
+    assert_eq!(evm_bal(&h, &trader), fp_to_wei(have));
     assert_eq!(native_bal(&h, &trader), FixedPoint::ZERO);
 }
 
@@ -134,7 +134,7 @@ fn test_round_trip_with_profit() {
     let initial = TestHarness::fp(10000);
     let profit = TestHarness::fp(500);
 
-    h.fund_evm(&trader, fp_to_u256(initial));
+    h.fund_evm(&trader, fp_to_wei(initial));
     let initial_evm = evm_bal(&h, &trader);
 
     // EVM -> native
@@ -152,7 +152,7 @@ fn test_round_trip_with_profit() {
         final_evm > initial_evm,
         "final EVM balance should exceed initial"
     );
-    assert_eq!(final_evm, fp_to_u256(total));
+    assert_eq!(final_evm, fp_to_wei(total));
     assert_eq!(native_bal(&h, &trader), FixedPoint::ZERO);
 }
 
@@ -163,38 +163,60 @@ fn test_zero_amount_transfers() {
     let trader = TestHarness::addr(6);
     let bal = TestHarness::fp(1000);
 
-    h.fund_evm(&trader, fp_to_u256(bal));
+    h.fund_evm(&trader, fp_to_wei(bal));
     h.fund_native(&trader, bal);
 
     // Zero deposit: no-op
     Lockbox::deposit_to_native(&h.state_db, &trader, FixedPoint::ZERO).unwrap();
-    assert_eq!(evm_bal(&h, &trader), fp_to_u256(bal));
+    assert_eq!(evm_bal(&h, &trader), fp_to_wei(bal));
     assert_eq!(native_bal(&h, &trader), bal);
 
     // Zero withdraw: no-op
     Lockbox::withdraw_from_native(&h.state_db, &trader, FixedPoint::ZERO).unwrap();
-    assert_eq!(evm_bal(&h, &trader), fp_to_u256(bal));
+    assert_eq!(evm_bal(&h, &trader), fp_to_wei(bal));
     assert_eq!(native_bal(&h, &trader), bal);
 }
 
 /// Full balance transfer with an odd amount: no rounding loss on round trip.
+///
+/// Units: native is 8-decimal, EVM 18-decimal wei, so the EVM side moves
+/// `amount × 10^10` wei. Native-action amounts are native units, so this path is
+/// exact both ways; a sub-unit EVM remainder is simply left in the EVM balance.
 #[test]
 fn test_full_balance_no_rounding_loss() {
     let h = TestHarness::new();
     let trader = TestHarness::addr(7);
     let amount = FixedPoint::from_raw(123_456_789_012_345_678i128);
+    let dust = U256::from(WEI_PER_NATIVE_UNIT - 1);
 
-    h.fund_evm(&trader, fp_to_u256(amount));
+    h.fund_evm(&trader, fp_to_wei(amount) + dust);
+    assert_eq!(
+        fp_to_wei(amount),
+        U256::from(123_456_789_012_345_678u128) * U256::from(WEI_PER_NATIVE_UNIT)
+    );
 
     // EVM -> native
     Lockbox::deposit_to_native(&h.state_db, &trader, amount).unwrap();
     assert_eq!(native_bal(&h, &trader), amount);
-    assert_eq!(evm_bal(&h, &trader), U256::ZERO);
+    assert_eq!(evm_bal(&h, &trader), dust, "sub-unit remainder stays in EVM");
 
     // native -> EVM
     Lockbox::withdraw_from_native(&h.state_db, &trader, amount).unwrap();
-    assert_eq!(evm_bal(&h, &trader), fp_to_u256(amount));
+    assert_eq!(evm_bal(&h, &trader), fp_to_wei(amount) + dust);
     assert_eq!(native_bal(&h, &trader), FixedPoint::ZERO);
+}
+
+/// EVM-side unit conversion (precompile deposit path): floor to native units, the
+/// non-round remainder (< 10^10 wei) is reported as dust for burning; a native
+/// amount round-trips exactly.
+#[test]
+fn test_wei_conversion_floor_and_dust() {
+    let five = TestHarness::fp(5);
+    assert_eq!(fp_to_wei(five), U256::from(5_000_000_000_000_000_000u128));
+    assert_eq!(wei_to_fp_floor(fp_to_wei(five)), Some((five, U256::ZERO)));
+
+    let dust = U256::from(1_234u64);
+    assert_eq!(wei_to_fp_floor(fp_to_wei(five) + dust), Some((five, dust)));
 }
 
 /// Conservation invariant: EVM + native total never changes during transfers.
@@ -203,13 +225,13 @@ fn test_conservation_invariant() {
     let h = TestHarness::new();
     let trader = TestHarness::addr(8);
     let total = TestHarness::fp(50000);
-    let total_u256 = fp_to_u256(total);
+    let total_u256 = fp_to_wei(total);
 
     h.fund_evm(&trader, total_u256);
 
     let check = |h: &TestHarness, msg: &str| {
         let evm = evm_bal(h, &trader);
-        let native = fp_to_u256(native_bal(h, &trader));
+        let native = fp_to_wei(native_bal(h, &trader));
         assert_eq!(evm + native, total_u256, "conservation violated: {msg}");
     };
 

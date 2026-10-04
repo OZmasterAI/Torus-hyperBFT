@@ -113,7 +113,7 @@ fn classify_market_order() {
     let action = NativeAction::PlaceOrder(PlaceOrderParams {
         market_id: 1,
         is_buy: true,
-        price: fp(0),
+        price: fp(100),
         quantity: fp(1),
         order_type: OrderType::Market,
         time_in_force: TimeInForce::IOC,
@@ -582,7 +582,7 @@ fn composite_root_changes_with_native_state() {
     // Execute a native action that writes to state (deposit to native).
     // First, fund an EVM account.
     let account = AccountInfo {
-        balance: U256::from(100_000_000_000u64), // 1000 in FixedPoint scale
+        balance: U256::from(1_000_000_000_000_000_000_000u128), // 1000 tokens in 18-dec wei
         nonce: 0,
         code_hash: KECCAK_EMPTY,
         code: None,

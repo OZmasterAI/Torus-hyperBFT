@@ -115,6 +115,7 @@ fn actions() -> Vec<NativeAction> {
             height: u64::MAX,
             hash: B256::repeat_byte(11),
         },
+        NativeAction::ClaimUnbonded,
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
         for new_qty in [None, Some(FixedPoint::MAX)] {
@@ -203,7 +204,7 @@ fn append_canonical_bytes_matches_frozen_encoder_for_all_variants() {
     }
     assert_eq!(
         tags,
-        (0u8..=26).collect(),
+        (0u8..=27).collect(),
         "all action tags must be covered"
     );
 }
@@ -587,6 +588,7 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
             buf.extend_from_slice(&height.to_be_bytes());
             buf.extend_from_slice(hash.as_slice());
         }
+        NativeAction::ClaimUnbonded => buf.push(27),
     }
     buf
 }

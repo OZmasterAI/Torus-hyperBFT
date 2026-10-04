@@ -127,6 +127,8 @@ pub(crate) enum Command {
     },
     /// Claim staking rewards
     ClaimRewards,
+    /// Claim undelegated stake whose unbonding period has elapsed
+    ClaimUnbonded,
     /// View order book for a market
     Orderbook {
         /// Market ID
@@ -180,7 +182,8 @@ pub(crate) enum Command {
         /// Side: buy or sell
         #[arg(long)]
         side: String,
-        /// Limit price (decimal, up to 8 places)
+        /// Limit price; for market / stop-market orders the REQUIRED
+        /// slippage cap (worst acceptable price) (decimal, up to 8 places)
         #[arg(long)]
         price: String,
         /// Quantity (decimal, up to 8 places)
@@ -362,6 +365,7 @@ async fn main() {
             commands::staking::cmd_undelegate(&cli, &rpc, validator, amount).await
         }
         Command::ClaimRewards => commands::staking::cmd_claim_rewards(&cli, &rpc).await,
+        Command::ClaimUnbonded => commands::staking::cmd_claim_unbonded(&cli, &rpc).await,
         Command::Orderbook { market_id } => {
             commands::query::cmd_orderbook(&rpc, market_id, cli.json).await
         }

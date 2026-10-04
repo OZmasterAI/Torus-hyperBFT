@@ -58,7 +58,13 @@ impl BlockProposer {
     ///
     /// Decodes each RLP-encoded transaction, executes the block against the
     /// current state, computes the post-execution state root, and fills in
-    /// all header fields. Does NOT modify the database.
+    /// all header fields. Does NOT commit the EVM bundle.
+    ///
+    /// F1 (s515): writer-precompile side effects (CoreWriter / lockbox queue rows)
+    /// stay pending in `exec_result.native_writes` — nothing is written to `state_db`,
+    /// so building a block that never commits leaves no queued action behind. Only
+    /// tests call this today (production executes blocks once, post-commit, in
+    /// `torus-consensus` app.rs).
     pub fn build_block(
         &self,
         state_db: &StateDb,

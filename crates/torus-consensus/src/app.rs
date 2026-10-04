@@ -1239,6 +1239,13 @@ enum ReplayGapOutcome {
         height: u64,
         last_good: TorusBlockHeader,
     },
+    /// s515 review 4: executing `height` latched the fail-stop (`exec_failed`).
+    /// The loop stopped there — no later height was executed or flushed on
+    /// top of the missing state. `last_good` is the last height that executed.
+    Failed {
+        height: u64,
+        last_good: TorusBlockHeader,
+    },
 }
 
 /// Replay every committed-but-unexecuted block in `(applied, committed]`, in ascending height order
@@ -1255,6 +1262,10 @@ enum ReplayGapOutcome {
 ///
 /// On a `Hole` the loop STOPS immediately: it does NOT execute or mark the offending height (or any
 /// height past it), so `applied` stays below the hole and the caller can latch the fail-stop.
+///
+/// `execute` returns whether the node may go on (s515 review 4: `false` once it latched the
+/// fail-stop) — the loop then stops at that height (`Failed`), so nothing after it executes and
+/// the native marker never passes it.
 fn replay_gap<H, B, X>(
     applied: u64,
     committed: u64,
@@ -1265,7 +1276,7 @@ fn replay_gap<H, B, X>(
 where
     H: FnMut(u64) -> Option<TorusBlockHeader>,
     B: FnMut(u64) -> Option<TorusBlockBody>,
-    X: FnMut(&TorusBlock),
+    X: FnMut(&TorusBlock) -> bool,
 {
     let mut last_good = torus_bridge::genesis_parent_header();
     for height in (applied + 1)..=committed {
@@ -1310,7 +1321,14 @@ where
             }
         };
 
-        execute(&block);
+        if !execute(&block) {
+            tracing::error!(
+                height,
+                committed_height = committed,
+                "crash recovery: FAIL-STOP while replaying committed height — not executing any later height"
+            );
+            return ReplayGapOutcome::Failed { height, last_good };
+        }
         last_good = header;
     }
     ReplayGapOutcome::Complete(last_good)
@@ -1568,6 +1586,14 @@ impl ExecutionContext {
         durable: DurableRows,
     ) {
         let height = torus_block.header.height;
+
+        // s515 review 4: the fail-stop latch is never cleared, and whatever
+        // tripped it left this node's state incomplete — execute (and flush)
+        // nothing on top of it (boot replay, live pipeline alike).
+        if self.exec_failed.load(Ordering::SeqCst) {
+            tracing::error!(height, "fail-stop latched — refusing to execute block");
+            return;
+        }
 
         // T1.2 body-determinism FAIL-STOP: the committed header is the consensus
         // datum; its `native_action_count` is a hashed field of the eth header.
@@ -1837,8 +1863,14 @@ impl ExecutionContext {
 
         // Bug (b): every boundary block runs the native phase (even when empty)
         // — it applies / computes the validator-set plans (`process_epoch_boundary`).
+        // CoreWriter / lockbox actions queued by the previous block's EVM txs target THIS
+        // height and are drained only on the native path — run it for them too, or an
+        // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
+        // value is already burned, so a stranded credit is lost value).
+        let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
         let run_native = has_native
             || computed_fee_revenue > 0
+            || core_writer_due
             || EpochManager::is_epoch_boundary(height, self.epoch_length);
 
         // ---- Native execution ----
@@ -4052,11 +4084,24 @@ impl TorusApp {
             committed,
             |height| load_replay_header(state_db, height),
             |height| load_replay_body(state_db, height),
-            |block| exec_ctx.execute_committed_block(block, vec![]),
+            |block| {
+                exec_ctx.execute_committed_block(block, vec![]);
+                !exec_ctx.exec_failed.load(Ordering::SeqCst)
+            },
         );
 
         match outcome {
             ReplayGapOutcome::Complete(last_header) => (last_header, None),
+            // The fail-stop is latched (the node halts on it); nothing past
+            // `height` was executed.
+            ReplayGapOutcome::Failed { height, last_good } => {
+                tracing::error!(
+                    failed_height = height,
+                    last_good_height = last_good.height,
+                    "crash recovery: replay stopped at a fail-stop"
+                );
+                (last_good, None)
+            }
             ReplayGapOutcome::Hole { height, last_good } => {
                 // FIX 1b: do NOT latch exec_failed / die pre-network. Park at the
                 // hole and let boot complete; the live strict-order heal loop +
@@ -7249,6 +7294,85 @@ mod crash_recovery_tests {
         );
     }
 
+    /// B1 (s515 review 4): a fail-stop latched while the boot replay executes
+    /// a height must stop the replay there. Height 1's header commits one
+    /// native action but its stored body has none, so executing it latches the
+    /// T1.2 body-count fail-stop; heights 2 and 3 (empty, linked to it) must
+    /// not execute on top of the missing state, and the native applied marker
+    /// must not move past the failed height.
+    ///
+    /// RED before B1: `replay_gap` ignored the latch and executed 2 and 3; the
+    /// applied marker ended at 3.
+    #[test]
+    fn b1_boot_replay_stops_at_a_fail_stop() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+
+        let mut b1 = make_block(1, vec![]);
+        b1.header.native_action_count = 1;
+        let mut b2 = make_block(2, vec![]);
+        b2.header.parent_hash = alloy_primitives::keccak256(b1.header.canonical_header_bytes());
+        let mut b3 = make_block(3, vec![]);
+        b3.header.parent_hash = alloy_primitives::keccak256(b2.header.canonical_header_bytes());
+        for b in [&b1, &b2, &b3] {
+            persist_block_for_test(&state_db, b);
+        }
+
+        let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
+
+        assert!(exec_ctx.exec_failed.load(Ordering::SeqCst), "height 1 must fail-stop");
+        assert_eq!(parked, None, "a fail-stop is not a hole");
+        assert_eq!(last.height, 0, "no height executed: last good is the genesis parent");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            None,
+            "nothing after the failed height may execute or move the applied marker"
+        );
+    }
+
+    /// B1 (review 4 F-2): `replay_gap` ignored a fail-stop latched while
+    /// executing a height and went on executing (and flushing) the later ones.
+    #[test]
+    fn r4_replay_gap_stops_at_a_failed_height() {
+        let blocks: Vec<TorusBlock> = (1..=3).map(|h| make_block(h, vec![])).collect();
+        let mut executed = Vec::new();
+        let outcome = replay_gap(
+            0,
+            3,
+            |h| Some(blocks[h as usize - 1].header.clone()),
+            |h| Some(blocks[h as usize - 1].body()),
+            |block| {
+                executed.push(block.header.height);
+                block.header.height != 2
+            },
+        );
+        assert_eq!(executed, vec![1, 2], "nothing after the failed height runs");
+        match outcome {
+            ReplayGapOutcome::Failed { height, last_good } => {
+                assert_eq!(height, 2);
+                assert_eq!(last_good.height, 1);
+            }
+            other => panic!("expected Failed {{ height: 2 }}, got {other:?}"),
+        }
+    }
+
+    /// B1: once the fail-stop is latched (it is never cleared) execution
+    /// writes nothing more — on every path, not only the boot replay.
+    ///
+    /// RED before B1: the empty block executed and wrote its applied marker.
+    #[test]
+    fn b1_latched_fail_stop_executes_nothing() {
+        let (config, state_db) = make_test_config_and_db();
+        let exec_ctx = make_exec_ctx(&config, &state_db);
+        exec_ctx.exec_failed.store(true, Ordering::SeqCst);
+        let before = dump_all_cfs(&state_db);
+
+        exec_ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+
+        assert_dumps_equal(&before, &dump_all_cfs(&state_db), "nothing runs after a fail-stop");
+        assert_eq!(read_native_applied_height(&state_db), None);
+    }
+
     /// Persist ONLY the header for a block (no body) — simulates a committed block whose body was
     /// never persisted or was pruned. Mirrors the header half of `persist_block_for_test`.
     fn persist_header_only_for_test(state_db: &StateDb, block: &TorusBlock) {
@@ -7299,7 +7423,10 @@ mod crash_recovery_tests {
             3,
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
-            |block| executed_order.push(block.header.height),
+            |block| {
+                executed_order.push(block.header.height);
+                true
+            },
         );
 
         assert_eq!(
@@ -7341,7 +7468,10 @@ mod crash_recovery_tests {
             3,
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
-            |block| executed_order.push(block.header.height),
+            |block| {
+                executed_order.push(block.header.height);
+                true
+            },
         );
 
         assert!(
@@ -11022,24 +11152,34 @@ mod crash_recovery_tests {
         );
     }
 
+    /// Wei per native raw unit: the EVM side is 18-decimal, native `FixedPoint` 8-decimal.
+    const WEI_PER_NATIVE_RAW: u64 = 10_000_000_000;
+
     /// Seed an EVM balance into CF_ACCOUNTS (72-byte record: balance ++ nonce ++ code_hash).
     /// `Lockbox::get_evm_balance` reads the first 32 bytes big-endian.
+    ///
+    /// `balance` is in NATIVE 8-decimal raw units (the unit of the native lockbox actions
+    /// these tests sign); it is stored as 18-decimal wei (×10^10).
     fn fund_evm_balance(state_db: &StateDb, addr: Address, balance: U256) {
+        let wei = balance * U256::from(WEI_PER_NATIVE_RAW);
         let mut rec = vec![0u8; 72];
-        rec[..32].copy_from_slice(&balance.to_be_bytes::<32>());
+        rec[..32].copy_from_slice(&wei.to_be_bytes::<32>());
         state_db
             .put_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice(), &rec)
             .unwrap();
     }
 
+    /// EVM balance in NATIVE 8-decimal raw units (wei / 10^10; the tests only move
+    /// whole native units, so the division is exact).
     fn read_evm_balance(state_db: &StateDb, addr: Address) -> U256 {
-        match state_db
+        let wei = match state_db
             .get_cf_raw(torus_state::cf::CF_ACCOUNTS, addr.as_slice())
             .unwrap()
         {
             Some(d) if d.len() >= 32 => U256::from_be_slice(&d[..32]),
             _ => U256::ZERO,
-        }
+        };
+        wei / U256::from(WEI_PER_NATIVE_RAW)
     }
 
     /// REGRESSION (correctness/fund-safety): an identical native action committed in
@@ -11057,7 +11197,8 @@ mod crash_recovery_tests {
         let (config, state_db) = make_test_config_and_db();
         let exec_ctx = make_exec_ctx(&config, &state_db);
 
-        // amount is a raw 8-decimal FixedPoint (u256_to_fp), NOT 18-decimal wei.
+        // Native lockbox action amounts are raw 8-decimal FixedPoint units (u256_to_fp),
+        // NOT 18-decimal wei; the lockbox debits amount × 10^10 wei from the EVM side.
         let amount_raw: u128 = FixedPoint::ONE.raw() as u128; // 1.0 == 100_000_000
         let amount = U256::from(amount_raw);
         let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();

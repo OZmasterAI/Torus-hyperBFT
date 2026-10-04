@@ -8,7 +8,7 @@ use torus_economics::governance::{
 };
 use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
 use torus_state::cf::{CF_FEE_CONFIG, CF_NATIVE_MARKETS};
-use torus_state::StateDb;
+use torus_state::{StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 // ============================================================================
@@ -672,4 +672,162 @@ fn query_governance_params_defaults() {
 
     // FIX MED-NEW-15: No params stored -> returns error (not silent zero-address default).
     assert!(gov.get_governance_params().is_err());
+}
+
+// ============================================================================
+// Market listing id assignment (parity audit BUG 4b)
+// ============================================================================
+
+fn listing(market_id: u64, base: &str) -> ExecutionPayload {
+    ExecutionPayload::MarketListing {
+        market_id,
+        base_asset: base.into(),
+        quote_asset: "USDC".into(),
+        lot_size: FixedPoint::from_raw(10_000_000),
+        tick_size: FixedPoint::from_raw(1_000_000),
+        initial_margin: FixedPoint::from_raw(500_000_000),
+    }
+}
+
+/// Seed a raw market row the way genesis does (8-byte BE key).
+fn seed_market(db: &StateDb, market_id: u64) {
+    db.put_cf_raw(
+        CF_NATIVE_MARKETS,
+        &market_id.to_be_bytes(),
+        b"genesis-market",
+    )
+    .unwrap();
+}
+
+/// 8-byte market keys currently present in CF_NATIVE_MARKETS, ascending.
+fn market_ids(db: &StateDb) -> Vec<u64> {
+    db.iterate_cf(CF_NATIVE_MARKETS, None)
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| k.len() == 8)
+        .map(|(k, _)| u64::from_be_bytes(k[..8].try_into().unwrap()))
+        .collect()
+}
+
+/// Submit + vote yes at block 10 (voting ends 100, timelock 10).
+fn submit_and_pass(gov: &GovernanceManager, payload: ExecutionPayload) -> u64 {
+    let id = gov
+        .submit_proposal(addr(2), "List".into(), "D".into(), Some(payload), 0)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    id
+}
+
+#[test]
+fn two_auto_id_listings_get_distinct_ids() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    let p1 = submit_and_pass(&gov, listing(0, "ETH"));
+    let p2 = submit_and_pass(&gov, listing(0, "SOL"));
+
+    // Both finalize at 101, both execute in the same block after the timelock.
+    gov.process_pending_proposals(101).unwrap();
+    let outcomes = gov.process_pending_proposals(120).unwrap();
+    assert!(outcomes.contains(&ProposalOutcome::Executed(p1)));
+    assert!(outcomes.contains(&ProposalOutcome::Executed(p2)));
+
+    assert_eq!(
+        market_ids(gov.state()),
+        vec![1, 2],
+        "auto-assigned listings must not clobber each other (or key 0)"
+    );
+}
+
+#[test]
+fn auto_id_listing_after_genesis_markets_is_max_plus_one() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    for mid in 1..=4 {
+        seed_market(gov.state(), mid);
+    }
+    // Non-market metadata rows that share the CF must be ignored.
+    gov.state()
+        .put_cf_raw(CF_NATIVE_MARKETS, b"__book_mode__", &[1])
+        .unwrap();
+    gov.state()
+        .put_cf_raw(
+            CF_NATIVE_MARKETS,
+            b"__next_global_order_id__",
+            &u128::MAX.to_be_bytes(),
+        )
+        .unwrap();
+
+    let id = submit_and_pass(&gov, listing(0, "ARB"));
+    gov.finalize_proposal(id, 101).unwrap();
+    assert_eq!(
+        gov.execute_proposal(id, 120).unwrap(),
+        ProposalOutcome::Executed(id)
+    );
+
+    assert_eq!(market_ids(gov.state()), vec![1, 2, 3, 4, 5]);
+    let row = gov
+        .state()
+        .get_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes())
+        .unwrap()
+        .unwrap();
+    assert_ne!(row, b"genesis-market".to_vec());
+}
+
+#[test]
+fn explicit_listing_id_colliding_at_submit_is_rejected() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    seed_market(gov.state(), 3);
+
+    let err = gov
+        .submit_proposal(addr(2), "List".into(), "D".into(), Some(listing(3, "X")), 0)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("market id 3"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn explicit_listing_id_colliding_at_execution_is_rejected() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    let id = submit_and_pass(&gov, listing(7, "X"));
+    gov.finalize_proposal(id, 101).unwrap();
+    // Market 7 appears (e.g. another listing executed) during the timelock.
+    seed_market(gov.state(), 7);
+
+    let err = gov.execute_proposal(id, 120).unwrap_err();
+    assert!(
+        err.to_string().contains("market id 7"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        gov.state()
+            .get_cf_raw(CF_NATIVE_MARKETS, &7u64.to_be_bytes())
+            .unwrap()
+            .unwrap(),
+        b"genesis-market".to_vec(),
+        "existing market row must not be overwritten"
+    );
+}
+
+#[test]
+fn explicit_free_listing_id_is_honoured() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    seed_market(gov.state(), 1);
+
+    let id = submit_and_pass(&gov, listing(42, "X"));
+    gov.finalize_proposal(id, 101).unwrap();
+    gov.execute_proposal(id, 120).unwrap();
+    assert_eq!(market_ids(gov.state()), vec![1, 42]);
 }

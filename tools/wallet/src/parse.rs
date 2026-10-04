@@ -1,13 +1,17 @@
 //! Parsing helpers for CLI argument → native types.
 //!
-//! - `parse_trs_to_wei`: decimal TRS → U256 (18 decimals). Used for all TRS transfers/staking.
+//! - `parse_trs_to_wei`: decimal TRS → U256 (18 decimals). Used for EVM value
+//!   transfers (`send`) and staking.
+//! - `parse_trs_to_native_units`: decimal TRS → U256 carrying a raw 8-decimal
+//!   FixedPoint. Used for the native lockbox actions (TransferToPerp /
+//!   TransferToSpot / Withdraw), whose `amount` is in native units.
 //! - Decimal → `FixedPoint` (8 decimals, i128) is `str::parse::<FixedPoint>`
 //!   (torus-types). Used for trading prices/quantities and market parameters.
 //! - `parse_address`: hex string → 20-byte EVM address.
 //! - `parse_pubkey`: 64 hex chars → 32-byte `PublicKey`.
 
 use alloy_primitives::{Address, U256};
-use torus_types::PublicKey;
+use torus_types::{FixedPoint, PublicKey};
 
 pub(crate) fn parse_trs_to_wei(trs: &str) -> Result<U256, String> {
     let parts: Vec<&str> = trs.split('.').collect();
@@ -45,6 +49,17 @@ pub(crate) fn parse_address(s: &str) -> Result<Address, String> {
     Ok(Address::from_slice(&bytes))
 }
 
+/// Parse a non-negative decimal TRS amount into native lockbox-action units: a raw
+/// 8-decimal FixedPoint carried in a U256 (`"1"` → `100_000_000`). The node's lockbox
+/// moves `raw × 10^10` wei on the EVM side.
+pub(crate) fn parse_trs_to_native_units(trs: &str) -> Result<U256, String> {
+    let fp: FixedPoint = trs.parse().map_err(|e| format!("{e}"))?;
+    if fp.raw() < 0 {
+        return Err("amount must not be negative".into());
+    }
+    Ok(U256::from(fp.raw() as u128))
+}
+
 pub(crate) fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -59,7 +74,20 @@ pub(crate) fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use torus_types::FixedPoint;
+
+    #[test]
+    fn test_parse_trs_to_native_units() {
+        assert_eq!(
+            parse_trs_to_native_units("1").unwrap(),
+            U256::from(100_000_000u64)
+        );
+        assert_eq!(
+            parse_trs_to_native_units("0.00000001").unwrap(),
+            U256::from(1u64)
+        );
+        assert!(parse_trs_to_native_units("0.000000001").is_err());
+        assert!(parse_trs_to_native_units("-1").is_err());
+    }
 
     #[test]
     fn test_parse_trs_to_wei() {
