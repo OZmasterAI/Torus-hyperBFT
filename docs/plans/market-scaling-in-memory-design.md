@@ -54,6 +54,10 @@ re-check. Phases are numbered in build order everywhere: 1 -> 2 -> 3 -> 4 -> 5.
 - Memory: ~2.4 KB per light user, ~21 KB per active user, ~400 B per resting
   order. 1M mixed users is ~8 GB of state. 64 GB per validator is enough; the
   real limit is the total number of resting orders, not users.
+- Target (s91, owner): 300+ markets, 300 the minimum for testnet. Gates are measured at
+  300 and at 10 markets (`crab-speed-target-design.md` stage gates). Measured s91: at 10
+  markets C1 gives ~0 on the full node, as estimated above; the crab per-fill gap there
+  (~0.37x main) gets its own per-fill track next to Phase 1 (`item6-phase1-impl.md` 5.1).
 - 16 owner decisions are in the last section, each with a recommendation.
 
 ## 1. Current state, mapped

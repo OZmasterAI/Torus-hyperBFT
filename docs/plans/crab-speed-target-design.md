@@ -420,3 +420,12 @@ AGREE/PASS, a normal drain, and the differential tests passing.
 
 These are guidance, not automatic rules. After the Gate 1 measurements the owner reviews
 the results and decides whether to merge, and whether Gates 2 and 3 should change.
+
+**s91 update (owner, 2026-10-04): load shapes for the gates.** Goal: 300+ markets, 300 the
+minimum for testnet. Gates 2 and 3 are measured on two shapes, both against main with the
+oracle on for the stack: 300 markets uniform (main gate: the per-account cost item 6
+removes) and 10 markets (the per-fill cost; every fill pays it at any market count). Gate 2
+passes only if both reach >= 0.9x main. Verdicts are measured on ozarchy (bare metal) in
+paired alternating cells. Reason: at 10 markets crab + C1 runs ~0.37x main on the full node
+(64k vs ~174k matched/s, engine 16.6 vs ~6 ms per 1k fills) and C1's ubench gain does not
+show there; Phase 1 alone does not close that gap (`item6-phase1-impl.md` sections 1.1, 5.1).

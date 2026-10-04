@@ -1,6 +1,10 @@
 # Implementation Plan: item 6 Phase 1 (resident rows, margin sums, liquidation L1)
 
-Status: PLAN, nothing built. Written s89 (2026-10-04).
+Status: IN PROGRESS. Written s89 (2026-10-04). s91: C1 `81a9567`, C2 `ccdb59b`, sync point 2
+`d52a33f` (main 92a02ed with native anti-spam + oracle lane + oracle-signer exemption, built on
+ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load shapes
+(section 1.1, step 6), a per-fill track next to C3/C4 (section 5.1), 18c builds and ozarchy
+(bare metal) measures (section 3).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -45,6 +49,25 @@ slower per fill and nothing stopped it on the way. This plan is organised around
 3; run-to-run noise about +-10-15% (marks off: total 27.7, margin 7.1, match 8.0, settle
 9.1, tail 0.7; marks on + walk 10: 48.0, within noise). The earlier prelim column
 (76 total) was too high. Empty block: `ubench_epoch` `UB_DRAIN=fresh`, 4937 holders.
+
+### 1.1 Two load shapes (s91, owner)
+
+Goal: 300+ markets; 300 is the minimum for testnet. The budget above is the 300-market
+shape (many positions per market maker: the account cost Phase 1 targets). The 10-market
+shape (2-3 positions per trader: the per-fill cost) is measured as well, because every
+fill pays the per-fill cost at any market count, and once C3/C4 remove the account cost
+the per-fill cost dominates at 300 markets too.
+
+| measurement | 300 markets | 10 markets |
+|---|---|---|
+| ubench_econ on 18c, `d52a33f` (C2), marks on, R, ms per 1k fills | 34.1 (margin 5.45, match 7.21, settle 7.54, other exec 4.50, tail 9.38) | 8.9 (margin 2.64, match 1.44, settle 2.67, other exec 1.49, tail 0.59) |
+| same, without R (`UB_NO_R=1`) | see C1 (54.3 on the C1 binary) | 10.3 (tail 1.60) |
+| full node on ozarchy, crab `81a9567` (C1) vs main, oracle on for crab, cap 400 | (measure) | 64.2k vs ~174-185k matched/s (~0.37x); engine 16.6 vs ~6 ms per 1k fills; exec thread 96-99% busy |
+| full node, C1 vs pre-C1 `9c4be2c` | (measure) | 64.2k vs 62.1k (+3.3%, within ~5% resolution): C1's ubench gain does not show at 10 markets |
+
+At 10 markets the ubench engine (8.9) explains only about half of the full node's 16.6 ms
+per 1k fills (review log 16). Phase 1's targets (margin, match, tail) are ~4.7 of the 8.9,
+so C3/C4 cannot close the 10-market gap on their own: that is the per-fill track (5.1).
 
 ## 2. Design decisions in this plan
 
@@ -174,6 +197,10 @@ struct PosSums { upnl: FixedPoint, position_im: FixedPoint, notional: FixedPoint
 ## 3. Steps
 
 Each step: tests first (they fail before the change), then the change, then the gate.
+Who measures (s91, owner): 18c builds (code, tests, a sanity ubench); ozarchy (Ryzen 9
+5950X, 32 threads, bare metal; 18c is a KVM VPS with +-10-15% ubench noise) gives the gate
+verdicts, ubench and full node. The ubench baselines are re-measured on ozarchy once
+(9c4be2c, C1, C2; 300 and 10 markets); 18c numbers are not compared with ozarchy numbers.
 Commands: full suite `cargo test --workspace` (base `9c4be2c`: 2601 pass / 0 fail / 39 ignored; after
 Step 0: 2607 / 0 / 40);
 golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
@@ -287,8 +314,9 @@ margin 1308 / 264, match 2829 / 117, liquidation 1840 / 96 (positions / balances
   runs the native phase and the walk costs ~0.5 s per block in the bench shape (5k
   traders x ~249 positions), so execution cannot keep up with an idle chain (~13 empty
   blocks/s). Pass = the node drains with the feed live; record empty-block exec ms.
-- Gate 2 (crab doc): >= 0.9x main. Owner reviews; merge of crab + Phase 1 into main
-  follows (normal merge).
+- Gate 2 (crab doc, s91 update): >= 0.9x main on BOTH shapes: 300 markets uniform (main
+  gate) and 10 markets, oracle on for crab, paired alternating cells on ozarchy. Owner
+  reviews; merge of crab + Phase 1 into main follows (normal merge).
 
 ## 4. Commit plan
 
@@ -304,6 +332,17 @@ and golden green, ubench numbers in the commit message.
 | O2 | tail misses AND dirty builds (traders touched this block) are the cause | partial re-value: sums − terms of the trader's touched markets + terms of its pending rows (needs O1) |
 | O3 | settle or margin shows R point lookups | hash index over R's entries |
 | L2 | tail > 1.0 ms/1k after O1/O2 (owner Q2) | healthy certificates (crab doc 2.3, P4) |
+
+### 5.1 Per-fill track (s91, owner; not optional)
+
+Closes the 10-market gap (section 1.1) for Gate 2's second shape. Scope comes from the
+ozarchy exec-thread profile at 10 markets, crab `d52a33f` vs main `92a02ed`
+(`~/bench-results-matched/ozarchy-prof10-*`): which buckets make up crab's extra ~10 ms
+per 1k fills, and what of the node path the ubench does not cover (~8 ms per 1k fills).
+Built on ozarchy on its own branch from the `perf/item6-phase1` tip, merged in after each
+finished step (method A); it names the files it touches first, because a fix in
+`native_executor.rs` overlaps C3/C4. Steps, tests and gates: added here once the profile
+is in.
 
 ## 6. Rollback
 
@@ -341,3 +380,4 @@ reviews it.
 | 13 | C2 / version | plan says "increments" | process-wide counter OK? | one counter: always up, never reused (also across a slot rebuild), may skip numbers | `ccdb59b` |
 | 14 | C2 / plumbing | not in the plan | accept `ctx.attach_resident_block` / `detach_resident_block` at each call site? | wired at 5 sites (app.rs, golden, ubench_econ, ubench_epoch, storage_reads); C3 reuses them for the sums cache | `ccdb59b` |
 | 15 | C2 / no oracle step | contexts that never run `begin_block_oracle` (criterion benches, many unit tests) have no table | none | they read the oracle per mark (same results, slower than the old per-batch memo); the node always runs it (`app.rs:2250`) | `ccdb59b` |
+| 16 | s91 / ubench vs full node | 10 markets: ubench engine 8.9 vs full node 16.6 ms per 1k fills (ozarchy); C1 +35% in the ubench, ~0 on the full node | Gate 2 on which shapes? | owner: both shapes, 300 markets main gate, both >= 0.9x; per-fill track 5.1 from the ozarchy profile; ozarchy measures | docs |
