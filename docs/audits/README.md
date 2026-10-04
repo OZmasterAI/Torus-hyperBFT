@@ -77,6 +77,7 @@ corrections; a repeated finding is not another defect.
 | 45 | [Round-robin liquidation cursor boundary](chain-5c756ff-pass45-liquidation-cursor-round-robin-2026-10-04.md) |
 | 46 | [ADL candidate scan window and progress](chain-5c756ff-pass46-adl-candidate-scan-progress-2026-10-04.md) |
 | 47 | [ADL candidate ranking total-order determinism](chain-5c756ff-pass47-adl-ranking-total-order-2026-10-04.md) |
+| 48 | [ADL bankruptcy price rounding](chain-5c756ff-pass48-adl-bankruptcy-price-rounding-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
