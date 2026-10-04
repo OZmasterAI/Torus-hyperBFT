@@ -4,8 +4,10 @@
 //! using jsonrpsee 0.26 with WebSocket subscription support.
 
 pub mod addr_rate;
+mod bounded_map;
 pub mod error;
 pub mod eth;
+pub mod ip_limit;
 pub mod net;
 pub mod streams;
 pub mod torus;
@@ -287,6 +289,11 @@ pub struct RpcState {
 /// JSON-RPC server combining eth, net, and web3 namespaces.
 pub struct RpcServer {
     state: RpcState,
+    /// Anti-spam item D: per-IP weight limit (`None` = off, the library
+    /// default; `torus-node` installs it from the env).
+    ip_limiter: Option<Arc<ip_limit::IpLimiter>>,
+    /// Per-WebSocket-connection subscription cap (jsonrpsee enforces it).
+    max_subs_per_conn: u32,
 }
 
 impl RpcServer {
@@ -322,7 +329,20 @@ impl RpcServer {
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
                 addr_limiter: None,
             },
+            ip_limiter: None,
+            max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
         }
+    }
+
+    /// Install the per-IP weight limit (anti-spam item D).
+    pub fn set_ip_limiter(&mut self, limiter: Arc<ip_limit::IpLimiter>) {
+        self.ip_limiter = Some(limiter);
+    }
+
+    /// Cap subscriptions per WebSocket connection (default
+    /// [`ip_limit::DEFAULT_MAX_SUBS_PER_CONN`]).
+    pub fn set_max_subscriptions_per_connection(&mut self, max: u32) {
+        self.max_subs_per_conn = max.max(1);
     }
 
     /// Install the per-address native request limit (anti-spam item B).
@@ -383,14 +403,29 @@ impl RpcServer {
     }
 
     /// Start the RPC server on the given address.
+    ///
+    /// Item D: the accept loop is ours (jsonrpsee's `to_service_builder`
+    /// pattern) rather than `Server::start`, because jsonrpsee 0.26 never
+    /// exposes the peer address to RPC middleware. Each accepted connection's
+    /// HTTP requests get a [`ip_limit::PeerIp`] extension, which jsonrpsee
+    /// copies into every JSON-RPC request (HTTP and WebSocket) for
+    /// [`IpLimitMiddleware`]. Connection limit, stop handle and graceful
+    /// shutdown behave as before.
     pub async fn start(
         self,
         addr: SocketAddr,
     ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-        let layer = MetricsLayer {
-            metrics: self.state.metrics.clone(),
-        };
-        let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
+        let metrics = self.state.metrics.clone();
+        // Metrics outermost, so refused calls still show in
+        // torus_rpc_requests_total{status="error"}.
+        let rpc_middleware = rpc_mw::RpcServiceBuilder::new()
+            .layer(MetricsLayer {
+                metrics: metrics.clone(),
+            })
+            .layer(IpLimitLayer {
+                limiter: self.ip_limiter.clone(),
+                metrics,
+            });
         // #40/#41: response-size and connection caps are env-configurable
         // (defaults 10 MiB / 512 connections).
         let max_response_bytes =
@@ -400,19 +435,51 @@ impl RpcServer {
         let server_cfg = jsonrpsee::server::ServerConfig::builder()
             .max_connections(max_connections)
             .max_response_body_size(max_response_bytes)
+            .max_subscriptions_per_connection(self.max_subs_per_conn)
             .build();
-        let server = ServerBuilder::with_config(server_cfg)
+        let svc_builder = ServerBuilder::with_config(server_cfg)
             .set_rpc_middleware(rpc_middleware)
-            .build(addr)
-            .await?;
-        let local_addr = server.local_addr()?;
+            .to_service_builder();
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
         let mut module = jsonrpsee::RpcModule::new(());
         module.merge(EthApiServer::into_rpc(self.state.clone()))?;
         module.merge(NetApiServer::into_rpc(self.state.clone()))?;
         module.merge(Web3ApiServer::into_rpc(self.state.clone()))?;
         module.merge(TorusApiServer::into_rpc(self.state.clone()))?;
-        let handle = server.start(module);
-        Ok((handle, local_addr))
+        let methods: jsonrpsee::Methods = module.into();
+        let (stop_handle, server_handle) = jsonrpsee::server::stop_channel();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, remote) = tokio::select! {
+                    res = listener.accept() => match res {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "rpc accept failed");
+                            continue;
+                        }
+                    },
+                    _ = stop_handle.clone().shutdown() => break,
+                };
+                let _ = socket.set_nodelay(true);
+                let svc = WithPeerIp {
+                    inner: svc_builder
+                        .clone()
+                        .build(methods.clone(), stop_handle.clone()),
+                    peer: ip_limit::PeerIp(remote.ip()),
+                };
+                let stopped = stop_handle.clone().shutdown();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        jsonrpsee::server::serve_with_graceful_shutdown(socket, svc, stopped).await
+                    {
+                        tracing::debug!(error = %e, "rpc connection ended with error");
+                    }
+                });
+            }
+        });
+        Ok((server_handle, local_addr))
     }
 
     /// Get a reference to the RPC state.
@@ -493,6 +560,160 @@ where
         batch: rpc_mw::Batch<'a>,
     ) -> impl std::future::Future<Output = Self::BatchResponse> + Send + 'a {
         self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: rpc_mw::Notification<'a>,
+    ) -> impl std::future::Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anti-spam item D: per-IP weight limit
+// ---------------------------------------------------------------------------
+
+/// Tags every HTTP request of one connection with its peer IP.
+#[derive(Clone)]
+struct WithPeerIp<S> {
+    inner: S,
+    peer: ip_limit::PeerIp,
+}
+
+impl<S, B> tower::Service<jsonrpsee::server::HttpRequest<B>> for WithPeerIp<S>
+where
+    S: tower::Service<jsonrpsee::server::HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: jsonrpsee::server::HttpRequest<B>) -> Self::Future {
+        req.extensions_mut().insert(self.peer);
+        self.inner.call(req)
+    }
+}
+
+#[derive(Clone)]
+struct IpLimitLayer {
+    limiter: Option<Arc<ip_limit::IpLimiter>>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S> tower::Layer<S> for IpLimitLayer {
+    type Service = IpLimitMiddleware<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        IpLimitMiddleware {
+            inner,
+            limiter: self.limiter.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Charges each call (or a whole JSON-RPC batch) its
+/// [`ip_limit::method_weight`] against the caller's IP bucket.
+#[derive(Clone)]
+struct IpLimitMiddleware<S> {
+    inner: S,
+    limiter: Option<Arc<ip_limit::IpLimiter>>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S> IpLimitMiddleware<S> {
+    /// True when the call must be refused (and counts it).
+    fn refuse(&self, ext: &jsonrpsee::Extensions, weight: u32, kind: &str) -> bool {
+        let (Some(limiter), Some(peer)) = (&self.limiter, ext.get::<ip_limit::PeerIp>()) else {
+            return false;
+        };
+        if limiter.check(peer.0, weight, Instant::now()) {
+            return false;
+        }
+        if let Some(ref m) = self.metrics {
+            m.rpc_ip_rejects
+                .get_or_create(&vec![("kind".into(), kind.into())])
+                .inc();
+        }
+        true
+    }
+
+    fn refusal(&self) -> jsonrpsee::types::ErrorObjectOwned {
+        let per_min = self.limiter.as_ref().map_or(0, |l| l.weight_per_min());
+        jsonrpsee::types::ErrorObjectOwned::owned(
+            ip_limit::RATE_LIMITED_CODE,
+            format!("rate limited: IP request weight over {per_min}/min, retry later"),
+            None::<()>,
+        )
+    }
+}
+
+impl<S> RpcServiceT for IpLimitMiddleware<S>
+where
+    S: RpcServiceT<
+            MethodResponse = rpc_mw::MethodResponse,
+            BatchResponse = rpc_mw::MethodResponse,
+            NotificationResponse = rpc_mw::MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type MethodResponse = rpc_mw::MethodResponse;
+    type BatchResponse = rpc_mw::MethodResponse;
+    type NotificationResponse = rpc_mw::MethodResponse;
+
+    fn call<'a>(
+        &self,
+        request: rpc_mw::Request<'a>,
+    ) -> impl std::future::Future<Output = Self::MethodResponse> + Send + 'a {
+        let weight = ip_limit::method_weight(request.method_name(), request.params().as_str());
+        let refused = self
+            .refuse(request.extensions(), weight, "call")
+            .then(|| self.refusal());
+        let inner = self.inner.clone();
+        async move {
+            match refused {
+                Some(err) => rpc_mw::MethodResponse::error(request.id(), err),
+                None => inner.call(request).await,
+            }
+        }
+    }
+
+    fn batch<'a>(
+        &self,
+        mut batch: rpc_mw::Batch<'a>,
+    ) -> impl std::future::Future<Output = Self::BatchResponse> + Send + 'a {
+        // jsonrpsee runs a batch's calls below this layer, so charge the
+        // whole batch here and refuse it whole (one error per call).
+        let weight: u32 = batch
+            .iter()
+            .flatten()
+            .map(|e| ip_limit::method_weight(e.method_name(), e.params().map(|p| p.get())))
+            .sum();
+        let refused = self
+            .refuse(batch.extensions(), weight, "batch")
+            .then(|| self.refusal());
+        let inner = self.inner.clone();
+        async move {
+            let Some(err) = refused else {
+                return inner.batch(batch).await;
+            };
+            let mut out = jsonrpsee::server::BatchResponseBuilder::new_with_limit(usize::MAX);
+            for entry in batch.into_iter().flatten() {
+                if let rpc_mw::BatchEntry::Call(req) = entry {
+                    let _ = out.append(rpc_mw::MethodResponse::error(req.id(), err.clone()));
+                }
+            }
+            rpc_mw::MethodResponse::from_batch(out.finish())
+        }
     }
 
     fn notification<'a>(
@@ -1784,6 +2005,153 @@ mod tests {
             text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="addr_rate_limited"} 2"#),
             "{text}"
         );
+        handle.stop().unwrap();
+    }
+
+    async fn start_with(server: RpcServer) -> (ServerHandle, SocketAddr) {
+        server.start("127.0.0.1:0".parse().unwrap()).await.unwrap()
+    }
+
+    /// Anti-spam item D: the peer IP reaches the RPC middleware, calls are
+    /// charged their weight, and an exhausted IP gets -32005 on single calls
+    /// and on a JSON-RPC batch (refused whole); refusals are counted.
+    #[tokio::test]
+    async fn ip_weight_limit_refuses_over_budget() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        // 10 weight per minute and NO exemptions: the test client is loopback.
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(10, Vec::new(), 100)));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        for i in 0..5 {
+            let r: Result<String, _> = client
+                .request("eth_chainId", jsonrpsee::rpc_params![])
+                .await;
+            assert!(r.is_ok(), "call {i}: {r:?}");
+        }
+        let err = client
+            .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
+            .await
+            .expect_err("6th cheap read is over 10/min");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limited") && msg.contains("-32005"),
+            "{msg}"
+        );
+
+        let mut batch = jsonrpsee::core::params::BatchRequestBuilder::new();
+        batch
+            .insert("eth_chainId", jsonrpsee::rpc_params![])
+            .unwrap();
+        batch
+            .insert("eth_blockNumber", jsonrpsee::rpc_params![])
+            .unwrap();
+        let b = client.batch_request::<String>(batch).await;
+        let refused = match &b {
+            Err(e) => e.to_string().contains("rate limited"),
+            Ok(resp) => resp.num_failed_calls() == 2,
+        };
+        assert!(refused, "batch must be refused: {b:?}");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="batch"} 1"#),
+            "{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Item D default: loopback is exempt, so local tooling is never limited.
+    #[tokio::test]
+    async fn ip_limit_default_exempts_loopback() {
+        let (_dir, state, mempool, executor) = setup();
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(
+            10,
+            ip_limit::parse_exempt(None).0,
+            100,
+        )));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        for _ in 0..50 {
+            let _: String = client
+                .request("eth_chainId", jsonrpsee::rpc_params![])
+                .await
+                .unwrap();
+        }
+        handle.stop().unwrap();
+    }
+
+    /// Item D: subscriptions are capped per WebSocket connection.
+    #[tokio::test]
+    async fn ws_subscriptions_capped_per_connection() {
+        use jsonrpsee::core::client::SubscriptionClientT;
+        let (_dir, state, mempool, executor) = setup();
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_max_subscriptions_per_connection(2);
+        let (handle, addr) = start_with(server).await;
+        let ws = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        async fn sub(
+            c: &jsonrpsee::ws_client::WsClient,
+        ) -> Result<
+            jsonrpsee::core::client::Subscription<serde_json::Value>,
+            jsonrpsee::core::ClientError,
+        > {
+            c.subscribe(
+                "torus_subscribe",
+                jsonrpsee::rpc_params!["newTrades"],
+                "torus_unsubscribe",
+            )
+            .await
+        }
+        let _a = sub(&ws).await.unwrap();
+        let _b = sub(&ws).await.unwrap();
+        assert!(
+            sub(&ws).await.is_err(),
+            "third subscription on one connection"
+        );
+        // A second connection has its own cap.
+        let ws2 = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let _c = sub(&ws2).await.unwrap();
         handle.stop().unwrap();
     }
 

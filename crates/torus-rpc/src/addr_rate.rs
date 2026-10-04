@@ -21,17 +21,17 @@
 //! makes the limit briefly stricter. The volume is read only when the buffer
 //! alone does not cover the request, so most requests cost no DB read.
 //!
-//! Memory is bounded by `max_addresses` with two generations: lookups hit
-//! `current`, then `previous` (moving the entry up); when `current` holds
-//! half the bound, `previous` is dropped and `current` becomes `previous`.
-//! An address idle for a whole generation is forgotten (it comes back with
+//! Memory is bounded by `max_addresses` ([`crate::bounded_map::TwoGen`]):
+//! an address idle for a whole generation is forgotten (it comes back with
 //! a fresh buffer — the same as a new funded key, which item A prices at
 //! 1 TRS). 200_000 addresses at ~100 B per entry is ~20 MB.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use alloy_primitives::Address;
+
+use crate::bounded_map::TwoGen;
 
 /// Default free requests per address (HL: 10_000).
 pub const DEFAULT_BUFFER: u64 = 10_000;
@@ -81,39 +81,11 @@ struct Entry {
     last_ok_ms: u64,
 }
 
-struct Generations {
-    current: HashMap<Address, Entry>,
-    previous: HashMap<Address, Entry>,
-}
-
-impl Generations {
-    fn used(&self, addr: &Address) -> u64 {
-        self.current
-            .get(addr)
-            .or_else(|| self.previous.get(addr))
-            .map_or(0, |e| e.used)
-    }
-
-    /// The entry for `addr` in `current` (moved up from `previous`, or new),
-    /// rotating generations first when `current` holds `half` entries.
-    fn entry(&mut self, addr: &Address, half: usize) -> &mut Entry {
-        if !self.current.contains_key(addr) {
-            let e = self.previous.remove(addr).unwrap_or_default();
-            if self.current.len() >= half {
-                self.previous = std::mem::take(&mut self.current);
-            }
-            self.current.insert(*addr, e);
-        }
-        self.current.get_mut(addr).expect("just inserted")
-    }
-}
-
 /// The per-address limiter. Cheap to share behind an `Arc`.
 pub struct AddrRateLimiter {
     buffer: u64,
     exempt: HashSet<Address>,
-    max_addresses: usize,
-    gens: Mutex<Generations>,
+    entries: Mutex<TwoGen<Address, Entry>>,
 }
 
 impl AddrRateLimiter {
@@ -121,11 +93,7 @@ impl AddrRateLimiter {
         Self {
             buffer,
             exempt,
-            max_addresses: max_addresses.max(2),
-            gens: Mutex::new(Generations {
-                current: HashMap::new(),
-                previous: HashMap::new(),
-            }),
+            entries: Mutex::new(TwoGen::new(max_addresses)),
         }
     }
 
@@ -156,7 +124,12 @@ impl AddrRateLimiter {
         // not cover the request, and never under the lock. Two concurrent
         // requests of one address can both pass on the same snapshot — a
         // bounded overshoot, fine for an anti-spam rule.
-        let used = self.gens.lock().unwrap().used(sender);
+        let used = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(sender)
+            .map_or(0, |e| e.used);
         let allowance = if used.saturating_add(weight) <= cap(self.buffer) {
             self.buffer
         } else {
@@ -164,8 +137,8 @@ impl AddrRateLimiter {
         };
         let limit = cap(allowance);
 
-        let mut gens = self.gens.lock().unwrap();
-        let e = gens.entry(sender, self.max_addresses / 2);
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries.entry_with(*sender, Entry::default);
         let within = e.used.saturating_add(weight) <= limit;
         // Exhausted: one action per EXHAUSTED_INTERVAL_MS since the last
         // admitted one (any weight).
@@ -189,8 +162,7 @@ impl AddrRateLimiter {
 
     /// Number of tracked addresses (both generations).
     pub fn tracked(&self) -> usize {
-        let g = self.gens.lock().unwrap();
-        g.current.len() + g.previous.len()
+        self.entries.lock().unwrap().len()
     }
 }
 

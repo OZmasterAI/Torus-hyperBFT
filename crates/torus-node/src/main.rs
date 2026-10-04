@@ -1020,6 +1020,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "native ingress anti-spam: per-address request limit OFF (TORUS_ADDR_RATE_LIMIT=0)"
         ),
     }
+    // Anti-spam item D: per-IP weight limit (TORUS_RPC_IP_WEIGHT_PER_MIN,
+    // default 1200, 0 = off; TORUS_RPC_IP_EXEMPT CIDRs, unset = loopback only)
+    // and the per-WebSocket-connection subscription cap.
+    let (ip_limiter, bad_cidrs) = torus_rpc::ip_limit::from_env();
+    for entry in &bad_cidrs {
+        warn!(%entry, "TORUS_RPC_IP_EXEMPT: not an IP or CIDR, ignored");
+    }
+    match ip_limiter {
+        Some(limiter) => {
+            info!(
+                weight_per_min = limiter.weight_per_min(),
+                exempt = ?limiter.exempt(),
+                "rpc anti-spam: per-IP weight limit (TORUS_RPC_IP_WEIGHT_PER_MIN / TORUS_RPC_IP_EXEMPT)"
+            );
+            rpc_server.set_ip_limiter(Arc::new(limiter));
+        }
+        None => info!("rpc anti-spam: per-IP weight limit OFF (TORUS_RPC_IP_WEIGHT_PER_MIN=0)"),
+    }
+    let max_subs_per_conn = torus_rpc::ip_limit::parse_max_subs_per_conn(
+        std::env::var("TORUS_RPC_MAX_SUBS_PER_CONN").ok(),
+    );
+    info!(
+        max_subs_per_conn,
+        "rpc: WebSocket subscriptions per connection (TORUS_RPC_MAX_SUBS_PER_CONN)"
+    );
+    rpc_server.set_max_subscriptions_per_connection(max_subs_per_conn);
 
     // Leader forwarding: RPC → network bridge
     let own_vk = verifying_key.to_bytes();
