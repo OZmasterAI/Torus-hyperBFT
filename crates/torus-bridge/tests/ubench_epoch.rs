@@ -18,13 +18,20 @@
 //!   stale: load fed, then block time jumps past the 60 s mark age (the s89 cell drain)
 //!   fresh: the feed keeps submitting every UB_FEED_EVERY blocks during the drain
 //!   none : never fed (no marks, the oracle-off cell)
+//! UB_MARK_WALK=<bp> (item 6 step 0.5): each feed round moves every market's
+//! submitted mark `±bp` around the mid (`common/econ_load.rs` `MarkWalk`);
+//! default 0 = the mid every round, as before.
 //! UB_SEED_TRADERS>0 replaces the econ load with directly written positions
 //! (UB_SEED_POS per trader) for scaling runs. Sizes: UB_SENDERS (5000),
 //! UB_MARKETS (300), UB_ACTIONS (60), UB_LOAD (150), UB_DRAIN_TO (420).
 //!
 //!   cargo test -p torus-bridge --release --test ubench_epoch -- --ignored --nocapture
 
+#[path = "common/econ_load.rs"]
+mod econ_load;
+
 use alloy_primitives::{Address, U256};
+use econ_load::MarkWalk;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -153,9 +160,11 @@ impl Chain {
     }
 }
 
-fn submit_all(ctx: &NativeExecContext<NativeStateOverlay>, markets: u64) {
-    let mark = FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE);
+fn submit_all(ctx: &NativeExecContext<NativeStateOverlay>, markets: u64, walk: &mut MarkWalk) {
+    let base = FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE);
+    walk.step();
     for m in 1..=markets {
+        let mark = walk.mark(base, m);
         for n in REPORTERS {
             ctx.oracle.submit_price(&special(n), m, mark, ctx.block_height, ctx.timestamp).unwrap();
         }
@@ -220,6 +229,7 @@ fn run() {
     let seed_pos = env("UB_SEED_POS", 250);
     let mode = std::env::var("UB_DRAIN").unwrap_or_else(|_| "stale".into());
     let fed = mode != "none";
+    let mut walk = MarkWalk::new(markets, env("UB_MARK_WALK", 0));
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -256,7 +266,7 @@ fn run() {
         let ov = NativeStateOverlay::with_parent(db.clone(), None);
         let mut ctx = chain.ctx(&ov, 1, ts);
         if fed {
-            submit_all(&ctx, markets);
+            submit_all(&ctx, markets, &mut walk);
         }
         let _ = NativeExecutor::begin_block_oracle(&mut ctx);
         chain.finish(ctx, ov, 1);
@@ -308,7 +318,7 @@ fn run() {
             let ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
             let mut ctx = chain.ctx(&ov, h, ts);
             if fed && h % env("UB_LOAD_FEED_EVERY", 8) == 1 % env("UB_LOAD_FEED_EVERY", 8) {
-                submit_all(&ctx, markets);
+                submit_all(&ctx, markets, &mut walk);
             }
             let _ = NativeExecutor::begin_block_oracle(&mut ctx);
             NativeExecutor::execute_batch(&mut ctx, &block);
@@ -360,7 +370,7 @@ fn run() {
         let mut ctx = chain.ctx(&ov, h, ts);
         let ctx_ms = ms(t);
         if feed_now {
-            submit_all(&ctx, markets);
+            submit_all(&ctx, markets, &mut walk);
         }
         // begin_block_oracle, split (same calls in the same order as oracle_inputs +
         // aggregate_oracle_prices)

@@ -9,138 +9,23 @@
 //! submit the mid (`TARGET * LEV`) for every market each block, so
 //! `begin_block_oracle` aggregates a usable mark (a fed chain: margin and the
 //! liquidation scan value accounts). Default: no listed market, no marks.
+//! `UB_MARK_WALK=<bp>` (with `UB_MARKS=1`, item 6 step 0.5): the submitted
+//! mark of every market walks `±bp` per block around the mid (bounded, mean-
+//! reverting, deterministic: `common/econ_load.rs` `MarkWalk`), so the mark
+//! changes every block. Default 0: the mid every block, as before.
 //!
 //!   cargo test -p torus-bridge --release --test ubench_econ -- --ignored --nocapture
 
-use alloy_primitives::{Address, U256};
+#[path = "common/econ_load.rs"]
+mod econ_load;
+
+use econ_load::{base_mark, env, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
 use std::collections::HashMap;
 use std::sync::Arc;
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::position::NativeBalance;
-use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
-use torus_state::cf::CF_NATIVE_MARKETS;
 use torus_state::{NativeStateOverlay, StateDb};
-use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
-
-fn env(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
-
-fn sender(i: u64) -> Address {
-    let mut b = [0xA7u8; 20];
-    b[12..20].copy_from_slice(&(i + 1).to_be_bytes());
-    Address::new(b)
-}
-
-fn special(n: u8) -> Address {
-    Address::new([n; 20])
-}
-
-struct Lcg(u64);
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0 >> 11
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn chance(&mut self, p_milli: u64) -> bool {
-        self.below(1000) < p_milli
-    }
-}
-
-const TARGET: i128 = 1500;
-const LEV: i128 = 20;
-const BAND: u64 = 5;
-const REPORTERS: [u8; 3] = [150, 151, 152];
-
-/// `UB_MARKS=1`: three Active validators and markets `1..=markets` listed.
-fn feed_setup(db: &StateDb, markets: u64) {
-    for n in REPORTERS {
-        StakingManager::new(db.clone())
-            .put_validator(
-                &special(n),
-                &ValidatorState {
-                    address: special(n),
-                    pubkey: [n; 32],
-                    commission_bps: 0,
-                    self_stake: MIN_SELF_DELEGATION,
-                    total_delegated: U256::ZERO,
-                    status: ValidatorStatus::Active,
-                    jailed_until: None,
-                    last_commission_change_block: None,
-                    oracle_signer: None,
-                },
-            )
-            .unwrap();
-    }
-    for m in 1..=markets {
-        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
-    }
-}
-
-fn econ_order(rng: &mut Lcg, s: u64, market_id: u64) -> PlaceOrderParams {
-    let is_buy = s.wrapping_add(market_id).is_multiple_of(2);
-    let aggressive = rng.chance(500);
-    let d = 1 + rng.below(BAND) as i128;
-    let mid = TARGET * LEV;
-    let units = if is_buy == aggressive { mid + d } else { mid - d };
-    let price = FixedPoint::from_raw(units * FixedPoint::SCALE);
-    let target = FixedPoint::from_raw(TARGET * FixedPoint::SCALE);
-    let lev = FixedPoint::from_raw(LEV * FixedPoint::SCALE);
-    let mut quantity = target * lev / price;
-    if quantity < FixedPoint::ONE {
-        quantity = FixedPoint::ONE;
-    }
-    PlaceOrderParams {
-        market_id,
-        is_buy,
-        price,
-        quantity,
-        order_type: OrderType::Limit,
-        time_in_force: TimeInForce::GTC,
-        reduce_only: false,
-        client_order_id: None,
-    }
-}
-
-struct Gen {
-    rng: Lcg,
-    senders: u64,
-    markets: u64,
-    batch: u64,
-    budget: u64,
-    open: HashMap<u64, u64>,
-}
-
-impl Gen {
-    fn block(&mut self, actions: u64) -> Vec<(Address, NativeAction)> {
-        let mut out = Vec::with_capacity(actions as usize);
-        for _ in 0..actions {
-            let s = self.rng.below(self.senders);
-            let open = self.open.entry(s).or_insert(0);
-            let a = if *open + self.batch > self.budget || self.rng.chance(50) {
-                *open = 0;
-                NativeAction::CancelAllOrders { market_id: None }
-            } else {
-                *open += self.batch;
-                let orders = (0..self.batch)
-                    .map(|_| {
-                        let m = 1 + self.rng.below(self.markets);
-                        econ_order(&mut self.rng, s, m)
-                    })
-                    .collect();
-                NativeAction::PlaceOrderBatch(orders)
-            };
-            out.push((sender(s), a));
-        }
-        out
-    }
-}
+use torus_types::FixedPoint;
 
 struct Sample {
     exec_ms: f64,
@@ -158,6 +43,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
     let warm = env("UB_WARM", 40);
     let measure = env("UB_MEASURE", 6);
     let fed = env("UB_MARKS", 0) == 1;
+    let mut walk = MarkWalk::new(markets, env("UB_MARK_WALK", 0));
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -214,8 +100,9 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64) {
         ctx.metrics = Some(metrics.clone());
         if fed {
             // Before the timed block start, stamped with this block (s85 feeder M1b).
-            let mark = FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE);
+            walk.step();
             for m in 1..=markets {
+                let mark = walk.mark(base_mark(), m);
                 for n in REPORTERS {
                     ctx.oracle.submit_price(&special(n), m, mark, ctx.block_height, ctx.timestamp).unwrap();
                 }
@@ -300,5 +187,39 @@ fn ubench_econ() {
         );
         per_run.push(per1k);
     }
-    println!("UB marks={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}", env("UB_MARKS", 0) == 1, median(per_run.clone()), per_run);
+    println!(
+        "UB marks={} walk_bp={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
+        env("UB_MARKS", 0) == 1,
+        env("UB_MARK_WALK", 0),
+        median(per_run.clone()),
+        per_run
+    );
+}
+
+/// `UB_MARK_WALK`: 0 bp submits the mid every block (the bench as before);
+/// 10 bp moves every market by exactly 10 bp a block, inside ±80 bp, on the
+/// offsets `bench-throughput oracle-feed --walk-bp 10` pins
+/// (`walk_offsets_are_pinned` in tools/bench-throughput/src/oracle_feed.rs).
+#[test]
+fn mark_walk_zero_is_the_mid_and_offsets_are_pinned() {
+    let mut still = MarkWalk::new(300, 0);
+    let mut walk = MarkWalk::new(300, 10);
+    let base = base_mark();
+    let mut market_1 = Vec::new();
+    let mut prev = vec![0i64; 301];
+    for block in 0..2_000 {
+        still.step();
+        walk.step();
+        for m in 1..=300 {
+            assert_eq!(still.mark(base, m), base, "block {block} market {m}");
+            let x = walk.offset_bp(m);
+            assert!(x.abs() <= 80 && (x - prev[m as usize]).abs() == 10, "block {block} market {m}: {x}");
+            prev[m as usize] = x;
+            assert_eq!(walk.mark(base, m).raw(), base.raw() * i128::from(10_000 + x) / 10_000);
+        }
+        if block < 12 {
+            market_1.push(walk.offset_bp(1));
+        }
+    }
+    assert_eq!(market_1, [10, 0, -10, -20, -30, -20, -10, 0, -10, -20, -10, 0]);
 }
