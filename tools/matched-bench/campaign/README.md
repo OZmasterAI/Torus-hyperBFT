@@ -207,6 +207,9 @@ market every `ORACLE_INTERVAL_MS` (default 2000, must be < 10000), with the keys
 fresh mark (90 s, else the cell fails); the feed is paused for the drain and the
 state digest, then stopped. Results: `oracle-feed.log`, `oracle-feed-stats.json`,
 `oracle-marks-*.json`, `summary.json .oracle_feed`. Details: `../run-cell.sh` header.
+`ORACLE_WALK_BP=N` (default 0, item 6) moves every market's price N bp per feed round
+around `ORACLE_PRICE` (bounded at ±8N bp; `oracle-feed --walk-bp`), so the marks
+change during the cell; N > 0 needs an arm whose `bench-throughput` has `--walk-bp`.
 
 Requirements:
 - The arm's `bench-throughput` must have the `oracle-feed` subcommand. main does
