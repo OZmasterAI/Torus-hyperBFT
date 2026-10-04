@@ -104,6 +104,7 @@ corrections; a repeated finding is not another defect.
 | 72 | [Community pool existence and routing](chain-5c756ff-pass72-community-pool-implementation-2026-10-04.md) |
 | 73 | [Fee rewards when proposer lacks a validator record](chain-5c756ff-pass73-fee-proposer-fallback-2026-10-04.md) |
 | 74 | [Treasury spend recipient balance arithmetic](chain-5c756ff-pass74-treasury-spend-recipient-overflow-2026-10-04.md) |
+| 75 | [Developer gas tracking epoch reset](chain-5c756ff-pass75-dev-pool-epoch-reset-wiring-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
