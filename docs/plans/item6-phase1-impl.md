@@ -8,8 +8,13 @@ ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load 
 `same_batch_bid_top_ups` (section 5.1, step PF1, built on ozarchy in parallel with C3).
 C3 `424d030` (pushed): correct, Gate 3 missed on 18c's sanity numbers (review log 18,
 owner review). C4 `62af701`: correct, Gate 4 met at 10 markets, missed at 300 (review log
-23). PF1 merged: `perf/item6-phase1` @ `0a25560` = C3 + C4 + PF1 (suite 2701 / 0 / 39),
-pushed; verdicts and the 300-market profile from ozarchy pending.
+23). PF1 merged: `perf/item6-phase1` @ `0a25560` = C3 + C4 + PF1 (suite 2701 / 0 / 39).
+Liquidation cooldown parity fix `2d03111` (whole position during the 30 s cooldown; X/A
+reading pending HL evidence, review log 28); tip `14236fa`, pushed. Ozarchy 300-market
+profile (C3 + PF1): 0.555x main; the cost is per-account position reads (section 1.1).
+**Remaining order (s91): C6 (B0 + A-lite + D) -> C7 (per-trader positions in memory)
+-> E1-E4 (empty block) -> C5 (warm == cold, last, so it covers C7's state) -> Gate 2**
+(section 5.2). Ubench gates are ratios to the base on the same machine (section 1.2).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -69,6 +74,7 @@ the per-fill cost dominates at 300 markets too.
 | same, without R (`UB_NO_R=1`) | see C1 (54.3 on the C1 binary) | 10.3 (tail 1.60) |
 | full node on ozarchy, crab `81a9567` (C1) vs main, oracle on for crab, cap 400 | (measure) | 64.2k vs ~174-185k matched/s (~0.37x); engine 16.6 vs ~6 ms per 1k fills; exec thread 96-99% busy |
 | full node, C1 vs pre-C1 `9c4be2c` | (measure) | 64.2k vs 62.1k (+3.3%, within ~5% resolution): C1's ubench gain does not show at 10 markets |
+| full node on ozarchy, crab C3 + PF1 `d9ef4f7` vs main | 49.6k vs 89.4k matched/s = **0.555x**; exec CPU 30.1 vs 13.45 ms per 1k: maker_fill_fits 5.08 / 0, prepare_one 3.94 / 0, liquidation 3.81 / 0, matching 3.39 / 1.72, settle 2.43 / 3.41, glue 7.48 / 5.88; hot: overlay `get_cf_raw`, BTreeMap range, `Vec<(Vec,Vec)>` collect, `positions_for_trader` | PF1: 127.5k vs 175.9k = 0.72x (with resends), 0.66x without; exec CPU 12.5 vs 10.05 |
 | exec-path CPU profile on ozarchy, crab `d52a33f` vs main `92a02ed`, ms per 1k fills | (after PF1) | crab 22.91 vs main 9.95: `same_batch_bid_top_ups` 11.21 vs 0, other margin 1.57 vs 0.10, maker checks 0.89 vs 0.04, matching 3.57 vs 2.97, settle 1.52 vs 1.41, liquidation 0.17 |
 
 At 10 markets the ubench engine (8.9) explains only about half of the full node's 16.6 ms
@@ -81,6 +87,22 @@ ubench missed it because its price levels are shallow (the cells' best ask level
 `app.rs:2245-2309`, which on crab also covers `begin_block_oracle`, `drain_core_writer`,
 `run_liquidations` and governance; main's covers only the two `execute_batch` calls.
 Compare crab vs main by profile CPU or matched/s, not by that timer.
+
+RPC (ozarchy, s91): crab's 1.8x RPC CPU per fill at 10 markets is not a crab cost. RPC CPU
+per request is equal (0.95-0.97x); crab simply gets ~1.85x more submit requests per fill,
+almost all fast busy refusals (closed-loop generator + slower exec = fuller backlog). It is
+a symptom of the exec gap: Gate 2 is decided by the exec path. Report RPC CPU per request
+and per admitted action, not only per fill.
+
+### 1.2 Ubench gates as ratios (s91)
+
+The absolute ms targets in section 1 were measured on 18c (KVM VPS). On ozarchy (bare
+metal) the same ubench runs 2-4x faster (300 mk marks: margin 2.15 vs 5.2 on 18c), so one
+build can pass on one machine and fail on the other. From s91 every ubench gate is a
+ratio to the base `9c4be2c` measured on the same machine in the same session (alternating
+runs): margin <= 0.20x base (1.5 / 7.5), match <= 0.21x (2.0 / 9.4), settle <= 1.0x,
+tail <= 0.06x (1.0 / 16.1), total <= 0.31x (14.7 / 46.7); fail lines scale the same way.
+Verdicts come from ozarchy. Gate 2 (full node vs main) stays the deciding gate.
 
 ## 2. Design decisions in this plan
 
@@ -312,6 +334,9 @@ margin 1308 / 264, match 2829 / 117, liquidation 1840 / 96 (positions / balances
 
 ### Step 5: warm == cold (commit C5, tests only)
 
+s91: built LAST (after C7 and E1-E4), so it also covers C7's per-trader records and any
+slot state E adds.
+
 - P5: 3 replicas over 200+ fed blocks, one restarted every K blocks (slot rebuilt cold),
   one with the sums cache dropped every block: identical state and every `h_n`.
 - Gate 5: green.
@@ -334,7 +359,8 @@ margin 1308 / 264, match 2829 / 117, liquidation 1840 / 96 (positions / balances
 ## 4. Commit plan
 
 C1 R + lifecycle + guards | C2 mark table, `BatchMarks` deleted | C3 sums cache,
-`BatchMakerAccounts` deleted | C4 L1 | C5 warm == cold tests. Every commit: full suite
+`BatchMakerAccounts` deleted | C4 L1 | PF1 (ozarchy) | cooldown fix | C6 B0 + A-lite + D |
+C7 per-trader positions in memory | E1-E4 empty block | C5 warm == cold tests (last). Every commit: full suite
 and golden green, ubench numbers in the commit message.
 
 ## 5. Optional steps (only when a gate says so)
@@ -379,6 +405,63 @@ merges it into `perf/item6-phase1` after C3 (method A). Ozarchy measures Gate PF
   crab exec-path CPU down by ~11 ms per 1k fills (expected ~22.9 -> ~11.7, about 2x
   matched/s, ~0.85x main). If the RPC `from_hex` load (resent shed batches) remains,
   that is its own item.
+- **Result (ozarchy, `0ebfd71`):** top_ups 11.21 -> 0.02 ms/1k; exec CPU 22.91 -> 12.49
+  (main 10.05 = 1.24x); matched/s 65.9k -> 127.5k (1.93x), 0.72x main. PASS (top_ups,
+  exec); the rest of the 10-market gap is exec 1.24x plus its RPC symptom (section 1.1).
+
+### 5.2 Per-account position cost at 300 markets: C6, C7 (s91, owner)
+
+Source: ozarchy profile (section 1.1) + a read-only analysis at `0a25560` (s91). Every
+active account is built once per block (per-block memo), and every account written this
+block is built again in liquidation. C3's persistent cache carries nothing between blocks
+(active accounts always trade). Two findings drive the order:
+- **B0 (redundant parent layer).** With R attached, the overlay still consults the parent
+  layer (the previous block's frozen writes) for R's two CFs, although R already holds that
+  state (`own_pending_delta`: "the parent layer is already in R"). `iterate_cf`
+  (`backend.rs` ~1848) takes the BTreeMap merge + double collect path whenever the parent
+  touched the prefix = nearly every active trader. Skipping the parent for R's CFs in
+  `get_cf_raw` / `iterate_cf` / `iterate_cf_from` / `prefix_exists` is a few lines.
+- **Cliff the bench does not hit.** The dirty branch of `pos_sums` has no memo and C3
+  deleted `BatchMakerAccounts`: a maker filled by an IOC / market order in the pre-EVM
+  batch is rebuilt from scratch for every market it fills in the post-EVM batch. The
+  bench sends GTC only, so it never shows.
+
+Estimates (exec ms per 1k fills at 300 markets, crab ~29 after C4, main 13.45; inferred;
+throughput ~ 1/exec, bounds 13.45/exec and 0.555 x 30.1/exec):
+
+| step | what | effort | exec after | vs main |
+|---|---|---|---|---|
+| C6 = B0 | skip the parent layer for R's CFs | S | ~26 | 0.52-0.64x |
+| C6 + A-lite | liquidation rebuild of a written trader = memo sums - terms of its R rows + terms of its pending rows (`position_terms` factored out of `build`, magnitude guard falling back to `build`; no stored terms); also removes the cliff | S-M | ~24 | 0.56-0.70x |
+| C6 + D | per-batch memo for dirty traders, frozen dirty flag instead of a lock per (maker, book), per-worker maker cache before the global Mutex | S | ~23.3 | 0.58-0.72x |
+| C7 | decoded positions per trader in R's slot, updated by each block's delta; valuation / maker checks read decoded structs (no format change, ~+100 MB per 1M positions) | M-L | ~19 | 0.71-0.88x |
+| O1 + O2 full | stored per-position terms, cache updated at block end instead of dropped | M | ~18.5 | 0.73-0.90x |
+
+O1 + O2 full only if marks are mostly stable (measure how many markets' marks move per
+block first). What remains after C7 (~5 ms per 1k over main): matching +1.7 (F1's
+book-side account checks), glue ~+1, books drain/save/load +0.8, per-order margin work
+~1-1.5, liquidation ~0.5. Tests: B0 = randomised layered-overlay test with and without
+parent, golden unchanged; A-lite = P1 shadow check vs `build` (already compares every
+answer); C7 = records == decoded R range (P1), warm == cold (C5), guards (P7). No
+consensus or state-format change in C6 / C7. Gates: ubench ratios (1.2) on ozarchy plus
+the 300-market full-node cell after C6 and after C7.
+
+### 5.3 Empty block: E1-E4 (s91)
+
+Read-only analysis at `0a25560` (ubench_epoch fresh, ~85 ms per block). The bench adds
+the exec thread E (~40 ms: ctx ~7, oracle ~19, liquidation ~13) and the writer thread W
+(~44 ms flush, uncached trie, ~300 `agg` rows rewritten every block because each stores
+the block time) serially; on the node they overlap. Fixes on E, no consensus change:
+- E1 oracle: one scan of the `sub` range per block for prune + aggregation; the mark
+  table built from the aggregation's own results (19 -> ~8 ms).
+- E2 liquidation: cooldown / pending rows read once per block as a set instead of ~4k
+  point reads; sorted trader list in R's slot so `traders_after` is a slice (13 -> ~3 ms).
+- E3 oracle `sub` rows resident (decoded, delta-maintained) (~8 -> ~3 ms).
+- E4 ctx: split timer first, then cache `margin_configs` in the slot (-1 to -6 ms).
+Expected E ~8-12 ms. W: `TORUS_NATIVE_TRIE_MAINTENANCE=0` (node-local; the analysis found
+no non-test consumer of the native root: VERIFY before deciding) or rewrite `agg` only
+when its inputs change (consensus change: row bytes and staleness timing). Measure E vs W
+on the node first (ozarchy idle-with-feed cell).
 
 ## 6. Rollback
 
@@ -426,3 +509,7 @@ reviews it.
 | 23 | C4 / Gate 4 (18c sanity, 3 pairs x 3 runs) | tail 9.83 -> 6.93 (300 mk), 10.05 -> 9.92 (300 mk walk 10) vs <= 1.0, fail 2.0: missed; 0.56 -> 0.45 at 10 mk: met. Split per block (300 mk, 585 traders scanned): traders written this block 51.8 ms (331 x ~157 us), cached 7.1, `traders_after` 3.4, other 2.7; walk 10 adds re-values 32.3 ms | build O2 (needs O1) for written traders and O1 for re-values? Proposal: decide after ozarchy's 300-market profile (is liquidation the biggest cost there?) | committed; O1 / O2 / L2 not built | `62af701` |
 | 24 | C4 / empty block | ~294 -> ~90 ms (ubench_epoch fresh, 2 pairs) vs <= 20, fail 75: missed; the walk itself 232 -> 15 ms | the rest is flush ~45 ms + oracle ~19 ms, not liquidation: separate work items? | recorded | `62af701` |
 | 25 | C4 / inherited diff | the first C4 builder was stopped by accident; its diff was complete (tests first verified, planted bugs caught) | none | a second builder reviewed it, measured, committed | `62af701` |
+| 26 | s91 / row 23 answered | ozarchy profile 6.2 (C3 + PF1, 300 mk): liquidation 3.81 < maker_fill_fits 5.08 + prepare_one 3.94; all three are per-account position reads | none | next steps target the margin path first: C6 (B0 + A-lite + D), C7 (section 5.2); O1 + O2 full only if marks are stable | docs |
+| 27 | s91 / RPC 1.8x | ozarchy: equal RPC CPU per request; more refused requests per fill because exec is slower | none | ruled out as a crab cost; gate metrics per request and per admitted action | docs |
+| 28 | cooldown fix / HL reading | HL docs say whole position DURING the cooldown (built: X); a community wiki and a third-party article say a pause, then whole AFTER it (Y); same-block handling of several positions (A one chunk per block, built; B each position by its rule; C whole right after the first chunk) is undocumented | X or Y? A, B or C? | evidence from HL's public liquidation fills being gathered (s91); follow-up commit if it disagrees with X + A | `2d03111` |
+| 29 | s91 / ubench gates | absolute ms targets are machine-dependent (ozarchy 2-4x faster than 18c) | OK to use ratios to the base on the same machine (section 1.2)? | changed | docs |
