@@ -389,39 +389,19 @@ enum SubmitSlot {
 }
 
 impl RpcState {
-    /// Anti-spam item B: charge `action` (its `order_count`) to `sender`'s
+    /// Anti-spam item B: refuse `action` when `sender` has used its
     /// per-address allowance. Runs after verify (the sender is unknown
     /// before) and before pool admission; a refusal is counted by reason and
-    /// returned as the per-item reply.
+    /// returned as the per-item reply. Charging happens on pool entry (the
+    /// mempool counts every pooled action, whatever its source), so an
+    /// admitted action is counted exactly once.
     fn check_addr_rate(
         &self,
         sender: &alloy_primitives::Address,
         action: &torus_types::NativeAction,
     ) -> Result<(), String> {
-        let Some(ref limiter) = self.addr_limiter else {
-            return Ok(());
-        };
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let weight = torus_mempool::rate_limit::order_count(action) as u64;
-        // Traded volume via the same accessor the open-order limit uses; a
-        // read error counts as no volume (only the buffer applies).
-        let volume_trs = || {
-            PositionManager::new(self.state.clone())
-                .get_cum_volume(sender)
-                .map(|v| (v.raw().max(0) / FixedPoint::SCALE) as u64)
-                .unwrap_or(0)
-        };
-        limiter
-            .check(
-                sender,
-                torus_mempool::is_cancel(action),
-                weight,
-                now_ms,
-                volume_trs,
-            )
+        self.mempool
+            .addr_rate_admits(sender, action)
             .map_err(|refusal| {
                 self.count_admit_reject(refusal.reason());
                 refusal.message(sender)

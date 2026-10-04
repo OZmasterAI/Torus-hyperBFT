@@ -6,6 +6,8 @@
 //! - Size-limited pool with eviction and replacement-by-fee
 //! - Drain interface for block proposers
 
+pub mod addr_rate;
+pub mod bounded_map;
 pub mod error;
 pub mod evm_pool;
 pub mod funded;
@@ -182,6 +184,10 @@ pub struct Mempool {
     /// [`rate_limit::ADMISSION_RATE_WINDOW_MS`] — the rate the admission limit
     /// follows.
     native_commit_log: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>>,
+    /// Anti-spam item B: per-address request limit (unset = off, the library
+    /// default; `torus-node` installs it from the env). Charged for every
+    /// action that enters the pool, enforced only at RPC ingress.
+    addr_limiter: std::sync::OnceLock<std::sync::Arc<addr_rate::AddrRateLimiter>>,
 }
 
 impl Mempool {
@@ -216,7 +222,47 @@ impl Mempool {
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            addr_limiter: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the per-address request limit (anti-spam item B). Set once;
+    /// a second call is ignored.
+    pub fn set_addr_rate_limiter(&self, limiter: std::sync::Arc<addr_rate::AddrRateLimiter>) {
+        let _ = self.addr_limiter.set(limiter);
+    }
+
+    /// The installed per-address limiter, if any.
+    pub fn addr_rate_limiter(&self) -> Option<&addr_rate::AddrRateLimiter> {
+        self.addr_limiter.get().map(|l| &**l)
+    }
+
+    /// Anti-spam item B, the RPC-ingress check: would `sender` be allowed
+    /// `action` (its `order_count` requests) now? Read-only; the count is
+    /// charged when the action enters the pool. `Ok` when no limiter is set.
+    pub fn addr_rate_admits(
+        &self,
+        sender: &Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), addr_rate::Refusal> {
+        let Some(limiter) = self.addr_limiter.get() else {
+            return Ok(());
+        };
+        // Traded volume via the same accessor the open-order limit uses; a
+        // read error counts as no volume (only the buffer applies).
+        let volume_trs = || {
+            torus_core::position::PositionManager::new(self.state.clone())
+                .get_cum_volume(sender)
+                .map(|v| (v.raw().max(0) / torus_types::FixedPoint::SCALE) as u64)
+                .unwrap_or(0)
+        };
+        limiter.admits(
+            sender,
+            is_cancel(action),
+            rate_limit::order_count(action) as u64,
+            now_ms(),
+            volume_trs,
+        )
     }
 
     /// Pool size at which RPC ingress sheds non-cancels before verification
@@ -683,11 +729,18 @@ impl Mempool {
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
         self.check_funded(&sender, &action.action)?;
+        let weight = rate_limit::order_count(&action.action) as u64;
         {
             let mut pool = self.native.write().unwrap();
             let result = pool.insert_with_restash_key(sender, action, cache_key);
             self.publish_native_pool_size(&pool);
             result?;
+        }
+        // Anti-spam item B: count every action that entered the pool, from
+        // any source, once (the insert above dedups by hash). Never refuses;
+        // RPC ingress enforces via `addr_rate_admits`. After the pool lock.
+        if let Some(limiter) = self.addr_limiter.get() {
+            limiter.charge(&sender, weight, now_ms());
         }
 
         // Seed only after a successful insert, so a rejected (dup/full) action
@@ -3555,5 +3608,140 @@ mod tests {
         let sel = pool.select_native_for_block(8);
         let cancels = sel.iter().filter(|a| is_cancel(&a.action)).count();
         assert_eq!(cancels, 2, "ceil(25% of 8)");
+    }
+
+    // ---- Anti-spam item B: counted on pool entry, enforced at RPC ----
+
+    fn limited_pool(buffer: u64, max_addresses: usize) -> (TempDir, Mempool) {
+        let (dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        pool.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            buffer,
+            std::collections::HashSet::new(),
+            max_addresses,
+        )));
+        (dir, pool)
+    }
+
+    fn order_batch(k: &SigningKey, nonce: u64, n: usize) -> SignedNativeAction {
+        let p = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100),
+            quantity: torus_types::FixedPoint::from_raw(100),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![p; n]),
+            nonce,
+            k,
+        )
+    }
+
+    fn used(pool: &Mempool, k: &SigningKey) -> u64 {
+        pool.addr_rate_limiter().unwrap().used(&address_from_key(k))
+    }
+
+    #[test]
+    fn addr_rate_counts_gossip_and_forwards_by_order_count() {
+        let (_dir, pool) = limited_pool(100, 1_000);
+        let k = key(90);
+        let s = address_from_key(&k);
+        let t0 = now_ms();
+        // Gossip (recover path): a batch of 3 counts 3.
+        pool.add_native_action_from_gossip(s, order_batch(&k, t0, 3))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 3);
+        // Forward / pre-proposal push (trusted path): cancels count 1.
+        pool.add_native_action_from_gossip_trusted(s, cancel_all(&k, t0 + 1))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 4);
+        // The same body arriving again is a pool duplicate: not recounted.
+        assert!(pool
+            .add_native_action_from_gossip(s, order_batch(&k, t0, 3))
+            .is_err());
+        assert_eq!(used(&pool, &k), 4);
+    }
+
+    #[test]
+    fn addr_rate_rpc_action_counted_exactly_once() {
+        let (_dir, pool) = limited_pool(100, 1_000);
+        let k = key(91);
+        let s = address_from_key(&k);
+        let a = order_batch(&k, now_ms(), 5);
+        // The RPC path: check (read-only), then the pool entry charges.
+        pool.addr_rate_admits(&s, &a.action).unwrap();
+        assert_eq!(used(&pool, &k), 0, "the check alone charges nothing");
+        pool.add_native_action_presigned(s, a.clone()).unwrap();
+        assert_eq!(used(&pool, &k), 5);
+        // Its gossip echo from a peer is a duplicate: still 5.
+        let _ = pool.add_native_action_from_gossip(s, a);
+        assert_eq!(used(&pool, &k), 5);
+        // A refused insert (duplicate) charges nothing either.
+        let b = cancel_all(&k, now_ms() + 1);
+        pool.add_native_action_presigned(s, b.clone()).unwrap();
+        assert!(pool.add_native_action_presigned(s, b).is_err());
+        assert_eq!(used(&pool, &k), 6);
+    }
+
+    #[test]
+    fn addr_rate_gossip_consumes_allowance_and_is_never_refused() {
+        let (_dir, pool) = limited_pool(4, 1_000);
+        let k = key(92);
+        let s = address_from_key(&k);
+        let t0 = now_ms();
+        // 4 orders via gossip use the whole buffer ...
+        pool.add_native_action_from_gossip(s, order_batch(&k, t0, 4))
+            .unwrap();
+        // ... so this node's RPC refuses the next order (exhausted, and the
+        // last pooled action was < 10 s ago).
+        let next = order_batch(&k, t0 + 1, 1);
+        assert!(matches!(
+            pool.addr_rate_admits(&s, &next.action),
+            Err(addr_rate::Refusal::Requests {
+                used: 4,
+                allowance: 4
+            })
+        ));
+        // Gossip is never refused by B: it is still admitted and counted.
+        pool.add_native_action_from_gossip(s, next).unwrap();
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&k, t0 + 2, 10))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 15);
+        // Another sender is unaffected.
+        let k2 = key(93);
+        pool.addr_rate_admits(&address_from_key(&k2), &next_action())
+            .unwrap();
+    }
+
+    fn next_action() -> torus_types::NativeAction {
+        torus_types::NativeAction::ClaimRewards
+    }
+
+    #[test]
+    fn addr_rate_pool_entry_counting_keeps_the_memory_bound() {
+        let (_dir, pool) = limited_pool(100, 8);
+        let t0 = now_ms();
+        for i in 0..50u8 {
+            let k = key(100 + i);
+            pool.add_native_action_from_gossip_trusted(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+            assert!(pool.addr_rate_limiter().unwrap().tracked() <= 8);
+        }
+    }
+
+    #[test]
+    fn addr_rate_off_without_a_limiter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let k = key(94);
+        pool.add_native_action_from_gossip(address_from_key(&k), order_batch(&k, now_ms(), 3))
+            .unwrap();
+        assert!(pool.addr_rate_limiter().is_none());
+        pool.addr_rate_admits(&address_from_key(&k), &next_action())
+            .unwrap();
     }
 }

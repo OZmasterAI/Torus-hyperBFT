@@ -15,7 +15,7 @@
 //!
 //! IPv6 clients are keyed by their /64 (one host gets a whole /64), IPv4 by
 //! address. Memory is bounded to [`DEFAULT_MAX_IPS`] buckets
-//! ([`crate::bounded_map::TwoGen`]).
+//! ([`torus_mempool::bounded_map::TwoGen`]).
 //!
 //! Exemptions: `TORUS_RPC_IP_EXEMPT` (comma-separated CIDRs or IPs). Unset =
 //! loopback only (127.0.0.0/8, ::1) — local tooling such as an oracle feeder.
@@ -28,7 +28,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::bounded_map::TwoGen;
+use torus_mempool::bounded_map::TwoGen;
 
 /// Default `TORUS_RPC_IP_WEIGHT_PER_MIN` (HL: 1200).
 pub const DEFAULT_WEIGHT_PER_MIN: u32 = 1200;

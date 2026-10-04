@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-pub(crate) struct TwoGen<K, V> {
+pub struct TwoGen<K, V> {
     current: HashMap<K, V>,
     previous: HashMap<K, V>,
     half: usize,
@@ -17,7 +17,7 @@ pub(crate) struct TwoGen<K, V> {
 
 impl<K: Hash + Eq + Copy, V> TwoGen<K, V> {
     /// `max` entries at most (at least 2).
-    pub(crate) fn new(max: usize) -> Self {
+    pub fn new(max: usize) -> Self {
         Self {
             current: HashMap::new(),
             previous: HashMap::new(),
@@ -25,13 +25,13 @@ impl<K: Hash + Eq + Copy, V> TwoGen<K, V> {
         }
     }
 
-    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+    pub fn get(&self, key: &K) -> Option<&V> {
         self.current.get(key).or_else(|| self.previous.get(key))
     }
 
     /// The entry for `key` in `current` (moved up from `previous`, or
     /// `init()`), rotating generations first when `current` is at its half.
-    pub(crate) fn entry_with(&mut self, key: K, init: impl FnOnce() -> V) -> &mut V {
+    pub fn entry_with(&mut self, key: K, init: impl FnOnce() -> V) -> &mut V {
         if !self.current.contains_key(&key) {
             let v = self.previous.remove(&key).unwrap_or_else(init);
             if self.current.len() >= self.half {
@@ -42,8 +42,12 @@ impl<K: Hash + Eq + Copy, V> TwoGen<K, V> {
         self.current.get_mut(&key).expect("just inserted")
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.current.len() + self.previous.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

@@ -1000,8 +1000,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(all_market_trades, "all-markets newTrades subscriptions");
     rpc_server.set_all_market_trades(all_market_trades);
     // Anti-spam item B: per-address native request limit, ON unless
-    // TORUS_ADDR_RATE_LIMIT=0. In memory, per node, reset on restart.
-    let (addr_limiter, bad_exempt) = torus_rpc::addr_rate::from_env();
+    // TORUS_ADDR_RATE_LIMIT=0. Counted for every action entering the mempool
+    // (RPC, gossip, forwards), enforced at RPC ingress. In memory, reset on
+    // restart.
+    let (addr_limiter, bad_exempt) = torus_mempool::addr_rate::from_env();
     for entry in &bad_exempt {
         warn!(%entry, "TORUS_ADDR_RATE_EXEMPT: not an address, ignored");
     }
@@ -1013,7 +1015,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 exempt = limiter.exempt_count(),
                 "native ingress anti-spam: per-address request limit (TORUS_ADDR_RATE_LIMIT / _BUFFER / _EXEMPT; node-local, in memory)"
             );
-            rpc_server.set_addr_rate_limiter(Arc::new(limiter));
+            mempool.set_addr_rate_limiter(Arc::new(limiter));
         }
         None => info!(
             enabled = false,

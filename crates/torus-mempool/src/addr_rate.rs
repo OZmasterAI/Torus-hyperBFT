@@ -1,4 +1,14 @@
-//! Per-address request limit at RPC native ingress (anti-spam item B).
+//! Per-address request limit (anti-spam item B).
+//!
+//! COUNTED on pool entry, ENFORCED at RPC ingress: the mempool charges every
+//! native action that enters this node's pool, whatever its source (RPC
+//! single/batch/bin, gossip, leader forwards), and RPC ingress refuses an
+//! action whose sender is over its allowance. Gossip spreads each action to
+//! every validator's pool within tens of ms, so each node's count
+//! approximates the address's network-wide count; gossiped and forwarded
+//! actions are never refused by this rule, so nodes never diverge on what
+//! they hold because of it. Each pooled action is counted once: the pool
+//! dedups by hash, and the charge follows a successful insert.
 //!
 //! Hyperliquid semantics, node-local and in memory:
 //! - allowance = `buffer` (default 10_000) + 1 request per 1 TRS of the
@@ -13,8 +23,8 @@
 //!   action; a batch of n > 1 orders is n requests and is refused.
 //!
 //! Counters live in this node's memory since it started: they reset on
-//! restart and are per node (a client spreading load over N nodes gets up to
-//! N allowances — still bounded, and each node protects itself).
+//! restart. A node that missed some gossip (just started, partitioned)
+//! under-counts until it catches up.
 //!
 //! The volume is read from the DB, which can lag execution by a block or
 //! more; the allowance is recomputed from whatever is read each time and the
@@ -98,10 +108,11 @@ impl AddrRateLimiter {
         }
     }
 
-    /// Charge `weight` requests to `sender` at `now_ms`. `cum_volume_trs` is
-    /// called (at most once) only when the buffer alone does not cover the
-    /// request.
-    pub fn check(
+    /// Would `sender` be allowed `weight` more requests at `now_ms`?
+    /// Read-only: the charge is [`Self::charge`], made when the action enters
+    /// the pool. `cum_volume_trs` is called (at most once) only when the
+    /// buffer alone does not cover the request.
+    pub fn admits(
         &self,
         sender: &Address,
         is_cancel: bool,
@@ -121,34 +132,37 @@ impl AddrRateLimiter {
                 allowance
             }
         };
-        // Read the volume (a DB point read) only when the buffer alone does
-        // not cover the request, and never under the lock. Two concurrent
-        // requests of one address can both pass on the same snapshot — a
-        // bounded overshoot, fine for an anti-spam rule.
-        let used = self
+        let e = self
             .entries
             .lock()
             .unwrap()
             .get(sender)
-            .map_or(0, |e| e.used);
-        let allowance = if used.saturating_add(weight) <= cap(self.buffer) {
+            .copied()
+            .unwrap_or_default();
+        // Read the volume (a DB point read) only when the buffer alone does
+        // not cover the request, and never under the lock. Two concurrent
+        // requests of one address can both pass on the same snapshot — a
+        // bounded overshoot, fine for an anti-spam rule.
+        let allowance = if e.used.saturating_add(weight) <= cap(self.buffer) {
             self.buffer
         } else {
             self.buffer.saturating_add(cum_volume_trs())
         };
         let limit = cap(allowance);
-
-        let mut entries = self.entries.lock().unwrap();
-        let e = entries.entry_with(*sender, Entry::default);
         let within = e.used.saturating_add(weight) <= limit;
         // Exhausted: one weight-1 action per EXHAUSTED_INTERVAL_MS since the
         // last admitted one (HL: a batch of n is n requests, so it never
         // fits the 1 request the slow mode grants).
         if within || (weight <= 1 && now_ms.saturating_sub(e.last_ok_ms) >= EXHAUSTED_INTERVAL_MS) {
-            e.used = e.used.saturating_add(weight);
-            e.last_ok_ms = now_ms;
             return Ok(());
         }
+        // Keep a refused address in the current generation, so a spammer
+        // that keeps getting refused is not forgotten (and reset) while
+        // other addresses rotate the map.
+        self.entries
+            .lock()
+            .unwrap()
+            .entry_with(*sender, Entry::default);
         Err(if is_cancel {
             Refusal::Cancels {
                 used: e.used,
@@ -160,6 +174,43 @@ impl AddrRateLimiter {
                 allowance: limit,
             }
         })
+    }
+
+    /// Count `weight` requests for `sender` at `now_ms`. Never refuses: the
+    /// mempool calls it for every action that enters the pool, whatever its
+    /// source (RPC, gossip, forward). O(1), one short lock, no DB read.
+    pub fn charge(&self, sender: &Address, weight: u64, now_ms: u64) {
+        if self.exempt.contains(sender) {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries.entry_with(*sender, Entry::default);
+        e.used = e.used.saturating_add(weight);
+        e.last_ok_ms = now_ms;
+    }
+
+    /// [`Self::admits`] then [`Self::charge`] (the unit tests' shorthand).
+    #[cfg(test)]
+    fn check(
+        &self,
+        sender: &Address,
+        is_cancel: bool,
+        weight: u64,
+        now_ms: u64,
+        cum_volume_trs: impl FnOnce() -> u64,
+    ) -> Result<(), Refusal> {
+        self.admits(sender, is_cancel, weight, now_ms, cum_volume_trs)?;
+        self.charge(sender, weight, now_ms);
+        Ok(())
+    }
+
+    /// Requests counted for `sender` so far (0 if untracked or exempt).
+    pub fn used(&self, sender: &Address) -> u64 {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(sender)
+            .map_or(0, |e| e.used)
     }
 
     /// Number of tracked addresses (both generations).

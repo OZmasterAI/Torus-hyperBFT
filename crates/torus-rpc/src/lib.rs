@@ -3,8 +3,9 @@
 //! Implements Ethereum-compatible `eth_*`, `net_*`, and `web3_*` namespaces
 //! using jsonrpsee 0.26 with WebSocket subscription support.
 
-pub mod addr_rate;
-mod bounded_map;
+/// Anti-spam item B lives in `torus-mempool` (it counts on pool entry);
+/// re-exported here for existing callers.
+pub use torus_mempool::addr_rate;
 pub mod error;
 pub mod eth;
 pub mod ip_limit;
@@ -281,9 +282,6 @@ pub struct RpcState {
     pub(crate) forward_bodies: bool,
     /// Admission control: cap concurrent submit_native_action calls.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Anti-spam item B: per-address native request limit (`None` = off,
-    /// the library default; `torus-node` installs it from the env).
-    pub(crate) addr_limiter: Option<Arc<addr_rate::AddrRateLimiter>>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -327,7 +325,6 @@ impl RpcServer {
                 forward_evm_tx: None,
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
-                addr_limiter: None,
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
@@ -345,9 +342,11 @@ impl RpcServer {
         self.max_subs_per_conn = max.max(1);
     }
 
-    /// Install the per-address native request limit (anti-spam item B).
+    /// Install the per-address native request limit (anti-spam item B) on
+    /// the mempool, which counts every pooled action; this server enforces it
+    /// at RPC ingress. Same as [`Mempool::set_addr_rate_limiter`].
     pub fn set_addr_rate_limiter(&mut self, limiter: Arc<addr_rate::AddrRateLimiter>) {
-        self.state.addr_limiter = Some(limiter);
+        self.state.mempool.set_addr_rate_limiter(limiter);
     }
 
     /// Configure leader forwarding for direct-to-leader native action submission.
@@ -2005,6 +2004,90 @@ mod tests {
             text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="addr_rate_limited"} 2"#),
             "{text}"
         );
+        handle.stop().unwrap();
+    }
+
+    /// Anti-spam item B, round 2: the mempool counts actions from every
+    /// source, so allowance a sender used through gossip (another node's
+    /// RPC) is gone here too; an action admitted via this RPC is counted
+    /// exactly once (on pool entry, not again at the RPC check).
+    #[tokio::test]
+    async fn addr_rate_limit_sees_gossip_and_counts_rpc_once() {
+        let (_dir, state, mempool, executor) = setup();
+        let k = |b: u8| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap();
+        let (gossiped, fresh) = (k(0x31), k(0x32));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let sign = |key: &k256::ecdsa::SigningKey, nonce: u64| {
+            torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                key,
+            )
+        };
+        let hex_of = |a: &torus_types::SignedNativeAction| {
+            format!("0x{}", hex::encode(serde_json::to_vec(a).unwrap()))
+        };
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_addr_rate_limiter(Arc::new(addr_rate::AddrRateLimiter::new(
+            2,
+            Default::default(),
+            1_000,
+        )));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let limiter = mempool.addr_rate_limiter().expect("installed on the mempool");
+
+        // Two actions of `gossiped` arrive from a peer: the buffer is used.
+        for i in 0..2 {
+            let a = sign(&gossiped, now_ms + i);
+            mempool
+                .add_native_action_from_gossip(a.recover_sender().unwrap(), a)
+                .unwrap();
+        }
+        let g_addr = sign(&gossiped, 0).recover_sender().unwrap();
+        assert_eq!(limiter.used(&g_addr), 2);
+        let refused: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![hex_of(&sign(&gossiped, now_ms + 2))],
+            )
+            .await;
+        assert!(refused
+            .expect_err("allowance used via gossip")
+            .to_string()
+            .contains("rate limited"));
+        assert_eq!(limiter.used(&g_addr), 2, "a refused action is not counted");
+
+        // A fresh sender's RPC action: counted once.
+        let a = sign(&fresh, now_ms);
+        let f_addr = a.recover_sender().unwrap();
+        let _: String = client
+            .request("torus_submitNativeAction", jsonrpsee::rpc_params![hex_of(&a)])
+            .await
+            .unwrap();
+        assert_eq!(limiter.used(&f_addr), 1);
+        let batch: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![hex_of(&sign(&fresh, now_ms + 1))]],
+            )
+            .await
+            .unwrap();
+        assert!(batch[0].error.is_none(), "{batch:?}");
+        assert_eq!(limiter.used(&f_addr), 2);
         handle.stop().unwrap();
     }
 
