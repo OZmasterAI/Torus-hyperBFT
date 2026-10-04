@@ -3,8 +3,12 @@
 Status: PLAN, nothing built. Written s89 (2026-10-04).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
-Base: `perf/s87-crab-fixes` @ `3d2dcd8` (after the option B review, item 2). All
-`file:line` references are for that commit (crates/...).
+Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
+command, tombstone fixes A/B + RPC staleness `3578199`/`a4c17e6`/`ac65f48`, then main merged
+in at sync point 1). The `file:line` references below were taken at `3d2dcd8`; Step 0
+re-checks them on the base (the s89 commits moved some lines in `native_executor.rs`,
+`backend.rs`, `db.rs`). Integration with main (owner, s89): method A, merge main INTO the
+Phase 1 branch at sync points (after a gated commit at most, and before Gate 2); no rebase.
 
 ## How this plan is organised (and why)
 
