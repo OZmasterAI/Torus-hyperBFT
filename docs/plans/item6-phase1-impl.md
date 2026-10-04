@@ -6,6 +6,8 @@ ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load 
 (section 1.1, step 6), a per-fill track next to C3/C4 (section 5.1), 18c builds and ozarchy
 (bare metal) measures (section 3). s91 profile: the 10-market gap is one function,
 `same_batch_bid_top_ups` (section 5.1, step PF1, built on ozarchy in parallel with C3).
+C3 `424d030` (pushed): correct, Gate 3 missed on 18c's sanity numbers (review log 18,
+owner review); C4 building.
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -414,3 +416,8 @@ reviews it.
 | 15 | C2 / no oracle step | contexts that never run `begin_block_oracle` (criterion benches, many unit tests) have no table | none | they read the oracle per mark (same results, slower than the old per-batch memo); the node always runs it (`app.rs:2250`) | `ccdb59b` |
 | 16 | s91 / ubench vs full node | 10 markets: ubench engine 8.9 vs full node 16.6 ms per 1k fills (ozarchy); C1 +35% in the ubench, ~0 on the full node | Gate 2 on which shapes? | owner: both shapes, 300 markets main gate, both >= 0.9x; per-fill track 5.1 from the ozarchy profile; ozarchy measures | docs |
 | 17 | s91 / profile | 10-market gap = `same_batch_bid_top_ups` 11.2 ms per 1k fills (O(crossing bids x resting asks)); ubench shallow levels hid it | none (owner decided) | step PF1 (5.1), built on ozarchy in parallel with C3 (`perf/item6-pf1`), merged after C3; ubench gets a deep-level shape | docs |
+| 18 | C3 / Gate 3 (18c sanity, 3 pairs x 3 runs) | 300 mk marks: margin 5.27 -> 5.18 (target 1.5, fail 3.0), match 6.63 -> 5.62 (target 2.0, fail 4.0), total 33.6 -> 31.3; walk 10 the same; 10 mk 8.37 -> 8.32. Miss in every pair | No optional step covers the cause (rebuilds of traders that trade; O1 needs a re-value share, measured ~0). Profile 300-market margin / match on the full node (ozarchy, after PF1) before any O2-like step? Are the absolute targets 1.5 / 2.0 right for crab's model, given Gate 2 is the real goal? | committed as instructed (correct); verdict to be confirmed on ozarchy; owner proposal: C4 next, 300-market profile after PF1 | `424d030` |
+| 19 | C3 / cache scope | the persistent cache carries 0 entries between blocks in `ubench_econ` and the fed storage test: every trader valued in a block also trades in it, so its sums are dropped at block end; only the per-block memo works (fix 1 already gave most of that). Valuation is ~0.72 of margin's 5.3 ms/1k (~14%); match values ~82k positions per block (299 makers) | keep the cache as-is? It pays off for traders valued without trading: the liquidation walk and empty blocks (C4) | kept | `424d030` |
+| 20 | C3 / outside-table marks | not in the plan | OK that a result using a mark for a market outside the block's mark table is never cached (computed each time)? | guard added | `424d030` |
+| 21 | C3 / storage-read test | the fixed-marks assert holds, but its traders trade every block, so it never shows a carried entry | add a non-trading-maker workload? | carried entries proven in P1 and the end_resident test | `424d030` |
+| 22 | C3 / cache shape | plan: per-entry version map | one version tag per cache, cleared when the version moves, OK? | done (same behaviour, smaller); memo stores read errors / uncacheable results as "none" so each trader is computed once per block; fix 1's one-scan test moved onto the node path | `424d030` |
