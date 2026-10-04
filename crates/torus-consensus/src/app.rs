@@ -16486,6 +16486,57 @@ mod crash_recovery_tests {
         assert_eq!(root_s, root_r);
     }
 
+    /// Item 6 C4 (plan Step 4, P3): the liquidation fixture (backstop, stage
+    /// 1, vault ADL) with L1 (R + sums cache, the node path) and with the
+    /// reference walk (`test_no_resident_rows`), serial and pipelined:
+    /// identical liquidation / position / balance rows after every block,
+    /// identical per-block consensus write sets (`h_n`), running hash and
+    /// final dump.
+    #[test]
+    fn liquidation_l1_and_reference_walk_identical_every_block() {
+        use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS};
+        let blocks = liq_det_blocks();
+        let run = |pipelined: bool, no_r: bool| {
+            let (config, db) = liq_det_fixture();
+            torus_state::running_hash::capture_begin(&db);
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.test_no_resident_rows = no_r;
+            if pipelined {
+                ctx.attach_flush_worker(None);
+            }
+            let mut per_block = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "pipelined={pipelined} no_r={no_r}");
+                if let Some(w) = ctx.flush_worker.as_ref() {
+                    assert!(w.wait_idle());
+                }
+                let rows: Vec<CfDump> = [CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+                    .iter()
+                    .map(|cf| (*cf, StateBackend::iterate_cf(&db, cf, None).unwrap()))
+                    .collect();
+                per_block.push(rows);
+            }
+            assert_eq!(ctx.resident_books.lock().unwrap().rows_builds(), u64::from(!no_r));
+            drop(ctx);
+            let captured = torus_state::running_hash::capture_take(&db);
+            let stored = torus_state::running_hash::read_running_hash(&db);
+            (per_block, captured, stored, dump_all_cfs(&db))
+        };
+        for pipelined in [false, true] {
+            let what = format!("pipelined={pipelined}");
+            let (rows_ref, cap_ref, hash_ref, dump_ref) = run(pipelined, true);
+            let (rows_l1, cap_l1, hash_l1, dump_l1) = run(pipelined, false);
+            for (h, (a, b)) in rows_ref.iter().zip(rows_l1.iter()).enumerate() {
+                assert_dumps_equal(a, b, &format!("{what}: rows after block {}", h + 1));
+            }
+            assert_write_sets_equal(&cap_ref, &cap_l1, &format!("{what}: walk vs L1"));
+            assert!(hash_l1.is_some());
+            assert_eq!(hash_ref, hash_l1, "{what}: running hash");
+            assert_dumps_equal(&dump_ref, &dump_l1, &format!("{what}: final dump"));
+        }
+    }
+
     /// Option B (s87): GTC limits `(market, is_buy, price, qty)` as one
     /// PlaceOrderBatch of `seed`.
     fn signed_limits(seed: u8, nonce: u64, orders: &[(u64, bool, i64, i64)]) -> SignedNativeAction {

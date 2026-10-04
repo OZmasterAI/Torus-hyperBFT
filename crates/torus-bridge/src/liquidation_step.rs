@@ -67,6 +67,7 @@ impl NativeExecutor {
             listed.iter().filter_map(|&m| reader.mark(m).map(|p| (m, p))).collect()
         };
         let prev = liq::prev_marks(&ctx.state, marks.keys().copied())?;
+        let l1 = Self::l1_on(ctx, &listed);
         // C1 (decided, s517): no separate index — walk CF_NATIVE_POSITIONS
         // (sorted by trader) from the round-robin cursor. SCAN + 2: the vault
         // (skipped) is at most one of them, so a pass that consumes every
@@ -82,7 +83,7 @@ impl NativeExecutor {
             }
             scanned += 1;
             last = Some(trader);
-            let h = match Self::liq_view(ctx, &marks, &trader)?.map(|v| liq::classify(&v)) {
+            let h = match Self::liq_view(ctx, &marks, &trader, l1)?.map(|v| liq::classify(&v)) {
                 Some(Some(h)) => h,
                 _ => {
                     // M2: nothing the step can do until a mark returns (the
@@ -113,7 +114,7 @@ impl NativeExecutor {
                 Health::Backstop => liq::backstop(&ctx.positions, &trader, &LIQUIDATOR_VAULT, |m| {
                     marks.get(&m).copied()
                 })?,
-                Health::Stage1 => Self::stage1(ctx, &marks, &trader, &mut results)?,
+                Health::Stage1 => Self::stage1(ctx, &marks, l1, &trader, &mut results)?,
                 Health::Healthy => {}
             }
             liq::settle_flat_deficit(&ctx.positions, &trader, &LIQUIDATOR_VAULT)?;
@@ -122,18 +123,18 @@ impl NativeExecutor {
             }
             // M2: still under MM (thin book, cooldown, bounded ADL) -> keep the
             // step due until the account is healthy, flat or unvaluable.
-            Self::mark_pending(ctx, &marks, &trader)?;
+            Self::mark_pending(ctx, &marks, l1, &trader)?;
             results.push(NativeActionResult::ok("liquidation", 3000));
         }
         // D8: the vault is exempt from stage 1 / backstop; ADL when its AV < 0.
         // (`classify` is Adl exactly when AV < 0, overflow-checked.)
-        if let Some(v) = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT)? {
+        if let Some(v) = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)? {
             if liq::classify(&v) == Some(Health::Adl) {
                 Self::adl_account(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
         // M2 for the vault: pending while it stays ADL-able.
-        let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT)?
+        let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)?
             .is_some_and(|v| liq::classify(&v) == Some(Health::Adl));
         liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
         liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
@@ -141,15 +142,31 @@ impl NativeExecutor {
         Ok(results)
     }
 
+    /// Item 6 C4 (plan 2.5, L1): whether [`Self::liq_view`] values from the
+    /// sums cache. Its sums value every market with a mark (the block's
+    /// table, else the oracle); the step's `Marks` only the `listed` ones.
+    /// They agree iff no market outside `listed` has a mark: a market outside
+    /// the table has no aggregate row (the table takes every aggregated
+    /// market, and only `begin_block_oracle` writes those rows), so
+    /// `delisted_marked` decides it. Normally empty; a delisted market with
+    /// a fresh aggregate (up to 60 s) turns L1 off for the block.
+    fn l1_on<T: StateBackend>(ctx: &NativeExecContext<T>, listed: &[MarketId]) -> bool {
+        ctx.sums.is_some() && ctx.block_marks.as_ref().is_some_and(|t| t.delisted_marked(listed).is_empty())
+    }
+
     /// Review H2 (user decision s517): the account is valued with its marked
     /// positions at the mark and its UNMARKED ones at their entry price (UPnL 0,
     /// IM / MM still count — `AccountView::build`'s fallback). `None` (skip)
     /// when it has no position in a marked market, holds an Isolated position,
     /// or the valuation overflows. Only marked positions are ever acted on.
+    /// Item 6 C4 (L1, `l1` from [`Self::l1_on`]): the position part from the
+    /// sums cache ([`AccountReader::pos_sums`]: the same `build` over the
+    /// same rows with the same marks), the balance a point read.
     fn liq_view<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
         trader: &Address,
+        l1: bool,
     ) -> Result<Option<AccountView>, CoreError> {
         // Fix 2a (s87): with no usable mark in any listed market no position
         // is marked, so every account is `None` below — skip the reads. The
@@ -157,6 +174,41 @@ impl NativeExecutor {
         if marks.is_empty() {
             return Ok(None);
         }
+        if !l1 {
+            #[cfg(test)]
+            if let Some(s) = ctx.sums.as_ref() {
+                bump(&s.counters.l1_off);
+            }
+            return Self::liq_view_walk(ctx, marks, trader);
+        }
+        let v = match AccountReader::of(ctx).pos_sums(trader) {
+            // `build` skips a non-Cross position; the step does not value
+            // such an account. `marked == 0`: no position at a mark.
+            Ok(s) if s.any_isolated || s.marked == 0 => None,
+            Ok(s) => Some(s.view(&ctx.positions.get_native_balance(trader)?)),
+            Err(CoreError::Overflow(_)) => None,
+            Err(e) => return Err(e),
+        };
+        #[cfg(test)]
+        if let Some(s) = ctx.sums.as_ref() {
+            bump(&s.counters.l1);
+            if s.shadow {
+                let want = Self::liq_view_walk(ctx, marks, trader);
+                if want.as_ref().ok() != Some(&v) {
+                    s.shadow_mismatches.lock().unwrap().push(format!("liq_view {trader}: L1 {v:?}, walk {want:?}"));
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// [`Self::liq_view`] without the cache: `build` over the trader's rows
+    /// at the step's `marks` (the reference path).
+    fn liq_view_walk<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        marks: &Marks,
+        trader: &Address,
+    ) -> Result<Option<AccountView>, CoreError> {
         let ps = ctx.positions.positions_for_trader(trader)?;
         if ps.iter().any(|p| p.margin_type != MarginType::Cross)
             || !ps.iter().any(|p| marks.contains_key(&p.market_id))
@@ -173,9 +225,10 @@ impl NativeExecutor {
     fn mark_pending<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
+        l1: bool,
         trader: &Address,
     ) -> Result<(), CoreError> {
-        let under = Self::liq_view(ctx, marks, trader)?
+        let under = Self::liq_view(ctx, marks, trader, l1)?
             .and_then(|v| liq::classify(&v))
             .is_some_and(|h| h != Health::Healthy);
         liq::set_pending(&ctx.state, trader, under)
@@ -187,6 +240,7 @@ impl NativeExecutor {
     fn stage1<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
+        l1: bool,
         trader: &Address,
         results: &mut Vec<NativeActionResult>,
     ) -> Result<(), CoreError> {
@@ -232,7 +286,7 @@ impl NativeExecutor {
                 liq::set_cooldown(&ctx.state, trader, ctx.timestamp)?;
                 break;
             }
-            match Self::liq_view(ctx, marks, trader)? {
+            match Self::liq_view(ctx, marks, trader, l1)? {
                 Some(v) if liq::classify(&v) == Some(Health::Healthy) => break,
                 None => break, // flat (or no longer valuable): nothing left to do
                 _ => {}
@@ -325,3 +379,7 @@ impl NativeExecutor {
             .ok())
     }
 }
+
+#[cfg(test)]
+#[path = "liquidation_l1_tests.rs"]
+mod liquidation_l1_tests;

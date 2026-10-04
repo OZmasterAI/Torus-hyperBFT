@@ -22,6 +22,10 @@
 //! memo), and with fixed marks only a trader the chain dirtied since its last
 //! valuation (or never valued) is scanned again (the sums cache).
 //!
+//! C4: the liquidation walk values through the same cache (L1): it scans a
+//! trader only when the block wrote its positions, or the trader is not
+//! valued yet at the block's mark version.
+//!
 //!   cargo test -p torus-bridge --test storage_reads_tests -- --nocapture
 
 #[path = "common/counting_backend.rs"]
@@ -365,6 +369,82 @@ fn fed_fixed_marks_rescan_only_dirtied_traders() {
         cached += last.keys().filter(|t| !block.contains_key(*t)).count();
     }
     println!("POSITION_SCANS walk0 rescans_of_dirtied={rescans} cached_trader_blocks={cached}");
+    assert!(cached > 0, "non-vacuous: some valued trader is not rescanned");
+}
+
+/// C4 (plan Step 4, 2.5 L1): positions prefix scans per block, per trader,
+/// over the margin, match AND liquidation paths, leaving out the
+/// liquidation scans of a trader the block itself wrote (dirty builds:
+/// `layer_touches`, the block's own rows must be read). Also returns the
+/// liquidation scans (all, dirty builds).
+fn valuation_scans(run: &FedRun) -> (Vec<BTreeMap<Vec<u8>, usize>>, usize, usize) {
+    let (mut liq, mut dirty) = (0usize, 0usize);
+    let per_block = run
+        .scans
+        .iter()
+        .enumerate()
+        .map(|(k, block)| {
+            let mut per: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+            for (path, prefix) in block {
+                if *path == "liquidation" {
+                    liq += 1;
+                    if run.dirtied[k].contains(prefix) {
+                        dirty += 1;
+                        continue;
+                    }
+                } else if !matches!(*path, "margin" | "match") {
+                    continue;
+                }
+                *per.entry(prefix.clone()).or_insert(0) += 1;
+            }
+            per
+        })
+        .collect();
+    (per_block, liq, dirty)
+}
+
+/// C4 (plan Step 4, 2.5 L1): with marks moving every block, the liquidation
+/// walk values each trader the block did not write from the block's sums
+/// memo: margin, match and liquidation together scan such a trader at most
+/// ONCE per block. Before C4 the walk rescanned every trader it valued.
+#[test]
+fn fed_liquidation_walk_values_untouched_traders_once_per_block() {
+    let run = run_fed_sequence(WALK_BP);
+    print_scans("walk10", &run);
+    assert!(run.fills > 0, "the sequence must trade");
+    let (per_block, liq, dirty) = valuation_scans(&run);
+    println!("POSITION_SCANS walk10 liquidation={liq} dirty_builds={dirty}");
+    assert!(liq > dirty, "non-vacuous: the walk values untouched traders");
+    for (i, block) in per_block.iter().enumerate() {
+        let over: Vec<_> = block.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(over.is_empty(), "block {}: untouched traders scanned more than once (margin + match + liquidation): {over:?}", i + 1);
+    }
+}
+
+/// C4 (plan Step 4, 2.5 L1): with fixed marks the walk reads an untouched
+/// trader's sums from the cache: a scan in block k (margin, match or
+/// liquidation; dirty builds aside) is of a trader never valued before or
+/// dirtied by a block since its last valuation. Before C4 the walk rescanned
+/// every trader every block.
+#[test]
+fn fed_fixed_marks_liquidation_walk_rescans_only_dirtied_traders() {
+    let run = run_fed_sequence(0);
+    assert!(run.fills > 0, "the sequence must trade");
+    let (per_block, liq, dirty) = valuation_scans(&run);
+    let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut cached = 0usize;
+    for (k, block) in per_block.iter().enumerate() {
+        for (trader, n) in block {
+            assert_eq!(*n, 1, "block {}: one valuation per untouched trader", k + 1);
+            if let Some(&j) = last.get(trader) {
+                let dirtied = (j..k).any(|b| run.dirtied[b].contains(trader));
+                assert!(dirtied, "block {}: trader {} rescanned, untouched since block {}", k + 1, hex(trader), j + 1);
+            }
+            last.insert(trader.clone(), k);
+        }
+        cached += last.keys().filter(|t| !block.contains_key(*t)).count();
+    }
+    println!("POSITION_SCANS walk0 liquidation={liq} dirty_builds={dirty} cached_trader_blocks={cached}");
     assert!(cached > 0, "non-vacuous: some valued trader is not rescanned");
 }
 

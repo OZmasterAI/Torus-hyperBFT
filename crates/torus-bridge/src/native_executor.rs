@@ -756,10 +756,8 @@ pub(crate) struct PosSums {
     maintenance: FixedPoint,
     /// Some position is not Cross (`build` skips it; liquidation does not
     /// value such an account). Read by L1 (C4).
-    #[allow(dead_code)]
     any_isolated: bool,
     /// Cross positions valued at a mark (not at entry). Read by L1 (C4).
-    #[allow(dead_code)]
     marked: u32,
 }
 
@@ -829,6 +827,9 @@ struct SumsCounters {
     memo: std::sync::atomic::AtomicUsize,
     computed: std::sync::atomic::AtomicUsize,
     dirty: std::sync::atomic::AtomicUsize,
+    /// C4: liquidation valuations through L1 / through the walk (L1 off).
+    l1: std::sync::atomic::AtomicUsize,
+    l1_off: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -935,8 +936,7 @@ impl BlockMarks {
     /// none). Liquidation values only listed markets at their mark
     /// (`liquidation_step` `Marks` = the table filtered to `listed`), every
     /// other reader any market with a mark: the two agree iff this is empty.
-    /// The liquidation step (L1, C4) is its first engine caller.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The liquidation step (L1, C4) decides with it.
     pub(crate) fn delisted_marked(&self, listed: &[MarketId]) -> Vec<MarketId> {
         let mut out: Vec<MarketId> = self
             .marks
