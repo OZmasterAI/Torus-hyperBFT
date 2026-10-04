@@ -47,6 +47,7 @@ corrections; a repeated finding is not another defect.
 | 15 | [C3/PF1 integration and critical-path follow-up](chain-d9ef4f7-pass15-follow-up-2026-10-04.md) |
 | 16 | [C4 liquidation cache review at the latest item 6 head](chain-0a25560-pass16-c4-review-2026-10-04.md) |
 | 17 | [Staking, rewards and validator rotation](chain-0a25560-pass17-staking-rotation-2026-10-04.md) |
+| 18 | [Consensus validation and crash recovery](chain-0a25560-pass18-consensus-recovery-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
