@@ -336,6 +336,40 @@ mod liquidation_step;
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
 
+/// PF1 (item 6): resting ask depth of one book for `same_batch_bid_top_ups`.
+/// `upto(price)` = saturating sum of `remaining_qty` over every resting ask
+/// priced <= `price`. Levels are summed lazily, once, by the first query that
+/// reaches them, in the same order as a per-order walk (levels ascending, queue
+/// order), so each prefix is that walk's accumulator after its level: equal bit
+/// for bit. A query costs a binary search, not a walk over every resting ask.
+struct AskDepth<'a, I: Iterator<Item = (&'a FixedPoint, &'a VecDeque<torus_core::order_book::Order>)>> {
+    levels: std::iter::Peekable<I>,
+    /// (level price, depth through that level), ascending.
+    through: Vec<(FixedPoint, FixedPoint)>,
+}
+
+impl<'a, I: Iterator<Item = (&'a FixedPoint, &'a VecDeque<torus_core::order_book::Order>)>> AskDepth<'a, I> {
+    fn new(levels: I) -> Self {
+        Self { levels: levels.peekable(), through: Vec::new() }
+    }
+
+    fn upto(&mut self, price: FixedPoint) -> FixedPoint {
+        while let Some((&level, q)) = self.levels.next_if(|(p, _)| **p <= price) {
+            let acc = self.through.last().map_or(FixedPoint::ZERO, |t| t.1);
+            let acc = q.iter().fold(acc, |acc, a| FixedPoint::from_raw(acc.raw().saturating_add(a.remaining_qty.raw())));
+            self.through.push((level, acc));
+        }
+        match self.through.partition_point(|(p, _)| *p <= price) {
+            0 => FixedPoint::ZERO,
+            n => self.through[n - 1].1,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "same_batch_depth_tests.rs"]
+mod same_batch_depth_tests;
+
 #[cfg(test)]
 #[path = "load_books_parallel_tests.rs"]
 mod load_books_parallel_tests;
@@ -6501,6 +6535,8 @@ impl NativeExecutor {
             let Some(book) = books.get(&market_id) else { continue };
             let Some(ask) = book.best_ask() else { continue };
             let mut bound: Option<FixedPoint> = None;
+            // PF1: resting ask depth, each level summed once per batch.
+            let mut book_depth = AskDepth::new(book.ask_queues());
             // s89: asks placed earlier in this batch that can rest, by price.
             let mut batch_asks: std::collections::BTreeMap<FixedPoint, FixedPoint> = std::collections::BTreeMap::new();
             for (k, p) in batch.iter().enumerate() {
@@ -6526,12 +6562,7 @@ impl NativeExecutor {
                 } else if o.time_in_force == TimeInForce::PostOnly {
                     false
                 } else {
-                    let book_depth = book
-                        .ask_queues()
-                        .take_while(|(price, _)| **price <= o.price)
-                        .flat_map(|(_, q)| q.iter())
-                        .fold(FixedPoint::ZERO, |acc, a| sat_add(acc, a.remaining_qty));
-                    let depth = batch_asks.range(..=o.price).fold(book_depth, |acc, (_, q)| sat_add(acc, *q));
+                    let depth = batch_asks.range(..=o.price).fold(book_depth.upto(o.price), |acc, (_, q)| sat_add(acc, *q));
                     o.quantity > depth
                 };
                 if rests {
