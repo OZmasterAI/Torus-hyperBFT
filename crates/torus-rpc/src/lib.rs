@@ -431,6 +431,12 @@ impl RpcServer {
             resolve_max_response_bytes(std::env::var(ENV_MAX_RESPONSE_MB).ok().as_deref());
         let max_connections =
             resolve_max_connections(std::env::var(ENV_MAX_CONNS).ok().as_deref());
+        // Our accept loop serves each connection with
+        // `serve_with_graceful_shutdown`, which does NOT apply the config's
+        // TCP/HTTP2 options: `set_keep_alive`, `set_keep_alive_timeout` and
+        // `set_tcp_no_delay` have no effect here (nodelay is set on the socket
+        // below). Using them requires serving the connection with hyper-util
+        // directly.
         let server_cfg = jsonrpsee::server::ServerConfig::builder()
             .max_connections(max_connections)
             .max_response_body_size(max_response_bytes)
@@ -2155,6 +2161,50 @@ mod tests {
         );
         assert!(
             text.contains(r#"torus_rpc_ip_rejects_total{kind="batch"} 1"#),
+            "{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Item D over WebSocket: the accept loop tags only the upgrade request
+    /// with the peer IP; the limit must still see every call on the socket
+    /// (a missing tag lets calls through unlimited).
+    #[tokio::test]
+    async fn ip_weight_limit_applies_over_websocket() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(10, Vec::new(), 100)));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let ws = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let r: Result<String, _> = ws.request("eth_chainId", jsonrpsee::rpc_params![]).await;
+            assert!(r.is_ok(), "call {i}: {r:?}");
+        }
+        let err = ws
+            .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
+            .await
+            .expect_err("6th cheap read over WebSocket is over 10/min");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limited") && msg.contains("-32005"),
+            "{msg}"
+        );
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
             "{text}"
         );
         handle.stop().unwrap();

@@ -288,8 +288,17 @@ environment variable has no effect.
    (section 5).
 2. Optional: the 256-key cell without `--retry-busy`, to measure how many
    honest orders a full pool loses.
-3. **Review D's custom accept loop** (HTTP/2 keep-alive configuration no
-   longer applied).
+3. Done 2026-10-04: **review of D's custom accept loop** against
+   jsonrpsee 0.26. Connection limit (a shared per-request guard, as
+   upstream), shutdown, accept errors and nodelay behave as before. The
+   config's keep-alive and nodelay options are not applied by
+   `serve_with_graceful_shutdown`; unused today (keep-alive defaults off),
+   now documented at the config. New test
+   `ip_weight_limit_applies_over_websocket`: WebSocket calls are limited
+   per IP (removing the peer-IP tag fails both IP tests). No runtime change.
+   **Deploy note:** behind a reverse proxy on the same host every client
+   looks like loopback, which is exempt by default, so D is off; set
+   `TORUS_RPC_IP_EXEMPT=` (empty) and limit at the proxy.
 4. **Merge with the crab stack** (`perf/s87-crab-fixes`): it changes the same
    files (`native_pool.rs` oracle lane, mempool `lib.rs`, `torus-rpc`
    `lib.rs` and `torus.rs`), and it adds oracle signer addresses
