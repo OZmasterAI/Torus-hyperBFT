@@ -4,7 +4,9 @@
 //!
 //! R holds the post-state of the previous block. A block's overlay reads R's
 //! two CFs from R in place of the DB ([`crate::NativeStateOverlay::attach_resident`]):
-//! own pending -> parent layer -> R; a key absent from R is absent. At the end
+//! own pending -> R; a key absent from R is absent. C6a (B0): the parent layer
+//! (the previous block's frozen writes) is not consulted for R's CFs, R
+//! already holds it. At the end
 //! of the block R takes the block's own writes and tombstones of the two CFs
 //! ([`ResidentDelta`], from [`crate::NativeStateOverlay::own_pending_delta`]).
 //!

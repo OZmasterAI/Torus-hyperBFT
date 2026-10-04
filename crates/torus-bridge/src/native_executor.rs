@@ -2147,7 +2147,8 @@ impl ResidentBlock {
 /// Item 6 Phase 1: start of a native block. TAKE the holder's rows slot and
 /// reuse it iff it holds the post-state of `height - 1` (slot height + 1 ==
 /// `height`, and the applied marker — read through `overlay`, i.e. pending ->
-/// parent -> DB — equals the slot height when present); otherwise build R from
+/// parent -> DB — equals the slot height when present, and C6a: the overlay's
+/// parent layer, if any, is the slot height's frozen set); otherwise build R from
 /// `overlay` (DB + parent layer: the previous block's post-state). Attach R to
 /// `overlay`, which must not have been cloned yet. `holder: None` = today's
 /// path (nothing attached). Called by app.rs and the harnesses
@@ -2170,7 +2171,10 @@ pub fn begin_resident(
         let marker = applied_marker(&*overlay);
         let height_ok = slot.height + 1 == height;
         let marker_ok = marker.is_none_or(|m| m == slot.height);
-        if height_ok && marker_ok {
+        // C6a (B0): the overlay reads R's CFs without its parent layer, so R
+        // must already hold it: the parent (if any) is the block R reflects.
+        let parent_ok = overlay.parent_height().is_none_or(|p| p == slot.height);
+        if height_ok && marker_ok && parent_ok {
             block.marks = slot.marks;
             block.sums = Some(BlockSums::new(slot.sums));
             return Some(slot.rows);
@@ -2179,7 +2183,8 @@ pub fn begin_resident(
             rows_height = slot.height,
             height,
             applied_marker = marker,
-            "item 6: resident rows stale (height/marker mismatch) — rebuilding R"
+            parent_height = overlay.parent_height(),
+            "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
         );
         None
     });

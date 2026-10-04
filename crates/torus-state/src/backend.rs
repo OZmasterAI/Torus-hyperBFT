@@ -961,9 +961,12 @@ pub struct NativeStateOverlay {
     parent: Option<Arc<FrozenPending>>,
     /// Item 6 Phase 1: resident rows R (the previous block's post-state of
     /// `CF_NATIVE_POSITIONS` / `CF_NATIVE_BALANCES`). When set, every read of
-    /// those two CFs goes own pending -> parent -> R and never reaches the DB;
-    /// a key absent from R is absent. Set by [`Self::attach_resident`] BEFORE
-    /// the overlay is cloned (clones made earlier do not see it).
+    /// those two CFs goes own pending -> R and never reaches the DB; a key
+    /// absent from R is absent. C6a (B0): nor the parent layer — R already
+    /// holds it (`end_resident` applied the parent block's own delta; a
+    /// rebuild reads DB + parent; `begin_resident` reuses R only when the
+    /// parent is the block R reflects). Set by [`Self::attach_resident`]
+    /// BEFORE the overlay is cloned (clones made earlier do not see it).
     resident: Option<Arc<ResidentRows>>,
 }
 
@@ -1776,6 +1779,46 @@ fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     Ok(out)
 }
 
+/// Item 6 C6a: `base` (R's rows under `prefix`, key order) with one pending
+/// layer `cfp` on top — its writes override, its tombstones remove — merged
+/// straight into the result. Same answer as collecting `base` into a map and
+/// applying `PendingState::overlay_into`.
+fn overlay_sorted<'a>(
+    cfp: &CfPending,
+    prefix: &[u8],
+    base: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut writes = cfp
+        .writes
+        .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .inspect(|_| overlay_visit())
+        .peekable();
+    let mut base = base.peekable();
+    let mut out = Vec::new();
+    loop {
+        let take_base = match (base.peek(), writes.peek()) {
+            (None, None) => break,
+            (Some((bk, _)), Some((wk, _))) => bk < wk,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+        };
+        if take_base {
+            let (k, v) = base.next().expect("peeked");
+            if !cfp.deletes.contains(k) {
+                out.push((k.clone(), v.clone()));
+            }
+        } else {
+            let (k, v) = writes.next().expect("peeked");
+            if base.peek().is_some_and(|(bk, _)| *bk == k) {
+                base.next();
+            }
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
+}
+
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         // C2: interned CF + borrowed key lookup — ZERO allocations on this path
@@ -1789,15 +1832,16 @@ impl StateBackend for NativeStateOverlay {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
+            // Item 6 Phase 1: R replaces the DB for its two CFs; C6a (B0):
+            // and the parent layer, which R already holds.
+            if let Some(rows) = self.resident_rows(id) {
+                return Ok(rows.get(key).cloned());
+            }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes).
             if let Some(parent) = &self.parent {
                 if let Some(hit) = parent.state.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
-            }
-            // Item 6 Phase 1: R replaces the DB for its two CFs.
-            if let Some(rows) = self.resident_rows(id) {
-                return Ok(rows.get(key).cloned());
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -1855,20 +1899,26 @@ impl StateBackend for NativeStateOverlay {
             // (the DB reports MissingColumnFamily, same as pre-C2).
             return StateBackend::iterate_cf(&self.db, cf, prefix);
         };
+        let p = prefix.unwrap_or(&[]);
+        // Item 6 Phase 1: R's prefix range stands in for the DB rows of its
+        // two CFs. C6a (B0): R already holds the parent layer, so only this
+        // overlay's own pending set goes on top — merged straight into the
+        // result (no intermediate Vec / BTreeMap).
+        if let Some(rows) = self.resident_rows(id) {
+            let base = rows
+                .range::<[u8], _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(p));
+            let state = self.pending.read().unwrap();
+            if !state.touches(id, p) {
+                return Ok(base.map(|(k, v)| (k.clone(), v.clone())).collect());
+            }
+            return Ok(overlay_sorted(state.cf(id), p, base));
+        }
         // Merge RocksDB entries with pending: RocksDB first, then the parent
         // layer (bl2 exec pipeline; absent on the serial path), then this
         // overlay's own pending set — each layer's tombstones remove and its
-        // writes override what sits below. Item 6 Phase 1: R's prefix range
-        // stands in for the DB rows of its two CFs.
-        let p = prefix.unwrap_or(&[]);
-        let db_entries = match self.resident_rows(id) {
-            Some(rows) => rows
-                .range::<[u8], _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
-                .take_while(|(k, _)| k.starts_with(p))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            None => StateBackend::iterate_cf(&self.db, cf, prefix)?,
-        };
+        // writes override what sits below.
+        let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
         let parent = self.parent.as_ref().map(|f| &f.state);
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
@@ -1905,14 +1955,15 @@ impl StateBackend for NativeStateOverlay {
         }
         let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
         let pending = self.pending.read().unwrap();
-        let parent = self.parent.as_ref().map(|p| &p.state);
-        // Item 6 Phase 1: R's range stands in for the RocksDB iterator.
+        // Item 6 Phase 1: R's range stands in for the RocksDB iterator; C6a
+        // (B0): R already holds the parent layer.
         if let Some(rows) = self.resident_rows(id) {
             let base = rows
                 .range::<[u8], _>(range)
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, parent, id, start, limit, base);
+            return merge_from(&pending, None, id, start, limit, base);
         }
+        let parent = self.parent.as_ref().map(|p| &p.state);
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -1935,11 +1986,14 @@ impl StateBackend for NativeStateOverlay {
         let Some(id) = intern_cf(cf) else {
             return StateBackend::prefix_exists(&self.db, cf, prefix);
         };
+        // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
+        let rows = self.resident_rows(id);
+        let parent = self.parent.as_ref().filter(|_| rows.is_none());
         let live = |key: &[u8]| -> bool {
             if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
                 return hit.is_some();
             }
-            match self.parent.as_ref().and_then(|p| p.state.lookup(id, key)) {
+            match parent.and_then(|p| p.state.lookup(id, key)) {
                 Some(hit) => hit.is_some(),
                 None => true,
             }
@@ -1947,13 +2001,13 @@ impl StateBackend for NativeStateOverlay {
         if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
             return Ok(true);
         }
-        if let Some(parent) = &self.parent {
+        if let Some(parent) = parent {
             if writes_under(&parent.state.cf(id).writes, prefix).any(|k| live(k)) {
                 return Ok(true);
             }
         }
         // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
-        if let Some(rows) = self.resident_rows(id) {
+        if let Some(rows) = rows {
             return Ok(rows
                 .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
                 .take_while(|(k, _)| k.starts_with(prefix))

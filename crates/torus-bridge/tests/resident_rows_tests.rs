@@ -271,3 +271,48 @@ fn metrics_count_rebuilds_and_size() {
     let text = metrics.encode();
     assert!(text.contains("torus_exec_resident_rows_build_seconds_count 1"), "{text}");
 }
+
+/// C6a (B0): R's CFs are read without the parent layer, so R is reused only
+/// when the overlay's parent is the frozen set of the block R reflects. A
+/// pipelined chain (parent = the previous block's frozen set, flushed one
+/// block later) reuses R and reads exactly DB + parent; a parent of another
+/// height (never on the node) rebuilds R from DB + that parent.
+#[test]
+fn pipelined_reuse_requires_the_parent_of_the_slot_height() {
+    let (_d, db) = open_db();
+    seed(&db);
+    let mut holder = ResidentBooks::default();
+    let mut parent: Option<Arc<torus_state::FrozenPending>> = None;
+    for h in 1..=4u64 {
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let block = begin_resident(Some(&mut holder), &mut overlay, h, None);
+        assert_eq!(block.rebuilt(), h == 1, "h{h}");
+        // Through R == through DB + parent (an overlay without R).
+        let plain = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        for cf in RESIDENT_CFS {
+            assert_eq!(overlay.iterate_cf(cf, None).unwrap(), plain.iterate_cf(cf, None).unwrap(), "h{h} {cf}");
+        }
+        overlay.put_cf_raw(CF_NATIVE_BALANCES, &[h as u8; 20], b"pipelined").unwrap();
+        overlay.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(h as u8 + 1, 1)).unwrap();
+        let delta = overlay.own_pending_delta();
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let frozen = overlay.freeze(h);
+        end_resident(&mut holder, block, &mut overlay, delta, true, None);
+        if let Some(p) = parent.take() {
+            p.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        }
+        parent = Some(frozen);
+    }
+    assert_eq!(holder.rows_builds(), 1, "reused along the chain");
+    // Block 4 durable (marker 4 in the DB: height and marker agree), then
+    // block 5 over a parent of height 3 (slot at 4): rebuilt, and the
+    // rebuilt R holds that parent's rows.
+    parent.take().unwrap().flush_with_native_trie_stats(&db, None, None, None).unwrap();
+    let odd = NativeStateOverlay::new(db.clone());
+    odd.put_cf_raw(CF_NATIVE_BALANCES, &[0x55; 20], b"odd-parent").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(odd.freeze(3)));
+    let block = begin_resident(Some(&mut holder), &mut overlay, 5, None);
+    assert!(block.rebuilt(), "parent 3 != slot 4");
+    assert_eq!(overlay.get_cf_raw(CF_NATIVE_BALANCES, &[0x55; 20]).unwrap(), Some(b"odd-parent".to_vec()));
+    assert_eq!(holder.rows_builds(), 2);
+}

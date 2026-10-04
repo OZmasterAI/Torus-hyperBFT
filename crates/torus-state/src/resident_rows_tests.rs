@@ -157,10 +157,11 @@ fn layer_touches_own_pending_only_with_resident() {
     assert!(!overlay.layer_touches(CF_NATIVE_BALANCES, &[2u8; 20]), "other CF");
 }
 
-/// Overlay with R: over random DB / R / parent / pending states, every read
-/// method on R's two CFs (`get_cf_raw`, `iterate_cf` with `None` and every
-/// prefix, `iterate_cf_from` over starts x limits, `prefix_exists`) equals the
-/// same read on a DB into which R (for its CFs; the DB rows for any other CF),
+/// Overlay with R: over random DB / R / parent / pending states (R already
+/// holding the parent, as on the node), every read method on R's two CFs
+/// (`get_cf_raw`, `iterate_cf` with `None` and every prefix,
+/// `iterate_cf_from` over starts x limits, `prefix_exists`) equals the same
+/// read on a DB into which R (for its CFs; the DB rows for any other CF),
 /// then the parent, then the pending set were flushed. R is authoritative: a
 /// DB row of R's CFs that R lacks is invisible. A non-R CF reads the DB.
 #[test]
@@ -221,9 +222,12 @@ fn overlay_with_resident_equals_flushed_db_over_random_layers() {
                 }
             }
         };
+        // C6a (B0): R holds the previous block's post-state, the parent layer
+        // included (`end_resident` applied the parent's own delta to R).
         let parent = (round % 4 != 0).then(|| {
             let p = NativeStateOverlay::new(db.clone());
             apply(&p, 0);
+            r_rows.apply(&p.own_pending_delta());
             p.freeze(1)
         });
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent);
@@ -291,4 +295,175 @@ fn db_row_absent_from_resident_is_invisible() {
     let detached = overlay.detach_resident();
     assert!(detached.is_some());
     assert_eq!(overlay.get_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap(), Some(b"db-only".to_vec()), "detached: DB again");
+}
+
+/// Every read of `cf` the overlay offers, over `keys` and `prefixes`, as one
+/// comparable dump (C6a).
+fn read_dump(ov: &NativeStateOverlay, cf: &str, keys: &BTreeSet<Vec<u8>>, prefixes: &BTreeSet<Vec<u8>>) -> Vec<String> {
+    let mut out = vec![format!("all {:?}", ov.iterate_cf(cf, None).unwrap())];
+    for k in keys.iter().chain(prefixes.iter()) {
+        out.push(format!("get {k:?} {:?}", ov.get_cf_raw(cf, k).unwrap()));
+    }
+    for p in prefixes {
+        out.push(format!("pfx {p:?} {:?}", ov.iterate_cf(cf, Some(p)).unwrap()));
+        out.push(format!("exists {p:?} {:?}", ov.prefix_exists(cf, p).unwrap()));
+        for limit in [0usize, 1, 2, 5, usize::MAX] {
+            out.push(format!("from {p:?} {limit} {:?}", ov.iterate_cf_from(cf, p, limit).unwrap()));
+        }
+    }
+    out
+}
+
+/// C6a (B0): with R attached, R's two CFs read own pending -> R and never the
+/// parent layer. Random DB / R / parent / pending layers (keys over a small
+/// alphabet, every op mix), two forms of R:
+/// * R already holds the parent (the node: `end_resident` applied it): the
+///   overlay with the parent, the same overlay without it and a DB flushed
+///   with R + parent + pending agree on all four read methods;
+/// * R does not hold the parent (never on the node): the overlay with the
+///   parent still reads exactly like the one without — the parent is not
+///   consulted for R's CFs.
+/// A non-R CF keeps reading the parent (non-vacuous: it differs).
+#[test]
+fn resident_cfs_skip_the_parent_layer() {
+    let mut seed: u64 = 0x5EED_00C6;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    const ALPHABET: [u8; 4] = [0x00, 0x01, 0xfe, 0xff];
+    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_ORDERS];
+    let (mut compared, mut other_cf_differs, mut parent_touched) = (0usize, 0usize, 0usize);
+    for round in 0..48 {
+        let r_holds_parent = round % 2 == 0;
+        let (db, _d1) = temp_db();
+        let (flushed, _d2) = temp_db();
+        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for _ in 0..4 + rnd(14) {
+            let len = 1 + rnd(4) as usize;
+            keys.insert((0..len).map(|_| ALPHABET[rnd(4) as usize]).collect());
+        }
+        // Per (cf, key): in DB, in R, parent op, pending op (0 none, 1 put, 2 delete).
+        let ops: Vec<(&str, Vec<u8>, bool, bool, u64, u64)> = cfs
+            .iter()
+            .flat_map(|cf| keys.iter().map(move |k| (*cf, k.clone())))
+            .map(|(cf, k)| (cf, k, rnd(2) == 1, rnd(2) == 1, rnd(3), rnd(3)))
+            .collect();
+        let mut r_rows = ResidentRows::default();
+        let seed_delta = NativeStateOverlay::new(flushed.clone());
+        for (cf, k, in_db, in_r, _, _) in &ops {
+            let resident = RESIDENT_CFS.contains(cf);
+            if *in_db {
+                db.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                if !resident {
+                    flushed.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                }
+            }
+            if resident && *in_r {
+                seed_delta.put_cf_raw(cf, k, &[b"r".as_slice(), k].concat()).unwrap();
+                flushed.put_cf_raw(cf, k, &[b"r".as_slice(), k].concat()).unwrap();
+            }
+        }
+        r_rows.apply(&seed_delta.own_pending_delta());
+        seed_delta.discard_tx();
+        let layer = |ov: &NativeStateOverlay, layer: u8, into_flushed: bool| {
+            for (cf, k, _, _, pa, pe) in &ops {
+                let v = [&[layer], k.as_slice()].concat();
+                match if layer == 0 { *pa } else { *pe } {
+                    1 => {
+                        ov.put_cf_raw(cf, k, &v).unwrap();
+                        if into_flushed {
+                            flushed.put_cf_raw(cf, k, &v).unwrap();
+                        }
+                    }
+                    2 => {
+                        ov.delete_cf_raw(cf, k).unwrap();
+                        if into_flushed {
+                            flushed.delete_cf_raw(cf, k).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let p = NativeStateOverlay::new(db.clone());
+        layer(&p, 0, r_holds_parent);
+        if r_holds_parent {
+            r_rows.apply(&p.own_pending_delta());
+        }
+        parent_touched += usize::from(!p.own_pending_delta().is_empty());
+        let parent = p.freeze(1);
+        let r = Arc::new(r_rows);
+        let mut with_parent = NativeStateOverlay::with_parent(db.clone(), Some(parent));
+        with_parent.attach_resident(r.clone());
+        let mut without = NativeStateOverlay::with_parent(db.clone(), None);
+        without.attach_resident(r);
+        layer(&with_parent, 1, true);
+        layer(&without, 1, false);
+
+        let mut prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+        prefixes.insert(Vec::new());
+        for k in &keys {
+            for l in 1..=k.len() {
+                prefixes.insert(k[..l].to_vec());
+            }
+            prefixes.insert([k.as_slice(), &[0xff]].concat());
+            prefixes.insert([k.as_slice(), &[0x00]].concat());
+        }
+        for cf in cfs {
+            let a = read_dump(&with_parent, cf, &keys, &prefixes);
+            let b = read_dump(&without, cf, &keys, &prefixes);
+            if !RESIDENT_CFS.contains(&cf) {
+                other_cf_differs += usize::from(a != b);
+                continue;
+            }
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x, y, "round {round} {cf} (R holds parent: {r_holds_parent}): with vs without parent");
+            }
+            assert_eq!(a.len(), b.len());
+            compared += a.len();
+            if r_holds_parent {
+                let want = read_dump(&NativeStateOverlay::new(flushed.clone()), cf, &keys, &prefixes);
+                assert_eq!(a, want, "round {round} {cf}: R + parent + pending == flushed DB");
+            }
+        }
+    }
+    assert!(compared > 10_000, "non-vacuous: {compared}");
+    assert!(parent_touched > 40, "parent layers with R-CF writes: {parent_touched}");
+    assert!(other_cf_differs > 10, "a non-R CF still reads the parent: {other_cf_differs}");
+}
+
+/// C6a (B0), the direct form: a parent-layer write or tombstone of R's CFs
+/// that R lacks is not visible through the overlay (R is the whole state
+/// below own pending); in another CF it is.
+#[test]
+fn parent_rows_of_resident_cfs_are_not_read() {
+    let (db, _dir) = temp_db();
+    let k = pos_key(1, 1);
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 1), b"db").unwrap();
+    let mut rows = ResidentRows::default();
+    let seed = NativeStateOverlay::new(db.clone());
+    seed.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 1), b"r").unwrap();
+    rows.apply(&seed.own_pending_delta());
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(CF_NATIVE_POSITIONS, &k, b"parent").unwrap();
+    parent.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 1)).unwrap();
+    parent.put_cf_raw(CF_NATIVE_ORDERS, &[1u8; 44], b"parent-order").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    overlay.attach_resident(Arc::new(rows));
+    let p = CF_NATIVE_POSITIONS;
+    assert_eq!(overlay.get_cf_raw(p, &k).unwrap(), None);
+    assert_eq!(overlay.get_cf_raw(p, &pos_key(2, 1)).unwrap(), Some(b"r".to_vec()));
+    assert_eq!(overlay.iterate_cf(p, None).unwrap(), vec![(pos_key(2, 1), b"r".to_vec())]);
+    assert!(overlay.iterate_cf(p, Some(&[1u8; 20])).unwrap().is_empty());
+    assert_eq!(overlay.iterate_cf_from(p, &[], 10).unwrap(), vec![(pos_key(2, 1), b"r".to_vec())]);
+    assert!(!overlay.prefix_exists(p, &[1u8; 20]).unwrap());
+    assert!(overlay.prefix_exists(p, &[2u8; 20]).unwrap());
+    assert_eq!(overlay.get_cf_raw(CF_NATIVE_ORDERS, &[1u8; 44]).unwrap(), Some(b"parent-order".to_vec()), "other CF: parent");
+    // Own pending still overrides R in every method.
+    overlay.put_cf_raw(p, &[1u8; 20 + 8], b"own").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(2, 1)).unwrap();
+    assert_eq!(overlay.iterate_cf(p, None).unwrap(), vec![([1u8; 28].to_vec(), b"own".to_vec())]);
+    assert!(!overlay.prefix_exists(p, &[2u8; 20]).unwrap());
+    assert!(overlay.prefix_exists(p, &[1u8; 20]).unwrap());
 }
