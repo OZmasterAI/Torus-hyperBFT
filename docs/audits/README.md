@@ -56,6 +56,7 @@ corrections; a repeated finding is not another defect.
 | 24 | [Staking claim atomicity](chain-0a25560-pass24-staking-claim-atomicity-2026-10-04.md) |
 | 25 | [Commission genesis bounds](chain-0a25560-pass25-commission-genesis-bounds-2026-10-04.md) |
 | 26 | [Validator inflation units](chain-0a25560-pass26-validator-inflation-units-2026-10-04.md) |
+| 27 | [Permanent-stake rewards and unlock](chain-0a25560-pass27-permanent-stake-rewards-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
