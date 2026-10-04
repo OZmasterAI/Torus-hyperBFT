@@ -348,7 +348,10 @@ pub fn apply_bundle_hashed(
             }
         } else {
             // Wipe every hashed storage entry under this account's 32-byte prefix.
-            let mut iter = db.inner().raw_iterator_cf(cf_stor);
+            let mut iter = db.inner().raw_iterator_cf_opt(
+                cf_stor,
+                crate::db::prefix_read_opts(hashed_address.as_slice()),
+            );
             iter.seek(hashed_address.as_slice());
             while iter.valid() {
                 let k = match iter.key() {

@@ -1888,10 +1888,7 @@ impl TorusApiServer for RpcState {
         // Forward prefix scan: keys encode descending block order via
         // (u64::MAX - block), so forward iteration returns newest first.
         let prefix = trader_addr.as_slice();
-        let iter = db.iterator_cf(
-            cf,
-            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-        );
+        let iter = torus_state::db::prefix_iter(db, &cf, prefix);
 
         // Each row holds the trader's fills in one block, in trade_index order.
         let mut trades = Vec::with_capacity(limit.min(256));

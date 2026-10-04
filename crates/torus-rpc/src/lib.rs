@@ -558,8 +558,9 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
 
         // Rows market_id(8) + block_height(8) + chunk(2), from chunk 0.
         let start_key = trade_key(market_id, block_height, 0);
-        let iter = db.iterator_cf(
+        let iter = db.iterator_cf_opt(
             trade_cf,
+            torus_state::db::prefix_read_opts(&start_key[..16]),
             rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
         );
         for item in iter {

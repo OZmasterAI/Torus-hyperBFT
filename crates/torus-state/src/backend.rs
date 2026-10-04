@@ -151,7 +151,7 @@ impl StateBackend for StateDb {
         let mut results = Vec::new();
         match prefix {
             Some(pfx) => {
-                let iter = db.prefix_iterator_cf(cf_handle, pfx);
+                let iter = crate::db::prefix_iter(db, &cf_handle, pfx);
                 for item in iter {
                     let (key, value) = item?;
                     if !key.starts_with(pfx) {
@@ -204,7 +204,7 @@ impl StateBackend for StateDb {
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        match db.prefix_iterator_cf(cf_handle, prefix).next() {
+        match crate::db::prefix_iter(db, &cf_handle, prefix).next() {
             Some(item) => Ok(item?.0.starts_with(prefix)),
             None => Ok(false),
         }
@@ -1835,7 +1835,7 @@ impl StateBackend for NativeStateOverlay {
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        for item in db.prefix_iterator_cf(cf_handle, prefix) {
+        for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
             let (key, _) = item?;
             if !key.starts_with(prefix) {
                 break;
