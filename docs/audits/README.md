@@ -100,6 +100,7 @@ corrections; a repeated finding is not another defect.
 | 68 | [Validator inflation tracker coverage](chain-5c756ff-pass68-validator-inflation-tracker-scope-2026-10-04.md) |
 | 69 | [Permanent reward compounding behavior](chain-5c756ff-pass69-permanent-reward-noncompounding-2026-10-04.md) |
 | 70 | [Permanent-stake top-up timestamp](chain-5c756ff-pass70-permanent-stake-lock-timestamp-2026-10-04.md) |
+| 71 | [Production routing of the developer fee bucket](chain-5c756ff-pass71-dev-pool-production-routing-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
