@@ -584,6 +584,9 @@ impl RpcState {
                                         ..
                                     } => "sender_queue_full",
                                     torus_mempool::MempoolError::NativePoolFull => "pool_full",
+                                    torus_mempool::MempoolError::UnfundedSender { .. } => {
+                                        "unfunded"
+                                    }
                                     _ => "other",
                                 });
                                 RpcSubmitResult {
@@ -1301,7 +1304,12 @@ impl TorusApiServer for RpcState {
 
         self.mempool
             .add_native_action_presigned(sender, action.clone())
-            .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
+            .map_err(|e| {
+                if matches!(e, torus_mempool::MempoolError::UnfundedSender { .. }) {
+                    self.count_admit_reject("unfunded");
+                }
+                ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}")))
+            })?;
 
         // B1: forward the PARSED action (structured tuple, no JSON re-encode).
         if let Some(leader_vk) = self.forward_leader_target() {

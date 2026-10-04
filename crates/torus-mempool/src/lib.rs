@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod evm_pool;
+pub mod funded;
 pub mod native_pool;
 pub mod rate_limit;
 pub mod validate;
@@ -87,6 +88,12 @@ pub struct MempoolConfig {
     pub native_admission_horizon_ms: u64,
     /// The admission limit never drops below this many pooled actions.
     pub native_admission_floor: usize,
+    // ---- Anti-spam item A ----
+    /// Whole TRS a sender must hold for its native actions to enter the pool
+    /// (see [`funded`]). 0 = off — the library default, so embedded users and
+    /// tests are unaffected; `torus-node` sets it from
+    /// `TORUS_INGRESS_MIN_COLLATERAL` (default 1).
+    pub ingress_min_collateral_trs: u64,
 }
 
 impl Default for MempoolConfig {
@@ -107,6 +114,7 @@ impl Default for MempoolConfig {
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
             native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
             native_admission_floor: rate_limit::admission_floor(),
+            ingress_min_collateral_trs: 0,
         }
     }
 }
@@ -604,7 +612,13 @@ impl Mempool {
                 "nonce too far in future".into(),
             ));
         }
-        self.submit_native_action_inner(sender, action, cache_key)
+        let result = self.submit_native_action_inner(sender, action, cache_key);
+        if let (Err(MempoolError::UnfundedSender { .. }), Some(m)) = (&result, self.metrics.get()) {
+            m.native_gossip_admit_rejects
+                .get_or_create(&vec![("reason".into(), "unfunded".into())])
+                .inc();
+        }
+        result
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
@@ -660,7 +674,7 @@ impl Mempool {
         action: SignedNativeAction,
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
-
+        self.check_funded(&sender, &action.action)?;
         {
             let mut pool = self.native.write().unwrap();
             let result = pool.insert_with_restash_key(sender, action, cache_key);
@@ -675,6 +689,29 @@ impl Mempool {
         }
         tracing::debug!(%sender, "native action added to mempool");
         Ok(())
+    }
+
+    /// Anti-spam item A: refuse a non-exempt action whose sender holds less
+    /// than `ingress_min_collateral_trs` (see [`funded`]). Runs on every
+    /// ingress path (RPC, gossip, forward) AFTER the sender is known — the
+    /// sender is only known once the signature (or the session) is verified —
+    /// and before the pool lock is taken.
+    fn check_funded(
+        &self,
+        sender: &Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), MempoolError> {
+        let min_trs = self.config.ingress_min_collateral_trs;
+        if min_trs == 0
+            || funded::is_exempt(action)
+            || funded::is_funded(&self.state, sender, min_trs)
+        {
+            return Ok(());
+        }
+        Err(MempoolError::UnfundedSender {
+            sender: *sender,
+            min_trs,
+        })
     }
 
     /// Drain native actions for a block proposal.
@@ -3256,5 +3293,230 @@ mod tests {
         pool.add_evm_tx(raw)
             .expect("pre-155 legacy tx must be admitted");
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    // ---- Anti-spam item A: funded-account check ----
+
+    fn funded_cfg(min_trs: u64) -> MempoolConfig {
+        MempoolConfig {
+            ingress_min_collateral_trs: min_trs,
+            ..MempoolConfig::default()
+        }
+    }
+
+    fn put_native(state: &StateDb, addr: &Address, available: i128, order_margin: i128) {
+        torus_core::position::PositionManager::new(state.clone())
+            .put_native_balance(
+                addr,
+                &torus_core::position::NativeBalance {
+                    available: torus_types::FixedPoint::from_raw(available),
+                    order_margin: torus_types::FixedPoint::from_raw(order_margin),
+                },
+            )
+            .unwrap();
+    }
+
+    const ONE_TRS: i128 = torus_types::FixedPoint::SCALE;
+
+    fn cancel_all(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::CancelAllOrders { market_id: None },
+            nonce,
+            k,
+        )
+    }
+
+    #[test]
+    fn parse_ingress_min_collateral_default_and_off() {
+        use crate::funded::parse_ingress_min_collateral as p;
+        assert_eq!(p(None), 1);
+        assert_eq!(p(Some("0".into())), 0);
+        assert_eq!(p(Some(" 5 ".into())), 5);
+        assert_eq!(p(Some("junk".into())), 1);
+        assert_eq!(
+            MempoolConfig::default().ingress_min_collateral_trs,
+            0,
+            "library default is off"
+        );
+    }
+
+    #[test]
+    fn unfunded_sender_rejected_on_rpc_path() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, funded_cfg(1));
+        let k = key(41);
+        let a = cancel_all(&k, now_ms());
+        let err = pool
+            .add_native_action_presigned(address_from_key(&k), a)
+            .expect_err("fresh key must be refused");
+        assert!(
+            matches!(err, MempoolError::UnfundedSender { min_trs: 1, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not funded"), "{err}");
+        assert!(
+            !err.to_string().contains("retry"),
+            "must not look retryable: {err}"
+        );
+        assert_eq!(pool.native_pool_size(), 0);
+    }
+
+    #[test]
+    fn funded_by_perp_collateral_spot_or_position() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        // available alone
+        let k1 = key(42);
+        put_native(&state, &address_from_key(&k1), ONE_TRS, 0);
+        pool.add_native_action_presigned(address_from_key(&k1), cancel_all(&k1, t0))
+            .expect("1 TRS available");
+        // available + order margin together reach the minimum
+        let k2 = key(43);
+        put_native(&state, &address_from_key(&k2), ONE_TRS / 2, ONE_TRS / 2);
+        pool.add_native_action_presigned(address_from_key(&k2), cancel_all(&k2, t0))
+            .expect("0.5 available + 0.5 order margin");
+        // spot (EVM) balance of 1 TRS
+        let k3 = key(44);
+        fund(&state, &address_from_key(&k3), U256::from(10u64.pow(18)), 0);
+        pool.add_native_action_presigned(address_from_key(&k3), cancel_all(&k3, t0))
+            .expect("1 TRS spot");
+        // open position, no balance at all
+        let k4 = key(45);
+        torus_core::position::PositionManager::new(state.clone())
+            .put_position(&torus_core::position::Position {
+                trader: address_from_key(&k4),
+                market_id: 1,
+                is_long: true,
+                size: torus_types::FixedPoint::from_raw(ONE_TRS),
+                entry_price: torus_types::FixedPoint::from_raw(ONE_TRS),
+                realized_pnl: torus_types::FixedPoint::ZERO,
+                isolated_margin: torus_types::FixedPoint::ZERO,
+                margin_type: torus_core::position::MarginType::Cross,
+            })
+            .unwrap();
+        pool.add_native_action_presigned(address_from_key(&k4), cancel_all(&k4, t0))
+            .expect("an open position must be manageable");
+        // just below the minimum on both sides
+        let k5 = key(46);
+        put_native(&state, &address_from_key(&k5), ONE_TRS - 1, 0);
+        fund(
+            &state,
+            &address_from_key(&k5),
+            U256::from(10u64.pow(18) - 1),
+            0,
+        );
+        assert!(matches!(
+            pool.add_native_action_presigned(address_from_key(&k5), cancel_all(&k5, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        assert_eq!(pool.native_pool_size(), 4);
+    }
+
+    #[test]
+    fn funded_check_exempts_validator_and_staking_exit_actions_and_can_be_off() {
+        use torus_types::NativeAction as A;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let k = key(47);
+        let t0 = now_ms();
+        let exempt = [
+            A::ClaimRewards,
+            A::ClaimUnbonded,
+            A::UnjailSelf,
+            A::AttestStateHash {
+                height: 100,
+                hash: B256::repeat_byte(1),
+            },
+        ];
+        for (i, a) in exempt.into_iter().enumerate() {
+            let s = torus_types::eip712::sign_native_action(a, t0 + i as u64, &k);
+            pool.add_native_action_presigned(address_from_key(&k), s)
+                .expect("exempt kind admitted unfunded");
+        }
+        // Gated kinds that a new user might try first are refused.
+        for (i, a) in [A::CreateSession {
+            session_pubkey: [3; 32],
+            expiry: t0 + 60_000,
+            scope: torus_types::SessionScope::Full,
+        }]
+        .into_iter()
+        .enumerate()
+        {
+            let s = torus_types::eip712::sign_native_action(a, t0 + 100 + i as u64, &k);
+            assert!(matches!(
+                pool.add_native_action_presigned(address_from_key(&k), s),
+                Err(MempoolError::UnfundedSender { .. })
+            ));
+        }
+        // min 0 = off
+        let off = Mempool::new(state, funded_cfg(0));
+        off.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+            .expect("check off");
+    }
+
+    #[test]
+    fn unfunded_sender_rejected_on_gossip_paths_and_counted() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let k = key(48);
+        let t0 = now_ms();
+        let a = cancel_all(&k, t0);
+        assert!(matches!(
+            pool.add_native_action_from_gossip(address_from_key(&k), a.clone()),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        assert!(matches!(
+            pool.add_native_action_from_gossip_trusted(address_from_key(&k), a.clone()),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // The body is still DA-mirrored (availability != validity).
+        assert!(pool
+            .get_native_da(&torus_types::compute_action_hash(&a))
+            .is_some());
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_native_gossip_admit_rejects_total{reason="unfunded"} 2"#),
+            "{text}"
+        );
+        put_native(&state, &address_from_key(&k), ONE_TRS, 0);
+        pool.add_native_action_from_gossip(address_from_key(&k), a)
+            .expect("funded now");
+    }
+
+    #[test]
+    fn session_action_checks_the_owner() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        let owner = Address::from([0x77; 20]);
+        let a = torus_types::eip712::sign_native_action_with_session(
+            torus_types::NativeAction::CancelAllOrders { market_id: None },
+            t0,
+            &([8u8; 32].into()),
+        );
+        let torus_types::ActionSignature::Session { session_pubkey, .. } = &a.signature else {
+            panic!("session signature expected")
+        };
+        state
+            .put_session(
+                session_pubkey,
+                &torus_types::SessionData {
+                    owner,
+                    expiry: t0 + 60_000,
+                    scope: torus_types::SessionScope::Full,
+                    created_at: t0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            pool.add_native_action_from_gossip(owner, a.clone()),
+            Err(MempoolError::UnfundedSender { sender, .. }) if sender == owner
+        ));
+        put_native(&state, &owner, ONE_TRS, 0);
+        pool.add_native_action_from_gossip(owner, a)
+            .expect("owner funded");
     }
 }

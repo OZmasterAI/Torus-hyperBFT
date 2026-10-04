@@ -575,8 +575,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mempool_config = MempoolConfig {
         chain_id: chain_config.chain_id,
         block_gas_limit: chain_config.evm_gas_limit,
+        // Anti-spam item A: ON in the node (default 1 TRS), 0 = off.
+        ingress_min_collateral_trs: torus_mempool::funded::ingress_min_collateral(),
         ..MempoolConfig::default()
     };
+    info!(
+        ingress_min_collateral_trs = mempool_config.ingress_min_collateral_trs,
+        "native ingress anti-spam: funded-account check (TORUS_INGRESS_MIN_COLLATERAL, whole TRS, 0 = off; node-local)"
+    );
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
     // r4: log the effective native block-selection bundle + direct-push floor
     // once at startup so a bench/ops snapshot (`nodeenv-*.txt`, journal) shows

@@ -1562,6 +1562,107 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Anti-spam item A: a sender without funds is refused after verify with
+    /// a distinct, non-retryable reply and counted as `unfunded`; a funded
+    /// sender in the same batch is admitted. Same on the single endpoint.
+    #[tokio::test]
+    async fn unfunded_sender_rejected_and_counted() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let cfg = MempoolConfig {
+            ingress_min_collateral_trs: 1,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let funded_key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let fresh_key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")
+                .unwrap(),
+        )
+        .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |key: &k256::ecdsa::SigningKey, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::CancelAllOrders { market_id: None },
+                nonce,
+                key,
+            );
+            let sender = signed.recover_sender().unwrap();
+            (
+                sender,
+                format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap())),
+            )
+        };
+        let (funded_addr, funded_payload) = mk(&funded_key, now_ms);
+        let (_, fresh_payload) = mk(&fresh_key, now_ms + 1);
+        torus_core::position::PositionManager::new(state.clone())
+            .put_native_balance(
+                &funded_addr,
+                &torus_core::position::NativeBalance {
+                    available: torus_types::FixedPoint::ONE,
+                    order_margin: torus_types::FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![funded_payload, fresh_payload]],
+            )
+            .await
+            .unwrap();
+        assert!(
+            results[0].error.is_none(),
+            "funded sender admitted: {:?}",
+            results[0]
+        );
+        let err = results[1].error.as_deref().unwrap_or("");
+        assert!(err.contains("not funded"), "distinct reply: {err}");
+        assert!(!err.contains("retry"), "must not look retryable: {err}");
+        assert_eq!(mempool.native_pool_size(), 1);
+
+        let (_, fresh_single) = mk(&fresh_key, now_ms + 2);
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![fresh_single],
+            )
+            .await;
+        let e = single.expect_err("single endpoint refuses too");
+        assert!(e.to_string().contains("not funded"), "{e}");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="unfunded"} 2"#),
+            "unfunded rejects not counted; dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
     /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
     /// are shed after a decode-only pass (no signature verification spent),
     /// while cancels still travel the full verify path so pool eviction
