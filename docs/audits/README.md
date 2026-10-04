@@ -61,6 +61,11 @@ corrections; a repeated finding is not another defect.
 | 29 | [Fee burn and supply reporting](chain-0a25560-pass29-fee-burn-supply-tracker-2026-10-04.md) |
 | 30 | [EVM fee revenue and beneficiary accounting](chain-0a25560-pass30-evm-fee-revenue-double-credit-2026-10-04.md) |
 | 31 | [Repeated jail-vote slashing](chain-0a25560-pass31-repeated-jail-vote-slashing-2026-10-04.md) |
+| 32 | [Lockbox boundary and delayed settlement](chain-0a25560-pass32-lockbox-boundaries-2026-10-04.md) |
+| 33 | [CoreWriter queue and staking roundtrip](chain-0a25560-pass33-corewriter-staking-roundtrip-2026-10-04.md) |
+| 34 | [Perpetual funding configuration and settlement](chain-0a25560-pass34-perpetual-funding-config-2026-10-04.md) |
+| 35 | [Backstop with unmarked positions](chain-0a25560-pass35-backstop-unmarked-collateral-2026-10-04.md) |
+| 36 | [Fee split write failure atomicity](chain-0a25560-pass36-fee-split-error-atomicity-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
