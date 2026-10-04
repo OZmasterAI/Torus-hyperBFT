@@ -1,0 +1,41 @@
+# arms.conf.example -- copy to <CAMPAIGN_DIR>/arms.conf and edit (the copy is
+# per-campaign and not committed). Read once by ab-driver.sh, after it takes the
+# global bench lock. Lines starting with '#' and empty lines are ignored.
+#
+# One line per arm, TAB-separated (not spaces!). Columns:
+#   1 arm            arm name; labels are <prefix>-<arm>-<round>. Name the baseline
+#                    arm main* (score.py pairs every other arm against it).
+#   2 artifacts_dir  ABSOLUTE dir holding release/torus-node and
+#                    release/bench-throughput (+ optional manifest.json provenance).
+#                    No $HOME / ~ expansion here.
+#   3 node_env       node env for run-cell.sh EXTRA_ENV, space-separated KEY=VAL
+#   4 rate           bench --rate                         (default 76000)
+#   5 crash_at       --crash-at seconds or comma list     (default none)
+#   6 duration       seconds of load                      (default 300)
+#   7 runner_env     space-separated KEY=VAL, run_cell.py allowlist: BAND
+#                    CROSS_FRACTION CANCEL_FRACTION MPS RATE_SCHEDULE DEPTH_OBSERVER
+#                    OPEN_ORDER_BUDGET BATCH NODE_CPUS BENCH_CPUS BENCH_RPCS CONC
+#                    SENDERS STATE_HASH_ACTIVATION ORACLE_FEED ORACLE_PRICE
+#                    ORACLE_INTERVAL_MS                   (default none)
+#   8 cap            block cap (BLOCK_CAP)                (default 200)
+#   9 markets        markets in the genesis / bench       (default 10)
+# Use '-' for an empty column that has later columns after it (bash read
+# collapses consecutive TABs, which would shift the columns).
+#
+# ORDER line: <round>:<arm> items, run left to right. r0 = unscored warm-up
+# (start-warmup.sh runs the r0 items, start-rounds.sh the rest). Interleave ABBA
+# and give every scored arm >= 4 cells. Optional loK items (low-load rounds) go
+# after all rN items.
+#
+# Below: the s87 config (300 markets, cap 400, 300 s, rate 76000) with a main
+# baseline and one candidate arm. The warm-up arm uses the candidate's binaries.
+warmup	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/cand	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300
+main	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/main	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300
+cand	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/cand	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300
+# Oracle-feed variant (needs a bench-throughput with the `oracle-feed` subcommand, see README):
+#candoracle	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/cand	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1 ORACLE_FEED=1 ORACLE_PRICE=30000 ORACLE_INTERVAL_MS=2000	400	300
+# CPU pinning variant (cores for val0/val1/val2, then the load generator). Needs a
+# harness (HARNESS_WT) from branch perf/s75-cpu-pinning: main's run-cell.sh ignores
+# NODE_CPUS/BENCH_CPUS (and RATE_SCHEDULE/DEPTH_OBSERVER) without an error.
+#mainpinned	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/main	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1 NODE_CPUS=0-5/6-10/11-15 BENCH_CPUS=16-17	400	300
+ORDER	r0:warmup r1:main r1:cand r2:cand r2:main r3:main r3:cand r4:cand r4:main

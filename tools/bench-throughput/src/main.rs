@@ -171,6 +171,14 @@ enum Command {
         /// cells stay reproducible.
         #[arg(long, default_value_t = 0)]
         open_order_budget: u64,
+        /// econ: when the node sheds an action as busy (admission limit or
+        /// full pool), back off and resend the SAME action instead of drawing
+        /// a new one. The node sheds only non-cancels, so without this the
+        /// admitted mix drifts toward all cancel-alls under overload and
+        /// cancels (selected first) starve placement. Default OFF, so prior
+        /// cells stay reproducible.
+        #[arg(long, default_value_t = false)]
+        retry_busy: bool,
         /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
         /// so a 1-lot order's margin lands exactly on target.
         #[arg(long, default_value_t = 0)]
@@ -572,6 +580,9 @@ struct EconShape {
     /// Max estimated open orders per sender (0 = off); see
     /// `econ_action_budgeted`.
     open_order_budget: u64,
+    /// Resend a shed action until admitted instead of drawing a new one; see
+    /// `submit_until_admitted`.
+    retry_busy: bool,
 }
 
 impl EconShape {
@@ -598,6 +609,7 @@ impl EconShape {
             cross_fraction: cross_fraction.clamp(0.0, 1.0),
             cancel_fraction: cancel_fraction.clamp(0.0, 1.0),
             open_order_budget: 0,
+            retry_busy: false,
         }
     }
 }
@@ -1731,13 +1743,66 @@ async fn submit_payloads(
     bin: bool,
     submitted: &AtomicU64,
 ) {
-    let result = if payloads.len() == 1 && !bin {
+    record_submit(
+        submit_once(client, url, payloads, req_id, bin).await,
+        submitted,
+    );
+}
+
+/// One submission of `payloads`; returns how many the server accepted.
+async fn submit_once(
+    client: &reqwest::Client,
+    url: &str,
+    payloads: &[String],
+    req_id: u64,
+    bin: bool,
+) -> Result<usize, String> {
+    if payloads.len() == 1 && !bin {
         submit_native_action(client, url, &payloads[0], req_id)
             .await
             .map(|()| 1usize)
     } else {
         submit_native_actions_batch(client, url, payloads, req_id, bin).await
-    };
+    }
+}
+
+/// `--retry-busy`: pause between resends of a shed action.
+const RETRY_BUSY_BACKOFF: Duration = Duration::from_millis(50);
+/// `--retry-busy`: stop resending an action this long after its first send,
+/// well inside the node's 60 s nonce window so an admitted resend can still
+/// commit before it expires.
+const RETRY_BUSY_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// True for the node's retryable "shed before verify" replies: the admission
+/// limit and the full pool (torus-rpc `ADMISSION_BUSY_MSG`,
+/// `POOL_FULL_PREVERIFY_MSG`). Both shed only non-cancels.
+fn is_busy_reject(err: &str) -> bool {
+    err.contains("admission limit reached") || err.contains("pool full (pre-verify)")
+}
+
+/// Call `submit` until it is not a busy reject, sleeping `backoff` between
+/// tries; returns the last result once a retry would end after `give_up`.
+async fn submit_until_admitted<F, Fut>(
+    mut submit: F,
+    backoff: Duration,
+    give_up: Instant,
+) -> Result<usize, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<usize, String>>,
+{
+    loop {
+        match submit().await {
+            Err(e) if is_busy_reject(&e) && Instant::now() + backoff < give_up => {
+                tokio::time::sleep(backoff).await
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Credit `submitted` with an accepted count, or log one of the first few errors.
+fn record_submit(result: Result<usize, String>, submitted: &AtomicU64) {
     match result {
         Ok(accepted) => {
             submitted.fetch_add(accepted as u64, Ordering::Relaxed);
@@ -1750,6 +1815,87 @@ async fn submit_payloads(
                 eprintln!("[submit] {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod busy_retry_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The exact per-item reply the node's RPC ingress returns when it sheds a
+    /// non-cancel, as `submit_native_actions_batch` wraps it.
+    const ADMISSION_BUSY: &str =
+        "0 accepted (1 sent): \"mempool: busy, admission limit reached (pre-verify), retry later\"";
+    const POOL_FULL: &str = "0 accepted (1 sent): \"mempool: pool full (pre-verify)\"";
+
+    #[test]
+    fn busy_and_pool_full_rejects_are_retryable_others_are_not() {
+        assert!(is_busy_reject(ADMISSION_BUSY));
+        assert!(is_busy_reject(POOL_FULL));
+        assert!(!is_busy_reject("0 accepted (1 sent): \"invalid nonce\""));
+        assert!(!is_busy_reject("http: connection refused"));
+    }
+
+    #[test]
+    fn econ_shape_defaults_retry_busy_off() {
+        assert!(!EconShape::new(1500, 0, 5, 0.5, 0.05).retry_busy);
+    }
+
+    #[tokio::test]
+    async fn resends_the_same_payload_until_admitted() {
+        let calls = AtomicUsize::new(0);
+        let r = submit_until_admitted(
+            || {
+                let n = calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if n < 2 {
+                        Err(ADMISSION_BUSY.to_string())
+                    } else {
+                        Ok(1)
+                    }
+                }
+            },
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(r, Ok(1));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn other_errors_are_not_retried() {
+        let calls = AtomicUsize::new(0);
+        let r = submit_until_admitted(
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Err::<usize, _>("http: connection refused".to_string()) }
+            },
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn gives_up_at_the_give_up_instant() {
+        let calls = AtomicUsize::new(0);
+        let start = Instant::now();
+        let r = submit_until_admitted(
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Err::<usize, _>(ADMISSION_BUSY.to_string()) }
+            },
+            Duration::from_millis(10),
+            start + Duration::from_millis(50),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!((2..=6).contains(&calls.load(Ordering::Relaxed)));
     }
 }
 
@@ -2865,6 +3011,27 @@ async fn run_consensus(
                     let url = urls[url_idx % url_count].clone();
                     url_idx += 1;
                     req_id += 1;
+                    if shape.retry_busy {
+                        // Closed loop: this sender draws its next action only
+                        // once this one is admitted (or given up on), so the
+                        // admitted mix keeps the generated cancel fraction.
+                        // A concurrency permit is held per attempt, never
+                        // across the backoff sleep.
+                        drop(permit);
+                        let give_up = deadline.min(Instant::now() + RETRY_BUSY_MAX_AGE);
+                        let (sem, client, url, payloads) = (&semaphore, &client, &url, &payloads);
+                        let result = submit_until_admitted(
+                            || async move {
+                                let _permit = sem.acquire().await.unwrap();
+                                submit_once(client, url, payloads, req_id, bin).await
+                            },
+                            RETRY_BUSY_BACKOFF,
+                            give_up,
+                        )
+                        .await;
+                        record_submit(result, &submitted);
+                        continue;
+                    }
                     let client = client.clone();
                     let submitted = submitted.clone();
                     tokio::spawn(async move {
@@ -3384,6 +3551,7 @@ async fn main() {
             cross_fraction,
             cancel_fraction,
             open_order_budget,
+            retry_busy,
             econ_mid,
             band,
             rate_total,
@@ -3408,6 +3576,7 @@ async fn main() {
             };
             let econ_shape = econ.then(|| EconShape {
                 open_order_budget,
+                retry_busy,
                 ..EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
             });
             run_consensus(

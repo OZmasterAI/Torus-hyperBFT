@@ -4,7 +4,7 @@
 #   run-cell.sh <worktree> <label> [MARKETS=10] [DUR=120] [RATE=76000] [EXTRA_ENV='K=V ...']
 #
 # BUILDS NOTHING. It stages the binary that already sits in
-# $TARGET_DIR/release/torus-node (default /home/18c/.cargo-target-matched) into
+# $TARGET_DIR/release/torus-node (default $HOME/.cargo-target-matched) into
 # <worktree>/target/release/torus-node (devnet/wsl/env.sh hardcodes that path),
 # proves the copy with md5sums, generates a MARKETS-market 3-val genesis, launches
 # the bare-metal 3-validator devnet with the RE-PROOF5 record-cell env (+EXTRA_ENV
@@ -17,8 +17,8 @@
 #
 # Optional env overrides:
 #   TARGET_DIR   cargo target dir holding torus-node + bench-throughput
-#                (default /home/18c/.cargo-target-matched)
-#   RESULTS_ROOT (default /home/18c/bench-results-matched)
+#                (default $HOME/.cargo-target-matched)
+#   RESULTS_ROOT (default $HOME/bench-results-matched)
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
 #   BATCH        --batch-size (400)               SUBMIT --submit-batch (1)
@@ -32,6 +32,11 @@
 #                cancel-all before its estimated open orders would pass N, so
 #                it stays under the chain's per-user open-order limit (1000+,
 #                all markets). Unset (default) = flag omitted.
+#   RETRY_BUSY=1 bench --retry-busy: a sender resends an action the node shed
+#                as busy instead of drawing a new one, so the admitted mix keeps
+#                the cancel fraction (without it, overloaded small-cap cells
+#                admit almost only cancel-alls and placement starves). Unset
+#                (default) = flag omitted.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -103,6 +108,25 @@
 #                metrics-before, bench end and metrics-after, into
 #                $OUT/schedstat.json (summarize.py -> sched_by_node). A
 #                thread the binary does not have is recorded as null.
+#   ORACLE_FEED=1  run an oracle price feed during the cell (s87), so the stack
+#                is benched with fresh MARK prices like a real chain. Unset/0
+#                (default) = no feed, exactly the pre-s87 cell. When 1: after the
+#                idle probe, `bench-throughput oracle-feed` signs submissions for
+#                all MARKETS markets with the 3 devnet validator keys
+#                ($MAINREPO/devnet/wsl/bench-validator-keys.json) every
+#                ORACLE_INTERVAL_MS (default 2000) at ORACLE_PRICE (default
+#                30000 = the bench econ mid, 20 x --target-margin 1500). The
+#                load starts only once torus_getMarkPrice on val0 shows a usable
+#                mark for EVERY market whose fresh aggregate was written after
+#                the feed started (all 3 validators reported); 90 s timeout,
+#                else the cell FAILS. The feed is SIGSTOPped for the drain and
+#                the state digest (its submissions are native actions: they
+#                would keep the drain's quiet counters and the digest's funnel
+#                snapshot moving forever; a mark stays usable 60 s past its last
+#                fresh aggregate), then SIGTERMed after the digest. Artifacts:
+#                oracle-feed.log, oracle-feed-stats.json, oracle-marks-*.json,
+#                summary.json .oracle_feed (sent/accepted/rejected/stale marks
+#                at bench end).
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -111,7 +135,7 @@
 #                exits without touching the devnet.
 set -uo pipefail
 
-usage() { sed -n '2,105p' "$0"; exit 2; }
+usage() { sed -n '2,124p' "$0"; exit 2; }
 [ $# -ge 2 ] || usage
 
 WT=$(cd "$1" && pwd) || { echo "FATAL: worktree '$1' not found" >&2; exit 2; }
@@ -144,8 +168,8 @@ if [ -n "${RUN_CELL_PRINT_PATHS:-}" ]; then
         "$WT" "$SELF_DIR" "$TOOLS_DIR" "$TOOLS_FROM_WORKTREE" "$MAINREPO"
     exit 0
 fi
-TARGET_DIR=${TARGET_DIR:-/home/18c/.cargo-target-matched}
-RESULTS_ROOT=${RESULTS_ROOT:-/home/18c/bench-results-matched}
+TARGET_DIR=${TARGET_DIR:-$HOME/.cargo-target-matched}
+RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}
 SENDERS=${SENDERS:-5000}
 CONC=${CONC:-256}
@@ -156,6 +180,7 @@ BAND=${BAND:-5}
 CROSS_FRACTION=${CROSS_FRACTION:-0.5}
 CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}
+RETRY_BUSY=${RETRY_BUSY:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -167,6 +192,11 @@ CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
 KILL_NODE=${KILL_NODE:-val1}
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
+ORACLE_FEED=${ORACLE_FEED:-0}
+ORACLE_PRICE=${ORACLE_PRICE:-30000}
+ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
+ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
+ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
 
 SRC_NODE="$TARGET_DIR/release/torus-node"
@@ -326,10 +356,24 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
 [[ "$BAND" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BAND must be a positive integer" >&2; exit 2; }
 [ -z "$OPEN_ORDER_BUDGET" ] || [[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]] || { echo "FATAL: OPEN_ORDER_BUDGET must be an integer" >&2; exit 2; }
+[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ] || { echo "FATAL: RETRY_BUSY must be 1 or unset" >&2; exit 2; }
 for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+case "$ORACLE_FEED" in
+    0) ;;
+    1)
+        [[ "$ORACLE_PRICE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v p="$ORACLE_PRICE" 'BEGIN{exit !(p>0)}' \
+            || { echo "FATAL: ORACLE_PRICE must be a positive number (got '$ORACLE_PRICE')" >&2; exit 2; }
+        # a fresh aggregate needs all 3 validators inside one 10 s window
+        [[ "$ORACLE_INTERVAL_MS" =~ ^[1-9][0-9]*$ ]] && [ "$ORACLE_INTERVAL_MS" -lt 10000 ] \
+            || { echo "FATAL: ORACLE_INTERVAL_MS must be an integer in 1..9999 (got '$ORACLE_INTERVAL_MS')" >&2; exit 2; }
+        [ -s "$ORACLE_KEYS" ] || { echo "FATAL: ORACLE_FEED=1 needs the validator key file $ORACLE_KEYS" >&2; exit 1; }
+        "$BENCH" oracle-feed --help >/dev/null 2>&1 || { echo "FATAL: ORACLE_FEED=1 but $BENCH has no oracle-feed subcommand" >&2; exit 1; }
+        ;;
+    *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
+esac
 
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
 # so a bad kill window can never be discovered mid-cell.
@@ -350,6 +394,8 @@ fi
 
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
 if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
+# A stray feed (from a SIGKILLed oracle cell) would sign into THIS devnet too.
+if pgrep -f "bench-throughput oracle-feed" >/dev/null; then echo "FATAL: an oracle feed is already running" >&2; exit 1; fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
     echo "FATAL: a devnet is already running ($RUN_DIR/pids) — run $WSL/stop-3val.sh first" >&2; exit 1
 fi
@@ -361,7 +407,24 @@ fi
 mkdir -p "$OUT"
 : > "$OUT/run.log"
 
-SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""
+SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; ORACLE_PID=""; ORACLE_RC=""
+# alive <pid>: running or stopped, NOT an unreaped zombie (kill -0 succeeds on those).
+alive() { local s; s=$(ps -o stat= -p "$1" 2>/dev/null) && [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }
+# Idempotent; safe on every exit path. TERM first, CONT so a feed paused for the
+# drain receives it, 10 s grace, then KILL. The feed writes its stats on TERM.
+stop_oracle_feed() {
+    [ -n "$ORACLE_PID" ] || return 0
+    local pid=$ORACLE_PID _t
+    ORACLE_PID=""
+    kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null
+    for _t in $(seq 1 50); do alive "$pid" || break; sleep 0.2; done
+    if alive "$pid"; then
+        kill -KILL "$pid" 2>/dev/null
+        log "WARNING: oracle feed pid $pid ignored SIGTERM for 10 s — SIGKILLed (stats may be missing)"
+    fi
+    wait "$pid" 2>/dev/null; ORACLE_RC=$?
+    log "oracle feed pid $pid stopped rc=$ORACLE_RC"
+}
 stop_sampler() {
     [ -n "$SAMPLER_PID" ] || return 0
     local pid="$SAMPLER_PID" rc=0
@@ -377,6 +440,7 @@ finish_fail() {
     [ -n "$CPU_PID" ] && kill "$CPU_PID" 2>/dev/null
     [ -n "$BENCH_PID" ] && kill "$BENCH_PID" 2>/dev/null
     [ -n "$CRASH_PID" ] && kill "$CRASH_PID" 2>/dev/null
+    stop_oracle_feed
     "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1 || true
     python3 - "$OUT" <<'PY' 2>/dev/null || true
 import json,sys,os,time
@@ -392,10 +456,13 @@ json.dump(d,open(p,'w'),indent=1)
 PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
+# Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
+if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
+[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
@@ -502,6 +569,83 @@ for _try in 1 2 3; do
     awk -v v="$IDLE_BLKS" 'BEGIN{exit !(v>=10)}' && break
 done
 
+# ---------------------------------------------------------------- 4b. oracle feed (ORACLE_FEED=1)
+# oracle_marks <since-height>: one JSON object on stdout, from val0's
+# torus_getMarkPrice for markets 1..MARKETS (whole pass capped at 30 s).
+#   usable = markPrice > 0: the RPC reports 0 unless the mark is usable, i.e.
+#            <= 60 s past its last FRESH aggregate (crates/torus-rpc torus.rs
+#            get_mark_price -> usable_oracle_price);
+#   fresh  = usable AND that aggregate was written in a block > since-height
+#            (the RPC's `timestamp` field carries the aggregate's BLOCK number):
+#            a fresh aggregate needs all 3 validators inside one 10 s window, so
+#            this proves the feed's submissions from every validator landed.
+oracle_marks() {
+    python3 - "${RPCS[0]}" "$MARKETS" "$1" <<'PYO'
+import json, sys, time, urllib.request
+url, n, since = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+deadline = time.monotonic() + 30
+# urllib/socket failures are OSError; bad JSON is ValueError; a missing or
+# malformed result is KeyError/TypeError. Each counts as an error, never a mark.
+RPC_ERRORS = (OSError, ValueError, KeyError, TypeError)
+def call(method, params):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(url, body, {"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.load(r)["result"]
+out = {"since_height": since, "markets": n, "checked": 0, "usable": 0, "fresh": 0, "errors": 0,
+       "head": None, "oldest_usable_agg_block": None, "max_agg_age_blocks": None, "not_fresh_ids": []}
+try:
+    out["head"] = int(call("eth_blockNumber", []), 16)
+except RPC_ERRORS:
+    out["errors"] += 1
+for mid in range(1, n + 1):
+    if time.monotonic() > deadline:
+        break
+    out["checked"] += 1
+    try:
+        r = call("torus_getMarkPrice", [hex(mid)])
+        usable, blk = float(r["markPrice"]) > 0, int(r["timestamp"])
+    except RPC_ERRORS:
+        out["errors"] += 1
+        usable, blk = False, 0
+    if usable:
+        out["usable"] += 1
+        o = out["oldest_usable_agg_block"]
+        out["oldest_usable_agg_block"] = blk if o is None else min(o, blk)
+    if usable and blk > since:
+        out["fresh"] += 1
+    elif len(out["not_fresh_ids"]) < 20:
+        out["not_fresh_ids"].append(mid)
+if out["head"] is not None and out["oldest_usable_agg_block"] is not None:
+    out["max_agg_age_blocks"] = out["head"] - out["oldest_usable_agg_block"]
+sys.stdout.write(json.dumps(out) + "\n")
+PYO
+}
+ORACLE_FRESH_S=""; ORACLE_MEND=""
+if [ "$ORACLE_FEED" = 1 ]; then
+    ORACLE_M=$(oracle_marks 0)
+    printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-before.json"
+    ORACLE_H0=$(jq -r '.head // empty' <<<"$ORACLE_M")
+    [[ "$ORACLE_H0" =~ ^[0-9]+$ ]] || die "oracle feed: cannot read val0's head (eth_blockNumber): $ORACLE_M"
+    log "oracle marks before the feed: usable=$(jq .usable <<<"$ORACLE_M")/$MARKETS head=$ORACLE_H0"
+    ORACLE_CMD=("$BENCH" oracle-feed --rpc-urls "$(IFS=,; printf '%s' "${RPCS[*]}")" --validator-keys "$ORACLE_KEYS" \
+        --markets "$MARKETS" --price "$ORACLE_PRICE" --interval-ms "$ORACLE_INTERVAL_MS" \
+        --stats-file "$OUT/oracle-feed-stats.json")
+    log "oracle feed: ${ORACLE_CMD[*]}"
+    T_ORACLE0=$(date +%s)
+    "${ORACLE_CMD[@]}" > "$OUT/oracle-feed.log" 2>&1 & ORACLE_PID=$!
+    log "oracle feed pid $ORACLE_PID; waiting for fresh marks on all $MARKETS markets (aggregate block > $ORACLE_H0, timeout ${ORACLE_FRESH_TIMEOUT}s)"
+    while [ $(( $(date +%s) - T_ORACLE0 )) -lt "$ORACLE_FRESH_TIMEOUT" ]; do
+        sleep 3
+        alive "$ORACLE_PID" || die "oracle feed exited before the marks were fresh — oracle-feed.log tail: $(tail -c 600 "$OUT/oracle-feed.log" | tr '\n' ' ')"
+        ORACLE_M=$(oracle_marks "$ORACLE_H0")
+        [ "$(jq -r .fresh <<<"$ORACLE_M")" = "$MARKETS" ] && { ORACLE_FRESH_S=$(( $(date +%s) - T_ORACLE0 )); break; }
+    done
+    printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-fresh.json"
+    [ -n "$ORACLE_FRESH_S" ] || die "oracle marks NOT fresh on all $MARKETS markets after ${ORACLE_FRESH_TIMEOUT}s: $ORACLE_M (see oracle-feed.log)"
+    log "oracle marks fresh on all $MARKETS markets after ${ORACLE_FRESH_S}s: $ORACLE_M"
+fi
+
 # ---------------------------------------------------------------- 5. samplers
 # Wide CSV: independent per-node 1 Hz attempts (bounded requests, no catch-up),
 # timestamped at response completion; per-node CSVs retain the exact
@@ -555,6 +699,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 # after cand/r6-harness-300m-digest-and-parity.
 [ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 [ -n "$OPEN_ORDER_BUDGET" ] && BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")
+[ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
@@ -625,6 +770,21 @@ BENCH_PID=""
 # a SIGKILLed+restarted node has a new pid: re-read so the snapshot follows the live process
 mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot bench_end "${PIDS_NOW[@]}"
 log "bench exited rc=$BENCH_RC after $((T_BENCH1 - T_BENCH0))s"
+# Oracle feed: record the marks the load ended with, then PAUSE the feed. Its
+# SubmitOraclePrices are native actions: running, they bump
+# torus_native_actions_processed_total and the native mempool gauge every
+# interval, so health.py's 10 s quiet window and the digest's funnel snapshot
+# could never hold. Paused, the marks stay usable for 60 s past the last fresh
+# aggregate; it is resumed only to receive SIGTERM after the digest.
+ORACLE_ALIVE_END=""
+if [ "$ORACLE_FEED" = 1 ]; then
+    if alive "$ORACLE_PID"; then ORACLE_ALIVE_END=1; else ORACLE_ALIVE_END=0; log "WARNING: oracle feed died during the load — see oracle-feed.log"; fi
+    ORACLE_MEND=$(oracle_marks "$ORACLE_H0")
+    printf '%s\n' "$ORACLE_MEND" > "$OUT/oracle-marks-bench-end.json"
+    log "oracle marks at bench end: $ORACLE_MEND"
+    kill -STOP "$ORACLE_PID" 2>/dev/null
+    log "oracle feed paused (SIGSTOP) for drain + digest"
+fi
 
 # ---------------------------------------------------------------- 7. drain
 # Counter quiescence alone also describes a wedged chain. Require complete
@@ -709,11 +869,14 @@ for i in 0 1 2; do
 done
 log "state digest: $MARKETS markets + $DIG_ACCTS accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
 TDIG0=$(date +%s)
+DIG_PIDS=()
 for i in 0 1 2; do
     "$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}" "$MARKETS" "$OUT/digest-accounts.txt" \
         "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
+    DIG_PIDS+=($!)
 done
-wait
+# Only the digests: a bare `wait` would also wait on the (paused) oracle feed forever.
+wait "${DIG_PIDS[@]}"
 TDIG1=$(date +%s)
 Q_AFTER_OK=0
 if Q_AFTER=$(funnel_snapshot); then Q_AFTER_OK=1; fi
@@ -724,6 +887,10 @@ for i in 0 1 2; do
 done
 log "state digest done in $((TDIG1 - TDIG0))s wall (per node: ${DIGSECS[*]} s), quiescent=$DIGEST_QUIESCENT"
 [ "$DIGEST_QUIESCENT" = 1 ] || log "WARNING: funnel counters moved or snapshot evidence was unavailable during the digest — digest is NOT a determinism proof for this cell"
+if [ "$ORACLE_FEED" = 1 ]; then
+    stop_oracle_feed
+    log "oracle feed: oracle_feed=1 $(jq -c '{sent,accepted,rejected,last_error}' "$OUT/oracle-feed-stats.json" 2>/dev/null || echo 'stats=MISSING') stale_marks_at_bench_end=$(jq -r '.markets - .usable' <<<"$ORACLE_MEND" 2>/dev/null) fresh_after_s=$ORACLE_FRESH_S"
+fi
 
 : > "$OUT/agreement.jsonl"
 for i in 0 1 2; do
@@ -818,6 +985,38 @@ python3 "$TOOLS_DIR/summarize.py" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
+# summary.json .oracle_feed: feed stats + the marks the load ended with
+# (stale_marks_at_bench_end = markets whose mark was NOT usable at bench end).
+if [ "$ORACLE_FEED" = 1 ] && [ "$rc" = 0 ]; then
+    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_INTERVAL_MS" "$ORACLE_RC" "$ORACLE_FRESH_S" "$ORACLE_ALIVE_END" <<'PYS' \
+        || log "WARNING: summary.json .oracle_feed not written"
+import json, os, sys
+out, price, interval, rc, fresh_s, alive_end = sys.argv[1:7]
+def load(name):
+    try:
+        with open(os.path.join(out, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+stats = load('oracle-feed-stats.json') or {}
+marks = load('oracle-marks-bench-end.json') or {}
+o = {'oracle_feed': 1, 'price': price, 'interval_ms': int(interval),
+     'rc': int(rc) if rc.lstrip('-').isdigit() else None,
+     'stats_present': bool(stats),
+     'sent': stats.get('sent'), 'accepted': stats.get('accepted'), 'rejected': stats.get('rejected'),
+     'last_error': stats.get('last_error'), 'per_validator': stats.get('per_validator'),
+     'fresh_after_s': int(fresh_s) if fresh_s.isdigit() else None,
+     'alive_at_bench_end': alive_end == '1',
+     'marks_at_bench_end': marks or None,
+     'stale_marks_at_bench_end': (marks['markets'] - marks['usable']) if 'usable' in marks else None}
+p = os.path.join(out, 'summary.json')
+with open(p) as f:
+    d = json.load(f)
+d['oracle_feed'] = o
+with open(p, 'w') as f:
+    json.dump(d, f, indent=1)
+PYS
+fi
 log "done -> $OUT/summary.json"
 [ "$rc" = 0 ] || exit "$rc"
 # A successful report write is not benchmark acceptance. Preserve artifacts and

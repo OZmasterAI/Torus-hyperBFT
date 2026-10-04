@@ -35,6 +35,9 @@ tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 
 MPS=3 tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench loc3-300m-r1 300 120 76000
 ```
 
+A/B campaigns of several builds (driver, warm-up, rounds, scoring, pruning):
+`campaign/README.md`.
+
 Harness self-test (offline, ~8 s, no devnet / no cargo):
 
 ```
@@ -46,7 +49,7 @@ python3 tools/matched-bench/test_harness.py
 1. Pre-flight: refuses to run if a bench, a `cargo build`, or a devnet is
    already running; refuses to overwrite a non-empty result dir (`OVERWRITE=1`).
    Never touches the live testnet validator (8555/9090/30333, `~/.cargo-target`).
-2. Stages `$TARGET_DIR/release/torus-node` (default `/home/18c/.cargo-target-matched`)
+2. Stages `$TARGET_DIR/release/torus-node` (default `$HOME/.cargo-target-matched`)
    into `<worktree>/target/release/torus-node` (`devnet/wsl/env.sh` hardcodes that
    path) and logs md5 of source and copy — abort on mismatch (stale-binary trap).
    Records the worktree commit + dirty count. NOTE: the runner cannot prove the
