@@ -2,8 +2,14 @@
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-[build]
-jobs = 6
+# Parallel rustc jobs are set PER MACHINE, not here: a `jobs` value in this
+# file would override every machine's own setting. Put it in
+# ~/.cargo/config.toml on each host, e.g.
+#   [build]
+#   jobs = 16
+# (or CARGO_BUILD_JOBS=N, which wins over both files). A host that sets
+# nothing uses all its cores. A release build of the big crates can use
+# 1-3 GB per job; run one cargo build or test at a time.
 
 [net]
 # Use the system `git` binary for fetches. cargo's built-in fetcher pulls the

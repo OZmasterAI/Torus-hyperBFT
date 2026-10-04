@@ -6,8 +6,11 @@
 //! - Size-limited pool with eviction and replacement-by-fee
 //! - Drain interface for block proposers
 
+pub mod addr_rate;
+pub mod bounded_map;
 pub mod error;
 pub mod evm_pool;
+pub mod funded;
 pub mod native_pool;
 pub mod rate_limit;
 pub mod validate;
@@ -87,6 +90,18 @@ pub struct MempoolConfig {
     pub native_admission_horizon_ms: u64,
     /// The admission limit never drops below this many pooled actions.
     pub native_admission_floor: usize,
+    // ---- Anti-spam item A ----
+    /// Whole TRS a sender must hold for its native actions to enter the pool
+    /// (see [`funded`]). 0 = off — the library default, so embedded users and
+    /// tests are unaffected; `torus-node` sets it from
+    /// `TORUS_INGRESS_MIN_COLLATERAL` (default 1).
+    pub ingress_min_collateral_trs: u64,
+    // ---- Anti-spam item C ----
+    /// Max percent of each selected native block that cancels may take ahead
+    /// of non-cancels (proposer-local). Default 25, ON everywhere (a fairness
+    /// fix, not a limit); 100 = the old unbounded cancel priority;
+    /// `TORUS_CANCEL_BLOCK_SHARE_PCT` env override.
+    pub native_cancel_block_share_pct: u8,
 }
 
 impl Default for MempoolConfig {
@@ -107,6 +122,8 @@ impl Default for MempoolConfig {
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
             native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
             native_admission_floor: rate_limit::admission_floor(),
+            ingress_min_collateral_trs: 0,
+            native_cancel_block_share_pct: rate_limit::cancel_block_share_pct(),
         }
     }
 }
@@ -167,16 +184,21 @@ pub struct Mempool {
     /// [`rate_limit::ADMISSION_RATE_WINDOW_MS`] — the rate the admission limit
     /// follows.
     native_commit_log: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>>,
+    /// Anti-spam item B: per-address request limit (unset = off, the library
+    /// default; `torus-node` installs it from the env). Charged for every
+    /// action that enters the pool, enforced only at RPC ingress.
+    addr_limiter: std::sync::OnceLock<std::sync::Arc<addr_rate::AddrRateLimiter>>,
 }
 
 impl Mempool {
     /// Create a new mempool backed by the given state database.
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
-        let native_pool = native_pool::NativePool::new(
+        let mut native_pool = native_pool::NativePool::new(
             config.native_pool_max_size,
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
+        native_pool.set_cancel_share_pct(config.native_cancel_block_share_pct);
         // DA store shares the same RocksDB handle; every native-action body the
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
@@ -200,7 +222,50 @@ impl Mempool {
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            addr_limiter: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the per-address request limit (anti-spam item B). Set once;
+    /// a second call is ignored.
+    pub fn set_addr_rate_limiter(&self, limiter: std::sync::Arc<addr_rate::AddrRateLimiter>) {
+        let _ = self.addr_limiter.set(limiter);
+    }
+
+    /// The installed per-address limiter, if any.
+    pub fn addr_rate_limiter(&self) -> Option<&addr_rate::AddrRateLimiter> {
+        self.addr_limiter.get().map(|l| &**l)
+    }
+
+    /// Anti-spam item B, the RPC-ingress check: would `sender` be allowed
+    /// `action` (its `order_count` requests) now? Read-only; the count is
+    /// charged when the action enters the pool. `Ok` when no limiter is set.
+    pub fn addr_rate_admits(
+        &self,
+        sender: &Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), addr_rate::Refusal> {
+        let Some(limiter) = self.addr_limiter.get() else {
+            return Ok(());
+        };
+        if funded::is_validator_duty_of_validator(&self.state, sender, action) {
+            return Ok(());
+        }
+        // Traded volume via the same accessor the open-order limit uses; a
+        // read error counts as no volume (only the buffer applies).
+        let volume_trs = || {
+            torus_core::position::PositionManager::new(self.state.clone())
+                .get_cum_volume(sender)
+                .map(|v| (v.raw().max(0) / torus_types::FixedPoint::SCALE) as u64)
+                .unwrap_or(0)
+        };
+        limiter.admits(
+            sender,
+            is_cancel(action),
+            rate_limit::order_count(action) as u64,
+            now_ms(),
+            volume_trs,
+        )
     }
 
     /// Pool size at which RPC ingress sheds non-cancels before verification
@@ -228,11 +293,14 @@ impl Mempool {
         )
     }
 
-    /// True when the native pool already holds at least the admission limit:
-    /// new non-cancels would likely expire before inclusion.
+    /// True when the native pool already holds at least the admission limit
+    /// of NON-cancels: new non-cancels would likely expire before inclusion.
+    /// Pooled cancels are not counted (anti-spam): item C caps them at a share
+    /// of each block, so they never delay orders by more than that share, and
+    /// counting them let funded cancel spam make ingress shed every order.
     pub fn native_admission_backlogged(&self) -> bool {
         self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().size() >= limit)
+            .is_some_and(|limit| self.native.read().unwrap().non_cancel_size() >= limit)
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -604,7 +672,13 @@ impl Mempool {
                 "nonce too far in future".into(),
             ));
         }
-        self.submit_native_action_inner(sender, action, cache_key)
+        let result = self.submit_native_action_inner(sender, action, cache_key);
+        if let (Err(MempoolError::UnfundedSender { .. }), Some(m)) = (&result, self.metrics.get()) {
+            m.native_gossip_admit_rejects
+                .get_or_create(&vec![("reason".into(), "unfunded".into())])
+                .inc();
+        }
+        result
     }
 
     /// Gossip includes sender address so receivers can skip ECDSA recovery.
@@ -660,6 +734,12 @@ impl Mempool {
         action: SignedNativeAction,
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
+        self.check_funded(&sender, &action.action)?;
+        let weight = rate_limit::order_count(&action.action) as u64;
+        // A registered validator's duty actions are not counted by item B
+        // (the validator-table read happens only for duty kinds).
+        let charge_b = self.addr_limiter.get().is_some()
+            && !funded::is_validator_duty_of_validator(&self.state, &sender, &action.action);
         // s517: oracle submissions get pool priority, so only an Active
         // validator or its registered hot signer may pool one, at most
         // ORACLE_PENDING_PER_VALIDATOR per validator (own address + signer).
@@ -699,6 +779,12 @@ impl Mempool {
             self.publish_native_pool_size(&pool);
             result?;
         }
+        // Anti-spam item B: count every action that entered the pool, from
+        // any source, once (the insert above dedups by hash). Never refuses;
+        // RPC ingress enforces via `addr_rate_admits`. After the pool lock.
+        if let Some(limiter) = self.addr_limiter.get().filter(|_| charge_b) {
+            limiter.charge(&sender, weight, now_ms());
+        }
 
         // Seed only after a successful insert, so a rejected (dup/full) action
         // never pollutes the cache.
@@ -737,8 +823,33 @@ impl Mempool {
             .then(|| vec![validator, *sender])
     }
 
+    /// Anti-spam item A: refuse a non-exempt action whose sender holds less
+    /// than `ingress_min_collateral_trs` (see [`funded`]). Runs on every
+    /// ingress path (RPC, gossip, forward) AFTER the sender is known — the
+    /// sender is only known once the signature (or the session) is verified —
+    /// and before the pool lock is taken.
+    fn check_funded(
+        &self,
+        sender: &Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), MempoolError> {
+        let min_trs = self.config.ingress_min_collateral_trs;
+        if min_trs == 0
+            || funded::is_exempt(action)
+            || funded::is_validator_duty_of_validator(&self.state, sender, action)
+            || funded::is_funded(&self.state, sender, min_trs)
+        {
+            return Ok(());
+        }
+        Err(MempoolError::UnfundedSender {
+            sender: *sender,
+            min_trs,
+        })
+    }
+
     /// Drain native actions for a block proposal.
-    /// Returns up to `limit` actions in priority order (cancels first).
+    /// Returns up to `limit` actions in selection order (a bounded cancel
+    /// share first, item C).
     /// Per-sender-per-block caps are enforced internally.
     pub fn drain_native(&self, limit: usize) -> Vec<SignedNativeAction> {
         // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
@@ -770,7 +881,8 @@ impl Mempool {
         self.native.read().unwrap().size()
     }
 
-    /// True when the native pool is at capacity (non-cancel admits will fail).
+    /// True when the native pool is at capacity (every admit but an oracle
+    /// submission, which may evict a normal entry, will fail).
     pub fn native_pool_is_full(&self) -> bool {
         self.native.read().unwrap().is_full()
     }
@@ -2521,6 +2633,35 @@ mod tests {
     }
 
     #[test]
+    fn pooled_cancels_do_not_make_admission_shed_orders() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state,
+            MempoolConfig {
+                native_admission_horizon_ms: 10_000,
+                native_admission_floor: 4,
+                ..MempoolConfig::default()
+            },
+        );
+        let t0 = now_ms();
+        // Funded cancel spam fills the pool past the limit (floor 4) ...
+        for i in 0..6 {
+            let k = key(150 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+        }
+        // ... but cancels are not order backlog: orders are still admitted.
+        assert!(!pool.native_admission_backlogged());
+        // Orders past the limit do backlog, as before.
+        for i in 0..4 {
+            let k = key(160 + i);
+            pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
+                .unwrap();
+        }
+        assert!(pool.native_admission_backlogged());
+    }
+
+    #[test]
     fn pool_size_limit_eviction() {
         let (_dir, state) = setup();
         let config = MempoolConfig {
@@ -3498,5 +3639,458 @@ mod tests {
         assert_eq!(sel[1].0, v);
         assert!(crate::native_pool::is_oracle_submission(&sel[1].1.action));
         assert_eq!(pool.native_pool_size(), 3, "the ClaimRewards stays pooled");
+    }
+
+    // ---- Anti-spam item A: funded-account check ----
+
+    fn funded_cfg(min_trs: u64) -> MempoolConfig {
+        MempoolConfig {
+            ingress_min_collateral_trs: min_trs,
+            ..MempoolConfig::default()
+        }
+    }
+
+    fn put_native(state: &StateDb, addr: &Address, available: i128, order_margin: i128) {
+        torus_core::position::PositionManager::new(state.clone())
+            .put_native_balance(
+                addr,
+                &torus_core::position::NativeBalance {
+                    available: torus_types::FixedPoint::from_raw(available),
+                    order_margin: torus_types::FixedPoint::from_raw(order_margin),
+                },
+            )
+            .unwrap();
+    }
+
+    const ONE_TRS: i128 = torus_types::FixedPoint::SCALE;
+
+    fn cancel_all(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::CancelAllOrders { market_id: None },
+            nonce,
+            k,
+        )
+    }
+
+    #[test]
+    fn parse_ingress_min_collateral_default_and_off() {
+        use crate::funded::parse_ingress_min_collateral as p;
+        assert_eq!(p(None), 1);
+        assert_eq!(p(Some("0".into())), 0);
+        assert_eq!(p(Some(" 5 ".into())), 5);
+        assert_eq!(p(Some("junk".into())), 1);
+        assert_eq!(
+            MempoolConfig::default().ingress_min_collateral_trs,
+            0,
+            "library default is off"
+        );
+    }
+
+    #[test]
+    fn unfunded_sender_rejected_on_rpc_path() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, funded_cfg(1));
+        let k = key(41);
+        let a = cancel_all(&k, now_ms());
+        let err = pool
+            .add_native_action_presigned(address_from_key(&k), a)
+            .expect_err("fresh key must be refused");
+        assert!(
+            matches!(err, MempoolError::UnfundedSender { min_trs: 1, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not funded"), "{err}");
+        assert!(
+            !err.to_string().contains("retry"),
+            "must not look retryable: {err}"
+        );
+        assert_eq!(pool.native_pool_size(), 0);
+    }
+
+    #[test]
+    fn funded_by_perp_collateral_spot_or_position() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        // available alone
+        let k1 = key(42);
+        put_native(&state, &address_from_key(&k1), ONE_TRS, 0);
+        pool.add_native_action_presigned(address_from_key(&k1), cancel_all(&k1, t0))
+            .expect("1 TRS available");
+        // available + order margin together reach the minimum
+        let k2 = key(43);
+        put_native(&state, &address_from_key(&k2), ONE_TRS / 2, ONE_TRS / 2);
+        pool.add_native_action_presigned(address_from_key(&k2), cancel_all(&k2, t0))
+            .expect("0.5 available + 0.5 order margin");
+        // spot (EVM) balance of 1 TRS
+        let k3 = key(44);
+        fund(&state, &address_from_key(&k3), U256::from(10u64.pow(18)), 0);
+        pool.add_native_action_presigned(address_from_key(&k3), cancel_all(&k3, t0))
+            .expect("1 TRS spot");
+        // open position, no balance at all
+        let k4 = key(45);
+        torus_core::position::PositionManager::new(state.clone())
+            .put_position(&torus_core::position::Position {
+                trader: address_from_key(&k4),
+                market_id: 1,
+                is_long: true,
+                size: torus_types::FixedPoint::from_raw(ONE_TRS),
+                entry_price: torus_types::FixedPoint::from_raw(ONE_TRS),
+                realized_pnl: torus_types::FixedPoint::ZERO,
+                isolated_margin: torus_types::FixedPoint::ZERO,
+                margin_type: torus_core::position::MarginType::Cross,
+            })
+            .unwrap();
+        pool.add_native_action_presigned(address_from_key(&k4), cancel_all(&k4, t0))
+            .expect("an open position must be manageable");
+        // just below the minimum on both sides
+        let k5 = key(46);
+        put_native(&state, &address_from_key(&k5), ONE_TRS - 1, 0);
+        fund(
+            &state,
+            &address_from_key(&k5),
+            U256::from(10u64.pow(18) - 1),
+            0,
+        );
+        assert!(matches!(
+            pool.add_native_action_presigned(address_from_key(&k5), cancel_all(&k5, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        assert_eq!(pool.native_pool_size(), 4);
+    }
+
+    #[test]
+    fn funded_check_exempts_staking_exit_actions_and_can_be_off() {
+        use torus_types::NativeAction as A;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let k = key(47);
+        let t0 = now_ms();
+        let exempt = [A::ClaimRewards, A::ClaimUnbonded];
+        for (i, a) in exempt.into_iter().enumerate() {
+            let s = torus_types::eip712::sign_native_action(a, t0 + i as u64, &k);
+            pool.add_native_action_presigned(address_from_key(&k), s)
+                .expect("exempt kind admitted unfunded");
+        }
+        // Gated kinds that a new user might try first are refused, and so are
+        // validator duties from a key that is not a registered validator.
+        for (i, a) in [
+            A::CreateSession {
+                session_pubkey: [3; 32],
+                expiry: t0 + 60_000,
+                scope: torus_types::SessionScope::Full,
+            },
+            A::UnjailSelf,
+            A::AttestStateHash {
+                height: 100,
+                hash: B256::repeat_byte(1),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = torus_types::eip712::sign_native_action(a, t0 + 100 + i as u64, &k);
+            assert!(matches!(
+                pool.add_native_action_presigned(address_from_key(&k), s),
+                Err(MempoolError::UnfundedSender { .. })
+            ));
+        }
+        // min 0 = off
+        let off = Mempool::new(state, funded_cfg(0));
+        off.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+            .expect("check off");
+    }
+
+    #[test]
+    fn unfunded_sender_rejected_on_gossip_paths_and_counted() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let k = key(48);
+        let t0 = now_ms();
+        let a = cancel_all(&k, t0);
+        assert!(matches!(
+            pool.add_native_action_from_gossip(address_from_key(&k), a.clone()),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        assert!(matches!(
+            pool.add_native_action_from_gossip_trusted(address_from_key(&k), a.clone()),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // The body is still DA-mirrored (availability != validity).
+        assert!(pool
+            .get_native_da(&torus_types::compute_action_hash(&a))
+            .is_some());
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_native_gossip_admit_rejects_total{reason="unfunded"} 2"#),
+            "{text}"
+        );
+        put_native(&state, &address_from_key(&k), ONE_TRS, 0);
+        pool.add_native_action_from_gossip(address_from_key(&k), a)
+            .expect("funded now");
+    }
+
+    #[test]
+    fn session_action_checks_the_owner() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        let owner = Address::from([0x77; 20]);
+        let a = torus_types::eip712::sign_native_action_with_session(
+            torus_types::NativeAction::CancelAllOrders { market_id: None },
+            t0,
+            &([8u8; 32].into()),
+        );
+        let torus_types::ActionSignature::Session { session_pubkey, .. } = &a.signature else {
+            panic!("session signature expected")
+        };
+        state
+            .put_session(
+                session_pubkey,
+                &torus_types::SessionData {
+                    owner,
+                    expiry: t0 + 60_000,
+                    scope: torus_types::SessionScope::Full,
+                    created_at: t0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            pool.add_native_action_from_gossip(owner, a.clone()),
+            Err(MempoolError::UnfundedSender { sender, .. }) if sender == owner
+        ));
+        put_native(&state, &owner, ONE_TRS, 0);
+        pool.add_native_action_from_gossip(owner, a)
+            .expect("owner funded");
+    }
+
+    /// Item C: `native_cancel_block_share_pct` reaches the pool.
+    #[test]
+    fn cancel_share_config_reaches_pool_selection() {
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_cancel_block_share_pct: 25,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state, cfg);
+        let t0 = now_ms();
+        for i in 0..8u8 {
+            let k = key(60 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+            let k = key(80 + i);
+            let a = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                t0,
+                &k,
+            );
+            pool.add_native_action_presigned(address_from_key(&k), a)
+                .unwrap();
+        }
+        let sel = pool.select_native_for_block(8);
+        let cancels = sel.iter().filter(|a| is_cancel(&a.action)).count();
+        assert_eq!(cancels, 2, "ceil(25% of 8)");
+    }
+
+    fn register_validator(state: &StateDb, who: &Address) {
+        // Only the row's presence is read at ingress.
+        state
+            .put_cf_raw(torus_state::cf::CF_STAKING_VALIDATORS, who.as_slice(), b"v")
+            .unwrap();
+    }
+
+    fn attest(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::AttestStateHash {
+                height: nonce,
+                hash: B256::repeat_byte(1),
+            },
+            nonce,
+            k,
+        )
+    }
+
+    #[test]
+    fn funded_check_admits_validator_duties_only_from_registered_validators() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let t0 = now_ms();
+        // A registered validator with 0 spot and 0 perp may attest.
+        let v = key(48);
+        register_validator(&state, &address_from_key(&v));
+        pool.add_native_action_presigned(address_from_key(&v), attest(&v, t0))
+            .expect("registered validator attests unfunded");
+        // A fresh key may not use the duty kinds to dodge the funded check.
+        let x = key(49);
+        assert!(matches!(
+            pool.add_native_action_presigned(address_from_key(&x), attest(&x, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+    }
+
+    #[test]
+    fn addr_rate_skips_validator_duties_of_registered_validators() {
+        let (_dir, pool) = limited_pool(2, 1_000);
+        let v = key(93);
+        let va = address_from_key(&v);
+        register_validator(&pool.state, &va);
+        let t0 = now_ms();
+        // Duty actions of a registered validator are neither charged at pool
+        // entry nor refused at RPC, however many it sends.
+        for i in 0..5 {
+            let a = attest(&v, t0 + i);
+            pool.addr_rate_admits(&va, &a.action)
+                .expect("validator duty never refused");
+            pool.add_native_action_from_gossip(va, a).unwrap();
+        }
+        assert_eq!(used(&pool, &v), 0);
+        // The same kind from a non-validator is counted like anything else.
+        let x = key(94);
+        let xa = address_from_key(&x);
+        for i in 0..2 {
+            pool.add_native_action_from_gossip(xa, attest(&x, t0 + i))
+                .unwrap();
+        }
+        assert_eq!(used(&pool, &x), 2);
+        assert!(pool
+            .addr_rate_admits(&xa, &attest(&x, t0 + 9).action)
+            .is_err());
+    }
+
+    // ---- Anti-spam item B: counted on pool entry, enforced at RPC ----
+
+    fn limited_pool(buffer: u64, max_addresses: usize) -> (TempDir, Mempool) {
+        let (dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        pool.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            buffer,
+            std::collections::HashSet::new(),
+            max_addresses,
+        )));
+        (dir, pool)
+    }
+
+    fn order_batch(k: &SigningKey, nonce: u64, n: usize) -> SignedNativeAction {
+        let p = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: torus_types::FixedPoint::from_raw(100),
+            quantity: torus_types::FixedPoint::from_raw(100),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::PlaceOrderBatch(vec![p; n]),
+            nonce,
+            k,
+        )
+    }
+
+    fn used(pool: &Mempool, k: &SigningKey) -> u64 {
+        pool.addr_rate_limiter().unwrap().used(&address_from_key(k))
+    }
+
+    #[test]
+    fn addr_rate_counts_gossip_and_forwards_by_order_count() {
+        let (_dir, pool) = limited_pool(100, 1_000);
+        let k = key(90);
+        let s = address_from_key(&k);
+        let t0 = now_ms();
+        // Gossip (recover path): a batch of 3 counts 3.
+        pool.add_native_action_from_gossip(s, order_batch(&k, t0, 3))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 3);
+        // Forward / pre-proposal push (trusted path): cancels count 1.
+        pool.add_native_action_from_gossip_trusted(s, cancel_all(&k, t0 + 1))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 4);
+        // The same body arriving again is a pool duplicate: not recounted.
+        assert!(pool
+            .add_native_action_from_gossip(s, order_batch(&k, t0, 3))
+            .is_err());
+        assert_eq!(used(&pool, &k), 4);
+    }
+
+    #[test]
+    fn addr_rate_rpc_action_counted_exactly_once() {
+        let (_dir, pool) = limited_pool(100, 1_000);
+        let k = key(91);
+        let s = address_from_key(&k);
+        let a = order_batch(&k, now_ms(), 5);
+        // The RPC path: check (read-only), then the pool entry charges.
+        pool.addr_rate_admits(&s, &a.action).unwrap();
+        assert_eq!(used(&pool, &k), 0, "the check alone charges nothing");
+        pool.add_native_action_presigned(s, a.clone()).unwrap();
+        assert_eq!(used(&pool, &k), 5);
+        // Its gossip echo from a peer is a duplicate: still 5.
+        let _ = pool.add_native_action_from_gossip(s, a);
+        assert_eq!(used(&pool, &k), 5);
+        // A refused insert (duplicate) charges nothing either.
+        let b = cancel_all(&k, now_ms() + 1);
+        pool.add_native_action_presigned(s, b.clone()).unwrap();
+        assert!(pool.add_native_action_presigned(s, b).is_err());
+        assert_eq!(used(&pool, &k), 6);
+    }
+
+    #[test]
+    fn addr_rate_gossip_consumes_allowance_and_is_never_refused() {
+        let (_dir, pool) = limited_pool(4, 1_000);
+        let k = key(92);
+        let s = address_from_key(&k);
+        let t0 = now_ms();
+        // 4 orders via gossip use the whole buffer ...
+        pool.add_native_action_from_gossip(s, order_batch(&k, t0, 4))
+            .unwrap();
+        // ... so this node's RPC refuses the next order (exhausted, and the
+        // last pooled action was < 10 s ago).
+        let next = order_batch(&k, t0 + 1, 1);
+        assert!(matches!(
+            pool.addr_rate_admits(&s, &next.action),
+            Err(addr_rate::Refusal::Requests {
+                used: 4,
+                allowance: 4
+            })
+        ));
+        // Gossip is never refused by B: it is still admitted and counted.
+        pool.add_native_action_from_gossip(s, next).unwrap();
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&k, t0 + 2, 10))
+            .unwrap();
+        assert_eq!(used(&pool, &k), 15);
+        // Another sender is unaffected.
+        let k2 = key(93);
+        pool.addr_rate_admits(&address_from_key(&k2), &next_action())
+            .unwrap();
+    }
+
+    fn next_action() -> torus_types::NativeAction {
+        torus_types::NativeAction::ClaimRewards
+    }
+
+    #[test]
+    fn addr_rate_pool_entry_counting_keeps_the_memory_bound() {
+        let (_dir, pool) = limited_pool(100, 8);
+        let t0 = now_ms();
+        for i in 0..50u8 {
+            let k = key(100 + i);
+            pool.add_native_action_from_gossip_trusted(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+            assert!(pool.addr_rate_limiter().unwrap().tracked() <= 8);
+        }
+    }
+
+    #[test]
+    fn addr_rate_off_without_a_limiter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let k = key(94);
+        pool.add_native_action_from_gossip(address_from_key(&k), order_batch(&k, now_ms(), 3))
+            .unwrap();
+        assert!(pool.addr_rate_limiter().is_none());
+        pool.addr_rate_admits(&address_from_key(&k), &next_action())
+            .unwrap();
     }
 }

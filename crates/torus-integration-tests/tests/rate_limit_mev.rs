@@ -111,12 +111,18 @@ fn native_pool_size_cap_enforced() {
         "expected pool full error, got: {err}"
     );
 
-    // Cancel evicts a non-cancel.
-    pool.submit_native_action(
-        addr(5),
-        make_native(5, NativeAction::CancelOrder { order_id: 1 }),
-    )
-    .unwrap();
+    // Anti-spam item C: a cancel no longer evicts a pending order — a full
+    // pool rejects it like any other action.
+    let err = pool
+        .submit_native_action(
+            addr(5),
+            make_native(5, NativeAction::CancelOrder { order_id: 1 }),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("pool full"),
+        "expected pool full error, got: {err}"
+    );
     assert_eq!(pool.native_pool_size(), 3);
 }
 

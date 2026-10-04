@@ -37,6 +37,20 @@
 #                the cancel fraction (without it, overloaded small-cap cells
 #                admit almost only cancel-alls and placement starves). Unset
 #                (default) = flag omitted.
+#   ANTISPAM=1   turn the node anti-spam limits ON (devnet/wsl/env.sh has them
+#                OFF): TORUS_INGRESS_MIN_COLLATERAL=1, TORUS_ADDR_RATE_LIMIT=1,
+#                TORUS_RPC_IP_WEIGHT_PER_MIN=1200. Exported before EXTRA_ENV,
+#                so EXTRA_ENV can override one knob (e.g. TORUS_ADDR_RATE_EXEMPT=
+#                0x..,0x.. for the bench senders, or TORUS_RPC_IP_EXEMPT= to
+#                limit loopback too). Unset (default) = limits off.
+#   SPAM_CANCEL_KEYS=K SPAM_CANCEL_RATE=R [SPAM_CANCEL_FUNDED=1]
+#                bench --spam-cancel-keys K --spam-cancel-rate R
+#                [--spam-cancel-funded]: K extra keys send CancelAllOrders at
+#                R actions/s in aggregate alongside the load, never retrying a
+#                refused one; bench.log reports their sent/accepted/rejected
+#                apart from the load ("Spam cancel-all ..."). FUNDED=1 uses the
+#                top K funded genesis accounts (never a load sender), else
+#                fresh unfunded keys. Unset (default) = flags omitted.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -188,6 +202,10 @@ CROSS_FRACTION=${CROSS_FRACTION:-0.5}
 CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}
 RETRY_BUSY=${RETRY_BUSY:-}
+ANTISPAM=${ANTISPAM:-}
+SPAM_CANCEL_KEYS=${SPAM_CANCEL_KEYS:-}
+SPAM_CANCEL_RATE=${SPAM_CANCEL_RATE:-}
+SPAM_CANCEL_FUNDED=${SPAM_CANCEL_FUNDED:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -365,6 +383,11 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [[ "$BAND" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BAND must be a positive integer" >&2; exit 2; }
 [ -z "$OPEN_ORDER_BUDGET" ] || [[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]] || { echo "FATAL: OPEN_ORDER_BUDGET must be an integer" >&2; exit 2; }
 [ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ] || { echo "FATAL: RETRY_BUSY must be 1 or unset" >&2; exit 2; }
+[ -z "$ANTISPAM" ] || [ "$ANTISPAM" = 1 ] || { echo "FATAL: ANTISPAM must be 1 or unset" >&2; exit 2; }
+[ -z "$SPAM_CANCEL_KEYS" ] || [[ "$SPAM_CANCEL_KEYS" =~ ^[0-9]+$ ]] || { echo "FATAL: SPAM_CANCEL_KEYS must be an integer" >&2; exit 2; }
+[ -z "$SPAM_CANCEL_RATE" ] || [[ "$SPAM_CANCEL_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FATAL: SPAM_CANCEL_RATE must be a number (actions/s)" >&2; exit 2; }
+[ -z "$SPAM_CANCEL_FUNDED" ] || [ "$SPAM_CANCEL_FUNDED" = 1 ] || { echo "FATAL: SPAM_CANCEL_FUNDED must be 1 or unset" >&2; exit 2; }
+[ -z "$SPAM_CANCEL_KEYS" ] || [ -n "$SPAM_CANCEL_RATE" ] || { echo "FATAL: SPAM_CANCEL_KEYS needs SPAM_CANCEL_RATE" >&2; exit 2; }
 for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
@@ -471,7 +494,7 @@ trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -511,6 +534,9 @@ log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS md5=$GEN_MD5"
 for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset "$v"; done
 for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
+if [ "$ANTISPAM" = 1 ]; then
+    export TORUS_INGRESS_MIN_COLLATERAL=1 TORUS_ADDR_RATE_LIMIT=1 TORUS_RPC_IP_WEIGHT_PER_MIN=1200
+fi
 for kv in $EXTRA_ENV; do export "$kv"; done
 # HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged
 # alongside the node env so a pinned cell is recognisable from its summary.
@@ -713,6 +739,9 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 [ -n "$OPEN_ORDER_BUDGET" ] && BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")
 [ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
+[ -n "$SPAM_CANCEL_KEYS" ] && BENCH_CMD+=(--spam-cancel-keys "$SPAM_CANCEL_KEYS")
+[ -n "$SPAM_CANCEL_RATE" ] && BENCH_CMD+=(--spam-cancel-rate "$SPAM_CANCEL_RATE")
+[ "$SPAM_CANCEL_FUNDED" = 1 ] && BENCH_CMD+=(--spam-cancel-funded)
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!

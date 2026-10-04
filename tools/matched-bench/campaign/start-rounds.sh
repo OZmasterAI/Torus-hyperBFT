@@ -5,12 +5,14 @@
 # set. RELAX_QUIET_R0 and DONE_FILE are explicitly unset; done marker
 # CAMPAIGN_DIR/campaign.done ("CAMPAIGN DONE|STOPPED ..." then "exit=N").
 # Refuses if campaign.done exists or the warm-up has not finished (warmup.done).
-# Usage: start-rounds.sh CAMPAIGN_DIR   (RESULTS_ROOT / HARNESS_WT / PREFIX pass through)
+# NO_WARMUP=1 skips the warm-up check, for a one-off smoke without an r0 item
+# (unscored-style check; never for a scored A/B campaign).
+# Usage: [NO_WARMUP=1] start-rounds.sh CAMPAIGN_DIR   (RESULTS_ROOT / HARNESS_WT / PREFIX pass through)
 set -eu
 C=$(cd "${1:?usage: start-rounds.sh CAMPAIGN_DIR}" && pwd)
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [ -e "$C/campaign.done" ] && { echo "campaign.done already exists; refusing" >&2; exit 1; }
-[ -e "$C/warmup.done" ] || { echo "warm-up not finished yet (no warmup.done); run start-warmup.sh first and wait for it" >&2; exit 1; }
+[ "${NO_WARMUP:-0}" = 1 ] || [ -e "$C/warmup.done" ] || { echo "warm-up not finished yet (no warmup.done); run start-warmup.sh first and wait for it (one-off smoke without a warm-up: NO_WARMUP=1 start-rounds.sh CAMPAIGN_DIR)" >&2; exit 1; }
 ORDER=${ORDER_OVERRIDE:-$(awk -F'\t' '$1=="ORDER"{o=$2} END{print o}' "$C/arms.conf" | tr ' ' '\n' | grep -v '^r0:' | paste -sd' ')}
 [ -n "$ORDER" ] || { echo "no measured (non-r0) items in ORDER" >&2; exit 1; }
 cd "$C"

@@ -7106,6 +7106,7 @@ dependencies = [
  "sha3",
  "tempfile",
  "tokio",
+ "torus-core",
  "torus-economics",
  "torus-state",
  "torus-telemetry",
