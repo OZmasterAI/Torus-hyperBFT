@@ -2036,6 +2036,9 @@ pub struct ExecPhaseAccum {
     /// Parallel settles that fell back to the sequential loop (worker panic
     /// or a position-side fill failure).
     pub settle_fallbacks: u64,
+    /// Same-batch bid bound (s87): non-pool sells topped up after Phase 2
+    /// ([`NativeExecutor::same_batch_bid_top_ups`]). A count, not a span.
+    pub same_batch_top_ups: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4357,7 +4360,7 @@ impl NativeExecutor {
         let pool_takers = Self::d2_pool_takers(&market_batches);
         // Same-batch bid bound (s87): top-ups come off what is left for the
         // pools, so they run before the pools are read.
-        Self::same_batch_bid_top_ups(
+        ctx.phase_accum.same_batch_top_ups += Self::same_batch_bid_top_ups(
             &ctx.positions,
             &ctx.order_books,
             &ctx.margin_configs,
@@ -6155,14 +6158,20 @@ impl NativeExecutor {
     /// Same-batch bid bound (s87, owner decision 1). After Phase 2, a
     /// non-pool sell (Option B: [`takes_bid_floor`], its sender's D2 pool
     /// is another market) is topped up to `reserve(bound, qty)`. `bound` is
-    /// the highest bid placed EARLIER in this batch in its market that can
-    /// rest: accepted in Phase 2 (so funded), a GTC / PostOnly `Limit`, not
-    /// reduce-only, price > 0 on the tick, quantity >= lot. It is capped at
-    /// the market's best ask at the start of the batch (a bid at or above
-    /// it fills against asks instead of resting); with no ask nothing
-    /// counts. Review 4 F-1: unfunded, IOC / FOK / market, stop, off-tick,
-    /// dust and reduce-only bids never count, and no bid counts above the
-    /// start best ask.
+    /// the highest bid placed EARLIER in this batch in its market that will
+    /// REST: accepted in Phase 2 (so funded) and [`can_rest_shape`] (a GTC /
+    /// PostOnly `Limit`, not reduce-only, price > 0 on the tick, quantity >=
+    /// lot), and, s89 review (option b), not consumed by the ask side — the
+    /// start-of-batch book asks plus the asks placed earlier in this batch
+    /// that are accepted and [`can_rest_shape`] (over-estimated opposing
+    /// depth: fewer bids count, never a bid that does not rest). A PostOnly
+    /// bid counts only below the lowest of those asks (else the book rejects
+    /// it, at no cost to its sender); a GTC bid only if its quantity exceeds
+    /// the ask quantity at prices <= its price (else the asks eat it whole).
+    /// A counted bid is capped at the market's best ask at the start of the
+    /// batch; with no ask nothing counts. Review 4 F-1: unfunded, IOC / FOK /
+    /// market, stop, off-tick, dust and reduce-only bids never count, and no
+    /// bid counts above the start best ask.
     ///
     /// Soft: never a placement gate, so every Phase-2 outcome is unchanged
     /// and no bid can get an honest order rejected. The top-up comes only
@@ -6173,6 +6182,14 @@ impl NativeExecutor {
     /// (release = reserved − hold at the limit, A5 exact). Deterministic: a
     /// pure function of the Phase-2 outcomes (serial == sharded) and the
     /// start-of-batch books.
+    ///
+    /// s89 review finding 2 (by design): a top-up is taken AHEAD of the
+    /// sender's own pool-market orders, even those earlier in flat order —
+    /// it comes off the free margin after the whole fold, before Phase 3
+    /// hands the rest to the pool, so a top-up can leave the sender's
+    /// earlier pool-market taker less to match with.
+    ///
+    /// Returns the number of sells topped up (instrumentation only).
     #[allow(clippy::too_many_arguments)]
     fn same_batch_bid_top_ups<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -6183,7 +6200,9 @@ impl NativeExecutor {
         excess_by_sender: &HashMap<Address, FixedPoint>,
         market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
         bal_cache: &mut BalanceCache,
-    ) {
+    ) -> u64 {
+        let sat_add = |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
+        let mut topped_up = 0;
         let pool_of: HashMap<Address, (MarketId, FixedPoint)> =
             pool_takers.iter().map(|&(s, m, pos_net)| (s, (m, pos_net))).collect();
         // (flat index, market, position in its batch, bound)
@@ -6192,22 +6211,41 @@ impl NativeExecutor {
             let Some(book) = books.get(&market_id) else { continue };
             let Some(ask) = book.best_ask() else { continue };
             let mut bound: Option<FixedPoint> = None;
+            // s89: asks placed earlier in this batch that can rest, by price.
+            let mut batch_asks: std::collections::BTreeMap<FixedPoint, FixedPoint> = std::collections::BTreeMap::new();
             for (k, p) in batch.iter().enumerate() {
                 let o = p.params;
-                if o.is_buy {
-                    let can_rest = matches!(o.order_type, OrderType::Limit)
-                        && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
-                        && !o.reduce_only
-                        && o.price > FixedPoint::ZERO
-                        && (book.tick_size <= FixedPoint::ZERO || o.price.raw() % book.tick_size.raw() == 0)
-                        && o.quantity >= book.lot_size;
-                    if can_rest {
-                        bound = bound.max(Some(o.price.min(ask)));
+                if !o.is_buy {
+                    if Self::can_rest_shape(o, book) {
+                        let q = batch_asks.entry(o.price).or_insert(FixedPoint::ZERO);
+                        *q = sat_add(*q, o.quantity);
                     }
-                } else if let Some(b) = bound {
-                    if Self::takes_bid_floor(o) && pool_of.get(&p.sender).is_some_and(|(m, _)| *m != market_id) {
-                        wanted.push((p.index, market_id, k, b));
+                    if let Some(b) = bound {
+                        if Self::takes_bid_floor(o) && pool_of.get(&p.sender).is_some_and(|(m, _)| *m != market_id) {
+                            wanted.push((p.index, market_id, k, b));
+                        }
                     }
+                    continue;
+                }
+                if !Self::can_rest_shape(o, book) {
+                    continue;
+                }
+                let lowest_ask = batch_asks.keys().next().map_or(ask, |&a| a.min(ask));
+                let rests = if o.price < lowest_ask {
+                    true
+                } else if o.time_in_force == TimeInForce::PostOnly {
+                    false
+                } else {
+                    let book_depth = book
+                        .ask_queues()
+                        .take_while(|(price, _)| **price <= o.price)
+                        .flat_map(|(_, q)| q.iter())
+                        .fold(FixedPoint::ZERO, |acc, a| sat_add(acc, a.remaining_qty));
+                    let depth = batch_asks.range(..=o.price).fold(book_depth, |acc, (_, q)| sat_add(acc, *q));
+                    o.quantity > depth
+                };
+                if rests {
+                    bound = bound.max(Some(o.price.min(ask)));
                 }
             }
         }
@@ -6232,7 +6270,21 @@ impl NativeExecutor {
             bal.order_margin += extra;
             bal_cache.set(&p.sender, bal);
             p.margin_reserved += extra;
+            topped_up += 1;
         }
+        topped_up
+    }
+
+    /// Same-batch bid bound (s87): `o`'s shape can rest in `book` — a GTC /
+    /// PostOnly `Limit`, not reduce-only, price > 0 on the tick, quantity >=
+    /// lot. Whether it does also depends on the opposing side (s89).
+    fn can_rest_shape(o: &PlaceOrderParams, book: &OrderBook) -> bool {
+        matches!(o.order_type, OrderType::Limit)
+            && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
+            && !o.reduce_only
+            && o.price > FixedPoint::ZERO
+            && (book.tick_size <= FixedPoint::ZERO || o.price.raw() % book.tick_size.raw() == 0)
+            && o.quantity >= book.lot_size
     }
 
     /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of

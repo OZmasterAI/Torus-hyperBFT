@@ -948,23 +948,105 @@ per_path!(non_pool_sell_fills_at_a_funded_same_batch_bid);
 
 /// Same-batch bound, cap: M bids 10 @101 in m1 and m2 and asks 10 @102 in
 /// m2; T (102) = [sell 10 @100 in m1 (pool; reserves 50, needs 50.5 at
-/// 101), X's funded bid 1 @104 in m2 (crosses the ask: fills 1 @102, never
-/// rests), sell 10 @100 in m2 (B: 50.5)]. The bound is capped at the ask:
-/// top-up reserve(102, 10) − 50.5 = 0.5 leaves the pool 1 and both sells
-/// fill 10 @101. Uncapped (104: top-up 1.5) the pool would be 0 and the m1
-/// sell would fill nothing.
+/// 101), X's funded bid 11 @104 in m2 (eats the ask 10 @102 and RESTS 1
+/// @104, so it counts: s89), sell 10 @100 in m2 (B: 50.5)]. The bound is
+/// capped at the start ask: top-up reserve(102, 10) − 50.5 = 0.5 leaves the
+/// pool 1 and both sells fill 10 (m2: 1 @104 + 9 @101 needs 50.65 <= 51).
+/// Uncapped (104: top-up 1.5) the pool would be 0 and the m1 sell would
+/// fill nothing; not counted, the m2 sell (budget 50.5) would fill only 9.
 fn same_batch_bid_counts_only_up_to_the_start_best_ask(path: Path) {
     let (mk, t, x) = (addr(1), addr(2), addr(5));
     let (_d, mut ctx) = fresh(path, &[mk, x]);
     run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 102, 10))]);
     fund_native(&ctx, &t, fp(102));
-    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(x, limit(2, true, 104, 1)), place(t, limit(2, false, 100, 10))]);
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(x, limit(2, true, 104, 11)), place(t, limit(2, false, 100, 10))]);
     assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
     assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{path:?}");
-    assert_eq!(pos_in(&ctx, &x, 2), fp(1), "{path:?}: X lifted the ask");
+    assert_eq!(pos_in(&ctx, &x, 2), fp(11), "{path:?}: X lifted the ask, then T hit its rest");
     assert_bal(&ctx, &t, fp(102), FixedPoint::ZERO, &format!("{path:?}"));
 }
 per_path!(same_batch_bid_counts_only_up_to_the_start_best_ask);
+
+/// Same-batch bound, s89 review: a bid that never rests does not count,
+/// even below the cap. M bids 10 @101 in m1 and m2 and asks 10 @102 in m2;
+/// T (101) = [sell 10 @100 in m1 (pool), <X's bid in m2>, sell 10 @100 in
+/// m2]. (P) a PostOnly bid 1 @104 crosses the ask: the book rejects it at no
+/// cost to X (also when it is larger than the ask depth: 11 @104). (G) a
+/// GTC bid 1 @104 the asks eat whole: fills 1 @102, never rests. Counted at
+/// the cap, the top-up reserve(102, 10) − 50.5 = 0.5 would empty T's pool
+/// and the m1 sell would fill nothing; not counted, both sells fill 10 @101
+/// exactly like the control run without X's bid.
+fn same_batch_bid_that_never_rests_does_not_top_up(path: Path) {
+    let mut outcomes = Vec::new();
+    for shape in ["control", "post_only_crossing", "post_only_crossing_deep", "gtc_eaten"] {
+        let (mk, t, x) = (addr(1), addr(2), addr(5));
+        let (_d, mut ctx) = fresh(path, &[mk, x]);
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 102, 10))]);
+        fund_native(&ctx, &t, fp(101));
+        let mut actions = vec![place(t, limit(1, false, 100, 10))];
+        match shape {
+            "post_only_crossing" => actions.push(place(x, with_tif(limit(2, true, 104, 1), TimeInForce::PostOnly))),
+            "post_only_crossing_deep" => actions.push(place(x, with_tif(limit(2, true, 104, 11), TimeInForce::PostOnly))),
+            "gtc_eaten" => actions.push(place(x, limit(2, true, 104, 1))),
+            _ => {}
+        }
+        actions.push(place(t, limit(2, false, 100, 10)));
+        let r = run(&mut ctx, path, &actions);
+        let what = format!("{path:?} {shape}");
+        assert!(r[0].success && r.last().unwrap().success, "{what}: {r:?}");
+        assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{what}");
+        assert_eq!(pos_in(&ctx, &x, 2), if shape == "gtc_eaten" { fp(1) } else { FixedPoint::ZERO }, "{what}");
+        assert!(resting_in(&ctx, &x, 2).is_empty(), "{what}: X's bid never rests");
+        assert_bal(&ctx, &t, fp(101), FixedPoint::ZERO, &what);
+        let b = bal(&ctx, &t);
+        outcomes.push((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2), b.available, b.order_margin));
+    }
+    assert!(outcomes.iter().all(|o| *o == outcomes[0]), "{path:?}: == control: {outcomes:?}");
+}
+per_path!(same_batch_bid_that_never_rests_does_not_top_up);
+
+/// Same-batch bound, s89 review: the ask side of m2 is the start-of-batch
+/// asks PLUS the asks placed EARLIER in the batch that can rest. M bids 10
+/// @101 in m1 and m2 and asks 10 @110 in m2; T = [sell 10 @100 in m1 (pool),
+/// Z's GTC ask 1 @104 in m2 (rests), X's bid 1 @p in m2, sell 10 @100 in m2
+/// (B: 50.5)]. A PostOnly bid at p = 104 (at Z's ask) or 105 (above it)
+/// crosses Z's ask: the book rejects it; a GTC bid 1 @104 fills Z's ask
+/// whole and never rests. None counts although all are below the start ask
+/// 110. T is funded so that the top-up reserve(p, 10) − 50.5 would take its
+/// whole free margin and the m1 sell would fill nothing. A PostOnly bid at
+/// p = 103 (below every ask) rests and counts: T (102) is topped up by 1.0
+/// and the m2 sell fills 1 @103 + 9 @101 (50.6; not counted, budget 50.5: 9).
+fn bid_crossing_an_earlier_same_batch_ask_does_not_top_up(path: Path) {
+    use TimeInForce::{PostOnly, GTC};
+    for (tif, p, funded) in [(PostOnly, 103, fp(102)), (PostOnly, 104, fp(102)), (PostOnly, 105, fp_cents(10_250)), (GTC, 104, fp(102))] {
+        let (mk, t, x, z) = (addr(1), addr(2), addr(5), addr(6));
+        let (_d, mut ctx) = fresh(path, &[mk, x, z]);
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 110, 10))]);
+        fund_native(&ctx, &t, funded);
+        let r = run(
+            &mut ctx,
+            path,
+            &[
+                place(t, limit(1, false, 100, 10)),
+                place(z, limit(2, false, 104, 1)),
+                place(x, with_tif(limit(2, true, p, 1), tif)),
+                place(t, limit(2, false, 100, 10)),
+            ],
+        );
+        let what = format!("{path:?} {tif:?} @{p}");
+        assert!(r[0].success && r[1].success && r[3].success, "{what}: {r:?}");
+        assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{what}");
+        let (x_pos, z_rest) = match (tif, p) {
+            (PostOnly, 103) => (fp(1), vec![fp(1)]), // rested, then T hit it
+            (PostOnly, _) => (FixedPoint::ZERO, vec![fp(1)]),
+            _ => (fp(1), vec![]), // X's GTC bid lifted Z's ask
+        };
+        assert_eq!(pos_in(&ctx, &x, 2), x_pos, "{what}");
+        assert_eq!(resting_in(&ctx, &z, 2), z_rest, "{what}: Z's ask");
+        assert_bal(&ctx, &t, funded, FixedPoint::ZERO, &what);
+    }
+}
+per_path!(bid_crossing_an_earlier_same_batch_ask_does_not_top_up);
 
 /// Same-batch bound, no ask at the start of the batch: nothing counts. M
 /// bids 10 @101 in m1 and m2 (no asks); T (101) = [sell 10 @100 in m1
@@ -993,12 +1075,27 @@ batch_paths!(same_batch_bid_does_not_count_without_a_start_ask);
 /// the m1 sell would fill 8 (IM(1,000 + q) <= 50.4); not counted, both fill
 /// 10 @101 on every path. X's bid: unfunded, IOC, FOK, market (cap 120),
 /// off-tick, dust (< lot), reduce-only, stop-limit, or [deep low bid 100 @1,
-/// 1 @120] with margin for the first only.
+/// 1 @120] with margin for the first only. s89 review (M asks @120 there):
+/// a PostOnly bid 10 @120 (crosses: the book rejects it) and a GTC bid 10
+/// @120 the asks eat whole (fills 10, never rests) never rest either.
 fn in_batch_griefer_bids_do_not_top_up_a_non_pool_sell(path: Path) {
-    for shape in ["unfunded", "ioc", "fok", "market", "off_tick", "dust", "reduce_only", "stop_limit", "deep_low_then_high"] {
+    for shape in [
+        "unfunded",
+        "ioc",
+        "fok",
+        "market",
+        "off_tick",
+        "dust",
+        "reduce_only",
+        "stop_limit",
+        "deep_low_then_high",
+        "post_only_crossing",
+        "gtc_eaten",
+    ] {
         let (mk, t, x) = (addr(1), addr(2), addr(5));
         let (_d, mut ctx) = fresh(path, &[mk]);
-        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 130, 10))]);
+        let ask = if matches!(shape, "post_only_crossing" | "gtc_eaten") { 120 } else { 130 };
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, ask, 10))]);
         fund_native(&ctx, &t, fp_cents(11_040));
         if shape != "unfunded" {
             fund_native(&ctx, &x, fp(if shape == "deep_low_then_high" { 10 } else { FUNDING }));
@@ -1017,6 +1114,8 @@ fn in_batch_griefer_bids_do_not_top_up_a_non_pool_sell(path: Path) {
                 x,
                 PlaceOrderParams { order_type: OrderType::StopLimit { trigger: fp(125), limit: fp(120) }, ..high },
             )),
+            "post_only_crossing" => actions.push(place(x, with_tif(high, TimeInForce::PostOnly))),
+            "gtc_eaten" => actions.push(place(x, high)),
             _ => {
                 actions.push(place(x, limit(2, true, 1, 100)));
                 actions.push(place(x, limit(2, true, 120, 1)));
@@ -1027,7 +1126,8 @@ fn in_batch_griefer_bids_do_not_top_up_a_non_pool_sell(path: Path) {
         let what = format!("{path:?} {shape}");
         assert!(r[0].success && r.last().unwrap().success, "{what}: {r:?}");
         assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{what}");
-        assert_eq!(pos_in(&ctx, &x, 2), FixedPoint::ZERO, "{what}");
+        let x_fills = if shape == "gtc_eaten" { fp(10) } else { FixedPoint::ZERO };
+        assert_eq!(pos_in(&ctx, &x, 2), x_fills, "{what}");
         assert_bal(&ctx, &t, fp_cents(11_040), FixedPoint::ZERO, &what);
     }
 }
@@ -1233,7 +1333,12 @@ per_path!(taker_only_rounding_does_not_cancel_a_sell_at_its_limit);
 /// After every block each sender's `order_margin` equals Σ reserve(price,
 /// remaining) over its resting rows exactly — B raises a non-pool sell's
 /// reservation, but every release is computed at the limit, so none is
-/// stranded or over-released.
+/// stranded or over-released. s89 review: non-vacuous for the same-batch
+/// bound (top-ups happen on both paths), and value is conserved: Σ
+/// (available + order_margin) + Σ signed size × (mid − entry) stays the
+/// funding total (no fees, no mark: no liquidation; every fill has two
+/// sides, so the reference price cancels) up to the entry-averaging
+/// rounding (measured <= 6 raw; any top-up is >= IM(1 × tick) = 0.05).
 #[test]
 fn order_margin_matches_resting_reservations_under_option_b() {
     struct Lcg(u64);
@@ -1244,12 +1349,14 @@ fn order_margin_matches_resting_reservations_under_option_b() {
         }
     }
     let senders: Vec<Address> = (0..40u8).map(|i| addr(10 + i)).collect();
+    let funding = |i: usize| fp([1_600, 4_000, 12_000, 100_000_000][i % 4]);
+    let funded = (0..senders.len()).fold(FixedPoint::ZERO, |acc, i| acc + funding(i));
     let mut totals = Vec::new();
     for threads in [1usize, 4] {
         let (_d, db) = open_test_db();
         let mut ctx = make_ctx(db);
         for (i, s) in senders.iter().enumerate() {
-            fund_native(&ctx, s, fp([1_600, 4_000, 12_000, 100_000_000][i % 4]));
+            fund_native(&ctx, s, funding(i));
         }
         let mut rng = Lcg(0x5EED_0087_0B0B);
         let (mut fills, mut checked) = (0u32, 0usize);
@@ -1285,6 +1392,12 @@ fn order_margin_matches_resting_reservations_under_option_b() {
                                 p.reduce_only = true;
                                 p.price = fp(if is_buy { mid + 2 } else { mid - 2 });
                             }
+                            // s89: bids inside the spread that rest — what the
+                            // same-batch bound counts (non-vacuity below).
+                            23..=32 if is_buy => {
+                                p.price = fp(mid);
+                                p.time_in_force = if rng.below(2) == 0 { TimeInForce::PostOnly } else { TimeInForce::GTC };
+                            }
                             _ => {}
                         }
                         p
@@ -1303,8 +1416,24 @@ fn order_margin_matches_resting_reservations_under_option_b() {
                 assert_eq!(bal(&ctx, s).order_margin, resting, "threads={threads} block={block} sender {s}");
                 checked += 1;
             }
+            let value = senders.iter().fold(FixedPoint::ZERO, |acc, s| {
+                let b = bal(&ctx, s);
+                (1..=12u64).fold(acc + b.available + b.order_margin, |acc, m| {
+                    acc + pos_in(&ctx, s, m) * fp(30_000) - ctx.positions.get_position(s, m).unwrap().map_or(FixedPoint::ZERO, |p| {
+                        let notional = p.size * p.entry_price;
+                        if p.is_long {
+                            notional
+                        } else {
+                            -notional
+                        }
+                    })
+                })
+            });
+            let drift = abs(value - funded);
+            assert!(drift <= FixedPoint::from_raw(100), "threads={threads} block={block}: value drift {drift}");
         }
         assert!(fills > 0 && checked == 8 * senders.len(), "threads={threads}: non-vacuous");
+        assert!(ctx.phase_accum.same_batch_top_ups > 0, "threads={threads}: same-batch top-ups happened");
         let state: Vec<(FixedPoint, FixedPoint)> =
             senders.iter().map(|s| bal(&ctx, s)).map(|b| (b.available, b.order_margin)).collect();
         totals.push(state);

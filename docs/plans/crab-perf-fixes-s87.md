@@ -30,6 +30,18 @@ positions 242 → 243), GOLDEN_B unchanged. ubench_econ: rejected_cancelled 5.35
 per run, fills/block 9.9k → 10.9k. Every remaining cancel is due to the ask cap: a crossing bid that
 rests above the start best ask (uncapped probe: 0). The ≤ 1% target is not met (~1.8% of accepted).
 
+Status (s89 review finding 1, owner decision option b): IMPLEMENTED as C7. A same-batch bid
+counts only if it will REST, judged conservatively before Phase 3 against the ask side = the
+start-of-batch book asks plus the earlier same-batch asks that can rest (accepted, GTC / PostOnly
+limit, not reduce-only, on tick, >= lot): a PostOnly bid only below the lowest of those asks, a
+GTC bid only if its quantity exceeds the ask quantity at prices <= its price. Closes the zero-cost
+crossing-PostOnly drain (P) and the 1-lot crossing-GTC drain (G). Cap, no-ask rule and the rest of
+C6 unchanged; the top-up still precedes the sender's own pool-market orders (finding 2, by
+design, documented). GOLDEN_A re-pinned (accepted 1712 → 1702, rejected_cancelled 175 → 179,
+rejected_margin 2077, liquidations 4, positions 243 unchanged), GOLDEN_B unchanged. ubench_econ:
+rejected_cancelled 1.56-1.83k → 4.22-4.77k per run (the over-estimated ask side; start-book-only
+depth probe: 2.58-2.89k), ms/1k fills median 30.4 → 28.1 (noise range).
+
 ## Design decision
 
 | Fix | Chosen design | Consensus impact |
