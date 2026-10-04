@@ -746,6 +746,45 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ]', src)
         self.assertIn("retry_busy='${RETRY_BUSY:-unset}'", src)
 
+    def test_spam_cancel_reaches_the_bench_only_when_set(self):
+        """SPAM_CANCEL_KEYS / SPAM_CANCEL_RATE / SPAM_CANCEL_FUNDED=1 -> bench
+        --spam-cancel-keys / --spam-cancel-rate / --spam-cancel-funded,
+        validated and recorded in the cell log line. Unset = flags omitted,
+        so older bench binaries and prior cells are unchanged."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        for v in ("SPAM_CANCEL_KEYS", "SPAM_CANCEL_RATE", "SPAM_CANCEL_FUNDED"):
+            self.assertIn(f"{v}=${{{v}:-}}", src)
+            self.assertIn(f"{v.lower()}='${{{v}:-unset}}'", src)
+        # Run run-cell.sh's own SPAM_CANCEL lines (defaults, validation, flag
+        # mapping) in bash and look at the resulting bench flags.
+        lines = [l for l in src.splitlines() if "SPAM_CANCEL" in l
+                 and not l.lstrip().startswith(("#", "log "))]
+        snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+
+        def run(**env):
+            base = {k: v for k, v in os.environ.items()
+                    if not k.startswith("SPAM_CANCEL")}
+            return subprocess.run(["bash", "-c", snippet], capture_output=True,
+                                  text=True, env=dict(base, **env))
+
+        r = run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="250.5")
+        self.assertEqual(r.stdout.strip(),
+                         "--spam-cancel-keys 8 --spam-cancel-rate 250.5", r.stderr)
+        r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="100", SPAM_CANCEL_FUNDED="1")
+        self.assertEqual(r.stdout.strip(), "--spam-cancel-keys 8 "
+                         "--spam-cancel-rate 100 --spam-cancel-funded", r.stderr)
+        for bad in ({"SPAM_CANCEL_KEYS": "x"},
+                    {"SPAM_CANCEL_KEYS": "8"},  # no rate
+                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "fast"},
+                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "1",
+                     "SPAM_CANCEL_FUNDED": "yes"}):
+            r = run(**bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+
     def test_antispam_off_on_devnet_and_switched_on_by_the_harness(self):
         """Node anti-spam limits (items A, B, D) are OFF on the bench devnet
         (devnet/wsl/env.sh defaults), ANTISPAM=1 turns them ON for a cell
