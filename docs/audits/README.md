@@ -110,6 +110,7 @@ corrections; a repeated finding is not another defect.
 | 78 | [EVM receipt fee aggregation](chain-14236fa-pass78-evm-fee-receipt-sum-2026-10-05.md) |
 | 79 | [Native-action fee collection](chain-14236fa-pass79-native-action-fee-collection-recheck-2026-10-05.md) |
 | 80 | [EVM beneficiary and protocol fee accounting](chain-14236fa-pass80-evm-fee-beneficiary-recheck-2026-10-05.md) |
+| 81 | [Fee burn versus cumulative burn reporting](chain-14236fa-pass81-fee-burn-tracker-recheck-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
