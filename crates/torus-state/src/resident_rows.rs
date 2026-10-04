@@ -51,6 +51,14 @@ impl ResidentDelta {
     pub fn is_empty(&self) -> bool {
         self.cfs.iter().all(Vec::is_empty)
     }
+
+    /// Keys of `cf` the block wrote or deleted, sorted (none for a CF outside
+    /// R). Item 6 C3: the traders whose cached margin sums the block dirtied.
+    pub fn keys<'a>(&'a self, cf: &str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        resident_slot(cf)
+            .into_iter()
+            .flat_map(move |s| self.cfs[s].iter().map(|(k, _)| k.as_slice()))
+    }
 }
 
 impl ResidentRows {

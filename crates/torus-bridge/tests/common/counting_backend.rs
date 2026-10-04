@@ -41,6 +41,17 @@ pub struct Counts {
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
     /// count, answered by a layer or not.
     layer_calls: Mutex<HashMap<(&'static str, &'static str), usize>>,
+    /// Item 6 C3: while armed, every `iterate_cf(CF_NATIVE_POSITIONS,
+    /// Some(prefix))` (answered by any layer) with its prefix and stack.
+    scan_probe: AtomicBool,
+    scans: Mutex<Vec<PositionScan>>,
+}
+
+/// Item 6 C3: one prefix scan of `CF_NATIVE_POSITIONS` (one
+/// `positions_for_trader`), wherever it was answered.
+pub struct PositionScan {
+    pub prefix: Vec<u8>,
+    pub stack: Backtrace,
 }
 
 #[derive(Clone)]
@@ -122,6 +133,19 @@ impl<T: StateBackend> CountingBackend<T> {
         std::mem::take(&mut *self.counts.storage_reads.lock().unwrap())
     }
 
+    /// Start recording every positions prefix scan with its stack.
+    pub fn arm_scan_probe(&self) {
+        self.counts.scan_probe.store(true, Ordering::SeqCst);
+    }
+
+    pub fn disarm_scan_probe(&self) {
+        self.counts.scan_probe.store(false, Ordering::SeqCst);
+    }
+
+    pub fn take_scans(&self) -> Vec<PositionScan> {
+        std::mem::take(&mut *self.counts.scans.lock().unwrap())
+    }
+
     pub fn take_layer_calls(&self) -> HashMap<(&'static str, &'static str), usize> {
         std::mem::take(&mut *self.counts.layer_calls.lock().unwrap())
     }
@@ -185,6 +209,10 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
     fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         if let (true, Some(p)) = (cf == CF_NATIVE_POSITIONS && self.armed(), prefix) {
             *self.counts.position_scans.lock().unwrap().entry(p.to_vec()).or_insert(0) += 1;
+        }
+        if let (true, Some(p)) = (cf == CF_NATIVE_POSITIONS && self.counts.scan_probe.load(Ordering::SeqCst), prefix) {
+            let scan = PositionScan { prefix: p.to_vec(), stack: Backtrace::force_capture() };
+            self.counts.scans.lock().unwrap().push(scan);
         }
         self.probe(cf, "iterate_cf", || self.inner.iterate_cf(cf, prefix))
     }
