@@ -115,8 +115,8 @@ and `ubench_econ.rs` (three call sites, so the harnesses measure the real path):
   `Arc::get_mut` on R (if another clone is alive: warn, metric, leave the holder empty =
   rebuild next block; a test asserts this never happens in the normal sequence), apply
   the delta, merge the block's sums memo, drop the sums of every trader in the delta's
-  position keys, stash with `height`. A fatal block returns early (`app.rs:2226-2238`,
-  `:2261-2271`) without calling it: the slot was taken, so the next block rebuilds.
+  position keys, stash with `height`. A fatal block returns early (`app.rs:2224-2238`,
+  `:2259-2271`) without calling it: the slot was taken, so the next block rebuilds.
 
 app.rs: change `let overlay` to `let mut overlay` at `:1931`; `begin_resident` at the top of `if run_native`
 (only sessions, nonces and the oracle / liquidation due-checks read the overlay before
