@@ -16,9 +16,10 @@ test reproduces them.
 ## October 4 chain reviews
 
 The reports preserve their reviewed revisions and verification limits. Passes
-1–7 review `cea1254`; passes 8–10 review production source at `d52a33f`.
-Pass 10 starts from the documentation-only commit `feb01b6`. Later passes add
-qualifications and corrections; a repeated finding is not another defect.
+1–7 review `cea1254`; passes 8–11 review production source at `d52a33f`.
+Passes 10 and 11 start from documentation-only commits `feb01b6` and `0c967ca`.
+Later passes add qualifications and corrections; a repeated finding is not
+another defect.
 
 | Pass | Main report |
 | --- | --- |
@@ -32,6 +33,7 @@ qualifications and corrections; a repeated finding is not another defect.
 | 8 | [Updated-branch review](chain-d52a33f-pass8-mixed-review-2026-10-04.md) |
 | 9 | [Lifecycle and history review](chain-d52a33f-pass9-mixed-review-2026-10-04.md) |
 | 10 | [RPC, operations and independent recheck](chain-d52a33f-pass10-mixed-review-2026-10-04.md) |
+| 11 | [Clients, state views and settlement](chain-d52a33f-pass11-mixed-review-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
