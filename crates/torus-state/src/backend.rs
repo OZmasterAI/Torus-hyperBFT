@@ -125,7 +125,7 @@ impl StateBackend for StateDb {
         let mut results = Vec::new();
         match prefix {
             Some(pfx) => {
-                let iter = db.prefix_iterator_cf(cf_handle, pfx);
+                let iter = crate::db::prefix_iter(db, &cf_handle, pfx);
                 for item in iter {
                     let (key, value) = item?;
                     if !key.starts_with(pfx) {

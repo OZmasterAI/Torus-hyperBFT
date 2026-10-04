@@ -1135,7 +1135,7 @@ impl CoreWriterQueue {
             .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
 
         let prefix = block_number.to_be_bytes();
-        let iter = db.prefix_iterator_cf(cf, prefix);
+        let iter = torus_state::db::prefix_iter(db, &cf, &prefix);
 
         let mut count = 0usize;
         for item in iter {

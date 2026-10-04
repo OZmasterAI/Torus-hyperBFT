@@ -20,6 +20,48 @@ pub const KECCAK_EMPTY: B256 = B256::new([
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
+/// The smallest key greater than every key that starts with `prefix`: strip
+/// trailing 0xff bytes, then increment the last byte. `None` for an empty or
+/// all-0xff prefix (no such key; the scan runs to the end of the CF).
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut succ = prefix.to_vec();
+    while let Some(last) = succ.pop() {
+        if last != 0xff {
+            succ.push(last + 1);
+            return Some(succ);
+        }
+    }
+    None
+}
+
+/// Read options for a forward scan of the keys under `prefix`, bounded above
+/// by [`prefix_successor`] (s89 fix A). No prefix extractor is configured, so
+/// without the bound RocksDB walks every tombstone after the prefix until it
+/// finds the next live key, which the caller then rejects. Callers still stop
+/// at the first key not starting with `prefix` (needed when there is no bound),
+/// so results are byte-identical; only the work past the prefix goes.
+pub fn prefix_read_opts(prefix: &[u8]) -> rocksdb::ReadOptions {
+    let mut ro = rocksdb::ReadOptions::default();
+    if let Some(upper) = prefix_successor(prefix) {
+        ro.set_iterate_upper_bound(upper);
+    }
+    ro
+}
+
+/// Forward iterator over `cf` from `prefix`, bounded by [`prefix_read_opts`].
+/// Replaces `DB::prefix_iterator_cf`, which sets no upper bound.
+pub fn prefix_iter<'a>(
+    db: &'a DB,
+    cf: &impl rocksdb::AsColumnFamilyRef,
+    prefix: &[u8],
+) -> rocksdb::DBIteratorWithThreadMode<'a, DB> {
+    db.iterator_cf_opt(
+        cf,
+        prefix_read_opts(prefix),
+        rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+    )
+}
+
 /// Central RocksDB database handle for the Torus node.
 ///
 /// Opens all column families defined in section 6.1. Provides typed accessors
@@ -760,7 +802,7 @@ impl StateDb {
     pub fn account_storage(&self, address: &Address) -> Result<Vec<(U256, U256)>, StateError> {
         let cf = self.cf(CF_STORAGE)?;
         let prefix = address.as_slice();
-        let iter = self.db.prefix_iterator_cf(cf, prefix);
+        let iter = prefix_iter(&self.db, &cf, prefix);
         let mut slots = Vec::new();
         for item in iter {
             let (key, value) = item?;
@@ -970,6 +1012,46 @@ fn parse_sync_wal_toggle(raw: Option<String>) -> bool {
     match raw {
         Some(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod prefix_successor_tests {
+    use super::prefix_successor;
+
+    #[test]
+    fn successor_strips_trailing_ff_and_increments() {
+        assert_eq!(prefix_successor(b"sub"), Some(b"suc".to_vec()));
+        assert_eq!(prefix_successor(&[0x01, 0xff]), Some(vec![0x02]));
+        assert_eq!(prefix_successor(&[0x01, 0xfe, 0xff, 0xff]), Some(vec![0x01, 0xff]));
+        assert_eq!(prefix_successor(&[0x00]), Some(vec![0x01]));
+        assert_eq!(prefix_successor(&[]), None);
+        assert_eq!(prefix_successor(&[0xff]), None);
+        assert_eq!(prefix_successor(&[0xff, 0xff, 0xff]), None);
+    }
+
+    /// Brute force over all 1..=2-byte prefixes and 1..=3-byte keys of an edge
+    /// alphabet: `key` starts with `prefix` <=> prefix <= key < successor.
+    #[test]
+    fn successor_bounds_exactly_the_prefixed_keys() {
+        const A: [u8; 5] = [0x00, 0x01, 0x7f, 0xfe, 0xff];
+        let mut words: Vec<Vec<u8>> = vec![];
+        for &a in &A {
+            words.push(vec![a]);
+            for &b in &A {
+                words.push(vec![a, b]);
+                for &c in &A {
+                    words.push(vec![a, b, c]);
+                }
+            }
+        }
+        for p in words.iter().filter(|w| w.len() <= 2) {
+            let succ = prefix_successor(p);
+            for k in &words {
+                let in_range = k >= p && succ.as_ref().is_none_or(|s| k < s);
+                assert_eq!(in_range, k.starts_with(p), "prefix {p:02x?} key {k:02x?}");
+            }
+        }
     }
 }
 

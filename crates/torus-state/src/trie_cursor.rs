@@ -32,7 +32,7 @@ use reth_trie_common::{BranchNodeCompact, Nibbles, TrieMask};
 use rocksdb::{DBRawIterator, WriteBatch};
 
 use crate::cf::{CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_TRIE_ACCOUNTS, CF_TRIE_STORAGE};
-use crate::db::{decode_account_info, StateDb};
+use crate::db::{decode_account_info, prefix_read_opts, StateDb};
 use crate::error::StateError;
 
 /// Length of the hashed-address prefix on storage-trie keys.
@@ -152,7 +152,9 @@ pub fn write_trie_updates(
     for (hashed_address, storage) in &updates.storage_tries {
         if storage.is_deleted {
             // Wipe every persisted node under this account's 32-byte prefix.
-            let mut iter = db.inner().raw_iterator_cf(stor_cf);
+            let mut iter = db
+                .inner()
+                .raw_iterator_cf_opt(stor_cf, prefix_read_opts(hashed_address.as_slice()));
             iter.seek(hashed_address.as_slice());
             while iter.valid() {
                 let key = match iter.key() {
@@ -234,22 +236,26 @@ impl<'a> RocksTrieCursor<'a> {
         cf_name: &'static str,
         hashed_address: Option<B256>,
     ) -> Result<Self, DatabaseError> {
-        let iter = Self::make_iter(db, cf_name)?;
+        let prefix = hashed_address.map(|a| a.0);
+        let iter = Self::make_iter(db, cf_name, prefix.as_ref())?;
         Ok(Self {
             db,
             cf_name,
-            prefix: hashed_address.map(|a| a.0),
+            prefix,
             iter,
             current: None,
         })
     }
 
+    /// Storage cursors are bounded to their account's prefix (s89 fix A).
     fn make_iter(
         db: &'a StateDb,
         cf_name: &'static str,
+        prefix: Option<&[u8; HASHED_ADDR_LEN]>,
     ) -> Result<DBRawIterator<'a>, DatabaseError> {
         let cf = db.cf_handle(cf_name).map_err(to_db_err)?;
-        Ok(db.inner().raw_iterator_cf(cf))
+        let ro = prefix.map(|p| prefix_read_opts(p)).unwrap_or_default();
+        Ok(db.inner().raw_iterator_cf_opt(cf, ro))
     }
 
     /// Full RocksDB key for a seek to `path` (prepends the storage prefix when present).
@@ -330,7 +336,7 @@ impl<'a> TrieCursor for RocksTrieCursor<'a> {
 
     fn reset(&mut self) {
         // Recreate the underlying iterator; the trait contract requires the next op to be a seek.
-        if let Ok(iter) = Self::make_iter(self.db, self.cf_name) {
+        if let Ok(iter) = Self::make_iter(self.db, self.cf_name, self.prefix.as_ref()) {
             self.iter = iter;
         }
         self.current = None;
@@ -340,7 +346,7 @@ impl<'a> TrieCursor for RocksTrieCursor<'a> {
 impl<'a> TrieStorageCursor for RocksTrieCursor<'a> {
     fn set_hashed_address(&mut self, hashed_address: B256) {
         self.prefix = Some(hashed_address.0);
-        if let Ok(iter) = Self::make_iter(self.db, self.cf_name) {
+        if let Ok(iter) = Self::make_iter(self.db, self.cf_name, self.prefix.as_ref()) {
             self.iter = iter;
         }
         self.current = None;
@@ -462,13 +468,15 @@ impl<'a> RocksHashedStorageCursor<'a> {
         Ok(Self {
             db,
             prefix: hashed_address.0,
-            iter: db.inner().raw_iterator_cf(cf),
+            iter: db
+                .inner()
+                .raw_iterator_cf_opt(cf, prefix_read_opts(hashed_address.as_slice())),
         })
     }
 
     fn refresh_iter(&mut self) {
         if let Ok(cf) = self.db.cf_handle(CF_HASHED_STORAGE) {
-            self.iter = self.db.inner().raw_iterator_cf(cf);
+            self.iter = self.db.inner().raw_iterator_cf_opt(cf, prefix_read_opts(&self.prefix));
         }
     }
 
