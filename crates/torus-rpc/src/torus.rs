@@ -389,6 +389,45 @@ enum SubmitSlot {
 }
 
 impl RpcState {
+    /// Anti-spam item B: charge `action` (its `order_count`) to `sender`'s
+    /// per-address allowance. Runs after verify (the sender is unknown
+    /// before) and before pool admission; a refusal is counted by reason and
+    /// returned as the per-item reply.
+    fn check_addr_rate(
+        &self,
+        sender: &alloy_primitives::Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), String> {
+        let Some(ref limiter) = self.addr_limiter else {
+            return Ok(());
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let weight = torus_mempool::rate_limit::order_count(action) as u64;
+        // Traded volume via the same accessor the open-order limit uses; a
+        // read error counts as no volume (only the buffer applies).
+        let volume_trs = || {
+            PositionManager::new(self.state.clone())
+                .get_cum_volume(sender)
+                .map(|v| (v.raw().max(0) / FixedPoint::SCALE) as u64)
+                .unwrap_or(0)
+        };
+        limiter
+            .check(
+                sender,
+                torus_mempool::is_cancel(action),
+                weight,
+                now_ms,
+                volume_trs,
+            )
+            .map_err(|refusal| {
+                self.count_admit_reject(refusal.reason());
+                refusal.message(sender)
+            })
+    }
+
     /// Count one admission-path rejection under its concrete reason label.
     fn count_admit_reject(&self, reason: &str) {
         if let Some(ref m) = self.metrics {
@@ -556,6 +595,12 @@ impl RpcState {
                 };
                 match item {
                     Ok((sender, action, hash)) => {
+                        if let Err(msg) = self.check_addr_rate(&sender, &action.action) {
+                            return RpcSubmitResult {
+                                hash: None,
+                                error: Some(msg),
+                            };
+                        }
                         let insert_t0 = std::time::Instant::now();
                         // B1: the leader-forward now carries the PARSED action
                         // (structured tuple, no JSON re-encode), so keep a copy
@@ -1305,6 +1350,8 @@ impl TorusApiServer for RpcState {
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?
         .map_err(ErrorObjectOwned::from)?;
 
+        self.check_addr_rate(&sender, &action.action)
+            .map_err(|msg| ErrorObjectOwned::from(RpcError::Internal(msg)))?;
         self.mempool
             .add_native_action_presigned(sender, action.clone())
             .map_err(|e| {

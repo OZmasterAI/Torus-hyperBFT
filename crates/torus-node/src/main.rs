@@ -999,6 +999,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     info!(all_market_trades, "all-markets newTrades subscriptions");
     rpc_server.set_all_market_trades(all_market_trades);
+    // Anti-spam item B: per-address native request limit, ON unless
+    // TORUS_ADDR_RATE_LIMIT=0. In memory, per node, reset on restart.
+    let (addr_limiter, bad_exempt) = torus_rpc::addr_rate::from_env();
+    for entry in &bad_exempt {
+        warn!(%entry, "TORUS_ADDR_RATE_EXEMPT: not an address, ignored");
+    }
+    match addr_limiter {
+        Some(limiter) => {
+            info!(
+                enabled = true,
+                buffer = limiter.buffer(),
+                exempt = limiter.exempt_count(),
+                "native ingress anti-spam: per-address request limit (TORUS_ADDR_RATE_LIMIT / _BUFFER / _EXEMPT; node-local, in memory)"
+            );
+            rpc_server.set_addr_rate_limiter(Arc::new(limiter));
+        }
+        None => info!(
+            enabled = false,
+            "native ingress anti-spam: per-address request limit OFF (TORUS_ADDR_RATE_LIMIT=0)"
+        ),
+    }
 
     // Leader forwarding: RPC → network bridge
     let own_vk = verifying_key.to_bytes();

@@ -3,6 +3,7 @@
 //! Implements Ethereum-compatible `eth_*`, `net_*`, and `web3_*` namespaces
 //! using jsonrpsee 0.26 with WebSocket subscription support.
 
+pub mod addr_rate;
 pub mod error;
 pub mod eth;
 pub mod net;
@@ -278,6 +279,9 @@ pub struct RpcState {
     pub(crate) forward_bodies: bool,
     /// Admission control: cap concurrent submit_native_action calls.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Anti-spam item B: per-address native request limit (`None` = off,
+    /// the library default; `torus-node` installs it from the env).
+    pub(crate) addr_limiter: Option<Arc<addr_rate::AddrRateLimiter>>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -316,8 +320,14 @@ impl RpcServer {
                 forward_evm_tx: None,
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
+                addr_limiter: None,
             },
         }
+    }
+
+    /// Install the per-address native request limit (anti-spam item B).
+    pub fn set_addr_rate_limiter(&mut self, limiter: Arc<addr_rate::AddrRateLimiter>) {
+        self.state.addr_limiter = Some(limiter);
     }
 
     /// Configure leader forwarding for direct-to-leader native action submission.
@@ -1659,6 +1669,120 @@ mod tests {
         assert!(
             text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="unfunded"} 2"#),
             "unfunded rejects not counted; dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Anti-spam item B: the per-address limit is charged after verify with
+    /// the batch's order count; over the allowance an address gets a
+    /// rate-limited reply (counted by reason) while exempt addresses and
+    /// other senders are unaffected. Same on the single endpoint.
+    #[tokio::test]
+    async fn addr_rate_limit_refuses_over_allowance_and_counts() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let key = |hex_key: &str| {
+            k256::ecdsa::SigningKey::from_slice(&hex::decode(hex_key).unwrap()).unwrap()
+        };
+        let limited = key("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let exempt = key("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |k: &k256::ecdsa::SigningKey, action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, k);
+            let sender = signed.recover_sender().unwrap();
+            (
+                sender,
+                format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap())),
+            )
+        };
+        let exempt_addr = mk(&exempt, torus_types::NativeAction::ClaimRewards, 0).0;
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        // Buffer 2, no volume: 2 non-cancel requests, 4 cumulative cancels.
+        server.set_addr_rate_limiter(Arc::new(addr_rate::AddrRateLimiter::new(
+            2,
+            [exempt_addr].into_iter().collect(),
+            1_000,
+        )));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let cancel = |id| torus_types::NativeAction::CancelOrder { order_id: id };
+        let batch: Vec<String> = vec![
+            mk(&limited, torus_types::NativeAction::ClaimRewards, now_ms).1,
+            mk(
+                &limited,
+                torus_types::NativeAction::ClaimRewards,
+                now_ms + 1,
+            )
+            .1,
+            mk(
+                &limited,
+                torus_types::NativeAction::ClaimRewards,
+                now_ms + 2,
+            )
+            .1,
+            mk(&limited, cancel(1), now_ms + 3).1,
+            mk(&limited, cancel(2), now_ms + 4).1,
+            mk(&limited, cancel(3), now_ms + 5).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 6).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 7).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 8).1,
+        ];
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        let errs: Vec<Option<&str>> = results.iter().map(|r| r.error.as_deref()).collect();
+        assert!(errs[0].is_none() && errs[1].is_none(), "{errs:?}");
+        // 3rd non-cancel: over the buffer, and < 10 s since the last admit.
+        assert!(errs[2].unwrap_or("").contains("rate limited"), "{errs:?}");
+        // Cancels have their own allowance: min(2 + 100_000, 2 * 2) = 4.
+        assert!(errs[3].is_none() && errs[4].is_none(), "{errs:?}");
+        assert!(errs[5].unwrap_or("").contains("rate limited"), "{errs:?}");
+        assert!(errs[6..].iter().all(Option::is_none), "exempt: {errs:?}");
+
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![
+                    mk(
+                        &limited,
+                        torus_types::NativeAction::ClaimRewards,
+                        now_ms + 9
+                    )
+                    .1
+                ],
+            )
+            .await;
+        assert!(single
+            .expect_err("single endpoint limited too")
+            .to_string()
+            .contains("rate limited"));
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(
+                r#"torus_rpc_submit_admit_rejects_total{reason="addr_cancel_rate_limited"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="addr_rate_limited"} 2"#),
+            "{text}"
         );
         handle.stop().unwrap();
     }
