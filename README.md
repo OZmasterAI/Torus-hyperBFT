@@ -23,6 +23,27 @@ High-performance EVM-compatible blockchain with HotStuff BFT consensus. Sub-100m
 cargo build --release -p torus-node
 ```
 
+The repo's `.cargo/config.toml` links with `clang` + **`mold`** and compiles
+the RocksDB C++ code through **`sccache`**, so install both first (Arch:
+`pacman -S mold sccache`; Ubuntu: `apt install mold`, `cargo install sccache`).
+Without them the build stops at the first link with
+`invalid linker name in argument '-fuse-ld=mold'`.
+
+**Parallel build jobs are set per machine**, not in the repo. Put the number
+in your own `~/.cargo/config.toml`:
+
+```toml
+[build]
+jobs = 16
+```
+
+- Pick it from the machine's threads and memory: a release build of the big
+  crates can use 1-3 GB per job (16 jobs peak around 20-40 GB).
+- A machine that sets nothing uses all its cores.
+- `CARGO_BUILD_JOBS=N` overrides it for one shell or command.
+- Run one cargo build or test at a time; two at once double the jobs and the
+  memory.
+
 ### Run a Testnet Node
 
 ```bash
