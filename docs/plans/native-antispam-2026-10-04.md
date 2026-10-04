@@ -207,11 +207,46 @@ No limit fired in these cells:
 - B did not fire against the spam: each spam key sent about 1.9k actions in
   60 s, under the 10k buffer.
 
+### Round-3 binary, 256 funded spam keys (`6398374`, 120 s cells)
+
+Cap 20, 256 funded keys sending cancel-alls at 2,000/s in total, C at 25%,
+`--retry-busy`. Both cells AGREE, liveness PASS, dissemination clean. Runs
+`ozarchy-as3-spam-funded256-cap20` and `ozarchy-as3-spam-funded256-B1000-cap20`
+in `~/bench-results-matched/` (each with `.poll.txt` and `.sys/` holding
+`sar` and `pidstat` output).
+
+| Cell | matched/s (best 60 s) | Blocks with orders | Pool peak (max 65,536) | Spam sent / accepted / refused |
+|---|---|---|---|---|
+| 256 funded keys | **72,881** (76,156) | 2,532 / 3,039 (83%) | **65,536**, full from about 15 s to 75 s | 239,807 / 138,789 / 101,018 (all `busy`) |
+| same, `ANTISPAM=1`, `TORUS_ADDR_RATE_BUFFER=1000` | **58,429** (72,033) | 2,399 / 2,935 (82%) | **65,536**, full from about 30 s to 120 s | 239,710 / 136,008 / 103,702 (all `busy`) |
+
+- **The pool fills.** 256 x 512 per-sender slots exceed the 65,536 pool, so
+  the pool sat full for about a minute. Each node refused about 12k items as
+  `pool_full` and 250k-390k as `pool_full_preverify`, far more than the
+  spam's 101k refusals, so most refusals hit the load's orders. Throughput
+  held (72.9k, as with 64 keys) only because the bench retries refused
+  orders; a client that does not retry loses them. Blocks with orders fell
+  from 93% (64 keys) to 83%. This reopens deferred f.
+- **B does not catch this spam.** Each spam key sent about 936 actions in
+  120 s, under the 1,000 buffer, so `addr_rate_limited` refused none of
+  them and `addr_cancel_rate_limited` stayed 0. B instead refused about
+  27k actions per node from the load's high-volume senders, which cost
+  20% of matched/s. Many keys each sending a little stay under any
+  per-address limit; Hyperliquid's answer to that is the congestion share
+  (deferred d), not B.
+- **Host.** `sar`: 84-87% busy on 32 CPUs, iowait under 0.1% on average;
+  the three nodes used about 5-7 cores each. Disk is not a factor. The
+  per-thread `pidstat` capture is empty because it started before the
+  nodes; the per-process numbers are valid.
+- n=1 per cell; the 64-key cells were 60 s, so compare block shares, not
+  totals.
+
 Not yet measured:
 
-- B against funded spam (needs a longer cell or a small
-  `TORUS_ADDR_RATE_BUFFER`);
-- spam from more than ~128 funded keys (see deferred f).
+- the same 256-key cell without `--retry-busy`, which would measure how
+  many honest orders a pool full of cancels actually loses;
+- B with a per-cancel or volume-scaled allowance against many small spam
+  keys.
 
 ## 6. Deferred, and why
 
@@ -220,9 +255,10 @@ Not yet measured:
 | a | Durable committed counter (counts survive restart and idle eviction) | Belongs in item 6 Phase 3's block-consistent in-memory view. `remove_committed_native` (`lib.rs:1205`) receives only hashes, so exact senders would need app.rs dispatch changes next to item 6 | Coordinate with 18c |
 | b | Enforcement at execution (HL-like; removes the last burst overshoot) | Consensus change plus a golden re-pin | 18c |
 | c | HL in-block order (makers, then cancels, then takers). Torus runs post-only after takers and oracle after orders | Consensus change | 18c |
-| d | E: congestion block-space share per address (2x previous-day maker share) | Needs per-day maker volume (the trade-history table has maker/taker) and adds per-address work to the proposer selection hot path. Separate build and bench | Later |
-| e | Trading fees | Separate topic. Without fees, two funded addresses trading with each other can farm B's volume credit | Separate |
-| f | Cancel quota in the pool (at most a share of the pool may be cancels) | Not needed for the measured attack: with the admission fix, 64 funded keys could not fill the pool (peak about 40k of 65,536). With more than about 128 funded keys (128 x 512 per-sender cap = 65,536), cancels could fill the pool and new orders would be refused as pool full; A makes each key cost at least 1 TRS. It gives no speed-up in normal load (cancels are about 5%), only protection. Deferred because `native_pool.rs` is also changed heavily by the crab stack (oracle lane), so it would conflict at merge | Later; measure first with a 256-key cell |
+| d | E: congestion block-space share per address (2x previous-day maker share) | The answer to many funded keys that each stay under B (section 5, 256-key cells). Needs each address's previous-day maker volume on the proposer hot path: reading trade history from RocksDB there is too slow, and validators may run with `TORUS_TRADE_HISTORY=0`. Home: a rolling per-address maker-volume counter in item 6's per-trader in-memory state (Phases 3-4). Proposer-local, no consensus change. **Decided 2026-10-04: build after item 6, together with 18c** | After item 6, with 18c |
+| e | Trading fees | Separate topic. Without fees, two funded addresses trading with each other can farm B's volume credit. **Must be revisited before the testnet deploy and again before mainnet** (decided 2026-10-04): rates, maker rebates, fee asset (TRS or a stable asset), where fees go; g's activation fee uses the same decisions | Before testnet, with 18c |
+| f | Cancel quota in the pool (at most a share of the pool may be cancels) | The 256-key cells (section 5) showed the pool fills and refuses the load's orders as pool full. **Decided 2026-10-04: not built; wait for E**, which removes the cause (keys without maker volume get almost no block space) instead of capping cancels, and does not refuse honest cancels during an attack. Until E, more than ~128 funded spam keys can fill the pool. f would also conflict with the crab stack's oracle lane in `native_pool.rs` | Dropped in favour of E |
+| g | Account activation fee (HL: 1 USDC per new account), replacing A's holding check with a one-time cost per key | Consensus change: executor charges the fee on an account's first action (or on the first transfer to a new address, as HL does), stores an activated flag, golden re-pin; A then checks the flag. Torus has no USDC: perp collateral is TRS, so a USD-priced fee needs a TRS/USD price or a stable asset. Fee destination is the same decision as e. Not harder after item 6 (one small per-account value; item 6 changes the per-trader state layout, so adding it after avoids moving it twice). Must land before mainnet: accounts that exist at the upgrade are marked activated, so keys created before it stay free | Before mainnet, with 18c, together with e |
 
 ## 7. Torus vs Hyperliquid after round 3
 
@@ -242,18 +278,16 @@ Not yet measured:
 
 ## 8. Next steps
 
-Run from the integration repo with the branch worktree. Arguments:
+Run the branch worktree's own `tools/matched-bench/run-cell.sh` (the
+integration repo's copy has no `SPAM_CANCEL_*` options). Arguments:
 `run-cell.sh <worktree> <label> [MARKETS] [DUR] [RATE] ['EXTRA_ENV']`.
 EXTRA_ENV is only read as the 6th positional argument; exporting it as an
 environment variable has no effect.
 
-1. **256 funded spam keys** (does the pool fill and refuse orders as pool
-   full? decides deferred f):
-   `RETRY_BUSY=1 BLOCK_CAP=20 SPAM_CANCEL_KEYS=256 SPAM_CANCEL_RATE=2000 SPAM_CANCEL_FUNDED=1 tools/matched-bench/run-cell.sh /home/oz/projects/wt/antispam spam-funded-256 10 120 76000`.
-   Watch `torus_mempool_native_size` and `pool_full` rejects.
-2. **B against funded spam:** the funded spam cell with `ANTISPAM=1` and
-   `'TORUS_ADDR_RATE_BUFFER=1000'` as EXTRA_ENV; expect
-   `addr_cancel_rate_limited` on the spam keys.
+1. Done 2026-10-04: **256 funded spam keys** and **B against funded spam**
+   (section 5).
+2. Optional: the 256-key cell without `--retry-busy`, to measure how many
+   honest orders a full pool loses.
 3. **Review D's custom accept loop** (HTTP/2 keep-alive configuration no
    longer applied).
 4. **Merge with the crab stack** (`perf/s87-crab-fixes`): it changes the same
@@ -262,4 +296,6 @@ environment variable has no effect.
    (`SetOracleSigner`). After that merge, the validator-duty exemption must
    also accept a validator's registered oracle signer; crab has an
    active-validator-or-signer helper in `torus-mempool`.
-5. Coordinate deferred items a-c with 18c.
+5. Coordinate deferred items a-c, d (E, after item 6; ask for a per-address
+   maker-volume counter in item 6's per-trader state) and g (activation fee,
+   with e) with 18c.
