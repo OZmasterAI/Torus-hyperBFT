@@ -8,8 +8,9 @@
 //! - cancels have their own, larger cumulative allowance
 //!   `min(allowance + 100_000, 2 * allowance)`, so a limited address can keep
 //!   cancelling for a while;
-//! - once exhausted: one action (any weight) per 10 s, counted from the
-//!   address's last admitted action.
+//! - once exhausted: one weight-1 action (a single order, a cancel, any other
+//!   single action) per 10 s, counted from the address's last admitted
+//!   action; a batch of n > 1 orders is n requests and is refused.
 //!
 //! Counters live in this node's memory since it started: they reset on
 //! restart and are per node (a client spreading load over N nodes gets up to
@@ -68,7 +69,7 @@ impl Refusal {
         };
         format!(
             "rate limited: {sender} used {used} of {allowance} {kind} (buffer + 1 per TRS traded); \
-             1 action per 10 s until traded volume grows"
+             1 single action per 10 s until traded volume grows"
         )
     }
 }
@@ -140,9 +141,10 @@ impl AddrRateLimiter {
         let mut entries = self.entries.lock().unwrap();
         let e = entries.entry_with(*sender, Entry::default);
         let within = e.used.saturating_add(weight) <= limit;
-        // Exhausted: one action per EXHAUSTED_INTERVAL_MS since the last
-        // admitted one (any weight).
-        if within || now_ms.saturating_sub(e.last_ok_ms) >= EXHAUSTED_INTERVAL_MS {
+        // Exhausted: one weight-1 action per EXHAUSTED_INTERVAL_MS since the
+        // last admitted one (HL: a batch of n is n requests, so it never
+        // fits the 1 request the slow mode grants).
+        if within || (weight <= 1 && now_ms.saturating_sub(e.last_ok_ms) >= EXHAUSTED_INTERVAL_MS) {
             e.used = e.used.saturating_add(weight);
             e.last_ok_ms = now_ms;
             return Ok(());
@@ -330,10 +332,47 @@ mod tests {
         l.check(&a(1), true, 1, 5_000, || 0).unwrap();
         assert!(l.check(&a(1), true, 1, 6_000, || 0).is_err());
         assert!(l.check(&a(1), false, 1, 14_999, || 0).is_err());
-        // Any weight passes in slow mode, once per 10 s.
-        l.check(&a(1), false, 400, 15_000, || 0).unwrap();
+        // Slow mode admits a weight-1 action once per 10 s.
+        l.check(&a(1), false, 1, 15_000, || 0).unwrap();
         assert!(l.check(&a(1), false, 1, 24_999, || 0).is_err());
         l.check(&a(1), true, 1, 25_000, || 0).unwrap();
+    }
+
+    #[test]
+    fn exhausted_mode_admits_only_weight_one_actions() {
+        // HL: a batch of n orders is n requests, so once exhausted only a
+        // single order / cancel / other single action passes, 1 per 10 s.
+        let l = AddrRateLimiter::new(1, HashSet::new(), 100);
+        l.check(&a(1), false, 1, 0, || 0).unwrap();
+        // Long past the interval, a 400-order batch is still refused.
+        assert_eq!(
+            l.check(&a(1), false, 400, 20_000, || 0),
+            Err(Refusal::Requests {
+                used: 1,
+                allowance: 1
+            })
+        );
+        assert!(l.check(&a(1), false, 2, 20_000, || 0).is_err());
+        // A single order passes 10 s after the last admitted action ...
+        l.check(&a(1), false, 1, 20_000, || 0).unwrap();
+        // ... and a second one within 10 s is refused.
+        assert!(l.check(&a(1), false, 1, 25_000, || 0).is_err());
+        l.check(&a(1), false, 1, 30_000, || 0).unwrap();
+    }
+
+    #[test]
+    fn exhausted_mode_keeps_the_cancel_allowance() {
+        // Requests exhausted, cancels min(10 + 100_000, 2 * 10) = 20 untouched.
+        let l = AddrRateLimiter::new(10, HashSet::new(), 100);
+        l.check(&a(1), false, 10, 0, || 0).unwrap();
+        assert!(l.check(&a(1), false, 1, 0, || 0).is_err());
+        for _ in 0..10 {
+            l.check(&a(1), true, 1, 0, || 0).unwrap();
+        }
+        assert!(l.check(&a(1), true, 1, 0, || 0).is_err());
+        // Exhausted cancels: one per 10 s.
+        l.check(&a(1), true, 1, 10_000, || 0).unwrap();
+        assert!(l.check(&a(1), true, 1, 19_999, || 0).is_err());
     }
 
     #[test]
