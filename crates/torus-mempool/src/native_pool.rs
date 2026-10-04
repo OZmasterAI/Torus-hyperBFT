@@ -144,6 +144,8 @@ pub(crate) struct NativePool {
     hash_index: HashMap<B256, Vec<SortKey>>,
     /// Insertion counter feeding [`SortKey`] tie order.
     next_seq: u64,
+    /// Pooled cancels, so admission can measure the non-cancel backlog alone.
+    cancel_count: usize,
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
@@ -161,6 +163,7 @@ impl NativePool {
             seen: HashSet::new(),
             hash_index: HashMap::new(),
             next_seq: 0,
+            cancel_count: 0,
             max_size,
             max_per_sender,
             max_per_block,
@@ -175,6 +178,12 @@ impl NativePool {
 
     pub fn size(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Pooled actions that are not cancels: the backlog the admission limit
+    /// measures, so pooled cancels never make ingress shed orders.
+    pub fn non_cancel_size(&self) -> usize {
+        self.entries.len() - self.cancel_count
     }
 
     /// True when the pool is at capacity — every insert is guaranteed to fail
@@ -304,6 +313,7 @@ impl NativePool {
                 restash_key,
             },
         );
+        self.cancel_count += usize::from(is_cancel);
 
         Ok(action_hash)
     }
@@ -314,6 +324,7 @@ impl NativePool {
     /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
+        self.cancel_count -= usize::from(entry.is_cancel);
         self.expiry_index.remove(&expiry_key(key));
         self.seen.remove(&(entry.sender, entry.action_hash));
         self.dec_sender_count(&entry.sender);
@@ -598,6 +609,10 @@ impl NativePool {
     #[cfg(test)]
     fn assert_index_consistent(&self) {
         assert_eq!(self.expiry_index.len(), self.entries.len());
+        assert_eq!(
+            self.cancel_count,
+            self.entries.values().filter(|e| e.is_cancel).count()
+        );
         for key in self.entries.keys() {
             assert!(self.expiry_index.contains(&expiry_key(key)), "missing expiry key");
         }
@@ -659,6 +674,26 @@ mod tests {
             nonce,
             signature: sig(),
         }
+    }
+
+    #[test]
+    fn non_cancel_size_tracks_inserts_and_every_removal() {
+        let mut pool = NativePool::new(100, 64, 100);
+        let cancel = |n| make_action(n, NativeAction::CancelAllOrders { market_id: None });
+        let other = |n| make_action(n, NativeAction::ClaimRewards);
+        let s = Address::repeat_byte(7);
+        let c1 = pool.insert(s, cancel(1)).unwrap();
+        pool.insert(s, cancel(2)).unwrap();
+        let o1 = pool.insert(s, other(3)).unwrap();
+        pool.insert(s, other(4)).unwrap();
+        pool.insert(s, other(5)).unwrap();
+        assert_eq!((pool.size(), pool.non_cancel_size()), (5, 3));
+        pool.remove_committed(&[c1]);
+        assert_eq!((pool.size(), pool.non_cancel_size()), (4, 3));
+        pool.remove_committed(&[o1]);
+        assert_eq!((pool.size(), pool.non_cancel_size()), (3, 2));
+        pool.drain(100);
+        assert_eq!((pool.size(), pool.non_cancel_size()), (0, 0));
     }
 
     #[test]

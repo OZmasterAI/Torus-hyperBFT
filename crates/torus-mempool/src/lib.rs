@@ -293,11 +293,14 @@ impl Mempool {
         )
     }
 
-    /// True when the native pool already holds at least the admission limit:
-    /// new non-cancels would likely expire before inclusion.
+    /// True when the native pool already holds at least the admission limit
+    /// of NON-cancels: new non-cancels would likely expire before inclusion.
+    /// Pooled cancels are not counted (anti-spam): item C caps them at a share
+    /// of each block, so they never delay orders by more than that share, and
+    /// counting them let funded cancel spam make ingress shed every order.
     pub fn native_admission_backlogged(&self) -> bool {
         self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().size() >= limit)
+            .is_some_and(|limit| self.native.read().unwrap().non_cancel_size() >= limit)
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -2565,6 +2568,35 @@ mod tests {
         );
         // An empty pool is never backlogged at a non-zero limit.
         assert!(!on.native_admission_backlogged());
+    }
+
+    #[test]
+    fn pooled_cancels_do_not_make_admission_shed_orders() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state,
+            MempoolConfig {
+                native_admission_horizon_ms: 10_000,
+                native_admission_floor: 4,
+                ..MempoolConfig::default()
+            },
+        );
+        let t0 = now_ms();
+        // Funded cancel spam fills the pool past the limit (floor 4) ...
+        for i in 0..6 {
+            let k = key(150 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, t0))
+                .unwrap();
+        }
+        // ... but cancels are not order backlog: orders are still admitted.
+        assert!(!pool.native_admission_backlogged());
+        // Orders past the limit do backlog, as before.
+        for i in 0..4 {
+            let k = key(160 + i);
+            pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
+                .unwrap();
+        }
+        assert!(pool.native_admission_backlogged());
     }
 
     #[test]
