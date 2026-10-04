@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -15,10 +15,13 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 3 | Does C1's ubench gain show on a full node at 10 markets? | No: +3.3% (within noise); engine 16.7 vs 16.6 ms/1k fills |
 | 4 | Where does crab's extra ~10 ms/1k fills go at 10 markets? | One function, `same_batch_bid_top_ups`: 11.2 ms CPU/1k, 49% of crab's exec path |
 | 5 | Does PF1 (`0ebfd71`) remove it? | Yes: 11.2 -> 0.02 ms/1k; matched/s 65.9k -> 127.5k (1.93x), 0.72x main |
+| 6 | C3 + PF1 (`d9ef4f7`): is the 10-market gap the bench's resend loop? Where does 300 markets go? Gate 3? | Not the resend loop (0.75x with retry, 0.66x without). 300 markets 0.555x main: margin + liquidation = `positions_for_trader` scans. Gate 3 margin FAIL (2.15 > 1.5), match PASS (1.32) |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
-~64k matched/s vs ~175k on main before PF1, 127.5k after. The remaining gap
-is mostly outside the execution path (section 5).
+~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
+rest of the gap outside the execution path; section 6 corrects that: with
+the resend loop removed the gap stays, and it is execution (~1.4-1.5x main)
+plus RPC ingress (~1.8x main).
 
 ## 1. Anti-spam no-regression A/B (main vs `feat/native-antispam`)
 
@@ -167,13 +170,115 @@ Exec CPU per fill is now 1.24x main, but throughput is 0.72x: the gap is
 mostly outside the exec path. Shed-and-resent batches fell 2.6x but remain
 ~2.5x main, and the RPC worker and kernel CPU compete for cores with
 execution on the shared host (exec wall per fill 1.5x main vs CPU 1.24x).
-That last link is inferred, not measured.
+That last link is inferred, not measured; section 6 tests it and rules the
+resend loop out.
+
+## 6. C3 + PF1 (`d9ef4f7`) vs main `92a02ed`: resend loop, 300 markets, Gate 3
+
+`merge/item6-c3-pf1` @ `d9ef4f7` = C3 `424d030` + `perf/item6-pf1`
+`9e10441` (measurement branch; workspace tests 2697 / 0 / 39, golden 3/3).
+Both nodes built with the section 4 profiling flags (c3pf1 node md5
+`e226ec7c`, main `31a95c65`), same load generator (c3pf1 bench `ee934fdf`).
+Cap 400, rate 76,000, 120 s, crab arm with the oracle feed, 2+2 interleaved
+after a warm-up. All cells AGREE / PASS / dissemination clean, crab marks
+fresh, `pool_full` 0. Cells `ozarchy-c3pf1-10m-*`, `ozarchy-c3pf1-300m-*`;
+driver `ozarchy-c3pf1-campaign.sh`.
+
+Per-thread CPU comes from a 1 Hz `/proc` sampler. RPC worker threads live
+48-71 s, so their numbers are accurate; scoped exec workers live under 1 s
+and are mostly missed, so "exec (+exited)" is process CPU minus the live
+threads, an upper bound.
+
+### 6.1 10 markets, with and without `RETRY_BUSY`
+
+| mode | arm | matched/s | engine ms/1k | CPU-s/1M | val0 rpc ms/1k | val0 exec (+exited) ms/1k | val0 sys ms/1k | val0 backlog_preverify |
+|---|---|---|---|---|---|---|---|---|
+| retry | c3pf1 | 130,700 | 5.49 | 48.9 | 7.83 | 5.36 (13.4) | 4.52 | 309k |
+| retry | main | 174,000 | 3.84 | 39.1 | 4.39 | 3.79 (11.0) | 3.18 | 187k |
+| retry | **ratio** | **0.751** | 1.43 | 1.25 | 1.78 | 1.41 (1.22) | 1.42 | 1.65 |
+| no retry | c3pf1 | 123,200 | 5.56 | 39.7 | 6.06 | 4.76 (11.7) | 3.88 | 254k |
+| no retry | main | 186,900 | 3.72 | 33.0 | 3.38 | 3.24 (9.4) | 2.67 | 152k |
+| no retry | **ratio** | **0.659** | 1.50 | 1.20 | 1.79 | 1.47 (1.25) | 1.46 | 1.68 |
+
+The no-retry cells at rate 76,000 were healthy (cancels went through: 99k vs
+113k cancelled), so no lower-rate fallback was needed. Without the resend
+loop crab loses 6% and main gains 7%: the loop is not the gap. Crab's RPC
+worker cost (1.8x) and extra `backlog_preverify` refusals (1.65x) stay in
+both modes. Why crab's ingress costs 1.8x main is open.
+
+### 6.2 300 markets (`RETRY_BUSY=1`)
+
+| arm | matched/s | best60 | commit ms | engine ms/1k | CPU-s/1M | fills/block | positions/account (sampled) |
+|---|---|---|---|---|---|---|---|
+| c3pf1 | 49,600 | 78,100 | 824 | 14.72 | 108.3 | 57.0k | 191.5 avg (median 298) |
+| main | 89,400 | 123,300 | 564 | 7.05 | 68.1 | 76.7k | 230.3 avg (median 300) |
+| **ratio** | **0.555** | 0.633 | 1.46 | 2.09 | 1.59 | 0.74 | |
+
+All four cells drained in 49-82 s (timeout 780 s); no drain artefact.
+
+Profile of val0 in the r1 cells (same method as section 4; margin split
+into its functions), ms CPU per 1k fills:
+
+| bucket | c3pf1 | main |
+|---|---|---|
+| margin: `maker_fill_fits` | **5.08** | 0 |
+| margin: `prepare_one` | **3.94** | 0 |
+| margin: `place_order_with_accounts` (non-matching) | 0.16 | 0.02 |
+| margin: `same_batch_bid_top_ups` | 0.04 | 0 |
+| margin, other | 0.40 | 0.12 |
+| liquidation | **3.81** | 0 |
+| matching | 3.39 | 1.72 |
+| settle | 2.43 | 3.41 |
+| books drain/save/load | 1.45 | 0.64 |
+| oracle (`begin_block_oracle`) | 0.14 | 0 |
+| `execute_batch_phases` glue | 7.48 | 5.88 |
+| other (hashing / compute / alloc) | 1.75 | 1.54 |
+| **exec path total** | **30.10** | **13.45** |
+| whole process (RPC worker) | 176.9 (60.0) | 112.5 (29.7) |
+
+Top self-time on crab's exec thread (% of exec): `NativeStateOverlay::get_cf_raw`
+8.7, `execute_batch_phases` 6.6, BTreeMap `Range` / `TakeWhile` map 5.3,
+`Vec<(Vec, Vec)>` collect 4.4, `positions_for_trader` 3.6, `__KeccakF1600`
+3.5, `FixedPoint::checked_mul` 3.3, `BTreeMap::get` 3.0, SipHash `write` 2.9,
+`get_position` 2.7, `DefaultHasher::write` 2.3.
+
+Margin and liquidation at 300 markets go mostly into
+`PositionManager::positions_for_trader`: a BTreeMap range scan over the
+overlay of every position an account holds, repeated per check. Inside
+`maker_fill_fits`: range scan 16%, Vec collect 10%, `get_cf_raw` 10.6%,
+`positions_for_trader` 9.6%, the function itself 5%. `liq_view`'s
+AccountView build and `prepare_one` (position reads plus the `PosSums`
+OnceLock init) follow the same pattern. Matching is 2x main
+(`place_order_with_accounts`, `match_market`, `match_at_level`). `from_hex`
+in RPC is 22.5% of crab's process user CPU.
+
+### 6.3 ubench Gate 3 (300 markets, marks on)
+
+`cargo test -p torus-bridge --release --test ubench_econ -- --ignored
+--nocapture`, default release flags, each commit in its own target dir,
+3 alternating runs per shape; median [range], ms per 1k fills, 10,184
+fills/block in all runs. Raw logs `ozarchy-c3pf1-ubench/`.
+
+| shape | commit | margin | match | settle | tail (liq) | total |
+|---|---|---|---|---|---|---|
+| `UB_MARKS=1 UB_MARKETS=300` | `d52a33f` | 2.11 [2.11-2.13] | 1.32 [1.32-1.33] | 2.29 | 4.21 | 11.44 [11.44-11.46] |
+| same | `d9ef4f7` | 2.15 [2.12-2.16] | 1.32 [1.32-1.33] | 2.28 | 4.07 | 11.36 [11.24-11.51] |
+| + `UB_MARK_WALK=10` | `d52a33f` | 2.14 [2.14-2.16] | 1.34 [1.32-1.35] | 2.33 | 4.21 | 11.52 [11.49-11.56] |
+| same | `d9ef4f7` | 2.19 [2.17-2.19] | 1.33 [1.32-1.33] | 2.31 | 4.25 | 11.52 [11.47-11.53] |
+
+Gate 3 (margin <= 1.5, match <= 2.0 ms/1k): margin **FAIL** (2.15-2.19),
+match **PASS** (1.32-1.33). C3 + PF1 shows no change against `d52a33f` on
+this ubench. ozarchy's absolute ubench numbers are 2-4x below 18c's sanity
+run (margin 5.2, match 5.6); compare ratios across machines, not values.
 
 ## Open
 
-- After C3 + PF1 merge: 300-market and 10-market full-node cells, crab vs
-  main, oracle on, 2+2; the Gate 3 ubench verdict.
-- One cell without `RETRY_BUSY` (or at a lower rate) to separate the resend
-  loop from node cost.
+- Margin and liquidation at 300 markets: `positions_for_trader` overlay
+  range scans per account (section 6.2), the target for the next item 6
+  step.
+- Why crab's RPC ingress costs ~1.8x main per fill at 10 markets
+  (section 6.1).
+- Gate 4 after C4 + PF1: ubench tail at 300 markets, `ubench_epoch
+  UB_DRAIN=fresh` empty block (target <= 20 ms).
 - Anti-spam D (per-IP RPC limit) has no validator exemption; no metric for
   oracle submissions evicted inside the pool.
