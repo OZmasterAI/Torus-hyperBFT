@@ -127,6 +127,13 @@
 #                oracle-feed.log, oracle-feed-stats.json, oracle-marks-*.json,
 #                summary.json .oracle_feed (sent/accepted/rejected/stale marks
 #                at bench end).
+#   ORACLE_WALK_BP=N  with ORACLE_FEED=1 (item 6): every feed round moves each
+#                market's price N bp around ORACLE_PRICE (`oracle-feed
+#                --walk-bp N`: deterministic, mean-reverting, bounded at ±8N
+#                bp), so the marks change while the cell runs. 0 (default) =
+#                the fixed price and the flag is not passed (older
+#                bench-throughput binaries keep working); N > 0 needs a binary
+#                whose oracle-feed has --walk-bp.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -195,6 +202,7 @@ SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 ORACLE_FEED=${ORACLE_FEED:-0}
 ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
+ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
@@ -361,8 +369,10 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+[[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
+    || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
 case "$ORACLE_FEED" in
-    0) ;;
+    0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
     1)
         [[ "$ORACLE_PRICE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v p="$ORACLE_PRICE" 'BEGIN{exit !(p>0)}' \
             || { echo "FATAL: ORACLE_PRICE must be a positive number (got '$ORACLE_PRICE')" >&2; exit 2; }
@@ -371,6 +381,8 @@ case "$ORACLE_FEED" in
             || { echo "FATAL: ORACLE_INTERVAL_MS must be an integer in 1..9999 (got '$ORACLE_INTERVAL_MS')" >&2; exit 2; }
         [ -s "$ORACLE_KEYS" ] || { echo "FATAL: ORACLE_FEED=1 needs the validator key file $ORACLE_KEYS" >&2; exit 1; }
         "$BENCH" oracle-feed --help >/dev/null 2>&1 || { echo "FATAL: ORACLE_FEED=1 but $BENCH has no oracle-feed subcommand" >&2; exit 1; }
+        [ "$ORACLE_WALK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --walk-bp \
+            || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP but $BENCH oracle-feed has no --walk-bp" >&2; exit 1; }
         ;;
     *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
 esac
@@ -462,7 +474,7 @@ if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
-[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
+[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
@@ -631,6 +643,7 @@ if [ "$ORACLE_FEED" = 1 ]; then
     ORACLE_CMD=("$BENCH" oracle-feed --rpc-urls "$(IFS=,; printf '%s' "${RPCS[*]}")" --validator-keys "$ORACLE_KEYS" \
         --markets "$MARKETS" --price "$ORACLE_PRICE" --interval-ms "$ORACLE_INTERVAL_MS" \
         --stats-file "$OUT/oracle-feed-stats.json")
+    [ "$ORACLE_WALK_BP" = 0 ] || ORACLE_CMD+=(--walk-bp "$ORACLE_WALK_BP")
     log "oracle feed: ${ORACLE_CMD[*]}"
     T_ORACLE0=$(date +%s)
     "${ORACLE_CMD[@]}" > "$OUT/oracle-feed.log" 2>&1 & ORACLE_PID=$!
@@ -988,10 +1001,10 @@ rc=${PIPESTATUS[0]}
 # summary.json .oracle_feed: feed stats + the marks the load ended with
 # (stale_marks_at_bench_end = markets whose mark was NOT usable at bench end).
 if [ "$ORACLE_FEED" = 1 ] && [ "$rc" = 0 ]; then
-    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_INTERVAL_MS" "$ORACLE_RC" "$ORACLE_FRESH_S" "$ORACLE_ALIVE_END" <<'PYS' \
+    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_INTERVAL_MS" "$ORACLE_RC" "$ORACLE_FRESH_S" "$ORACLE_ALIVE_END" "$ORACLE_WALK_BP" <<'PYS' \
         || log "WARNING: summary.json .oracle_feed not written"
 import json, os, sys
-out, price, interval, rc, fresh_s, alive_end = sys.argv[1:7]
+out, price, interval, rc, fresh_s, alive_end, walk_bp = sys.argv[1:8]
 def load(name):
     try:
         with open(os.path.join(out, name)) as f:
@@ -1000,7 +1013,7 @@ def load(name):
         return None
 stats = load('oracle-feed-stats.json') or {}
 marks = load('oracle-marks-bench-end.json') or {}
-o = {'oracle_feed': 1, 'price': price, 'interval_ms': int(interval),
+o = {'oracle_feed': 1, 'price': price, 'walk_bp': int(walk_bp), 'interval_ms': int(interval),
      'rc': int(rc) if rc.lstrip('-').isdigit() else None,
      'stats_present': bool(stats),
      'sent': stats.get('sent'), 'accepted': stats.get('accepted'), 'rejected': stats.get('rejected'),

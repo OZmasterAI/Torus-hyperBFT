@@ -1749,6 +1749,65 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def test_walk_bp_reaches_the_feed_only_when_set(self):
+        """Item 6: ORACLE_WALK_BP=N -> oracle-feed --walk-bp N. 0 (default) =
+        flag omitted, so the command is exactly the fixed-price feed and older
+        bench-throughput binaries keep working. Recorded in the summary."""
+        self.assertIn("ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}", self.src)
+        block = self.fn("    ORACLE_CMD=(", '\n    log "oracle feed: ${ORACLE_CMD[*]}"')
+        for walk, want in (("0", []), ("10", ["--walk-bp", "10"])):
+            script = (
+                'BENCH=bt RPCS=(r0 r1) ORACLE_KEYS=k MARKETS=3 ORACLE_PRICE=30000 '
+                "ORACLE_INTERVAL_MS=2000 OUT=o ORACLE_WALK_BP=%s\n" % walk
+                + block
+                + '\nprintf "%s\\n" "${ORACLE_CMD[@]}"\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = r.stdout.split("\n")[:-1]
+            self.assertEqual(argv[:2], ["bt", "oracle-feed"])
+            self.assertEqual(argv[-len(want) :] if want else [], want, argv)
+            self.assertEqual(argv.count("--walk-bp"), len(want) // 2, argv)
+        self.assertIn("'walk_bp': int(walk_bp)", self.src)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"ORACLE_WALK_BP",', f.read())
+
+    def test_bad_walk_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="oracle-walk-pre-")
+        try:
+            tgt = os.path.join(tmp, "release")
+            os.makedirs(tgt)
+            for b in ("torus-node", "bench-throughput"):
+                p = os.path.join(tgt, b)
+                with open(p, "w") as f:
+                    # an oracle-feed without --walk-bp (an older binary)
+                    f.write("#!/bin/sh\necho 'Usage: oracle-feed --price <PRICE>'\n")
+                os.chmod(p, 0o755)
+            wt = os.path.dirname(os.path.dirname(HERE))
+            for env, rc, msg in (
+                (dict(ORACLE_FEED="1", ORACLE_WALK_BP="x"), 2, "ORACLE_WALK_BP must be"),
+                (dict(ORACLE_FEED="1", ORACLE_WALK_BP="1250"), 2, "ORACLE_WALK_BP must be"),
+                (dict(ORACLE_WALK_BP="10"), 2, "needs ORACLE_FEED=1"),
+                (dict(ORACLE_FEED="1", ORACLE_WALK_BP="10"), 1, "has no --walk-bp"),
+            ):
+                r = subprocess.run(
+                    [RUN_CELL_SH, wt, "oracle-walk-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                )
+                self.assertEqual(r.returncode, rc, (env, r.stderr))
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "oracle-walk-pre-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):
