@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -16,6 +16,8 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 4 | Where does crab's extra ~10 ms/1k fills go at 10 markets? | One function, `same_batch_bid_top_ups`: 11.2 ms CPU/1k, 49% of crab's exec path |
 | 5 | Does PF1 (`0ebfd71`) remove it? | Yes: 11.2 -> 0.02 ms/1k; matched/s 65.9k -> 127.5k (1.93x), 0.72x main |
 | 6 | C3 + PF1 (`d9ef4f7`): is the 10-market gap the bench's resend loop? Where does 300 markets go? Gate 3? | Not the resend loop (0.75x with retry, 0.66x without). 300 markets 0.555x main: margin + liquidation = `positions_for_trader` scans. Gate 3 margin FAIL (2.15 > 1.5), match PASS (1.32) |
+| 7 | Baseline `14236fa` (C4): what changed, what is left? | 300 markets unchanged (49.4k, 0.553x main); liquidation 3.1-3.4 ms/1k (-15%), biggest crab-only cost `maker_fill_fits` 4.2-4.5. ubench ratios to `9c4be2c` all past their fail lines except settle. Empty block 30.0 ms, 10.7 of it trie flush |
+| 8 | Is the native trie root used? What is left after C6 / C7? | Trie root: no production reader; off by default saves ~17 ms per empty block and ~4 ms/1k on the flush worker (owner question open). After C6 / C7: crab ~0.58x main estimated; ~6 ms/1k of named fixes reach ~0.78x, the rest needs an IPC measurement |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -317,8 +319,219 @@ perf data; no new cells. Full analysis: `ozarchy-rpc18-analysis.md`.
 - **For gates,** report RPC CPU per request and per admitted action, not
   only per fill.
 
+## 7. Baseline `14236fa` (C3 + C4 + PF1 + cooldown fix), 2026-10-05
+
+Crab only, no main arm (main references are the section 6 cells, so allow
+for session drift). Same profiling flags and harness as section 6; node md5
+`7da38063`. 300 markets, cap 400, rate 76,000, `RETRY_BUSY=1`, oracle feed
+on, a warm-up and 2 measured cells, both profiled. All cells AGREE / PASS,
+marks fresh. Cells `ozarchy-14236fa-300m-{warm,r1,r2}`, ubench logs
+`ozarchy-14236fa-ubench/`.
+
+### 7.1 Full node, 300 markets
+
+| cell | matched/s | engine ms/1k | CPU-s/1M | val0 exec ms CPU/1k | positions/account avg (median) |
+|---|---|---|---|---|---|
+| r1 | 48,200 | 14.41 | 107.5 | 28.25 | 188 (296) |
+| r2 | 50,700 | 14.11 | 104.6 | 27.34 | 206 (298) |
+| C3 + PF1 (section 6.2) | 49,600 | 14.72 | 108.3 | 30.10 | 191.5 (298) |
+| main (section 6.2) | 89,400 | 7.05 | 68.1 | 13.45 | - |
+
+C4 leaves full-node throughput unchanged: 49.4k matched/s, 0.553x main.
+
+| bucket, ms CPU per 1k fills | r1 | r2 | C3 + PF1 | main |
+|---|---|---|---|---|
+| `execute_batch_phases` glue | 7.76 | 7.16 | 7.48 | 5.88 |
+| margin: `maker_fill_fits` | 4.21 | 4.49 | 5.08 | 0 |
+| margin: `prepare_one` | 4.06 | 3.65 | 3.94 | 0 |
+| liquidation | 3.11 | 3.36 | 3.81 | 0 |
+| matching | 3.03 | 3.05 | 3.39 | 1.72 |
+| settle | 2.42 | 2.02 | 2.43 | 3.41 |
+| books drain/save/load | 1.39 | 1.29 | 1.45 | 0.64 |
+| oracle (`begin_block_oracle`) | 0.13 | 0.15 | 0.14 | - |
+| **exec total** | **28.25** | **27.34** | **30.10** | **13.45** |
+
+Liquidation is still 3.1-3.4 ms/1k (-15% from C4). 94% of it is
+`liq_view -> AccountReader::pos_sums -> direct_sums` rebuilding traders
+written in the block; two thirds of that is `positions_for_trader` range
+scans over the overlay (`iterate_cf` and the `Vec<(Vec, Vec)>` collect).
+Crab-only margin and liquidation make up ~12 of the ~14.4 ms/1k gap to
+main: the targets of C6 / C7 in the plan. RPC CPU per request is flat
+(435-450 µs), as in section 6.4.
+
+### 7.2 ubench, ratio to `9c4be2c` on ozarchy
+
+Default release flags, each commit in its own target dir, 3 alternating
+runs, median [range], ms per 1k fills.
+
+| shape | commit | margin | match | settle | tail (liq) | total |
+|---|---|---|---|---|---|---|
+| 300 mk, marks | `9c4be2c` | 2.99 | 2.31 | 3.02 | 7.56 | 17.31 [17.06-17.57] |
+| 300 mk, marks | `14236fa` | 2.02 | 1.30 | 2.33 | 3.15 | 10.24 [10.17-10.40] |
+| **ratio** | | **0.68** | **0.56** | 0.77 | **0.42** | **0.59** |
+| gate / fail line | | 0.20 / 0.40 | 0.21 / 0.43 | 1.0 | 0.06 / 0.12 | 0.31 / 0.36 |
+| 300 mk, marks, walk 10 | `14236fa` | 2.12 | 1.32 | 2.31 | 4.31 | 11.64 |
+| 10 mk, marks | `9c4be2c` | 1.40 | 0.38 | 1.03 | 0.62 | 3.99 |
+| 10 mk, marks | `14236fa` | 0.99 | 0.32 | 0.95 | 0.18 | 2.97 |
+| **ratio** | | 0.71 | 0.84 | 0.92 | 0.29 | 0.74 |
+
+Every ratio gate except settle is past its fail line. `9c4be2c` has no
+`UB_MARK_WALK` (added in `3924b76`, not an ancestor), so the walk shape ran
+on `14236fa` only. ozarchy's `9c4be2c` total is 17.3 (18c's: 46.7):
+compare ratios across machines, not values.
+
+### 7.3 Empty block (`ubench_epoch`, `UB_DRAIN=fresh`, 4,937 holders)
+
+| | total ms | ctx | oracle [prune / inputs / agg / marks] | liquidation | flush (W) |
+|---|---|---|---|---|---|
+| default | 30.04 | 4.53 | 5.84 [1.96 / 0.11 / 3.07 / 0.97] | 4.81 | 10.67 |
+| `TORUS_NATIVE_TRIE_MAINTENANCE=0` | 13.49 | 4.45 | 4.16 [0.90 / 0.09 / 2.00 / 0.81] | 4.58 | 0.33 |
+
+The oracle step is 5.8 ms here, already below E1's ~8 ms target (set from
+18c's ~19 ms); E1 is postponed as low priority. Trie maintenance (flush
+10.7 ms) is the biggest single cost of the empty block.
+
+## 8. Read-only analyses on `51051c9` (no builds)
+
+### 8.1 Native trie root: used in production?
+
+No. `CF_NATIVE_TRIE`, `CF_NATIVE_HASHED` and the stored root are written
+but never read on a production path (same finding as s450 and the s83
+reader check). Full analysis: `ozarchy-trie-analysis.md`.
+
+- **The flag:** read once per process at
+  `crates/torus-state/src/native_trie.rs:321-331`; only `0` turns it off.
+- **On:** `apply_native_dirty` (`backend.rs:1520-1567`, on
+  `torus-flush-worker`, `exec_pipeline.rs:205` / `:426`) rehashes the
+  changed buckets of the 65,536-bucket Merkle and writes nodes, mirror rows
+  and root into the block's write batch.
+- **Off:** it writes one `META_NATIVE_TRIE_STALE` key. At boot,
+  `app.rs:3848-3854` rebuilds a missing or stale trie only when the flag is
+  on.
+
+| reader | file:line | production? | with the flag off |
+|---|---|---|---|
+| `flagged_native_root` / `native_root_routed` | `torus-bridge/src/state_root.rs:75-101` | only via the two rows below | falls back to a full scan |
+| `build_block_with_native` (proposer) | `proposer.rs:187`, `:269` | no, tests only (`native_bridge_tests.rs:665`) | - |
+| `validate_block_with_native` (validator) | `validator.rs:342`, `:460` | no, tests only (`native_bridge_tests.rs:414`) | - |
+| live block validation | `app.rs:1814` (EVM blocks only) | yes | EVM root + empty native root (`state_root.rs:119-130`); never reads the trie |
+| block header `state_root` | `app.rs:5207` (parent's); genesis EVM-only (`torus-genesis/src/lib.rs:497`) | yes | independent |
+| running state hash / `getStateHash` | `backend.rs:1430-1460`; `torus-rpc/src/torus.rs:1215` | yes | independent; trie CFs and the stale key excluded (`running_hash.rs:470-484`, `:586`) |
+| snapshot verify | `snapshot.rs:139` | yes | full scan, never the stored trie |
+| RPC proofs | none (`torus-rpc/src/lib.rs:5053` is test code) | - | - |
+| explorer, bench digest / AGREE | `torus-explorer/src/indexer.rs:293`, `digest-node.sh` | - | read the header root or books / balances |
+
+**Turning it off by default** breaks nothing in consensus, mixed fleets,
+restart / replay, snapshots or existing databases. Turning it back on costs
+one rebuild at boot. What breaks is tests:
+- the default assertion in `native_trie.rs:1827-1832`;
+- tests that flush through the env-reading wrappers and then read the stored
+  root: `torus-bridge/tests/{root_cache,level_rows,deferred_save,save_books_parallel}_tests.rs`,
+  `torus-integration-tests/tests/chaos.rs`, and the `app.rs` crash-recovery
+  tests at 13302, 13415, 13476, 14075, 14136, 14325, 15780, 16313. They
+  would need maintenance forced on.
+
+**Savings:**
+- Empty block at 300 markets: flush 11.1 -> 0.4 ms, total 30.4 -> 13.3 ms.
+- Full node at 300 markets: trie maintenance is 156-163 ms per block, about
+  42% of the flush worker's wall time, 4.0 ms per 1k fills, and 4.5-5% of
+  the node's user cycles.
+- Execution (~870 ms per block) is the limit at this load, not the flush
+  worker (~387 ms), so throughput will not rise one for one. s83 measured
+  +31% at 300 markets when the flush worker was the limit.
+
+**Open owner question (from s450):** were the two `*_with_native` paths
+abandoned on purpose? If so, make off the default (one line in
+`parse_native_trie_maintenance`), force maintenance on in the trie tests
+and keep `=1` as an opt-in. If the root is needed later: lazily on request
+(`native_root_full`), every N blocks, or async (Option A in
+`docs/plans/async-native-trie-maintenance.md`).
+
+### 8.2 Crab vs main gap left after C6 / C7 (300 markets)
+
+From the section 7 crab profile (r1; r2 agrees) and the section 6.2 main
+profile, source lines via `llvm-addr2line -i` on the build-id-cache
+binaries. Full analysis: `ozarchy-gap-after-c7-analysis.md`. Workload per
+fill is the same: 1.76 vs 1.80 submitted orders per fill, ~84k fills per
+block, identical `Fill` / `Order` / `MatchRequest` layouts.
+
+**Matching, 3.03 vs 1.72 ms/1k (+1.31):**
+
+| part | crab | main | delta |
+|---|---|---|---|
+| `maker_fill_fits` code inlined (`order_book.rs:2015`), crab-only | 0.16 | 0 | +0.16 |
+| post-match account update (`set_free`, `need()`, `checked_mul`; 1193-1222), crab-only | 0.16 | 0 | +0.16 |
+| `MatchMargin` built with an `AccountMargins` lookup (1051), crab-only | 0.07 | 0 | +0.07 |
+| touched set + `sweep_reduce_only` (1128-1147) | 0.18 | 0.12 | +0.06 |
+| `match_at_level` shared bookkeeping | 0.50 | 0.33 | +0.17 |
+| `insert_order` | 0.55 | 0.35 | +0.20 |
+| `match_market` self | 0.41 | 0.21 | +0.20 |
+| execution thread (`cancel_all_many`, sort, drain) | 0.72 | 0.54 | +0.18 |
+
+Only ~0.40 is crab-only code. The other ~0.9 is the same code costing
+1.3-2x more per operation (e.g. `sort_native_actions` 1.43x with the same
+work per fill). The likely cause is cache / IPC; this data cannot prove it.
+
+**Glue, 7.76 vs 5.88 ms/1k (+1.88):**
+
+| region (crab line / main line) | crab | main | delta |
+|---|---|---|---|
+| reduce-only tracking (4975 / 4241), shared | 2.10 | 2.49 | -0.39 |
+| `AccountMargins` setup (4986-5005), crab-only | 0.93 | 0 | +0.93 |
+| `same_batch_bid_top_ups` inlined part, crab-only | 0.71 | 0 | +0.71 |
+| `settle_market_results_parallel` inlined | 1.54 | 1.12 | +0.42 |
+| `PositionCache` `flush_all` | 0.82 | 0.67 | +0.15 |
+| `phase2_reservation_basis` / open order counts | 0.89 | 0.73 | +0.16 |
+| Phase 2 serial loop | 0.33 | 0.61 | -0.28 |
+| `phase2_bid_floors` (4809), crab-only | 0.06 | 0 | +0.06 |
+| other | 0.39 | 0.27 | +0.12 |
+
+The books bucket (1.34 vs 0.64) is not a books slowdown: 0.67 of it is
+`end_resident` (crab-only, applying the block's writes to the resident
+rows), counted there by the bucket rules. `drain_book` itself is +11%.
+
+**Crab-only parts and ideas (not built):**
+
+| part | ms/1k | removed by C6 / C7? | idea |
+|---|---|---|---|
+| `AccountMargins` setup | 0.93 | ~0.05 | `position_px` (1134) re-reads the row already read at 4975; reuse it (~0.6) |
+| same-batch top-ups (inlined) | 0.74 | no | drop the i128 tick `%` in `can_rest_shape` (0.28; Phase 2 already checked the tick) |
+| F1 code in matching | 0.40 | no | `AccountMargins` as a Vec by sender slot; skip the hold-price `checked_mul` when nothing rests |
+| `end_resident` apply | 0.67 | C7 changes the layout | apply the delta off the execution thread's critical path |
+| shared-code inflation | ~1.6 | maybe indirectly | measure IPC / LLC misses first |
+
+**Estimate after C6 / C7:**
+
+| component, ms/1k | now | after C6 / C7 |
+|---|---|---|
+| liquidation | 3.23 | ~0.5 |
+| `maker_fill_fits` (C7 cuts the `positions_for_trader` scans, 1.51) | 4.35 | ~3.0 |
+| `prepare_one` | 3.85 | ~3.4 |
+| glue / matching / books delta | +1.57 / +1.32 / +0.70 | ~+1.5 / +1.3 / +0.7 |
+| settle delta (crab cheaper) | -1.19 | -1.19 |
+| other | +0.48 | +0.45 |
+| **total gap** | **+14.35** (27.8 - 13.45) | **~+9.7: crab ~23.1, ~0.58x main** |
+
+This assumes throughput scales with 1 / (exec ms per 1k fills), which fits
+the observed 0.55x at 2.07x the cost. Gate 2 (0.9x) needs ~14.9, so ~8.2
+more ms/1k must go. A plausible path, about 6.0 (~0.78x):
+- incremental per-trader margin sums for makers (`maker_fill_fits`) -2.2;
+- a slimmer `prepare_one` -1.5 to -2;
+- the glue fixes above -1.2;
+- `end_resident` off the critical path -0.6;
+- `AccountMargins` as a Vec in matching -0.2.
+
+The last ~2 would have to come from the per-operation inflation, so the
+next measurement is `perf stat` IPC and LLC misses on the execution thread.
+
 ## Open
 
+- Native trie maintenance off by default: owner question on the
+  `*_with_native` paths (section 8.1).
+- IPC / LLC-miss measurement on the execution thread, crab vs main, to
+  explain the ~1.6 ms/1k of shared-code inflation (section 8.2).
+- E1 (oracle step) postponed, low priority: 5.8 ms per empty block on
+  ozarchy (section 7.3).
 - Margin and liquidation at 300 markets: `positions_for_trader` overlay
   range scans per account (section 6.2), the target for the next item 6
   step.
