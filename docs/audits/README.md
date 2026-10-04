@@ -49,6 +49,7 @@ corrections; a repeated finding is not another defect.
 | 17 | [Staking, rewards and validator rotation](chain-0a25560-pass17-staking-rotation-2026-10-04.md) |
 | 18 | [Consensus validation and crash recovery](chain-0a25560-pass18-consensus-recovery-2026-10-04.md) |
 | 19 | [Execution durability and flush pipeline](chain-0a25560-pass19-execution-durability-2026-10-04.md) |
+| 20 | [DA body custody and async validation](chain-0a25560-pass20-da-async-validation-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
