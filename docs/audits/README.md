@@ -19,6 +19,9 @@ The reports preserve their reviewed revisions and verification limits. Passes
 1–7 review `cea1254`; passes 8–12 review production source at `d52a33f`.
 Passes 10, 11 and 12 start from documentation-only commits `feb01b6`,
 `0c967ca` and `11756e8`.
+Pass 13 reviews `merge/item6-c3-pf1` at `d9ef4f7` from a separate source
+checkout. Its documents are committed to `audit/chain-findings-2026-10-04`
+without merging that source branch; source links pin the reviewed commit.
 Later passes add qualifications and corrections; a repeated finding is not
 another defect.
 
@@ -36,6 +39,7 @@ another defect.
 | 10 | [RPC, operations and independent recheck](chain-d52a33f-pass10-mixed-review-2026-10-04.md) |
 | 11 | [Clients, state views and settlement](chain-d52a33f-pass11-mixed-review-2026-10-04.md) |
 | 12 | [Feeder, staking and governance](chain-d52a33f-pass12-mixed-review-2026-10-04.md) |
+| 13 | [Whole-project review at the C3/PF1 integration head](chain-d9ef4f7-pass13-project-wide-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
