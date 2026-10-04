@@ -124,6 +124,7 @@ corrections; a repeated finding is not another defect.
 | 92 | [Slashing state transition atomicity](chain-14236fa-pass92-slash-partial-state-transition-2026-10-05.md) |
 | 93 | [Jail-vote record before threshold actions](chain-14236fa-pass93-jail-vote-slash-failure-state-2026-10-05.md) |
 | 94 | [Governance permanent-stake unlock write ordering](chain-14236fa-pass94-permanent-unlock-partial-credit-2026-10-05.md) |
+| 95 | [Governance treasury-spend write ordering](chain-14236fa-pass95-treasury-spend-partial-transfer-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
