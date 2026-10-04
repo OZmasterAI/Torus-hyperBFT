@@ -43,6 +43,7 @@ another defect.
 | 12 | [Feeder, staking and governance](chain-d52a33f-pass12-mixed-review-2026-10-04.md) |
 | 13 | [Whole-project review at the C3/PF1 integration head](chain-d9ef4f7-pass13-project-wide-2026-10-04.md) |
 | 14 | [Sol 6.1 follow-up: history, economics, storage and client recovery](chain-d9ef4f7-pass14-sol-review-2026-10-04.md) |
+| 15 | [C3/PF1 integration and critical-path follow-up](chain-d9ef4f7-pass15-follow-up-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
