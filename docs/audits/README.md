@@ -24,8 +24,9 @@ checkout. Its documents are committed to `audit/chain-findings-2026-10-04`
 without merging that source branch; source links pin the reviewed commit.
 Pass 14 continues at the same source revision from documentation commit
 `f39a352`, using only GPT-6.1-sol reviewers as requested.
-Later passes add qualifications and corrections; a repeated finding is not
-another defect.
+Pass 15 follows up on C3/PF1 at `d9ef4f7`. Pass 16 reviews C4 on
+`perf/item6-phase1` at `0a25560`. Later passes add qualifications and
+corrections; a repeated finding is not another defect.
 
 | Pass | Main report |
 | --- | --- |
@@ -44,6 +45,7 @@ another defect.
 | 13 | [Whole-project review at the C3/PF1 integration head](chain-d9ef4f7-pass13-project-wide-2026-10-04.md) |
 | 14 | [Sol 6.1 follow-up: history, economics, storage and client recovery](chain-d9ef4f7-pass14-sol-review-2026-10-04.md) |
 | 15 | [C3/PF1 integration and critical-path follow-up](chain-d9ef4f7-pass15-follow-up-2026-10-04.md) |
+| 16 | [C4 liquidation cache review at the latest item 6 head](chain-0a25560-pass16-c4-review-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
