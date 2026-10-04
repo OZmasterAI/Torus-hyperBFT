@@ -9,12 +9,14 @@ ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load 
 C3 `424d030` (pushed): correct, Gate 3 missed on 18c's sanity numbers (review log 18,
 owner review). C4 `62af701`: correct, Gate 4 met at 10 markets, missed at 300 (review log
 23). PF1 merged: `perf/item6-phase1` @ `0a25560` = C3 + C4 + PF1 (suite 2701 / 0 / 39).
-Liquidation cooldown parity fix `2d03111` (whole position during the 30 s cooldown; X/A
-reading pending HL evidence, review log 28); tip `14236fa`, pushed. Ozarchy 300-market
+Liquidation cooldown parity fix `2d03111` (whole position during the 30 s cooldown = X,
+confirmed by HL's public liquidation fills; same-block rule A -> B follow-up, review log
+28); tip `14236fa`, pushed. Ozarchy 300-market
 profile (C3 + PF1): 0.555x main; the cost is per-account position reads (section 1.1).
-**Remaining order (s91): C6 (B0 + A-lite + D) -> C7 (per-trader positions in memory)
--> E1-E4 (empty block) -> C5 (warm == cold, last, so it covers C7's state) -> Gate 2**
-(section 5.2). Ubench gates are ratios to the base on the same machine (section 1.2).
+**Remaining order (s91): cooldown same-block rule A -> B (18c) -> C6 (B0 + A-lite + D,
+18c) -> C7 (per-trader positions in memory) -> E2-E4 (18c; E1 built on ozarchy in
+parallel, branch `perf/item6-e1`) -> C5 (warm == cold, last, so it covers C7's state) ->
+Gate 2** (sections 5.2, 5.3). Ozarchy measures `14236fa` first (baseline before C6). Ubench gates are ratios to the base on the same machine (section 1.2).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -453,7 +455,8 @@ the exec thread E (~40 ms: ctx ~7, oracle ~19, liquidation ~13) and the writer t
 (~44 ms flush, uncached trie, ~300 `agg` rows rewritten every block because each stores
 the block time) serially; on the node they overlap. Fixes on E, no consensus change:
 - E1 oracle: one scan of the `sub` range per block for prune + aggregation; the mark
-  table built from the aggregation's own results (19 -> ~8 ms).
+  table built from the aggregation's own results (19 -> ~8 ms). Built on ozarchy
+  (`perf/item6-e1` from `14236fa`, oracle code only), merged by 18c.
 - E2 liquidation: cooldown / pending rows read once per block as a set instead of ~4k
   point reads; sorted trader list in R's slot so `traders_after` is a slice (13 -> ~3 ms).
 - E3 oracle `sub` rows resident (decoded, delta-maintained) (~8 -> ~3 ms).
@@ -511,5 +514,5 @@ reviews it.
 | 25 | C4 / inherited diff | the first C4 builder was stopped by accident; its diff was complete (tests first verified, planted bugs caught) | none | a second builder reviewed it, measured, committed | `62af701` |
 | 26 | s91 / row 23 answered | ozarchy profile 6.2 (C3 + PF1, 300 mk): liquidation 3.81 < maker_fill_fits 5.08 + prepare_one 3.94; all three are per-account position reads | none | next steps target the margin path first: C6 (B0 + A-lite + D), C7 (section 5.2); O1 + O2 full only if marks are stable | docs |
 | 27 | s91 / RPC 1.8x | ozarchy: equal RPC CPU per request; more refused requests per fill because exec is slower | none | ruled out as a crab cost; gate metrics per request and per admitted action | docs |
-| 28 | cooldown fix / HL reading | HL docs say whole position DURING the cooldown (built: X); a community wiki and a third-party article say a pause, then whole AFTER it (Y); same-block handling of several positions (A one chunk per block, built; B each position by its rule; C whole right after the first chunk) is undocumented | X or Y? A, B or C? | evidence from HL's public liquidation fills being gathered (s91); follow-up commit if it disagrees with X + A | `2d03111` |
+| 28 | cooldown fix / HL reading | HL docs: whole position DURING the cooldown (X, built); wiki / article: pause, then whole AFTER (Y). Same block: A (one chunk per block, built), B (each position by its own rule), C (whole right after the first chunk). **Evidence (s91, HL public API, 44 liquidated accounts, 270 orders, `orderStatus` origSz):** X: within 30 s after a 20% chunk the next order is the whole remainder (23 / 23, 2.8-22.5 s); after 30 s 20% again (17 / 17). B: every position > 100k gets its own 20% order in the same block, <= 100k whole (up to 7 positions in one block, same hash); in the cooldown all positions whole in one block. Liquidation stops once back above MM (many single-chunk episodes); backstop rare (thin-book cascades after partly filled whole-remainder IOC orders) | none (owner: B) | X kept; follow-up commit A -> B (18c, before C6), tests first, P3 L1 vs walk under B; raw data in the s91 scratchpad `hl-liq/` | `2d03111` + follow-up |
 | 29 | s91 / ubench gates | absolute ms targets are machine-dependent (ozarchy 2-4x faster than 18c) | OK to use ratios to the base on the same machine (section 1.2)? | changed | docs |
