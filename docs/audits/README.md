@@ -114,6 +114,7 @@ corrections; a repeated finding is not another defect.
 | 82 | [Fee schedule configuration source](chain-14236fa-pass82-fee-schedule-genesis-recheck-2026-10-05.md) |
 | 83 | [Commission effective at epoch boundary](chain-14236fa-pass83-commission-boundary-snapshot-2026-10-05.md) |
 | 84 | [Pending reward balance arithmetic](chain-14236fa-pass84-pending-reward-accumulation-overflow-2026-10-05.md) |
+| 85 | [Liquid account credit arithmetic](chain-14236fa-pass85-staking-liquid-balance-credit-overflow-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
