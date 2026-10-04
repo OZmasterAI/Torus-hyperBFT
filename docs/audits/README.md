@@ -86,6 +86,7 @@ corrections; a repeated finding is not another defect.
 | 54 | [Reservation release when a stop triggers](chain-5c756ff-pass54-triggered-stop-margin-release-2026-10-04.md) |
 | 55 | [Stop trigger equality semantics](chain-5c756ff-pass55-stop-trigger-equality-2026-10-04.md) |
 | 56 | [Triggered-stop cascade ordering and termination](chain-5c756ff-pass56-triggered-stop-cascade-order-2026-10-04.md) |
+| 57 | [Slashing of pending undelegations](chain-5c756ff-pass57-slash-pending-unbondings-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
