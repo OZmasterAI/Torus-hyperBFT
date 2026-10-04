@@ -75,6 +75,7 @@ corrections; a repeated finding is not another defect.
 | 43 | [Reduce-only allowance at matching time](chain-5c756ff-pass43-reduce-only-match-allowance-2026-10-04.md) |
 | 44 | [Empty-block scheduling for pending liquidations](chain-5c756ff-pass44-liquidation-empty-block-due-2026-10-04.md) |
 | 45 | [Round-robin liquidation cursor boundary](chain-5c756ff-pass45-liquidation-cursor-round-robin-2026-10-04.md) |
+| 46 | [ADL candidate scan window and progress](chain-5c756ff-pass46-adl-candidate-scan-progress-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
