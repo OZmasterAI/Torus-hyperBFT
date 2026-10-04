@@ -112,6 +112,7 @@ corrections; a repeated finding is not another defect.
 | 80 | [EVM beneficiary and protocol fee accounting](chain-14236fa-pass80-evm-fee-beneficiary-recheck-2026-10-05.md) |
 | 81 | [Fee burn versus cumulative burn reporting](chain-14236fa-pass81-fee-burn-tracker-recheck-2026-10-05.md) |
 | 82 | [Fee schedule configuration source](chain-14236fa-pass82-fee-schedule-genesis-recheck-2026-10-05.md) |
+| 83 | [Commission effective at epoch boundary](chain-14236fa-pass83-commission-boundary-snapshot-2026-10-05.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
