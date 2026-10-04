@@ -1,0 +1,91 @@
+{
+  "prp": "item6-phase1",
+  "created": "2026-10-04T05:28:39",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Step 0: guardrails (base numbers, storage-read counter test, writer audit, test-only reference switch)",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/tests/",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test --workspace",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Step 1 (C1): resident rows R + lifecycle + guards",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/resident_rows.rs",
+        "crates/torus-state/src/backend.rs",
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test --workspace && cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test -p torus-bridge --test perf_equivalence_golden",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Step 2 (C2): block mark table, delete BatchMarks",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test -p torus-bridge --test perf_equivalence_golden",
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Step 3 (C3): sums cache + consumers (P1, P2), delete BatchMakerAccounts",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-core/src/margin.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test --workspace",
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Step 4 (C4): liquidation L1 (P3)",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/liquidation_step.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test --workspace",
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Step 5 (C5): warm == cold tests (P5)",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cd /home/18c/projects/wt/item6-phase1 && CARGO_TARGET_DIR=$HOME/.cargo-target-item6-p1 cargo test --workspace",
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Step 6: Gate 2 devnet campaign (owner starts)",
+      "status": "pending",
+      "files": [],
+      "validate": "manual: owner reviews campaign RESULTS.md",
+      "depends_on": [
+        6
+      ]
+    }
+  ]
+}

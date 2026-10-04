@@ -353,7 +353,12 @@ What changes
   before boot; R is built after) and the bench-throughput seeding context
   (offline). Task 0 repeats this audit on the actual Phase 1 base.
 
-**1b. Margin summary** (crab doc 2.2; owner Q3, Q5).
+**1b. Margin summary** (crab doc 2.2; owner Q3, Q5). The Phase 1 plan
+(`item6-phase1-impl.md`, S1/S2, owner to confirm) builds a smaller first form:
+each trader's four position sums plus counts, computed by `build` itself over
+R's rows and cached per mark version, with no balance mirror. The stored
+per-position terms below are its optional step O1, built only if a cost gate
+needs them.
 - `position_terms(pos, mark, tiers)` is factored out of `AccountView::build`
   (inline today, crab `margin.rs:158-167`). `build` (cold path, tests) and the
   summary both call it. Own commit, no behaviour change, goldens unchanged.
