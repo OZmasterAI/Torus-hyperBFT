@@ -251,7 +251,7 @@ enum Command {
         secret_keys: bool,
     },
     /// Keep oracle MARK prices fresh on the bench devnet: every --interval-ms
-    /// each validator signs --price for markets 1..=--markets (ceil(N/256)
+    /// each validator signs --price (or its --walk-bp walk) for markets 1..=--markets (ceil(N/256)
     /// `SubmitOraclePrices` chunks, sample time = now) and sends them to its
     /// own node. Runs until SIGTERM/SIGINT; stats every ~10 s to --stats-file.
     OracleFeed {
@@ -267,6 +267,10 @@ enum Command {
         /// Mark price in whole TRS (bench econ mid 20 * 1500 = 30000).
         #[arg(long, default_value_t = 30_000)]
         price: u64,
+        /// Item 6: walk every market's price ±N bp per round around --price
+        /// (deterministic, mean-reverting, bounded at ±8N bp); 0 = fixed price.
+        #[arg(long, default_value_t = 0)]
+        walk_bp: u64,
         #[arg(long, default_value_t = 2_000)]
         interval_ms: u64,
         #[arg(long, default_value = "oracle-feed-stats.json")]
@@ -3616,6 +3620,7 @@ async fn main() {
             validator_keys,
             markets,
             price,
+            walk_bp,
             interval_ms,
             stats_file,
         } => {
@@ -3624,6 +3629,7 @@ async fn main() {
                 validator_keys: &validator_keys,
                 markets,
                 price,
+                walk_bp,
                 interval_ms,
                 stats_file: &stats_file,
             };

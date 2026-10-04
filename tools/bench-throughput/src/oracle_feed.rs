@@ -7,7 +7,9 @@
 //! its own node: ceil(N/256) `SubmitOraclePrices` chunks, sample time = now,
 //! nonce strictly increasing. Building, nonces and signing are the
 //! price-feeder's own (`torus_price_feeder::submit`), so the payload is exactly
-//! what a production feeder sends.
+//! what a production feeder sends. `--walk-bp N` (item 6 step 0.5) moves every
+//! market's price `±N` bp per round around `--price` ([`PriceWalk`]); 0 (the
+//! default) is the fixed price.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -77,6 +79,69 @@ fn parse_validator_keys(raw: &str) -> Result<Vec<ValidatorKey>, String> {
 pub fn market_prices(markets: &BTreeSet<MarketId>, price_whole: u64) -> BTreeMap<MarketId, FixedPoint> {
     let p = FixedPoint::from_raw(price_whole as i128 * FixedPoint::SCALE);
     markets.iter().map(|&m| (m, p)).collect()
+}
+
+/// Item 6 step 0.5 (`--walk-bp`): a deterministic, bounded, mean-reverting
+/// walk of every market's price, one step per round, so the aggregated mark
+/// changes every round (with one fixed price the mark version never changes
+/// and the engine's re-value cost is never measured). Each step moves a
+/// market's offset by exactly `walk_bp` basis points, toward the base price
+/// with probability `1/2 + |offset| / (2 * bound)`, `bound = 8 * walk_bp`, so
+/// it never leaves `base ± bound` (80 bp at 10 bp per round: far inside the
+/// 250 bp IM−MM gap at 20x, liquidations stay rare). The draw depends only on
+/// (round, market): every run and every validator sees the same prices.
+/// `walk_bp = 0` is exactly [`market_prices`] every round. Same rule as the
+/// ubench's `UB_MARK_WALK` (`crates/torus-bridge/tests/common/econ_load.rs`).
+pub struct PriceWalk {
+    /// [`market_prices`]: round 0 and every round of a 0 bp walk.
+    base: BTreeMap<MarketId, FixedPoint>,
+    walk_bp: i64,
+    offsets_bp: BTreeMap<MarketId, i64>,
+    rounds: u64,
+}
+
+/// SplitMix64 finaliser: one round's draw for one market.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl PriceWalk {
+    /// Bound of the walk as a multiple of the step.
+    pub const BOUND_STEPS: i64 = 8;
+
+    /// Err when the bound would reach the price itself (`8 * walk_bp >= 10_000`).
+    pub fn new(markets: &BTreeSet<MarketId>, price_whole: u64, walk_bp: u64) -> Result<Self, String> {
+        if walk_bp.saturating_mul(Self::BOUND_STEPS as u64) >= 10_000 {
+            return Err(format!("--walk-bp {walk_bp}: the walk's bound (8 x) must stay below 10000 bp"));
+        }
+        Ok(Self {
+            base: market_prices(markets, price_whole),
+            walk_bp: walk_bp as i64,
+            offsets_bp: markets.iter().map(|&m| (m, 0)).collect(),
+            rounds: 0,
+        })
+    }
+
+    /// Advance one round and return its prices.
+    pub fn next_round(&mut self) -> BTreeMap<MarketId, FixedPoint> {
+        self.rounds += 1;
+        let (w, bound) = (self.walk_bp, Self::BOUND_STEPS * self.walk_bp);
+        if w > 0 {
+            for (&m, x) in self.offsets_bp.iter_mut() {
+                let draw = mix(self.rounds.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ m) % (2 * bound) as u64;
+                let toward_base = (draw as i64) < bound + x.abs();
+                let down = if *x == 0 { toward_base } else { toward_base == (*x > 0) };
+                *x += if down { -w } else { w };
+            }
+        }
+        self.base
+            .iter()
+            .map(|(&m, p)| (m, FixedPoint::from_raw(p.raw() * i128::from(10_000 + self.offsets_bp[&m]) / 10_000)))
+            .collect()
+    }
 }
 
 /// One validator's submissions for one interval: chunks of <= 256 prices,
@@ -221,6 +286,8 @@ pub struct FeedArgs<'a> {
     pub validator_keys: &'a Path,
     pub markets: u64,
     pub price: u64,
+    /// [`PriceWalk`] step per round in basis points (0 = fixed `price`).
+    pub walk_bp: u64,
     pub interval_ms: u64,
     pub stats_file: &'a Path,
 }
@@ -237,7 +304,7 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
     }
     let nodes: Vec<RpcNode> = urls.iter().map(|u| RpcNode::new(u)).collect::<Result<_, _>>()?;
     let listed = listed_markets(&nodes[0], a.markets).await?;
-    let prices = market_prices(&listed, a.price);
+    let mut walk = PriceWalk::new(&listed, a.price, a.walk_bp)?;
     let probe_market = *listed.first().expect("non-empty");
     let probe_client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().map_err(|e| e.to_string())?;
     let mut nonces = vec![NonceGen::default(); keys.len()];
@@ -246,9 +313,11 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
         println!("[oracle-feed] val{} {:#x} -> {}", k.index, k.address, urls[k.index]);
     }
     println!(
-        "[oracle-feed] {} markets at {} TRS, {} chunk(s)/validator every {} ms",
+        "[oracle-feed] {} markets at {} TRS (walk ±{} bp/round, bound ±{} bp), {} chunk(s)/validator every {} ms",
         listed.len(),
         a.price,
+        a.walk_bp,
+        a.walk_bp as i64 * PriceWalk::BOUND_STEPS,
         listed.len().div_ceil(torus_core::oracle::MAX_ORACLE_PRICES_PER_SUBMISSION),
         a.interval_ms
     );
@@ -272,6 +341,7 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
             _ = tick.tick() => {}
         }
         let now = now_ms();
+        let prices = walk.next_round();
         let mut set = tokio::task::JoinSet::new();
         for (i, k) in keys.iter().enumerate() {
             let signed = round(&prices, &listed, &k.key, &mut nonces[i], now);
@@ -423,6 +493,65 @@ mod tests {
         s.write(&path).unwrap();
         let back: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(back["rejected"], 1);
+    }
+
+    /// Item 6 step 0.5: `--walk-bp 0` (the default) is today's fixed price.
+    #[test]
+    fn walk_zero_is_the_fixed_price_every_round() {
+        let m = markets(300);
+        let mut w = PriceWalk::new(&m, 30_000, 0).unwrap();
+        for round in 0..100 {
+            assert_eq!(w.next_round(), market_prices(&m, 30_000), "round {round}");
+        }
+    }
+
+    /// Same (round, market) -> same price on every run; every round moves every
+    /// market by exactly the step; never past ±8 steps; each market its own path.
+    #[test]
+    fn walk_is_deterministic_bounded_and_moves_every_round() {
+        let m = markets(300);
+        let (mut a, mut b) = (PriceWalk::new(&m, 30_000, 10).unwrap(), PriceWalk::new(&m, 30_000, 10).unwrap());
+        let base = 30_000 * FixedPoint::SCALE;
+        let step = base * 10 / 10_000;
+        let (lo, hi) = (base - 8 * step, base + 8 * step);
+        let mut prev = market_prices(&m, 30_000);
+        let (mut at_bound, mut spread) = (false, false);
+        for round in 0..5_000 {
+            let p = a.next_round();
+            assert_eq!(p, b.next_round(), "round {round}");
+            assert_eq!(p.keys().copied().collect::<BTreeSet<_>>(), m);
+            for (id, px) in &p {
+                assert!((lo..=hi).contains(&px.raw()), "round {round} market {id}: {px:?}");
+                assert_eq!((px.raw() - prev[id].raw()).abs(), step, "round {round} market {id}");
+                at_bound |= px.raw() == lo || px.raw() == hi;
+            }
+            spread |= p.values().collect::<BTreeSet<_>>().len() > 1;
+            prev = p;
+        }
+        assert!(at_bound && spread, "the walk must reach its bound and differ across markets");
+    }
+
+    /// Offsets (bp) of market 1 over the first 12 rounds of a 10 bp walk.
+    const WALK_10BP_MARKET_1: [i128; 12] = [10, 0, -10, -20, -30, -20, -10, 0, -10, -20, -10, 0];
+
+    /// The first rounds of market 1 at 10 bp, pinned: the ubench's
+    /// `UB_MARK_WALK` (`crates/torus-bridge/tests/common/econ_load.rs`) pins
+    /// the same offsets, so the devnet feed and the ubench walk alike.
+    #[test]
+    fn walk_offsets_are_pinned() {
+        let m = markets(3);
+        let mut w = PriceWalk::new(&m, 30_000, 10).unwrap();
+        let base = 30_000 * FixedPoint::SCALE;
+        let got: Vec<i128> = (0..12).map(|_| (w.next_round()[&1].raw() - base) * 10_000 / base).collect();
+        assert_eq!(got, WALK_10BP_MARKET_1);
+    }
+
+    #[test]
+    fn walk_rejects_a_bound_at_or_past_the_price() {
+        let m = markets(3);
+        assert!(PriceWalk::new(&m, 30_000, 1_249).is_ok());
+        assert!(PriceWalk::new(&m, 30_000, 1_250).is_err());
+        assert!(PriceWalk::new(&m, 30_000, u64::MAX).is_err());
     }
 
     /// The node's own path end to end: JSON wire decode (as torus_submitNativeAction),
