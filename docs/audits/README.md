@@ -81,6 +81,7 @@ corrections; a repeated finding is not another defect.
 | 49 | [Previous-mark reset across oracle outages](chain-5c756ff-pass49-adl-previous-mark-outage-2026-10-04.md) |
 | 50 | [Oracle aggregate freshness boundary](chain-5c756ff-pass50-oracle-staleness-boundary-2026-10-04.md) |
 | 51 | [Oracle quorum after outlier rejection](chain-5c756ff-pass51-oracle-quorum-after-outliers-2026-10-04.md) |
+| 52 | [Session expiry units on latest branch](chain-5c756ff-pass52-session-expiry-recheck-latest-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
