@@ -32,6 +32,11 @@
 #                cancel-all before its estimated open orders would pass N, so
 #                it stays under the chain's per-user open-order limit (1000+,
 #                all markets). Unset (default) = flag omitted.
+#   RETRY_BUSY=1 bench --retry-busy: a sender resends an action the node shed
+#                as busy instead of drawing a new one, so the admitted mix keeps
+#                the cancel fraction (without it, overloaded small-cap cells
+#                admit almost only cancel-alls and placement starves). Unset
+#                (default) = flag omitted.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -175,6 +180,7 @@ BAND=${BAND:-5}
 CROSS_FRACTION=${CROSS_FRACTION:-0.5}
 CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}
+RETRY_BUSY=${RETRY_BUSY:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -350,6 +356,7 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$MPS" ] || [[ "$MPS" =~ ^[0-9]+$ ]] || { echo "FATAL: MPS must be an integer" >&2; exit 2; }
 [[ "$BAND" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BAND must be a positive integer" >&2; exit 2; }
 [ -z "$OPEN_ORDER_BUDGET" ] || [[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]] || { echo "FATAL: OPEN_ORDER_BUDGET must be an integer" >&2; exit 2; }
+[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ] || { echo "FATAL: RETRY_BUSY must be 1 or unset" >&2; exit 2; }
 for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
@@ -452,7 +459,7 @@ trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -692,6 +699,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 # after cand/r6-harness-300m-digest-and-parity.
 [ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 [ -n "$OPEN_ORDER_BUDGET" ] && BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")
+[ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!

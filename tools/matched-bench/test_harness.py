@@ -734,6 +734,18 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('[[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]]', src)
         self.assertIn("open_order_budget='${OPEN_ORDER_BUDGET:-unset}'", src)
 
+    def test_retry_busy_reaches_the_bench_only_when_set(self):
+        """RETRY_BUSY=1 -> bench --retry-busy (resend a shed action instead of
+        drawing a new one, so the admitted mix keeps the cancel fraction).
+        Unset = flag omitted, so older bench binaries and prior cells are
+        unchanged."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("RETRY_BUSY=${RETRY_BUSY:-}", src)
+        self.assertIn('[ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)', src)
+        self.assertIn('[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ]', src)
+        self.assertIn("retry_busy='${RETRY_BUSY:-unset}'", src)
+
     def test_open_limit_rejects_are_sampled(self):
         """The open-limit funnel counter is in both sampler column sets."""
         with open(RUN_CELL_SH) as f:
