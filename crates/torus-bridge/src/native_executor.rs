@@ -739,6 +739,153 @@ struct AccountReader<'a, T: StateBackend> {
     margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
     /// Item 6 C2: the block's mark table (`None`: every `mark` reads the oracle).
     marks: Option<&'a BlockMarks>,
+    /// Item 6 C3: the block's margin sums cache (`None`: every valuation
+    /// builds over the trader's rows, the reference path).
+    sums: Option<&'a BlockSums>,
+}
+
+/// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
+/// [`AccountView`] — exactly `AccountView::build`'s sums over a trader's
+/// positions (same function, same rows: bit-exact by construction) — plus
+/// what liquidation's valuation guard reads (L1, C4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PosSums {
+    upnl: FixedPoint,
+    position_im: FixedPoint,
+    notional: FixedPoint,
+    maintenance: FixedPoint,
+    /// Some position is not Cross (`build` skips it; liquidation does not
+    /// value such an account). Read by L1 (C4).
+    #[allow(dead_code)]
+    any_isolated: bool,
+    /// Cross positions valued at a mark (not at entry). Read by L1 (C4).
+    #[allow(dead_code)]
+    marked: u32,
+}
+
+impl PosSums {
+    /// `build`'s view with balance `bal`: `build` copies the two balance
+    /// fields and adds the position sums, which never read the balance.
+    fn view(&self, bal: &NativeBalance) -> AccountView {
+        AccountView {
+            available: bal.available,
+            order_margin: bal.order_margin,
+            upnl: self.upnl,
+            position_im: self.position_im,
+            notional: self.notional,
+            maintenance: self.maintenance,
+        }
+    }
+}
+
+/// A trader's sums, `Err(())` = `build` overflowed (reproduced as
+/// `CoreError::Overflow("account margin overflows i128")`).
+type SumsResult = Result<PosSums, ()>;
+
+/// Address length: a positions key's trader prefix.
+const TRADER_PREFIX: usize = 20;
+
+/// Item 6 C3: the persistent sums, kept in the resident rows slot and
+/// read-only during a block: each trader's sums over its rows in R, valued
+/// with the mark table / configs of `version`. An entry stays valid while
+/// no block writes the trader's positions (`end_resident` drops those) and
+/// the version holds (versions are never reused, so an entry at another
+/// version is never read; the map is cleared when the version moves).
+#[derive(Debug, Default)]
+struct SumsCache {
+    version: u64,
+    map: HashMap<Address, SumsResult>,
+}
+
+/// Item 6 C3: one block's sums state on the context — the slot's cache and
+/// the block's memo (fix 1's pattern: the map lock covers the lookup only,
+/// callers needing the same trader wait on its cell for ONE computation;
+/// safe under parallel Phase 2 / 3). A cell holds `None` when the result may
+/// not be cached (a positions read error, or a mark outside the table):
+/// callers then compute it directly.
+#[derive(Debug, Default)]
+pub(crate) struct BlockSums {
+    cache: SumsCache,
+    /// The mark version the memo's entries are valued at (set by
+    /// `fill_block_marks`; `None`: no table, the cache is not used).
+    memo_version: Option<u64>,
+    memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
+    /// P1 (tests): every cached answer is also computed by the reference
+    /// path; differences are recorded (a panic in a worker would be caught).
+    #[cfg(test)]
+    shadow: bool,
+    #[cfg(test)]
+    shadow_mismatches: std::sync::Mutex<Vec<String>>,
+    #[cfg(test)]
+    counters: SumsCounters,
+}
+
+/// Which path answered each `pos_sums` call (tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SumsCounters {
+    shadow: std::sync::atomic::AtomicUsize,
+    persistent: std::sync::atomic::AtomicUsize,
+    memo: std::sync::atomic::AtomicUsize,
+    computed: std::sync::atomic::AtomicUsize,
+    dirty: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+fn bump(c: &std::sync::atomic::AtomicUsize) {
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl BlockSums {
+    fn new(cache: SumsCache) -> Self {
+        Self { cache, ..Self::default() }
+    }
+
+    /// The block's mark table was (re)filled: the memo restarts at `version`.
+    fn start(&mut self, version: Option<u64>) {
+        self.memo.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.memo_version = version;
+    }
+
+    /// End of the block: the memo joins the cache (at the memo's version),
+    /// then the sums of every trader in `dirtied` (the block's own position
+    /// keys) are dropped — the memo's entries were built over R before the
+    /// block's writes.
+    fn into_cache<'k>(self, dirtied: impl Iterator<Item = &'k [u8]>) -> SumsCache {
+        let mut cache = self.cache;
+        if let Some(version) = self.memo_version {
+            if cache.version != version {
+                cache.map.clear();
+                cache.version = version;
+            }
+            let memo = self.memo.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (trader, cell) in memo {
+                if let Some(Some(r)) = cell.get() {
+                    cache.map.insert(trader, *r);
+                }
+            }
+        }
+        for key in dirtied.filter(|k| k.len() >= TRADER_PREFIX) {
+            cache.map.remove(&Address::from_slice(&key[..TRADER_PREFIX]));
+        }
+        cache
+    }
+
+    /// P1 shadow check: `cached` == the reference path's answer.
+    #[cfg(test)]
+    fn shadow_check(&self, trader: &Address, cached: &SumsResult, reference: impl FnOnce() -> Result<SumsResult, CoreError>) {
+        if !self.shadow {
+            return;
+        }
+        bump(&self.counters.shadow);
+        let want = reference();
+        if want.as_ref().ok() != Some(cached) {
+            self.shadow_mismatches
+                .lock()
+                .unwrap()
+                .push(format!("{trader}: cached {cached:?}, reference {want:?}"));
+        }
+    }
 }
 
 /// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
@@ -819,6 +966,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
         }
     }
 
@@ -841,15 +989,110 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     }
 
     /// F1: `trader`'s cross-margin account with balance `bal` — positions at
-    /// the mark, else at entry (s517 decision 2).
+    /// the mark, else at entry (s517 decision 2). Item 6 C3: the position
+    /// part from [`Self::pos_sums`].
     fn view(&self, trader: &Address, bal: &NativeBalance) -> Result<AccountView, CoreError> {
-        let ps = self.positions.positions_for_trader(trader)?;
-        AccountView::build(bal, &ps, |m| self.mark(m), |m| self.tiers(m))
+        Ok(self.pos_sums(trader)?.view(bal))
     }
 
     /// F1: UPnL − position IM of `trader` (balance-independent part of `free`).
     fn pos_net(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
         Ok(self.view(trader, &NativeBalance::default())?.pos_net())
+    }
+
+    /// Item 6 C3 (plan 2.4): `trader`'s position sums.
+    /// 1. no cache or no mark table: `build` over `positions_for_trader`;
+    /// 2. the block wrote under the trader's positions prefix: the same, over
+    ///    the overlay (own pending + R);
+    /// 3. the slot's entry at the block's mark version;
+    /// 4. else the block's memo, built once over R's rows (the overlay with
+    ///    nothing of the trader pending reads exactly them).
+    fn pos_sums(&self, trader: &Address) -> Result<PosSums, CoreError> {
+        let r = match (self.sums, self.marks) {
+            (Some(s), Some(table)) if s.memo_version == Some(table.version) => {
+                if self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()) {
+                    #[cfg(test)]
+                    bump(&s.counters.dirty);
+                    self.direct_sums(trader)?
+                } else {
+                    let r = self.cached_sums(s, table.version, trader)?;
+                    #[cfg(test)]
+                    s.shadow_check(trader, &r, || self.direct_sums(trader));
+                    r
+                }
+            }
+            _ => self.direct_sums(trader)?,
+        };
+        r.map_err(|()| CoreError::Overflow("account margin overflows i128".into()))
+    }
+
+    /// Paths 1 and 2: `build` over the trader's rows as the backend shows them.
+    fn direct_sums(&self, trader: &Address) -> Result<SumsResult, CoreError> {
+        Ok(self.sums_of(&self.positions.positions_for_trader(trader)?).0)
+    }
+
+    /// Paths 3 and 4 (the trader has nothing pending this block).
+    fn cached_sums(&self, s: &BlockSums, version: u64, trader: &Address) -> Result<SumsResult, CoreError> {
+        if s.cache.version == version {
+            if let Some(r) = s.cache.map.get(trader) {
+                #[cfg(test)]
+                bump(&s.counters.persistent);
+                return Ok(*r);
+            }
+        }
+        let cell = s
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*trader)
+            .or_default()
+            .clone();
+        #[cfg(test)]
+        let computed = std::cell::Cell::new(false);
+        let memo = *cell.get_or_init(|| {
+            #[cfg(test)]
+            computed.set(true);
+            let ps = self.positions.positions_for_trader(trader).ok()?;
+            let (r, in_table) = self.sums_of(&ps);
+            in_table.then_some(r)
+        });
+        #[cfg(test)]
+        bump(if computed.get() { &s.counters.computed } else { &s.counters.memo });
+        match memo {
+            Some(r) => Ok(r),
+            None => self.direct_sums(trader),
+        }
+    }
+
+    /// `AccountView::build`'s sums over `ps` with this reader's marks and
+    /// tiers, and whether every mark it used came from the block's table
+    /// (only then is the result a function of R's rows and the mark version,
+    /// i.e. cacheable; a market outside the table reads the oracle).
+    fn sums_of(&self, ps: &[torus_core::position::Position]) -> (SumsResult, bool) {
+        let marked = std::cell::Cell::new(0u32);
+        let in_table = std::cell::Cell::new(true);
+        let mark = |m: MarketId| {
+            let mark = match self.marks.and_then(|t| t.marks.get(&m)) {
+                Some(mark) => *mark,
+                None => {
+                    in_table.set(false);
+                    self.mark(m)
+                }
+            };
+            marked.set(marked.get().saturating_add(u32::from(mark.is_some())));
+            mark
+        };
+        let r = AccountView::build(&NativeBalance::default(), ps, mark, |m| self.tiers(m))
+            .map(|v| PosSums {
+                upnl: v.upnl,
+                position_im: v.position_im,
+                notional: v.notional,
+                maintenance: v.maintenance,
+                any_isolated: ps.iter().any(|p| p.margin_type != MarginType::Cross),
+                marked: marked.get(),
+            })
+            .map_err(|_| ());
+        (r, in_table.get())
     }
 
     /// F1: signed position in `market_id` and the price it is valued at
@@ -896,42 +1139,6 @@ impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
     fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
         let (signed_pos, px) = self.maker_position_px(maker, market_id);
         MakerAccount { free: self.maker_free(maker), signed_pos, px }
-    }
-}
-
-/// Fix 1 (s87): the makers' start-of-batch free margin (F1 D8 snapshot),
-/// computed ONCE per `execute_batch` call and shared by every market worker
-/// (was: once per maker per market). Sound because nothing writes the backend
-/// between the end of Phase 2 and the end of Phase 4 (reservations and fills
-/// sit in the write-back caches), so `free` is the same in every market. Only
-/// the START value is shared: each book still runs its own copy (D8). Lives on
-/// the stack of one Phase 3; never used on the single path.
-struct BatchMakerAccounts<'r, 'a, T: StateBackend> {
-    reader: &'r AccountReader<'a, T>,
-    free: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<FixedPoint>>>>,
-}
-
-impl<'r, 'a, T: StateBackend> BatchMakerAccounts<'r, 'a, T> {
-    fn new(reader: &'r AccountReader<'a, T>) -> Self {
-        Self { reader, free: std::sync::Mutex::new(HashMap::new()) }
-    }
-}
-
-impl<T: StateBackend> MakerAccountSource for BatchMakerAccounts<'_, '_, T> {
-    fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
-        // The map lock covers the lookup only; workers needing the same maker
-        // wait on its cell for ONE computation (a pure function of the frozen
-        // backend: which worker computes it does not matter).
-        let cell = self
-            .free
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(*maker)
-            .or_default()
-            .clone();
-        let free = *cell.get_or_init(|| self.reader.maker_free(maker));
-        let (signed_pos, px) = self.reader.maker_position_px(maker, market_id);
-        MakerAccount { free, signed_pos, px }
     }
 }
 
@@ -1745,6 +1952,9 @@ struct RowsSlot {
     /// C2: the mark table / configs of block `height` (None: that block had
     /// no table — the next one takes a new version).
     marks: Option<BlockMarksState>,
+    /// C3: the traders' margin sums over `rows` (plan 2.4). Built empty with
+    /// R, dropped with it.
+    sums: SumsCache,
     height: u64,
 }
 
@@ -1881,6 +2091,10 @@ pub struct ResidentBlock {
     /// [`NativeExecContext::detach_resident_block`], this block's (stashed
     /// by `end_resident`).
     marks: Option<BlockMarksState>,
+    /// C3: the slot's sums cache (empty when R was built) and, after
+    /// [`NativeExecContext::detach_resident_block`], this block's memo;
+    /// `end_resident` merges them. `None`: R not attached (no cache).
+    sums: Option<BlockSums>,
 }
 
 impl ResidentBlock {
@@ -1913,7 +2127,7 @@ pub fn begin_resident(
     height: u64,
     metrics: Option<&torus_telemetry::Metrics>,
 ) -> ResidentBlock {
-    let mut block = ResidentBlock { height, attached: false, rebuilt: false, marks: None };
+    let mut block = ResidentBlock { height, attached: false, rebuilt: false, marks: None, sums: None };
     let Some(holder) = holder else {
         return block;
     };
@@ -1924,6 +2138,7 @@ pub fn begin_resident(
         let marker_ok = marker.is_none_or(|m| m == slot.height);
         if height_ok && marker_ok {
             block.marks = slot.marks;
+            block.sums = Some(BlockSums::new(slot.sums));
             return Some(slot.rows);
         }
         tracing::warn!(
@@ -1970,6 +2185,8 @@ pub fn begin_resident(
     }
     overlay.attach_resident(rows);
     block.attached = true;
+    // C3: a built R starts with an empty sums cache.
+    block.sums.get_or_insert_with(BlockSums::default);
     block
 }
 
@@ -2007,7 +2224,13 @@ pub fn end_resident(
         m.exec_resident_rows.set(r.len() as i64);
         m.exec_resident_rows_bytes.set(r.bytes() as i64);
     }
-    holder.rows = Some(RowsSlot { rows, marks: block.marks, height: block.height });
+    // C3: the block's memo joins the slot's sums; every trader whose
+    // positions the block wrote or deleted loses its sums.
+    let sums = block
+        .sums
+        .map(|s| s.into_cache(delta.keys(torus_state::cf::CF_NATIVE_POSITIONS)))
+        .unwrap_or_default();
+    holder.rows = Some(RowsSlot { rows, marks: block.marks, sums, height: block.height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -2055,6 +2278,10 @@ mod cancel_batch_exec_tests;
 #[cfg(test)]
 #[path = "block_marks_tests.rs"]
 mod block_marks_tests;
+
+#[cfg(test)]
+#[path = "sums_cache_tests.rs"]
+mod sums_cache_tests;
 
 #[cfg(test)]
 mod resident_books_toggle_tests {
@@ -2136,6 +2363,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Item 6 C2: the previous block's mark state from the resident rows slot
     /// ([`Self::attach_resident_block`]), consumed by `begin_block_oracle`.
     prev_marks: Option<BlockMarksState>,
+    /// Item 6 C3: the block's margin sums cache ([`Self::attach_resident_block`]
+    /// to [`Self::detach_resident_block`]; `None`: every valuation builds).
+    sums: Option<BlockSums>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -2642,6 +2872,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             margin_configs,
             block_marks: None,
             prev_marks: None,
+            sums: None,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -2688,6 +2919,8 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// tests) every block's table takes a new version.
     pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
         self.prev_marks = block.marks.take();
+        // C3: the slot's sums cache (used once the table is filled).
+        self.sums = block.sums.take();
     }
 
     /// Item 6 C2: hand this block's mark table and configs to `block` for
@@ -2699,6 +2932,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             .block_marks
             .take()
             .map(|marks| BlockMarksState { marks, configs: self.margin_configs.clone() });
+        // C3: the sums cache and this block's memo, merged by `end_resident`.
+        if let Some(sums) = self.sums.take() {
+            block.sums = Some(sums);
+        }
     }
 
     /// Item 6 C2: the version of the block's mark table (`None`: no table).
@@ -4545,6 +4782,7 @@ impl NativeExecutor {
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
         };
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
@@ -4745,12 +4983,13 @@ impl NativeExecutor {
         }
 
         // F1 (s517 #4): workers only READ the backend through `reader`.
-        // Fix 1 (s87): each maker's snapshot free margin once per call.
-        let makers = BatchMakerAccounts::new(&reader);
+        // Item 6 C3: a maker's `free` = its balance (frozen backend during
+        // matching) + its position sums, memoised for the block (was fix 1's
+        // per-call `BatchMakerAccounts`): the same value in every market.
         let mut market_results = match MarketWorkerPool::match_parallel_with(
             worker_batches,
             ctx.timestamp,
-            Some(&makers),
+            Some(&reader),
         ) {
             Ok(r) => r,
             Err(panic) => {
@@ -6857,6 +7096,7 @@ impl NativeExecutor {
             now: ctx.timestamp,
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
@@ -8330,6 +8570,10 @@ impl NativeExecutor {
     pub fn fill_block_marks<T: StateBackend>(ctx: &mut NativeExecContext<T>, listed: &[MarketId]) {
         let prev = ctx.prev_marks.take();
         ctx.block_marks = None;
+        // C3: memo entries are valued at one table version.
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(None);
+        }
         let aggregated = match ctx.oracle.aggregated_market_ids() {
             Ok(m) => m,
             Err(e) => {
@@ -8350,6 +8594,9 @@ impl NativeExecutor {
             _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
         };
         ctx.block_marks = Some(BlockMarks { marks, version });
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(Some(version));
+        }
     }
 
     /// Aggregate oracle prices for `markets` at the block timestamp — called by
@@ -8842,10 +9089,10 @@ mod integer_margin_tests {
     }
 }
 
-/// Fix 1 (s87) / item 6 C2: the batch memo and the block mark table return
-/// exactly what the per-call reads do.
+/// Fix 1 (s87) / item 6 C2 / C3: the block mark table and the sums cache
+/// (memo and persistent entries) return exactly what the per-call reads do.
 #[cfg(test)]
-mod batch_maker_accounts_tests {
+mod maker_accounts_tests {
     use super::*;
     use torus_core::position::Position;
 
@@ -8865,19 +9112,20 @@ mod batch_maker_accounts_tests {
     /// short, random entry, sometimes isolated, one overflow-sized), balances
     /// with negative `available`, marks fresh / stale / absent per market.
     /// Every (trader, market) pair, queried in a shuffled order from 4 threads
-    /// through one `BatchMakerAccounts` (marks from a block table, item 6
-    /// C2), equals `AccountReader::maker_account` without memos or table; a
-    /// reader with the table gives the same `mark` / `view` / `pos_net` /
-    /// `position_px`.
+    /// through one reader with the block's table and sums cache (item 6 C2 /
+    /// C3: over an overlay with R, first through the block memo, then through
+    /// the persistent entries it leaves), equals `AccountReader::maker_account`
+    /// without cache or table; that reader gives the same `mark` / `view` /
+    /// `pos_net` / `position_px`.
     #[test]
-    fn batch_maker_accounts_equal_reader_on_random_states() {
+    fn cached_reader_maker_accounts_equal_reader_on_random_states() {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
         let now = 10_000u64;
-        let ctx = NativeExecContext::new(db, 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let ctx = NativeExecContext::new(db.clone(), 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
         let reporters: Vec<(Address, FixedPoint)> = (0..3u8).map(|i| (Address::new([200 + i; 20]), fp(1))).collect();
         let mut rng = Lcg(0x5EED_0001);
-        let (mut pairs_checked, mut marked, mut overflowed) = (0usize, 0usize, 0usize);
+        let (mut pairs_checked, mut marked, mut overflowed, mut persistent) = (0usize, 0usize, 0usize, 0usize);
         for round in 0..200u64 {
             let n_traders = 1 + rng.below(12);
             let n_markets = 1 + rng.below(25);
@@ -8931,8 +9179,14 @@ mod batch_maker_accounts_tests {
                 }
             }
             let plain = AccountReader::of(&ctx);
-            let table = BlockMarks { marks: BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), version: 0 };
-            let reader = AccountReader { marks: Some(&table), ..AccountReader::of(&ctx) };
+            let table = BlockMarks { marks: BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), version: 7 };
+            // The block's view: an overlay with R (nothing pending), its context.
+            let mut overlay = NativeStateOverlay::new(db.clone());
+            overlay.attach_resident(Arc::new(torus_state::ResidentRows::build(&overlay).unwrap()));
+            let rctx = NativeExecContext::new(overlay, 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            let mut memo_sums = BlockSums { shadow: true, ..BlockSums::default() };
+            memo_sums.start(Some(7));
+            let reader = AccountReader { marks: Some(&table), sums: Some(&memo_sums), ..AccountReader::of(&rctx) };
             for &m in &markets {
                 assert_eq!(reader.mark(m), plain.mark(m), "round {round}: mark {m}");
                 marked += usize::from(plain.mark(m).is_some());
@@ -8956,7 +9210,6 @@ mod batch_maker_accounts_tests {
                     );
                 }
             }
-            let batch = BatchMakerAccounts::new(&reader);
             std::thread::scope(|s| {
                 for w in 0..4u64 {
                     let mut order = pairs.clone();
@@ -8964,17 +9217,34 @@ mod batch_maker_accounts_tests {
                     for i in (1..order.len()).rev() {
                         order.swap(i, shuffle.below(i as u64 + 1) as usize);
                     }
-                    let (batch, want) = (&batch, &want);
+                    let (reader, want) = (&reader, &want);
                     s.spawn(move || {
                         for (t, m) in order {
-                            assert_eq!(batch.maker_account(&t, m), want[&(t, m)], "round {round}: {t} market {m}");
+                            assert_eq!(reader.maker_account(&t, m), want[&(t, m)], "round {round}: {t} market {m}");
                         }
                     });
                 }
             });
             pairs_checked += pairs.len();
+            // The memo, carried as persistent entries into the next block's sums.
+            let c = &memo_sums.counters;
+            let computed = c.computed.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
+            assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
+            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_cache(std::iter::empty())) };
+            next.start(Some(7));
+            let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
+            for &(t, m) in &pairs {
+                assert_eq!(carried.maker_account(&t, m), want[&(t, m)], "round {round}: persistent {t} market {m}");
+            }
+            persistent += next.counters.persistent.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(next.counters.computed.load(std::sync::atomic::Ordering::Relaxed), 0, "round {round}: no rebuild");
+            assert!(next.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
         }
-        assert!(pairs_checked > 1_000 && marked > 100 && overflowed > 0, "non-vacuous: {pairs_checked} {marked} {overflowed}");
+        assert!(
+            pairs_checked > 1_000 && marked > 100 && overflowed > 0 && persistent > 1_000,
+            "non-vacuous: {pairs_checked} {marked} {overflowed} {persistent}"
+        );
     }
 }
 

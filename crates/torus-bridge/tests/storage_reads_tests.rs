@@ -16,6 +16,12 @@
 //! mark table reads each market's mark once (end of `begin_block_oracle`)
 //! and answers every later mark read of the block.
 //!
+//! C3: the same sequence records every positions prefix scan (one
+//! `positions_for_trader`, answered by any layer) with its path: the margin
+//! and match paths value each trader at most once per block (the sums
+//! memo), and with fixed marks only a trader the chain dirtied since its last
+//! valuation (or never valued) is scanned again (the sums cache).
+//!
 //!   cargo test -p torus-bridge --test storage_reads_tests -- --nocapture
 
 #[path = "common/counting_backend.rs"]
@@ -23,8 +29,10 @@ mod counting_backend;
 #[path = "common/econ_load.rs"]
 mod econ_load;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+
+use std::backtrace::Backtrace;
 
 use counting_backend::{CountingBackend, Counts, StorageRead};
 use econ_load::{base_mark, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
@@ -39,6 +47,8 @@ const MARKETS: u64 = 6;
 const ACTIONS: u64 = 24;
 const BLOCKS: u64 = 20;
 const WALK_BP: u64 = 10;
+/// Address length: a positions key's trader prefix.
+const ADDR: usize = 20;
 
 /// Engine path of one storage read, from the OUTERMOST frame that names a
 /// phase (a liquidation's stage-1 order runs triggered stops: still
@@ -46,6 +56,11 @@ const WALK_BP: u64 = 10;
 /// (reduce-only policing, checked takers' prices, maker checks),
 /// `liquidation` = `run_liquidations`; the rest is reported, not asserted.
 fn path_of(read: &StorageRead) -> &'static str {
+    path_of_stack(&read.stack)
+}
+
+/// [`path_of`] for any recorded stack.
+fn path_of_stack(stack: &Backtrace) -> &'static str {
     const MARKERS: &[(&str, &str)] = &[
         ("prepare_one", "margin"),
         ("phase2_", "margin"),
@@ -53,7 +68,6 @@ fn path_of(read: &StorageRead) -> &'static str {
         ("d2_pool_takers", "margin"),
         ("match_parallel", "match"),
         ("reduce_only_positions_for", "match"),
-        ("BatchMakerAccounts", "match"),
         ("settle_market_results", "settle"),
         ("add_cum_volume", "settle"),
         ("run_triggered_stops", "settle"),
@@ -61,7 +75,7 @@ fn path_of(read: &StorageRead) -> &'static str {
         ("run_liquidations", "liquidation"),
         ("begin_block_oracle", "oracle"),
     ];
-    let stack = read.stack.to_string();
+    let stack = stack.to_string();
     let frames: Vec<&str> = stack.lines().filter(|l| !l.trim_start().starts_with("at ")).collect();
     if let Some(path) = frames.iter().rev().find_map(|f| MARKERS.iter().find(|(m, _)| f.contains(m)).map(|(_, p)| *p)) {
         return path;
@@ -105,19 +119,29 @@ fn assert_memtable_only(db: &StateDb) {
 /// Path, CF and op of a storage read.
 type ReadKey = (&'static str, &'static str, &'static str);
 
-/// Storage reads per (path, cf, op) and overlay calls of the two CFs per
-/// (cf, op) over all blocks, the fills, the R builds and the oracle point
-/// reads of each block (oracle step through liquidation).
-type FedRun = (BTreeMap<ReadKey, usize>, HashMap<(&'static str, &'static str), usize>, u64, u64, Vec<usize>);
+/// One fed run: storage reads per (path, cf, op) and overlay calls of the
+/// two CFs per (cf, op) over all blocks, the fills, the R builds, the oracle
+/// point reads of each block (oracle step through liquidation), and per
+/// block the positions prefix scans as (path, trader prefix) and the traders
+/// whose positions the block wrote or deleted.
+struct FedRun {
+    per_path: BTreeMap<ReadKey, usize>,
+    calls: HashMap<(&'static str, &'static str), usize>,
+    fills: u64,
+    builds: u64,
+    oracle_reads: Vec<usize>,
+    scans: Vec<Vec<(&'static str, Vec<u8>)>>,
+    dirtied: Vec<BTreeSet<Vec<u8>>>,
+}
 
-/// Runs the fed sequence.
-fn run_fed_sequence() -> FedRun {
+/// Runs the fed sequence with marks moving `walk_bp` per block.
+fn run_fed_sequence(walk_bp: u64) -> FedRun {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     setup(&db);
     let counts = Arc::new(Counts::default());
     let mut gen = Gen { rng: Lcg(0x5EED_0006), senders: SENDERS, markets: MARKETS, batch: 30, budget: 90, open: HashMap::new() };
-    let mut walk = MarkWalk::new(MARKETS, WALK_BP);
+    let mut walk = MarkWalk::new(MARKETS, walk_bp);
     let mut books = HashMap::new();
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
@@ -126,6 +150,7 @@ fn run_fed_sequence() -> FedRun {
     let mut fills = 0u64;
     let mut holder = ResidentBooks::default();
     let mut oracle_reads = Vec::new();
+    let (mut scans, mut dirtied) = (Vec::new(), Vec::new());
     for h in 1..=BLOCKS {
         let block = gen.block(ACTIONS);
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
@@ -144,12 +169,14 @@ fn run_fed_sequence() -> FedRun {
             }
         }
         backend.arm_storage_probe();
+        backend.arm_scan_probe();
         backend.arm();
         let agg = NativeExecutor::begin_block_oracle(&mut ctx);
         assert!(agg.iter().all(|r| r.success), "mark aggregation: {agg:?}");
         NativeExecutor::execute_batch(&mut ctx, &block);
         let _ = NativeExecutor::run_liquidations(&mut ctx);
         backend.disarm();
+        backend.disarm_scan_probe();
         backend.disarm_storage_probe();
         oracle_reads.push(backend.oracle_reads());
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
@@ -164,9 +191,11 @@ fn run_fed_sequence() -> FedRun {
         for (k, v) in backend.take_layer_calls() {
             *calls.entry(k).or_insert(0) += v;
         }
+        scans.push(backend.take_scans().into_iter().map(|s| (path_of_stack(&s.stack), s.prefix)).collect::<Vec<_>>());
         drop(backend);
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
+        dirtied.push(delta.keys(CF_NATIVE_POSITIONS).filter(|k| k.len() >= ADDR).map(|k| k[..ADDR].to_vec()).collect());
         let frozen = overlay.freeze(h);
         end_resident(&mut holder, resident, &mut overlay, delta, true, None);
         if let Some(p) = parent.take() {
@@ -177,7 +206,7 @@ fn run_fed_sequence() -> FedRun {
     assert_eq!(holder.rows_shared_fallbacks(), 0);
     assert_eq!(holder.rows_height(), Some(BLOCKS));
     assert_memtable_only(&db);
-    (per_path, calls, fills, holder.rows_builds(), oracle_reads)
+    FedRun { per_path, calls, fills, builds: holder.rows_builds(), oracle_reads, scans, dirtied }
 }
 
 /// The instrument itself: a DB-resident balance read through the overlay is a
@@ -235,7 +264,7 @@ fn storage_probe_sees_db_reads_and_not_layer_hits() {
 
 #[test]
 fn fed_block_path_reads_positions_and_balances_from_memory_only() {
-    let (per_path, calls, fills, builds, _) = run_fed_sequence();
+    let FedRun { per_path, calls, fills, builds, .. } = run_fed_sequence(WALK_BP);
     println!("STORAGE_READS blocks={BLOCKS} senders={SENDERS} markets={MARKETS} fills={fills} walk_bp={WALK_BP} r_builds={builds}");
     for ((path, cf, op), n) in &per_path {
         println!("STORAGE_READS path={path} cf={cf} op={op} reads={n}");
@@ -261,8 +290,84 @@ fn fed_block_path_reads_positions_and_balances_from_memory_only() {
 /// plus the liquidation step read the rows again.
 #[test]
 fn fed_block_reads_each_mark_once() {
-    let (_, _, fills, _, oracle_reads) = run_fed_sequence();
+    let FedRun { fills, oracle_reads, .. } = run_fed_sequence(WALK_BP);
     println!("ORACLE_READS markets={MARKETS} per_block={oracle_reads:?}");
     assert!(fills > 0, "the sequence must trade");
     assert_eq!(oracle_reads, vec![MARKETS as usize; BLOCKS as usize], "oracle point reads per block");
+}
+
+/// Positions prefix scans of the margin and match paths per block, per trader.
+fn margin_match_scans(run: &FedRun) -> Vec<BTreeMap<Vec<u8>, usize>> {
+    run.scans
+        .iter()
+        .map(|block| {
+            let mut per: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+            for (path, prefix) in block {
+                if matches!(*path, "margin" | "match") {
+                    *per.entry(prefix.clone()).or_insert(0) += 1;
+                }
+            }
+            per
+        })
+        .collect()
+}
+
+/// Every positions scan of the run per path (printed for the record).
+fn print_scans(label: &str, run: &FedRun) {
+    let mut per: BTreeMap<&str, usize> = BTreeMap::new();
+    for (path, _) in run.scans.iter().flatten() {
+        *per.entry(path).or_insert(0) += 1;
+    }
+    println!("POSITION_SCANS {label} fills={} per_path={per:?}", run.fills);
+}
+
+/// C3 (plan Step 3): with marks moving every block (a new mark version each
+/// block), Phase 2 (`prepare_one`'s `pos_net`) and Phase 3 (the makers'
+/// `free`) value each trader at most ONCE per block, together: the block's
+/// sums memo. Before C3: once per order / per maker per market.
+#[test]
+fn fed_margin_and_match_value_each_trader_once_per_block() {
+    let run = run_fed_sequence(WALK_BP);
+    print_scans("walk10", &run);
+    assert!(run.fills > 0, "the sequence must trade");
+    let per_block = margin_match_scans(&run);
+    let total: usize = per_block.iter().flat_map(|b| b.values()).sum();
+    assert!(total > 0, "non-vacuous: the margin / match paths value traders");
+    for (i, block) in per_block.iter().enumerate() {
+        let over: Vec<_> = block.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(over.is_empty(), "block {}: traders scanned more than once on margin + match: {over:?}", i + 1);
+    }
+}
+
+/// C3 (plan Step 3): with fixed marks the version never moves, so a trader
+/// valued once keeps its cached sums until a block writes its positions:
+/// a margin / match scan in block k is of a trader never valued on these
+/// paths before, or dirtied by a block since its last valuation.
+#[test]
+fn fed_fixed_marks_rescan_only_dirtied_traders() {
+    let run = run_fed_sequence(0);
+    print_scans("walk0", &run);
+    assert!(run.fills > 0, "the sequence must trade");
+    let per_block = margin_match_scans(&run);
+    // trader -> block of its last margin / match valuation
+    let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
+    let (mut rescans, mut cached) = (0usize, 0usize);
+    for (k, block) in per_block.iter().enumerate() {
+        for (trader, n) in block {
+            assert_eq!(*n, 1, "block {}: one valuation per trader", k + 1);
+            if let Some(&j) = last.get(trader) {
+                let dirtied = (j..k).any(|b| run.dirtied[b].contains(trader));
+                assert!(dirtied, "block {}: trader {} rescanned, untouched since block {}", k + 1, hex(trader), j + 1);
+                rescans += 1;
+            }
+            last.insert(trader.clone(), k);
+        }
+        cached += last.keys().filter(|t| !block.contains_key(*t)).count();
+    }
+    println!("POSITION_SCANS walk0 rescans_of_dirtied={rescans} cached_trader_blocks={cached}");
+    assert!(cached > 0, "non-vacuous: some valued trader is not rescanned");
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
