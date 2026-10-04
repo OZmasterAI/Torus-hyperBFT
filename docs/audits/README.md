@@ -53,6 +53,7 @@ corrections; a repeated finding is not another defect.
 | 21 | [Cross-path action accounting and replay](chain-0a25560-pass21-action-accounting-replay-2026-10-04.md) |
 | 22 | [Staking unbonding configuration](chain-0a25560-pass22-staking-unbonding-config-2026-10-04.md) |
 | 23 | [Delegation exit and reward eligibility](chain-0a25560-pass23-delegation-reward-eligibility-2026-10-04.md) |
+| 24 | [Staking claim atomicity](chain-0a25560-pass24-staking-claim-atomicity-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
