@@ -34,6 +34,7 @@ slower per fill and nothing stopped it on the way. This plan is organised around
 | liquidation tail | 25.7 | <= 1.0 | 2.0 | `tail_ms` |
 | total | ~76 (prelim) | <= 14.7 | 16.6 | median of 3 |
 | storage reads on margin + liquidation paths | thousands per block | **0** | > 0 | counting backend (test) |
+| empty block with live feed (liquidation walk, 2048 traders) | ~500 ms (s89 probe) | <= 20 ms | 75 ms (= 13 blocks/s) | `ubench_epoch` `UB_DRAIN=fresh` |
 | devnet matched/s, oracle on (Gate 2) | (measure) | >= 0.9x main | < 0.9x | paired alternating cells |
 
 The first step re-measures the "today" column on the base commit (same box, same
@@ -270,6 +271,12 @@ golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
 - Devnet crab cells, oracle on (needs item 2's `run_cell.py` allowlist), paired
   alternating cells vs main and vs the base branch, warm-up cell, AGREE/PASS, drain.
   Record matched/s, CPU-s/1M, engine split, `rejected_cancelled`, RSS.
+- Live-feed idle check (s89): one extra cell with the oracle feed kept running through
+  the drain (the harness pauses it today, so marks go stale and the liquidation walk takes
+  its cheap path). s89 probe (`ubench_epoch.rs`): with the feed live, every empty block
+  runs the native phase and the walk costs ~0.5 s per block in the bench shape (5k
+  traders x ~249 positions), so execution cannot keep up with an idle chain (~13 empty
+  blocks/s). Pass = the node drains with the feed live; record empty-block exec ms.
 - Gate 2 (crab doc): >= 0.9x main. Owner reviews; merge of crab + Phase 1 into main
   follows (normal merge).
 
