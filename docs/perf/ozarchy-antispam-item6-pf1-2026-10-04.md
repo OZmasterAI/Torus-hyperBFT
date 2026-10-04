@@ -20,8 +20,10 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
 rest of the gap outside the execution path; section 6 corrects that: with
-the resend loop removed the gap stays, and it is execution (~1.4-1.5x main)
-plus RPC ingress (~1.8x main).
+the resend loop removed the gap stays, and it is execution (~1.4-1.5x main).
+Crab's ~1.8x RPC CPU per fill is a consequence of that, not a separate cost:
+equal CPU per request, 1.85x more (mostly refused) requests per fill
+(section 6.4).
 
 ## 1. Anti-spam no-regression A/B (main vs `feat/native-antispam`)
 
@@ -204,7 +206,8 @@ The no-retry cells at rate 76,000 were healthy (cancels went through: 99k vs
 113k cancelled), so no lower-rate fallback was needed. Without the resend
 loop crab loses 6% and main gains 7%: the loop is not the gap. Crab's RPC
 worker cost (1.8x) and extra `backlog_preverify` refusals (1.65x) stay in
-both modes. Why crab's ingress costs 1.8x main is open.
+both modes. Section 6.4 explains the 1.8x: it is shedding volume, not a
+per-request cost.
 
 ### 6.2 300 markets (`RETRY_BUSY=1`)
 
@@ -271,13 +274,57 @@ match **PASS** (1.32-1.33). C3 + PF1 shows no change against `d52a33f` on
 this ubench. ozarchy's absolute ubench numbers are 2-4x below 18c's sanity
 run (margin 5.2, match 5.6); compare ratios across machines, not values.
 
+### 6.4 Why crab's RPC costs ~1.8x main per fill at 10 markets
+
+From the existing section 6.1 cells (1 Hz `/proc` sampler) and the section 5
+perf data; no new cells. Full analysis: `ozarchy-rpc18-analysis.md`.
+
+| val0, retry / no retry | crab | main | ratio |
+|---|---|---|---|
+| RPC worker ms CPU per 1k fills | 7.83 / 6.06 | 4.39 / 3.38 | 1.78 / 1.79 |
+| submit requests per 1k fills | 17.4 / 14.4 | 9.4 / 7.6 | 1.84 / 1.90 |
+| refused (`backlog_preverify`) per 1k fills | 15.1 / 12.0 | 7.2 / 5.5 | 2.11 / 2.18 |
+| RPC worker µs CPU per request | 452 / 422 | 467 / 446 | 0.97 / 0.95 |
+
+- **Not a crab code cost.** CPU per request is the same on both arms. A
+  refused request costs ~0.5 ms of RPC CPU on both (0.495 crab, 0.519
+  main); one shared cost per refused request plus one per admitted request
+  reproduces all 8 cells within 6%, with no crab-specific term.
+- **Mechanism.** The load generator is closed-loop (256 requests in flight
+  per node), so its request rate is 256 / mean round trip. Crab's slower
+  execution keeps the pool backlogged more often, busy refusals return
+  fast, and the generator sends again. The 1.8x is a symptom of the
+  execution gap and should shrink as execution gets faster.
+- **The 5.5x in section 5** is the same mechanism at peak shedding (59.3 vs
+  12.0 requests per 1k fills in that 45 s window; 388 vs 350 µs per
+  request).
+- **No crab-only RPC frames.** The `torus.rs` diff between main and crab
+  touches only oracle paths, which `PlaceOrderBatch` never runs. The
+  oracle feed's own RPC load is under 0.03% of requests (64 submits and
+  21 mark reads per cell vs 300-400k batch submits). Sys CPU per request
+  is equal (75-78 vs 80-84 µs).
+- **Side item, open:** the signature-verify pool (`torus-ingress-v`) costs
+  1.22-1.27x per admitted action on crab.
+- **Optional, both arms:** the shed path decodes the whole hex payload
+  before refusing (`parse_bytes`, `crates/torus-rpc/src/types.rs:93-96`,
+  `hex` 0.4; the decode-only shed task `torus.rs:507-528` on `d9ef4f7` is
+  63% of crab's RPC cycles under shedding, `from_hex` alone 50%).
+  Classifying a request by peeking the bincode variant tag (the first 8
+  hex characters) would remove ~60% of RPC CPU under shedding; switching
+  to `alloy_primitives::hex` (const-hex, already in `Cargo.lock`) cuts
+  roughly the `from_hex` half. Either makes an overloaded node cheaper to
+  keep busy.
+- **For gates,** report RPC CPU per request and per admitted action, not
+  only per fill.
+
 ## Open
 
 - Margin and liquidation at 300 markets: `positions_for_trader` overlay
   range scans per account (section 6.2), the target for the next item 6
   step.
-- Why crab's RPC ingress costs ~1.8x main per fill at 10 markets
-  (section 6.1).
+- Optional: cheaper shed path (peek the action tag or const-hex) and the
+  1.22-1.27x signature-verify cost per admitted action on crab (section
+  6.4).
 - Gate 4 after C4 + PF1: ubench tail at 300 markets, `ubench_epoch
   UB_DRAIN=fresh` empty block (target <= 20 ms).
 - Anti-spam D (per-IP RPC limit) has no validator exemption; no metric for
