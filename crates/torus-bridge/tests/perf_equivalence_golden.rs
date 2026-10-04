@@ -416,20 +416,22 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// Scenario A — serial and engine-forced (4 threads) are identical. Pinned on
 /// c93c579; re-pinned at option B (s87): an intended outcome change (a
 /// non-pool batch sell reserves at the start-of-batch best bid; taker-only
-/// rounding allowance). Fixes 1-3 were proven against the c93c579 digests.
+/// rounding allowance) and again at the same-batch bid bound (s87: a
+/// non-pool sell topped up for an earlier funded bid of the batch). Fixes
+/// 1-3 were proven against the c93c579 digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0x97a019f723fb8016a94c49312d448c7c8fa6d2e45748dcb4649138e0725700f2",
-    "0x97c1282cfdb652cfcfdbcf1f1155799cbb011e46d5daf7b151ba5ce83e9e6f8f",
-    "0x5c727dd6855271b0c44b65e0205cfe637095cc30ddee2ad3633161dd9714b005",
-    "0xb7742e49fd8eee2c6e0912c8b81db3a800eb73c3cf54736209ea37f2d33073cb",
-    "0xa3af2f57259b6a20e6bf7d0fd807ab296d1f3ea1c8b7d0d506b17f7e3ae83b5f",
-    "0x8d4c86b3a7754849b811dda505137c2a0b4909765c2a528c5fc1fa0e5f72c899",
-    "0x88c2d4f08eca760e7c390f0fe32312ebd7cdee7a06c5605800c3e3000506d870",
-    "0x2ee42dae75812922366fb9525300adb374a28476c4d17e08786371b3971dcac9",
-    "0x0d6557fb541fe9533c54f578d130f7388ce06ad4bc6a7a6c0514991e2fa78c7c",
-    "0xba4c045956410dc085a84c4e2cd14df1f4fc6cf348f6a9b4c2b23331974efac5",
-    "0x2de559f0e059e2f07c277f49b4c19452e9bd8729fa4d932b8812235f5d047ca3",
+    "0x2284087928a8c8753efa5355fb90d3993a781ccd6dc93642fea91528732cbdad",
+    "0xd2b12e97afcc3e48298e57d228207bf55bc9e3dc2dfc33097f31a2bbaae9ef0c",
+    "0xa45594ed9f827218f72502d7c8eba37026da60fa0b5aeb4db8f102db83f5fd65",
+    "0x7a2927595ee3b64da6689e0bf0f65b6df3ad4dfc5d0138d01f89b2bc5b154195",
+    "0xa7fe4778b90ebd296c6fa42197c4cc44bc5316be9aaaaded834e8cc2a64789af",
+    "0x44e31f6894412b56308466998c80688666dfe5aed558887b6d62d9f10fd857dd",
+    "0x1c6705550c3e64d8bd13578cd7dbb73bf13e704113f008a1eadb0c0c8c0f4a5a",
+    "0x18d99245bf209e33a43a71a8304c377497086733c06d6dbb14f91473a7f23981",
+    "0x8bbb6cdbf35c7b0036256b6c7014015f00deb82ab0e54ebaef6c509c8b5a3f55",
+    "0x47b3d05363d83b02de298faf74833efb7f4d0bd034c6c109a3d9036cde3e7f85",
+    "0xc3c4abb7a103956157a7f7f792975ebf9ea53ae71161df1d328313b5a6aa48ba",
 ];
 /// Scenario B on c93c579.
 const GOLDEN_B: [&str; 18] = [

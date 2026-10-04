@@ -4354,8 +4354,21 @@ impl NativeExecutor {
                 *excess_by_sender.entry(p.sender).or_insert(FixedPoint::ZERO) += p.excess_im;
             }
         }
+        let pool_takers = Self::d2_pool_takers(&market_batches);
+        // Same-batch bid bound (s87): top-ups come off what is left for the
+        // pools, so they run before the pools are read.
+        Self::same_batch_bid_top_ups(
+            &ctx.positions,
+            &ctx.order_books,
+            &ctx.margin_configs,
+            &basis,
+            &pool_takers,
+            &excess_by_sender,
+            &mut market_batches,
+            &mut bal_cache,
+        );
         let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
-        for (sender, market_id, pos_net) in Self::d2_pool_takers(&market_batches) {
+        for (sender, market_id, pos_net) in pool_takers {
             let available = bal_cache
                 .load(&ctx.positions, &sender)
                 .map_or(FixedPoint::ZERO, |b| b.available);
@@ -6137,6 +6150,89 @@ impl NativeExecutor {
             }
         }
         out
+    }
+
+    /// Same-batch bid bound (s87, owner decision 1). After Phase 2, a
+    /// non-pool sell (Option B: [`takes_bid_floor`], its sender's D2 pool
+    /// is another market) is topped up to `reserve(bound, qty)`. `bound` is
+    /// the highest bid placed EARLIER in this batch in its market that can
+    /// rest: accepted in Phase 2 (so funded), a GTC / PostOnly `Limit`, not
+    /// reduce-only, price > 0 on the tick, quantity >= lot. It is capped at
+    /// the market's best ask at the start of the batch (a bid at or above
+    /// it fills against asks instead of resting); with no ask nothing
+    /// counts. Review 4 F-1: unfunded, IOC / FOK / market, stop, off-tick,
+    /// dust and reduce-only bids never count, and no bid counts above the
+    /// start best ask.
+    ///
+    /// Soft: never a placement gate, so every Phase-2 outcome is unchanged
+    /// and no bid can get an honest order rejected. The top-up comes only
+    /// from the sender's free margin left after its WHOLE Phase-2 fold
+    /// (`available + pos_net − excess`, what Phase 3 would give its D2
+    /// pool), all or nothing, in flat order. It joins `margin_reserved` (the
+    /// taker-only budget) and is released after matching like the rest
+    /// (release = reserved − hold at the limit, A5 exact). Deterministic: a
+    /// pure function of the Phase-2 outcomes (serial == sharded) and the
+    /// start-of-batch books.
+    #[allow(clippy::too_many_arguments)]
+    fn same_batch_bid_top_ups<T: StateBackend>(
+        positions: &PositionManager<T>,
+        books: &HashMap<MarketId, OrderBook>,
+        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        pool_takers: &[(Address, MarketId, FixedPoint)],
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        bal_cache: &mut BalanceCache,
+    ) {
+        let pool_of: HashMap<Address, (MarketId, FixedPoint)> =
+            pool_takers.iter().map(|&(s, m, pos_net)| (s, (m, pos_net))).collect();
+        // (flat index, market, position in its batch, bound)
+        let mut wanted: Vec<(usize, MarketId, usize, FixedPoint)> = Vec::new();
+        for (&market_id, batch) in market_batches.iter() {
+            let Some(book) = books.get(&market_id) else { continue };
+            let Some(ask) = book.best_ask() else { continue };
+            let mut bound: Option<FixedPoint> = None;
+            for (k, p) in batch.iter().enumerate() {
+                let o = p.params;
+                if o.is_buy {
+                    let can_rest = matches!(o.order_type, OrderType::Limit)
+                        && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
+                        && !o.reduce_only
+                        && o.price > FixedPoint::ZERO
+                        && (book.tick_size <= FixedPoint::ZERO || o.price.raw() % book.tick_size.raw() == 0)
+                        && o.quantity >= book.lot_size;
+                    if can_rest {
+                        bound = bound.max(Some(o.price.min(ask)));
+                    }
+                } else if let Some(b) = bound {
+                    if Self::takes_bid_floor(o) && pool_of.get(&p.sender).is_some_and(|(m, _)| *m != market_id) {
+                        wanted.push((p.index, market_id, k, b));
+                    }
+                }
+            }
+        }
+        wanted.sort_unstable_by_key(|w| w.0);
+        for (i, market_id, k, bound) in wanted {
+            let Some(p) = market_batches.get_mut(&market_id).and_then(|b| b.get_mut(k)) else { continue };
+            let res_qty = basis.get(&i).map_or(p.params.quantity, |b| b.1);
+            let Ok(need) = Self::try_reserve_for_qty_cfg(margin_configs.get(&market_id), bound, res_qty) else {
+                continue;
+            };
+            let extra = need - p.margin_reserved;
+            if extra <= FixedPoint::ZERO {
+                continue;
+            }
+            let Ok(mut bal) = bal_cache.load(positions, &p.sender) else { continue };
+            let pos_net = pool_of.get(&p.sender).map_or(FixedPoint::ZERO, |v| v.1);
+            let excess = excess_by_sender.get(&p.sender).copied().unwrap_or(FixedPoint::ZERO);
+            if bal.available + pos_net - excess < extra {
+                continue;
+            }
+            bal.available -= extra;
+            bal.order_margin += extra;
+            bal_cache.set(&p.sender, bal);
+            p.margin_reserved += extra;
+        }
     }
 
     /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of

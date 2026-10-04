@@ -856,8 +856,10 @@ fn non_pool_sell_tier_crossing_at_the_better_bid_is_covered(path: Path) {
 per_path!(non_pool_sell_tier_crossing_at_the_better_bid_is_covered);
 
 /// Option B §7.2 #7 (review 4 F-1 shapes, not gameable): bids placed
-/// EARLIER IN THE BATCH never move a non-pool sell's reservation — only the
-/// start-of-batch best bid does. M bids 10 @101 in m2; T (61) = [pool order
+/// EARLIER IN THE BATCH never move a non-pool sell's placement-checked
+/// reservation — only the start-of-batch best bid does (the same-batch bound
+/// below is a top-up after Phase 2, never a gate; m2 has no ask here, so it
+/// adds nothing). M bids 10 @101 in m2; T (61) = [pool order
 /// (10), <X's high bid>, sell 10 @100 in m2]. reserve(101, 10) = 50.5 <= 51
 /// is admitted and fills 10 @101; a bound at X's 120 (60 > 51) would reject
 /// it. X's bid is: unfunded (rejected), IOC (nothing to hit, cancelled),
@@ -896,6 +898,167 @@ fn in_batch_high_bid_does_not_move_a_non_pool_sell_reservation(path: Path) {
     }
 }
 per_path!(in_batch_high_bid_does_not_move_a_non_pool_sell_reservation);
+
+// ---- Same-batch bid bound (s87, owner decision 1) ----
+// After Phase 2, a non-pool sell is topped up from its sender's free margin
+// left after the whole Phase-2 fold (what would otherwise go to its D2 pool)
+// to cover the highest bid placed EARLIER IN THE SAME BATCH that can rest:
+// accepted in Phase 2 (funded), a GTC / PostOnly limit, not reduce-only, on
+// the tick, at least a lot, capped at the market's start-of-batch best ask
+// (no ask: nothing counts). All or nothing; never a placement gate.
+
+/// One `#[test]` per batch path (Batch, Parallel) — shapes where the single
+/// path's account budget differs by design.
+macro_rules! batch_paths {
+    ($case:ident) => {
+        mod $case {
+            use super::*;
+            #[test]
+            fn batch() {
+                super::$case(Path::Batch)
+            }
+            #[test]
+            fn parallel() {
+                super::$case(Path::Parallel)
+            }
+        }
+    };
+}
+
+/// Same-batch bound (bench repro): M bids 10 @101 and asks 10 @110 in m2;
+/// B's funded GTC bid 10 @105 sorts before T's non-pool sell 10 @100. B
+/// reserved the sell at 101 (50.5); its first fill @105 needs 52.5 → 0
+/// fills, Cancelled. Now it is topped up to reserve(105, 10) = 52.5 from
+/// T's free margin and fills 10 @105, like the single path.
+fn non_pool_sell_fills_at_a_funded_same_batch_bid(path: Path) {
+    let (mk, t, b) = (addr(1), addr(2), addr(4));
+    let (_d, mut ctx) = fresh(path, &[mk, t, b]);
+    let metrics = metered(&mut ctx);
+    run(&mut ctx, path, &[place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 110, 10))]);
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(b, limit(2, true, 105, 10)), place(t, limit(2, false, 100, 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), -fp(10), "{path:?}");
+    assert_eq!(pos_in(&ctx, &b, 2), fp(10), "{path:?}: filled at B's bid");
+    assert_eq!(resting_in(&ctx, &mk, 2), vec![fp(10), fp(10)], "{path:?}: M untouched");
+    assert_bal(&ctx, &t, fp(990), fp(10), &format!("{path:?}: top-up released"));
+    assert_bal(&ctx, &b, fp(FUNDING), FixedPoint::ZERO, &format!("{path:?}"));
+    assert_eq!(metrics.orders_rejected_cancelled.get(), 0, "{path:?}");
+}
+per_path!(non_pool_sell_fills_at_a_funded_same_batch_bid);
+
+/// Same-batch bound, cap: M bids 10 @101 in m1 and m2 and asks 10 @102 in
+/// m2; T (102) = [sell 10 @100 in m1 (pool; reserves 50, needs 50.5 at
+/// 101), X's funded bid 1 @104 in m2 (crosses the ask: fills 1 @102, never
+/// rests), sell 10 @100 in m2 (B: 50.5)]. The bound is capped at the ask:
+/// top-up reserve(102, 10) − 50.5 = 0.5 leaves the pool 1 and both sells
+/// fill 10 @101. Uncapped (104: top-up 1.5) the pool would be 0 and the m1
+/// sell would fill nothing.
+fn same_batch_bid_counts_only_up_to_the_start_best_ask(path: Path) {
+    let (mk, t, x) = (addr(1), addr(2), addr(5));
+    let (_d, mut ctx) = fresh(path, &[mk, x]);
+    run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 102, 10))]);
+    fund_native(&ctx, &t, fp(102));
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(x, limit(2, true, 104, 1)), place(t, limit(2, false, 100, 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{path:?}");
+    assert_eq!(pos_in(&ctx, &x, 2), fp(1), "{path:?}: X lifted the ask");
+    assert_bal(&ctx, &t, fp(102), FixedPoint::ZERO, &format!("{path:?}"));
+}
+per_path!(same_batch_bid_counts_only_up_to_the_start_best_ask);
+
+/// Same-batch bound, no ask at the start of the batch: nothing counts. M
+/// bids 10 @101 in m1 and m2 (no asks); T (101) = [sell 10 @100 in m1
+/// (pool), X's funded bid 1 @102 in m2 (rests), sell 10 @100 in m2]. No
+/// top-up: the pool keeps 0.5 and m1 fills 10; the m2 sell (budget 50.5)
+/// fills 1 @102 and 8 @101 (IM(102 + 101 q + 100 (9 − q)) <= 50.5) and the
+/// last 1 is cancelled. Counted, the top-up 0.5 would empty the pool (m1:
+/// 0 fills). Batch paths only: the single path's budget is the account.
+fn same_batch_bid_does_not_count_without_a_start_ask(path: Path) {
+    let (mk, t, x) = (addr(1), addr(2), addr(5));
+    let (_d, mut ctx) = fresh(path, &[mk, x]);
+    run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10))]);
+    fund_native(&ctx, &t, fp(101));
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10)), place(x, limit(2, true, 102, 1)), place(t, limit(2, false, 100, 10))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(9)), "{path:?}");
+    assert_bal(&ctx, &t, fp(101), FixedPoint::ZERO, &format!("{path:?}"));
+}
+batch_paths!(same_batch_bid_does_not_count_without_a_start_ask);
+
+/// Same-batch bound vs review 4 F-1 (not gameable): bids that cannot rest
+/// funded at their price never top up a non-pool sell. M bids 10 @101 in
+/// m1 and m2 and asks 10 @130 in m2; T (110.40) = [sell 10 @100 in m1
+/// (pool), <X's bid @120>, sell 10 @100 in m2]. Counted, the top-up
+/// reserve(120, 10) − 50.5 = 9.5 <= free 9.9 would leave the pool 0.4 and
+/// the m1 sell would fill 8 (IM(1,000 + q) <= 50.4); not counted, both fill
+/// 10 @101 on every path. X's bid: unfunded, IOC, FOK, market (cap 120),
+/// off-tick, dust (< lot), reduce-only, stop-limit, or [deep low bid 100 @1,
+/// 1 @120] with margin for the first only.
+fn in_batch_griefer_bids_do_not_top_up_a_non_pool_sell(path: Path) {
+    for shape in ["unfunded", "ioc", "fok", "market", "off_tick", "dust", "reduce_only", "stop_limit", "deep_low_then_high"] {
+        let (mk, t, x) = (addr(1), addr(2), addr(5));
+        let (_d, mut ctx) = fresh(path, &[mk]);
+        run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10)), place(mk, limit(2, true, 101, 10)), place(mk, limit(2, false, 130, 10))]);
+        fund_native(&ctx, &t, fp_cents(11_040));
+        if shape != "unfunded" {
+            fund_native(&ctx, &x, fp(if shape == "deep_low_then_high" { 10 } else { FUNDING }));
+        }
+        let high = limit(2, true, 120, 10);
+        let mut actions = vec![place(t, limit(1, false, 100, 10))];
+        match shape {
+            "unfunded" => actions.push(place(x, high)),
+            "ioc" => actions.push(place(x, with_tif(high, TimeInForce::IOC))),
+            "fok" => actions.push(place(x, with_tif(high, TimeInForce::FOK))),
+            "market" => actions.push(place(x, market(2, true, fp(120), 10))),
+            "off_tick" => actions.push(place(x, PlaceOrderParams { price: fp_cents(12_050), ..high })),
+            "dust" => actions.push(place(x, PlaceOrderParams { quantity: fp_cents(50), ..high })),
+            "reduce_only" => actions.push(place(x, PlaceOrderParams { reduce_only: true, ..high })),
+            "stop_limit" => actions.push(place(
+                x,
+                PlaceOrderParams { order_type: OrderType::StopLimit { trigger: fp(125), limit: fp(120) }, ..high },
+            )),
+            _ => {
+                actions.push(place(x, limit(2, true, 1, 100)));
+                actions.push(place(x, limit(2, true, 120, 1)));
+            }
+        }
+        actions.push(place(t, limit(2, false, 100, 10)));
+        let r = run(&mut ctx, path, &actions);
+        let what = format!("{path:?} {shape}");
+        assert!(r[0].success && r.last().unwrap().success, "{what}: {r:?}");
+        assert_eq!((pos_in(&ctx, &t, 1), pos_in(&ctx, &t, 2)), (-fp(10), -fp(10)), "{what}");
+        assert_eq!(pos_in(&ctx, &x, 2), FixedPoint::ZERO, "{what}");
+        assert_bal(&ctx, &t, fp_cents(11_040), FixedPoint::ZERO, &what);
+    }
+}
+per_path!(in_batch_griefer_bids_do_not_top_up_a_non_pool_sell);
+
+/// Same-batch bound, soft: the top-up is never a placement gate and takes
+/// only free margin left after the sender's whole Phase-2 fold, all or
+/// nothing. M bids 10 @101 in m2 and m3 and asks 10 @130 in m2; B's funded
+/// bid 10 @105 in m2; T = [pool order (10), sell 10 @100 in m2, sell 10
+/// @100 in m3] (each 50.5 at the start bid). T 112 (free 1 < top-up 2): no
+/// top-up — nothing rejected, m3 fills 10, the m2 sell (budget 50.5) fills
+/// 2 @105 (IM(105 q + 100 (10 − q)) <= 50.5) and the rest is cancelled, as
+/// before the bound. T 114 (free 3): topped up, m2 fills 10 @105.
+fn same_batch_top_up_is_soft_and_all_or_nothing(path: Path) {
+    for (funded, m2) in [(112, -fp(2)), (114, -fp(10))] {
+        let (mk, t, b) = (addr(1), addr(2), addr(4));
+        let (_d, mut ctx) = fresh(path, &[mk, b]);
+        run(&mut ctx, path, &[place(mk, limit(2, true, 101, 10)), place(mk, limit(3, true, 101, 10)), place(mk, limit(2, false, 130, 10))]);
+        fund_native(&ctx, &t, fp(funded));
+        let r = run(
+            &mut ctx,
+            path,
+            &[place(t, pool_order()), place(b, limit(2, true, 105, 10)), place(t, limit(2, false, 100, 10)), place(t, limit(3, false, 100, 10))],
+        );
+        let what = format!("{path:?} T={funded}");
+        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert_eq!((pos_in(&ctx, &t, 2), pos_in(&ctx, &t, 3)), (m2, -fp(10)), "{what}");
+        assert_bal(&ctx, &t, fp(funded - 10), fp(10), &what);
+    }
+}
+batch_paths!(same_batch_top_up_is_soft_and_all_or_nothing);
 
 /// Option B, unchanged: buys of a multi-market sender in non-pool markets
 /// (GTC, IOC, FOK limit buys @105 and a market buy cap 110 at mark 100, all

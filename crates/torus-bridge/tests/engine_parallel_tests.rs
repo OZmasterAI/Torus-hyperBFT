@@ -1481,3 +1481,77 @@ fn option_b_shapes_identical() {
         }
     }
 }
+
+/// Same-batch bid bound (s87): non-pool sells topped up for a funded bid
+/// placed earlier in the batch (bench shape), capped at the start best ask
+/// (a crossing bid), not counted for griefer bids (unfunded, IOC, off-tick)
+/// and all-or-nothing for a tight sender — byte-identical for threads
+/// {off, 2, 4, 8}.
+#[test]
+fn same_batch_bid_shapes_identical() {
+    let mk = addr(51);
+    let (t1, t2, t3, t4, b, x, y) = (addr(52), addr(53), addr(54), addr(55), addr(56), addr(57), addr(58));
+    let mut b1: Vec<_> = [1u64, 2, 3, 4, 5, 7, 9].iter().map(|&m| place(mk, gtc(m, true, 101, 10))).collect();
+    b1.extend([(2u64, 110), (4, 102), (5, 130), (7, 130)].map(|(m, p)| place(mk, gtc(m, false, p, 10))));
+    let b2 = vec![
+        place(t1, gtc(1, false, 200, 1)), // t1's pool (rests)
+        place(b, gtc(2, true, 105, 10)),  // funded, rests below the ask 110
+        place(t2, gtc(3, false, 100, 10)), // t2's pool: fills @101 from the pool
+        place(y, gtc(5, true, 120, 10)),  // unfunded: rejected
+        place(t1, gtc(2, false, 100, 10)), // topped up: fills 10 @105
+        place(x, gtc(4, true, 104, 1)),   // crosses the ask 102: capped
+        place(x, order(5, true, fp(120), fp(10), TimeInForce::IOC)),
+        place(x, order(5, true, FixedPoint::from_raw(fp(120).raw() + 1), fp(10), TimeInForce::GTC)), // off-tick
+        place(t2, gtc(4, false, 100, 10)), // cap: top-up 0.5, both t2 sells fill
+        place(t3, gtc(6, false, 200, 1)), // t3's pool (rests)
+        place(t3, gtc(5, false, 100, 10)), // griefers: no top-up, fills @101
+        place(t4, gtc(8, false, 200, 1)), // t4's pool (rests)
+        place(b, gtc(7, true, 105, 10)),
+        place(t4, gtc(7, false, 100, 10)), // tight: no top-up, fills 2 @105
+        place(t4, gtc(9, false, 100, 10)),
+    ];
+    let run = |threads: usize| -> (RunFingerprint, Vec<FixedPoint>) {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        fund_native(&ctx, &mk, fp(1_000_000));
+        for (t, a) in [(t1, 1_000), (t2, 102), (t3, 1_000), (t4, 112), (b, 1_000), (x, 1_000)] {
+            fund_native(&ctx, &t, fp(a));
+        }
+        let mut results = Vec::new();
+        let mut total_gas = Vec::new();
+        for batch in [b1.clone(), b2.clone()] {
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
+            assert!(ctx.fatal_error.is_none());
+            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            total_gas.push(r.total_gas);
+        }
+        let pos = |t: &Address, m: MarketId| match ctx.positions.get_position(t, m).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        };
+        let positions =
+            vec![pos(&t1, 2), pos(&b, 2), pos(&t2, 3), pos(&t2, 4), pos(&x, 4), pos(&t3, 5), pos(&t4, 7), pos(&t4, 9)];
+        ctx.save_order_books();
+        let fp_run = RunFingerprint {
+            cf_dump: state_dump(&ctx),
+            results,
+            total_gas,
+            trade_index: ctx.trade_index,
+            next_global_order_id: ctx.next_global_order_id,
+            state_root: compute_native_state_root(&ctx.state).expect("state root"),
+        };
+        (fp_run, positions)
+    };
+    let (golden, positions) = run(0);
+    assert_eq!(
+        positions,
+        vec![-fp(10), fp(10), -fp(10), -fp(10), fp(1), -fp(10), -fp(2), -fp(10)],
+        "same-batch bound shapes"
+    );
+    for threads in [2usize, 4, 8] {
+        for _ in 0..5 {
+            assert_eq!(golden, run(threads).0, "threads={threads}");
+        }
+    }
+}

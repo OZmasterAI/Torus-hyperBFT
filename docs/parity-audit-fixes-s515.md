@@ -124,8 +124,14 @@ and block-timestamp rows are on `feat/oracle-aggregation` (stacked on it, s517).
     reserves — and is placement-checked — at max(its limit or mark-or-cap, the
     market's best bid at the start of Phase 2); its resting row and every
     release stay at the limit. A taker-only budget gets the makers' +1 raw
-    rounding allowance (B2). Bids placed earlier in the same batch above the
-    start best bid are still not covered (residual, item D).
+    rounding allowance (B2). Same-batch bid bound (s87): after Phase 2 such a
+    sell is topped up, from the free margin left after its sender's whole
+    Phase-2 fold (all or nothing, never a placement gate), to cover the
+    highest bid placed earlier in the same batch in its market that can rest
+    (accepted, GTC / PostOnly limit, not reduce-only, on the tick, >= lot),
+    capped at the market's start-of-batch best ask (no ask: nothing counts).
+    A top-up moves at most the IM of q × (best ask − start best bid) from the
+    sender's pool to that sell for the batch; it is released after matching.
   * D3 — withdrawals do not count resting orders' reservations as collateral
     (stricter than HL).
   * D4 — a resting closing quantity is free at match but still reserved at

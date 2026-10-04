@@ -16460,6 +16460,51 @@ mod crash_recovery_tests {
         assert_eq!(root_s, root_r);
     }
 
+    /// Same-batch bid bound: T (71) 1,000, B (74) 1,000, M (73) rich.
+    fn same_batch_bid_fixture() -> (ChainConfig, StateDb) {
+        let (config, db) = option_b_fixture();
+        let pm = torus_core::position::PositionManager::new(db.clone());
+        for seed in [71u8, 74] {
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &torus_core::position::NativeBalance { available: px(1_000), order_margin: FixedPoint::ZERO },
+            )
+            .unwrap();
+        }
+        (config, db)
+    }
+
+    /// Same-batch bid bound (s87): block 1: M bids 10 @101 in markets 1 and 2
+    /// and asks 10 @110 in market 2; block 5: B bids 10 @105 in market 2,
+    /// then T sells 10 @100 in both — the market-2 sell (non-pool) is topped
+    /// up for B's earlier bid and fills 10 @105. Serial, pipelined (parked)
+    /// and crash replay give identical state.
+    #[test]
+    fn same_batch_bid_serial_pipelined_and_replay_are_identical() {
+        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10), (2, false, 110, 10)])]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
+        rounds.push(vec![
+            signed_limits(74, 5_074, &[(2, true, 105, 10)]),
+            signed_limits(71, 5_071, &[(1, false, 100, 10), (2, false, 100, 10)]),
+        ]); // 5
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
+        let blocks = liq_blocks(rounds);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, same_batch_bid_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, same_batch_bid_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, same_batch_bid_fixture);
+        let pm = torus_core::position::PositionManager::new(db_s.clone());
+        for m in [1u64, 2] {
+            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!((p.is_long, p.size), (false, px(10)), "market {m}: T filled");
+        }
+        let b = pm.get_position(&oracle_addr(74), 2).unwrap().expect("B long");
+        assert_eq!((b.is_long, b.size), (true, px(10)), "B's same-batch bid filled");
+        assert_dumps_equal(&serial, &piped, "same-batch bid: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "same-batch bid: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
     fn signed_stop_limit_buy(seed: u8, nonce: u64, trigger: i64, limit: i64, qty: i64) -> SignedNativeAction {
         torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(torus_types::PlaceOrderParams {

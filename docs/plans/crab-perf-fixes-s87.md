@@ -18,7 +18,17 @@ re-pinned (accepted 1555 → 1686, rejected_cancelled 299 → 188, rejected_marg
 GOLDEN_B unchanged. ubench_econ: rejected_cancelled ~17.5k → ~5.6k per run, fills/block 6.2k →
 9.9k, ms/1k fills ~37-41 → ~29-30 (UB_MARKS=1 ~59-69 → ~42-46). Every remaining zero-fill
 exhaustion hits a bid placed earlier in the same batch above the start best bid (probe; 25-28% of
-the pre-B 17.5k). The same-batch bound is NOT implemented; it needs owner approval.
+the pre-B 17.5k).
+
+Status (same-batch bid bound, s87, owner decision 1): IMPLEMENTED as C6. After Phase 2 a
+non-pool sell is topped up, all or nothing, from its sender's free margin left after the whole
+Phase-2 fold (never a placement gate), to cover the highest earlier bid of the batch in its market
+that can rest (accepted, GTC / PostOnly limit, not reduce-only, on tick, >= lot), capped at the
+start-of-batch best ask (no ask: none counts). Review 4 F-1 shapes cannot count. GOLDEN_A
+re-pinned (accepted 1686 → 1712, rejected_cancelled 188 → 175, rejected_margin 2079 → 2077,
+positions 242 → 243), GOLDEN_B unchanged. ubench_econ: rejected_cancelled 5.35-5.85k → 1.56-1.83k
+per run, fills/block 9.9k → 10.9k. Every remaining cancel is due to the ask cap: a crossing bid that
+rests above the start best ask (uncapped probe: 0). The ≤ 1% target is not met (~1.8% of accepted).
 
 ## Design decision
 
