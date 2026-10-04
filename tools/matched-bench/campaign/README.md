@@ -149,7 +149,7 @@ Check the warm-up's `summary.json` (agreement AGREE, liveness PASS) before going
 $T/start-rounds.sh "$C"
 ```
 
-Refuses if `warmup.done` is missing or `campaign.done` exists. A 300 s cell takes
+Refuses if `warmup.done` is missing or `campaign.done` exists. For a one-off smoke cell without a warm-up (ORDER has no `r0` item), run `NO_WARMUP=1 start-rounds.sh "$C"`: same launcher, quiet checks and done marker, only the warm-up check is skipped. Do not use it for a scored A/B campaign. A 300 s cell takes
 about 12.6 min plus quiet-host waits. Watch `$C/progress.tsv` (one row per cell:
 exit, accepted, matched_s_avg, agreement, liveness), `$C/campaign.log`,
 `$C/quiet-checks.log`. Done when `$C/campaign.done` exists (`CAMPAIGN DONE` or
