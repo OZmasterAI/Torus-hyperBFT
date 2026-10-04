@@ -9,6 +9,8 @@ torus-types = { workspace = true }
 torus-state = { workspace = true }
 # s517 oracle feeder: oracle-submission admission reads validator records.
 torus-economics = { workspace = true }
+# Item A (funded-account check): PositionManager / lockbox accessors.
+torus-core = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-eips = { workspace = true }

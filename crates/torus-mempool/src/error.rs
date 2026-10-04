@@ -40,6 +40,10 @@ pub enum MempoolError {
     NativeSenderQueueFull { sender: Address },
     /// FIX EVM-FIND-05: Native action validation failed (chain ID, nonce freshness, signature).
     NativeValidationFailed(String),
+    /// Anti-spam item A: the sender (session owner for session actions) holds
+    /// less than the node's `TORUS_INGRESS_MIN_COLLATERAL` TRS. Not retryable
+    /// until the account is funded.
+    UnfundedSender { sender: Address, min_trs: u64 },
     /// FIX EVM-FIND-08: Transaction nonce is too far in the future.
     NonceTooFar {
         sender: Address,
@@ -91,6 +95,11 @@ impl fmt::Display for MempoolError {
             Self::NativeValidationFailed(e) => {
                 write!(f, "native action validation failed: {e}")
             }
+            Self::UnfundedSender { sender, min_trs } => write!(
+                f,
+                "account not funded: {sender} holds less than {min_trs} TRS (spot + perp); \
+                 deposit before sending actions"
+            ),
             Self::NonceTooFar { sender, have, max } => {
                 write!(
                     f,

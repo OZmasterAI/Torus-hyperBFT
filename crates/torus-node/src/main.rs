@@ -575,8 +575,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mempool_config = MempoolConfig {
         chain_id: chain_config.chain_id,
         block_gas_limit: chain_config.evm_gas_limit,
+        // Anti-spam item A: ON in the node (default 1 TRS), 0 = off.
+        ingress_min_collateral_trs: torus_mempool::funded::ingress_min_collateral(),
         ..MempoolConfig::default()
     };
+    info!(
+        ingress_min_collateral_trs = mempool_config.ingress_min_collateral_trs,
+        "native ingress anti-spam: funded-account check (TORUS_INGRESS_MIN_COLLATERAL, whole TRS, 0 = off; node-local)"
+    );
+    info!(
+        cancel_block_share_pct = mempool_config.native_cancel_block_share_pct,
+        "native pool: cancels take at most this share of a selected block ahead of orders (TORUS_CANCEL_BLOCK_SHARE_PCT, 100 = old cancel priority; proposer-local)"
+    );
     let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
     // r4: log the effective native block-selection bundle + direct-push floor
     // once at startup so a bench/ops snapshot (`nodeenv-*.txt`, journal) shows
@@ -989,6 +999,55 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     info!(all_market_trades, "all-markets newTrades subscriptions");
     rpc_server.set_all_market_trades(all_market_trades);
+    // Anti-spam item B: per-address native request limit, ON unless
+    // TORUS_ADDR_RATE_LIMIT=0. Counted for every action entering the mempool
+    // (RPC, gossip, forwards), enforced at RPC ingress. In memory, reset on
+    // restart.
+    let (addr_limiter, bad_exempt) = torus_mempool::addr_rate::from_env();
+    for entry in &bad_exempt {
+        warn!(%entry, "TORUS_ADDR_RATE_EXEMPT: not an address, ignored");
+    }
+    match addr_limiter {
+        Some(limiter) => {
+            info!(
+                enabled = true,
+                buffer = limiter.buffer(),
+                exempt = limiter.exempt_count(),
+                "native ingress anti-spam: per-address request limit (TORUS_ADDR_RATE_LIMIT / _BUFFER / _EXEMPT; node-local, in memory)"
+            );
+            mempool.set_addr_rate_limiter(Arc::new(limiter));
+        }
+        None => info!(
+            enabled = false,
+            "native ingress anti-spam: per-address request limit OFF (TORUS_ADDR_RATE_LIMIT=0)"
+        ),
+    }
+    // Anti-spam item D: per-IP weight limit (TORUS_RPC_IP_WEIGHT_PER_MIN,
+    // default 1200, 0 = off; TORUS_RPC_IP_EXEMPT CIDRs, unset = loopback only)
+    // and the per-WebSocket-connection subscription cap.
+    let (ip_limiter, bad_cidrs) = torus_rpc::ip_limit::from_env();
+    for entry in &bad_cidrs {
+        warn!(%entry, "TORUS_RPC_IP_EXEMPT: not an IP or CIDR, ignored");
+    }
+    match ip_limiter {
+        Some(limiter) => {
+            info!(
+                weight_per_min = limiter.weight_per_min(),
+                exempt = ?limiter.exempt(),
+                "rpc anti-spam: per-IP weight limit (TORUS_RPC_IP_WEIGHT_PER_MIN / TORUS_RPC_IP_EXEMPT)"
+            );
+            rpc_server.set_ip_limiter(Arc::new(limiter));
+        }
+        None => info!("rpc anti-spam: per-IP weight limit OFF (TORUS_RPC_IP_WEIGHT_PER_MIN=0)"),
+    }
+    let max_subs_per_conn = torus_rpc::ip_limit::parse_max_subs_per_conn(
+        std::env::var("TORUS_RPC_MAX_SUBS_PER_CONN").ok(),
+    );
+    info!(
+        max_subs_per_conn,
+        "rpc: WebSocket subscriptions per connection (TORUS_RPC_MAX_SUBS_PER_CONN)"
+    );
+    rpc_server.set_max_subscriptions_per_connection(max_subs_per_conn);
 
     // Leader forwarding: RPC → network bridge
     let own_vk = verifying_key.to_bytes();

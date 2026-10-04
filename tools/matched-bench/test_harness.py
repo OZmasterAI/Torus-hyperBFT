@@ -746,6 +746,88 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ]', src)
         self.assertIn("retry_busy='${RETRY_BUSY:-unset}'", src)
 
+    def test_spam_cancel_reaches_the_bench_only_when_set(self):
+        """SPAM_CANCEL_KEYS / SPAM_CANCEL_RATE / SPAM_CANCEL_FUNDED=1 -> bench
+        --spam-cancel-keys / --spam-cancel-rate / --spam-cancel-funded,
+        validated and recorded in the cell log line. Unset = flags omitted,
+        so older bench binaries and prior cells are unchanged."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        for v in ("SPAM_CANCEL_KEYS", "SPAM_CANCEL_RATE", "SPAM_CANCEL_FUNDED"):
+            self.assertIn(f"{v}=${{{v}:-}}", src)
+            self.assertIn(f"{v.lower()}='${{{v}:-unset}}'", src)
+        # Run run-cell.sh's own SPAM_CANCEL lines (defaults, validation, flag
+        # mapping) in bash and look at the resulting bench flags.
+        lines = [l for l in src.splitlines() if "SPAM_CANCEL" in l
+                 and not l.lstrip().startswith(("#", "log "))]
+        snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+
+        def run(**env):
+            base = {k: v for k, v in os.environ.items()
+                    if not k.startswith("SPAM_CANCEL")}
+            return subprocess.run(["bash", "-c", snippet], capture_output=True,
+                                  text=True, env=dict(base, **env))
+
+        r = run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="250.5")
+        self.assertEqual(r.stdout.strip(),
+                         "--spam-cancel-keys 8 --spam-cancel-rate 250.5", r.stderr)
+        r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="100", SPAM_CANCEL_FUNDED="1")
+        self.assertEqual(r.stdout.strip(), "--spam-cancel-keys 8 "
+                         "--spam-cancel-rate 100 --spam-cancel-funded", r.stderr)
+        for bad in ({"SPAM_CANCEL_KEYS": "x"},
+                    {"SPAM_CANCEL_KEYS": "8"},  # no rate
+                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "fast"},
+                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "1",
+                     "SPAM_CANCEL_FUNDED": "yes"}):
+            r = run(**bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+
+    def test_antispam_off_on_devnet_and_switched_on_by_the_harness(self):
+        """Node anti-spam limits (items A, B, D) are OFF on the bench devnet
+        (devnet/wsl/env.sh defaults), ANTISPAM=1 turns them ON for a cell
+        (validated, logged), and EXTRA_ENV can still override any single
+        knob (it is exported after). Item C (cancel block share) is a
+        fairness fix and stays at the node default everywhere."""
+        wsl_env = os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "devnet", "wsl", "env.sh"
+        )
+        with open(wsl_env) as f:
+            env_src = f.read()
+        for knob in (
+            "TORUS_INGRESS_MIN_COLLATERAL",
+            "TORUS_ADDR_RATE_LIMIT",
+            "TORUS_RPC_IP_WEIGHT_PER_MIN",
+        ):
+            self.assertIn(f'export {knob}="${{{knob}:-0}}"', env_src)
+        self.assertNotIn("TORUS_CANCEL_BLOCK_SHARE_PCT=", env_src)
+        r = subprocess.run(
+            ["bash", "-c", f'source "{wsl_env}"; '
+             'echo "$TORUS_INGRESS_MIN_COLLATERAL $TORUS_ADDR_RATE_LIMIT $TORUS_RPC_IP_WEIGHT_PER_MIN"'],
+            capture_output=True, text=True,
+            env={k: v for k, v in os.environ.items() if not k.startswith("TORUS_")},
+        )
+        self.assertEqual(r.stdout.strip(), "0 0 0", r.stderr)
+
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("ANTISPAM=${ANTISPAM:-}", src)
+        self.assertIn('[ -z "$ANTISPAM" ] || [ "$ANTISPAM" = 1 ]', src)
+        self.assertIn("antispam='${ANTISPAM:-unset}'", src)
+        on = src.index('if [ "$ANTISPAM" = 1 ]; then')
+        block = src[on : src.index("fi", on)]
+        for kv in (
+            "TORUS_INGRESS_MIN_COLLATERAL=1",
+            "TORUS_ADDR_RATE_LIMIT=1",
+            "TORUS_RPC_IP_WEIGHT_PER_MIN=1200",
+        ):
+            self.assertIn(kv, block)
+        # exported after the env clean and before EXTRA_ENV
+        self.assertLess(src.index("for v in $(env | grep -oE '^TORUS_"), on)
+        self.assertLess(on, src.index('for kv in $EXTRA_ENV; do export "$kv"; done'))
+
     def test_open_limit_rejects_are_sampled(self):
         """The open-limit funnel counter is in both sampler column sets."""
         with open(RUN_CELL_SH) as f:

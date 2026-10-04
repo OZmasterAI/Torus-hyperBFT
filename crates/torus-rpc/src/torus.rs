@@ -405,7 +405,7 @@ fn ingress_verify_pool() -> &'static rayon::ThreadPool {
 /// `Proceed` payloads are consumed (`mem::take`) when handed to the verify
 /// closure; only the variant tag matters afterwards.
 enum SubmitSlot {
-    /// Pay full verification (normal path; cancels even when the pool is full).
+    /// Pay full verification (normal path; cancels past the admission limit).
     Proceed(String),
     /// Shed before crypto with this per-item error (reason already counted).
     Rejected(String),
@@ -426,6 +426,25 @@ impl RpcState {
             .get_price(mid, header.timestamp)
             .ok()
             .filter(|op| op.usable().is_some())
+    }
+
+    /// Anti-spam item B: refuse `action` when `sender` has used its
+    /// per-address allowance. Runs after verify (the sender is unknown
+    /// before) and before pool admission; a refusal is counted by reason and
+    /// returned as the per-item reply. Charging happens on pool entry (the
+    /// mempool counts every pooled action, whatever its source), so an
+    /// admitted action is counted exactly once.
+    fn check_addr_rate(
+        &self,
+        sender: &alloy_primitives::Address,
+        action: &torus_types::NativeAction,
+    ) -> Result<(), String> {
+        self.mempool
+            .addr_rate_admits(sender, action)
+            .map_err(|refusal| {
+                self.count_admit_reject(refusal.reason());
+                refusal.message(sender)
+            })
     }
 
     /// Count one admission-path rejection under its concrete reason label.
@@ -466,21 +485,23 @@ impl RpcState {
                 .observe(permit_wait_t0.elapsed().as_secs_f64());
         }
 
-        // Sprint 5 (C): when the native pool is already full, normal
-        // actions are doomed at admission — shed them after a decode-only
-        // pass instead of paying signature verification. Priority actions
-        // (cancels; s517: oracle submissions) proceed to full verification
-        // (admission evicts a normal entry to make room; the mempool's oracle
-        // gate then admits only Active validators and their signers).
+        // Sprint 5 (C): when the native pool is already full, every action
+        // but an oracle submission is doomed at admission — shed it after a
+        // decode-only pass instead of paying signature verification.
+        // Anti-spam item C: cancels too, since a full pool no longer lets a
+        // cancel evict an order. s517: oracle submissions proceed to full
+        // verification (admission evicts a normal entry to make room; the
+        // mempool's oracle gate admits only Active validators and signers).
         // s65 item B: the same pre-verify shed when the pool already holds
         // more than the admission limit (recent commit rate x horizon), with a
-        // retryable "busy" instead of "pool full".
-        let shed_msg = if self.mempool.native_pool_is_full() {
-            Some(POOL_FULL_PREVERIFY_MSG)
+        // retryable "busy" instead of "pool full" — there cancels still pass
+        // (the admission limit never sheds cancels).
+        let (shed_msg, cancels_pass) = if self.mempool.native_pool_is_full() {
+            (Some(POOL_FULL_PREVERIFY_MSG), false)
         } else if self.mempool.native_admission_backlogged() {
-            Some(ADMISSION_BUSY_MSG)
+            (Some(ADMISSION_BUSY_MSG), true)
         } else {
-            None
+            (None, true)
         };
         let mut slots: Vec<SubmitSlot> = if let Some(shed_msg) = shed_msg {
             let screened = tokio::task::spawn_blocking(move || {
@@ -491,7 +512,11 @@ impl RpcState {
                             .map_err(|e| format!("invalid hex: {e}"))
                             .and_then(|bytes| decode(&bytes));
                         match decoded {
-                            Ok(action) if torus_mempool::is_priority(&action.action) => {
+                            Ok(action)
+                                if torus_mempool::is_oracle_submission(&action.action)
+                                    || (cancels_pass
+                                        && torus_mempool::is_cancel(&action.action)) =>
+                            {
                                 SubmitSlot::Proceed(signed_action)
                             }
                             Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),
@@ -594,6 +619,12 @@ impl RpcState {
                 };
                 match item {
                     Ok((sender, action, hash)) => {
+                        if let Err(msg) = self.check_addr_rate(&sender, &action.action) {
+                            return RpcSubmitResult {
+                                hash: None,
+                                error: Some(msg),
+                            };
+                        }
                         let insert_t0 = std::time::Instant::now();
                         // B1: the leader-forward now carries the PARSED action
                         // (structured tuple, no JSON re-encode), so keep a copy
@@ -625,6 +656,9 @@ impl RpcState {
                                         ..
                                     } => "sender_queue_full",
                                     torus_mempool::MempoolError::NativePoolFull => "pool_full",
+                                    torus_mempool::MempoolError::UnfundedSender { .. } => {
+                                        "unfunded"
+                                    }
                                     _ => "other",
                                 });
                                 RpcSubmitResult {
@@ -1338,9 +1372,16 @@ impl TorusApiServer for RpcState {
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?
         .map_err(ErrorObjectOwned::from)?;
 
+        self.check_addr_rate(&sender, &action.action)
+            .map_err(|msg| ErrorObjectOwned::from(RpcError::Internal(msg)))?;
         self.mempool
             .add_native_action_presigned(sender, action.clone())
-            .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}"))))?;
+            .map_err(|e| {
+                if matches!(e, torus_mempool::MempoolError::UnfundedSender { .. }) {
+                    self.count_admit_reject("unfunded");
+                }
+                ErrorObjectOwned::from(RpcError::Internal(format!("mempool: {e}")))
+            })?;
 
         // B1: forward the PARSED action (structured tuple, no JSON re-encode).
         if let Some(leader_vk) = self.forward_leader_target() {

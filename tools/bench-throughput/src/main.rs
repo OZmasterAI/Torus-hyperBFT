@@ -205,6 +205,22 @@ enum Command {
         /// the SUT and can melt val0's RPC core. Turn on only for forensics.
         #[arg(long, default_value_t = false)]
         sweep_bodies: bool,
+        /// Cancel-spam load (anti-spam cells): K extra keys sending
+        /// CancelAllOrders (all markets) alongside the normal load, at
+        /// --spam-cancel-rate actions/s in aggregate. Spammers never retry a
+        /// refused action; their sent/accepted/rejected counts are reported
+        /// apart from the load. 0 (default) = off, so prior cells stay
+        /// reproducible.
+        #[arg(long, default_value_t = 0)]
+        spam_cancel_keys: usize,
+        /// Aggregate cancel-spam rate in actions/s across all spam keys
+        /// (required > 0 when --spam-cancel-keys > 0).
+        #[arg(long, default_value_t = 0.0)]
+        spam_cancel_rate: f64,
+        /// Spam from funded genesis accounts (the top K of the bulk-funded
+        /// index range, never a load sender) instead of fresh unfunded keys.
+        #[arg(long, default_value_t = false)]
+        spam_cancel_funded: bool,
     },
     Combined {
         #[arg(
@@ -1903,6 +1919,359 @@ mod busy_retry_tests {
     }
 }
 
+/// Bulk-funded genesis sender indices: testnet/gen-weighted-genesis.sh funds
+/// `BULK_OFFSET` (60) .. 60 + `BULK_COUNT` (100_000) with the `gen-accounts`
+/// derivation (the 3-validator devnet genesis inherits them).
+const FUNDED_BULK_START: usize = 60;
+const FUNDED_BULK_END: usize = 100_060;
+
+/// Where `--spam-cancel-*` keys come from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpamKeys {
+    /// Funded genesis indices `first..first + keys` (the top of the bulk range).
+    Funded { first: usize },
+    /// Fresh keys no genesis funds (deterministic per index, for repeatable cells).
+    Unfunded,
+}
+
+/// The `--spam-cancel-*` plan: `keys` spammers sending CancelAllOrders at
+/// `rate` actions/s in aggregate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpamCancel {
+    keys: usize,
+    rate: f64,
+    source: SpamKeys,
+}
+
+/// Validate the `--spam-cancel-*` flags against the load's sender range.
+/// `Ok(None)` = off (`keys == 0`).
+fn spam_cancel_plan(
+    keys: usize,
+    rate: f64,
+    funded: bool,
+    senders: usize,
+    sender_offset: usize,
+) -> Result<Option<SpamCancel>, String> {
+    if keys == 0 {
+        return Ok(None);
+    }
+    if !(rate.is_finite() && rate > 0.0) {
+        return Err(format!(
+            "--spam-cancel-rate must be > 0 with --spam-cancel-keys {keys} (got {rate})"
+        ));
+    }
+    let source = if funded {
+        let Some(first) = FUNDED_BULK_END
+            .checked_sub(keys)
+            .filter(|f| *f >= FUNDED_BULK_START)
+        else {
+            return Err(format!(
+                "--spam-cancel-funded: {keys} keys exceed the {} funded genesis accounts",
+                FUNDED_BULK_END - FUNDED_BULK_START
+            ));
+        };
+        let load_end = sender_offset.saturating_add(senders);
+        if sender_offset < FUNDED_BULK_END && load_end > first {
+            return Err(format!(
+                "--spam-cancel-funded: spam indices {first}..{FUNDED_BULK_END} overlap the \
+                 load senders {sender_offset}..{load_end}; lower --senders or --spam-cancel-keys"
+            ));
+        }
+        SpamKeys::Funded { first }
+    } else {
+        SpamKeys::Unfunded
+    };
+    Ok(Some(SpamCancel { keys, rate, source }))
+}
+
+impl SpamCancel {
+    fn signing_keys(&self) -> Vec<SigningKey> {
+        match self.source {
+            SpamKeys::Funded { first } => load_sender_keys(self.keys, first)
+                .into_iter()
+                .map(|k| k.signing_key)
+                .collect(),
+            // A seed space disjoint from load_sender_keys (0xBEEF_0000 + idx).
+            SpamKeys::Unfunded => (0..self.keys)
+                .map(|i| {
+                    let mut rng = StdRng::seed_from_u64(0x5BA4_CA9C_0000_0000 + i as u64);
+                    SigningKey::random(&mut rng)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Why the node refused a spam action (bench report buckets).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpamReject {
+    /// Item A: sender below the ingress minimum collateral.
+    Unfunded,
+    /// Item B: per-address request limit.
+    AddrLimited,
+    /// Item D: per-IP weight limit.
+    IpLimited,
+    /// Full pool / admission limit.
+    Busy,
+    Other,
+}
+
+impl SpamReject {
+    const ALL: [SpamReject; 5] = [
+        SpamReject::Unfunded,
+        SpamReject::AddrLimited,
+        SpamReject::IpLimited,
+        SpamReject::Busy,
+        SpamReject::Other,
+    ];
+
+    fn classify(err: &str) -> Self {
+        if err.contains("not funded") {
+            SpamReject::Unfunded
+        } else if err.contains("rate limited: IP") {
+            SpamReject::IpLimited
+        } else if err.contains("rate limited") {
+            SpamReject::AddrLimited
+        } else if is_busy_reject(err) || err.contains("pool full") {
+            SpamReject::Busy
+        } else {
+            SpamReject::Other
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SpamReject::Unfunded => "unfunded",
+            SpamReject::AddrLimited => "addr_rate_limited",
+            SpamReject::IpLimited => "ip_rate_limited",
+            SpamReject::Busy => "busy",
+            SpamReject::Other => "other",
+        }
+    }
+}
+
+/// Spam counters, kept apart from the load's.
+#[derive(Default)]
+struct SpamStats {
+    sent: AtomicU64,
+    accepted: AtomicU64,
+    /// Indexed like [`SpamReject::ALL`].
+    rejected: [AtomicU64; 5],
+}
+
+/// Run the spammers until `deadline`: each of the `plan.keys` keys sends one
+/// signed CancelAllOrders (all markets) every `keys / rate` seconds to its
+/// own RPC endpoint (round robin), one request in flight per key, and never
+/// retries a refused action.
+fn spawn_spam_cancel(
+    plan: SpamCancel,
+    client: reqwest::Client,
+    urls: Arc<Vec<String>>,
+    deadline: Instant,
+    stats: Arc<SpamStats>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let interval = Duration::from_secs_f64(plan.keys as f64 / plan.rate);
+    plan.signing_keys()
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let (client, urls, stats) = (client.clone(), urls.clone(), stats.clone());
+            tokio::spawn(async move {
+                let url = &urls[i % urls.len()];
+                // Spread the spammers over one interval.
+                tokio::time::sleep(interval.mul_f64(i as f64 / plan.keys as f64)).await;
+                let mut next = Instant::now();
+                let mut last_nonce = 0u64;
+                let mut req_id = 0xC0DE_0000_0000u64 + (i as u64) * 1_000_000;
+                while next < deadline {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    last_nonce = now_ms.max(last_nonce + 1);
+                    let signed = sign_native_action(
+                        NativeAction::CancelAllOrders { market_id: None },
+                        last_nonce,
+                        &key,
+                    );
+                    let payload =
+                        format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+                    req_id += 1;
+                    stats.sent.fetch_add(1, Ordering::Relaxed);
+                    match submit_native_action(&client, url, &payload, req_id).await {
+                        Ok(()) => {
+                            stats.accepted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let kind = SpamReject::classify(&e);
+                            let slot = SpamReject::ALL.iter().position(|k| *k == kind).unwrap();
+                            stats.rejected[slot].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    next += interval;
+                    tokio::time::sleep_until(next.max(Instant::now()).into()).await;
+                }
+            })
+        })
+        .collect()
+}
+
+/// One report line, apart from the load's numbers.
+fn spam_report(plan: &SpamCancel, stats: &SpamStats) -> String {
+    let rejected: Vec<u64> = stats
+        .rejected
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
+    let by_reason: Vec<String> = SpamReject::ALL
+        .iter()
+        .zip(&rejected)
+        .map(|(k, n)| format!("{}={n}", k.label()))
+        .collect();
+    format!(
+        "Spam cancel-all ({} {} keys, {} actions/s): sent {} accepted {} rejected {} ({})",
+        plan.keys,
+        match plan.source {
+            SpamKeys::Funded { .. } => "funded",
+            SpamKeys::Unfunded => "unfunded",
+        },
+        plan.rate,
+        stats.sent.load(Ordering::Relaxed),
+        stats.accepted.load(Ordering::Relaxed),
+        rejected.iter().sum::<u64>(),
+        by_reason.join(" ")
+    )
+}
+
+#[cfg(test)]
+mod spam_cancel_tests {
+    use super::*;
+
+    fn addr(k: &SigningKey) -> Address {
+        let p = k.verifying_key().to_encoded_point(false);
+        Address::from_slice(&alloy_primitives::keccak256(&p.as_bytes()[1..])[12..])
+    }
+
+    fn consensus_flags(extra: &[&str]) -> (usize, f64, bool) {
+        let cli = Cli::try_parse_from(
+            ["bench-throughput", "consensus"]
+                .iter()
+                .chain(extra)
+                .copied(),
+        )
+        .expect("parses");
+        let Command::Consensus {
+            spam_cancel_keys,
+            spam_cancel_rate,
+            spam_cancel_funded,
+            ..
+        } = cli.command
+        else {
+            panic!("consensus subcommand")
+        };
+        (spam_cancel_keys, spam_cancel_rate, spam_cancel_funded)
+    }
+
+    #[test]
+    fn spam_cancel_flags_default_off_and_parse() {
+        assert_eq!(consensus_flags(&[]), (0, 0.0, false));
+        assert_eq!(
+            consensus_flags(&[
+                "--spam-cancel-keys",
+                "8",
+                "--spam-cancel-rate",
+                "250.5",
+                "--spam-cancel-funded"
+            ]),
+            (8, 250.5, true)
+        );
+        assert_eq!(spam_cancel_plan(0, 0.0, false, 5000, 60), Ok(None));
+        assert_eq!(spam_cancel_plan(0, 99.0, true, 5000, 60), Ok(None));
+    }
+
+    #[test]
+    fn spam_cancel_needs_a_positive_rate() {
+        assert!(spam_cancel_plan(4, 0.0, false, 5000, 60).is_err());
+        assert!(spam_cancel_plan(4, -1.0, false, 5000, 60).is_err());
+        assert!(spam_cancel_plan(4, f64::NAN, false, 5000, 60).is_err());
+    }
+
+    #[test]
+    fn funded_spam_keys_are_the_top_of_the_funded_range_and_not_load_senders() {
+        // gen-weighted-genesis.sh funds indices 60..100_060; the load senders
+        // use --sender-offset 60 --senders N, so the spammers take the top K.
+        let plan = spam_cancel_plan(3, 30.0, true, 5000, 60).unwrap().unwrap();
+        assert_eq!(plan.keys, 3);
+        assert_eq!(plan.source, SpamKeys::Funded { first: 100_057 });
+        let want: Vec<Address> = load_sender_keys(3, 100_057)
+            .iter()
+            .map(|k| addr(&k.signing_key))
+            .collect();
+        let got: Vec<Address> = plan.signing_keys().iter().map(addr).collect();
+        assert_eq!(got, want, "same derivation as gen-accounts (funded)");
+        // Load senders 60..60+N must not reach the spam range.
+        assert!(spam_cancel_plan(10, 1.0, true, 99_990, 60).is_ok());
+        assert!(spam_cancel_plan(10, 1.0, true, 99_991, 60).is_err());
+        // Senders above the funded range do not collide either.
+        assert!(spam_cancel_plan(10, 1.0, true, 100, 100_060).is_ok());
+        // More keys than funded accounts.
+        assert!(spam_cancel_plan(100_001, 1.0, true, 0, 0).is_err());
+    }
+
+    #[test]
+    fn unfunded_spam_keys_are_fresh_deterministic_and_distinct() {
+        let plan = spam_cancel_plan(16, 30.0, false, 5000, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.source, SpamKeys::Unfunded);
+        let a: Vec<Address> = plan.signing_keys().iter().map(addr).collect();
+        let b: Vec<Address> = plan.signing_keys().iter().map(addr).collect();
+        assert_eq!(a, b, "deterministic per run");
+        let uniq: std::collections::HashSet<_> = a.iter().collect();
+        assert_eq!(uniq.len(), 16);
+        // Never a bench sender key (hardhat 0..20 or the funded bulk range).
+        let bench: std::collections::HashSet<Address> = load_sender_keys(2_000, 0)
+            .iter()
+            .map(|k| addr(&k.signing_key))
+            .collect();
+        assert!(a.iter().all(|x| !bench.contains(x)));
+    }
+
+    #[test]
+    fn spam_report_is_one_line_apart_from_the_load() {
+        let plan = spam_cancel_plan(2, 10.0, false, 5000, 60).unwrap().unwrap();
+        let stats = SpamStats::default();
+        stats.sent.store(7, Ordering::Relaxed);
+        stats.accepted.store(3, Ordering::Relaxed);
+        stats.rejected[0].store(4, Ordering::Relaxed);
+        assert_eq!(
+            spam_report(&plan, &stats),
+            "Spam cancel-all (2 unfunded keys, 10 actions/s): sent 7 accepted 3 rejected 4 \
+             (unfunded=4 addr_rate_limited=0 ip_rate_limited=0 busy=0 other=0)"
+        );
+    }
+
+    #[test]
+    fn spam_rejects_are_classified() {
+        let r = |e: &str| SpamReject::classify(e);
+        assert_eq!(
+            r("rpc: mempool: account not funded: 0xab holds less than 1 TRS"),
+            SpamReject::Unfunded
+        );
+        assert_eq!(
+            r("rpc: rate limited: 0xab used 10 of 10 cancel requests"),
+            SpamReject::AddrLimited
+        );
+        assert_eq!(
+            r("rpc: rate limited: IP request weight over 1200/min, retry later"),
+            SpamReject::IpLimited
+        );
+        assert_eq!(r("rpc: mempool: pool full (pre-verify)"), SpamReject::Busy);
+        assert_eq!(r("rpc: mempool: native pool full"), SpamReject::Busy);
+        assert_eq!(r("http: connection refused"), SpamReject::Other);
+    }
+}
+
 async fn submit_native_action(
     client: &reqwest::Client,
     url: &str,
@@ -2485,6 +2854,7 @@ async fn run_consensus(
     rate_total: f64,
     metrics_urls_str: &str,
     sweep_bodies: bool,
+    spam: Option<SpamCancel>,
 ) {
     // Locality plan: 0 = today's uniform draw over 1..=markets (default).
     let plan = MarketPlan::new(markets, markets_per_sender);
@@ -2550,6 +2920,12 @@ async fn run_consensus(
     );
     println!("Duration: {duration_secs}s");
     println!("Senders: {num_senders} (offset {sender_offset})");
+    if let Some(p) = &spam {
+        println!(
+            "Cancel spam: {} {:?} keys, {} actions/s aggregate, no retry",
+            p.keys, p.source, p.rate
+        );
+    }
     println!("Batch size: {orders_per_action} order(s)/action");
     println!("Submit batch: {submit_batch} action(s)/RPC call");
     println!("RPC endpoints: {}", rpc_urls.len());
@@ -2910,6 +3286,18 @@ async fn run_consensus(
         }
     });
 
+    // Cancel spammers (--spam-cancel-keys), counted apart from the load.
+    let spam_stats = Arc::new(SpamStats::default());
+    let spam_handles = spam.map_or_else(Vec::new, |p| {
+        spawn_spam_cancel(
+            p,
+            (*client).clone(),
+            rpc_urls.clone(),
+            deadline,
+            spam_stats.clone(),
+        )
+    });
+
     // Sender tasks
     let mut sender_handles = Vec::new();
 
@@ -3166,7 +3554,7 @@ async fn run_consensus(
         }));
     }
 
-    for h in sender_handles {
+    for h in sender_handles.into_iter().chain(spam_handles) {
         let _ = h.await;
     }
 
@@ -3336,6 +3724,9 @@ async fn run_consensus(
         format_num(final_submitted),
         submit_rate,
     );
+    if let Some(p) = &spam {
+        println!("{}", spam_report(p, &spam_stats));
+    }
 
     // Debug: full body-sweep accounting, only when --sweep-bodies re-fetched it.
     if let Some(summary) = &sweep_summary {
@@ -3561,6 +3952,9 @@ async fn main() {
             rate_total,
             metrics_urls,
             sweep_bodies,
+            spam_cancel_keys,
+            spam_cancel_rate,
+            spam_cancel_funded,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -3575,6 +3969,19 @@ async fn main() {
                 "session" => SignMode::Session,
                 other => {
                     eprintln!("unknown --sign-mode {other:?} (expected \"eip712\" or \"session\")");
+                    std::process::exit(2);
+                }
+            };
+            let spam = match spam_cancel_plan(
+                spam_cancel_keys,
+                spam_cancel_rate,
+                spam_cancel_funded,
+                senders.max(1),
+                sender_offset,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
                     std::process::exit(2);
                 }
             };
@@ -3601,6 +4008,7 @@ async fn main() {
                 rate_total,
                 &metrics_urls,
                 sweep_bodies,
+                spam,
             )
             .await
         }

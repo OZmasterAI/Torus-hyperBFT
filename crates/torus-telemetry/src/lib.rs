@@ -137,8 +137,15 @@ pub struct Metrics {
     pub rpc_submit_admit_forward_seconds: Histogram,
     /// Batch-submit items rejected at admission, labeled by concrete reason
     /// (duplicate / sender_queue_full / pool_full / rate_limited /
-    /// verify_failed / other) — shows WHICH limit fires under saturation.
+    /// verify_failed / unfunded / other) — shows WHICH limit fires under
+    /// saturation.
     pub rpc_submit_admit_rejects: Family<Vec<(String, String)>, Counter>,
+    /// Native actions refused at gossip/forward admission by a node-local
+    /// anti-spam rule, by reason (`unfunded`).
+    pub native_gossip_admit_rejects: Family<Vec<(String, String)>, Counter>,
+    /// RPC calls refused by the per-IP weight limit (anti-spam item D), by
+    /// `kind` (`call` / `batch`).
+    pub rpc_ip_rejects: Family<Vec<(String, String)>, Counter>,
 
     // Link-storm visibility (Sprint 3.5) — the s338 sweep produced 155+ pull
     // timeouts and 238 substream exhaustions visible only as log warns.
@@ -1073,6 +1080,20 @@ impl Metrics {
             "torus_rpc_submit_admit_rejects",
             "Batch-submit items rejected at admission, by reason",
             rpc_submit_admit_rejects.clone(),
+        );
+
+        let native_gossip_admit_rejects = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_native_gossip_admit_rejects",
+            "Native actions refused at gossip/forward admission by a node-local anti-spam rule, by reason",
+            native_gossip_admit_rejects.clone(),
+        );
+
+        let rpc_ip_rejects = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_rpc_ip_rejects",
+            "RPC calls refused by the per-IP weight limit, by kind (call / batch)",
+            rpc_ip_rejects.clone(),
         );
 
         let native_da_pull_failures = Counter::default();
@@ -2096,6 +2117,8 @@ impl Metrics {
             rpc_submit_admit_insert_seconds,
             rpc_submit_admit_forward_seconds,
             rpc_submit_admit_rejects,
+            native_gossip_admit_rejects,
+            rpc_ip_rejects,
             native_da_pull_failures,
             direct_send_failures_untracked,
             block_transactions_count,

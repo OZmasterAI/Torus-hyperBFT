@@ -3,8 +3,12 @@
 //! Implements Ethereum-compatible `eth_*`, `net_*`, and `web3_*` namespaces
 //! using jsonrpsee 0.26 with WebSocket subscription support.
 
+/// Anti-spam item B lives in `torus-mempool` (it counts on pool entry);
+/// re-exported here for existing callers.
+pub use torus_mempool::addr_rate;
 pub mod error;
 pub mod eth;
+pub mod ip_limit;
 pub mod net;
 pub mod streams;
 pub mod torus;
@@ -283,6 +287,11 @@ pub struct RpcState {
 /// JSON-RPC server combining eth, net, and web3 namespaces.
 pub struct RpcServer {
     state: RpcState,
+    /// Anti-spam item D: per-IP weight limit (`None` = off, the library
+    /// default; `torus-node` installs it from the env).
+    ip_limiter: Option<Arc<ip_limit::IpLimiter>>,
+    /// Per-WebSocket-connection subscription cap (jsonrpsee enforces it).
+    max_subs_per_conn: u32,
 }
 
 impl RpcServer {
@@ -317,7 +326,27 @@ impl RpcServer {
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
             },
+            ip_limiter: None,
+            max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
         }
+    }
+
+    /// Install the per-IP weight limit (anti-spam item D).
+    pub fn set_ip_limiter(&mut self, limiter: Arc<ip_limit::IpLimiter>) {
+        self.ip_limiter = Some(limiter);
+    }
+
+    /// Cap subscriptions per WebSocket connection (default
+    /// [`ip_limit::DEFAULT_MAX_SUBS_PER_CONN`]).
+    pub fn set_max_subscriptions_per_connection(&mut self, max: u32) {
+        self.max_subs_per_conn = max.max(1);
+    }
+
+    /// Install the per-address native request limit (anti-spam item B) on
+    /// the mempool, which counts every pooled action; this server enforces it
+    /// at RPC ingress. Same as [`Mempool::set_addr_rate_limiter`].
+    pub fn set_addr_rate_limiter(&mut self, limiter: Arc<addr_rate::AddrRateLimiter>) {
+        self.state.mempool.set_addr_rate_limiter(limiter);
     }
 
     /// Configure leader forwarding for direct-to-leader native action submission.
@@ -373,36 +402,89 @@ impl RpcServer {
     }
 
     /// Start the RPC server on the given address.
+    ///
+    /// Item D: the accept loop is ours (jsonrpsee's `to_service_builder`
+    /// pattern) rather than `Server::start`, because jsonrpsee 0.26 never
+    /// exposes the peer address to RPC middleware. Each accepted connection's
+    /// HTTP requests get a [`ip_limit::PeerIp`] extension, which jsonrpsee
+    /// copies into every JSON-RPC request (HTTP and WebSocket) for
+    /// [`IpLimitMiddleware`]. Connection limit, stop handle and graceful
+    /// shutdown behave as before.
     pub async fn start(
         self,
         addr: SocketAddr,
     ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-        let layer = MetricsLayer {
-            metrics: self.state.metrics.clone(),
-        };
-        let rpc_middleware = rpc_mw::RpcServiceBuilder::new().layer(layer);
+        let metrics = self.state.metrics.clone();
+        // Metrics outermost, so refused calls still show in
+        // torus_rpc_requests_total{status="error"}.
+        let rpc_middleware = rpc_mw::RpcServiceBuilder::new()
+            .layer(MetricsLayer {
+                metrics: metrics.clone(),
+            })
+            .layer(IpLimitLayer {
+                limiter: self.ip_limiter.clone(),
+                metrics,
+            });
         // #40/#41: response-size and connection caps are env-configurable
         // (defaults 10 MiB / 512 connections).
         let max_response_bytes =
             resolve_max_response_bytes(std::env::var(ENV_MAX_RESPONSE_MB).ok().as_deref());
         let max_connections =
             resolve_max_connections(std::env::var(ENV_MAX_CONNS).ok().as_deref());
+        // Our accept loop serves each connection with
+        // `serve_with_graceful_shutdown`, which does NOT apply the config's
+        // TCP/HTTP2 options: `set_keep_alive`, `set_keep_alive_timeout` and
+        // `set_tcp_no_delay` have no effect here (nodelay is set on the socket
+        // below). Using them requires serving the connection with hyper-util
+        // directly.
         let server_cfg = jsonrpsee::server::ServerConfig::builder()
             .max_connections(max_connections)
             .max_response_body_size(max_response_bytes)
+            .max_subscriptions_per_connection(self.max_subs_per_conn)
             .build();
-        let server = ServerBuilder::with_config(server_cfg)
+        let svc_builder = ServerBuilder::with_config(server_cfg)
             .set_rpc_middleware(rpc_middleware)
-            .build(addr)
-            .await?;
-        let local_addr = server.local_addr()?;
+            .to_service_builder();
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
         let mut module = jsonrpsee::RpcModule::new(());
         module.merge(EthApiServer::into_rpc(self.state.clone()))?;
         module.merge(NetApiServer::into_rpc(self.state.clone()))?;
         module.merge(Web3ApiServer::into_rpc(self.state.clone()))?;
         module.merge(TorusApiServer::into_rpc(self.state.clone()))?;
-        let handle = server.start(module);
-        Ok((handle, local_addr))
+        let methods: jsonrpsee::Methods = module.into();
+        let (stop_handle, server_handle) = jsonrpsee::server::stop_channel();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, remote) = tokio::select! {
+                    res = listener.accept() => match res {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "rpc accept failed");
+                            continue;
+                        }
+                    },
+                    _ = stop_handle.clone().shutdown() => break,
+                };
+                let _ = socket.set_nodelay(true);
+                let svc = WithPeerIp {
+                    inner: svc_builder
+                        .clone()
+                        .build(methods.clone(), stop_handle.clone()),
+                    peer: ip_limit::PeerIp(remote.ip()),
+                };
+                let stopped = stop_handle.clone().shutdown();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        jsonrpsee::server::serve_with_graceful_shutdown(socket, svc, stopped).await
+                    {
+                        tracing::debug!(error = %e, "rpc connection ended with error");
+                    }
+                });
+            }
+        });
+        Ok((server_handle, local_addr))
     }
 
     /// Get a reference to the RPC state.
@@ -483,6 +565,160 @@ where
         batch: rpc_mw::Batch<'a>,
     ) -> impl std::future::Future<Output = Self::BatchResponse> + Send + 'a {
         self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: rpc_mw::Notification<'a>,
+    ) -> impl std::future::Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anti-spam item D: per-IP weight limit
+// ---------------------------------------------------------------------------
+
+/// Tags every HTTP request of one connection with its peer IP.
+#[derive(Clone)]
+struct WithPeerIp<S> {
+    inner: S,
+    peer: ip_limit::PeerIp,
+}
+
+impl<S, B> tower::Service<jsonrpsee::server::HttpRequest<B>> for WithPeerIp<S>
+where
+    S: tower::Service<jsonrpsee::server::HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: jsonrpsee::server::HttpRequest<B>) -> Self::Future {
+        req.extensions_mut().insert(self.peer);
+        self.inner.call(req)
+    }
+}
+
+#[derive(Clone)]
+struct IpLimitLayer {
+    limiter: Option<Arc<ip_limit::IpLimiter>>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S> tower::Layer<S> for IpLimitLayer {
+    type Service = IpLimitMiddleware<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        IpLimitMiddleware {
+            inner,
+            limiter: self.limiter.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Charges each call (or a whole JSON-RPC batch) its
+/// [`ip_limit::method_weight`] against the caller's IP bucket.
+#[derive(Clone)]
+struct IpLimitMiddleware<S> {
+    inner: S,
+    limiter: Option<Arc<ip_limit::IpLimiter>>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl<S> IpLimitMiddleware<S> {
+    /// True when the call must be refused (and counts it).
+    fn refuse(&self, ext: &jsonrpsee::Extensions, weight: u32, kind: &str) -> bool {
+        let (Some(limiter), Some(peer)) = (&self.limiter, ext.get::<ip_limit::PeerIp>()) else {
+            return false;
+        };
+        if limiter.check(peer.0, weight, Instant::now()) {
+            return false;
+        }
+        if let Some(ref m) = self.metrics {
+            m.rpc_ip_rejects
+                .get_or_create(&vec![("kind".into(), kind.into())])
+                .inc();
+        }
+        true
+    }
+
+    fn refusal(&self) -> jsonrpsee::types::ErrorObjectOwned {
+        let per_min = self.limiter.as_ref().map_or(0, |l| l.weight_per_min());
+        jsonrpsee::types::ErrorObjectOwned::owned(
+            ip_limit::RATE_LIMITED_CODE,
+            format!("rate limited: IP request weight over {per_min}/min, retry later"),
+            None::<()>,
+        )
+    }
+}
+
+impl<S> RpcServiceT for IpLimitMiddleware<S>
+where
+    S: RpcServiceT<
+            MethodResponse = rpc_mw::MethodResponse,
+            BatchResponse = rpc_mw::MethodResponse,
+            NotificationResponse = rpc_mw::MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type MethodResponse = rpc_mw::MethodResponse;
+    type BatchResponse = rpc_mw::MethodResponse;
+    type NotificationResponse = rpc_mw::MethodResponse;
+
+    fn call<'a>(
+        &self,
+        request: rpc_mw::Request<'a>,
+    ) -> impl std::future::Future<Output = Self::MethodResponse> + Send + 'a {
+        let weight = ip_limit::method_weight(request.method_name(), request.params().as_str());
+        let refused = self
+            .refuse(request.extensions(), weight, "call")
+            .then(|| self.refusal());
+        let inner = self.inner.clone();
+        async move {
+            match refused {
+                Some(err) => rpc_mw::MethodResponse::error(request.id(), err),
+                None => inner.call(request).await,
+            }
+        }
+    }
+
+    fn batch<'a>(
+        &self,
+        mut batch: rpc_mw::Batch<'a>,
+    ) -> impl std::future::Future<Output = Self::BatchResponse> + Send + 'a {
+        // jsonrpsee runs a batch's calls below this layer, so charge the
+        // whole batch here and refuse it whole (one error per call).
+        let weight: u32 = batch
+            .iter()
+            .flatten()
+            .map(|e| ip_limit::method_weight(e.method_name(), e.params().map(|p| p.get())))
+            .sum();
+        let refused = self
+            .refuse(batch.extensions(), weight, "batch")
+            .then(|| self.refusal());
+        let inner = self.inner.clone();
+        async move {
+            let Some(err) = refused else {
+                return inner.batch(batch).await;
+            };
+            let mut out = jsonrpsee::server::BatchResponseBuilder::new_with_limit(usize::MAX);
+            for entry in batch.into_iter().flatten() {
+                if let rpc_mw::BatchEntry::Call(req) = entry {
+                    let _ = out.append(rpc_mw::MethodResponse::error(req.id(), err.clone()));
+                }
+            }
+            rpc_mw::MethodResponse::from_batch(out.finish())
+        }
     }
 
     fn notification<'a>(
@@ -1754,12 +1990,502 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// Sprint 5 Task 4: with the native pool at capacity, non-cancel actions
-    /// are shed after a decode-only pass (no signature verification spent),
-    /// while cancels still travel the full verify path so pool eviction
-    /// semantics are preserved.
+    /// Anti-spam item A: a sender without funds is refused after verify with
+    /// a distinct, non-retryable reply and counted as `unfunded`; a funded
+    /// sender in the same batch is admitted. Same on the single endpoint.
     #[tokio::test]
-    async fn pool_full_sheds_non_cancels_before_verify() {
+    async fn unfunded_sender_rejected_and_counted() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let cfg = MempoolConfig {
+            ingress_min_collateral_trs: 1,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let funded_key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let fresh_key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")
+                .unwrap(),
+        )
+        .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |key: &k256::ecdsa::SigningKey, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::CancelAllOrders { market_id: None },
+                nonce,
+                key,
+            );
+            let sender = signed.recover_sender().unwrap();
+            (
+                sender,
+                format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap())),
+            )
+        };
+        let (funded_addr, funded_payload) = mk(&funded_key, now_ms);
+        let (_, fresh_payload) = mk(&fresh_key, now_ms + 1);
+        torus_core::position::PositionManager::new(state.clone())
+            .put_native_balance(
+                &funded_addr,
+                &torus_core::position::NativeBalance {
+                    available: torus_types::FixedPoint::ONE,
+                    order_margin: torus_types::FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![funded_payload, fresh_payload]],
+            )
+            .await
+            .unwrap();
+        assert!(
+            results[0].error.is_none(),
+            "funded sender admitted: {:?}",
+            results[0]
+        );
+        let err = results[1].error.as_deref().unwrap_or("");
+        assert!(err.contains("not funded"), "distinct reply: {err}");
+        assert!(!err.contains("retry"), "must not look retryable: {err}");
+        assert_eq!(mempool.native_pool_size(), 1);
+
+        let (_, fresh_single) = mk(&fresh_key, now_ms + 2);
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![fresh_single],
+            )
+            .await;
+        let e = single.expect_err("single endpoint refuses too");
+        assert!(e.to_string().contains("not funded"), "{e}");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="unfunded"} 2"#),
+            "unfunded rejects not counted; dump:\n{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Anti-spam item B: the per-address limit is charged after verify with
+    /// the batch's order count; over the allowance an address gets a
+    /// rate-limited reply (counted by reason) while exempt addresses and
+    /// other senders are unaffected. Same on the single endpoint.
+    #[tokio::test]
+    async fn addr_rate_limit_refuses_over_allowance_and_counts() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let key = |hex_key: &str| {
+            k256::ecdsa::SigningKey::from_slice(&hex::decode(hex_key).unwrap()).unwrap()
+        };
+        let limited = key("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let exempt = key("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mk = |k: &k256::ecdsa::SigningKey, action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, k);
+            let sender = signed.recover_sender().unwrap();
+            (
+                sender,
+                format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap())),
+            )
+        };
+        let exempt_addr = mk(&exempt, torus_types::NativeAction::ClaimRewards, 0).0;
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        // Buffer 2, no volume: 2 non-cancel requests, 4 cumulative cancels.
+        server.set_addr_rate_limiter(Arc::new(addr_rate::AddrRateLimiter::new(
+            2,
+            [exempt_addr].into_iter().collect(),
+            1_000,
+        )));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let cancel = |id| torus_types::NativeAction::CancelOrder { order_id: id };
+        let batch: Vec<String> = vec![
+            mk(&limited, torus_types::NativeAction::ClaimRewards, now_ms).1,
+            mk(
+                &limited,
+                torus_types::NativeAction::ClaimRewards,
+                now_ms + 1,
+            )
+            .1,
+            mk(
+                &limited,
+                torus_types::NativeAction::ClaimRewards,
+                now_ms + 2,
+            )
+            .1,
+            mk(&limited, cancel(1), now_ms + 3).1,
+            mk(&limited, cancel(2), now_ms + 4).1,
+            mk(&limited, cancel(3), now_ms + 5).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 6).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 7).1,
+            mk(&exempt, torus_types::NativeAction::ClaimRewards, now_ms + 8).1,
+        ];
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        let errs: Vec<Option<&str>> = results.iter().map(|r| r.error.as_deref()).collect();
+        assert!(errs[0].is_none() && errs[1].is_none(), "{errs:?}");
+        // 3rd non-cancel: over the buffer, and < 10 s since the last admit.
+        assert!(errs[2].unwrap_or("").contains("rate limited"), "{errs:?}");
+        // Cancels have their own allowance: min(2 + 100_000, 2 * 2) = 4.
+        assert!(errs[3].is_none() && errs[4].is_none(), "{errs:?}");
+        assert!(errs[5].unwrap_or("").contains("rate limited"), "{errs:?}");
+        assert!(errs[6..].iter().all(Option::is_none), "exempt: {errs:?}");
+
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![
+                    mk(
+                        &limited,
+                        torus_types::NativeAction::ClaimRewards,
+                        now_ms + 9
+                    )
+                    .1
+                ],
+            )
+            .await;
+        assert!(single
+            .expect_err("single endpoint limited too")
+            .to_string()
+            .contains("rate limited"));
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(
+                r#"torus_rpc_submit_admit_rejects_total{reason="addr_cancel_rate_limited"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="addr_rate_limited"} 2"#),
+            "{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Anti-spam item B, round 2: the mempool counts actions from every
+    /// source, so allowance a sender used through gossip (another node's
+    /// RPC) is gone here too; an action admitted via this RPC is counted
+    /// exactly once (on pool entry, not again at the RPC check).
+    #[tokio::test]
+    async fn addr_rate_limit_sees_gossip_and_counts_rpc_once() {
+        let (_dir, state, mempool, executor) = setup();
+        let k = |b: u8| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap();
+        let (gossiped, fresh) = (k(0x31), k(0x32));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let sign = |key: &k256::ecdsa::SigningKey, nonce: u64| {
+            torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                nonce,
+                key,
+            )
+        };
+        let hex_of = |a: &torus_types::SignedNativeAction| {
+            format!("0x{}", hex::encode(serde_json::to_vec(a).unwrap()))
+        };
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_addr_rate_limiter(Arc::new(addr_rate::AddrRateLimiter::new(
+            2,
+            Default::default(),
+            1_000,
+        )));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let limiter = mempool.addr_rate_limiter().expect("installed on the mempool");
+
+        // Two actions of `gossiped` arrive from a peer: the buffer is used.
+        for i in 0..2 {
+            let a = sign(&gossiped, now_ms + i);
+            mempool
+                .add_native_action_from_gossip(a.recover_sender().unwrap(), a)
+                .unwrap();
+        }
+        let g_addr = sign(&gossiped, 0).recover_sender().unwrap();
+        assert_eq!(limiter.used(&g_addr), 2);
+        let refused: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![hex_of(&sign(&gossiped, now_ms + 2))],
+            )
+            .await;
+        assert!(refused
+            .expect_err("allowance used via gossip")
+            .to_string()
+            .contains("rate limited"));
+        assert_eq!(limiter.used(&g_addr), 2, "a refused action is not counted");
+
+        // A fresh sender's RPC action: counted once.
+        let a = sign(&fresh, now_ms);
+        let f_addr = a.recover_sender().unwrap();
+        let _: String = client
+            .request("torus_submitNativeAction", jsonrpsee::rpc_params![hex_of(&a)])
+            .await
+            .unwrap();
+        assert_eq!(limiter.used(&f_addr), 1);
+        let batch: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![hex_of(&sign(&fresh, now_ms + 1))]],
+            )
+            .await
+            .unwrap();
+        assert!(batch[0].error.is_none(), "{batch:?}");
+        assert_eq!(limiter.used(&f_addr), 2);
+        handle.stop().unwrap();
+    }
+
+    async fn start_with(server: RpcServer) -> (ServerHandle, SocketAddr) {
+        server.start("127.0.0.1:0".parse().unwrap()).await.unwrap()
+    }
+
+    /// Anti-spam item D: the peer IP reaches the RPC middleware, calls are
+    /// charged their weight, and an exhausted IP gets -32005 on single calls
+    /// and on a JSON-RPC batch (refused whole); refusals are counted.
+    #[tokio::test]
+    async fn ip_weight_limit_refuses_over_budget() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        // 10 weight per minute and NO exemptions: the test client is loopback.
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(10, Vec::new(), 100)));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        for i in 0..5 {
+            let r: Result<String, _> = client
+                .request("eth_chainId", jsonrpsee::rpc_params![])
+                .await;
+            assert!(r.is_ok(), "call {i}: {r:?}");
+        }
+        let err = client
+            .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
+            .await
+            .expect_err("6th cheap read is over 10/min");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limited") && msg.contains("-32005"),
+            "{msg}"
+        );
+
+        let mut batch = jsonrpsee::core::params::BatchRequestBuilder::new();
+        batch
+            .insert("eth_chainId", jsonrpsee::rpc_params![])
+            .unwrap();
+        batch
+            .insert("eth_blockNumber", jsonrpsee::rpc_params![])
+            .unwrap();
+        let b = client.batch_request::<String>(batch).await;
+        let refused = match &b {
+            Err(e) => e.to_string().contains("rate limited"),
+            Ok(resp) => resp.num_failed_calls() == 2,
+        };
+        assert!(refused, "batch must be refused: {b:?}");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="batch"} 1"#),
+            "{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Item D over WebSocket: the accept loop tags only the upgrade request
+    /// with the peer IP; the limit must still see every call on the socket
+    /// (a missing tag lets calls through unlimited).
+    #[tokio::test]
+    async fn ip_weight_limit_applies_over_websocket() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(10, Vec::new(), 100)));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let ws = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let r: Result<String, _> = ws.request("eth_chainId", jsonrpsee::rpc_params![]).await;
+            assert!(r.is_ok(), "call {i}: {r:?}");
+        }
+        let err = ws
+            .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
+            .await
+            .expect_err("6th cheap read over WebSocket is over 10/min");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limited") && msg.contains("-32005"),
+            "{msg}"
+        );
+        let text = metrics.encode();
+        assert!(
+            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
+            "{text}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Item D default: loopback is exempt, so local tooling is never limited.
+    #[tokio::test]
+    async fn ip_limit_default_exempts_loopback() {
+        let (_dir, state, mempool, executor) = setup();
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(
+            10,
+            ip_limit::parse_exempt(None).0,
+            100,
+        )));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        for _ in 0..50 {
+            let _: String = client
+                .request("eth_chainId", jsonrpsee::rpc_params![])
+                .await
+                .unwrap();
+        }
+        handle.stop().unwrap();
+    }
+
+    /// Item D: subscriptions are capped per WebSocket connection.
+    #[tokio::test]
+    async fn ws_subscriptions_capped_per_connection() {
+        use jsonrpsee::core::client::SubscriptionClientT;
+        let (_dir, state, mempool, executor) = setup();
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_max_subscriptions_per_connection(2);
+        let (handle, addr) = start_with(server).await;
+        let ws = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        async fn sub(
+            c: &jsonrpsee::ws_client::WsClient,
+        ) -> Result<
+            jsonrpsee::core::client::Subscription<serde_json::Value>,
+            jsonrpsee::core::ClientError,
+        > {
+            c.subscribe(
+                "torus_subscribe",
+                jsonrpsee::rpc_params!["newTrades"],
+                "torus_unsubscribe",
+            )
+            .await
+        }
+        let _a = sub(&ws).await.unwrap();
+        let _b = sub(&ws).await.unwrap();
+        assert!(
+            sub(&ws).await.is_err(),
+            "third subscription on one connection"
+        );
+        // A second connection has its own cap.
+        let ws2 = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let _c = sub(&ws2).await.unwrap();
+        handle.stop().unwrap();
+    }
+
+    /// Sprint 5 Task 4 / item C: with the native pool at capacity, every
+    /// action is shed after a decode-only pass (no signature verification
+    /// spent) — cancels included, since a full pool no longer lets a cancel
+    /// evict an order.
+    #[tokio::test]
+    async fn pool_full_sheds_every_action_before_verify() {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         // Capacity 0: the pool is permanently "full" from the first submit.
@@ -1810,34 +2536,26 @@ mod tests {
             .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
             .await
             .unwrap();
-        // Non-cancel: shed before signature verification.
-        assert_eq!(
-            results[0].error.as_deref(),
-            Some("mempool: pool full (pre-verify)"),
-            "non-cancel should be pre-verify shed: {:?}",
-            results[0]
-        );
-        // Cancel: full verify path, rejected at admission (nothing to evict).
-        assert!(
-            results[1]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("native action pool full"),
-            "cancel should reach real admission: {:?}",
-            results[1]
-        );
+        // Item C: a full pool admits nothing (cancels no longer evict an
+        // order), so both kinds are shed before signature verification.
+        for r in &results {
+            assert_eq!(
+                r.error.as_deref(),
+                Some("mempool: pool full (pre-verify)"),
+                "pre-verify shed expected: {r:?}"
+            );
+        }
 
         let text = metrics.encode();
         assert!(
             text.contains(
-                r#"torus_rpc_submit_admit_rejects_total{reason="pool_full_preverify"} 1"#
+                r#"torus_rpc_submit_admit_rejects_total{reason="pool_full_preverify"} 2"#
             ),
-            "pre-verify shed not counted; dump:\n{text}"
+            "pre-verify sheds not counted; dump:\n{text}"
         );
         assert!(
-            text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="pool_full"} 1"#),
-            "cancel admission reject not counted; dump:\n{text}"
+            !text.contains(r#"torus_rpc_submit_admit_rejects_total{reason="pool_full"}"#),
+            "no action should reach admission; dump:\n{text}"
         );
         handle.stop().unwrap();
     }

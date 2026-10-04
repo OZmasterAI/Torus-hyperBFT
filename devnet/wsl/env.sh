@@ -58,6 +58,15 @@ export TORUS_SHARD_CUSTODY="${TORUS_SHARD_CUSTODY:-0}"
 # host parallelism; set TORUS_SAVE_BOOKS_WORKERS=1 for the serial loop, N>=2
 # to cap the drain threads (TORUS_SAVE_BOOKS_MIN_OPS = work gate, default 32).
 # Left unset here on purpose — the binary default is the measured config.
+# Node anti-spam limits (items A, B, D: funded-account check, per-address
+# request limit, per-IP weight limit) are ON in the node binary but OFF on
+# the bench devnet, whose senders would otherwise be throttled; turn them on
+# for a cell with tools/matched-bench/run-cell.sh ANTISPAM=1. Item C (cancel
+# share of each block, TORUS_CANCEL_BLOCK_SHARE_PCT) is a fairness fix and
+# stays at the node default here too.
+export TORUS_INGRESS_MIN_COLLATERAL="${TORUS_INGRESS_MIN_COLLATERAL:-0}"
+export TORUS_ADDR_RATE_LIMIT="${TORUS_ADDR_RATE_LIMIT:-0}"
+export TORUS_RPC_IP_WEIGHT_PER_MIN="${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}"
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"
