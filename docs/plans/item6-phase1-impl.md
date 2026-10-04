@@ -188,7 +188,15 @@ golden `cargo test -p torus-bridge --test perf_equivalence_golden`; ubench
 - 0.4 Reference switch for tests only: `#[cfg(test)]` app field
   `test_no_resident_rows` (like `test_book_mode`) and `begin_resident(None, ..)` in the
   harnesses = today's path. No runtime flag (D16).
-- Gate 0: base numbers recorded; counter test fails as expected.
+- 0.5 Moving marks. Both bench mark sources submit ONE fixed price per market
+  (`ubench_econ` `UB_MARKS=1`: the mid every block; devnet `oracle-feed`: `--price`,
+  default 30000, `oracle_feed.rs:76-80`). With fixed marks the mark version never
+  changes, so the re-value cost (O1 / L2 triggers) is never measured. Add a small
+  deterministic mean-reverting walk: `UB_MARK_WALK=<bp per block>` in the ubench and
+  `--walk-bp` / `ORACLE_WALK_BP` in the feeder (default 0 = today). Size it so that
+  liquidations stay rare (e.g. 10 bp per block around the mid). Gates 3 and 4 are
+  measured with walk 0 AND with the walk; the walk numbers decide O1 / O2 / L2.
+- Gate 0: base numbers recorded (walk 0 and walk on); counter test fails as expected.
 
 ### Step 1: R (commit C1)
 
