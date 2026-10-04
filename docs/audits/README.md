@@ -73,6 +73,7 @@ corrections; a repeated finding is not another defect.
 | 41 | [Liquidation health classification at the two-thirds boundary](chain-5c756ff-pass41-liquidation-health-boundaries-2026-10-04.md) |
 | 42 | [Liquidation slippage cap by margin tier](chain-5c756ff-pass42-liquidation-slippage-cap-2026-10-04.md) |
 | 43 | [Reduce-only allowance at matching time](chain-5c756ff-pass43-reduce-only-match-allowance-2026-10-04.md) |
+| 44 | [Empty-block scheduling for pending liquidations](chain-5c756ff-pass44-liquidation-empty-block-due-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
