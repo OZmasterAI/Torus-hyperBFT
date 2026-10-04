@@ -5,7 +5,7 @@ Status: IN PROGRESS. Written s89 (2026-10-04). s91: C1 `81a9567`, C2 `ccdb59b`, 
 ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load shapes
 (section 1.1, step 6), a per-fill track next to C3/C4 (section 5.1), 18c builds and ozarchy
 (bare metal) measures (section 3). s91 profile: the 10-market gap is one function,
-`same_batch_bid_top_ups` (section 5.1, step PF1, built right after C3).
+`same_batch_bid_top_ups` (section 5.1, step PF1, built on ozarchy in parallel with C3).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -350,8 +350,10 @@ ozarchy exec-thread profile at 10 markets, crab `d52a33f` vs main `92a02ed`
 per 1k fills, and what of the node path the ubench does not cover (~8 ms per 1k fills).
 Profile result (s91, `~/bench-results-matched/ozarchy-prof10-{crab,main}/` on ozarchy): the
 gap is `NativeExecutor::same_batch_bid_top_ups` (`native_executor.rs:6484` at `d52a33f`,
-from the same-batch bid bound `3d2dcd8` / `ef5eab7`). Owner s91: 18c builds the fix, its own
-commit on `perf/item6-phase1` right after C3 (same file); ozarchy measures.
+from the same-batch bid bound `3d2dcd8` / `ef5eab7`). Owner s91: ozarchy builds the fix in
+parallel with C3, on its own branch `perf/item6-pf1` from `d52a33f`, touching only
+`same_batch_bid_top_ups` plus tests (C3 changes other functions of the same file); 18c
+merges it into `perf/item6-phase1` after C3 (method A). Ozarchy measures Gate PF1.
 
 **Step PF1: per-level ask depth in `same_batch_bid_top_ups` (commit PF1)**
 - Cause: for every GTC bid at or above the best ask that may rest, the function sums
@@ -411,4 +413,4 @@ reviews it.
 | 14 | C2 / plumbing | not in the plan | accept `ctx.attach_resident_block` / `detach_resident_block` at each call site? | wired at 5 sites (app.rs, golden, ubench_econ, ubench_epoch, storage_reads); C3 reuses them for the sums cache | `ccdb59b` |
 | 15 | C2 / no oracle step | contexts that never run `begin_block_oracle` (criterion benches, many unit tests) have no table | none | they read the oracle per mark (same results, slower than the old per-batch memo); the node always runs it (`app.rs:2250`) | `ccdb59b` |
 | 16 | s91 / ubench vs full node | 10 markets: ubench engine 8.9 vs full node 16.6 ms per 1k fills (ozarchy); C1 +35% in the ubench, ~0 on the full node | Gate 2 on which shapes? | owner: both shapes, 300 markets main gate, both >= 0.9x; per-fill track 5.1 from the ozarchy profile; ozarchy measures | docs |
-| 17 | s91 / profile | 10-market gap = `same_batch_bid_top_ups` 11.2 ms per 1k fills (O(crossing bids x resting asks)); ubench shallow levels hid it | none (owner decided) | step PF1 (5.1), 18c after C3, ozarchy measures; ubench gets a deep-level shape | docs |
+| 17 | s91 / profile | 10-market gap = `same_batch_bid_top_ups` 11.2 ms per 1k fills (O(crossing bids x resting asks)); ubench shallow levels hid it | none (owner decided) | step PF1 (5.1), built on ozarchy in parallel with C3 (`perf/item6-pf1`), merged after C3; ubench gets a deep-level shape | docs |
