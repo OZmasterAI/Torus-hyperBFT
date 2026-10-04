@@ -4,7 +4,8 @@ Status: IN PROGRESS. Written s89 (2026-10-04). s91: C1 `81a9567`, C2 `ccdb59b`, 
 `d52a33f` (main 92a02ed with native anti-spam + oracle lane + oracle-signer exemption, built on
 ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load shapes
 (section 1.1, step 6), a per-fill track next to C3/C4 (section 5.1), 18c builds and ozarchy
-(bare metal) measures (section 3).
+(bare metal) measures (section 3). s91 profile: the 10-market gap is one function,
+`same_batch_bid_top_ups` (section 5.1, step PF1, built right after C3).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -64,10 +65,18 @@ the per-fill cost dominates at 300 markets too.
 | same, without R (`UB_NO_R=1`) | see C1 (54.3 on the C1 binary) | 10.3 (tail 1.60) |
 | full node on ozarchy, crab `81a9567` (C1) vs main, oracle on for crab, cap 400 | (measure) | 64.2k vs ~174-185k matched/s (~0.37x); engine 16.6 vs ~6 ms per 1k fills; exec thread 96-99% busy |
 | full node, C1 vs pre-C1 `9c4be2c` | (measure) | 64.2k vs 62.1k (+3.3%, within ~5% resolution): C1's ubench gain does not show at 10 markets |
+| exec-path CPU profile on ozarchy, crab `d52a33f` vs main `92a02ed`, ms per 1k fills | (after PF1) | crab 22.91 vs main 9.95: `same_batch_bid_top_ups` 11.21 vs 0, other margin 1.57 vs 0.10, maker checks 0.89 vs 0.04, matching 3.57 vs 2.97, settle 1.52 vs 1.41, liquidation 0.17 |
 
 At 10 markets the ubench engine (8.9) explains only about half of the full node's 16.6 ms
 per 1k fills (review log 16). Phase 1's targets (margin, match, tail) are ~4.7 of the 8.9,
 so C3/C4 cannot close the 10-market gap on their own: that is the per-fill track (5.1).
+The profile found the rest: one function, `same_batch_bid_top_ups`, ~86% of the gap and
+~49% of crab's exec-path CPU; account-level margin itself costs ~2.3 ms per 1k fills. The
+ubench missed it because its price levels are shallow (the cells' best ask levels hold
+~50k orders). Units: the harness "engine ms/1k fills" is wall time of the timer at
+`app.rs:2245-2309`, which on crab also covers `begin_block_oracle`, `drain_core_writer`,
+`run_liquidations` and governance; main's covers only the two `execute_batch` calls.
+Compare crab vs main by profile CPU or matched/s, not by that timer.
 
 ## 2. Design decisions in this plan
 
@@ -339,10 +348,31 @@ Closes the 10-market gap (section 1.1) for Gate 2's second shape. Scope comes fr
 ozarchy exec-thread profile at 10 markets, crab `d52a33f` vs main `92a02ed`
 (`~/bench-results-matched/ozarchy-prof10-*`): which buckets make up crab's extra ~10 ms
 per 1k fills, and what of the node path the ubench does not cover (~8 ms per 1k fills).
-Built on ozarchy on its own branch from the `perf/item6-phase1` tip, merged in after each
-finished step (method A); it names the files it touches first, because a fix in
-`native_executor.rs` overlaps C3/C4. Steps, tests and gates: added here once the profile
-is in.
+Profile result (s91, `~/bench-results-matched/ozarchy-prof10-{crab,main}/` on ozarchy): the
+gap is `NativeExecutor::same_batch_bid_top_ups` (`native_executor.rs:6484` at `d52a33f`,
+from the same-batch bid bound `3d2dcd8` / `ef5eab7`). Owner s91: 18c builds the fix, its own
+commit on `perf/item6-phase1` right after C3 (same file); ozarchy measures.
+
+**Step PF1: per-level ask depth in `same_batch_bid_top_ups` (commit PF1)**
+- Cause: for every GTC bid at or above the best ask that may rest, the function sums
+  `remaining_qty` over every resting ask ORDER up to the bid price
+  (`ask_queues().take_while(..).flat_map(q.iter()).fold(..)`): O(crossing bids x resting
+  asks). It is also a quadratic cost an attacker can drive (many tiny asks at one level,
+  crossing bids), so it is fixed before testnet regardless of Gate 2.
+- Change: the book depth per ask level, summed once per market per batch (prefix sums
+  over the levels up to the batch's highest crossing bid, computed lazily on the first
+  crossing bid), then a range lookup per bid. Exact: every `remaining_qty` is
+  non-negative, so the saturating sum is the same in any grouping (min(true sum, MAX)).
+  Same decisions, same results; no consensus or state change.
+- Tests first: differential test, old walk vs prefix sums, on random books and batches
+  (deep levels, many levels, empty book, bids below / at / above the levels, saturation)
+  -> identical `rests` decisions and identical top-ups; golden A/B unchanged; the s87/s89
+  same-batch tests green. A deep-level ubench shape (e.g. `UB_DEEP_LEVELS`: resting asks
+  concentrated on a few levels) so the ubench sees this cost from now on.
+- Gate PF1 (ozarchy): 10 markets full node, `top_ups` < 0.5 ms per 1k fills in the profile;
+  crab exec-path CPU down by ~11 ms per 1k fills (expected ~22.9 -> ~11.7, about 2x
+  matched/s, ~0.85x main). If the RPC `from_hex` load (resent shed batches) remains,
+  that is its own item.
 
 ## 6. Rollback
 
@@ -381,3 +411,4 @@ reviews it.
 | 14 | C2 / plumbing | not in the plan | accept `ctx.attach_resident_block` / `detach_resident_block` at each call site? | wired at 5 sites (app.rs, golden, ubench_econ, ubench_epoch, storage_reads); C3 reuses them for the sums cache | `ccdb59b` |
 | 15 | C2 / no oracle step | contexts that never run `begin_block_oracle` (criterion benches, many unit tests) have no table | none | they read the oracle per mark (same results, slower than the old per-batch memo); the node always runs it (`app.rs:2250`) | `ccdb59b` |
 | 16 | s91 / ubench vs full node | 10 markets: ubench engine 8.9 vs full node 16.6 ms per 1k fills (ozarchy); C1 +35% in the ubench, ~0 on the full node | Gate 2 on which shapes? | owner: both shapes, 300 markets main gate, both >= 0.9x; per-fill track 5.1 from the ozarchy profile; ozarchy measures | docs |
+| 17 | s91 / profile | 10-market gap = `same_batch_bid_top_ups` 11.2 ms per 1k fills (O(crossing bids x resting asks)); ubench shallow levels hid it | none (owner decided) | step PF1 (5.1), 18c after C3, ozarchy measures; ubench gets a deep-level shape | docs |

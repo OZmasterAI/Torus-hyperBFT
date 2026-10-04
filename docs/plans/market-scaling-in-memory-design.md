@@ -664,7 +664,10 @@ how margin is split between markets.
 market reserve at `max(limit, B0)`, `B0` = that market's best bid at the
 start of Phase 2 (`phase2_bid_floors`, `:6139-6153`); `3d2dcd8` adds the
 same-batch bound (`same_batch_bid_top_ups`, `:6177-6236`). Cuts the takers
-cancelled for margin from ~19% to ~1.8%. Not part of any item 6 phase.
+cancelled for margin from ~19% to ~1.8%. Not part of any item 6 phase. s91: the
+same-batch bound's will-rest check walked every resting ask order per crossing bid
+(O(crossing bids x resting asks)); at 10 markets with deep levels it was ~49% of crab's
+exec CPU. Fixed by per-level depth prefix sums, step PF1 in `item6-phase1-impl.md` 5.1.
 
 **Fix 2b (liquidation scan cost with marks) folds into Phase 1.** It was
 planned as a separate health-buffer index; instead the liquidation walk is

@@ -52,6 +52,7 @@ traders at the end of every block. Bench traders hold ~250 positions each.
 | Liquidation (`liquidation_pass`, `liquidation_step.rs:56`) | `traders_after` seeks + `liq_view` (`:149`) = all positions + balance for 2048 traders, every block | 2048 x positions | fix 2a: skipped while no listed market has a mark; full cost with marks (~24-25 ms/1k) |
 | Overlay prefix scan (`iterate_cf`, `backend.rs:1677`) | linear filter over all pending + parent writes of the CF | writes per block | fix 3: range lookup |
 | D2 one-market pool (`:4268-4348`) | a sender's free margin goes only to the market of its first checked taker; elsewhere taker-only | design rule | unchanged: ~17.5k takers per ubench run cancelled, fills/block 6.2k vs 11.3k |
+| Same-batch bid bound (`same_batch_bid_top_ups`, added later by `3d2dcd8` / `ef5eab7`; s91 profile) | per crossing GTC bid: sums `remaining_qty` of every resting ask order up to its price | crossing bids x resting asks (deep levels) | s91: 11.2 ms per 1k fills on the full node at 10 markets, ~49% of crab exec CPU; fix = per-level depth prefix sums once per market per batch (item 6 plan step PF1) |
 
 ### 2.2 Per-trader margin summary in memory
 
