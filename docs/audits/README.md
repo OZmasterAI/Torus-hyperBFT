@@ -82,6 +82,7 @@ corrections; a repeated finding is not another defect.
 | 50 | [Oracle aggregate freshness boundary](chain-5c756ff-pass50-oracle-staleness-boundary-2026-10-04.md) |
 | 51 | [Oracle quorum after outlier rejection](chain-5c756ff-pass51-oracle-quorum-after-outliers-2026-10-04.md) |
 | 52 | [Session expiry units on latest branch](chain-5c756ff-pass52-session-expiry-recheck-latest-2026-10-04.md) |
+| 53 | [Duplicate native nonce within a committed block](chain-5c756ff-pass53-native-duplicate-nonce-live-guard-2026-10-04.md) |
 
 Main reports link their detailed agent reports and supporting source models.
 Pass 5 did not complete. Models illustrate bounded source-derived behavior;
