@@ -15,6 +15,11 @@ test reproduces them.
 
 ## October 4 chain reviews
 
+For a deduplicated overview of the findings, see
+[`chain-findings-synthesis-2026-10-05.md`](chain-findings-synthesis-2026-10-05.md).
+The 40 focused read-only follow-up runs are recorded in
+[`chain-14236fa-40-review-runs-2026-10-05.md`](chain-14236fa-40-review-runs-2026-10-05.md).
+
 The reports preserve their reviewed revisions and verification limits. Passes
 1–7 review `cea1254`; passes 8–12 review production source at `d52a33f`.
 Passes 10, 11 and 12 start from documentation-only commits `feb01b6`,
