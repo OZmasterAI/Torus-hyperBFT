@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{ResidentRows, RESIDENT_CFS};
 use crate::backend::{NativeStateOverlay, StateBackend};
-use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS};
+use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS};
 use crate::db::StateDb;
 
 fn temp_db() -> (StateDb, tempfile::TempDir) {
@@ -551,9 +551,13 @@ fn layer_keys_are_own_pending_keys_with_resident() {
     assert_eq!(overlay.layer_keys(CF_NATIVE_BALANCES), Some(vec![[4u8; 20].to_vec()]));
 }
 
-/// Item 6 E2-E4: R's column families — positions and balances (C1) and the
-/// liquidation rows (E2: cooldown / pending / previous marks / cursor).
+/// Item 6 E2-E4: R's column families — positions and balances (C1), the
+/// liquidation rows (E2: cooldown / pending / previous marks / cursor) and
+/// the oracle rows (E3: submissions, aggregates, signer index).
 #[test]
 fn resident_cfs_are_the_native_hot_cfs() {
-    assert_eq!(RESIDENT_CFS.to_vec(), vec![CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION]);
+    assert_eq!(
+        RESIDENT_CFS.to_vec(),
+        vec![CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE]
+    );
 }
