@@ -263,26 +263,38 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
 /// (native_executor.rs:656; exec-side fix is a separate consensus item).
 /// Point-gets on the 8-byte BE market key; the order-id counter row in the
 /// same CF has a 24-byte key (NEXT_GLOBAL_ORDER_ID_KEY) so it never collides.
-/// Cheap: runs BEFORE signature verify; batches dedup market ids first.
+/// Cheap: runs BEFORE signature verify; batches read each market row once.
+///
+/// s92 item B: orders also get the book's placement tick and lot rules
+/// (`OrderBook::place_order_with_accounts`), with the market row's tick/lot,
+/// so they are refused here instead of being silently rejected by the book.
+/// A batch is one signed action, so one bad order rejects all of it.
 pub(crate) fn validate_known_markets(
     action: &torus_types::NativeAction,
     state_db: &torus_state::StateDb,
 ) -> Result<(), String> {
-    let check = |mid: u64| -> Result<(), String> {
+    // `(tick_raw, lot_raw)` of a listed market; `None` when the row does not
+    // decode as a market (placeholder rows): only existence is checked then.
+    let spec = |mid: u64| -> Result<Option<(i128, i128)>, String> {
         match state_db.get_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes()) {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(row)) => Ok(StoredMarket::try_from_slice(&row)
+                .ok()
+                .map(|m| (m.tick_size_raw, m.lot_size_raw))),
             Ok(None) => Err(format!("unknown market_id {mid}")),
             Err(e) => Err(format!("market lookup failed: {e}")),
         }
     };
+    let check = |mid: u64| spec(mid).map(|_| ());
     match action {
-        torus_types::NativeAction::PlaceOrder(p) => check(p.market_id),
+        torus_types::NativeAction::PlaceOrder(p) => check_tick_lot(p, spec(p.market_id)?),
         torus_types::NativeAction::PlaceOrderBatch(orders) => {
-            let mut seen = std::collections::BTreeSet::new();
+            let mut specs = std::collections::BTreeMap::new();
             for p in orders {
-                if seen.insert(p.market_id) {
-                    check(p.market_id)?;
-                }
+                let s = match specs.entry(p.market_id) {
+                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::btree_map::Entry::Vacant(e) => *e.insert(spec(p.market_id)?),
+                };
+                check_tick_lot(p, s)?;
             }
             Ok(())
         }
@@ -311,6 +323,37 @@ pub(crate) fn validate_known_markets(
         }
         _ => Ok(()),
     }
+}
+
+/// The book's placement checks, same semantics and order: the lot applies to
+/// every order type (`qty < lot`, so lot 0 admits any qty >= 0); the tick only
+/// to `Limit`, and only when tick > 0. Messages mirror the executor's modify
+/// path (`exec_modify_order`) without its "modify rejected: " prefix.
+fn check_tick_lot(
+    p: &torus_types::PlaceOrderParams,
+    spec: Option<(i128, i128)>,
+) -> Result<(), String> {
+    let Some((tick, lot)) = spec else {
+        return Ok(());
+    };
+    if p.quantity.raw() < lot {
+        return Err(format!(
+            "quantity {} below the lot size {}",
+            p.quantity,
+            FixedPoint::from_raw(lot)
+        ));
+    }
+    if matches!(p.order_type, torus_types::OrderType::Limit)
+        && tick > 0
+        && p.price.raw() % tick != 0
+    {
+        return Err(format!(
+            "price {} is not a multiple of the tick {}",
+            p.price,
+            FixedPoint::from_raw(tick)
+        ));
+    }
+    Ok(())
 }
 
 /// Parse + structurally validate + signature-verify one hex-encoded signed
@@ -2435,6 +2478,211 @@ mod oracle_ingress_tests {
         }
         verify(&state, vec![(1, fp(100))]).unwrap();
         verify(&state, vec![(1, FixedPoint::from_raw(MAX_ORACLE_PRICE_RAW))]).unwrap();
+    }
+}
+
+/// s92 item B: ingress applies the book's placement tick and lot rules
+/// (`OrderBook::place_order_with_accounts`) using the market row's tick/lot,
+/// so an off-tick Limit or a sub-lot order gets an error instead of a silent
+/// book reject reported as executed.
+#[cfg(test)]
+mod tick_lot_ingress_tests {
+    use super::*;
+    use torus_types::{MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+    const NOW: u64 = 1_000_000;
+
+    /// A market row in the genesis / governance borsh layout (`StoredMarket`).
+    fn list(state: &torus_state::StateDb, mid: MarketId, tick_raw: i128, lot_raw: i128) {
+        use borsh::BorshSerialize;
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        lot_raw.serialize(&mut row).unwrap();
+        tick_raw.serialize(&mut row).unwrap();
+        (5 * FixedPoint::SCALE).serialize(&mut row).unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row)
+            .unwrap();
+    }
+
+    fn order(
+        mid: MarketId,
+        price_raw: i128,
+        qty_raw: i128,
+        order_type: OrderType,
+    ) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: mid,
+            is_buy: true,
+            price: FixedPoint::from_raw(price_raw),
+            quantity: FixedPoint::from_raw(qty_raw),
+            order_type,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    fn place(state: &torus_state::StateDb, p: PlaceOrderParams) -> Result<(), String> {
+        validate_known_markets(&NativeAction::PlaceOrder(p), state)
+    }
+
+    fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    const S: i128 = FixedPoint::SCALE;
+
+    #[test]
+    fn off_tick_limit_rejected_with_executor_message() {
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S); // tick 0.5, lot 1
+        let e = place(&state, order(1, 100 * S + S / 4, S, OrderType::Limit)).unwrap_err();
+        assert_eq!(
+            e,
+            "price 100.25000000 is not a multiple of the tick 0.50000000"
+        );
+    }
+
+    #[test]
+    fn on_tick_limit_passes() {
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S);
+        place(&state, order(1, 100 * S + S / 2, S, OrderType::Limit)).unwrap();
+    }
+
+    /// The book tick-checks only `Limit`: a Market order's price is a slippage
+    /// cap, and stops are not checked at placement either.
+    #[test]
+    fn non_limit_orders_are_not_tick_checked() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let odd = 100 * S + 7;
+        place(&state, order(1, odd, S, OrderType::Market)).unwrap();
+        place(
+            &state,
+            order(
+                1,
+                odd,
+                S,
+                OrderType::StopMarket {
+                    trigger: FixedPoint::from_raw(odd),
+                },
+            ),
+        )
+        .unwrap();
+        let limit = FixedPoint::from_raw(odd);
+        place(
+            &state,
+            order(
+                1,
+                odd,
+                S,
+                OrderType::StopLimit {
+                    trigger: limit,
+                    limit,
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn qty_below_lot_rejected_for_every_order_type_and_equal_passes() {
+        let (_d, state) = db();
+        list(&state, 1, S, S / 10); // tick 1, lot 0.1
+        let trig = FixedPoint::from_raw(90 * S);
+        for ot in [
+            OrderType::Limit,
+            OrderType::Market,
+            OrderType::StopMarket { trigger: trig },
+            OrderType::StopLimit {
+                trigger: trig,
+                limit: trig,
+            },
+        ] {
+            let e = place(&state, order(1, 100 * S, S / 10 - 1, ot)).unwrap_err();
+            assert_eq!(
+                e, "quantity 0.09999999 below the lot size 0.10000000",
+                "{ot:?}"
+            );
+            place(&state, order(1, 100 * S, S / 10, ot)).unwrap();
+        }
+    }
+
+    /// Executor: tick <= 0 disables the tick check (no division); the dust
+    /// check is a plain `qty < lot`, so lot 0 admits any qty >= 0.
+    #[test]
+    fn zero_tick_and_zero_lot_match_the_book() {
+        let (_d, state) = db();
+        list(&state, 1, 0, 0);
+        place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
+        place(&state, order(1, 100 * S + 7, 0, OrderType::Limit)).unwrap();
+        let e = place(&state, order(1, 100 * S, -1, OrderType::Limit)).unwrap_err();
+        assert_eq!(e, "quantity -0.00000001 below the lot size 0.00000000");
+    }
+
+    /// A batch is one signed action: one bad order rejects the whole action
+    /// (as an unknown market does today), each market's row read once.
+    #[test]
+    fn batch_with_one_bad_order_is_rejected_whole() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        list(&state, 2, S / 2, S);
+        let good = vec![
+            order(1, 100 * S, S, OrderType::Limit),
+            order(2, 100 * S + S / 2, S, OrderType::Limit),
+        ];
+        validate_known_markets(&NativeAction::PlaceOrderBatch(good.clone()), &state).unwrap();
+        let mut bad = good.clone();
+        bad.push(order(1, 100 * S + S / 2, S, OrderType::Limit));
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(bad), &state).unwrap_err();
+        assert_eq!(
+            e,
+            "price 100.50000000 is not a multiple of the tick 1.00000000"
+        );
+        let mut dust = good;
+        dust.insert(0, order(2, 100 * S, S - 1, OrderType::Limit));
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(dust), &state).unwrap_err();
+        assert_eq!(e, "quantity 0.99999999 below the lot size 1.00000000");
+    }
+
+    /// The rejection reaches the client through the normal ingress path
+    /// (per-item error string from `verify_one_action`).
+    #[test]
+    fn verify_one_action_surfaces_the_tick_error() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(order(1, 100 * S + 1, S, OrderType::Limit)),
+            NOW,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+        let e = verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, NOW)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "price 100.00000001 is not a multiple of the tick 1.00000000"
+        );
+    }
+
+    /// Rows that do not decode as a market (test fixtures seed placeholders)
+    /// keep today's behaviour: the market exists, nothing else is checked.
+    #[test]
+    fn undecodable_row_only_checks_existence() {
+        let (_d, state) = db();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
+            .unwrap();
+        place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
+        let e = place(&state, order(9, 100 * S, S, OrderType::Limit)).unwrap_err();
+        assert_eq!(e, "unknown market_id 9");
     }
 }
 
