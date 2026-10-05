@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -26,6 +26,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 14 | What does M1 (`90a752c`) give at 300 markets? What does end_resident cost? | 76.5k matched/s, **+17%, 0.760x main** (was 0.648x); engine 9.93 -> 7.72 ms/1k (1.09x main). Margin 210 -> 125 ms/blk (-38% per fill), match 92 -> 45 (-49%). end_resident is untimed; from the profile **+29.7 ms/blk** (67 -> 97), ~3.5x the expected 8.6, mostly `BlockSums::into_cache` re-decoding positions |
 | 15 | How much of end_resident can move off the exec thread (step 2)? Does `c58775f` pass Gate 2 at 10 markets? | Today's window end_resident(N) -> begin_resident(N+1) is ~23 ms wall, hiding only 10-24 of ~106 ms; moving begin_resident(N+1) to just before `new_env` widens it to ~100 ms and hides 76-95. The bench is exec-bound (no idle). 10 markets: **0.893x main** (both trie off, interleaved; pairs 0.885x / 0.901x), up from PF1's 0.72x; **Gate 2 (>= 0.9x) not met by ~1%**, within the cell spread |
 | 16 | Does `5524646` (end_resident timers, sums reuse decoded positions) pass Gate 2 at 10 markets without perf on either arm? | **0.866x main** (pairs 0.877x / 0.855x; both trie off, interleaved): **Gate 2 not met**. Perf off did not help (crab 152.8k vs 156.2k profiled in 15). Gap unchanged: native blk/s 2.01 vs 2.24, views 395 vs 335 ms. end_resident ~5.8 ms/blk (rows 3.4, positions 1.8), ~6 of the ~18 ms/blk untimed excess. `run-cell.sh` `WIDE_COLS` lacks the timer columns |
+| 17 | Where does the 10-market gap outside the engine go (views, RPC / gossip / ingress CPU, untimed exec)? | Nowhere outside execution: in the load window crab's exec block is +51.5 ms (485.5 vs 434.0) at equal fills per block. Views are exec-paced (64-deep channel fills 25-30 s earlier; free-running views 314-330 vs 325-348 ms). RPC +3.5 ms/1k is 2.3x more refused requests (equal CPU per request); signature verify equal per action. Untimed +23 ms/blk is mostly C's `native_failures` (`canonical_bytes`, ~20 ms CPU) plus end_resident (~7). Cutting those two and two small items: ~0.92x main (est.) |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1505,6 +1506,154 @@ by the engine count; see the harness note below):
   sampler never records them and `residual_untimed` still contains
   end_resident. Fix: add the three `_sum` columns.
 
+## 17. Where the 10-market gap outside the engine goes (2026-10-05)
+
+Read-only analysis of the section 15 and 16 cells plus one new profiled main
+cell, `ozarchy-main-prof-10m`: main `92a02ed` (node md5 `31a95c65`) with
+`TORUS_NATIVE_TRIE_MAINTENANCE=0`, same shape and perf as the 15.2 crab cells
+(10 markets, rate 76,000, `RETRY_BUSY=1`, 120 s, val0 `cycles:u` 45 s from
+35 s), after a 60 s warm cell. AGREE, liveness PASS, ACCEPT, trie checks OK;
+176,150 matched/s and 433 ms per native block, level with the unprofiled main
+cells. Crab profiles: 15.2's `c58775f` r1 / r2. Driver
+`ozarchy-main-prof-10m-campaign.sh`; analysis and scripts
+`ozarchy-10m-gap-analysis.md`, `ozarchy-10m-gap-tools/`.
+
+Sections 15.2 and 16 average engine, chain and fills per block over bench +
+drain. Over the load window alone the gap is on the execution thread (val0-2,
+4 cells per arm):
+
+| ms per native block, load window | crab (`c58775f`, `5524646`) | main | crab - main |
+|---|---|---|---|
+| fills per native block | 76.7k | 78.3k | -2% |
+| exec block (= chain) | **485.5** | **434.0** | **+51.5** |
+| engine (margin / tail / rest) | 344.2 (112.5 / 11.2 / 220.5) | 314.4 (75.6 / 0.1 / 238.7) | +29.8 (+36.9 / +11.1 / -18.2) |
+| verify + replay guard + save_books | 77.1 | 78.3 | -1.2 |
+| residual untimed | 64.2 | 41.2 | **+23.0** |
+| exec wall per 1k fills | 6.33 | 5.54 | 1.14x (-> 0.875x) |
+
+- Exec thread busy 98% on both arms. The scoped workers' CPU per block is
+  equal (430-456 vs 443 ms); the exec main thread has +56 ms CPU per block
+  in the profile, which is the whole gap.
+
+### 17.1 Views
+
+Once the 64-deep exec channel (`EXEC_QUEUE_DEPTH`) is full,
+`on_committed_block` -> `dispatch_to_exec` blocks the HotStuff thread on
+`exec_tx.send` (`app.rs:6177` at `c58775f`), and views run at the
+execution rate. Crab fills the channel 25-30 s earlier.
+
+| val0 | crab (4 cells) | main (4 cells + main-prof) |
+|---|---|---|
+| channel full at (s into the load) | 70-78 | 97-106, one cell never |
+| ramp (20 s to fill): view ms | **314-330** | **325-348** |
+| ramp: views/s; executed native blk/s | 3.0-3.2; 2.02-2.06 | 2.9-3.1; 2.28-2.36 |
+| ramp: proposal build ms | 107-115 | 107-115 |
+| channel full: view ms; exec block ms | 512-556; 513-554 | 444-490; 444-496 |
+| channel full: `on_committed_block` ms (val0, `c58775f`) | 367-386 (ramp ~80) | - |
+| load-window view ms | 393-397 | 335-360 |
+
+- **No view phase is slower on crab while consensus runs free:** proposal
+  build (select 55-60, mirror 42-46, attest 9-10 ms), DA reconstruct
+  (14 vs 12-13), insert/persist, vote delay and QC times match main.
+  Dissemination is clean in every cell.
+- **It is a wait, not CPU contention:** 395 vs 335 ms is the mix of ramp
+  views (~320 ms) and exec-paced views (~530 ms), with crab ~45 s of the
+  122 s exec-paced vs ~15-25 s on main. hotstuff-algo CPU is +10% (126-131
+  vs 112-125 ms per committed block) but off the critical path.
+- No exec-watermark pacing (`TORUS_EXEC_THROTTLE_WATERMARKS` unset): 396-399
+  vs 400-401 actions per native block.
+
+### 17.2 CPU per fill
+
+Perf window, ms CPU per 1k fills, crab r1 / r2 vs main-prof (trie off):
+
+| thread | crab | main | delta | per unit of work |
+|---|---|---|---|---|
+| rpc-worker | 7.27 / 7.51 | 3.89 | **+3.49** | 344 vs 363 µs per request |
+| `torus-gossip-ve` | 9.91 / 9.97 | 9.19 | +0.75 | 1,582 vs 1,579 µs per gossip-received action |
+| `torus-ingress-v` | 6.10 / 6.01 | 5.32 | +0.73 | 963 vs 914 µs per gossip-received action |
+| torus-execution | 10.40 / 10.96 | 9.60 | +1.08 | see 17.3 |
+| process total (user / sys) | 55.7 / 58.0 | 46.1 | +10.7 | +7.6 / +3.2 |
+
+| rpc-worker class | crab | main | delta |
+|---|---|---|---|
+| hex decode (`hex::FromHex` in `parse_bytes`) | 3.10 | 1.18 | **+1.92** |
+| JSON / HTTP / jsonrpsee / `method_weight` | 2.51 | 1.44 | +1.07 |
+| bincode (`decode_action_bin`) | 0.52 | 0.25 | +0.27 |
+| Keccak, mempool admit, other | 1.26 | 1.03 | +0.23 |
+
+- **RPC: refusals, not crab code.** CPU per request is equal; crab gets 2.0x
+  the requests per fill (21.5 vs 10.7 per 1k) because 2.3x are refused by
+  `backlog_preverify` (18.5 vs 7.9 per 1k). Admitted requests per fill are
+  equal over the run (2.19-2.23 vs 2.25-2.26 per 1k). The full-hex shed
+  decode is the biggest item (+1.92), the HTTP/JSON layer the second.
+  Oracle feed: 30 of ~146k requests.
+- **Signature verify is not a cause:** Keccak and secp256k1 per action are
+  equal (gossip 957 / 403 vs 958 / 398 µs; ingress 453 / 188 vs 447 / 187).
+  Section 6.4's 1.22-1.27x is not reproduced; ingress is 1.05x per action,
+  mostly `__sched_yield`.
+- **The gossip / ingress per-fill excess is a window effect:** in the 45 s
+  window crab verifies 1.63 actions per executed action vs 1.54 (admission
+  runs ahead of the slower execution); over the whole run 1.185 vs 1.187,
+  with equal nonce-expiry (15.8% vs 15.7% of submitted).
+- Contention bound: exec main thread run-queue wait +4-7 ms per committed
+  block (37.5-40.3 vs 30.6-35.2, schedstat). Inferred upper bound for what
+  the extra CPU costs execution.
+
+### 17.3 Untimed exec time
+
+Exec main thread, inclusive ms CPU per native block by direct callee of
+`execute_committed_block_with` (perf window, ~69k fills per block):
+
+| callee | crab r1 / r2 | main | crab - main |
+|---|---|---|---|
+| **`action_results::native_failures`** (`{closure#8}`) | **19.5 / 21.1** | 0 | **+20.3** |
+| of which `NativeAction::canonical_bytes` | 14.2 / 15.6 | 0 | +14.9 |
+| `end_resident` | 7.2 / 7.5 | 0 | +7.3 |
+| `own_pending_delta` | 1.2 / 1.1 | 0 | +1.2 |
+| context drop (`drop_glue`) | 1.2 / 2.2 | 0.2 | +1.5 |
+| `sort_native_actions` | 10.5 / 9.2 | 9.2 | +0.7 |
+| block fn self + `drop_slow` | 0.7 / 1.1 | 4.3 | -3.4 |
+| `run_liquidations_with` (engine tail) | 10.6 / 10.5 | 0 | +10.6 |
+| `execute_batch_phases` (engine) | 226.8 / 237.2 | 215.5 | +16.5 |
+
+- **Most of the untimed excess is C (`9195c32`), not end_resident.**
+  `native_failures` sits between the engine and save_books timers and runs
+  for 152 failures per native block (68,786 over 451 blocks in crab r1;
+  52% of actions), ~134 µs each. `body_position` re-encodes the failing
+  action and every same-sender, same-category action in the batch list and
+  in `executed` with `canonical_bytes()` whenever a sender has more than one
+  such action, which the backlogged bench makes common. At 300 markets
+  (section 13) this was within noise; at 10 markets it is ~4% of the block.
+- Crab-only untimed CPU ~30 ms, ~27 net of main-only frames, covers the
+  wall excess (+23 ms load window, +17.5 bench + drain). end_resident is
+  7.3 ms CPU here, 5.8 ms wall from the `5524646` timers.
+- Engine, for reference: `prepare_one` +46.7 against -40 of main-only
+  frames (`take_open_slot`, `get_position`, `try_reserve_for_qty_cfg`,
+  `rustc_entry`); `stitch_outcome` +8.8; liquidation 10.6 (`pos_sums` 3.5,
+  `traders_after` 1.9, cooldown / pending reads 3.2) with no liquidations
+  in the bench.
+
+### 17.4 What to cut
+
+Estimates against crab's 485.5 ms per native block (load window):
+
+| # | cut | saves (est.) | where |
+|---|---|---|---|
+| 1 | Map failures to body positions by index: carry each action's original index through the sort, drop `canonical_bytes` from `body_position` | ~20 ms/blk (~0.27 ms/1k), crab only | `sort_native_actions` / `sort_deterministic` (`native_executor.rs:9749-9792`), `native_failures` / `body_position` (`action_results.rs:99-170`), `app.rs:2359` |
+| 2 | Margin (engine) | up to ~37 ms/blk | section 11.4 (`prepare_one`) |
+| 3 | Liquidation scan when nothing can be liquidatable (design check; marks constant in this bench) | up to ~10 ms/blk | `run_liquidations_with`, `liq_view` `pos_sums`, `traders_after` |
+| 4 | end_resident off the exec thread (step 2) | ~6 ms/blk | `end_resident`, section 15.1 |
+| 5 | `own_pending_delta` and crab's context drop | ~2.7 ms/blk | `NativeStateOverlay::own_pending_delta`, `drop(ctx)` |
+| 6 | Shed by peeking the bincode tag before the hex decode (both arms) | ~3.5 of crab's 7.4 rpc ms/1k; exec only via contention, <= 4-7 ms/blk | `parse_bytes` (`crates/torus-rpc/src/types.rs:93-96`), shed task in `torus.rs` |
+| - | `sort_native_actions` clones every action (both arms) | ~4 ms/blk on both; do with 1 | `native_executor.rs:9755` |
+
+- 1 + 4 + 5 (~29 ms) put crab at ~456 ms per block: **~0.92x main**
+  (est.); with 3, ~0.94x. Signature verify, gossip verify, the oracle feed
+  and consensus are not cuts.
+- Instrumentation: a timer around `native_failures`. (The end_resident
+  columns in `run-cell.sh` `WIDE_COLS`, section 16, are in `e65411d`.)
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1532,6 +1681,13 @@ by the engine count; see the harness note below):
   0.893x with perf on crab in 15.2); remaining gap is outside the engine
   (block rate, view length, RPC / gossip-verify / ingress CPU per fill).
   300-market half to run on step 2.
+- 10-market gap is all on the exec thread (section 17): +51.5 ms per block
+  in the load window; views are exec-paced. Cheapest cut: C's
+  `native_failures` re-encodes actions with `canonical_bytes` (~20 ms per
+  block at 10 markets); map failures by original index instead. Also
+  untimed: no timer around `native_failures`.
+- Shed path: `parse_bytes` decodes the whole hex payload before refusing
+  (~1.9 ms/1k on crab, ~1.2 on main; section 17.2).
 - A main pair interleaved with crab cells, trie off, to tighten the
   0.638x / 0.648x / 0.760x ratios (sections 10.1, 12.1, 14.1).
 - Cheaper hasher for the Address-keyed maps: the +0.46 ms/1k SipHash of
