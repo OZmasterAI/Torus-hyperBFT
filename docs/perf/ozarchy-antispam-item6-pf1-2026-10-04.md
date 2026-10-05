@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -20,6 +20,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 8 | Is the native trie root used? What is left after C6 / C7? | Trie root: no production reader; off by default saves ~17 ms per empty block and ~4 ms/1k on the flush worker (owner question open). After C6 / C7: crab ~0.58x main estimated; ~6 ms/1k of named fixes reach ~0.78x, the rest needs an IPC measurement |
 | 9 | Does the crab / main ratio change with the trie off? Is the shared-code inflation cache misses? | Trie off: crab +3.4%, main +12.5%, ratio 0.553x -> 0.508x (main was partly flush-bound). Inflation is 1.2-2.5x more instructions per fill, not lower IPC |
 | 10 | What do C6 + C7 (`82bd1a4`) give at 300 markets, trie off? | 64.2k matched/s, +25.7% vs `14236fa`: **0.638x main** (was 0.508x). Engine 14.0 -> 10.2 ms/1k; state reads 8.3 -> 1.7, liquidation 3.2 -> 0.9, `maker_fill_fits` 4.3 -> 1.5 ms/1k. Left: margin phase 216-221 vs ~95 ms/blk on main |
+| 11 | Where does C7's margin phase go vs main? What can be cut? | 5.09 vs 1.47 ms CPU/1k fills (+3.6; ENGINE wall 3.96 vs 1.46). 2.9 is crab-only code: the F1 account check in `prepare_one` 1.77, top-ups / pool takers / bid floors 1.15. `HashMap` work is +1.6 of the gap. `AccountReader::get_position` is ~0.15 margin, ~1.1 match timer. Named cuts ~1.7-2.7 ms/1k (est.), almost all in 18c's files |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -752,6 +753,203 @@ C7. The execution-thread buckets below are not trie work.
   or below main per block. Then glue (5.3 ms/1k) and hashing (~2.7,
   untouched by C6 / C7).
 
+## 11. Margin phase breakdown: crab 82bd1a4 vs main 92a02ed (300 markets)
+
+Read-only, from existing profiles; nothing built. Crab: the section 10
+cells (`ozarchy-82bd1a4-c7-r1` / `-r2`, binary md5 `2783579b`, build-id
+`be880ac0`). Main: `ozarchy-c3pf1-300m-main-r1` (section 6.2), the only
+cycles profile of main `92a02ed` at 300 markets; its binary
+(`wt/main/target/release/torus-node`, build-id `0c1dc011`, the one in
+`perf.data`) is still on disk. Every execution-thread sample is expanded
+into its inlined frames with `llvm-addr2line -i`; a sample is in the
+margin phase when the line of `execute_batch_phases` on its stack is inside
+the ENGINE margin timer (crab `native_executor.rs` 5101-5302, Phase 2 from
+`open_order_counts` to the pools; main 3937-4216). That phase runs serially
+on the execution thread on both (every `prepare_one` sample comes from the
+serial loop at 5246; the sharded prepare never ran), so its CPU is its wall
+time. ms CPU per 1k fills as in section 10.2. Tools
+`ozarchy-margin-c7-tools/`, analysis `ozarchy-margin-c7-analysis.md`.
+
+**Caveats:** the main profile ran with the trie **on**, the C3 + PF1 load
+generator, one cell, 79k fills/s under perf. Margin code is not trie work:
+that cell's ENGINE margin is 1.35 ms/1k fills vs 1.46 in the trie-off main
+cells. Profile ms/1k read 1.29x the ENGINE margin on crab (5.09 vs 3.96)
+and 1.09x on main (1.47 vs 1.35); the reason is not resolved, so crab
+profile savings convert to ENGINE wall at about 0.78x (estimate).
+
+| margin phase, ms/1k fills | crab r1 | crab r2 | main | delta (mean) |
+|---|---|---|---|---|
+| ENGINE wall (ms/blk / fills per blk) | 3.97 | 3.95 | 1.46 (trie-off cells) | **+2.50** |
+| profile CPU, perf window | 5.07 | 5.12 | 1.47 | **+3.62** |
+
+### 11.1 By region and by function
+
+| region (crab line) | crab r1 / r2 | main | kind |
+|---|---|---|---|
+| per-order prepare (`prepare_one`, 5246; main: inline loop) | 2.74 / 2.69 | 0.59 | mixed, below |
+| `same_batch_bid_top_ups` (5278) | 0.78 / 0.83 | 0 | crab-only |
+| `phase2_reservation_basis` (5156) | 0.60 / 0.59 | 0.47 | shared |
+| `open_order_counts` (5111) | 0.35 / 0.36 | 0.26 | shared |
+| `d2_pool_takers` (5275) | 0.24 / 0.24 | 0 | crab-only |
+| order id + `market_batches` push (`stitch_outcome`, 5247) | 0.20 / 0.22 | 0.13 | shared |
+| `phase2_bid_floors` (5158) | 0.08 / 0.08 | 0 | crab-only |
+| loop, collect, `excess_by_sender` | 0.07 / 0.11 | 0.03 | |
+| **total** | **5.07 / 5.12** | **1.47** | |
+
+`prepare_one` by source-line group (mean r1 / r2; "maps" = `HashMap` probe,
+SipHash and rehash inside the group):
+
+| group (lines) | ms/1k | maps | crab-only? |
+|---|---|---|---|
+| `proj.get` 5616, `AccountReader::position_px` 5618, `proj.entry` 5619 | 0.63 | 0.47 | yes |
+| `take_open_slot` 5548 + `open_slots.entry` 5549 | 0.40 | 0.21 | shared (main 0.31) |
+| `pos_nets.get` 5603 + `AccountReader::pos_net` 5605 (valuation) | 0.33 | 0.17 | yes |
+| `account_check` 5639 (`placement_need`) | 0.32 | 0.05 | yes |
+| projection 5679-5706 (`proj.get_mut`, release `checked_mul` x2, `im_delta`) | 0.28 | 0.13 | yes |
+| `BalanceCache` load 5597 / set 5668 | 0.21 | 0.17 | shared (main 0.14) |
+| `try_reserve_for_qty_cfg` 5583 | 0.17 | 0 | shared (main 0.13) |
+| bid floor, Option B (5576-5578) | 0.11 | 0.06 | yes |
+| `open_slots.insert` 5709 + `pool.entry` 5712 | 0.10 | 0.10 | yes |
+| `margin_configs.get` 5568, `basis.get`, other | 0.12 | 0.06 | shared |
+| **total** | **2.66** | **1.42** | crab-only 1.77 |
+
+| gap part | crab | main | delta |
+|---|---|---|---|
+| crab-only per order (F1 account check in `prepare_one`) | 1.77 | 0 | +1.77 |
+| crab-only per batch (top-ups 0.81, pool takers 0.24, bid floors 0.08, excess 0.02) | 1.15 | 0 | +1.15 |
+| shared per-order steps (open slot, reservation, `BalanceCache`, id + push) | 1.20 | 0.73 | +0.47 |
+| shared batch passes (`phase2_reservation_basis`, `open_order_counts`) | 0.97 | 0.75 | +0.22 |
+| **total** | **5.09** | **1.47** | **+3.62** |
+
+| what the innermost frames do (r1 / r2) | crab | main |
+|---|---|---|
+| SipHash (std `HashMap` hashing) | 1.39 / 1.32 | 0.58 |
+| `HashMap` probe / insert / rehash | 1.15 / 1.14 | 0.35 |
+| FixedPoint / i128 arithmetic | 0.65 / 0.64 | 0.12 |
+| alloc / free, `format!` | 0.23 / 0.24 | 0.16 |
+| other (compares, loads, first touch of order params) | 1.66 / 1.78 | 0.27 |
+
+- **About 80% of the gap is crab-only code** (2.9 of 3.6); the shared
+  steps cost +0.7 more, mostly more map lookups per order.
+- **`HashMap` work is +1.6 of the +3.6:** 2.5 ms/1k on crab vs 0.9 on
+  main. Per order, `prepare_one` does about 10-18 map lookups, keyed by
+  sender, (sender, market) or market: `open_slots` (entry, then a second
+  `insert`), `basis`, `margin_configs`, `bid_floors`, `pos_nets`, `proj`
+  (get, entry, get_mut), `released`, `committed`, `pool` (get, entry),
+  `BalanceCache` (load, set) and `tiers` (twice), plus the
+  `market_batches` entry; main's loop does about 6 including that entry. Every `SenderFold` map starts empty, so they rehash as they
+  grow (0.10 at 5619; 0.14 in the basis `closing` map, which main has too).
+  The s82 A/B (main, 2026-09-30) swapped the exec maps to ahash with no
+  measurable gain, so the lever is fewer lookups, not another hasher.
+- **FixedPoint:** `checked_mul` is an i256 multiply and an i256 division by
+  10^8 (ethnum `idivmod4`). Inclusive `checked_mul` in the margin phase
+  0.51 vs 0.10 on main; on the whole execution thread 1.07-1.16 vs 0.27.
+  Margin-phase callers: `placement_need` (margin.rs 115-117, 0.15),
+  the projection release (5689 / 5691, 0.12), `try_reserve_for_qty_cfg`
+  (6603, then `price * qty` again in `reserve_for_qty_cfg` 6589: the same
+  product twice, also on main) and `position_terms` in the memo build.
+
+### 11.2 Hot lines (r1, r2 in brackets)
+
+- **`prepare_one` 2.69 [2.63].** 5619 0.27 [0.28]: `proj.entry` after a
+  miss (0.15 entry incl. rehash, 0.12 first touch of the new slot). 5605
+  0.27 [0.24]: `pos_net` -> `pos_sums` -> `cached_sums` -> the block memo's
+  `get_or_init` -> `sums_of` -> `AccountView::build_with`, i.e. a full
+  valuation the first time a sender appears in the block. 5639 0.25 [0.26]:
+  `account_check` -> `placement_need`, three `checked_mul` (0.06 / 0.05 /
+  0.05) and two `im_delta`. 5549 0.23 [0.18]: `open_slots.entry`. 5618 0.20
+  [0.22]: `position_px` = `get_position` 0.14 + `mark` 0.07. 5548 0.18
+  [0.17]: `take_open_slot`, 0.11 of it the `format!` of the "open order
+  limit reached" reject (6757; main pays the same 0.10).
+- **`same_batch_bid_top_ups` 0.78 [0.83].** `can_rest_shape` 0.22 [0.29],
+  all on 7195 (`o.order_type`): the first read of each order's params, a
+  cold load of ~150 ns per order. The i128 tick `%` (7199) is 0.003, so the
+  section 8.2 idea of dropping it saves nothing. 7168 0.15 [0.16] (`basis`
+  lookup and `p.params.quantity`, again a first touch), 7157 0.13
+  (`AskDepth::upto` 0.11 and the `batch_asks` range fold).
+- **`phase2_reservation_basis` 0.60 [0.59]** (main 0.47, same code): 7035
+  `closing.entry` 0.32 (rehash 0.14), 7045 0.12 (first touch of the entry),
+  6995 `order_books.get` 0.11 [0.09].
+- **`open_order_counts` 0.35 [0.36]** (main 0.26): `trader_orders.get` per
+  (book, sender) at `order_book.rs:1696` 0.25 [0.24].
+- **`d2_pool_takers` 0.24:** collect of every checked taker (7214) 0.08,
+  sort (7215) 0.07, `BTreeSet` dedup and collect (7221) 0.10.
+- **Valuation memo (`cached_sums`, all phases) 1.01 [0.93]:** 0.94 is the
+  memo build (`build_with` margin.rs:212 -> `position_terms`: 171
+  `size.checked_mul(px)` 0.17, 174 `diff.checked_mul(size)` 0.16, 176
+  `order_initial_margin` 0.13, mark / tiers closures 0.33). Only 0.25 of it
+  is in the margin phase; the rest is `maker_free` in the match workers and
+  `liq_view` (0.75 [0.71]). The persistent cache drops every trader the
+  block wrote, and active traders write every block, so they are rebuilt.
+
+### 11.3 `AccountReader::get_position` and `AccountMargins` are match-timer cost
+
+| `AccountReader::get_position` caller | timer | r1 | r2 |
+|---|---|---|---|
+| `reduce_only_positions_for` (7287), Phase 3 setup on the execution thread | match | 0.73 | 0.77 |
+| `AccountMargins` setup, `position_px` (5346) | match | 0.17 | 0.18 |
+| `maker_position_px` (1485), match workers | match | 0.23 | 0.25 |
+| `prepare_one`, `position_px` (5618) | margin | 0.14 | 0.17 |
+| **total** | | **1.27** | **1.37** |
+
+- **Only ~0.15 of section 10.2's 1.27 is margin phase.** Inside it,
+  `trader_positions::find` (binary search of the trader's
+  `Vec<Position>` by market) is 0.99 [1.09], the `Position` clone 0.16,
+  `resident_positions` (dirty set + records map) 0.10 [0.12].
+- **The same (sender, market) row is read up to three times per batch**
+  (5618, 7287, 5346). Main's reduce-only tracking reads it from the overlay
+  (`signed_position` 2.21 ms/1k), so crab is already ~1.1 cheaper there.
+- **`AccountMargins` setup (5342-5355) is 0.43 [0.44]** (was 0.93 at
+  `14236fa`): `position_px` 0.19, `insert_taker_only` 0.12 [0.10],
+  `am.get` 0.07 [0.10], `pools.get` 0.03.
+
+### 11.4 What to cut
+
+Estimates (not measured), profile ms/1k fills on crab; ENGINE wall is about
+0.78x. 18c is editing `order_book.rs`, torus-types, `native_executor.rs`
+and the off-tick reject in `prepare_one` / `place_order_inner`, so almost
+every candidate is in 18c's files.
+
+1. **One sender entry per order in `prepare_one`:** merge `open_slots`,
+   `pos_nets`, `released`, `committed` and `pool` into one per-sender
+   entry, one `proj` entry instead of get + entry + get_mut, pre-sized fold
+   maps. **-0.5 to -0.7.** `native_executor.rs` `prepare_one` /
+   `SenderFold` (18c's files).
+2. **`same_batch_bid_top_ups`:** skip a market with no candidate sell
+   (count them in `prepare_one`), or keep the rest shape, price and
+   quantity in `PreparedOrder` so the scan does not touch cold params.
+   **-0.3 to -0.8** (the share of markets with a candidate is not
+   measured). `native_executor.rs` (18c's files).
+3. **`FixedPoint::checked_mul` i128 fast path** when both operands fit in
+   63 bits, and one price x qty in `try_reserve_for_qty_cfg`. **Margin -0.3
+   to -0.4**, execution thread ~-0.6. torus-types `lib.rs:87`,
+   `native_executor.rs` 6589 / 6603 (18c's files).
+4. **Keep traders' sums across blocks:** update the slot entry with the C6b
+   delta at `end_resident` instead of dropping every trader the block
+   wrote. **Margin -0.25**, up to -0.6 more in `maker_free` / `liq_view`.
+   `native_executor.rs` `BlockSums::into_cache` / `cached_sums` (18c's
+   files).
+5. **`d2_pool_takers` from the fold** (`pool` and `pos_nets` already hold
+   each sender's first checked market and pos_net). **-0.2.**
+   `native_executor.rs` (18c's files).
+6. **Pre-size the `phase2_reservation_basis` maps** (`closing`, `growth`,
+   `out`). **-0.14** (main would gain ~0.10). `native_executor.rs` (18c's
+   files).
+7. **Market-indexed arrays for the block's marks and tiers**
+   (`AccountReader::mark` / `tiers`, `margin_configs.get`). **-0.15.**
+   `native_executor.rs` (18c's files).
+8. **Match timer, same thread:** pass the pre-batch (signed, px) that
+   `prepare_one` read into Phase 3, so `reduce_only_positions_for` and the
+   `AccountMargins` setup stop re-reading it. **-0.6 to -0.8.**
+   `native_executor.rs` (18c's files). A (trader, market) index in
+   `TraderPositions` would cut `find` instead (`trader_positions.rs`, not
+   18c's; low confidence, -0.3).
+
+Items 1-7 add up to about 1.7-2.7 ms/1k (1.3-2.1 ENGINE wall): margin
+~216 -> ~105-145 ms per block at ~55k fills per block, against main's
+95-97 (estimate). The account check itself (`placement_need`, 0.32) and
+the first valuation of a sender new to the block stay.
+
 ## Open
 
 - Native trie maintenance off by default: owner question on the
@@ -764,8 +962,8 @@ C7. The execution-thread buckets below are not trie work.
 - E1 (oracle step) postponed, low priority: 5.8 ms per empty block on
   ozarchy (section 7.3).
 - Margin at 300 markets after C6 + C7: margin phase 216-221 vs ~95 ms per
-  block on main, `prepare_one` 2.7 and `AccountReader::get_position` 1.27
-  ms/1k (section 10). The `positions_for_trader` scans are gone.
+  block on main (section 10). Breakdown and cut list in section 11;
+  almost every cut is in files 18c is editing (section 11.4).
 - A main pair interleaved with C7 cells, trie off, to tighten the 0.638x
   (section 10.1).
 - Optional: cheaper shed path (peek the action tag or const-hex) and the
