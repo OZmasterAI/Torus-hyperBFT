@@ -416,6 +416,11 @@ pub struct Metrics {
     /// (M1 cut 4). rows + positions + the memo merge / drops ==
     /// `exec_end_resident_seconds`.
     pub exec_end_resident_positions_seconds: Histogram,
+    /// Item 6 step 2: time the exec thread waited for the `end_resident`
+    /// worker at the join (next block's `begin_resident`, or an untouched
+    /// block's advance), once per worker joined: the part of
+    /// `exec_end_resident_seconds` still on the critical path.
+    pub exec_end_resident_wait_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -1715,6 +1720,12 @@ impl Metrics {
             "Item 6: end_resident, decoded positions following the delta plus the sums carry",
             exec_end_resident_positions_seconds.clone(),
         );
+        let exec_end_resident_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_wait_seconds",
+            "Item 6: exec thread waiting for the end_resident worker at the join (exposed end_resident)",
+            exec_end_resident_wait_seconds.clone(),
+        );
 
         let exec_queue_depth = Gauge::default();
         registry.register(
@@ -2255,6 +2266,7 @@ impl Metrics {
             exec_end_resident_seconds,
             exec_end_resident_rows_seconds,
             exec_end_resident_positions_seconds,
+            exec_end_resident_wait_seconds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2543,6 +2555,7 @@ mod tests {
             "torus_exec_end_resident_seconds",
             "torus_exec_end_resident_rows_seconds",
             "torus_exec_end_resident_positions_seconds",
+            "torus_exec_end_resident_wait_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",

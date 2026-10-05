@@ -1971,29 +1971,6 @@ impl ExecutionContext {
 
         // ---- Native execution ----
         if run_native {
-            // Item 6 Phase 1: take (or build) the resident rows R — the
-            // previous block's post-state of CF_NATIVE_POSITIONS /
-            // CF_NATIVE_BALANCES — and attach them before the overlay is
-            // cloned into the context; every read of the two CFs in this block
-            // is then served from memory. Not gated by TORUS_RESIDENT_BOOKS.
-            // Only the oracle / liquidation due-checks read the overlay before
-            // this point, and neither reads R's CFs.
-            #[cfg(test)]
-            let no_resident_rows = self.test_no_resident_rows;
-            #[cfg(not(test))]
-            let no_resident_rows = false;
-            let mut resident_rows = {
-                let mut holder = self
-                    .resident_books
-                    .lock()
-                    .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
-                torus_bridge::native_executor::begin_resident(
-                    (!no_resident_rows).then_some(&mut *holder),
-                    &mut overlay,
-                    height,
-                    self.metrics.as_deref(),
-                )
-            };
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
@@ -2150,6 +2127,28 @@ impl ExecutionContext {
                 .resident_books
                 .lock()
                 .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+            // Item 6 Phase 1: take (or build) the resident rows R — the
+            // previous block's post-state of CF_NATIVE_POSITIONS /
+            // CF_NATIVE_BALANCES — and attach them before the overlay is
+            // cloned into the context (`new_env` below); every read of the two
+            // CFs in this block is then served from memory. Not gated by
+            // TORUS_RESIDENT_BOOKS. Step 2: this is as late as R can be taken,
+            // so the previous block's `end_resident` worker overlaps everything
+            // above (verify, the replay guard, the bundle seed, the action
+            // sort); `begin_resident` waits for it first. Nothing above reads
+            // R's CFs through this overlay (the oracle / liquidation
+            // due-checks, sessions, nonces); a read of them before the attach
+            // would go to DB + parent layer, the same post-(h−1) content.
+            #[cfg(test)]
+            let no_resident_rows = self.test_no_resident_rows;
+            #[cfg(not(test))]
+            let no_resident_rows = false;
+            let mut resident_rows = torus_bridge::native_executor::begin_resident(
+                (!no_resident_rows).then_some(&mut *resident_books),
+                &mut overlay,
+                height,
+                self.metrics.as_deref(),
+            );
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -2613,18 +2612,22 @@ impl ExecutionContext {
             // block's delta and goes back to the holder at `height`. A failed
             // flush (or an early return above: fatal block, failed hand-off)
             // leaves the slot empty, so the next native block rebuilds R.
+            // Step 2: the work runs on a worker thread that owns R (the lock
+            // is held only to hand the job over); the next access of the
+            // rows slot — the next native block's `begin_resident` or an
+            // untouched block's `advance_untouched` — joins it first.
             {
                 let mut holder = self
                     .resident_books
                     .lock()
                     .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
-                torus_bridge::native_executor::end_resident(
+                torus_bridge::native_executor::end_resident_on_worker(
                     &mut holder,
                     resident_rows,
                     &mut overlay,
                     resident_delta,
                     resident_ok,
-                    self.metrics.as_deref(),
+                    self.metrics.clone(),
                 );
             }
 
@@ -17266,7 +17269,7 @@ mod crash_recovery_tests {
 
     /// R between blocks (holder slot) as per-CF dumps; `None` = slot empty.
     fn resident_rows_dump(ctx: &ExecutionContext) -> Option<Vec<CfDump>> {
-        let holder = ctx.resident_books.lock().unwrap();
+        let mut holder = ctx.resident_books.lock().unwrap();
         holder.rows().map(|r| {
             torus_state::resident_rows::RESIDENT_CFS
                 .iter()
@@ -17360,10 +17363,49 @@ mod crash_recovery_tests {
                 assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
                 assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on}"));
             }
-            let holder = ctx.resident_books.lock().unwrap();
+            let mut holder = ctx.resident_books.lock().unwrap();
             assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
             assert_eq!(holder.rows_shared_fallbacks(), 0, "on={on}: Arc::get_mut never fails");
             assert!(holder.rows().unwrap().len() > 2, "non-vacuous");
+        }
+    }
+
+    /// Item 6 step 2: on the committed-block path, serial and pipelined, each
+    /// native block hands `end_resident` to a worker (in flight when the
+    /// block returns); the next block (native: `begin_resident`, untouched:
+    /// `advance_untouched`) joins it, so R still equals the DB after every
+    /// block; the end timer and the join's wait timer count once per worker.
+    /// Prints the worker's time vs the exposed wait (18c sanity, tiny blocks).
+    #[test]
+    fn end_resident_runs_on_a_worker_joined_by_the_next_block() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            ctx.metrics = Some(metrics.clone());
+            let mut spawned = 0.0;
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+                assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+                let in_flight = ctx.resident_books.lock().unwrap().rows_in_flight();
+                spawned += f64::from(u8::from(in_flight));
+                // Odd heights: the next block joins the worker itself.
+                if b.header.height.is_multiple_of(2) {
+                    assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("worker on={on}"));
+                }
+            }
+            ctx.resident_books.lock().unwrap().settle_rows();
+            let text = metrics.encode();
+            let v = |name: &str| metric_value(&text, name);
+            assert!(spawned >= 4.0, "on={on}: native blocks ran on the worker ({spawned})");
+            assert_eq!(v("torus_exec_end_resident_seconds_count"), spawned, "on={on}");
+            assert_eq!(v("torus_exec_end_resident_wait_seconds_count"), spawned, "on={on}: one join per worker");
+            println!(
+                "STEP2 on={on} workers={spawned} end_resident_ms_sum={:.3} wait_ms_sum={:.3}",
+                v("torus_exec_end_resident_seconds_sum") * 1e3,
+                v("torus_exec_end_resident_wait_seconds_sum") * 1e3
+            );
         }
     }
 
@@ -17590,7 +17632,7 @@ mod crash_recovery_tests {
         let ctx = t.join().unwrap();
         assert!(ctx.exec_failed.load(Ordering::SeqCst));
         {
-            let holder = ctx.resident_books.lock().unwrap();
+            let mut holder = ctx.resident_books.lock().unwrap();
             assert_eq!(holder.rows_builds(), 1, "block 3 reused R (no rebuild)");
             assert_eq!(holder.rows_height(), None, "failed hand-off: R not stashed");
         }

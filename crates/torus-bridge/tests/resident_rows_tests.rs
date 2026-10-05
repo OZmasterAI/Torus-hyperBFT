@@ -62,7 +62,7 @@ fn serial_block(db: &StateDb, holder: &mut ResidentBooks, h: u64, writes: &[(u8,
     rebuilt
 }
 
-fn assert_r_equals_db(holder: &ResidentBooks, db: &StateDb, what: &str) {
+fn assert_r_equals_db(holder: &mut ResidentBooks, db: &StateDb, what: &str) {
     let rows = holder.rows().unwrap_or_else(|| panic!("{what}: holder drained"));
     assert_eq!(dump_rows(rows), dump_db(db), "{what}: R != DB scan");
     // Item 6 C7: undecodable values and `cvlm` keys included.
@@ -76,10 +76,10 @@ fn successor_with_matching_marker_reuses_r() {
     let mut holder = ResidentBooks::default();
     assert!(serial_block(&db, &mut holder, 1, &[(1, b"x1")]), "cold start builds");
     assert_eq!(holder.rows_height(), Some(1));
-    assert_r_equals_db(&holder, &db, "after 1");
+    assert_r_equals_db(&mut holder, &db, "after 1");
     for h in 2..=5 {
         assert!(!serial_block(&db, &mut holder, h, &[(h as u8, b"xh"), (9, b"new")]), "h{h}: reuse");
-        assert_r_equals_db(&holder, &db, &format!("after {h}"));
+        assert_r_equals_db(&mut holder, &db, &format!("after {h}"));
     }
     assert_eq!(holder.rows_builds(), 1);
     assert_eq!(holder.rows_shared_fallbacks(), 0);
@@ -118,7 +118,7 @@ fn skipped_height_rebuilds() {
     db.put_cf_raw(CF_NATIVE_BALANCES, &[2u8; 20], b"applied-elsewhere").unwrap();
     db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &2u64.to_be_bytes()).unwrap();
     assert!(serial_block(&db, &mut holder, 3, &[]), "slot 1 vs block 3: rebuild");
-    assert_r_equals_db(&holder, &db, "after 3");
+    assert_r_equals_db(&mut holder, &db, "after 3");
     // No marker row at all: the height sequence alone guards (like the books).
     let (_d2, db2) = open_db();
     seed(&db2);
@@ -151,7 +151,7 @@ fn fatal_block_and_failed_flush_drain_the_slot() {
     }
     assert_eq!(holder.rows_height(), None, "taken by the fatal block");
     assert!(serial_block(&db, &mut holder, 2, &[]), "re-executed block 2 rebuilds");
-    assert_r_equals_db(&holder, &db, "after the replayed 2");
+    assert_r_equals_db(&mut holder, &db, "after the replayed 2");
 
     let mut overlay = NativeStateOverlay::new(db.clone());
     let block = begin_resident(Some(&mut holder), &mut overlay, 3, None);
@@ -160,7 +160,7 @@ fn fatal_block_and_failed_flush_drain_the_slot() {
     end_resident(&mut holder, block, &mut overlay, delta, false, None);
     assert_eq!(holder.rows_height(), None, "ok = false drains");
     assert!(serial_block(&db, &mut holder, 3, &[]), "rebuild after a failed flush");
-    assert_r_equals_db(&holder, &db, "after 3");
+    assert_r_equals_db(&mut holder, &db, "after 3");
 }
 
 /// `Arc::get_mut` fallback: a clone of R still alive at `end_resident` (an
@@ -182,7 +182,7 @@ fn live_clone_of_r_falls_back_to_a_rebuild() {
     assert_eq!(holder.rows_height(), None);
     drop(leaked);
     assert!(serial_block(&db, &mut holder, 3, &[]));
-    assert_r_equals_db(&holder, &db, "after 3");
+    assert_r_equals_db(&mut holder, &db, "after 3");
 }
 
 /// `begin_resident(None, ..)` = today's path: nothing attached, reads go to
@@ -227,7 +227,7 @@ fn pipelined_r_tracks_db_plus_parent() {
         parent = Some(frozen);
     }
     parent.unwrap().flush_with_native_trie_stats(&db, Some(6), None, None).unwrap();
-    assert_r_equals_db(&holder, &db, "after 6");
+    assert_r_equals_db(&mut holder, &db, "after 6");
     assert_eq!(holder.rows_builds(), 1);
 }
 

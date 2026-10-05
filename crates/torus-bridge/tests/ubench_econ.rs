@@ -19,6 +19,11 @@
 //! is printed as `r_end/blk`). `UB_NO_R=1` runs without R (today's path) for
 //! A/B pairs on one binary. Each run also times a cold R build over the final
 //! DB (`R rows / bytes / build_ms`).
+//! `UB_R_WORKER=1` (item 6 step 2): `end_resident_on_worker` instead of
+//! `end_resident`, joined by the next block's `begin_resident` (`end_resident/blk` is
+//! then the hand-over only; `timer/blk` and `wait/blk` come from the
+//! worker's and the join's timers). The harness has no pre-native work
+//! between the blocks, so this shows equal results, not the node's overlap.
 //!
 //!   cargo test -p torus-bridge --release --test ubench_econ -- --ignored --nocapture
 
@@ -28,7 +33,9 @@ mod econ_load;
 use econ_load::{base_mark, env, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
 use std::collections::HashMap;
 use std::sync::Arc;
-use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
+use torus_bridge::native_executor::{
+    begin_resident, end_resident, end_resident_on_worker, NativeExecContext, NativeExecutor, ResidentBooks,
+};
 use torus_core::position::NativeBalance;
 use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{NativeStateOverlay, ResidentRows, StateBackend, StateDb};
@@ -62,8 +69,10 @@ fn hist_sum(metrics: &torus_telemetry::Metrics, name: &str) -> Option<f64> {
 }
 
 /// Item 6 step 1: end_resident's sub-timers (ms, summed over the measured
-/// blocks): R applying the delta, the decoded positions + sums carry.
-const END_SUBS: [&str; 2] = ["exec_end_resident_rows", "exec_end_resident_positions"];
+/// blocks): R applying the delta, the decoded positions + sums carry; step 2:
+/// the whole of end_resident (worker side) and the join's wait.
+const END_SUBS: [&str; 4] =
+    ["exec_end_resident_rows", "exec_end_resident_positions", "exec_end_resident", "exec_end_resident_wait"];
 
 fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>) {
     let senders = env("UB_SENDERS", 600);
@@ -74,6 +83,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
     let fed = env("UB_MARKS", 0) == 1;
     let mut walk = MarkWalk::new(markets, env("UB_MARK_WALK", 0));
     let resident = env("UB_NO_R", 0) != 1;
+    let worker = env("UB_R_WORKER", 0) == 1;
     let mut holder = ResidentBooks::default();
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -114,12 +124,13 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
     let mut placed_measured = 0u64;
     let mut subs0: Vec<Option<f64>> = vec![None; END_SUBS.len()];
     for h in 1..=(warm + measure) {
-        if h == warm + 1 {
-            subs0 = END_SUBS.iter().map(|n| hist_sum(&metrics, n)).collect();
-        }
         let block = gen.block(actions);
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
         let mut rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, None);
+        if h == warm + 1 {
+            // After the join of block `warm`'s worker (step 2).
+            subs0 = END_SUBS.iter().map(|n| hist_sum(&metrics, n)).collect();
+        }
         let mut ctx = NativeExecContext::new(
             overlay.clone(),
             h + 1,
@@ -167,7 +178,11 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         let delta = if rows.attached() { overlay.own_pending_delta() } else { Default::default() };
         let frozen = overlay.freeze(h);
         let t3 = std::time::Instant::now();
-        end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
+        if worker {
+            end_resident_on_worker(&mut holder, rows, &mut overlay, delta, true, Some(metrics.clone()));
+        } else {
+            end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
+        }
         let end = t3.elapsed();
         let r_end = t2.elapsed();
         if h > warm {
@@ -240,7 +255,7 @@ fn ubench_econ() {
             "UB run={r} blocks={} fills/blk={:.0} engine_ms/blk={:.1} engine_ms/1k_fills={:.2} \
              [exec/1k={:.2} margin/1k={:.2} match/1k={:.2} settle/1k={:.2} tail(liq)/1k={:.2}] \
              rejected_cancelled={} accepted={} resting_end={} r_end/blk={:.2}ms \
-             [end_resident/blk={:.2}ms rows/blk={}ms positions/blk={}ms] \
+             [end_resident/blk={:.2}ms rows/blk={}ms positions/blk={}ms timer/blk={}ms wait/blk={}ms] \
              R rows={} bytes={} build_ms={:.1} build_ms_per_1M_rows={:.0}",
             s.len(),
             fills as f64 / n,
@@ -258,6 +273,8 @@ fn ubench_econ() {
             end / n,
             sub(0),
             sub(1),
+            sub(2),
+            sub(3),
             rb.rows,
             rb.bytes,
             rb.ms,
@@ -266,10 +283,11 @@ fn ubench_econ() {
         per_run.push(per1k);
     }
     println!(
-        "UB marks={} walk_bp={} resident_rows={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
+        "UB marks={} walk_bp={} resident_rows={} r_worker={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
         env("UB_MARKS", 0) == 1,
         env("UB_MARK_WALK", 0),
         env("UB_NO_R", 0) != 1,
+        env("UB_R_WORKER", 0) == 1,
         median(per_run.clone()),
         per_run
     );

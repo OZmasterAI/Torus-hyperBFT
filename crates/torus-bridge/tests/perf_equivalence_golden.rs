@@ -9,7 +9,8 @@
 //! a `NativeStateOverlay` over the previous block's frozen set, then
 //! `freeze` + `flush` with the running state hash on. Item 6 Phase 1 (C1):
 //! the resident rows R are attached exactly as app.rs does
-//! (`begin_resident` / `end_resident`); every scenario also runs without R
+//! (`begin_resident` / `end_resident`, and item 6 step 2's
+//! `end_resident_on_worker`); every scenario also runs without R
 //! (`begin_resident(None, ..)`, today's path) against the same digests. A block's digest =
 //! keccak256 over the DB after its flush (every `HASHED_CFS` CF, the native
 //! state root, the running hash — which also covers tombstones) ‖ its
@@ -22,7 +23,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{keccak256, Address, U256};
-use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
+use torus_bridge::native_executor::{
+    begin_resident, end_resident, end_resident_on_worker, NativeExecContext, NativeExecutor, ResidentBooks,
+};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::liquidation as liq;
 use torus_core::order_book::OrderBook;
@@ -147,11 +150,25 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
     data
 }
 
+/// How a run keeps the resident rows R.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum R {
+    /// Today's path (`begin_resident(None, ..)`).
+    Off,
+    /// R attached, `end_resident` inline.
+    Inline,
+    /// Item 6 step 2 (app.rs): `end_resident_on_worker`, joined by the next
+    /// block's `begin_resident`.
+    Worker,
+}
+
+const R_MODES: [R; 3] = [R::Inline, R::Worker, R::Off];
+
 /// Runs `blocks` on the pipelined overlay path; `threads` = `None` runs
-/// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `resident`
-/// attaches the resident rows R (else today's path). Returns one hex digest
-/// per block.
-fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -> Vec<String> {
+/// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `r`: how
+/// the resident rows R are kept. Returns one hex digest per block.
+fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<String> {
+    let resident = r != R::Off;
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
     let metrics = Arc::new(Metrics::new());
@@ -240,7 +257,11 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
-        end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
+        if r == R::Worker {
+            end_resident_on_worker(&mut holder, rows, &mut overlay, delta, true, Some(metrics.clone()));
+        } else {
+            end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
+        }
         if let Some(p) = parent.take() {
             flush(p, &outputs, &mut digests);
         }
@@ -523,29 +544,29 @@ fn check(name: &str, got: &[String], want: &[&str]) {
 
 #[test]
 fn scenario_a_serial_digests_golden() {
-    for resident in [true, false] {
+    for r in R_MODES {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        check("GOLDEN_A", &run(&db, &blocks, None, resident), &GOLDEN_A);
+        check("GOLDEN_A", &run(&db, &blocks, None, r), &GOLDEN_A);
     }
 }
 
 #[test]
 fn scenario_a_engine_digests_golden() {
-    for resident in [true, false] {
+    for r in R_MODES {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        check("GOLDEN_A", &run(&db, &blocks, Some(4), resident), &GOLDEN_A);
+        check("GOLDEN_A", &run(&db, &blocks, Some(4), r), &GOLDEN_A);
     }
 }
 
 #[test]
 fn scenario_b_liquidation_digests_equal_c93c579() {
-    for resident in [true, false] {
+    for r in R_MODES {
         let (_d, db) = listed_db(&[1, 2, 3]);
         let blocks = scenario_b(&db);
-        check("GOLDEN_B", &run(&db, &blocks, None, resident), &GOLDEN_B);
+        check("GOLDEN_B", &run(&db, &blocks, None, r), &GOLDEN_B);
     }
 }

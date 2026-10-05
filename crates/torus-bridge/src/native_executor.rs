@@ -2683,11 +2683,25 @@ pub struct ResidentBooks {
     /// advances), but NOT gated by `TORUS_RESIDENT_BOOKS`: every node keeps R.
     /// See [`begin_resident`] / [`end_resident`].
     rows: Option<RowsSlot>,
+    /// Item 6 step 2: the slot being made by [`end_resident_on_worker`] on
+    /// its worker thread (the worker owns R, the delta and the sums; it never
+    /// touches this holder). Joined into `rows` by [`Self::settle_rows`],
+    /// which every reader / writer of `rows` calls first, so nothing can see
+    /// the slot of the block before the worker finished it.
+    rows_pending: Option<PendingRows>,
     /// Item 6 Phase 1: R builds (cold start or guard trip) and
     /// `end_resident` calls that found another clone of R alive (test /
     /// ops introspection).
     rows_builds: u64,
     rows_shared_fallbacks: u64,
+}
+
+/// Item 6 step 2: one block's `end_resident` running on a worker thread.
+struct PendingRows {
+    handle: std::thread::JoinHandle<RowsSlot>,
+    height: u64,
+    /// For the wait timer at the join.
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 struct RowsSlot {
@@ -2714,20 +2728,57 @@ struct ResidentInner {
 
 impl ResidentBooks {
     /// Drop any resident state (books and rows) — the next block rebuilds
-    /// from the DB.
+    /// from the DB. Waits for an `end_resident` worker first (step 2).
     pub fn invalidate(&mut self) {
+        self.settle_rows();
         self.inner = None;
         self.rows = None;
     }
 
+    /// Item 6 step 2: wait for the `end_resident` worker (if one runs) and
+    /// put the slot it made into the holder; observes
+    /// `exec_end_resident_wait_seconds` (the time this thread waited). A
+    /// worker that panicked leaves the slot empty: the next native block
+    /// rebuilds R, as after a failed block. Every access to the rows slot
+    /// calls this first.
+    pub fn settle_rows(&mut self) {
+        let Some(PendingRows { handle, height, metrics }) = self.rows_pending.take() else {
+            return;
+        };
+        let timer = std::time::Instant::now();
+        let joined = handle.join();
+        if let Some(m) = metrics.as_deref() {
+            m.exec_end_resident_wait_seconds.observe(timer.elapsed().as_secs_f64());
+        }
+        match joined {
+            Ok(slot) => self.rows = Some(slot),
+            Err(_) => {
+                tracing::error!(
+                    height,
+                    "item 6: end_resident worker panicked — dropping R (next native block rebuilds it)"
+                );
+                self.rows = None;
+            }
+        }
+    }
+
+    /// Item 6 step 2: an `end_resident` worker has not been joined yet
+    /// (test / ops introspection; does not wait).
+    pub fn rows_in_flight(&self) -> bool {
+        self.rows_pending.is_some()
+    }
+
     /// Item 6 Phase 1: the resident rows R between blocks (None = drained or
-    /// taken by a block in progress).
-    pub fn rows(&self) -> Option<&torus_state::ResidentRows> {
+    /// taken by a block in progress). Waits for an `end_resident` worker.
+    pub fn rows(&mut self) -> Option<&torus_state::ResidentRows> {
+        self.settle_rows();
         self.rows.as_ref().map(|s| &*s.rows)
     }
 
-    /// Item 6 Phase 1: the block height whose post-state R holds.
-    pub fn rows_height(&self) -> Option<u64> {
+    /// Item 6 Phase 1: the block height whose post-state R holds. Waits for
+    /// an `end_resident` worker.
+    pub fn rows_height(&mut self) -> Option<u64> {
+        self.settle_rows();
         self.rows.as_ref().map(|s| s.height)
     }
 
@@ -2744,7 +2795,8 @@ impl ResidentBooks {
 
     /// Item 6 C7: whether the slot's decoded positions equal a cold decode
     /// of its R (`None`: no slot). Test / ops introspection.
-    pub fn trader_positions_match_rows(&self) -> Option<bool> {
+    pub fn trader_positions_match_rows(&mut self) -> Option<bool> {
+        self.settle_rows();
         self.rows.as_ref().map(|s| s.positions.same_as(&TraderPositions::build(&s.rows)))
     }
 
@@ -2782,6 +2834,8 @@ impl ResidentBooks {
     pub fn advance_untouched_with(&mut self, enabled: bool, block_height: u64) -> bool {
         // Item 6 Phase 1: the rows slot advances (or drains) by the same rule,
         // independent of the books' kill switch (R has no runtime switch).
+        // Step 2: the previous block's slot first (its worker may still run).
+        self.settle_rows();
         match self.rows.as_mut() {
             Some(slot) if slot.height + 1 == block_height => slot.height = block_height,
             Some(slot) => {
@@ -2847,6 +2901,21 @@ pub struct ResidentBlock {
     /// [`NativeExecContext::detach_resident_block`], this block's memo;
     /// `end_resident` merges them. `None`: R not attached (no cache).
     sums: Option<BlockSums>,
+    /// Step 2 tests: runs first inside the `end_resident` worker (hold it,
+    /// or panic in it).
+    #[cfg(test)]
+    worker_hook: Option<WorkerHook>,
+}
+
+/// Step 2 tests: see [`ResidentBlock::worker_hook`].
+#[cfg(test)]
+pub(crate) struct WorkerHook(pub(crate) Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for WorkerHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerHook")
+    }
 }
 
 impl ResidentBlock {
@@ -2880,10 +2949,21 @@ pub fn begin_resident(
     height: u64,
     metrics: Option<&torus_telemetry::Metrics>,
 ) -> ResidentBlock {
-    let mut block = ResidentBlock { height, attached: false, rebuilt: false, marks: None, sums: None };
+    let mut block = ResidentBlock {
+        height,
+        attached: false,
+        rebuilt: false,
+        marks: None,
+        sums: None,
+        #[cfg(test)]
+        worker_hook: None,
+    };
     let Some(holder) = holder else {
         return block;
     };
+    // Step 2: the previous block's slot may still be in its `end_resident`
+    // worker — wait for it here, before the slot is taken (never later).
+    holder.settle_rows();
     debug_assert!(!overlay.has_resident(), "begin_resident on an overlay that already has R");
     let reused = holder.rows.take().and_then(|slot| {
         let marker = applied_marker(&*overlay);
@@ -2955,6 +3035,9 @@ pub fn begin_resident(
 /// `Arc::get_mut`, applies `delta` and stashes it at `block`'s height. If a
 /// clone of R is still alive (never in the normal sequence) or `!ok`, the
 /// slot stays empty and the next block rebuilds.
+///
+/// Runs on the calling thread; [`end_resident_on_worker`] is the same work on
+/// a worker thread (app.rs).
 pub fn end_resident(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
@@ -2963,78 +3046,171 @@ pub fn end_resident(
     ok: bool,
     metrics: Option<&torus_telemetry::Metrics>,
 ) {
+    holder.settle_rows();
     let timer = std::time::Instant::now();
-    end_resident_inner(holder, block, overlay, delta, ok, metrics);
+    if let Some(job) = end_resident_take(holder, block, overlay, delta, ok) {
+        holder.rows = Some(job.run(metrics));
+    }
     // Item 6 step 1: the whole upkeep (the delta and the memo dropped included).
     if let Some(m) = metrics {
         m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
     }
 }
 
-fn end_resident_inner(
+/// Item 6 step 2: [`end_resident`] with its work (R applying `delta`, the
+/// decoded positions and the sums carry) on a new worker thread, so it
+/// overlaps the next block's work up to its [`begin_resident`]. The checks
+/// (`ok`, R attached, no other clone of R alive) run here, on the calling
+/// thread, exactly as in `end_resident`; the worker then owns R, the delta and
+/// the block's sums, and never touches `holder`. The slot it makes enters
+/// `holder` at the next access of the rows slot ([`ResidentBooks::settle_rows`]:
+/// `begin_resident`, `advance_untouched`, `invalidate`, the introspection
+/// methods), so every later block sees exactly the slot `end_resident` would
+/// have stashed. A failed spawn or a panic in the worker leaves the slot
+/// empty (the next native block rebuilds R). `exec_end_resident_seconds` is
+/// observed by the worker (its time plus the checks here).
+pub fn end_resident_on_worker(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
     overlay: &mut NativeStateOverlay,
     delta: torus_state::ResidentDelta,
     ok: bool,
-    metrics: Option<&torus_telemetry::Metrics>,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
 ) {
-    let Some(mut rows) = overlay.detach_resident() else {
+    holder.settle_rows();
+    let timer = std::time::Instant::now();
+    let Some(job) = end_resident_take(holder, block, overlay, delta, ok) else {
+        if let Some(m) = metrics.as_deref() {
+            m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
+        }
         return;
     };
-    if !block.attached || !ok {
-        return;
+    let height = job.height;
+    let checks = timer.elapsed();
+    let worker_metrics = metrics.clone();
+    let spawned = std::thread::Builder::new().name("torus-end-resident".into()).spawn(move || {
+        let timer = std::time::Instant::now();
+        let slot = job.run(worker_metrics.as_deref());
+        if let Some(m) = worker_metrics.as_deref() {
+            m.exec_end_resident_seconds.observe((checks + timer.elapsed()).as_secs_f64());
+        }
+        slot
+    });
+    match spawned {
+        Ok(handle) => holder.rows_pending = Some(PendingRows { handle, height, metrics }),
+        Err(e) => {
+            // The job (R included) was dropped with the closure.
+            tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+        }
     }
-    let Some(r) = Arc::get_mut(&mut rows) else {
+}
+
+/// Item 6 step 2: `end_resident`'s inputs once its checks passed — owned by
+/// whichever thread runs [`Self::run`].
+struct EndResidentJob {
+    /// R, with no other clone alive (checked by [`end_resident_take`]).
+    rows: Arc<torus_state::ResidentRows>,
+    height: u64,
+    marks: Option<BlockMarksState>,
+    sums: Option<BlockSums>,
+    delta: torus_state::ResidentDelta,
+    #[cfg(test)]
+    worker_hook: Option<WorkerHook>,
+}
+
+/// `end_resident`'s checks: detach R from `overlay`; `None` (slot stays
+/// empty) if R was not attached, `!ok`, or another clone of R is alive.
+fn end_resident_take(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: torus_state::ResidentDelta,
+    ok: bool,
+) -> Option<EndResidentJob> {
+    let mut rows = overlay.detach_resident()?;
+    if !block.attached || !ok {
+        return None;
+    }
+    if Arc::get_mut(&mut rows).is_none() {
         holder.rows_shared_fallbacks += 1;
         tracing::warn!(
             height = block.height,
             "item 6: resident rows still shared at end of block — dropping R (next block rebuilds)"
         );
-        return;
-    };
+        return None;
+    }
     let ResidentBlock { height, marks, sums, .. } = block;
-    // C3: the block's memo joins the slot's sums; item 6 M1: every trader
-    // whose positions the block wrote or deleted has its sums moved on to
-    // its rows after the block, else loses them (step 1: while its decoded
-    // positions follow the delta, below).
-    let (mut carry, records) = match sums {
-        Some(mut s) => {
-            let records = s.records.take();
-            (Some(s.into_carry(marks.as_ref())), records)
+    Some(EndResidentJob {
+        rows,
+        height,
+        marks,
+        sums,
+        delta,
+        #[cfg(test)]
+        worker_hook: block.worker_hook,
+    })
+}
+
+impl EndResidentJob {
+    /// R takes the block's delta; the decoded positions and the sums follow.
+    fn run(self, metrics: Option<&torus_telemetry::Metrics>) -> RowsSlot {
+        let EndResidentJob {
+            mut rows,
+            height,
+            marks,
+            sums,
+            delta,
+            #[cfg(test)]
+            worker_hook,
+        } = self;
+        #[cfg(test)]
+        if let Some(hook) = worker_hook {
+            (hook.0)();
         }
-        None => (None, None),
-    };
-    let timer = std::time::Instant::now();
-    r.apply(&delta);
-    if let Some(m) = metrics {
-        m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
-        m.exec_resident_rows.set(r.len() as i64);
-        m.exec_resident_rows_bytes.set(r.bytes() as i64);
-    }
-    // C7: the decoded positions follow the delta (decoded cold if the
-    // context kept the block's state).
-    let timer = std::time::Instant::now();
-    let positions = match records {
-        Some(mut p) => {
-            match carry.as_mut() {
-                Some(c) => p.apply(&delta, r, Some(&mut |t: &Address, report| c.trader(t, report))),
-                None => p.apply(&delta, r, None),
+        let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
+        // C3: the block's memo joins the slot's sums; item 6 M1: every trader
+        // whose positions the block wrote or deleted has its sums moved on to
+        // its rows after the block, else loses them (step 1: while its decoded
+        // positions follow the delta, below).
+        let (mut carry, records) = match sums {
+            Some(mut s) => {
+                let records = s.records.take();
+                (Some(s.into_carry(marks.as_ref())), records)
             }
-            p
+            None => (None, None),
+        };
+        let timer = std::time::Instant::now();
+        r.apply(&delta);
+        if let Some(m) = metrics {
+            m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
+            m.exec_resident_rows.set(r.len() as i64);
+            m.exec_resident_rows_bytes.set(r.bytes() as i64);
         }
-        None => {
-            if let Some(c) = carry.as_mut() {
-                c.drop_written(&delta);
+        // C7: the decoded positions follow the delta (decoded cold if the
+        // context kept the block's state).
+        let timer = std::time::Instant::now();
+        let positions = match records {
+            Some(mut p) => {
+                match carry.as_mut() {
+                    Some(c) => p.apply(&delta, r, Some(&mut |t: &Address, report| c.trader(t, report))),
+                    None => p.apply(&delta, r, None),
+                }
+                p
             }
-            TraderPositions::build(r)
+            None => {
+                if let Some(c) = carry.as_mut() {
+                    c.drop_written(&delta);
+                }
+                TraderPositions::build(r)
+            }
+        };
+        if let Some(m) = metrics {
+            m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
         }
-    };
-    if let Some(m) = metrics {
-        m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
+        let sums = carry.map(|c| c.cache).unwrap_or_default();
+        drop(delta);
+        RowsSlot { rows, marks, sums, positions, height }
     }
-    let sums = carry.map(|c| c.cache).unwrap_or_default();
-    holder.rows = Some(RowsSlot { rows, marks, sums, positions, height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -3086,6 +3262,10 @@ mod block_marks_tests;
 #[cfg(test)]
 #[path = "sums_cache_tests.rs"]
 mod sums_cache_tests;
+
+#[cfg(test)]
+#[path = "end_resident_worker_tests.rs"]
+mod end_resident_worker_tests;
 
 #[cfg(test)]
 mod resident_books_toggle_tests {

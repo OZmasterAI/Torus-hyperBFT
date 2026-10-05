@@ -290,6 +290,14 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
 /// [`run`]; `calm`: marks are written only every 4th block (item 6 M1: the
 /// mark version holds across blocks, so written traders' sums are carried).
 fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<BlockOut> {
+    run_mode(seed, cached, calm, false, stats)
+}
+
+/// [`run_with`]; `worker` (item 6 step 2, app.rs's order): `begin_resident`
+/// after the block's pre-native writes (just before the context), and
+/// `end_resident_on_worker`; the slot checks run on odd blocks (an explicit
+/// join first), even blocks leave the join to the next `begin_resident`.
+fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats) -> Vec<BlockOut> {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     for m in 1..=5u64 {
@@ -312,8 +320,7 @@ fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<Block
     for h in 1..=BLOCKS {
         let now = 10_000 + 7 * h;
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
-        let mut rb = begin_resident(cached.then_some(&mut holder), &mut overlay, h, None);
-        assert_eq!(rb.attached(), cached);
+        let early = (!worker).then(|| begin_resident(cached.then_some(&mut holder), &mut overlay, h, None));
         // Previous block's governance: a listing at 12, a delisting at 25
         // (configs show in the next context).
         if h == 12 {
@@ -339,6 +346,11 @@ fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<Block
                 _ => {}
             }
         }
+        let mut rb = match early {
+            Some(rb) => rb,
+            None => begin_resident(cached.then_some(&mut holder), &mut overlay, h, None),
+        };
+        assert_eq!(rb.attached(), cached);
         let mut ctx =
             NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
         // Multi-tier config for market 2, changing every 7 blocks.
@@ -390,8 +402,14 @@ fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<Block
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
-        end_resident(&mut holder, rb, &mut overlay, delta, true, None);
-        if cached {
+        if worker {
+            end_resident_on_worker(&mut holder, rb, &mut overlay, delta, true, None);
+            assert_eq!(holder.rows_in_flight(), cached, "seed {seed} block {h}: deferred");
+        } else {
+            end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        }
+        if cached && (!worker || h % 2 == 1) {
+            holder.settle_rows();
             assert_eq!(holder.trader_positions_match_rows(), Some(true), "seed {seed} block {h}: records warm == cold");
             stats.carried += holder.rows.as_ref().map_or(0, |slot| slot.sums.carried);
             stats.slot_checked += check_slot_sums(&holder, &format!("seed {seed} block {h}"));
@@ -462,6 +480,34 @@ fn carried_sums_equal_reference_on_calm_marks() {
     );
     assert!(stats.carried > 200 && stats.persistent_hits > 300, "carried entries used: {stats:?}");
     assert!(stats.slot_checked > 500, "slot entries checked warm == cold: {stats:?}");
+}
+
+/// Item 6 step 2: the node's order (begin late, end on the worker) gives
+/// the same results and rows as the reference run and the inline run, block
+/// by block, with moving and with calm marks (carried sums); the slot's sums
+/// and decoded records equal a cold build after the checked blocks.
+#[test]
+fn end_resident_on_worker_equals_inline_and_reference() {
+    for calm in [false, true] {
+        let mut stats = Stats::default();
+        for seed in 1..=3u64 {
+            let s = seed * 0x57E9_2002;
+            let on_worker = run_mode(s, true, calm, true, &mut stats);
+            let inline = run_mode(s, true, calm, false, &mut Stats::default());
+            let reference = run_mode(s, false, calm, false, &mut Stats::default());
+            for (h, ((w, i), r)) in on_worker.iter().zip(&inline).zip(&reference).enumerate() {
+                let h = h + 1;
+                assert_eq!(w.results, r.results, "calm={calm} seed {seed} block {h}: results vs reference");
+                assert_eq!(w.results, i.results, "calm={calm} seed {seed} block {h}: results vs inline");
+                assert!(w.rows == r.rows && w.rows == i.rows, "calm={calm} seed {seed} block {h}: rows");
+            }
+        }
+        println!("SUMS_CACHE worker calm={calm} carried={} slot_checked={} shadow={}", stats.carried, stats.slot_checked, stats.shadow);
+        assert!(stats.slot_checked > 200 && stats.shadow > 1_000, "calm={calm}: non-vacuous: {stats:?}");
+        if calm {
+            assert!(stats.carried > 50, "carried entries: {stats:?}");
+        }
+    }
 }
 
 /// The cache is dropped with the slot: a guard trip (skipped height) rebuilds
@@ -893,6 +939,17 @@ fn dirty_trader_reads_pending_rows_not_its_record() {
 /// to R.
 #[test]
 fn trader_positions_follow_the_slot_guards() {
+    slot_guards(false);
+}
+
+/// Item 6 step 2: the same guards with `end_resident` on the worker (every
+/// check below joins it first).
+#[test]
+fn trader_positions_follow_the_slot_guards_on_worker() {
+    slot_guards(true);
+}
+
+fn slot_guards(worker: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
@@ -942,9 +999,13 @@ fn trader_positions_follow_the_slot_guards() {
             return; // never reaches end_resident: the slot stays taken (empty)
         }
         overlay.flush_with_native_trie_and_marker(&db, h).unwrap();
-        end_resident(holder, rb, &mut overlay, delta, end != End::Failed, None);
+        if worker {
+            end_resident_on_worker(holder, rb, &mut overlay, delta, end != End::Failed, None);
+        } else {
+            end_resident(holder, rb, &mut overlay, delta, end != End::Failed, None);
+        }
     };
-    let check = |holder: &ResidentBooks, h: u64, builds: u64, what: &str| {
+    let check = |holder: &mut ResidentBooks, h: u64, builds: u64, what: &str| {
         assert_eq!(holder.rows_builds(), builds, "{what}: builds after {h}");
         assert_eq!(holder.trader_positions_match_rows(), Some(true), "{what}: records == cold decode of R after {h}");
         let rows = holder.rows().unwrap().rows(CF_NATIVE_POSITIONS).unwrap().clone();
@@ -954,28 +1015,28 @@ fn trader_positions_follow_the_slot_guards() {
     };
     for h in 1..=4 {
         block(&mut holder, h, End::Normal);
-        check(&holder, h, 1, "normal");
+        check(&mut holder, h, 1, "normal");
     }
     block(&mut holder, 6, End::Normal);
-    check(&holder, 6, 2, "skipped height 5");
+    check(&mut holder, 6, 2, "skipped height 5");
     block(&mut holder, 7, End::NoDetach);
-    check(&holder, 7, 2, "context kept its block state");
+    check(&mut holder, 7, 2, "context kept its block state");
     block(&mut holder, 8, End::Failed);
     assert_eq!(holder.trader_positions_match_rows(), None, "failed block: slot empty");
     // The failed block's writes were flushed anyway: the DB is at 8.
     block(&mut holder, 9, End::Normal);
-    check(&holder, 9, 3, "after a failed block");
+    check(&mut holder, 9, 3, "after a failed block");
     holder.invalidate();
     assert_eq!(holder.trader_positions_match_rows(), None);
     block(&mut holder, 10, End::Normal);
-    check(&holder, 10, 4, "after invalidate");
+    check(&mut holder, 10, 4, "after invalidate");
     block(&mut holder, 11, End::Fatal);
     assert_eq!(holder.trader_positions_match_rows(), None, "fatal block: slot taken");
     // The fatal block's writes never reached the DB: 11 again.
     block(&mut holder, 11, End::Normal);
-    check(&holder, 11, 5, "re-executed after a fatal block");
+    check(&mut holder, 11, 5, "re-executed after a fatal block");
     for h in 12..=15 {
         block(&mut holder, h, End::Normal);
-        check(&holder, h, 5, "normal again");
+        check(&mut holder, h, 5, "normal again");
     }
 }
