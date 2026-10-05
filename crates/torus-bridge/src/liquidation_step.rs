@@ -74,7 +74,7 @@ impl NativeExecutor {
         // (skipped) is at most one of them, so a pass that consumes every
         // fetched trader without hitting a budget has reached the end.
         let cursor = liq::cursor(&ctx.state)?;
-        let accounts = liq::traders_after(&ctx.state, cursor, scan.saturating_add(2))?;
+        let accounts = Self::liq_traders_after(ctx, cursor, scan.saturating_add(2))?;
         let mut results = Vec::new();
         let (mut scanned, mut acted, mut last, mut cut) = (0usize, 0usize, None, false);
         for &trader in accounts.iter().filter(|a| **a != LIQUIDATOR_VAULT) {
@@ -141,6 +141,35 @@ impl NativeExecutor {
         liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
         Ok(results)
+    }
+
+    /// Item 6 E2: the walk's candidates (`liq::traders_after(&ctx.state,
+    /// after, limit)`) from the slot's sorted trader set when the context
+    /// holds the decoded records with R attached (traders the block wrote are
+    /// looked up through the overlay); else the walk itself (one seek per
+    /// trader).
+    fn liq_traders_after<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        after: Option<Address>,
+        limit: usize,
+    ) -> Result<Vec<Address>, CoreError> {
+        let Some(records) = ctx.sums.as_ref().and_then(|s| s.records.as_ref()) else {
+            return liq::traders_after(&ctx.state, after, limit);
+        };
+        let Some(out) = records.traders_after(&ctx.state, after, limit)? else {
+            return liq::traders_after(&ctx.state, after, limit);
+        };
+        #[cfg(test)]
+        if let Some(s) = ctx.sums.as_ref() {
+            bump(&s.counters.traders_slice);
+            if s.shadow {
+                let want = liq::traders_after(&ctx.state, after, limit);
+                if want.as_ref().ok() != Some(&out) {
+                    s.shadow_mismatches.lock().unwrap().push(format!("traders_after {after:?} {limit}: slot {out:?}, walk {want:?}"));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Item 6 C4 (plan 2.5, L1): whether [`Self::liq_view`] values from the

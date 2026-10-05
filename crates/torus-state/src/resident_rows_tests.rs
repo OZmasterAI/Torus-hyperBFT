@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{ResidentRows, RESIDENT_CFS};
 use crate::backend::{NativeStateOverlay, StateBackend};
-use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS};
+use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS};
 use crate::db::StateDb;
 
 fn temp_db() -> (StateDb, tempfile::TempDir) {
@@ -58,7 +58,17 @@ fn build_equals_iterate_cf_of_both_cfs() {
         db.put_cf_raw(CF_NATIVE_BALANCES, &k, b"odd-b").unwrap();
     }
     db.put_cf_raw(CF_NATIVE_ORDERS, &[1u8; 44], b"order").unwrap();
+    // Item 6 E2-E4: the further R CFs, any key shape.
+    for cf in &RESIDENT_CFS[2..] {
+        for k in odd_keys().iter().chain([pos_key(1, 1), vec![0x02; 21]].iter()) {
+            db.put_cf_raw(cf, k, &[b"x".as_slice(), k].concat()).unwrap();
+        }
+    }
     let parent = NativeStateOverlay::new(db.clone());
+    for cf in &RESIDENT_CFS[2..] {
+        parent.put_cf_raw(cf, &[0x04; 3], b"parent-new").unwrap();
+        parent.delete_cf_raw(cf, &[0x02; 21]).unwrap();
+    }
     parent.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(9, 1), b"parent-new").unwrap();
     parent.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(1, 1), b"parent-over").unwrap();
     parent.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 2)).unwrap();
@@ -77,7 +87,7 @@ fn build_equals_iterate_cf_of_both_cfs() {
     }
     assert_eq!(rows.len(), total);
     assert_eq!(rows.bytes(), bytes_of(&rows));
-    assert!(rows.rows(CF_NATIVE_ORDERS).is_none(), "only R's two CFs are resident");
+    assert!(rows.rows(CF_NATIVE_ORDERS).is_none(), "only R's CFs are resident");
     assert!(rows.rows(CF_NATIVE_POSITIONS).unwrap().contains_key(&odd_keys()[1]), "cvlm kept");
     assert!(!rows.rows(CF_NATIVE_BALANCES).unwrap().contains_key(&odd_keys()[0]), "parent tombstone");
 }
@@ -172,7 +182,7 @@ fn overlay_with_resident_equals_flushed_db_over_random_layers() {
         (seed >> 33) % n
     };
     const ALPHABET: [u8; 4] = [0x00, 0x01, 0xfe, 0xff];
-    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_ORDERS];
+    let cfs: Vec<&str> = RESIDENT_CFS.iter().copied().chain([CF_NATIVE_ORDERS]).collect();
     let (mut checked, mut hidden) = (0usize, 0usize);
     for round in 0..40 {
         let (db, _d1) = temp_db();
@@ -243,7 +253,7 @@ fn overlay_with_resident_equals_flushed_db_over_random_layers() {
             prefixes.insert([k.as_slice(), &[0xff]].concat());
             prefixes.insert([k.as_slice(), &[0x00]].concat());
         }
-        for cf in cfs {
+        for cf in cfs.iter().copied() {
             let want_all = StateBackend::iterate_cf(&flushed, cf, None).unwrap();
             assert_eq!(overlay.iterate_cf(cf, None).unwrap(), want_all, "round {round} {cf}: None");
             for k in keys.iter().chain(prefixes.iter()) {
@@ -332,7 +342,7 @@ fn resident_cfs_skip_the_parent_layer() {
         (seed >> 33) % n
     };
     const ALPHABET: [u8; 4] = [0x00, 0x01, 0xfe, 0xff];
-    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_ORDERS];
+    let cfs: Vec<&str> = RESIDENT_CFS.iter().copied().chain([CF_NATIVE_ORDERS]).collect();
     let (mut compared, mut other_cf_differs, mut parent_touched) = (0usize, 0usize, 0usize);
     for round in 0..48 {
         let r_holds_parent = round % 2 == 0;
@@ -410,7 +420,7 @@ fn resident_cfs_skip_the_parent_layer() {
             prefixes.insert([k.as_slice(), &[0xff]].concat());
             prefixes.insert([k.as_slice(), &[0x00]].concat());
         }
-        for cf in cfs {
+        for cf in cfs.iter().copied() {
             let a = read_dump(&with_parent, cf, &keys, &prefixes);
             let b = read_dump(&without, cf, &keys, &prefixes);
             if !RESIDENT_CFS.contains(&cf) {
@@ -539,4 +549,11 @@ fn layer_keys_are_own_pending_keys_with_resident() {
     }
     assert!(overlay.layer_keys(CF_NATIVE_ORDERS).is_none(), "not an R CF");
     assert_eq!(overlay.layer_keys(CF_NATIVE_BALANCES), Some(vec![[4u8; 20].to_vec()]));
+}
+
+/// Item 6 E2-E4: R's column families — positions and balances (C1) and the
+/// liquidation rows (E2: cooldown / pending / previous marks / cursor).
+#[test]
+fn resident_cfs_are_the_native_hot_cfs() {
+    assert_eq!(RESIDENT_CFS.to_vec(), vec![CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION]);
 }

@@ -1,13 +1,14 @@
 //! Item 6 Phase 1 (C1): resident rows R — every row of `CF_NATIVE_POSITIONS`
-//! and `CF_NATIVE_BALANCES` in memory, kept across blocks by the execution
+//! and `CF_NATIVE_BALANCES` (and, item 6 E2-E4, of the further CFs in
+//! [`RESIDENT_CFS`]) in memory, kept across blocks by the execution
 //! pipeline (`ResidentBooks` in torus-bridge).
 //!
 //! R holds the post-state of the previous block. A block's overlay reads R's
-//! two CFs from R in place of the DB ([`crate::NativeStateOverlay::attach_resident`]):
+//! CFs from R in place of the DB ([`crate::NativeStateOverlay::attach_resident`]):
 //! own pending -> R; a key absent from R is absent. C6a (B0): the parent layer
 //! (the previous block's frozen writes) is not consulted for R's CFs, R
 //! already holds it. At the end
-//! of the block R takes the block's own writes and tombstones of the two CFs
+//! of the block R takes the block's own writes and tombstones of R's CFs
 //! ([`ResidentDelta`], from [`crate::NativeStateOverlay::own_pending_delta`]).
 //!
 //! Node-local cache, never consensus-visible: R is built from and equal to
@@ -17,11 +18,16 @@
 use std::collections::BTreeMap;
 
 use crate::backend::StateBackend;
-use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
+use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS};
 use crate::error::StateError;
 
-/// R's column families, in slot order.
-pub const RESIDENT_CFS: [&str; 2] = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES];
+/// R's column families, in slot order: positions and balances (C1), and
+/// item 6 E2's liquidation rows (cooldown / pending / previous-mark / cursor,
+/// read per scanned trader by the liquidation step). Written only through the
+/// block's overlay, like the first two.
+pub const RESIDENT_CFS: [&str; N] = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION];
+/// Number of R's column families.
+const N: usize = 3;
 
 /// Slot of `cf` in [`RESIDENT_CFS`], `None` for any other CF.
 #[inline]
@@ -32,20 +38,20 @@ pub fn resident_slot(cf: &str) -> Option<usize> {
 /// One sorted map per resident CF.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ResidentRows {
-    cfs: [BTreeMap<Vec<u8>, Vec<u8>>; 2],
-    /// Sum of key + value lengths over both maps.
+    cfs: [BTreeMap<Vec<u8>, Vec<u8>>; N],
+    /// Sum of key + value lengths over every map.
     bytes: usize,
 }
 
-/// One block's own writes (`Some`) and tombstones (`None`) of R's two CFs,
+/// One block's own writes (`Some`) and tombstones (`None`) of R's CFs,
 /// key-sorted per CF.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ResidentDelta {
-    pub(crate) cfs: [Vec<(Vec<u8>, Option<Vec<u8>>)>; 2],
+    pub(crate) cfs: [Vec<(Vec<u8>, Option<Vec<u8>>)>; N],
 }
 
 impl ResidentDelta {
-    /// Entries (writes + tombstones) over both CFs.
+    /// Entries (writes + tombstones) over R's CFs.
     pub fn len(&self) -> usize {
         self.cfs.iter().map(Vec::len).sum()
     }
@@ -83,7 +89,7 @@ pub struct ResidentChange {
 }
 
 impl ResidentRows {
-    /// Every row of R's two CFs as `backend` sees them (`iterate_cf(cf, None)`).
+    /// Every row of R's CFs as `backend` sees them (`iterate_cf(cf, None)`).
     /// Build it through an overlay WITHOUT R attached: DB + parent layer = the
     /// previous block's post-state.
     pub fn build<B: StateBackend>(backend: &B) -> Result<Self, StateError> {
@@ -126,7 +132,7 @@ impl ResidentRows {
         &self.cfs[slot]
     }
 
-    /// Rows over both CFs.
+    /// Rows over R's CFs.
     pub fn len(&self) -> usize {
         self.cfs.iter().map(BTreeMap::len).sum()
     }
@@ -135,7 +141,7 @@ impl ResidentRows {
         self.cfs.iter().all(BTreeMap::is_empty)
     }
 
-    /// Key + value bytes over both CFs (map overhead not included).
+    /// Key + value bytes over R's CFs (map overhead not included).
     pub fn bytes(&self) -> usize {
         self.bytes
     }

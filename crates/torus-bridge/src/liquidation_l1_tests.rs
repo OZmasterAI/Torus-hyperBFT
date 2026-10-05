@@ -129,6 +129,9 @@ struct Stats {
     multi_same_block: usize,
     l1: usize,
     l1_off: usize,
+    /// E2: candidate lists from the slot's trader set (shadow-checked
+    /// against the walk inside the step).
+    traders_slice: usize,
     shadow: usize,
     persistent: usize,
     memo: usize,
@@ -351,6 +354,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             let get = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
             stats.l1 += get(&c.l1);
             stats.l1_off += get(&c.l1_off);
+            stats.traders_slice += get(&c.traders_slice);
             stats.shadow += get(&c.shadow);
             stats.persistent += get(&c.persistent);
             stats.memo += get(&c.memo);
@@ -410,6 +414,7 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
         "rule B: two chunks of one account in one block, every MULTI account: {s:?}"
     );
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
+    assert_eq!(s.traders_slice, 6 * BLOCKS as usize, "E2: every L1 block's candidates from the slot: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");

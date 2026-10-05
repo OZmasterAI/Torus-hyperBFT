@@ -976,8 +976,8 @@ pub struct NativeStateOverlay {
     /// on the serial path (exact-today: own pending -> DB).
     parent: Option<Arc<FrozenPending>>,
     /// Item 6 Phase 1: resident rows R (the previous block's post-state of
-    /// `CF_NATIVE_POSITIONS` / `CF_NATIVE_BALANCES`). When set, every read of
-    /// those two CFs goes own pending -> R and never reaches the DB; a key
+    /// `RESIDENT_CFS`). When set, every read of
+    /// R's CFs goes own pending -> R and never reaches the DB; a key
     /// absent from R is absent. C6a (B0): nor the parent layer — R already
     /// holds it (`end_resident` applied the parent block's own delta; a
     /// rebuild reads DB + parent; `begin_resident` reuses R only when the
@@ -999,7 +999,7 @@ impl std::fmt::Debug for NativeStateOverlay {
 /// [`CfId`] -> slot in [`crate::resident_rows::RESIDENT_CFS`].
 #[inline]
 fn resident_slot_of(id: CfId) -> Option<usize> {
-    static IDS: OnceLock<[CfId; 2]> = OnceLock::new();
+    static IDS: OnceLock<[CfId; crate::resident_rows::RESIDENT_CFS.len()]> = OnceLock::new();
     IDS.get_or_init(|| RESIDENT_CFS.map(|cf| intern_cf(cf).expect("resident CF is registered")))
         .iter()
         .position(|x| *x == id)
@@ -1053,7 +1053,7 @@ impl NativeStateOverlay {
     }
 
     /// Item 6 Phase 1: this overlay's OWN pending writes and tombstones of R's
-    /// two CFs (the parent layer is already in R), key-sorted. Take it before
+    /// CFs (the parent layer is already in R), key-sorted. Take it before
     /// [`Self::freeze`] (which moves the pending set out) or the flush.
     pub fn own_pending_delta(&self) -> ResidentDelta {
         let state = self.pending.read().unwrap();
@@ -1884,7 +1884,7 @@ impl StateBackend for NativeStateOverlay {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
-            // Item 6 Phase 1: R replaces the DB for its two CFs; C6a (B0):
+            // Item 6 Phase 1: R replaces the DB for its CFs; C6a (B0):
             // and the parent layer, which R already holds.
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).cloned());
@@ -1953,7 +1953,7 @@ impl StateBackend for NativeStateOverlay {
         };
         let p = prefix.unwrap_or(&[]);
         // Item 6 Phase 1: R's prefix range stands in for the DB rows of its
-        // two CFs. C6a (B0): R already holds the parent layer, so only this
+        // CFs. C6a (B0): R already holds the parent layer, so only this
         // overlay's own pending set goes on top — merged straight into the
         // result (no intermediate Vec / BTreeMap).
         if let Some(rows) = self.resident_rows(id) {

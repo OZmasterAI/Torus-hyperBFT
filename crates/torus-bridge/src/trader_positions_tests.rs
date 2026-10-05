@@ -110,6 +110,9 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
     assert!(rec.same_as(&TraderPositions::build(rows)), "{tag}: warm records != cold build");
     let pm = PositionManager::new(db.clone());
     let r = rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    // E2: the trader set = the traders of R's 28-byte keys (opaque or not).
+    let with_key: BTreeSet<Address> = r.keys().filter(|k| k.len() == 28).map(|k| Address::from_slice(&k[..20])).collect();
+    assert_eq!(rec.traders, with_key, "{tag}: trader set != traders of R's 28-byte keys");
     let mut prefixes: BTreeSet<Address> =
         r.keys().filter(|k| k.len() >= 20).map(|k| Address::from_slice(&k[..20])).collect();
     prefixes.extend((0..=TRADERS).map(trader));
@@ -246,4 +249,84 @@ fn empty_trader_and_missing_market() {
     let ps = [position(trader(0), 2, 1, true), position(trader(0), 5, 2, false)];
     assert_eq!(find(&ps, 5).map(|p| p.market_id), Some(5));
     assert!(find(&ps, 3).is_none());
+}
+
+/// Item 6 E2: `traders_after` over R's trader set and the block's own
+/// pending rows == the liquidation walk (`liq::traders_after`) through the
+/// same overlay (R attached), for every cursor (none, each trader, addresses
+/// between and around them) and limit, over random blocks with irregular
+/// rows, traders that appear in the block (first position) and traders whose
+/// every position the block deletes. Without R it answers `None` (the caller
+/// walks).
+#[test]
+fn traders_after_equals_the_walk_over_r_and_pending() {
+    use torus_core::liquidation as liq;
+    let (mut compared, mut appeared, mut vanished) = (0usize, 0usize, 0usize);
+    for seed in 1..=8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0xE2E2_0517);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let mut rows = ResidentRows::build(&db).unwrap();
+        let mut rec = TraderPositions::build(&rows);
+        for h in 1..=80 {
+            let mut o = NativeStateOverlay::new(db.clone());
+            o.attach_resident(std::sync::Arc::new(rows.clone()));
+            random_block(&o, &mut rng);
+            // A trader's first position (a new trader, some blocks at the
+            // last market key `t ‖ ff×8`), and a trader losing every row.
+            if rng.below(3) == 0 {
+                let t = trader(TRADERS + rng.below(3));
+                let m = if rng.below(2) == 0 { MarketId::MAX } else { 1 + rng.below(MARKETS) };
+                o.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m), &bytes(&position(t, m, 9, true))).unwrap();
+            }
+            if rng.below(3) == 0 {
+                let t = trader(rng.below(TRADERS + 3));
+                let keys: Vec<Vec<u8>> = o
+                    .iterate_cf(CF_NATIVE_POSITIONS, Some(t.as_slice()))
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .filter(|k| k.len() == 28)
+                    .collect();
+                for k in keys {
+                    o.delete_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap();
+                }
+            }
+            let mut cursors: Vec<Option<Address>> = vec![None, Some(Address::ZERO), Some(Address::new([0xff; 20]))];
+            for i in 0..TRADERS + 3 {
+                let t = trader(i);
+                cursors.push(Some(t));
+                let mut b = t.0 .0;
+                b[19] ^= 0x80;
+                cursors.push(Some(Address::new(b)));
+                b[0] = 0x3B;
+                cursors.push(Some(Address::new(b)));
+            }
+            let walk_all = liq::traders_after(&o, None, usize::MAX).unwrap();
+            appeared += walk_all.iter().filter(|t| !rec.traders.contains(*t)).count();
+            vanished += rec.traders.iter().filter(|t| !walk_all.contains(*t)).count();
+            for after in &cursors {
+                for limit in [0usize, 1, 2, 3, 5, usize::MAX] {
+                    let want = liq::traders_after(&o, *after, limit).unwrap();
+                    let got = rec.traders_after(&o, *after, limit).unwrap();
+                    assert_eq!(got, Some(want), "seed {seed} block {h}: after {after:?} limit {limit}");
+                    compared += 1;
+                }
+            }
+            assert_eq!(rec.traders_after(&db, None, usize::MAX).unwrap(), None, "no R: the caller walks");
+            let delta = o.own_pending_delta();
+            o.detach_resident();
+            o.flush(&db).unwrap();
+            rows.apply(&delta);
+            rec.apply(&delta, &rows, None);
+        }
+    }
+    println!("TRADERS_AFTER compared={compared} appeared={appeared} vanished={vanished}");
+    assert!(compared > 10_000, "non-vacuous: {compared}");
+    assert!(appeared > 50 && vanished > 50, "traders appear / vanish in the block: {appeared} / {vanished}");
 }

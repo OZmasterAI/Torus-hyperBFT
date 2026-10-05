@@ -1147,6 +1147,8 @@ struct SumsCounters {
     l1_off: std::sync::atomic::AtomicUsize,
     /// C7: position reads / memo builds answered by the decoded records.
     records: std::sync::atomic::AtomicUsize,
+    /// E2: liquidation candidate lists from the slot's trader set.
+    traders_slice: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
