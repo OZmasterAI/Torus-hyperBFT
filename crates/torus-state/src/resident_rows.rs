@@ -18,19 +18,22 @@
 use std::collections::BTreeMap;
 
 use crate::backend::StateBackend;
-use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
+use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
 use crate::error::StateError;
 
 /// R's column families, in slot order: positions and balances (C1), and
 /// item 6 E2's liquidation rows (cooldown / pending / previous-mark / cursor,
 /// read per scanned trader by the liquidation step) and E3's oracle rows
 /// (submissions, aggregates, signer index: the block-start oracle step reads
-/// every submission and aggregate each block). Written only through the
-/// block's overlay, like the first two.
+/// every submission and aggregate each block) and E4's market rows (listings
+/// and their margin configs, scanned by the context, the oracle step and the
+/// liquidation step each block; the order-id counter and book-mode marker,
+/// written on the exec thread before the block's delta is taken). Written
+/// only through the block's overlay, like the first two.
 pub const RESIDENT_CFS: [&str; N] =
-    [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE];
+    [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_MARKETS];
 /// Number of R's column families.
-const N: usize = 4;
+const N: usize = 5;
 
 /// Slot of `cf` in [`RESIDENT_CFS`], `None` for any other CF.
 #[inline]

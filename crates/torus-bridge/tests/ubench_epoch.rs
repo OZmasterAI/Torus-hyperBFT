@@ -28,6 +28,7 @@
 //! outside the block's timing, R advances). `UB_NO_R=1`: without R.
 //! C2: the split oracle step ends with `fill_block_marks` (the block mark
 //! table, `marks=` in the per-block line), and the slot carries its version.
+//! UB_REAL_MARKETS=1 (item 6 E4): genesis-layout market rows instead of `b"listed"`.
 //! UB_SEED_TRADERS>0 replaces the econ load with directly written positions
 //! (UB_SEED_POS per trader) for scaling runs. Sizes: UB_SENDERS (5000),
 //! UB_MARKETS (300), UB_ACTIONS (60), UB_LOAD (150), UB_DRAIN_TO (420).
@@ -100,8 +101,15 @@ fn feed_setup(db: &StateDb, markets: u64) {
             )
             .unwrap();
     }
+    // Item 6 E4: `UB_REAL_MARKETS=1` lists markets with genesis-layout rows
+    // (one 5% tier, tick / lot 1) as on a node; the default `b"listed"`
+    // rows fail the margin-config decode, which costs ~20 us per row (borsh
+    // allocates and zeroes up to 1 MiB for the bogus string length).
+    let real = env("UB_REAL_MARKETS", 0) == 1;
+    let one = FixedPoint::ONE.raw();
+    let row = borsh::to_vec(&("BASE".to_string(), "USDC".to_string(), one, one, 5 * one)).unwrap();
     for m in 1..=markets {
-        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), if real { &row } else { b"listed" }).unwrap();
     }
 }
 fn econ_order(rng: &mut Lcg, s: u64, m: u64) -> PlaceOrderParams {

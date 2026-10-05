@@ -107,6 +107,9 @@ fn maker(i: u64) -> Address {
 #[derive(Default, PartialEq, Eq)]
 struct BlockOut {
     results: String,
+    /// E4: the context's margin configs and listed markets (market rows
+    /// read through R in the L1 run).
+    markets: String,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     triggered: u64,
 }
@@ -286,6 +289,10 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
         }
         let mut ctx =
             NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let ctx_markets = (
+            ctx.margin_configs.iter().map(|(m, c)| (*m, c.clone())).collect::<BTreeMap<_, _>>(),
+            ctx.governance.listed_market_ids().unwrap(),
+        );
         ctx.margin_configs.insert(2, tiered(2));
         ctx.order_books = std::mem::take(&mut books);
         ctx.next_global_order_id = next_id;
@@ -369,10 +376,11 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             r.results.iter().map(|x| (&x.error, x.success)).collect::<Vec<_>>(),
             liq.iter().map(|x| (&x.error, x.success, x.gas_used)).collect::<Vec<_>>()
         );
+        let markets = format!("{:?} {:?}", ctx_markets.0, ctx_markets.1);
         let mut rows = liq_rows;
         rows.extend(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap());
         rows.extend(overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
-        out.push(BlockOut { results, rows, triggered: metrics.liquidations_triggered.get() });
+        out.push(BlockOut { results, markets, rows, triggered: metrics.liquidations_triggered.get() });
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
@@ -400,6 +408,7 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
         let reference = run(seed * 0x517C_C1B7, false, &mut Stats::default());
         for (h, (a, b)) in with_l1.iter().zip(reference.iter()).enumerate() {
             assert_eq!(a.results, b.results, "seed {seed} block {}: results", h + 1);
+            assert_eq!(a.markets, b.markets, "seed {seed} block {}: margin configs / listed markets", h + 1);
             assert!(a.rows == b.rows, "seed {seed} block {}: liquidation / position / balance rows", h + 1);
             assert_eq!(a.triggered, b.triggered, "seed {seed} block {}: liquidations_triggered", h + 1);
         }
