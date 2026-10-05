@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -21,6 +21,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 9 | Does the crab / main ratio change with the trie off? Is the shared-code inflation cache misses? | Trie off: crab +3.4%, main +12.5%, ratio 0.553x -> 0.508x (main was partly flush-bound). Inflation is 1.2-2.5x more instructions per fill, not lower IPC |
 | 10 | What do C6 + C7 (`82bd1a4`) give at 300 markets, trie off? | 64.2k matched/s, +25.7% vs `14236fa`: **0.638x main** (was 0.508x). Engine 14.0 -> 10.2 ms/1k; state reads 8.3 -> 1.7, liquidation 3.2 -> 0.9, `maker_fill_fits` 4.3 -> 1.5 ms/1k. Left: margin phase 216-221 vs ~95 ms/blk on main |
 | 11 | Where does C7's margin phase go vs main? What can be cut? | 5.09 vs 1.47 ms CPU/1k fills (+3.6; ENGINE wall 3.96 vs 1.46). 2.9 is crab-only code: the F1 account check in `prepare_one` 1.77, top-ups / pool takers / bid floors 1.15. `HashMap` work is +1.6 of the gap. `AccountReader::get_position` is ~0.15 margin, ~1.1 match timer. Named cuts ~1.7-2.7 ms/1k (est.), almost all in 18c's files |
+| 12 | What do P1-P4 + fix A (`239ff69`) give at 300 markets? | 65.2k matched/s, **0.648x main** (was 0.638x): +1.5%, within 82bd1a4's cell spread; engine 10.2 -> 9.93 ms/1k (-2.7%, both cells). `checked_mul` -77%, matching -15%, margin buckets -14%, settle -17%; +0.5 ms/1k SipHash from the new Address-keyed `TraderMargins` map. Margin still 207-212 vs ~96 ms/blk on main |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -950,10 +951,121 @@ Items 1-7 add up to about 1.7-2.7 ms/1k (1.3-2.1 ENGINE wall): margin
 95-97 (estimate). The account check itself (`placement_need`, 0.32) and
 the first valuation of a sender new to the block stay.
 
+## 12. `239ff69` (P1-P4 + fix A) at 300 markets, trie off by default (2026-10-05)
+
+Crab only, `perf/item6-phase1` @ `239ff69`: `82bd1a4` plus P1-P4
+(matching per-fill fixes, `FixedPoint::checked_mul` fast path), fix A
+(off-tick and dust rejected before the book), and the merges of section
+11, trie maintenance off by default (`db6c9de`) and the RPC tick / lot
+check (`44b7473`). The deltas below are all of these together. Same run
+shape and build flags as section 10 (300 markets, cap 400, rate 76,000,
+`RETRY_BUSY=1`, 120 s, oracle feed 30000 / 2000 ms / walk 0: 402/402
+accepted in r1 and r2; warm 60 s without perf, then r1 and r2 with val0
+perf). Node md5 `88e2ddfe`, load generator md5 `ecd6bf45` (both built from
+`239ff69`). All cells AGREE, liveness PASS, ACCEPT. Driver and analysis:
+`ozarchy-239ff69-campaign.sh`, `ozarchy-239ff69-analysis.md`.
+
+- **Trie off without `EXTRA_ENV`:** no node had a `TORUS_NATIVE_TRIE*`
+  variable. `db6c9de` reworded the boot line: the old "maintenance
+  DISABLED" text is gone, and the new `native trie maintenance off
+  (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables)` line
+  (`app.rs:3852`) appears once in each of the 9 node logs. No rebuild ran.
+- **Load is comparable:** no new rejection class. `rejected_other` (where
+  fix A counts) and `rejected_book` stay 0; the open-limit and cancelled
+  rejects are the same order as `82bd1a4` (13.2-14.7M and 1.48M vs
+  12.2-13.2M and 1.44-1.46M per cell). RPC call-level errors are 0-80 per
+  node (`82bd1a4`: 0-20) against 0.2-1.0M successful calls, and the bench
+  log has no tick or lot message.
+
+### 12.1 Full node
+
+| cell | matched/s | best60 | engine ms/1k | CPU-s per 1M fills | chain ms | pipelined ms | handoff wait ms | commit ms avg / p50 | blk/s | native blk/s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `239ff69` r1 (perf val0) | 65,620 | 100,163 | 9.92 | 80.5 | 691 | 146 | 0.18 | 631 / 408 | 1.1 | 1.06 |
+| `239ff69` r2 (perf val0) | 64,751 | 100,722 | 9.93 | 80.7 | 664 | 139 | 0.02 | 628 / 414 | 1.1 | 1.07 |
+| **`239ff69` mean** | **65,186** | 100,443 | **9.93** | **80.6** | 678 | 143 | 0.10 | 630 / 411 | 1.1 | 1.06 |
+| `82bd1a4` mean (10.1) | 64,204 | 97,783 | 10.21 | 81.6 | 703 | 167 | 0.1 | 651 / 378 | 1.0 | 1.02 |
+| main `92a02ed` trie off (9.1) | 100,573 | 131,094 | 7.06 | 60 | 564 | 173 | 0.24 | 481 / 336 | 1.6 | 1.33 |
+| warm `239ff69` (60 s, no perf) | 76,710 | 99,593 | 8.35 | 62.2 | 587 | 127 | 0.17 | 520 / 358 | 0.9 | 0.89 |
+| warm `82bd1a4` (60 s, no perf) | 71,355 | 98,432 | 8.85 | 63.6 | 656 | 158 | 0.08 | 543 / 350 | 0.8 | 0.81 |
+
+| ratio to main | `82bd1a4` | `239ff69` |
+|---|---|---|
+| matched/s | 0.638x | **0.648x** |
+| engine ms/1k | 1.44x | 1.41x |
+| CPU-s per 1M fills | 1.36x | 1.34x |
+
+- **+1.5% matched/s** (65.2k vs 64.2k), within the `82bd1a4` r1 / r2
+  spread (65.1k vs 63.3k), so one round does not resolve it. The
+  unprofiled warm cells give +7.5%. **Engine time per fill -2.7%** is
+  consistent (9.92 / 9.93 vs 10.17 / 10.25); CPU per fill -1.2%, chain
+  time -3.5%, commit interval -3%.
+- **Caveat:** as in section 10, the main reference is the section 9.1 pair
+  (not interleaved, no perf, `14236fa` load generator).
+
+Engine phases on val0 (ms per block):
+
+| | total | phase 1 | margin | match | settle | tail (incl. liquidation) | untimed | fills per native block |
+|---|---|---|---|---|---|---|---|---|
+| `239ff69` r1 / r2 | 550 / 526 | 50 / 47 | 212 / 207 | 94 / 89 | 134 / 126 | 44 / 42 | 16 / 15 | 55.4k / 52.9k |
+| `82bd1a4` r1 / r2 | 553 / 573 | 45 / 47 | 216 / 221 | 96 / 102 | 128 / 135 | 48 / 46 | 20 / 21 | 54.4k / 55.8k |
+| main trie off r1 / r2 | 459 / 466 | 51 / 50 | 95 / 97 | 149 / 151 | 155 / 158 | 0.05 | 9 | 65.1k / 66.0k |
+
+Per 1k fills: margin 3.87 vs 3.96 (-2%), match 1.69 vs 1.80 (-6%), settle
+2.39 vs 2.39, tail 0.79 vs 0.86. Margin is still 2.2x main per block.
+
+### 12.2 val0 execution-thread profile
+
+ms CPU per 1k fills over the perf window, mean of r1 / r2 (both builds
+trie off, so unlike 10.2 the flush side is comparable too).
+
+| bucket | `82bd1a4` | `239ff69` | delta |
+|---|---|---|---|
+| execution thread total | 20.8 | 19.4 | **-1.4 (-7%)** |
+| matching | 2.98 | 2.54 | **-0.44 (-15%)** |
+| margin, all buckets | 5.56 | 4.78 | **-0.79 (-14%)** |
+| margin: `maker_fill_fits` | 1.46 | 1.13 | -0.33 |
+| margin: `prepare_one` | 2.66 | 2.47 | -0.19 |
+| settle | 2.04 | 1.69 | **-0.35 (-17%)** |
+| `execute_batch_phases` glue | 5.35 | 5.51 | +0.15 |
+| books drain / save / load | 1.90 | 1.93 | 0 |
+| liquidation | 0.89 | 0.86 | 0 |
+| leaf kind: compute | 14.0 | 12.2 | -1.9 |
+| leaf kind: hashing | 4.00 | 4.52 | **+0.5** |
+| leaf kind: state reads | 1.70 | 1.57 | -0.1 |
+| `torus-flush-worker` thread | 3.8 | 3.3 | -0.5 |
+
+| `82bd1a4` | `239ff69` | delta | symbol |
+|---|---|---|---|
+| 1.12 | 0.26 | **-0.86** | `FixedPoint::checked_mul` (inclusive) |
+| 0.28 | 0 | -0.28 | ethnum `idivmod4` (the old 256-bit divide) |
+| 0.12 | 0.27 | +0.16 | `__divti3` (the new i128 divide; 0.10 of it under `checked_mul`) |
+| 2.08 | 1.56 | -0.52 | `OrderBook::match_at_level` (inclusive) |
+| 2.05 | 1.71 | -0.35 | `settle_market_results_parallel` (inclusive) |
+| 1.62 | 1.36 | -0.26 | `AccountReader::pos_sums` (inclusive) |
+| 1.27 | 1.17 | -0.11 | `AccountReader::get_position` (self) |
+| 0.83 | 1.29 | **+0.46** | `RandomState::hash_one<&Address>` (inclusive) |
+
+- **P1-P4 hit what they target:** the `checked_mul` fast path removes the
+  256-bit divide (-77%), and matching, margin and settle all drop 14-17%.
+- **About a third of that comes back as SipHash** on `Address` keys
+  (+0.46): mostly the new `RawTable<(Address, TraderMargins)>` from P1,
+  plus `prepare_one`, `place_order_with_accounts` and
+  `HashMap<Address, FixedPoint>`. A cheaper hasher on the Address-keyed
+  maps is a small follow-up; s82 found SipHash -> ahash below A/B
+  resolution node-wide, but this map is new.
+- **The profile gain (-7%) is bigger than the engine-timer gain (-2.7%).**
+  Not explained here; section 11 also found the crab profile reads 1.29x
+  the engine timer.
+- **Left:** the margin phase (207-212 vs 95-97 ms per block), the target of
+  M1 (the section 11 cuts, plus books created from the market row's tick
+  and lot).
+
 ## Open
 
-- Native trie maintenance off by default: owner question on the
-  `*_with_native` paths (section 8.1).
+- Native trie maintenance is off by default since `db6c9de` (owner
+  decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
+  12).
 - Shared-code inflation (~1.7 ms/1k) is extra instructions, not cache
   misses (section 9.2): next, calls per fill and `perf annotate` of
   `drain_book`, `cancel_all_many`, `insert_order`, `match_market`.
@@ -964,8 +1076,10 @@ the first valuation of a sender new to the block stay.
 - Margin at 300 markets after C6 + C7: margin phase 216-221 vs ~95 ms per
   block on main (section 10). Breakdown and cut list in section 11;
   almost every cut is in files 18c is editing (section 11.4).
-- A main pair interleaved with C7 cells, trie off, to tighten the 0.638x
-  (section 10.1).
+- A main pair interleaved with crab cells, trie off, to tighten the
+  0.638x / 0.648x ratios (sections 10.1, 12.1).
+- Cheaper hasher for the Address-keyed maps (`TraderMargins`), +0.46
+  ms/1k of SipHash in `239ff69` (section 12.2).
 - Optional: cheaper shed path (peek the action tag or const-hex) and the
   1.22-1.27x signature-verify cost per admitted action on crab (section
   6.4).
