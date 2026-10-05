@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -24,6 +24,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 12 | What do P1-P4 + fix A (`239ff69`) give at 300 markets? | 65.2k matched/s, **0.648x main** (was 0.638x): +1.5%, within 82bd1a4's cell spread; engine 10.2 -> 9.93 ms/1k (-2.7%, both cells). `checked_mul` -77%, matching -15%, margin buckets -14%, settle -17%; +0.5 ms/1k SipHash from the new Address-keyed `TraderMargins` map. Margin still 207-212 vs ~96 ms/blk on main |
 | 13 | What does C (per-action failure records, `9195c32`) cost? How many failures does the bench produce? | No measurable cost (warm pair: matched/s +0.9%, engine -1.2%, pipelined 128 vs 127 ms). Failures are **not** ~0: 147 failed actions per native block (52% of actions, nearly all batches with open-limit rejects), ~10 KB per block, ~0.14% of the flush batch; identical on all 3 validators. Zero-fill IOCs and crossing post-only orders still show "executed" |
 | 14 | What does M1 (`90a752c`) give at 300 markets? What does end_resident cost? | 76.5k matched/s, **+17%, 0.760x main** (was 0.648x); engine 9.93 -> 7.72 ms/1k (1.09x main). Margin 210 -> 125 ms/blk (-38% per fill), match 92 -> 45 (-49%). end_resident is untimed; from the profile **+29.7 ms/blk** (67 -> 97), ~3.5x the expected 8.6, mostly `BlockSums::into_cache` re-decoding positions |
+| 15 | How much of end_resident can move off the exec thread (step 2)? Does `c58775f` pass Gate 2 at 10 markets? | Today's window end_resident(N) -> begin_resident(N+1) is ~23 ms wall, hiding only 10-24 of ~106 ms; moving begin_resident(N+1) to just before `new_env` widens it to ~100 ms and hides 76-95. The bench is exec-bound (no idle). 10 markets: **0.893x main** (both trie off, interleaved; pairs 0.885x / 0.901x), up from PF1's 0.72x; **Gate 2 (>= 0.9x) not met by ~1%**, within the cell spread |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1269,6 +1270,165 @@ threads).
   1.6 blk/s) and CPU per fill 1.21x. Outside the engine, end_resident
   (14.2) is the biggest item to cut next.
 
+## 15. Step 2 window and Gate 2 at 10 markets (`c58775f`, 2026-10-05)
+
+### 15.1 Step 2 feasibility: how much of end_resident can move off the execution thread
+
+No build. From the section 14 `90a752c` val0 profiles (300 markets):
+`perf script` timestamps on the main execution thread, aligned to val0's
+"executing finalized block" / "block done" log lines (clock offset pinned
+to within 0.5 ms per run). Analysis and per-block CSVs:
+`ozarchy-step2-window-analysis.md`, `ozarchy-step2-tools/`.
+
+- **The window is shorter than assumed.** At `90a752c`, begin_resident
+  of block N+1 runs **before** signature verification (`app.rs:1985`;
+  verify starts at `app.rs:1996`), so verify, nonces and
+  `sort_native_actions` are not between end_resident(N) and
+  begin_resident(N+1). Body decode is not on the execution thread at
+  all. Today's window holds the end of block N (fills hand-off, metrics,
+  state-hash check, overlay drop; ~10 ms CPU) and block N+1's preamble
+  (height / parent checks, overlay setup).
+- **The bench is exec-bound.** At every native block's "block done" the
+  next block was already queued (49/49 and 54/54 in the perf windows,
+  302/304 over the load); execution runs 35-42 s (p50) behind consensus,
+  and waiting-for-work idle is 0 ms. Idle time hides nothing here; case
+  (b) below only adds time the thread spends without user-mode samples
+  (kernel, blocking).
+
+end_resident here: 109.7 / 102.0 ms CPU per block (wall 121 / 116). (Section
+14.2 gives 102 / 92 because it divides by a different block count.)
+
+| ms per block, r1 / r2 | today: window up to begin_resident(N+1) | begin_resident(N+1) moved to just before `NativeExecContext::new_env` |
+|---|---|---|
+| window, wall (mean / p10 / p50 / p90) | 25.2 / 16.8 / 24.6 / 37.9 and 21.9 / 12.7 / 20.3 / 31.7 | 107.1 / 92.2 / 102.9 / 127.2 and 99.5 / 84.1 / 99.2 / 117.5 |
+| window, busy CPU (mean) | 12.2 / 10.2 | 87.3 / 81.0 |
+| (a) hidden, busy work only | **11.8 / 10.2** | **82.8 / 76.1** |
+| (b) hidden, including no-sample time | **24.1 / 21.9** | **95.3 / 87.3** |
+| blocks where all of end_resident is hidden | 1/37, 0/38 | 16/37, 16/38 |
+| end_resident still exposed (wall) | ~83 | ~15 (p50 8-11, p90 ~38) |
+
+- **Dependency:** block N+1 needs end_resident's output (resident rows
+  with block N applied, the `into_cache` sums, decoded positions, marks)
+  before (1) the resident rows are attached to the overlay, before its
+  first clone in `new_env`, and (2) `attach_resident_block` hands the sums
+  and marks to the context before `begin_block_oracle` and margin.
+  Everything between end_resident(N) and that point (verify, which reads
+  sessions; the replay guard, which reads nonces; the action-status
+  write; `sort_native_actions`) reads no positions or balances.
+- **To check before building it:** the resident rows share the
+  `resident_books` mutex with the books, which `new_env` locks, so a
+  worker must take the rows out of the holder rather than hold the lock
+  through the window; verify's parallel signature recovery would compete
+  for cores (headroom: ~8.6 busy cores of 32 in the perf window); and
+  end_resident cannot start much earlier, because its input
+  (`own_pending_delta`) is ready only after the book save, with ~2 ms of
+  CPU after it.
+
+### 15.2 Gate 2 at 10 markets: `c58775f` vs main `92a02ed`, both trie off
+
+Crab `c58775f` = `90a752c` (M1) + C + typed reject reasons; trie off by
+default. Main `92a02ed` (node md5 `31a95c65`, as sections 5 and 9.1) with
+`TORUS_NATIVE_TRIE_MAINTENANCE=0` through `EXTRA_ENV`, because crab now
+defaults to off and main to on. Section 5 shape: 10 markets, rate 76,000,
+`RETRY_BUSY=1`, 120 s; crab with the oracle feed (10/10 marks fresh). Both
+arms use the `c58775f` load generator (md5 `265b8969`); crab node md5
+`494d8812`. Order: crab warm (60 s), crab r1 (perf val0), main r1, crab r2
+(perf val0), main r2 -- interleaved, main without perf. All cells AGREE,
+liveness PASS, ACCEPT. Checks: no `TORUS_NATIVE_TRIE*` on crab nodes and
+one "off (default" boot line per crab log; `=0` in every main node's
+environment and one "DISABLED" line per main log; no rebuilds. Driver and
+analysis: `ozarchy-c58775f-10m-campaign.sh`,
+`ozarchy-c58775f-10m-analysis.md`. The cells ran after 15.1 finished, so
+the analysis did not load the host.
+
+| cell | matched/s | best60 | engine ms/1k | CPU-s per 1M fills | chain ms | pipelined ms | commit ms avg / p50 | blk/s | native blk/s | fills per native block | val0 backlog_preverify |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| crab r1 (perf val0) | 157,907 | 191,106 | 4.12 | 41.1 | 382 | 71 | 396 / 320 | 2.0 | 2.01 | 64.7k | 381,867 |
+| main r1 | 178,518 | 211,908 | 3.77 | 38.4 | 364 | 78 | 350 / 301 | 2.3 | 2.29 | 68.8k | 277,457 |
+| crab r2 (perf val0) | 154,490 | 182,156 | 4.14 | 41.8 | 377 | 72 | 395 / 329 | 2.0 | 2.02 | 63.3k | 400,879 |
+| main r2 | 171,506 | 205,051 | 3.83 | 39.1 | 369 | 77 | 338 / 248 | 2.4 | 2.21 | 68.6k | 289,899 |
+| **crab mean** | **156,198** | 186,631 | **4.13** | **41.5** | 380 | 72 | 395 / 325 | 2.0 | 2.01 | 64.0k | 391,373 |
+| **main mean (trie off)** | **175,012** | 208,480 | **3.80** | **38.8** | 366 | 78 | 344 / 275 | 2.35 | 2.25 | 68.7k | 283,678 |
+| crab warm (60 s, no perf) | 184,735 | 188,108 | 3.51 | 33.8 | 325 | 63 | 333 / 236 | 2.1 | 2.14 | 62.6k | 116,741 |
+| section 5 PF1 `0ebfd71` mean | 127,460 | 151,035 | 5.57 | 49.2 | 458 | 159 | 449 / 369 | 1.7 | 1.71 | 64.1k | 487,801 |
+| section 5 main mean (trie on) | 175,904 | 207,179 | 3.80 | 39.3 | 368 | 175 | 343 / 264 | 2.4 | 2.22 | 68.8k | 198,474 |
+
+| crab / main | section 5 (PF1 vs main, trie on) | `c58775f` vs main (both trie off, interleaved) |
+|---|---|---|
+| matched/s | 0.72x | **0.893x** (r1 pair 0.885x, r2 pair 0.901x) |
+| best60 | 0.73x | 0.895x |
+| engine ms/1k | 1.47x | 1.09x |
+| CPU-s per 1M fills | 1.25x | 1.07x |
+| val0 backlog_preverify | 2.46x | 1.38x |
+
+- **Gate 2 at 10 markets (>= 0.9x): 0.893x, ~1% short.** The two pairs
+  fall on either side of the line, so the result is within the cell
+  spread (crab 154.5-157.9k, main 171.5-178.5k).
+- **All of the change since section 5 is crab:** +22.5% (156.2k vs
+  127.5k). Main is unchanged (175.0k trie off vs 175.9k trie on): at 10
+  markets main's flush does not limit it (handoff wait ~0.1 ms either
+  way), unlike at 300 markets (9.1).
+- **Perf bias:** both measured crab cells ran under perf, the main cells
+  did not. In section 5 the profiled main cell was not below the
+  unprofiled one, so the bias is taken as < ~1-2%; not ruled out. The
+  crab warm cell (184.7k, no perf) is above main's 120 s cells, but 60 s
+  warm cells always run higher (section 5 PF1 warm 158.7k vs 127.5k), so
+  it is not a comparison.
+- **Load is comparable:** matched / placed 0.794 (crab) and 0.797 (main)
+  as in section 5; crab cancelled / placed 0.0047 (was 0.0043); book,
+  other and margin rejects 0 everywhere, so C and the typed reasons add no
+  reject class. Crab's open-limit share fell from 0.78 to 0.67-0.69 of
+  placed as placed rose 16%.
+
+Engine phases on val0:
+
+| | total | phase 1 | margin | match | settle | tail | untimed | PHASE residual_untimed |
+|---|---|---|---|---|---|---|---|---|
+| crab r1 / r2, ms/blk | 266.5 / 262.0 | 58.0 / 54.6 | 88.2 / 86.9 | 46.0 / 45.3 | 60.9 / 62.4 | 9.4 / 8.9 | 3.9 / 3.9 | 53.2 / 54.1 |
+| main r1 / r2, ms/blk | 259.4 / 263.0 | 65.0 / 67.3 | 66.8 / 66.2 | 51.8 / 53.0 | 68.4 / 68.9 | 0.1 / 0.1 | 7.3 / 7.3 | 36.7 / 37.1 |
+| section 5 PF1 r1 / r2, ms/blk | 360.1 / 353.2 | 44.8 / 47.1 | 163.1 / 157.0 | 63.3 / 61.3 | 63.7 / 62.7 | 17.2 / 16.7 | 8.0 / 8.4 | 40.1 / 40.3 |
+| **crab, ms/1k fills** | 4.13 | 0.88 | **1.37** | 0.71 | 0.96 | 0.14 | 0.06 | 0.84 |
+| **main, ms/1k fills** | 3.80 | 0.96 | **0.97** | 0.76 | 1.00 | 0.00 | 0.11 | 0.54 |
+| section 5 PF1, ms/1k fills | 5.56 | 0.72 | 2.50 | 0.97 | 0.99 | 0.26 | 0.13 | 0.63 |
+
+- Margin per fill -45% vs PF1 and now 1.41x main; match is below main and
+  settle level. The engine gap per fill (+0.33 ms/1k) is margin (+0.40)
+  and tail (+0.14), partly offset by phase 1 and match.
+- **end_resident is small at 10 markets:** 7.2 / 7.5 ms per block (0.10
+  ms/1k; `into_cache` 1.6 / 1.9) from the profile, as `c58775f` has no
+  timer. It explains ~7 of crab's +17 ms per block `residual_untimed`
+  over main. Its 300-market cost (97 ms, 14.2) scales with written
+  traders' positions; here a trader holds at most 10.
+
+val0 execution-thread profile, ms CPU per 1k fills (main column: section
+5's profiled main r1, trie on; this run's main cells were not profiled):
+
+| bucket | section 5 PF1 r1 | `c58775f` mean | main (section 5) |
+|---|---|---|---|
+| execution threads total | 12.49 | **10.68** | 10.05 |
+| margin, all buckets | 2.38 | **1.05** | 0.16 |
+| margin: `prepare_one` | 1.37 | 0.68 | - |
+| margin: `maker_fill_fits` | 0.60 | 0.28 | - |
+| matching | 3.72 | 3.59 | 3.38 |
+| settle | 1.33 | 1.06 | 1.52 |
+| books drain / save / load (incl. end_resident) | 1.00 | 1.21 | 1.18 |
+| `FixedPoint::checked_mul` | 0.84 | 0.16 | |
+| `torus-flush-worker` thread | 2.39 | 1.02 | 2.47 |
+| rpc-worker threads | 23.0 | **7.4** | 4.2 |
+| `torus-gossip-ve` thread | 7.5 | 9.9 | 8.5 |
+| `torus-ingress-v` thread | 4.6 | 6.1 | 5.2 |
+| process CPU (user / sys / total) | 60.0 / 17.5 / 77.5 | 47.8 / 9.1 / **56.8** | 41.8 / 6.1 / 47.9 |
+
+- **Left at 10 markets:** per block, crab's engine (264 vs 261 ms) and
+  chain time (380 vs 366 ms) are close to main's. The gap shows up
+  instead as fewer native blocks per second (2.01 vs 2.25) with fewer
+  fills per block (64.0k vs 68.7k), longer consensus views on val0
+  during the load (396 vs 342 ms; wall per committed block 498 vs 419),
+  and more CPU per fill in the RPC, gossip-verify and ingress threads.
+  These are observations; this run does not show the cause.
+- The 300-market half of Gate 2 was not run here (section 14: 0.760x at
+  `90a752c`).
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1286,14 +1446,20 @@ threads).
 - end_resident after M1: +29.7 ms per block, mostly
   `BlockSums::into_cache` re-decoding positions; untimed, needs a metric
   (section 14.2).
+- Step 2 (end_resident off the execution thread): needs begin_resident
+  of the next block moved to just before `new_env` to hide most of it
+  (~80-95 of ~106 ms at 300 markets); `resident_books` lock and verify
+  core contention to check (section 15.1).
+- Gate 2 at 10 markets: 0.893x, ~1% short; remaining gap is outside the
+  engine (block rate, view length, RPC / gossip-verify / ingress CPU per
+  fill; section 15.2). 300-market half still to run.
 - A main pair interleaved with crab cells, trie off, to tighten the
   0.638x / 0.648x / 0.760x ratios (sections 10.1, 12.1, 14.1).
 - Cheaper hasher for the Address-keyed maps: the +0.46 ms/1k SipHash of
   `239ff69` (section 12.2) is gone after M1 (section 14.3);
   `hash_one<&Address>` is still 0.94 ms/1k.
-- C: zero-fill IOC and crossing post-only orders still show "executed",
-  and reason codes are parsed from error text; both need
-  `native_executor.rs` (section 13.2).
+- C: zero-fill IOC and crossing post-only orders still show "executed"
+  (section 13.2); reason codes are typed since `4a26653`.
 - Optional: cheaper shed path (peek the action tag or const-hex) and the
   1.22-1.27x signature-verify cost per admitted action on crab (section
   6.4).
