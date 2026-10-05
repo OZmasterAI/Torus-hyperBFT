@@ -3,7 +3,9 @@
 //! walking every resting ask ORDER per crossing bid. Differential tests
 //! against a verbatim copy of the pre-PF1 function (`old_top_ups`, the
 //! per-order walk) on seeded random books and batches: same return value,
-//! same per-order `margin_reserved`, same balance cache.
+//! same per-order `margin_reserved`, same balance cache. Item 6 M1: the new
+//! function reads Phase 2's copied [`TopUpShape`] and stops each market at
+//! its last candidate sell; the oracle still reads the params of every order.
 
 use super::*;
 use torus_core::order_book::Order;
@@ -247,6 +249,13 @@ struct Case {
     balances: Vec<(Address, NativeBalance)>,
 }
 
+impl Case {
+    /// Item 6 M1: the D2 pools as Phase 2's fold hands them on.
+    fn pools(&self) -> HashMap<Address, (MarketId, FixedPoint)> {
+        self.pool_takers.iter().map(|&(s, m, n)| (s, (m, n))).collect()
+    }
+}
+
 const SENDERS: u64 = 12;
 
 fn random_case(seed: u64) -> Case {
@@ -317,8 +326,13 @@ fn run(
     ) -> u64,
 ) -> (u64, Vec<(usize, FixedPoint)>, Vec<(Address, FixedPoint, FixedPoint)>, Vec<Address>) {
     let positions = PositionManager::new(EmptyBackend);
+    let pools = case.pools();
     let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
     for (i, (m, sender, params, reserved)) in case.orders.iter().enumerate() {
+        // Item 6 M1: the candidate flag Phase 2 sets (`prepare_one`'s Option
+        // B condition; `fold_pool_equals_phase3_pool` pins it to this).
+        let candidate =
+            NativeExecutor::takes_bid_floor(params) && pools.get(sender).is_some_and(|(pm, _)| pm != m);
         batches.entry(*m).or_default().push(PreparedOrder {
             index: i,
             sender: *sender,
@@ -326,7 +340,8 @@ fn run(
             order_id: i as u128 + 1,
             margin_reserved: *reserved,
             checked_pos_net: None,
-            excess_im: FixedPoint::ZERO,
+            pre_pos: None,
+            top_up: TopUpShape::of(params, candidate),
         });
     }
     let mut cache = BalanceCache::new();
@@ -347,10 +362,9 @@ fn run_both(case: &Case) -> u64 {
     let old = run(case, |pm, b, c| {
         old_top_ups(pm, &case.books, &case.configs, &case.basis, &case.pool_takers, &case.excess, b, c)
     });
+    let pools = case.pools();
     let new = run(case, |pm, b, c| {
-        NativeExecutor::same_batch_bid_top_ups(
-            pm, &case.books, &case.configs, &case.basis, &case.pool_takers, &case.excess, b, c,
-        )
+        NativeExecutor::same_batch_bid_top_ups(pm, &case.books, &case.configs, &case.basis, &pools, &case.excess, b, c)
     });
     assert_eq!(new, old);
     old.0
