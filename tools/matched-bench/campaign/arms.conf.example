@@ -29,6 +29,9 @@
 #
 # Below: the s87 config (300 markets, cap 400, 300 s, rate 76000) with a main
 # baseline and one candidate arm. The warm-up arm uses the candidate's binaries.
+# TORUS_NATIVE_TRIE_MAINTENANCE: off is the node default from 2026-10-05 on (only =1
+# enables). Keep the explicit =0 so binaries built before that change, which
+# default to on, run the same configuration.
 warmup	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/cand	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300
 main	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/main	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300
 cand	/home/YOU/bench-results-matched/s88-example-20261004/artifacts/cand	TORUS_BODY_FETCH_TRACE=1 RUST_LOG=info,libp2p_gossipsub::behaviour=error TIMEOUT_BASE_MS=1200 TORUS_BODY_SERVE_THREAD=1 TORUS_DEFER_PARENT_FEED=0 TORUS_NATIVE_TRIE_MAINTENANCE=0	76000	-	300	OPEN_ORDER_BUDGET=900 STATE_HASH_ACTIVATION=1	400	300

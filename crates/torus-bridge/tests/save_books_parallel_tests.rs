@@ -233,6 +233,7 @@ fn run_universe(
     blocks: usize,
     per_block: usize,
 ) -> RunResult {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (dir, db) = open_test_db();
     {
         let ctx0 = NativeExecContext::new_with_mode(

@@ -1382,6 +1382,31 @@ impl NativeStateOverlay {
     }
 }
 
+/// Per-`cf_tag` count of the native-root entries `state` plus `sidecar` would put
+/// in the dirty map, without building it (maintenance off). Equal to counting the
+/// keys of the merged [`PendingState::native_dirty_ref`] maps: a CF's writes and
+/// deletes are disjoint by invariant, and a sidecar key already in the main set is
+/// counted once.
+fn native_dirty_counts(state: &PendingState, sidecar: Option<&PendingState>) -> [usize; 7] {
+    let mut counts = [0usize; 7];
+    for (idx, cfp) in state.cfs.iter().enumerate() {
+        let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
+            continue;
+        };
+        let mut n = cfp.writes.len() + cfp.deletes.len();
+        if let Some(side) = sidecar {
+            let sp = &side.cfs[idx];
+            let in_main = |k: &Vec<u8>| cfp.writes.contains_key(k) || cfp.deletes.contains(k);
+            n += sp.writes.keys().filter(|k| !in_main(k)).count();
+            n += sp.deletes.iter().filter(|k| !in_main(k)).count();
+        }
+        if let Some(slot) = counts.get_mut(tag as usize) {
+            *slot += n;
+        }
+    }
+    counts
+}
+
 /// Running state hash: blocks with at least this many pending entries digest
 /// on a scoped thread, overlapped with the batch build (below it, inline).
 const PARALLEL_DIGEST_MIN_ENTRIES: usize = 4096;
@@ -1488,13 +1513,18 @@ fn flush_pending_after_batch(
         // Native-root dirty map, folded into the SAME batch. BORROWED from the
         // pending maps (s450): `state`'s read guard is held for this whole
         // function and the trie only reads the set, so nothing is copied out.
-        let mut dirty = state.native_dirty_ref();
-        // Deferred book save: the sidecar's root-CF entries enter the ROOT
-        // computation exactly as if the exec thread had written them into its
-        // overlay (same canonical (tag, key) order — BTreeMap merge).
-        if let Some(side) = sidecar {
-            dirty.extend(side.native_dirty_ref());
-        }
+        // Built only when the trie is maintained; with maintenance off the
+        // metric and the stale marker need just the per-CF counts.
+        let dirty = maintain_trie.then(|| {
+            let mut dirty = state.native_dirty_ref();
+            // Deferred book save: the sidecar's root-CF entries enter the ROOT
+            // computation exactly as if the exec thread had written them into its
+            // overlay (same canonical (tag, key) order — BTreeMap merge).
+            if let Some(side) = sidecar {
+                dirty.extend(side.native_dirty_ref());
+            }
+            dirty
+        });
         // r7: the batch BUILD (serializing the pending maps) is a different
         // lever from the RocksDB WRITE (WAL + memtable), so keep the two
         // timers apart instead of summing them into one `write_seconds`.
@@ -1531,29 +1561,24 @@ fn flush_pending_after_batch(
             state_hash_entries: 0,
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
-        for (tag, _) in dirty.keys() {
-            if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
-                *slot += 1;
+        match &dirty {
+            Some(dirty) => {
+                for (tag, _) in dirty.keys() {
+                    if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
+                        *slot += 1;
+                    }
+                }
             }
+            None => stats.dirty_entries_by_cf = native_dirty_counts(state, sidecar),
         }
-        let trie_result = if dirty.is_empty() {
+        let has_native_writes = stats.dirty_entries_by_cf.iter().any(|&n| n > 0);
+        let trie_result = if !has_native_writes {
             Ok(())
-        } else if !maintain_trie {
-            // s83 Option 0 (`TORUS_NATIVE_TRIE_MAINTENANCE=0`): no trie/mirror ops; instead mark
-            // the trie stale in the SAME batch, so state, marker and sentinel commit together. The
-            // caches are left untouched — they are only reachable through `apply_native_dirty`,
-            // which the once-per-process mode never calls, and a boot rebuild moves the persisted
-            // root they self-authenticate against.
-            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
-                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
-            })?;
-            batch.put_cf(cf, crate::cf::META_NATIVE_TRIE_STALE, [1u8]);
-            Ok(())
-        } else {
+        } else if let Some(dirty) = &dirty {
             match crate::native_trie::apply_native_dirty(
                 target,
                 &mut batch,
-                &dirty,
+                dirty,
                 trie_cache.as_deref_mut(),
                 member_cache.as_deref_mut(),
                 parallel,
@@ -1577,6 +1602,17 @@ fn flush_pending_after_batch(
                     Err(e)
                 }
             }
+        } else {
+            // Maintenance off (the default; `TORUS_NATIVE_TRIE_MAINTENANCE=1` turns it on): no
+            // trie/mirror ops; instead mark the trie stale in the SAME batch, so state, marker
+            // and sentinel commit together. The caches are left untouched — they are only reachable through `apply_native_dirty`,
+            // which the once-per-process mode never calls, and a boot rebuild moves the persisted
+            // root they self-authenticate against.
+            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
+                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
+            })?;
+            batch.put_cf(cf, crate::cf::META_NATIVE_TRIE_STALE, [1u8]);
+            Ok(())
         };
         stats.root_seconds = root_timer.elapsed().as_secs_f64();
 
@@ -2470,6 +2506,7 @@ mod tests {
 
     #[test]
     fn owned_put_parent_reads_and_frozen_flush_match_borrowed_root_and_rows() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         let (old_db, _old_dir) = temp_db();
         let (owned_db, _owned_dir) = temp_db();
         for (db, owned) in [(&old_db, false), (&owned_db, true)] {
@@ -2873,6 +2910,7 @@ mod tests {
     /// native root equal to the full scan, in one atomic batch. Non-root CFs (nonces) are excluded.
     #[test]
     fn flush_with_native_trie_maintains_root() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{CF_NATIVE_NONCES, CF_STAKING_VALIDATORS};
         let (db, _dir) = temp_db();
         crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
@@ -2908,6 +2946,7 @@ mod tests {
     /// finds the native balance AND the marker, and the marker is byte-for-byte the height's BE bytes.
     #[test]
     fn flush_with_native_trie_and_marker_writes_marker_atomically() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{CF_CONSENSUS_META, CF_STAKING_VALIDATORS, META_NATIVE_APPLIED_HEIGHT};
         let (db, _dir) = temp_db();
         crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
@@ -3483,6 +3522,7 @@ mod tests {
     /// it), and neither frozen set is mutated by the flush (read-only / Sync).
     #[test]
     fn sidecar_flush_identical_to_combined_overlay_flush() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{
             CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
             META_NATIVE_APPLIED_HEIGHT,
@@ -3721,6 +3761,103 @@ mod tests {
         crate::native_trie::build_native_trie_to_cf(&db).unwrap();
         assert!(!is_native_trie_stale(&db).unwrap());
         assert_eq!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
+    }
+
+    /// Off -> on across a real restart: blocks flushed with maintenance off (the default) leave a
+    /// stale trie on disk; the DB is closed and reopened, and the boot helper with maintenance on
+    /// (`TORUS_NATIVE_TRIE_MAINTENANCE=1`) rebuilds it to the root of a run maintained throughout.
+    #[test]
+    fn maintenance_off_then_on_after_reopen_rebuilds_to_maintained_root() {
+        use crate::native_trie::{
+            ensure_native_trie_built, is_native_trie_stale, native_root_full, persisted_native_root,
+        };
+        let (db_on, _a) = temp_db();
+        s83_seed(&db_on);
+        s83_blocks(&db_on, 1, 4, true);
+        let maintained_root = persisted_native_root(&db_on).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = StateDb::open(dir.path()).unwrap();
+            s83_seed(&db);
+            s83_blocks(&db, 1, 4, false);
+            assert!(is_native_trie_stale(&db).unwrap());
+            assert_ne!(persisted_native_root(&db).unwrap(), maintained_root, "trie lags state");
+        }
+        let db = StateDb::open(dir.path()).unwrap();
+        assert!(is_native_trie_stale(&db).unwrap(), "stale marker survives the restart");
+        assert!(ensure_native_trie_built(&db, true).unwrap(), "ON at boot: rebuild");
+        assert!(!is_native_trie_stale(&db).unwrap());
+        assert_eq!(persisted_native_root(&db).unwrap(), maintained_root);
+        assert_eq!(maintained_root, native_root_full(&db).unwrap());
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(s83_dump(&db_on, cf), s83_dump(&db, cf), "CF {cf}");
+        }
+    }
+
+    /// Maintenance off: a block with NO native-root writes (only a non-root nonce) writes no stale
+    /// marker; the first block with native-root writes does.
+    #[test]
+    fn maintenance_off_stale_marker_only_with_native_writes() {
+        use crate::cf::{CF_CONSENSUS_META, CF_NATIVE_NONCES, META_NATIVE_TRIE_STALE};
+        use crate::native_trie::is_native_trie_stale;
+        let (db, _d) = temp_db();
+        s83_seed(&db);
+
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.put_cf_raw(CF_NATIVE_NONCES, b"\x01", b"n").unwrap();
+        let stats = {
+            let state = ov.pending.read().unwrap();
+            flush_pending_with_native_trie_stats(&state, None, &db, Some(1), None, None, false)
+                .unwrap()
+        };
+        assert!(!is_native_trie_stale(&db).unwrap(), "no native writes: no marker");
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_TRIE_STALE).unwrap(),
+            None
+        );
+        assert_eq!(stats.dirty_entries_by_cf, [0; 7]);
+
+        s83_blocks(&db, 2, 2, false);
+        assert!(is_native_trie_stale(&db).unwrap(), "native writes: marker written");
+    }
+
+    /// Maintenance off still fills `dirty_entries_by_cf`, with the same values maintain mode
+    /// reports, including the deferred-book sidecar (whose keys may repeat the main set's).
+    #[test]
+    fn maintenance_off_dirty_entries_metric_matches_maintained() {
+        use crate::cf::{CF_NATIVE_NONCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS};
+        let run = |maintain: bool| {
+            let (db, _d) = temp_db();
+            s83_seed(&db);
+            let ov = NativeStateOverlay::new(db.clone());
+            ov.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01a", b"1").unwrap();
+            ov.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01b", b"2").unwrap();
+            ov.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book1", b"x").unwrap();
+            ov.delete_cf_raw(CF_NATIVE_POSITIONS, b"\x00\x02gone").unwrap();
+            ov.put_cf_raw(CF_NATIVE_NONCES, b"\x01", b"n").unwrap();
+            let side = NativeStateOverlay::new(db.clone());
+            // `book1` repeats a main-set key (counted once); `book2` is new; a delete too.
+            side.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book1", b"y").unwrap();
+            side.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book2", b"z").unwrap();
+            side.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book3").unwrap();
+            let state = ov.pending.read().unwrap();
+            let side_state = side.pending.read().unwrap();
+            flush_pending_with_native_trie_stats(
+                &state,
+                Some(&side_state),
+                &db,
+                Some(1),
+                None,
+                None,
+                maintain,
+            )
+            .unwrap()
+            .dirty_entries_by_cf
+        };
+        let off = run(false);
+        assert_eq!(off, [2, 3, 1, 0, 0, 0, 0]);
+        assert_eq!(off, run(true));
     }
 
     // ======================================================================
@@ -4233,7 +4370,7 @@ mod tests {
                     }
                 }
                 let t = std::time::Instant::now();
-                // Root skip (TORUS_NATIVE_TRIE_MAINTENANCE=0): the configuration
+                // Root skip (maintenance off, the default): the configuration
                 // the running hash replaces the per-block root for.
                 // Odd heights hash (applied height set), even ones flush the
                 // same-sized set without any applied height into the

@@ -3843,11 +3843,13 @@ impl TorusApp {
         // Phase A A2.2: same for the native bucketed-Merkle trie. No-op after first boot; keeps the
         // incremental native root's base ready while the full-scan native root stays primary until
         // TORUS_INCREMENTAL_STATE_ROOT is enabled.
-        // s83 Option 0: also rebuilds a trie left stale by a `TORUS_NATIVE_TRIE_MAINTENANCE=0` run;
-        // with maintenance off it does nothing (stale => readers take the full-scan root).
+        // Maintenance is OFF by default (the maintained root has no production reader): then this
+        // does nothing (absent / stale => readers take the full-scan root). With
+        // `TORUS_NATIVE_TRIE_MAINTENANCE=1` it builds a missing trie and rebuilds one left stale by
+        // an earlier maintenance-off run, once, before replay.
         let maintain_trie = torus_state::native_trie::native_trie_maintenance_enabled();
         if !maintain_trie {
-            tracing::info!("native trie maintenance DISABLED (TORUS_NATIVE_TRIE_MAINTENANCE=0): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
+            tracing::info!("native trie maintenance off (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
         }
         if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db, maintain_trie) {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
@@ -13286,6 +13288,7 @@ mod crash_recovery_tests {
     /// Run the fixture OFF (serial) or ON (pipeline), drain, return the full state
     /// dump + persisted native root + the ctx's fail-stop latch.
     fn run_pipeline_fixture(on: bool) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let gate = crate::exec_pipeline::WorkerGate::new();
@@ -13401,6 +13404,7 @@ mod crash_recovery_tests {
     /// consensus state.
     #[test]
     fn trade_history_off_writes_no_trade_rows_and_leaves_state_identical() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let run = |history: bool| {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
@@ -13458,6 +13462,7 @@ mod crash_recovery_tests {
         history: bool,
         sink_wants: Option<bool>,
     ) -> (Vec<CfDump>, torus_types::B256, Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let mut ctx = pipeline_ctx(&state_db, on, None);
@@ -13948,6 +13953,7 @@ mod crash_recovery_tests {
     ///       fail-stop, so restart-replay re-executes from the marker.
     #[test]
     fn exec_pipeline_deferred_books_atomic_and_match_serial() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         use torus_bridge::native_executor::{
             BookMode, NativeExecContext, NativeExecutor, ResidentBooks,
         };
@@ -14299,6 +14305,7 @@ mod crash_recovery_tests {
         on: bool,
         mode: torus_bridge::native_executor::BookMode,
     ) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_book_fixture(&state_db);
         let gate = crate::exec_pipeline::WorkerGate::new();
@@ -15747,6 +15754,7 @@ mod crash_recovery_tests {
     /// validators (the BFT minimum), so the consensus-side rotation check is
     /// not vacuous.
     fn epoch_fixture(boundary_action: bool) -> EpochOutcome {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (mut config, db) = make_test_config_and_db();
         config.epoch_length = 4;
         let staking = StakingManager::new(db.clone());
@@ -16267,6 +16275,7 @@ mod crash_recovery_tests {
         blocks: &[TorusBlock],
         fixture: fn() -> (ChainConfig, StateDb),
     ) -> (Vec<CfDump>, torus_types::B256, StateDb) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (config, db) = fixture();
         match mode {
             OracleRun::Serial => {

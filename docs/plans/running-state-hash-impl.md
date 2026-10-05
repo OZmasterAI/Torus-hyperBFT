@@ -7,7 +7,8 @@ local `main` @ e4273ec; line numbers as of that commit.
 
 ## Why
 
-Root skip (`TORUS_NATIVE_TRIE_MAINTENANCE=0`, e4273ec) removes the per-block
+Root skip (`TORUS_NATIVE_TRIE_MAINTENANCE=0`, e4273ec; the default since 2026-10-05,
+where only `=1` maintains) removes the per-block
 native trie: +12% matched/s at 100 markets, +31% at 300 (uniform load). What it
 gives up is a per-block fingerprint of state. The running hash brings that back
 at O(changed rows) cost. Tree maintenance stays a node-local option; the running

@@ -74,7 +74,7 @@ fn flagged_evm_root(
 /// (a consensus-splitting bug) rather than voting it.
 fn native_root_routed(state_db: &StateDb, incremental: bool) -> Result<B256, StateError> {
     // Same full-scan fallback as the EVM half when incremental is off or the native trie is unbuilt
-    // — or stale (s83: `TORUS_NATIVE_TRIE_MAINTENANCE=0` let state move on without it).
+    // — or stale (maintenance off, the default, let state move on without it).
     if !incremental
         || !torus_state::native_trie::is_native_trie_built(state_db)?
         || torus_state::native_trie::is_native_trie_stale(state_db)?
