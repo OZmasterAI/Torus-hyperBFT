@@ -27,6 +27,8 @@ use trader_orders::TraderOrders;
 
 #[cfg(test)]
 mod matching_entry_tests;
+#[cfg(test)]
+mod account_margins_p1_tests;
 
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,
@@ -232,9 +234,10 @@ impl TakerMarginLimit {
         free: FixedPoint,
         left_before: FixedPoint,
     ) -> Option<FixedPoint> {
+        debug_assert!(std::ptr::eq(self, m.limit), "need of the taker's own limit");
         let closing = q.min(free);
         let closed = m.allowance0 - free + closing;
-        let before = m.size0.checked_mul(m.px).ok()?;
+        let before = m.before?;
         let mut after = (m.size0 - closed)
             .checked_mul(m.px)
             .ok()?
@@ -246,7 +249,15 @@ impl TakerMarginLimit {
             let open_rest = ((left_before - q) - (free - closing)).max(FixedPoint::ZERO);
             after = after.checked_add(hp.checked_mul(open_rest).ok()?).ok()?;
         }
-        Some(crate::margin::im_delta(self.tiers.as_deref(), before, after))
+        // `im_delta(tiers, before, after)`, IM(after) first as there; P3:
+        // IM(before) once per taker (same value, computed at the same first
+        // call, so even a 0x tier panics where it did).
+        let tiers = self.tiers.as_deref();
+        let im_after = crate::margin::order_initial_margin(tiers, after);
+        let im_before = *m
+            .im_before
+            .get_or_init(|| crate::margin::order_initial_margin(tiers, before));
+        Some(im_after - im_before)
     }
 
     /// Largest quantity `<= q` (all of `q`, or a multiple of the lot) that
@@ -293,6 +304,10 @@ struct MatchMargin<'a> {
     size0: FixedPoint,
     px: FixedPoint,
     allowance0: FixedPoint,
+    /// Item 6 P3: `size0 × px` (`None` on overflow) and its IM at the
+    /// limit's tiers (filled by the first `need`) — constant per taker.
+    before: Option<FixedPoint>,
+    im_before: std::cell::OnceCell<FixedPoint>,
     /// F1: `limit.budget` + the sender's running free margin.
     budget: FixedPoint,
     /// Notional of the charged (non-closing) part of the fills so far.
@@ -338,9 +353,13 @@ impl MatchMargin<'_> {
 /// every reduce-only sender — flat traders as zero. Review 5: also every
 /// taker with a [`TakerMarginLimit`], whose closing fills are free; absent,
 /// it is charged as if flat (conservative).
+///
+/// Item 6 P1: a `HashMap` — only point reads and writes, never iterated
+/// (iteration order would be per-process random), so nothing it decides
+/// depends on an order.
 #[derive(Clone, Debug, Default)]
 pub struct ReduceOnlyPositions {
-    positions: BTreeMap<Address, FixedPoint>,
+    positions: HashMap<Address, FixedPoint>,
 }
 
 impl ReduceOnlyPositions {
@@ -393,19 +412,31 @@ pub fn reduce_only_allowance(signed_pos: FixedPoint, is_buy: bool) -> FixedPoint
 pub struct AccountMargins {
     /// The market's leverage tiers (maker check).
     tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>,
-    /// Takers' running budgets (installed by the executor; D2 pools).
-    accounts: BTreeMap<Address, AccountMargin>,
-    /// Review fix 2 (s517): makers' running free margins, loaded from
-    /// their D8 snapshot — kept apart from the taker pools (a sender's pool
-    /// is 0 outside its first checked taker's market, which is not its
-    /// maker free margin).
-    makers: BTreeMap<Address, AccountMargin>,
-    /// Review fix 4 (s517): traders whose `accounts` entry is only a taker
-    /// budget of 0 (D2: a sender's markets other than its pool market) —
-    /// NOT their account, so their makers keep the snapshot. Every other
-    /// `accounts` entry IS the sender's running account in this book and is
-    /// shared by its takers and its makers.
-    taker_only: BTreeSet<Address>,
+    /// Item 6 P1: ONE entry per trader (was three `BTreeMap` / `BTreeSet`
+    /// keyed by trader: `accounts`, `makers`, `taker_only`), so a maker
+    /// fill finds and commits its running margin with one lookup. A
+    /// `HashMap`: point reads and writes only, never iterated.
+    traders: HashMap<Address, TraderMargins>,
+}
+
+/// Item 6 P1: one trader's part of [`AccountMargins`] — the three former
+/// maps' entries, unchanged in meaning.
+#[derive(Clone, Copy, Debug, Default)]
+struct TraderMargins {
+    /// Its taker's running budget (installed by the executor; D2 pools) —
+    /// was `accounts`.
+    taker: Option<AccountMargin>,
+    /// Review fix 4 (s517): `taker` is only a taker budget of 0 (D2: a
+    /// sender's markets other than its pool market) — NOT its account, so
+    /// its makers keep the snapshot. Any other `taker` entry IS the
+    /// sender's running account in this book and is shared by its takers
+    /// and its makers. Was the `taker_only` set (never cleared by `insert`).
+    taker_only: bool,
+    /// Review fix 2 (s517): its makers' running free margin, loaded from
+    /// the D8 snapshot — kept apart from the taker pool (a sender's pool is
+    /// 0 outside its first checked taker's market, which is not its maker
+    /// free margin). Was `makers`.
+    maker: Option<AccountMargin>,
 }
 
 /// F1 (s517): one trader's entry in [`AccountMargins`].
@@ -422,64 +453,62 @@ impl AccountMargins {
     pub fn new(tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>) -> Self {
         Self {
             tiers,
-            accounts: BTreeMap::new(),
-            makers: BTreeMap::new(),
-            taker_only: BTreeSet::new(),
+            traders: HashMap::new(),
         }
     }
 
     pub fn insert(&mut self, trader: Address, free: FixedPoint, px: FixedPoint) {
-        self.accounts.insert(trader, AccountMargin { free, px });
+        self.traders.entry(trader).or_default().taker = Some(AccountMargin { free, px });
     }
 
     /// Review fix 4 (s517): a taker budget of 0 that is NOT `trader`'s
     /// account (D2 non-pool market): its takers fill within their own
     /// reservation; its makers are checked against their snapshot.
     pub fn insert_taker_only(&mut self, trader: Address, px: FixedPoint) {
-        self.accounts.insert(trader, AccountMargin { free: FixedPoint::ZERO, px });
-        self.taker_only.insert(trader);
-    }
-
-    /// Review fix 4: whether `trader`'s `accounts` entry is its shared account.
-    fn shared(&self, trader: &Address) -> bool {
-        self.accounts.contains_key(trader) && !self.taker_only.contains(trader)
+        let e = self.traders.entry(trader).or_default();
+        e.taker = Some(AccountMargin { free: FixedPoint::ZERO, px });
+        e.taker_only = true;
     }
 
     pub fn get(&self, trader: &Address) -> Option<AccountMargin> {
-        self.accounts.get(trader).copied()
+        self.traders.get(trader).and_then(|e| e.taker)
+    }
+
+    /// `trader`'s taker entry and whether it is a taker-only budget (one
+    /// lookup).
+    fn taker(&self, trader: &Address) -> (Option<AccountMargin>, bool) {
+        self.traders.get(trader).map_or((None, false), |e| (e.taker, e.taker_only))
     }
 
     fn set_free(&mut self, trader: &Address, free: FixedPoint) {
-        if let Some(a) = self.accounts.get_mut(trader) {
+        if let Some(a) = self.traders.get_mut(trader).and_then(|e| e.taker.as_mut()) {
             a.free = free;
         }
     }
+}
 
-    /// F1 (s517 #4): `trader`'s entry, snapshotted from `src` the first
-    /// time it is needed in this placement / batch (also seeding its
-    /// position in `ro` when the book does not track it yet).
-    fn load(
-        &mut self,
-        trader: Address,
-        market_id: MarketId,
-        src: &dyn MakerAccountSource,
-        ro: &mut ReduceOnlyPositions,
-    ) -> AccountMargin {
-        // Review fix 4: in the book holding its account (single path, D2
-        // pool market) a maker shares the running entry its takers spend.
-        if self.shared(&trader) {
-            return self.accounts[&trader];
-        }
-        if let Some(a) = self.makers.get(&trader) {
-            return *a;
-        }
-        let m = src.maker_account(&trader, market_id);
-        if ro.get(&trader).is_none() {
-            ro.insert(trader, m.signed_pos);
-        }
-        let a = AccountMargin { free: m.free, px: m.px };
-        self.makers.insert(trader, a);
-        a
+/// F1 (s517 #4): `trader`'s running margin as a maker — its shared account
+/// in the book holding it (review fix 4: single path, D2 pool market; a
+/// maker shares the running entry its takers spend), else its snapshot,
+/// loaded from `src` the first time it is needed in this placement / batch
+/// (also seeding its position in `ro` when the book does not track it
+/// yet). Item 6 P1: one lookup; the caller commits through the slot.
+fn maker_slot<'m>(
+    traders: &'m mut HashMap<Address, TraderMargins>,
+    trader: Address,
+    market_id: MarketId,
+    src: &dyn MakerAccountSource,
+    ro: &mut ReduceOnlyPositions,
+) -> &'m mut AccountMargin {
+    match traders.entry(trader).or_default() {
+        TraderMargins { taker: Some(a), taker_only: false, .. } => a,
+        TraderMargins { maker, .. } => maker.get_or_insert_with(|| {
+            let m = src.maker_account(&trader, market_id);
+            if ro.get(&trader).is_none() {
+                ro.insert(trader, m.signed_pos);
+            }
+            AccountMargin { free: m.free, px: m.px }
+        }),
     }
 }
 
@@ -518,13 +547,16 @@ fn maker_fill_fits(
     q: FixedPoint,
     rem: FixedPoint,
 ) -> bool {
-    let a = accounts.load(maker, market_id, src, ro);
+    // Item 6 P1 / P3: split borrow — the slot, and the tiers without an
+    // Arc clone per fill.
+    let AccountMargins { tiers, traders } = accounts;
+    let slot = maker_slot(traders, maker, market_id, src, ro);
+    let a = *slot;
     let s = ro.get(&maker).unwrap_or(FixedPoint::ZERO);
     let size = if s < FixedPoint::ZERO { -s } else { s };
     let closing = q.min(reduce_only_allowance(s, maker_is_buy));
     let px = if a.px > FixedPoint::ZERO { a.px } else { price };
-    let t = accounts.tiers.clone();
-    let t = t.as_deref();
+    let t = tiers.as_deref();
     let delta = (|| {
         let before = size.checked_mul(px).ok()?;
         let after = (size - closing)
@@ -542,11 +574,9 @@ fn maker_fill_fits(
     let delta = delta.map(|d| if d == FixedPoint::from_raw(1) { FixedPoint::ZERO } else { d });
     match delta {
         Some(d) if closing == q || d <= a.free => {
-            if accounts.shared(&maker) {
-                accounts.set_free(&maker, a.free - d);
-            } else if let Some(e) = accounts.makers.get_mut(&maker) {
-                e.free = a.free - d;
-            }
+            // The entry `maker_slot` read: its shared account, else its
+            // snapshot (always present after the load).
+            slot.free = a.free - d;
             true
         }
         _ => false,
@@ -1050,22 +1080,25 @@ impl OrderBook {
         // tracked map.
         let mut match_margin = margin.map(|limit| {
             let signed = self.reduce_only_positions.get(&trader).unwrap_or(FixedPoint::ZERO);
-            let acct = self.account_margins.get(&trader);
+            let (acct, taker_only) = self.account_margins.taker(&trader);
             let px = match acct {
                 Some(a) if a.px > FixedPoint::ZERO => a.px,
                 Some(_) => self.last_trade_price.unwrap_or(FixedPoint::ZERO),
                 None => FixedPoint::ZERO,
             };
+            let size0 = if signed < FixedPoint::ZERO { -signed } else { signed };
             MatchMargin {
                 limit,
                 lot: self.lot_size,
-                size0: if signed < FixedPoint::ZERO { -signed } else { signed },
+                size0,
                 px,
                 allowance0: reduce_only_allowance(signed, params.is_buy),
+                before: size0.checked_mul(px).ok(),
+                im_before: std::cell::OnceCell::new(),
                 budget: limit.budget + acct.map_or(FixedPoint::ZERO, |a| a.free),
                 charged: FixedPoint::ZERO,
                 exhausted: false,
-                taker_only: self.account_margins.taker_only.contains(&trader),
+                taker_only,
             }
         });
         if params.time_in_force == TimeInForce::FOK {
@@ -1088,7 +1121,7 @@ impl OrderBook {
                     quantity <= free
                         || notional.is_some_and(|n| {
                             let closing = quantity.min(free);
-                            let before = m.size0.checked_mul(m.px).ok();
+                            let before = m.before;
                             let after = (m.size0 - closing)
                                 .checked_mul(m.px)
                                 .ok()
