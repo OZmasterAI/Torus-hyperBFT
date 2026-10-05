@@ -101,6 +101,40 @@ struct Stats {
     records: usize,
     /// Item 6 M1: written traders' sums carried by `end_resident`.
     carried: usize,
+    /// Item 6 step 1: slot entries checked against a cold build after
+    /// `end_resident` ([`check_slot_sums`]).
+    slot_checked: usize,
+}
+
+/// Item 6 step 1 (warm == cold): after `end_resident`, every entry of the
+/// slot's sums cache a later block can read (the slot's mark version) ==
+/// `build` over R's rows after the block, decoded cold from R (not from the
+/// decoded records), with the slot's mark table and configs; every market a
+/// cached trader's Cross positions use is in the table. Returns the entries
+/// checked.
+fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
+    use borsh::BorshDeserialize;
+    let Some(slot) = holder.rows.as_ref() else { return 0 };
+    let Some(t) = slot.marks.as_ref().filter(|t| t.marks.version == slot.sums.version) else { return 0 };
+    let rows = slot.rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    for (trader, cached) in &slot.sums.map {
+        let ps: Vec<Position> = rows
+            .range(trader.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(trader.as_slice()))
+            .map(|(k, v)| Position::try_from_slice(v).unwrap_or_else(|e| panic!("{tag}: cached {trader} row {k:?}: {e}")))
+            .collect();
+        let in_table = std::cell::Cell::new(true);
+        let mark = |m: MarketId| {
+            t.marks.get(m).unwrap_or_else(|| {
+                in_table.set(false);
+                None
+            })
+        };
+        let want = build_sums(&ps, mark, |m| t.configs.get(&m).map(|c| c.tiers.as_slice()));
+        assert!(in_table.get(), "{tag}: cached {trader} uses a market outside the table");
+        assert_eq!(*cached, want, "{tag}: slot sums of {trader} != cold build over R");
+    }
+    slot.sums.map.len()
 }
 
 /// Cache path == reference path for every trader: `view`, `pos_net`,
@@ -360,6 +394,7 @@ fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<Block
         if cached {
             assert_eq!(holder.trader_positions_match_rows(), Some(true), "seed {seed} block {h}: records warm == cold");
             stats.carried += holder.rows.as_ref().map_or(0, |slot| slot.sums.carried);
+            stats.slot_checked += check_slot_sums(&holder, &format!("seed {seed} block {h}"));
         }
         if let Some(p) = parent.take() {
             p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
@@ -400,6 +435,7 @@ fn sums_cache_equals_reference_on_seeded_sequences() {
     // Item 6 M1: written traders' sums carried to the next block (and then
     // shadow-checked at every use above).
     assert!(stats.carried > 0, "carried entries: {stats:?}");
+    assert!(stats.slot_checked > 1_000, "slot entries checked warm == cold: {stats:?}");
     assert!(stats.computed > 100 && stats.dirty > 100, "every cache path used: {stats:?}");
     assert!(stats.overflowed > 0, "overflow-sized positions reached: {stats:?}");
     assert!(stats.versions.len() > 6, "marks / configs moved: {stats:?}");
@@ -420,8 +456,12 @@ fn carried_sums_equal_reference_on_calm_marks() {
             assert!(a.rows == b.rows, "seed {seed} block {}: position / balance rows", h + 1);
         }
     }
-    println!("SUMS_CACHE calm carried={} persistent={} shadow={}", stats.carried, stats.persistent_hits, stats.shadow);
+    println!(
+        "SUMS_CACHE calm carried={} persistent={} shadow={} slot_checked={}",
+        stats.carried, stats.persistent_hits, stats.shadow, stats.slot_checked
+    );
     assert!(stats.carried > 200 && stats.persistent_hits > 300, "carried entries used: {stats:?}");
+    assert!(stats.slot_checked > 500, "slot entries checked warm == cold: {stats:?}");
 }
 
 /// The cache is dropped with the slot: a guard trip (skipped height) rebuilds

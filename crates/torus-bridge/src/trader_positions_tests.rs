@@ -53,6 +53,53 @@ struct Stats {
     opaque: usize,
     found: usize,
     cleared: usize,
+    /// Item 6 step 1: traders reported with their changes / as re-decoded.
+    reported: usize,
+    reported_none: usize,
+    changes: usize,
+}
+
+/// One trader's report of `apply` (owned copy).
+type Report = (Address, Option<(Vec<Change>, Vec<Position>)>);
+
+/// Item 6 step 1: `apply`'s reports for one block — exactly one per trader
+/// prefix the delta writes under (key order); a trader reported with
+/// changes was regular before (`before`) and after (`after`), its `now` is
+/// its record after, and its changes compose its record before into it, each
+/// change's `before` being its position before; a trader reported without
+/// was opaque before or after.
+fn check_reports(reports: &[Report], delta: &ResidentDelta, before: &TraderPositions, after: &TraderPositions, stats: &mut Stats, tag: &str) {
+    let mut written: Vec<Address> =
+        delta.entries(CF_NATIVE_POSITIONS).filter(|(k, _)| k.len() >= 20).map(|(k, _)| Address::from_slice(&k[..20])).collect();
+    written.dedup();
+    assert_eq!(reports.iter().map(|r| r.0).collect::<Vec<_>>(), written, "{tag}: one report per written trader");
+    for (t, report) in reports {
+        let Some((changes, now)) = report else {
+            stats.reported_none += 1;
+            assert!(before.get(t).is_none() || after.get(t).is_none(), "{tag}: {t} re-decoded while regular");
+            continue;
+        };
+        stats.reported += 1;
+        stats.changes += changes.len();
+        let was = before.get(t).unwrap_or_else(|| panic!("{tag}: {t} reported but opaque before"));
+        let is = after.get(t).unwrap_or_else(|| panic!("{tag}: {t} reported but opaque after"));
+        assert_eq!(now.iter().map(bytes).collect::<Vec<_>>(), is.iter().map(bytes).collect::<Vec<_>>(), "{tag}: {t} now");
+        let mut cur: std::collections::BTreeMap<MarketId, Vec<u8>> = was.iter().map(|p| (p.market_id, bytes(p))).collect();
+        for (old, new) in changes {
+            let m = old.as_ref().or(new.as_ref()).expect("a change has a side").market_id;
+            assert_eq!(cur.get(&m), old.as_ref().map(bytes).as_ref(), "{tag}: {t} market {m} before");
+            match new {
+                Some(p) => {
+                    assert_eq!(p.market_id, m, "{tag}: {t} one market per change");
+                    cur.insert(m, bytes(p));
+                }
+                None => {
+                    cur.remove(&m);
+                }
+            }
+        }
+        assert_eq!(cur.into_values().collect::<Vec<_>>(), is.iter().map(bytes).collect::<Vec<_>>(), "{tag}: {t} changes compose");
+    }
 }
 
 /// `rec` == a cold build over `rows`, and for every trader prefix in R (and
@@ -156,6 +203,7 @@ fn records_equal_decoded_rows_after_random_deltas() {
         }
         let mut rows = ResidentRows::build(&db).unwrap();
         let mut rec = TraderPositions::build(&rows);
+        let mut plain = TraderPositions::build(&rows);
         check(&rec, &rows, &db, &mut stats, &format!("seed {seed} start"));
         let mut was_opaque: HashSet<Address> = (0..TRADERS).map(trader).filter(|t| rec.get(t).is_none()).collect();
         for h in 1..=150 {
@@ -163,10 +211,21 @@ fn records_equal_decoded_rows_after_random_deltas() {
             random_block(&o, &mut rng);
             let delta = o.own_pending_delta();
             o.flush(&db).unwrap();
+            let before = TraderPositions::build(&rows);
             rows.apply(&delta);
-            rec.apply(&delta, &rows);
+            let mut reports: Vec<Report> = Vec::new();
+            rec.apply(
+                &delta,
+                &rows,
+                Some(&mut |t: &Address, r: Option<(&[Change], &[Position])>| {
+                    reports.push((*t, r.map(|(c, n)| (c.to_vec(), n.to_vec()))));
+                }),
+            );
+            plain.apply(&delta, &rows, None);
+            assert!(plain.same_as(&rec), "seed {seed} block {h}: records with / without reports");
             assert_eq!(rows, ResidentRows::build(&db).unwrap(), "seed {seed} block {h}: R == DB");
             check(&rec, &rows, &db, &mut stats, &format!("seed {seed} block {h}"));
+            check_reports(&reports, &delta, &before, &rec, &mut stats, &format!("seed {seed} block {h}"));
             let now: HashSet<Address> = (0..TRADERS).map(trader).filter(|t| rec.get(t).is_none()).collect();
             stats.cleared += was_opaque.difference(&now).count();
             was_opaque = now;
@@ -175,6 +234,7 @@ fn records_equal_decoded_rows_after_random_deltas() {
     println!("TRADER_POSITIONS P1 {stats:?}");
     assert!(stats.regular > 3_000 && stats.found > 10_000, "non-vacuous: {stats:?}");
     assert!(stats.opaque > 500 && stats.cleared > 20, "irregular rows come and go: {stats:?}");
+    assert!(stats.reported > 1_000 && stats.reported_none > 50 && stats.changes > 3_000, "reports: {stats:?}");
 }
 
 /// A trader without rows reads as no positions; `find` misses a market it

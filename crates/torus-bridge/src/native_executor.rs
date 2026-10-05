@@ -888,21 +888,20 @@ pub(crate) struct PosSums {
 const ABS_GUARD: u128 = i128::MAX as u128;
 
 /// C6b (A-lite) / item 6 M1: `base` (a trader's sums over some rows) minus
-/// the terms of each changed row as it was (`.0`) plus its terms now (`.1`),
-/// valued with `marks` and `tiers`. Exact: the sums are integer sums of the
-/// same [`position_terms`] as `build`, the order does not matter while
-/// nothing overflows, every step is checked, and the guard (Σ |term| <=
-/// `i128::MAX`, see [`PosSums::abs`]) proves `build` over the rows now
+/// the terms of each changed row's position as it was (`.0`) plus its terms
+/// now (`.1`), valued with `marks` and `tiers`. Exact: the sums are integer
+/// sums of the same [`position_terms`] as `build`, the order does not matter
+/// while nothing overflows, every step is checked, and the guard (Σ |term|
+/// <= `i128::MAX`, see [`PosSums::abs`]) proves `build` over the rows now
 /// cannot overflow either. `None` (the caller builds or drops): the guard
-/// on `base`, a row that does not decode, a Cross position in a market
-/// outside `marks`, an overflow, or the guard on the result.
-fn sums_with_row_changes<'t>(
+/// on `base`, a Cross position in a market outside `marks`, an overflow, or
+/// the guard on the result.
+fn sums_with_changes<'t>(
     base: PosSums,
-    changes: &[(Option<&[u8]>, Option<&[u8]>)],
+    changes: &[trader_positions::Change],
     marks: &BlockMarks,
     tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
 ) -> Option<SumsResult> {
-    use borsh::BorshDeserialize;
     if base.abs.iter().any(|a| *a > ABS_GUARD) {
         return None;
     }
@@ -910,11 +909,10 @@ fn sums_with_row_changes<'t>(
     let (mut abs, mut isolated, mut marked) = (base.abs, base.isolated, base.marked);
     // Removals first (exact: `abs` holds no saturated value), then additions.
     for add in [false, true] {
-        for &(resident, current) in changes {
-            let Some(row) = (if add { current } else { resident }) else {
+        for (resident, current) in changes {
+            let Some(pos) = (if add { current } else { resident }) else {
                 continue;
             };
-            let pos = torus_core::position::Position::try_from_slice(row).ok()?;
             let step = |n: u32| if add { n.checked_add(1) } else { n.checked_sub(1) };
             if pos.margin_type != MarginType::Cross {
                 isolated = step(isolated)?;
@@ -924,7 +922,7 @@ fn sums_with_row_changes<'t>(
             if mark.is_some() {
                 marked = step(marked)?;
             }
-            let t = position_terms(&pos, mark, tiers(pos.market_id)).ok()?;
+            let t = position_terms(pos, mark, tiers(pos.market_id)).ok()?;
             for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
                 let x = x.raw();
                 if add {
@@ -942,6 +940,40 @@ fn sums_with_row_changes<'t>(
     }
     let [upnl, position_im, notional, maintenance] = sums.map(FixedPoint::from_raw);
     Some(Ok(PosSums { upnl, position_im, notional, maintenance, isolated, marked, abs }))
+}
+
+/// C3: `AccountView::build`'s sums over `ps` valued with `mark` / `tiers`
+/// (`Err(())`: `build` overflowed), with the counts and magnitudes of
+/// [`PosSums`].
+fn build_sums<'t>(
+    ps: &[torus_core::position::Position],
+    mark: impl Fn(MarketId) -> Option<FixedPoint>,
+    tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+) -> SumsResult {
+    let marked = std::cell::Cell::new(0u32);
+    let mark = |m: MarketId| {
+        let mark = mark(m);
+        marked.set(marked.get().saturating_add(u32::from(mark.is_some())));
+        mark
+    };
+    let mut abs = [0u128; 4];
+    let seen = |_: &torus_core::position::Position, t: &torus_core::margin::PositionTerms| {
+        for (a, x) in abs.iter_mut().zip(t.parts()) {
+            *a = a.saturating_add(x.raw().unsigned_abs());
+        }
+    };
+    AccountView::build_with(&NativeBalance::default(), ps, mark, tiers, seen)
+        .map(|v| PosSums {
+            upnl: v.upnl,
+            position_im: v.position_im,
+            notional: v.notional,
+            maintenance: v.maintenance,
+            isolated: u32::try_from(ps.iter().filter(|p| p.margin_type != MarginType::Cross).count())
+                .unwrap_or(u32::MAX),
+            marked: marked.get(),
+            abs,
+        })
+        .map_err(|_| ())
 }
 
 impl PosSums {
@@ -975,14 +1007,14 @@ const TRADER_PREFIX: usize = 20;
 /// read-only during a block: each trader's sums over its rows in R, valued
 /// with the mark table / configs of `version`. An entry follows the
 /// trader's rows: a block that writes them moves it on to the rows after the
-/// block or drops it (item 6 M1, [`BlockSums::into_cache`]); it is read only
+/// block or drops it (item 6 M1, [`SumsCarry::trader`]); it is read only
 /// while the version holds (versions are never reused, so an entry at
 /// another version is never read; the map is cleared when the version moves).
 #[derive(Debug, Default)]
 struct SumsCache {
     version: u64,
     map: HashMap<Address, SumsResult>,
-    /// Item 6 M1 (tests): entries `into_cache` moved on to a trader's rows
+    /// Item 6 M1 (tests): entries `end_resident` moved on to a trader's rows
     /// after the block (instead of dropping them).
     #[cfg(test)]
     carried: usize,
@@ -1013,6 +1045,83 @@ pub(crate) struct BlockSums {
     shadow_mismatches: std::sync::Mutex<Vec<String>>,
     #[cfg(test)]
     counters: SumsCounters,
+}
+
+/// Item 6 M1 / step 1: the slot's sums after a block, while R's decoded
+/// positions follow the block's delta ([`TraderPositions::apply`] reports
+/// each written trader to [`Self::trader`]).
+struct SumsCarry<'a> {
+    cache: SumsCache,
+    /// The block's mark table / configs (and the configs' tiers by market)
+    /// when the entries may be carried; `None`: written traders' entries are
+    /// dropped.
+    table: Option<(&'a BlockMarksState, DenseTiers<'a>)>,
+}
+
+impl SumsCarry<'_> {
+    /// A trader the block wrote under: its entry (sums over R's rows before
+    /// the block, at the table's version) moves on to its rows after the
+    /// block, or is dropped when that is not possible (no entry, no carry,
+    /// `changes` unknown: `None`, a Cross position in a market outside the
+    /// table, an overflow or the guard of [`sums_with_changes`]). Exact: the
+    /// entry is then `build` over R's rows after the block at the version,
+    /// as an entry the next block would compute (used only while the version
+    /// holds, i.e. the same marks and configs). `changes` / `now`: the
+    /// trader's changed positions (before, after) and its positions after
+    /// the block (see [`TraderPositions::apply`]); when re-valuing all of
+    /// `now` costs no more terms than the changes (2 per change), `build`
+    /// over `now` instead (the same sums, exactly).
+    fn trader(&mut self, trader: &Address, report: Option<(&[trader_positions::Change], &[torus_core::position::Position])>) {
+        let moved = (|| {
+            let (t, dense) = self.table.as_ref()?;
+            let (changes, now) = report?;
+            let base = self.cache.map.get(trader)?.ok()?;
+            let tiers = |m: MarketId| {
+                if dense.tiers.is_empty() {
+                    t.configs.get(&m).map(|c| c.tiers.as_slice())
+                } else {
+                    dense.tiers.get(m as usize).copied().flatten()
+                }
+            };
+            if now.len() <= 2 * changes.len() {
+                let in_table = std::cell::Cell::new(true);
+                let mark = |m: MarketId| {
+                    t.marks.get(m).unwrap_or_else(|| {
+                        in_table.set(false);
+                        None
+                    })
+                };
+                let r = build_sums(now, mark, tiers);
+                return in_table.get().then_some(r);
+            }
+            sums_with_changes(base, changes, &t.marks, tiers)
+        })();
+        match moved {
+            Some(r) => {
+                self.cache.map.insert(*trader, r);
+                #[cfg(test)]
+                {
+                    self.cache.carried += 1;
+                }
+            }
+            None => {
+                self.cache.map.remove(trader);
+            }
+        }
+    }
+
+    /// Every trader the block wrote under loses its entry (no decoded
+    /// positions to follow).
+    fn drop_written(&mut self, delta: &torus_state::ResidentDelta) {
+        let mut last: Option<&[u8]> = None;
+        for (key, _) in delta.entries(torus_state::cf::CF_NATIVE_POSITIONS) {
+            let Some(prefix) = key.get(..TRADER_PREFIX) else { continue };
+            if last != Some(prefix) {
+                self.cache.map.remove(&Address::from_slice(prefix));
+                last = Some(prefix);
+            }
+        }
+    }
 }
 
 /// Which path answered each `pos_sums` call (tests).
@@ -1092,25 +1201,11 @@ impl BlockSums {
         r.ok()
     }
 
-    /// End of the block: the memo joins the cache (at the memo's version);
-    /// then each trader the block wrote under (`delta` = the block's own
-    /// writes / tombstones of the positions CF, key-sorted; `resident` = R's
-    /// rows before they are applied) has its entry — sums over R's rows
-    /// before the block — moved on to its rows after the block (item 6 M1,
-    /// [`sums_with_row_changes`] with `table`, the block's mark table and
-    /// configs, the version's), or dropped when that is not possible (no
-    /// entry, no table at the cache's version, a key that is not a position
-    /// row, any `None` of the update), or when the version moved at this
-    /// block's start (`stable`, see below). Exact: the entry is then `build`
-    /// over R's rows at the version, as an entry the next block would
-    /// compute (used only while the version holds, i.e. the same marks and
-    /// configs).
-    fn into_cache<'k>(
-        self,
-        delta: impl Iterator<Item = (&'k [u8], Option<&'k [u8]>)>,
-        resident: Option<&std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
-        table: Option<&BlockMarksState>,
-    ) -> SumsCache {
+    /// End of the block: the memo joins the cache (at the memo's version),
+    /// returned with what [`SumsCarry::trader`] needs to move on the entry of
+    /// each trader the block wrote under (item 6 M1): `table`, the block's
+    /// mark table and configs, when the entries may be carried (see below).
+    fn into_carry(self, table: Option<&BlockMarksState>) -> SumsCarry<'_> {
         // Node-local policy: carry only while the mark version held across
         // the previous block (the slot's cache is at this block's version).
         // A moving version (marks move most blocks) clears the next block's
@@ -1135,59 +1230,10 @@ impl BlockSums {
             }
         }
         // Carry only at the version the entries are valued at.
-        let carry = match (table, resident) {
-            (Some(t), Some(rows))
-                if stable && self.memo_version == Some(t.marks.version) && cache.version == t.marks.version =>
-            {
-                Some((t, rows))
-            }
-            _ => None,
-        };
-        const POSITION_KEY: usize = TRADER_PREFIX + 8;
-        // Keys are sorted, so each trader's position keys are contiguous.
-        let mut dropped: Vec<Address> = Vec::new();
-        let mut group: Option<(Address, Vec<(Option<&[u8]>, Option<&[u8]>)>)> = None;
-        let finish = |cache: &mut SumsCache, g: Option<(Address, Vec<(Option<&[u8]>, Option<&[u8]>)>)>| {
-            let Some((trader, rows)) = g else { return };
-            let moved = carry.and_then(|(t, _)| {
-                let base = cache.map.get(&trader)?.ok()?;
-                sums_with_row_changes(base, &rows, &t.marks, |m| t.configs.get(&m).map(|c| c.tiers.as_slice()))
-            });
-            match moved {
-                Some(r) => {
-                    cache.map.insert(trader, r);
-                    #[cfg(test)]
-                    {
-                        cache.carried += 1;
-                    }
-                }
-                None => {
-                    cache.map.remove(&trader);
-                }
-            }
-        };
-        for (key, now) in delta.filter(|(k, _)| k.len() >= TRADER_PREFIX) {
-            let trader = Address::from_slice(&key[..TRADER_PREFIX]);
-            if key.len() != POSITION_KEY || carry.is_none() {
-                dropped.push(trader);
-                continue;
-            }
-            if group.as_ref().is_none_or(|g| g.0 != trader) {
-                finish(&mut cache, group.take());
-                group = Some((trader, Vec::new()));
-            }
-            let before = carry.and_then(|(_, rows)| rows.get(key)).map(Vec::as_slice);
-            if let Some(g) = group.as_mut() {
-                g.1.push((before, now));
-            }
-        }
-        finish(&mut cache, group.take());
-        // A key that is not a position row (e.g. `cvlm`, other length) drops
-        // its prefix's entry, as before (after the updates: never kept).
-        for trader in dropped {
-            cache.map.remove(&trader);
-        }
-        cache
+        let table = table.filter(|t| {
+            stable && self.memo_version == Some(t.marks.version) && cache.version == t.marks.version
+        });
+        SumsCarry { cache, table: table.map(|t| (t, DenseTiers::of(&t.configs))) }
     }
 
     /// P1 shadow check: `cached` == the reference path's answer.
@@ -1564,9 +1610,16 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         }
         let changes =
             self.positions.state().resident_changes(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice())?;
-        let rows: Vec<(Option<&[u8]>, Option<&[u8]>)> =
-            changes.iter().map(|c| (c.resident.as_deref(), c.current.as_deref())).collect();
-        sums_with_row_changes(base, &rows, table, |m| self.tiers(m))
+        // A row that does not decode: `None` (the caller builds).
+        let decode = |row: &Option<Vec<u8>>| -> Option<Option<torus_core::position::Position>> {
+            use borsh::BorshDeserialize;
+            row.as_deref().map_or(Some(None), |r| torus_core::position::Position::try_from_slice(r).ok().map(Some))
+        };
+        let changes = changes
+            .iter()
+            .map(|c| Some((decode(&c.resident)?, decode(&c.current)?)))
+            .collect::<Option<Vec<_>>>()?;
+        sums_with_changes(base, &changes, table, |m| self.tiers(m))
     }
 
     /// Paths 3 and 4 (the trader has nothing pending this block).
@@ -1618,38 +1671,15 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// (only then is the result a function of R's rows and the mark version,
     /// i.e. cacheable; a market outside the table reads the oracle).
     fn sums_of(&self, ps: &[torus_core::position::Position]) -> (SumsResult, bool) {
-        let marked = std::cell::Cell::new(0u32);
         let in_table = std::cell::Cell::new(true);
-        let mark = |m: MarketId| {
-            let mark = match self.marks.and_then(|t| t.get(m)) {
-                Some(mark) => mark,
-                None => {
-                    in_table.set(false);
-                    self.mark(m)
-                }
-            };
-            marked.set(marked.get().saturating_add(u32::from(mark.is_some())));
-            mark
-        };
-        let mut abs = [0u128; 4];
-        let seen = |_: &torus_core::position::Position, t: &torus_core::margin::PositionTerms| {
-            for (a, x) in abs.iter_mut().zip(t.parts()) {
-                *a = a.saturating_add(x.raw().unsigned_abs());
+        let mark = |m: MarketId| match self.marks.and_then(|t| t.get(m)) {
+            Some(mark) => mark,
+            None => {
+                in_table.set(false);
+                self.mark(m)
             }
         };
-        let r = AccountView::build_with(&NativeBalance::default(), ps, mark, |m| self.tiers(m), seen)
-            .map(|v| PosSums {
-                upnl: v.upnl,
-                position_im: v.position_im,
-                notional: v.notional,
-                maintenance: v.maintenance,
-                isolated: u32::try_from(ps.iter().filter(|p| p.margin_type != MarginType::Cross).count())
-                    .unwrap_or(u32::MAX),
-                marked: marked.get(),
-                abs,
-            })
-            .map_err(|_| ());
-        (r, in_table.get())
+        (build_sums(ps, mark, |m| self.tiers(m)), in_table.get())
     }
 
     /// F1: signed position in `market_id` and the price it is valued at
@@ -2963,20 +2993,18 @@ fn end_resident_inner(
         );
         return;
     };
+    let ResidentBlock { height, marks, sums, .. } = block;
     // C3: the block's memo joins the slot's sums; item 6 M1: every trader
     // whose positions the block wrote or deleted has its sums moved on to
-    // its rows after the block (R before `apply`), else loses them.
-    // Step 1: the sums part and the decoded positions below share one timer.
-    let timer = std::time::Instant::now();
-    let (sums, records) = match block.sums {
+    // its rows after the block, else loses them (step 1: while its decoded
+    // positions follow the delta, below).
+    let (mut carry, records) = match sums {
         Some(mut s) => {
             let records = s.records.take();
-            let cf = torus_state::cf::CF_NATIVE_POSITIONS;
-            (s.into_cache(delta.entries(cf), r.rows(cf), block.marks.as_ref()), records)
+            (Some(s.into_carry(marks.as_ref())), records)
         }
-        None => (SumsCache::default(), None),
+        None => (None, None),
     };
-    let sums_time = timer.elapsed();
     let timer = std::time::Instant::now();
     r.apply(&delta);
     if let Some(m) = metrics {
@@ -2989,15 +3017,24 @@ fn end_resident_inner(
     let timer = std::time::Instant::now();
     let positions = match records {
         Some(mut p) => {
-            p.apply(&delta, r);
+            match carry.as_mut() {
+                Some(c) => p.apply(&delta, r, Some(&mut |t: &Address, report| c.trader(t, report))),
+                None => p.apply(&delta, r, None),
+            }
             p
         }
-        None => TraderPositions::build(r),
+        None => {
+            if let Some(c) = carry.as_mut() {
+                c.drop_written(&delta);
+            }
+            TraderPositions::build(r)
+        }
     };
     if let Some(m) = metrics {
-        m.exec_end_resident_positions_seconds.observe((sums_time + timer.elapsed()).as_secs_f64());
+        m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
     }
-    holder.rows = Some(RowsSlot { rows, marks: block.marks, sums, positions, height: block.height });
+    let sums = carry.map(|c| c.cache).unwrap_or_default();
+    holder.rows = Some(RowsSlot { rows, marks, sums, positions, height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -10200,7 +10237,7 @@ mod maker_accounts_tests {
             let computed = c.computed.load(std::sync::atomic::Ordering::Relaxed);
             assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
             assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
-            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_cache(std::iter::empty(), None, None)) };
+            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_carry(None).cache) };
             next.start(Some(7));
             let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
             for &(t, m) in &pairs {

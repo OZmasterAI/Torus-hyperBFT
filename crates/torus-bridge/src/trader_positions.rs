@@ -28,6 +28,13 @@ use torus_types::MarketId;
 const TRADER: usize = 20;
 const KEY: usize = 28;
 
+/// Item 6 step 1: one changed row of a regular trader at the end of a block:
+/// its position before the block and after (`None`: no row).
+pub(crate) type Change = (Option<Position>, Option<Position>);
+
+/// Item 6 step 1: [`TraderPositions::apply`]'s per-trader report.
+pub(crate) type Seen<'a> = dyn FnMut(&Address, Option<(&[Change], &[Position])>) + 'a;
+
 #[derive(Debug, Default)]
 pub(crate) struct TraderPositions {
     /// Regular traders with at least one row: their positions in key order.
@@ -98,45 +105,35 @@ impl TraderPositions {
     /// with `rows` = R after it. A regular write or a tombstone of a regular
     /// trader updates its record in place (only the written rows decode); any
     /// other change of a trader re-decodes its rows from `rows`.
-    pub(crate) fn apply(&mut self, delta: &ResidentDelta, rows: &ResidentRows) {
+    ///
+    /// Item 6 step 1: `seen` (if any) is called once per trader the delta
+    /// writes under (key order), right after its rows are followed:
+    /// `Some((changes, now))` for a trader regular before and after the
+    /// block, with each changed row's position before / after (composing
+    /// exactly from its record before the block to `now`, its record after);
+    /// `None` when its rows are re-decoded (opaque before, or an irregular
+    /// write).
+    pub(crate) fn apply(&mut self, delta: &ResidentDelta, rows: &ResidentRows, mut seen: Option<&mut Seen<'_>>) {
         let mut reload: Vec<Address> = Vec::new();
-        for (k, v) in delta.entries(CF_NATIVE_POSITIONS) {
-            if k.len() < TRADER {
-                continue;
+        let mut group: Vec<(&[u8], Option<&[u8]>)> = Vec::new();
+        let mut changes: Vec<Change> = Vec::new();
+        // The delta is key-sorted: a trader's entries are adjacent.
+        let mut entries = delta.entries(CF_NATIVE_POSITIONS).filter(|(k, _)| k.len() >= TRADER).peekable();
+        while let Some(first) = entries.next() {
+            group.clear();
+            group.push(first);
+            while let Some(e) = entries.next_if(|(k, _)| k[..TRADER] == first.0[..TRADER]) {
+                group.push(e);
             }
-            let t = Address::from_slice(&k[..TRADER]);
-            if !self.opaque.is_empty() && self.opaque.contains(&t) {
+            let t = Address::from_slice(&first.0[..TRADER]);
+            changes.clear();
+            if !self.follow(t, &group, &mut changes, seen.as_deref_mut()) {
                 reload.push(t);
-                continue;
-            }
-            match v {
-                // A regular trader holds no irregular row: nothing to remove.
-                None if k.len() != KEY => {}
-                None => {
-                    let m = MarketId::from_be_bytes(k[TRADER..].try_into().expect("28-byte key"));
-                    if let Some(ps) = self.map.get_mut(&t) {
-                        if let Ok(i) = ps.binary_search_by_key(&m, |p| p.market_id) {
-                            ps.remove(i);
-                            if ps.is_empty() {
-                                self.map.remove(&t);
-                            }
-                        }
-                    }
+                if let Some(f) = seen.as_deref_mut() {
+                    f(&t, None);
                 }
-                Some(v) => match decode(k, v) {
-                    Some(p) => {
-                        let ps = self.map.entry(t).or_default();
-                        match ps.binary_search_by_key(&p.market_id, |q| q.market_id) {
-                            Ok(i) => ps[i] = p,
-                            Err(i) => ps.insert(i, p),
-                        }
-                    }
-                    None => reload.push(t),
-                },
             }
         }
-        // The delta is key-sorted: a trader's entries are adjacent.
-        reload.dedup();
         let Some(r) = rows.rows(CF_NATIVE_POSITIONS) else {
             return;
         };
@@ -148,6 +145,63 @@ impl TraderPositions {
                 .collect();
             self.set(t, ps);
         }
+    }
+
+    /// One trader's entries of the delta (`group`, key order) on its record;
+    /// `false`: its rows must be re-decoded (opaque, or an irregular write).
+    /// With `seen`, the changed rows are collected into `changes` and handed
+    /// to it with the record after them.
+    fn follow(
+        &mut self,
+        t: Address,
+        group: &[(&[u8], Option<&[u8]>)],
+        changes: &mut Vec<Change>,
+        seen: Option<&mut Seen<'_>>,
+    ) -> bool {
+        if !self.opaque.is_empty() && self.opaque.contains(&t) {
+            return false;
+        }
+        let collect = seen.is_some();
+        let ps = self.map.entry(t).or_default();
+        for &(k, v) in group {
+            match v {
+                // A regular trader holds no irregular row: nothing to remove.
+                None if k.len() != KEY => {}
+                None => {
+                    let m = MarketId::from_be_bytes(k[TRADER..].try_into().expect("28-byte key"));
+                    if let Ok(i) = ps.binary_search_by_key(&m, |p| p.market_id) {
+                        let old = ps.remove(i);
+                        if collect {
+                            changes.push((Some(old), None));
+                        }
+                    }
+                }
+                Some(v) => {
+                    let Some(p) = decode(k, v) else {
+                        // Re-decoded from R; an emptied record is removed there.
+                        return false;
+                    };
+                    let new = collect.then(|| p.clone());
+                    let old = match ps.binary_search_by_key(&p.market_id, |q| q.market_id) {
+                        Ok(i) => Some(std::mem::replace(&mut ps[i], p)),
+                        Err(i) => {
+                            ps.insert(i, p);
+                            None
+                        }
+                    };
+                    if collect {
+                        changes.push((old, new));
+                    }
+                }
+            }
+        }
+        if let Some(f) = seen {
+            f(&t, Some((changes.as_slice(), ps.as_slice())));
+        }
+        if ps.is_empty() {
+            self.map.remove(&t);
+        }
+        true
     }
 
     /// `trader`'s positions in key order (empty: no rows), `None` if opaque.
