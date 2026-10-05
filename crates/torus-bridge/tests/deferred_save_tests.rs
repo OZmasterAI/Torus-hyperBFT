@@ -207,6 +207,7 @@ enum Leg {
 /// the flush worker's view — and folded into the block's flush via
 /// `flush_with_sidecar_native_trie_stats`.
 fn run_universe(mode: BookMode, leg: Leg, seed: u64) -> RunResult {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
     use torus_state::FrozenPending;
     use torus_bridge::native_executor::DeferredBookSave;

@@ -779,6 +779,7 @@ struct ComboResult {
 }
 
 fn run_combo_mode2(combo: Combo, restart_before: Option<u64>) -> ComboResult {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
     {
         let ctx0 = make_ctx(db.clone(), 0, BookMode::LevelAuthority);
@@ -927,6 +928,7 @@ fn run_levelcache_universe(
     blocks: usize,
     restart_before: Option<u64>,
 ) -> CacheRunResult {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
     {
         let ctx0 = make_ctx(db.clone(), 0, BookMode::LevelAuthority);
@@ -1044,6 +1046,7 @@ fn levelhash_cache_differential_matrix_byte_identical() {
 
 #[test]
 fn mode2_dirty_entries_scale_with_levels_not_orders() {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
     {
         let ctx0 = make_ctx(db.clone(), 0, BookMode::LevelAuthority);
@@ -1111,6 +1114,7 @@ fn mode2_dirty_entries_scale_with_levels_not_orders() {
 
 #[test]
 fn crash_between_save_and_stash_rebuilds_and_verifies() {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
     {
         let ctx0 = make_ctx(db.clone(), 0, BookMode::LevelAuthority);

@@ -161,7 +161,7 @@ pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
 pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 
 /// Key in CF_CONSENSUS_META: present (`[1]`) iff native state advanced without native-trie
-/// maintenance (`TORUS_NATIVE_TRIE_MAINTENANCE=0`), so CF_NATIVE_TRIE / CF_NATIVE_HASHED lag it.
+/// maintenance (off unless `TORUS_NATIVE_TRIE_MAINTENANCE=1`), so CF_NATIVE_TRIE / CF_NATIVE_HASHED lag it.
 /// Written in the flush's atomic batch; cleared only by a full `build_native_trie_to_cf`.
 pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
 

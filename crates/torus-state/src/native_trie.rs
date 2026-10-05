@@ -294,8 +294,9 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 /// Ensure the native trie + mirror exist and are current, building them if absent OR marked stale
 /// (idempotent boot helper). Returns `true` iff a build was performed. The trie CF always holds at
 /// least the root marker once built (even for empty native state), so its emptiness is the reliable
-/// "not yet built" signal. `maintain == false` (`TORUS_NATIVE_TRIE_MAINTENANCE=0`) does no trie
-/// work at all: an absent or stale trie stays so (readers fall back to [`native_root_full`]).
+/// "not yet built" signal. `maintain == false` (the default; see
+/// [`native_trie_maintenance_enabled`]) does no trie work at all: an absent or stale trie stays
+/// so (readers fall back to [`native_root_full`]).
 pub fn ensure_native_trie_built(db: &StateDb, maintain: bool) -> Result<bool, StateError> {
     if !maintain || (is_native_trie_built(db)? && !is_native_trie_stale(db)?) {
         return Ok(false);
@@ -315,19 +316,50 @@ pub fn is_native_trie_stale(db: &StateDb) -> Result<bool, StateError> {
         .is_some())
 }
 
-/// s83 Option 0: `TORUS_NATIVE_TRIE_MAINTENANCE=0` skips per-block native trie/mirror maintenance
-/// (the maintained root has no live consumer); unset / `"1"` / anything else maintains exactly as
-/// today. Read once per process — the mode cannot flip mid-run.
+/// Per-block native trie/mirror maintenance is OFF by default: the maintained root has no
+/// production reader (s450, item 6 section 8.1), so each native block only writes the
+/// `META_NATIVE_TRIE_STALE` marker. `TORUS_NATIVE_TRIE_MAINTENANCE=1` turns it on (any other
+/// value leaves it off); a stale trie is then rebuilt once at boot ([`ensure_native_trie_built`]).
+/// Read once per process — in production the mode cannot flip mid-run.
 pub fn native_trie_maintenance_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        parse_native_trie_maintenance(std::env::var("TORUS_NATIVE_TRIE_MAINTENANCE").ok())
-    })
+    match MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed) {
+        MAINTENANCE_ON => true,
+        MAINTENANCE_OFF => false,
+        _ => {
+            let on =
+                parse_native_trie_maintenance(std::env::var("TORUS_NATIVE_TRIE_MAINTENANCE").ok());
+            let v = if on { MAINTENANCE_ON } else { MAINTENANCE_OFF };
+            // First resolution wins; a concurrent force-on is kept.
+            let _ = MAINTENANCE.compare_exchange(
+                MAINTENANCE_UNRESOLVED,
+                v,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed) == MAINTENANCE_ON
+        }
+    }
 }
 
-/// Pure parse: only `"0"` disables.
+/// TEST-ONLY process-wide switch: turn native trie maintenance on, whatever the env says, for
+/// tests that read [`persisted_native_root`] after a flush through the env-resolved wrappers.
+/// One switch for every test in the process (tests run in parallel, so per-test env would race);
+/// it only ever turns maintenance ON, so the one possible flip is off -> on, which leaves a
+/// stale trie marked stale until a rebuild. Never called by production code.
+#[doc(hidden)]
+pub fn force_native_trie_maintenance_on_for_tests() {
+    MAINTENANCE.store(MAINTENANCE_ON, std::sync::atomic::Ordering::Relaxed);
+}
+
+const MAINTENANCE_UNRESOLVED: u8 = 0;
+const MAINTENANCE_OFF: u8 = 1;
+const MAINTENANCE_ON: u8 = 2;
+static MAINTENANCE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(MAINTENANCE_UNRESOLVED);
+
+/// Pure parse: only `"1"` (trimmed) enables; unset or anything else is off.
 fn parse_native_trie_maintenance(v: Option<String>) -> bool {
-    !matches!(v.as_deref().map(str::trim), Some("0"))
+    matches!(v.as_deref().map(str::trim), Some("1"))
 }
 
 /// `true` if the native bucketed trie has been built (cheap probe: `CF_NATIVE_TRIE` is non-empty —
@@ -1541,6 +1573,7 @@ mod tests {
     /// empty CF contributes nothing.
     #[test]
     fn liquidation_cf_is_native_root_tag_6_incremental_equals_full() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::CF_NATIVE_LIQUIDATION;
         assert_eq!(cf_tag(CF_NATIVE_LIQUIDATION), Some(6));
         let tags: Vec<u8> = NATIVE_ROOT_CFS.iter().map(|(_, t)| *t).collect();
@@ -1821,15 +1854,17 @@ mod tests {
         }
     }
 
-    /// s83 Option 0: maintenance defaults ON (exact-today); only `"0"` skips it.
+    /// Maintenance defaults OFF (the maintained root has no production reader); only `"1"`
+    /// turns it on, anything else (including `"0"`) leaves it off.
     #[test]
-    fn native_trie_maintenance_default_on_only_zero_disables() {
-        assert!(parse_native_trie_maintenance(None));
+    fn native_trie_maintenance_default_off_only_one_enables() {
+        assert!(!parse_native_trie_maintenance(None));
         assert!(parse_native_trie_maintenance(Some("1".to_string())));
+        assert!(parse_native_trie_maintenance(Some(" 1 ".to_string())));
         assert!(!parse_native_trie_maintenance(Some("0".to_string())));
         assert!(!parse_native_trie_maintenance(Some(" 0 ".to_string())));
-        for v in ["false", "off", "", "no", "2", "00"] {
-            assert!(parse_native_trie_maintenance(Some(v.to_string())), "{v}");
+        for v in ["true", "on", "", "yes", "2", "01", "11"] {
+            assert!(!parse_native_trie_maintenance(Some(v.to_string())), "{v}");
         }
     }
 

@@ -127,6 +127,7 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
 /// attaches the resident rows R (else today's path). Returns one hex digest
 /// per block.
 fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -> Vec<String> {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
     let metrics = Arc::new(Metrics::new());
     let mut books: HashMap<MarketId, OrderBook> = HashMap::new();

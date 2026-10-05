@@ -169,6 +169,7 @@ fn dump_cf(db: &StateDb, cf: &'static str) -> Vec<(&'static str, Vec<u8>, Vec<u8
 /// carried across blocks. `restart_before`: drop BOTH holders before that
 /// block (process restart).
 fn run_combo(modes: Modes, restart_before: Option<u64>) -> ComboResult {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
 
     // Fund actors directly, then build the trie base (the boot-time
@@ -364,6 +365,7 @@ fn restart_mid_sequence_invisible_all_modes() {
 /// leave the persisted root untouched.
 #[test]
 fn flush_level_clean_rewrite_elision() {
+    torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let (_dir, db) = open_test_db();
     let bal = NativeBalance {
         available: fp(1_000),
