@@ -524,6 +524,55 @@ more ms/1k must go. A plausible path, about 6.0 (~0.78x):
 The last ~2 would have to come from the per-operation inflation, so the
 next measurement is `perf stat` IPC and LLC misses on the execution thread.
 
+## 9. Trie maintenance on vs off, 300 markets (PRELIMINARY, 2026-10-05)
+
+**Status:** 3 of 4 trie-off cells done, `ozarchy-trie0-main-r2` still
+running. The IPC counter analysis and the agent's per-thread CPU and
+flush-worker numbers are not in yet. Numbers below come straight from each
+cell's `summary.json`.
+
+Same binaries as section 7: crab `14236fa` (node md5 `7da38063`), main
+`92a02ed` (`31a95c65`), the `14236fa` load generator. 300 markets, cap
+400, rate 76,000, `RETRY_BUSY=1`, 120 s; crab with the oracle feed. The
+logged node env shows `TORUS_NATIVE_TRIE_MAINTENANCE=0` for the trie-off
+cells. The section 6 and 7 cells did not set it, so they ran with
+maintenance on (the default). 18c's campaign `arms.conf.example` sets `=0`
+on every arm, so cells from that harness are trie-off cells.
+
+| cell | trie | matched/s | best60 | engine ms/1k | chain ms | pipelined ms | handoff wait ms | commit ms avg |
+|---|---|---|---|---|---|---|---|---|
+| crab `14236fa` r1 (section 7) | on | 48,220 | 80,519 | 14.41 | 1,007 | 583 | 1.83 | 847 |
+| crab `14236fa` r2 (section 7) | on | 50,651 | 79,503 | 14.11 | 827 | 489 | 1.78 | 687 |
+| main r1 (section 6.2) | on | 87,792 | 125,375 | 7.24 | 764 | 689 | 77.87 | 572 |
+| main r2 (section 6.2) | on | 91,023 | 121,136 | 6.86 | 722 | 660 | 98.94 | 556 |
+| crab `ozarchy-trie0-crab-r1` | off | 51,871 | 80,659 | 13.86 | 920 | 167 | 0.01 | 852 |
+| main `ozarchy-trie0-main-r1` | off | 100,744 | 129,761 | 7.05 | 560 | 172 | 0.24 | 477 |
+| crab `ozarchy-trie0-crab-r2` | off | 50,398 | 80,709 | 14.09 | 850 | 149 | 0.01 | 724 |
+| main `ozarchy-trie0-main-r2` | off | pending | | | | | | |
+
+All finished cells: AGREE, liveness PASS, ACCEPT.
+
+So far:
+- **Crab:** 49.4k -> 51.1k matched/s (+3.4%) with the trie off. The engine
+  time per fill is unchanged (14.1-14.4 vs 13.9-14.1): crab is bound by
+  execution, so the flush worker's saving barely shows.
+- **Main:** 89.4k -> 100.7k (+12.7%, one cell). With the trie on, main's
+  execution thread waited ~78-99 ms per block for the previous flush
+  (handoff wait). With it off that wait is gone (0.24 ms), so main gains
+  more than crab.
+- **Pipelined time** (the flush side) drops from ~490-690 ms to ~150-170 ms
+  per block on both arms.
+- **Ratio, preliminary:** trie on 0.553x; trie off 51.1k / 100.7k = ~0.51x.
+  The crab/main ratio gets slightly worse with the trie off, because only
+  main was partly flush-bound. Wait for main-r2 before relying on it. The
+  trie-on cells come from earlier sessions (drift of a few percent is
+  possible); the trie-off pair ran interleaved in one window.
+
+IPC cells (`ozarchy-ipc-{crab,main}`, run under `perf record` with a
+cycles + instructions event group, so throughput is lower than unprofiled
+cells): crab 45,261 vs main 79,065 matched/s, engine 14.86 vs 7.67 ms/1k,
+both AGREE / PASS / ACCEPT. The counter analysis is pending.
+
 ## Open
 
 - Native trie maintenance off by default: owner question on the
