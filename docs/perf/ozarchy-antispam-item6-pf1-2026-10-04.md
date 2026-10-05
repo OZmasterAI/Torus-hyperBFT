@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -23,6 +23,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 11 | Where does C7's margin phase go vs main? What can be cut? | 5.09 vs 1.47 ms CPU/1k fills (+3.6; ENGINE wall 3.96 vs 1.46). 2.9 is crab-only code: the F1 account check in `prepare_one` 1.77, top-ups / pool takers / bid floors 1.15. `HashMap` work is +1.6 of the gap. `AccountReader::get_position` is ~0.15 margin, ~1.1 match timer. Named cuts ~1.7-2.7 ms/1k (est.), almost all in 18c's files |
 | 12 | What do P1-P4 + fix A (`239ff69`) give at 300 markets? | 65.2k matched/s, **0.648x main** (was 0.638x): +1.5%, within 82bd1a4's cell spread; engine 10.2 -> 9.93 ms/1k (-2.7%, both cells). `checked_mul` -77%, matching -15%, margin buckets -14%, settle -17%; +0.5 ms/1k SipHash from the new Address-keyed `TraderMargins` map. Margin still 207-212 vs ~96 ms/blk on main |
 | 13 | What does C (per-action failure records, `9195c32`) cost? How many failures does the bench produce? | No measurable cost (warm pair: matched/s +0.9%, engine -1.2%, pipelined 128 vs 127 ms). Failures are **not** ~0: 147 failed actions per native block (52% of actions, nearly all batches with open-limit rejects), ~10 KB per block, ~0.14% of the flush batch; identical on all 3 validators. Zero-fill IOCs and crossing post-only orders still show "executed" |
+| 14 | What does M1 (`90a752c`) give at 300 markets? What does end_resident cost? | 76.5k matched/s, **+17%, 0.760x main** (was 0.648x); engine 9.93 -> 7.72 ms/1k (1.09x main). Margin 210 -> 125 ms/blk (-38% per fill), match 92 -> 45 (-49%). end_resident is untimed; from the profile **+29.7 ms/blk** (67 -> 97), ~3.5x the expected 8.6, mostly `BlockSums::into_cache` re-decoding positions |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1122,6 +1123,152 @@ blocks from `torus_exec_native_blocks_total`, including the drain):
   open_limit, tick, lot, price, batch_cap, fill, other); a changed message
   falls back to `other` until the executor returns a typed reason.
 
+## 14. M1 (`90a752c`) at 300 markets, trie off by default (2026-10-05)
+
+Crab only, `perf/item6-phase1` @ `90a752c` = `239ff69` + `7c365d4`
+(off-tick stop-limit and non-positive limit rejected before the book; one
+tick / lot text) + `e81aa2e` (books created from the market row's tick and
+lot) + `49df3eb` (M1 margin phase: one entry per sender, per-batch market
+table, fold pools, Phase 3 reuses Phase 2 reads) + `b9959e2` (M1: carry
+written traders' sums across stable-mark blocks; dense mark / tier
+indexes). It does **not** contain C (section 13). Same run shape and build
+flags as section 12; node md5 `50dcee7e`, load generator md5 `22d30038`.
+Warm (60 s, no perf), then r1 and r2 with val0 perf. All cells AGREE,
+liveness PASS, ACCEPT; oracle 402/402, marks fresh 300/300. Driver and
+analysis: `ozarchy-90a752c-campaign.sh`, `ozarchy-90a752c-analysis.md`.
+
+- **Trie off:** no node had a `TORUS_NATIVE_TRIE*` variable; each of the 9
+  node logs has one `native trie maintenance off (default; ...)` line and
+  no rebuild.
+- **Load is comparable:** the bench genesis has tick / lot 1.0 / 1.0 on all
+  300 markets, so books built from the market row match the old
+  auto-created ones. `rejected_book`, `rejected_other` and
+  `rejected_margin` stay 0; matched / placed (0.700) and cancelled /
+  placed (0.080) are unchanged. Open-limit rejects are higher (16.2-16.8M,
+  0.81-0.83 of placed, vs 13.2-14.7M, 0.71-0.79): an existing class that
+  grows with throughput (it already moved 13.2 -> 14.7M between the
+  `239ff69` cells).
+
+### 14.1 Full node
+
+| cell | matched/s | best60 | engine ms/1k | CPU-s per 1M fills | chain ms | pipelined ms | handoff wait ms | commit ms avg / p50 | blk/s | native blk/s | fills per native block |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `90a752c` r1 (perf val0) | 74,733 | 103,867 | 7.82 | 73.3 | 579 | 144 | 0.06 | 569 / 444 | 1.2 | 1.22 | 52.0k |
+| `90a752c` r2 (perf val0) | 78,186 | 102,324 | 7.62 | 72.3 | 565 | 143 | 0.03 | 550 / 500 | 1.3 | 1.29 | 51.8k |
+| **`90a752c` mean** | **76,459** | 103,096 | **7.72** | **72.8** | 572 | 144 | 0.05 | 560 / 472 | 1.25 | 1.26 | 51.9k |
+| `239ff69` mean (12.1) | 65,186 | 100,443 | 9.93 | 80.6 | 678 | 143 | 0.10 | 630 / 411 | 1.1 | 1.06 | 54.2k |
+| main `92a02ed` trie off (9.1) | 100,573 | 131,094 | 7.06 | 60 | 564 | 173 | 0.24 | 481 / 336 | 1.6 | 1.33 | 65.5k |
+| warm `90a752c` (60 s, no perf) | 91,886 | 106,211 | 6.47 | 58.1 | 476 | 121 | 0.07 | 447 / 368 | 1.2 | 1.22 | 51.3k |
+| warm `239ff69` (60 s, no perf) | 76,710 | 99,593 | 8.35 | 62.2 | 587 | 127 | 0.17 | 520 / 358 | 0.9 | 0.89 | 56.5k |
+
+| ratio to main | `239ff69` | `90a752c` |
+|---|---|---|
+| matched/s | 0.648x | **0.760x** |
+| engine ms/1k | 1.41x | 1.09x |
+| CPU-s per 1M fills | 1.34x | 1.21x |
+
+- **+17.3% matched/s** (76.5k vs 65.2k), far outside either build's cell
+  spread (74.7-78.2k vs 64.8-65.6k). The unprofiled warm cells give
+  +19.8% (91.9k, 0.91x main). Engine time per fill -22%, CPU per fill
+  -10%, chain time -16%, native blocks per second +19%; pipelined (flush)
+  time and handoff wait unchanged.
+- **Caveat:** as before, the main reference is the section 9.1 pair (not
+  interleaved, no perf, `14236fa` load generator).
+
+Engine phases on val0 (ms per block):
+
+| | total | phase 1 | margin | match | settle | tail (incl. liquidation) | untimed |
+|---|---|---|---|---|---|---|---|
+| `90a752c` r1 / r2 | 407 / 395 | 54 / 52 | **126 / 125** | **46 / 45** | 130 / 128 | 35 / 30 | 16 / 16 |
+| `239ff69` r1 / r2 | 550 / 526 | 50 / 47 | 212 / 207 | 94 / 89 | 134 / 126 | 44 / 42 | 16 / 15 |
+| main trie off r1 / r2 | 459 / 466 | 51 / 50 | 95 / 97 | 149 / 151 | 155 / 158 | 0.05 | 9 |
+
+Per 1k fills: **margin 2.41 vs 3.87 (-38%)**, **match 0.87 vs 1.69
+(-49%)**, settle 2.49 vs 2.39 (+4%), tail 0.62 vs 0.79. Margin per block
+is now 1.3x main (was 2.2x). The match timer halves although matching CPU
+does not drop: it is execution-thread wall time and includes the
+maker-side margin work done during matching (`maker_fill_fits`,
+`maker_account`), which M1 halves (14.3).
+
+### 14.2 end_resident (end-of-block upkeep)
+
+**`end_resident` is not timed by any metric.** It runs after the flush
+handoff (`app.rs:2588`) with no timer around it; the function
+(`native_executor.rs:2903`) only sets the resident-rows gauges. Its time
+lands in summarize.py's PHASE `residual_untimed`. The numbers below are
+inclusive CPU on the execution thread from the val0 profile (it runs
+single-threaded there, so CPU ~ wall), cross-checked against
+`residual_untimed`.
+
+| | end_resident ms per block | ms per 1k fills | `BlockSums::into_cache` | `ResidentRows::apply` | `TraderPositions::apply` | end_resident self |
+|---|---|---|---|---|---|---|
+| `239ff69` r1 / r2 | 64.8 / 69.8 (mean 67.3) | 1.00 / 1.03 | - | 27.8 / 32.2 | 19.1 / 20.7 | 13.3 |
+| `90a752c` r1 / r2 | 102.0 / 92.0 (mean 97.0) | 1.61 / 1.48 | 20.4 / 15.1 | 30.4 / 28.3 | 20.3 / 19.0 | 26.0 |
+| delta | **+29.7** | **+0.53** | +17.8 | -0.6 | -0.2 | +12.7 |
+
+- **Cut 4 costs ~30 ms per block here, about 3.5x the ~8.6 ms expected**
+  (marks steady, oracle walk 0, ~52k fills per block).
+- **`BlockSums::into_cache` (~18 ms):** ~40% borsh decode of `Position`
+  rows and ~30% `position_terms`: it re-decodes and re-sums every written
+  trader's positions. end_resident's own time (+12.7 ms) is the inlined
+  walk of the block's position rows that feeds it.
+- **Cross-check:** `residual_untimed` on val0 is 88.8 / 86.5 ms per block
+  in `239ff69` and 120.0 / 116.6 in `90a752c` (+30.7; warm +26.4),
+  matching the profile. The other exec-thread stages outside the engine
+  (verify, save_books) are unchanged.
+- **Well paid for** (margin -84 and match -46 ms per block), but it is now
+  the largest new single cost. Next trim: avoid the re-decode by carrying
+  the positions `TraderPositions` already decoded, or summing from the
+  delta's decoded rows. A timer (metric) around `end_resident` would make
+  it visible without a profile.
+
+### 14.3 val0 execution-thread profile
+
+ms CPU per 1k fills over the perf window, mean of r1 / r2 (all execution
+threads).
+
+| bucket | `239ff69` | `90a752c` | delta |
+|---|---|---|---|
+| execution threads total | 19.39 | 16.52 | **-2.87 (-15%)** |
+| margin, all buckets | 4.78 | 2.33 | **-2.45 (-51%)** |
+| margin: `prepare_one` | 2.47 | 1.45 | -1.02 |
+| margin: `maker_fill_fits` | 1.13 | 0.68 | -0.46 |
+| margin (other) | 1.10 | 0.13 | -0.97 |
+| margin: `same_batch_bid_top_ups` | 0.04 | 0.03 | 0 |
+| `execute_batch_phases` glue | 5.51 | 4.15 | -1.36 |
+| matching | 2.54 | 2.72 | +0.18 |
+| settle | 1.69 | 1.74 | +0.05 |
+| books drain / save / load (contains end_resident) | 1.93 | 2.42 | **+0.49** |
+| liquidation | 0.86 | 0.73 | -0.12 |
+| leaf kind: hashing | 4.52 | 3.51 | **-1.0** |
+| leaf kind: compute | 12.2 | 10.4 | -1.8 |
+| `torus-flush-worker` thread | 3.28 | 3.01 | -0.27 |
+| process CPU ms per 1k (user + sys) | 152 | 137 | -15 (-10%) |
+
+| `239ff69` | `90a752c` | delta | symbol (inclusive unless noted) |
+|---|---|---|---|
+| 1.81 | 1.16 | -0.65 | `AccountReader::get_position` (self 1.18 -> 0.52) |
+| 1.36 | 0.58 | -0.77 | `AccountReader::pos_sums` |
+| 0.94 | 0.49 | -0.45 | `AccountReader::maker_account` |
+| 1.29 | 0.94 | -0.36 | `RandomState::hash_one<&Address>` |
+| 0.95 | 0.35 | **-0.59** | SipHash write (self) |
+| 0.25 | inlined | -0.24 visible | `d2_pool_takers` (M1 fold pools) |
+| 1.56 | 1.17 | -0.39 | `OrderBook::match_at_level` (`maker_fill_fits` under it) |
+| 0.27 | 0.18 | -0.08 | `FixedPoint::checked_mul` |
+| 1.02 | 1.55 | **+0.53** | `end_resident` |
+| 0.05 | 0.17 | +0.12 | `Position` borsh decode (mostly `into_cache`) |
+| 1.17 | 1.34 | +0.17 | `__KeccakF1600` (self) |
+
+- **M1 hits its targets:** margin CPU halves; the SipHash P1 added in
+  `239ff69` (+0.5) is more than removed; position reads drop 0.45-0.77
+  each (one entry per sender, Phase 3 reusing Phase 2 reads).
+- `reduce_only_positions_for` and `phase2_reservation_basis` have no frame
+  in either build (inlined), so their share shows in the callers.
+- **Left:** per block the engine total is already below main (401 vs 463
+  ms), but per fill it is still 1.09x (main runs more fills per block at
+  1.6 blk/s) and CPU per fill 1.21x. Outside the engine, end_resident
+  (14.2) is the biggest item to cut next.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1134,13 +1281,16 @@ blocks from `torus_exec_native_blocks_total`, including the drain):
   trie on/off comparison (section 9.1).
 - E1 (oracle step) postponed, low priority: 5.8 ms per empty block on
   ozarchy (section 7.3).
-- Margin at 300 markets after C6 + C7: margin phase 216-221 vs ~95 ms per
-  block on main (section 10). Breakdown and cut list in section 11;
-  almost every cut is in files 18c is editing (section 11.4).
+- Margin at 300 markets after M1: 125 vs ~96 ms per block on main (was
+  216-221 after C6 + C7; section 14.1). Cut list in section 11.
+- end_resident after M1: +29.7 ms per block, mostly
+  `BlockSums::into_cache` re-decoding positions; untimed, needs a metric
+  (section 14.2).
 - A main pair interleaved with crab cells, trie off, to tighten the
-  0.638x / 0.648x ratios (sections 10.1, 12.1).
-- Cheaper hasher for the Address-keyed maps (`TraderMargins`), +0.46
-  ms/1k of SipHash in `239ff69` (section 12.2).
+  0.638x / 0.648x / 0.760x ratios (sections 10.1, 12.1, 14.1).
+- Cheaper hasher for the Address-keyed maps: the +0.46 ms/1k SipHash of
+  `239ff69` (section 12.2) is gone after M1 (section 14.3);
+  `hash_one<&Address>` is still 0.94 ms/1k.
 - C: zero-fill IOC and crossing post-only orders still show "executed",
   and reason codes are parsed from error text; both need
   `native_executor.rs` (section 13.2).
