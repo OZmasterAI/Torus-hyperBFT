@@ -529,3 +529,86 @@ reviews it.
 | 40 | fix A / stop-limit limit | a StopLimit with an off-tick limit is accepted at placement, holds a slot and margin while pending, rejected only on trigger | owner s92: YES, check at placement | M1 | - |
 | 41 | fix A / Limit price <= 0 | still reaches the book, holds a slot and margin, reports ok (`validate_order_price` checks only Market / Stop) | owner s92: YES, reject before the book | M1 | - |
 | 42 | ozarchy B / tick source | RPC (`fix/rpc-tick-check` `44b7473`) reads tick / lot from the market row; the executor creates every book with ONE / ONE (`native_executor.rs` ~5313, ~7561) and never reads the row; all markets today 1 / 1 | none (s92: fix in M1) | M1: create books from the market row; align RPC and executor messages | - |
+| 43 | M1 / listing validation | governance market listings do not check tick > 0 and lot > 0; since row 42 a lot of 0 makes a book that accepts zero-quantity orders and a tick of 0 turns the tick check off | validate at proposal time? (consensus change) | not built (s92 recommendation: yes) | - |
+| 44 | M1 / undecodable market row | executor uses 1 / 1, RPC only checks the market exists (test placeholders only) | should the RPC also apply 1 / 1? | not built (recommendation: yes) | - |
+| 45 | M1 / book guard | the book itself does not tick-check a StopLimit's limit; every executor path checks it before the book | add it to the book as a second guard? | not built (recommendation: yes) | - |
+| 46 | M1 / RPC price <= 0 | RPC does not reject a Limit with price <= 0 at intake; the executor rejects it before the book | add it at intake? (node-local) | not built (recommendation: yes) | - |
+| 47 | M1 cut 4 / end-of-block cost | 18c estimate ~8.6 ms/block; **ozarchy section 14: +29.7 ms/block** (`end_resident` 67 -> 97, untimed; `BlockSums::into_cache` ~18) | count in the gates or move off the execution thread? | step 1 (reuse C7's decoded positions + timer), then step 2 if the overlap check pays (section 9.7) | `b9959e2` |
+| 48 | M1 / hasher | a faster per-process-seeded hasher (foldhash / ahash) would be a new direct dependency; not measured; s82 A/B found no gain from ahash on the exec maps | add? | not added (recommendation: no) | - |
+| 49 | M1 / client-visible | RPC messages now start with "order rejected: "; off-tick StopLimit limits rejected at intake | none (heads-up for clients) | built | `7c365d4` |
+| 50 | C / zero-fill IOC, crossing PostOnly | still report executed (success); recording them needs the settle loop to return a result per order | failed with new codes, or a separate "canceled" status like HL? | unchanged | `4a26653` |
+| 51 | C / typed reasons | three reasons differ from C's text parser: modify price <= 0 `other` -> `price`, modify qty <= 0 `other` -> `lot`, withdrawal refused by margin `other` -> `margin` | confirm, or revert those three to `other`? | built | `4a26653` |
+| 52 | C / reduce-only rejects | stored as `other` | dedicated code (next free value 8)? | not built | - |
+
+## 9. s92 decisions: options considered, chosen, not chosen, and why
+
+Measurements: ozarchy results doc sections 10-14 (`docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md`).
+
+### 9.1 Shared-code inflation (crab vs main, 300 markets, s92 read-only analysis)
+- Finding: `insert_order`, `drain_book`, `sort_native_actions`, `cancel_all_many` are byte-identical in
+  both builds, so their 1.4-1.6x instructions per fill are workload; `match_at_level` /
+  `match_market` inflation is F1 (every sender and maker tracked, `maker_fill_fits` on every fill:
+  ~7-9 `BTreeMap<Address>` lookups and ~10 i256 `checked_mul` per fill vs ~3 on main).
+- Chosen: P1 (one `HashMap` entry per trader), P2 (exact i128 fast path in `checked_mul` /
+  `checked_div`), P3 (loop invariants), P4(a) (no second position read). Measured: `checked_mul`
+  1.12 -> 0.26 ms/1k (section 12).
+- Not chosen: a faster hasher (new dependency; attacker-chosen addresses need a seeded hasher;
+  s82 found no gain), row 48. P4(b) first skipped (the tick `%` was not redundant), removed after
+  fix A made it redundant (row 39); ozarchy section 11: it cost nothing anyway.
+
+### 9.2 Book rejects reported as success (off-tick bug)
+Every order the book rejects reported ok, held a slot / margin / order id / the D2 pool for the
+batch, and `app.rs` discarded execution results, so users saw "executed" for every reject.
+| option | gain | risk / cost | decision |
+|---|---|---|---|
+| A executor pre-book reject | removes the in-batch side effects; ~0 on honest load, +3-5% under off-tick spam | consensus change (lockstep deploy); serial / sharded must read the same tick | built `d4ece00` |
+| B RPC intake check | immediate error for the user, bad orders never enter a block | node-local; tick source could differ from the book's (fixed by row 42) | built by ozarchy `44b7473` |
+| C real per-action results | fixes "executed" for every reject type, incl. margin | write cost: storing every action ~13-26 GB/day, failures only ~KB/block | built by ozarchy `9195c32` (failures only, flush worker; measured no cost), typed reasons `4a26653` |
+Not chosen: B alone (other nodes bypass it, side effects stay); storing every action's status (disk).
+
+### 9.3 Native trie maintenance: off by default
+- Options: flip the default off; keep on and set `=0` in configs; decide at Gate 2. Chosen: off
+  (`db6c9de`).
+- Why: nothing reads the trie in production (re-verified on `82bd1a4`: the only readers are
+  `build_block_with_native` / `validate_block_with_native*`, called only from tests). History
+  (git): the node used a native root by FULL SCAN in block build / validate until `02aa50c`
+  (2026-05-22) removed those calls; the incremental trie was built 2026-06-07 into the
+  already-orphaned path, so it was never used. Cost when on: ~160 ms/block on the flush worker,
+  main -12.5% throughput.
+- Reversible: `TORUS_NATIVE_TRIE_MAINTENANCE=1` plus a one-time boot rebuild (tested
+  byte-identical); not consensus. Side effect: Gate 2 ratio harder (0.553x -> 0.508x at
+  `14236fa`). Open: whether dropping the native root from blocks in `02aa50c` was intended.
+
+### 9.4 Tick / lot source (row 42)
+RPC read the market row, the executor created books with 1 / 1 and never read the row. Chosen:
+the market row is the single source for new books (`e81aa2e`); existing books keep their stored
+meta. Not chosen: leave until a non-1 market is listed (silent disagreement risk).
+
+### 9.5 Rows 40 / 41 (owner: yes)
+Off-tick StopLimit limit and Limit price <= 0 rejected before the book, same pattern as A
+(`7c365d4`).
+
+### 9.6 Measuring each step separately
+Ozarchy benched P1-P4 + A (`239ff69`) and M1 (`90a752c`, without C) as separate rounds, because
+C's cost was measured ~0 on its own (section 13) and M1 needed clean attribution (it exposed the
+end-of-block cost, row 47). Not chosen: one combined round after M1 (faster, no attribution).
+
+### 9.7 After M1: order of the next steps
+1. Step 1: `into_cache` reuses C7's decoded positions, timer around `end_resident` (S, exact,
+   ~-18 ms/block; the timer also feeds step 2).
+2. Step 2: move `end_resident` off the execution thread, ONLY if it pays. Block N+1's native
+   execution needs the updated resident rows, so only N+1's pre-native work (decode, signature
+   checks, nonces, oracle) can overlap with it; the saving is min(`end_resident`, that window).
+   A small window means an M-size concurrent change for a small gain, so skip and go to step 3.
+   Ozarchy measures the window from the M1 profiles first.
+3. E2-E4, C5 (last), sync main, Gate 2 at 300 and 10 markets.
+
+### 9.8 Work split (s92)
+18c builds in the item 6 files (`native_executor.rs`, `order_book.rs`, `torus-types`); ozarchy
+builds isolated pieces on branches from the item 6 tip (RPC check, trie default, C) and measures
+on bare metal; 18c merges with method A and runs the full suite on the merged tree.
+
+### 9.9 Bench load note
+Section 13: ~52% of actions on the 300-market bench load fail, mostly batches hitting the
+open-order limit at execution. matched/s is unaffected (it counts fills), but a large share of
+each block is rejected work; revisit the load generator before Gate 2's final cells.
