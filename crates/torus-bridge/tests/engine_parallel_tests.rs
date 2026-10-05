@@ -1248,10 +1248,11 @@ fn open_limit_margin_rejected_order_takes_no_slot() {
 }
 
 /// Conservative by design: the slot is taken before matching, so an order
-/// the book then rejects (PostOnly would cross, dust quantity, off-tick
-/// price) keeps its slot until the batch ends.
+/// the book then rejects (PostOnly would cross) keeps its slot until the
+/// batch ends. Fix A (s92): dust and off-tick orders are rejected before
+/// the book (Phase 2), so they take no slot — the later GTCs get them.
 #[test]
-fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
+fn open_limit_book_rejected_orders_keep_their_slot_but_off_tick_and_dust_take_none() {
     let (q, maker) = (addr(1), addr(2));
     let half = FixedPoint::from_raw(FixedPoint::SCALE / 2);
     let post_only = order(6, true, fp(60), fp(1), TimeInForce::PostOnly);
@@ -1264,6 +1265,8 @@ fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
         place(q, dust),
         place(q, off_tick),
         place(q, gtc(6, true, 50, 1)),
+        place(q, gtc(6, true, 49, 1)),
+        place(q, gtc(6, true, 48, 1)),
     ];
     let mut runs = Vec::new();
     for threads in [0usize, 2, 4] {
@@ -1276,12 +1279,17 @@ fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
         NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
         let results: Vec<_> = r.results.iter().map(|r| (r.success, r.error.clone())).collect();
-        assert!(results[..3].iter().all(|r| r.0), "book rejects report ok: {results:?}");
-        assert!(is_open_limit(&results[3]), "{results:?}");
-        assert_eq!(metrics.orders_rejected_book.get(), 3);
+        assert!(results[0].0, "a book reject (PostOnly cross) reports ok: {results:?}");
+        let err = |i: usize, s: &str| !results[i].0 && results[i].1.as_deref().is_some_and(|e| e.contains(s));
+        assert!(err(1, "below the lot size"), "{results:?}");
+        assert!(err(2, "is not a multiple of the tick"), "{results:?}");
+        assert!(results[3].0 && results[4].0, "slots 999 and 1000: {results:?}");
+        assert!(is_open_limit(&results[5]), "{results:?}");
+        assert_eq!(metrics.orders_rejected_book.get(), 1);
+        assert_eq!(metrics.orders_rejected_other.get(), 2);
         assert_eq!(metrics.orders_rejected_open_limit.get(), 1);
         let open: usize = ctx.order_books.values().map(|b| b.open_order_count(&q)).sum();
-        assert_eq!(open, 997, "nothing rested from the second batch");
+        assert_eq!(open, 999, "the two on-tick GTCs rested");
         ctx.save_order_books();
         runs.push((results, state_dump(&ctx)));
     }

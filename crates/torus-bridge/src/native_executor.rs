@@ -5162,6 +5162,8 @@ impl NativeExecutor {
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
         // Option B (s87): each market's best bid at the start of Phase 2.
         let bid_floors = Self::phase2_bid_floors(ctx, &place_orders);
+        // Fix A (s92): each market's book tick / lot at the start of Phase 2.
+        let shapes = Self::phase2_book_shapes(ctx, &place_orders);
         // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
         // coexists with the stitch's `&mut ctx.next_global_order_id`. Item 6
         // C2: marks from the block's table (fix 1's per-call memo is gone).
@@ -5201,7 +5203,7 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
-                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &bid_floors, &groups, engine_threads, n) {
+                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &bid_floors, &shapes, &groups, engine_threads, n) {
                     Some((outcomes, worker_cache)) => {
                         // Sender shards are disjoint, so the merged cache is
                         // exactly the serial loop's cache.
@@ -5249,7 +5251,7 @@ impl NativeExecutor {
                     (_, FlatAction::Other(_)) => unreachable!(),
                 };
                 let outcome =
-                    Self::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &mut fold, i, sender, params);
+                    Self::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &shapes, &mut fold, i, sender, params);
                 Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
@@ -5568,13 +5570,15 @@ impl NativeExecutor {
     /// the available balance left after it, in this per-sender fold.
     /// Reduce-only is NOT pre-checked here: Phase 2 only sees pre-batch
     /// positions, so the book polices it at match time (Phase 3).
-    /// Option B (s87): `bid_floors` = [`phase2_bid_floors`].
+    /// Option B (s87): `bid_floors` = [`phase2_bid_floors`]. Fix A (s92):
+    /// `shapes` = [`phase2_book_shapes`].
     #[allow(clippy::too_many_arguments)]
     fn prepare_one<T: StateBackend>(
         reader: &AccountReader<'_, T>,
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         bid_floors: &HashMap<MarketId, FixedPoint>,
+        shapes: &HashMap<MarketId, (FixedPoint, FixedPoint)>,
         fold: &mut SenderFold,
         i: usize,
         sender: &Address,
@@ -5592,6 +5596,19 @@ impl NativeExecutor {
             Err((reason, msg)) => return PrepOutcome::Reject { reason, msg },
         };
         if let Err(msg) = Self::validate_order_price(params) {
+            return PrepOutcome::Reject {
+                reason: RejectReason::Other,
+                msg,
+            };
+        }
+        // Fix A (s92): the book's dust / off-tick rejects, before anything
+        // is reserved, projected or pooled (every market of the batch has an
+        // entry; the fallback is the same `(ONE, ONE)` as `book_shape`).
+        let shape = shapes
+            .get(&params.market_id)
+            .copied()
+            .unwrap_or((FixedPoint::ONE, FixedPoint::ONE));
+        if let Some(msg) = Self::book_shape_violation(params, shape) {
             return PrepOutcome::Reject {
                 reason: RejectReason::Other,
                 msg,
@@ -5817,6 +5834,7 @@ impl NativeExecutor {
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         bid_floors: &HashMap<MarketId, FixedPoint>,
+        shapes: &HashMap<MarketId, (FixedPoint, FixedPoint)>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
@@ -5845,6 +5863,7 @@ impl NativeExecutor {
                                             open_at_start,
                                             basis,
                                             bid_floors,
+                                            shapes,
                                             &mut fold,
                                             i,
                                             sender,
@@ -6748,9 +6767,11 @@ impl NativeExecutor {
     /// sender's first such order in this `execute_batch` call: its open orders
     /// after Phase 1 (`open_at_start`) and the limit from the stored
     /// `cum_volume`. A slot is taken before matching, so an order the book
-    /// then rejects (PostOnly cross, dust, off-tick) keeps it for the call. Returns
+    /// then rejects (e.g. a PostOnly cross) keeps it for the call; dust and
+    /// off-tick orders are rejected before the book (fix A, s92). Returns
     /// the slots with this order counted; the caller stores them only once the
-    /// order also passed its margin reserve, so a rejected order takes no slot.
+    /// order also passed its price / shape checks and margin reserve, so a
+    /// rejected order takes no slot.
     fn take_open_slot<T: StateBackend>(
         slots: &mut Option<OpenSlots>,
         positions: &PositionManager<T>,
@@ -7107,6 +7128,22 @@ impl NativeExecutor {
         out
     }
 
+    /// Fix A (s92): every batch market's [`book_shape`] after Phase 1, read
+    /// once and shared read-only by the serial and sharded prepare paths
+    /// (the sharded workers have no books; Phase 2 does not touch them, so
+    /// this is exactly what Phase 3 matches against).
+    fn phase2_book_shapes<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> HashMap<MarketId, (FixedPoint, FixedPoint)> {
+        let mut out = HashMap::new();
+        for &(_, _, p) in orders {
+            out.entry(p.market_id)
+                .or_insert_with(|| Self::book_shape(&ctx.order_books, p.market_id));
+        }
+        out
+    }
+
     /// Same-batch bid bound (s87, owner decision 1). After Phase 2, a
     /// non-pool sell (Option B: [`takes_bid_floor`], its sender's D2 pool
     /// is another market) is topped up to `reserve(bound, qty)`. `bound` is
@@ -7274,6 +7311,41 @@ impl NativeExecutor {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Fix A (s92): the book's dust and off-tick rejects
+    /// (`OrderBook::place_order_with_accounts`, same rules, same order: dust
+    /// for every order type, then the tick for `Limit` only), applied BEFORE
+    /// the book so such an order takes no open-order slot, reserves nothing,
+    /// gets no order id and no in-batch projection / D2 pool. `shape` = the
+    /// market book's `(tick_size, lot_size)`; a market without a book uses
+    /// `(ONE, ONE)`, the book placement would create. The book keeps its own
+    /// checks.
+    fn book_shape_violation(params: &PlaceOrderParams, (tick, lot): (FixedPoint, FixedPoint)) -> Option<String> {
+        if params.quantity < lot {
+            return Some(format!(
+                "order rejected: quantity {} below the lot size {lot}",
+                params.quantity
+            ));
+        }
+        if matches!(params.order_type, OrderType::Limit)
+            && tick > FixedPoint::ZERO
+            && params.price.raw() % tick.raw() != 0
+        {
+            return Some(format!(
+                "order rejected: price {} is not a multiple of the tick {tick}",
+                params.price
+            ));
+        }
+        None
+    }
+
+    /// Fix A (s92): a market's `(tick_size, lot_size)` for
+    /// [`book_shape_violation`] — its book's, `(ONE, ONE)` without one.
+    fn book_shape(books: &HashMap<MarketId, OrderBook>, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+        books
+            .get(&market_id)
+            .map_or((FixedPoint::ONE, FixedPoint::ONE), |b| (b.tick_size, b.lot_size))
     }
 
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
@@ -7447,20 +7519,25 @@ impl NativeExecutor {
         let market_id = params.market_id;
 
         // s515 (BUG 1): market / stop orders need a positive price cap.
+        // Fix A (s92): the book's dust / off-tick rejects, before any
+        // reservation, order id or (missing) book.
         // s515 (BUG 2): reduce-only needs a position it can reduce.
         let mut ro_pos = None;
-        let pre_check = Self::validate_order_price(params).err().or_else(|| {
-            if !params.reduce_only {
-                return None;
-            }
-            match Self::signed_position(&ctx.positions, sender, market_id) {
-                Ok(pos) => {
-                    ro_pos = Some(pos);
-                    Self::reduce_only_violation(pos, params)
+        let pre_check = Self::validate_order_price(params)
+            .err()
+            .or_else(|| Self::book_shape_violation(params, Self::book_shape(&ctx.order_books, market_id)))
+            .or_else(|| {
+                if !params.reduce_only {
+                    return None;
                 }
-                Err(e) => Some(e.to_string()),
-            }
-        });
+                match Self::signed_position(&ctx.positions, sender, market_id) {
+                    Ok(pos) => {
+                        ro_pos = Some(pos);
+                        Self::reduce_only_violation(pos, params)
+                    }
+                    Err(e) => Some(e.to_string()),
+                }
+            });
         if let Some(msg) = pre_check {
             // Funnel (perf A1): died pre-book on validation.
             if let Some(ref m) = ctx.metrics {
@@ -9776,6 +9853,7 @@ mod option_b_fold_pool_tests {
                 orders.iter().enumerate().map(|(i, (s, p))| (i, *s, p)).collect();
             let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
             let bid_floors = NativeExecutor::phase2_bid_floors(&ctx, &place_orders);
+            let shapes = NativeExecutor::phase2_book_shapes(&ctx, &place_orders);
             let open_at_start = HashMap::new();
             let reader = AccountReader::of(&ctx);
 
@@ -9786,7 +9864,7 @@ mod option_b_fold_pool_tests {
             let mut next_id = 1u128;
             let mut first_seen: HashMap<Address, bool> = HashMap::new();
             for (i, (s, p)) in orders.iter().enumerate() {
-                let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &mut fold, i, s, p);
+                let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &bid_floors, &shapes, &mut fold, i, s, p);
                 if let PrepOutcome::Pass(r, _, _) = &outcome {
                     let base = basis.get(&i).map_or(NativeExecutor::reserve_price(p), |b| b.0);
                     let qty = basis.get(&i).map_or(p.quantity, |b| b.1);
@@ -9820,6 +9898,7 @@ mod option_b_fold_pool_tests {
                 &open_at_start,
                 &basis,
                 &bid_floors,
+                &shapes,
                 &groups,
                 2,
                 orders.len(),
