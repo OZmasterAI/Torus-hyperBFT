@@ -34,6 +34,10 @@ pub struct Metrics {
     // Transaction metrics
     pub evm_txs_processed: Counter,
     pub native_actions_processed: Counter,
+    /// v2 action status: native actions recorded as failed at execution.
+    pub exec_action_failures: Counter,
+    /// v2 action status: bytes written to `cf_block_action_status`.
+    pub exec_action_status_bytes: Counter,
 
     // Consensus metrics
     pub consensus_rounds: Counter,
@@ -807,6 +811,20 @@ impl Metrics {
             "torus_native_actions_processed",
             "Total native actions processed",
             native_actions_processed.clone(),
+        );
+
+        let exec_action_failures = Counter::default();
+        registry.register(
+            "torus_exec_action_failures",
+            "Native actions recorded as failed at execution (v2 action status)",
+            exec_action_failures.clone(),
+        );
+
+        let exec_action_status_bytes = Counter::default();
+        registry.register(
+            "torus_exec_action_status_bytes",
+            "Bytes written to cf_block_action_status",
+            exec_action_status_bytes.clone(),
         );
 
         let consensus_rounds = Counter::default();
@@ -2078,6 +2096,8 @@ impl Metrics {
             block_build_encode_seconds,
             evm_txs_processed,
             native_actions_processed,
+            exec_action_failures,
+            exec_action_status_bytes,
             consensus_rounds,
             consensus_view,
             state_root_compute_seconds,

@@ -1668,7 +1668,8 @@ impl TorusApiServer for RpcState {
             block_number: hex_u64(block_number),
             native_actions,
             native_action_count: body.native_actions.len() as u32,
-            native_action_status: status.as_ref().map(|s| labels(&s.native_skipped)),
+            native_action_status: status.as_ref().map(crate::types::native_action_labels),
+            native_action_failures: status.as_ref().map(crate::types::native_action_failures),
             evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
         }))

@@ -27,9 +27,10 @@ pub const CF_BLOCK_HASH_TO_NUMBER: &str = "cf_block_hash_to_number";
 /// the committed-but-not-yet-executed window.
 pub const CF_COMMIT_MANIFEST: &str = "cf_commit_manifest";
 
-/// Per-block executed/skipped record keyed by 8-byte BE height (s84): which
-/// native actions and EVM txs of the block execution skipped. Node-local
-/// derived data, never hashed; see [`crate::action_status`].
+/// Per-block action status record keyed by 8-byte BE height (s84, v2): which
+/// native actions and EVM txs of the block execution skipped, and which native
+/// actions executed and failed (reason + message). Node-local derived data,
+/// never hashed, not a native-root CF; see [`crate::action_status`].
 pub const CF_BLOCK_ACTION_STATUS: &str = "cf_block_action_status";
 
 // Receipts and logs

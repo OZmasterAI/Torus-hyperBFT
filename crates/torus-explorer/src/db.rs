@@ -228,7 +228,8 @@ pub struct NativeActionRow {
     pub proposal_id: Option<i64>,
     pub payload: String,
     /// s84: `"executed"` or `"skipped"` (`torus_getBlockBody`
-    /// `nativeActionStatus`); `None` until the block executed on the node.
+    /// `nativeActionStatus`); v2: `"failed (<reason>...): <message>"`;
+    /// `None` until the block executed on the node.
     pub status: Option<String>,
 }
 

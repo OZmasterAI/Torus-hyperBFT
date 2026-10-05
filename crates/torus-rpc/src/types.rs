@@ -560,6 +560,44 @@ pub struct RpcLeaderInfo {
 // Block Body Response (for explorer indexing)
 // ============================================================================
 
+/// v2: one native action that executed and failed (`torus_getBlockBody`).
+/// For a PlaceOrderBatch, `order` is the first failing order's position in
+/// the batch (whose reason / message these are) and `failedOrders` how many of
+/// its orders failed; a batch skipped whole (empty / over the cap) has
+/// `failedOrders` 0. Any other action: `order` 0, `failedOrders` 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcActionFailure {
+    pub index: u32,
+    pub reason: String,
+    pub message: String,
+    pub order: u32,
+    pub failed_orders: u32,
+}
+
+/// Per native action `"executed"` / `"skipped"` / `"failed"`.
+pub fn native_action_labels(s: &torus_state::action_status::BlockActionStatus) -> Vec<String> {
+    (0..s.native_skipped.len())
+        .map(|i| s.native_label(i).to_string())
+        .collect()
+}
+
+/// The record's native failures, RPC-shaped.
+pub fn native_action_failures(
+    s: &torus_state::action_status::BlockActionStatus,
+) -> Vec<RpcActionFailure> {
+    s.native_failed
+        .iter()
+        .map(|f| RpcActionFailure {
+            index: f.index,
+            reason: f.reason.as_str().to_string(),
+            message: f.message.clone(),
+            order: f.order,
+            failed_orders: f.failed_orders,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcBlockBody {
@@ -571,8 +609,14 @@ pub struct RpcBlockBody {
     /// or session, replayed nonce; no state change). `null` while the block
     /// has not executed on this node, or for a block executed before the
     /// record existed.
+    /// v2: `"failed"` too — executed, but the executor refused it (margin,
+    /// open-order limit, off-tick price, ...); see `native_action_failures`.
     #[serde(default)]
     pub native_action_status: Option<Vec<String>>,
+    /// v2: every `"failed"` native action, ascending `index`. `null` like
+    /// `native_action_status`; empty for a block recorded before v2.
+    #[serde(default)]
+    pub native_action_failures: Option<Vec<RpcActionFailure>>,
     /// s84: every EVM transaction of the body, in body order, executed or
     /// skipped (the eth methods list only the executed ones). Each is the eth
     /// transaction object with `transactionIndex` = body position (NOT the eth
