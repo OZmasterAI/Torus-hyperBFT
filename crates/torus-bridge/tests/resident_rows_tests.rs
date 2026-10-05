@@ -272,6 +272,10 @@ fn metrics_count_rebuilds_and_size() {
     assert_eq!(metrics.exec_resident_rows_bytes.get(), rows.bytes() as i64);
     let text = metrics.encode();
     assert!(text.contains("torus_exec_resident_rows_build_seconds_count 1"), "{text}");
+    // Item 6 step 1: end_resident and its two main parts, once per block.
+    for name in ["end_resident", "end_resident_rows", "end_resident_positions"] {
+        assert!(text.contains(&format!("torus_exec_{name}_seconds_count 3")), "{name}: {text}");
+    }
 }
 
 /// C6a (B0): R's CFs are read without the parent layer, so R is reused only

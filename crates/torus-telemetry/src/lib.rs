@@ -404,6 +404,18 @@ pub struct Metrics {
     pub exec_resident_rows_rebuilds: Counter,
     /// Item 6 Phase 1: time to build R (a full scan of both CFs).
     pub exec_resident_rows_build_seconds: Histogram,
+    /// Item 6 step 1: `end_resident` (R's end-of-block upkeep on the exec
+    /// thread, after the flush / hand-off), once per call. Before this it
+    /// landed in summarize.py's `residual_untimed`.
+    pub exec_end_resident_seconds: Histogram,
+    /// Item 6 step 1: inside `end_resident`, `ResidentRows::apply` (R takes
+    /// the block's delta).
+    pub exec_end_resident_rows_seconds: Histogram,
+    /// Item 6 step 1: inside `end_resident`, the decoded positions following
+    /// the delta (`TraderPositions`) plus the sums carry that rides that pass
+    /// (M1 cut 4). rows + positions + the memo merge / drops ==
+    /// `exec_end_resident_seconds`.
+    pub exec_end_resident_positions_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -1685,6 +1697,24 @@ impl Metrics {
             "Item 6: time to build the resident rows R (full scan of both CFs)",
             exec_resident_rows_build_seconds.clone(),
         );
+        let exec_end_resident_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_seconds",
+            "Item 6: end_resident (resident rows R end-of-block upkeep on the exec thread)",
+            exec_end_resident_seconds.clone(),
+        );
+        let exec_end_resident_rows_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_rows_seconds",
+            "Item 6: end_resident, R applying the block's delta (ResidentRows::apply)",
+            exec_end_resident_rows_seconds.clone(),
+        );
+        let exec_end_resident_positions_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_positions_seconds",
+            "Item 6: end_resident, decoded positions following the delta plus the sums carry",
+            exec_end_resident_positions_seconds.clone(),
+        );
 
         let exec_queue_depth = Gauge::default();
         registry.register(
@@ -2222,6 +2252,9 @@ impl Metrics {
             exec_resident_rows_bytes,
             exec_resident_rows_rebuilds,
             exec_resident_rows_build_seconds,
+            exec_end_resident_seconds,
+            exec_end_resident_rows_seconds,
+            exec_end_resident_positions_seconds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2507,6 +2540,9 @@ mod tests {
             "torus_exec_resident_rows_bytes",
             "torus_exec_resident_rows_rebuilds",
             "torus_exec_resident_rows_build_seconds",
+            "torus_exec_end_resident_seconds",
+            "torus_exec_end_resident_rows_seconds",
+            "torus_exec_end_resident_positions_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",

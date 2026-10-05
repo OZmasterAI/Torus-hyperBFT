@@ -115,10 +115,21 @@ COUNTERS = {
 COMMIT_BUCKETS = [("0.1", 0), ("0.2", 50), ("0.4", 100), ("+Inf", 100)]
 
 
-def write_fixture(out, include_r6=True, bl1="serial"):
-    """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary)."""
+# Item 6 step 1: end_resident and its two subs (per native block).
+END_RESIDENT = {
+    "exec_end_resident_seconds": 0.030,
+    "exec_end_resident_rows_seconds": 0.012,
+    "exec_end_resident_positions_seconds": 0.010,
+}
+
+
+def write_fixture(out, include_r6=True, bl1="serial", end_resident=False):
+    """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary).
+    end_resident: the binary times end_resident (item 6 step 1)."""
     extra = {"serial": BL1_SERIAL, "pipelined": BL1_PIPELINED, "none": {}}[bl1]
     per_blk = dict(PER_BLK)
+    if end_resident:
+        per_blk.update(END_RESIDENT)
     if bl1 == "none":
         for k in ("exec_save_books_drain_seconds", "exec_save_books_write_seconds"):
             per_blk.pop(k)
@@ -596,6 +607,31 @@ def main_s58():
     print("test_summarize.py: OK")
 
 
+def main_end_resident():
+    """Item 6 step 1: a binary that times end_resident reports it as an
+    exec-thread phase (with its two subs) and residual_untimed drops by it;
+    an older binary reports 0.0 and keeps its residual."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        er = p0["phases"]["end_resident"]
+        close(er["ms"], 30.0, "end_resident ms/blk")
+        close(er["end_resident_rows_ms"], 12.0, "end_resident_rows_ms")
+        close(er["end_resident_positions_ms"], 10.0, "end_resident_positions_ms")
+        assert er["off_chain"] is False, "end_resident runs on the exec thread"
+        check_phase_accounting(p0, worker=True)
+        close(p0["phases"]["residual_untimed"]["ms"], 15.0, "residual (pipelined, end_resident timed)")
+        ci = p0["chain_identity"]
+        assert "end_resident" in ci["e_phases"], ci
+        close(ci["e_phase_sum_ms"], 840.0, "e_phase_sum_ms (end_resident timed)")
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined")
+        p0 = run(out)["phase_by_node"]["val0"]
+        close(p0["phases"]["end_resident"]["ms"], 0.0, "end_resident on an older binary")
+        close(p0["phases"]["residual_untimed"]["ms"], 45.0, "residual (older binary)")
+
+
 if __name__ == "__main__":
     main()
+    main_end_resident()
     main_s58()

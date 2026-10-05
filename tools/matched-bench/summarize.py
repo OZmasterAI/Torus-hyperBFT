@@ -117,7 +117,14 @@ for node, rs in rows.items():
     funnel[node] = d
 
 # ---------------------------------------------------------------- phase breakdown
-PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books", "flush", "body_persist"]
+PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books", "flush", "body_persist",
+          "end_resident"]
+# Item 6 step 1: `end_resident` (R's end-of-block upkeep, exec thread, after
+# the flush / hand-off; 0.0 on an older binary, where it sits in
+# residual_untimed). Its subs: R applying the delta, and the decoded
+# positions following it with the sums carry; the rest is the memo merge and
+# drops. Not nested in any other phase.
+END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions"]
 # r7 state-write-build-vs-db-split: state_write is reported alongside its two
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
@@ -137,7 +144,8 @@ ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flus
 SAVE_SUB_BL1 = ["save_books_drain", "save_books_write"]
 SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6,
        "save_books": SAVE_SUB_BL1,
-       "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"]}
+       "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"],
+       "end_resident": END_RESIDENT_SUB}
 
 
 def hist_quantile(pairs, q):
@@ -456,7 +464,7 @@ for node, rs in rows.items():
     #     (on a serial binary that includes flush);
     #   * the chain can never exceed the block wall (the empty-block share is
     #     the whole difference).
-    e_phases = ["verify", "replay_guard", "load_books", "engine", "save_books"]
+    e_phases = ["verify", "replay_guard", "load_books", "engine", "save_books", "end_resident"]
     if not p["worker_present"]:
         e_phases.append("flush")
     e_sum = round(sum(ph[k]["ms"] for k in e_phases), 2)

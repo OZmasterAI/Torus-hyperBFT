@@ -2933,6 +2933,22 @@ pub fn end_resident(
     ok: bool,
     metrics: Option<&torus_telemetry::Metrics>,
 ) {
+    let timer = std::time::Instant::now();
+    end_resident_inner(holder, block, overlay, delta, ok, metrics);
+    // Item 6 step 1: the whole upkeep (the delta and the memo dropped included).
+    if let Some(m) = metrics {
+        m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
+    }
+}
+
+fn end_resident_inner(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: torus_state::ResidentDelta,
+    ok: bool,
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
     let Some(mut rows) = overlay.detach_resident() else {
         return;
     };
@@ -2950,6 +2966,8 @@ pub fn end_resident(
     // C3: the block's memo joins the slot's sums; item 6 M1: every trader
     // whose positions the block wrote or deleted has its sums moved on to
     // its rows after the block (R before `apply`), else loses them.
+    // Step 1: the sums part and the decoded positions below share one timer.
+    let timer = std::time::Instant::now();
     let (sums, records) = match block.sums {
         Some(mut s) => {
             let records = s.records.take();
@@ -2958,13 +2976,17 @@ pub fn end_resident(
         }
         None => (SumsCache::default(), None),
     };
+    let sums_time = timer.elapsed();
+    let timer = std::time::Instant::now();
     r.apply(&delta);
     if let Some(m) = metrics {
+        m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
         m.exec_resident_rows.set(r.len() as i64);
         m.exec_resident_rows_bytes.set(r.bytes() as i64);
     }
     // C7: the decoded positions follow the delta (decoded cold if the
     // context kept the block's state).
+    let timer = std::time::Instant::now();
     let positions = match records {
         Some(mut p) => {
             p.apply(&delta, r);
@@ -2972,6 +2994,9 @@ pub fn end_resident(
         }
         None => TraderPositions::build(r),
     };
+    if let Some(m) = metrics {
+        m.exec_end_resident_positions_seconds.observe((sums_time + timer.elapsed()).as_secs_f64());
+    }
     holder.rows = Some(RowsSlot { rows, marks: block.marks, sums, positions, height: block.height });
 }
 
