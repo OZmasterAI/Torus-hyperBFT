@@ -833,6 +833,8 @@ struct AccountReader<'a, T: StateBackend> {
     /// Item 6 C6c: the `execute_batch` call's valuation state (Phase 2 / 3
     /// reader only; `None` elsewhere).
     batch: Option<&'a BatchSums>,
+    /// Item 6 M1: `margin_configs`' tiers by market id (batch reader only).
+    dense_tiers: Option<&'a DenseTiers<'a>>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -859,6 +861,63 @@ pub(crate) struct PosSums {
 
 /// C6b: the guard's bound (see [`PosSums::abs`]).
 const ABS_GUARD: u128 = i128::MAX as u128;
+
+/// C6b (A-lite) / item 6 M1: `base` (a trader's sums over some rows) minus
+/// the terms of each changed row as it was (`.0`) plus its terms now (`.1`),
+/// valued with `marks` and `tiers`. Exact: the sums are integer sums of the
+/// same [`position_terms`] as `build`, the order does not matter while
+/// nothing overflows, every step is checked, and the guard (Σ |term| <=
+/// `i128::MAX`, see [`PosSums::abs`]) proves `build` over the rows now
+/// cannot overflow either. `None` (the caller builds or drops): the guard
+/// on `base`, a row that does not decode, a Cross position in a market
+/// outside `marks`, an overflow, or the guard on the result.
+fn sums_with_row_changes<'t>(
+    base: PosSums,
+    changes: &[(Option<&[u8]>, Option<&[u8]>)],
+    marks: &BlockMarks,
+    tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+) -> Option<SumsResult> {
+    use borsh::BorshDeserialize;
+    if base.abs.iter().any(|a| *a > ABS_GUARD) {
+        return None;
+    }
+    let mut sums = [base.upnl.raw(), base.position_im.raw(), base.notional.raw(), base.maintenance.raw()];
+    let (mut abs, mut isolated, mut marked) = (base.abs, base.isolated, base.marked);
+    // Removals first (exact: `abs` holds no saturated value), then additions.
+    for add in [false, true] {
+        for &(resident, current) in changes {
+            let Some(row) = (if add { current } else { resident }) else {
+                continue;
+            };
+            let pos = torus_core::position::Position::try_from_slice(row).ok()?;
+            let step = |n: u32| if add { n.checked_add(1) } else { n.checked_sub(1) };
+            if pos.margin_type != MarginType::Cross {
+                isolated = step(isolated)?;
+                continue;
+            }
+            let mark = marks.get(pos.market_id)?;
+            if mark.is_some() {
+                marked = step(marked)?;
+            }
+            let t = position_terms(&pos, mark, tiers(pos.market_id)).ok()?;
+            for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
+                let x = x.raw();
+                if add {
+                    *sum = sum.checked_add(x)?;
+                    *a = a.saturating_add(x.unsigned_abs());
+                } else {
+                    *sum = sum.checked_sub(x)?;
+                    *a = a.checked_sub(x.unsigned_abs())?;
+                }
+            }
+        }
+    }
+    if abs.iter().any(|a| *a > ABS_GUARD) {
+        return None;
+    }
+    let [upnl, position_im, notional, maintenance] = sums.map(FixedPoint::from_raw);
+    Some(Ok(PosSums { upnl, position_im, notional, maintenance, isolated, marked, abs }))
+}
 
 impl PosSums {
     /// Some position is not Cross.
@@ -889,14 +948,19 @@ const TRADER_PREFIX: usize = 20;
 
 /// Item 6 C3: the persistent sums, kept in the resident rows slot and
 /// read-only during a block: each trader's sums over its rows in R, valued
-/// with the mark table / configs of `version`. An entry stays valid while
-/// no block writes the trader's positions (`end_resident` drops those) and
-/// the version holds (versions are never reused, so an entry at another
-/// version is never read; the map is cleared when the version moves).
+/// with the mark table / configs of `version`. An entry follows the
+/// trader's rows: a block that writes them moves it on to the rows after the
+/// block or drops it (item 6 M1, [`BlockSums::into_cache`]); it is read only
+/// while the version holds (versions are never reused, so an entry at
+/// another version is never read; the map is cleared when the version moves).
 #[derive(Debug, Default)]
 struct SumsCache {
     version: u64,
     map: HashMap<Address, SumsResult>,
+    /// Item 6 M1 (tests): entries `into_cache` moved on to a trader's rows
+    /// after the block (instead of dropping them).
+    #[cfg(test)]
+    carried: usize,
 }
 
 /// Item 6 C3: one block's sums state on the context — the slot's cache and
@@ -1003,12 +1067,36 @@ impl BlockSums {
         r.ok()
     }
 
-    /// End of the block: the memo joins the cache (at the memo's version),
-    /// then the sums of every trader in `dirtied` (the block's own position
-    /// keys) are dropped — the memo's entries were built over R before the
-    /// block's writes.
-    fn into_cache<'k>(self, dirtied: impl Iterator<Item = &'k [u8]>) -> SumsCache {
+    /// End of the block: the memo joins the cache (at the memo's version);
+    /// then each trader the block wrote under (`delta` = the block's own
+    /// writes / tombstones of the positions CF, key-sorted; `resident` = R's
+    /// rows before they are applied) has its entry — sums over R's rows
+    /// before the block — moved on to its rows after the block (item 6 M1,
+    /// [`sums_with_row_changes`] with `table`, the block's mark table and
+    /// configs, the version's), or dropped when that is not possible (no
+    /// entry, no table at the cache's version, a key that is not a position
+    /// row, any `None` of the update), or when the version moved at this
+    /// block's start (`stable`, see below). Exact: the entry is then `build`
+    /// over R's rows at the version, as an entry the next block would
+    /// compute (used only while the version holds, i.e. the same marks and
+    /// configs).
+    fn into_cache<'k>(
+        self,
+        delta: impl Iterator<Item = (&'k [u8], Option<&'k [u8]>)>,
+        resident: Option<&std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+        table: Option<&BlockMarksState>,
+    ) -> SumsCache {
+        // Node-local policy: carry only while the mark version held across
+        // the previous block (the slot's cache is at this block's version).
+        // A moving version (marks move most blocks) clears the next block's
+        // cache, so carried entries would be thrown away (measured: ~1 ms
+        // per 1k fills of block-end work for nothing at walk 10).
+        let stable = self.memo_version.is_some_and(|v| v == self.cache.version);
         let mut cache = self.cache;
+        #[cfg(test)]
+        {
+            cache.carried = 0;
+        }
         if let Some(version) = self.memo_version {
             if cache.version != version {
                 cache.map.clear();
@@ -1021,8 +1109,58 @@ impl BlockSums {
                 }
             }
         }
-        for key in dirtied.filter(|k| k.len() >= TRADER_PREFIX) {
-            cache.map.remove(&Address::from_slice(&key[..TRADER_PREFIX]));
+        // Carry only at the version the entries are valued at.
+        let carry = match (table, resident) {
+            (Some(t), Some(rows))
+                if stable && self.memo_version == Some(t.marks.version) && cache.version == t.marks.version =>
+            {
+                Some((t, rows))
+            }
+            _ => None,
+        };
+        const POSITION_KEY: usize = TRADER_PREFIX + 8;
+        // Keys are sorted, so each trader's position keys are contiguous.
+        let mut dropped: Vec<Address> = Vec::new();
+        let mut group: Option<(Address, Vec<(Option<&[u8]>, Option<&[u8]>)>)> = None;
+        let finish = |cache: &mut SumsCache, g: Option<(Address, Vec<(Option<&[u8]>, Option<&[u8]>)>)>| {
+            let Some((trader, rows)) = g else { return };
+            let moved = carry.and_then(|(t, _)| {
+                let base = cache.map.get(&trader)?.ok()?;
+                sums_with_row_changes(base, &rows, &t.marks, |m| t.configs.get(&m).map(|c| c.tiers.as_slice()))
+            });
+            match moved {
+                Some(r) => {
+                    cache.map.insert(trader, r);
+                    #[cfg(test)]
+                    {
+                        cache.carried += 1;
+                    }
+                }
+                None => {
+                    cache.map.remove(&trader);
+                }
+            }
+        };
+        for (key, now) in delta.filter(|(k, _)| k.len() >= TRADER_PREFIX) {
+            let trader = Address::from_slice(&key[..TRADER_PREFIX]);
+            if key.len() != POSITION_KEY || carry.is_none() {
+                dropped.push(trader);
+                continue;
+            }
+            if group.as_ref().is_none_or(|g| g.0 != trader) {
+                finish(&mut cache, group.take());
+                group = Some((trader, Vec::new()));
+            }
+            let before = carry.and_then(|(_, rows)| rows.get(key)).map(Vec::as_slice);
+            if let Some(g) = group.as_mut() {
+                g.1.push((before, now));
+            }
+        }
+        finish(&mut cache, group.take());
+        // A key that is not a position row (e.g. `cvlm`, other length) drops
+        // its prefix's entry, as before (after the updates: never kept).
+        for trader in dropped {
+            cache.map.remove(&trader);
         }
         cache
     }
@@ -1104,6 +1242,9 @@ thread_local! {
 #[derive(Debug)]
 pub(crate) struct BlockMarks {
     marks: HashMap<MarketId, Option<FixedPoint>>,
+    /// Item 6 M1: `marks` indexed by market id (`dense[m]` = `marks.get(m)`)
+    /// when every id is below [`DENSE_MARKETS`]; empty otherwise.
+    dense: Vec<Option<Option<FixedPoint>>>,
     /// Changes exactly when the table or `margin_configs` differ from the
     /// previous block's ([`BlockMarksState`], kept in the resident rows slot);
     /// a changed block takes a new process-wide value, never one used before
@@ -1115,7 +1256,52 @@ pub(crate) struct BlockMarks {
 /// second holder never meets an old value).
 static MARK_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Item 6 M1: market ids below this get dense (array-indexed) per-market
+/// tables ([`BlockMarks::get`], [`DenseTiers`]); any larger id keeps the map.
+const DENSE_MARKETS: u64 = 4096;
+
+/// Item 6 M1: `map` as an array indexed by market id, when every key is below
+/// [`DENSE_MARKETS`] (else empty: callers use the map).
+fn dense_index<'m, V, W: Clone>(map: &'m HashMap<MarketId, V>, f: impl Fn(&'m V) -> W) -> Vec<Option<W>> {
+    match map.keys().max() {
+        Some(&max) if max < DENSE_MARKETS => {
+            let mut v = vec![None; max as usize + 1];
+            for (m, x) in map {
+                v[*m as usize] = Some(f(x));
+            }
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Item 6 M1: a margin config map's tiers indexed by market id
+/// ([`dense_index`]), built per `execute_batch` call from the map the batch
+/// reader borrows, so it holds exactly the map's tiers.
+struct DenseTiers<'a> {
+    tiers: Vec<Option<&'a [MarginTier]>>,
+}
+
+impl<'a> DenseTiers<'a> {
+    fn of(configs: &'a HashMap<MarketId, MarketMarginConfig>) -> Self {
+        Self { tiers: dense_index(configs, |c| c.tiers.as_slice()) }
+    }
+}
+
 impl BlockMarks {
+    fn new(marks: HashMap<MarketId, Option<FixedPoint>>, version: u64) -> Self {
+        let dense = dense_index(&marks, |m| *m);
+        Self { marks, dense, version }
+    }
+
+    /// `marks.get(m)`, through the dense index when there is one.
+    fn get(&self, m: MarketId) -> Option<Option<FixedPoint>> {
+        if self.dense.is_empty() {
+            return self.marks.get(&m).copied();
+        }
+        self.dense.get(m as usize).copied().flatten()
+    }
+
     /// The per-read mark rule for each of `markets`.
     fn read<T: StateBackend>(
         oracle: &OracleManager<T>,
@@ -1169,6 +1355,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
             batch: None,
+            dense_tiers: None,
         }
     }
 
@@ -1180,14 +1367,17 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// placement of a block (single, batch serial, batch sharded) reads the
     /// same value on every validator.
     fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
-        match self.marks.and_then(|t| t.marks.get(&market_id)) {
-            Some(mark) => *mark,
+        match self.marks.and_then(|t| t.get(market_id)) {
+            Some(mark) => mark,
             None => self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable()),
         }
     }
 
     fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
-        self.margin_configs.get(&market_id).map(|c| c.tiers.as_slice())
+        match self.dense_tiers.filter(|d| !d.tiers.is_empty()) {
+            Some(d) => d.tiers.get(market_id as usize).copied().flatten(),
+            None => self.margin_configs.get(&market_id).map(|c| c.tiers.as_slice()),
+        }
     }
 
     /// F1: `trader`'s cross-margin account with balance `bal` — positions at
@@ -1343,49 +1533,15 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// that does not decode, a Cross position in a market outside the mark
     /// table, an overflow, or the guard.
     fn delta_sums(&self, s: &BlockSums, table: &BlockMarks, trader: &Address) -> Option<SumsResult> {
-        use borsh::BorshDeserialize;
         let base = s.base(table.version, trader)?;
         if base.abs.iter().any(|a| *a > ABS_GUARD) {
             return None;
         }
         let changes =
             self.positions.state().resident_changes(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice())?;
-        let mut sums = [base.upnl.raw(), base.position_im.raw(), base.notional.raw(), base.maintenance.raw()];
-        let (mut abs, mut isolated, mut marked) = (base.abs, base.isolated, base.marked);
-        // Removals first (exact: `abs` holds no saturated value), then additions.
-        for add in [false, true] {
-            for c in &changes {
-                let Some(row) = (if add { &c.current } else { &c.resident }) else {
-                    continue;
-                };
-                let pos = torus_core::position::Position::try_from_slice(row).ok()?;
-                let step = |n: u32| if add { n.checked_add(1) } else { n.checked_sub(1) };
-                if pos.margin_type != MarginType::Cross {
-                    isolated = step(isolated)?;
-                    continue;
-                }
-                let mark = *table.marks.get(&pos.market_id)?;
-                if mark.is_some() {
-                    marked = step(marked)?;
-                }
-                let t = position_terms(&pos, mark, self.tiers(pos.market_id)).ok()?;
-                for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
-                    let x = x.raw();
-                    if add {
-                        *sum = sum.checked_add(x)?;
-                        *a = a.saturating_add(x.unsigned_abs());
-                    } else {
-                        *sum = sum.checked_sub(x)?;
-                        *a = a.checked_sub(x.unsigned_abs())?;
-                    }
-                }
-            }
-        }
-        if abs.iter().any(|a| *a > ABS_GUARD) {
-            return None;
-        }
-        let [upnl, position_im, notional, maintenance] = sums.map(FixedPoint::from_raw);
-        Some(Ok(PosSums { upnl, position_im, notional, maintenance, isolated, marked, abs }))
+        let rows: Vec<(Option<&[u8]>, Option<&[u8]>)> =
+            changes.iter().map(|c| (c.resident.as_deref(), c.current.as_deref())).collect();
+        sums_with_row_changes(base, &rows, table, |m| self.tiers(m))
     }
 
     /// Paths 3 and 4 (the trader has nothing pending this block).
@@ -1440,8 +1596,8 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         let marked = std::cell::Cell::new(0u32);
         let in_table = std::cell::Cell::new(true);
         let mark = |m: MarketId| {
-            let mark = match self.marks.and_then(|t| t.marks.get(&m)) {
-                Some(mark) => *mark,
+            let mark = match self.marks.and_then(|t| t.get(m)) {
+                Some(mark) => mark,
                 None => {
                     in_table.set(false);
                     self.mark(m)
@@ -2766,20 +2922,22 @@ pub fn end_resident(
         );
         return;
     };
+    // C3: the block's memo joins the slot's sums; item 6 M1: every trader
+    // whose positions the block wrote or deleted has its sums moved on to
+    // its rows after the block (R before `apply`), else loses them.
+    let (sums, records) = match block.sums {
+        Some(mut s) => {
+            let records = s.records.take();
+            let cf = torus_state::cf::CF_NATIVE_POSITIONS;
+            (s.into_cache(delta.entries(cf), r.rows(cf), block.marks.as_ref()), records)
+        }
+        None => (SumsCache::default(), None),
+    };
     r.apply(&delta);
     if let Some(m) = metrics {
         m.exec_resident_rows.set(r.len() as i64);
         m.exec_resident_rows_bytes.set(r.bytes() as i64);
     }
-    // C3: the block's memo joins the slot's sums; every trader whose
-    // positions the block wrote or deleted loses its sums.
-    let (sums, records) = match block.sums {
-        Some(mut s) => {
-            let records = s.records.take();
-            (s.into_cache(delta.keys(torus_state::cf::CF_NATIVE_POSITIONS)), records)
-        }
-        None => (SumsCache::default(), None),
-    };
     // C7: the decoded positions follow the delta (decoded cold if the
     // context kept the block's state).
     let positions = match records {
@@ -5336,6 +5494,7 @@ impl NativeExecutor {
         // C6c: the call's valuation state (the backend is frozen from here
         // to the cache flush after settlement).
         let batch_sums = ctx.sums.is_some().then(|| BatchSums::new(&ctx.positions));
+        let dense_tiers = DenseTiers::of(&ctx.margin_configs);
         let reader = AccountReader {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
@@ -5344,6 +5503,7 @@ impl NativeExecutor {
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
             batch: batch_sums.as_ref(),
+            dense_tiers: Some(&dense_tiers),
         };
         // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
         // configs and marks: each batch market's, once (item 6 M1).
@@ -7823,6 +7983,7 @@ impl NativeExecutor {
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
             batch: None,
+            dense_tiers: None,
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
@@ -9316,7 +9477,7 @@ impl NativeExecutor {
             Some(p) if p.marks.marks == marks && p.configs == ctx.margin_configs => p.marks.version,
             _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
         };
-        ctx.block_marks = Some(BlockMarks { marks, version });
+        ctx.block_marks = Some(BlockMarks::new(marks, version));
         if let Some(sums) = ctx.sums.as_mut() {
             sums.start(Some(version));
         }
@@ -9902,7 +10063,7 @@ mod maker_accounts_tests {
                 }
             }
             let plain = AccountReader::of(&ctx);
-            let table = BlockMarks { marks: BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), version: 7 };
+            let table = BlockMarks::new(BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), 7);
             // The block's view: an overlay with R (nothing pending), its context.
             let mut overlay = NativeStateOverlay::new(db.clone());
             overlay.attach_resident(Arc::new(torus_state::ResidentRows::build(&overlay).unwrap()));
@@ -9954,7 +10115,7 @@ mod maker_accounts_tests {
             let computed = c.computed.load(std::sync::atomic::Ordering::Relaxed);
             assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
             assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
-            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_cache(std::iter::empty())) };
+            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_cache(std::iter::empty(), None, None)) };
             next.start(Some(7));
             let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
             for &(t, m) in &pairs {

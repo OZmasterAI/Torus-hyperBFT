@@ -258,3 +258,40 @@ fn reference_path_tables_match_and_versions_are_never_reused() {
         versions.push(v_ref);
     }
 }
+
+/// Item 6 M1 (cut 7): the dense per-market indexes answer exactly as the
+/// maps for every id (present, absent, mark `None`, past the last key, and
+/// a map with an id at or past `DENSE_MARKETS`, which keeps the map).
+#[test]
+fn dense_indexes_equal_the_maps() {
+    let mut seed = 0x5EED_D3E5u64;
+    let mut below = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut dense_used = 0;
+    for round in 0..300 {
+        let span = if round % 10 == 0 { DENSE_MARKETS + 50 } else { 1 + below(400) };
+        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
+        let mut configs: HashMap<MarketId, MarketMarginConfig> = HashMap::new();
+        for _ in 0..below(60) {
+            let m = below(span);
+            marks.insert(m, (below(3) > 0).then(|| fp(1 + below(1000) as i64)));
+            if below(2) == 0 {
+                configs.insert(m, MarketMarginConfig::new(m, 1 + below(50) as u32));
+            }
+        }
+        let table = BlockMarks::new(marks.clone(), 1);
+        dense_used += usize::from(!table.dense.is_empty());
+        let tiers = DenseTiers::of(&configs);
+        for m in (0..span + 3).chain([DENSE_MARKETS - 1, DENSE_MARKETS, u64::MAX]) {
+            assert_eq!(table.get(m), marks.get(&m).copied(), "round {round}: mark {m}");
+            let dense = tiers.tiers.get(m as usize).copied().flatten();
+            let want = configs.get(&m).map(|c| c.tiers.as_slice());
+            if !tiers.tiers.is_empty() {
+                assert_eq!(dense.map(<[MarginTier]>::as_ptr), want.map(<[MarginTier]>::as_ptr), "round {round}: tiers {m}");
+            }
+        }
+    }
+    assert!(dense_used > 200, "non-vacuous: {dense_used}");
+}

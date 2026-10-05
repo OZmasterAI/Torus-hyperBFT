@@ -99,6 +99,8 @@ struct Stats {
     versions: BTreeSet<u64>,
     /// C7: reads answered by the decoded records.
     records: usize,
+    /// Item 6 M1: written traders' sums carried by `end_resident`.
+    carried: usize,
 }
 
 /// Cache path == reference path for every trader: `view`, `pos_net`,
@@ -248,6 +250,12 @@ fn block_actions(rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
 /// One seeded run. `cached`: the node path (R, slot, sums cache, shadow
 /// check on); else the reference path (`begin_resident(None, ..)`).
 fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
+    run_with(seed, cached, false, stats)
+}
+
+/// [`run`]; `calm`: marks are written only every 4th block (item 6 M1: the
+/// mark version holds across blocks, so written traders' sums are carried).
+fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<BlockOut> {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     for m in 1..=5u64 {
@@ -283,6 +291,9 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
         // Marks: kept (ages, stale after 60 s = ~9 blocks), refreshed at the
         // same price, moved, removed (absent), and rewritten (reappearing).
         for m in 1..=MARKETS {
+            if calm && h % 4 != 0 {
+                continue;
+            }
             match rng.below(10) {
                 0..=3 => {}
                 4..=5 => overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(prices[m as usize], now - 1)).unwrap(),
@@ -348,6 +359,7 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
         end_resident(&mut holder, rb, &mut overlay, delta, true, None);
         if cached {
             assert_eq!(holder.trader_positions_match_rows(), Some(true), "seed {seed} block {h}: records warm == cold");
+            stats.carried += holder.rows.as_ref().map_or(0, |slot| slot.sums.carried);
         }
         if let Some(p) = parent.take() {
             p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
@@ -376,8 +388,8 @@ fn sums_cache_equals_reference_on_seeded_sequences() {
         }
     }
     println!(
-        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} delta={} delta_fallback={} overflowed={} versions={} records={}",
-        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.delta, stats.delta_fallback, stats.overflowed, stats.versions.len(), stats.records
+        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} delta={} delta_fallback={} overflowed={} versions={} records={} carried={}",
+        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.delta, stats.delta_fallback, stats.overflowed, stats.versions.len(), stats.records, stats.carried
     );
     assert!(stats.records > 5_000, "C7: decoded records used: {stats:?}");
     // C6b: dirty traders are re-valued from their memo sums (shadow-checked
@@ -385,17 +397,40 @@ fn sums_cache_equals_reference_on_seeded_sequences() {
     assert!(stats.delta > 100 && stats.delta_fallback > 10, "both dirty paths used: {stats:?}");
     assert!(stats.explicit > 5_000 && stats.shadow > 5_000, "non-vacuous: {stats:?}");
     assert!(stats.persistent_hits > 100 && stats.memo_hits > 100, "every cache path used: {stats:?}");
+    // Item 6 M1: written traders' sums carried to the next block (and then
+    // shadow-checked at every use above).
+    assert!(stats.carried > 0, "carried entries: {stats:?}");
     assert!(stats.computed > 100 && stats.dirty > 100, "every cache path used: {stats:?}");
     assert!(stats.overflowed > 0, "overflow-sized positions reached: {stats:?}");
     assert!(stats.versions.len() > 6, "marks / configs moved: {stats:?}");
 }
 
-/// The cache is dropped with the slot: a guard trip (skipped height) rebuilds
-/// R with an empty cache, and `end_resident` drops the sums of every trader
-/// the block wrote (positions), keeps the others, and keeps nothing at a
-/// stale version.
+/// Item 6 M1 (cut 4): with calm marks the version holds across blocks, so
+/// `end_resident` carries the sums of the traders each block wrote; every
+/// later use is shadow-checked against `build` (inside `run`), and the run
+/// equals the reference run block by block (warm == cold).
 #[test]
-fn end_resident_drops_dirtied_traders_and_rebuild_starts_empty() {
+fn carried_sums_equal_reference_on_calm_marks() {
+    let mut stats = Stats::default();
+    for seed in 1..=3u64 {
+        let cached = run_with(seed * 0x5EED_CA1A, true, true, &mut stats);
+        let reference = run_with(seed * 0x5EED_CA1A, false, true, &mut Stats::default());
+        for (h, (a, b)) in cached.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(a.results, b.results, "seed {seed} block {}: results", h + 1);
+            assert!(a.rows == b.rows, "seed {seed} block {}: position / balance rows", h + 1);
+        }
+    }
+    println!("SUMS_CACHE calm carried={} persistent={} shadow={}", stats.carried, stats.persistent_hits, stats.shadow);
+    assert!(stats.carried > 200 && stats.persistent_hits > 300, "carried entries used: {stats:?}");
+}
+
+/// The cache is dropped with the slot: a guard trip (skipped height) rebuilds
+/// R with an empty cache. Item 6 M1: `end_resident` moves the sums of a
+/// trader the block wrote (positions) on to its rows after the block
+/// (before M1: dropped), keeps the others, and keeps nothing at a stale
+/// version. Every answer is shadow-checked against `build`.
+#[test]
+fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
@@ -423,11 +458,14 @@ fn end_resident_drops_dirtied_traders_and_rebuild_starts_empty() {
         let mut rb = begin_resident(Some(holder), &mut overlay, h, None);
         let mut ctx = NativeExecContext::new(overlay.clone(), h, 10_001, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
         ctx.attach_resident_block(&mut rb);
+        ctx.sums.as_mut().unwrap().shadow = true;
         let _ = NativeExecutor::begin_block_oracle(&mut ctx);
         let reader = AccountReader::of(&ctx);
         reader.pos_net(&a).unwrap();
         reader.pos_net(&b).unwrap();
         let hits = ctx.sums.as_ref().unwrap().counters.persistent.load(std::sync::atomic::Ordering::Relaxed);
+        let bad = ctx.sums.as_ref().unwrap().shadow_mismatches.lock().unwrap().clone();
+        assert!(bad.is_empty(), "block {h}: {bad:?}");
         if write_a {
             ctx.positions.delete_position(&a, 1).unwrap();
         }
@@ -441,8 +479,9 @@ fn end_resident_drops_dirtied_traders_and_rebuild_starts_empty() {
         (kept, hits)
     };
     assert_eq!(block(&mut holder, 1, false), (vec![a, b], 0), "both valued and kept");
-    assert_eq!(block(&mut holder, 2, true), (vec![b], 2), "a's positions written: dropped");
-    assert_eq!(block(&mut holder, 3, false), (vec![a, b], 1), "a valued again, b from the slot");
+    assert_eq!(block(&mut holder, 2, true), (vec![a, b], 2), "a's positions written: carried");
+    assert_eq!(holder.rows.as_ref().unwrap().sums.carried, 1);
+    assert_eq!(block(&mut holder, 3, false), (vec![a, b], 2), "a's carried sums (now flat) from the slot");
     assert_eq!(block(&mut holder, 4, false), (vec![a, b], 2), "both from the slot");
     assert_eq!(block(&mut holder, 6, false), (vec![a, b], 0), "skipped height: R rebuilt, cache starts empty");
     assert_eq!(holder.rows_builds(), 2);
