@@ -7,6 +7,10 @@
 //!   open-order slot, no margin, no order id, no pending stop.
 //! * Row 41: a `Limit` with price <= 0 is rejected before the book (it used
 //!   to reach the book, report ok and hold a slot and margin for the batch).
+//! * Row 42: a book is created with the tick and lot of the market's
+//!   `CF_NATIVE_MARKETS` row (genesis / governance layout), not 1 / 1; a
+//!   market without a decodable row keeps 1 / 1, and a book that already
+//!   exists keeps its stored tick / lot.
 
 use std::sync::Arc;
 
@@ -14,6 +18,7 @@ use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_bridge::state_root::compute_native_state_root;
+use torus_core::order_book::OrderBook;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
     CF_BOOK_ORDER_ROWS, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
@@ -31,6 +36,10 @@ fn addr(n: u8) -> Address {
 
 fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * S)
+}
+
+fn fpr(raw: i128) -> FixedPoint {
+    FixedPoint::from_raw(raw)
 }
 
 fn fund_native(ctx: &NativeExecContext, trader: &Address, amount: FixedPoint) {
@@ -64,6 +73,11 @@ fn stop_limit(market_id: MarketId, is_buy: bool, trigger: i64, limit: FixedPoint
 
 fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
     (sender, NativeAction::PlaceOrder(p))
+}
+
+/// The genesis / governance market row: base, quote, lot, tick, initial margin.
+fn market_row(tick: i128, lot: i128) -> Vec<u8> {
+    borsh::to_vec(&("BTC".to_string(), "USD".to_string(), lot, tick, 5 * S)).unwrap()
 }
 
 fn state_dump(ctx: &NativeExecContext) -> Vec<(String, Vec<u8>, Vec<u8>)> {
@@ -245,5 +259,77 @@ fn row41_rejected_limit_takes_no_open_order_slot() {
         let r = exec(&mut ctx, mode, &[place(a, gtc(2, true, 0, 1)), place(a, gtc(2, true, 5, 1))]);
         assert!(err_has(&r[0], "limit order requires a positive price"), "{mode:?}: {:?}", r[0]);
         assert!(r[1].0, "{mode:?}: the slot is still free: {:?}", r[1]);
+    }
+}
+
+/// Row 42: a market with a row (tick 0.5, lot 0.1) and no book gets a book
+/// with the row's tick and lot on every path; pre-book checks use them; the
+/// book persists them. A placeholder row (not a market layout) and a market
+/// without a row keep 1 / 1.
+#[test]
+fn row42_books_created_from_the_market_row() {
+    let (a, c) = (addr(1), addr(3));
+    let block = vec![
+        place(a, order(5, true, fpr(100 * S + S / 2), fpr(S / 5))), // 0: rests (tick 0.5, lot 0.1)
+        place(a, order(5, true, fpr(100 * S + S / 4), fp(1))),      // 1: off the tick 0.5
+        place(a, order(5, true, fp(100), fpr(S / 20))),             // 2: below the lot 0.1
+        place(c, order(5, false, fpr(101 * S + S / 2), fpr(3 * S / 10))), // 3: rests
+        place(a, order(6, true, fpr(100 * S + S / 2), fp(1))),      // 4: placeholder row: tick 1
+        place(a, order(7, true, fp(100), fpr(S / 2))),              // 5: no row: lot 1
+        place(c, order(6, false, fp(101), fp(2))),                  // 6: rests in m6 (1 / 1)
+    ];
+    let mut batch = Vec::new();
+    for mode in MODES {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes(), &market_row(S / 2, S / 10)).unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &6u64.to_be_bytes(), b"listed").unwrap();
+        let mut ctx = NativeExecContext::new(db.clone(), 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
+        for t in [a, c] {
+            fund_native(&ctx, &t, fp(1_000_000));
+        }
+        let r = exec(&mut ctx, mode, &block);
+        for i in [0usize, 3, 6] {
+            assert!(r[i].0, "{mode:?} #{i}: {:?}", r[i]);
+        }
+        assert!(err_has(&r[1], "order rejected: price 100.25000000 is not a multiple of the tick 0.50000000"), "{mode:?}: {:?}", r[1]);
+        assert!(err_has(&r[2], "order rejected: quantity 0.05000000 below the lot size 0.10000000"), "{mode:?}: {:?}", r[2]);
+        assert!(err_has(&r[4], "is not a multiple of the tick 1.00000000"), "{mode:?}: {:?}", r[4]);
+        assert!(err_has(&r[5], "below the lot size 1.00000000"), "{mode:?}: {:?}", r[5]);
+        let b5 = &ctx.order_books[&5];
+        assert_eq!((b5.tick_size, b5.lot_size), (fpr(S / 2), fpr(S / 10)), "{mode:?}");
+        assert_eq!(b5.best_bid(), Some(fpr(100 * S + S / 2)), "{mode:?}");
+        let b6 = &ctx.order_books[&6];
+        assert_eq!((b6.tick_size, b6.lot_size), (FixedPoint::ONE, FixedPoint::ONE), "{mode:?}");
+        assert!(!ctx.order_books.contains_key(&7), "{mode:?}: a rejected order creates no book");
+        let w = world(&mut ctx);
+        // The book's stored meta carries the row's tick / lot across a reload.
+        drop(ctx);
+        let reloaded = NativeExecContext::new(db, 2, 1001, 0, 100, 10, addr(99), addr(100), addr(101));
+        let b5 = &reloaded.order_books[&5];
+        assert_eq!((b5.tick_size, b5.lot_size), (fpr(S / 2), fpr(S / 10)), "{mode:?}: reloaded");
+        if mode.is_some() {
+            batch.push((r, w));
+        }
+    }
+    assert!(batch.windows(2).all(|w| w[0] == w[1]), "engine modes differ");
+}
+
+/// Row 42: a book that exists keeps its stored tick / lot even when the
+/// market row says otherwise (existing persisted books are not rewritten).
+#[test]
+fn row42_existing_book_keeps_its_meta() {
+    let a = addr(1);
+    for mode in MODES {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes(), &market_row(S / 2, S / 10)).unwrap();
+        let mut ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
+        fund_native(&ctx, &a, fp(1_000_000));
+        ctx.order_books.insert(5, OrderBook::new(5, FixedPoint::ONE, FixedPoint::ONE));
+        let r = exec(&mut ctx, mode, &[place(a, order(5, true, fpr(100 * S + S / 2), fp(1))), place(a, gtc(5, true, 100, 1))]);
+        assert!(err_has(&r[0], "is not a multiple of the tick 1.00000000"), "{mode:?}: {:?}", r[0]);
+        assert!(r[1].0, "{mode:?}: {:?}", r[1]);
+        assert_eq!(ctx.order_books[&5].tick_size, FixedPoint::ONE, "{mode:?}");
     }
 }

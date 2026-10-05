@@ -1,5 +1,5 @@
 //! Item 6 M1 (review rows 40-42): the placement shape rule shared by the
-//! executor (pre-book) and the RPC (intake).
+//! executor (pre-book) and the RPC (intake), and the market row's tick / lot.
 
 use super::*;
 
@@ -20,6 +20,11 @@ fn order(price: i128, qty: i128, order_type: OrderType) -> PlaceOrderParams {
         reduce_only: false,
         client_order_id: None,
     }
+}
+
+/// The genesis / governance row layout: base, quote, lot, tick, initial margin.
+fn row(lot: i128, tick: i128) -> Vec<u8> {
+    borsh::to_vec(&("BTC".to_string(), "USD".to_string(), lot, tick, 5 * S)).unwrap()
 }
 
 /// Lot first (every order type), then the tick for a `Limit` price and for
@@ -68,4 +73,16 @@ fn shape_violation_messages() {
         tick.placement_message(),
         "order rejected: price 100.25000000 is not a multiple of the tick 0.50000000"
     );
+}
+
+/// The row's (tick, lot) as stored (raw, no clamping); `None` for a row
+/// that does not decode exactly (placeholders, truncated, trailing bytes).
+#[test]
+fn market_row_shape_decodes_the_listing_row() {
+    assert_eq!(market_row_shape(&row(S / 10, S / 2)), Some((fpr(S / 2), fpr(S / 10))));
+    assert_eq!(market_row_shape(&row(0, 0)), Some((FixedPoint::ZERO, FixedPoint::ZERO)));
+    assert_eq!(market_row_shape(b"listed"), None);
+    let full = row(S, S);
+    assert_eq!(market_row_shape(&full[..full.len() - 1]), None);
+    assert_eq!(market_row_shape(&[full.as_slice(), &[0]].concat()), None);
 }

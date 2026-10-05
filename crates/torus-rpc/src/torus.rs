@@ -268,20 +268,20 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
 /// s92 item B: orders also get the book's placement tick and lot rules
 /// (`OrderBook::place_order_with_accounts`), with the market row's tick/lot,
 /// so they are refused here instead of being silently rejected by the book.
-/// Item 6 M1: the rule and the text are the executor's
-/// (`torus_core::order_book::shape_violation`).
+/// Item 6 M1: the rule, the text and the row decoder are the executor's
+/// (`torus_core::order_book::{shape_violation, market_row_shape}`), and the
+/// executor creates a missing book with the row's tick / lot (row 42).
 /// A batch is one signed action, so one bad order rejects all of it.
 pub(crate) fn validate_known_markets(
     action: &torus_types::NativeAction,
     state_db: &torus_state::StateDb,
 ) -> Result<(), String> {
-    // `(tick, lot)` of a listed market; `None` when the row does not
-    // decode as a market (placeholder rows): only existence is checked then.
+    // `(tick, lot)` of a listed market (item 6 M1: the decoder the executor
+    // creates books with); `None` when the row does not decode as a market
+    // (placeholder rows): only existence is checked then.
     let spec = |mid: u64| -> Result<Option<(FixedPoint, FixedPoint)>, String> {
         match state_db.get_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes()) {
-            Ok(Some(row)) => Ok(StoredMarket::try_from_slice(&row)
-                .ok()
-                .map(|m| (FixedPoint::from_raw(m.tick_size_raw), FixedPoint::from_raw(m.lot_size_raw)))),
+            Ok(Some(row)) => Ok(torus_core::order_book::market_row_shape(&row)),
             Ok(None) => Err(format!("unknown market_id {mid}")),
             Err(e) => Err(format!("market lookup failed: {e}")),
         }
@@ -2578,6 +2578,57 @@ mod tick_lot_ingress_tests {
             order(1, odd, S, OrderType::StopLimit { trigger: odd_fp, limit: on_tick }),
         )
         .unwrap();
+    }
+
+    /// Item 6 M1 (row 42): the RPC intake check and the executor (which now
+    /// creates books from the same market row) give the same answer and the
+    /// same text on a market whose tick / lot are not 1, for every order
+    /// type: an order the RPC admits passes the executor's pre-book check.
+    #[test]
+    fn rpc_and_executor_agree_on_a_non_one_tick_market() {
+        use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+        use torus_core::position::NativeBalance;
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S / 10); // tick 0.5, lot 0.1
+        let mut ctx = NativeExecContext::new(
+            state.clone(),
+            1,
+            1000,
+            0,
+            100,
+            10,
+            alloy_primitives::Address::repeat_byte(99),
+            alloy_primitives::Address::repeat_byte(100),
+            alloy_primitives::Address::repeat_byte(101),
+        );
+        let trader = alloy_primitives::Address::repeat_byte(1);
+        let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&trader, &bal).unwrap();
+        let fpr = FixedPoint::from_raw;
+        let trig = fpr(200 * S);
+        let orders = [
+            order(1, 100 * S + S / 2, S / 5, OrderType::Limit),     // ok
+            order(1, 100 * S + S / 4, S, OrderType::Limit),         // off tick
+            order(1, 100 * S, S / 20, OrderType::Limit),            // below lot
+            order(1, 100 * S + 3, S, OrderType::Market),            // cap not checked (no liquidity: book rejects)
+            order(1, 0, S, OrderType::StopLimit { trigger: trig, limit: fpr(150 * S + 1) }), // off tick
+            order(1, 0, S, OrderType::StopLimit { trigger: trig, limit: fpr(150 * S) }),     // ok
+            order(1, 100 * S + 1, S / 20, OrderType::StopMarket { trigger: trig }),         // below lot
+        ];
+        for (i, p) in orders.into_iter().enumerate() {
+            let rpc = place(&state, p.clone());
+            let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
+            match rpc {
+                Err(e) => assert_eq!(exec.error.as_deref(), Some(e.as_str()), "#{i}"),
+                Ok(()) => assert!(
+                    exec.error.as_deref().is_none_or(|e| !e.contains("tick") && !e.contains("lot size")),
+                    "#{i}: {:?}",
+                    exec.error
+                ),
+            }
+        }
+        let book = &ctx.order_books[&1];
+        assert_eq!((book.tick_size, book.lot_size), (fpr(S / 2), fpr(S / 10)));
     }
 
     #[test]

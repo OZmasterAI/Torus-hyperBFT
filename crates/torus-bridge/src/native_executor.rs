@@ -18,9 +18,9 @@ use torus_core::margin::{
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    reduce_only_allowance, shape_violation, AccountMargins, Fill, MakerAccount, MakerAccountSource,
-    OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit,
-    TriggeredStop,
+    market_row_shape, reduce_only_allowance, shape_violation, AccountMargins, Fill, MakerAccount,
+    MakerAccountSource, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, ShapeViolation,
+    TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
@@ -5316,10 +5316,15 @@ impl NativeExecutor {
             HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
-            let mut book = ctx
-                .order_books
-                .remove(&market_id)
-                .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
+            // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
+            // checked against (`shapes` holds every batch market).
+            let mut book = ctx.order_books.remove(&market_id).unwrap_or_else(|| {
+                let (tick, lot) = shapes
+                    .get(&market_id)
+                    .copied()
+                    .unwrap_or_else(|| Self::market_shape(&ctx.state, market_id));
+                OrderBook::new(market_id, tick, lot)
+            });
 
             // s515 (BUG 2): police reduce-only orders. Positions are loaded
             // as of this point (all Phase-1 effects, none of this batch's
@@ -5604,7 +5609,7 @@ impl NativeExecutor {
         }
         // Fix A (s92): the book's dust / off-tick rejects, before anything
         // is reserved, projected or pooled (every market of the batch has an
-        // entry; the fallback is the same `(ONE, ONE)` as `book_shape`).
+        // entry; the fallback is never taken).
         let shape = shapes
             .get(&params.market_id)
             .copied()
@@ -7140,7 +7145,7 @@ impl NativeExecutor {
         let mut out = HashMap::new();
         for &(_, _, p) in orders {
             out.entry(p.market_id)
-                .or_insert_with(|| Self::book_shape(&ctx.order_books, p.market_id));
+                .or_insert_with(|| Self::book_shape(&ctx.order_books, &ctx.state, p.market_id));
         }
         out
     }
@@ -7341,11 +7346,31 @@ impl NativeExecutor {
     }
 
     /// Fix A (s92): a market's `(tick_size, lot_size)` for
-    /// [`book_shape_violation`] — its book's, `(ONE, ONE)` without one.
-    fn book_shape(books: &HashMap<MarketId, OrderBook>, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+    /// [`book_shape_violation`] — its book's; item 6 M1 (row 42): without a
+    /// book, [`market_shape`] (the tick / lot the book will be created with).
+    fn book_shape<T: StateBackend>(
+        books: &HashMap<MarketId, OrderBook>,
+        state: &T,
+        market_id: MarketId,
+    ) -> (FixedPoint, FixedPoint) {
         books
             .get(&market_id)
-            .map_or((FixedPoint::ONE, FixedPoint::ONE), |b| (b.tick_size, b.lot_size))
+            .map_or_else(|| Self::market_shape(state, market_id), |b| (b.tick_size, b.lot_size))
+    }
+
+    /// Item 6 M1 (row 42): the `(tick, lot)` a NEW book of `market_id` is
+    /// created with — its `CF_NATIVE_MARKETS` row's
+    /// ([`market_row_shape`], the row the RPC intake check reads), `(ONE,
+    /// ONE)` when there is no row, it does not decode or the read fails.
+    /// Every node reads the same row (governance / genesis writes only), so
+    /// every path creates the same book. A book that exists keeps its own.
+    fn market_shape<T: StateBackend>(state: &T, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+        state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|row| market_row_shape(&row))
+            .unwrap_or((FixedPoint::ONE, FixedPoint::ONE))
     }
 
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
@@ -7522,10 +7547,12 @@ impl NativeExecutor {
         // Fix A (s92): the book's dust / off-tick rejects, before any
         // reservation, order id or (missing) book.
         // s515 (BUG 2): reduce-only needs a position it can reduce.
+        // Item 6 M1 (row 42): a missing book is created below with `shape`.
         let mut ro_pos = None;
+        let shape = Self::book_shape(&ctx.order_books, &ctx.state, market_id);
         let pre_check = Self::validate_order_price(params)
             .err()
-            .or_else(|| Self::book_shape_violation(params, Self::book_shape(&ctx.order_books, market_id)))
+            .or_else(|| Self::book_shape_violation(params, shape))
             .or_else(|| {
                 if !params.reduce_only {
                     return None;
@@ -7677,7 +7704,7 @@ impl NativeExecutor {
         let book = ctx
             .order_books
             .entry(market_id)
-            .or_insert_with(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
+            .or_insert_with(|| OrderBook::new(market_id, shape.0, shape.1));
 
         // s515 (BUG 2): police reduce-only orders against CURRENT positions.
         // Review 5: a checked taker's position too — its closing fills are

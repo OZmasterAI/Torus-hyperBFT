@@ -447,6 +447,15 @@ pub fn shape_violation(params: &PlaceOrderParams, tick: FixedPoint, lot: FixedPo
     (tick > FixedPoint::ZERO && price.raw() % tick.raw() != 0).then_some(ShapeViolation::OffTick { price, tick })
 }
 
+/// Item 6 M1 (row 42): `(tick, lot)` of a `CF_NATIVE_MARKETS` row in the
+/// genesis / governance layout (base `String`, quote `String`, lot `i128`,
+/// tick `i128`, initial margin `i128`, borsh), as stored. `None` when the
+/// row does not decode exactly (e.g. test placeholders).
+pub fn market_row_shape(row: &[u8]) -> Option<(FixedPoint, FixedPoint)> {
+    let (_base, _quote, lot, tick, _im) = <(String, String, i128, i128, i128)>::try_from_slice(row).ok()?;
+    Some((FixedPoint::from_raw(tick), FixedPoint::from_raw(lot)))
+}
+
 #[cfg(test)]
 mod shape_tests;
 
