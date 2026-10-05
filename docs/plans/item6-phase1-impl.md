@@ -22,10 +22,19 @@ reasons `4a26653`; tip `c58775f`. Ozarchy 300 markets, trie off (results doc sec
 10-14): 0.508x (`14236fa`) -> 0.638x (C6 + C7) -> 0.648x (`239ff69`) -> **0.760x** (M1
 `90a752c`, 76.5k vs main 100.6k; unprofiled warm cell 0.91x). Decisions with the options not
 taken: section 9.
-**Remaining order (s92): step 1 `into_cache` reuses C7's decoded positions + `end_resident`
-timer (building) -> step 2 `end_resident` off the execution thread, only if the overlap check
-says it pays (section 9.7) -> E2-E4 -> C5 (warm == cold, last) -> sync main -> Gate 2 (300 and
-10 markets; 10 markets not re-measured since PF1, 0.72x).** Ubench gates are ratios to the base on the same machine (section 1.2).
+s92 later: step 1 `end_resident` timers `b2bcfaa` + sums carry reuses C7's decoded positions
+`1242d80` (18c ubench `end_resident` 21.1 -> 14.2 ms/block, steady marks); step 2
+`end_resident` on a worker, `begin_resident` moved to just before `new_env` `2333ba4` (ozarchy
+section 15: hides ~76-95 of ~105 ms/block at 300 markets) + harness columns `e65411d`; tip
+`4acdc59` (suite 2770 / 0 / 39). **Gate 2 at 10 markets** (sections 15-16, interleaved main,
+trie off both arms): 0.893x (`c58775f`, perf on crab) and **0.866x** without perf
+(`5524646`): missed. Engine per block ~ main; the rest is outside the engine (consensus views
+395 vs 335 ms, rpc / gossip-verify / ingress CPU per fill, ~12 ms/block untimed); ozarchy
+section 17 breaks it down.
+**Remaining order (s92, later): E2-E4 (building; re-measure the empty block first, E1 never
+built) | ozarchy: section 17 (10-market gap outside the engine), then 300 markets on `4acdc59`
+(step 2) -> 10-market cuts from section 17 -> C5 (warm == cold, last) -> sync main -> Gate 2
+(300 and 10 markets).** Ubench gates are ratios to the base on the same machine (section 1.2).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
@@ -621,3 +630,21 @@ on bare metal; 18c merges with method A and runs the full suite on the merged tr
 Section 13: ~52% of actions on the 300-market bench load fail, mostly batches hitting the
 open-order limit at execution. matched/s is unaffected (it counts fills), but a large share of
 each block is rejected work; revisit the load generator before Gate 2's final cells.
+
+### 8.1 Review log, s92 later (rows 53-65; the table above ends at 52, section 9 sits between)
+
+| # | step / gate | measured vs target | question for the owner | what was done (proposal) | commit |
+|---|---|---|---|---|---|
+| 53 | step 1 / timers | `end_resident` total + 2 parts (rows, positions incl. sums carry) | none | no separate sums timer: the carry runs inside the positions pass | `b2bcfaa` |
+| 54 | step 1 / irregular row | trader with an opaque row or irregular write | none | its sums entry is dropped (before: carried from R's rows); exact, costs one rebuild | `1242d80` |
+| 55 | step 1 / irregular tombstone | tombstone of an irregular key under a regular trader | keep carrying, or drop as before (conservative)? | carried (exact: a regular trader has no irregular row) | `1242d80` |
+| 56 | step 1 / rebuild vs adjust | positions after <= 2 x changes | none | rebuild from the decoded list (same sums, fewer terms) | `1242d80` |
+| 57 | step 1 / no decoded positions | never happens in the node sequence | none | written traders dropped (exact) | `1242d80` |
+| 58 | step 1 / dropped ideas | in-place copy in `ResidentRows::apply`; skip the change list when the carry is off | none | not shipped (no measurable gain) | - |
+| 59 | step 2 / worker shape | one thread spawn per native block (~tens of us) | OK, or a persistent worker + channel? | spawn per block (no lifecycle / shutdown code) | `2333ba4` |
+| 60 | step 2 / failure mode | a panic in `end_resident` used to panic the exec thread (poisoned mutex, halt) | OK that it now drops R and the next block rebuilds (R is a cache, the DB is authoritative)? | built | `2333ba4` |
+| 61 | step 2 / spawn failure | `Builder::spawn` error drops the job | none | slot dropped, next block rebuilds (no inline fallback) | `2333ba4` |
+| 62 | step 2 / worker CPU | 18c: worker-side `end_resident` +15-25% CPU vs inline (cold caches) | measure on ozarchy against verify's cores | reported | `2333ba4` |
+| 63 | step 2 / harnesses | golden runs inline / worker / off; ubench_econ inline unless `UB_R_WORKER=1`; ubench_epoch, storage_reads, liquidation_l1 inline | none | as described | `2333ba4` |
+| 64 | step 2 / accounting | a join on a block without a native phase counts in that block's wall | none (rare) | noted in `summarize.py` | `2333ba4` |
+| 65 | step 1 / harness gap | `run-cell.sh` never sampled the `end_resident` timers (summary.json showed 0; ozarchy section 16) | none | columns added, pinned by a test | `e65411d` |
