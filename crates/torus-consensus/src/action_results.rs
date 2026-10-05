@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use alloy_primitives::Address;
 use torus_bridge::native_executor::classify_action;
 use torus_bridge::NativeBatchResult;
-use torus_state::action_status::{BlockActionStatus, NativeActionFailure};
+use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure};
 use torus_types::NativeAction;
 
 /// Result entries `action` contributes to `execute_batch`: one per order of a
@@ -38,8 +38,9 @@ fn flat_len(action: &NativeAction) -> usize {
     }
 }
 
-/// A failing action of one list: (list position, order, failed orders, message).
-type ListFailure = (usize, u32, u32, String);
+/// A failing action of one list: (list position, order, failed orders,
+/// the first failing entry's reason and message).
+type ListFailure = (usize, u32, u32, FailureReason, String);
 
 /// Failures of one `execute_batch` over `list`, by list position. `None` when
 /// the result count does not match the flatten (never expected; the caller
@@ -62,6 +63,7 @@ fn list_failures(
                     pos,
                     0,
                     0,
+                    FailureReason::BatchCap,
                     format!(
                         "PlaceOrderBatch skipped: {} orders, cap {}",
                         orders.len(),
@@ -76,11 +78,13 @@ fn list_failures(
         let mut failed = entries.iter().enumerate().filter(|(_, r)| !r.success);
         if let Some((first, _)) = failed.next() {
             let failed_orders = 1 + failed.count() as u32;
+            // The executor's typed reason; the message is only stored.
+            let reason = entries[first].reason;
             let message = entries[first]
                 .error
                 .take()
                 .unwrap_or_else(|| "failed".to_string());
-            out.push((pos, first as u32, failed_orders, message));
+            out.push((pos, first as u32, failed_orders, reason, message));
         }
     }
     Some(out)
@@ -108,7 +112,7 @@ pub fn native_failures(
             );
             continue;
         };
-        for (pos, order, failed_orders, message) in failures {
+        for (pos, order, failed_orders, reason, message) in failures {
             let by_sender = by_sender.get_or_insert_with(|| {
                 let mut m: HashMap<Address, Vec<usize>> = HashMap::new();
                 for (k, (sender, _)) in executed.iter().enumerate() {
@@ -121,6 +125,7 @@ pub fn native_failures(
                     body_index[k],
                     order,
                     failed_orders,
+                    reason,
                     message,
                 ));
             }
@@ -182,7 +187,6 @@ pub fn encode_status(
 mod tests {
     use super::*;
     use torus_bridge::NativeActionResult;
-    use torus_state::action_status::FailureReason;
     use torus_types::{FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
 
     fn order(price: i128) -> PlaceOrderParams {
@@ -204,15 +208,17 @@ mod tests {
             success: true,
             error: None,
             gas_used: 0,
+            reason: FailureReason::Other,
         }
     }
 
-    fn err(msg: &str) -> NativeActionResult {
+    fn err(reason: FailureReason, msg: &str) -> NativeActionResult {
         NativeActionResult {
             action_type: "x",
             success: false,
             error: Some(msg.to_string()),
             gas_used: 0,
+            reason,
         }
     }
 
@@ -248,13 +254,14 @@ mod tests {
             executed[0].clone(),
             executed[2].clone(),
         ];
-        // Flat: [] (empty batch) + 3 orders + 1 + 1.
+        // Flat: [] (empty batch) + 3 orders + 1 + 1. The reasons are the
+        // results' own, whatever the message says (no text parsing).
         let result = batch(vec![
             ok(),
-            err("order rejected: price 2 is not a multiple of the tick 1"),
-            err("insufficient margin: need 1, have 0 (account)"),
+            err(FailureReason::Tick, "order rejected: price 2 is not a multiple of the tick 1"),
+            err(FailureReason::Margin, "insufficient margin: need 1, have 0 (account)"),
             ok(),
-            err("open order limit reached: 1 open orders, limit 1"),
+            err(FailureReason::OpenLimit, "some text"),
         ]);
         let failures = native_failures(
             &executed,
@@ -283,7 +290,13 @@ mod tests {
             &executed,
             &[0],
             [
-                (&executed, batch(vec![err("x"), err("y")])),
+                (
+                    &executed,
+                    batch(vec![
+                        err(FailureReason::Other, "x"),
+                        err(FailureReason::Other, "y"),
+                    ]),
+                ),
                 (&[], batch(vec![])),
             ],
         );

@@ -3149,6 +3149,7 @@ mod tests {
                 2,
                 0,
                 1,
+                torus_state::action_status::FailureReason::Margin,
                 "insufficient margin: need 5, have 1 (account)".to_string(),
             )],
         };

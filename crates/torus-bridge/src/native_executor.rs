@@ -30,6 +30,7 @@ use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
+use torus_state::action_status::FailureReason;
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
@@ -50,6 +51,10 @@ pub struct NativeActionResult {
     pub success: bool,
     pub error: Option<String>,
     pub gas_used: u64,
+    /// Why it failed, set where the check failed (v2 action status stores
+    /// it; never derived from `error`). `Other` for a success and for any
+    /// failure without a dedicated code.
+    pub reason: FailureReason,
 }
 
 impl NativeActionResult {
@@ -59,18 +64,28 @@ impl NativeActionResult {
             success: true,
             error: None,
             gas_used,
+            reason: FailureReason::Other,
         }
     }
 
     fn err(action_type: &'static str, error: String) -> Self {
+        Self::rejected(action_type, (FailureReason::Other, error))
+    }
+
+    /// A failure with its typed reason.
+    fn rejected(action_type: &'static str, (reason, error): Rejection) -> Self {
         Self {
             action_type,
             success: false,
             error: Some(error),
             gas_used: 0,
+            reason,
         }
     }
 }
+
+/// A refused action: its typed reason and its message.
+type Rejection = (FailureReason, String);
 
 /// Result of executing a batch of native actions.
 #[derive(Clone, Debug)]
@@ -634,9 +649,9 @@ enum EngineMode {
 enum PrepOutcome {
     /// The stitch assigns the global order id and builds the `PreparedOrder`.
     Pass(PrepPass),
-    /// Rejected pre-book. `reason` selects the funnel counter; `msg` is the
-    /// exact serial-path error string.
-    Reject { reason: RejectReason, msg: String },
+    /// Rejected pre-book. `funnel` selects the funnel counter; `reason` is
+    /// the result's typed reason, `msg` the exact serial-path error string.
+    Reject { funnel: RejectReason, reason: FailureReason, msg: String },
 }
 
 /// L3-ENG: a passed order's Phase-2 results ([`PreparedOrder`]'s fields).
@@ -785,6 +800,16 @@ enum RejectReason {
 }
 
 impl RejectReason {
+    /// The result's reason of a reject counted under this funnel counter
+    /// (the open-order slot check: `OpenLimit` or a state read error).
+    fn failure(self) -> FailureReason {
+        match self {
+            RejectReason::Margin => FailureReason::Margin,
+            RejectReason::OpenLimit => FailureReason::OpenLimit,
+            RejectReason::Other => FailureReason::Other,
+        }
+    }
+
     fn count(self, m: &torus_telemetry::Metrics) {
         match self {
             RejectReason::Margin => m.orders_rejected_margin.inc(),
@@ -5018,12 +5043,15 @@ impl NativeExecutor {
             // never re-enters this arm — no recursion.
             NativeAction::PlaceOrderBatch(orders) => {
                 if !torus_types::batch_len_within_cap(orders.len()) {
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order_batch",
-                        format!(
-                            "batch size {} outside [1, {}] — skipped (deterministic cap)",
-                            orders.len(),
-                            torus_types::NATIVE_ORDERS_PER_BATCH_CAP
+                        (
+                            FailureReason::BatchCap,
+                            format!(
+                                "batch size {} outside [1, {}] — skipped (deterministic cap)",
+                                orders.len(),
+                                torus_types::NATIVE_ORDERS_PER_BATCH_CAP
+                            ),
                         ),
                     );
                 }
@@ -5036,6 +5064,12 @@ impl NativeExecutor {
                     success: ok == total,
                     error: (ok != total).then(|| format!("{ok}/{total} orders placed")),
                     gas_used: batch.total_gas,
+                    // The first failing order's reason.
+                    reason: batch
+                        .results
+                        .iter()
+                        .find(|r| !r.success)
+                        .map_or(FailureReason::Other, |r| r.reason),
                 }
             }
             NativeAction::CancelOrder { order_id } => {
@@ -5914,11 +5948,12 @@ impl NativeExecutor {
         // Open-order limit first: a rejected order reserves nothing.
         let taken = match Self::take_open_slot(&mut st.open_slots, reader.positions, open_at_start, sender, params) {
             Ok(taken) => taken,
-            Err((reason, msg)) => return PrepOutcome::Reject { reason, msg },
+            Err((funnel, msg)) => return PrepOutcome::Reject { funnel, reason: funnel.failure(), msg },
         };
-        if let Err(msg) = Self::validate_order_price(params) {
+        if let Err((reason, msg)) = Self::validate_order_price(params) {
             return PrepOutcome::Reject {
-                reason: RejectReason::Other,
+                funnel: RejectReason::Other,
+                reason,
                 msg,
             };
         }
@@ -5935,9 +5970,10 @@ impl NativeExecutor {
         };
         // Fix A (s92): the book's dust / off-tick rejects, before anything
         // is reserved, projected or pooled.
-        if let Some(msg) = Self::book_shape_violation(params, market.shape) {
+        if let Some((reason, msg)) = Self::book_shape_violation(params, market.shape) {
             return PrepOutcome::Reject {
-                reason: RejectReason::Other,
+                funnel: RejectReason::Other,
+                reason,
                 msg,
             };
         }
@@ -5970,7 +6006,8 @@ impl NativeExecutor {
             Ok(r) => r,
             Err(msg) => {
                 return PrepOutcome::Reject {
-                    reason: RejectReason::Other,
+                    funnel: RejectReason::Other,
+                    reason: FailureReason::Price,
                     msg,
                 }
             }
@@ -5985,7 +6022,8 @@ impl NativeExecutor {
                 Ok(bal) => bal,
                 Err(e) => {
                     return PrepOutcome::Reject {
-                        reason: RejectReason::Other,
+                        funnel: RejectReason::Other,
+                        reason: FailureReason::Other,
                         msg: e.to_string(),
                     }
                 }
@@ -6000,7 +6038,8 @@ impl NativeExecutor {
                         Ok(v) => *st.pos_net.insert(v),
                         Err(e) => {
                             return PrepOutcome::Reject {
-                                reason: RejectReason::Other,
+                                funnel: RejectReason::Other,
+                                reason: FailureReason::Other,
                                 msg: e.to_string(),
                             }
                         }
@@ -6017,7 +6056,8 @@ impl NativeExecutor {
                             }
                             Err(e) => {
                                 return PrepOutcome::Reject {
-                                    reason: RejectReason::Other,
+                                    funnel: RejectReason::Other,
+                                    reason: FailureReason::Other,
                                     msg: e.to_string(),
                                 }
                             }
@@ -6038,9 +6078,10 @@ impl NativeExecutor {
                     bal.available + pn + credit - st.committed,
                 ) {
                     Ok(need) => need,
-                    Err(msg) => {
+                    Err((reason, msg)) => {
                         return PrepOutcome::Reject {
-                            reason: RejectReason::Margin,
+                            funnel: RejectReason::Margin,
+                            reason,
                             msg,
                         }
                     }
@@ -6142,12 +6183,12 @@ impl NativeExecutor {
                         top_up: TopUpShape::of(params, pass.top_up_candidate),
                     });
             }
-            PrepOutcome::Reject { reason, msg } => {
+            PrepOutcome::Reject { funnel, reason, msg } => {
                 // Funnel (perf A1): died pre-book.
                 if let Some(ref m) = metrics {
-                    reason.count(m);
+                    funnel.count(m);
                 }
-                results[i] = NativeActionResult::err("place_order", msg);
+                results[i] = NativeActionResult::rejected("place_order", (reason, msg));
             }
         }
     }
@@ -6332,9 +6373,9 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
-                            results[prep.index] = NativeActionResult::err(
+                            results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
-                                format!("taker fill failed: {e}"),
+                                (FailureReason::Fill, format!("taker fill failed: {e}")),
                             );
                             fill_failed = true;
                             break;
@@ -6353,9 +6394,9 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
-                            results[prep.index] = NativeActionResult::err(
+                            results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
-                                format!("maker fill failed: {e}"),
+                                (FailureReason::Fill, format!("maker fill failed: {e}")),
                             );
                             fill_failed = true;
                             break;
@@ -6716,7 +6757,8 @@ impl NativeExecutor {
                 }
 
                 if let Some(err) = fill_failed {
-                    results[prep.index] = NativeActionResult::err("place_order", err);
+                    results[prep.index] =
+                        NativeActionResult::rejected("place_order", (FailureReason::Fill, err));
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -7322,7 +7364,7 @@ impl NativeExecutor {
         params: &PlaceOrderParams,
         res_price: FixedPoint,
         free: FixedPoint,
-    ) -> Result<FixedPoint, String> {
+    ) -> Result<FixedPoint, Rejection> {
         if params.reduce_only {
             return Ok(FixedPoint::ZERO);
         }
@@ -7330,13 +7372,14 @@ impl NativeExecutor {
         let px = if px > FixedPoint::ZERO { px } else { res_price };
         let can_rest = !Self::never_rests(params); // stops: true
         match placement_need(tiers, signed, px, params.is_buy, params.quantity, res_price, can_rest) {
-            None => Err(format!(
-                "order notional overflows: price {res_price} x quantity {}",
-                params.quantity
+            None => Err((
+                FailureReason::Price,
+                format!("order notional overflows: price {res_price} x quantity {}", params.quantity),
             )),
-            Some(need) if need > FixedPoint::ZERO && need > free => {
-                Err(format!("insufficient margin: need {need}, have {free} (account)"))
-            }
+            Some(need) if need > FixedPoint::ZERO && need > free => Err((
+                FailureReason::Margin,
+                format!("insufficient margin: need {need}, have {free} (account)"),
+            )),
             Some(need) => Ok(need),
         }
     }
@@ -7661,8 +7704,8 @@ impl NativeExecutor {
     /// zero margin and matched at any price.
     /// Item 6 M1 (row 41): a `Limit` price must be positive too (the book
     /// rejects it; checked here so it is rejected before the book).
-    fn validate_order_price(params: &PlaceOrderParams) -> Result<(), String> {
-        match params.order_type {
+    fn validate_order_price(params: &PlaceOrderParams) -> Result<(), Rejection> {
+        let reject = match params.order_type {
             OrderType::Limit if params.price <= FixedPoint::ZERO => Err(format!(
                 "limit order requires a positive price, got {}",
                 params.price
@@ -7677,7 +7720,8 @@ impl NativeExecutor {
                 "stop-limit order requires a positive limit price, got {limit}"
             )),
             _ => Ok(()),
-        }
+        };
+        reject.map_err(|msg| (FailureReason::Price, msg))
     }
 
     /// Fix A (s92): the book's dust and off-tick rejects
@@ -7690,8 +7734,16 @@ impl NativeExecutor {
     /// checks. Item 6 M1: the rule and its text are
     /// [`torus_core::order_book::shape_violation`] (shared with the RPC
     /// intake check), which also checks a `StopLimit`'s limit (row 40).
-    fn book_shape_violation(params: &PlaceOrderParams, (tick, lot): (FixedPoint, FixedPoint)) -> Option<String> {
-        shape_violation(params, tick, lot).map(|v| v.placement_message())
+    fn book_shape_violation(params: &PlaceOrderParams, (tick, lot): (FixedPoint, FixedPoint)) -> Option<Rejection> {
+        shape_violation(params, tick, lot).map(|v| (Self::shape_reason(&v), v.placement_message()))
+    }
+
+    /// The result's reason of a tick / lot violation (placement and modify).
+    fn shape_reason(v: &ShapeViolation) -> FailureReason {
+        match v {
+            ShapeViolation::OffTick { .. } => FailureReason::Tick,
+            ShapeViolation::BelowLot { .. } => FailureReason::Lot,
+        }
     }
 
     /// Fix A (s92): a market's `(tick_size, lot_size)` for
@@ -7837,7 +7889,7 @@ impl NativeExecutor {
             if let Some(ref m) = ctx.metrics {
                 reason.count(m);
             }
-            return NativeActionResult::err("place_order", msg);
+            return NativeActionResult::rejected("place_order", (reason.failure(), msg));
         }
         let mut triggered = VecDeque::new();
         let result = Self::place_order_inner(ctx, sender, params, None, &mut triggered);
@@ -7910,17 +7962,17 @@ impl NativeExecutor {
                 match Self::signed_position(&ctx.positions, sender, market_id) {
                     Ok(pos) => {
                         ro_pos = Some(pos);
-                        Self::reduce_only_violation(pos, params)
+                        Self::reduce_only_violation(pos, params).map(|m| (FailureReason::Other, m))
                     }
-                    Err(e) => Some(e.to_string()),
+                    Err(e) => Some((FailureReason::Other, e.to_string())),
                 }
             });
-        if let Some(msg) = pre_check {
+        if let Some(rejection) = pre_check {
             // Funnel (perf A1): died pre-book on validation.
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
             }
-            return NativeActionResult::err("place_order", msg);
+            return NativeActionResult::rejected("place_order", rejection);
         }
 
         // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
@@ -7964,7 +8016,7 @@ impl NativeExecutor {
                 if let Some(ref m) = ctx.metrics {
                     m.orders_rejected_other.inc();
                 }
-                return NativeActionResult::err("place_order", msg);
+                return NativeActionResult::rejected("place_order", (FailureReason::Price, msg));
             }
         };
 
@@ -8009,7 +8061,7 @@ impl NativeExecutor {
                             }
                         };
                         let free = bal.available + pos_net;
-                        if let Err(msg) = Self::account_check(
+                        if let Err(rejection) = Self::account_check(
                             reader.tiers(market_id),
                             signed,
                             px,
@@ -8021,7 +8073,7 @@ impl NativeExecutor {
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_margin.inc();
                             }
-                            return NativeActionResult::err("place_order", msg);
+                            return NativeActionResult::rejected("place_order", rejection);
                         }
                         account = Some((free, px));
                     }
@@ -8170,9 +8222,9 @@ impl NativeExecutor {
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
                     }
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order",
-                        format!("taker fill failed: {e}"),
+                        (FailureReason::Fill, format!("taker fill failed: {e}")),
                     );
                 }
             };
@@ -8196,9 +8248,9 @@ impl NativeExecutor {
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
                     }
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order",
-                        format!("maker fill failed: {e}"),
+                        (FailureReason::Fill, format!("maker fill failed: {e}")),
                     );
                 }
             };
@@ -8521,6 +8573,7 @@ impl NativeExecutor {
         new_qty: Option<FixedPoint>,
     ) -> NativeActionResult {
         let err = |msg: String| NativeActionResult::err("modify_order", msg);
+        let rejected = |reason, msg: String| NativeActionResult::rejected("modify_order", (reason, msg));
         if new_price.is_none() && new_qty.is_none() {
             return err("nothing to modify: no new price or quantity".to_string());
         }
@@ -8543,7 +8596,7 @@ impl NativeExecutor {
 
         let price = new_price.unwrap_or(old.price);
         if price <= FixedPoint::ZERO {
-            return err(format!("modify rejected: price must be positive, got {price}"));
+            return rejected(FailureReason::Price, format!("modify rejected: price must be positive, got {price}"));
         }
         // s515 review 3: only a NEW price is tick-checked — an order resting
         // off the current tick (tick changed, legacy row) can still be resized.
@@ -8552,18 +8605,18 @@ impl NativeExecutor {
             && price.raw() % book.tick_size.raw() != 0
         {
             let v = ShapeViolation::OffTick { price, tick: book.tick_size };
-            return err(format!("modify rejected: {v}"));
+            return rejected(Self::shape_reason(&v), format!("modify rejected: {v}"));
         }
         let mut qty = new_qty.unwrap_or(old.remaining_qty);
         if qty <= FixedPoint::ZERO {
-            return err(format!("modify rejected: quantity must be positive, got {qty}"));
+            return rejected(FailureReason::Lot, format!("modify rejected: quantity must be positive, got {qty}"));
         }
         // Placement's convention (s515 review 3): the lot applies to the
         // REQUESTED quantity; the reduce-only clamp below may land under it
         // (it closes the position exactly — placement rests such an order too).
         if new_qty.is_some() && qty < book.lot_size {
             let v = ShapeViolation::BelowLot { quantity: qty, lot: book.lot_size };
-            return err(format!("modify rejected: {v}"));
+            return rejected(Self::shape_reason(&v), format!("modify rejected: {v}"));
         }
         let crosses = if is_buy {
             book.best_ask().is_some_and(|ask| price >= ask)
@@ -8598,7 +8651,7 @@ impl NativeExecutor {
             .unwrap_or(FixedPoint::ZERO);
         let new_reserved = match Self::try_reserve_for_qty_cfg(cfg, price, qty) {
             Ok(m) => m,
-            Err(msg) => return err(msg),
+            Err(msg) => return rejected(FailureReason::Price, msg),
         };
         let extra = new_reserved - old_reserved;
         // F1 (s517, D1 strict HL) + review fixes 3/5: THE modify gate — the
@@ -8621,7 +8674,10 @@ impl NativeExecutor {
             let tiers = cfg.map(|c| c.tiers.as_slice());
             let need = |q, p| placement_need(tiers, signed, px, is_buy, q, p, true);
             let Some(need_new) = need(qty, price) else {
-                return err(format!("order notional overflows: price {price} x quantity {qty}"));
+                return rejected(
+                    FailureReason::Price,
+                    format!("order notional overflows: price {price} x quantity {qty}"),
+                );
             };
             // Review fix 5 (s517): cancel-and-replace equivalence — the old
             // order gives back its whole reservation (>= its need when it
@@ -8632,9 +8688,10 @@ impl NativeExecutor {
             let delta = need_new - old_cost;
             let free = bal.available + pos_net;
             if need_new > FixedPoint::ZERO && delta > FixedPoint::ZERO && delta > free {
-                return err(format!(
-                    "insufficient margin for modify: need {delta}, have {free} (account)"
-                ));
+                return rejected(
+                    FailureReason::Margin,
+                    format!("insufficient margin for modify: need {delta}, have {free} (account)"),
+                );
             }
         }
         if extra > FixedPoint::ZERO {
@@ -9256,8 +9313,8 @@ impl NativeExecutor {
                 return NativeActionResult::err("withdraw_from_native", "amount overflow".into())
             }
         };
-        if let Err(msg) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
-            return NativeActionResult::err("withdraw_from_native", msg);
+        if let Err(rejection) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::rejected("withdraw_from_native", rejection);
         }
         match Lockbox::withdraw_from_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_from_native", 1500),
@@ -9276,8 +9333,8 @@ impl NativeExecutor {
             Some(fp) => fp,
             None => return NativeActionResult::err("withdraw_to", "amount overflow".into()),
         };
-        if let Err(msg) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
-            return NativeActionResult::err("withdraw_to", msg);
+        if let Err(rejection) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::rejected("withdraw_to", rejection);
         }
         match Lockbox::withdraw_from_native_to(&ctx.state, sender, to, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
@@ -9296,24 +9353,27 @@ impl NativeExecutor {
         ctx: &NativeExecContext<T>,
         sender: &Address,
         amount: FixedPoint,
-    ) -> Result<(), String> {
+    ) -> Result<(), Rejection> {
         let bal = ctx
             .positions
             .get_native_balance(sender)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| (FailureReason::Other, e.to_string()))?;
         if amount <= FixedPoint::ZERO || amount > bal.available {
             return Ok(());
         }
         let view = AccountReader::of(ctx)
             .view(sender, &bal)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| (FailureReason::Other, e.to_string()))?;
         if view.withdrawal_allowed(amount) {
             return Ok(());
         }
-        Err(format!(
-            "withdrawal of {amount} would leave the account under-margined: equity after (excl. order margin) {}, required {}",
-            view.equity() - view.order_margin - amount,
-            view.transfer_required()
+        Err((
+            FailureReason::Margin,
+            format!(
+                "withdrawal of {amount} would leave the account under-margined: equity after (excl. order margin) {}, required {}",
+                view.equity() - view.order_margin - amount,
+                view.transfer_required()
+            ),
         ))
     }
 

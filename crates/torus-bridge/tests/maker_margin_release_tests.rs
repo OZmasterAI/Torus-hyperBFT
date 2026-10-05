@@ -464,6 +464,7 @@ fn legacy_cancel_all_margin(
         success: true,
         error: None,
         gas_used: 500,
+        reason: torus_state::action_status::FailureReason::Other,
     }
 }
 

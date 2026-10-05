@@ -39,21 +39,25 @@ const ACTION_STATUS_V2: u8 = 0x02;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
-/// Why a native action failed at execution. Derived from the executor's
-/// error text ([`FailureReason::classify`]); the text itself is stored too.
+/// Why a native action failed at execution: the executor's typed reason
+/// (`NativeActionResult::reason`, set where the check failed; the message
+/// is stored too). The `u8` codes are stored: never renumber, only add.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FailureReason {
+    /// Anything without its own code (unknown order, ownership, reduce-only,
+    /// staking / governance / oracle / session errors, state read errors).
     Other = 0,
-    /// Account margin check (`insufficient margin`).
+    /// An account margin check: placement, modify, withdrawal.
     Margin = 1,
-    /// Open-order limit reached.
+    /// Open-order limit reached (plain, or the reduce-only / stop rule).
     OpenLimit = 2,
-    /// Limit price not a multiple of the market tick.
+    /// A limit (or stop-limit limit, or modify) price off the market tick.
     Tick = 3,
-    /// Quantity below the market lot size.
+    /// Quantity below the market lot size (or a modify quantity <= 0).
     Lot = 4,
-    /// Invalid price (missing price cap, notional overflow, ...).
+    /// Invalid price: not positive (limit, market cap, stop-limit limit,
+    /// modify), or a notional that overflows.
     Price = 5,
     /// A PlaceOrderBatch skipped wholesale (empty or over the batch cap).
     BatchCap = 6,
@@ -62,31 +66,6 @@ pub enum FailureReason {
 }
 
 impl FailureReason {
-    /// Reason code of an executor error message.
-    pub fn classify(message: &str) -> Self {
-        if message.starts_with("insufficient margin") {
-            Self::Margin
-        } else if message.starts_with("open order limit") {
-            Self::OpenLimit
-        } else if message.contains("is not a multiple of the tick") {
-            Self::Tick
-        } else if message.contains("below the lot size") {
-            Self::Lot
-        } else if message.starts_with("order notional overflows")
-            || message.contains("requires a positive")
-        {
-            Self::Price
-        } else if message.starts_with("PlaceOrderBatch skipped") {
-            Self::BatchCap
-        } else if message.starts_with("taker fill failed")
-            || message.starts_with("maker fill failed")
-        {
-            Self::Fill
-        } else {
-            Self::Other
-        }
-    }
-
     /// Unknown codes (a newer writer) read as `Other`.
     pub fn from_u8(code: u8) -> Self {
         match code {
@@ -134,13 +113,18 @@ pub struct NativeActionFailure {
 }
 
 impl NativeActionFailure {
-    /// A failure with its reason classified from `message`.
-    pub fn new(index: u32, order: u32, failed_orders: u32, message: String) -> Self {
+    pub fn new(
+        index: u32,
+        order: u32,
+        failed_orders: u32,
+        reason: FailureReason,
+        message: String,
+    ) -> Self {
         Self {
             index,
             order,
             failed_orders,
-            reason: FailureReason::classify(&message),
+            reason,
             message,
         }
     }
@@ -294,8 +278,14 @@ impl BlockActionStatus {
 mod tests {
     use super::*;
 
-    fn failure(index: u32, order: u32, failed: u32, msg: &str) -> NativeActionFailure {
-        NativeActionFailure::new(index, order, failed, msg.to_string())
+    fn failure(
+        index: u32,
+        order: u32,
+        failed: u32,
+        reason: FailureReason,
+        msg: &str,
+    ) -> NativeActionFailure {
+        NativeActionFailure::new(index, order, failed, reason, msg.to_string())
     }
 
     #[test]
@@ -332,11 +322,18 @@ mod tests {
             evm_skipped: vec![],
             native_skipped: vec![true, false, false, false],
             native_failed: vec![
-                failure(1, 0, 1, "insufficient margin: need 5, have 1 (account)"),
+                failure(
+                    1,
+                    0,
+                    1,
+                    FailureReason::Margin,
+                    "insufficient margin: need 5, have 1 (account)",
+                ),
                 failure(
                     3,
                     7,
                     2,
+                    FailureReason::OpenLimit,
                     "open order limit reached: 1000 open orders, limit 1000",
                 ),
             ],
@@ -360,7 +357,7 @@ mod tests {
         let status = BlockActionStatus {
             evm_skipped: vec![],
             native_skipped: vec![false],
-            native_failed: vec![failure(0, 0, 1, &long)],
+            native_failed: vec![failure(0, 0, 1, FailureReason::Other, &long)],
         };
         let back = BlockActionStatus::decode(&status.encode()).unwrap();
         let msg = &back.native_failed[0].message;
@@ -368,35 +365,32 @@ mod tests {
         assert!(long.starts_with(msg.as_str()));
     }
 
+    /// The stored codes and names are a format: pinned, one per reason, and
+    /// a stored code always reads back as the reason it was written as.
     #[test]
-    fn classifies_executor_messages() {
-        for (msg, want) in [
-            (
-                "insufficient margin: need 1, have 0 (account)",
-                FailureReason::Margin,
-            ),
-            (
-                "open order limit reached: 1 open orders, limit 1",
-                FailureReason::OpenLimit,
-            ),
-            (
-                "order rejected: price 1.5 is not a multiple of the tick 1",
-                FailureReason::Tick,
-            ),
-            (
-                "order rejected: quantity 0.1 below the lot size 1",
-                FailureReason::Lot,
-            ),
-            (
-                "order notional overflows: price 1 x quantity 2",
-                FailureReason::Price,
-            ),
-            ("PlaceOrderBatch skipped: 0 orders", FailureReason::BatchCap),
-            ("taker fill failed: x", FailureReason::Fill),
-            ("order not found", FailureReason::Other),
-        ] {
-            assert_eq!(FailureReason::classify(msg), want, "{msg}");
-            assert_eq!(FailureReason::from_u8(want as u8), want);
+    fn reason_codes_and_names_are_stable() {
+        let all = [
+            (FailureReason::Other, 0, "other"),
+            (FailureReason::Margin, 1, "margin"),
+            (FailureReason::OpenLimit, 2, "open_limit"),
+            (FailureReason::Tick, 3, "tick"),
+            (FailureReason::Lot, 4, "lot"),
+            (FailureReason::Price, 5, "price"),
+            (FailureReason::BatchCap, 6, "batch_cap"),
+            (FailureReason::Fill, 7, "fill"),
+        ];
+        for (reason, code, name) in all {
+            assert_eq!(reason as u8, code, "{name}");
+            assert_eq!(FailureReason::from_u8(code), reason, "{name}");
+            assert_eq!(reason.as_str(), name);
+            let status = BlockActionStatus {
+                evm_skipped: vec![],
+                native_skipped: vec![false],
+                // The message says nothing about the reason: it is not parsed.
+                native_failed: vec![failure(0, 0, 1, reason, "x")],
+            };
+            let back = BlockActionStatus::decode(&status.encode()).unwrap();
+            assert_eq!(back.native_failed[0].reason, reason, "{name}");
         }
         assert_eq!(FailureReason::from_u8(200), FailureReason::Other);
     }
@@ -427,7 +421,7 @@ mod tests {
         let v2 = BlockActionStatus {
             evm_skipped: vec![],
             native_skipped: vec![false; 2],
-            native_failed: vec![failure(1, 0, 1, "boom")],
+            native_failed: vec![failure(1, 0, 1, FailureReason::Fill, "boom")],
         }
         .encode();
         assert_eq!(BlockActionStatus::decode(&v2[..v2.len() - 1]), None);

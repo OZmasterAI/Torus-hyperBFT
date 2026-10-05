@@ -37,6 +37,31 @@ use torus_state::{FrozenPending, NativeStateOverlay, StateBackend, StateDb};
 use torus_telemetry::Metrics;
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
+/// A result's fields as the digests pin them: the four the struct had at
+/// pin time, `Debug`-formatted exactly as then (same type name, same field
+/// order). The typed `reason` (v2 action status) is covered by
+/// `action_reason_tests`.
+#[derive(Debug)]
+#[allow(dead_code)] // read through `Debug` only
+struct NativeActionResult {
+    action_type: &'static str,
+    success: bool,
+    error: Option<String>,
+    gas_used: u64,
+}
+
+fn pinned(results: &[torus_bridge::native_executor::NativeActionResult]) -> Vec<NativeActionResult> {
+    results
+        .iter()
+        .map(|r| NativeActionResult {
+            action_type: r.action_type,
+            success: r.success,
+            error: r.error.clone(),
+            gas_used: r.gas_used,
+        })
+        .collect()
+}
+
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
@@ -174,9 +199,10 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, resident: bool) -
             Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act),
         };
         ctx.save_order_books();
+        let (agg, liq_res) = (pinned(&agg), pinned(&liq_res));
         outputs.push(format!(
             "agg={agg:?}|res={:?}|gas={}|liq={liq_res:?}|trades={}|next_id={}|fatal={:?}|acc={} rc={} rm={} ol={} rb={} cpf={} stp={} oth={} liqs={}",
-            res.results,
+            pinned(&res.results),
             res.total_gas,
             ctx.trade_index,
             ctx.next_global_order_id,

@@ -11016,6 +11016,7 @@ mod crash_recovery_tests {
                     index,
                     0,
                     1,
+                    torus_state::action_status::FailureReason::Other,
                     format!("no rewards to claim for {sender}"),
                 )
             };
@@ -11144,8 +11145,17 @@ mod crash_recovery_tests {
     /// engine (`None` = production `execute_batch`), `pipelined` hands the
     /// flush to the worker. Returns the DB after every block is durable.
     fn run_failure_fixture(engine_threads: Option<usize>, pipelined: bool) -> StateDb {
+        run_fixture_blocks(failure_fixture_blocks(), engine_threads, pipelined)
+    }
+
+    /// [`run_failure_fixture`] over `blocks` (block 1 = the funding block:
+    /// each of its senders gets an EVM balance first).
+    fn run_fixture_blocks(
+        blocks: Vec<TorusBlock>,
+        engine_threads: Option<usize>,
+        pipelined: bool,
+    ) -> StateDb {
         let (_c, state_db) = make_test_config_and_db();
-        let blocks = failure_fixture_blocks();
         let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
         for signed in &blocks[0].native_actions {
             fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
@@ -11160,7 +11170,7 @@ mod crash_recovery_tests {
         if pipelined {
             assert_eq!(
                 ctx.flush_worker.as_ref().map(|w| w.durable_height()),
-                Some(3),
+                Some(blocks.len() as u64),
                 "every block went through the flush worker"
             );
         }
@@ -11231,6 +11241,147 @@ mod crash_recovery_tests {
                     assert_eq!(raw[0], 0x01, "{label}: height {h} keeps v1");
                     assert!(action_status(&db, h).unwrap().native_failed.is_empty());
                 }
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
+    }
+
+    /// Typed reasons, one action per reason code (market 1, tick = lot = 1):
+    ///   1  fund A, B, C
+    ///   2  0 A sell 100.5x1 GTC                       tick
+    ///      1 A stop-limit buy, limit 100.5             tick (row 40)
+    ///      2 A buy 100x0.5                             lot
+    ///      3 A buy 0x1 GTC                             price (row 41)
+    ///      4 A market buy, cap 0                       price
+    ///      5 B buy 100x1000 GTC                        margin
+    ///      6 C batch of 1001 buys 1x1                  open_limit at order 1000, 1 failed
+    ///      7 A empty PlaceOrderBatch                   batch_cap (0 failed orders)
+    ///      8 A cancel unknown order id                 other
+    ///      9 A sell 100x1 GTC                          executes
+    fn reason_fixture_blocks() -> Vec<TorusBlock> {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[81u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[82u8; 32]).unwrap();
+        let k_c = k256::ecdsa::SigningKey::from_slice(&[83u8; 32]).unwrap();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty_tenths: i128| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: px(qty_tenths),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let place = |o: PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let fund = |k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k);
+        let mut blocks = vec![
+            make_block(1, vec![fund(&k_a), fund(&k_b), fund(&k_c)]),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 1005, 10)), 2, &k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::StopLimit {
+                                trigger: px(1200),
+                                limit: px(1005),
+                            },
+                            ..order(true, 0, 10)
+                        }),
+                        3,
+                        &k_a,
+                    ),
+                    sign(place(order(true, 1000, 5)), 4, &k_a),
+                    sign(place(order(true, 0, 10)), 5, &k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::Market,
+                            time_in_force: TimeInForce::IOC,
+                            ..order(true, 0, 10)
+                        }),
+                        6,
+                        &k_a,
+                    ),
+                    sign(place(order(true, 1000, 10_000)), 2, &k_b),
+                    sign(
+                        NativeAction::PlaceOrderBatch(vec![order(true, 10, 10); 1001]),
+                        2,
+                        &k_c,
+                    ),
+                    sign(NativeAction::PlaceOrderBatch(vec![]), 7, &k_a),
+                    sign(NativeAction::CancelOrder { order_id: 999_999 }, 8, &k_a),
+                    sign(place(order(false, 1000, 10)), 9, &k_a),
+                ],
+            ),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Typed reasons: every reason code the executor can produce from a
+    /// block is stored as the executor's own reason (M1's tick / lot texts
+    /// included), at its body position, in every exec mode and on both
+    /// flushes, with identical bytes in every CF. `fill` needs a state
+    /// fault at settlement (bridge code path only).
+    #[test]
+    fn typed_reasons_are_stored_for_every_reason_code() {
+        use torus_state::action_status::FailureReason as R;
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_fixture_blocks(reason_fixture_blocks(), threads, pipelined);
+                let status = action_status(&db, 2).expect("block 2 record");
+                assert_eq!(status.native_skipped, vec![false; 10], "{label}");
+                let got: Vec<(u32, u32, u32, R)> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| (f.index, f.order, f.failed_orders, f.reason))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        (0, 0, 1, R::Tick),
+                        (1, 0, 1, R::Tick),
+                        (2, 0, 1, R::Lot),
+                        (3, 0, 1, R::Price),
+                        (4, 0, 1, R::Price),
+                        (5, 0, 1, R::Margin),
+                        (6, 1000, 1, R::OpenLimit),
+                        (7, 0, 0, R::BatchCap),
+                        (8, 0, 1, R::Other),
+                    ],
+                    "{label}: {:?}",
+                    status.native_failed
+                );
+                let msgs: Vec<&str> =
+                    status.native_failed.iter().map(|f| f.message.as_str()).collect();
+                for (i, want) in [
+                    "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
+                    "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
+                    "order rejected: quantity 0.50000000 below the lot size 1.00000000",
+                    "limit order requires a positive price",
+                    "market order requires a positive price cap",
+                    "insufficient margin",
+                    "open order limit reached: 1000 open orders, limit 1000",
+                    "PlaceOrderBatch skipped: 0 orders",
+                    "order 999999 not found",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert!(msgs[i].starts_with(want), "{label} #{i}: {:?}", msgs[i]);
+                }
+                assert_eq!(status.native_label(9), "executed", "{label}");
                 dumps.push((label, dump_all_cfs(&db)));
             }
         }

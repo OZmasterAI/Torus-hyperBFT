@@ -631,3 +631,40 @@ pub struct RpcBlockBody {
     #[serde(default)]
     pub evm_transaction_status: Option<Vec<String>>,
 }
+
+#[cfg(test)]
+mod action_failure_tests {
+    use super::*;
+    use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure};
+
+    /// Every stored reason code reaches `nativeActionFailures` as its stable
+    /// name, read from the record (not from the message).
+    #[test]
+    fn every_reason_code_is_visible_by_name() {
+        let all = [
+            (FailureReason::Other, "other"),
+            (FailureReason::Margin, "margin"),
+            (FailureReason::OpenLimit, "open_limit"),
+            (FailureReason::Tick, "tick"),
+            (FailureReason::Lot, "lot"),
+            (FailureReason::Price, "price"),
+            (FailureReason::BatchCap, "batch_cap"),
+            (FailureReason::Fill, "fill"),
+        ];
+        let status = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false; all.len()],
+            native_failed: all
+                .iter()
+                .enumerate()
+                .map(|(i, (r, _))| NativeActionFailure::new(i as u32, 0, 1, *r, "msg".into()))
+                .collect(),
+        };
+        let stored = BlockActionStatus::decode(&status.encode()).unwrap();
+        let rpc = native_action_failures(&stored);
+        let names: Vec<&str> = rpc.iter().map(|f| f.reason.as_str()).collect();
+        let want: Vec<&str> = all.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names, want);
+        assert!(native_action_labels(&stored).iter().all(|l| l == "failed"));
+    }
+}
