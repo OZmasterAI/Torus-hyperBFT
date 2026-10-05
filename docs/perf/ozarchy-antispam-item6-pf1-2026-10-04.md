@@ -673,6 +673,31 @@ the load. All cells AGREE, liveness PASS, ACCEPT. Build flags as `14236fa`
   cells profiled val0 and the references did not, which biases C7 low, so
   0.638x is if anything conservative.
 
+Chain and commit cadence, same columns as the 9.1 table, from each cell's
+`summary.json` headline (blk/s: val0 committed height over the bench
+window; native blk/s: non-empty blocks per second from the val0 phase
+log):
+
+| cell | trie | matched/s | best60 | engine ms/1k | chain ms | pipelined ms | handoff wait ms | commit ms avg / p50 | blk/s | native blk/s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C7 warm (60 s, no perf) | off | 71,355 | 98,432 | 8.85 | 656 | 158 | 0.08 | 543 / 350 | 0.8 | 0.81 |
+| C7 r1 (perf val0) | off | 65,111 | 97,624 | 10.17 | 692 | 164 | 0.21 | 645 / 312 | 1.0 | 1.05 |
+| C7 r2 (perf val0) | off | 63,296 | 97,941 | 10.25 | 713 | 169 | 0.02 | 657 / 443 | 1.0 | 0.99 |
+| `14236fa` `ozarchy-trie0-warm` (60 s) | off | 57,057 | 86,379 | 11.67 | 645 | 116 | 0.21 | 451 / 202 | 1.1 | 1.13 |
+| `14236fa` `ozarchy-trie0-crab-r1` | off | 51,871 | 80,659 | 13.86 | 920 | 167 | 0.01 | 852 / 299 | 0.7 | 0.66 |
+| `14236fa` `ozarchy-trie0-crab-r2` | off | 50,398 | 80,709 | 14.09 | 850 | 149 | 0.01 | 724 / 220 | 0.9 | 0.85 |
+| main `ozarchy-trie0-main-r1` | off | 100,744 | 129,761 | 7.05 | 560 | 172 | 0.24 | 477 / 271 | 1.6 | 1.33 |
+| main `ozarchy-trie0-main-r2` | off | 100,401 | 132,426 | 7.07 | 568 | 174 | 0.23 | 485 / 400 | 1.6 | 1.33 |
+
+- **Chain time per block falls ~885 -> ~703 ms** (r1 / r2 means) and the
+  average commit interval ~788 -> ~651 ms, so crab commits ~1.0 blocks/s
+  vs ~0.8 for `14236fa` and 1.6 for main, at a similar ~53-59k fills per
+  native block (main ~65k). Pipelined (flush) time is unchanged.
+- The 60 s warm cells do not follow this: the `14236fa` warm cell had
+  about the same chain time (645 vs 656 ms) and more blocks/s (1.1 vs 0.8)
+  despite fewer fills/s. Not investigated; use the 120 s r1 / r2 pairs for
+  the comparison.
+
 Engine phases on val0 (ms per block):
 
 | | total | phase 1 | margin | match | settle | tail (incl. liquidation) | untimed |
