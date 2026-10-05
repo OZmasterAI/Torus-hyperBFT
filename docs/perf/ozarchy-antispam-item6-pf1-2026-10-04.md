@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -19,6 +19,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 7 | Baseline `14236fa` (C4): what changed, what is left? | 300 markets unchanged (49.4k, 0.553x main); liquidation 3.1-3.4 ms/1k (-15%), biggest crab-only cost `maker_fill_fits` 4.2-4.5. ubench ratios to `9c4be2c` all past their fail lines except settle. Empty block 30.0 ms, 10.7 of it trie flush |
 | 8 | Is the native trie root used? What is left after C6 / C7? | Trie root: no production reader; off by default saves ~17 ms per empty block and ~4 ms/1k on the flush worker (owner question open). After C6 / C7: crab ~0.58x main estimated; ~6 ms/1k of named fixes reach ~0.78x, the rest needs an IPC measurement |
 | 9 | Does the crab / main ratio change with the trie off? Is the shared-code inflation cache misses? | Trie off: crab +3.4%, main +12.5%, ratio 0.553x -> 0.508x (main was partly flush-bound). Inflation is 1.2-2.5x more instructions per fill, not lower IPC |
+| 10 | What do C6 + C7 (`82bd1a4`) give at 300 markets, trie off? | 64.2k matched/s, +25.7% vs `14236fa`: **0.638x main** (was 0.508x). Engine 14.0 -> 10.2 ms/1k; state reads 8.3 -> 1.7, liquidation 3.2 -> 0.9, `maker_fill_fits` 4.3 -> 1.5 ms/1k. Left: margin phase 216-221 vs ~95 ms/blk on main |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -627,6 +628,130 @@ lower IPC:
   both builds, to separate "called more often" from "more instructions per
   call", then cut the per-call work.
 
+## 10. C6 + C7 (`82bd1a4`) at 300 markets, trie off (2026-10-05)
+
+Crab only, `perf/item6-phase1` @ `82bd1a4`, which holds everything after
+`14236fa`: the liquidation rule-B fix (`51051c9`), C6a (`d1ca548`), C6b
+(`41b0d4b`), C6c (`3df3e15`) and C7 (`82bd1a4`). The deltas below are C6
+and C7 together, not C7 alone. Same run shape as section 7 (300 markets,
+cap 400, rate 76,000, `RETRY_BUSY=1`, 120 s, oracle feed 30000 / 2000 ms /
+walk 0: 402/402 accepted, marks fresh 300/300) with
+`TORUS_NATIVE_TRIE_MAINTENANCE=0` through `EXTRA_ENV`: in the environment
+of all 3 nodes in every cell, one "maintenance DISABLED" boot line in each
+of the 9 node logs, no rebuild. Order: warm (60 s, no perf), r1, r2; r1 and
+r2 ran `perf record` (cycles:u, 499 Hz, fp) on val0 for 45 s from 35 s into
+the load. All cells AGREE, liveness PASS, ACCEPT. Build flags as `14236fa`
+(mold, frame pointers, `line-tables-only`); node md5 `2783579b`, the
+`82bd1a4` load generator (md5 `89744d01`). Driver and analysis:
+`ozarchy-82bd1a4-c7-campaign.sh`, `ozarchy-82bd1a4-c7-analysis.md`.
+
+### 10.1 Full node
+
+| cell | matched/s | best60 | engine ms/1k | flush phase ms | exec_root ms/blk | handoff wait ms | CPU-s per 1M fills |
+|---|---|---|---|---|---|---|---|
+| C7 r1 (perf val0) | 65,111 | 97,624 | 10.17 | 165 | 0.56 | 0.21 | 81.4 |
+| C7 r2 (perf val0) | 63,296 | 97,941 | 10.25 | 171 | 0.61 | 0.02 | 81.8 |
+| **C7 mean** | **64,204** | 97,783 | **10.21** | 168 | 0.6 | 0.1 | **81.6** |
+| crab `14236fa` trie off (9.1) | 51,134 | 80,684 | 13.98 | 159 | 0.55 | 0.01 | 100 |
+| main `92a02ed` trie off (9.1) | 100,573 | 131,094 | 7.06 | 174 | 0.96 | 0.24 | 60 |
+| warm C7 (60 s, no perf) | 71,355 | 98,432 | 8.85 | 159 | 0.49 | 0.08 | 63.6 |
+| warm `14236fa` trie off (60 s) | 57,057 | 86,379 | 11.67 | 116 | 0.39 | 0.21 | 75.3 |
+
+| ratio | `14236fa` trie off | C7 trie off |
+|---|---|---|
+| matched/s, crab / main | 0.508x | **0.638x** |
+| engine ms/1k, crab / main | 1.97x | 1.44x |
+| CPU-s per 1M fills, crab / main | 1.68x | 1.36x |
+
+- **+25.7% vs `14236fa`** (64.2k vs 51.1k); the unprofiled warm cells agree
+  (+25%, 71.4k vs 57.1k). Engine time per fill -27%, CPU per fill -18%.
+- **Flush side unchanged:** flush phase, `exec_root` and handoff wait match
+  the `14236fa` trie-off cells. Crab is still limited by its execution
+  thread.
+- **Caveats:** the main and `14236fa` references are the section 9.1 cells
+  (same day, not interleaved, `14236fa` load generator). The C7 round
+  cells profiled val0 and the references did not, which biases C7 low, so
+  0.638x is if anything conservative.
+
+Chain and commit cadence, same columns as the 9.1 table, from each cell's
+`summary.json` headline (blk/s: val0 committed height over the bench
+window; native blk/s: non-empty blocks per second from the val0 phase
+log):
+
+| cell | trie | matched/s | best60 | engine ms/1k | chain ms | pipelined ms | handoff wait ms | commit ms avg / p50 | blk/s | native blk/s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C7 warm (60 s, no perf) | off | 71,355 | 98,432 | 8.85 | 656 | 158 | 0.08 | 543 / 350 | 0.8 | 0.81 |
+| C7 r1 (perf val0) | off | 65,111 | 97,624 | 10.17 | 692 | 164 | 0.21 | 645 / 312 | 1.0 | 1.05 |
+| C7 r2 (perf val0) | off | 63,296 | 97,941 | 10.25 | 713 | 169 | 0.02 | 657 / 443 | 1.0 | 0.99 |
+| `14236fa` `ozarchy-trie0-warm` (60 s) | off | 57,057 | 86,379 | 11.67 | 645 | 116 | 0.21 | 451 / 202 | 1.1 | 1.13 |
+| `14236fa` `ozarchy-trie0-crab-r1` | off | 51,871 | 80,659 | 13.86 | 920 | 167 | 0.01 | 852 / 299 | 0.7 | 0.66 |
+| `14236fa` `ozarchy-trie0-crab-r2` | off | 50,398 | 80,709 | 14.09 | 850 | 149 | 0.01 | 724 / 220 | 0.9 | 0.85 |
+| main `ozarchy-trie0-main-r1` | off | 100,744 | 129,761 | 7.05 | 560 | 172 | 0.24 | 477 / 271 | 1.6 | 1.33 |
+| main `ozarchy-trie0-main-r2` | off | 100,401 | 132,426 | 7.07 | 568 | 174 | 0.23 | 485 / 400 | 1.6 | 1.33 |
+
+- **Chain time per block falls ~885 -> ~703 ms** (r1 / r2 means) and the
+  average commit interval ~788 -> ~651 ms, so crab commits ~1.0 blocks/s
+  vs ~0.8 for `14236fa` and 1.6 for main, at a similar ~53-59k fills per
+  native block (main ~65k). Pipelined (flush) time is unchanged.
+- The 60 s warm cells do not follow this: the `14236fa` warm cell had
+  about the same chain time (645 vs 656 ms) and more blocks/s (1.1 vs 0.8)
+  despite fewer fills/s. Not investigated; use the 120 s r1 / r2 pairs for
+  the comparison.
+
+Engine phases on val0 (ms per block):
+
+| | total | phase 1 | margin | match | settle | tail (incl. liquidation) | untimed |
+|---|---|---|---|---|---|---|---|
+| C7 r1 / r2 | 553 / 573 | 45 / 47 | 216 / 221 | 96 / 102 | 128 / 135 | **48 / 46** | 20 / 21 |
+| `14236fa` trie off r1 / r2 | 812 / 746 | 42 / 40 | 265 / 245 | 178 / 162 | 136 / 122 | **170 / 159** | 20 / 17 |
+| main trie off r1 / r2 | 459 / 466 | 51 / 50 | 95 / 97 | 149 / 151 | 155 / 158 | 0.05 | 9 |
+
+C7 runs more fills per block (about 1 block/s at 65k vs 51k fills/s), so
+the per-block drops understate the per-fill drops.
+
+### 10.2 val0 execution-thread profile
+
+ms CPU per 1k fills over the perf window, mean of r1 / r2. The only
+`14236fa` profile is section 7's (trie **on**), so the flush-worker drop
+(15.0 -> 3.8) is mostly the trie being off and cannot be split from C6 /
+C7. The execution-thread buckets below are not trie work.
+
+| bucket | `14236fa` | C7 | delta |
+|---|---|---|---|
+| execution thread total | 27.8 | 20.8 | -7.0 |
+| leaf kind: state reads (overlay / RocksDB) | 8.30 | 1.70 | **-6.6** |
+| `execute_batch_phases` glue | 7.46 | 5.35 | -2.1 |
+| margin: `maker_fill_fits` | 4.35 | 1.46 | -2.9 |
+| margin: `prepare_one` | 3.86 | 2.66 | -1.2 |
+| liquidation | 3.24 | 0.89 | **-2.3 (-72%)** |
+| matching | 3.04 | 2.98 | 0 |
+| settle | 2.22 | 2.04 | -0.2 |
+| margin (other; `AccountView::build_with` and sums land here) | 0.33 | 1.28 | +0.95 |
+| books drain / save / load | 1.34 | 1.90 | +0.6 |
+
+| `14236fa` | C7 | delta | self symbol |
+|---|---|---|---|
+| 2.51 | 0.53 | -1.97 | `NativeStateOverlay::get_cf_raw` |
+| 1.38 | 0 | -1.38 | BTreeMap range iterator (`positions_for_trader` scan) |
+| 1.13 | 0 | -1.13 | `Vec<(Vec<u8>, Vec<u8>)>` collect of the scan |
+| 0.89 | 0 | -0.89 | `PositionManager::positions_for_trader` |
+| 0.79 | 0.02 | -0.77 | `PositionManager::get_position` |
+| 0.91 | 0.25 | -0.66 | `BTreeMap<Vec<u8>, Vec<u8>>::get` |
+| 0.28 | 0.03 | -0.25 | `Position::deserialize` (borsh) |
+| 0 | **1.27** | +1.27 | **`AccountReader::get_position`** (decoded-slot lookup) |
+| 0.45 | 0.27 | -0.18 | `AccountView::build` -> `build_with` |
+| 2.7 | 2.7 | 0 | hashing (SipHash + Keccak) |
+
+- **C6 + C7 remove the range scans, overlay reads and borsh decodes**
+  behind the per-trader position and sum rebuilds (about 5.5 ms/1k),
+  replaced by `AccountReader::get_position` at 1.27. This is also the
+  low-IPC crab-only code section 9.2 named (`positions_for_trader`,
+  `get_cf_raw`, `maker_fill_fits`).
+- **Left of the engine gap (10.2 vs 7.1 ms/1k):** mostly the margin phase
+  (216-221 vs ~95 ms per block on main); match and settle are already at
+  or below main per block. Then glue (5.3 ms/1k) and hashing (~2.7,
+  untouched by C6 / C7).
+
 ## Open
 
 - Native trie maintenance off by default: owner question on the
@@ -638,9 +763,11 @@ lower IPC:
   trie on/off comparison (section 9.1).
 - E1 (oracle step) postponed, low priority: 5.8 ms per empty block on
   ozarchy (section 7.3).
-- Margin and liquidation at 300 markets: `positions_for_trader` overlay
-  range scans per account (section 6.2), the target for the next item 6
-  step.
+- Margin at 300 markets after C6 + C7: margin phase 216-221 vs ~95 ms per
+  block on main, `prepare_one` 2.7 and `AccountReader::get_position` 1.27
+  ms/1k (section 10). The `positions_for_trader` scans are gone.
+- A main pair interleaved with C7 cells, trie off, to tighten the 0.638x
+  (section 10.1).
 - Optional: cheaper shed path (peek the action tag or const-hex) and the
   1.22-1.27x signature-verify cost per admitted action on crab (section
   6.4).
