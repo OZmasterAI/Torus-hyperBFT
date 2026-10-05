@@ -3141,9 +3141,16 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
+        // v2: action 2 executed and failed (margin).
         let record = torus_state::action_status::BlockActionStatus {
             evm_skipped: vec![true],
             native_skipped: vec![false, true, false],
+            native_failed: vec![torus_state::action_status::NativeActionFailure::new(
+                2,
+                0,
+                1,
+                "insufficient margin: need 5, have 1 (account)".to_string(),
+            )],
         };
         state
             .put_cf_raw(
@@ -3174,7 +3181,17 @@ mod tests {
         let executed = get(1).await;
         assert_eq!(
             executed["nativeActionStatus"],
-            serde_json::json!(["executed", "skipped", "executed"])
+            serde_json::json!(["executed", "skipped", "failed"])
+        );
+        assert_eq!(
+            executed["nativeActionFailures"],
+            serde_json::json!([{
+                "index": 2,
+                "reason": "margin",
+                "message": "insufficient margin: need 5, have 1 (account)",
+                "order": 0,
+                "failedOrders": 1
+            }])
         );
         assert_eq!(
             executed["evmTransactionStatus"],
@@ -3183,9 +3200,11 @@ mod tests {
         assert_eq!(executed["nativeActions"].as_array().unwrap().len(), 3);
         let pending = get(2).await;
         assert!(pending["nativeActionStatus"].is_null());
+        assert!(pending["nativeActionFailures"].is_null());
         assert!(pending["evmTransactionStatus"].is_null());
         let empty = get(3).await;
         assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
+        assert_eq!(empty["nativeActionFailures"], serde_json::json!([]));
         assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
         handle.stop().unwrap();
     }
@@ -3296,6 +3315,7 @@ mod tests {
                 &torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![false, true, false],
                     native_skipped: vec![],
+                    native_failed: vec![],
                 }
                 .encode(),
             )

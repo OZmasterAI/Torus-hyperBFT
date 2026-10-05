@@ -638,6 +638,11 @@ struct ExecutionContext {
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
     test_crash_after_evm_section: bool,
+    /// Test-only stand-in for `TORUS_PARALLEL_ENGINE` (a process-global
+    /// `OnceLock`): `Some(n)` runs native batches through
+    /// `execute_batch_engine_mode(n)`; `None` = production `execute_batch`.
+    #[cfg(test)]
+    test_engine_threads: Option<usize>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -2058,6 +2063,9 @@ impl ExecutionContext {
 
             let replay_guard_timer = std::time::Instant::now();
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
+            // v2 action status: body position of each `sender_actions` entry.
+            let mut sender_body_index: Vec<u32> =
+                Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             let mut dropped_invalid: u64 = 0;
             // Defense-in-depth replay guard. The non-destructive mempool selection ×
@@ -2103,6 +2111,7 @@ impl ExecutionContext {
                 }
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
+                sender_body_index.push(i as u32);
             }
             if dropped_invalid > 0 {
                 // FIX 2: surface the count of dropped-at-exec actions (state-dependent
@@ -2120,23 +2129,6 @@ impl ExecutionContext {
                     .observe(replay_guard_timer.elapsed().as_secs_f64());
                 m.native_actions_processed
                     .inc_by(sender_actions.len() as u64);
-            }
-
-            // s84: the executed/skipped record rides this block's flush batch
-            // (or its frozen set on the pipelined path). Not a hashed or
-            // native-root CF, so state hash and root are untouched.
-            if has_native || has_evm {
-                let status = torus_state::action_status::BlockActionStatus {
-                    evm_skipped: std::mem::take(&mut evm_skipped),
-                    native_skipped,
-                };
-                if let Err(e) = overlay.put_cf_raw(
-                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
-                    &height.to_be_bytes(),
-                    &status.encode(),
-                ) {
-                    tracing::error!(%e, height, "failed to stage the executed/skipped record");
-                }
             }
 
             overlay.seed_from_bundle(&bundle);
@@ -2248,8 +2240,19 @@ impl ExecutionContext {
             // CoreWriter) reads one mark. A storage fault sets `fatal_error`
             // (the fail-stop check after the batches catches it).
             let _ = NativeExecutor::begin_block_oracle(&mut ctx);
-            NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-            NativeExecutor::execute_batch(&mut ctx, &post_evm);
+            #[cfg(test)]
+            let engine_threads = self.test_engine_threads;
+            #[cfg(not(test))]
+            let engine_threads: Option<usize> = None;
+            let run_batch =
+                |ctx: &mut NativeExecContext<_>, list: &[(Address, torus_types::NativeAction)]| {
+                    match engine_threads {
+                        Some(n) => NativeExecutor::execute_batch_engine_mode(ctx, list, n),
+                        None => NativeExecutor::execute_batch(ctx, list),
+                    }
+                };
+            let pre_results = run_batch(&mut ctx, &pre_evm);
+            let post_results = run_batch(&mut ctx, &post_evm);
             // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
             // was consumed and this block's post-state is unreconstructable.
             // Do NOT run the remaining phases, do NOT flush the overlay or
@@ -2346,6 +2349,24 @@ impl ExecutionContext {
                 m.exec_post_engine_tail_seconds.observe(tail_secs);
                 m.exec_engine_untimed_seconds.observe(untimed_secs);
             }
+
+            // v2 action status: the executed/skipped record plus the native
+            // failures, mapped to body positions here (only the failing
+            // entries; their messages are moved, not copied). Encoded and
+            // written where the block's batch is built: the flush worker on
+            // the pipelined path, the flush below on the serial one. Not a
+            // hashed or native-root CF, so state hash and root are untouched.
+            let action_status = (has_native || has_evm).then(|| {
+                torus_state::action_status::BlockActionStatus {
+                    evm_skipped: std::mem::take(&mut evm_skipped),
+                    native_failed: crate::action_results::native_failures(
+                        &sender_actions,
+                        &sender_body_index,
+                        [(&pre_evm, pre_results), (&post_evm, post_results)],
+                    ),
+                    native_skipped,
+                }
+            });
 
             let save_books_timer = std::time::Instant::now();
             // Deferred book save (s63 port of item 6a, origin 4298728):
@@ -2451,11 +2472,23 @@ impl ExecutionContext {
                     evm_addrs,
                     books: deferred_books,
                     order_nonces: order_nonces.clone(),
+                    action_status,
                 }) {
                     return;
                 }
                 resident_ok = true;
             } else {
+            if let Some(status) = &action_status {
+                let bytes =
+                    crate::action_results::encode_status(status, self.metrics.as_deref());
+                if let Err(e) = overlay.put_cf_raw(
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &bytes,
+                ) {
+                    tracing::error!(%e, height, "failed to stage the action status record");
+                }
+            }
             // Item 6 Phase 1: the context's overlay clones hold R; drop them
             // so `end_resident` can take R back.
             drop(ctx);
@@ -2726,6 +2759,7 @@ impl ExecutionContext {
             let status = torus_state::action_status::BlockActionStatus {
                 evm_skipped: std::mem::take(&mut evm_skipped),
                 native_skipped: vec![],
+                native_failed: vec![],
             };
             match self
                 .state_db
@@ -2734,7 +2768,7 @@ impl ExecutionContext {
                 Ok(cf) => evm_batch.get_or_insert_with(Default::default).put_cf(
                     cf,
                     height.to_be_bytes(),
-                    status.encode(),
+                    crate::action_results::encode_status(&status, self.metrics.as_deref()),
                 ),
                 Err(e) => {
                     tracing::error!(%e, height, "failed to stage the executed/skipped record")
@@ -3832,6 +3866,8 @@ impl TorusApp {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_engine_threads: None,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -10651,6 +10687,8 @@ mod crash_recovery_tests {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_engine_threads: None,
         }
     }
 
@@ -10971,11 +11009,22 @@ mod crash_recovery_tests {
                 "replica {replica} fail-stopped"
             );
 
+            // v2: both ClaimRewards execute (nonce consumed) and fail —
+            // nothing to claim — so they also carry a failure record.
+            let no_rewards = |index: u32, sender: Address| {
+                torus_state::action_status::NativeActionFailure::new(
+                    index,
+                    0,
+                    1,
+                    format!("no rewards to claim for {sender}"),
+                )
+            };
             assert_eq!(
                 action_status(&state_db, 1),
                 Some(torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![],
                     native_skipped: vec![false],
+                    native_failed: vec![no_rewards(0, k256_address(&key_a))],
                 })
             );
             assert_eq!(
@@ -10983,8 +11032,9 @@ mod crash_recovery_tests {
                 Some(torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![true, false],
                     native_skipped: vec![true, true, true, false],
+                    native_failed: vec![no_rewards(3, k256_address(&key_c))],
                 }),
-                "replica {replica}: replay, forged and expired skipped; valid executed"
+                "replica {replica}: replay, forged and expired skipped; valid executed (and failed)"
             );
             assert!(nonce_consumed(&state_db, k256_address(&key_a), 1));
             assert!(
@@ -11012,6 +11062,181 @@ mod crash_recovery_tests {
         }
         assert_dumps_equal(&dumps[0], &dumps[1], "replica 0 vs 1");
         assert_dumps_equal(&dumps[0], &dumps[2], "replica 0 vs 2");
+    }
+
+    // ---- v2 action status: per-action execution failures ----
+
+    /// Blocks for the failure-record tests (market 1, tick = lot = 1):
+    ///   1  fund A, B
+    ///   2  0 A sell 100x1 GTC                       executes (rests)
+    ///      1 B buy 100x1000 GTC                     fails: margin
+    ///      2 A sell 100.5x1 GTC                     fails: off-tick
+    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   fails: order 1 off-tick, 2 failed
+    ///      4 replay of block 1's A action           skipped
+    ///      5 A cancel unknown order id              fails (pre-EVM list)
+    ///      6 B IOC buy 100.5x1                      fails: off-tick (pre-EVM list)
+    ///      7 A sell 100x1 GTC (same as 0, new nonce) executes
+    ///   3  A sell 120x1 GTC                         executes (v1 record)
+    fn failure_fixture_blocks() -> Vec<TorusBlock> {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[72u8; 32]).unwrap();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty: i128| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: FixedPoint::from_raw(qty * FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let place = |o: torus_types::PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let fund_a = sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_a);
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![
+                    fund_a.clone(),
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_b),
+                ],
+            ),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 1000, 1)), 2, &k_a),
+                    sign(place(order(true, 1000, 1000)), 2, &k_b),
+                    sign(place(order(false, 1005, 1)), 3, &k_a),
+                    sign(
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(true, 900, 1),
+                            order(true, 905, 1),
+                            order(true, 910, 1),
+                            order(true, 915, 1),
+                        ]),
+                        3,
+                        &k_b,
+                    ),
+                    fund_a,
+                    sign(NativeAction::CancelOrder { order_id: 999_999 }, 4, &k_a),
+                    sign(
+                        place(torus_types::PlaceOrderParams {
+                            time_in_force: torus_types::TimeInForce::IOC,
+                            ..order(true, 1005, 1)
+                        }),
+                        4,
+                        &k_b,
+                    ),
+                    sign(place(order(false, 1000, 1)), 5, &k_a),
+                ],
+            ),
+            make_block(3, vec![sign(place(order(false, 1200, 1)), 6, &k_a)]),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Runs the failure fixture on a fresh DB: `engine_threads` pins the
+    /// engine (`None` = production `execute_batch`), `pipelined` hands the
+    /// flush to the worker. Returns the DB after every block is durable.
+    fn run_failure_fixture(engine_threads: Option<usize>, pipelined: bool) -> StateDb {
+        let (_c, state_db) = make_test_config_and_db();
+        let blocks = failure_fixture_blocks();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        for signed in &blocks[0].native_actions {
+            fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
+        }
+        let mut ctx = pipeline_ctx(&state_db, pipelined, None);
+        ctx.test_engine_threads = engine_threads;
+        for block in &blocks {
+            dispatch_and_execute(&ctx, &state_db, block);
+        }
+        assert!(ctx.pipeline_barrier(), "flush worker drained");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+        if pipelined {
+            assert_eq!(
+                ctx.flush_worker.as_ref().map(|w| w.durable_height()),
+                Some(3),
+                "every block went through the flush worker"
+            );
+        }
+        drop(ctx);
+        state_db
+    }
+
+    /// v2: margin-rejected, off-tick (single, IOC and inside a batch) and
+    /// unknown-cancel actions show failed with a reason, at their body
+    /// position, in every exec mode (production auto, engine threads 0/2/4)
+    /// and on both the serial and the pipelined flush; successes stay
+    /// executed, the replay stays skipped, and every run writes identical
+    /// bytes to every CF.
+    ///
+    /// RED before v2: the record only knew executed/skipped (no failures).
+    #[test]
+    fn execution_failures_are_recorded_identically_in_every_exec_mode() {
+        use torus_state::action_status::FailureReason;
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_failure_fixture(threads, pipelined);
+                let status = action_status(&db, 2).expect("block 2 record");
+                assert_eq!(
+                    status.native_skipped,
+                    vec![false, false, false, false, true, false, false, false],
+                    "{label}"
+                );
+                let got: Vec<(u32, u32, u32, FailureReason)> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| (f.index, f.order, f.failed_orders, f.reason))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        (1, 0, 1, FailureReason::Margin),
+                        (2, 0, 1, FailureReason::Tick),
+                        (3, 1, 2, FailureReason::Tick),
+                        (5, 0, 1, FailureReason::Other),
+                        (6, 0, 1, FailureReason::Tick),
+                    ],
+                    "{label}: {:?}",
+                    status.native_failed
+                );
+                assert!(
+                    status.native_failed[0]
+                        .message
+                        .starts_with("insufficient margin"),
+                    "{label}"
+                );
+                let labels: Vec<&str> = (0..8).map(|i| status.native_label(i)).collect();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "executed", "failed", "failed", "failed", "skipped", "failed", "failed",
+                        "executed"
+                    ],
+                    "{label}"
+                );
+                // Block 1 and 3: nothing failed -> the compact v1 record.
+                for h in [1u64, 3] {
+                    let raw = db
+                        .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &h.to_be_bytes())
+                        .unwrap()
+                        .expect("record");
+                    assert_eq!(raw[0], 0x01, "{label}: height {h} keeps v1");
+                    assert!(action_status(&db, h).unwrap().native_failed.is_empty());
+                }
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
     }
 
     // ---- s84 decision 2: the parent link is checked before the vote ----
@@ -11227,6 +11452,7 @@ mod crash_recovery_tests {
             Some(torus_state::action_status::BlockActionStatus {
                 evm_skipped: vec![true],
                 native_skipped: vec![],
+                native_failed: vec![],
             })
         );
         assert_eq!(action_status(&state_db, 2), None);
@@ -14104,6 +14330,7 @@ mod crash_recovery_tests {
                     evm_addrs: vec![],
                     books: Some(save),
                     order_nonces: vec![],
+                    action_status: None,
                 })
                 .unwrap();
             assert!(worker.wait_idle());
@@ -14121,6 +14348,7 @@ mod crash_recovery_tests {
                 evm_addrs: vec![],
                 books: Some(save3.unwrap()),
                 order_nonces: vec![],
+                action_status: None,
             })
             .unwrap();
         assert!(gate.wait_received(3), "W must have taken job 3");
@@ -14159,6 +14387,7 @@ mod crash_recovery_tests {
                 evm_addrs: vec![],
                 books: save,
                 order_nonces: vec![],
+                action_status: None,
             })
             .unwrap();
         assert!(!worker_c.wait_idle(), "wait_idle must report the failure");
