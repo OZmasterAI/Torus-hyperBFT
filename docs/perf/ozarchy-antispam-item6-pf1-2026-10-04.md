@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -22,6 +22,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 10 | What do C6 + C7 (`82bd1a4`) give at 300 markets, trie off? | 64.2k matched/s, +25.7% vs `14236fa`: **0.638x main** (was 0.508x). Engine 14.0 -> 10.2 ms/1k; state reads 8.3 -> 1.7, liquidation 3.2 -> 0.9, `maker_fill_fits` 4.3 -> 1.5 ms/1k. Left: margin phase 216-221 vs ~95 ms/blk on main |
 | 11 | Where does C7's margin phase go vs main? What can be cut? | 5.09 vs 1.47 ms CPU/1k fills (+3.6; ENGINE wall 3.96 vs 1.46). 2.9 is crab-only code: the F1 account check in `prepare_one` 1.77, top-ups / pool takers / bid floors 1.15. `HashMap` work is +1.6 of the gap. `AccountReader::get_position` is ~0.15 margin, ~1.1 match timer. Named cuts ~1.7-2.7 ms/1k (est.), almost all in 18c's files |
 | 12 | What do P1-P4 + fix A (`239ff69`) give at 300 markets? | 65.2k matched/s, **0.648x main** (was 0.638x): +1.5%, within 82bd1a4's cell spread; engine 10.2 -> 9.93 ms/1k (-2.7%, both cells). `checked_mul` -77%, matching -15%, margin buckets -14%, settle -17%; +0.5 ms/1k SipHash from the new Address-keyed `TraderMargins` map. Margin still 207-212 vs ~96 ms/blk on main |
+| 13 | What does C (per-action failure records, `9195c32`) cost? How many failures does the bench produce? | No measurable cost (warm pair: matched/s +0.9%, engine -1.2%, pipelined 128 vs 127 ms). Failures are **not** ~0: 147 failed actions per native block (52% of actions, nearly all batches with open-limit rejects), ~10 KB per block, ~0.14% of the flush batch; identical on all 3 validators. Zero-fill IOCs and crossing post-only orders still show "executed" |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1061,6 +1062,66 @@ trie off, so unlike 10.2 the flush side is comparable too).
   M1 (the section 11 cuts, plus books created from the market row's tick
   and lot).
 
+## 13. C: per-action execution results (`9195c32`) at 300 markets (2026-10-05)
+
+`feat/action-results` @ `9195c32` = `239ff69` + C: the execution result of
+each action is mapped back to its position in the block body, and failed
+actions are stored (reason code + message up to 96 bytes) in a v2
+`CF_BLOCK_ACTION_STATUS` record, written on the flush worker. A block with
+no failures writes the old v1 bytes. A `PlaceOrderBatch` with any failed
+order is one failure entry (first failing order, its reason, how many
+failed). The record is not hashed (not in `HASHED_CFS`, `NATIVE_ROOT_CFS`
+or the EVM state root). Counters: `torus_exec_action_failures_total`,
+`torus_exec_action_status_bytes_total`.
+
+Same run shape and build flags as section 12, trie off by default. Node md5
+`8db911fb`. A warm cell (60 s) and one 120 s cell, **both without perf**.
+All cells AGREE, liveness PASS, ACCEPT. Driver
+`ozarchy-action-results-campaign.sh`, cells `ozarchy-action-results-{warm,r1}`.
+
+### 13.1 Full node
+
+| cell | matched/s | best60 | engine ms/1k | chain ms | pipelined ms | handoff wait ms | commit ms avg / p50 | blk/s | native blk/s | fills per native block |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C warm (60 s) | 77,425 | 96,297 | 8.25 | 598 | 128 | 0.05 | 521 / 348 | 0.9 | 0.89 | 57.1k |
+| `239ff69` warm (60 s) | 76,710 | 99,593 | 8.35 | 587 | 127 | 0.17 | 520 / 358 | 0.9 | 0.89 | 56.5k |
+| C r1 (no perf) | 67,436 | 94,807 | 9.57 | 669 | 140 | 0.03 | 621 / 492 | 1.1 | 1.11 | 53.9k |
+| `239ff69` r1 / r2 (perf val0, 12.1) | 65,620 / 64,751 | 100,163 / 100,722 | 9.92 / 9.93 | 691 / 664 | 146 / 139 | 0.18 / 0.02 | 631 / 628 avg | 1.1 | 1.06 / 1.07 | 55.4k / 52.9k |
+
+- **No measurable cost.** The warm cells are the like-for-like pair (no
+  perf on either): matched/s +0.9%, engine ms/1k -1.2%, pipelined (flush)
+  128 vs 127 ms per block, chain +2%.
+- **C r1 is not directly comparable** with the `239ff69` round cells, which
+  profiled val0. Its best60 is lower (94.8k vs ~100k); one cell, not
+  resolved.
+
+### 13.2 Failure records
+
+From `metrics-{before,after}-val0.txt` (each cell boots fresh; native
+blocks from `torus_exec_native_blocks_total`, including the drain):
+
+| cell | actions | failed actions | failed share | native blocks | failures per block | status-CF bytes | bytes per block | bytes per failure |
+|---|---|---|---|---|---|---|---|---|
+| C warm | 57,823 | 25,790 | 45% | 237 | 108.8 | 1,762,736 | 7,438 | 68 |
+| C r1 | 91,683 | 47,359 | 52% | 322 | **147.1** | 3,234,773 | **10,046** | 68 |
+
+- **Failures are not ~0 on this load.** The bench's open-limit rejects
+  (~41-45k orders per native block) happen at execution (Phase 2
+  `prepare_one` -> `take_open_slot`), so nearly every batch that contains
+  one becomes a failure entry. 68 bytes per failure matches the open-limit
+  message length; a per-reason count per block was not taken.
+- **Per action, not per order:** ~10 KB per block, ~0.14% of the ~7.2 MB
+  flush batch. One entry per order would be ~45k entries per block.
+- **Deterministic:** failure counts and byte totals are identical on all 3
+  validators in both cells.
+- **Still reported as executed:** IOC orders with zero fills (the bench's
+  ~1.5M "rej cancelled" per cell) and crossing post-only orders; the
+  executor reports both as success. Recording them needs the settle loop
+  in `native_executor.rs`.
+- **Reason codes come from the executor's error text** (margin,
+  open_limit, tick, lot, price, batch_cap, fill, other); a changed message
+  falls back to `other` until the executor returns a typed reason.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1080,6 +1141,9 @@ trie off, so unlike 10.2 the flush side is comparable too).
   0.638x / 0.648x ratios (sections 10.1, 12.1).
 - Cheaper hasher for the Address-keyed maps (`TraderMargins`), +0.46
   ms/1k of SipHash in `239ff69` (section 12.2).
+- C: zero-fill IOC and crossing post-only orders still show "executed",
+  and reason codes are parsed from error text; both need
+  `native_executor.rs` (section 13.2).
 - Optional: cheaper shed path (peek the action tag or const-hex) and the
   1.22-1.27x signature-verify cost per admitted action on crab (section
   6.4).
