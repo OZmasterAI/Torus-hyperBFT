@@ -18,6 +18,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 6 | C3 + PF1 (`d9ef4f7`): is the 10-market gap the bench's resend loop? Where does 300 markets go? Gate 3? | Not the resend loop (0.75x with retry, 0.66x without). 300 markets 0.555x main: margin + liquidation = `positions_for_trader` scans. Gate 3 margin FAIL (2.15 > 1.5), match PASS (1.32) |
 | 7 | Baseline `14236fa` (C4): what changed, what is left? | 300 markets unchanged (49.4k, 0.553x main); liquidation 3.1-3.4 ms/1k (-15%), biggest crab-only cost `maker_fill_fits` 4.2-4.5. ubench ratios to `9c4be2c` all past their fail lines except settle. Empty block 30.0 ms, 10.7 of it trie flush |
 | 8 | Is the native trie root used? What is left after C6 / C7? | Trie root: no production reader; off by default saves ~17 ms per empty block and ~4 ms/1k on the flush worker (owner question open). After C6 / C7: crab ~0.58x main estimated; ~6 ms/1k of named fixes reach ~0.78x, the rest needs an IPC measurement |
+| 9 | Does the crab / main ratio change with the trie off? Is the shared-code inflation cache misses? | Trie off: crab +3.4%, main +12.5%, ratio 0.553x -> 0.508x (main was partly flush-bound). Inflation is 1.2-2.5x more instructions per fill, not lower IPC |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -524,61 +525,117 @@ more ms/1k must go. A plausible path, about 6.0 (~0.78x):
 The last ~2 would have to come from the per-operation inflation, so the
 next measurement is `perf stat` IPC and LLC misses on the execution thread.
 
-## 9. Trie maintenance on vs off, 300 markets (PRELIMINARY, 2026-10-05)
-
-**Status:** 3 of 4 trie-off cells done, `ozarchy-trie0-main-r2` still
-running. The IPC counter analysis and the agent's per-thread CPU and
-flush-worker numbers are not in yet. Numbers below come straight from each
-cell's `summary.json`.
+## 9. Trie maintenance on vs off, and IPC / cache misses (300 markets, 2026-10-05)
 
 Same binaries as section 7: crab `14236fa` (node md5 `7da38063`), main
 `92a02ed` (`31a95c65`), the `14236fa` load generator. 300 markets, cap
-400, rate 76,000, `RETRY_BUSY=1`, 120 s; crab with the oracle feed. The
-logged node env shows `TORUS_NATIVE_TRIE_MAINTENANCE=0` for the trie-off
-cells. The section 6 and 7 cells did not set it, so they ran with
-maintenance on (the default). 18c's campaign `arms.conf.example` sets `=0`
-on every arm, so cells from that harness are trie-off cells.
+400, rate 76,000, `RETRY_BUSY=1`, 120 s; crab with the oracle feed. All
+cells AGREE, liveness PASS, ACCEPT. Analyses: `ozarchy-trie0-analysis.md`,
+`ozarchy-ipc-analysis.md`.
+
+### 9.1 Trie maintenance on vs off
+
+The section 6 and 7 cells did not set `TORUS_NATIVE_TRIE_MAINTENANCE`, so
+they ran with maintenance **on** (the default). 18c's campaign
+`arms.conf.example` sets `=0` on every arm, so cells from that harness are
+trie-off cells. For the trie-off cells `=0` was passed through `EXTRA_ENV`:
+all 3 nodes had it in their environment, every node log has the
+"maintenance DISABLED ... trie marked stale" boot line, and no rebuild ran.
 
 | cell | trie | matched/s | best60 | engine ms/1k | chain ms | pipelined ms | handoff wait ms | commit ms avg |
 |---|---|---|---|---|---|---|---|---|
-| crab `14236fa` r1 (section 7) | on | 48,220 | 80,519 | 14.41 | 1,007 | 583 | 1.83 | 847 |
-| crab `14236fa` r2 (section 7) | on | 50,651 | 79,503 | 14.11 | 827 | 489 | 1.78 | 687 |
+| crab r1 (section 7) | on | 48,220 | 80,519 | 14.41 | 1,007 | 583 | 1.83 | 847 |
+| crab r2 (section 7) | on | 50,651 | 79,503 | 14.11 | 827 | 489 | 1.78 | 687 |
 | main r1 (section 6.2) | on | 87,792 | 125,375 | 7.24 | 764 | 689 | 77.87 | 572 |
 | main r2 (section 6.2) | on | 91,023 | 121,136 | 6.86 | 722 | 660 | 98.94 | 556 |
 | crab `ozarchy-trie0-crab-r1` | off | 51,871 | 80,659 | 13.86 | 920 | 167 | 0.01 | 852 |
 | main `ozarchy-trie0-main-r1` | off | 100,744 | 129,761 | 7.05 | 560 | 172 | 0.24 | 477 |
 | crab `ozarchy-trie0-crab-r2` | off | 50,398 | 80,709 | 14.09 | 850 | 149 | 0.01 | 724 |
-| main `ozarchy-trie0-main-r2` | off | pending | | | | | | |
+| main `ozarchy-trie0-main-r2` | off | 100,401 | 132,426 | 7.07 | 568 | 174 | 0.23 | 485 |
 
-All finished cells: AGREE, liveness PASS, ACCEPT.
+| arm | trie on (mean) | trie off (mean) | change | CPU-s per 1M fills on -> off |
+|---|---|---|---|---|
+| crab | 49,435 | 51,134 | +3.4% | 106 -> 100 |
+| main | 89,407 | 100,573 | +12.5% | 68 -> 60 |
+| **crab / main** | **0.553x** | **0.508x** | worse | |
 
-So far:
-- **Crab:** 49.4k -> 51.1k matched/s (+3.4%) with the trie off. The engine
-  time per fill is unchanged (14.1-14.4 vs 13.9-14.1): crab is bound by
-  execution, so the flush worker's saving barely shows.
-- **Main:** 89.4k -> 100.7k (+12.7%, one cell). With the trie on, main's
-  execution thread waited ~78-99 ms per block for the previous flush
-  (handoff wait). With it off that wait is gone (0.24 ms), so main gains
-  more than crab.
-- **Pipelined time** (the flush side) drops from ~490-690 ms to ~150-170 ms
-  per block on both arms.
-- **Ratio, preliminary:** trie on 0.553x; trie off 51.1k / 100.7k = ~0.51x.
-  The crab/main ratio gets slightly worse with the trie off, because only
-  main was partly flush-bound. Wait for main-r2 before relying on it. The
-  trie-on cells come from earlier sessions (drift of a few percent is
-  possible); the trie-off pair ran interleaved in one window.
+- **The ratio gets worse with the trie off.** With it on, main is partly
+  held back by the flush worker: its execution thread waited 78-99 ms per
+  block for the previous flush (handoff wait). Crab is limited by its own
+  execution thread (handoff wait ~2 ms), so removing the trie frees main
+  far more than crab.
+- **Engine time per fill does not change** on either arm; the flush side
+  (pipelined time) drops from ~490-690 to ~150-175 ms per block on both.
+- **Drift:** the trie-on cells are from earlier sessions (main's with a
+  different load generator, the C3 + PF1 bench, same node binary). The
+  trie-off pair ran interleaved in one window. The direction holds; the
+  size (0.553 -> 0.508) is about +-0.02. A trie-on pair in the same session
+  would remove the caveat.
+- **For comparisons with 18c:** cells from 18c's campaign harness (trie
+  off) put main ~12% higher than ours, and crab ~3% higher.
 
-IPC cells (`ozarchy-ipc-{crab,main}`, run under `perf record` with a
-cycles + instructions event group, so throughput is lower than unprofiled
-cells): crab 45,261 vs main 79,065 matched/s, engine 14.86 vs 7.67 ms/1k,
-both AGREE / PASS / ACCEPT. The counter analysis is pending.
+### 9.2 IPC and cache misses: why shared code costs more on crab
+
+One crab cell and one main cell (`ozarchy-ipc-{crab,main}`) under
+`perf record -F 499 --call-graph fp` on val0, each event sampled on its own:
+cycles, instructions, L1d load misses, loads served from DRAM
+(`ls_dmnd_fills_from_sys.mem_io_local`; this Zen 3 host has no per-process
+`LLC-load-misses`) and branch misses, for 45 s from 35 s into the load.
+`perf record -p` follows threads created after it attaches (checked), so
+the short-lived execution workers are counted. Throughput under 5 events:
+crab 45,261, main 79,065 matched/s (0.92x / 0.88x of the unprofiled cells;
+ratio 0.57x). Cycles are converted at ~3.3 GHz.
+
+| group, per 1k fills (crab / main) | Mcycles | Minstr | IPC | L1d misses / 1k instr | DRAM fills / 1k instr | branch misses / 1k instr |
+|---|---|---|---|---|---|---|
+| whole process | 412 / 260 | 603 / 421 | 1.46 / 1.62 | 9.6 / 8.9 | 0.55 / 0.43 | 1.47 / 1.23 |
+| execution (incl. workers) | 95.5 / 43.3 | 98.8 / 48.4 | 1.03 / 1.12 | 15.2 / 14.7 | 1.53 / 1.14 | 1.73 / 1.62 |
+| flush worker | 42.8 / 34.6 | 61.0 / 49.8 | 1.42 / 1.44 | 6.1 / 5.9 | 0.85 / 0.85 | 1.23 / 1.16 |
+| RPC workers | 222 / 103 | 353 / 168 | 1.59 / 1.62 | 8.1 / 8.1 | 0.31 / 0.30 | 1.54 / 1.49 |
+
+Shared functions, extra cycles on crab split into more instructions and
+lower IPC:
+
+| function | Mcycles / 1k fills (crab / main) | instr ratio | IPC (crab / main) | extra = from instructions + from IPC |
+|---|---|---|---|---|
+| `match_market` (self) | 1.05 / 0.55 | 2.12 | 1.20 / 1.08 | +0.50 = +0.62 - 0.12 |
+| `match_at_level` (self) | 1.07 / 0.58 | 2.47 | 1.30 / 0.96 | +0.48 = +0.86 - 0.37 |
+| `insert_order` (self) | 0.43 / 0.30 | 1.58 | 1.07 / 0.98 | +0.13 = +0.17 - 0.04 |
+| `cancel_all_many` (incl.) | 1.30 / 0.96 | 1.39 | 0.57 / 0.55 | +0.34 = +0.38 - 0.04 |
+| `sort_native_actions` (incl.) | 0.40 / 0.32 | 1.37 | 0.75 / 0.70 | +0.09 = +0.12 - 0.03 |
+| `drain_book` (incl.) | 3.71 / 2.67 | 1.40 | 1.04 / 1.03 | +1.04 = +1.06 - 0.02 |
+| `PositionCache::flush_all` (incl.) | 2.22 / 1.83 | 1.22 | 1.36 / 1.35 | +0.39 = +0.40 - 0.01 |
+| `execute_batch_phases` self (incl. inlined settle) | 5.24 / 3.09 | 1.60 | 0.67 / 0.71 | +2.15 = +1.85 + 0.29 |
+| `compute_market_settle_plan` (self) | 1.30 / 0.91 | 1.05 | 0.78 / 1.06 | +0.39 = +0.04 + 0.34 |
+| **sum** | | | | **+5.50 = +5.51 - 0.01 (~1.7 ms/1k)** |
+
+- **Verdict: more instructions, not cache misses.** The shared code runs
+  1.2-2.5x more instructions per fill on crab; the IPC part nets to about
+  zero. Misses per instruction (L1d, DRAM, dTLB) are the same within
+  noise, and matching even runs at a higher IPC on crab. Only
+  `compute_market_settle_plan` and the glue lose IPC (~0.2 ms/1k together).
+- `match_market` / `match_at_level` include crab-only margin code inlined
+  into them (~0.4 ms/1k, section 8.2), so not all of their extra
+  instructions are shared code.
+- **Lower IPC does cost the execution path ~7.2 Mcycles (~2.2 ms/1k)**, but
+  in crab-only code: `positions_for_trader` IPC 0.65 with 2.6 DRAM fills
+  per 1k instructions; `get_cf_raw` and `maker_fill_fits` IPC 0.82. Fewer
+  range scans (the C7 layout, `AccountMargins` as a Vec by sender slot) is
+  the cache fix, worth up to ~2 ms/1k.
+- **Next:** count calls per fill and `perf annotate` the instructions event
+  for `drain_book`, `cancel_all_many`, `insert_order` and `match_market` in
+  both builds, to separate "called more often" from "more instructions per
+  call", then cut the per-call work.
 
 ## Open
 
 - Native trie maintenance off by default: owner question on the
   `*_with_native` paths (section 8.1).
-- IPC / LLC-miss measurement on the execution thread, crab vs main, to
-  explain the ~1.6 ms/1k of shared-code inflation (section 8.2).
+- Shared-code inflation (~1.7 ms/1k) is extra instructions, not cache
+  misses (section 9.2): next, calls per fill and `perf annotate` of
+  `drain_book`, `cancel_all_many`, `insert_order`, `match_market`.
+- A trie-on crab / main pair in one session, to tighten the 0.553 -> 0.508
+  trie on/off comparison (section 9.1).
 - E1 (oracle step) postponed, low priority: 5.8 ms per empty block on
   ozarchy (section 7.3).
 - Margin and liquidation at 300 markets: `positions_for_trader` overlay
