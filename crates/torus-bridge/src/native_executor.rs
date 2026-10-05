@@ -7264,13 +7264,19 @@ impl NativeExecutor {
     /// Same-batch bid bound (s87): `o`'s shape can rest in `book` — a GTC /
     /// PostOnly `Limit`, not reduce-only, price > 0 on the tick, quantity >=
     /// lot. Whether it does also depends on the opposing side (s89).
+    /// Item 6 P4(b): `o` passed Phase 2, which (fix A, s92) rejects dust
+    /// and off-tick orders against [`phase2_book_shapes`] — this `book`'s
+    /// tick and lot (nothing touches the books in between) — so only the
+    /// other conditions are checked here.
     fn can_rest_shape(o: &PlaceOrderParams, book: &OrderBook) -> bool {
+        debug_assert!(
+            Self::book_shape_violation(o, (book.tick_size, book.lot_size)).is_none(),
+            "Phase 2 rejects dust and off-tick orders"
+        );
         matches!(o.order_type, OrderType::Limit)
             && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
             && !o.reduce_only
             && o.price > FixedPoint::ZERO
-            && (book.tick_size <= FixedPoint::ZERO || o.price.raw() % book.tick_size.raw() == 0)
-            && o.quantity >= book.lot_size
     }
 
     /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of

@@ -31,6 +31,17 @@ impl StateBackend for EmptyBackend {
     }
 }
 
+/// The pre-P4(b) `can_rest_shape` (d52a33f), verbatim: P4(b) dropped the
+/// tick and lot clauses, which fix A's Phase-2 reject made redundant.
+fn old_can_rest_shape(o: &PlaceOrderParams, book: &OrderBook) -> bool {
+    matches!(o.order_type, OrderType::Limit)
+        && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
+        && !o.reduce_only
+        && o.price > FixedPoint::ZERO
+        && (book.tick_size <= FixedPoint::ZERO || o.price.raw() % book.tick_size.raw() == 0)
+        && o.quantity >= book.lot_size
+}
+
 /// The pre-PF1 `same_batch_bid_top_ups` (d52a33f), verbatim: the oracle.
 #[allow(clippy::too_many_arguments)]
 fn old_top_ups<T: StateBackend>(
@@ -56,7 +67,7 @@ fn old_top_ups<T: StateBackend>(
         for (k, p) in batch.iter().enumerate() {
             let o = p.params;
             if !o.is_buy {
-                if NativeExecutor::can_rest_shape(o, book) {
+                if old_can_rest_shape(o, book) {
                     let q = batch_asks.entry(o.price).or_insert(FixedPoint::ZERO);
                     *q = sat_add(*q, o.quantity);
                 }
@@ -67,7 +78,7 @@ fn old_top_ups<T: StateBackend>(
                 }
                 continue;
             }
-            if !NativeExecutor::can_rest_shape(o, book) {
+            if !old_can_rest_shape(o, book) {
                 continue;
             }
             let lowest_ask = batch_asks.keys().next().map_or(ask, |&a| a.min(ask));
