@@ -403,6 +403,53 @@ pub fn reduce_only_allowance(signed_pos: FixedPoint, is_buy: bool) -> FixedPoint
     }
 }
 
+/// Item 6 M1 (review rows 40-42): why a placement breaks its market's tick or
+/// lot. One text for the executor's pre-book reject, the RPC's intake check
+/// and (after "modify rejected: ") the modify path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeViolation {
+    /// `quantity < lot` (every order type).
+    BelowLot { quantity: FixedPoint, lot: FixedPoint },
+    /// A `Limit` price, or a `StopLimit` limit, off a positive tick.
+    OffTick { price: FixedPoint, tick: FixedPoint },
+}
+
+impl std::fmt::Display for ShapeViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BelowLot { quantity, lot } => write!(f, "quantity {quantity} below the lot size {lot}"),
+            Self::OffTick { price, tick } => write!(f, "price {price} is not a multiple of the tick {tick}"),
+        }
+    }
+}
+
+impl ShapeViolation {
+    /// The placement reject text (executor and RPC).
+    pub fn placement_message(&self) -> String {
+        format!("order rejected: {self}")
+    }
+}
+
+/// Item 6 M1: the placement shape rule of a market with `tick` / `lot` —
+/// [`OrderBook::place_order_with_accounts`]'s dust and tick rejects, same
+/// order (lot first, for every order type; then the tick when `tick > 0`
+/// for a `Limit` price), plus (row 40) a `StopLimit`'s limit, which is the
+/// `Limit` price it is placed at when triggered.
+pub fn shape_violation(params: &PlaceOrderParams, tick: FixedPoint, lot: FixedPoint) -> Option<ShapeViolation> {
+    if params.quantity < lot {
+        return Some(ShapeViolation::BelowLot { quantity: params.quantity, lot });
+    }
+    let price = match params.order_type {
+        OrderType::Limit => params.price,
+        OrderType::StopLimit { limit, .. } => limit,
+        OrderType::Market | OrderType::StopMarket { .. } => return None,
+    };
+    (tick > FixedPoint::ZERO && price.raw() % tick.raw() != 0).then_some(ShapeViolation::OffTick { price, tick })
+}
+
+#[cfg(test)]
+mod shape_tests;
+
 /// F1 (s517): account-level margin state of ONE book for the current
 /// placement / batch — the running free margin (and position valuation
 /// price) of each trader whose fills the book must check. Installed by the

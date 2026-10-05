@@ -18,8 +18,9 @@ use torus_core::margin::{
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    reduce_only_allowance, AccountMargins, Fill, MakerAccount, MakerAccountSource, OrderBook,
-    OrderStatus, PlaceResult, ReduceOnlyPositions, TakerMarginLimit, TriggeredStop,
+    reduce_only_allowance, shape_violation, AccountMargins, Fill, MakerAccount, MakerAccountSource,
+    OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit,
+    TriggeredStop,
 };
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
@@ -7304,8 +7305,14 @@ impl NativeExecutor {
     /// IOC limit, so its `price` is a REQUIRED worst-acceptable-price cap
     /// (the book never matches past it). Pre-s515 a market order reserved
     /// zero margin and matched at any price.
+    /// Item 6 M1 (row 41): a `Limit` price must be positive too (the book
+    /// rejects it; checked here so it is rejected before the book).
     fn validate_order_price(params: &PlaceOrderParams) -> Result<(), String> {
         match params.order_type {
+            OrderType::Limit if params.price <= FixedPoint::ZERO => Err(format!(
+                "limit order requires a positive price, got {}",
+                params.price
+            )),
             OrderType::Market | OrderType::StopMarket { .. } if params.price <= FixedPoint::ZERO => {
                 Err(format!(
                     "market order requires a positive price cap (worst acceptable price), got {}",
@@ -7326,24 +7333,11 @@ impl NativeExecutor {
     /// gets no order id and no in-batch projection / D2 pool. `shape` = the
     /// market book's `(tick_size, lot_size)`; a market without a book uses
     /// `(ONE, ONE)`, the book placement would create. The book keeps its own
-    /// checks.
+    /// checks. Item 6 M1: the rule and its text are
+    /// [`torus_core::order_book::shape_violation`] (shared with the RPC
+    /// intake check), which also checks a `StopLimit`'s limit (row 40).
     fn book_shape_violation(params: &PlaceOrderParams, (tick, lot): (FixedPoint, FixedPoint)) -> Option<String> {
-        if params.quantity < lot {
-            return Some(format!(
-                "order rejected: quantity {} below the lot size {lot}",
-                params.quantity
-            ));
-        }
-        if matches!(params.order_type, OrderType::Limit)
-            && tick > FixedPoint::ZERO
-            && params.price.raw() % tick.raw() != 0
-        {
-            return Some(format!(
-                "order rejected: price {} is not a multiple of the tick {tick}",
-                params.price
-            ));
-        }
-        None
+        shape_violation(params, tick, lot).map(|v| v.placement_message())
     }
 
     /// Fix A (s92): a market's `(tick_size, lot_size)` for
@@ -8179,10 +8173,8 @@ impl NativeExecutor {
             && book.tick_size > FixedPoint::ZERO
             && price.raw() % book.tick_size.raw() != 0
         {
-            return err(format!(
-                "modify rejected: price {price} is not a multiple of the tick {}",
-                book.tick_size
-            ));
+            let v = ShapeViolation::OffTick { price, tick: book.tick_size };
+            return err(format!("modify rejected: {v}"));
         }
         let mut qty = new_qty.unwrap_or(old.remaining_qty);
         if qty <= FixedPoint::ZERO {
@@ -8192,10 +8184,8 @@ impl NativeExecutor {
         // REQUESTED quantity; the reduce-only clamp below may land under it
         // (it closes the position exactly — placement rests such an order too).
         if new_qty.is_some() && qty < book.lot_size {
-            return err(format!(
-                "modify rejected: quantity {qty} below the lot size {}",
-                book.lot_size
-            ));
+            let v = ShapeViolation::BelowLot { quantity: qty, lot: book.lot_size };
+            return err(format!("modify rejected: {v}"));
         }
         let crosses = if is_buy {
             book.best_ask().is_some_and(|ask| price >= ask)
