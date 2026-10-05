@@ -243,6 +243,10 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         self.inner.resident_changes(cf, prefix)
     }
 
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        self.inner.layer_keys(cf)
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
         self.inner.atomic_write(ops)
     }

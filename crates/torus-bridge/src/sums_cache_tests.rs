@@ -552,3 +552,146 @@ fn delta_guard_falls_back_when_build_order_overflows() {
     assert_eq!(c.delta.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(c.delta_fallback.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+/// C6c (D): every maker is valued at most once per `execute_batch` call,
+/// clean or dirty, serial or with 4 workers. Four makers rest asks in six
+/// books; an IOC buy dirties makers 0 and 1 (market 1); then two batches
+/// buy through makers 0-3 in the five other books. A valuation = a memo
+/// build, a partial re-value or a direct build (not a cache hit). Every
+/// answer is shadow-checked against `build`.
+#[test]
+fn maker_valued_at_most_once_per_batch() {
+    const BOOKS: u64 = 6;
+    const MAKERS: u64 = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let now = 10_000;
+    let makers: Vec<Address> = (0..MAKERS).map(trader).collect();
+    {
+        let pm = PositionManager::new(db.clone());
+        for m in 1..=BOOKS + 10 {
+            if m <= BOOKS {
+                db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+            }
+            db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(MID + m as i64), now - 1)).unwrap();
+            for (i, mk) in makers.iter().enumerate() {
+                pm.put_position(&Position {
+                    trader: *mk,
+                    market_id: m,
+                    is_long: (m + i as u64) % 2 == 0,
+                    size: fp(2 + i as i64),
+                    entry_price: fp(MID - 7),
+                    realized_pnl: FixedPoint::ZERO,
+                    isolated_margin: FixedPoint::ZERO,
+                    margin_type: MarginType::Cross,
+                })
+                .unwrap();
+            }
+        }
+        for i in 0..MAKERS + BOOKS + 2 {
+            pm.put_native_balance(&trader(i), &NativeBalance { available: fp(10_000_000), order_margin: FixedPoint::ZERO }).unwrap();
+        }
+    }
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut overlay, 1, None);
+    let mut ctx = NativeExecContext::new(overlay.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    ctx.sums.as_mut().expect("slot sums attached").shadow = true;
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    let order = |m: MarketId, is_buy: bool, qty: i64, tif: TimeInForce| {
+        NativeAction::PlaceOrder(PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: fp(MID),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: tif,
+            reduce_only: false,
+            client_order_id: None,
+        })
+    };
+    let valued = |ctx: &NativeExecContext<NativeStateOverlay>| -> Vec<usize> {
+        let c = &ctx.sums.as_ref().unwrap().counters;
+        makers.iter().map(|m| c.valuations_of(m)).collect()
+    };
+    let run = |ctx: &mut NativeExecContext<NativeStateOverlay>, actions: &[(Address, NativeAction)], threads: usize, tag: &str| {
+        let before = valued(ctx);
+        let r = NativeExecutor::execute_batch_engine_mode(ctx, actions, threads);
+        assert!(r.results.iter().all(|x| x.success), "{tag}: {:?}", r.results.iter().map(|x| &x.error).collect::<Vec<_>>());
+        let after = valued(ctx);
+        for (i, (a, b)) in after.iter().zip(before.iter()).enumerate() {
+            assert!(a - b <= 1, "{tag}: maker {i} valued {}x in one batch", a - b);
+        }
+    };
+    let asks: Vec<_> = makers.iter().flat_map(|mk| (1..=BOOKS).map(move |m| (*mk, order(m, false, 10, TimeInForce::GTC)))).collect();
+    run(&mut ctx, &asks, 0, "asks");
+    let taker = |k: u64| trader(MAKERS + k);
+    run(&mut ctx, &[(taker(0), order(1, true, 11, TimeInForce::IOC))], 0, "pre-EVM IOC");
+    for mk in &makers[..2] {
+        assert!(ctx.positions.state().layer_touches(CF_NATIVE_POSITIONS, mk.as_slice()), "makers 0, 1 dirtied");
+    }
+    for (threads, tag) in [(0usize, "post-EVM serial"), (4, "post-EVM 4 workers")] {
+        let buys: Vec<_> = (2..=BOOKS).map(|m| (taker(m), order(m, true, 25, TimeInForce::GTC))).collect();
+        run(&mut ctx, &buys, threads, tag);
+    }
+    let sums = ctx.sums.as_ref().unwrap();
+    let bad = sums.shadow_mismatches.lock().unwrap().clone();
+    assert!(bad.is_empty(), "{bad:?}");
+    assert!(sums.counters.dirty.load(std::sync::atomic::Ordering::Relaxed) > 0, "dirty makers asked for");
+    let reference = AccountReader { sums: None, ..AccountReader::of(&ctx) };
+    let cached = AccountReader::of(&ctx);
+    for mk in &makers {
+        let bal = ctx.positions.get_native_balance(mk).unwrap();
+        assert_eq!(cached.view(mk, &bal).unwrap(), reference.view(mk, &bal).unwrap());
+    }
+    for m in 2..=BOOKS {
+        let p = ctx.positions.get_position(&taker(m), m).unwrap().expect("taker filled");
+        assert_eq!(p.size, fp(4 * 10), "market {m}: every maker's ask taken");
+    }
+}
+
+/// C6c: the Phase 3 worker's maker cache serves one batch only: a new
+/// batch on the same thread sees the maker's account as it is now (here a
+/// balance and a position written between the two batches).
+#[test]
+fn worker_maker_cache_is_per_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let now = 10_000;
+    let mk = trader(0);
+    db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(MID), now - 1)).unwrap();
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut overlay, 1, None);
+    let mut ctx = NativeExecContext::new(overlay.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    ctx.positions.put_native_balance(&mk, &NativeBalance { available: fp(1_000), order_margin: FixedPoint::ZERO }).unwrap();
+    let free = |ctx: &NativeExecContext<NativeStateOverlay>| {
+        let batch = BatchSums::new(&ctx.positions);
+        let reader = AccountReader { batch: Some(&batch), ..AccountReader::of(ctx) };
+        let first = reader.maker_free(&mk);
+        assert_eq!(reader.maker_free(&mk), first, "same batch: cached");
+        assert_eq!(first, AccountReader::of(ctx).maker_free(&mk), "== the uncached value");
+        first
+    };
+    assert_eq!(free(&ctx), fp(1_000));
+    ctx.positions.put_native_balance(&mk, &NativeBalance { available: fp(2_000), order_margin: FixedPoint::ZERO }).unwrap();
+    assert_eq!(free(&ctx), fp(2_000), "next batch: the new balance");
+    ctx.positions
+        .put_position(&Position {
+            trader: mk,
+            market_id: 1,
+            is_long: true,
+            size: fp(10),
+            entry_price: fp(MID - 10),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+    // UPnL +100, IM 10 x 1000 / 20 = 500.
+    assert_eq!(free(&ctx), fp(2_000 + 100 - 500), "next batch: the new position");
+}

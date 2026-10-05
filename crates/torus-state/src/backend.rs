@@ -85,6 +85,14 @@ pub trait StateBackend: Clone + Send + Sync {
         None
     }
 
+    /// Item 6 C6c: with resident rows attached and `cf` one of their CFs,
+    /// every key of `cf` THIS block's own pending set writes or deletes,
+    /// sorted (`layer_touches(cf, p)` iff one of them starts with `p`).
+    /// Default `None` = not available (callers ask `layer_touches`).
+    fn layer_keys(&self, _cf: &str) -> Option<Vec<Vec<u8>>> {
+        None
+    }
+
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
 
     fn get_account(&self, address: &Address) -> Result<Option<AccountInfo>, StateError> {
@@ -2046,6 +2054,16 @@ impl StateBackend for NativeStateOverlay {
             }
             _ => true,
         }
+    }
+
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        let id = intern_cf(cf)?;
+        self.resident_rows(id)?;
+        let state = self.pending.read().unwrap();
+        let cfp = state.cf(id);
+        let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
+        keys.sort_unstable();
+        Some(keys)
     }
 
     fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {

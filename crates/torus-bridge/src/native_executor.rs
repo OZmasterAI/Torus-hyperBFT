@@ -776,6 +776,9 @@ struct AccountReader<'a, T: StateBackend> {
     /// Item 6 C3: the block's margin sums cache (`None`: every valuation
     /// builds over the trader's rows, the reference path).
     sums: Option<&'a BlockSums>,
+    /// Item 6 C6c: the `execute_batch` call's valuation state (Phase 2 / 3
+    /// reader only; `None` elsewhere).
+    batch: Option<&'a BatchSums>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -880,6 +883,9 @@ struct SumsCounters {
     /// Full valuations (`build` over a trader's rows: the memo's or a
     /// direct one; not the shadow check's) per trader.
     builds: std::sync::Mutex<HashMap<Address, usize>>,
+    /// C6c: valuations per trader — full builds plus partial re-values
+    /// (cache / memo hits are not valuations).
+    valuations: std::sync::Mutex<HashMap<Address, usize>>,
     /// C4: liquidation valuations through L1 / through the walk (L1 off).
     l1: std::sync::atomic::AtomicUsize,
     l1_off: std::sync::atomic::AtomicUsize,
@@ -894,6 +900,16 @@ fn bump(c: &std::sync::atomic::AtomicUsize) {
 impl SumsCounters {
     fn built(&self, trader: &Address) {
         *self.builds.lock().unwrap().entry(*trader).or_insert(0) += 1;
+        self.valued(trader);
+    }
+
+    fn valued(&self, trader: &Address) {
+        *self.valuations.lock().unwrap().entry(*trader).or_insert(0) += 1;
+    }
+
+    /// Valuations of `trader` so far.
+    pub(crate) fn valuations_of(&self, trader: &Address) -> usize {
+        self.valuations.lock().unwrap().get(trader).copied().unwrap_or(0)
     }
 
     /// Full valuations of `trader` so far.
@@ -966,6 +982,52 @@ impl BlockSums {
                 .push(format!("{trader}: cached {cached:?}, reference {want:?}"));
         }
     }
+}
+
+/// Item 6 C6c (D): one `execute_batch` call's valuation state, on its
+/// Phase 2 / 3 reader. Sound because the backend is frozen while that
+/// reader lives: Phase 2 and Phase 4 write through the balance / position
+/// caches, flushed after settlement (the reader is gone by then), and the
+/// Phase 3 workers only read. Built only with a sums cache attached.
+/// * `dirty`: the traders with own pending position writes, read once
+///   (`layer_keys`) in place of a `layer_touches` lock per (maker, book);
+///   `None` = not available (ask `layer_touches`).
+/// * `memo`: a dirty trader's sums, computed once per call (partial
+///   re-value or build); a cell holding `None` = a read error (the caller
+///   computes it directly and gets the error).
+/// * `id`: keys each Phase 3 worker's maker cache ([`MAKER_FREE`]).
+pub(crate) struct BatchSums {
+    id: u64,
+    dirty: Option<std::collections::HashSet<Address>>,
+    memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
+}
+
+/// C6c: source of [`BatchSums::id`] (process-wide, never reused; 0 unused).
+static BATCH_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl BatchSums {
+    fn new<T: StateBackend>(positions: &PositionManager<T>) -> Self {
+        let dirty = positions.state().layer_keys(torus_state::cf::CF_NATIVE_POSITIONS).map(|keys| {
+            keys.iter()
+                .filter(|k| k.len() >= TRADER_PREFIX)
+                .map(|k| Address::from_slice(&k[..TRADER_PREFIX]))
+                .collect()
+        });
+        Self {
+            id: BATCH_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            dirty,
+            memo: std::sync::Mutex::default(),
+        }
+    }
+}
+
+thread_local! {
+    /// C6c (D): each Phase 3 worker's maker cache, in front of the shared
+    /// memo locks: [`AccountReader::maker_free`] per maker for the batch
+    /// `.0` ([`BatchSums::id`]; another batch clears it). A maker's free
+    /// margin is the same in every market of a batch (frozen backend).
+    static MAKER_FREE: std::cell::RefCell<(u64, HashMap<Address, FixedPoint>)> =
+        std::cell::RefCell::new((0, HashMap::new()));
 }
 
 /// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
@@ -1046,6 +1108,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
+            batch: None,
         }
     }
 
@@ -1092,24 +1155,36 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     fn pos_sums(&self, trader: &Address) -> Result<PosSums, CoreError> {
         let r = match (self.sums, self.marks) {
             (Some(s), Some(table)) if s.memo_version == Some(table.version) => {
-                if self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()) {
+                let dirty = match self.batch.and_then(|b| b.dirty.as_ref()) {
+                    Some(set) => set.contains(trader),
+                    None => self
+                        .positions
+                        .state()
+                        .layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()),
+                };
+                if dirty {
                     #[cfg(test)]
                     bump(&s.counters.dirty);
-                    match self.delta_sums(s, table, trader) {
-                        Some(r) => {
-                            #[cfg(test)]
-                            {
-                                bump(&s.counters.delta);
-                                s.shadow_check(trader, &r, || self.reference_sums(trader));
+                    // C6c: once per `execute_batch` call.
+                    let r = match self.batch {
+                        Some(b) => {
+                            let cell = b
+                                .memo
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .entry(*trader)
+                                .or_default()
+                                .clone();
+                            match *cell.get_or_init(|| self.dirty_sums(s, table, trader).ok()) {
+                                Some(r) => r,
+                                None => self.dirty_sums(s, table, trader)?,
                             }
-                            r
                         }
-                        None => {
-                            #[cfg(test)]
-                            bump(&s.counters.delta_fallback);
-                            self.direct_sums(trader)?
-                        }
-                    }
+                        None => self.dirty_sums(s, table, trader)?,
+                    };
+                    #[cfg(test)]
+                    s.shadow_check(trader, &r, || self.reference_sums(trader));
+                    r
                 } else {
                     let r = self.cached_sums(s, table.version, trader)?;
                     #[cfg(test)]
@@ -1120,6 +1195,25 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             _ => self.direct_sums(trader)?,
         };
         r.map_err(|()| CoreError::Overflow("account margin overflows i128".into()))
+    }
+
+    /// Path 2: the partial re-value (C6b), else `build` over the overlay.
+    fn dirty_sums(&self, s: &BlockSums, table: &BlockMarks, trader: &Address) -> Result<SumsResult, CoreError> {
+        match self.delta_sums(s, table, trader) {
+            Some(r) => {
+                #[cfg(test)]
+                {
+                    bump(&s.counters.delta);
+                    s.counters.valued(trader);
+                }
+                Ok(r)
+            }
+            None => {
+                #[cfg(test)]
+                bump(&s.counters.delta_fallback);
+                self.direct_sums(trader)
+            }
+        }
     }
 
     /// Paths 1 and 2: `build` over the trader's rows as the backend shows them.
@@ -1290,11 +1384,41 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
 impl<T: StateBackend> AccountReader<'_, T> {
     /// F1 (s517 #4): a maker's snapshot free margin — balance and positions
     /// from the backend. A read error snapshots as 0 (deterministic).
+    /// C6c: on a batch reader, once per maker per Phase 3 worker
+    /// ([`MAKER_FREE`]).
     fn maker_free(&self, maker: &Address) -> FixedPoint {
-        self.positions
-            .get_native_balance(maker)
-            .and_then(|b| self.view(maker, &b))
-            .map_or(FixedPoint::ZERO, |v| v.free())
+        let compute = || {
+            self.positions
+                .get_native_balance(maker)
+                .and_then(|b| self.view(maker, &b))
+                .map_or(FixedPoint::ZERO, |v| v.free())
+        };
+        let Some(b) = self.batch else {
+            return compute();
+        };
+        let hit = MAKER_FREE.with(|c| {
+            let c = c.borrow();
+            if c.0 == b.id { c.1.get(maker).copied() } else { None }
+        });
+        if let Some(free) = hit {
+            #[cfg(test)]
+            if let Some(s) = self.sums.filter(|s| s.shadow) {
+                let want = compute();
+                if want != free {
+                    s.shadow_mismatches.lock().unwrap().push(format!("maker_free {maker}: worker cache {free:?}, now {want:?}"));
+                }
+            }
+            return free;
+        }
+        let free = compute();
+        MAKER_FREE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != b.id {
+                *c = (b.id, HashMap::new());
+            }
+            c.1.insert(*maker, free);
+        });
+        free
     }
 
     /// F1: `maker`'s signed position in `market_id` and its valuation price;
@@ -4955,6 +5079,9 @@ impl NativeExecutor {
         // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
         // coexists with the stitch's `&mut ctx.next_global_order_id`. Item 6
         // C2: marks from the block's table (fix 1's per-call memo is gone).
+        // C6c: the call's valuation state (the backend is frozen from here
+        // to the cache flush after settlement).
+        let batch_sums = ctx.sums.is_some().then(|| BatchSums::new(&ctx.positions));
         let reader = AccountReader {
             positions: &ctx.positions,
             oracle: &ctx.oracle,
@@ -4962,6 +5089,7 @@ impl NativeExecutor {
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
+            batch: batch_sums.as_ref(),
         };
 
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
@@ -7273,6 +7401,7 @@ impl NativeExecutor {
             margin_configs: &ctx.margin_configs,
             marks: ctx.block_marks.as_ref(),
             sums: ctx.sums.as_ref(),
+            batch: None,
         };
         let needs_account = !params.reduce_only;
         let mut account = None;

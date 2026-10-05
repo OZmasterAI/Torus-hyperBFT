@@ -513,3 +513,30 @@ fn resident_changes_lists_own_pending_keys_with_r_and_current_rows() {
     assert!(overlay.resident_changes(CF_NATIVE_ORDERS, &[1u8; 20]).is_none(), "not an R CF");
     assert_eq!(overlay.resident_changes(CF_NATIVE_BALANCES, &[1u8; 20]).map(|v| v.len()), Some(1));
 }
+
+/// C6c: `layer_keys` = every key of the CF the overlay's OWN pending set
+/// writes or deletes (sorted); with R only (else / `StateDb`: `None`). A
+/// prefix touches iff some listed key starts with it (`layer_touches`).
+#[test]
+fn layer_keys_are_own_pending_keys_with_resident() {
+    let (db, _dir) = temp_db();
+    let p = CF_NATIVE_POSITIONS;
+    assert!(db.layer_keys(p).is_none());
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(p, &pos_key(1, 1), b"parent").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    assert!(overlay.layer_keys(p).is_none(), "no R");
+    overlay.attach_resident(Arc::new(ResidentRows::build(&overlay).unwrap()));
+    assert_eq!(overlay.layer_keys(p), Some(vec![]), "the parent is in R");
+    overlay.put_cf_raw(p, &pos_key(3, 1), b"w").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(2, 7)).unwrap();
+    overlay.put_cf_raw(p, &[9u8; 5], b"short").unwrap();
+    overlay.put_cf_raw(CF_NATIVE_BALANCES, &[4u8; 20], b"b").unwrap();
+    let keys = overlay.layer_keys(p).unwrap();
+    assert_eq!(keys, vec![pos_key(2, 7), pos_key(3, 1), vec![9u8; 5]]);
+    for t in 0..=10u8 {
+        assert_eq!(overlay.layer_touches(p, &[t; 20]), keys.iter().any(|k| k.starts_with(&[t; 20])), "trader {t}");
+    }
+    assert!(overlay.layer_keys(CF_NATIVE_ORDERS).is_none(), "not an R CF");
+    assert_eq!(overlay.layer_keys(CF_NATIVE_BALANCES), Some(vec![[4u8; 20].to_vec()]));
+}
