@@ -1429,13 +1429,19 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         market_id: MarketId,
     ) -> Result<(FixedPoint, FixedPoint), CoreError> {
         let mark = self.mark(market_id);
-        Ok(match self.get_position(trader, market_id)? {
+        Ok(Self::signed_px(self.get_position(trader, market_id)?.as_ref(), mark))
+    }
+
+    /// [`Self::position_px`] of a position already read, with the market's
+    /// `mark` (item 6 P4: Phase 3 reuses `reduce_only_positions_for`'s read).
+    fn signed_px(p: Option<&torus_core::position::Position>, mark: Option<FixedPoint>) -> (FixedPoint, FixedPoint) {
+        match p {
             Some(p) => (
                 if p.is_long { p.size } else { -p.size },
-                position_price(&p, mark),
+                position_price(p, mark),
             ),
             None => (FixedPoint::ZERO, mark.unwrap_or(FixedPoint::ZERO)),
-        })
+        }
     }
 }
 
@@ -5324,12 +5330,19 @@ impl NativeExecutor {
             // EVERY sender of the batch in this market is tracked (checked
             // takers value their position; maker checks need in-batch
             // positions).
+            // Item 6 P4: each read position (`None` = the read failed), for
+            // the checked senders' valuation price below — the same read
+            // `position_px` makes (same reader, nothing written in between).
+            let mut read: HashMap<Address, Option<Option<torus_core::position::Position>>> = HashMap::new();
             if !prepared.is_empty() || book.has_reduce_only_orders() {
                 let ro = Self::reduce_only_positions_for(
                     &reader,
                     &book,
                     market_id,
                     prepared.iter().map(|p| p.sender),
+                    |t, r| {
+                        read.insert(t, r.as_ref().ok().cloned());
+                    },
                 );
                 book.set_reduce_only_positions(ro);
             }
@@ -5340,11 +5353,34 @@ impl NativeExecutor {
             // F1 (s517, D2): each checked sender's exclusive pool (0 outside
             // the market of its first checked taker) and valuation price.
             let mut am = AccountMargins::new(tiers.clone());
+            // P4: the mark `position_px` reads, once per market (only when a
+            // checked sender needs it, as before).
+            let mut mark: Option<Option<FixedPoint>> = None;
             for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
                 if am.get(&p.sender).is_none() {
-                    let px = reader
-                        .position_px(&p.sender, market_id)
-                        .map_or(FixedPoint::ZERO, |(_, px)| px);
+                    // `position_px(..).map_or(0, px)`: a failed read values at 0.
+                    let px = match read.get(&p.sender) {
+                        Some(Some(pos)) => {
+                            let mark = *mark.get_or_insert_with(|| reader.mark(market_id));
+                            AccountReader::<T>::signed_px(pos.as_ref(), mark).1
+                        }
+                        Some(None) => FixedPoint::ZERO,
+                        // Every checked sender is in `prepared`, so read.
+                        None => reader
+                            .position_px(&p.sender, market_id)
+                            .map_or(FixedPoint::ZERO, |(_, px)| px),
+                    };
+                    #[cfg(test)]
+                    if let Some(s) = reader.sums.filter(|s| s.shadow) {
+                        let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
+                        if want != px || !read.contains_key(&p.sender) {
+                            s.shadow_mismatches.lock().unwrap().push(format!(
+                                "P4 px {} {market_id}: reused {px:?}, position_px {want:?}, read {}",
+                                p.sender,
+                                read.contains_key(&p.sender)
+                            ));
+                        }
+                    }
                     // Review fix 4 (s517): only the pool market's entry is
                     // the sender's account (shared with its makers there).
                     match pools.get(&(p.sender, market_id)) {
@@ -7274,21 +7310,27 @@ impl NativeExecutor {
     /// A position row that fails to read polices as flat (every node reads
     /// the same bytes, so this stays deterministic). Item 6 C7: read through
     /// `reader` (decoded records for clean traders).
+    ///
+    /// Item 6 P4: `read` sees every trader's read (Phase 3 values its
+    /// checked senders' positions from it instead of reading them again).
     fn reduce_only_positions_for<T: StateBackend>(
         reader: &AccountReader<'_, T>,
         book: &OrderBook,
         market_id: MarketId,
         ro_senders: impl Iterator<Item = Address>,
+        mut read: impl FnMut(Address, &Result<Option<torus_core::position::Position>, CoreError>),
     ) -> ReduceOnlyPositions {
         let mut traders: BTreeSet<Address> = book.reduce_only_traders().into_iter().collect();
         traders.extend(ro_senders);
         let mut out = ReduceOnlyPositions::new();
         for t in traders {
-            let pos = match reader.get_position(&t, market_id) {
+            let r = reader.get_position(&t, market_id);
+            let pos = match &r {
                 Ok(Some(p)) if p.is_long => p.size,
                 Ok(Some(p)) => -p.size,
                 Ok(None) | Err(_) => FixedPoint::ZERO,
             };
+            read(t, &r);
             out.insert(t, pos);
         }
         out
@@ -7573,6 +7615,7 @@ impl NativeExecutor {
                 book,
                 market_id,
                 reread.then_some(*sender).into_iter(),
+                |_, _| {},
             );
             if let (true, Some(pos)) = (track_sender, ro_pos) {
                 ro.insert(*sender, pos);
