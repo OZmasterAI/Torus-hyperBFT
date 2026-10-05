@@ -61,6 +61,15 @@ impl ResidentDelta {
             .into_iter()
             .flat_map(move |s| self.cfs[s].iter().map(|(k, _)| k.as_slice()))
     }
+
+    /// The block's writes (`Some`) and tombstones (`None`) of `cf`, key-sorted
+    /// (none for a CF outside R). Item 6 C7: the decoded per-trader positions
+    /// follow them.
+    pub fn entries<'a>(&'a self, cf: &str) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
+        resident_slot(cf)
+            .into_iter()
+            .flat_map(move |s| self.cfs[s].iter().map(|(k, v)| (k.as_slice(), v.as_deref())))
+    }
 }
 
 /// Item 6 C6b: one key of an R CF that the block's own pending set writes

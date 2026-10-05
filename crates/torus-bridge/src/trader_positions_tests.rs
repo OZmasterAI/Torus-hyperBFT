@@ -1,0 +1,189 @@
+//! Item 6 C7 (plan 5.2) P1: the decoded per-trader positions equal the
+//! decoding of R's rows, trader by trader, after every random block delta,
+//! and the records maintained warm (`apply`) equal a cold `build`.
+//! Irregular rows (keys other than `trader ‖ market`, values that do not
+//! decode or name another trader / market, short keys) never break it: their
+//! trader reads through the overlay, as today.
+
+use std::collections::BTreeSet;
+
+use super::*;
+use torus_core::position::{position_key, MarginType, PositionManager};
+use torus_state::cf::CF_NATIVE_POSITIONS;
+use torus_state::{NativeStateOverlay, StateBackend, StateDb};
+use torus_types::{FixedPoint, MarketId};
+
+struct Lcg(u64);
+impl Lcg {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) % n
+    }
+}
+
+const TRADERS: u64 = 6;
+const MARKETS: u64 = 8;
+
+fn trader(i: u64) -> Address {
+    let mut b = [0x3Cu8; 20];
+    b[12..].copy_from_slice(&(i + 1).to_be_bytes());
+    Address::new(b)
+}
+
+fn position(t: Address, m: MarketId, raw: u64, long: bool) -> Position {
+    Position {
+        trader: t,
+        market_id: m,
+        is_long: long,
+        size: FixedPoint::from_raw(i128::from(raw) + 1),
+        entry_price: FixedPoint::from_raw(i128::from(raw) * 7 + 3),
+        realized_pnl: FixedPoint::from_raw(-(i128::from(raw))),
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: if raw.is_multiple_of(5) { MarginType::Isolated } else { MarginType::Cross },
+    }
+}
+
+fn bytes(p: &Position) -> Vec<u8> {
+    borsh::to_vec(p).unwrap()
+}
+
+#[derive(Default, Debug)]
+struct Stats {
+    regular: usize,
+    opaque: usize,
+    found: usize,
+    cleared: usize,
+}
+
+/// `rec` == a cold build over `rows`, and for every trader prefix in R (and
+/// every test trader): a recorded trader's positions == the DB's
+/// `positions_for_trader` and each market's `get_position` (`db` == R); an
+/// opaque trader's range holds an irregular row.
+fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut Stats, tag: &str) {
+    assert!(rec.same_as(&TraderPositions::build(rows)), "{tag}: warm records != cold build");
+    let pm = PositionManager::new(db.clone());
+    let r = rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    let mut prefixes: BTreeSet<Address> =
+        r.keys().filter(|k| k.len() >= 20).map(|k| Address::from_slice(&k[..20])).collect();
+    prefixes.extend((0..=TRADERS).map(trader));
+    for t in prefixes {
+        match rec.get(&t) {
+            Some(ps) => {
+                stats.regular += 1;
+                let want = pm.positions_for_trader(&t).expect("a recorded trader decodes");
+                assert_eq!(
+                    ps.iter().map(bytes).collect::<Vec<_>>(),
+                    want.iter().map(bytes).collect::<Vec<_>>(),
+                    "{tag}: positions of {t}"
+                );
+                for m in 0..=MARKETS + 1 {
+                    let want = pm.get_position(&t, m).expect("a recorded trader's row decodes");
+                    stats.found += usize::from(want.is_some());
+                    assert_eq!(find(ps, m).map(bytes), want.as_ref().map(bytes), "{tag}: {t} market {m}");
+                }
+            }
+            None => {
+                stats.opaque += 1;
+                let irregular = r
+                    .range(t.to_vec()..)
+                    .take_while(|(k, _)| k.starts_with(t.as_slice()))
+                    .any(|(k, v)| {
+                        k.len() != 28
+                            || Position::try_from_slice(v).map_or(true, |p| position_key(&p.trader, p.market_id) != k[..])
+                    });
+                assert!(irregular, "{tag}: {t} opaque without an irregular row");
+            }
+        }
+    }
+}
+
+use borsh::BorshDeserialize;
+
+/// One random block's writes / tombstones of `CF_NATIVE_POSITIONS`.
+fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
+    // Irregular rows are written in about one block of six (they stay until
+    // their own key is rewritten or deleted); removals happen in any block.
+    let wild = rng.below(6) == 0;
+    for _ in 0..1 + rng.below(12) {
+        let t = trader(rng.below(TRADERS));
+        let m = 1 + rng.below(MARKETS);
+        let key = position_key(&t, m);
+        let p = position(t, m, rng.below(1_000), rng.below(2) == 0);
+        let mut choice = rng.below(100);
+        if !wild && matches!(choice, 85 | 86 | 91..=94 | 98) {
+            choice = 0;
+        }
+        match choice {
+            0..=69 => o.put_cf_raw(CF_NATIVE_POSITIONS, &key, &bytes(&p)).unwrap(),
+            70..=84 => o.delete_cf_raw(CF_NATIVE_POSITIONS, &key).unwrap(),
+            // a longer key under the trader holding a valid position
+            85..=86 => o.put_cf_raw(CF_NATIVE_POSITIONS, &[&key[..], &[1]].concat(), &bytes(&p)).unwrap(),
+            87..=90 => o.delete_cf_raw(CF_NATIVE_POSITIONS, &[&key[..], &[1]].concat()).unwrap(),
+            // a valid position of another trader / market at this key
+            91 => {
+                let other = position(trader((rng.below(TRADERS) + 1) % TRADERS), m + 1, 5, true);
+                o.put_cf_raw(CF_NATIVE_POSITIONS, &key, &bytes(&other)).unwrap();
+            }
+            92 => {
+                let other = position(t, m + 1, 5, true);
+                o.put_cf_raw(CF_NATIVE_POSITIONS, &key, &bytes(&other)).unwrap();
+            }
+            // a value that does not decode
+            93 => o.put_cf_raw(CF_NATIVE_POSITIONS, &key, &[7, 7, 7]).unwrap(),
+            // the bare 20-byte prefix, and a short key (under no trader)
+            94 => o.put_cf_raw(CF_NATIVE_POSITIONS, t.as_slice(), &bytes(&p)).unwrap(),
+            95..=97 => o.delete_cf_raw(CF_NATIVE_POSITIONS, t.as_slice()).unwrap(),
+            98 => o.put_cf_raw(CF_NATIVE_POSITIONS, &key[..10], &[1, 2]).unwrap(),
+            _ => o.delete_cf_raw(CF_NATIVE_POSITIONS, &key[..10]).unwrap(),
+        }
+    }
+}
+
+/// P1: 8 seeds x 150 blocks, the records maintained by `apply` after every
+/// block == a cold build == the decoded DB rows trader by trader.
+#[test]
+fn records_equal_decoded_rows_after_random_deltas() {
+    let mut stats = Stats::default();
+    for seed in 1..=8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x9E37_79B9);
+        // A starting state with rows of every kind, then the cold build.
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let mut rows = ResidentRows::build(&db).unwrap();
+        let mut rec = TraderPositions::build(&rows);
+        check(&rec, &rows, &db, &mut stats, &format!("seed {seed} start"));
+        let mut was_opaque: HashSet<Address> = (0..TRADERS).map(trader).filter(|t| rec.get(t).is_none()).collect();
+        for h in 1..=150 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            let delta = o.own_pending_delta();
+            o.flush(&db).unwrap();
+            rows.apply(&delta);
+            rec.apply(&delta, &rows);
+            assert_eq!(rows, ResidentRows::build(&db).unwrap(), "seed {seed} block {h}: R == DB");
+            check(&rec, &rows, &db, &mut stats, &format!("seed {seed} block {h}"));
+            let now: HashSet<Address> = (0..TRADERS).map(trader).filter(|t| rec.get(t).is_none()).collect();
+            stats.cleared += was_opaque.difference(&now).count();
+            was_opaque = now;
+        }
+    }
+    println!("TRADER_POSITIONS P1 {stats:?}");
+    assert!(stats.regular > 3_000 && stats.found > 10_000, "non-vacuous: {stats:?}");
+    assert!(stats.opaque > 500 && stats.cleared > 20, "irregular rows come and go: {stats:?}");
+}
+
+/// A trader without rows reads as no positions; `find` misses a market it
+/// does not hold.
+#[test]
+fn empty_trader_and_missing_market() {
+    let rec = TraderPositions::build(&ResidentRows::default());
+    assert_eq!(rec.get(&trader(0)).map(<[Position]>::len), Some(0));
+    let ps = [position(trader(0), 2, 1, true), position(trader(0), 5, 2, false)];
+    assert_eq!(find(&ps, 5).map(|p| p.market_id), Some(5));
+    assert!(find(&ps, 3).is_none());
+}

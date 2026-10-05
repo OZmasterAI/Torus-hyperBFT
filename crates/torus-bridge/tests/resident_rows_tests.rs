@@ -65,6 +65,8 @@ fn serial_block(db: &StateDb, holder: &mut ResidentBooks, h: u64, writes: &[(u8,
 fn assert_r_equals_db(holder: &ResidentBooks, db: &StateDb, what: &str) {
     let rows = holder.rows().unwrap_or_else(|| panic!("{what}: holder drained"));
     assert_eq!(dump_rows(rows), dump_db(db), "{what}: R != DB scan");
+    // Item 6 C7: undecodable values and `cvlm` keys included.
+    assert_eq!(holder.trader_positions_match_rows(), Some(true), "{what}: decoded positions != R");
 }
 
 #[test]

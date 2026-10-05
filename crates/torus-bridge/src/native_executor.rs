@@ -332,6 +332,10 @@ impl BalanceCache {
 #[path = "liquidation_step.rs"]
 mod liquidation_step;
 
+#[path = "trader_positions.rs"]
+mod trader_positions;
+use trader_positions::TraderPositions;
+
 #[cfg(test)]
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
@@ -858,6 +862,10 @@ pub(crate) struct BlockSums {
     /// `fill_block_marks`; `None`: no table, the cache is not used).
     memo_version: Option<u64>,
     memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
+    /// Item 6 C7: R's positions decoded per trader (from the slot; `None`:
+    /// every read goes through the overlay). Read only for a trader with
+    /// nothing pending ([`AccountReader::resident_positions`]).
+    records: Option<TraderPositions>,
     /// P1 (tests): every cached answer is also computed by the reference
     /// path; differences are recorded (a panic in a worker would be caught).
     #[cfg(test)]
@@ -889,6 +897,8 @@ struct SumsCounters {
     /// C4: liquidation valuations through L1 / through the walk (L1 off).
     l1: std::sync::atomic::AtomicUsize,
     l1_off: std::sync::atomic::AtomicUsize,
+    /// C7: position reads / memo builds answered by the decoded records.
+    records: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1155,14 +1165,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     fn pos_sums(&self, trader: &Address) -> Result<PosSums, CoreError> {
         let r = match (self.sums, self.marks) {
             (Some(s), Some(table)) if s.memo_version == Some(table.version) => {
-                let dirty = match self.batch.and_then(|b| b.dirty.as_ref()) {
-                    Some(set) => set.contains(trader),
-                    None => self
-                        .positions
-                        .state()
-                        .layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()),
-                };
-                if dirty {
+                if self.dirty(trader) {
                     #[cfg(test)]
                     bump(&s.counters.dirty);
                     // C6c: once per `execute_batch` call.
@@ -1195,6 +1198,53 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             _ => self.direct_sums(trader)?,
         };
         r.map_err(|()| CoreError::Overflow("account margin overflows i128".into()))
+    }
+
+    /// Whether the block wrote under `trader`'s positions prefix (own pending
+    /// writes or tombstones): C6c's frozen set on a batch reader, else
+    /// `layer_touches` ("dirty" when R is not attached).
+    fn dirty(&self, trader: &Address) -> bool {
+        match self.batch.and_then(|b| b.dirty.as_ref()) {
+            Some(set) => set.contains(trader),
+            None => self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()),
+        }
+    }
+
+    /// Item 6 C7: `trader`'s positions decoded from R's slot — what the
+    /// overlay reads for a trader with nothing pending. `None` (read the
+    /// overlay): no records, the trader is dirty, or it holds an irregular
+    /// row.
+    fn resident_positions(&self, trader: &Address) -> Option<&'a [torus_core::position::Position]> {
+        let records = self.sums?.records.as_ref()?;
+        if self.dirty(trader) {
+            return None;
+        }
+        records.get(trader)
+    }
+
+    /// `trader`'s position in `market_id`: C7's record when clean, else the
+    /// overlay (`PositionManager::get_position`).
+    fn get_position(
+        &self,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<torus_core::position::Position>, CoreError> {
+        let Some(ps) = self.resident_positions(trader) else {
+            return self.positions.get_position(trader, market_id);
+        };
+        let p = trader_positions::find(ps, market_id).cloned();
+        #[cfg(test)]
+        if let Some(s) = self.sums {
+            bump(&s.counters.records);
+            if s.shadow {
+                let want = format!("{:?}", self.positions.get_position(trader, market_id));
+                let got = format!("{:?}", Ok::<_, CoreError>(p.clone()));
+                if want != got {
+                    s.shadow_mismatches.lock().unwrap().push(format!("get_position {trader} {market_id}: record {got}, overlay {want}"));
+                }
+            }
+        }
+        Ok(p)
     }
 
     /// Path 2: the partial re-value (C6b), else `build` over the overlay.
@@ -1312,8 +1362,16 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
                 computed.set(true);
                 s.counters.built(trader);
             }
-            let ps = self.positions.positions_for_trader(trader).ok()?;
-            let (r, in_table) = self.sums_of(&ps);
+            // C7: the caller found the trader clean, so its record (if
+            // any) is exactly the overlay's rows.
+            let (r, in_table) = match s.records.as_ref().and_then(|rec| rec.get(trader)) {
+                Some(ps) => {
+                    #[cfg(test)]
+                    bump(&s.counters.records);
+                    self.sums_of(ps)
+                }
+                None => self.sums_of(&self.positions.positions_for_trader(trader).ok()?),
+            };
             in_table.then_some(r)
         });
         #[cfg(test)]
@@ -1371,7 +1429,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         market_id: MarketId,
     ) -> Result<(FixedPoint, FixedPoint), CoreError> {
         let mark = self.mark(market_id);
-        Ok(match self.positions.get_position(trader, market_id)? {
+        Ok(match self.get_position(trader, market_id)? {
             Some(p) => (
                 if p.is_long { p.size } else { -p.size },
                 position_price(&p, mark),
@@ -2253,6 +2311,9 @@ struct RowsSlot {
     /// C3: the traders' margin sums over `rows` (plan 2.4). Built empty with
     /// R, dropped with it.
     sums: SumsCache,
+    /// C7: `rows`' positions decoded per trader. Built with R, updated by
+    /// each block's delta, dropped with it.
+    positions: TraderPositions,
     height: u64,
 }
 
@@ -2292,6 +2353,12 @@ impl ResidentBooks {
     /// (`Arc::get_mut` failed: a clone was alive). 0 in the normal sequence.
     pub fn rows_shared_fallbacks(&self) -> u64 {
         self.rows_shared_fallbacks
+    }
+
+    /// Item 6 C7: whether the slot's decoded positions equal a cold decode
+    /// of its R (`None`: no slot). Test / ops introspection.
+    pub fn trader_positions_match_rows(&self) -> Option<bool> {
+        self.rows.as_ref().map(|s| s.positions.same_as(&TraderPositions::build(&s.rows)))
     }
 
     /// Whether the holder currently carries state (test/ops introspection).
@@ -2440,7 +2507,7 @@ pub fn begin_resident(
         let parent_ok = overlay.parent_height().is_none_or(|p| p == slot.height);
         if height_ok && marker_ok && parent_ok {
             block.marks = slot.marks;
-            block.sums = Some(BlockSums::new(slot.sums));
+            block.sums = Some(BlockSums { records: Some(slot.positions), ..BlockSums::new(slot.sums) });
             return Some(slot.rows);
         }
         tracing::warn!(
@@ -2460,6 +2527,9 @@ pub fn begin_resident(
                 Ok(rows) => {
                     holder.rows_builds += 1;
                     block.rebuilt = true;
+                    // C3: an empty sums cache; C7: R's positions decoded.
+                    block.sums =
+                        Some(BlockSums { records: Some(TraderPositions::build(&rows)), ..BlockSums::default() });
                     if let Some(m) = metrics {
                         m.exec_resident_rows_rebuilds.inc();
                         m.exec_resident_rows_build_seconds
@@ -2488,8 +2558,6 @@ pub fn begin_resident(
     }
     overlay.attach_resident(rows);
     block.attached = true;
-    // C3: a built R starts with an empty sums cache.
-    block.sums.get_or_insert_with(BlockSums::default);
     block
 }
 
@@ -2529,11 +2597,23 @@ pub fn end_resident(
     }
     // C3: the block's memo joins the slot's sums; every trader whose
     // positions the block wrote or deleted loses its sums.
-    let sums = block
-        .sums
-        .map(|s| s.into_cache(delta.keys(torus_state::cf::CF_NATIVE_POSITIONS)))
-        .unwrap_or_default();
-    holder.rows = Some(RowsSlot { rows, marks: block.marks, sums, height: block.height });
+    let (sums, records) = match block.sums {
+        Some(mut s) => {
+            let records = s.records.take();
+            (s.into_cache(delta.keys(torus_state::cf::CF_NATIVE_POSITIONS)), records)
+        }
+        None => (SumsCache::default(), None),
+    };
+    // C7: the decoded positions follow the delta (decoded cold if the
+    // context kept the block's state).
+    let positions = match records {
+        Some(mut p) => {
+            p.apply(&delta, r);
+            p
+        }
+        None => TraderPositions::build(r),
+    };
+    holder.rows = Some(RowsSlot { rows, marks: block.marks, sums, positions, height: block.height });
 }
 
 /// s63 runtime toggle, default ON since s64: each maximal run of consecutive
@@ -5246,7 +5326,7 @@ impl NativeExecutor {
             // positions).
             if !prepared.is_empty() || book.has_reduce_only_orders() {
                 let ro = Self::reduce_only_positions_for(
-                    &ctx.positions,
+                    &reader,
                     &book,
                     market_id,
                     prepared.iter().map(|p| p.sender),
@@ -7192,9 +7272,10 @@ impl NativeExecutor {
     /// s515 (BUG 2): the positions `book` must police — every trader with a
     /// resting reduce-only order there plus the given reduce-only senders.
     /// A position row that fails to read polices as flat (every node reads
-    /// the same bytes, so this stays deterministic).
+    /// the same bytes, so this stays deterministic). Item 6 C7: read through
+    /// `reader` (decoded records for clean traders).
     fn reduce_only_positions_for<T: StateBackend>(
-        positions: &PositionManager<T>,
+        reader: &AccountReader<'_, T>,
         book: &OrderBook,
         market_id: MarketId,
         ro_senders: impl Iterator<Item = Address>,
@@ -7203,7 +7284,11 @@ impl NativeExecutor {
         traders.extend(ro_senders);
         let mut out = ReduceOnlyPositions::new();
         for t in traders {
-            let pos = Self::signed_position(positions, &t, market_id).unwrap_or(FixedPoint::ZERO);
+            let pos = match reader.get_position(&t, market_id) {
+                Ok(Some(p)) if p.is_long => p.size,
+                Ok(Some(p)) => -p.size,
+                Ok(None) | Err(_) => FixedPoint::ZERO,
+            };
             out.insert(t, pos);
         }
         out
@@ -7484,7 +7569,7 @@ impl NativeExecutor {
             // was written since); a failed / skipped read reads it here.
             let reread = track_sender && ro_pos.is_none();
             let mut ro = Self::reduce_only_positions_for(
-                &ctx.positions,
+                &reader,
                 book,
                 market_id,
                 reread.then_some(*sender).into_iter(),

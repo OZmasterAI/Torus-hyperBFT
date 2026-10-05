@@ -9,7 +9,9 @@
 //! Item 6 C3: the per-batch snapshot is gone; the maker's position sums come
 //! from the block's sums memo (node path: R attached through
 //! `begin_resident`, the slot's sums through `attach_resident_block`), so the
-//! account is still valued once.
+//! account is still valued once. Item 6 C7: that one valuation reads M's
+//! decoded positions from R's slot (M has nothing pending), so the overlay
+//! sees no positions scan at all (valued once: `maker_valued_at_most_once_per_batch`).
 
 #[path = "common/counting_backend.rs"]
 mod counting_backend;
@@ -120,7 +122,8 @@ fn fixture() -> Fixture {
 /// Fix 1 RED: five takers each sell into one of M's five bids in ONE batch:
 /// M's account is loaded once (one positions scan) and every market's mark
 /// is read at most once (C2: never — the block's table answers).
-/// c93c579: 5 scans and 100+ mark reads (20 per view).
+/// c93c579: 5 scans and 100+ mark reads (20 per view). C7: 0 scans (M's
+/// decoded record).
 #[test]
 fn a_maker_filling_in_five_markets_is_valued_once_per_batch() {
     for threads in [0usize, 4] {
@@ -142,7 +145,7 @@ fn a_maker_filling_in_five_markets_is_valued_once_per_batch() {
             state.oracle_reads()
         );
         assert_eq!(ctx.trade_index, BOOKS as u32, "every taker filled against M");
-        assert_eq!(state.position_scans(addr(1).as_slice()), 1, "threads {threads}: M's positions scans");
+        assert_eq!(state.position_scans(addr(1).as_slice()), 0, "threads {threads}: M's positions scans (C7: record)");
         assert_eq!(state.oracle_reads(), 0, "threads {threads}: mark reads for {MARKETS} markets (block table)");
     }
 }

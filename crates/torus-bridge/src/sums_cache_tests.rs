@@ -97,6 +97,8 @@ struct Stats {
     delta_fallback: usize,
     overflowed: usize,
     versions: BTreeSet<u64>,
+    /// C7: reads answered by the decoded records.
+    records: usize,
 }
 
 /// Cache path == reference path for every trader: `view`, `pos_net`,
@@ -124,6 +126,14 @@ fn check_all<T: StateBackend>(ctx: &NativeExecContext<T>, stats: &mut Stats, tag
         assert_eq!(cached.maker_free(&t), reference.maker_free(&t), "{tag}: maker free of trader {i}");
         for m in 1..=MARKETS {
             assert_eq!(cached.maker_account(&t, m), reference.maker_account(&t, m), "{tag}: maker account {i} market {m}");
+        }
+        // C7: point reads (decoded records for a clean trader) == the overlay.
+        for m in 0..=MARKETS + 1 {
+            assert_eq!(
+                format!("{:?}", cached.get_position(&t, m)),
+                format!("{:?}", ctx.positions.get_position(&t, m)),
+                "{tag}: position of trader {i} market {m}"
+            );
         }
         stats.explicit += 1;
     }
@@ -179,6 +189,28 @@ fn write_positions<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h
             _ => pos.size += size(rng),
         }
         ctx.positions.put_position(&pos).unwrap();
+    }
+    // C7: an irregular row under the last trader (a longer key holding a
+    // valid position of a market outside the table), written and removed
+    // now and then: that trader then reads through the overlay.
+    let odd_trader = trader(TRADERS - 1);
+    let odd_key = [torus_core::position::position_key(&odd_trader, 99).as_slice(), &[1]].concat();
+    match h % 6 {
+        3 => {
+            let odd = Position {
+                trader: odd_trader,
+                market_id: 99,
+                is_long: true,
+                size: fp(1),
+                entry_price: fp(MID),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            };
+            ctx.positions.state().put_cf_raw(CF_NATIVE_POSITIONS, &odd_key, &borsh::to_vec(&odd).unwrap()).unwrap();
+        }
+        5 => ctx.positions.state().delete_cf_raw(CF_NATIVE_POSITIONS, &odd_key).unwrap(),
+        _ => {}
     }
     // Balance-only writes (sums unaffected), negative `available` included.
     for _ in 0..rng.below(3) {
@@ -300,6 +332,7 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.dirty += c.dirty.load(std::sync::atomic::Ordering::Relaxed);
             stats.delta += c.delta.load(std::sync::atomic::Ordering::Relaxed);
             stats.delta_fallback += c.delta_fallback.load(std::sync::atomic::Ordering::Relaxed);
+            stats.records += c.records.load(std::sync::atomic::Ordering::Relaxed);
         }
         books = std::mem::take(&mut ctx.order_books);
         next_id = ctx.next_global_order_id;
@@ -313,6 +346,9 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<BlockOut> {
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
         end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        if cached {
+            assert_eq!(holder.trader_positions_match_rows(), Some(true), "seed {seed} block {h}: records warm == cold");
+        }
         if let Some(p) = parent.take() {
             p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
         }
@@ -340,9 +376,10 @@ fn sums_cache_equals_reference_on_seeded_sequences() {
         }
     }
     println!(
-        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} delta={} delta_fallback={} overflowed={} versions={}",
-        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.delta, stats.delta_fallback, stats.overflowed, stats.versions.len()
+        "SUMS_CACHE P1 explicit={} shadow={} persistent={} memo={} computed={} dirty={} delta={} delta_fallback={} overflowed={} versions={} records={}",
+        stats.explicit, stats.shadow, stats.persistent_hits, stats.memo_hits, stats.computed, stats.dirty, stats.delta, stats.delta_fallback, stats.overflowed, stats.versions.len(), stats.records
     );
+    assert!(stats.records > 5_000, "C7: decoded records used: {stats:?}");
     // C6b: dirty traders are re-valued from their memo sums (shadow-checked
     // against `build` above); the guard / no-base paths still build.
     assert!(stats.delta > 100 && stats.delta_fallback > 10, "both dirty paths used: {stats:?}");
@@ -694,4 +731,172 @@ fn worker_maker_cache_is_per_batch() {
         .unwrap();
     // UPnL +100, IM 10 x 1000 / 20 = 500.
     assert_eq!(free(&ctx), fp(2_000 + 100 - 500), "next batch: the new position");
+}
+
+/// C7 (plan 5.2): a trader with own pending position writes in the block
+/// reads them (the overlay), not its decoded record of R; a clean trader
+/// reads its record. Single-path reader (`layer_touches`) and batch reader
+/// (C6c's frozen dirty set) alike.
+#[test]
+fn dirty_trader_reads_pending_rows_not_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let now = 10_000;
+    let (a, b) = (trader(0), trader(1));
+    let pos = |t: Address, m: MarketId, size: i64| Position {
+        trader: t,
+        market_id: m,
+        is_long: true,
+        size: fp(size),
+        entry_price: fp(MID - 10),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    {
+        let pm = PositionManager::new(db.clone());
+        for m in 1..=3u64 {
+            db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+            db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(MID), now - 1)).unwrap();
+        }
+        pm.put_position(&pos(a, 1, 2)).unwrap();
+        pm.put_position(&pos(a, 2, 3)).unwrap();
+        pm.put_position(&pos(b, 1, 4)).unwrap();
+    }
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut overlay, 1, None);
+    let mut ctx = NativeExecContext::new(overlay.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    ctx.sums.as_mut().unwrap().shadow = true;
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    let records = |ctx: &NativeExecContext<NativeStateOverlay>| {
+        ctx.sums.as_ref().unwrap().counters.records.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let show = |r: Result<Option<Position>, CoreError>| format!("{r:?}");
+    // Clean: both from the records.
+    let reader = AccountReader::of(&ctx);
+    assert_eq!(show(reader.get_position(&a, 1)), show(ctx.positions.get_position(&a, 1)));
+    assert_eq!(records(&ctx), 1, "clean trader: record");
+    // a: market 1 resized, market 2 closed, market 3 opened (pending only).
+    ctx.positions.put_position(&pos(a, 1, 9)).unwrap();
+    ctx.positions.delete_position(&a, 2).unwrap();
+    ctx.positions.put_position(&pos(a, 3, 5)).unwrap();
+    let stale = ctx.sums.as_ref().unwrap().records.as_ref().unwrap().get(&a).unwrap();
+    assert_eq!(stale.len(), 2, "a's record still holds R (the test is not vacuous)");
+    let batch = BatchSums::new(&ctx.positions);
+    for (tag, reader) in [
+        ("single", AccountReader::of(&ctx)),
+        ("batch", AccountReader { batch: Some(&batch), ..AccountReader::of(&ctx) }),
+    ] {
+        let before = records(&ctx);
+        for m in 1..=3 {
+            assert_eq!(show(reader.get_position(&a, m)), show(ctx.positions.get_position(&a, m)), "{tag}: a market {m}");
+        }
+        assert_eq!(records(&ctx), before, "{tag}: dirty trader never reads its record");
+        let reference = AccountReader { sums: None, ..AccountReader::of(&ctx) };
+        assert_eq!(format!("{:?}", reader.pos_net(&a)), format!("{:?}", reference.pos_net(&a)), "{tag}: a pos_net");
+        assert_eq!(reader.maker_account(&a, 3), reference.maker_account(&a, 3), "{tag}: a maker account");
+        assert_eq!(show(reader.get_position(&b, 1)), show(ctx.positions.get_position(&b, 1)), "{tag}: b");
+        assert!(records(&ctx) > before, "{tag}: clean trader b still reads its record");
+        assert_eq!(format!("{:?}", reader.pos_net(&b)), format!("{:?}", reference.pos_net(&b)), "{tag}: b pos_net");
+    }
+    assert_eq!(show(AccountReader::of(&ctx).get_position(&a, 3)), show(Ok(Some(pos(a, 3, 5)))));
+    let bad = ctx.sums.as_ref().unwrap().shadow_mismatches.lock().unwrap().clone();
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// C7 guards (P7): the decoded records live and die with R's slot. After
+/// every block they equal a cold decode of R; reused across normal blocks;
+/// rebuilt with R after a skipped height, an invalidation, a failed block
+/// (`ok = false`) or a block that never reached `end_resident` (fatal); a
+/// context that never handed its block state back still leaves records equal
+/// to R.
+#[test]
+fn trader_positions_follow_the_slot_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(MID), 10_000)).unwrap();
+    let mut holder = ResidentBooks::default();
+    #[derive(Clone, Copy, PartialEq)]
+    enum End {
+        Normal,
+        NoDetach,
+        Failed,
+        Fatal,
+    }
+    // One block at `h` writing trader (h % 4)'s position in market h % 3 + 1
+    // (deleting it when h % 5 == 0).
+    let block = |holder: &mut ResidentBooks, h: u64, end: End| {
+        let mut overlay = NativeStateOverlay::new(db.clone());
+        let mut rb = begin_resident(Some(holder), &mut overlay, h, None);
+        let mut ctx = NativeExecContext::new(overlay.clone(), h, 10_001, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.attach_resident_block(&mut rb);
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        let t = trader(h % 4);
+        let m = h % 3 + 1;
+        // Read through the records (or the overlay) before and after the write.
+        let reader = AccountReader::of(&ctx);
+        assert_eq!(format!("{:?}", reader.get_position(&t, m)), format!("{:?}", ctx.positions.get_position(&t, m)), "block {h}");
+        if h.is_multiple_of(5) {
+            ctx.positions.delete_position(&t, m).unwrap();
+        } else {
+            let p = Position {
+                trader: t,
+                market_id: m,
+                is_long: h.is_multiple_of(2),
+                size: fp(h as i64),
+                entry_price: fp(MID),
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: MarginType::Cross,
+            };
+            ctx.positions.put_position(&p).unwrap();
+        }
+        if end != End::NoDetach {
+            ctx.detach_resident_block(&mut rb);
+        }
+        drop(ctx);
+        let delta = overlay.own_pending_delta();
+        if end == End::Fatal {
+            return; // never reaches end_resident: the slot stays taken (empty)
+        }
+        overlay.flush_with_native_trie_and_marker(&db, h).unwrap();
+        end_resident(holder, rb, &mut overlay, delta, end != End::Failed, None);
+    };
+    let check = |holder: &ResidentBooks, h: u64, builds: u64, what: &str| {
+        assert_eq!(holder.rows_builds(), builds, "{what}: builds after {h}");
+        assert_eq!(holder.trader_positions_match_rows(), Some(true), "{what}: records == cold decode of R after {h}");
+        let rows = holder.rows().unwrap().rows(CF_NATIVE_POSITIONS).unwrap().clone();
+        let db_rows: std::collections::BTreeMap<_, _> =
+            StateBackend::iterate_cf(&db, CF_NATIVE_POSITIONS, None).unwrap().into_iter().collect();
+        assert_eq!(rows, db_rows, "{what}: R == DB after {h}");
+    };
+    for h in 1..=4 {
+        block(&mut holder, h, End::Normal);
+        check(&holder, h, 1, "normal");
+    }
+    block(&mut holder, 6, End::Normal);
+    check(&holder, 6, 2, "skipped height 5");
+    block(&mut holder, 7, End::NoDetach);
+    check(&holder, 7, 2, "context kept its block state");
+    block(&mut holder, 8, End::Failed);
+    assert_eq!(holder.trader_positions_match_rows(), None, "failed block: slot empty");
+    // The failed block's writes were flushed anyway: the DB is at 8.
+    block(&mut holder, 9, End::Normal);
+    check(&holder, 9, 3, "after a failed block");
+    holder.invalidate();
+    assert_eq!(holder.trader_positions_match_rows(), None);
+    block(&mut holder, 10, End::Normal);
+    check(&holder, 10, 4, "after invalidate");
+    block(&mut holder, 11, End::Fatal);
+    assert_eq!(holder.trader_positions_match_rows(), None, "fatal block: slot taken");
+    // The fatal block's writes never reached the DB: 11 again.
+    block(&mut holder, 11, End::Normal);
+    check(&holder, 11, 5, "re-executed after a fatal block");
+    for h in 12..=15 {
+        block(&mut holder, h, End::Normal);
+        check(&holder, h, 5, "normal again");
+    }
 }

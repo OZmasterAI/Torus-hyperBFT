@@ -26,6 +26,13 @@
 //! trader only when the block wrote its positions, or the trader is not
 //! valued yet at the block's mark version.
 //!
+//! C7: valuations and point reads of a trader the block does not write read
+//! its positions decoded in R's slot, so the sequence scans NO such trader
+//! on any path ([`clean_scans`]); the C3 / C4 bounds below still hold for
+//! whatever scans remain (dirty traders whose partial re-value falls back to
+//! a build). The per-trader valuation counts behind C3 / C4 are checked by
+//! the sums cache counters (`sums_cache_tests`).
+//!
 //!   cargo test -p torus-bridge --test storage_reads_tests -- --nocapture
 
 #[path = "common/counting_backend.rs"]
@@ -316,6 +323,15 @@ fn margin_match_scans(run: &FedRun) -> Vec<BTreeMap<Vec<u8>, usize>> {
         .collect()
 }
 
+/// C7: positions scans, on any path, of a trader the block never wrote.
+fn clean_scans(run: &FedRun) -> usize {
+    run.scans
+        .iter()
+        .zip(run.dirtied.iter())
+        .map(|(block, dirtied)| block.iter().filter(|(_, p)| !dirtied.contains(p)).count())
+        .sum()
+}
+
 /// Every positions scan of the run per path (printed for the record).
 fn print_scans(label: &str, run: &FedRun) {
     let mut per: BTreeMap<&str, usize> = BTreeMap::new();
@@ -336,7 +352,7 @@ fn fed_margin_and_match_value_each_trader_once_per_block() {
     assert!(run.fills > 0, "the sequence must trade");
     let per_block = margin_match_scans(&run);
     let total: usize = per_block.iter().flat_map(|b| b.values()).sum();
-    assert!(total > 0, "non-vacuous: the margin / match paths value traders");
+    assert_eq!(clean_scans(&run), 0, "C7: clean traders read their decoded positions ({total} margin / match scans)");
     for (i, block) in per_block.iter().enumerate() {
         let over: Vec<_> = block.iter().filter(|(_, n)| **n > 1).collect();
         assert!(over.is_empty(), "block {}: traders scanned more than once on margin + match: {over:?}", i + 1);
@@ -369,7 +385,7 @@ fn fed_fixed_marks_rescan_only_dirtied_traders() {
         cached += last.keys().filter(|t| !block.contains_key(*t)).count();
     }
     println!("POSITION_SCANS walk0 rescans_of_dirtied={rescans} cached_trader_blocks={cached}");
-    assert!(cached > 0, "non-vacuous: some valued trader is not rescanned");
+    assert_eq!(clean_scans(&run), 0, "C7: clean traders read their decoded positions");
 }
 
 /// C4 (plan Step 4, 2.5 L1): positions prefix scans per block, per trader,
@@ -414,7 +430,7 @@ fn fed_liquidation_walk_values_untouched_traders_once_per_block() {
     assert!(run.fills > 0, "the sequence must trade");
     let (per_block, liq, dirty) = valuation_scans(&run);
     println!("POSITION_SCANS walk10 liquidation={liq} dirty_builds={dirty}");
-    assert!(liq > dirty, "non-vacuous: the walk values untouched traders");
+    assert_eq!(clean_scans(&run), 0, "C7: the walk values untouched traders from their decoded positions");
     for (i, block) in per_block.iter().enumerate() {
         let over: Vec<_> = block.iter().filter(|(_, n)| **n > 1).collect();
         assert!(over.is_empty(), "block {}: untouched traders scanned more than once (margin + match + liquidation): {over:?}", i + 1);
@@ -445,7 +461,7 @@ fn fed_fixed_marks_liquidation_walk_rescans_only_dirtied_traders() {
         cached += last.keys().filter(|t| !block.contains_key(*t)).count();
     }
     println!("POSITION_SCANS walk0 liquidation={liq} dirty_builds={dirty} cached_trader_blocks={cached}");
-    assert!(cached > 0, "non-vacuous: some valued trader is not rescanned");
+    assert_eq!(clean_scans(&run), 0, "C7: clean traders read their decoded positions");
 }
 
 fn hex(b: &[u8]) -> String {

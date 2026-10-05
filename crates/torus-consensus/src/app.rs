@@ -16903,6 +16903,12 @@ mod crash_recovery_tests {
         assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(h), "{what}: R height after {h}");
         let rows = resident_rows_dump(ctx).expect("R stashed");
         assert_dumps_equal(&rows, &resident_cfs_in_db(db), &format!("{what}: R vs DB after {h}"));
+        // Item 6 C7: the slot's decoded positions == a cold decode of R.
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().trader_positions_match_rows(),
+            Some(true),
+            "{what}: decoded positions vs R after {h}"
+        );
     }
 
     /// Run the book fixture in `mode`, serial or pipelined, with R
