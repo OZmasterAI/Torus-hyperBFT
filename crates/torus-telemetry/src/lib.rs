@@ -324,6 +324,9 @@ pub struct Metrics {
     /// block — previously buried in the unattributed residual because it runs
     /// BEFORE `exec_engine_seconds` starts.
     pub exec_load_books_seconds: Histogram,
+    /// Item 6 E4: the context's margin-config load (one scan of the market
+    /// rows plus their decode), a part of `exec_load_books_seconds`.
+    pub exec_margin_configs_seconds: Histogram,
     /// PROFILER (s470): commit-callback persistence — block-body JSON write to
     /// CF_BLOCK_BODIES (+ standalone applied-height marker on non-native blocks).
     pub exec_body_persist_seconds: Histogram,
@@ -1551,6 +1554,12 @@ impl Metrics {
              (O(total resting depth); classic blob or C4 rows depending on TORUS_BOOK_ROWS)",
             exec_load_books_seconds.clone(),
         );
+        let exec_margin_configs_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_exec_margin_configs_seconds",
+            "Item 6 E4: the context's margin-config load (market rows scan + decode), part of load_books",
+            exec_margin_configs_seconds.clone(),
+        );
 
         let exec_body_persist_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
@@ -2239,6 +2248,7 @@ impl Metrics {
             exec_block_seconds,
             exec_evm_seconds,
             exec_load_books_seconds,
+            exec_margin_configs_seconds,
             exec_body_persist_seconds,
             commit_persist_seconds,
             vote_state_write_seconds,
@@ -2542,6 +2552,7 @@ mod tests {
             "torus_exec_block_seconds",
             "torus_exec_evm_seconds",
             "torus_exec_load_books_seconds",
+            "torus_exec_margin_configs_seconds",
             "torus_exec_body_persist_seconds",
             "torus_commit_persist_seconds",
             "torus_commit_body_encode_seconds",

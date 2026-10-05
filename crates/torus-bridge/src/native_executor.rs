@@ -3566,6 +3566,8 @@ pub struct LoadTimings {
     pub markets: u32,
     pub orders: u64,
     pub levels: u64,
+    /// Item 6 E4: `load_margin_configs` (every context, resident or not).
+    pub margin_configs_ns: u128,
 }
 
 /// L3 save-books attribution (µbench-only): breakdown of the mode-2
@@ -3835,6 +3837,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         // Item 3 (F2, F8, D11): margin configs from the market listings. A read
         // error is a node fault (fatal, like the book load).
+        let margin_configs_timer = std::time::Instant::now();
         let margin_configs = match Self::load_margin_configs(&state) {
             Ok(m) => m,
             Err(e) => {
@@ -3844,6 +3847,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 HashMap::new()
             }
         };
+        load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
 
         Self {
             positions,

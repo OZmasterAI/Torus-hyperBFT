@@ -392,7 +392,7 @@ fn run() {
     if mode == "stale" {
         ts += 300; // > 60 s mark age (cell: drain blocks minutes after the last submission)
     }
-    let mut rows: Vec<(u64, bool, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut rows: Vec<(u64, bool, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
     for h in first..=drain_to {
         if h % 13 == 0 {
             ts += 1;
@@ -415,7 +415,7 @@ fn run() {
         let run_native = boundary || due || feed_now;
         if !run_native {
             // marker-only block (the parent flush is W's work on the node)
-            rows.push((h, false, due_ms, 0.0, 0.0, 0.0, 0.0, 0.0, ms(t_block)));
+            rows.push((h, false, due_ms, 0.0, 0.0, 0.0, 0.0, 0.0, ms(t_block), 0.0, 0.0));
             drop(ov);
             chain.marker_only(h);
             continue;
@@ -424,6 +424,8 @@ fn run() {
         let mut resident_block = chain.begin(&mut ov, h);
         let mut ctx = chain.ctx(&ov, h, ts, &mut resident_block);
         let ctx_ms = ms(t);
+        // E4: the context's margin-config load (part of ctx).
+        let mc_ms = ctx.load_timings.margin_configs_ns as f64 / 1e6;
         if feed_now {
             submit_all(&ctx, markets, &mut walk);
         }
@@ -470,11 +472,11 @@ fn run() {
         let total = ms(t_block);
         if boundary || h % EPOCH <= 3 || h < first + 3 {
             println!(
-                "  h={h} native barrier={barrier_ms:.2} ctx={ctx_ms:.2} due={due_ms:.2} oracle={oracle_ms:.2}[prune={prune_ms:.2}({pruned}) inputs={inputs_ms:.2} agg={agg_ms:.2}(ok {agg_ok}) marks={marks_ms:.2}] liq={liq_ms:.2}(results {}) gov={gov_ms:.2} epoch={epoch_ms:.2} flush={flush_ms:.2} total={total:.2}",
+                "  h={h} native barrier={barrier_ms:.2} ctx={ctx_ms:.2}[margin_configs={mc_ms:.2}] due={due_ms:.2} oracle={oracle_ms:.2}[prune={prune_ms:.2}({pruned}) inputs={inputs_ms:.2} agg={agg_ms:.2}(ok {agg_ok}) marks={marks_ms:.2}] liq={liq_ms:.2}(results {}) gov={gov_ms:.2} epoch={epoch_ms:.2} flush={flush_ms:.2} total={total:.2}",
                 liq_res.len()
             );
         }
-        rows.push((h, true, due_ms, oracle_ms, liq_ms, gov_ms, epoch_ms, flush_ms, total));
+        rows.push((h, true, due_ms, oracle_ms, liq_ms, gov_ms, epoch_ms, flush_ms, total, ctx_ms, mc_ms));
     }
     println!(
         "UBENCH R after drain: builds={} shared_fallbacks={} height={:?}",
@@ -496,7 +498,7 @@ fn run() {
     if let Some(carried) = chain.holder.rows() {
         assert_eq!(carried, &cold, "R carried through the drain == cold build");
     }
-    let class = |r: &(u64, bool, f64, f64, f64, f64, f64, f64, f64)| match r.0 % EPOCH {
+    let class = |r: &(u64, bool, f64, f64, f64, f64, f64, f64, f64, f64, f64)| match r.0 % EPOCH {
         0 => "x00",
         1 => "x01",
         2 => "x02",
@@ -519,11 +521,13 @@ fn run() {
         }
         let n = v.len() as f64;
         let nat = v.iter().filter(|r| r.1).count();
-        let avg = |f: fn(&&(u64, bool, f64, f64, f64, f64, f64, f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / n;
+        let avg = |f: fn(&&(u64, bool, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / n;
         println!(
-            "SUMMARY mode={mode} resident_rows={resident} {c}: n={} native={nat} due={:.3} oracle={:.2} liq={:.2} gov={:.3} epoch={:.2} flush={:.2} total={:.2} ms (avg)",
+            "SUMMARY mode={mode} resident_rows={resident} {c}: n={} native={nat} due={:.3} ctx={:.2}[margin_configs={:.2}] oracle={:.2} liq={:.2} gov={:.3} epoch={:.2} flush={:.2} total={:.2} ms (avg)",
             v.len(),
             avg(|r| r.2),
+            avg(|r| r.9),
+            avg(|r| r.10),
             avg(|r| r.3),
             avg(|r| r.4),
             avg(|r| r.5),

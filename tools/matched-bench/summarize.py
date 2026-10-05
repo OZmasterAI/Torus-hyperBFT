@@ -149,7 +149,10 @@ ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flus
 # -> the only half a flush worker could take). drain + write == save_books to
 # rounding; both 0.0 on a pre-bl1 binary AND on book modes 0/1 (no two-pass save).
 SAVE_SUB_BL1 = ["save_books_drain", "save_books_write"]
+# Item 6 E4: the context's margin-config load (`load_margin_configs`, one
+# scan of the market rows), a part of load_books; 0.0 on an older binary.
 SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6,
+       "load_books": ["margin_configs"],
        "save_books": SAVE_SUB_BL1,
        "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"],
        "end_resident": END_RESIDENT_SUB}

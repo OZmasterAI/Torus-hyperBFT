@@ -2212,6 +2212,8 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_load_books_seconds
                     .observe(load_books_timer.elapsed().as_secs_f64());
+                m.exec_margin_configs_seconds
+                    .observe(ctx.load_timings.margin_configs_ns as f64 / 1e9);
                 m.exec_resting_orders.set(ctx.resting_order_count() as i64);
                 if ctx.resident_rebuilt() {
                     m.exec_resident_rebuilds.inc();
@@ -12232,6 +12234,7 @@ mod crash_recovery_tests {
             "torus_exec_block_seconds",
             "torus_exec_evm_seconds",
             "torus_exec_load_books_seconds",
+            "torus_exec_margin_configs_seconds",
             "torus_exec_body_persist_seconds",
         ] {
             assert!(
