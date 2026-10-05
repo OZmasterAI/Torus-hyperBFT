@@ -13,10 +13,19 @@ Liquidation cooldown parity fix `2d03111` (whole position during the 30 s cooldo
 confirmed by HL's public liquidation fills; same-block rule A -> B follow-up, review log
 28); tip `14236fa`, pushed. Ozarchy 300-market
 profile (C3 + PF1): 0.555x main; the cost is per-account position reads (section 1.1).
-**Remaining order (s91): cooldown same-block rule A -> B (18c) -> C6 (B0 + A-lite + D,
-18c) -> C7 (per-trader positions in memory) -> E2-E4 (18c; E1 built on ozarchy in
-parallel, branch `perf/item6-e1`) -> C5 (warm == cold, last, so it covers C7's state) ->
-Gate 2** (sections 5.2, 5.3). Ozarchy measures `14236fa` first (baseline before C6). Ubench gates are ratios to the base on the same machine (section 1.2).
+s92 (2026-10-05): built and pushed on `perf/item6-phase1` (suite 2760 / 0 / 39 at `4a26653`):
+C7 `82bd1a4`; P1-P4 matching per-fill fixes `b809d43` `1606853` `205f996`; fix A off-tick /
+dust rejected before the book `d4ece00` + P4(b) `14a0d20`; ozarchy: trie maintenance off by
+default `db6c9de`, RPC tick / lot check `44b7473`; M1 margin-phase cuts + rows 40-42
+`7c365d4` `e81aa2e` `49df3eb` `b9959e2`; ozarchy C per-action results `9195c32` + typed
+reasons `4a26653`; tip `c58775f`. Ozarchy 300 markets, trie off (results doc sections
+10-14): 0.508x (`14236fa`) -> 0.638x (C6 + C7) -> 0.648x (`239ff69`) -> **0.760x** (M1
+`90a752c`, 76.5k vs main 100.6k; unprofiled warm cell 0.91x). Decisions with the options not
+taken: section 9.
+**Remaining order (s92): step 1 `into_cache` reuses C7's decoded positions + `end_resident`
+timer (building) -> step 2 `end_resident` off the execution thread, only if the overlap check
+says it pays (section 9.7) -> E2-E4 -> C5 (warm == cold, last) -> sync main -> Gate 2 (300 and
+10 markets; 10 markets not re-measured since PF1, 0.72x).** Ubench gates are ratios to the base on the same machine (section 1.2).
 Design: `market-scaling-in-memory-design.md` Phase 1 + section 3.6; targets and proof
 obligations: `crab-speed-target-design.md` sections 2.2, 2.3, 4, 5 ("crab doc").
 Base: `perf/s87-crab-fixes` @ `9c4be2c` (s89: option B review fix `ef5eab7`, oracle-feed
