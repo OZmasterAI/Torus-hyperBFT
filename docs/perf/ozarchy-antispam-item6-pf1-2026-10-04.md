@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`), moving prices and the bench in-flight cap (`5584880`, `59fa407`), Phase 2 step 0 profile
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`), moving prices and the bench in-flight cap (`5584880`, `59fa407`), Phase 2 step 0 profile, s94 batch cost and liquidation stress (`35e69b3`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -32,6 +32,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 20 | With the oracle feed live through the drain (plan Step 6), does `5584880` drain, and what does an oracle-only block cost to execute? How large is the bench's open-limit reject share? Does the pre-merge `cargo test` pass? | **Drains in 38.2 s with the feed live; AGREE, liveness PASS. Oracle-only blocks 4.6 ms p50, 5.92 ms max (target <= 20 ms)**, exec lag 0-1 in the quiet window; walk 0 (prices static). Reject share unchanged: 52-54% of actions fail, 39-43% of orders are open-limit rejects (only reject reason), `OPEN_ORDER_BUDGET` unset. `cargo test --workspace`: 2806 passed, 0 failed |
 | 21 | Do moving prices (walk 10 bp) change the merge gate? Does a per-sender in-flight cap (`--max-in-flight`) with `OPEN_ORDER_BUDGET` remove the open-limit rejects without losing throughput? What is crab / main on that shape? | Walk 10: **1.088x main** (walk 0 1.132x; walk costs ~4% matched/s), 0 liquidations, drains with the feed live. Cap: the budget (counting in-flight places) takes open-limit rejects 40% -> **0%** at every N; main matched/s 96-101k -> ~173k; plateau from N=2 on main and crab. Crab (`59fa407`) / main at N=2: **1.054x** (section 19 uncapped 1.097x); margin per fill 1.32x main. Standard shape from now on: **N=4 + budget 900** (21.4) |
 | 22 | Phase 2 step 0: on the standard shape (N=4 + budget 900), are the Phase 2 targets still the top costs? What do moving prices add? Rows 7, 77, 78? | Crab / main **1.059x** (r1). Targets not in the planned order: **cancel-all book scan 27 ms/block** (plan 105-140), **>= 14-16k thread spawns / min** (plan ~1,300), flush 16 ms on exec + 74 ms flush worker, **stops diff ~0.06 ms (drop)**. Margin per fill 1.26x main. Walk 10: +13 ms engine per block (re-value). Row 77: first block after load waits on the flush worker's backlog. Row 78: empty blocks = liquidation sweep rebuilding `pos_sums`. Row 7: 0.33-0.37 s per 1M rows at start (est. ~0.56 s at 1.6M rows) |
+| 23 | Does the s94 batch (main `35e69b3`) cost throughput? Does a liquidation storm stay live? | Batch: **1.057x main** at r1 (section 22: 1.059x), no measurable cost, 0 off-mark band refusals. Liquidation stress: S=400 **pass** (100 accounts, all backstop, step <= 115 ms, vault +19.98M). S=750 **liveness FAIL**: 100 accounts all ADL over ~270 markets each, liquidation step 332 / 123 / 241 s on 3 blocks, **consensus frozen ~11.6 min**; state agrees, vault deficit 26.5M (expected) |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -2341,6 +2342,90 @@ The Phase 2 targets are still on the list but not in the planned order:
 Settle, margin and match are larger than any Phase 2 target but are not
 Phase 2 items.
 
+## 23. s94 batch cost and liquidation stress (`35e69b3`, 2026-10-06)
+
+### 23.1 Batch cost: main `35e69b3` vs `92a02ed`
+
+Main `35e69b3` = the s94 batch (EVM fee, read-precompile gas, CoreWriter,
+inflation self-stake, off-mark bad debt / +-50% band, governance atomic
+writes, auth replay nonce window, liquidation telemetry), node `c2ea1ff8`,
+oracle feed as the crab arm (walk 0, paused for the drain); main `92a02ed`
+(`31a95c65`, `TORUS_NATIVE_TRIE_MAINTENANCE=0`, no feed). Both arms bench
+`361cf3ef` (from `35e69b3`), N=4 + budget 900, 300 markets, 120 s, no perf.
+Fresh genesis per cell (`b83180e1`, chain id 7778, regenerated in each cell's
+worktree). Order: candidate warm, cand r1, main r1, cand r2, main r2. All
+cells rc 0, AGREE, liveness PASS, no deaths, exe md5 3/3 per arm, oracle
+stale 0. Driver `~/bench-results-matched/ozarchy-bd-campaign.sh`, table
+`ozarchy-bd-analysis.txt`.
+
+| cell | matched/s | best60 | native blk/s | engine ms/1k | margin ms/1k | match ms/1k | CPU-s per 1M fills |
+|---|---|---|---|---|---|---|---|
+| cand r1 | 181,500 | 190,535 | 5.451 | 4.29 | 0.98 | 0.53 | 30.2 |
+| main r1 | 171,746 | 182,667 | 3.585 | 4.61 | 0.73 | 1.43 | 31.8 |
+| cand r2 | 180,501 | 190,865 | 5.369 | 4.28 | 1.01 | 0.52 | 30.2 |
+| main r2 | 159,788 | 170,127 | 3.358 | 4.96 | 0.78 | 1.48 | 33.2 |
+
+- **No measurable cost:** r1 1.057x (section 22, `59fa407`: 1.059x). r2 1.130x
+  is a low main outlier (-7%). Per fill the candidate is within 1.5-3% of
+  `59fa407` (engine +1.7%, margin +1.7%, match +3%). Both arms are ~1.7%
+  below their section 22 values (bench / host drift, not the node).
+- **Off-mark band refusals: 0** (`torus_orders_rejected_other_total` and
+  `torus_exec_action_failures_total` 0 on every node).
+
+### 23.2 Liquidation stress (`bench/liq-stress` @ `af8529e`)
+
+Node `c2ea1ff8` (= `35e69b3`; the branch changes only `tools/`), bench
+`ec4e14a9`. Standard shape (N=4 + budget 900, 300 markets), walk 10 bp,
+`ORACLE_FEED_DRAIN=1`; stress cells add `LIQ_THIN=200` (bulk senders 60-259
+on 1M TRS) and a parity-signed shock at round 45 (`ORACLE_SHOCK_BP` S: odd
+markets +S bp, even -S bp, so the 100 even-index thin senders lose on every
+position). The vault and 50 thin senders are in the digest. Driver
+`ozarchy-liq-campaign.sh`; per cell `liq-stress.json`, `liq-lines-val*.txt`,
+`thin-snap.jsonl`.
+
+| | warm | S=400 | S=750 |
+|---|---|---|---|
+| verdict | rc 0, ACCEPT | rc 0, ACCEPT | **rc 2, REJECT (liveness FAIL)** |
+| AGREE (incl. vault + thin) | AGREE | AGREE | AGREE |
+| matched/s (best60) | 171,299 (180,563) | 161,565 (184,444) | 127,720 (179,405) |
+| liquidations (val0 / 1 / 2) | 0 | 100 / 100 / 100 | 100 / 100 / 100 |
+| stage 1 / backstop / ADL | - | **0 / 100 / 0** | 0 / 0 / **100** |
+| acted per block (3 blocks) | - | 47 / 20 / 33 | 47 / 20 / 33 |
+| liquidation step on those blocks | ~18 ms baseline | 98 / 46 / 115 ms | **331.8 / 123.4 / 241.1 s** |
+| pending / deferred | - | 0 throughout | 0 throughout |
+| feed-live drain | 23 s | 33 s | 749 s of 780 |
+| vault (identical on all nodes) | - | +19,984,975.69, 300 positions | **deficit 26,516,805.13**, 0 positions |
+
+- **S=750 stalls the chain:** all 100 accounts go to ADL, each with positions
+  in ~257-279 markets: 26,778 ADL (account, market) steps per node and
+  27,410 counterparty closes (26,309 single, 327 with 2, 121 with 3, 21 with
+  4), ~26 ms per account-market, all inside 3 blocks. Consensus height stayed
+  at 787-789 from 18:12:37 to 18:24:14 (~11.6 min). State stayed identical
+  (AGREE). ADL has no per-block work budget: one large move can halt block
+  production for minutes. **P0 before testnet.**
+- **The vault deficit at S=750 is the expected finding** (nothing refills
+  it): identical in `torus_liquidator_vault_deficit`, `torus_getLiquidatorVault`
+  on all 3 nodes and the digest.
+- **S=400 went straight to backstop** (0 stage 1), although a 4% loss against
+  a 5% initial margin was expected to land in stage 1. Unexplained: the thin
+  accounts may be deeper than modelled, or classification differs from the
+  design.
+- **Who:** exactly the 100 even-index thin senders (balances 0 after S=400;
+  the ADL lines name the same 100 at S=750); no ADL'd account outside the
+  thin set (counterparty identities are only in the debug-level close lines).
+- **Row 76:** pending never rose above 0 and all 100 accounts were acted on
+  within 3 blocks (budget 64 per block), so "liquidate touched accounts
+  first" is not needed at this size. Exec lag was already 65-66 from the load,
+  so the shock adds nothing measurable to it at S=400.
+- **Harness issues found:** an untracked, gitignored
+  `testnet/genesis-weighted-full.json` in the worktree (61 balances, written
+  by a harness test) made the first attempt's node exit with `invalid
+  address: oracle-feed` and the `LIQ_THIN` patch match 0 rows (attempt
+  archived in `ozarchy-liq-attempt1/`); a target dir reflink-seeded from
+  another build kept a stale bench binary; `liq_stress.py` raises KeyError on
+  `torus_exec_post_engine_tail_seconds_count` (`sampler.csv` has only
+  `_sum`). Results above use a patched copy (`ozarchy-liq-tools/`).
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -2432,3 +2517,13 @@ Phase 2 items.
   placeholder): before testnet, microbench ns per unit (row read / 32 B blob /
   32 B returned) and size it so a 30M-gas block of reads fits the block exec
   budget.
+- **P0 before testnet: ADL has no per-block work budget** (section 23.2): at
+  S=750, 100 accounts x ~270 markets of ADL took 332 / 123 / 241 s on three
+  blocks and froze consensus ~11.6 min. Needs a budget (account-markets or
+  closes per block) with carry-over, and cheaper per-close work.
+- Liquidation stress at S=400 classified every account as backstop, none as
+  stage 1 (section 23.2): check the thin accounts' margin at the shock and
+  the classification.
+- Harness: fix `liq_stress.py` (`_count` column), keep harness tests from
+  writing `testnet/genesis-weighted-full.json` into the worktree, and avoid
+  stale binaries from reflink-seeded target dirs (section 23.2).
