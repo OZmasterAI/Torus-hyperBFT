@@ -9841,19 +9841,10 @@ impl NativeExecutor {
 
             // HL-parity: a stop order type (a row queued before the precompile
             // rejected them) fails instead of running as a plain Limit order.
-            if let QueuedActionKind::PlaceOrder { order_type, .. } = qa.kind {
-                if decode_order_type(order_type).is_none() {
-                    results.push(NativeActionResult::err(
-                        "core_writer",
-                        format!("unsupported CoreWriter order_type {order_type}"),
-                    ));
-                    continue;
-                }
-            }
-
             let result = match core_writer_to_native(qa) {
-                Some(action) => Self::execute(ctx, &qa.trader, &action),
-                None => Self::exec_settle_lockbox_deposit(ctx, qa),
+                Ok(Some(action)) => Self::execute(ctx, &qa.trader, &action),
+                Ok(None) => Self::exec_settle_lockbox_deposit(ctx, qa),
+                Err(e) => NativeActionResult::err("core_writer", e),
             };
             results.push(result);
         }
@@ -10243,10 +10234,11 @@ fn sort_deterministic(mut keyed: Vec<KeyedAction>) -> IndexedActions {
 
 /// Convert a CoreWriter queued action to a NativeAction for execution.
 ///
-/// `None` for `LockboxDeposit`: its native-only credit has no `NativeAction` form and is
-/// settled directly by `drain_core_writer`.
-fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
-    Some(match &qa.kind {
+/// `Ok(None)` for `LockboxDeposit`: its native-only credit has no `NativeAction` form
+/// and is settled directly by `drain_core_writer`. `Err` for a `PlaceOrder` whose
+/// order type is not Limit / Market (stop types carry no trigger price here).
+fn core_writer_to_native(qa: &QueuedAction) -> Result<Option<NativeAction>, String> {
+    Ok(Some(match &qa.kind {
         QueuedActionKind::PlaceOrder {
             market_id,
             side,
@@ -10259,8 +10251,8 @@ fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
             is_buy: *side == 0,
             price: *price,
             quantity: *quantity,
-            // `drain_core_writer` rejects any other code before converting.
-            order_type: decode_order_type(*order_type).unwrap_or(OrderType::Limit),
+            order_type: decode_order_type(*order_type)
+                .ok_or_else(|| format!("unsupported CoreWriter order_type {order_type}"))?,
             time_in_force: decode_time_in_force(*time_in_force),
             reduce_only: false,
             client_order_id: None,
@@ -10289,8 +10281,43 @@ fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
         QueuedActionKind::LockboxWithdraw { amount } => NativeAction::TransferToSpot {
             amount: fp_to_u256(*amount),
         },
-        QueuedActionKind::LockboxDeposit { .. } => return None,
-    })
+        QueuedActionKind::LockboxDeposit { .. } => return Ok(None),
+    }))
+}
+
+#[cfg(test)]
+mod core_writer_conversion_tests {
+    use super::*;
+
+    fn place(order_type: u8) -> QueuedAction {
+        QueuedAction {
+            trader: Address::new([1; 20]),
+            kind: QueuedActionKind::PlaceOrder {
+                market_id: 1,
+                side: 0,
+                order_type,
+                price: FixedPoint::from_raw(100),
+                quantity: FixedPoint::from_raw(1),
+                time_in_force: 0,
+            },
+            block_queued: 1,
+        }
+    }
+
+    /// Review nit: the conversion itself refuses stop / unknown order types
+    /// (no silent Limit fallback left anywhere); Limit and Market convert.
+    #[test]
+    fn stop_and_unknown_order_types_do_not_convert() {
+        for t in [2u8, 3, 4, 255] {
+            assert!(core_writer_to_native(&place(t)).is_err(), "order_type {t}");
+        }
+        for (t, want) in [(0u8, OrderType::Limit), (1, OrderType::Market)] {
+            match core_writer_to_native(&place(t)) {
+                Ok(Some(NativeAction::PlaceOrder(p))) => assert_eq!(p.order_type, want),
+                other => panic!("order_type {t}: {other:?}"),
+            }
+        }
+    }
 }
 
 /// CoreWriter order type: 0 = Limit, 1 = Market; `None` for anything else
