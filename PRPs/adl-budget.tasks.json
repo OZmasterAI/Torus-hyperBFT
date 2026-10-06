@@ -67,7 +67,7 @@
     {
       "id": "A5",
       "name": "at B: positions to the side escrow at the clamped rule-H price with a RUNNING rest (O(P), adl_rest becomes cfg(test) shadow), obligation rows, D9 never positive (error log if > 0; test p2_d9_remainder_is_never_positive); escrows skipped by the pass; run_liquidations_with(work)",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-core/src/liquidation.rs",
         "crates/torus-bridge/src/liquidation_step.rs",
@@ -86,7 +86,7 @@
     {
       "id": "A6",
       "name": "drain under W: update_obligation (overwrite existing / delete at 0); 1 unit per row visited, per-block ranking cache per (market, side) with a per-key position (adl_close returns closes/next/read), close at stored price, listed-unmarked rows wait / delisted rows rank at the stored price (OQ1), escrow pairing via vault, dust sweep (test-only bound, >=1 token error log), vault pending row set AFTER the drain; HL-sized event in one block; non-ignored W floor test; GOLDEN_B re-pin",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-bridge/src/liquidation_step.rs",
         "crates/torus-bridge/src/liquidation_l1_tests.rs",
@@ -103,7 +103,7 @@
     {
       "id": "A7",
       "name": "e2e (0x07 rows keep empty blocks due with a usable mark through block 15, equal roots; restart mid-drain = uninterrupted; test_adl_work hook) + records-vs-walk work units equal (L1) + gauges (queue rows, queue_deficit, adl_work_total, escrow notional, dust, pairing) + gated node-local value sum (TORUS_LIQ_VALUE_SUM)",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-consensus/src/app.rs",
         "crates/torus-bridge/src/native_executor.rs",
@@ -122,7 +122,7 @@
     {
       "id": "A8",
       "name": "ubench_adl multi-block + HL mode (N=5000, one side, 100 keys, 300 rows); measure units/ms incl. block-B ms; per-block bound incl. adl_cross rows; set ADL_WORK_PER_BLOCK = max(1.25 x U_hl, 500,900); document in adl-budget.md (bench-runner)",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/torus-bridge/tests/ubench_adl.rs",
         "crates/torus-core/src/liquidation.rs",

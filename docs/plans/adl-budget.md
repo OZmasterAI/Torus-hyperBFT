@@ -258,8 +258,8 @@ Sections 4-5 above describe the earlier account queue (Q4-Q6 before P2). Where t
 this section, this section holds: there is no account queue, no freeze and no re-classification,
 and the queue gauge counts rows.
 
-W is one constant, high enough that an HL-sized event (a few hundred account-markets) closes the
-escrows in its own block. Only S=750-type storms spill over several blocks. HL's Oct 10 2025 ADL
+W is one constant (630,000, measured in §9), high enough that an HL-sized event (a few hundred
+account-markets) closes the escrows in its own block. Only S=750-type storms spill over several blocks. HL's Oct 10 2025 ADL
 (raw node_fills) closed every (account, coin) fully in one block.
 
 **H: the previous mark.** Row `0x03 ‖ market` holds `last(16) ‖ [prev(16)]`. When the step's mark
@@ -287,3 +287,46 @@ params). The future funding item **must exclude the positions of `ADL_ESCROW_LON
 `ADL_ESCROW_SHORT`**: they neither pay nor receive, otherwise an escrow could not end at 0.
 Counterparties keep paying and receiving funding until their obligation is drained. This is a
 small difference from HL that only shows during a storm (HL parity backlog item).
+
+## 9. Budget measurement (A8, measured)
+
+`crates/torus-bridge/tests/ubench_adl.rs` (ignored; real `run_liquidations_with` through
+`NativeStateOverlay` with R attached, scan 2,048 / act 64 / `UB_ADL_WORK`). ozarchy, quiet
+(load < 1.5), release with `-C force-frame-pointers=yes`, 3 runs each, at W = 630,000. Setup:
+N = 5,000 traders × 300 markets (1.5M position rows), bankrupt accounts long size 1 (one side).
+*B ms* = step start → the last `liquidation: ADL to escrow` event (classification + transfers);
+*step ms* = the `liquidation step` line's `ms`; ns/unit = (step − B − the healthy-scan baseline)
+/ `adl_work`.
+
+| case | block | transfers | rows closed | units | B ms | step ms (3 runs) | ns/unit |
+|---|---|---|---|---|---|---|---|
+| HL: 3 accounts × 100 markets | B | 300 | 300 | 500,800 | 1.0 | 532 / 537 / 540 | 1,059-1,075 (median 1,068) |
+| S=750-like: 100 × 270 | B₁ (64 accounts) | 17,280 | 7,745 | 630,126 | 66-68 | 12,303 / 12,305 / 12,344 | ~19,450 |
+| | B₂ (36 accounts) | 9,720 | 7,808 | 630,862 | 36-37 | 4,193 / 4,266 / 4,352 | ~6,700 |
+| | drain 3 | 0 | 5,184 | 630,616 | — | 502 / 537 / 538 | ~830 |
+| | drain 4 | 0 | 4,464 | 634,178 | — | 480 / 505 / 507 | ~780 |
+| | drain 5 | 0 | 1,799 | 253,698 | — | 178 / 179 / 180 | ~700 |
+
+* **W = 630,000** = max(1.25 × U_hl, 100 × (5,000 + 3) + 300 × 2) rounded up to 10,000, with
+  U_hl = 500,800 (100 rankings × 5,002 traders + 300 rows × 2). The HL event closes the escrows
+  in block B (asserted by the HL mode); S=750-like drains in 5 blocks (B spans 2 at act 64).
+  Before (b60bdff, §2): 27,000 steps × 12-16 ms ≈ 6-7 min of step time.
+* **Owner condition (block B outside W, ~250 ms): block B's own work holds** (1 ms HL, 67 ms
+  for 64 accounts × 270 markets). **The W-block does not:** an HL event's block costs ~540 ms
+  here (~1 s at the rig factor 1.9-2), and a block with B's transfers *and* a drain costs up to
+  12.3 s for the same units (19 µs/unit vs 0.8).
+* Why (perf): in the HL block ~70 % of the step is the ranking AV (`reader.view` / `pos_sums`
+  per candidate, ~2,500 per (market, side), 100 rankings). In B₁, 83 % is `liq_traders_after`
+  run once per ranking: `layer_keys(CF_NATIVE_POSITIONS)` (the block's ~17k pending position
+  keys) plus a `has_key` overlay seek per dirty trader, × 270 rankings. Units count traders
+  examined, not the block's pending keys, so W does not bound that cost.
+* Open (owner): hoist the trader set out of `adl_candidates_of` (once per drain; a trader gone
+  flat returns no position), and/or charge B's transfers into W, or a lower per-block act limit
+  for ADL accounts; a per-block AV cache for the ranking. Not implemented.
+
+Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
+`RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes"`,
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`; `UB_ADL_WORK` overrides W):
+
+    UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
+    UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture

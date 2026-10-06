@@ -61,8 +61,10 @@ pub const LIQ_ACT_PER_BLOCK: usize = 64;
 /// adl-budget Q3: the drain's work units per block — traders examined by a
 /// ranking + rows visited + candidates read (+ edge rows). Chosen (A8) so an
 /// HL-sized event (a few hundred account-markets) closes the escrows in its
-/// own block; one constant. Placeholder until A8 measures it.
-pub const ADL_WORK_PER_BLOCK: u64 = 1_000_000;
+/// own block; one constant. A8 (measured, `ubench_adl` HL mode: N = 5,000
+/// traders, 3 accounts x 100 markets, one side): U_hl = 500,800 units;
+/// W = max(1.25 U_hl, 500,900) rounded up to 10,000 (adl-budget.md §9).
+pub const ADL_WORK_PER_BLOCK: u64 = 630_000;
 /// Rows per seek of the bounded walks.
 const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
