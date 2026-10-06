@@ -33,8 +33,16 @@ trie off both arms): 0.893x (`c58775f`, perf on crab) and **0.866x** without per
 section 17 breaks it down.
 s94: **Gate 2 met** on B-blind `31cea69` vs main `92a02ed` (ozarchy section 19, merged into
 `perf/item6-phase1`): 300 markets **1.097x**, 10 markets **0.997x**. Residual zero-fill sell cuts
-0.063% of placed, so option A is deferred behind a counter trigger (section 9.10). Remaining:
-C5 (warm == cold), then sync main (re-run Gate 2 if main has moved).
+0.063% of placed, so option A is deferred behind a counter trigger (section 9.10).
+s94 later (`perf/item6-phase1` @ `9ab36ee`, pushed): C5 warm == cold `6571a76` (3 replicas, 210
+blocks, every `h_n`); main synced (docs only since `92a02ed`, Gate 2 holds); row 43 listing check
+`8d449f5`; governance `Failed` status `e439982` (row 73). Ozarchy: step 6 live-feed idle check
+**passed** (section 20, `5584880`: oracle-only block max 5.92 ms, drained in 38 s; harness
+`ORACLE_FEED_DRAIN=1`); moving prices (walk 10, 2 rounds, section 21 pending): **1.088x main**,
+0.961x walk 0, no liquidation fired (row 76); cargo test 2806 / 0 on `5584880`.
+**Remaining: pre-merge `cargo test --workspace` on `9ab36ee` (ozarchy) -> owner review -> merge
+into main.** Phase 2 prep on ozarchy: generator fix `bench/max-in-flight` (open-limit rejects
+39-43% of orders on both arms, section 20.3), then the step 0 profile.
 **Remaining order (s92, later): E2-E4 (building; re-measure the empty block first, E1 never
 built) | ozarchy: section 17 (10-market gap outside the engine), then 300 markets on `4acdc59`
 (step 2) -> 10-market cuts from section 17 -> C5 (warm == cold, last) -> sync main -> Gate 2
@@ -551,7 +559,7 @@ reviews it.
 | 40 | fix A / stop-limit limit | a StopLimit with an off-tick limit is accepted at placement, holds a slot and margin while pending, rejected only on trigger | owner s92: YES, check at placement | M1 | - |
 | 41 | fix A / Limit price <= 0 | still reaches the book, holds a slot and margin, reports ok (`validate_order_price` checks only Market / Stop) | owner s92: YES, reject before the book | M1 | - |
 | 42 | ozarchy B / tick source | RPC (`fix/rpc-tick-check` `44b7473`) reads tick / lot from the market row; the executor creates every book with ONE / ONE (`native_executor.rs` ~5313, ~7561) and never reads the row; all markets today 1 / 1 | none (s92: fix in M1) | M1: create books from the market row; align RPC and executor messages | - |
-| 43 | M1 / listing validation | governance market listings do not check tick > 0 and lot > 0; since row 42 a lot of 0 makes a book that accepts zero-quantity orders and a tick of 0 turns the tick check off | validate at proposal time? (consensus change) | not built (s92 recommendation: yes) | - |
+| 43 | M1 / listing validation | governance market listings do not check tick > 0 and lot > 0; since row 42 a lot of 0 makes a book that accepts zero-quantity orders and a tick of 0 turns the tick check off | validate at proposal time? (consensus change) | s94 owner: yes. Built: refused at proposal creation and at execution (no market row), genesis refuses; native `ListMarket` / `UpdateMarketParams` already governance-only; no 0 market in any repo genesis / fixture (128 checked) | `8d449f5` |
 | 44 | M1 / undecodable market row | executor uses 1 / 1, RPC only checks the market exists (test placeholders only) | should the RPC also apply 1 / 1? | not built (recommendation: yes) | - |
 | 45 | M1 / book guard | the book itself does not tick-check a StopLimit's limit; every executor path checks it before the book | add it to the book as a second guard? | not built (recommendation: yes) | - |
 | 46 | M1 / RPC price <= 0 | RPC does not reject a Limit with price <= 0 at intake; the executor rejects it before the book | add it at intake? (node-local) | not built (recommendation: yes) | - |
@@ -635,7 +643,7 @@ Section 13: ~52% of actions on the 300-market bench load fail, mostly batches hi
 open-order limit at execution. matched/s is unaffected (it counts fills), but a large share of
 each block is rejected work; revisit the load generator before Gate 2's final cells.
 
-### 8.1 Review log, s92 later (rows 53-65; the table above ends at 52, section 9 sits between)
+### 8.1 Review log, s92-s94 (rows 53-79; the table above ends at 52, section 9 sits between)
 
 | # | step / gate | measured vs target | question for the owner | what was done (proposal) | commit |
 |---|---|---|---|---|---|
@@ -658,6 +666,14 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
 | 69 | bench fixture | `b"listed"` market rows add ~6 ms of fake ctx per block in `ubench_epoch` / `ubench_econ` (failed borsh decode allocates 1 MiB); ozarchy section 7.3's ctx was mostly this | default to real rows (breaks comparison with past runs) or a length guard in `market_margin_config`? (s92 suggestion: real rows by default, note the break) | `UB_REAL_MARKETS=1` added | `ecf4aec` |
 | 70 | E1 | oracle step now 1.8-2.0 ms per empty block | none | dropped | - |
 | 71 | liquidation skip (section 17 cut 3) | no exact whole-pass skip: the pass writes the hashed cursor and clears cooldown / pending rows; per-trader "healthy at mark version V" certificate is exact but saves ~1 ms per empty block after E2 | none (s92: dropped) | not built | - |
+| 72 | C5 coverage | cooldown / pending rows appear in 2 of 210 blocks (one seeded account, 1,100 @100 over the 100k chunk threshold) | none | covered thinly; a dedicated cooldown sequence can follow | `6571a76` |
+| 73 | governance / failed execution (pre-existing) | a passed proposal failing at execution stayed `Passed`, retried every block, and its `?` aborted the loop, so every later due proposal was skipped forever (reachable via `MarketIdInUse`) | s94 owner: fix before the merge | `ProposalStatus::Failed` (borsh 6), loop continues, per-proposal results, RPC `"Failed"`; payload errors -> Failed, storage / decode errors still stop the step; every Failed case raised before the first write (8 cases byte-checked) | `e439982` |
+| 74 | governance / storage errors (pre-existing) | `app.rs` ~2315 discards `process_governance`'s results and governance never sets `fatal_error`: a storage error skips governance for that block, the node does not halt (liquidation does) | halt the node on a governance storage error? (consensus) | open | - |
+| 75 | governance / partial writes (pre-existing) | TreasurySpend and PermanentUnlock write more than once; a storage error after the first write keeps it and leaves the proposal `Passed`, so a retry could pay twice | make both all-or-nothing? (recommendation: yes, before mainnet) | open | - |
+| 76 | liquidation at full-node load | no cell ever fired a liquidation (walk 10 stays within +-80 bp; 0 on every node, drain included); correctness covered by `liquidation_tests` + C5 (7) | none | stress cell before testnet (larger walk or accounts seeded near maintenance) | - |
+| 77 | drain after load (walk pair) | one 20-49 ms oracle-only block per node right after the load ends (both W10 runs, W0 r1); steady p50 ~4 ms | none | investigate in the Phase 2 step 0 profile | - |
+| 78 | empty block with feed live | 2.5-2.8 ms vs 0.03-0.06 ms with the feed paused; likely M1's mark-carry pass over positions (timings only, not confirmed in code) | none | Phase 2 step 0 profile | - |
+| 79 | trading app (separate repo) | RPC proposal status can now be `"Failed"` | none | add `"Failed"` to the app's status type | - |
 
 ### 9.10 Zero-fill sell cuts at 300 markets (s92, owner decisions)
 - Finding (ozarchy section 18 + 18c read-only checks): at 300 markets ~8% of placed orders are GTC sell
