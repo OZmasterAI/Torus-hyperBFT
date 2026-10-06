@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -29,6 +29,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 17 | Where does the 10-market gap outside the engine go (views, RPC / gossip / ingress CPU, untimed exec)? | Nowhere outside execution: in the load window crab's exec block is +51.5 ms (485.5 vs 434.0) at equal fills per block. Views are exec-paced (64-deep channel fills 25-30 s earlier; free-running views 314-330 vs 325-348 ms). RPC +3.5 ms/1k is 2.3x more refused requests (equal CPU per request); signature verify equal per action. Untimed +23 ms/blk is mostly C's `native_failures` (`canonical_bytes`, ~20 ms CPU) plus end_resident (~7). Cutting those two and two small items: ~0.92x main (est.) |
 | 18 | Does step 2 (`4acdc59`: end_resident on a worker, begin_resident before `new_env`) pass Gate 2 at 300 markets? | **0.832x main** (pairs 0.819x / 0.844x; interleaved, both trie off), up from 0.760x (section 14): **Gate 2 not met**. Step 2 hides ~92% of end_resident (exec wait 4.8-5.3 ms per block, p50 0.4, p90 16-22, vs ~15 estimated); `residual_untimed` -56 ms per block; no visible cost to verify. Per block crab is now level with or faster than main (chain 548 vs 601 ms); the gap is 0.77x fills per native block (matched / placed 0.70 vs 0.77, fewer placed per action), present since section 9 |
 | 19 | Does B-blind (`31cea69`: non-pool sell top-up replaces the same-batch bound, on top of cuts 1/2/5/6) pass Gate 2 at both shapes? Is option A needed? | **Yes at both: 1.097x main at 300 markets** (pairs 1.102x / 1.092x; was 0.832x) **and 0.997x at 10 markets** (1.017x / 0.978x; was 0.866x); interleaved, both trie off, no perf. Fills per native block 0.956x at 300 markets (was 0.77x): matched / placed 0.766 vs 0.767. Non-pool zero-fill sell cuts 0.063% of placed (threshold 0.5%): **option A not needed**. All top-ups full; margin cancels and reduce-only cuts 0. 10-market margin +0.067 ms/1k vs main |
+| 20 | With the oracle feed live through the drain (plan Step 6), does `5584880` drain, and what does an oracle-only block cost to execute? How large is the bench's open-limit reject share? Does the pre-merge `cargo test` pass? | **Drains in 38.2 s with the feed live; AGREE, liveness PASS. Oracle-only blocks 4.6 ms p50, 5.92 ms max (target <= 20 ms)**, exec lag 0-1 in the quiet window; walk 0 (prices static). Reject share unchanged: 52-54% of actions fail, 39-43% of orders are open-limit rejects (only reject reason), `OPEN_ORDER_BUDGET` unset. `cargo test --workspace`: 2806 passed, 0 failed |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1916,6 +1917,122 @@ process-lifetime counters cover the whole cell. Raw values are per node.
   40% at 10 markets.
 - The counters are exported with a `_total` suffix.
 
+## 20. Live-feed idle check, reject share, pre-merge tests (`5584880`, 2026-10-06)
+
+`perf/item6-phase1` @ `5584880` (= `31cea69` + test-only
+`ResidentBooks::drop_sums_cache()` + docs). Node md5 `721e48d7` (not
+`3a3c8951`; the code diff is test-only, the cause of the md5 change is not
+checked); bench-throughput `cc12451c`. Same build flags as section 19.
+
+### 20.1 Harness: `ORACLE_FEED_DRAIN=1` (`bench/oracle-feed-drain` @ `ffc245e`)
+
+With `ORACLE_FEED=1`, `run-cell.sh` SIGSTOPs the oracle feed for the drain,
+so marks go stale and the liquidation walk takes its cheap path. On a real
+chain the feed never stops. The opt-in `ORACLE_FEED_DRAIN=1` (needs
+`ORACLE_FEED=1`; default 0 runs exactly as before) keeps the feed running
+through the drain, then pauses it, runs a second (settle) drain of up to
+60 s, and only then takes the after-snapshots and the digest.
+
+`health.py drain --feed-live` is done when, for the quiet window:
+- the order counters (placed, matched, resting) do not move and every node
+  keeps committing;
+- `torus_mempool_native_size` <= the feed's own entries (2 rounds x 3
+  validators x ceil(markets / 256) = 12 at 300 markets). No metric splits
+  the mempool by action kind, so this is a proxy for "no bench action
+  pending";
+- no flush or trade-writer work is pending;
+- `torus_exec_queue_depth` (committed blocks not yet executed) <= 2 on
+  every sample.
+
+It writes `drain-feed-live.tsv` and `drain.json .feed_live`. Commits:
+`37ff2af` (mode + 10 tests) and `ffc245e` (review fix: the window filter
+compared a rounded sample time against an unrounded window start, so about
+half the time the sample before the window leaked into p95 / max; plus a
+test that runs the real `stop_oracle_feed` on the paused feed). Matched-bench
+tests: `test_health.py` 29 OK, `test_harness.py` 101 OK, the other files OK.
+
+### 20.2 The cell
+
+One cell, section 19's 300-market crab shape (cap 400, rate 76,000,
+`RETRY_BUSY=1`, 120 s, feed 30000 / 2000 ms / walk 0, trie variable unset,
+no perf) plus `ORACLE_FEED_DRAIN=1`; own systemd unit through `detach.sh`,
+09:01-09:05; no warm-up cell, no main reference, no SIGKILL trace. OUT
+`~/bench-results-matched/ozarchy-feeddrain-5584880-300m-r1/`, driver
+`ozarchy-feeddrain-5584880-cell.sh`.
+
+| check | result |
+|---|---|
+| run-cell rc | 0, VALIDITY ACCEPT |
+| feed-live drain | **drained in 38.2 s** (timeout 780 s), feed live |
+| settle drain (feed paused) | drained after 11 s |
+| agreement / liveness | AGREE / PASS |
+| node exe | 3/3 pids `721e48d7`, no trie variable |
+| process deaths | none (3 nodes, load generator rc 0, feed rc 0 at stop) |
+| oracle | 510 sent / 510 accepted / 0 rejected; stale 0, fresh 300/300 |
+| matched/s | 111,440 (best60 131,435), 1.008x section 19 crab r1 (110,593) |
+
+Exec ms per oracle-only block, timed per block from the node logs
+(`execution pipeline: executing finalized block` -> `block done`), quiet
+window (drain s 28.2-38.2):
+
+| node | oracle-only blocks | p50 ms | p95 ms | max ms | empty block p50 ms |
+|---|---|---|---|---|---|
+| val0 | 4 | 4.21 | 4.91 | 4.91 | 2.78 |
+| val1 | 4 | 4.58 | 5.92 | 5.92 | 2.90 |
+| val2 | 4 | 4.76 | 4.93 | 4.93 | 2.83 |
+| pooled | 12 | ~4.6 | 5.92 | **5.92** | |
+
+- **Target <= 20 ms: met.** Every oracle-only block after the load (heights
+  682-1160) was <= 5.92 ms. The only slow blocks were the last two bench
+  blocks (h680 / h681, 400 / 292 actions, 135-189 ms).
+- **The harness's own figure is empty-block time.** It reports a mean per
+  1 s sample from `torus_exec_chain_seconds`; the idle chain runs bursts of
+  ~27 blocks/s with 1-3 s gaps, so 0 of 21 intervals held one block and its
+  p50 2.80 / max 3.24 ms are empty blocks. Exact numbers need per-block
+  timing in the node.
+- **Exec lag** (`torus_exec_queue_depth`, 1 s samples): 61-66 while the load
+  backlog drains (0-26 s), then 0 on all nodes from 27-28 s (the backlog
+  cleared in one sample); quiet window min / median / max 0 / 0 / 1.
+- **Walk 0:** prices did not move. Marks were fresh (not the stale cheap
+  path), but nothing pushed accounts toward liquidation. The s89
+  `ubench_epoch` probe (~548 ms per empty block with a live feed, 18c) is a
+  different measurement; this cell confirms the E2-E4 cut on a real node
+  for this shape only. With `ORACLE_WALK_BP` > 0, liquidations that fill
+  orders would move the order counters and the feed-live drain would time
+  out (fails safe).
+
+### 20.3 Open-limit reject share (section 19 cells, no new cells)
+
+Deltas `metrics-after` - `metrics-before` on val0 of each section 19 cell
+(`~/bench-results-matched/ozarchy-bblind-31cea69-<shape>-<cell>/`), as in
+section 13.2.
+
+| cell | actions | failed actions (share) | open-limit order rejects (share of orders) | open-limit rejects per native block |
+|---|---|---|---|---|
+| 300 mk crab r1 | 109,542 | 57,112 (52.1%) | 17.20M (41.9%) | 46.7k |
+| 300 mk crab r2 | 113,608 | 60,097 (52.9%) | 18.24M (42.8%) | 52.3k |
+| 300 mk main r1 | 105,289 | n/a | 16.34M (41.3%) | 61.2k |
+| 300 mk main r2 | 106,927 | n/a | 16.81M (41.9%) | 61.8k |
+| 10 mk crab r1 | 149,312 | 80,539 (53.9%) | 23.70M (42.3%) | 48.9k |
+| 10 mk crab r2 | 148,158 | 79,698 (53.8%) | 23.35M (42.0%) | 47.8k |
+| 10 mk main r1 | 147,383 | n/a | 22.99M (41.5%) | 61.6k |
+| 10 mk main r2 | 149,758 | n/a | 23.55M (41.9%) | 62.0k |
+
+- **Unchanged since section 13.2** (45-52% failed actions at `239ff69`).
+- `torus_exec_action_failures_total` has no reason label and is absent on
+  main `92a02ed`. At the order level `torus_orders_rejected_open_limit_total`
+  is the only non-zero reject reason (margin, book, other are 0), so nearly
+  all failed actions are open-limit batches; the counters cannot show it
+  per action.
+- `OPEN_ORDER_BUDGET` was unset in all 10 cells (`open_order_budget='unset'`).
+- Main's higher rejects per block are its larger blocks (no feed: ~394 vs
+  ~300-330 actions per block), not a higher reject rate.
+
+### 20.4 Pre-merge tests
+
+`cargo test --workspace -q` on `5584880` (TESTING.md "Before merging to
+main"): rc 0, **2806 passed, 0 failed**, no panics, 565 s.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1970,5 +2087,12 @@ process-lifetime counters cover the whole cell. Raw values are per node.
   6.4).
 - Gate 4 after C4 + PF1: ubench tail at 300 markets, `ubench_epoch
   UB_DRAIN=fresh` empty block (target <= 20 ms).
+- Live-feed idle check (plan Step 6) met at `5584880` with walk 0: oracle-only
+  blocks <= 5.92 ms with the feed live through the drain (section 20). Not
+  covered: a moving walk (`ORACLE_WALK_BP` > 0), and per-block exec timing
+  in the node (the harness's per-interval mean only sees empty blocks).
+- Bench open-limit reject share is still 52-54% of actions (section 20.3):
+  per-sender in-flight cap in the generator (18c) before the Phase 2 step 0
+  profile.
 - Anti-spam D (per-IP RPC limit) has no validator exemption; no metric for
   oracle submissions evicted inside the pool.
