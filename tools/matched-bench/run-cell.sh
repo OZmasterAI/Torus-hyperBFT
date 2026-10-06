@@ -189,6 +189,16 @@ if [ -n "${RUN_CELL_PRINT_PATHS:-}" ]; then
         "$WT" "$SELF_DIR" "$TOOLS_DIR" "$TOOLS_FROM_WORKTREE" "$MAINREPO"
     exit 0
 fi
+# A cell runs in its own transient user service, never as a descendant of an
+# interactive or agent shell: see campaign/detach.sh (2026-10-06, three
+# 300-market runs lost a process to an outside SIGKILL). BENCH_ALLOW_UNDETACHED=1
+# overrides, for a deliberate one-off.
+BENCH_UNIT_RE='/bench-[^/]*\.service$'
+if [ "${BENCH_ALLOW_UNDETACHED:-0}" != 1 ] && ! grep -qE "$BENCH_UNIT_RE" /proc/self/cgroup; then
+    echo "FATAL: not running in a bench-*.service unit; start the cell or campaign with" \
+        "tools/matched-bench/campaign/detach.sh NAME LOGFILE CMD... (override: BENCH_ALLOW_UNDETACHED=1)" >&2
+    exit 2
+fi
 TARGET_DIR=${TARGET_DIR:-$HOME/.cargo-target-matched}
 RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}

@@ -1820,7 +1820,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=30,
-                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                    env=dict(
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1", **env
+                    ),
                 )
                 self.assertEqual(r.returncode, 2, r.stderr)
                 self.assertIn(msg, r.stderr)
@@ -1879,7 +1882,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=30,
-                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                    env=dict(
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1", **env
+                    ),
                 )
                 self.assertEqual(r.returncode, rc, (env, r.stderr))
                 self.assertIn(msg, r.stderr)
@@ -1890,6 +1896,106 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+
+
+# ----------------------------------- cells run detached from the caller's shell
+DETACH_SH = os.path.join(HERE, "campaign", "detach.sh")
+
+
+def _in_bench_unit():
+    with open("/proc/self/cgroup") as f:
+        return "/bench-" in f.read()
+
+
+def _have_user_systemd():
+    if not shutil.which("systemd-run"):
+        return False
+    r = subprocess.run(
+        ["systemctl", "--user", "is-system-running"], capture_output=True, text=True
+    )
+    return r.stdout.strip() in ("running", "degraded")
+
+
+class DetachTest(unittest.TestCase):
+    """2026-10-06 ozarchy: three 300-market runs each lost one process (val1,
+    val2, the load generator) to a SIGKILL that was no OOM kill and no
+    kill/tkill/tgkill. The cells ran as descendants of an agent's shell. A cell
+    must run in its own transient systemd --user service (campaign/detach.sh),
+    whose parent is the user manager, not the shell that started it."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="detach-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    @unittest.skipIf(_in_bench_unit(), "test process already runs in a bench unit")
+    def test_run_cell_refuses_outside_a_bench_unit(self):
+        wt = os.path.join(self.d, "wt")
+        os.makedirs(os.path.join(wt, "devnet", "wsl"))
+        results = os.path.join(self.d, "results")
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("BENCH_ALLOW_UNDETACHED", "RUN_CELL_PRINT_PATHS")
+        }
+        env.update(RESULTS_ROOT=results, DATA_ROOT=os.path.join(self.d, "data"))
+        r = subprocess.run(
+            ["bash", RUN_CELL_SH, wt, "probe-label"],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("detach.sh", r.stderr)
+        self.assertFalse(os.path.exists(results), "refused cell must not write results")
+        self.assertFalse(os.path.exists(os.path.join(self.d, "data")))
+
+    def _detach(self, name, script):
+        log = os.path.join(self.d, "out.log")
+        r = subprocess.run(
+            ["bash", DETACH_SH, name, log, "bash", "-c", script],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, DETACH_PROBE="carried"), cwd=self.d,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        deadline = time.time() + 20
+        text = None
+        while time.time() < deadline:
+            if os.path.exists(log):
+                with open(log) as f:
+                    text = f.read()
+                if "DONE" in text:
+                    return text
+            time.sleep(0.2)
+        self.fail("detached command never finished; log: %r" % text)
+
+    @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
+    def test_detach_runs_in_a_bench_service_parented_by_the_user_manager(self):
+        name = "test-detach-%d" % os.getpid()
+        out = self._detach(
+            name,
+            'echo "CG=$(cut -d: -f3 /proc/self/cgroup)"; '
+            'echo "PARENT=$(ps -o comm= -p $PPID)"; '
+            'echo "PROBE=$DETACH_PROBE"; echo "PWD=$PWD"; echo DONE',
+        )
+        kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
+        self.assertEqual(kv["PARENT"], "systemd")
+        self.assertEqual(kv["PROBE"], "carried", "caller's exported env must carry over")
+        self.assertEqual(kv["PWD"], self.d, "caller's working directory must carry over")
+
+    @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
+    def test_run_cell_guard_accepts_a_detached_unit(self):
+        with open(RUN_CELL_SH) as f:
+            line = next(l for l in f if l.startswith("BENCH_UNIT_RE="))
+        out = self._detach(
+            "test-guard-%d" % os.getpid(),
+            line + 'grep -qE "$BENCH_UNIT_RE" /proc/self/cgroup && echo IN=1; echo DONE',
+        )
+        self.assertIn("IN=1", out)
+
+    def test_detach_needs_a_name_a_log_and_a_command(self):
+        r = subprocess.run(["bash", DETACH_SH, "x", "/tmp/x.log"],
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage", r.stderr)
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):

@@ -138,7 +138,8 @@ DRY_RUN=1 $T/ab-driver.sh "$C"
 $T/start-warmup.sh "$C"
 ```
 
-Detached (`setsid nohup`); returns at once. Logs: `$C/<label>.log` (run-cell.sh),
+Detached as its own systemd --user service (`detach.sh`, unit
+`bench-<campaign>-warmup.service`; stop with `systemctl --user stop <unit>`); returns at once. Logs: `$C/<label>.log` (run-cell.sh),
 `$C/<label>.driver.log` (run_cell.py), `$C/campaign.log`, `$C/warmup.nohup`. Done
 when `$C/warmup.done` exists: `CAMPAIGN DONE <time>` from the driver plus `exit=N`.
 Check the warm-up's `summary.json` (agreement AGREE, liveness PASS) before going on.
