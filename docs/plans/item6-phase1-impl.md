@@ -668,12 +668,13 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
 | 71 | liquidation skip (section 17 cut 3) | no exact whole-pass skip: the pass writes the hashed cursor and clears cooldown / pending rows; per-trader "healthy at mark version V" certificate is exact but saves ~1 ms per empty block after E2 | none (s92: dropped) | not built | - |
 | 72 | C5 coverage | cooldown / pending rows appear in 2 of 210 blocks (one seeded account, 1,100 @100 over the 100k chunk threshold) | none | covered thinly; a dedicated cooldown sequence can follow | `6571a76` |
 | 73 | governance / failed execution (pre-existing) | a passed proposal failing at execution stayed `Passed`, retried every block, and its `?` aborted the loop, so every later due proposal was skipped forever (reachable via `MarketIdInUse`) | s94 owner: fix before the merge | `ProposalStatus::Failed` (borsh 6), loop continues, per-proposal results, RPC `"Failed"`; payload errors -> Failed, storage / decode errors still stop the step; every Failed case raised before the first write (8 cases byte-checked) | `e439982` |
-| 74 | governance / storage errors (pre-existing) | `app.rs` ~2315 discards `process_governance`'s results and governance never sets `fatal_error`: a storage error skips governance for that block, the node does not halt (liquidation does) | halt the node on a governance storage error? (consensus) | open | - |
-| 75 | governance / partial writes (pre-existing) | TreasurySpend and PermanentUnlock write more than once; a storage error after the first write keeps it and leaves the proposal `Passed`, so a retry could pay twice | make both all-or-nothing? (recommendation: yes, before mainnet) | open | - |
+| 74 | governance / storage errors (pre-existing) | `app.rs` 2335-2337 runs `process_governance`, `distribute_fees` and `process_epoch_boundary` after the last `fatal_error` check (2323) and discards their results: a storage error skips the rest of the step, the node does not halt (liquidation does). s96 design check: a block is all or nothing (one overlay, one RocksDB WriteBatch at flush), but nothing rolls back inside a block (`begin_tx` / `revert_tx`, `backend.rs` 1233-1250, are EVM-only), so partial writes commit: `process_pending_proposals` keeps proposal N when N+1 errors, `cast_vote` writes the tally before the vote row. Staking: the `staking.rs` functions return errors, but the ~7 `exec_*` handlers (`exec_delegate` 9226 .. `exec_register_validator` 9333, `top_up_self_stake`) turn them into action errors; buffered slash / tombstone failures are only logged (`app.rs` 1770-1785) | owner s94 (9.14 C): halt the node like liquidation. s96 design check sets the scope: one helper latches `fatal_error` for `EconomicsError::State` / `Borsh` (local faults) in `process_governance` and the staking handlers, plus a `fatal_error` check after 2337; errors every validator hits alike (`GovernanceNotInitialized`, invariants) must not halt. Fail-stop beats today (partial commit, silent state-hash divergence); the chain continues while fewer than f nodes halt | decided (s94), scope from the s96 design check; next in the 18c build queue (9.15) | - |
+| 75 | governance / partial writes (pre-existing) | TreasurySpend and PermanentUnlock write more than once; a storage error after the first write keeps it and leaves the proposal `Passed`, so a retry could pay twice | make both all-or-nothing? (owner s94, 9.14 C: yes) | built: each payload is staged and applied in one `atomic_write` with the Executed status row; merged to main in the s94 batch (`a3bfab2`, s96). Same pattern still open: `cast_vote` and the staking writes (row 74) | `720805e` |
 | 76 | liquidation at full-node load | no cell ever fired a liquidation (walk 10 stays within +-80 bp; 0 on every node, drain included); correctness covered by `liquidation_tests` + C5 (7) | none | stress cell before testnet (larger walk or accounts seeded near maintenance) | - |
 | 77 | drain after load (walk pair) | one 20-49 ms oracle-only block per node right after the load ends (both W10 runs, W0 r1); steady p50 ~4 ms | none | investigate in the Phase 2 step 0 profile | - |
 | 78 | empty block with feed live | 2.5-2.8 ms vs 0.03-0.06 ms with the feed paused; likely M1's mark-carry pass over positions (timings only, not confirmed in code) | none | Phase 2 step 0 profile | - |
 | 79 | trading app (separate repo) | RPC proposal status can now be `"Failed"` | none | add `"Failed"` to the app's status type | - |
+| 80 | genesis `fee_split` ignored (pre-existing; s96, also hl-parity `findings.md` ~530) | genesis parses `fee_split.start` / `.end` (`torus-genesis/src/lib.rs` 146) and copies `start` into `ChainConfig.fee_*_bps` (537-540); `end` is never used and nothing reads the `ChainConfig` fields outside tests. The split is `distribute_fees` (`native_executor.rs` 10064) -> `RewardDistributor::distribute_block_fees` (`rewards.rs` 24), which lerps the constants `FEE_START_*` / `FEE_END_*` (`torus-economics/src/types.rs` 365-374). Only `testnet/genesis-weighted-base*.json` set `fee_split`, with the constants' start values (1000 / 0 / 4500 / 4500), so nothing differs today; a changed genesis would be silently ignored | delete the dead fields and genesis keys, or thread the genesis values into `distribute_block_fees` (consensus fee path; every node reads the same genesis), with an optional governance override? | open (before testnet) | - |
 
 ### 9.10 Zero-fill sell cuts at 300 markets (s92, owner decisions)
 - Finding (ozarchy section 18 + 18c read-only checks): at 300 markets ~8% of placed orders are GTC sell
@@ -750,7 +751,7 @@ with moving prices (re-value cost) is checked first in the Phase 2 step 0 profil
 order.
 
 ### 9.13 Backlog after the Phase 1 merge (s94)
-Not merge blockers; each is tracked where it is defined.
+Not merge blockers; each is tracked where it is defined. Status after the s96 merges: 9.15.
 
 | item | where | when | recommendation |
 |---|---|---|---|
@@ -801,3 +802,29 @@ already (16, 17, 26, 28, 36, 40-43, 71, 73, 9.10, 9.12) or asked no question.
 
 Build queue on 18c (s94): bad-debt fix (building) -> row 75 (building) -> row 74 -> B batch
 (44, 45, 46, 52, 69) -> row 50 -> 9.11 counter + pin tests -> anti-spam eviction metric.
+
+### 9.15 Backlog status after the s96 merges
+main `35e69b3` (s96) = Phase 1 (`59fa407`) + the s94 batch (`integrate/s94-batch` `a0eda77`,
+merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/liq-telemetry`
+(`0ce261b`; nextest 2922/0, native root identical with and without metrics).
+
+| item | status (s96) |
+|---|---|
+| bad-debt fix (fills far from the mark) | merged (`fix/offmark-bad-debt`); ozarchy's fresh-genesis cost cell (`35e69b3` vs `92a02ed`, N=4 + b900, x2) running |
+| row 75 TreasurySpend / PermanentUnlock all-or-nothing | merged (`720805e`) |
+| row 74 governance / staking storage errors halt | decided s94; scope set by the s96 design check (row 74); next to build |
+| row 80 genesis `fee_split` ignored | new (s96); owner choice before testnet |
+| liquidation stress at full-node load (row 76) | telemetry merged; liq-stress cells S=400 / S=750 on `35e69b3` + `bench/liq-stress` next on ozarchy |
+| bench load: open-limit rejects (section 20.3) | `bench/max-in-flight` merged; standard shape `MAX_IN_FLIGHT=4` + `OPEN_ORDER_BUDGET=900` |
+| rows 77-78 slow first block, empty block with the feed live | profiled (results doc section 22): flush-worker wait (77, Phase 3) and `run_liquidations_with` sums (78, Phase 2 P2-4 design check) |
+| 9.14 D row 48 (faster hasher) | `hash_one` / SipHash showed (~13% of execution self time): Phase 2 P2-5 (`item6-phase2-impl.md` 9.5) |
+| 9.14 B batch (rows 44, 45, 46, 52, 69), row 50 "canceled", 9.11 counter, anti-spam eviction metric | unchanged; build after row 74 (they touch `order_book.rs` / RPC) |
+| `/tmp` test-folder leak (`app.rs`) | unchanged; after the merge (now unblocked) |
+| compiler warnings (ozarchy s17): `swarm.rs` 3047 `enqueue_body_fetch_traced` and 3210 `handle_consensus_direct` unused; `bench-throughput` `main.rs` 1592 needless `mut`, `in_flight.rs` 152 unused | new; small cleanup, anytime |
+| other 9.13 rows (native root 9.3, oracle M2, anti-spam D, runbook, C5 cooldown, trading app `"Failed"`) | unchanged |
+
+Item 6 Phase 2: full plan with owner decisions in `item6-phase2-impl.md` (`docs/item6-phase2-plan`);
+base and gate reference main `35e69b3`.
+
+Build queue on 18c (s96): row 74 -> B batch (44, 45, 46, 52, 69) -> row 50 -> 9.11 counter + pin
+tests -> anti-spam eviction metric; Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.
