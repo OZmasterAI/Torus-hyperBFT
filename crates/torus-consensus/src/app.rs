@@ -17422,6 +17422,10 @@ mod crash_recovery_tests {
     fn offmark_fill_e2e_is_refused_and_the_counterparty_gets_back_only_its_deposit() {
         use torus_core::liquidation::LIQUIDATOR_VAULT;
         use torus_core::position::{NativeBalance, PositionManager};
+        use torus_state::action_status::FailureReason;
+        // Inside the nonce window (block h's time is (1_000 + h) s, window
+        // +-60 s): the same base as `NONCE_BASE` on the nonce-window branch.
+        const NB: u64 = 1_000_000;
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
         let (a, b) = (oracle_addr(75), oracle_addr(76));
@@ -17439,13 +17443,13 @@ mod crash_recovery_tests {
                 reduce_only: false,
                 client_order_id: None,
             }),
-            2_076,
+            NB + 2_076,
             &oracle_key(76),
         );
         let to_spot = |nonce: u64, amount: i64| {
             torus_types::eip712::sign_native_action(
                 NativeAction::TransferToSpot { amount: U256::from(px(amount).raw() as u128) },
-                nonce,
+                NB + nonce,
                 &oracle_key(76),
             )
         };
@@ -17466,7 +17470,16 @@ mod crash_recovery_tests {
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
+        // Refused for the right reason: executed (not skipped), failed with
+        // `price_band`; the transfer executed.
+        let s2 = action_status(&db, 2).expect("block 2 status");
+        assert!(s2.native_skipped.iter().all(|s| !s), "block 2: nothing skipped (nonces in window)");
+        assert_eq!(s2.native_failed.len(), 1, "block 2: only B's sell failed");
+        assert_eq!(s2.native_failed[0].reason, FailureReason::PriceBand, "block 2: refused by the band");
         dispatch_and_execute(&ctx, &db, &blocks[2]);
+        let s3 = action_status(&db, 3).expect("block 3 status");
+        assert!(s3.native_skipped.iter().all(|s| !s), "block 3: the transfer was executed, not skipped");
+        assert_eq!(s3.native_failed.len(), 1, "block 3: B's 1,000 refused");
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "block 3: nothing more");
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
