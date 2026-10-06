@@ -44,6 +44,18 @@ EXTRA = [
 ]
 
 
+# s92 (B-blind observability): the executor's margin-cut counters, as
+# torus-telemetry names them (`_total` added by the exporter).
+S92_COUNTERS = [
+    f"torus_sell_cuts_{pool}_{fill}_{bucket}"
+    for pool in ("pool", "nonpool")
+    for fill in ("zero", "partial")
+    for bucket in ("t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p")
+] + ["torus_maker_margin_cancels", "torus_reduce_only_cuts"]
+S92_TOP_UPS = []
+S92_COUNTERS += S92_TOP_UPS
+
+
 class PhaseMappingTests(unittest.TestCase):
     def test_emitted_phase_rows_match_legacy_header_and_actual_awk(self):
         here = Path(__file__).parent
@@ -183,6 +195,37 @@ class PhaseMappingTests(unittest.TestCase):
         e_phases = re.search(r"e_phases = \[([^\]]*)\]", text)
         self.assertIsNotNone(e_phases)
         self.assertIn('"action_status"', e_phases.group(1))
+
+    def test_s92_margin_cut_counters_are_sampled_and_summarized(self):
+        """s92 (B-blind observability): the sell-cut counters (pool / non-pool
+        x zero-fill / partial x tick bucket), maker margin cancels and
+        reduce-only cuts are sampled, and summarize.py reports each one's
+        delta over the bench window per node."""
+        here = Path(__file__).parent
+        wide = (
+            re.search(r'^WIDE_COLS="([^"]+)"', (here / "run-cell.sh").read_text(), re.M)
+            .group(1)
+            .split()
+        )
+        names = S92_COUNTERS
+        self.assertEqual(len(names), 26 + len(S92_TOP_UPS))
+        for name in names:
+            self.assertIn(f"{name}_total", wide, name)
+        import test_summarize as ts
+
+        saved = dict(ts.COUNTERS)
+        ts.COUNTERS.update(
+            {f"{n[len('torus_') :]}_total": 3 + i for i, n in enumerate(names)}
+        )
+        try:
+            with tempfile.TemporaryDirectory() as out:
+                ts.write_fixture(out)
+                f0 = ts.run(out)["funnel_by_node"]["val0"]
+        finally:
+            ts.COUNTERS.clear()
+            ts.COUNTERS.update(saved)
+        for i, n in enumerate(names):
+            self.assertEqual(f0.get(f"delta_{n[len('torus_') :]}_total"), 3 + i, n)
 
 
 if __name__ == "__main__":

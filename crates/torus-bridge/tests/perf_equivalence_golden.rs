@@ -294,6 +294,20 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             db.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap().len(),
             db.iterate_cf(CF_NATIVE_LIQUIDATION, None).unwrap().len(),
         );
+        // s92: sell cuts as [pool / non-pool][zero / partial] totals (print
+        // only; not part of the digests).
+        let cuts: Vec<Vec<u64>> = metrics
+            .sell_margin_cuts
+            .iter()
+            .map(|by_fill| by_fill.iter().map(|b| b.iter().map(|c| c.get()).sum()).collect())
+            .collect();
+        println!(
+            "s92 threads={threads:?}: sell_cuts pool(zero, partial)={:?} non_pool(zero, partial)={:?} maker_margin_cancels={} reduce_only_cuts={}",
+            cuts[0],
+            cuts[1],
+            metrics.maker_margin_cancels.get(),
+            metrics.reduce_only_cuts.get(),
+        );
     }
     digests
 }

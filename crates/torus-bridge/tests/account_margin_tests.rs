@@ -607,9 +607,12 @@ fn maker_margin_cancel(path: Path) {
         assert_eq!(pos_in(&ctx, &m, 2), fp(10));
         set_mark(&ctx, 2, fp(mark));
         run(&mut ctx, path, &[place(m2, limit(1, true, 99, 10))]);
+        let metrics = metered(&mut ctx);
         let r = run(&mut ctx, path, &[place(t, market(1, false, fp(1), 10))]);
         let what = format!("{path:?} mark={mark}");
         assert!(r[0].success, "{what}: {:?}", r[0].error);
+        assert_eq!(metrics.maker_margin_cancels.get(), u64::from(cancelled), "{what}: s92 counter");
+        assert!(sell_cuts(&metrics).is_empty(), "{what}: the taker fitted");
         assert_eq!(pos_in(&ctx, &t, 1), -fp(10), "{what}");
         assert!(resting_in(&ctx, &m, 1).is_empty(), "{what}: M's bid gone either way");
         assert_eq!(pos_in(&ctx, &m, 1), if cancelled { FixedPoint::ZERO } else { fp(10) }, "{what}");
@@ -1325,6 +1328,82 @@ fn taker_only_rounding_does_not_cancel_a_sell_at_its_limit(path: Path) {
     assert_eq!(metrics.orders_rejected_cancelled.get(), 0, "{path:?}");
 }
 per_path!(taker_only_rounding_does_not_cancel_a_sell_at_its_limit);
+
+// ---- s92 margin-cut counters (observability only) ----
+
+/// Non-zero s92 sell-cut counters as `(non_pool, partial, tick bucket, count)`.
+fn sell_cuts(m: &torus_telemetry::Metrics) -> Vec<(usize, usize, usize, u64)> {
+    let mut out = Vec::new();
+    for (np, by_fill) in m.sell_margin_cuts.iter().enumerate() {
+        for (partial, buckets) in by_fill.iter().enumerate() {
+            for (b, c) in buckets.iter().enumerate() {
+                if c.get() > 0 {
+                    out.push((np, partial, b, c.get()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// s92 counters: a POOL sell cut part-way. M bids 10 @101 in m1; T (50.25)
+/// sells 10 @100 there (its first checked order, so its pool; single path:
+/// the account): fills 5 @101, then its margin runs out at 101 = 1 tick
+/// above the price it reserved at (100) → `[pool][partial][1-2 ticks]`.
+fn sell_cut_counter_pool_partial(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk]);
+    run(&mut ctx, path, &[place(mk, limit(1, true, 101, 10))]);
+    fund_native(&ctx, &t, fp_cents(5_025));
+    let metrics = metered(&mut ctx);
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 10))]);
+    assert!(r[0].success, "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), -fp(5), "{path:?}");
+    assert_eq!(sell_cuts(&metrics), vec![(0, 1, 1, 1)], "{path:?}");
+    assert_eq!(metrics.orders_cancelled_partial_fill.get(), 1, "{path:?}");
+}
+per_path!(sell_cut_counter_pool_partial);
+
+/// s92 counters: a NON-POOL sell cut with zero fills. m2 has no bid at the
+/// start of the batch (so no bid floor); T (1,000) = [pool order in m1, X's
+/// bid 1 @1005 in m2 (rests), sell 1 @1000 in m2]. The sell's budget is its
+/// reservation at 1,000 (50); the fill @1005 needs 50.25 → cancelled with no
+/// fill, 5 ticks above its reservation price → `[non-pool][zero][3-5]`.
+/// Batch paths only: the single path's budget is the account.
+fn sell_cut_counter_non_pool_zero_fill(path: Path) {
+    let (t, x) = (addr(2), addr(5));
+    let (_d, mut ctx) = fresh(path, &[t, x]);
+    let metrics = metered(&mut ctx);
+    let r = run(&mut ctx, path, &[place(t, pool_order()), place(x, limit(2, true, 1_005, 1)), place(t, limit(2, false, 1_000, 1))]);
+    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 2), FixedPoint::ZERO, "{path:?}");
+    assert_eq!(resting_in(&ctx, &x, 2), vec![fp(1)], "{path:?}: X's bid untouched");
+    assert_eq!(sell_cuts(&metrics), vec![(1, 0, 2, 1)], "{path:?}");
+    assert_eq!(metrics.orders_rejected_cancelled.get(), 1, "{path:?}");
+}
+batch_paths!(sell_cut_counter_non_pool_zero_fill);
+
+/// s92 counters: reduce-only cuts. T long 4 in m1 rests a reduce-only sell
+/// 4 @110; its plain sell 4 @100 into M's bid closes the position, so the
+/// post-fill sweep cancels the reduce-only order: one cut.
+fn reduce_only_cut_counter(path: Path) {
+    let (mk, t) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(path, &[mk, t]);
+    ctx.positions
+        .apply_fill(&t, 1, true, fp(4), fp(100), torus_core::position::MarginType::Cross)
+        .unwrap();
+    let ro = PlaceOrderParams { reduce_only: true, ..limit(1, false, 110, 4) };
+    assert!(run(&mut ctx, path, &[place(t, ro)])[0].success, "{path:?}");
+    run(&mut ctx, path, &[place(mk, limit(1, true, 100, 4))]);
+    let metrics = metered(&mut ctx);
+    let r = run(&mut ctx, path, &[place(t, limit(1, false, 100, 4))]);
+    assert!(r[0].success, "{path:?}: {r:?}");
+    assert_eq!(pos_in(&ctx, &t, 1), FixedPoint::ZERO, "{path:?}");
+    assert!(resting_in(&ctx, &t, 1).is_empty(), "{path:?}: the reduce-only sell is cut");
+    assert_eq!(metrics.reduce_only_cuts.get(), 1, "{path:?}");
+    assert_eq!(metrics.maker_margin_cancels.get(), 0, "{path:?}");
+}
+per_path!(reduce_only_cut_counter);
 
 /// Option B §7.3 #15 (A5 telescoping under B): a seeded multi-market run
 /// shaped like golden scenario A (40 senders x 12 markets, thin to rich

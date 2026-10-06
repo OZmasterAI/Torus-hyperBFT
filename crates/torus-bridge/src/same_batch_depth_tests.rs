@@ -342,6 +342,7 @@ fn run(
             checked_pos_net: None,
             pre_pos: None,
             top_up: TopUpShape::of(params, candidate),
+            res_price: params.price,
         });
     }
     let mut cache = BalanceCache::new();

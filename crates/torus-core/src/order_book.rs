@@ -141,6 +141,10 @@ pub struct PlaceResult {
     /// match time because their account could not afford the fill. Released
     /// by the executor exactly like reduce-only cuts (A5 telescoping).
     pub margin_cancels: Vec<ReduceOnlyCut>,
+    /// s92 (observability only): the level price at which this taker's
+    /// match-time margin ([`TakerMarginLimit`]) ran out — it was cancelled
+    /// there, after the fills that fitted (`Cancelled`); `None` otherwise.
+    pub margin_cut_price: Option<FixedPoint>,
 }
 
 impl PlaceResult {
@@ -154,6 +158,7 @@ impl PlaceResult {
             reduce_only_cuts: vec![],
             triggered_stops: vec![],
             margin_cancels: vec![],
+            margin_cut_price: None,
         }
     }
 }
@@ -313,6 +318,8 @@ struct MatchMargin<'a> {
     /// Notional of the charged (non-closing) part of the fills so far.
     charged: FixedPoint,
     exhausted: bool,
+    /// s92: the level price where `exhausted` was set.
+    cut_at: Option<FixedPoint>,
     /// B2 (s87): the sender's entry here is a taker-only budget (D2
     /// non-pool market), which gets the makers' rounding allowance.
     taker_only: bool,
@@ -1154,6 +1161,7 @@ impl OrderBook {
                 budget: limit.budget + acct.map_or(FixedPoint::ZERO, |a| a.free),
                 charged: FixedPoint::ZERO,
                 exhausted: false,
+                cut_at: None,
                 taker_only,
             }
         });
@@ -1196,6 +1204,7 @@ impl OrderBook {
         let (fills, self_trade_cancels, mut reduce_only_cuts, margin_cancels) =
             self.execute_match(&mut order, match_margin.as_mut(), makers);
         let margin_exhausted = match_margin.as_ref().is_some_and(|m| m.exhausted);
+        let margin_cut_price = match_margin.as_ref().and_then(|m| m.cut_at);
 
         if let Some(last_fill) = fills.last() {
             self.last_trade_price = Some(last_fill.price);
@@ -1326,6 +1335,7 @@ impl OrderBook {
             reduce_only_cuts,
             triggered_stops,
             margin_cancels,
+            margin_cut_price,
         }
     }
 
@@ -2093,6 +2103,7 @@ impl OrderBook {
                 fill_qty = fits;
                 if fill_qty <= FixedPoint::ZERO {
                     m.exhausted = true;
+                    m.cut_at = Some(price);
                     break;
                 }
                 taker_cut = Some((exhausted, free));
@@ -2130,7 +2141,10 @@ impl OrderBook {
                 }
             }
             if let (Some(m), Some((exhausted, free))) = (margin.as_deref_mut(), taker_cut) {
-                m.exhausted |= exhausted;
+                if exhausted {
+                    m.exhausted = true;
+                    m.cut_at = Some(price);
+                }
                 // Cannot overflow: `affordable` returned a purely closing
                 // quantity (charges nothing) or one whose notional it
                 // computed checked.
@@ -6116,6 +6130,32 @@ mod taker_margin_limit_tests {
         assert_eq!(filled(&r), fp(2));
         assert_eq!(r.status, OrderStatus::Cancelled);
         assert_eq!(b.orders_for_trader(&addr(3))[0].remaining_qty, fp(2));
+    }
+
+    /// s92: `margin_cut_price` is the level price where the taker's margin ran
+    /// out: mid-level (2 of 4 @100), before a level it cannot afford (@90),
+    /// at the first level with zero fills; `None` when every fill fits or the
+    /// taker has no margin limit.
+    #[test]
+    fn margin_cut_price_is_the_level_the_taker_ran_out_at() {
+        let cases: [(&[(i64, i64)], Option<FixedPoint>, Option<i64>, usize); 5] = [
+            (&[(100, 4)], Some(fp(12)), Some(100), 1),
+            (&[(100, 2), (90, 2)], Some(fp(12)), Some(90), 1),
+            (&[(100, 4)], Some(fp(4)), Some(100), 0),
+            (&[(100, 4)], Some(fp(20)), None, 1),
+            (&[(100, 4)], None, None, 1),
+        ];
+        for (bids, budget, cut, fills) in cases {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            for &(p, q) in bids {
+                b.place_order(order(true, fp(p), fp(q)), addr(1), 1);
+            }
+            let lim = budget.map(|x| limit(x, None));
+            let r = b.place_order_with_margin(market_sell(fp(4)), addr(2), 2, lim.as_ref());
+            let what = format!("bids {bids:?} budget {budget:?}");
+            assert_eq!(r.margin_cut_price, cut.map(fp), "{what}");
+            assert_eq!(r.fills.len(), fills, "{what}");
+        }
     }
 
     /// GTC sell 4 @50 against bid 100 x 1, budget 16: filling 1 costs 5 plus

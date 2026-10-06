@@ -469,6 +469,10 @@ struct PreparedOrder<'a> {
     /// Item 6 M1: what `same_batch_bid_top_ups` reads, copied while Phase 2
     /// has the params hot.
     top_up: TopUpShape,
+    /// s92 (observability only): the price `margin_reserved` was taken at
+    /// (Phase 2's reservation price, raised to a granted top-up's price); the
+    /// sell-cut counters bucket a cut by its hit price minus this.
+    res_price: FixedPoint,
 }
 
 /// Item 6 M1: an order's fields `same_batch_bid_top_ups` reads (its params
@@ -713,6 +717,8 @@ struct PrepPass {
     pre_pos: Option<(FixedPoint, FixedPoint)>,
     /// Item 6 M1: [`TopUpShape::candidate`].
     top_up_candidate: bool,
+    /// s92: [`PreparedOrder::res_price`].
+    res_price: FixedPoint,
     /// Review fix 1: the order's own unchecked excess (what
     /// [`SenderState::excess_unchecked`] sums; tests' oracle).
     #[cfg(test)]
@@ -6330,6 +6336,12 @@ impl NativeExecutor {
             for r in &mbr.results {
                 triggered.extend(r.result.triggered_stops.iter().cloned());
             }
+            // s92 counters (aligned with the market's prepared orders).
+            if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
+                for (r, p) in mbr.results.iter().zip(prepared) {
+                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up.candidate);
+                }
+            }
         }
         let settle_timer = std::time::Instant::now();
         // C3: parallel settle pays a thread scope + plan handoff, so it needs
@@ -6654,6 +6666,7 @@ impl NativeExecutor {
             checked_pos_net: checked.then_some(pos_net),
             pre_pos,
             top_up_candidate: floor_candidate,
+            res_price,
             #[cfg(test)]
             excess_im: if checked { FixedPoint::ZERO } else { excess },
         })
@@ -6691,6 +6704,7 @@ impl NativeExecutor {
                         checked_pos_net: pass.checked_pos_net,
                         pre_pos: pass.pre_pos,
                         top_up: TopUpShape::of(params, pass.top_up_candidate),
+                        res_price: pass.res_price,
                     });
             }
             PrepOutcome::Reject { funnel, reason, msg } => {
@@ -7502,6 +7516,30 @@ impl NativeExecutor {
         }
     }
 
+    /// s92 (B-blind observability; nothing reads it back): one book
+    /// outcome's maker margin cancels and reduce-only cuts and, for a SELL
+    /// taker whose match-time margin ran out, its cut — `[non_pool]
+    /// [partial][bucket]`, the bucket of its hit price minus `res_price` (the
+    /// price its reservation was taken at) in ticks of `tick`, rounded up.
+    /// `non_pool`: its budget was the D2 taker-only reservation.
+    fn record_margin_cuts(
+        m: &torus_telemetry::Metrics,
+        is_buy: bool,
+        result: &PlaceResult,
+        res_price: FixedPoint,
+        tick: FixedPoint,
+        non_pool: bool,
+    ) {
+        m.maker_margin_cancels.inc_by(result.margin_cancels.len() as u64);
+        m.reduce_only_cuts.inc_by(result.reduce_only_cuts.len() as u64);
+        if let (false, Some(hit)) = (is_buy, result.margin_cut_price) {
+            let d = hit.raw().saturating_sub(res_price.raw());
+            let ticks = if d <= 0 { 0 } else { (d - 1) / tick.raw().max(1) + 1 };
+            let bucket = torus_telemetry::margin_cut_tick_bucket(ticks);
+            m.sell_margin_cuts[usize::from(non_pool)][usize::from(!result.fills.is_empty())][bucket].inc();
+        }
+    }
+
     /// A5 (maker-fill margin leak): THE reserve/release formula.
     ///
     /// Margin reserved for `qty` of a limit order at `price` in `market_id`:
@@ -8192,6 +8230,7 @@ impl NativeExecutor {
             bal.order_margin += extra;
             bal_cache.set(&p.sender, bal);
             p.margin_reserved += extra;
+            p.res_price = bound;
             topped_up += 1;
         }
         topped_up
@@ -8701,6 +8740,8 @@ impl NativeExecutor {
         if let Some(ref m) = ctx.metrics {
             m.orders_self_trade_cancels
                 .inc_by(result.self_trade_cancels.len() as u64);
+            // s92: the single path's budget is the account (never non-pool).
+            Self::record_margin_cuts(m, params.is_buy, &result, res_price, book.tick_size, false);
         }
 
         // FIX 2: Release margin for the filled / cancelled portion; keep the
@@ -10922,7 +10963,7 @@ mod option_b_fold_pool_tests {
                 let mut v: Vec<_> = b
                     .values()
                     .flatten()
-                    .map(|p| (p.index, p.order_id, p.margin_reserved, p.checked_pos_net, p.pre_pos, p.top_up))
+                    .map(|p| (p.index, p.order_id, p.margin_reserved, p.checked_pos_net, p.pre_pos, p.top_up, p.res_price))
                     .collect();
                 v.sort_unstable_by_key(|x| x.0);
                 v

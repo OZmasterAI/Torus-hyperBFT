@@ -90,6 +90,19 @@ pub struct Metrics {
     /// Orders that died on other error paths: balance read/write failures,
     /// fill-application failures.
     pub orders_rejected_other: Counter,
+    /// s92 (B-blind observability): SELL takers whose match-time margin ran
+    /// out (the book's `margin_cut_price`), indexed `[non_pool][partial]
+    /// [bucket]`: `non_pool` 1 = the sender's D2 taker-only budget (its pool
+    /// is another market), `partial` 1 = fills before the cut, `bucket` =
+    /// [`margin_cut_tick_bucket`] of (hit price - reservation price) in
+    /// ticks. Names: [`sell_cut_metric_names`].
+    pub sell_margin_cuts: [[[Counter; 6]; 2]; 2],
+    /// s92: resting makers cancelled whole at match time because their
+    /// account could not afford the fill (HL `marginCanceled`).
+    pub maker_margin_cancels: Counter,
+    /// s92: reduce-only cuts (a resting reduce-only order cut at match time
+    /// or shrunk / cancelled by the post-fill sweep), one per cut.
+    pub reduce_only_cuts: Counter,
 
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
@@ -970,6 +983,27 @@ impl Metrics {
             "torus_orders_rejected_cancelled",
             "IOC/FOK/Market orders cancelled on arrival with zero fills",
             orders_rejected_cancelled.clone(),
+        );
+
+        let sell_margin_cuts: [[[Counter; 6]; 2]; 2] = Default::default();
+        for (name, c) in sell_cut_metric_names().iter().zip(sell_margin_cuts.iter().flatten().flatten()) {
+            registry.register(
+                name,
+                "Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92)",
+                c.clone(),
+            );
+        }
+        let maker_margin_cancels = Counter::default();
+        registry.register(
+            "torus_maker_margin_cancels",
+            "Resting makers cancelled whole at match time for margin (HL marginCanceled)",
+            maker_margin_cancels.clone(),
+        );
+        let reduce_only_cuts = Counter::default();
+        registry.register(
+            "torus_reduce_only_cuts",
+            "Reduce-only order cuts at match time or by the post-fill sweep",
+            reduce_only_cuts.clone(),
         );
 
         let orders_cancelled_partial_fill = Counter::default();
@@ -2180,6 +2214,9 @@ impl Metrics {
             orders_cancelled_partial_fill,
             orders_self_trade_cancels,
             orders_rejected_other,
+            sell_margin_cuts,
+            maker_margin_cancels,
+            reduce_only_cuts,
             pruner_blocks_removed,
             rpc_requests_total,
             rpc_request_duration_seconds,
@@ -2479,6 +2516,37 @@ pub async fn serve_metrics(
     }
 }
 
+/// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
+pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
+
+/// s92: the [`MARGIN_CUT_TICK_BUCKETS`] index of a cut `ticks` above the
+/// reservation price: `<= 0`, 1-2, 3-5, 6-10, 11-30, more.
+pub fn margin_cut_tick_bucket(ticks: i128) -> usize {
+    match ticks {
+        ..=0 => 0,
+        1..=2 => 1,
+        3..=5 => 2,
+        6..=10 => 3,
+        11..=30 => 4,
+        _ => 5,
+    }
+}
+
+/// s92: the names of [`Metrics::sell_margin_cuts`] in its index order
+/// (`torus_sell_cuts_{pool|nonpool}_{zero|partial}_{bucket}`; the exporter
+/// adds `_total`).
+pub fn sell_cut_metric_names() -> Vec<String> {
+    let mut out = Vec::with_capacity(24);
+    for pool in ["pool", "nonpool"] {
+        for fill in ["zero", "partial"] {
+            for bucket in MARGIN_CUT_TICK_BUCKETS {
+                out.push(format!("torus_sell_cuts_{pool}_{fill}_{bucket}"));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2501,6 +2569,29 @@ mod tests {
                 "{stage} series must exist at 0:\n{text}"
             );
         }
+    }
+
+    /// s92 (B-blind observability): every sell-cut series exists from
+    /// start-up under the names `run-cell.sh` samples, indexed
+    /// `[non_pool][partial][bucket]`; the tick buckets split at 0 / 2 / 5 /
+    /// 10 / 30; maker margin cancels and reduce-only cuts are counters.
+    #[test]
+    fn margin_cut_counters_are_exported_and_bucketed() {
+        let m = Metrics::new();
+        m.sell_margin_cuts[1][0][2].inc();
+        m.maker_margin_cancels.inc_by(2);
+        m.reduce_only_cuts.inc_by(3);
+        let text = m.encode();
+        let names = sell_cut_metric_names();
+        assert_eq!(names.len(), 24);
+        for name in &names {
+            let want = if name == "torus_sell_cuts_nonpool_zero_t3_5" { 1 } else { 0 };
+            assert!(text.contains(&format!("{name}_total {want}\n")), "{name}:\n{text}");
+        }
+        assert!(text.contains("torus_maker_margin_cancels_total 2\n"), "{text}");
+        assert!(text.contains("torus_reduce_only_cuts_total 3\n"), "{text}");
+        let buckets: Vec<usize> = [-5, 0, 1, 2, 3, 5, 6, 10, 11, 30, 31, 1_000].map(margin_cut_tick_bucket).to_vec();
+        assert_eq!(buckets, vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
     }
 
     #[test]
