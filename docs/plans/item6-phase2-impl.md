@@ -1,6 +1,7 @@
 # Implementation Plan: item 6 Phase 2 (per-block work in proportion to fills)
 
-Status: PLAN, nothing built. Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
+Status: PLAN, nothing built; owner decisions recorded s96 (section 9, with the options not
+chosen). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
 `integrate/s94-batch`; "section 22" below). Short form and the phases after this one:
 `item6-phases-2-5-plans.md`. Design: `market-scaling-in-memory-design.md` section 3, Phase 2.
@@ -9,7 +10,10 @@ Phase 1 verdict and the carried-over gates: `item6-phase1-impl.md` 9.12 and 9.13
 Code references are `file:function` with line numbers at `origin/integrate/s94-batch`
 (`a0eda77`). The step 0 profile ran crab = main `59fa407`; the hot files named here
 (`cancel_batch.rs`, `market_workers.rs`, `position.rs`) are the same on both, and
-`native_executor.rs` differs only in places this plan does not touch.
+`native_executor.rs` differs only in places this plan does not touch. The Phase 2 base is
+now main `35e69b3` (9.6): `a0eda77` plus `feat/liq-telemetry`, which changed
+`liquidation_step.rs`, `app.rs` and `torus-core/src/liquidation.rs`, so P2-4's line numbers
+there may have moved.
 
 Every number below is from section 22 or from the code, unless it is marked
 **(estimate)**.
@@ -22,8 +26,8 @@ No consensus rule, no state format and no state hash changes (same as Phase 1).
 
 | gate | target (fail line) | measured by | source |
 |---|---|---|---|
-| Phase gate, 300 markets | matched/s >= +7% vs Phase 1 (`59fa407`) | interleaved cells, section 6 | short plan, Phase 2 |
-| Phase gate, 10 markets | no regression vs Phase 1 beyond the ~5% cell resolution | interleaved cells | short plan; Phase 1 plan 1.1 |
+| Phase gate, 300 markets | matched/s >= +7% vs the Phase 2 base (main `35e69b3`, 9.6) | interleaved cells, section 6 | short plan, Phase 2; owner s96 (9.1) |
+| Phase gate, 10 markets | no regression vs the base beyond the ~5% cell resolution | interleaved cells | short plan; Phase 1 plan 1.1 |
 | Gate 2 holds | >= 0.9x main `92a02ed`, 300 and 10 markets (today 1.097x / 0.997x) | one reference pair per campaign | Phase 1 plan 9.12 |
 | Gate 3 (carried) | margin <= 1.5 ms/1k (3.0), match <= 2.0 ms/1k (4.0) | `ubench_econ`, walk 0 and walk 10, reported | Phase 1 plan 9.12 |
 | Gate 4 (carried) | tail <= 1.0 ms/1k (2.0); today 1.97 static, 2.98 moving (past fail) | `ubench_econ`, walk 0 and walk 10, reported | Phase 1 plan 9.12 |
@@ -38,6 +42,11 @@ execution thread (section 3). Engine time is 190 ms per native block on crab r2.
 execution thread stays the bottleneck, matched/s rises about in proportion, so +5-15%.
 The +7% lower bound needs about 13-17 ms per block of real saving. The pool (P2-3) is not
 in that number: its cost is sys time and latency, which `cycles:u` does not rank.
+Rule of thumb used in section 9: about +0.4-0.55% matched/s per ms saved per native block.
+
+Checkpoint after step 0 (owner s96, 9.1): if steps 0.2 / 0.3 put P2-1 + P2-2 below 13 ms per
+native block, the owner decides between pulling P2-5 (hasher) into the gate set and
+accepting a lower gate (as Gates 3 / 4 were accepted missed in 9.12).
 
 ## 2. What the step 0 profile measured (section 22.1, crab r2, load window)
 
@@ -121,10 +130,11 @@ covers before step 0 closes.
   - counter test: a cancel-all visits only the sender's markets (fails today: 300).
 - Gate P2-1: phase 1 ms per native block down by at least half the step 0.3 estimate;
   correctness tests green.
-- Optional P2-1b, CancelOrder / ModifyOrder by id (`exec_cancel_order` :8814,
-  `exec_modify_order` :9045) still loop over all books to find an order id. Not measured:
-  the standard shape sends no single cancels. Build only on owner request (open question
-  2), with its own ubench cell.
+- P2-1b, CancelOrder / ModifyOrder by id (`exec_cancel_order` :8814,
+  `exec_modify_order` :9045) still loop over all books to find an order id (the cancel
+  probes every book twice). Not measured: the standard shape sends no single cancels.
+  Owner s96 chose option B (market in the order id) with one point to confirm; the options
+  and the consensus caveat are in 9.2. Step 0.2 adds a cancel-by-id cell.
 
 ### P2-2 Cache flush on the execution thread (15.9 ms; flush worker 74.4 ms is Phase 3)
 
@@ -174,7 +184,7 @@ covers before step 0 closes.
   - `native_executor.rs:end_resident_on_worker` (:3209, one named thread per block, :3229);
   - on the flush worker, `backend.rs:flush_pending_after_batch` (:1554, digest spawn
     :1592).
-- Change: one dedicated, named exec pool built once (rayon is already in the workspace:
+- Change (owner s96: option A, 9.3): one dedicated, named exec pool built once (rayon is already in the workspace:
   `torus-types`, `torus-consensus`, `torus-rpc`, `torus-node`; `rayon::ThreadPool::scope`
   lets jobs borrow block data like `thread::scope` does). Not the global rayon pool:
   ingress on the global pool starved consensus work before (s352,
@@ -218,7 +228,7 @@ covers before step 0 closes.
   `build_sums`. Section 22.3: oracle-only blocks in the walk-10 drain window mean 14.4 ms,
   of which 14.5 of 16.5 ms main-thread CPU is this path; blocks with no native action
   mean 6.0 ms, `run_liquidations` 5.25 of 6.35 ms.
-- Change: none yet. Step 4 is a read-only design check of two options:
+- Change: none yet (owner s96: option A, 9.4). Step 4 is a read-only design check of two options:
   (a) skip a trader whose health is provably unchanged under the mark move (a bound from
   the cached sums and the largest mark change); the skip must produce the same writes
   (`clear_cooldown`, `set_pending`) and results as the full path;
@@ -234,6 +244,27 @@ covers before step 0 closes.
   P1 / P3; `liquidation_tests.rs` green.
 - Gate P2-4: tail with walk 10 below 2.0 ms/1k (`ubench_econ`); empty block with the feed
   live still <= 20 ms.
+
+### P2-5 Keyed fast hasher for exec-path maps (fallback item, owner s96: option C, 9.5)
+
+- Where: `Address`- and `OrderId`-keyed `HashMap`s / `HashSet`s on the execution path
+  (section 22: SipHash `write` 6.6%, `hash_one<Address>` 3.5%, `hash_one<u128>` 3.1% of
+  execution self time, ~13% together; Keccak 5.5% is the state hash and is not touched).
+- Change: `foldhash` with a random seed per process (already in `Cargo.lock` 0.1.5 / 0.2.0
+  through `hashbrown`; add it as a direct dependency) behind one type alias, swapped in map
+  by map, hottest first.
+- Expected saving (estimate, the least certain in this plan): 5-20 ms per native block,
+  +2-7% matched/s. A microbench of the hot maps comes first and sets the estimate.
+- Role: the fallback at the step 0 checkpoint (section 1). If the checkpoint does not need
+  it, it is built after steps 1-3 and measured on its own.
+- Risk: std's `RandomState` is already seeded per process, so a map whose iteration order
+  reaches results or state is a bug today (one known case, `exec_cancel_all_run` :8956, is
+  fixed by P2-1). foldhash adds no new risk of that kind. Flooding: keyed, so user-chosen
+  addresses cannot be ground into one bucket.
+- Tests: audit that no exec-path map iteration reaches results, state or the state hash;
+  app differential (CF dumps + `h_n`) with two different seeds.
+- Gate P2-5: the microbench's ms per native block mostly realised in a cell; no
+  correctness change.
 
 ### Dropped: stops dirty flag in `diff_stop_rows`
 
@@ -256,11 +287,13 @@ each commit, one full `cargo test --workspace` before the merge.
 
 ### Step 0: guardrails (no engine change)
 
-- 0.1 Branch `perf/item6-phase2` from the base (open question 6). Record the suite counts.
+- 0.1 Branch `perf/item6-phase2` from main `35e69b3` (9.6). Record the suite counts.
 - 0.2 Node-local counters and harness columns (not hashed): per cancel-all, books
   visited and books where the sender had orders or stops; thread spawns per site per
   block; process sys CPU per 1k fills and per native block (from `/proc/<pid>/stat`);
-  per-block exec timing in the node for oracle-only blocks (section 20.2 asked for it).
+  per-block exec timing in the node for oracle-only blocks (section 20.2 asked for it);
+  a cancel-by-id bench cell (a share of single CancelOrder / ModifyOrder) for P2-1b (9.2);
+  a microbench of the hot `Address` / `OrderId` maps with SipHash vs foldhash for P2-5.
 - 0.3 `perf annotate` of `cancel_all_many` and `exec_cancel_all_run` on the standard
   shape: split the 18.2 ms scan into `trader_orders.get` probes, `take_pending_stops`,
   the members filter and `partition_point`. This sets the P2-1 estimate.
@@ -274,15 +307,17 @@ each commit, one full `cargo test --workspace` before the merge.
 | step | commit | gate |
 |---|---|---|
 | 1 | P2-1 cancel-all index | P2-1 above |
+| 1b | P2-1b order id -> market (only if the owner confirms C in 9.2; B is a separate consensus item) | cancel-by-id cell |
 | 2 | P2-3 exec pool | P2-3 above |
 | 3 | P2-2 batch flush | P2-2 above |
 | 4 | P2-4 design check (read-only); build only if it passes | P2-4 above |
+| 4b | P2-5 hasher (earlier if the step 0 checkpoint pulls it in) | P2-5 above |
 | 5 | phase campaign (section 6) | section 1 |
 
 ## 5. Commit plan
 
-C0 counters + reference paths | C1 cancel-all index | C2 exec pool | C3 batch flush |
-(C4 liquidation skip, if step 4 passes). Every commit: full suite and goldens green,
+C0 counters + reference paths | C1 cancel-all index | (C1b order id lookup, per 9.2) |
+C2 exec pool | C3 batch flush | (C4 liquidation skip, if step 4 passes) | C5 hasher. Every commit: full suite and goldens green,
 per-item ms in the commit message. One commit per item so a single item can be benched
 from an intermediate commit if its effect must be isolated.
 
@@ -295,8 +330,7 @@ Standard shape (results doc 21.4, as section 22):
 - oracle feed 30000 / 2000 ms on both arms (both are crab now), walk 0; plus walk 10
   (`ORACLE_WALK_BP=10`) cells, and `ORACLE_FEED_DRAIN=1` drain cells for rows 77-78;
 - 10-market cells with the same settings;
-- arms: Phase 2 branch vs Phase 1 (`59fa407`, or main after the s94 batch merge),
-  interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
+- arms: Phase 2 branch vs the base, main `35e69b3` (9.6), interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
   Gate 2; perf only in separate cells (perf costs ~4.4% on both arms);
 - every heavy cell under the `signal_generate` trace, each its own systemd unit through
   `detach.sh` (results doc Open, section 19);
@@ -311,10 +345,8 @@ Standard shape (results doc 21.4, as section 22):
   and optional O1 / O2 (Phase 1 plan section 5).
 - The flush worker (74.4 ms) and row 77: Phase 3 (coalesced state checkpoints).
 - Phases 3-5 in full (`item6-phases-2-5-plans.md`).
-- A cheaper hasher for `Address`-keyed maps: hashing is ~17% of execution self time
-  (SipHash `write` 6.6%, `hash_one<Address>` 3.5%, `hash_one<u128>` 3.1%), but it is not a
-  Phase 2 item in section 22 and user-chosen keys raise a hash-flooding question
-  (open question 5).
+- P2-1b option B (market in the order id) if the owner keeps it: a consensus change, its
+  own item (9.2).
 - Backlog items in Phase 1 plan 9.13 (maker over-commit, governance errors, etc.).
 
 ## 8. Review log (filled during the build)
@@ -322,15 +354,115 @@ Standard shape (results doc 21.4, as section 22):
 | # | step | finding | decision |
 |---|---|---|---|
 
-## 9. Open questions for the owner
+## 9. Owner decisions (s96, 2026-10-06)
 
-1. Phase gate: keep +7% vs Phase 1? The measured items give about +5-15% (estimate);
-   step 0.2 / 0.3 will narrow it.
-2. P2-1b (CancelOrder / ModifyOrder id index): in Phase 2 or not? Not measured on the
-   standard shape.
-3. Pool: a dedicated rayon pool (rayon is already a workspace dependency), or a small
-   std-only pool?
-4. P2-4: keep the design check in Phase 2, or move the liquidation sums to Phases 4-5 as
-   9.12 says for the tail?
-5. Hasher swap (~17% of self time): its own item, Phase 2 optional, or later?
-6. Base: main `59fa407`, or main after `integrate/s94-batch` merges?
+Each question lists the chosen option and the options not chosen. The options not chosen
+are kept because some may matter later. Impact is an estimate unless marked measured
+(rule of thumb, section 1: about +0.4-0.55% matched/s per ms saved per native block).
+"HL" = Hyperliquid's official docs (links per item); "not public" = HL does not document it.
+
+### 9.1 Phase gate
+
+**Chosen: keep +7%** (300 markets) against the Phase 2 base (9.6), with the step 0
+checkpoint (section 1): below 13 ms of P2-1 + P2-2, the owner picks P2-5 or a lower gate.
+
+| option | needs (ms per native block) | note |
+|---|---|---|
+| **+7% (chosen)** | 13-17 | smallest gate clearly above the ~5% cell resolution |
+| +5% | ~10 | a pass cannot be told from noise at ~5% resolution |
+| +10% | ~20-24 | likely needs P2-5 too; relevant if step 0 puts P2-1 near its 18 ms ceiling |
+
+### 9.2 CancelOrder / ModifyOrder by order id (P2-1b)
+
+Today: `exec_cancel_order` probes every book twice (~600 map lookups, ~10-20 us per
+cancel, estimate); `exec_modify_order` also loops over all books. Standard shape: 0 ms
+(every cancel is a cancel-all). With traffic like HL's (makers cancel and modify by id):
+~10-20 ms per 1,000 cancels per native block (estimate).
+
+HL: `cancel {a, o}` and `cancelByCloid {asset, cloid}` name the asset; `modify` names
+only the oid plus the new order (which carries the asset); `orderStatus` takes only user
++ oid; no user cancel-all, only `scheduleCancel` (>= 5 s ahead, 10 triggers per day).
+Whether oids are global or per market: not public.
+(hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint,
+.../api/info-endpoint)
+
+**Chosen: B, market in the order id** (`OrderId` is u128, `MarketId` u64: id =
+`market_id << 64 | sequence`). **To confirm (found while writing this, s96):** order ids
+come from the global counter `next_global_order_id` (`native_executor.rs:6760, 7131`) and
+are stored in book rows and results, so B changes consensus-visible values (the id format,
+book state, receipts). That breaks Phase 2's rule of no consensus or state format change
+(section 1). B therefore needs its own consensus item: every validator switches at one
+height (or a fresh genesis), a rule for ids issued before the switch (fall back to the
+scan, or a one-time map), and a check of clients that assume sequential ids (trading app,
+SDK). Owner: B as a separate consensus item after Phase 2, or C inside Phase 2?
+
+| option | saving | HL parity | consensus | note |
+|---|---|---|---|---|
+| A. market in the action (`{market, oid}`) | full (no lookup) | **same as HL** | action format change | SDK and app change; modify still needs B or C. Relevant if the action format is aligned with HL anyway |
+| **B. market in the id (chosen)** | full; modify too | HL-like (cancel without naming the market) | **yes** (id format, state) | no action format change; separate consensus item, see above |
+| C. node-local id -> market map (superset, rebuilt at load, as P2-1) | full minus one map write per resting order (~0.05-0.1 us, est.) | HL-like | none | fits Phase 2's rule; more memory |
+| D. nothing | 0 | gap | none | cost grows with cancel-by-id traffic |
+
+Step 0.2 adds a cancel-by-id cell so the saving is measured before building.
+
+### 9.3 Exec pool (P2-3)
+
+Today ~62 thread spawns per native block from 7 sites; cost ~0.5-3 ms per native block
+(estimate; step 0.2 measures). HL: not public; the docs say more cores make blocks
+faster and recommend >= 32 cores
+(hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/optimizing-latency).
+
+| option | block time (est.) | matched/s (est.) | note |
+|---|---|---|---|
+| **A. dedicated rayon pool (chosen)** | -0.5-3 ms, plus work stealing across uneven markets | +0.2-1.5% | rayon already a dependency; not the global pool (s352) |
+| B. small std-only pool | -0.5-3 ms, no stealing | +0.2-1.3% | own code; relevant if rayon's scope overhead shows in step 0.2 |
+| C. keep scoped spawns, merge the 7 sites | about half of A | +0.1-0.7% | smallest change; fallback if the per-site panic rules are hard to keep in a pool |
+
+### 9.4 Liquidation sums with moving marks (P2-4)
+
+Measured (walk 10 vs walk 0): sums re-value 6.5 -> 24.2 ms, liquidation 10.7 -> 24.7 ms per
+block, matched/s 0.975x; so the bench ceiling is about +2.5% matched/s, and the cost sits in
+oracle-only / empty blocks (row 78).
+
+HL: mark price = median of (oracle + 150 s EMA of mid - oracle), (book bid / ask / last),
+(external perp mids); oracle every 3 s; cross accounts liquidated below maintenance margin
+x open notional. Check frequency and incremental vs full recompute: not public.
+(hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices, .../hypercore/oracle,
+.../trading/margining, .../trading/liquidations)
+
+| option | block time | matched/s | note |
+|---|---|---|---|
+| **A. design check now, code in Phase 4 (chosen)** | 0 now; later most of the 14-18 ms | 0 now, up to +2.5% later | Phase 4's one record per trader changes the layout, so code now would be redone; build in Phase 2 only if the check finds an exact rule worth >= 5 ms at walk 10 |
+| B. all in Phases 4-5 | 0 now | 0 now | Gate 4 stays past its fail line (2.98 vs 2.0 ms/1k) until then |
+| C. re-value only markets whose mark moved | up to 14-18 ms when few marks move; little when all move | 0 to +2.5% | bench moves all 300 each oracle round; HL's mark includes its own book, so it likely moves every block (inference). Relevant if real feeds update markets at different times |
+
+### 9.5 Hasher (P2-5)
+
+Measured (section 22): SipHash ~13% of execution self time (`write` 6.6%,
+`hash_one<Address>` 3.5%, `hash_one<u128>` 3.1%); Keccak 5.5% is the state hash and stays.
+HL: hash functions and data structures not public (node source not released,
+github.com/hyperliquid-dex/node). HL's flood defence is per address: deposit before acting,
+1 request per 1 USDC traded + 10k buffer, 1,000-5,000 open orders per user
+(.../api/rate-limits-and-user-limits). We lack these admission limits; that gap matters
+more than the hasher.
+
+| option | block time (est.) | matched/s (est.) | flood-safe | note |
+|---|---|---|---|---|
+| A. keep SipHash | 0 | 0 | yes | |
+| B. FxHash / raw address bytes | largest | +3-8% | **no** for user-chosen keys | keys are free to make, so colliding addresses are cheap to grind. Relevant for maps whose keys users cannot choose (`MarketId`, sequential `OrderId`) |
+| **C. foldhash, seed per process (chosen)** | ~90% of B, 5-20 ms | +2-7% | yes | no new order risk (std is already seeded per process); P2-5, the step 0 fallback |
+
+### 9.6 Base
+
+**Chosen (s96 recommendation, owner asked for one): main `35e69b3`** = the s94 batch
+(`a0eda77`) + `feat/liq-telemetry` (`0ce261b`), both merged and pushed in s96. The +7% is
+measured against `35e69b3` too, not `59fa407`: the batch (bad-debt, auth replay, gas
+fixes) and the telemetry changed the code since Phase 1, and a `59fa407` reference would
+mix their effect into Phase 2's. ozarchy's bad-debt cost cell (`35e69b3` vs `92a02ed`,
+N=4 + b900, x2) gives the new base's Gate 2 reading. `59fa407` stays the Phase 1 record.
+
+| option | note |
+|---|---|
+| **main `35e69b3` (chosen)** | has every merged fix; no merge conflicts later |
+| main `59fa407` | lacks the batch fixes; conflicts in `native_executor.rs` / `app.rs` at merge |
+| main `a3bfab2` (batch without telemetry) | relevant only if the telemetry shows a cost on the execution thread (ozarchy: native root identical; ms cost not measured yet) |
