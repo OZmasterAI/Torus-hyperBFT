@@ -142,6 +142,8 @@ struct Stats {
     /// adl-budget Q1: ADL counterparty rankings (each from the slot's
     /// trader set, shadow-checked like the pass's list).
     adl_rankings: usize,
+    /// A8 perf (P1): trader sets the drains took (shared by their rankings).
+    adl_trader_sets: usize,
     shadow: usize,
     persistent: usize,
     memo: usize,
@@ -370,6 +372,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.l1_off += get(&c.l1_off);
             stats.traders_slice += get(&c.traders_slice);
             stats.adl_rankings += get(&c.adl_rankings);
+            stats.adl_trader_sets += get(&c.adl_trader_sets);
             stats.shadow += get(&c.shadow);
             stats.persistent += get(&c.persistent);
             stats.memo += get(&c.memo);
@@ -437,8 +440,8 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
         "rule B: two chunks of one account in one block, every MULTI account: {s:?}"
     );
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
-    assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_rankings, "E2: pass + ADL rankings from the slot: {s:?}");
-    assert!(s.adl_rankings > 0, "ADL rankings met: {s:?}");
+    assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_trader_sets, "E2: pass + one ADL set per drain from the slot: {s:?}");
+    assert!(s.adl_rankings > 0 && s.adl_trader_sets > 0 && s.adl_trader_sets <= s.adl_rankings, "ADL rankings met: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");
@@ -504,4 +507,178 @@ fn p2_ranks_each_market_side_once_per_block() {
         parent = Some(frozen);
     }
     assert_eq!(rankings, vec![0, 4], "block 2: one ranking per (market, long)");
+}
+
+/// An ADL fixture for [`adl_run`]: `k` bankrupt accounts long 1 in markets
+/// `1..=pu`; scan / act / W budgets of the step.
+#[derive(Clone, Copy)]
+struct AdlShape {
+    k: u64,
+    pu: u64,
+    act: usize,
+    work: u64,
+    /// Market `pu + 1`: bankrupt 0 long 2 against bankrupt 1 short 2, no
+    /// other holder: both escrows hold it -> escrow pairing (vault pays).
+    two_sided: bool,
+}
+
+/// What one block of [`adl_run`] left: positions / balances / liquidation
+/// rows, the drain's units, the step's results.
+#[derive(PartialEq, Eq, Debug)]
+struct AdlBlock {
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    adl_work: u64,
+    results: String,
+}
+
+fn adl_bankrupt(b: u64) -> Address {
+    let mut a = [0x11u8; 20];
+    a[12..].copy_from_slice(&(b + 1).to_be_bytes());
+    Address::new(a)
+}
+
+/// adl-budget A8 perf (P1 + P3): the node lifecycle (R attached when
+/// `resident`, the sums shadow on) over `shape`. Counterparties: 24 traders
+/// short 1-3 in most ADL markets (funded 100,000), 4 "solo" traders short 1
+/// in market 1 only, funded 30 (high leverage: ranked first, closed out,
+/// gone from the trader set), the vault short 2 in markets 2 and 3 (an
+/// ordinary candidate; the pairing pays it), a sink long on the other side.
+/// Block 1 at 1,000 (rule-H base), then 900 until the queue is empty and
+/// every bankrupt account was ADL'd (cap 40 blocks), plus one block.
+fn adl_run(shape: AdlShape, resident: bool, caches: bool) -> Vec<AdlBlock> {
+    ADL_CACHES_OFF.with(|c| c.set(!caches));
+    let AdlShape { k, pu, act, work, two_sided } = shape;
+    let markets = pu + u64::from(two_sided);
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    for m in 1..=markets {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+    }
+    let sink = trader(500);
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, 1_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let fund = |t: &Address, v: i64| {
+            ctx.positions.put_native_balance(t, &NativeBalance { available: fp(v), order_margin: FixedPoint::ZERO }).unwrap();
+        };
+        let pair = |long: &Address, short: &Address, m: MarketId, q: u64| {
+            ctx.positions.apply_fill(long, m, true, fp(q as i64), fp(MID), MarginType::Cross).unwrap();
+            ctx.positions.apply_fill(short, m, false, fp(q as i64), fp(MID), MarginType::Cross).unwrap();
+        };
+        fund(&sink, 100_000_000);
+        for i in 0..24 {
+            fund(&trader(i), 100_000);
+            for m in 1..=pu {
+                if (i + m) % 4 != 0 {
+                    pair(&sink, &trader(i), m, 1 + (i * m) % 3);
+                }
+            }
+        }
+        for j in 0..4 {
+            fund(&trader(100 + j), 30); // MM 25 at 1,000
+            pair(&sink, &trader(100 + j), 1, 1);
+        }
+        for m in [2, 3] {
+            pair(&sink, &LIQUIDATOR_VAULT, m, 2);
+        }
+        for b in 0..k {
+            // MM 25 per position at 1,000: AV 50 pu >= 25 pu (+ 50 for the
+            // two-sided pair); at 900: 50 pu - 100 pu (-/+ 200) < 0.
+            fund(&adl_bankrupt(b), 50 * pu as i64);
+            for m in 1..=pu {
+                pair(&adl_bankrupt(b), &sink, m, 1);
+            }
+        }
+        if two_sided {
+            pair(&adl_bankrupt(0), &adl_bankrupt(1), markets, 2);
+        }
+    }
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    let mut holder = ResidentBooks::default();
+    let mut parent: Option<Arc<FrozenPending>> = None;
+    let (mut out, mut tail) = (Vec::new(), 0);
+    for h in 1..=40u64 {
+        let now = 10_000 + h;
+        let price = if h == 1 { MID } else { 900 };
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut rb = begin_resident(resident.then_some(&mut holder), &mut overlay, h, None);
+        for m in 1..=markets {
+            overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(price), now - 1)).unwrap();
+        }
+        let mut ctx =
+            NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.metrics = Some(metrics.clone());
+        ctx.attach_resident_block(&mut rb);
+        if resident {
+            ctx.sums.as_mut().expect("slot sums attached").shadow = true;
+        }
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        let liq = NativeExecutor::run_liquidations_with(&mut ctx, 2_048, act, work);
+        assert!(ctx.fatal_error.is_none(), "h {h}: {:?}", ctx.fatal_error);
+        if let Some(s) = ctx.sums.as_ref() {
+            let bad = s.shadow_mismatches.lock().unwrap().clone();
+            assert!(bad.is_empty(), "h {h}: {bad:?}");
+        }
+        let done = h > 1
+            && metrics.liquidations_adl.get() >= k
+            && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none();
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        let mut rows = overlay.iterate_cf(CF_NATIVE_LIQUIDATION, None).unwrap();
+        rows.extend(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap());
+        rows.extend(overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
+        let results = format!("{:?}", liq.iter().map(|x| (&x.error, x.success, x.gas_used)).collect::<Vec<_>>());
+        out.push(AdlBlock { rows, adl_work: metrics.liquidation_adl_work_total.get(), results });
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = if rb.attached() { overlay.own_pending_delta() } else { Default::default() };
+        let frozen = overlay.freeze(h);
+        end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        if let Some(p) = parent.take() {
+            p.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        }
+        parent = Some(frozen);
+        tail += usize::from(done);
+        if tail == 2 {
+            if two_sided {
+                assert_ne!(metrics.liquidation_adl_pairing.get(), 0.0, "the escrows paired");
+            }
+            ADL_CACHES_OFF.with(|c| c.set(false));
+            return out;
+        }
+    }
+    panic!("not drained in 40 blocks");
+}
+
+/// adl-budget A8 perf (P1 + P3): the drain with its caches (one trader set
+/// per drain, kept by dropping traders gone flat; the ranking AV memoized
+/// per trader, dropped for both parties of every close and for the vault on
+/// a pairing) is bit-identical to the reference (a fresh set and AV per
+/// ranking): an HL-like event (3 accounts x 6 markets, default W, drained
+/// in B) and an S=750-like storm (10 accounts x 6 markets, act 3: B over 4
+/// blocks mixed with the drain, W 60: several drain blocks; a two-sided
+/// market: pairing), with and without R. Equal positions, balances and
+/// liquidation rows, drain units and results block by block; caches used
+/// (AV hits, traders dropped, sets taken) — and every hit equals a fresh
+/// valuation, every set the walk (shadow asserts inside the drain).
+#[test]
+fn adl_drain_caches_are_bit_identical() {
+    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
+    let storm = AdlShape { k: 10, pu: 6, act: 3, work: 60, two_sided: true };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        for resident in [true, false] {
+            ADL_CACHE_STATS.with(|s| s.set((0, 0, 0)));
+            let cached = adl_run(shape, resident, true);
+            let (hits, dropped, sets) = ADL_CACHE_STATS.with(|s| s.get());
+            let reference = adl_run(shape, resident, false);
+            assert_eq!(cached.len(), reference.len(), "{name} R={resident}: blocks");
+            for (h, (a, b)) in cached.iter().zip(&reference).enumerate() {
+                assert!(a == b, "{name} R={resident} block {}: rows / units / results differ", h + 1);
+            }
+            let drain_blocks = cached.windows(2).filter(|w| w[1].adl_work > w[0].adl_work).count();
+            println!("ADL caches {name} R={resident}: blocks={} drain_blocks={drain_blocks} hits={hits} dropped={dropped} sets={sets}", cached.len());
+            assert!(hits > 0 && dropped > 0 && sets > 0, "{name} R={resident}: caches used");
+            if name == "storm" {
+                assert!(drain_blocks >= 3, "{name}: a multi-block drain");
+            }
+        }
+    }
 }

@@ -1101,6 +1101,9 @@ struct SumsCounters {
     traders_slice: std::sync::atomic::AtomicUsize,
     /// adl-budget Q1: ADL counterparty rankings (one trader list each).
     adl_rankings: std::sync::atomic::AtomicUsize,
+    /// adl-budget A8 perf (P1): trader sets the drain took (one per drain
+    /// with a ranking; the rankings share it).
+    adl_trader_sets: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]

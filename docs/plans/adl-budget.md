@@ -298,14 +298,17 @@ N = 5,000 traders × 300 markets (1.5M position rows), bankrupt accounts long si
 *step ms* = the `liquidation step` line's `ms`; ns/unit = (step − B − the healthy-scan baseline)
 / `adl_work`.
 
-| case | block | transfers | rows closed | units | B ms | step ms (3 runs) | ns/unit |
-|---|---|---|---|---|---|---|---|
-| HL: 3 accounts × 100 markets | B | 300 | 300 | 500,800 | 1.0 | 532 / 537 / 540 | 1,059-1,075 (median 1,068) |
-| S=750-like: 100 × 270 | B₁ (64 accounts) | 17,280 | 7,745 | 630,126 | 66-68 | 12,303 / 12,305 / 12,344 | ~19,450 |
-| | B₂ (36 accounts) | 9,720 | 7,808 | 630,862 | 36-37 | 4,193 / 4,266 / 4,352 | ~6,700 |
-| | drain 3 | 0 | 5,184 | 630,616 | — | 502 / 537 / 538 | ~830 |
-| | drain 4 | 0 | 4,464 | 634,178 | — | 480 / 505 / 507 | ~780 |
-| | drain 5 | 0 | 1,799 | 253,698 | — | 178 / 179 / 180 | ~700 |
+*Before* = d0dfed7 (a trader set and AV per ranking); *after* = the drain caches (one trader
+set per drain, the ranking AV memoized per trader; bit-identical, same units per block).
+
+| case | block | transfers | rows closed | units | B ms | step ms before (3 runs) | ns/unit before | step ms after (3 runs) | ns/unit after |
+|---|---|---|---|---|---|---|---|---|---|
+| HL: 3 accounts × 100 markets | B | 300 | 300 | 500,800 | 1.0 | 532 / 537 / 540 | 1,059-1,075 (median 1,068) | 396 / 399 / 405 | 787-804 (median 792) |
+| S=750-like: 100 × 270 | B₁ (64 accounts) | 17,280 | 7,745 | 630,126 | 65-68 | 12,303 / 12,305 / 12,344 | ~19,450 | 715 / 722 / 727 | ~1,040 |
+| | B₂ (36 accounts) | 9,720 | 7,808 | 630,862 | 35-37 | 4,193 / 4,266 / 4,352 | ~6,700 | 571 / 571 / 575 | ~850 |
+| | drain 3 | 0 | 5,184 | 630,616 | — | 502 / 537 / 538 | ~830 | 399 / 400 / 402 | ~635 |
+| | drain 4 | 0 | 4,464 | 634,178 | — | 480 / 505 / 507 | ~780 | 386 / 387 / 390 | ~610 |
+| | drain 5 | 0 | 1,799 | 253,698 | — | 178 / 179 / 180 | ~700 | 138 / 139 / 141 | ~550 |
 
 * **W = 630,000** = max(1.25 × U_hl, 100 × (5,000 + 3) + 300 × 2) rounded up to 10,000, with
   U_hl = 500,800 (100 rankings × 5,002 traders + 300 rows × 2). The HL event closes the escrows
@@ -320,9 +323,16 @@ N = 5,000 traders × 300 markets (1.5M position rows), bankrupt accounts long si
   run once per ranking: `layer_keys(CF_NATIVE_POSITIONS)` (the block's ~17k pending position
   keys) plus a `has_key` overlay seek per dirty trader, × 270 rankings. Units count traders
   examined, not the block's pending keys, so W does not bound that cost.
-* Open (owner): hoist the trader set out of `adl_candidates_of` (once per drain; a trader gone
-  flat returns no position), and/or charge B's transfers into W, or a lower per-block act limit
-  for ADL accounts; a per-block AV cache for the ranking. Not implemented.
+* **After the caches** (`DrainCache`, `liquidation_step.rs`; proof: the lib test
+  `adl_drain_caches_are_bit_identical`, the seeded L1 test, the goldens unchanged): the HL block
+  is ~400 ms, still above ~250 ms; a B + drain block is 0.57-0.72 s (was 4.3-12.3 s); a full-W
+  drain block ~0.4 s. Remaining profile of the HL drain (perf, inclusive, partly nested):
+  ~73 % under `get_position` (each ranking point-reads all 5,002 traders' position in its
+  market: the overlay's dirty-range check, the records hash lookup, a binary search), ~29 %
+  `pos_sums` (AV builds: first sight of each candidate and after each close), ~20 %
+  `adl_rank`'s sort. W unchanged; the ~250 ms question is open (owner).
+* Still open (owner): charge B's transfers into W, or a lower per-block act limit for ADL
+  accounts; a per-market holder list (C2) instead of reading every trader per ranking.
 
 Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
 `RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes"`,

@@ -17,6 +17,15 @@ use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_POSIT
 
 type Marks = BTreeMap<MarketId, FixedPoint>;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the ADL drain's caches (P1 trader set, P3 ranking AV) off =
+    /// the reference path (a fresh trader set and AV per ranking).
+    static ADL_CACHES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: (AV cache hits, traders dropped from the set, sets taken).
+    static ADL_CACHE_STATS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
 /// What one step did — telemetry only (metrics and logs), never read by
 /// execution.
 #[derive(Default)]
@@ -45,6 +54,47 @@ struct LiqStats {
     /// The step's marks (A7: the escrow gauges and the value sum value at
     /// them).
     marks: Marks,
+}
+
+/// adl-budget A8 perf (P1 + P3, bit-identical): the ADL drain's caches for
+/// one block, built from state at the drain (never carried over a block).
+///
+/// * `traders`: `liq_traders_after(None, MAX)` taken once, at the drain's
+///   first ranking (after block B's transfers), then kept equal to a fresh
+///   read: during the drain the only writes are closes that move size from
+///   an escrow to an existing opposite holder (`adl_close`: q <= the
+///   holder's size, never a flip), escrow pairings (`cross_close`: the two
+///   escrows' positions, the vault's BALANCE) and obligation rows — so no
+///   trader gains a first position key, and one that loses its last is
+///   dropped ([`Self::touched`]). (A trader gone flat would be skipped by
+///   `get_position` anyway; the drop keeps `traders.len()`, the ranking's
+///   work units, equal to a fresh set.) The dust sweep runs after the last
+///   ranking.
+/// * `av`: the ranking AV per trader — a function of its balance, its
+///   positions and the block's fixed marks / configs — used only as a
+///   lookup (never iterated); dropped for both parties of every close and
+///   for the vault on a pairing, i.e. for every account the drain writes.
+#[derive(Default)]
+struct DrainCache {
+    traders: Option<Vec<Address>>,
+    av: HashMap<Address, FixedPoint>,
+}
+
+impl DrainCache {
+    /// The drain wrote `t`'s position in `m` (and balance): drop its AV, and
+    /// drop it from the set once it holds no position row (one seek, only
+    /// when its row in `m` is gone).
+    fn touched<T: StateBackend>(&mut self, ctx: &NativeExecContext<T>, t: &Address, m: MarketId) -> Result<(), CoreError> {
+        self.av.remove(t);
+        let Some(list) = self.traders.as_mut() else { return Ok(()) };
+        let Ok(i) = list.binary_search(t) else { return Ok(()) };
+        if ctx.positions.get_position(t, m)?.is_none() && !trader_positions::has_key(&ctx.state, t)? {
+            list.remove(i);
+            #[cfg(test)]
+            ADL_CACHE_STATS.with(|s| s.set((s.get().0, s.get().1 + 1, s.get().2)));
+        }
+        Ok(())
+    }
 }
 
 impl NativeExecutor {
@@ -419,16 +469,42 @@ impl NativeExecutor {
     /// with the block's dirty traders, else the walk), through the records for a
     /// clean trader and the overlay for a dirty one; escrows skipped. Returns the
     /// candidates and the traders examined (the ranking's work units, Q3).
+    /// A8 perf: the set and the ranking AV come from the drain's `cache`
+    /// ([`DrainCache`]: the same values as a fresh read, see there).
     fn adl_candidates_of<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         m: MarketId,
         want_long: bool,
+        cache: &mut DrainCache,
     ) -> Result<(Vec<liq::AdlCandidate>, u64), CoreError> {
-        let traders = Self::liq_traders_after(ctx, None, usize::MAX)?;
+        #[cfg(test)]
+        let on = !ADL_CACHES_OFF.with(|c| c.get());
+        #[cfg(not(test))]
+        let on = true;
+        let fresh_set;
+        let DrainCache { traders, av } = cache;
+        let traders: &[Address] = if on {
+            if traders.is_none() {
+                *traders = Some(Self::liq_traders_after(ctx, None, usize::MAX)?);
+                #[cfg(test)]
+                ADL_CACHE_STATS.with(|s| s.set((s.get().0, s.get().1, s.get().2 + 1)));
+                #[cfg(test)]
+                if let Some(s) = ctx.sums.as_ref() {
+                    bump(&s.counters.adl_trader_sets);
+                }
+            }
+            let kept = traders.as_deref().expect("taken above");
+            #[cfg(test)]
+            assert_eq!(kept, liq::traders_after(&ctx.state, None, usize::MAX)?.as_slice(), "kept trader set == the walk");
+            kept
+        } else {
+            fresh_set = Self::liq_traders_after(ctx, None, usize::MAX)?;
+            &fresh_set
+        };
         let reader = AccountReader::of(ctx);
         // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
         // storage error stays an error (fail-stop).
-        let cands = liq::adl_candidates(&traders, want_long, |t| reader.get_position(t, m), |t| {
+        let value = |t: &Address| -> Result<FixedPoint, CoreError> {
             let bal = ctx.positions.get_native_balance(t)?;
             let v = match reader.view(t, &bal) {
                 Ok(v) => v,
@@ -436,6 +512,22 @@ impl NativeExecutor {
                 Err(e) => return Err(e),
             };
             Ok(v.available.checked_add(v.order_margin).and_then(|x| x.checked_add(v.upnl)).unwrap_or(FixedPoint::ZERO))
+        };
+        let cands = liq::adl_candidates(traders, want_long, |t| reader.get_position(t, m), |t| {
+            if !on {
+                return value(t);
+            }
+            if let Some(&v) = av.get(t) {
+                #[cfg(test)]
+                {
+                    assert_eq!(v, value(t)?, "ranking AV cache hit == a fresh valuation ({t})");
+                    ADL_CACHE_STATS.with(|s| s.set((s.get().0 + 1, s.get().1, s.get().2)));
+                }
+                return Ok(v);
+            }
+            let v = value(t)?;
+            av.insert(*t, v);
+            Ok(v)
         })?;
         #[cfg(test)]
         if let Some(s) = ctx.sums.as_ref() {
@@ -749,6 +841,7 @@ impl NativeExecutor {
     ) -> Result<(), CoreError> {
         let mut ranked: BTreeMap<(MarketId, bool), (Vec<liq::AdlCandidate>, usize)> = BTreeMap::new();
         let mut paired: BTreeMap<MarketId, Vec<u8>> = BTreeMap::new();
+        let mut cache = DrainCache::default();
         let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
         while used < work {
             let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
@@ -761,7 +854,7 @@ impl NativeExecutor {
             };
             let key = (o.market, o.is_long);
             if !ranked.contains_key(&key) {
-                let (c, examined) = Self::adl_candidates_of(ctx, o.market, !o.is_long)?;
+                let (c, examined) = Self::adl_candidates_of(ctx, o.market, !o.is_long, &mut cache)?;
                 used += examined;
                 ranked.insert(key, (liq::adl_rank(rank_px, c), 0));
             }
@@ -774,10 +867,21 @@ impl NativeExecutor {
             for (c, q) in &closes {
                 tracing::debug!(market = o.market, account = %o.trader, counterparty = %c, size = %q, price = %o.price, "liquidation: ADL close");
                 o.size -= *q;
+                cache.touched(ctx, c, o.market)?;
+            }
+            if !closes.is_empty() {
+                cache.touched(ctx, &escrow, o.market)?;
             }
             if o.size > FixedPoint::ZERO {
+                let before = o.size;
                 let from = paired.entry(o.market).or_default();
                 used += Self::adl_cross(ctx, &mut o, from, stats)?;
+                if o.size != before {
+                    // cross_close wrote both escrows and the vault's balance.
+                    cache.touched(ctx, &liq::ADL_ESCROW_LONG, o.market)?;
+                    cache.touched(ctx, &liq::ADL_ESCROW_SHORT, o.market)?;
+                    cache.av.remove(&LIQUIDATOR_VAULT);
+                }
             }
             if o.size > FixedPoint::ZERO {
                 // Review M1: the escrow holds Σ rows and OI is symmetric, so

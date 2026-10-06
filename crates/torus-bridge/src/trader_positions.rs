@@ -312,8 +312,8 @@ impl TraderPositions {
 
 /// Item 6 E2: whether `state` holds a 28-byte position key of `t`. They all
 /// lie in `[t ‖ 00×8, t ‖ ff×8]`; longer keys under `t` in between are
-/// stepped over.
-fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, StateError> {
+/// stepped over. (adl-budget A8 perf: also the ADL drain's flat check.)
+pub(super) fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, StateError> {
     let mut start = [t.as_slice(), &[0u8; KEY - TRADER]].concat();
     loop {
         let Some((k, _)) = state.iterate_cf_from(CF_NATIVE_POSITIONS, &start, 1)?.pop() else {
