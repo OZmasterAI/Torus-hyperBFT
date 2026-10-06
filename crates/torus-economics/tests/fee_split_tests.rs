@@ -202,12 +202,13 @@ fn validator_commission_proposer_keeps_commission() {
     mgr.delegate(d1, proposer, wei(30_000)).unwrap();
     mgr.delegate(d2, proposer, wei(70_000)).unwrap();
 
-    let reward_amount = wei(10_000);
+    let reward_amount = wei(11_000);
     FeeSplitter::distribute_validator_rewards(&mgr, &proposer, reward_amount).unwrap();
 
-    // Commission = 10% of 10_000 = 1_000 -> proposer pending rewards.
+    // Self-stake share = 10k/110k of 11_000 = 1_000; commission = 10% of the
+    // delegators' 10_000 = 1_000 -> proposer pending rewards 2_000.
     let proposer_rewards = mgr.get_pending_rewards(&proposer).unwrap().unwrap();
-    assert_eq!(proposer_rewards.amount, wei(1_000));
+    assert_eq!(proposer_rewards.amount, wei(2_000));
 
     // Delegator pool = 9_000.
     // d1: 30k/100k * 9000 = 2700
@@ -231,11 +232,12 @@ fn single_delegator_gets_all_non_commission() {
         .unwrap(); // 20% commission
     mgr.delegate(d1, proposer, wei(50_000)).unwrap();
 
-    FeeSplitter::distribute_validator_rewards(&mgr, &proposer, wei(5_000)).unwrap();
+    FeeSplitter::distribute_validator_rewards(&mgr, &proposer, wei(6_000)).unwrap();
 
-    // Commission = 20% of 5000 = 1000.
+    // Self-stake share = 10k/60k of 6000 = 1000; commission = 20% of the
+    // delegator's 5000 = 1000 -> proposer 2000.
     let proposer_rewards = mgr.get_pending_rewards(&proposer).unwrap().unwrap();
-    assert_eq!(proposer_rewards.amount, wei(1_000));
+    assert_eq!(proposer_rewards.amount, wei(2_000));
 
     // Single delegator gets all remaining = 4000.
     let d1_rewards = mgr.get_pending_rewards(&d1).unwrap().unwrap();

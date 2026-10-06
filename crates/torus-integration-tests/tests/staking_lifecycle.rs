@@ -67,7 +67,7 @@ fn test_full_staking_lifecycle() {
     assert_eq!(val.total_delegated, wei(5_000));
 
     // Distribute block fees at final epoch (25% to validators).
-    let total_fees = wei(10_000);
+    let total_fees = wei(12_000);
     RewardDistributor::distribute_block_fees(
         &staking,
         validator,
@@ -79,18 +79,19 @@ fn test_full_staking_lifecycle() {
     .unwrap();
 
     // At TRANSITION_EPOCHS: 25% burn, 25% validator, 25% treasury, 25% dev_pool.
-    // Validator share = 2,500. Commission (10%) = 250 -> proposer rewards.
-    // Delegator pool = 2,250 -> single delegator gets all.
+    // Validator share = 3,000. Self-stake share 10k/15k = 2,000; commission
+    // (10%) of the delegator's 1,000 = 100 -> proposer rewards 2,100.
+    // Delegator pool = 900 -> single delegator gets all.
     let del_rewards = staking.get_pending_rewards(&delegator).unwrap().unwrap();
     let val_rewards = staking.get_pending_rewards(&validator).unwrap().unwrap();
-    assert_eq!(del_rewards.amount, wei(2_250));
-    assert_eq!(val_rewards.amount, wei(250));
+    assert_eq!(del_rewards.amount, wei(900));
+    assert_eq!(val_rewards.amount, wei(2_100));
 
     // Delegator claims rewards.
     let initial_bal = balance(&h, &delegator);
     let claimed = staking.claim_rewards(delegator).unwrap();
-    assert_eq!(claimed, wei(2_250));
-    assert_eq!(balance(&h, &delegator), initial_bal + wei(2_250));
+    assert_eq!(claimed, wei(900));
+    assert_eq!(balance(&h, &delegator), initial_bal + wei(900));
 
     // Second claim fails.
     assert!(staking.claim_rewards(delegator).is_err());
@@ -297,7 +298,7 @@ fn test_validator_commission_exact_math() {
     staking.delegate(d1, proposer, wei(30_000)).unwrap();
     staking.delegate(d2, proposer, wei(70_000)).unwrap();
 
-    let total_fees = wei(10_000);
+    let total_fees = wei(44_000);
     RewardDistributor::distribute_block_fees(
         &staking,
         proposer,
@@ -308,11 +309,12 @@ fn test_validator_commission_exact_math() {
     )
     .unwrap();
 
-    // At TRANSITION_EPOCHS: validator gets 25% = 2,500.
-    // Commission (10%) = 250 -> proposer.
-    // Delegator pool = 2,250.
-    // d1: 30k/100k * 2250 = 675.
-    // d2: remainder = 2250 - 675 = 1575.
+    // At TRANSITION_EPOCHS: validator gets 25% = 11,000.
+    // Self-stake share 10k/110k = 1,000; commission (10%) of the delegators'
+    // 10,000 = 1,000 -> proposer 2,000.
+    // Delegator pool = 9,000.
+    // d1: 30k/100k * 9000 = 2,700.
+    // d2: remainder = 9000 - 2700 = 6,300.
     let r_proposer = staking
         .get_pending_rewards(&proposer)
         .unwrap()
@@ -321,12 +323,12 @@ fn test_validator_commission_exact_math() {
     let r_d1 = staking.get_pending_rewards(&d1).unwrap().unwrap().amount;
     let r_d2 = staking.get_pending_rewards(&d2).unwrap().unwrap().amount;
 
-    assert_eq!(r_proposer, wei(250));
-    assert_eq!(r_d1, wei(675));
-    assert_eq!(r_d2, wei(1575));
+    assert_eq!(r_proposer, wei(2_000));
+    assert_eq!(r_d1, wei(2_700));
+    assert_eq!(r_d2, wei(6_300));
 
-    // Conservation: commission + delegator shares = validator share.
-    assert_eq!(r_proposer + r_d1 + r_d2, wei(2_500));
+    // Conservation: self share + commission + delegator shares = validator share.
+    assert_eq!(r_proposer + r_d1 + r_d2, wei(11_000));
 }
 
 /// Unbonding timing: undelegate -> process before period (nothing) ->

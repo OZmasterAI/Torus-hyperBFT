@@ -88,41 +88,7 @@ impl RewardDistributor {
             }
         };
 
-        let bps_10000 = U256::from(10_000u32);
-        let commission = validator_share * U256::from(val.commission_bps) / bps_10000;
-        let delegator_pool = validator_share - commission;
-
-        if !commission.is_zero() {
-            staking.credit_rewards(*proposer, commission)?;
-        }
-
-        if delegator_pool.is_zero() || val.total_delegated.is_zero() {
-            if !delegator_pool.is_zero() {
-                staking.credit_rewards(*proposer, delegator_pool)?;
-            }
-            return Ok(());
-        }
-
-        let delegations = staking.delegations_for_validator(proposer)?;
-        let total_delegated = val.total_delegated;
-
-        let mut distributed = U256::ZERO;
-        let last_idx = delegations.len().saturating_sub(1);
-
-        for (i, del) in delegations.iter().enumerate() {
-            let share = if i == last_idx {
-                delegator_pool - distributed
-            } else {
-                delegator_pool * del.amount / total_delegated
-            };
-
-            if !share.is_zero() {
-                staking.credit_rewards(del.delegator, share)?;
-                distributed += share;
-            }
-        }
-
-        Ok(())
+        split_validator_reward(staking, &val, validator_share)
     }
 
     /// Distribute permanent staking rewards at epoch boundary.
@@ -196,7 +162,6 @@ impl RewardDistributor {
             return Ok(U256::ZERO);
         }
 
-        let bps_10000 = U256::from(10_000u32);
         let mut distributed = U256::ZERO;
         let last_val_idx = active.len().saturating_sub(1);
 
@@ -212,40 +177,7 @@ impl RewardDistributor {
             }
             distributed += val_emission;
 
-            // Commission split
-            let commission = val_emission * U256::from(val.commission_bps) / bps_10000;
-            let delegator_pool = val_emission - commission;
-
-            if !commission.is_zero() {
-                staking.credit_rewards(val.address, commission)?;
-            }
-
-            // If no delegators, validator gets everything
-            if delegator_pool.is_zero() || val.total_delegated.is_zero() {
-                if !delegator_pool.is_zero() {
-                    staking.credit_rewards(val.address, delegator_pool)?;
-                }
-                continue;
-            }
-
-            // Distribute to delegators pro-rata
-            let delegations = staking.delegations_for_validator(&val.address)?;
-            let total_delegated = val.total_delegated;
-            let mut del_distributed = U256::ZERO;
-            let last_del_idx = delegations.len().saturating_sub(1);
-
-            for (j, del) in delegations.iter().enumerate() {
-                let share = if j == last_del_idx {
-                    delegator_pool - del_distributed
-                } else {
-                    delegator_pool * del.amount / total_delegated
-                };
-
-                if !share.is_zero() {
-                    staking.credit_rewards(del.delegator, share)?;
-                    del_distributed += share;
-                }
-            }
+            split_validator_reward(staking, val, val_emission)?;
         }
 
         // Update cumulative tracker
@@ -261,6 +193,57 @@ impl RewardDistributor {
 
         Ok(total_emission)
     }
+}
+
+/// Split `amount` earned by validator `val`'s whole stake (self + delegated)
+/// into pending rewards. HL-parity fix: the self-stake earns its pro-rata
+/// share (`amount * self_stake / total_stake`, floor); commission is taken on
+/// the delegators' share only; the validator is credited self share +
+/// commission, and the rest goes to the delegations pro rata by amount, the
+/// last one taking the rounding remainder. Without delegations the validator
+/// gets everything. (It used to give the whole post-commission amount to the
+/// delegations, self-stake share included.) Value is conserved exactly.
+fn split_validator_reward<T: StateBackend>(
+    staking: &StakingManager<T>,
+    val: &ValidatorState,
+    amount: U256,
+) -> Result<()> {
+    let delegations = if val.total_delegated.is_zero() {
+        Vec::new()
+    } else {
+        staking.delegations_for_validator(&val.address)?
+    };
+    if delegations.is_empty() {
+        if !amount.is_zero() {
+            staking.credit_rewards(val.address, amount)?;
+        }
+        return Ok(());
+    }
+
+    let self_share = amount * val.self_stake / val.total_stake();
+    let delegators_share = amount - self_share;
+    let commission = delegators_share * U256::from(val.commission_bps) / U256::from(10_000u32);
+    let delegator_pool = delegators_share - commission;
+
+    let validator_cut = self_share + commission;
+    if !validator_cut.is_zero() {
+        staking.credit_rewards(val.address, validator_cut)?;
+    }
+
+    let mut distributed = U256::ZERO;
+    let last_idx = delegations.len() - 1;
+    for (i, del) in delegations.iter().enumerate() {
+        let share = if i == last_idx {
+            delegator_pool - distributed
+        } else {
+            delegator_pool * del.amount / val.total_delegated
+        };
+        if !share.is_zero() {
+            staking.credit_rewards(del.delegator, share)?;
+            distributed += share;
+        }
+    }
+    Ok(())
 }
 
 /// Integer-only linear interpolation in basis points.
@@ -403,43 +386,7 @@ impl FeeSplitter {
             }
         };
 
-        let bps_10000 = U256::from(10_000u32);
-        let commission = amount * U256::from(val.commission_bps) / bps_10000;
-        let delegator_pool = amount - commission;
-
-        // Proposer keeps commission.
-        if !commission.is_zero() {
-            staking.credit_rewards(*proposer, commission)?;
-        }
-
-        // If no delegators, proposer gets everything.
-        if delegator_pool.is_zero() || val.total_delegated.is_zero() {
-            if !delegator_pool.is_zero() {
-                staking.credit_rewards(*proposer, delegator_pool)?;
-            }
-            return Ok(());
-        }
-
-        let delegations = staking.delegations_for_validator(proposer)?;
-        let total_delegated = val.total_delegated;
-
-        let mut distributed = U256::ZERO;
-        let last_idx = delegations.len().saturating_sub(1);
-
-        for (i, del) in delegations.iter().enumerate() {
-            let share = if i == last_idx {
-                // Last delegator gets remainder to avoid rounding dust.
-                delegator_pool - distributed
-            } else {
-                delegator_pool * del.amount / total_delegated
-            };
-            if !share.is_zero() {
-                staking.credit_rewards(del.delegator, share)?;
-                distributed += share;
-            }
-        }
-
-        Ok(())
+        split_validator_reward(staking, &val, amount)
     }
 
     /// Credit treasury address and update cumulative tracker.
@@ -623,7 +570,7 @@ mod tests {
         mgr.delegate(d2, proposer, wei(70_000)).unwrap();
 
         // At transition end: validator gets 25% of fees.
-        let total_fees = wei(10_000);
+        let total_fees = wei(44_000);
         RewardDistributor::distribute_block_fees(
             &mgr,
             proposer,
@@ -634,15 +581,16 @@ mod tests {
         )
         .unwrap();
 
-        // Validator share = 2500. Commission = 250 → proposer.
-        // Delegator pool = 2250. d1: 675, d2: 1575.
+        // Validator share = 11,000. Self-stake share 10k/110k = 1,000;
+        // commission 10% of the delegators' 10,000 = 1,000 → proposer 2,000.
+        // Delegator pool = 9,000. d1: 2,700, d2: 6,300.
         let r1 = mgr.get_pending_rewards(&d1).unwrap().unwrap();
         let r2 = mgr.get_pending_rewards(&d2).unwrap().unwrap();
         let rv = mgr.get_pending_rewards(&proposer).unwrap().unwrap();
 
-        assert_eq!(r1.amount, wei(675));
-        assert_eq!(r2.amount, wei(1575));
-        assert_eq!(rv.amount, wei(250));
+        assert_eq!(r1.amount, wei(2_700));
+        assert_eq!(r2.amount, wei(6_300));
+        assert_eq!(rv.amount, wei(2_000));
     }
 
     #[test]
@@ -725,16 +673,117 @@ mod tests {
         let d1_rewards = mgr.get_pending_rewards(&d1).unwrap().unwrap().amount;
         let d2_rewards = mgr.get_pending_rewards(&d2).unwrap().unwrap().amount;
 
-        // Commission = emission * 10%
-        let bps = U256::from(10_000u32);
-        let expected_commission = emission * U256::from(1000u32) / bps;
-        assert_eq!(val_rewards, expected_commission);
+        // Self-stake share 50k/150k of the emission, plus 10% commission on
+        // the delegators' share.
+        let self_share = emission * wei(50_000) / wei(150_000);
+        let expected_commission = (emission - self_share) * U256::from(1000u32) / U256::from(10_000u32);
+        assert_eq!(val_rewards, self_share + expected_commission);
 
         // Sum of all rewards = total emission
         assert_eq!(val_rewards + d1_rewards + d2_rewards, emission);
 
         // d2 gets more than d1 (70k vs 30k delegated)
         assert!(d2_rewards > d1_rewards);
+    }
+
+    /// HL-parity: the validator's self-stake earns its pro-rata share of the
+    /// emission. Self 10k + one 1k delegator, 0% commission: the validator gets
+    /// 10/11 and the delegator 1/11 (it used to get everything, 100% of the
+    /// emission for 9% of the stake).
+    #[test]
+    fn validator_inflation_pays_the_self_stake_share_to_the_validator() {
+        let (_dir, mgr) = setup();
+        let val = register_active_validator(&mgr, 1, 10_000, 0);
+        let d1 = addr(2);
+        fund(&mgr, &d1, wei(10_000));
+        mgr.delegate(d1, val, wei(1_000)).unwrap();
+
+        let emission = RewardDistributor::distribute_validator_inflation(&mgr, 43_200).unwrap();
+        let self_share = emission * wei(10_000) / wei(11_000);
+
+        let rv = mgr.get_pending_rewards(&val).unwrap().unwrap().amount;
+        let r1 = mgr.get_pending_rewards(&d1).unwrap().unwrap().amount;
+        assert_eq!(rv, self_share, "validator gets the self-stake share");
+        assert_eq!(r1, emission - self_share, "delegator gets its own share only");
+    }
+
+    /// The fee validator share follows the same rule (same setup, the
+    /// validator bucket at the end of the transition is 25% of the fees).
+    #[test]
+    fn fee_validator_share_pays_the_self_stake_share_to_the_validator() {
+        let (_dir, mgr) = setup();
+        let proposer = addr(1);
+        let d1 = addr(2);
+        fund(&mgr, &proposer, wei(10_000));
+        fund(&mgr, &d1, wei(10_000));
+        mgr.register_validator(proposer, [1u8; 32], 0, wei(10_000)).unwrap();
+        mgr.delegate(d1, proposer, wei(1_000)).unwrap();
+
+        RewardDistributor::distribute_block_fees(
+            &mgr,
+            proposer,
+            wei(11_000),
+            TRANSITION_EPOCHS,
+            addr(10),
+            addr(11),
+        )
+        .unwrap();
+
+        // Validator bucket 2,750: self 10/11 = 2,500, delegator 250.
+        assert_eq!(mgr.get_pending_rewards(&proposer).unwrap().unwrap().amount, wei(2_500));
+        assert_eq!(mgr.get_pending_rewards(&d1).unwrap().unwrap().amount, wei(250));
+    }
+
+    fn pending(mgr: &StakingManager, a: &Address) -> U256 {
+        mgr.get_pending_rewards(a).unwrap().map(|r| r.amount).unwrap_or_default()
+    }
+
+    /// Review nit: an uneven split floors every share and the LAST delegation
+    /// takes the remainder; nothing is lost. Self 10k, two 10k delegations,
+    /// 10% commission, 1,000 raw units: self 333, delegators 667, commission
+    /// floor(66.7) = 66 -> validator 399; pool 601 -> 300 and 301 (remainder).
+    #[test]
+    fn uneven_split_floors_and_the_last_delegation_takes_the_remainder() {
+        let (_dir, mgr) = setup();
+        let val = addr(1);
+        fund(&mgr, &val, wei(10_000));
+        mgr.register_validator(val, [1u8; 32], 1000, wei(10_000)).unwrap();
+        for d in [addr(2), addr(3)] {
+            fund(&mgr, &d, wei(10_000));
+            mgr.delegate(d, val, wei(10_000)).unwrap();
+        }
+        let last = mgr.delegations_for_validator(&val).unwrap().last().unwrap().delegator;
+        let first = if last == addr(2) { addr(3) } else { addr(2) };
+
+        FeeSplitter::distribute_validator_rewards(&mgr, &val, U256::from(1_000u64)).unwrap();
+
+        assert_eq!(pending(&mgr, &val), U256::from(399u64));
+        assert_eq!(pending(&mgr, &first), U256::from(300u64));
+        assert_eq!(pending(&mgr, &last), U256::from(301u64), "remainder to the last");
+    }
+
+    /// Review nit: a validator with no self-stake left (but delegations) earns
+    /// only its commission; the delegators share the rest pro rata. Delegations
+    /// 1k and 3k, 10% commission, 1,000 raw units: validator 100, 225 / 675.
+    #[test]
+    fn zero_self_stake_with_delegators_earns_commission_only() {
+        let (_dir, mgr) = setup();
+        let val = addr(1);
+        fund(&mgr, &val, wei(10_000));
+        mgr.register_validator(val, [1u8; 32], 1000, wei(10_000)).unwrap();
+        for (d, amount) in [(addr(2), 1_000u64), (addr(3), 3_000)] {
+            fund(&mgr, &d, wei(amount));
+            mgr.delegate(d, val, wei(amount)).unwrap();
+        }
+        let mut v = mgr.get_validator(&val).unwrap().unwrap();
+        v.self_stake = U256::ZERO;
+        mgr.put_validator(&val, &v).unwrap();
+
+        FeeSplitter::distribute_validator_rewards(&mgr, &val, U256::from(1_000u64)).unwrap();
+
+        assert_eq!(pending(&mgr, &val), U256::from(100u64), "commission only");
+        assert_eq!(pending(&mgr, &addr(2)), U256::from(225u64));
+        assert_eq!(pending(&mgr, &addr(3)), U256::from(675u64));
     }
 
     #[test]
