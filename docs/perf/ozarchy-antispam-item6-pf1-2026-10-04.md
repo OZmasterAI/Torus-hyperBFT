@@ -2424,3 +2424,11 @@ Phase 2 items.
   flush worker), sums caching in the liquidation sweep; stops dirty flag
   dropped. Thread spawn cost needs a sys-time / latency measurement
   (`cycles:u` cannot rank it).
+- Perf backlog: `delegations_for_validator` (`staking.rs`) scans the whole
+  `CF_STAKING_DELEGATIONS` table on every call; with the self-stake reward
+  split (`fix/inflation-self-stake`) that is per block once the validator fee
+  share is above 0 bps, and once per active validator at epoch boundaries.
+- Read precompile gas (`fix/read-precompile-gas`, 50 gas per unit is a
+  placeholder): before testnet, microbench ns per unit (row read / 32 B blob /
+  32 B returned) and size it so a 30M-gas block of reads fits the block exec
+  budget.
