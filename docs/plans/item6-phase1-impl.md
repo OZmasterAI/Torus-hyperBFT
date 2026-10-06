@@ -767,3 +767,37 @@ Not merge blockers; each is tracked where it is defined.
 | bench load: open-limit rejects 39-43% of orders | section 20.3 | before Phase 2 profile | `bench/max-in-flight` (ozarchy sweep running) |
 | C5 cooldown coverage thin | row 72 | anytime | dedicated cooldown sequence |
 | operator runbook: price feeder + oracle signer per validator, >= 3 reporters and > 2/3 stake, NTP (5 s skew) | review summary section 5 | before testnet | testnet runbook |
+
+### 9.14 Owner answers to the open review-log questions (s94, batch)
+Owner (s94): "A accept all, B yes all, C as proposed". Rows not listed here either had an answer
+already (16, 17, 26, 28, 36, 40-43, 71, 73, 9.10, 9.12) or asked no question.
+
+- **A. Accepted as built:** rows 1, 3, 4, 8, 11, 13, 14, 19, 20, 21 (answer: no extra workload),
+  22, 29, 30, 32, 33, 37, 38, 51, 55, 59, 60, 66.
+- **B. Yes, build (size S each; queued after the bad-debt fix because 45 touches `order_book.rs`):**
+  - 44: RPC applies tick / lot 1 / 1 when a market row can't be decoded (`torus-rpc`).
+  - 45: StopLimit limit tick check inside the book as a second guard (`order_book.rs`).
+  - 46: RPC rejects a Limit price <= 0 at intake (`torus-rpc`, node-local).
+  - 52: reduce-only rejects get their own reason code (`action_status.rs` + check site).
+  - 69: real market rows by default in BOTH `ubench_epoch` and `ubench_econ` (today only
+    `ubench_epoch` has `UB_REAL_MARKETS`; row 69's "both" was wrong); note the comparability break.
+- **C. Decisions:**
+  - 75: all-or-nothing TreasurySpend / PermanentUnlock: yes (building, `fix/governance-atomic-writes`).
+  - 74: a governance storage error **halts the node** (`fatal_error`), like liquidation. Build after 75.
+  - 50: zero-fill IOC and crossing PostOnly report **"canceled"** (HL style) instead of
+    "executed"; before testnet (needs per-order results from the settle loop).
+  - 7: R rebuild cost: decide later; re-measure in the Phase 2 step 0 profile (R now holds 5 CFs).
+  - 9.3: native root dropped in `02aa50c`: decide before mainnet (delete the orphaned trie paths,
+    or bring a root back for light clients / state proofs).
+  - Anti-spam D validator exemption: measure first (add a metric for oracle submissions evicted
+    in the pool), before testnet.
+  - Oracle M2 (block timestamp lower bound, `4a12020`): review with the oracle docs before testnet.
+  - 9.11: superseded by the s94 design check: over-commit cannot happen while every market has one
+    flat tier (resting orders prepay their IM). Build a non-consensus counter + tests that pin
+    `d <= 0` under flat tiers; multi-tier configs trigger option 4 (reserve at the position tier).
+    The real bad-debt route it found (fills far from the mark) is fixed on `fix/offmark-bad-debt`.
+- **D. Moot:** rows 2, 6, 18, 23, 24, 31, 47, 62 (settled by ratios, step 2, E2-E4 and 9.12);
+  48 (faster hasher): no, revisit only if `hash_one` shows in the Phase 2 profile.
+
+Build queue on 18c (s94): bad-debt fix (building) -> row 75 (building) -> row 74 -> B batch
+(44, 45, 46, 52, 69) -> row 50 -> 9.11 counter + pin tests -> anti-spam eviction metric.
