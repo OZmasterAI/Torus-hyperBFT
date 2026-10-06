@@ -43,6 +43,8 @@ All metrics are prefixed with `torus_`:
 | `torus_state_root_compute_seconds` | Histogram | State root computation time |
 | `torus_mempool_evm_size` | Gauge | Pending EVM transactions in mempool |
 | `torus_mempool_native_size` | Gauge | Pending native actions in mempool |
+| `torus_mempool_oracle_evicted_total` | Counter | Pooled oracle submissions evicted by a newer one from the same validator at the per-validator cap (4); node-local |
+| `torus_liquidator_vault_deficit` | Gauge | Liquidator vault's negative cash in tokens (0 when not negative); set after each liquidation pass, reads 0 after a restart until the next pass |
 | `torus_peers_connected` | Gauge | Number of connected P2P peers |
 | `torus_db_size_bytes` | Gauge | Total RocksDB data directory size in bytes |
 

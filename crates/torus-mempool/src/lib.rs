@@ -763,13 +763,17 @@ impl Mempool {
                 // it); one older than every pooled one is rejected.
                 if pool.oracle_pending(accounts) >= crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR
                     && !pool.contains(&sender, &action)
-                    && !pool.evict_oldest_oracle_older_than(accounts, action.nonce)
                 {
-                    return Err(MempoolError::NativeValidationFailed(format!(
-                        "oracle pending cap {} reached for validator {} (all pooled submissions are newer)",
-                        crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
-                        accounts[0]
-                    )));
+                    if !pool.evict_oldest_oracle_older_than(accounts, action.nonce) {
+                        return Err(MempoolError::NativeValidationFailed(format!(
+                            "oracle pending cap {} reached for validator {} (all pooled submissions are newer)",
+                            crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
+                            accounts[0]
+                        )));
+                    }
+                    if let Some(m) = self.metrics.get() {
+                        m.mempool_oracle_evicted.inc();
+                    }
                 }
             }
             let result = pool.insert_with_restash_key(sender, action, cache_key);
@@ -3581,6 +3585,8 @@ mod tests {
         use torus_economics::ValidatorStatus::Active;
         let (_dir, state) = setup();
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
         let (kv, ks, kw) = (key(41), key(42), key(43));
         let (v, s, w) = (address_from_key(&kv), address_from_key(&ks), address_from_key(&kw));
         put_oracle_validator(&state, v, Active, Some(s));
@@ -3601,9 +3607,11 @@ mod tests {
             Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("oracle pending cap"), "{m}"),
             other => panic!("expected the cap, got {other:?}"),
         }
+        assert_eq!(metrics.mempool_oracle_evicted.get(), 0, "duplicate / older evict nothing");
         // Newer: evicts V's oldest (nonce `now`), admitted.
         pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
         assert_eq!(pool.native_pool_size(), 4);
+        assert_eq!(metrics.mempool_oracle_evicted.get(), 1, "one pooled submission evicted");
         // Another validator is unaffected; V's non-oracle actions are not capped.
         pool.add_native_action(oracle_from(&kw, now)).unwrap();
         pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
