@@ -253,9 +253,12 @@ includes the vault's own), `torus_liquidation_scanned_total`, `torus_liquidation
 gauges `torus_liquidation_pending` = pending rows ∪ the scan-window candidates the act budget
 left unclassified (an upper bound; counting exactly would mean classifying up to ~2,000 more
 accounts on every budget-cut block) and `torus_liquidation_deferred` (that second part alone).
+The pending rows are re-counted only on a step that changed one (or the first step after a
+start); `adl` counts ADL runs (an ADL'd account, or the vault, also when nothing closes).
 Logs: one info line per step that acted (height, scanned, acted, per-class counts, deferred,
-pending, ms), debug otherwise; one info line per ADL close (`liquidation: ADL close`: account,
-counterparty, market, size, price). Metric rows: `docs/monitoring-setup.md`.
+pending, ms), debug otherwise; one info line per ADL'd (account, market) (`liquidation: ADL`:
+counterparty count, total size, price), each counterparty close at debug. Metric rows:
+`docs/monitoring-setup.md`.
 
 ### Margin configs (F2, F8)
 

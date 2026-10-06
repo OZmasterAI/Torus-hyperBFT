@@ -89,6 +89,10 @@ pub struct Metrics {
     /// The second part of `liquidation_pending` alone: window candidates left
     /// unclassified by the act budget this block (0 when the budget held).
     pub liquidation_deferred: Gauge,
+    /// Not exported: the pending-row count of the last liquidation step, -1
+    /// before the first (or after a read error). The step re-counts the rows
+    /// only when it changed one or this is -1.
+    pub liquidation_pending_rows_cache: std::sync::atomic::AtomicI64,
 
     // Order-funnel metrics (perf A1) — where PlaceOrder actions die inside
     // execute_batch. Observability only: incremented in torus-bridge's
@@ -2329,6 +2333,7 @@ impl Metrics {
             liquidation_acted,
             liquidation_pending,
             liquidation_deferred,
+            liquidation_pending_rows_cache: std::sync::atomic::AtomicI64::new(-1),
             orders_placed_accepted,
             orders_resting,
             orders_rejected_margin,

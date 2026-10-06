@@ -30,6 +30,8 @@ struct LiqStats {
     /// ADL'd accounts, the vault's own ADL included.
     adl: u64,
     vault_adl: bool,
+    /// Whether the step wrote or deleted any pending row.
+    pending_changed: bool,
     /// The scan window's candidates (ascending, vault excluded) the act
     /// budget left unclassified; empty when the budget held.
     deferred: Vec<Address>,
@@ -65,29 +67,41 @@ impl NativeExecutor {
     }
 
     /// Node-local telemetry of one step (after its timer stopped): the
-    /// counters, the pending gauge (only with metrics attached) and the log
-    /// line (info when the step acted, else debug). Read-only: a read error
-    /// skips the pending value, never the block.
+    /// counters, the pending gauge and the log line (info when the step acted,
+    /// else debug; `pending` only with metrics attached). Read-only: a read
+    /// error skips the pending value, never the block.
     fn liquidation_telemetry<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         s: &LiqStats,
         took: std::time::Duration,
     ) {
         let happened = s.acted > 0 || s.vault_adl;
-        // Pending = pending rows ∪ deferred window candidates (both ascending).
-        let pending = if (ctx.metrics.is_some() || happened) && ctx.fatal_error.is_none() {
-            match liq::pending_traders(&ctx.state) {
-                Ok(rows) => {
-                    let both = rows.iter().filter(|t| s.deferred.binary_search(t).is_ok()).count();
-                    Some((rows.len() + s.deferred.len() - both) as u64)
-                }
-                Err(e) => {
-                    tracing::debug!(%e, "liquidation telemetry: pending rows unreadable");
-                    None
+        // Pending = pending rows ∪ deferred window candidates (metrics only).
+        // The row count is re-read only when this step changed a row or the
+        // Metrics instance has none yet (a start; a read error resets it); a
+        // deferred candidate was not scanned, so its row is as before.
+        let pending = match ctx.metrics.as_ref() {
+            Some(m) if ctx.fatal_error.is_none() => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let cached = m.liquidation_pending_rows_cache.load(Relaxed);
+                let rows = if s.pending_changed || cached < 0 {
+                    liq::pending_count(&ctx.state)
+                } else {
+                    Ok(cached as u64)
+                };
+                match rows.and_then(|r| Ok((r, liq::pending_among(&ctx.state, &s.deferred)?))) {
+                    Ok((rows, both)) => {
+                        m.liquidation_pending_rows_cache.store(rows as i64, Relaxed);
+                        Some(rows + s.deferred.len() as u64 - both)
+                    }
+                    Err(e) => {
+                        m.liquidation_pending_rows_cache.store(-1, Relaxed);
+                        tracing::debug!(%e, "liquidation telemetry: pending rows unreadable");
+                        None
+                    }
                 }
             }
-        } else {
-            None
+            _ => None,
         };
         if let Some(ref m) = ctx.metrics {
             m.liquidation_step_seconds.observe(took.as_secs_f64());
@@ -162,7 +176,9 @@ impl NativeExecutor {
             if scanned == scan || acted == act {
                 cut = true;
                 if acted == act {
-                    stats.deferred = accounts[i..].iter().filter(not_vault).copied().collect();
+                    // Only the window: the walk fetched scan + 2 candidates.
+                    stats.deferred =
+                        accounts[i..].iter().filter(not_vault).take(scan - scanned).copied().collect();
                 }
                 break;
             }
@@ -174,7 +190,7 @@ impl NativeExecutor {
                 _ => {
                     // M2: nothing the step can do until a mark returns (the
                     // oracle step makes those blocks due).
-                    liq::set_pending(&ctx.state, &trader, false)?;
+                    stats.pending_changed |= liq::set_pending(&ctx.state, &trader, false)?;
                     results.push(NativeActionResult::err(
                         "liquidation",
                         format!("{trader}: skipped (no marked position / overflow / isolated)"),
@@ -184,7 +200,7 @@ impl NativeExecutor {
             };
             if h == Health::Healthy {
                 liq::clear_cooldown(&ctx.state, &trader)?;
-                liq::set_pending(&ctx.state, &trader, false)?;
+                stats.pending_changed |= liq::set_pending(&ctx.state, &trader, false)?;
                 continue;
             }
             acted += 1;
@@ -216,7 +232,7 @@ impl NativeExecutor {
             }
             // M2: still under MM (thin book, cooldown, bounded ADL) -> keep the
             // step due until the account is healthy, flat or unvaluable.
-            Self::mark_pending(ctx, &marks, l1, &trader)?;
+            stats.pending_changed |= Self::mark_pending(ctx, &marks, l1, &trader)?;
             results.push(NativeActionResult::ok("liquidation", 3000));
         }
         // D8: the vault is exempt from stage 1 / backstop; ADL when its AV < 0.
@@ -231,7 +247,7 @@ impl NativeExecutor {
         // M2 for the vault: pending while it stays ADL-able.
         let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)?
             .is_some_and(|v| liq::classify(&v) == Some(Health::Adl));
-        liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
+        stats.pending_changed |= liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
         liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
         // Metric: the vault's deficit (negative cash it absorbed, D9). A pure
@@ -357,13 +373,13 @@ impl NativeExecutor {
     }
 
     /// Review M2: the pending row of `trader` after its action — set iff it is
-    /// still valuable and not healthy.
+    /// still valuable and not healthy. Returns whether the row changed.
     fn mark_pending<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
         l1: bool,
         trader: &Address,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
         let under = Self::liq_view(ctx, marks, trader, l1)?
             .and_then(|v| liq::classify(&v))
             .is_some_and(|h| h != Health::Healthy);
@@ -498,7 +514,22 @@ impl NativeExecutor {
                     .and_then(|x| x.checked_add(v.upnl))
                     .unwrap_or(FixedPoint::ZERO))
             })?;
-            liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
+            let closes = liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
+            // Telemetry: one info line per (account, market), each close at debug.
+            let mut size = FixedPoint::ZERO;
+            for (c, q) in &closes {
+                tracing::debug!(account = %u, counterparty = %c, market = m, size = %q, price = %px, "liquidation: ADL close");
+                size += *q;
+            }
+            tracing::info!(
+                height = ctx.block_height,
+                account = %u,
+                market = m,
+                counterparties = closes.len(),
+                size = %size,
+                price = %px,
+                "liquidation: ADL"
+            );
         }
         if *u != LIQUIDATOR_VAULT
             && !ctx

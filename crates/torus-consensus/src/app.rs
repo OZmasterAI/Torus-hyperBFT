@@ -17447,7 +17447,10 @@ mod crash_recovery_tests {
             .encode()
             .lines()
             .find_map(|l| l.strip_prefix("torus_liquidation_step_seconds_count ").map(|v| v.trim().parse::<u64>().unwrap()));
-        assert!(steps.is_some_and(|n| n >= 2), "step samples {steps:?}");
+        // One sample per native block: 1 (actions), 2..=12 (oracle rows /
+        // pending row), 13 (actions), 14 (pending row); 15 runs no native
+        // phase (flat, rows pruned, no actions).
+        assert_eq!(steps, Some(14), "step samples");
     }
 
     /// s94 bad-debt route (`crates/torus-bridge/tests/

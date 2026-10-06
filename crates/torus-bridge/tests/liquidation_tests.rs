@@ -1149,3 +1149,62 @@ fn telemetry_does_not_change_results_or_state() {
         assert_eq!(db1.iterate_cf(cf, None).unwrap(), db2.iterate_cf(cf, None).unwrap(), "{cf}");
     }
 }
+
+/// Seven stage-1 accounts a1..a7 and s = addr(200), an empty book (every
+/// acted account stays pending), mark 990; books saved.
+fn seven_under_mm() -> (tempfile::TempDir, StateDb) {
+    let (d, db) = liq_db(&[1]);
+    let s = addr(200);
+    let mut ctx = ctx_at(db.clone(), 1);
+    fund(&ctx, &s, fp(10_000_000));
+    for a in (1..=7).map(addr) {
+        fund(&ctx, &a, fp(345));
+        place(&mut ctx, &a, limit(1, true, 900, 1));
+        open_pair(&ctx, &a, &s, 1, 10, 1_000);
+    }
+    set_mark(&ctx, 1, fp(990));
+    ctx.save_order_books();
+    (d, db)
+}
+
+/// Review nit: `deferred` is bounded by the scan window (the walk fetches
+/// scan + 2 candidates). Scan 4 / act 4: the budget runs out exactly at the
+/// 4th (= scan-th) account: nothing in the window was deferred (a5, a6 are
+/// lookahead), pending = the 4 rows. Scan 4 / act 2: a3, a4 deferred.
+#[test]
+fn telemetry_deferred_stays_inside_the_scan_window() {
+    for (act, deferred, pending) in [(4usize, 0i64, 4i64), (2, 2, 4)] {
+        let (_d, db) = seven_under_mm();
+        let mut ctx = ctx_at(db, 1);
+        let met = metered(&mut ctx);
+        NativeExecutor::run_liquidations_with(&mut ctx, 4, act);
+        assert!(ctx.fatal_error.is_none());
+        let t = liq_tel(&met);
+        assert_eq!((t.acted, t.deferred, t.pending), (act as u64, deferred, pending), "act {act}");
+    }
+}
+
+/// Review S1: the pending rows are re-counted only when the step changed one
+/// (or on the first step of a Metrics instance, i.e. after a start). Block 2
+/// sets 7 rows (scan); block 3 acts on the same 7, still pending: no row
+/// changes, no scan, the gauge keeps 7; a fresh Metrics (restart) at block 4
+/// scans once more.
+#[test]
+fn telemetry_rescans_pending_rows_only_after_a_change() {
+    let (_d, db) = seven_under_mm();
+    let state = CountingBackend::new(db.clone());
+    let step = |h: u64, met: &std::sync::Arc<torus_telemetry::Metrics>| {
+        let mut ctx = NativeExecContext::new(state.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+        ctx.metrics = Some(met.clone());
+        let before = state.pending_scans();
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        ctx.save_order_books();
+        (state.pending_scans() - before, met.liquidation_pending.get(), met.liquidation_acted.get())
+    };
+    let m = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    assert_eq!(step(2, &m), (1, 7, 7), "block 2: 7 rows written -> one scan");
+    assert_eq!(step(3, &m), (0, 7, 14), "block 3: no row changed -> no scan");
+    let fresh = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    assert_eq!(step(4, &fresh), (1, 7, 7), "block 4, new Metrics: forced scan");
+}

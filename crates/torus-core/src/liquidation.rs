@@ -304,16 +304,18 @@ pub fn backstop<T: StateBackend>(
 
 /// Decision 5 (ADL): close `u`'s position in `m` at `price` against `ranked`
 /// in order, `q = min(remaining, candidate size)` each (a candidate whose
-/// position vanished or changed side is skipped). Returns the closed size.
+/// position vanished or changed side is skipped). Returns the closes in
+/// order, `(counterparty, size)` (the caller logs them).
 pub fn adl_close<T: StateBackend>(
     pm: &PositionManager<T>,
     u: &Address,
     m: MarketId,
     price: FixedPoint,
     ranked: &[AdlCandidate],
-) -> Result<FixedPoint, CoreError> {
+) -> Result<Vec<(Address, FixedPoint)>, CoreError> {
+    let mut closes = Vec::new();
     let Some(up) = pm.get_position(u, m)? else {
-        return Ok(FixedPoint::ZERO);
+        return Ok(closes);
     };
     let mut remaining = up.size;
     for c in ranked {
@@ -329,10 +331,10 @@ pub fn adl_close<T: StateBackend>(
         }
         let q = remaining.min(cp.size);
         transfer(pm, u, &c.trader, m, q, price)?;
-        tracing::info!(account = %u, counterparty = %c.trader, market = m, size = %q, %price, "liquidation: ADL close");
+        closes.push((c.trader, q));
         remaining -= q;
     }
-    Ok(up.size - remaining)
+    Ok(closes)
 }
 
 /// ADL counterparties in `m`: every position on side `want_long`, `exclude`
@@ -465,37 +467,55 @@ fn pending_key(t: &Address) -> [u8; 21] {
 }
 
 /// Review M2: mark (`true`) / clear (`false`) `t` as still under MM after its
-/// liquidation action — writes only when the row changes.
-pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<(), CoreError> {
+/// liquidation action — writes only when the row changes; returns whether
+/// it did.
+pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<bool, CoreError> {
     let k = pending_key(t);
     let exists = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some();
     match (on, exists) {
         (true, false) => state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &[1])?,
         (false, true) => state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?,
-        _ => {}
+        _ => return Ok(false),
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Telemetry (node-local, read-only): the traders holding a pending row,
-/// ascending — paged seeks over the `0x06` tag (the last tag in the CF).
-pub fn pending_traders<T: StateBackend>(state: &T) -> Result<Vec<Address>, CoreError> {
-    let mut out = Vec::new();
-    let mut start = vec![PENDING_TAG];
+/// Telemetry (node-local, read-only): the number of pending rows — paged
+/// prefix seeks over the `0x06` tag, nothing collected.
+pub fn pending_count<T: StateBackend>(state: &T) -> Result<u64, CoreError> {
+    let (mut n, mut start) = (0u64, vec![PENDING_TAG]);
     loop {
-        let page = state.iterate_cf_from(CF_NATIVE_LIQUIDATION, &start, SCAN_PAGE)?;
+        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[PENDING_TAG], &start, SCAN_PAGE)?;
+        n += page.len() as u64;
+        match page.last() {
+            Some((k, _)) if page.len() == SCAN_PAGE => start = [k.as_slice(), &[0u8]].concat(),
+            _ => return Ok(n),
+        }
+    }
+}
+
+/// Telemetry (node-local, read-only): how many of `traders` (ascending) hold
+/// a pending row — one paged seek over their key range, the rows of other
+/// traders in it skipped.
+pub fn pending_among<T: StateBackend>(state: &T, traders: &[Address]) -> Result<u64, CoreError> {
+    let (Some(first), Some(last)) = (traders.first(), traders.last()) else {
+        return Ok(0);
+    };
+    let (end, mut start) = (pending_key(last), pending_key(first).to_vec());
+    let mut n = 0u64;
+    loop {
+        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[PENDING_TAG], &start, SCAN_PAGE)?;
         for (k, _) in &page {
-            if k.first() != Some(&PENDING_TAG) {
-                return Ok(out);
+            if k.as_slice() > end.as_slice() {
+                return Ok(n);
             }
-            if k.len() != 21 {
-                return Err(malformed("pending key"));
+            if k.len() == 21 && traders.binary_search(&Address::from_slice(&k[1..])).is_ok() {
+                n += 1;
             }
-            out.push(Address::from_slice(&k[1..]));
         }
         match page.last() {
             Some((k, _)) if page.len() == SCAN_PAGE => start = [k.as_slice(), &[0u8]].concat(),
-            _ => return Ok(out),
+            _ => return Ok(n),
         }
     }
 }
