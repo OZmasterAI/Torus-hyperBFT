@@ -966,3 +966,186 @@ fn unmarked_step_rows_equal_the_full_scan_rules() {
 fn liq_rows_db(db: &StateDb, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
     db.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap()
 }
+
+// ---- Telemetry (node-local; never read by execution) ----
+
+/// The step's metrics, read back: (stage 1, backstop, ADL, scanned, acted,
+/// pending, deferred) and the step histogram's sample count.
+#[derive(Debug, PartialEq)]
+struct LiqTel {
+    stage1: u64,
+    backstop: u64,
+    adl: u64,
+    scanned: u64,
+    acted: u64,
+    pending: i64,
+    deferred: i64,
+    steps: u64,
+}
+
+fn liq_tel(m: &torus_telemetry::Metrics) -> LiqTel {
+    let text = m.encode();
+    let steps = text
+        .lines()
+        .find_map(|l| l.strip_prefix("torus_liquidation_step_seconds_count "))
+        .map_or(0, |v| v.trim().parse().unwrap());
+    LiqTel {
+        stage1: m.liquidations_stage1.get(),
+        backstop: m.liquidations_backstop.get(),
+        adl: m.liquidations_adl.get(),
+        scanned: m.liquidation_scanned.get(),
+        acted: m.liquidation_acted.get(),
+        pending: m.liquidation_pending.get(),
+        deferred: m.liquidation_deferred.get(),
+        steps,
+    }
+}
+
+fn metered(ctx: &mut NativeExecContext) -> std::sync::Arc<torus_telemetry::Metrics> {
+    let m = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    ctx.metrics = Some(m.clone());
+    m
+}
+
+/// Stage 1 (the fixture of `stage1_closes_into_the_book_and_the_trader_keeps_the_rest`):
+/// t and s are scanned (m has only a bid), t is acted on by stage 1 and ends
+/// flat: nothing pending. One step = one histogram sample.
+#[test]
+fn telemetry_counts_a_stage1_account() {
+    let (_d, db) = liq_db(&[1]);
+    let mut ctx = ctx_at(db, 1);
+    let (t, s, m) = (addr(1), addr(2), addr(3));
+    fund(&ctx, &t, fp(300));
+    fund(&ctx, &s, fp(1_000_000));
+    fund(&ctx, &m, fp(1_000_000));
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    place(&mut ctx, &m, limit(1, true, 985, 10));
+    set_mark(&ctx, 1, fp(990));
+    let met = metered(&mut ctx);
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO);
+    let want = LiqTel { stage1: 1, backstop: 0, adl: 0, scanned: 2, acted: 1, pending: 0, deferred: 0, steps: 1 };
+    assert_eq!(liq_tel(&met), want);
+    assert_eq!(met.liquidations_triggered.get(), 1);
+}
+
+/// Backstop (the fixture of `backstop_moves_only_marked_positions`): t goes to
+/// the vault; t keeps only an unmarked position (not valuable: no pending
+/// row) and the vault's AV >= 0 (no ADL).
+#[test]
+fn telemetry_counts_a_backstop_account() {
+    let (_d, db) = liq_db(&[1, 2]);
+    let mut ctx = ctx_at(db, 1);
+    let (t, s) = (addr(1), addr(2));
+    fund(&ctx, &t, fp(100));
+    fund(&ctx, &s, fp(1_000_000));
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    open_pair(&ctx, &t, &s, 2, 1, 1_000);
+    set_mark(&ctx, 1, fp(990));
+    let met = metered(&mut ctx);
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert_eq!(pos(&ctx, &LIQUIDATOR_VAULT, 1), fp(10));
+    let want = LiqTel { stage1: 0, backstop: 1, adl: 0, scanned: 2, acted: 1, pending: 0, deferred: 0, steps: 1 };
+    assert_eq!(liq_tel(&met), want);
+}
+
+/// ADL (`adl_fixture`): block 1 at 990 scans 4 healthy accounts; block 2 at
+/// 900 ADLs t (acted, class ADL). Two steps, two samples.
+#[test]
+fn telemetry_counts_an_adl_account() {
+    let (_d, db, [t, ..]) = adl_fixture();
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let mut c1 = ctx_at(db.clone(), 1);
+    c1.metrics = Some(met.clone());
+    set_mark(&c1, 1, fp(990));
+    NativeExecutor::run_liquidations(&mut c1);
+    let want = LiqTel { stage1: 0, backstop: 0, adl: 0, scanned: 4, acted: 0, pending: 0, deferred: 0, steps: 1 };
+    assert_eq!(liq_tel(&met), want, "block 1: all healthy");
+    let mut c2 = ctx_at(db.clone(), 2);
+    c2.metrics = Some(met.clone());
+    set_mark(&c2, 1, fp(900));
+    NativeExecutor::run_liquidations(&mut c2);
+    assert_eq!(pos(&c2, &t, 1), FixedPoint::ZERO);
+    let want = LiqTel { stage1: 0, backstop: 0, adl: 1, scanned: 8, acted: 1, pending: 0, deferred: 0, steps: 2 };
+    assert_eq!(liq_tel(&met), want, "block 2: t ADL'd");
+}
+
+/// The vault's own ADL (`the_vault_is_adld_when_its_value_goes_negative`):
+/// counted as ADL, NOT as acted (outside the act budget).
+#[test]
+fn telemetry_counts_the_vault_adl_outside_the_act_budget() {
+    let (_d, db) = liq_db(&[1]);
+    let (t, s) = (addr(1), addr(2));
+    let mut c1 = ctx_at(db.clone(), 1);
+    fund(&c1, &t, fp(300));
+    fund(&c1, &s, fp(1_000_000));
+    open_pair(&c1, &t, &s, 1, 10, 1_000);
+    set_mark(&c1, 1, fp(975));
+    NativeExecutor::run_liquidations(&mut c1);
+    let mut c2 = ctx_at(db.clone(), 2);
+    set_mark(&c2, 1, fp(900));
+    let met = metered(&mut c2);
+    NativeExecutor::run_liquidations(&mut c2);
+    assert_eq!(pos(&c2, &LIQUIDATOR_VAULT, 1), FixedPoint::ZERO, "the vault was ADL'd");
+    // Scanned: s only (t is flat after block 1's backstop; the vault is excluded).
+    let want = LiqTel { stage1: 0, backstop: 0, adl: 1, scanned: 1, acted: 0, pending: 0, deferred: 0, steps: 1 };
+    assert_eq!(liq_tel(&met), want);
+}
+
+/// 70 stage-1 accounts (a1..a70) against s = addr(200), an empty book (no
+/// fill: every acted account stays under MM -> pending row), default budgets
+/// (act 64):
+/// * block 1: a1..a64 acted, cut; pending rows a1..a64; deferred = a65..a70
+///   and s = 7 (unclassified: s is healthy, the upper bound counts it);
+///   pending = 64 + 7 = 71.
+/// * block 2 (from the cursor): a65..a70 acted, s healthy, end: deferred 0,
+///   pending = the 70 rows.
+/// * block 3 (wraps to a1): a1..a64 acted again, cut; deferred 7, of which
+///   a65..a70 already hold pending rows: pending = |70 rows ∪ 7| = 71.
+fn budget_fixture(metrics: bool) -> (tempfile::TempDir, StateDb, Vec<LiqTel>, Vec<String>) {
+    let (d, db) = liq_db(&[1]);
+    let s = addr(200);
+    let mut ctx = ctx_at(db.clone(), 1);
+    fund(&ctx, &s, fp(10_000_000));
+    for a in (1..=70).map(addr) {
+        fund(&ctx, &a, fp(345));
+        place(&mut ctx, &a, limit(1, true, 900, 1));
+        open_pair(&ctx, &a, &s, 1, 10, 1_000);
+    }
+    set_mark(&ctx, 1, fp(990));
+    let met = metrics.then(|| metered(&mut ctx));
+    let (mut tel, mut results) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        let r = NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        results.push(format!("{r:?}"));
+        if let Some(m) = &met {
+            tel.push(liq_tel(m));
+        }
+    }
+    ctx.save_order_books();
+    (d, db, tel, results)
+}
+
+#[test]
+fn telemetry_pending_counts_work_the_act_budget_deferred() {
+    let (_d, _db, tel, _) = budget_fixture(true);
+    let want = [
+        LiqTel { stage1: 64, backstop: 0, adl: 0, scanned: 64, acted: 64, pending: 71, deferred: 7, steps: 1 },
+        LiqTel { stage1: 70, backstop: 0, adl: 0, scanned: 71, acted: 70, pending: 70, deferred: 0, steps: 2 },
+        LiqTel { stage1: 134, backstop: 0, adl: 0, scanned: 135, acted: 134, pending: 71, deferred: 7, steps: 3 },
+    ];
+    assert_eq!(tel, want);
+}
+
+/// Node-local: attaching metrics changes neither the step's results nor any
+/// state row (every CF the step touches, dumped after the three blocks).
+#[test]
+fn telemetry_does_not_change_results_or_state() {
+    let (_d1, db1, _, r1) = budget_fixture(true);
+    let (_d2, db2, _, r2) = budget_fixture(false);
+    assert_eq!(r1, r2, "step results");
+    for cf in [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, CF_NATIVE_LIQUIDATION] {
+        assert_eq!(db1.iterate_cf(cf, None).unwrap(), db2.iterate_cf(cf, None).unwrap(), "{cf}");
+    }
+}

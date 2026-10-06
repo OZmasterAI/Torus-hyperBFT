@@ -246,6 +246,17 @@ liquidation pass, 0 after a restart until the next pass) and RPC `torus_getLiqui
 (`address`, signed `availableBalance`, `deficit`, `openPositions`; reads committed state, see
 `docs/api/liquidator-vault.md`).
 
+Step telemetry (`feat/liq-telemetry`, node-local: no state writes, metrics only when attached,
+block results identical): histogram `torus_liquidation_step_seconds` (one sample per step);
+counters `torus_liquidations_{stage1,backstop,adl}_total` (accounts acted on per class; ADL
+includes the vault's own), `torus_liquidation_scanned_total`, `torus_liquidation_acted_total`;
+gauges `torus_liquidation_pending` = pending rows ∪ the scan-window candidates the act budget
+left unclassified (an upper bound; counting exactly would mean classifying up to ~2,000 more
+accounts on every budget-cut block) and `torus_liquidation_deferred` (that second part alone).
+Logs: one info line per step that acted (height, scanned, acted, per-class counts, deferred,
+pending, ms), debug otherwise; one info line per ADL close (`liquidation: ADL close`: account,
+counterparty, market, size, price). Metric rows: `docs/monitoring-setup.md`.
+
 ### Margin configs (F2, F8)
 
 `NativeExecContext` constructors load `margin_configs` from `CF_NATIVE_MARKETS` rows

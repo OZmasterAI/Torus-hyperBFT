@@ -287,3 +287,29 @@ fn adl_candidates_scan_at_most_max_rows() {
     assert_eq!(shorts(1), Vec::<Address>::new());
     assert_eq!(shorts(0), Vec::<Address>::new());
 }
+
+/// Telemetry: `pending_traders` lists exactly the traders with a pending row,
+/// ascending, across seek pages (1,030 rows > one 1,024-row page), and ignores
+/// the other tags (a cooldown row, the cursor).
+#[test]
+fn pending_traders_lists_the_pending_rows_across_pages() {
+    use torus_core::liquidation::{pending_traders, put_cursor, set_cooldown, set_pending};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    assert!(pending_traders(&db).unwrap().is_empty());
+    let mut want: Vec<Address> = (0..1_030u32)
+        .map(|i| {
+            let mut a = [0u8; 20];
+            a[16..].copy_from_slice(&i.to_be_bytes());
+            Address::new(a)
+        })
+        .collect();
+    for t in want.iter().rev() {
+        set_pending(&db, t, true).unwrap();
+    }
+    set_cooldown(&db, &addr(7), 1_000).unwrap();
+    put_cursor(&db, Some(addr(9))).unwrap();
+    set_pending(&db, &want[5], false).unwrap();
+    want.remove(5);
+    assert_eq!(pending_traders(&db).unwrap(), want);
+}

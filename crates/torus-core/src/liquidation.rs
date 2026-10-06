@@ -329,6 +329,7 @@ pub fn adl_close<T: StateBackend>(
         }
         let q = remaining.min(cp.size);
         transfer(pm, u, &c.trader, m, q, price)?;
+        tracing::info!(account = %u, counterparty = %c.trader, market = m, size = %q, %price, "liquidation: ADL close");
         remaining -= q;
     }
     Ok(up.size - remaining)
@@ -474,6 +475,29 @@ pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+/// Telemetry (node-local, read-only): the traders holding a pending row,
+/// ascending — paged seeks over the `0x06` tag (the last tag in the CF).
+pub fn pending_traders<T: StateBackend>(state: &T) -> Result<Vec<Address>, CoreError> {
+    let mut out = Vec::new();
+    let mut start = vec![PENDING_TAG];
+    loop {
+        let page = state.iterate_cf_from(CF_NATIVE_LIQUIDATION, &start, SCAN_PAGE)?;
+        for (k, _) in &page {
+            if k.first() != Some(&PENDING_TAG) {
+                return Ok(out);
+            }
+            if k.len() != 21 {
+                return Err(malformed("pending key"));
+            }
+            out.push(Address::from_slice(&k[1..]));
+        }
+        match page.last() {
+            Some((k, _)) if page.len() == SCAN_PAGE => start = [k.as_slice(), &[0u8]].concat(),
+            _ => return Ok(out),
+        }
+    }
 }
 
 /// D3: whether `t` chunked less than [`CHUNK_COOLDOWN_SECS`] of block time ago.

@@ -68,6 +68,27 @@ pub struct Metrics {
     /// every liquidation step. Node-local observability, never read by
     /// execution.
     pub liquidator_vault_deficit: Gauge<f64, std::sync::atomic::AtomicU64>,
+    /// Wall time of one liquidation step (`run_liquidations`), one observation
+    /// per native block. Node-local; telemetry reads after the timer stop.
+    pub liquidation_step_seconds: Histogram,
+    /// Accounts the step acted on, by class: stage 1 (book orders), backstop
+    /// (to the vault), ADL. `adl` also counts the vault's own ADL (which is
+    /// outside the 64-per-block act budget and not in `liquidation_acted`).
+    pub liquidations_stage1: Counter,
+    pub liquidations_backstop: Counter,
+    pub liquidations_adl: Counter,
+    /// Accounts the step classified (vault excluded) / acted on (budgeted,
+    /// vault excluded; equals `liquidations_triggered`).
+    pub liquidation_scanned: Counter,
+    pub liquidation_acted: Counter,
+    /// After the step: pending rows (accounts acted on and still under MM,
+    /// carried over until rescanned; the vault while ADL-able) UNION the
+    /// candidates of this block's scan window left unclassified because the
+    /// act budget ran out. An upper bound: the unclassified ones may be healthy.
+    pub liquidation_pending: Gauge,
+    /// The second part of `liquidation_pending` alone: window candidates left
+    /// unclassified by the act budget this block (0 when the budget held).
+    pub liquidation_deferred: Gauge,
 
     // Order-funnel metrics (perf A1) — where PlaceOrder actions die inside
     // execute_batch. Observability only: incremented in torus-bridge's
@@ -963,6 +984,62 @@ impl Metrics {
             "torus_liquidator_vault_deficit",
             "Liquidator vault deficit (negative cash, tokens) after the last liquidation step",
             liquidator_vault_deficit.clone(),
+        );
+
+        let liquidation_step_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_liquidation_step_seconds",
+            "Liquidation step wall time per native block (run_liquidations)",
+            liquidation_step_seconds.clone(),
+        );
+
+        let liquidations_stage1 = Counter::default();
+        registry.register(
+            "torus_liquidations_stage1",
+            "Accounts liquidated by stage 1 (reduce-only IOC orders into the book)",
+            liquidations_stage1.clone(),
+        );
+
+        let liquidations_backstop = Counter::default();
+        registry.register(
+            "torus_liquidations_backstop",
+            "Accounts backstopped (positions and collateral moved to the liquidator vault)",
+            liquidations_backstop.clone(),
+        );
+
+        let liquidations_adl = Counter::default();
+        registry.register(
+            "torus_liquidations_adl",
+            "Accounts auto-deleveraged (ADL), the liquidator vault's own ADL included",
+            liquidations_adl.clone(),
+        );
+
+        let liquidation_scanned = Counter::default();
+        registry.register(
+            "torus_liquidation_scanned",
+            "Accounts classified by the liquidation step (vault excluded)",
+            liquidation_scanned.clone(),
+        );
+
+        let liquidation_acted = Counter::default();
+        registry.register(
+            "torus_liquidation_acted",
+            "Accounts acted on by the liquidation step within the per-block act budget (vault excluded)",
+            liquidation_acted.clone(),
+        );
+
+        let liquidation_pending = Gauge::default();
+        registry.register(
+            "torus_liquidation_pending",
+            "After the liquidation step: accounts left under maintenance (pending rows) plus scan-window candidates the act budget left unclassified (upper bound)",
+            liquidation_pending.clone(),
+        );
+
+        let liquidation_deferred = Gauge::default();
+        registry.register(
+            "torus_liquidation_deferred",
+            "After the liquidation step: scan-window candidates left unclassified because the act budget ran out",
+            liquidation_deferred.clone(),
         );
 
         let orders_placed_accepted = Counter::default();
@@ -2244,6 +2321,14 @@ impl Metrics {
             orders_matched,
             liquidations_triggered,
             liquidator_vault_deficit,
+            liquidation_step_seconds,
+            liquidations_stage1,
+            liquidations_backstop,
+            liquidations_adl,
+            liquidation_scanned,
+            liquidation_acted,
+            liquidation_pending,
+            liquidation_deferred,
             orders_placed_accepted,
             orders_resting,
             orders_rejected_margin,

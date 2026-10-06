@@ -45,6 +45,14 @@ All metrics are prefixed with `torus_`:
 | `torus_mempool_native_size` | Gauge | Pending native actions in mempool |
 | `torus_mempool_oracle_evicted_total` | Counter | Pooled oracle submissions evicted by a newer one from the same validator at the per-validator cap (4); node-local |
 | `torus_liquidator_vault_deficit` | Gauge | Liquidator vault's negative cash in tokens (0 when not negative); set after each liquidation pass, reads 0 after a restart until the next pass |
+| `torus_liquidation_step_seconds` | Histogram | Wall time of the liquidation step (`run_liquidations`) per native block; `_sum`/`_count` deltas give ms per block |
+| `torus_liquidations_stage1_total` | Counter | Accounts acted on by stage 1 (reduce-only IOC orders into the book); an account under maintenance over several blocks counts once per block |
+| `torus_liquidations_backstop_total` | Counter | Accounts backstopped (marked positions and collateral moved to the liquidator vault) |
+| `torus_liquidations_adl_total` | Counter | Accounts auto-deleveraged, the liquidator vault's own ADL included (one info log line `liquidation: ADL close` per counterparty close) |
+| `torus_liquidation_scanned_total` | Counter | Accounts the step classified (vault excluded) |
+| `torus_liquidation_acted_total` | Counter | Accounts acted on within the 64-per-block act budget (vault excluded; equals `torus_liquidations_triggered_total`) |
+| `torus_liquidation_pending` | Gauge | After each step: accounts holding a pending row (acted on and still under maintenance, carried over until rescanned; the vault while ADL-able) UNION the scan-window candidates the act budget left unclassified. An upper bound (the unclassified ones may be healthy); liquidatable accounts the round-robin has not reached and no budget cut deferred are not counted. 0 after a restart until the next step |
+| `torus_liquidation_deferred` | Gauge | After each step: the scan-window candidates left unclassified because the act budget ran out (0 when it held) |
 | `torus_peers_connected` | Gauge | Number of connected P2P peers |
 | `torus_db_size_bytes` | Gauge | Total RocksDB data directory size in bytes |
 

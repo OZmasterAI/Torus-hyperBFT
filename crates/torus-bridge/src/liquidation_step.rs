@@ -17,6 +17,24 @@ use torus_state::cf::CF_NATIVE_LIQUIDATION;
 
 type Marks = BTreeMap<MarketId, FixedPoint>;
 
+/// What one step did — telemetry only (metrics and logs), never read by
+/// execution.
+#[derive(Default)]
+struct LiqStats {
+    /// Accounts classified (the vault excluded).
+    scanned: u64,
+    /// Accounts acted on within the act budget (the vault excluded).
+    acted: u64,
+    stage1: u64,
+    backstop: u64,
+    /// ADL'd accounts, the vault's own ADL included.
+    adl: u64,
+    vault_adl: bool,
+    /// The scan window's candidates (ascending, vault excluded) the act
+    /// budget left unclassified; empty when the budget held.
+    deferred: Vec<Address>,
+}
+
 impl NativeExecutor {
     /// Item 3 block step (after `drain_core_writer`, before governance): stage 1
     /// (book) / backstop (vault) / ADL on the block-start mark. A storage error
@@ -33,12 +51,73 @@ impl NativeExecutor {
         scan: usize,
         act: usize,
     ) -> Vec<NativeActionResult> {
-        match Self::liquidation_pass(ctx, scan, act) {
+        let started = std::time::Instant::now();
+        let mut stats = LiqStats::default();
+        let out = match Self::liquidation_pass(ctx, scan, act, &mut stats) {
             Ok(r) => r,
             Err(e) => {
                 ctx.fatal_error = Some(format!("liquidation step: {e}"));
                 Vec::new()
             }
+        };
+        Self::liquidation_telemetry(ctx, &stats, started.elapsed());
+        out
+    }
+
+    /// Node-local telemetry of one step (after its timer stopped): the
+    /// counters, the pending gauge (only with metrics attached) and the log
+    /// line (info when the step acted, else debug). Read-only: a read error
+    /// skips the pending value, never the block.
+    fn liquidation_telemetry<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        s: &LiqStats,
+        took: std::time::Duration,
+    ) {
+        let happened = s.acted > 0 || s.vault_adl;
+        // Pending = pending rows ∪ deferred window candidates (both ascending).
+        let pending = if (ctx.metrics.is_some() || happened) && ctx.fatal_error.is_none() {
+            match liq::pending_traders(&ctx.state) {
+                Ok(rows) => {
+                    let both = rows.iter().filter(|t| s.deferred.binary_search(t).is_ok()).count();
+                    Some((rows.len() + s.deferred.len() - both) as u64)
+                }
+                Err(e) => {
+                    tracing::debug!(%e, "liquidation telemetry: pending rows unreadable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(ref m) = ctx.metrics {
+            m.liquidation_step_seconds.observe(took.as_secs_f64());
+            m.liquidations_stage1.inc_by(s.stage1);
+            m.liquidations_backstop.inc_by(s.backstop);
+            m.liquidations_adl.inc_by(s.adl);
+            m.liquidation_scanned.inc_by(s.scanned);
+            m.liquidation_acted.inc_by(s.acted);
+            m.liquidation_deferred.set(s.deferred.len() as i64);
+            if let Some(p) = pending {
+                m.liquidation_pending.set(p as i64);
+            }
+        }
+        let ms = took.as_secs_f64() * 1e3;
+        if happened {
+            tracing::info!(
+                height = ctx.block_height,
+                scanned = s.scanned,
+                acted = s.acted,
+                stage1 = s.stage1,
+                backstop = s.backstop,
+                adl = s.adl,
+                vault_adl = s.vault_adl,
+                deferred = s.deferred.len(),
+                pending = ?pending,
+                ms,
+                "liquidation step"
+            );
+        } else {
+            tracing::debug!(height = ctx.block_height, scanned = s.scanned, ms, "liquidation step: nothing acted on");
         }
     }
 
@@ -58,6 +137,7 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         scan: usize,
         act: usize,
+        stats: &mut LiqStats,
     ) -> Result<Vec<NativeActionResult>, CoreError> {
         let listed = ctx
             .governance
@@ -77,12 +157,17 @@ impl NativeExecutor {
         let accounts = Self::liq_traders_after(ctx, cursor, scan.saturating_add(2))?;
         let mut results = Vec::new();
         let (mut scanned, mut acted, mut last, mut cut) = (0usize, 0usize, None, false);
-        for &trader in accounts.iter().filter(|a| **a != LIQUIDATOR_VAULT) {
+        let not_vault = |a: &&Address| **a != LIQUIDATOR_VAULT;
+        for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_vault(a)) {
             if scanned == scan || acted == act {
                 cut = true;
+                if acted == act {
+                    stats.deferred = accounts[i..].iter().filter(not_vault).copied().collect();
+                }
                 break;
             }
             scanned += 1;
+            stats.scanned += 1;
             last = Some(trader);
             let h = match Self::liq_view(ctx, &marks, &trader, l1)?.map(|v| liq::classify(&v)) {
                 Some(Some(h)) => h,
@@ -103,6 +188,13 @@ impl NativeExecutor {
                 continue;
             }
             acted += 1;
+            stats.acted += 1;
+            match h {
+                Health::Stage1 => stats.stage1 += 1,
+                Health::Backstop => stats.backstop += 1,
+                Health::Adl => stats.adl += 1,
+                Health::Healthy => {}
+            }
             if let Some(ref m) = ctx.metrics {
                 m.liquidations_triggered.inc();
             }
@@ -131,6 +223,8 @@ impl NativeExecutor {
         // (`classify` is Adl exactly when AV < 0, overflow-checked.)
         if let Some(v) = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)? {
             if liq::classify(&v) == Some(Health::Adl) {
+                stats.adl += 1;
+                stats.vault_adl = true;
                 Self::adl_account(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
