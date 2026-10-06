@@ -31,6 +31,10 @@ trie off both arms): 0.893x (`c58775f`, perf on crab) and **0.866x** without per
 (`5524646`): missed. Engine per block ~ main; the rest is outside the engine (consensus views
 395 vs 335 ms, rpc / gossip-verify / ingress CPU per fill, ~12 ms/block untimed); ozarchy
 section 17 breaks it down.
+s94: **Gate 2 met** on B-blind `31cea69` vs main `92a02ed` (ozarchy section 19, merged into
+`perf/item6-phase1`): 300 markets **1.097x**, 10 markets **0.997x**. Residual zero-fill sell cuts
+0.063% of placed, so option A is deferred behind a counter trigger (section 9.10). Remaining:
+C5 (warm == cold), then sync main (re-run Gate 2 if main has moved).
 **Remaining order (s92, later): E2-E4 (building; re-measure the empty block first, E1 never
 built) | ozarchy: section 17 (10-market gap outside the engine), then 300 markets on `4acdc59`
 (step 2) -> 10-market cuts from section 17 -> C5 (warm == cold, last) -> sync main -> Gate 2
@@ -674,6 +678,16 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
   Golden A re-pinned per commit; golden B must not change.
 - Not chosen: C (fixes nothing for users), D (well-funded orders fail where HL fills them), B-bid
   (counts same-batch bids; reopens griefing, breaks the s89 tests' intent).
+- Result (ozarchy section 19, `31cea69` vs main `92a02ed`): Gate 2 met, 300 markets 1.097x, 10 markets
+  0.997x. Residual non-pool zero-fill sell cuts 0.063% of placed at 300 markets (buckets t1_2 / t3_5 /
+  t6_10 only), 0.0038% at 10; pool and partial cuts 0; all top-ups full; maker margin cancels and
+  reduce-only cuts 0.
+- s94 owner decision: **A deferred**, not scheduled and not dropped. Below its 0.5% threshold, and
+  it is consensus-affecting (golden re-pin, a second settle + flush every block). Trigger: non-pool
+  zero-fill sell cuts > 0.5% of placed on testnet or real flow (bench flow is synthetic; volatility
+  past the 10 bps reservation is what produces cuts). If it fires, first try a larger delta (the
+  bucket counters size it; measure the extra free margin the top-up holds), then A with the scope
+  and budget above.
 
 ### 9.11 Open owner question: maker over-commit across markets in one batch (s92)
 - Crab matches markets in parallel. A maker's fills are checked against a snapshot of its free margin
