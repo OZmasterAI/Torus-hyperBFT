@@ -708,7 +708,7 @@ def add_oracle_drain(out, blocks, secs):
         f.write("\n".join(lines + extra) + "\n")
 
 
-def run_drain(out):
+def run_drain(out, stdout=False):
     """`run` with a 20 s drain after the load window."""
     cmd = [sys.executable, SUMMARIZE, "--out", out, "--label", "fixture",
            "--t-bench0", "1000", "--t-bench1", str(1000 + SPAN),
@@ -717,7 +717,16 @@ def run_drain(out):
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, "summarize.py failed:\n%s\n%s" % (r.stdout, r.stderr)
     with open(os.path.join(out, "summary.json")) as f:
-        return json.load(f)
+        s = json.load(f)
+    return (s, r.stdout) if stdout else s
+
+
+# The exec-chain ruler: every field below is per native block or derived from
+# one, so in feed-drain mode none of it may mix the load and drain windows.
+RULER = ("chain_ms", "gap_to_100ms", "pipelined_ms", "handoff_wait_ms", "empty_block_ms",
+         "fills_per_native_block", "engine_ms_per_1k_fills", "chain_ms_p50", "chain_ms_p95",
+         "handoff_wait_ms_p95", "pipelined_ms_p95", "native_blocks_counter", "block_ms",
+         "phase_window_native_blocks", "chain_identity", "phases")
 
 
 def main_feed_drain():
@@ -727,6 +736,29 @@ def main_feed_drain():
     (15000/40 = 375 instead of 1500) and the chain mean. The bench+drain
     values are kept beside them. Default mode (no feed_live) is unchanged."""
     oracle_blocks, oracle_secs = 30, 0.005
+    for bl1 in ("serial", "pipelined"):
+        with tempfile.TemporaryDirectory() as ref:
+            # The load window alone: what every ruler field must equal in
+            # feed-drain mode.
+            write_fixture(ref, bl1=bl1)
+            want = run(ref)["phase_by_node"]["val0"]
+        with tempfile.TemporaryDirectory() as d:
+            write_fixture(d, bl1=bl1)
+            add_oracle_drain(d, oracle_blocks, oracle_secs)
+            with open(os.path.join(d, "drain.json"), "w") as f:
+                json.dump({"drained": True, "feed_live": {"native_blocks": oracle_blocks}}, f)
+            s, out = run_drain(d, stdout=True)
+            p0 = s["phase_by_node"]["val0"]
+            for k in RULER:
+                assert p0[k] == want[k], (bl1, k, p0[k], want[k])
+            assert p0["phase_window"].startswith("load [t_bench0, t_bench1]"), p0["phase_window"]
+            assert p0["chain_identity"]["chain_covers_e_phases"] is True, p0["chain_identity"]
+            # Cadence and the drain cadence are untouched by the mode.
+            assert p0["drain"] is not None
+            line = next(l for l in out.splitlines() if l.startswith("CHAIN val0:"))
+            assert "chain_ms=%s " % want["chain_ms"] in line, line
+            assert "empty_block_ms=%s " % want["empty_block_ms"] in line, line
+            assert "fills/blk=%s " % want["fills_per_native_block"] in line, line
     with tempfile.TemporaryDirectory() as d:
         write_fixture(d)
         add_oracle_drain(d, oracle_blocks, oracle_secs)
@@ -736,7 +768,8 @@ def main_feed_drain():
         close(p0["fills_per_native_block"], 15000 / nb, "default fills/blk (bench+drain)")
         bd_chain = (BL1_SERIAL["exec_chain_seconds"] * BLOCKS + oracle_blocks * oracle_secs) / nb * 1000
         close(p0["chain_ms"], bd_chain, "default chain_ms (bench+drain)")
-        assert "chain_fills_window" not in p0 and "bench_drain" not in p0, sorted(p0)
+        assert "bench_drain" not in p0, sorted(p0)
+        assert p0["phase_window"] == "bench+drain [t_bench0, t_drain]", p0["phase_window"]
         default_keys = sorted(p0)
 
         with open(os.path.join(d, "drain.json"), "w") as f:
@@ -746,7 +779,7 @@ def main_feed_drain():
         close(p0["fills_per_native_block"], 1500.0, "feed-drain fills/blk (load window)")
         close(p0["chain_ms"], 1080.0, "feed-drain chain_ms (load window)")
         close(p0["gap_to_100ms"], 980.0, "feed-drain gap_to_100ms follows chain_ms")
-        assert p0["chain_fills_window"].startswith("load [t_bench0, t_bench1]"), p0["chain_fills_window"]
+        assert p0["phase_window"].startswith("load [t_bench0, t_bench1]"), p0["phase_window"]
         bd = p0["bench_drain"]
         close(bd["fills_per_native_block"], 15000 / nb, "kept bench+drain fills/blk")
         close(bd["chain_ms"], bd_chain, "kept bench+drain chain_ms")
@@ -754,8 +787,8 @@ def main_feed_drain():
         h = s["headline"]
         close(h["chain_ms"], 1080.0, "headline chain_ms")
         close(h["fills_per_native_block"], 1500.0, "headline fills/blk")
-        # Only the two fields (+ gap), a label and the kept values change.
-        assert sorted(set(p0) - {"chain_fills_window", "bench_drain"}) == default_keys
+        # Same keys as default mode, plus the kept bench+drain values.
+        assert sorted(set(p0) - {"bench_drain"}) == default_keys
     print("test_summarize.py feed-drain: OK")
 
 

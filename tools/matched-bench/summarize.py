@@ -325,20 +325,21 @@ def _feed_drain():
 
 
 FEED_DRAIN = _feed_drain()
-phase = {}
-for node, rs in rows.items():
-    if not rs:
-        continue
-    sel = [r for r in rs if t0 <= r["ts"] <= td]
+def node_phase(node, rs, hi, buckets, window):
+    """One node's exec-phase table and bl1 chain ruler over [t_bench0, hi]
+    (per NATIVE block; percentiles from `buckets`). Cadence (load / drain /
+    incl_drain) and order age keep their own fixed windows. None when the
+    window holds no native block."""
+    sel = [r for r in rs if t0 <= r["ts"] <= hi]
     if len(sel) < 2:
-        continue
+        return None
     a, b = sel[0], sel[-1]
     nall = m(b, "exec_block_seconds_count") - m(a, "exec_block_seconds_count")   # every committed block
     nblk = m(b, "exec_engine_seconds_count") - m(a, "exec_engine_seconds_count")  # native (loaded) blocks only
     ncommit = m(b, "blocks_committed_total") - m(a, "blocks_committed_total")
     span = b["ts"] - a["ts"]
     if nblk <= 0:
-        continue
+        return None
     def dsum(k):
         return m(b, "exec_" + k + "_seconds_sum") - m(a, "exec_" + k + "_seconds_sum")
     def per_blk(k):
@@ -370,7 +371,7 @@ for node, rs in rows.items():
     cad_all = cadence(rs, t0, td, BUCKETS, node)
     p = {"cadence_window": "load [t_bench0, t_bench1]",
          "block_ms": round(tot, 2),
-         "phase_window": "bench+drain [t_bench0, t_drain]",
+         "phase_window": window,
          "phase_window_s": span,
          "phase_window_native_blocks": nblk,
          "phase_window_all_exec_blocks": nall,
@@ -468,7 +469,7 @@ for node, rs in rows.items():
         return m(b, name + "_count") - m(a, name + "_count")
 
     def pctl(metric, q):
-        v = hist_quantile(BUCKETS.get((node, metric)), q)
+        v = hist_quantile(buckets.get((node, metric)), q)
         return round(v * 1000.0, 1) if v is not None else None
 
     nchain = craw("exec_chain_seconds")
@@ -577,26 +578,36 @@ for node, rs in rows.items():
     # s77: over bench+drain, so orders submitted late in the window still
     # reach every stage.
     p["order_age_ms"] = order_age(BUCKETS, node)
-    # ORACLE_FEED_DRAIN=1: the live feed keeps adding ORACLE-ONLY native blocks
-    # through the drain (350-630 per node on the 300-market walk cells), which
-    # dilutes fills per native block and the chain mean over bench+drain
-    # (22-33k fills/blk vs 67k with the feed paused). In that mode both cover
-    # the LOAD window [t_bench0, t_bench1]; the bench+drain values stay under
-    # `bench_drain`. Default mode is unchanged.
+    return p
+
+
+# Keys of the bench+drain table kept beside a feed-drain cell's load-window one.
+BENCH_DRAIN_KEYS = ("phase_window", "phase_window_native_blocks", "block_ms", "chain_ms",
+                    "gap_to_100ms", "pipelined_ms", "handoff_wait_ms", "empty_block_ms",
+                    "fills_per_native_block", "engine_ms_per_1k_fills", "chain_ms_p50",
+                    "chain_ms_p95")
+phase = {}
+for node, rs in rows.items():
+    if not rs:
+        continue
     if FEED_DRAIN:
-        lw = [r for r in rs if t0 <= r["ts"] <= t1]
-        la, lb = (lw[0], lw[-1]) if len(lw) >= 2 else (None, None)
-        lnb = (m(lb, "exec_engine_seconds_count") - m(la, "exec_engine_seconds_count")) if la else 0
-        p["bench_drain"] = {k: p[k] for k in ("chain_ms", "fills_per_native_block", "gap_to_100ms")}
-        lchain = (round((m(lb, "exec_chain_seconds_sum") - m(la, "exec_chain_seconds_sum")) / lnb * 1000.0, 2)
-                  if bl1 and lnb > 0 else None)
-        p["chain_ms"] = lchain
-        p["gap_to_100ms"] = round(lchain - 100.0, 2) if lchain is not None else None
-        p["fills_per_native_block"] = (round((m(lb, "orders_matched_total") - m(la, "orders_matched_total")) / lnb, 1)
-                                       if lnb > 0 else None)
-        p["chain_fills_window"] = ("load [t_bench0, t_bench1] (ORACLE_FEED_DRAIN=1: the live feed's "
-                                   "oracle-only drain blocks are excluded; bench+drain in `bench_drain`)")
-    phase[node] = p
+        # ORACLE_FEED_DRAIN=1: the live feed keeps adding ORACLE-ONLY native
+        # blocks through the drain (350-630 per node on the 300-market walk
+        # cells), which dilutes every per-native-block number over bench+drain
+        # (22-33k fills/blk vs 67k with the feed paused). The whole exec-phase
+        # table and chain ruler (and its identity gate) move to the LOAD window
+        # so no field mixes windows; the bench+drain ruler stays in
+        # `bench_drain`. Default mode is unchanged.
+        p = node_phase(node, rs, t1, BUCKETS_LOAD,
+                       "load [t_bench0, t_bench1] (ORACLE_FEED_DRAIN=1: the live feed's oracle-only "
+                       "drain blocks are excluded; bench+drain in `bench_drain`)")
+        pb = node_phase(node, rs, td, BUCKETS, "bench+drain [t_bench0, t_drain]")
+        if p is not None and pb is not None:
+            p["bench_drain"] = {k: pb[k] for k in BENCH_DRAIN_KEYS}
+    else:
+        p = node_phase(node, rs, td, BUCKETS, "bench+drain [t_bench0, t_drain]")
+    if p is not None:
+        phase[node] = p
 
 # ---------------------------------------------------------------- consensus (metrics-before/after)
 # Per-view consensus-thread means from the WHOLE-RUN metrics-before/after
