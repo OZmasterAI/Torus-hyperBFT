@@ -274,6 +274,46 @@ class SummarizeTest(unittest.TestCase):
             funnel = s["funnel_by_node"][node]
             self.assertEqual(funnel["delta_orders_rejected_open_limit_total"], 0)
 
+    BENCH_LOG_CAPPED = (
+        "Submitted (load-gen accepted): 73,251 native actions (610/s)  [secondary]\n"
+        "Econ mix (load-gen accepted): place 69000 (94.2%) | cancel-all 4251 (5.8%) "
+        "[sent: place 70000 cancel-all 4300]\n"
+        "In-flight cap 1 action(s)/sender: released committed=72000 refused=1300 "
+        "timeout=950 | in flight at end 4 | block tail http://127.0.0.1:8647: "
+        "fetched=3600 errors=12 missed=1\n"
+    )
+
+    def test_capped_cell_records_cap_budget_rate_mix_and_releases(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1",
+                                            "--open-order-budget", "900"])
+        self.assertEqual(s["cell"]["max_in_flight"], 1)
+        self.assertEqual(s["cell"]["open_order_budget"], 900)
+        ing = s["ingest"]
+        self.assertEqual(ing["bench_submit_rate"], 610.0)
+        self.assertEqual(ing["econ_mix"], {
+            "place": 69000, "cancel_all": 4251,
+            "place_share": 0.942, "cancel_all_share": 0.058,
+            "sent_place": 70000, "sent_cancel_all": 4300})
+        self.assertEqual(ing["in_flight"], {
+            "cap": 1, "released_committed": 72000, "released_refused": 1300,
+            "released_timeout": 950, "in_flight_at_end": 4,
+            "tail_url": "http://127.0.0.1:8647", "tail_fetched": 3600,
+            "tail_errors": 12, "tail_missed": 1})
+
+    def test_uncapped_legacy_cell_reports_none_for_the_new_fields(self):
+        write_cell(self.d, 1_000, 1_000)  # bench.log: legacy one-liner, no rate
+        write_agreement(self.d, ["same"] * 3)
+        s, _ = run_summarize(self.d)
+        self.assertIsNone(s["cell"]["max_in_flight"])
+        self.assertIsNone(s["cell"]["open_order_budget"])
+        self.assertIsNone(s["ingest"]["bench_submit_rate"])
+        self.assertIsNone(s["ingest"]["econ_mix"])
+        self.assertIsNone(s["ingest"]["in_flight"])
+
     def test_first120_equals_avg_on_a_120s_cell(self):
         write_cell(self.d, 40_000, 0, dur=120)
         write_agreement(self.d, ["same"] * 3)
@@ -745,6 +785,45 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn('[ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)', src)
         self.assertIn('[ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ]', src)
         self.assertIn("retry_busy='${RETRY_BUSY:-unset}'", src)
+
+    def test_max_in_flight_reaches_the_bench_only_when_set(self):
+        """MAX_IN_FLIGHT=N -> bench --max-in-flight N, with the block-body tail
+        on val2 (never val0, which takes all ingress under BENCH_RPCS=0).
+        Validated, logged, allowlisted in campaign/run_cell.py and recorded in
+        summary.json via summarize.py (also on resummarize). Unset = flags
+        omitted, so older bench binaries and prior cells are unchanged."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-}", src)
+        self.assertIn("max_in_flight='${MAX_IN_FLIGHT:-unset}'", src)
+        self.assertIn('--max-in-flight "${MAX_IN_FLIGHT:-}"', src)
+        self.assertIn('--open-order-budget "${OPEN_ORDER_BUDGET:-}"', src)
+        self.assertLess(src.index("#   MAX_IN_FLIGHT=N"), src.index("set -uo pipefail"))
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"MAX_IN_FLIGHT",', f.read())
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            res = f.read()
+        self.assertIn("--max-in-flight \"$(j '.cell.max_in_flight // \"\"')\"", res)
+        self.assertIn("--open-order-budget \"$(j '.cell.open_order_budget // \"\"')\"", res)
+        lines = [l for l in src.splitlines() if "MAX_IN_FLIGHT" in l
+                 and not l.lstrip().startswith(("#", "log ", "--", "python3"))]
+        snippet = ("RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
+                   "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"')
+
+        def run(**env):
+            base = {k: v for k, v in os.environ.items() if k != "MAX_IN_FLIGHT"}
+            return subprocess.run(["bash", "-c", snippet], capture_output=True,
+                                  text=True, env=dict(base, **env))
+
+        r = run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        r = run(MAX_IN_FLIGHT="1")
+        self.assertEqual(r.stdout.strip(), "--max-in-flight 1 --in-flight-watch-rpc "
+                         "http://127.0.0.1:8647", r.stderr)
+        for bad in ("x", "0", "-1", "1.5"):
+            r = run(MAX_IN_FLIGHT=bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
 
     def test_spam_cancel_reaches_the_bench_only_when_set(self):
         """SPAM_CANCEL_KEYS / SPAM_CANCEL_RATE / SPAM_CANCEL_FUNDED=1 -> bench

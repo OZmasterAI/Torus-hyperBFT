@@ -22,7 +22,7 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
-          "drain-timeout", "markets-per-sender"]:
+          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -1020,6 +1020,36 @@ def parse_dissem(raw):
         out[node] = d
     return out
 
+def parse_bench_log(path):
+    """bench.log end-of-run lines -> (submit rate actions/s, econ mix, in-flight
+    releases); each None when its line is absent (older bench, cap off)."""
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, None, None
+    m = re.search(r"Submitted \(load-gen accepted\): [0-9,]+ native actions \(([0-9.]+)/s\)", text)
+    rate = float(m.group(1)) if m else None
+    m = re.search(r"Econ mix \(load-gen accepted\): place (\d+) \(([0-9.]+)%\) \| "
+                  r"cancel-all (\d+) \(([0-9.]+)%\) \[sent: place (\d+) cancel-all (\d+)\]", text)
+    mix = None if not m else {
+        "place": int(m.group(1)), "cancel_all": int(m.group(3)),
+        "place_share": round(float(m.group(2)) / 100, 4),
+        "cancel_all_share": round(float(m.group(4)) / 100, 4),
+        "sent_place": int(m.group(5)), "sent_cancel_all": int(m.group(6))}
+    m = re.search(r"In-flight cap (\d+) action\(s\)/sender: released committed=(\d+) "
+                  r"refused=(\d+) timeout=(\d+) \| in flight at end (\d+) \| block tail (\S+): "
+                  r"fetched=(\d+) errors=(\d+) missed=(\d+)", text)
+    inflight = None if not m else {
+        "cap": int(m.group(1)), "released_committed": int(m.group(2)),
+        "released_refused": int(m.group(3)), "released_timeout": int(m.group(4)),
+        "in_flight_at_end": int(m.group(5)), "tail_url": m.group(6),
+        "tail_fetched": int(m.group(7)), "tail_errors": int(m.group(8)),
+        "tail_missed": int(m.group(9))}
+    return rate, mix, inflight
+
+
+bench_submit_rate, econ_mix, in_flight = parse_bench_log(os.path.join(OUT, "bench.log"))
 dissem = parse_dissem(A.dissem)
 if dissem:
     dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
@@ -1079,6 +1109,8 @@ summary = {
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
+             "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
+             "open_order_budget": int(A.open_order_budget) if A.open_order_budget else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
@@ -1126,6 +1158,9 @@ summary = {
         "crash_gate": crash.get("verdict") if crash else None,
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
+               "bench_submit_rate": bench_submit_rate,
+               "econ_mix": econ_mix,
+               "in_flight": in_flight,
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],
                "note": "NONCE_WINDOW_MS=60s: backlog older than 60 s is evicted silently; submitted-processed gap = expiry"},
