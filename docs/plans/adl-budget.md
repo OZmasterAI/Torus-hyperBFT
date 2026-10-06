@@ -86,6 +86,9 @@ of work in total, hence Q2 (rank once per block and market) and the budget (Part
 
 ### Q2 — ranking per step or per (block, market)?
 
+> Final (section 8): once per **(block, market, side)**, from a per-block cache with a per-key
+> position.
+
 * **Per step** (today's semantics): every ADL'd account-market re-ranks m. Exact "current
   state" ranking; cost = rankings × holders.
 * **Per (block, market) (recommended):** the first ADL step in m in a block ranks m once; later
@@ -96,6 +99,11 @@ of work in total, hence Q2 (rank once per block and market) and the budget (Part
   ~12,600 (≈ 0.5 s → bounded by the budget anyway).
 
 ## 4. Part B — budget and carry-over queue
+
+> **Superseded in part by section 8 (final, s96).** The queue holds obligation rows
+> (`0x07 ‖ height ‖ market ‖ side ‖ trader`), not accounts. The account is flat at B, so there
+> is no freeze and no re-classification. W is sized so an HL-sized event closes in one block.
+> The queue gauge counts rows. This section is kept for the reasoning behind the options.
 
 ### Budget (Q3)
 
@@ -201,9 +209,9 @@ accounts incl. the vault) across the whole drain.
 | # | Question | Decision |
 |---|---|---|
 | Q1 | Candidate source | C1 now (no format change); C2 if a 100k-account sweep shows ranking dominates; C3 only as a later consensus item |
-| Q2 | Ranking refresh | once per (block, market), candidates re-read at close |
-| Q3 | Budget unit | candidates examined + closes; W from the measurement (≤ ~20 ms ADL per block) |
-| Q4 | Queue order | FIFO `0x07 ‖ height ‖ trader` in `CF_NATIVE_LIQUIDATION` |
+| Q2 | Ranking refresh | once per (block, market, **side**), candidates re-read at close (per-block cache with a per-key position) |
+| Q3 | Budget unit | rows visited + candidates examined + candidates read at close (+ edge rows); one constant W, sized so an **HL-sized event closes the escrows in its own block** (supersedes the earlier "≤ ~20 ms") |
+| Q4 | Queue order | FIFO obligation rows `0x07 ‖ height ‖ market ‖ side ‖ trader` → (size, price) in `CF_NATIVE_LIQUIDATION` (section 8) |
 | Q5 | Queued account actions | **dropped** (s96 final): the account is flat at B, nothing to freeze |
 | Q6 | Deficit in between | **P2** (s96 final): terms fixed at B, positions to two ADL escrows, deficit to the vault at B (section 8) |
 | H | Previous mark (D10 change) | the last mark **different** from the current one, per market (section 8) |
@@ -218,8 +226,11 @@ AV < 0), the pass does the following:
    (the previous mark, rule H below, clamped one-sided to the account's bankruptcy price:
    `liq::adl_price`, `bankruptcy_price`, `adl_rest`, unchanged), then transfer the position to
    an **ADL escrow** at that price.
-3. D9: the account's remaining collateral (any sign) moves to the vault. The account ends flat
-   at exactly 0 and leaves liquidation in B.
+3. D9: the account's remaining collateral moves to the vault. Under the one-sided clamp it is
+   **never positive**: each clamped close keeps AV at the mark ≤ 0, inductively; the ceil
+   rounding goes against the trader; and the `b ≤ 0` mark fallback would need AV ≥ mark × size
+   > 0, which is impossible for an ADL-classified account. So the vault only ever receives a
+   deficit (≤ 0). The account ends flat at exactly 0 and leaves liquidation in B.
 
 The escrows:
 * There are two protocol accounts with no key: `ADL_ESCROW_LONG` takes bankrupt longs and
@@ -238,6 +249,14 @@ The queue:
   against each other, each at its own stored price, and the vault pays the difference.
 * A flat escrow's remaining balance (dust from averaged entries) is swept to the vault and
   reported separately.
+* Node-local gauges (metrics only):
+  * `torus_liquidation_adl_queue`: obligation **rows**, not accounts;
+  * `torus_liquidation_adl_queue_deficit`: the escrows' balance + UPnL at the mark;
+  * escrow notional, swept dust, and edge-pairing amounts.
+
+Sections 4-5 above describe the earlier account queue (Q4-Q6 before P2). Where they differ from
+this section, this section holds: there is no account queue, no freeze and no re-classification,
+and the queue gauge counts rows.
 
 W is one constant, high enough that an HL-sized event (a few hundred account-markets) closes the
 escrows in its own block. Only S=750-type storms spill over several blocks. HL's Oct 10 2025 ADL
