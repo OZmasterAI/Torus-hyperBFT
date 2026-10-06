@@ -8433,7 +8433,7 @@ impl NativeExecutor {
                 match Self::signed_position(&ctx.positions, sender, market_id) {
                     Ok(pos) => {
                         ro_pos = Some(pos);
-                        Self::reduce_only_violation(pos, params).map(|m| (FailureReason::Other, m))
+                        Self::reduce_only_violation(pos, params).map(|m| (FailureReason::ReduceOnly, m))
                     }
                     Err(e) => Some((FailureReason::Other, e.to_string())),
                 }
@@ -9130,7 +9130,10 @@ impl NativeExecutor {
             };
             let allowance = reduce_only_allowance(pos, is_buy);
             if allowance == FixedPoint::ZERO {
-                return err("reduce-only order rejected: no position to reduce".to_string());
+                return rejected(
+                    FailureReason::ReduceOnly,
+                    "reduce-only order rejected: no position to reduce".to_string(),
+                );
             }
             qty = qty.min(allowance);
         }

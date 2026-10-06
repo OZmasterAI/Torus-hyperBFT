@@ -206,6 +206,8 @@ fn reduce_only_without_position_rejected() {
             assert!(!r[0].success, "single: must be rejected");
             let err = r[0].error.as_deref().unwrap_or("");
             assert!(err.contains("reduce-only"), "unexpected error {err:?}");
+            // Row 52 (s94 B): its own reason (was `Other`).
+            assert_eq!(r[0].reason, torus_state::action_status::FailureReason::ReduceOnly);
         }
         assert_eq!(pos(&ctx, &t), FixedPoint::ZERO, "{path:?}: must not open a short");
         assert_eq!(resting(&ctx, &m), vec![fp(4)], "{path:?}: bid untouched");
@@ -229,6 +231,8 @@ fn reduce_only_on_increasing_side_rejected() {
             assert!(!r[0].success, "single: must be rejected");
             let err = r[0].error.as_deref().unwrap_or("");
             assert!(err.contains("reduce-only"), "unexpected error {err:?}");
+            // Row 52 (s94 B): its own reason (was `Other`).
+            assert_eq!(r[0].reason, torus_state::action_status::FailureReason::ReduceOnly);
         }
         assert_eq!(pos(&ctx, &t), fp(4), "{path:?}: long must not increase");
         assert_eq!(resting(&ctx, &m2), vec![fp(4)], "{path:?}: ask untouched");
