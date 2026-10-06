@@ -380,6 +380,78 @@ fn invalid_ed25519_signature_rejected() {
     );
 }
 
+// ---- A8: session expiry in blocks (the header timestamp is SECONDS) ----
+
+const BLOCK_TS_SECS: u64 = 1_700_000_000;
+
+/// Register the test session key for `addr(1)` with `expiry_ms` and return a
+/// session-signed cancel whose nonce is the block time.
+fn session_cancel(state_db: &StateDb, expiry_ms: u64) -> SignedNativeAction {
+    let session_key = make_ed25519_key();
+    let session = SessionData {
+        owner: addr(1),
+        expiry: expiry_ms,
+        scope: SessionScope::Trading,
+        created_at: 0,
+    };
+    state_db
+        .put_session(&session_key.verifying_key().to_bytes(), &session)
+        .unwrap();
+    sign_with_session(
+        NativeAction::CancelOrder { order_id: 1 },
+        BLOCK_TS_SECS * 1000,
+        &session_key,
+    )
+}
+
+fn propose(state_db: &StateDb, signed: SignedNativeAction) -> Result<torus_types::TorusBlock, String> {
+    torus_bridge::BlockProposer::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0))
+        .build_block_with_native(
+            state_db,
+            &torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID),
+            &torus_bridge::genesis_parent_header(),
+            vec![signed],
+            vec![],
+            BLOCK_TS_SECS,
+            addr(99),
+        )
+        .map(|p| p.block)
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn block_proposal_rejects_session_expired_at_header_time() {
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    // Boundary: a session expiring exactly at the block time is still valid.
+    propose(&state_db, session_cancel(&state_db, block_ms)).expect("valid at expiry");
+    let err = propose(&state_db, session_cancel(&state_db, block_ms - 1))
+        .expect_err("a session expired 1 ms before the block must not be proposed");
+    assert!(err.contains("session key expired"), "{err}");
+}
+
+#[test]
+fn block_validation_rejects_session_expired_at_header_time() {
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    let evm = torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID);
+    let validator =
+        torus_bridge::BlockValidator::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0));
+    let block = propose(&state_db, session_cancel(&state_db, block_ms)).unwrap();
+
+    let ok = validator
+        .validate_block_with_native(&block, &state_db, &evm)
+        .expect("a session expiring exactly at the block time is valid");
+    assert_eq!(ok.native_sender_actions[0].0, addr(1));
+
+    // Same block, the session now expired 1 ms before the block time.
+    session_cancel(&state_db, block_ms - 1);
+    let err = validator
+        .validate_block_with_native(&block, &state_db, &evm)
+        .expect_err("an expired session must fail block validation");
+    assert!(err.to_string().contains("session key expired"), "{err}");
+}
+
 #[test]
 fn session_scope_transfers_only_blocks_trading() {
     let (_dir, state_db) = open_test_db();

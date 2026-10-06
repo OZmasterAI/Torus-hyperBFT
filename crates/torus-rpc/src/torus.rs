@@ -2479,6 +2479,37 @@ mod ack_scratch_tests {
         }
     }
 
+    /// A8: RPC intake checks session expiry in milliseconds, inclusive: a
+    /// session expiring exactly now is accepted, one that expired 1 ms ago
+    /// is rejected.
+    #[test]
+    fn rpc_rejects_an_expired_session_at_the_ms_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let session = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 42 },
+            NOW,
+            &([8u8; 32].into()),
+        );
+        let ActionSignature::Session { session_pubkey, .. } = &session.signature else {
+            panic!("expected session signature")
+        };
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&session).unwrap()));
+        let verify_with_expiry = |expiry| {
+            let data = torus_types::SessionData {
+                owner: Address::from([9; 20]),
+                expiry,
+                scope: torus_types::SessionScope::Trading,
+                created_at: 0,
+            };
+            state.put_session(session_pubkey, &data).unwrap();
+            verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, NOW)
+        };
+        assert_eq!(verify_with_expiry(NOW).unwrap().0, Address::from([9; 20]));
+        let err = verify_with_expiry(NOW - 1).unwrap_err();
+        assert!(err.contains("session key expired"), "{err}");
+    }
+
     #[test]
     fn acknowledgement_scratch_parallel_results_preserve_index_order() {
         use rayon::prelude::*;

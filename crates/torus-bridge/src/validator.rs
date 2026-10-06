@@ -371,9 +371,11 @@ impl BlockValidator {
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         let mut sender_actions = Vec::with_capacity(block.native_actions.len());
         let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
+        // A8: the header timestamp is SECONDS, session expiry MILLISECONDS.
+        let block_ms = torus_types::eip712::block_timestamp_ms(block.header.timestamp);
         for (i, signed) in block.native_actions.iter().enumerate() {
             let sender = signed
-                .resolve_sender(block.header.timestamp, |pubkey| {
+                .resolve_sender(block_ms, |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
                 .map_err(|e| {

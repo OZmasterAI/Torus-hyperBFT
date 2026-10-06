@@ -26,6 +26,15 @@ pub const TORUS_CHAIN_ID: u64 = 7778;
 /// Maximum allowed nonce drift from current time (60 seconds).
 pub const NONCE_WINDOW_MS: u64 = 60_000;
 
+/// A block header's timestamp (UNIX **seconds**) in **milliseconds**, the unit
+/// of nonces, the nonce window and session expiry. Every block-context auth
+/// check (session expiry, nonce window) converts with this — A8: passing the
+/// header seconds where milliseconds are expected meant no session ever
+/// expired in a block.
+pub fn block_timestamp_ms(header_timestamp_secs: u64) -> u64 {
+    header_timestamp_secs.saturating_mul(1000)
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -877,9 +886,14 @@ impl SignedNativeAction {
     /// Resolve the sender address using state-based session lookup.
     /// For Eip712: recovers ECDSA sender directly.
     /// For Session: verifies ed25519, then looks up session owner via the provided closure.
+    ///
+    /// `current_time_ms` is MILLISECONDS (the unit of `SessionData::expiry`); a
+    /// session is valid while `current_time_ms <= expiry`. In a block context
+    /// pass [`block_timestamp_ms`] of the header timestamp, never the raw
+    /// header seconds.
     pub fn resolve_sender<F>(
         &self,
-        current_timestamp: u64,
+        current_time_ms: u64,
         session_lookup: F,
     ) -> Result<Address, Eip712Error>
     where
@@ -908,7 +922,7 @@ impl SignedNativeAction {
                 vk.verify(signing_hash.as_slice(), &ed_sig)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
                 let session = session_lookup(session_pubkey).ok_or(Eip712Error::SessionNotFound)?;
-                if current_timestamp > session.expiry {
+                if current_time_ms > session.expiry {
                     return Err(Eip712Error::SessionExpired);
                 }
                 if !session.scope.allows(&self.action) {
@@ -1099,6 +1113,9 @@ fn par_recover(
 /// The resolved sender is exactly what `SignedNativeAction::resolve_sender`
 /// would return, so callers reuse it directly instead of recovering a second
 /// time — secp256k1 ecrecover happens once per action, not twice.
+///
+/// `timestamp` is MILLISECONDS, like `resolve_sender`'s `current_time_ms`
+/// (a block caller passes [`block_timestamp_ms`] of the header timestamp).
 ///
 /// The EIP-712 ecrecovers (the dominant per-action cost) run under the
 /// [`VerifyMode`] from `TORUS_PARALLEL_VERIFY`; the result is order-preserving
@@ -1767,6 +1784,43 @@ mod tests {
             .resolve_sender(0, |pk| (pk == &pubkey).then(|| session.clone()))
             .expect("session-signed action resolves to owner");
         assert_eq!(got, owner);
+    }
+
+    /// A8: session expiry is inclusive and in MILLISECONDS on both the ingress
+    /// (`resolve_sender`) and the exec (`batch_verify`) path: valid at exactly
+    /// `expiry`, expired 1 ms later.
+    #[test]
+    fn session_expiry_boundary_is_inclusive_ms_on_both_paths() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[45u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x45; 20]);
+        let expiry = TEST_NONCE + 3_600_000;
+        let session = SessionData {
+            owner,
+            expiry,
+            scope: SessionScope::Trading,
+            created_at: TEST_NONCE,
+        };
+        let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+        let signed =
+            sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, TEST_NONCE, &ed_key);
+
+        assert_eq!(signed.resolve_sender(expiry, lookup), Ok(owner));
+        assert_eq!(
+            signed.resolve_sender(expiry + 1, lookup),
+            Err(Eip712Error::SessionExpired)
+        );
+        let at = |t| batch_verify_native_actions(std::slice::from_ref(&signed), t, lookup)[0];
+        assert_eq!(at(expiry), Some(owner));
+        assert_eq!(at(expiry + 1), None);
+    }
+
+    /// A8: header seconds -> milliseconds, saturating.
+    #[test]
+    fn block_timestamp_ms_converts_header_seconds() {
+        assert_eq!(block_timestamp_ms(1_700_000_000), 1_700_000_000_000);
+        assert_eq!(block_timestamp_ms(0), 0);
+        assert_eq!(block_timestamp_ms(u64::MAX), u64::MAX);
     }
 
     /// O2/G3: least-privilege market makers must be able to batch under

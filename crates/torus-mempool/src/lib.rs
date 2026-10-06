@@ -596,19 +596,11 @@ impl Mempool {
                     })?,
                 }
             }
-            torus_types::ActionSignature::Session { .. } => {
-                let pubkey = action.verify_session_signature().map_err(|e| {
-                    MempoolError::NativeValidationFailed(format!("gossip session sig: {e}"))
-                })?;
-                match self.state.get_session(&pubkey) {
-                    Ok(Some(session)) => session.owner,
-                    _ => {
-                        return Err(MempoolError::NativeValidationFailed(
-                            "gossip session unknown".into(),
-                        ))
-                    }
-                }
-            }
+            // A8: the full session check (signature, registration, expiry in
+            // ms against this node's clock, scope) — the same as RPC intake.
+            torus_types::ActionSignature::Session { .. } => action
+                .resolve_sender(now_ms(), |pk| self.state.get_session(pk).ok().flatten())
+                .map_err(|e| MempoolError::NativeValidationFailed(format!("gossip session: {e}")))?,
         };
         if verified_sender != claimed_sender {
             return Err(MempoolError::NativeValidationFailed(
@@ -3950,6 +3942,44 @@ mod tests {
         put_native(&state, &owner, ONE_TRS, 0);
         pool.add_native_action_from_gossip(owner, a)
             .expect("owner funded");
+    }
+
+    /// A8: gossip admission checks the session's expiry (milliseconds, like
+    /// the RPC path), not only its owner: an expired session is refused, a
+    /// live one admitted.
+    #[test]
+    fn gossip_rejects_an_expired_session() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let now = now_ms();
+        let owner = Address::from([0x78; 20]);
+        let a = torus_types::eip712::sign_native_action_with_session(
+            torus_types::NativeAction::CancelAllOrders { market_id: None },
+            now,
+            &([9u8; 32].into()),
+        );
+        let torus_types::ActionSignature::Session { session_pubkey, .. } = &a.signature else {
+            panic!("session signature expected")
+        };
+        let put = |expiry| {
+            let session = torus_types::SessionData {
+                owner,
+                expiry,
+                scope: torus_types::SessionScope::Trading,
+                created_at: 0,
+            };
+            state.put_session(session_pubkey, &session).unwrap();
+        };
+        put(now - 1);
+        match pool.add_native_action_from_gossip(owner, a.clone()) {
+            Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("expired"), "{m}"),
+            other => panic!("expired session admitted: {other:?}"),
+        }
+        // Valid while `now <= expiry`; admission reads the clock again, so give
+        // the boundary a margin that cannot be crossed during the test.
+        put(now + 60_000);
+        pool.add_native_action_from_gossip(owner, a)
+            .expect("live session admitted");
     }
 
     /// Item C: `native_cancel_block_share_pct` reaches the pool.

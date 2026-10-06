@@ -1979,7 +1979,8 @@ impl ExecutionContext {
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
-                    torus_block.header.timestamp,
+                    // A8: header SECONDS -> the MILLISECONDS of session expiry.
+                    torus_types::eip712::block_timestamp_ms(torus_block.header.timestamp),
                     |pubkey| overlay.get_session(pubkey).ok().flatten(),
                     // Exec trust-cache read (gated by --exec-trust-cache, default
                     // off): when enabled, a HIT reuses a locally-verified sender
@@ -10943,6 +10944,53 @@ mod crash_recovery_tests {
             torus_economics::MIN_SELF_DELEGATION,
             "exec-time structural sig failure must NOT slash the proposer"
         );
+    }
+
+    /// A8: exec checks session expiry in MILLISECONDS against the header
+    /// timestamp (SECONDS): a session that expired 1 ms before the block time is
+    /// skipped, one expiring exactly at the block time executes — on the serial
+    /// and on the pipelined flush. RED before A8: the raw header seconds (~1e3)
+    /// never exceeded a ms expiry (~1e6), so the expired action executed.
+    #[test]
+    fn session_expired_at_block_time_is_skipped_serial_and_pipelined() {
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[36u8; 32]);
+        let owner = Address::new([0x36; 20]);
+        let block_ms =
+            torus_types::eip712::block_timestamp_ms(make_block(1, vec![]).header.timestamp);
+        let block = make_block(
+            1,
+            vec![torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                block_ms,
+                &session_key,
+            )],
+        );
+        for pipelined in [false, true] {
+            for (expiry, skipped) in [(block_ms, false), (block_ms - 1, true)] {
+                let (_c, state_db) = make_test_config_and_db();
+                state_db
+                    .put_session(
+                        &session_key.verifying_key().to_bytes(),
+                        &torus_types::SessionData {
+                            owner,
+                            expiry,
+                            scope: torus_types::SessionScope::Trading,
+                            created_at: 0,
+                        },
+                    )
+                    .unwrap();
+                let ctx = pipeline_ctx(&state_db, pipelined, None);
+                dispatch_and_execute(&ctx, &state_db, &block);
+                assert!(ctx.pipeline_barrier(), "flush worker drained");
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+                assert_eq!(
+                    action_status(&state_db, 1).expect("block 1 record").native_skipped,
+                    vec![skipped],
+                    "pipelined {pipelined}: expiry {expiry} vs block time {block_ms} ms"
+                );
+                drop(ctx);
+            }
+        }
     }
 
     // ---- s84 decision 1: skip invalid actions, record executed/skipped ----
