@@ -117,6 +117,14 @@ python3 tools/matched-bench/test_harness.py
    or gaps over 5 seconds restart the interval. `drain-samples.jsonl` retains
    observations and `drain.json` records the result. `DRAIN_TIMEOUT` defaults to
    `180 + 2*MARKETS` seconds; reaching it does not establish drain.
+   With `ORACLE_FEED=1 ORACLE_FEED_DRAIN=1` the feed keeps running and the
+   drain uses `--feed-live`: only placed/matched/resting must stay unchanged,
+   the native mempool may hold the feed's own entries (`--feed-mempool-max`,
+   6 per 256 markets) and the execution queue (= exec lag) must stay <=
+   `--max-lag` (2) on every sample. No metric splits the mempool by action
+   kind, so "bench pool empty" is that proxy. `drain-feed-live.tsv` holds the
+   per-sample exec lag and mean ms per native block (`torus_exec_chain_seconds`);
+   `drain.json .feed_live` its summary over the final quiet window.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
