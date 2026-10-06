@@ -2902,6 +2902,15 @@ impl ResidentBooks {
         self.rows.as_ref().map(|s| s.positions.same_as(&TraderPositions::build(&s.rows)))
     }
 
+    /// Item 6 C5 (tests): empty the slot's sums cache (R, its decoded
+    /// positions and the mark state stay), so the next block values every
+    /// trader afresh. Returns the entries dropped. Waits for an
+    /// `end_resident` worker. Not called on the node path.
+    pub fn drop_sums_cache(&mut self) -> usize {
+        self.settle_rows();
+        self.rows.as_mut().map_or(0, |s| std::mem::take(&mut s.sums.map).len())
+    }
+
     /// Whether the holder currently carries state (test/ops introspection).
     pub fn is_populated(&self) -> bool {
         self.inner.is_some()

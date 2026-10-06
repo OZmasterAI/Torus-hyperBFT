@@ -17836,4 +17836,447 @@ mod crash_recovery_tests {
         drop(ctx2);
         assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "crash + restart with R vs serial without R");
     }
+
+    // ======================================================================
+    // Item 6 Phase 1 C5 (plan Step 5, P5): warm == cold
+    // ======================================================================
+
+    /// Blocks fed, epoch length (boundaries at 50 / 100 / 150 / 200) and the
+    /// restart period of the cold replica (7 does not divide 50).
+    const C5_BLOCKS: u64 = 210;
+    const C5_EPOCH: u64 = 50;
+    const C5_RESTART_EVERY: u64 = 7;
+    const C5_MARKETS: [u64; 3] = [1, 2, 3];
+    /// Traders (signing-key seeds): 81 / 82 also move funds EVM <-> perp,
+    /// 84 is thin (margin cuts). Makers quote every market.
+    const C5_TRADERS: [u8; 6] = [81, 82, 83, 84, 85, 86];
+    const C5_MAKERS: [u8; 2] = [89, 90];
+    /// Seeded before block 1: V1 long 10 @100 in market 1 (collateral 40),
+    /// V2 short 10 @100 in market 2 (collateral 60): backstop after the
+    /// shocks; V3 long 1,100 @100 in market 3 (collateral 6,200; notional
+    /// over the chunk threshold, MM 5,500 at 100): stage 1 on the walk, 20%
+    /// chunks into bids far thinner than its size (cooldown and pending
+    /// rows); S their counterparty.
+    const C5_V1: u8 = 91;
+    const C5_V2: u8 = 93;
+    const C5_V3: u8 = 94;
+    const C5_S: u8 = 92;
+    const C5_EVM_FUNDING: u128 = 10_000;
+
+    /// splitmix64: the generator's only source of variety (fixed seed, no clock).
+    struct C5Rng(u64);
+
+    impl C5Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// 3 Active oracle validators; market 1 a placeholder row (no margin
+    /// config / shape: defaults), markets 2 and 3 governance-layout rows
+    /// (lot 0.001, tick 0.01, initial margin 5% / 10%); traders, makers and
+    /// the seeded thin positions funded; 81 / 82 hold EVM balance.
+    fn c5_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = C5_EPOCH;
+        for (seed, mult) in ORACLE_VALIDATORS {
+            oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
+        }
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"listed").unwrap();
+        for (m, im) in [(2u64, 5i64), (3, 10)] {
+            let row = (
+                "BTC".to_string(),
+                "USDC".to_string(),
+                FixedPoint::SCALE / 1_000,
+                FixedPoint::SCALE / 100,
+                px(im).raw(),
+            );
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &borsh::to_vec(&row).unwrap())
+                .unwrap();
+        }
+        let pm = PositionManager::new(db.clone());
+        let fund = |seed: u8, amt: i64| {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap()
+        };
+        for (i, seed) in C5_TRADERS.into_iter().enumerate() {
+            fund(seed, if seed == 84 { 150 } else { 3_000 + 1_000 * i as i64 });
+        }
+        for seed in C5_MAKERS.into_iter().chain([C5_S]) {
+            fund(seed, 1_000_000);
+        }
+        fund(C5_V1, 40);
+        fund(C5_V2, 60);
+        fund(C5_V3, 6_200);
+        let (v1, v2, s) = (oracle_addr(C5_V1), oracle_addr(C5_V2), oracle_addr(C5_S));
+        pm.apply_fill(&v1, 1, true, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 1, false, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&v2, 2, false, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 2, true, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&oracle_addr(C5_V3), 3, true, px(1_100), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 3, false, px(1_100), px(100), MarginType::Cross).unwrap();
+        for seed in [81u8, 82] {
+            fund_evm_balance(&db, oracle_addr(seed), U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128));
+        }
+        (config, db)
+    }
+
+    /// What the generator fed (non-vacuity of the input side).
+    #[derive(Debug, Default)]
+    struct C5Fed {
+        empty: u64,
+        mark_rounds: u64,
+        non_pool_sell_batches: u64,
+        cancels: u64,
+        transfers: u64,
+    }
+
+    /// The P5 sequence: heights 1..=C5_BLOCKS (ts 1000 + h), linked. Oracle
+    /// rounds (all 3 validators, all 3 markets) every 5th block plus at
+    /// random, marks walking +-2 per round with two shocks (market 1 -15% at
+    /// 60: V1 under water; market 2 +18% at 120: V2); a maker requoting
+    /// every market each non-empty block (cancel-all every 6th); 1-3 trader
+    /// actions: resting limits, crossing limits, two-market sell batches
+    /// crossing the bid (the second is a non-pool sell: B-blind top-up),
+    /// cancel-alls, EVM <-> perp transfers; ~1/5 of the other blocks empty.
+    fn c5_blocks() -> (Vec<TorusBlock>, C5Fed) {
+        let mut rng = C5Rng(0xC5_0005);
+        let mut fed = C5Fed::default();
+        let mut mark = [100i64; 3];
+        let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
+        let mut sign = |seed: u8, action: NativeAction| {
+            let n = nonces.entry(seed).or_insert(0);
+            *n += 1;
+            torus_types::eip712::sign_native_action(action, *n, &oracle_key(seed))
+        };
+        let order = |m: u64, is_buy: bool, price: i64, qty: i64| torus_types::PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: px(price),
+            quantity: px(qty),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let units = |v: u128| U256::from(v * FixedPoint::ONE.raw() as u128);
+        let mut blocks = Vec::new();
+        for h in 1..=C5_BLOCKS {
+            let mut actions = Vec::new();
+            let shock = h == 60 || h == 120;
+            let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
+            if mark_round {
+                fed.mark_rounds += 1;
+                match h {
+                    1 => {}
+                    60 => mark[0] = mark[0] * 85 / 100,
+                    120 => mark[1] = mark[1] * 118 / 100,
+                    _ => {
+                        for p in &mut mark {
+                            *p = (*p + rng.below(5) as i64 - 2).max(50);
+                        }
+                    }
+                }
+                for (seed, _) in ORACLE_VALIDATORS {
+                    let prices = C5_MARKETS.iter().zip(mark).map(|(m, p)| (*m, px(p))).collect();
+                    actions.push(torus_types::eip712::sign_native_action(
+                        NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                            prices,
+                            timestamp: (1_000 + h) * 1_000,
+                        }),
+                        h * 1_000 + seed as u64,
+                        &oracle_key(seed),
+                    ));
+                }
+            }
+            if !mark_round && rng.below(5) == 0 {
+                fed.empty += 1;
+                blocks.push(make_block(h, actions));
+                continue;
+            }
+            let maker = C5_MAKERS[(h % 2) as usize];
+            if h % 6 == 0 {
+                actions.push(sign(maker, NativeAction::CancelAllOrders { market_id: None }));
+                fed.cancels += 1;
+            }
+            let mut quotes = Vec::new();
+            for (i, m) in C5_MARKETS.into_iter().enumerate() {
+                let q = 2 + rng.below(4) as i64;
+                quotes.push(order(m, true, mark[i] - 1 - rng.below(2) as i64, q));
+                quotes.push(order(m, false, mark[i] + 1 + rng.below(2) as i64, q));
+            }
+            actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
+            for _ in 0..1 + rng.below(3) {
+                let t = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                let mi = rng.below(3) as usize;
+                let (m, p) = (C5_MARKETS[mi], mark[mi]);
+                let qty = 1 + rng.below(4) as i64;
+                let action = match rng.below(10) {
+                    0..=3 => {
+                        let is_buy = rng.below(2) == 0;
+                        let off = 1 + rng.below(3) as i64;
+                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p - off } else { p + off }, qty))
+                    }
+                    4 | 5 => {
+                        let is_buy = rng.below(2) == 0;
+                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p + 2 } else { p - 2 }, qty))
+                    }
+                    6 => {
+                        let mj = (mi + 1 + rng.below(2) as usize) % 3;
+                        fed.non_pool_sell_batches += 1;
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(m, false, p - 2, qty),
+                            order(C5_MARKETS[mj], false, mark[mj] - 2, qty),
+                        ])
+                    }
+                    7 => {
+                        fed.cancels += 1;
+                        NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) }
+                    }
+                    8 if t == 81 || t == 82 => {
+                        fed.transfers += 1;
+                        if rng.below(2) == 0 {
+                            NativeAction::TransferToPerp { amount: units(100) }
+                        } else {
+                            NativeAction::TransferToSpot { amount: units(50) }
+                        }
+                    }
+                    _ => {
+                        let mj = (mi + 1) % 3;
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(m, true, p - 1 - rng.below(3) as i64, qty),
+                            order(C5_MARKETS[mj], false, mark[mj] + 1 + rng.below(3) as i64, qty),
+                        ])
+                    }
+                };
+                actions.push(sign(t, action));
+            }
+            blocks.push(make_block(h, actions));
+        }
+        link_blocks(&mut blocks);
+        (blocks, fed)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum C5Replica {
+        /// One context for every block.
+        Warm,
+        /// Context dropped and recreated after every `C5_RESTART_EVERY`th
+        /// block: R, its decoded positions, the sums cache and the books
+        /// rebuilt cold.
+        Restarted,
+        /// One context; the sums cache emptied before every block.
+        SumsDropped,
+    }
+
+    struct C5Run {
+        db: StateDb,
+        dump: Vec<CfDump>,
+        captured: CapturedWrites,
+        hash: Option<(u64, [u8; 32])>,
+        builds: u64,
+        restarts: u64,
+        sums_dropped: usize,
+        r_rows: usize,
+        /// Blocks after which an oracle mark price differed from the block before.
+        mark_moves: u64,
+        mark_moves_after_last_epoch: u64,
+        /// Blocks after which `CF_NATIVE_LIQUIDATION` held cooldown / pending rows.
+        liq_row_blocks: u64,
+        metrics: Arc<torus_telemetry::Metrics>,
+    }
+
+    /// Feed `blocks` through the committed-block path on a fresh
+    /// `c5_fixture` DB as `replica`. After every block: no fail-stop, R ==
+    /// the DB scan of its CFs and decoded positions == a cold decode
+    /// (`assert_resident_rows_track_db`; a restarted context has no R until
+    /// its first native block), no shared fallback.
+    fn c5_run(
+        blocks: &[TorusBlock],
+        replica: C5Replica,
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+    ) -> C5Run {
+        use torus_state::cf::{CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE};
+        let (config, db) = c5_fixture();
+        torus_state::running_hash::capture_begin(&db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let what = format!("{replica:?} pipelined={pipelined} {mode:?}");
+        let new_ctx = || {
+            let mut c = make_exec_ctx(&config, &db);
+            c.test_book_mode = mode;
+            c.metrics = Some(metrics.clone());
+            if pipelined {
+                c.attach_flush_worker(None);
+            }
+            c
+        };
+        let mark_prices = |db: &StateDb| -> Vec<(Vec<u8>, Vec<u8>)> {
+            StateBackend::iterate_cf(db, CF_NATIVE_ORACLE, Some(b"agg"))
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| (k, v[..16].to_vec()))
+                .collect()
+        };
+        let mut ctx = new_ctx();
+        let (mut builds, mut restarts, mut sums_dropped) = (0, 0, 0);
+        let (mut mark_moves, mut mark_moves_after_last_epoch, mut liq_row_blocks) = (0, 0, 0);
+        let mut prev_marks = Vec::new();
+        let last = blocks.last().expect("blocks").header.height;
+        for b in blocks {
+            let h = b.header.height;
+            if replica == C5Replica::SumsDropped {
+                sums_dropped += ctx.resident_books.lock().unwrap().drop_sums_cache();
+            }
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: fail-stop at {h}");
+            if ctx.resident_books.lock().unwrap().rows_builds() == 0 {
+                assert_eq!(replica, C5Replica::Restarted, "{what}: R never built by {h}");
+                if let Some(w) = ctx.flush_worker.as_ref() {
+                    assert!(w.wait_idle(), "{what}: W failed");
+                }
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: {h}");
+            } else {
+                assert_resident_rows_track_db(&ctx, &db, h, &what);
+            }
+            assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}: {h}");
+            let marks = mark_prices(&db);
+            if marks != prev_marks {
+                mark_moves += 1;
+                mark_moves_after_last_epoch += u64::from(h > (last / C5_EPOCH) * C5_EPOCH);
+                prev_marks = marks;
+            }
+            // Cooldown / pending rows: tag + trader (the 9-byte previous-mark rows persist).
+            liq_row_blocks += u64::from(
+                StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, None).unwrap().iter().any(|(k, _)| k.len() == 21),
+            );
+            if replica == C5Replica::Restarted && h % C5_RESTART_EVERY == 0 && h < last {
+                builds += ctx.resident_books.lock().unwrap().rows_builds();
+                restarts += 1;
+                drop(ctx);
+                ctx = new_ctx();
+            }
+        }
+        let r_rows = ctx.resident_books.lock().unwrap().rows().map_or(0, |r| r.len());
+        builds += ctx.resident_books.lock().unwrap().rows_builds();
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        let hash = torus_state::running_hash::read_running_hash(&db);
+        let dump = dump_all_cfs(&db);
+        C5Run {
+            db,
+            dump,
+            captured,
+            hash,
+            builds,
+            restarts,
+            sums_dropped,
+            r_rows,
+            mark_moves,
+            mark_moves_after_last_epoch,
+            liq_row_blocks,
+            metrics,
+        }
+    }
+
+    /// Item 6 C5 (plan Step 5, P5): warm == cold in one configuration. The
+    /// 210 blocks (4 epoch boundaries) through three replicas, each on its
+    /// own DB: warm (one context), restarted every 7 blocks (R, decoded
+    /// positions, sums cache, marks and books rebuilt cold) and sums-dropped
+    /// (cache emptied before every block). R == DB after every block on
+    /// each (`c5_run`); identical per-block consensus write sets (every
+    /// `h_n`), running hash and full dump; the sequence is non-vacuous.
+    /// Returns the warm run.
+    fn c5_warm_equals_cold(pipelined: bool, mode: Option<torus_bridge::native_executor::BookMode>) -> C5Run {
+        let started = std::time::Instant::now();
+        let what = format!("pipelined={pipelined} {mode:?}");
+        let (blocks, fed) = c5_blocks();
+        assert_eq!(blocks.len() as u64, C5_BLOCKS);
+        let warm = c5_run(&blocks, C5Replica::Warm, pipelined, mode);
+        let restarted = c5_run(&blocks, C5Replica::Restarted, pipelined, mode);
+        let dropped = c5_run(&blocks, C5Replica::SumsDropped, pipelined, mode);
+
+        assert_eq!((warm.builds, dropped.builds), (1, 1), "{what}: R built once");
+        assert_eq!(restarted.restarts, (C5_BLOCKS - 1) / C5_RESTART_EVERY, "{what}");
+        assert_eq!(restarted.builds, restarted.restarts + 1, "{what}: one cold build per (re)start");
+        assert_eq!(
+            warm.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=C5_BLOCKS).collect::<Vec<_>>(),
+            "{what}: every height through the hashed flush"
+        );
+        assert!(warm.hash.is_some());
+        assert_eq!(warm.hash, Some(fold_captured(&warm.captured)), "{what}");
+        for (name, other) in [("restarted", &restarted), ("sums dropped", &dropped)] {
+            assert_write_sets_equal(&warm.captured, &other.captured, &format!("{what}: warm vs {name}"));
+            assert_eq!(warm.hash, other.hash, "{what}: running hash, warm vs {name}");
+            assert_dumps_equal(&warm.dump, &other.dump, &format!("{what}: warm vs {name}"));
+        }
+
+        // Non-vacuous (the warm replica; the others equal it).
+        let pm = torus_core::position::PositionManager::new(warm.db.clone());
+        let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap().len();
+        let liquidations = warm.metrics.liquidations_triggered.get();
+        let top_ups = warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
+        let v1 = signed_pos_of(&warm.db, &oracle_addr(C5_V1));
+        let v2 = pm.get_position(&oracle_addr(C5_V2), 2).unwrap().map(|p| p.size);
+        let v3 = pm.get_position(&oracle_addr(C5_V3), 3).unwrap().map(|p| p.size);
+        let funded = U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128);
+        let evm_moved = [81u8, 82].iter().filter(|&&s| read_evm_balance(&warm.db, oracle_addr(s)) != funded).count();
+        println!(
+            "C5 {what}: fed {fed:?}; fills {fills}, liquidations {liquidations}, top-ups {top_ups}, \
+             mark moves {} ({} after the last epoch boundary), blocks with cooldown / pending rows {}, \
+             R rows {}, V1 {v1:?}, V2 {v2:?}, V3 {v3:?}, EVM balances moved {evm_moved}, sums entries dropped {}, \
+             restarts {} / builds {}; {:.1} s",
+            warm.mark_moves,
+            warm.mark_moves_after_last_epoch,
+            warm.liq_row_blocks,
+            warm.r_rows,
+            dropped.sums_dropped,
+            restarted.restarts,
+            restarted.builds,
+            started.elapsed().as_secs_f64(),
+        );
+        assert!(fed.empty >= 10 && fed.cancels >= 20 && fed.transfers >= 2 && fed.non_pool_sell_batches >= 10, "{fed:?}");
+        assert!(fills >= 200, "{what}: fills {fills}");
+        assert!(liquidations >= 2, "{what}: liquidations {liquidations}");
+        assert!(top_ups >= 20, "{what}: B-blind top-ups {top_ups}");
+        assert!(warm.mark_moves >= 50 && warm.mark_moves_after_last_epoch >= 1, "{what}: mark moves");
+        assert!(warm.liq_row_blocks >= 1, "{what}: cooldown / pending rows");
+        assert!(warm.r_rows >= 30, "{what}: R rows {}", warm.r_rows);
+        assert_eq!(v1, FixedPoint::ZERO, "{what}: V1 liquidated");
+        assert_eq!(v2, None, "{what}: V2 liquidated");
+        assert_ne!(v3, Some(px(1_100)), "{what}: V3 liquidated");
+        assert_eq!(evm_moved, 2, "{what}: deposits / withdrawals moved EVM balances");
+        assert!(dropped.sums_dropped >= 500, "{what}: the cache held entries ({})", dropped.sums_dropped);
+        warm
+    }
+
+    #[test]
+    fn warm_equals_cold_every_block_serial() {
+        c5_warm_equals_cold(false, None);
+    }
+
+    /// Also serial == pipelined (one more warm run).
+    #[test]
+    fn warm_equals_cold_every_block_pipelined() {
+        let piped = c5_warm_equals_cold(true, None);
+        let serial = c5_run(&c5_blocks().0, C5Replica::Warm, false, None);
+        assert_write_sets_equal(&serial.captured, &piped.captured, "serial vs pipelined");
+        assert_eq!(serial.hash, piped.hash, "serial vs pipelined");
+        assert_dumps_equal(&serial.dump, &piped.dump, "serial vs pipelined");
+    }
+
+    #[test]
+    fn warm_equals_cold_every_block_pipelined_level_authority_chunked() {
+        c5_warm_equals_cold(true, Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked));
+    }
 }
