@@ -566,7 +566,7 @@ reviews it.
 | 47 | M1 cut 4 / end-of-block cost | 18c estimate ~8.6 ms/block; **ozarchy section 14: +29.7 ms/block** (`end_resident` 67 -> 97, untimed; `BlockSums::into_cache` ~18) | count in the gates or move off the execution thread? | step 1 (reuse C7's decoded positions + timer), then step 2 if the overlap check pays (section 9.7) | `b9959e2` |
 | 48 | M1 / hasher | a faster per-process-seeded hasher (foldhash / ahash) would be a new direct dependency; not measured; s82 A/B found no gain from ahash on the exec maps | add? | not added (recommendation: no) | - |
 | 49 | M1 / client-visible | RPC messages now start with "order rejected: "; off-tick StopLimit limits rejected at intake | none (heads-up for clients) | built | `7c365d4` |
-| 50 | C / zero-fill IOC, crossing PostOnly | still report executed (success); recording them needs the settle loop to return a result per order | failed with new codes, or a separate "canceled" status like HL? | unchanged | `4a26653` |
+| 50 | C / zero-fill IOC, crossing PostOnly | still report executed (success); recording them needs the settle loop to return a result per order | failed with new codes, or a separate "canceled" status like HL? | built (s96 owner: **"rejected"** with HL names; "canceled" stays for a user's cancel): the book sets `PlaceResult::reject` on every refusal and zero-fill cancel; one helper `NativeActionResult::placed` at the sequential settle, pass B and `place_order_inner`, gas kept (1000). Codes 10-14 `ioc_cancel`, `bad_alo_px`, `market_no_liquidity`, `fok_cancel` (HL has no FOK: `fokCancelRejected`), `bad_trigger_px`; RPC names `iocCancelRejected`, `badAloPxRejected`, `marketOrderNoLiquidityRejected`, `reduceOnlyRejected` (9), `perpMarginRejected` (1, placement margin check too), `fokCancelRejected`, `badTriggerPxRejected`. Record v3 (outcome per entry + per-order list, empty today; v1 / v2 still read). Partial fills stay executed. Node-local: golden A re-pinned for success / error only (pre-row-50 view = old pins) | `d8f79878` |
 | 51 | C / typed reasons | three reasons differ from C's text parser: modify price <= 0 `other` -> `price`, modify qty <= 0 `other` -> `lot`, withdrawal refused by margin `other` -> `margin` | confirm, or revert those three to `other`? | built | `4a26653` |
 | 52 | C / reduce-only rejects | stored as `other` | dedicated code (next free value 8)? | built (B batch): `FailureReason::ReduceOnly` = **9** (8 was already `PriceBand`), name `reduce_only`, for HL `reduceOnlyRejected` (row 50); set in `exec_place_order` and `exec_modify_order`. Node-local record only; old records keep `other` (0), an older reader reads 9 as `other`. Found: in a block, reduce-only placement rejects come from the book on the `execute_batch` path and report executed (row 50's per-order results), so the record sees 9 from ModifyOrder | `860da7d` |
 
@@ -819,7 +819,8 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 | rows 77-78 slow first block, empty block with the feed live | profiled (results doc section 22): flush-worker wait (77, Phase 3) and `run_liquidations_with` sums (78, Phase 2 P2-4 design check) |
 | 9.14 D row 48 (faster hasher) | `hash_one` / SipHash showed (~13% of execution self time): Phase 2 P2-5 (`item6-phase2-impl.md` 9.5) |
 | 9.14 B batch (rows 44, 45, 46, 52, 69) | built on `fix/s94-b-batch` (`9ab2837`, `d9e3c19`, `457fd70`, `860da7d`, `553aa51`); not merged yet |
-| row 50 "canceled", 9.11 counter, anti-spam eviction metric | unchanged; row 50 next |
+| row 50 "rejected" (HL names; s96 owner chose "rejected", not "canceled") | built on `feat/row50-rejected-status` (`d8f79878`); not merged yet |
+| 9.11 counter, anti-spam eviction metric | unchanged; next: 9.11 counter |
 | `/tmp` test-folder leak (`app.rs`) | unchanged; after the merge (now unblocked) |
 | compiler warnings (ozarchy s17): `swarm.rs` 3047 `enqueue_body_fetch_traced` and 3210 `handle_consensus_direct` unused; `bench-throughput` `main.rs` 1592 needless `mut`, `in_flight.rs` 152 unused | new; small cleanup, anytime |
 | other 9.13 rows (native root 9.3, oracle M2, anti-spam D, runbook, C5 cooldown, trading app `"Failed"`) | unchanged |
@@ -827,5 +828,5 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 Item 6 Phase 2: full plan with owner decisions in `item6-phase2-impl.md` (`docs/item6-phase2-plan`);
 base and gate reference main `35e69b3`.
 
-Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> next: row 50 -> 9.11 counter + pin
+Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> row 50 done -> next: 9.11 counter + pin
 tests -> anti-spam eviction metric; Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.
