@@ -16,8 +16,8 @@
 //! Per-step time: the gaps between consecutive `liquidation: ADL` info events
 //! of one account (one event per (account, market) step, the same deltas the
 //! liq-stress logs gave). Also prints direct timings of the step's parts over
-//! the block-2 state before the step: `liq::adl_candidates` (65,536-row
-//! window, AV closure returning 0) and the `adl_rest` reads
+//! the block-2 state before the step: `liq::adl_candidates` over the fallback
+//! trader walk (every trader, AV closure returning 0) and the `adl_rest` reads
 //! (`positions_for_trader` + `AccountView::build`).
 //!
 //!   UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use torus_bridge::native_executor::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
-use torus_core::liquidation::{self as liq, ADL_MAX_SCAN_ROWS};
+use torus_core::liquidation as liq;
 use torus_core::margin::AccountView;
 use torus_core::position::{MarginType, NativeBalance};
 use torus_state::cf::{CF_CONSENSUS_META, CF_NATIVE_POSITIONS, META_NATIVE_APPLIED_HEIGHT};
@@ -127,9 +127,7 @@ fn ubench_adl_step() {
     }
     let rows = db.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap().len();
     println!(
-        "ADL setup: traders={n} bankrupt={k} positions/bankrupt={pu} R={resident} position rows={rows} \
-         (window {ADL_MAX_SCAN_ROWS}: {}) setup_ms={:.0}",
-        if rows > ADL_MAX_SCAN_ROWS { "capped" } else { "whole CF" },
+        "ADL setup: traders={n} bankrupt={k} positions/bankrupt={pu} R={resident} position rows={rows} setup_ms={:.0}",
         ms(t)
     );
 
@@ -186,7 +184,8 @@ fn parts<T: StateBackend>(ctx: &NativeExecContext<T>, low: FixedPoint, pu: u64) 
     let t = Instant::now();
     let mut found = 0;
     for m in 1..=reps {
-        found += liq::adl_candidates(&ctx.positions, m, &u, false, ADL_MAX_SCAN_ROWS, |_| Ok(FixedPoint::ZERO))
+        let traders = liq::traders_after(&ctx.state, None, usize::MAX).unwrap();
+        found += liq::adl_candidates(&traders, false, |t| ctx.positions.get_position(t, m), |_| Ok(FixedPoint::ZERO))
             .unwrap()
             .len();
     }

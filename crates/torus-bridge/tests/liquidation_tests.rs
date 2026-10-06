@@ -108,7 +108,7 @@ fn total_value(ctx: &NativeExecContext, marks: &BTreeMap<MarketId, FixedPoint>) 
         }
     }
     for p in all_positions(ctx) {
-        v += p.unrealized_pnl(marks[&p.market_id]);
+        v += marks.get(&p.market_id).map_or(FixedPoint::ZERO, |mk| p.unrealized_pnl(*mk));
     }
     v
 }
@@ -729,6 +729,44 @@ fn the_vault_is_adld_when_its_value_goes_negative() {
     assert_eq!(bal(&c2, &s).available, fp(1_000_300), "10 x (1,000 - 970)");
     assert_eq!(oi(&c2, 1), (FixedPoint::ZERO, FixedPoint::ZERO));
     assert_eq!(total_value(&c2, &marks(&[(1, 900)])), before);
+}
+
+/// Q1 (s96): ADL counterparties = EVERY opposite-side holder. 230 padding
+/// traders (low addresses) x 301 rows = 69,230 rows > 65,536, each short 1 in
+/// market 1 with a huge AV (ranks low). `top` (0xFF.., highest address) is
+/// short 4 with AV 500 at 900 -> rank (1000/900) x (3600/500) = 8: first.
+/// U long 4 @ 1,000, collateral 200: AV -200 at 900 -> ADL; 4 close against top.
+#[test]
+fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
+    let (_d, db) = liq_db(&[1]);
+    let ctx = ctx_at(db.clone(), 1);
+    let pad = |i: u32| {
+        let mut a = [0x01u8; 20];
+        a[16..].copy_from_slice(&i.to_be_bytes());
+        Address::new(a)
+    };
+    let (u, top, sink) = (addr(0x02), Address::new([0xFF; 20]), Address::new([0xEE; 20]));
+    fund(&ctx, &sink, fp(1_000_000_000));
+    for i in 0..230 {
+        fund(&ctx, &pad(i), fp(1_000_000));
+        open_pair(&ctx, &sink, &pad(i), 1, 1, 1_000);
+        for m in 2..=301 {
+            open_pair(&ctx, &pad(i), &sink, m, 1, 100); // unlisted: valued at entry
+        }
+    }
+    fund(&ctx, &u, fp(200));
+    fund(&ctx, &top, fp(100));
+    open_pair(&ctx, &u, &top, 1, 4, 1_000);
+    assert!(all_positions(&ctx).len() > 65_536);
+    let mut c = ctx_at(db.clone(), 2);
+    set_mark(&c, 1, fp(900));
+    let before = total_value(&c, &marks(&[(1, 900)]));
+    NativeExecutor::run_liquidations(&mut c);
+    assert_eq!(pos(&c, &u, 1), FixedPoint::ZERO);
+    assert_eq!(pos(&c, &top, 1), FixedPoint::ZERO, "top-ranked, highest address: closed first");
+    assert!((0..230).all(|i| pos(&c, &pad(i), 1) == -fp(1)), "no padding trader touched");
+    assert_eq!(oi(&c, 1), (fp(230), fp(230)));
+    assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
 // ---- T7e: budgets, carry-over, due, stops ----

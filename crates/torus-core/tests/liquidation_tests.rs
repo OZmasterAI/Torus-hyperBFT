@@ -271,22 +271,30 @@ fn bankruptcy_price_rounds_against_the_trader() {
     assert_eq!(bankruptcy_price(fp(1), true, FixedPoint::ZERO, fp(1)), None);
 }
 
-/// Review H3 (s517): ADL candidates come from a BOUNDED walk of the positions
-/// CF (`max_rows` rows in key order, paged) — never a full-CF load. Rows:
-/// addr(1) long, addr(2) short, addr(3) short (market 1), addr(4) market 2.
+/// Q1 (s96): ADL counterparties = every holder on side `want_long` among
+/// `traders`, read through `get`, in `traders` order. The vault is an
+/// ordinary holder; the two ADL escrows are never candidates (P2). One read
+/// per non-escrow trader.
 #[test]
-fn adl_candidates_scan_at_most_max_rows() {
+fn adl_candidates_are_every_opposite_holder_except_the_escrows() {
+    use torus_core::liquidation::{ADL_ESCROW_LONG, ADL_ESCROW_SHORT};
     let (_d, pm) = setup();
     open_pair(&pm, &addr(1), &addr(2), 1, 3, 100);
     open_pair(&pm, &addr(5), &addr(3), 1, 1, 100);
-    open_pair(&pm, &addr(4), &addr(6), 2, 1, 100);
-    let shorts = |rows: usize| -> Vec<Address> {
-        adl_candidates(&pm, 1, &addr(1), false, rows, |_| Ok(fp(1))).unwrap().iter().map(|c| c.trader).collect()
-    };
-    assert_eq!(shorts(usize::MAX), vec![addr(2), addr(3)]);
-    assert_eq!(shorts(2), vec![addr(2)], "rows addr(1), addr(2) only");
-    assert_eq!(shorts(1), Vec::<Address>::new());
-    assert_eq!(shorts(0), Vec::<Address>::new());
+    open_pair(&pm, &addr(4), &LIQUIDATOR_VAULT, 1, 2, 100);
+    open_pair(&pm, &ADL_ESCROW_LONG, &ADL_ESCROW_SHORT, 1, 7, 100);
+    open_pair(&pm, &addr(7), &addr(6), 2, 1, 100); // market 2 only
+    let traders = traders_after(pm.state(), None, usize::MAX).unwrap();
+    let reads = std::cell::Cell::new(0);
+    let shorts = adl_candidates(&traders, false, |t| { reads.set(reads.get() + 1); pm.get_position(t, 1) }, |_| Ok(fp(1)))
+        .unwrap();
+    assert_eq!(
+        shorts.iter().map(|c| (c.trader, c.size)).collect::<Vec<_>>(),
+        vec![(addr(2), fp(3)), (addr(3), fp(1)), (LIQUIDATOR_VAULT, fp(2))]
+    );
+    assert_eq!(reads.get(), traders.len() - 2, "escrows are not read");
+    let longs = adl_candidates(&traders, true, |t| pm.get_position(t, 1), |_| Ok(fp(1))).unwrap();
+    assert_eq!(longs.iter().map(|c| c.trader).collect::<Vec<_>>(), vec![addr(1), addr(4), addr(5)]);
 }
 
 /// Telemetry: `pending_count` counts exactly the pending rows across seek

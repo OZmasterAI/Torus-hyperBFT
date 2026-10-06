@@ -26,6 +26,26 @@ use crate::position::{MarginType, Position, PositionManager};
 /// Item 3 (decision 7): the liquidator vault — a fixed protocol account (no
 /// known key: no signed action can come from it). Deposits: later branch.
 pub const LIQUIDATOR_VAULT: Address = Address::new(*b"torus-liquidator-vlt");
+/// adl-budget P2 (owner s96): the ADL escrows — protocol accounts (no known
+/// key) that take a bankrupt account's positions at their ADL price in the
+/// bankruptcy block, one per side so opposite obligations never net. Never
+/// classified, never ADL candidates, excluded from funding (adl-budget §8).
+pub const ADL_ESCROW_LONG: Address = Address::new(*b"torus-adl-escrow-lng");
+pub const ADL_ESCROW_SHORT: Address = Address::new(*b"torus-adl-escrow-sht");
+
+/// The escrow that takes a bankrupt position of side `is_long`.
+pub fn adl_escrow(is_long: bool) -> Address {
+    if is_long {
+        ADL_ESCROW_LONG
+    } else {
+        ADL_ESCROW_SHORT
+    }
+}
+
+pub fn is_adl_escrow(a: &Address) -> bool {
+    *a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT
+}
+
 /// HL: positions above this notional (at the mark) are liquidated in chunks.
 /// Raw units (`FixedPoint::from_raw` is not `const`).
 pub const CHUNK_NOTIONAL_THRESHOLD_RAW: i128 = 100_000 * FixedPoint::SCALE;
@@ -38,11 +58,6 @@ pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
 /// D5 (decided, user s517): accounts acted on per block.
 pub const LIQ_ACT_PER_BLOCK: usize = 64;
-/// Review H3 (s517): ADL counterparties are searched in at most this many
-/// `CF_NATIVE_POSITIONS` rows (key order, paged) per ADL'd position. Beyond
-/// it the ranking covers that window only; a partial close is retried by a
-/// later step. Deterministic; bounds the rare ADL path's cost.
-pub const ADL_MAX_SCAN_ROWS: usize = 65_536;
 /// Rows per seek of the bounded walks.
 const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
@@ -337,47 +352,28 @@ pub fn adl_close<T: StateBackend>(
     Ok(closes)
 }
 
-/// ADL counterparties in `m`: every position on side `want_long`, `exclude`
-/// skipped, in `CF_NATIVE_POSITIONS` key order; `av` values each. Review H3:
-/// a paged walk of at most `max_rows` rows (the caller passes
-/// [`ADL_MAX_SCAN_ROWS`]) — never a whole-CF load.
-pub fn adl_candidates<T: StateBackend>(
-    pm: &PositionManager<T>,
-    m: MarketId,
-    exclude: &Address,
+/// Q1 (s96): ADL counterparties = every position on side `want_long` of
+/// `traders` (ascending, each once; the escrows skipped), `get` reading a
+/// trader's position in the ADL market, `av` valuing a holder (ranking only,
+/// C7). The ranking's work units are `traders.len()` (Q3).
+pub fn adl_candidates(
+    traders: &[Address],
     want_long: bool,
-    max_rows: usize,
-    av: impl Fn(&Address) -> Result<FixedPoint, CoreError>,
+    mut get: impl FnMut(&Address) -> Result<Option<Position>, CoreError>,
+    mut av: impl FnMut(&Address) -> Result<FixedPoint, CoreError>,
 ) -> Result<Vec<AdlCandidate>, CoreError> {
-    let mut rows = Vec::new();
-    let mut start: Vec<u8> = Vec::new();
-    while rows.len() < max_rows {
-        let want = SCAN_PAGE.min(max_rows - rows.len());
-        let page = pm.state().iterate_cf_from(CF_NATIVE_POSITIONS, &start, want)?;
-        let done = page.len() < want;
-        if let Some((k, _)) = page.last() {
-            start = [k.as_slice(), &[0u8]].concat(); // the next key after k
-        }
-        rows.extend(page);
-        if done {
-            break;
-        }
-    }
     let mut out = Vec::new();
-    for (k, v) in rows {
-        if k.len() != 28 || k[20..28] != m.to_be_bytes() {
-            continue;
-        }
-        let p: Position = borsh::from_slice(&v).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        if p.is_long != want_long || p.trader == *exclude || p.size <= FixedPoint::ZERO {
+    for t in traders.iter().filter(|t| !is_adl_escrow(t)) {
+        let Some(p) = get(t)? else { continue };
+        if p.is_long != want_long || p.size <= FixedPoint::ZERO {
             continue;
         }
         out.push(AdlCandidate {
-            trader: p.trader,
+            trader: *t,
             is_long: p.is_long,
             size: p.size,
             entry_price: p.entry_price,
-            account_value: av(&p.trader)?,
+            account_value: av(t)?,
         });
     }
     Ok(out)

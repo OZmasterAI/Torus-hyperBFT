@@ -1099,6 +1099,8 @@ struct SumsCounters {
     records: std::sync::atomic::AtomicUsize,
     /// E2: liquidation candidate lists from the slot's trader set.
     traders_slice: std::sync::atomic::AtomicUsize,
+    /// adl-budget Q1: ADL counterparty rankings (one trader list each).
+    adl_rankings: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]

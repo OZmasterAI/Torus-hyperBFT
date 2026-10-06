@@ -294,6 +294,36 @@ impl NativeExecutor {
         Ok(out)
     }
 
+    /// adl-budget Q1 (C1): `m`'s counterparties on side `want_long` — a point
+    /// read of every trader of the positions CF (the slot's sorted set merged
+    /// with the block's dirty traders, else the walk), through the records for a
+    /// clean trader and the overlay for a dirty one; escrows skipped. Returns the
+    /// candidates and the traders examined (the ranking's work units, Q3).
+    fn adl_candidates_of<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        m: MarketId,
+        want_long: bool,
+    ) -> Result<(Vec<liq::AdlCandidate>, u64), CoreError> {
+        let traders = Self::liq_traders_after(ctx, None, usize::MAX)?;
+        let reader = AccountReader::of(ctx);
+        // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
+        // storage error stays an error (fail-stop).
+        let cands = liq::adl_candidates(&traders, want_long, |t| reader.get_position(t, m), |t| {
+            let bal = ctx.positions.get_native_balance(t)?;
+            let v = match reader.view(t, &bal) {
+                Ok(v) => v,
+                Err(CoreError::Overflow(_)) => return Ok(FixedPoint::ZERO),
+                Err(e) => return Err(e),
+            };
+            Ok(v.available.checked_add(v.order_margin).and_then(|x| x.checked_add(v.upnl)).unwrap_or(FixedPoint::ZERO))
+        })?;
+        #[cfg(test)]
+        if let Some(s) = ctx.sums.as_ref() {
+            bump(&s.counters.adl_rankings);
+        }
+        Ok((cands, traders.len() as u64))
+    }
+
     /// Item 6 C4 (plan 2.5, L1): whether [`Self::liq_view`] values from the
     /// sums cache. Its sums value every market with a mark (the block's
     /// table, else the oracle); the step's `Marks` only the `listed` ones.
@@ -498,22 +528,7 @@ impl NativeExecutor {
             let bankruptcy = Self::adl_rest(ctx, marks, u, m)?
                 .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
             let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
-            let reader = AccountReader::of(ctx);
-            // C7: ranking AV with entry fallback for unmarked markets. An
-            // overflowing valuation ranks last (AV 0) — ranking only; a
-            // storage error stays an error (fail-stop).
-            let cands = liq::adl_candidates(&ctx.positions, m, u, !p.is_long, liq::ADL_MAX_SCAN_ROWS, |t| {
-                let bal = ctx.positions.get_native_balance(t)?;
-                let v = match reader.view(t, &bal) {
-                    Ok(v) => v,
-                    Err(CoreError::Overflow(_)) => return Ok(FixedPoint::ZERO),
-                    Err(e) => return Err(e),
-                };
-                Ok(v.available
-                    .checked_add(v.order_margin)
-                    .and_then(|x| x.checked_add(v.upnl))
-                    .unwrap_or(FixedPoint::ZERO))
-            })?;
+            let (cands, _) = Self::adl_candidates_of(ctx, m, !p.is_long)?;
             let closes = liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
             // Telemetry: one info line per (account, market), each close at debug.
             let mut size = FixedPoint::ZERO;

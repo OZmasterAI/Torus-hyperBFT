@@ -62,10 +62,10 @@ C5 recorded as known limitations.
 
 * **H3 — bounded scans.** `StateBackend::iterate_cf_from(cf, start, limit)` (StateDb: RocksDB
   seek; overlay: merge of DB / parent / pending honouring tombstones). The candidate walk seeks
-  once per trader (`trader ‖ ff×8 ‖ 00` skips its rows); ADL counterparties are searched in at
-  most `ADL_MAX_SCAN_ROWS` = 65,536 position rows (key order, pages of 1,024) per ADL'd
-  position — with more rows the HL ranking covers that window only and a partial close is
-  retried by a later step (known limitation).
+  once per trader (`trader ‖ ff×8 ‖ 00` skips its rows). ADL counterparties: the 65,536-row
+  window (`ADL_MAX_SCAN_ROWS`) is superseded by adl-budget Q1 (`adl-budget.md`): every trader
+  of the positions CF (the slot's sorted set, else the walk) gets one point read of its position
+  in the ADL market, so the HL ranking always covers every opposite-side holder.
 
 * **M1 — no activation height.** Liquidation, the CancelAll change and the margin configs apply
   from block 1: a node with this binary needs a fresh genesis and cannot replay / sync a chain
