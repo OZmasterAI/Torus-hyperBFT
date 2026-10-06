@@ -45,6 +45,9 @@ pub struct Counts {
     pub rows_read: AtomicUsize,
     /// Always on: value bytes any read returned (point reads and scans).
     pub bytes_read: AtomicUsize,
+    /// Always on: scans of `CF_NATIVE_LIQUIDATION` starting in the pending
+    /// tag (`0x06`) — the liquidation telemetry's pending-row reads.
+    pub pending_scans: AtomicUsize,
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
     /// count, answered by a layer or not.
     layer_calls: Mutex<HashMap<(&'static str, &'static str), usize>>,
@@ -113,6 +116,17 @@ impl<T: StateBackend> CountingBackend<T> {
             let bytes: usize = rows.iter().map(|(_, v)| v.len()).sum();
             self.counts.bytes_read.fetch_add(bytes, Ordering::SeqCst);
         }
+    }
+
+    fn count_pending_scan(&self, cf: &str, start: &[u8]) {
+        if cf == CF_NATIVE_LIQUIDATION && start.first() == Some(&0x06) {
+            self.counts.pending_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Scans of the pending rows so far (never reset).
+    pub fn pending_scans(&self) -> usize {
+        self.counts.pending_scans.load(Ordering::SeqCst)
     }
 
     pub fn new(inner: T) -> Self {
@@ -249,6 +263,7 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
     }
 
     fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.count_pending_scan(cf, start);
         let out = self.probe(cf, "iterate_cf_from", || self.inner.iterate_cf_from(cf, start, limit));
         self.count_rows(&out);
         out
@@ -267,6 +282,7 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.count_pending_scan(cf, start);
         let out = self.inner.iterate_cf_prefix_from(cf, prefix, start, limit);
         self.count_rows(&out);
         out

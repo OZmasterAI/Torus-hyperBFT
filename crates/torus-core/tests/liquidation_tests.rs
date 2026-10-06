@@ -198,8 +198,9 @@ fn adl_close_pairs_against_ranked_counterparties_at_the_price() {
             AdlCandidate { trader: s2, is_long: false, size: fp(3), entry_price: fp(1_100), account_value: fp(1_600) },
         ],
     );
-    let closed = adl_close(&pm, &u, 1, fp(990), &ranked).unwrap();
-    assert_eq!(closed, fp(4));
+    // The closes, in rank order: (counterparty, size) — the bridge logs them.
+    let closes = adl_close(&pm, &u, 1, fp(990), &ranked).unwrap();
+    assert_eq!(closes, vec![(s2, fp(3)), (s1, fp(1))]);
     assert!(pm.get_position(&u, 1).unwrap().is_none());
     assert!(pm.get_position(&s2, 1).unwrap().is_none());
     assert_eq!(pm.get_position(&s1, 1).unwrap().unwrap().size, fp(3));
@@ -286,4 +287,34 @@ fn adl_candidates_scan_at_most_max_rows() {
     assert_eq!(shorts(2), vec![addr(2)], "rows addr(1), addr(2) only");
     assert_eq!(shorts(1), Vec::<Address>::new());
     assert_eq!(shorts(0), Vec::<Address>::new());
+}
+
+/// Telemetry: `pending_count` counts exactly the pending rows across seek
+/// pages (1,030 rows > one 1,024-row page), ignoring the other tags (a
+/// cooldown row, the cursor); `pending_among` counts the rows of a sorted
+/// trader list only. `set_pending` reports whether it changed the row.
+#[test]
+fn pending_rows_are_counted_across_pages() {
+    use torus_core::liquidation::{pending_among, pending_count, put_cursor, set_cooldown, set_pending};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    assert_eq!(pending_count(&db).unwrap(), 0);
+    let t = |i: u32| {
+        let mut a = [0u8; 20];
+        a[16..].copy_from_slice(&i.to_be_bytes());
+        Address::new(a)
+    };
+    for i in (0..1_030u32).rev() {
+        assert!(set_pending(&db, &t(i), true).unwrap(), "{i}: new row");
+    }
+    assert!(!set_pending(&db, &t(7), true).unwrap(), "already set: no write");
+    assert!(!set_pending(&db, &addr(250), false).unwrap(), "absent: no delete");
+    set_cooldown(&db, &addr(7), 1_000).unwrap();
+    put_cursor(&db, Some(addr(9))).unwrap();
+    assert!(set_pending(&db, &t(5), false).unwrap(), "cleared");
+    assert_eq!(pending_count(&db).unwrap(), 1_029);
+    // Sorted list: t(4), t(5) (cleared), t(6), t(1_029), t(2_000) (never set).
+    let among = [t(4), t(5), t(6), t(1_029), t(2_000)];
+    assert_eq!(pending_among(&db, &among).unwrap(), 3);
+    assert_eq!(pending_among(&db, &[]).unwrap(), 0);
 }

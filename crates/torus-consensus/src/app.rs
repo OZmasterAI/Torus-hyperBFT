@@ -17405,6 +17405,54 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
+    /// Liquidation telemetry is node-local: the M2 sequence above (stage 1
+    /// in blocks 2..=14, T flat after 14) with metrics attached and
+    /// without gives identical full dumps (block results included) and native
+    /// roots; with metrics the step counters / gauge / histogram move.
+    #[test]
+    fn liquidation_telemetry_does_not_change_block_results_or_state() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 11)); // 2..=12
+        rounds.push(vec![signed_bid(73, 13_073, 966, 4), signed_stop_limit_buy(73, 13_074, 960, 966, 6)]); // 13
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 14, 15
+        let blocks = liq_blocks(rounds);
+        let run = |metrics: Option<Arc<torus_telemetry::Metrics>>| {
+            let (config, db) = liq_fixture_db(10, 300);
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.metrics = metrics;
+            for (i, b) in blocks.iter().enumerate() {
+                ctx.execute_committed_block(b, vec![]);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "block {}", i + 1);
+            }
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+            (dump_all_cfs(&db), root, db)
+        };
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        let (with, root_w, db_w) = run(Some(m.clone()));
+        let (without, root_n, _) = run(None);
+        assert_eq!(signed_pos_of(&db_w, &oracle_addr(71)), FixedPoint::ZERO, "non-vacuous: T liquidated");
+        assert_dumps_equal(&with, &without, "liquidation telemetry: metrics attached vs not");
+        assert_eq!(root_w, root_n);
+        // Block 1's submissions aggregate at block 2's start; T is acted on by
+        // stage 1 in every block 2..=14 (no bid before block 13: it stays under
+        // MM), once per block.
+        assert_eq!(m.liquidations_stage1.get(), 13, "stage 1 in blocks 2..=14");
+        assert_eq!(m.liquidation_acted.get(), 13);
+        assert_eq!(m.liquidations_triggered.get(), 13);
+        assert_eq!((m.liquidations_backstop.get(), m.liquidations_adl.get()), (0, 0));
+        assert_eq!(m.liquidation_pending.get(), 0, "flat after block 14");
+        let steps = m
+            .encode()
+            .lines()
+            .find_map(|l| l.strip_prefix("torus_liquidation_step_seconds_count ").map(|v| v.trim().parse::<u64>().unwrap()));
+        // One sample per native block: 1 (actions), 2..=12 (oracle rows /
+        // pending row), 13 (actions), 14 (pending row); 15 runs no native
+        // phase (flat, rows pruned, no actions).
+        assert_eq!(steps, Some(14), "step samples");
+    }
+
     /// s94 bad-debt route (`crates/torus-bridge/tests/
     /// offmark_bad_debt_tests.rs` has the executor-level cases), through
     /// committed blocks on the live dispatch path. A (seed 75) and B (76),

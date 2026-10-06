@@ -202,7 +202,9 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
         }
         for &(tag, t) in &b.rows {
             match tag {
-                liq::PENDING_TAG => liq::set_pending(&ctx.state, &t, true).unwrap(),
+                liq::PENDING_TAG => {
+                    liq::set_pending(&ctx.state, &t, true).unwrap();
+                }
                 _ => liq::set_cooldown(&ctx.state, &t, b.ts - 5).unwrap(),
             }
         }
