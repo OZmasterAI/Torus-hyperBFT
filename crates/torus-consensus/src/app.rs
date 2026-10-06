@@ -33,7 +33,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions, BlockCommitter, BlockProposer, BlockValidator, BundleState,
+    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
     NativeExecContext, NativeExecutor,
 };
 use torus_economics::{EpochManager, SlashReason, StakingManager};
@@ -2119,7 +2119,13 @@ impl ExecutionContext {
                 }
             }
 
-            let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
+            // Item 6 cut 1: the actions move into the sort (no second clone),
+            // which returns each entry's position in `sender_actions` for the
+            // action status below. Tests keep a copy for the pre-cut oracle.
+            #[cfg(test)]
+            let oracle_executed = sender_actions.clone();
+            let ((pre_evm, pre_index), (post_evm, post_index)) =
+                sort_native_actions_indexed(sender_actions);
             // rank8: books come from the resident holder when
             // TORUS_RESIDENT_BOOKS=1 (and its staleness guard passes);
             // otherwise this is exactly the classic per-block reload.
@@ -2357,17 +2363,46 @@ impl ExecutionContext {
             // written where the block's batch is built: the flush worker on
             // the pipelined path, the flush below on the serial one. Not a
             // hashed or native-root CF, so state hash and root are untouched.
+            // Item 6 cut 1: failures map to body positions by the sort's
+            // index (timed: `exec_action_status_seconds`).
+            #[cfg(test)]
+            let oracle_results = (pre_results.clone(), post_results.clone());
+            let action_status_timer = std::time::Instant::now();
             let action_status = (has_native || has_evm).then(|| {
                 torus_state::action_status::BlockActionStatus {
                     evm_skipped: std::mem::take(&mut evm_skipped),
                     native_failed: crate::action_results::native_failures(
-                        &sender_actions,
                         &sender_body_index,
-                        [(&pre_evm, pre_results), (&post_evm, post_results)],
+                        [
+                            (&pre_evm, &pre_index, pre_results),
+                            (&post_evm, &post_index, post_results),
+                        ],
                     ),
                     native_skipped,
                 }
             });
+            if let Some(ref m) = self.metrics {
+                m.exec_action_status_seconds
+                    .observe(action_status_timer.elapsed().as_secs_f64());
+            }
+            // Every exec-mode test checks the stored record against the
+            // pre-cut content match, byte for byte.
+            #[cfg(test)]
+            if let Some(status) = &action_status {
+                let oracle = torus_state::action_status::BlockActionStatus {
+                    native_failed: crate::action_results::native_failures_by_content(
+                        &oracle_executed,
+                        &sender_body_index,
+                        [(&pre_evm, oracle_results.0), (&post_evm, oracle_results.1)],
+                    ),
+                    ..status.clone()
+                };
+                assert_eq!(
+                    status.encode(),
+                    oracle.encode(),
+                    "cut 1: index mapping != content match at height {height}"
+                );
+            }
 
             let save_books_timer = std::time::Instant::now();
             // Deferred book save (s63 port of item 6a, origin 4298728):
@@ -11387,6 +11422,133 @@ mod crash_recovery_tests {
                     assert!(msgs[i].starts_with(want), "{label} #{i}: {:?}", msgs[i]);
                 }
                 assert_eq!(status.native_label(9), "executed", "{label}");
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
+    }
+
+    /// Item 6 cut 1: random blocks 2..=5 (three funded senders; repeated
+    /// identical orders of one sender under new nonces, off-tick / lot /
+    /// margin failures, PlaceOrderBatch with bad orders, empty batches, IOC
+    /// and cancels, replays skipped), in every exec mode and on both flushes.
+    /// Each block's stored record is checked against the pre-cut content
+    /// match byte for byte inside the exec path (`#[cfg(test)]` oracle);
+    /// here every run writes identical bytes to every CF and the blocks do
+    /// fail actions that share a sender and content.
+    #[test]
+    fn random_blocks_store_the_content_match_record_in_every_exec_mode() {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let keys: Vec<k256::ecdsa::SigningKey> = (91u8..94)
+            .map(|b| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap())
+            .collect();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty_tenths: i128, tif| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: px(qty_tenths),
+            order_type: OrderType::Limit,
+            time_in_force: tif,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let mut seed = 0x51_7cc1_b727_220au64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut nonces = vec![1u64; keys.len()];
+        let mut blocks = vec![make_block(
+            1,
+            keys.iter()
+                .map(|k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k))
+                .collect(),
+        )];
+        let mut signed_so_far = blocks[0].native_actions.clone();
+        for height in 2..=5u64 {
+            let mut actions = Vec::new();
+            for _ in 0..24 {
+                let who = next(keys.len() as u64) as usize;
+                // A replay of an earlier action (skipped by the guard).
+                if next(10) == 0 {
+                    let i = next(signed_so_far.len() as u64) as usize;
+                    actions.push(signed_so_far[i].clone());
+                    continue;
+                }
+                // Few distinct contents, so one sender repeats them.
+                let buy = next(2) == 0;
+                let price = [995, 1000, 1005][next(3) as usize];
+                let qty = [10, 5, 100_000][next(3) as usize];
+                let tif = if next(4) == 0 {
+                    TimeInForce::IOC
+                } else {
+                    TimeInForce::GTC
+                };
+                let action = match next(7) {
+                    0 => NativeAction::CancelOrder {
+                        order_id: 999_999 + next(2) as u128,
+                    },
+                    1 => NativeAction::PlaceOrderBatch(
+                        (0..next(4))
+                            .map(|k| {
+                                order(buy, [1000, 1005][(k % 2) as usize], 10, TimeInForce::GTC)
+                            })
+                            .collect(),
+                    ),
+                    _ => NativeAction::PlaceOrder(order(buy, price, qty, tif)),
+                };
+                nonces[who] += 1;
+                actions.push(sign(action, nonces[who], &keys[who]));
+            }
+            signed_so_far.extend(actions.iter().cloned());
+            blocks.push(make_block(height, actions));
+        }
+        link_blocks(&mut blocks);
+        // Per block, per body position: does the sender have another action
+        // with the same content in the block? (Recovered once: slow in debug.)
+        let has_twin: Vec<Vec<bool>> = blocks
+            .iter()
+            .map(|block| {
+                let keyed: Vec<(Address, Vec<u8>)> = block
+                    .native_actions
+                    .iter()
+                    .map(|a| (a.recover_sender().unwrap(), a.action.canonical_bytes()))
+                    .collect();
+                keyed
+                    .iter()
+                    .map(|k| keyed.iter().filter(|o| *o == k).count() > 1)
+                    .collect()
+            })
+            .collect();
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_fixture_blocks(blocks.clone(), threads, pipelined);
+                let mut shared_content_failures = 0;
+                for (h, twin) in has_twin.iter().enumerate().skip(1) {
+                    let status = action_status(&db, h as u64 + 1).expect("record");
+                    assert!(status.native_skipped.iter().any(|&s| s), "{label}: replays");
+                    shared_content_failures += status
+                        .native_failed
+                        .iter()
+                        .filter(|f| twin[f.index as usize])
+                        .count();
+                }
+                assert!(
+                    shared_content_failures > 3,
+                    "{label}: failures among one sender's identical actions \
+                     ({shared_content_failures})"
+                );
                 dumps.push((label, dump_all_cfs(&db)));
             }
         }

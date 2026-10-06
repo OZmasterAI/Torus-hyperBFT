@@ -9997,22 +9997,35 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
 pub fn sort_native_actions(
     actions: &[(Address, NativeAction)],
 ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
+    let ((pre_evm, _), (post_evm, _)) = sort_native_actions_indexed(actions.to_vec());
+    (pre_evm, post_evm)
+}
+
+/// One sorted list of [`sort_native_actions_indexed`]: the actions, and for
+/// each one its position in the input.
+pub type IndexedActions = (Vec<(Address, NativeAction)>, Vec<u32>);
+
+/// [`sort_native_actions`] by value (no clone of the actions), returning with
+/// each list the input position of every entry, so a per-entry result maps
+/// back to its action by index (item 6 cut 1: the v2 action status).
+///
+/// Same lists as [`sort_native_actions`]: the key is (category, sender,
+/// keccak of the canonical bytes) and the sort is stable, so entries with
+/// equal keys keep their input order.
+pub fn sort_native_actions_indexed(
+    actions: Vec<(Address, NativeAction)>,
+) -> (IndexedActions, IndexedActions) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
-
-    for (sender, action) in actions {
-        let pair = (*sender, action.clone());
-        match classify_action(action) {
-            ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(pair),
-            _ => post_evm.push(pair),
+    for (i, (sender, action)) in actions.into_iter().enumerate() {
+        let key = action_sort_key(&sender, &action);
+        let entry = (key, i as u32, (sender, action));
+        match key.0 {
+            ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(entry),
+            _ => post_evm.push(entry),
         }
     }
-
-    // Deterministic sort: (category, sender, action_content_hash).
-    sort_deterministic(&mut pre_evm);
-    sort_deterministic(&mut post_evm);
-
-    (pre_evm, post_evm)
+    (sort_deterministic(pre_evm), sort_deterministic(post_evm))
 }
 
 /// Deterministic sort key for a native action.
@@ -10025,18 +10038,19 @@ fn action_sort_key(sender: &Address, action: &NativeAction) -> (ActionCategory, 
     (category, *sender, hash)
 }
 
-/// Sort actions deterministically by (category, sender, action_content_hash).
-fn sort_deterministic(actions: &mut Vec<(Address, NativeAction)>) {
-    // Pre-compute sort keys to avoid repeated hashing during sort.
-    let mut keyed: Vec<_> = actions
-        .drain(..)
-        .map(|(s, a)| {
-            let key = action_sort_key(&s, &a);
-            (key, (s, a))
-        })
-        .collect();
+/// An action with its pre-computed sort key and its input position.
+type KeyedAction = (
+    (ActionCategory, Address, B256),
+    u32,
+    (Address, NativeAction),
+);
+
+/// Sort keyed actions deterministically by (category, sender,
+/// action_content_hash), stable (the keys are pre-computed to avoid repeated
+/// hashing during the sort); returns the actions and their input positions.
+fn sort_deterministic(mut keyed: Vec<KeyedAction>) -> IndexedActions {
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    actions.extend(keyed.into_iter().map(|(_, pair)| pair));
+    keyed.into_iter().map(|(_, i, pair)| (pair, i)).unzip()
 }
 
 // ============================================================================

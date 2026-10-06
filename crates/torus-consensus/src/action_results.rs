@@ -2,22 +2,25 @@
 //! native actions' positions in the block body
 //! (`torus_state::action_status`).
 //!
-//! The exec thread runs `sort_native_actions` (pre-EVM / post-EVM lists, each
-//! sorted by (category, sender, content hash)) and one `execute_batch` per
-//! list, which flattens every PlaceOrderBatch into one result per order. This
-//! module undoes both steps for the failing entries only: flat result ->
-//! action of the list (the executor's flatten, replayed) -> body position
-//! (same sender + category, then same content and rank among identical
-//! actions: the sort is stable). Only failures carry data out of here; the
-//! encoding happens where the record is written (the flush worker on the
-//! pipelined path).
+//! The exec thread runs `sort_native_actions_indexed` (pre-EVM / post-EVM
+//! lists, each sorted by (category, sender, content hash), with each entry's
+//! input position) and one `execute_batch` per list, which flattens every
+//! PlaceOrderBatch into one result per order. This module undoes both steps
+//! for the failing entries only: flat result -> action of the list (the
+//! executor's flatten, replayed) -> body position (the entry's input
+//! position, then the replay guard's body index; item 6 cut 1 replaced a
+//! content match). Only failures carry data out of here; the encoding
+//! happens where the record is written (the flush worker on the pipelined
+//! path).
 //!
 //! Deterministic: a pure function of the block, the replay-guard decisions and
 //! the executor's results, which are themselves identical in every exec mode.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
 use alloy_primitives::Address;
+#[cfg(test)]
 use torus_bridge::native_executor::classify_action;
 use torus_bridge::NativeBatchResult;
 use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure};
@@ -92,11 +95,53 @@ fn list_failures(
 
 /// The block's native execution failures, ascending body index.
 ///
-/// `executed` = the actions handed to `sort_native_actions` (body order, the
-/// replay guard's skips removed), `body_index[k]` = body position of
-/// `executed[k]`; `batches` = each sorted list with its `execute_batch`
-/// result.
+/// `body_index[k]` = body position of the k-th action handed to
+/// `sort_native_actions_indexed` (body order, the replay guard's skips
+/// removed); `batches` = each sorted list, the input position of each of its
+/// entries (the sort's index list) and its `execute_batch` result. A failure
+/// maps to its body position by index (item 6 cut 1; the pre-cut content
+/// match is kept as the test oracle [`native_failures_by_content`]).
+#[allow(clippy::type_complexity)]
 pub fn native_failures(
+    body_index: &[u32],
+    batches: [(&[(Address, NativeAction)], &[u32], NativeBatchResult); 2],
+) -> Vec<NativeActionFailure> {
+    let mut out = Vec::new();
+    for (list, executed_index, result) in batches {
+        let Some(failures) = list_failures(list, result) else {
+            tracing::error!(
+                actions = list.len(),
+                "native batch result count does not match its actions — no failures recorded"
+            );
+            continue;
+        };
+        for (pos, order, failed_orders, reason, message) in failures {
+            // Both lookups always hit (the sort returns one input position
+            // per entry); a miss records nothing, like the content match did.
+            let Some(&index) = executed_index
+                .get(pos)
+                .and_then(|&k| body_index.get(k as usize))
+            else {
+                continue;
+            };
+            out.push(NativeActionFailure::new(
+                index,
+                order,
+                failed_orders,
+                reason,
+                message,
+            ));
+        }
+    }
+    out.sort_by_key(|f| f.index);
+    out
+}
+
+/// The pre-cut mapping (C, `9195c32`): each failing list entry found again
+/// in `executed` by sender, category and canonical bytes. Test oracle for
+/// [`native_failures`].
+#[cfg(test)]
+pub(crate) fn native_failures_by_content(
     executed: &[(Address, NativeAction)],
     body_index: &[u32],
     batches: [(&[(Address, NativeAction)], NativeBatchResult); 2],
@@ -106,10 +151,6 @@ pub fn native_failures(
     let mut by_sender: Option<HashMap<Address, Vec<usize>>> = None;
     for (list, result) in batches {
         let Some(failures) = list_failures(list, result) else {
-            tracing::error!(
-                actions = list.len(),
-                "native batch result count does not match its actions — no failures recorded"
-            );
             continue;
         };
         for (pos, order, failed_orders, reason, message) in failures {
@@ -140,6 +181,7 @@ pub fn native_failures(
 /// action with its sender and content, r = its rank among identical entries
 /// of `list`. Content is compared (canonical bytes) only when the sender has
 /// more than one action of that category.
+#[cfg(test)]
 fn body_position(
     executed: &[(Address, NativeAction)],
     by_sender: &HashMap<Address, Vec<usize>>,
@@ -258,15 +300,31 @@ mod tests {
         // results' own, whatever the message says (no text parsing).
         let result = batch(vec![
             ok(),
-            err(FailureReason::Tick, "order rejected: price 2 is not a multiple of the tick 1"),
-            err(FailureReason::Margin, "insufficient margin: need 1, have 0 (account)"),
+            err(
+                FailureReason::Tick,
+                "order rejected: price 2 is not a multiple of the tick 1",
+            ),
+            err(
+                FailureReason::Margin,
+                "insufficient margin: need 1, have 0 (account)",
+            ),
             ok(),
             err(FailureReason::OpenLimit, "some text"),
         ]);
         let failures = native_failures(
-            &executed,
             &body_index,
-            [(&list, result), (&[], batch(vec![]))],
+            [
+                (&list, &[3, 1, 0, 2], result.clone()),
+                (&[], &[], batch(vec![])),
+            ],
+        );
+        assert_eq!(
+            failures,
+            native_failures_by_content(
+                &executed,
+                &body_index,
+                [(&list, result), (&[], batch(vec![]))],
+            )
         );
         let got: Vec<_> = failures
             .iter()
@@ -287,19 +345,232 @@ mod tests {
         let a = Address::repeat_byte(1);
         let executed = vec![(a, NativeAction::PlaceOrder(order(1)))];
         let failures = native_failures(
-            &executed,
             &[0],
             [
                 (
                     &executed,
+                    &[0],
                     batch(vec![
                         err(FailureReason::Other, "x"),
                         err(FailureReason::Other, "y"),
                     ]),
                 ),
-                (&[], batch(vec![])),
+                (&[], &[], batch(vec![])),
             ],
         );
         assert!(failures.is_empty());
+    }
+
+    /// Item 6 cut 1: on random blocks (repeated identical actions of one
+    /// sender, every category, PlaceOrderBatch with bad orders, empty and
+    /// over-cap batches, replay-guard skips as gaps in the body index, random
+    /// successes / failures and reasons), the index mapping stores exactly
+    /// the record the pre-cut content match stored, byte for byte.
+    #[test]
+    fn index_mapping_matches_the_content_match_on_random_blocks() {
+        use torus_bridge::native_executor::sort_native_actions_indexed;
+        use torus_types::NATIVE_ORDERS_PER_BATCH_CAP;
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        const REASONS: [FailureReason; 7] = [
+            FailureReason::Other,
+            FailureReason::Margin,
+            FailureReason::OpenLimit,
+            FailureReason::Tick,
+            FailureReason::Lot,
+            FailureReason::Price,
+            FailureReason::Fill,
+        ];
+        let mut failures_seen = 0usize;
+        for round in 0..400 {
+            let body_len = next(48) as usize;
+            let mut executed = Vec::new();
+            let mut body_index = Vec::new();
+            let mut native_skipped = Vec::new();
+            for i in 0..body_len {
+                // Replay-guard skips leave gaps in the body index.
+                if next(6) == 0 {
+                    native_skipped.push(true);
+                    continue;
+                }
+                native_skipped.push(false);
+                let sender = Address::repeat_byte(1 + next(3) as u8);
+                let o = |p: u64, tif| PlaceOrderParams {
+                    time_in_force: tif,
+                    ..order(1 + p as i128)
+                };
+                let action = match next(8) {
+                    0 => NativeAction::CancelOrder {
+                        order_id: next(2) as u128,
+                    },
+                    1 => NativeAction::PlaceOrder(o(next(2), TimeInForce::IOC)),
+                    2 | 3 => NativeAction::PlaceOrder(o(next(2), TimeInForce::GTC)),
+                    4 => NativeAction::PlaceOrderBatch(
+                        (0..next(4)).map(|k| o(k % 2, TimeInForce::GTC)).collect(),
+                    ),
+                    5 if next(10) == 0 => NativeAction::PlaceOrderBatch(vec![
+                        order(1);
+                        NATIVE_ORDERS_PER_BATCH_CAP
+                            + 1
+                    ]),
+                    5 => NativeAction::TransferToPerp {
+                        amount: alloy_primitives::U256::from(next(2)),
+                    },
+                    6 => NativeAction::ClaimRewards,
+                    _ => NativeAction::CancelAllOrders {
+                        market_id: Some(1 + next(2)),
+                    },
+                };
+                executed.push((sender, action));
+                body_index.push(i as u32);
+            }
+            let ((pre, pre_idx), (post, post_idx)) = sort_native_actions_indexed(executed.clone());
+            // One random result per flat entry, built twice (new and oracle).
+            let mut draw = |list: &[(Address, NativeAction)]| {
+                let n: usize = list.iter().map(|(_, a)| flat_len(a)).sum();
+                (0..n)
+                    .map(|_| match next(3) {
+                        0 => None,
+                        _ => Some((REASONS[next(7) as usize], format!("e{}", next(5)))),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let to_batch = |spec: &[Option<(FailureReason, String)>]| {
+                batch(
+                    spec.iter()
+                        .map(|e| match e {
+                            None => ok(),
+                            Some((r, m)) => err(*r, m),
+                        })
+                        .collect(),
+                )
+            };
+            let (pre_spec, post_spec) = (draw(&pre), draw(&post));
+            let new = native_failures(
+                &body_index,
+                [
+                    (&pre, &pre_idx, to_batch(&pre_spec)),
+                    (&post, &post_idx, to_batch(&post_spec)),
+                ],
+            );
+            let old = native_failures_by_content(
+                &executed,
+                &body_index,
+                [(&pre, to_batch(&pre_spec)), (&post, to_batch(&post_spec))],
+            );
+            failures_seen += new.len();
+            let record = |native_failed| {
+                BlockActionStatus {
+                    evm_skipped: vec![false; round % 3],
+                    native_skipped: native_skipped.clone(),
+                    native_failed,
+                }
+                .encode()
+            };
+            assert_eq!(record(new), record(old), "round {round}");
+        }
+        assert!(failures_seen > 1000, "the rounds exercise failures");
+    }
+
+    /// Item 6 cut 1 µbench (exec-thread work outside every engine timer):
+    /// the sort plus the failure mapping, pre-cut (`sort_native_actions`
+    /// clone + content match) vs cut 1 (sort by value + index lookup), on a
+    /// node-shaped block (section 17: ~400 actions, ~152 failures per native
+    /// block): `UB_SENDERS` senders x `UB_PER_SENDER` PlaceOrderBatch of
+    /// `UB_ORDERS` orders, `UB_FAILING` of them with a failing order.
+    ///
+    ///   cargo test -p torus-consensus --release --lib ubench_failure_mapping -- --ignored --nocapture
+    #[test]
+    #[ignore = "µbench — run with --release --ignored --nocapture"]
+    fn ubench_failure_mapping() {
+        use torus_bridge::native_executor::{sort_native_actions, sort_native_actions_indexed};
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (senders, per_sender, orders, failing, iters) = (
+            env("UB_SENDERS", 100),
+            env("UB_PER_SENDER", 4),
+            env("UB_ORDERS", 400),
+            env("UB_FAILING", 152),
+            env("UB_ITERS", 30),
+        );
+        let mut executed = Vec::new();
+        for k in 0..per_sender {
+            for s in 0..senders {
+                let sender = Address::repeat_byte(1 + (s % 250) as u8);
+                let batch: Vec<PlaceOrderParams> = (0..orders)
+                    .map(|o| PlaceOrderParams {
+                        market_id: 1 + (o % 10) as u64,
+                        ..order(100 + (o + k * 7 + s) as i128)
+                    })
+                    .collect();
+                executed.push((sender, NativeAction::PlaceOrderBatch(batch)));
+            }
+        }
+        let body_index: Vec<u32> = (0..executed.len() as u32).collect();
+        // `failing` of the block's actions, spread evenly, fail at one order.
+        let n_actions = executed.len();
+        let results = |list: &[(Address, NativeAction)]| {
+            let mut out = Vec::new();
+            for (pos, (_, a)) in list.iter().enumerate() {
+                let fails = pos * failing / n_actions != (pos + 1) * failing / n_actions;
+                for o in 0..flat_len(a) {
+                    out.push(if fails && o == 3 {
+                        err(FailureReason::OpenLimit, "open order limit reached")
+                    } else {
+                        ok()
+                    });
+                }
+            }
+            batch(out)
+        };
+        let (pre0, post0) = sort_native_actions(&executed);
+        let (r_pre, r_post) = (results(&pre0), results(&post0));
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (mut old_ms, mut new_ms) = (Vec::new(), Vec::new());
+        let (mut old_map_ms, mut new_map_ms) = (Vec::new(), Vec::new());
+        let mut n_failures = 0;
+        for _ in 0..iters {
+            let (a, b) = (r_pre.clone(), r_post.clone());
+            let t = std::time::Instant::now();
+            let (pre, post) = sort_native_actions(&executed);
+            let t_map = std::time::Instant::now();
+            let old = native_failures_by_content(&executed, &body_index, [(&pre, a), (&post, b)]);
+            old_map_ms.push(t_map.elapsed().as_secs_f64() * 1e3);
+            old_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            drop((pre, post));
+
+            let (a, b) = (r_pre.clone(), r_post.clone());
+            let owned = executed.clone();
+            let t = std::time::Instant::now();
+            let ((pre, pre_i), (post, post_i)) = sort_native_actions_indexed(owned);
+            let t_map = std::time::Instant::now();
+            let new = native_failures(&body_index, [(&pre, &pre_i, a), (&post, &post_i, b)]);
+            new_map_ms.push(t_map.elapsed().as_secs_f64() * 1e3);
+            new_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(new, old);
+            n_failures = new.len();
+        }
+        println!(
+            "UB failure_mapping actions={} orders/action={orders} failures={n_failures} \
+             sort+map ms: old={:.2} new={:.2} | map only ms: old={:.2} new={:.3}",
+            executed.len(),
+            median(old_ms),
+            median(new_ms),
+            median(old_map_ms),
+            median(new_map_ms),
+        );
     }
 }

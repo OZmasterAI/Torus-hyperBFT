@@ -163,6 +163,27 @@ class PhaseMappingTests(unittest.TestCase):
         self.assertIsNotNone(sub, "SUB has no load_books entry")
         self.assertIn('"margin_configs"', sub.group(1))
 
+    def test_action_status_phase_is_sampled_and_summarized(self):
+        """Item 6 cut 1: the action status (native failures mapped to body
+        positions, exec thread, after the engine) is sampled (sum, count) and
+        summarize.py reports it as an exec-thread phase in the chain identity,
+        so residual_untimed no longer holds it."""
+        here = Path(__file__).parent
+        wide = (
+            re.search(r'^WIDE_COLS="([^"]+)"', (here / "run-cell.sh").read_text(), re.M)
+            .group(1)
+            .split()
+        )
+        for suffix in ("sum", "count"):
+            self.assertIn(f"torus_exec_action_status_seconds_{suffix}", wide)
+        text = (here / "summarize.py").read_text()
+        phases = re.search(r"^PHASES = \[([^\]]*)\]", text, re.M)
+        self.assertIsNotNone(phases)
+        self.assertIn('"action_status"', phases.group(1))
+        e_phases = re.search(r"e_phases = \[([^\]]*)\]", text)
+        self.assertIsNotNone(e_phases)
+        self.assertIn('"action_status"', e_phases.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()

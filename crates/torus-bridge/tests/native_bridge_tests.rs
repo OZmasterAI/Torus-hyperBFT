@@ -781,3 +781,111 @@ fn sort_uses_canonical_bytes_not_debug() {
         );
     }
 }
+
+/// Item 6 cut 1: `sort_native_actions_indexed` (by value, with input
+/// positions) yields exactly the lists of the pre-cut `sort_native_actions`
+/// (clone, then a stable sort by (category, sender, keccak(canonical
+/// bytes))), and its positions point back at the input entries, on random
+/// blocks with repeated identical actions from one sender.
+#[test]
+fn indexed_sort_matches_the_pre_cut_sort_and_maps_back() {
+    use torus_bridge::native_executor::sort_native_actions_indexed;
+
+    // The pre-cut algorithm, verbatim in behaviour (test oracle).
+    #[allow(clippy::type_complexity)]
+    fn old_sort(
+        actions: &[(Address, NativeAction)],
+    ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
+        let key = |(s, a): &(Address, NativeAction)| {
+            (
+                classify_action(a),
+                *s,
+                alloy_primitives::keccak256(a.canonical_bytes()),
+            )
+        };
+        let (mut pre, mut post): (Vec<_>, Vec<_>) = actions.iter().cloned().partition(|(_, a)| {
+            matches!(
+                classify_action(a),
+                ActionCategory::Cancellation | ActionCategory::NonGtcOrder
+            )
+        });
+        for list in [&mut pre, &mut post] {
+            let mut keyed: Vec<_> = list.drain(..).map(|p| (key(&p), p)).collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            list.extend(keyed.into_iter().map(|(_, p)| p));
+        }
+        (pre, post)
+    }
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let bytes = |l: &[(Address, NativeAction)]| -> Vec<(Address, Vec<u8>)> {
+        l.iter().map(|(s, a)| (*s, a.canonical_bytes())).collect()
+    };
+    let order = |market: u64, buy: bool, p: i64, tif| PlaceOrderParams {
+        market_id: 1 + market,
+        is_buy: buy,
+        price: fp(p),
+        quantity: fp(1),
+        order_type: OrderType::Limit,
+        time_in_force: tif,
+        reduce_only: false,
+        client_order_id: None,
+    };
+    for _ in 0..300 {
+        let len = next(40) as usize;
+        let mut actions: Vec<(Address, NativeAction)> = Vec::with_capacity(len);
+        for _ in 0..len {
+            let sender = addr(1 + next(3) as u8);
+            let (m, b, p) = (next(2), next(2) == 0, 100 + next(2) as i64);
+            let action = match next(6) {
+                0 => NativeAction::CancelOrder {
+                    order_id: next(3) as u128,
+                },
+                1 => NativeAction::PlaceOrder(order(m, b, p, TimeInForce::IOC)),
+                2 => NativeAction::PlaceOrder(order(m, b, p, TimeInForce::GTC)),
+                3 => NativeAction::PlaceOrderBatch(
+                    (0..next(3))
+                        .map(|_| order(m, b, 100, TimeInForce::GTC))
+                        .collect(),
+                ),
+                4 => NativeAction::TransferToPerp {
+                    amount: U256::from(next(2)),
+                },
+                _ => NativeAction::ClaimRewards,
+            };
+            actions.push((sender, action));
+        }
+        let (old_pre, old_post) = old_sort(&actions);
+        let ((pre, pre_idx), (post, post_idx)) = sort_native_actions_indexed(actions.clone());
+        assert_eq!(bytes(&pre), bytes(&old_pre));
+        assert_eq!(bytes(&post), bytes(&old_post));
+        for (list, idx) in [(&pre, &pre_idx), (&post, &post_idx)] {
+            assert_eq!(list.len(), idx.len());
+            for (entry, &i) in list.iter().zip(idx.iter()) {
+                assert_eq!(
+                    bytes(std::slice::from_ref(entry)),
+                    bytes(&actions[i as usize..=i as usize])
+                );
+            }
+        }
+        // Each input position exactly once across both lists.
+        let mut all: Vec<u32> = pre_idx.iter().chain(post_idx.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..len as u32).collect::<Vec<_>>());
+        // Equal keys keep input order (stable): positions ascend within a run
+        // of identical (sender, content) entries.
+        for (list, idx) in [(&pre, &pre_idx), (&post, &post_idx)] {
+            for w in 0..list.len().saturating_sub(1) {
+                if bytes(&list[w..=w]) == bytes(&list[w + 1..=w + 1]) {
+                    assert!(idx[w] < idx[w + 1]);
+                }
+            }
+        }
+    }
+}

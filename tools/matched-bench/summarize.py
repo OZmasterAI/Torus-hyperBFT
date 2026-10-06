@@ -117,8 +117,11 @@ for node, rs in rows.items():
     funnel[node] = d
 
 # ---------------------------------------------------------------- phase breakdown
-PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books", "flush", "body_persist",
-          "end_resident", "end_resident_wait"]
+PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_status", "save_books", "flush",
+          "body_persist", "end_resident", "end_resident_wait"]
+# Item 6 cut 1: `action_status` (the v2 action status: native failures mapped
+# to body positions), exec thread, between engine and save_books; 0.0 on an
+# older binary, where it sits in residual_untimed.
 # Item 6 step 1: `end_resident` (R's end-of-block upkeep, exec thread, after
 # the flush / hand-off; 0.0 on an older binary, where it sits in
 # residual_untimed). Its subs: R applying the delta, and the decoded
@@ -484,7 +487,8 @@ for node, rs in rows.items():
     #     (on a serial binary that includes flush);
     #   * the chain can never exceed the block wall (the empty-block share is
     #     the whole difference).
-    e_phases = ["verify", "replay_guard", "load_books", "engine", "save_books", "end_resident_wait"]
+    e_phases = ["verify", "replay_guard", "load_books", "engine", "action_status", "save_books",
+                "end_resident_wait"]
     if not end_resident_worker:
         e_phases.append("end_resident")
     if not p["worker_present"]:
