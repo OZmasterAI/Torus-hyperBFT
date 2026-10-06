@@ -30,7 +30,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 18 | Does step 2 (`4acdc59`: end_resident on a worker, begin_resident before `new_env`) pass Gate 2 at 300 markets? | **0.832x main** (pairs 0.819x / 0.844x; interleaved, both trie off), up from 0.760x (section 14): **Gate 2 not met**. Step 2 hides ~92% of end_resident (exec wait 4.8-5.3 ms per block, p50 0.4, p90 16-22, vs ~15 estimated); `residual_untimed` -56 ms per block; no visible cost to verify. Per block crab is now level with or faster than main (chain 548 vs 601 ms); the gap is 0.77x fills per native block (matched / placed 0.70 vs 0.77, fewer placed per action), present since section 9 |
 | 19 | Does B-blind (`31cea69`: non-pool sell top-up replaces the same-batch bound, on top of cuts 1/2/5/6) pass Gate 2 at both shapes? Is option A needed? | **Yes at both: 1.097x main at 300 markets** (pairs 1.102x / 1.092x; was 0.832x) **and 0.997x at 10 markets** (1.017x / 0.978x; was 0.866x); interleaved, both trie off, no perf. Fills per native block 0.956x at 300 markets (was 0.77x): matched / placed 0.766 vs 0.767. Non-pool zero-fill sell cuts 0.063% of placed (threshold 0.5%): **option A not needed**. All top-ups full; margin cancels and reduce-only cuts 0. 10-market margin +0.067 ms/1k vs main |
 | 20 | With the oracle feed live through the drain (plan Step 6), does `5584880` drain, and what does an oracle-only block cost to execute? How large is the bench's open-limit reject share? Does the pre-merge `cargo test` pass? | **Drains in 38.2 s with the feed live; AGREE, liveness PASS. Oracle-only blocks 4.6 ms p50, 5.92 ms max (target <= 20 ms)**, exec lag 0-1 in the quiet window; walk 0 (prices static). Reject share unchanged: 52-54% of actions fail, 39-43% of orders are open-limit rejects (only reject reason), `OPEN_ORDER_BUDGET` unset. `cargo test --workspace`: 2806 passed, 0 failed |
-| 21 | Do moving prices (walk 10 bp) change the merge gate? Does a per-sender in-flight cap (`--max-in-flight`) with `OPEN_ORDER_BUDGET` remove the open-limit rejects without losing throughput? What is crab / main on that shape? | Walk 10: **1.088x main** (walk 0 1.132x; walk costs ~4% matched/s), 0 liquidations, drains with the feed live. Cap: the budget (counting in-flight places) takes open-limit rejects 40% -> **0%** at every N; main matched/s 96-101k -> ~173k; plateau from N=2 (chosen **N=2 + budget 900**). Crab (`59fa407`) / main at that shape: **1.054x** (section 19 uncapped 1.097x); margin per fill 1.32x main |
+| 21 | Do moving prices (walk 10 bp) change the merge gate? Does a per-sender in-flight cap (`--max-in-flight`) with `OPEN_ORDER_BUDGET` remove the open-limit rejects without losing throughput? What is crab / main on that shape? | Walk 10: **1.088x main** (walk 0 1.132x; walk costs ~4% matched/s), 0 liquidations, drains with the feed live. Cap: the budget (counting in-flight places) takes open-limit rejects 40% -> **0%** at every N; main matched/s 96-101k -> ~173k; plateau from N=2 on main and crab. Crab (`59fa407`) / main at N=2: **1.054x** (section 19 uncapped 1.097x); margin per fill 1.32x main. Standard shape from now on: **N=4 + budget 900** (21.4) |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -2137,8 +2137,9 @@ deaths; the tail had 0 errors and 0 missed blocks in every capped cell.
   The cap is what makes the budget's estimate accurate: the budget alone
   reaches only 30%.
 - **Plateau from N=2:** N=2 is 98.1% of the best (N=8), N=4 98.9%, N=16
-  97.8%; N=1 is 85.3%. Chosen setting: **N=2 + budget 900** (smallest N within
-  3% of the best). Main at N=2 repeats at 170.4k / 174.1k in 21.3.
+  97.8%; N=1 is 85.3%. N=2 was the first pick (smallest N within 3% of the
+  best); after crab's own plateau the standard shape is N=4 (21.4). Main at
+  N=2 repeats at 170.4k / 174.1k in 21.3.
 - **Blocks are smaller without the backlog** (220-300 vs ~392 actions); full
   blocks only came from the backlog. No idle gaps mid-run in any capped cell
   (the only 1-3 s gaps are before the first native block).
@@ -2188,6 +2189,32 @@ Table `ozarchy-mif2-blockB-analysis.txt`.
   blocks at ~0.4x the size. Part of the difference is the oracle feed (crab
   only), which adds small native blocks; matched/s and per-fill costs are
   unaffected.
+
+### 21.4 Crab plateau and the standard shape (N=4 + budget 900)
+
+Crab `59fa407` as in 21.3, one cell each at N=4 and N=8 + budget 900 (after
+a 60 s warm cell at N=4); N=2 from 21.3. All cells rc 0, AGREE, liveness
+PASS, oracle stale 0 / fresh 300, tail 0 errors / 0 missed. Driver
+`ozarchy-mif3-campaign.sh`, table `ozarchy-mif3-analysis.txt`.
+
+| N + 900 | crab matched/s | % of crab best | main matched/s | % of main best | crab native blk/s | crab actions per native block | crab cancel-all share |
+|---|---|---|---|---|---|---|---|
+| 2 | 181.6k (r1 179.9k, r2 183.4k) | 97.4% (r1 96.5%) | 173.0k | 98.1% | 7.4-7.7 | 93-96 | 34% |
+| 4 | 184.0k | 98.7% | 174.3k (3 cells) | 98.9% | 5.32 | 139 | 39% |
+| 8 | 186.5k | 100% | 176.3k | 100% | 5.28 | 136 | 38% |
+
+- **Standard shape from now on, both arms (including the Phase 2 step 0
+  profile): `MAX_IN_FLIGHT=4`, `OPEN_ORDER_BUDGET=900`** (18c, s94). N=2
+  passes the rule (smallest N with both arms within 3% of their own best)
+  only by 0.4 points, and crab r1 alone fails it; N=4 passes both arms with
+  room, and its block shape (~138 actions per native block on crab) is
+  closer to a loaded chain, which matters for per-block numbers (cancel
+  scan, flush).
+- **Per-fill costs are flat across N** on crab (engine 4.14-4.17, margin
+  0.93-0.95, match 0.48-0.50 ms/1k; CPU 29.6-29.9 s per 1M fills), so the
+  N=2 crab / main ratios in 21.3 carry over per fill.
+- N=4 vs N=8 (1.4%) is inside N=2's own r1 / r2 spread (1.9%); one cell
+  each.
 
 ## Open
 
@@ -2258,8 +2285,9 @@ Table `ozarchy-mif2-blockB-analysis.txt`.
 - Slow first oracle-only block after the load (20-49 ms) and ~2.5 ms empty
   blocks while the feed is live (section 21.1): look at both in the Phase 2
   step 0 profile.
-- Phase 2 step 0 shape: `MAX_IN_FLIGHT=2`, `OPEN_ORDER_BUDGET=900` on both
-  arms (section 21.2); 34-39% of actions are cancel-alls on this shape.
+- Standard shape (Phase 2 step 0 and later): `MAX_IN_FLIGHT=4`,
+  `OPEN_ORDER_BUDGET=900` on both arms (section 21.4); 38-39% of actions are
+  cancel-alls on this shape.
 - Feed-drain mode reports exec ms per oracle-only block as a per-interval
   mean that only sees empty blocks; exact numbers need per-block exec timing
   in the node (section 20.2).
