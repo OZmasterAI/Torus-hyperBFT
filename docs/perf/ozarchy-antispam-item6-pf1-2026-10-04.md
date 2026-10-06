@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`), moving prices and the bench in-flight cap (`5584880`, `59fa407`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`), moving prices and the bench in-flight cap (`5584880`, `59fa407`), Phase 2 step 0 profile
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -31,6 +31,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 19 | Does B-blind (`31cea69`: non-pool sell top-up replaces the same-batch bound, on top of cuts 1/2/5/6) pass Gate 2 at both shapes? Is option A needed? | **Yes at both: 1.097x main at 300 markets** (pairs 1.102x / 1.092x; was 0.832x) **and 0.997x at 10 markets** (1.017x / 0.978x; was 0.866x); interleaved, both trie off, no perf. Fills per native block 0.956x at 300 markets (was 0.77x): matched / placed 0.766 vs 0.767. Non-pool zero-fill sell cuts 0.063% of placed (threshold 0.5%): **option A not needed**. All top-ups full; margin cancels and reduce-only cuts 0. 10-market margin +0.067 ms/1k vs main |
 | 20 | With the oracle feed live through the drain (plan Step 6), does `5584880` drain, and what does an oracle-only block cost to execute? How large is the bench's open-limit reject share? Does the pre-merge `cargo test` pass? | **Drains in 38.2 s with the feed live; AGREE, liveness PASS. Oracle-only blocks 4.6 ms p50, 5.92 ms max (target <= 20 ms)**, exec lag 0-1 in the quiet window; walk 0 (prices static). Reject share unchanged: 52-54% of actions fail, 39-43% of orders are open-limit rejects (only reject reason), `OPEN_ORDER_BUDGET` unset. `cargo test --workspace`: 2806 passed, 0 failed |
 | 21 | Do moving prices (walk 10 bp) change the merge gate? Does a per-sender in-flight cap (`--max-in-flight`) with `OPEN_ORDER_BUDGET` remove the open-limit rejects without losing throughput? What is crab / main on that shape? | Walk 10: **1.088x main** (walk 0 1.132x; walk costs ~4% matched/s), 0 liquidations, drains with the feed live. Cap: the budget (counting in-flight places) takes open-limit rejects 40% -> **0%** at every N; main matched/s 96-101k -> ~173k; plateau from N=2 on main and crab. Crab (`59fa407`) / main at N=2: **1.054x** (section 19 uncapped 1.097x); margin per fill 1.32x main. Standard shape from now on: **N=4 + budget 900** (21.4) |
+| 22 | Phase 2 step 0: on the standard shape (N=4 + budget 900), are the Phase 2 targets still the top costs? What do moving prices add? Rows 7, 77, 78? | Crab / main **1.059x** (r1). Targets not in the planned order: **cancel-all book scan 27 ms/block** (plan 105-140), **>= 14-16k thread spawns / min** (plan ~1,300), flush 16 ms on exec + 74 ms flush worker, **stops diff ~0.06 ms (drop)**. Margin per fill 1.26x main. Walk 10: +13 ms engine per block (re-value). Row 77: first block after load waits on the flush worker's backlog. Row 78: empty blocks = liquidation sweep rebuilding `pos_sums`. Row 7: 0.33-0.37 s per 1M rows at start (est. ~0.56 s at 1.6M rows) |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -2216,6 +2217,130 @@ PASS, oracle stale 0 / fresh 300, tail 0 errors / 0 missed. Driver
 - N=4 vs N=8 (1.4%) is inside N=2's own r1 / r2 spread (1.9%); one cell
   each.
 
+## 22. Phase 2 step 0 profile at N=4 + budget 900 (2026-10-06)
+
+Crab = main `59fa407` (node `1cf9f647`, oracle feed 30000 / 2000 ms, walk 0,
+paused for the drain); main `92a02ed` (`31a95c65`,
+`TORUS_NATIVE_TRIE_MAINTENANCE=0`, no feed). Both arms bench `9b32d897`,
+`MAX_IN_FLIGHT=4`, `OPEN_ORDER_BUDGET=900` (section 21.4), 300 markets
+uniform, cap 400, rate 76,000, `RETRY_BUSY=1`, 120 s, trie off. Order: crab
+warm (60 s), crab r1, main r1 (no perf), crab r2, main r2 (perf on val0:
+`cycles:u`, 499 Hz, frame pointers, 45 s from 35 s into the load), crab-w10
+(walk 10 bp + `ORACLE_FEED_DRAIN=1`, perf in the load window plus a 25 s,
+1999 Hz drain window from load end); 14:27-15:01. All 6 cells rc 0, AGREE,
+liveness PASS, no deaths, exe md5 as staged, oracle stale 0 / fresh 300,
+tail 0 errors / 0 missed; cancel-alls 37.4-38.8% of actions. Driver
+`~/bench-results-matched/ozarchy-p2s0-campaign.sh`, tools
+`ozarchy-p2s0-tools/`, output `ozarchy-p2s0-analysis.txt`.
+
+- **Crab / main matched/s:** r1 (no perf) 184,786 / 174,530 = **1.059x**;
+  r2 (perf) 1.057x. Perf costs ~4.4% on both arms.
+
+### 22.1 Exec costs (load window)
+
+ms per native block | ms per 1k fills; crab r2 has 39.2k fills per native
+block, main r2 52.1k, so compare arms per 1k fills. Phases from the node's
+timers; the sub-rows from perf (inclusive).
+
+| crab rank | item | crab | main |
+|---|---|---|---|
+| 1 | settle phase | 71.8 \| 1.83 | 98.6 \| 1.89 |
+| 2 | margin phase | 37.6 \| 0.96 | 39.7 \| 0.76 |
+| 3 | match phase | 33.5 \| 0.86 | 100.5 \| 1.93 |
+| 4 | phase 1 (actions) | 31.8 \| 0.81 | 44.2 \| 0.85 |
+| | of which cancel-all | **26.7 \| 0.68** | 37.8 \| 0.73 |
+| | of which the book scan | 18.2 \| 0.46 | 26.5 \| 0.51 |
+| 5 | save books | 23.9 \| 0.61 | 30.2 \| 0.58 |
+| | of which `diff_stop_rows` | **0.06** | 0.14 |
+| 6 | cache flush on the exec thread | 15.9 \| 0.41 | 22.5 \| 0.43 |
+| | flush worker (own thread) | **74.4 \| 1.90** | 122.9 \| 2.36 |
+| 7 | verify | 10.1 \| 0.26 | 13.0 |
+| 8 | end_resident wait | 7.1 \| 0.18 | n/a |
+| 9 | sums re-value (walk 0) | 6.5 \| 0.17 | n/a |
+| | engine / chain | 190 / 246 | 286 / 354 |
+
+- **Cancel-all is the largest Phase 2 target on the exec thread:** 26.7 ms
+  per block (~84% of phase 1; the plan's 105-140 ms was the old backlogged
+  shape). On this shape every cancel is a cancel-all (37-39% of actions);
+  `exec_cancel_all_run` loops over all 300 books and calls
+  `take_pending_stops` and `cancel_all_many` per book; hot lines
+  `trader_orders.get(sender)` and `partition_point`
+  (`cancel_batch.rs:338-359`). An OrderId / trader -> MarketId index removes
+  the scan.
+- **Thread spawns: at least 14-16k per minute** (crab r2 15,651, main
+  14,000, w10 14,047; ~62 per native block on crab, 78 on main; 99.7% live
+  under 1 s), from `match_parallel_capped_with`,
+  `settle_market_results_parallel` and `drain_books_parallel`. Lower bound:
+  perf only counts threads that got a sample (~2 ms of run time); the 1 Hz
+  task sampler sees 20-129 / min. The cost is sys time and latency, which
+  `cycles:u` does not rank (spawn / sync 0.011 ms per 1k in user cycles; sys
+  CPU 2 -> 9 ms per 1k with perf on). The plan's ~1,300 / 60 s is an order of
+  magnitude low.
+- **Cache flush:** 15.9 ms on the exec thread (`put_position` 8.7, `get`
+  4.2, sort 2.8; `position.rs:659-662`) plus 74.4 ms on the flush worker,
+  which matches the plan's 65-81 ms. The worker's backlog also causes row 77.
+- **Stops dirty flag: drop it from Phase 2.** `diff_stop_rows` is ~0.06 ms
+  per block; save books is now the book drain itself (23.4 ms).
+- **Margin per fill:** crab 0.961 vs main 0.762 ms per 1k, **1.26x** (1.32x in
+  21.3); per block 0.95x.
+- **Top self time** (crab r2, every `torus-execution` thread including
+  workers): `execute_batch_phases` 8.1%, SipHash `DefaultHasher::write` 6.6%,
+  Keccak 5.5%, `hash_one<Address>` 3.5%, `cancel_all_many` 3.4%,
+  `AccountReader::get_position` 3.4%, `hash_one<u128>` 3.1%,
+  `place_order_with_accounts` 3.0%, `match_market` 2.9%,
+  `compute_market_settle_plan` 2.6%. Hashing is ~17% of self time. On main,
+  RocksDB `get_position` reads in settle are 32.6% inclusive.
+
+### 22.2 Moving prices (walk 10 vs walk 0, crab load windows)
+
+| ms per native block | walk 0 | walk 10 |
+|---|---|---|
+| sums re-value | 6.5 | 24.2 |
+| liquidation (`pos_sums` / `build_sums`) | 10.7 | 24.7 |
+| margin | 45.3 | 48.9 |
+| matching | 99 | 95 |
+| engine | 190 | 203 (1.07x) |
+
+Chain 1.04x, matched/s 0.975x: re-valuing with moving prices adds ~13 ms of
+engine time per block (plan 9.12).
+
+### 22.3 Rows 77, 78 and 7
+
+- **Row 77, the slow first block after the load:** h956 took 59 / 80 / 62 ms
+  wall on val0 / val1 / val2, but only 1.75 ms of main-thread CPU (mostly
+  `run_liquidations` / `pos_sums`). ~119 ms of exec-side CPU in that interval
+  is the flush worker writing the load backlog to RocksDB (crc32c,
+  `trade_rows::encode_block`, memtable insert): the block waits on the
+  backlog flush, not on its own work. Dropping `NativeStateOverlay` /
+  `PendingState` between blocks (BTreeMap drop) cost ~38 ms in total.
+- **Row 78, empty blocks with the feed live:** 15 oracle-only blocks in the
+  drain window, mean 14.4 ms (p50 4.7, p90 48); of 16.5 ms main-thread CPU,
+  14.5 is `run_liquidations_with -> liq_view -> pos_sums -> build_sums`
+  (`position_terms`, `__divti3`, `tiers`). 417 blocks with no native
+  action: mean 6.0 ms (p50 3.0), `run_liquidations` 5.25 of 6.35 ms,
+  `begin_block_oracle` 0.83. The empty-block cost is the liquidation sweep
+  rebuilding `pos_sums` every block while marks are fresh.
+- **Row 7, R rebuild:** measured at process start, 100,360 rows in 32-37 ms
+  (0.33-0.37 s per 1M rows) on every crab validator. At the cell-end size
+  (1.606M rows) a restart is ~0.56 s at that rate, ~3.3 s at row 7's 2.07 s
+  per 1M; both estimates, no restart measured. Well under tens of seconds, so
+  no restart cell (18c).
+
+### 22.4 Verdict
+
+The Phase 2 targets are still on the list but not in the planned order:
+1. **Cancel-all book scan** (27 ms per block on the exec thread);
+2. **worker pool** (>= 14-16k thread spawns per minute; cost in sys time and
+   latency, not ranked by `cycles:u`);
+3. **cache flush** (16 ms on the exec thread + the 74 ms flush worker, which
+   also stalls the first block after a backlog);
+4. then caching sums for the liquidation sweep (rows 77-78, +13 ms per block
+   with moving prices) and margin per fill (1.26x main).
+5. **Drop the stops dirty flag** (~0.06 ms).
+
+Settle, margin and match are larger than any Phase 2 target but are not
+Phase 2 items.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -2291,3 +2416,8 @@ PASS, oracle stale 0 / fresh 300, tail 0 errors / 0 missed. Driver
 - Feed-drain mode reports exec ms per oracle-only block as a per-interval
   mean that only sees empty blocks; exact numbers need per-block exec timing
   in the node (section 20.2).
+- Phase 2 order from the step 0 profile (section 22): cancel-all book scan,
+  worker pool (>= 14-16k thread spawns per minute), cache flush (exec part and
+  flush worker), sums caching in the liquidation sweep; stops dirty flag
+  dropped. Thread spawn cost needs a sys-time / latency measurement
+  (`cycles:u` cannot rank it).
