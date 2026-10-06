@@ -7,8 +7,9 @@ use torus_economics::governance::{
     ProposalType,
 };
 use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
-use torus_state::cf::{CF_FEE_CONFIG, CF_NATIVE_MARKETS};
-use torus_state::{StateBackend, StateDb};
+use torus_state::cf::{ALL_CF_NAMES, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS};
+use torus_state::error::StateError;
+use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 // ============================================================================
@@ -830,4 +831,415 @@ fn explicit_free_listing_id_is_honoured() {
     gov.finalize_proposal(id, 101).unwrap();
     gov.execute_proposal(id, 120).unwrap();
     assert_eq!(market_ids(gov.state()), vec![1, 42]);
+}
+
+/// Item 2: the oracle aggregates exactly the listed markets — the 8-byte keys
+/// of CF_NATIVE_MARKETS, ascending; metadata rows (other key lengths) skipped.
+#[test]
+fn listed_market_ids_are_the_8_byte_keys_ascending() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let gov = GovernanceManager::new(db.clone());
+    for id in [9u64, 1, 300] {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &id.to_be_bytes(), b"m").unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_MARKETS, b"__book_mode__", &[1]).unwrap();
+    db.put_cf_raw(CF_NATIVE_MARKETS, b"__next_global_order_id__", &7u128.to_be_bytes())
+        .unwrap();
+    assert_eq!(gov.listed_market_ids().unwrap(), vec![1, 9, 300]);
+    assert!(gov.market_exists(9).unwrap());
+    assert!(!gov.market_exists(2).unwrap());
+}
+
+// ============================================================================
+// Row 43: a listing needs tick_size > 0 and lot_size > 0. Books are built from
+// the market row; a lot of 0 accepts zero-quantity orders and a tick of 0 turns
+// the tick check off.
+// ============================================================================
+
+fn listing_tick_lot(tick_raw: i128, lot_raw: i128) -> ExecutionPayload {
+    ExecutionPayload::MarketListing {
+        market_id: 0,
+        base_asset: "ETH".into(),
+        quote_asset: "USDC".into(),
+        lot_size: FixedPoint::from_raw(lot_raw),
+        tick_size: FixedPoint::from_raw(tick_raw),
+        initial_margin: FixedPoint::from_raw(500_000_000),
+    }
+}
+
+fn assert_not_positive<T: std::fmt::Debug>(r: Result<T, EconomicsError>, field: &str) {
+    match r {
+        Err(e @ EconomicsError::MarketListingNotPositive { .. }) => {
+            assert_eq!(e.to_string(), format!("market listing {field} must be > 0"));
+        }
+        other => panic!("expected MarketListingNotPositive({field}), got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_market_listing_rejects_zero_or_negative_tick_or_lot() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let submit = |p| gov.submit_proposal(addr(2), "List".into(), "D".into(), Some(p), 0);
+
+    assert_not_positive(submit(listing_tick_lot(0, 1_000_000)), "tick_size");
+    assert_not_positive(submit(listing_tick_lot(-1, 1_000_000)), "tick_size");
+    assert_not_positive(submit(listing_tick_lot(1_000_000, 0)), "lot_size");
+    assert_not_positive(submit(listing_tick_lot(1_000_000, -1)), "lot_size");
+    assert_not_positive(submit(listing_tick_lot(0, 0)), "tick_size");
+
+    // Refused proposals are not stored and consume no proposal id.
+    assert!(gov.get_proposal(1).unwrap().is_none());
+    assert_eq!(submit(listing_tick_lot(1, 1)).unwrap(), 1);
+    assert_eq!(
+        gov.get_proposal(1).unwrap().unwrap().proposal_type,
+        ProposalType::MarketListing
+    );
+}
+
+#[test]
+fn execute_market_listing_rejects_zero_tick_or_lot_without_writing_a_market() {
+    for (tick, lot, field) in [(0, 1, "tick_size"), (1, 0, "lot_size")] {
+        let (_dir, gov, staking) = setup();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+        // Pass a valid listing, then overwrite the stored payload (bypassing
+        // submission) so a bad listing reaches execution.
+        let id = submit_and_pass(&gov, listing(0, "ETH"));
+        gov.finalize_proposal(id, 101).unwrap();
+        let mut p = gov.get_proposal(id).unwrap().unwrap();
+        p.execution_payload = Some(listing_tick_lot(tick, lot));
+        gov.state()
+            .put_cf_raw(
+                CF_GOVERNANCE_PROPOSALS,
+                &id.to_be_bytes(),
+                &borsh::to_vec(&p).unwrap(),
+            )
+            .unwrap();
+
+        // A direct call: error, no market row, still Passed.
+        assert_not_positive(gov.execute_proposal(id, 120), field);
+        assert!(market_ids(gov.state()).is_empty(), "no market row ({field})");
+        assert_eq!(
+            gov.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Passed
+        );
+        // The per-block path marks it Failed with the same reason.
+        assert_eq!(
+            gov.process_pending_proposals(120).unwrap(),
+            vec![ProposalOutcome::Failed(
+                id,
+                format!("market listing {field} must be > 0")
+            )]
+        );
+        assert!(market_ids(gov.state()).is_empty(), "no market row ({field})");
+        assert_eq!(
+            gov.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Failed
+        );
+    }
+}
+
+// ============================================================================
+// s94: a passed proposal whose execution fails becomes Failed (terminal) and
+// no longer blocks later proposals. Storage errors still abort the step.
+// ============================================================================
+
+/// Overwrite a stored proposal's payload (bypassing submission checks).
+fn overwrite_payload(gov: &GovernanceManager, id: u64, payload: ExecutionPayload) {
+    let mut p = gov.get_proposal(id).unwrap().unwrap();
+    p.execution_payload = Some(payload);
+    gov.state()
+        .put_cf_raw(
+            CF_GOVERNANCE_PROPOSALS,
+            &id.to_be_bytes(),
+            &borsh::to_vec(&p).unwrap(),
+        )
+        .unwrap();
+}
+
+/// Every column family except the proposals CF, in a comparable form.
+fn dump_all_but_proposals(db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+    ALL_CF_NAMES
+        .iter()
+        .filter(|cf| **cf != CF_GOVERNANCE_PROPOSALS)
+        .map(|cf| (*cf, db.iterate_cf(cf, None).unwrap()))
+        .collect()
+}
+
+#[test]
+fn failed_execution_does_not_block_a_later_proposal_in_the_same_block() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    let p1 = submit_and_pass(&gov, listing(7, "X"));
+    let p2 = submit_and_pass(&gov, listing(8, "Y"));
+    assert_eq!(
+        gov.process_pending_proposals(101).unwrap(),
+        vec![ProposalOutcome::Passed(p1), ProposalOutcome::Passed(p2)]
+    );
+    // Market 7 appears during the timelock: p1 (executed first) now fails.
+    seed_market(gov.state(), 7);
+
+    assert_eq!(
+        gov.process_pending_proposals(120).unwrap(),
+        vec![
+            ProposalOutcome::Failed(p1, "market id 7 already exists".into()),
+            ProposalOutcome::Executed(p2),
+        ]
+    );
+    assert_eq!(gov.get_proposal(p1).unwrap().unwrap().status, ProposalStatus::Failed);
+    assert_eq!(gov.get_proposal(p2).unwrap().unwrap().status, ProposalStatus::Executed);
+    assert_eq!(market_ids(gov.state()), vec![7, 8]);
+    assert_eq!(
+        gov.state()
+            .get_cf_raw(CF_NATIVE_MARKETS, &7u64.to_be_bytes())
+            .unwrap()
+            .unwrap(),
+        b"genesis-market".to_vec(),
+        "the failed listing must not overwrite market 7"
+    );
+    assert_eq!(
+        gov.get_proposals_by_status(ProposalStatus::Failed)
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![p1]
+    );
+}
+
+#[test]
+fn failed_proposal_is_terminal_and_not_retried() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    let id = submit_and_pass(&gov, listing(7, "X"));
+    gov.finalize_proposal(id, 101).unwrap();
+    seed_market(gov.state(), 7);
+    assert_eq!(
+        gov.process_pending_proposals(120).unwrap(),
+        vec![ProposalOutcome::Failed(id, "market id 7 already exists".into())]
+    );
+
+    // Remove the conflict: a retry would now succeed, so a no-op proves
+    // that Failed is never retried.
+    gov.state()
+        .delete_cf_raw(CF_NATIVE_MARKETS, &7u64.to_be_bytes())
+        .unwrap();
+    let state_before = dump_all_but_proposals(gov.state());
+    let proposals_before = gov.state().iterate_cf(CF_GOVERNANCE_PROPOSALS, None).unwrap();
+    for block in [121, 500, 10_000] {
+        assert!(gov.process_pending_proposals(block).unwrap().is_empty());
+    }
+    assert_eq!(dump_all_but_proposals(gov.state()), state_before);
+    assert_eq!(
+        gov.state().iterate_cf(CF_GOVERNANCE_PROPOSALS, None).unwrap(),
+        proposals_before
+    );
+    // A direct call refuses it too.
+    assert!(matches!(
+        gov.execute_proposal(id, 10_001),
+        Err(EconomicsError::ProposalNotPassed(p)) if p == id
+    ));
+}
+
+/// Each payload kind that can fail at execution: the step marks the proposal
+/// Failed with the reason and writes nothing else (no half-applied payload).
+#[test]
+fn failed_execution_leaves_no_partial_state_for_any_payload_kind() {
+    type Sabotage = fn(&GovernanceManager, u64);
+    let cases: Vec<(&str, ExecutionPayload, Sabotage, String)> = vec![
+        (
+            "param change, value out of range",
+            ExecutionPayload::ParameterChange {
+                param_key: "max_leverage".into(),
+                new_value: "10".into(),
+            },
+            |gov, id| {
+                overwrite_payload(
+                    gov,
+                    id,
+                    ExecutionPayload::ParameterChange {
+                        param_key: "max_leverage".into(),
+                        new_value: "0".into(),
+                    },
+                )
+            },
+            "invalid parameter value for max_leverage: must be between 1 and 200".into(),
+        ),
+        (
+            "param change, key not modifiable",
+            ExecutionPayload::ParameterChange {
+                param_key: "max_leverage".into(),
+                new_value: "10".into(),
+            },
+            |gov, id| {
+                overwrite_payload(
+                    gov,
+                    id,
+                    ExecutionPayload::ParameterChange {
+                        param_key: "gov_next_id".into(),
+                        new_value: "1".into(),
+                    },
+                )
+            },
+            "governance parameter not modifiable: gov_next_id".into(),
+        ),
+        (
+            "treasury spend over balance",
+            ExecutionPayload::TreasurySpend {
+                recipient: addr(50),
+                amount: U256::from(1_000u64),
+                reason: "r".into(),
+            },
+            |gov, _| fund(gov.state(), &addr(99), U256::from(999u64)),
+            "treasury insufficient balance: have 999, need 1000".into(),
+        ),
+        (
+            "listing id taken",
+            listing(7, "X"),
+            |gov, _| seed_market(gov.state(), 7),
+            "market id 7 already exists".into(),
+        ),
+        (
+            "listing tick 0",
+            listing(0, "X"),
+            |gov, id| overwrite_payload(gov, id, listing_tick_lot(0, 1)),
+            "market listing tick_size must be > 0".into(),
+        ),
+        (
+            "permanent unlock, no stake",
+            ExecutionPayload::PermanentUnlock {
+                staker: addr(60),
+                amount: U256::from(1u64),
+            },
+            |_, _| {},
+            format!("permanent stake not found for {}", addr(60)),
+        ),
+        (
+            "permanent unlock, amount over stake",
+            ExecutionPayload::PermanentUnlock {
+                staker: addr(3),
+                amount: wei(1_000),
+            },
+            |_, _| {},
+            format!(
+                "permanent unlock amount {} exceeds stake {}",
+                wei(1_000),
+                wei(10)
+            ),
+        ),
+        (
+            "permanent unlock, amount 0",
+            ExecutionPayload::PermanentUnlock {
+                staker: addr(3),
+                amount: U256::ZERO,
+            },
+            |_, _| {},
+            "invalid parameter value for amount: permanent unlock amount must be > 0".into(),
+        ),
+    ];
+
+    for (name, payload, sabotage, reason) in cases {
+        let (_dir, gov, staking) = setup();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+        // addr(3): a small permanent staker (unlock cases), never votes.
+        setup_voter(&staking, 3, validator, U256::ZERO, wei(10));
+        // addr(3)'s accrued rewards: an unlock that half-ran would claim them.
+        staking.credit_rewards(addr(3), wei(1)).unwrap();
+
+        let id = submit_and_pass(&gov, payload);
+        gov.finalize_proposal(id, 101).unwrap();
+        sabotage(&gov, id);
+        let state_before = dump_all_but_proposals(gov.state());
+        let mut expected = gov.get_proposal(id).unwrap().unwrap();
+        assert_eq!(expected.status, ProposalStatus::Passed, "{name}");
+
+        assert_eq!(
+            gov.process_pending_proposals(120).unwrap(),
+            vec![ProposalOutcome::Failed(id, reason)],
+            "{name}"
+        );
+        assert_eq!(dump_all_but_proposals(gov.state()), state_before, "{name}");
+        // The proposal row differs only in its status.
+        expected.status = ProposalStatus::Failed;
+        assert_eq!(
+            gov.state()
+                .get_cf_raw(CF_GOVERNANCE_PROPOSALS, &id.to_be_bytes())
+                .unwrap()
+                .unwrap(),
+            borsh::to_vec(&expected).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+/// `StateDb` whose `put` of one market row fails (an injected storage fault).
+#[derive(Clone)]
+struct FailingMarketPut {
+    inner: StateDb,
+    market_id: u64,
+}
+
+impl FailingMarketPut {
+    fn hit(&self, cf: &str, key: &[u8]) -> bool {
+        cf == CF_NATIVE_MARKETS && key == self.market_id.to_be_bytes()
+    }
+}
+
+impl StateBackend for FailingMarketPut {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        StateBackend::get_cf_raw(&self.inner, cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        if self.hit(cf, key) {
+            return Err(StateError::InvalidData("injected write failure".into()));
+        }
+        StateBackend::put_cf_raw(&self.inner, cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        StateBackend::delete_cf_raw(&self.inner, cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        StateBackend::iterate_cf(&self.inner, cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        StateBackend::atomic_write(&self.inner, ops)
+    }
+}
+
+/// A storage error is not an execution failure: the step still returns the
+/// error (as before), the proposal stays Passed and later ones are not run.
+#[test]
+fn storage_error_during_execution_still_aborts_the_step() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    let p1 = submit_and_pass(&gov, listing(7, "X"));
+    let p2 = submit_and_pass(&gov, listing(8, "Y"));
+    gov.process_pending_proposals(101).unwrap();
+
+    let faulty = GovernanceManager::new(FailingMarketPut {
+        inner: gov.state().clone(),
+        market_id: 7,
+    });
+    match faulty.process_pending_proposals(120) {
+        Err(EconomicsError::State(e)) => assert!(e.to_string().contains("injected")),
+        other => panic!("expected the storage error, got {other:?}"),
+    }
+    assert_eq!(gov.get_proposal(p1).unwrap().unwrap().status, ProposalStatus::Passed);
+    assert_eq!(gov.get_proposal(p2).unwrap().unwrap().status, ProposalStatus::Passed);
+    assert!(market_ids(gov.state()).is_empty());
 }

@@ -38,6 +38,7 @@ fn seed_validators(db: &StateDb, fourth_stake: u64) {
             status: ValidatorStatus::Active,
             jailed_until: None,
             last_commission_change_block: None,
+            oracle_signer: None,
         };
         staking.put_validator(&addr(n), &v).unwrap();
     };

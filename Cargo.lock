@@ -1094,6 +1094,7 @@ dependencies = [
  "torus-core",
  "torus-economics",
  "torus-genesis",
+ "torus-price-feeder",
  "torus-state",
  "torus-telemetry",
  "torus-types",
@@ -6930,6 +6931,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "borsh 1.6.1",
  "ed25519-dalek",
  "hotstuff_rs",
  "k256",
@@ -6940,6 +6942,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "torus-bridge",
+ "torus-core",
  "torus-economics",
  "torus-evm",
  "torus-mempool",
@@ -7104,6 +7107,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "torus-core",
+ "torus-economics",
  "torus-state",
  "torus-telemetry",
  "torus-types",
@@ -7173,6 +7177,36 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "zeroize",
+]
+
+[[package]]
+name = "torus-price-feeder"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "borsh 1.6.1",
+ "clap",
+ "hex",
+ "jsonrpsee",
+ "k256",
+ "rand 0.8.5",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "torus-core",
+ "torus-economics",
+ "torus-evm",
+ "torus-mempool",
+ "torus-rpc",
+ "torus-state",
+ "torus-types",
+ "torus-wallet",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

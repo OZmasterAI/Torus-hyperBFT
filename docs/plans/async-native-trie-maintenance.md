@@ -383,7 +383,10 @@ This is a further, structural reason to prefer 0.
 Naming, gating, and test strategy. **No code is written by this document.**
 
 **Env var:** `TORUS_NATIVE_TRIE_MAINTENANCE` — unset or `1` = maintain (**exact-today**);
-`0` = skip. Follows the `OnceLock` reader idiom of `native_root_cache_enabled()` /
+`0` = skip. *(Superseded 2026-10-05: the default is now OFF — unset or any value other than `1`
+skips maintenance; only `1` maintains. The owner chose this after the item 6 audit found no
+production reader of the maintained root; see
+`docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` §8.1.)* Follows the `OnceLock` reader idiom of `native_root_cache_enabled()` /
 `parallel_bucket_hash_threads()` / `bucket_hash_min_buckets()` in `native_trie.rs`. Default-off
 in the sense required by constraint (a): **default = today's behaviour, byte-identical roots.**
 

@@ -955,6 +955,17 @@ mod tests {
         hash
     }
 
+    /// The node executed through `height` (the applied-height marker).
+    fn store_applied_height(state: &StateDb, height: u64) {
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &height.to_be_bytes(),
+            )
+            .unwrap();
+    }
+
     fn store_body(state: &StateDb, height: u64, body: &TorusBlockBody) {
         state
             .put_cf_raw(
@@ -1795,6 +1806,295 @@ mod tests {
             ),
             "backlog sheds not counted; dump:\n{text}"
         );
+        handle.stop().unwrap();
+    }
+
+    /// Cut 6: `submitNativeActionsBin` decides the shed from the bincode tag.
+    /// While backlogged: a well-formed refused action and (the one deliberate
+    /// exception) a refused tag with a broken body both get "busy" and count as
+    /// `backlog_preverify`; a cancel still verifies; an unreadable tag keeps
+    /// its decode error and `verify_failed`. Not backlogged: the broken body
+    /// gets its decode error as before.
+    #[tokio::test]
+    async fn bin_shed_peeks_tag_and_malformed_keeps_decode_error_outside_shedding() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let mk = |action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
+            format!("0x{}", hex::encode(bincode::serialize(&signed).unwrap()))
+        };
+        let full = mk(torus_types::NativeAction::ClaimRewards, now_ms + 9);
+        let broken = full[..full.len() - 2].to_string();
+
+        for backlogged in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let state = StateDb::open(dir.path()).unwrap();
+            let cfg = if backlogged {
+                MempoolConfig {
+                    native_admission_horizon_ms: 1,
+                    native_admission_floor: 0,
+                    ..Default::default()
+                }
+            } else {
+                MempoolConfig::default()
+            };
+            let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+            assert_eq!(mempool.native_admission_backlogged(), backlogged);
+            let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let mut server = RpcServer::new(
+                state,
+                mempool,
+                executor,
+                TORUS_CHAIN_ID,
+                100,
+                BlockNotifier::new(),
+            );
+            server.set_metrics(metrics.clone());
+            let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+
+            let batch = vec![
+                mk(torus_types::NativeAction::ClaimRewards, now_ms),
+                broken.clone(),
+                mk(
+                    torus_types::NativeAction::CancelOrder { order_id: 7 },
+                    now_ms + 1,
+                ),
+                "0xzz".to_string(),
+            ];
+            let results: Vec<RpcSubmitResult> = client
+                .request(
+                    "torus_submitNativeActionsBin",
+                    jsonrpsee::rpc_params![batch],
+                )
+                .await
+                .unwrap();
+            let err = |i: usize| results[i].error.clone().unwrap_or_default();
+            assert!(err(3).starts_with("invalid hex: "), "{:?}", results[3]);
+            assert!(
+                !err(2).contains("busy"),
+                "cancel must pass: {:?}",
+                results[2]
+            );
+            let text = metrics.encode();
+            if backlogged {
+                assert_eq!(err(0), crate::torus::ADMISSION_BUSY_MSG);
+                // The deliberate exception: shed by tag, body never decoded.
+                assert_eq!(err(1), crate::torus::ADMISSION_BUSY_MSG);
+                assert!(
+                    text.contains(
+                        r#"torus_rpc_submit_admit_rejects_total{reason="backlog_preverify"} 2"#
+                    ),
+                    "dump:\n{text}"
+                );
+                assert!(
+                    text.contains(
+                        r#"torus_rpc_submit_admit_rejects_total{reason="verify_failed"} 1"#
+                    ),
+                    "dump:\n{text}"
+                );
+            } else {
+                assert!(
+                    err(1).starts_with("invalid action encoding: "),
+                    "{:?}",
+                    results[1]
+                );
+                assert!(!err(0).contains("busy"), "{:?}", results[0]);
+                assert!(!text.contains("backlog_preverify"), "dump:\n{text}");
+            }
+            handle.stop().unwrap();
+        }
+    }
+
+    // ---- s517 oracle feeder M3: priority screens let oracle submissions through ----
+
+    /// Active validator V (key `ac09…ff80`) with hot signer S (key `[21; 32]`),
+    /// market 1 listed. Returns (V key, S key).
+    fn oracle_fixture(state: &StateDb) -> (k256::ecdsa::SigningKey, k256::ecdsa::SigningKey) {
+        let vk = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap(),
+        )
+        .unwrap();
+        let sk = k256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+        let addr = |k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, 0, k)
+                .recover_sender()
+                .unwrap()
+        };
+        let (v, s) = (addr(&vk), addr(&sk));
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &v,
+                &torus_economics::ValidatorState {
+                    address: v,
+                    pubkey: [3; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: Some(s),
+                },
+            )
+            .unwrap();
+        state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&s), v.as_slice())
+            .unwrap();
+        store_market(state, 1, "BTC", "USD");
+        (vk, sk)
+    }
+
+    fn oracle_payload(k: &k256::ecdsa::SigningKey, nonce: u64) -> String {
+        let signed = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, fp(100))],
+                timestamp: 0,
+            }),
+            nonce,
+            k,
+        );
+        format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+    }
+
+    fn unix_ms() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn admission_backlog_lets_validator_and_signer_oracle_through() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, sk) = oracle_fixture(&state);
+        let cfg = MempoolConfig { native_admission_horizon_ms: 1, native_admission_floor: 0, ..Default::default() };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        assert!(mempool.native_admission_backlogged());
+        let server = RpcServer::new(
+            state,
+            mempool.clone(),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{addr}")).unwrap();
+        let now = unix_ms();
+        let stranger = k256::ecdsa::SigningKey::from_slice(&[22u8; 32]).unwrap();
+        let batch = vec![oracle_payload(&vk, now), oracle_payload(&sk, now), oracle_payload(&stranger, now)];
+        let results: Vec<RpcSubmitResult> =
+            client.request("torus_submitNativeActions", jsonrpsee::rpc_params![batch]).await.unwrap();
+        assert!(results[0].error.is_none(), "{:?}", results[0]);
+        assert!(results[1].error.is_none(), "{:?}", results[1]);
+        let e = results[2].error.as_deref().unwrap_or("");
+        assert!(e.contains("active validator or its signer") && !e.contains("busy"), "{e}");
+        // The single endpoint admits S too.
+        let r: Result<String, _> =
+            client.request("torus_submitNativeAction", jsonrpsee::rpc_params![oracle_payload(&sk, now + 1)]).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(mempool.native_pool_size(), 3);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_full_lets_validator_oracle_through() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, _) = oracle_fixture(&state);
+        let cfg = MempoolConfig { native_pool_max_size: 1, ..Default::default() };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let now = unix_ms();
+        let other = k256::ecdsa::SigningKey::from_slice(&[23u8; 32]).unwrap();
+        mempool
+            .add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &other))
+            .unwrap();
+        assert!(mempool.native_pool_is_full());
+        let server = RpcServer::new(
+            state,
+            mempool.clone(),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{addr}")).unwrap();
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![vec![oracle_payload(&vk, now)]])
+            .await
+            .unwrap();
+        assert!(results[0].error.is_none(), "{:?}", results[0]);
+        assert_eq!(mempool.native_pool_size(), 1, "the oracle submission evicted the ClaimRewards");
+        let pooled = mempool.drain_native(10);
+        assert!(matches!(pooled[0].action, torus_types::NativeAction::SubmitOraclePrices(_)));
+        handle.stop().unwrap();
+    }
+
+    /// s517 oracle feeder R1: `getValidators` reports `oracleSigner` when set
+    /// and omits the field otherwise.
+    #[tokio::test]
+    async fn get_validators_reports_oracle_signer() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let (vk, sk) = oracle_fixture(&state); // V with signer S
+        let addr = |k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, 0, k)
+                .recover_sender()
+                .unwrap()
+        };
+        let w = Address::repeat_byte(0x77);
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &w,
+                &torus_economics::ValidatorState {
+                    address: w,
+                    pubkey: [4; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Jailed,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: None,
+                },
+            )
+            .unwrap();
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let server = RpcServer::new(
+            state,
+            mempool,
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (handle, sock) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build(format!("http://{sock}")).unwrap();
+        let vals: serde_json::Value =
+            client.request("torus_getValidators", jsonrpsee::rpc_params![]).await.unwrap();
+        let find = |a: Address| {
+            vals.as_array().unwrap().iter().find(|x| x["address"] == format!("{a:#x}")).cloned().unwrap()
+        };
+        let v = find(addr(&vk));
+        assert_eq!(v["oracleSigner"], format!("{:#x}", addr(&sk)));
+        assert_eq!(v["status"], "active");
+        let j = find(w);
+        assert!(j.get("oracleSigner").is_none(), "absent signer omits the field: {j}");
+        assert_eq!(j["status"], "jailed");
         handle.stop().unwrap();
     }
 
@@ -2949,9 +3249,17 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
+        // v2: action 2 executed and failed (margin).
         let record = torus_state::action_status::BlockActionStatus {
             evm_skipped: vec![true],
             native_skipped: vec![false, true, false],
+            native_failed: vec![torus_state::action_status::NativeActionFailure::new(
+                2,
+                0,
+                1,
+                torus_state::action_status::FailureReason::Margin,
+                "insufficient margin: need 5, have 1 (account)".to_string(),
+            )],
         };
         state
             .put_cf_raw(
@@ -2982,7 +3290,17 @@ mod tests {
         let executed = get(1).await;
         assert_eq!(
             executed["nativeActionStatus"],
-            serde_json::json!(["executed", "skipped", "executed"])
+            serde_json::json!(["executed", "skipped", "failed"])
+        );
+        assert_eq!(
+            executed["nativeActionFailures"],
+            serde_json::json!([{
+                "index": 2,
+                "reason": "margin",
+                "message": "insufficient margin: need 5, have 1 (account)",
+                "order": 0,
+                "failedOrders": 1
+            }])
         );
         assert_eq!(
             executed["evmTransactionStatus"],
@@ -2991,9 +3309,11 @@ mod tests {
         assert_eq!(executed["nativeActions"].as_array().unwrap().len(), 3);
         let pending = get(2).await;
         assert!(pending["nativeActionStatus"].is_null());
+        assert!(pending["nativeActionFailures"].is_null());
         assert!(pending["evmTransactionStatus"].is_null());
         let empty = get(3).await;
         assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
+        assert_eq!(empty["nativeActionFailures"], serde_json::json!([]));
         assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
         handle.stop().unwrap();
     }
@@ -3104,6 +3424,7 @@ mod tests {
                 &torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![false, true, false],
                     native_skipped: vec![],
+                    native_failed: vec![],
                 }
                 .encode(),
             )
@@ -4192,6 +4513,183 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Item 2: a stale aggregate reads as absent — markPrice = indexPrice = 0,
+    /// timestamp 0 (ABI unchanged). Usable at age 60, stale at 61 (header time).
+    #[tokio::test]
+    async fn torus_get_mark_price_hides_a_stale_oracle_price() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        for (latest_ts, want) in [(5_060u64, Some(fp(50_000))), (5_061, None)] {
+            let (_dir, state, mempool, executor) = setup();
+            let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+            let reps = [
+                Address::from([0xA1; 20]),
+                Address::from([0xA2; 20]),
+                Address::from([0xA3; 20]),
+            ];
+            for v in &reps {
+                oracle.submit_price(v, 1, fp(50_000), 10, 5_000).unwrap();
+            }
+            let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+            oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: latest_ts,
+                    ..test_header(20, 0, 0)
+                },
+            );
+            store_applied_height(&state, 20);
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let mp: RpcMarkPrice = client
+                .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x1"])
+                .await
+                .unwrap();
+            let (px, ts) = match want {
+                Some(p) => (p, 10),
+                None => (FixedPoint::ZERO, 0),
+            };
+            assert_eq!(
+                (mp.mark_price, mp.index_price, mp.timestamp),
+                (dec_fp(px), dec_fp(px), ts),
+                "executed head's header ts {latest_ts}"
+            );
+            handle.stop().unwrap();
+        }
+    }
+
+    /// s89: the oracle state the RPC reads is the EXECUTED state, so the mark's
+    /// staleness is judged at the executed height's header time (the eth
+    /// view's head, min(applied, committed)), not at the committed head's.
+    /// Under exec lag the committed head is minutes ahead and every mark read
+    /// stale. Aggregate at ts 5_000; executed height 20 at ts 5_030 (fresh);
+    /// committed head 30 at ts 5_200 (would be stale).
+    #[tokio::test]
+    async fn torus_mark_price_staleness_uses_the_executed_height() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x11; 20]);
+        PositionManager::new(state.clone())
+            .put_position(&Position {
+                trader,
+                market_id: 1,
+                is_long: true,
+                size: fp(5),
+                entry_price: fp(50000),
+                realized_pnl: fp(100),
+                isolated_margin: fp(2500),
+                margin_type: MarginType::Isolated,
+            })
+            .unwrap();
+        let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+        let reps = [
+            Address::from([0xA1; 20]),
+            Address::from([0xA2; 20]),
+            Address::from([0xA3; 20]),
+        ];
+        for v in &reps {
+            oracle.submit_price(v, 1, fp(51_000), 10, 5_000).unwrap();
+        }
+        let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+        oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+        for (h, ts) in [(20u64, 5_030u64), (30, 5_200)] {
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: ts,
+                    ..test_header(h, 0, 0)
+                },
+            );
+        }
+        store_applied_height(&state, 20);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let mp: RpcMarkPrice = client
+            .request("torus_getMarkPrice", jsonrpsee::rpc_params!["0x1"])
+            .await
+            .unwrap();
+        assert_eq!(
+            (mp.mark_price, mp.timestamp),
+            (dec_fp(fp(51_000)), 10),
+            "fresh at the executed height 20 although stale at the committed head 30"
+        );
+        let pos: Option<RpcPosition> = client
+            .request(
+                "torus_getPosition",
+                jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pos.unwrap().unrealized_pnl, dec_fp(fp(5_000)), "PnL at the usable mark");
+        handle.stop().unwrap();
+    }
+
+    /// Item 2: getPosition's unrealized PnL uses the oracle aggregate only
+    /// while usable (age <= 60 s of header time); stale ⇒ entry price (PnL 0).
+    #[tokio::test]
+    async fn torus_get_position_ignores_a_stale_oracle_price() {
+        use torus_core::oracle::{OracleConfig, OracleManager};
+        for (latest_ts, want_pnl) in [(5_060u64, fp(5_000)), (5_061, FixedPoint::ZERO)] {
+            let (_dir, state, mempool, executor) = setup();
+            let trader = Address::from([0x11; 20]);
+            PositionManager::new(state.clone())
+                .put_position(&Position {
+                    trader,
+                    market_id: 1,
+                    is_long: true,
+                    size: fp(5),
+                    entry_price: fp(50000),
+                    realized_pnl: fp(100),
+                    isolated_margin: fp(2500),
+                    margin_type: MarginType::Isolated,
+                })
+                .unwrap();
+            let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+            let reps = [
+                Address::from([0xA1; 20]),
+                Address::from([0xA2; 20]),
+                Address::from([0xA3; 20]),
+            ];
+            for v in &reps {
+                oracle.submit_price(v, 1, fp(51_000), 10, 5_000).unwrap();
+            }
+            let stakes: Vec<_> = reps.iter().map(|v| (*v, fp(1))).collect();
+            oracle.aggregate_price(1, 10, 5_000, &stakes).unwrap();
+            store_header(
+                &state,
+                &TorusBlockHeader {
+                    timestamp: latest_ts,
+                    ..test_header(20, 0, 0)
+                },
+            );
+            store_applied_height(&state, 20);
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let pos: Option<RpcPosition> = client
+                .request(
+                    "torus_getPosition",
+                    jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pos.unwrap().unrealized_pnl,
+                dec_fp(want_pnl),
+                "executed head's header ts {latest_ts}"
+            );
+            handle.stop().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn torus_get_user_trades_basic() {
         let (_dir, state, mempool, executor) = setup();
@@ -4559,16 +5057,23 @@ mod tests {
         let market_id: u64 = 7;
         let oracle_price = fp(42000);
 
-        // Write a StoredAggregatedPrice entry for market 7.
-        // Binary layout: price(i128 16 BE) + block_number(u64 8 BE) + num_reporters(u32 4 BE).
+        // Write a StoredAggregatedPrice entry for market 7. Binary layout:
+        // price(i128 16 BE) + block_number(u64 8 BE) + num_reporters(u32 4 BE)
+        // + block timestamp(u64 8 BE).
         let mut key = Vec::with_capacity(11);
         key.extend_from_slice(b"agg");
         key.extend_from_slice(&market_id.to_be_bytes());
-        let mut value = Vec::with_capacity(28);
+        let latest = test_header(1, 0, 0);
+        let mut value = Vec::with_capacity(36);
         value.extend_from_slice(&oracle_price.raw().to_be_bytes());
         value.extend_from_slice(&1u64.to_be_bytes()); // block_number
         value.extend_from_slice(&3u32.to_be_bytes()); // num_reporters
+        value.extend_from_slice(&latest.timestamp.to_be_bytes()); // fresh: age 0
         state.put_cf_raw(CF_NATIVE_ORACLE, &key, &value).unwrap();
+        // Item 2: the mark is time-based — "now" is the executed head's
+        // header timestamp (s89).
+        store_header(&state, &latest);
+        store_applied_height(&state, 1);
 
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;
@@ -4688,6 +5193,7 @@ mod state_hash_rpc_tests {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             staking.put_validator(&v.address, &v).unwrap();
         }

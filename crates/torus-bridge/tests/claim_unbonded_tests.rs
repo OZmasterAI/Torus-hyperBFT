@@ -252,6 +252,7 @@ fn claim_unbonded_via_core_writer_executes_next_block() {
         &addr(DELEGATOR),
         &db,
         b,
+        0,
     )
     .expect("claimUnbonded() selector must be accepted");
     assert_eq!(out.len(), 32, "returns a single ABI word");

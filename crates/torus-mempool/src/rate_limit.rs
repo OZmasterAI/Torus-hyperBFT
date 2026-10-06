@@ -175,6 +175,9 @@ pub fn admission_limit(
     Some(by_rate.max(floor))
 }
 
+/// s517: at most this many pooled oracle submissions per validator, counted
+/// over the validator's own address plus its hot oracle signer.
+pub const ORACLE_PENDING_PER_VALIDATOR: usize = 4;
 // ---- Anti-spam item C: bounded cancel prefix ----
 
 /// Default share (percent) of each selected native block that cancels may

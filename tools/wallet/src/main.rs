@@ -1,7 +1,6 @@
 //! Torus CLI wallet — key management, queries, and transactions.
 
 mod commands;
-mod keystore;
 mod parse;
 mod rpc;
 mod sign;
@@ -11,6 +10,7 @@ mod test_utils;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use torus_wallet::keystore;
 
 use crate::rpc::RpcClient;
 
@@ -309,6 +309,24 @@ pub(crate) enum Command {
         #[arg(long)]
         new_pubkey: String,
     },
+    /// Set, rotate or clear this validator's hot oracle signer (sign with the
+    /// VALIDATOR keystore via --keystore). Setting needs the SIGNER key too: it
+    /// signs a proof of possession for this validator. The signer may only
+    /// submit oracle prices for this validator; run once, again only to rotate.
+    SetOracleSigner {
+        /// Signer keystore (e.g. from `price-feeder keygen`)
+        #[arg(long, conflicts_with_all = ["clear", "signer_key_file"])]
+        signer_keystore: Option<PathBuf>,
+        /// Signer hex key file (mode 0600)
+        #[arg(long, conflicts_with = "clear")]
+        signer_key_file: Option<PathBuf>,
+        /// Passphrase file for --signer-keystore (else prompted)
+        #[arg(long)]
+        signer_passphrase_file: Option<PathBuf>,
+        /// Remove the signer (no signer key needed)
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 // ============================================================================
@@ -497,6 +515,17 @@ async fn main() {
         Command::Unjail => commands::validator::cmd_unjail(&cli, &rpc).await,
         Command::RotateKey { new_pubkey } => {
             commands::validator::cmd_rotate_key(&cli, &rpc, new_pubkey).await
+        }
+        Command::SetOracleSigner { signer_keystore, signer_key_file, signer_passphrase_file, clear } => {
+            commands::validator::cmd_set_oracle_signer(
+                &cli,
+                &rpc,
+                signer_keystore.as_deref(),
+                signer_key_file.as_deref(),
+                signer_passphrase_file.as_deref(),
+                *clear,
+            )
+            .await
         }
     };
 

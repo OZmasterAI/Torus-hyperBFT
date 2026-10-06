@@ -1248,10 +1248,11 @@ fn open_limit_margin_rejected_order_takes_no_slot() {
 }
 
 /// Conservative by design: the slot is taken before matching, so an order
-/// the book then rejects (PostOnly would cross, dust quantity, off-tick
-/// price) keeps its slot until the batch ends.
+/// the book then rejects (PostOnly would cross) keeps its slot until the
+/// batch ends. Fix A (s92): dust and off-tick orders are rejected before
+/// the book (Phase 2), so they take no slot — the later GTCs get them.
 #[test]
-fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
+fn open_limit_book_rejected_orders_keep_their_slot_but_off_tick_and_dust_take_none() {
     let (q, maker) = (addr(1), addr(2));
     let half = FixedPoint::from_raw(FixedPoint::SCALE / 2);
     let post_only = order(6, true, fp(60), fp(1), TimeInForce::PostOnly);
@@ -1264,6 +1265,8 @@ fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
         place(q, dust),
         place(q, off_tick),
         place(q, gtc(6, true, 50, 1)),
+        place(q, gtc(6, true, 49, 1)),
+        place(q, gtc(6, true, 48, 1)),
     ];
     let mut runs = Vec::new();
     for threads in [0usize, 2, 4] {
@@ -1276,14 +1279,368 @@ fn open_limit_book_rejected_orders_keep_their_slot_for_the_batch() {
         NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
         let results: Vec<_> = r.results.iter().map(|r| (r.success, r.error.clone())).collect();
-        assert!(results[..3].iter().all(|r| r.0), "book rejects report ok: {results:?}");
-        assert!(is_open_limit(&results[3]), "{results:?}");
-        assert_eq!(metrics.orders_rejected_book.get(), 3);
+        assert!(results[0].0, "a book reject (PostOnly cross) reports ok: {results:?}");
+        let err = |i: usize, s: &str| !results[i].0 && results[i].1.as_deref().is_some_and(|e| e.contains(s));
+        assert!(err(1, "below the lot size"), "{results:?}");
+        assert!(err(2, "is not a multiple of the tick"), "{results:?}");
+        assert!(results[3].0 && results[4].0, "slots 999 and 1000: {results:?}");
+        assert!(is_open_limit(&results[5]), "{results:?}");
+        assert_eq!(metrics.orders_rejected_book.get(), 1);
+        assert_eq!(metrics.orders_rejected_other.get(), 2);
         assert_eq!(metrics.orders_rejected_open_limit.get(), 1);
         let open: usize = ctx.order_books.values().map(|b| b.open_order_count(&q)).sum();
-        assert_eq!(open, 997, "nothing rested from the second batch");
+        assert_eq!(open, 999, "the two on-tick GTCs rested");
         ctx.save_order_books();
         runs.push((results, state_dump(&ctx)));
     }
     assert!(runs.windows(2).all(|w| w[0] == w[1]));
+}
+
+// ============================================================================
+// F1 (s517): account-level margin shapes
+// ============================================================================
+
+/// Publish `price` as market `market_id`'s aggregated oracle (mark) price
+/// (copied from market_order_margin_tests.rs).
+fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
+    let reporters = [addr(150), addr(151), addr(152)];
+    for v in &reporters {
+        ctx.oracle
+            .submit_price(v, market_id, price, ctx.block_height, ctx.timestamp)
+            .unwrap();
+    }
+    let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
+    let agg = ctx
+        .oracle
+        .aggregate_price(market_id, ctx.block_height, ctx.timestamp, &stakes)
+        .unwrap();
+    assert_eq!(agg, price, "test oracle aggregates to the mark");
+}
+
+fn mkt(market_id: MarketId, is_buy: bool, cap: i64, qty: i64) -> PlaceOrderParams {
+    PlaceOrderParams {
+        order_type: OrderType::Market,
+        time_in_force: TimeInForce::IOC,
+        ..gtc(market_id, is_buy, cap, qty)
+    }
+}
+
+/// F1 (s517): account-level shapes — a sender with positions sending
+/// checked takers into three markets in one batch (exclusive pool, running
+/// budget, flip), an under-water maker cancelled mid-batch (HL
+/// marginCanceled), a UPnL-funded reservation taking cash negative, a
+/// withdrawal against positions — byte-identical for threads {off, 2, 4, 8}.
+#[test]
+fn f1_account_margin_shapes_identical() {
+    let (t, mk) = (addr(40), addr(41));
+    let mut b1 = Vec::new();
+    for m in 1..=4u64 {
+        if m < 4 {
+            b1.push(place(addr(2), gtc(m, false, 100, 40))); // no asks in m4
+        }
+        b1.push(place(addr(3), gtc(m, true, 99, 40)));
+    }
+    b1.push(place(t, gtc(1, true, 100, 10))); // t long 10 in m1
+    b1.push(place(mk, gtc(4, true, 100, 10))); // mk's bid rests at the top of m4
+    b1.push(place(mk, gtc(2, true, 100, 10))); // mk long 10 in m2 (mark 80 later: under water)
+    let b2 = vec![
+        place(t, mkt(1, false, 1, 30)), // flip: 10 close, 20 open
+        place(t, mkt(2, false, 1, 20)),
+        place(t, mkt(3, false, 1, 20)),
+        place(addr(5), mkt(4, false, 1, 10)), // hits mk's bid first
+        place(t, gtc(5, true, 100, 60)),      // D1: UPnL-funded (mark m1 150), cash → negative
+        (
+            t,
+            NativeAction::TransferToSpot {
+                amount: alloy_primitives::U256::from(fp(1).raw() as u128),
+            },
+        ),
+    ];
+    let run = |threads: usize| -> RunFingerprint {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        for a in [addr(2), addr(3), addr(5)] {
+            fund_native(&ctx, &a, fp(1_000_000));
+        }
+        fund_native(&ctx, &t, fp(200));
+        fund_native(&ctx, &mk, fp(100));
+        let mut results = Vec::new();
+        let mut total_gas = Vec::new();
+        for (k, batch) in [b1.clone(), b2.clone()].iter().enumerate() {
+            if k == 1 {
+                set_mark(&ctx, 2, fp(80)); // mk under water before batch 2
+                set_mark(&ctx, 1, fp(150)); // t in profit: funds the m5 bid beyond cash
+            }
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, batch, threads);
+            assert!(ctx.fatal_error.is_none());
+            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            total_gas.push(r.total_gas);
+        }
+        // Sanity: the shape really exercises the maker cancel — mk's m4 bid
+        // is gone and mk never got a position there.
+        assert!(
+            ctx.order_books.get(&4).is_none_or(|b| b.orders_for_trader(&mk).is_empty()),
+            "threads={threads}: mk's under-water bid must be margin-cancelled"
+        );
+        assert!(ctx.positions.get_position(&mk, 4).unwrap().is_none(), "threads={threads}");
+        ctx.save_order_books();
+        RunFingerprint {
+            cf_dump: state_dump(&ctx),
+            results,
+            total_gas,
+            trade_index: ctx.trade_index,
+            next_global_order_id: ctx.next_global_order_id,
+            state_root: compute_native_state_root(&ctx.state).expect("state root"),
+        }
+    };
+    let golden = run(0);
+    for threads in [2usize, 4, 8] {
+        for _ in 0..5 {
+            assert_eq!(golden, run(threads), "threads={threads}");
+        }
+    }
+}
+
+/// Option B (s87): the non-pool sell shapes — several multi-market senders
+/// whose sells in non-pool markets meet a better start-of-batch bid (GTC,
+/// IOC, FOK, market sell above the mark, a partial fill that rests at its
+/// limit), a tight sender rejected at placement, an in-batch higher bid
+/// ahead of a non-pool sell, and a B2 at-limit sell adding to a short —
+/// byte-identical for threads {off, 2, 4, 8}.
+#[test]
+fn option_b_shapes_identical() {
+    let mk = addr(41);
+    let (t1, t2, t3, t4, x) = (addr(42), addr(43), addr(44), addr(45), addr(46));
+    let one = FixedPoint::from_raw(1);
+    let b1: Vec<_> = (1..=7u64)
+        .map(|m| place(mk, gtc(m, true, 101, 10)))
+        .chain([place(mk, order(8, true, fp(101), fp(1) + one, TimeInForce::GTC))])
+        .collect();
+    let b2 = vec![
+        place(t1, gtc(1, false, 100, 10)), // t1's pool
+        place(t1, gtc(2, false, 100, 10)), // B: fills 10 @101
+        place(t1, order(3, false, fp(100), fp(10), TimeInForce::IOC)),
+        place(t2, mkt(4, false, 1, 3)), // t2's pool
+        place(t2, order(7, false, fp(100), fp(3), TimeInForce::FOK)),
+        place(t2, mkt(5, false, 1, 10)), // B above the mark 90
+        place(x, gtc(6, true, 120, 10)), // unfunded in-batch high bid: rejected
+        place(t3, gtc(1, false, 200, 1)), // t3's pool (rests)
+        place(t3, gtc(6, false, 100, 14)), // fills 10 @101, rests 4 @100
+        place(t3, gtc(2, false, 100, 10)), // tight: rejected at placement
+        place(t4, gtc(1, false, 200, 1)), // t4's pool (rests)
+        place(t4, order(8, false, fp(101), fp(1) + one, TimeInForce::GTC)), // B2
+    ];
+    let run = |threads: usize| -> (RunFingerprint, Vec<FixedPoint>) {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        fund_native(&ctx, &mk, fp(1_000_000));
+        fund_native(&ctx, &t1, fp(1_000));
+        fund_native(&ctx, &t2, fp(1_000));
+        fund_native(&ctx, &t3, fp(81));
+        fund_native(&ctx, &t4, fp(1_000));
+        ctx.positions
+            .apply_fill(&t4, 8, false, fp(1), FixedPoint::from_raw(fp(100).raw() + 19), torus_core::position::MarginType::Cross)
+            .unwrap();
+        set_mark(&ctx, 5, fp(90));
+        let mut results = Vec::new();
+        let mut total_gas = Vec::new();
+        for batch in [b1.clone(), b2.clone()] {
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
+            assert!(ctx.fatal_error.is_none());
+            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            total_gas.push(r.total_gas);
+        }
+        let pos = |t: &Address, m: MarketId| match ctx.positions.get_position(t, m).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        };
+        let positions = vec![
+            pos(&t1, 2),
+            pos(&t1, 3),
+            pos(&t2, 4),
+            pos(&t2, 7),
+            pos(&t2, 5),
+            pos(&t3, 6),
+            pos(&t3, 2),
+            pos(&t4, 8),
+        ];
+        ctx.save_order_books();
+        let fp_run = RunFingerprint {
+            cf_dump: state_dump(&ctx),
+            results,
+            total_gas,
+            trade_index: ctx.trade_index,
+            next_global_order_id: ctx.next_global_order_id,
+            state_root: compute_native_state_root(&ctx.state).expect("state root"),
+        };
+        (fp_run, positions)
+    };
+    let (golden, positions) = run(0);
+    // Non-vacuous: every B shape filled on the canonical serial path.
+    assert_eq!(
+        positions,
+        vec![-fp(10), -fp(10), -fp(3), -fp(3), -fp(10), -fp(10), FixedPoint::ZERO, -(fp(2) + one)],
+        "option B shapes"
+    );
+    for threads in [2usize, 4, 8] {
+        for _ in 0..5 {
+            assert_eq!(golden, run(threads).0, "threads={threads}");
+        }
+    }
+}
+
+/// B-blind (s92): non-pool sells topped up to reserve(B0 x (1 + 10 bps))
+/// from the free margin left after the Phase-2 fold — the old s87 / s89
+/// same-batch bound shapes (funded bid beyond δ, a bid that lifts the start
+/// ask and rests, griefer bids: unfunded, IOC, off-tick, a GTC bid eaten
+/// whole, PostOnly bids crossing the start ask or an earlier same-batch ask,
+/// tight senders) re-pinned, plus a sell filling at a same-batch bid within
+/// δ, a partial top-up (flat order) and senders with no free margin left —
+/// byte-identical, counters included, for threads {off, 2, 4, 8}.
+#[test]
+fn b_blind_shapes_identical() {
+    let mk = addr(51);
+    let (t1, t2, t3, t4, b, x, y) = (addr(52), addr(53), addr(54), addr(55), addr(56), addr(57), addr(58));
+    let (t5, t6, t7, z) = (addr(59), addr(60), addr(61), addr(62));
+    let (t8, t9, t10) = (addr(63), addr(64), addr(65));
+    let post_only = |m: MarketId, p: i64| order(m, true, fp(p), fp(1), TimeInForce::PostOnly);
+    let mut b1: Vec<_> = [1u64, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15].iter().map(|&m| place(mk, gtc(m, true, 101, 10))).collect();
+    b1.extend(
+        [(2u64, 110), (4, 102), (5, 130), (7, 130), (11, 102), (13, 102), (15, 110)].map(|(m, p)| place(mk, gtc(m, false, p, 10))),
+    );
+    b1.extend((16u64..=20).map(|m| place(mk, gtc(m, true, 1_000, 1))));
+    let b2 = vec![
+        place(t1, gtc(1, false, 200, 1)), // t1's pool (rests)
+        place(b, gtc(2, true, 105, 10)),  // funded, rests below the ask 110
+        place(t2, gtc(3, false, 100, 10)), // t2's pool: fills @101 from the pool
+        place(y, gtc(5, true, 120, 10)),  // unfunded: rejected
+        place(t1, gtc(2, false, 100, 10)), // beyond δ: fills 2 @105, cut
+        place(x, gtc(4, true, 104, 1)),   // eaten by the ask 102, never rests
+        place(x, order(5, true, fp(120), fp(10), TimeInForce::IOC)),
+        place(x, order(5, true, FixedPoint::from_raw(fp(120).raw() + 1), fp(10), TimeInForce::GTC)), // off-tick
+        place(t2, gtc(4, false, 100, 10)), // δ top-up: both t2 sells fill
+        place(t3, gtc(6, false, 200, 1)), // t3's pool (rests)
+        place(t3, gtc(5, false, 100, 10)), // griefers: fills @101
+        place(t4, gtc(8, false, 200, 1)), // t4's pool (rests)
+        place(b, gtc(7, true, 105, 10)),
+        place(t4, gtc(7, false, 100, 10)), // beyond δ: fills 2 @105
+        place(t4, gtc(9, false, 100, 10)),
+        place(t5, gtc(10, false, 100, 10)), // t5's pool: the δ top-up in m11 comes first, fills 8
+        place(x, post_only(11, 104)),        // crosses the ask 102: book reject
+        place(t5, gtc(11, false, 100, 10)), // fills 10
+        place(t6, gtc(12, false, 100, 10)), // t6's pool
+        place(x, gtc(13, true, 104, 11)),   // eats the ask 102 and rests 1 @104
+        place(t6, gtc(13, false, 100, 10)), // not topped up for it: fills 1 @104 + 7 @101
+        place(t7, gtc(14, false, 100, 10)), // t7's pool
+        place(z, gtc(15, false, 104, 1)),   // same-batch ask, rests below the start ask 110
+        place(x, post_only(15, 104)),        // crosses z's ask: book reject
+        place(t7, gtc(15, false, 100, 10)), // both t7 sells fill 10
+        place(t8, gtc(6, false, 200, 1)),   // t8's pool (rests)
+        place(b, gtc(16, true, 1_001, 1)),
+        place(b, gtc(17, true, 1_001, 1)),
+        place(b, gtc(18, true, 1_001, 1)),
+        place(t8, gtc(16, false, 999, 1)), // within δ: topped up to 50.05, fills @1,001
+        place(t9, gtc(6, false, 200, 1)),  // t9's pool (rests)
+        place(t9, gtc(17, false, 999, 1)), // full top-up (0.05): fills @1,001
+        place(t9, gtc(18, false, 999, 1)), // partial (0.03): cut at 1,001
+        place(t10, gtc(6, false, 200, 1)), // t10's pool (rests)
+        place(t10, gtc(19, false, 999, 1)), // no free margin left: no top-up, fills @1,000
+        place(t10, gtc(20, false, 999, 1)),
+    ];
+    let run = |threads: usize| -> (RunFingerprint, Vec<FixedPoint>, Vec<u64>) {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db);
+        let metrics = Arc::new(Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        fund_native(&ctx, &mk, fp(1_000_000));
+        for (t, a) in [(t1, 1_000), (t2, 102), (t3, 1_000), (t4, 112), (b, 1_000), (x, 1_000), (t5, 101), (t6, 102), (t7, 102), (z, 1_000), (t8, 1_000), (t10, 110)] {
+            fund_native(&ctx, &t, fp(a));
+        }
+        fund_native(&ctx, &t9, FixedPoint::from_raw(fp(110).raw() + fp(8).raw() / 100));
+        let mut results = Vec::new();
+        let mut total_gas = Vec::new();
+        for batch in [b1.clone(), b2.clone()] {
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
+            assert!(ctx.fatal_error.is_none());
+            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            total_gas.push(r.total_gas);
+        }
+        let pos = |t: &Address, m: MarketId| match ctx.positions.get_position(t, m).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        };
+        let positions = vec![
+            pos(&t1, 2),
+            pos(&b, 2),
+            pos(&t2, 3),
+            pos(&t2, 4),
+            pos(&x, 4),
+            pos(&t3, 5),
+            pos(&t4, 7),
+            pos(&t4, 9),
+            pos(&t5, 10),
+            pos(&t5, 11),
+            pos(&t6, 12),
+            pos(&t6, 13),
+            pos(&x, 13),
+            pos(&t7, 14),
+            pos(&t7, 15),
+            pos(&t8, 16),
+            pos(&t9, 17),
+            pos(&t9, 18),
+            pos(&t10, 19),
+            pos(&t10, 20),
+        ];
+        let mut counters =
+            vec![metrics.sell_top_ups_full.get(), metrics.sell_top_ups_partial.get(), metrics.sell_top_ups_none.get()];
+        counters.extend(metrics.sell_margin_cuts.iter().flatten().flatten().map(|c| c.get()));
+        ctx.save_order_books();
+        let fp_run = RunFingerprint {
+            cf_dump: state_dump(&ctx),
+            results,
+            total_gas,
+            trade_index: ctx.trade_index,
+            next_global_order_id: ctx.next_global_order_id,
+            state_root: compute_native_state_root(&ctx.state).expect("state root"),
+        };
+        (fp_run, positions, counters)
+    };
+    let (golden, positions, counters) = run(0);
+    let (one, zero) = (fp(1), FixedPoint::ZERO);
+    assert_eq!(
+        positions,
+        vec![
+            -fp(2),
+            fp(2),
+            -fp(10),
+            -fp(10),
+            one,
+            -fp(10),
+            -fp(2),
+            -fp(10),
+            -fp(8),
+            -fp(10),
+            -fp(10),
+            -fp(8),
+            fp(11),
+            -fp(10),
+            -fp(10),
+            -one,
+            -one,
+            zero,
+            -one,
+            -one,
+        ],
+        "B-blind shapes"
+    );
+    assert_eq!(counters[..3], [10, 1, 2], "top-ups [full, partial, none]");
+    for threads in [2usize, 4, 8] {
+        for _ in 0..5 {
+            let (got, _, c) = run(threads);
+            assert_eq!(golden, got, "threads={threads}");
+            assert_eq!(counters, c, "threads={threads}: counters");
+        }
+    }
 }

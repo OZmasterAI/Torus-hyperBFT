@@ -75,6 +75,18 @@ def worst60_blk(rs):
                 break
     return worst or 0.0
 
+# s92 (B-blind observability): the executor's margin-cut counters — sell
+# takers cut by match-time margin by budget (pool / non-pool), fills before
+# the cut (zero / partial) and hit minus reservation price in ticks; maker
+# margin cancels; reduce-only cuts; B-blind top-ups granted in full / partly /
+# not at all. Reported as deltas over the bench window
+# (0 on an older binary).
+S92_COUNTERS = ["sell_cuts_%s_%s_%s_total" % (pool, fill, b)
+                for pool in ("pool", "nonpool") for fill in ("zero", "partial")
+                for b in ("t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p")] + [
+    "maker_margin_cancels_total", "reduce_only_cuts_total",
+    "sell_top_ups_full_total", "sell_top_ups_partial_total", "sell_top_ups_none_total"]
+
 funnel = {}
 for node, rs in rows.items():
     if not rs:
@@ -111,13 +123,30 @@ for node, rs in rows.items():
               "orders_rejected_open_limit_total", "orders_rejected_book_total",
               "orders_rejected_cancelled_total", "orders_rejected_other_total", "blocks_committed_total",
               "block_height", "consensus_timeout_total_total", "native_gossip_published_actions_total",
-              "native_gossip_dropped_full_total", "member_cache_evictions_total"]:
+              "native_gossip_dropped_full_total", "member_cache_evictions_total"] + S92_COUNTERS:
         d["delta_" + k] = m(last, k) - m(first, k)
     d["samples"] = len(rs)
     funnel[node] = d
 
 # ---------------------------------------------------------------- phase breakdown
-PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "save_books", "flush", "body_persist"]
+PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_status", "save_books", "flush",
+          "body_persist", "end_resident", "end_resident_wait"]
+# Item 6 cut 1: `action_status` (the v2 action status: native failures mapped
+# to body positions), exec thread, between engine and save_books; 0.0 on an
+# older binary, where it sits in residual_untimed.
+# Item 6 step 1: `end_resident` (R's end-of-block upkeep, exec thread, after
+# the flush / hand-off; 0.0 on an older binary, where it sits in
+# residual_untimed). Its subs: R applying the delta, and the decoded
+# positions following it with the sums carry; the rest is the memo merge and
+# drops. Not nested in any other phase.
+# Item 6 step 2: `end_resident` runs on a worker thread (joined by the next
+# block's begin_resident, or an untouched block's advance), so it is then an
+# OFF-chain phase like a worker's flush; `end_resident_wait` is the time the
+# exec thread waited at that join: the part of end_resident still on the
+# critical path (0.0 before step 2). A step 2 binary is recognised by a
+# non-zero wait count. The rare join on an untouched block lands in that
+# block's wall, not in a native block's chain.
+END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions"]
 # r7 state-write-build-vs-db-split: state_write is reported alongside its two
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
@@ -135,9 +164,13 @@ ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flus
 # -> the only half a flush worker could take). drain + write == save_books to
 # rounding; both 0.0 on a pre-bl1 binary AND on book modes 0/1 (no two-pass save).
 SAVE_SUB_BL1 = ["save_books_drain", "save_books_write"]
+# Item 6 E4: the context's margin-config load (`load_margin_configs`, one
+# scan of the market rows), a part of load_books; 0.0 on an older binary.
 SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6,
+       "load_books": ["margin_configs"],
        "save_books": SAVE_SUB_BL1,
-       "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"]}
+       "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"],
+       "end_resident": END_RESIDENT_SUB}
 
 
 def hist_quantile(pairs, q):
@@ -313,6 +346,11 @@ for node, rs in rows.items():
         m(b, "flush_worker_seconds_count") - m(a, "flush_worker_seconds_count")
     ) > 0
     off_chain_phases = ["flush"] if worker_present else []
+    end_resident_worker = (
+        m(b, "exec_end_resident_wait_seconds_count") - m(a, "exec_end_resident_wait_seconds_count")
+    ) > 0
+    if end_resident_worker:
+        off_chain_phases.append("end_resident")
     # Cadence is reported per WINDOW (see cadence()). The top-level cadence
     # fields are the LOAD window [t0, t1]; `drain` and `incl_drain` sit beside
     # them. The exec-phase ms table below (block_ms, phases, chain ruler) stays
@@ -362,7 +400,9 @@ for node, rs in rows.items():
                               "off_chain": False,
                               "pct_of_block": round(100 * (tot - acc) / tot, 1) if tot else None,
                               "note": "block_ms minus the phases timed ON THE EXEC THREAD"
-                                      + (" (flush excluded: observed by the flush worker)" if worker_present else "")}
+                                      + (" (flush excluded: observed by the flush worker)" if worker_present else "")
+                                      + (" (end_resident excluded: observed by its worker; end_resident_wait is the"
+                                         " exec thread's share)" if end_resident_worker else "")}
     p["off_chain_phases"] = off_chain_phases
     p["phases"] = ph
     # early vs late (first / last 60 s of the LOADED window = until matched stops moving)
@@ -450,13 +490,19 @@ for node, rs in rows.items():
     p["chain_ms_p50"] = pctl("torus_exec_chain_seconds_bucket", 0.50)
     p["chain_ms_p95"] = pctl("torus_exec_chain_seconds_bucket", 0.95)
     p["handoff_wait_ms_p95"] = pctl("torus_exec_handoff_wait_seconds_bucket", 0.95)
+    # Item 6 step 2: the exposed end_resident (join wait), per join.
+    p["end_resident_wait_ms_p50"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.50)
+    p["end_resident_wait_ms_p90"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.90)
     p["pipelined_ms_p95"] = pctl("torus_flush_worker_seconds_bucket", 0.95)
     # The ruler's own per-node-cell acceptance gate:
     #   * the chain must COVER every phase still running on the exec thread
     #     (on a serial binary that includes flush);
     #   * the chain can never exceed the block wall (the empty-block share is
     #     the whole difference).
-    e_phases = ["verify", "replay_guard", "load_books", "engine", "save_books"]
+    e_phases = ["verify", "replay_guard", "load_books", "engine", "action_status", "save_books",
+                "end_resident_wait"]
+    if not end_resident_worker:
+        e_phases.append("end_resident")
     if not p["worker_present"]:
         e_phases.append("flush")
     e_sum = round(sum(ph[k]["ms"] for k in e_phases), 2)

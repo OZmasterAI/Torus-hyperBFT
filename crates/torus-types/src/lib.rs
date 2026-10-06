@@ -84,7 +84,15 @@ impl FixedPoint {
     }
 
     /// Checked multiplication with i256 intermediate to avoid overflow.
+    ///
+    /// Item 6 P2: when the raw product fits i128 it is divided in i128 —
+    /// the same truncating quotient (|p / SCALE| < |p|, so it fits), bit for
+    /// bit; otherwise the i256 path decides (a quotient that fits, or the
+    /// overflow error).
     pub fn checked_mul(self, rhs: Self) -> Result<Self, ArithmeticError> {
+        if let Some(p) = self.0.checked_mul(rhs.0) {
+            return Ok(FixedPoint(p / Self::SCALE));
+        }
         use ethnum::i256;
         let result = i256::from(self.0) * i256::from(rhs.0) / i256::from(Self::SCALE);
         if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
@@ -98,6 +106,11 @@ impl FixedPoint {
     pub fn checked_div(self, rhs: Self) -> Result<Self, ArithmeticError> {
         if rhs.0 == 0 {
             return Err(ArithmeticError::DivisionByZero);
+        }
+        // Item 6 P2: i128 when `self × SCALE` fits (same truncating
+        // quotient; `checked_div` leaves MIN / -1 to the i256 path).
+        if let Some(q) = self.0.checked_mul(Self::SCALE).and_then(|n| n.checked_div(rhs.0)) {
+            return Ok(FixedPoint(q));
         }
         use ethnum::i256;
         let result = i256::from(self.0) * i256::from(Self::SCALE) / i256::from(rhs.0);
@@ -235,6 +248,18 @@ pub struct Signature {
     pub s: [u8; 32],
 }
 
+/// Review M3 (s517): proof that whoever registers a hot oracle signer holds
+/// its key — the signer's EIP-712 signature over
+/// `OracleSignerProof(address validator,uint64 chainId,uint64 nonce)`
+/// (`eip712::sign_oracle_signer_proof`). The validator field stops another
+/// validator replaying the proof; chain id (struct + domain) binds the chain;
+/// `nonce` makes each proof distinct (the wallet uses the action's nonce).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleSignerProof {
+    pub nonce: u64,
+    pub signature: Signature,
+}
+
 /// Ed25519 public key (32 bytes) for validator consensus signing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PublicKey(pub [u8; 32]);
@@ -247,7 +272,7 @@ pub enum SessionScope {
     /// TransferToPerp, TransferToSpot only.
     TransfersOnly,
     /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded.
+    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded, SetOracleSigner.
     Full,
 }
 
@@ -283,6 +308,7 @@ impl SessionScope {
                     | NativeAction::PermanentStake { .. }
                     | NativeAction::ClaimRewards
                     | NativeAction::ClaimUnbonded
+                    | NativeAction::SetOracleSigner { .. }
             ),
         }
     }
@@ -692,6 +718,19 @@ pub enum NativeAction {
     /// Release every matured unbonding entry across all of the sender's
     /// delegations back to their balance (explicit claim, Hyperliquid-style).
     ClaimUnbonded,
+
+    // === Oracle (appended — s517 hot oracle signer) ===
+    /// Set the sender validator's hot oracle signer, or clear it with
+    /// `Address::ZERO`. EIP-712 only (never a session key). The signer may then
+    /// submit `SubmitOraclePrices` on the validator's behalf — nothing else
+    /// (docs/plans/oracle-feeder.md §1). Rotation replaces it.
+    ///
+    /// `proof` (review M3) is required to set a signer and ignored when
+    /// clearing: without it, another validator could squat a signer address.
+    SetOracleSigner {
+        signer: Address,
+        proof: Option<OracleSignerProof>,
+    },
 }
 
 impl NativeAction {
@@ -964,6 +1003,20 @@ impl NativeAction {
             }
             NativeAction::ClaimUnbonded => {
                 buf.push(27);
+            }
+            NativeAction::SetOracleSigner { signer, proof } => {
+                buf.push(28);
+                buf.extend_from_slice(signer.as_slice());
+                match proof {
+                    None => buf.push(0),
+                    Some(p) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&p.nonce.to_be_bytes());
+                        buf.push(p.signature.v);
+                        buf.extend_from_slice(&p.signature.r);
+                        buf.extend_from_slice(&p.signature.s);
+                    }
+                }
             }
         }
     }
@@ -1393,6 +1446,36 @@ pub struct ValidatorSet {
 mod tests {
     use super::*;
 
+    /// s517 oracle feeder S1: `SetOracleSigner` is canonical tag 28 (27 is
+    /// ClaimUnbonded after the s87 rebase; 26 is main's AttestStateHash) + the
+    /// 20-byte signer, and survives a serde JSON round trip.
+    #[test]
+    fn set_oracle_signer_canonical_bytes_and_json_roundtrip() {
+        let signer = Address::repeat_byte(0x5a);
+        let a = NativeAction::SetOracleSigner { signer, proof: None };
+        let mut want = vec![28u8];
+        want.extend_from_slice(signer.as_slice());
+        want.push(0); // review M3: no proof
+        assert_eq!(a.canonical_bytes(), want);
+        let json = serde_json::to_string(&a).unwrap();
+        let back: NativeAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.canonical_bytes(), want);
+        let clear = NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None };
+        assert_ne!(clear.canonical_bytes(), want);
+        // With a proof: 1 ‖ nonce(8 BE) ‖ v ‖ r ‖ s.
+        let sig = Signature { v: 27, r: [1; 32], s: [2; 32] };
+        let p = NativeAction::SetOracleSigner {
+            signer,
+            proof: Some(OracleSignerProof { nonce: 5, signature: sig }),
+        };
+        let b = p.canonical_bytes();
+        assert_eq!(b.len(), 1 + 20 + 1 + 8 + 65);
+        assert_eq!(&b[21..30], &[1, 0, 0, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(b[30], 27);
+        let back: NativeAction = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.canonical_bytes(), b);
+    }
+
     /// S470 knob default: a ChainConfig serialized before the field existed
     /// (no `commit_lag_backoff_cap` key) must deserialize with the commit-lag
     /// backoff OFF (0) — an un-upgraded genesis runs the exact pre-S470
@@ -1525,6 +1608,111 @@ mod tests {
     fn checked_div_by_zero_returns_error() {
         let result = FixedPoint::ONE.checked_div(FixedPoint::ZERO);
         assert_eq!(result, Err(ArithmeticError::DivisionByZero));
+    }
+
+    /// Item 6 P2: the i256 reference `checked_mul` / `checked_div` (the
+    /// pre-P2 bodies, verbatim).
+    fn ref_mul(a: i128, b: i128) -> Result<i128, ArithmeticError> {
+        use ethnum::i256;
+        let result = i256::from(a) * i256::from(b) / i256::from(FixedPoint::SCALE);
+        if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
+            return Err(ArithmeticError::Overflow);
+        }
+        Ok(result.as_i128())
+    }
+
+    fn ref_div(a: i128, b: i128) -> Result<i128, ArithmeticError> {
+        if b == 0 {
+            return Err(ArithmeticError::DivisionByZero);
+        }
+        use ethnum::i256;
+        let result = i256::from(a) * i256::from(FixedPoint::SCALE) / i256::from(b);
+        if result > i256::from(i128::MAX) || result < i256::from(i128::MIN) {
+            return Err(ArithmeticError::Overflow);
+        }
+        Ok(result.as_i128())
+    }
+
+    /// Operands for the P2 differential tests: the i128 edges, ±SCALE
+    /// multiples, values around sqrt(i128::MAX) and i128::MAX / SCALE, and
+    /// random values of every bit length and both signs.
+    fn p2_operands() -> Vec<i128> {
+        let s = FixedPoint::SCALE;
+        let root = 13_043_817_825_332_782_212i128; // floor(sqrt(i128::MAX))
+        let q = i128::MAX / s;
+        let mut v = vec![
+            0, 1, 2, 7, s - 1, s, s + 1, 2 * s, 99_999_999, 123_456_789_012,
+            i128::MAX, i128::MAX - 1, i128::MIN, i128::MIN + 1,
+            i128::MAX / 2, i128::MIN / 2, root - 1, root, root + 1,
+            q - 1, q, q + 1, i128::MAX / 3, 1 << 64, (1 << 64) - 1, 1 << 100,
+        ];
+        let neg: Vec<i128> = v.iter().filter(|x| **x != i128::MIN).map(|x| -x).collect();
+        v.extend(neg);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..600 {
+            let bits = (next() % 128) as u32;
+            let raw = ((u128::from(next()) << 64) | u128::from(next())) >> (127 - bits);
+            let r = raw as i128;
+            v.push(if next() & 1 == 1 { r.wrapping_neg() } else { r });
+        }
+        v
+    }
+
+    /// Item 6 P2: the i128 fast path of `checked_mul` is bit-identical to the
+    /// i256 path on every pair — including products that overflow i128
+    /// whose quotient fits (fallback) and quotients that overflow (Err).
+    #[test]
+    fn p2_checked_mul_matches_i256_reference() {
+        let ops = p2_operands();
+        let (mut fast, mut fallback_ok, mut overflow) = (0, 0, 0);
+        for &a in &ops {
+            for &b in &ops {
+                let want = ref_mul(a, b);
+                let got = FixedPoint(a).checked_mul(FixedPoint(b)).map(|r| r.0);
+                assert_eq!(got, want, "checked_mul({a}, {b})");
+                match (a.checked_mul(b), want) {
+                    (Some(_), _) => fast += 1,
+                    (None, Ok(_)) => fallback_ok += 1,
+                    (None, Err(_)) => overflow += 1,
+                }
+            }
+        }
+        // Every class is exercised.
+        assert!(fast > 1000 && fallback_ok > 1000 && overflow > 1000, "{fast} {fallback_ok} {overflow}");
+    }
+
+    /// Item 6 P2: the same for `checked_div` (i128 `a * SCALE / b` when the
+    /// numerator fits and the division does not overflow).
+    #[test]
+    fn p2_checked_div_matches_i256_reference() {
+        let ops = p2_operands();
+        let (mut fast, mut fallback_ok, mut overflow) = (0, 0, 0);
+        for &a in &ops {
+            for &b in &ops {
+                let want = ref_div(a, b);
+                let got = FixedPoint(a).checked_div(FixedPoint(b)).map(|r| r.0);
+                assert_eq!(got, want, "checked_div({a}, {b})");
+                match (a.checked_mul(FixedPoint::SCALE), want) {
+                    (_, Err(ArithmeticError::DivisionByZero)) => {}
+                    (Some(_), _) => fast += 1,
+                    (None, Ok(_)) => fallback_ok += 1,
+                    (None, Err(_)) => overflow += 1,
+                }
+            }
+        }
+        assert!(fast > 1000 && fallback_ok > 1000 && overflow > 1000, "{fast} {fallback_ok} {overflow}");
+        // MIN / -1 overflows on both paths (the numerator a * SCALE can
+        // never be i128::MIN — not a multiple of SCALE — so the i128
+        // division itself never overflows; `checked_div` guards it anyway).
+        assert_eq!(FixedPoint::MIN.checked_div(FixedPoint(-1)), Err(ArithmeticError::Overflow));
+        assert_eq!(ref_div(i128::MIN, -1), Err(ArithmeticError::Overflow));
+        assert_ne!(i128::MIN % FixedPoint::SCALE, 0);
     }
 
     #[test]

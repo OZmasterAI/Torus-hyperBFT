@@ -1820,7 +1820,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=30,
-                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                    env=dict(
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1", **env
+                    ),
                 )
                 self.assertEqual(r.returncode, 2, r.stderr)
                 self.assertIn(msg, r.stderr)
@@ -1856,6 +1859,128 @@ class OracleFeedHarnessTest(unittest.TestCase):
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
             self.assertIn('"ORACLE_WALK_BP",', f.read())
 
+    def test_feed_drain_defaults_off_and_bad_env_fails_preflight(self):
+        """ORACLE_FEED_DRAIN=1 keeps the feed live through the drain. 0 (default)
+        = today's cell; any other value, or 1 without ORACLE_FEED=1, is FATAL."""
+        self.assertIn("ORACLE_FEED_DRAIN=${ORACLE_FEED_DRAIN:-0}", self.src)
+        doc = self.src.index("#   ORACLE_FEED_DRAIN=1")
+        self.assertLess(self.src.index("#   ORACLE_FEED=1"), doc)
+        self.assertLess(doc, self.src.index("set -uo pipefail"))
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"ORACLE_FEED_DRAIN",', f.read())
+        tmp = tempfile.mkdtemp(prefix="oracle-drain-pre-")
+        try:
+            tgt = os.path.join(tmp, "release")
+            os.makedirs(tgt)
+            for b in ("torus-node", "bench-throughput"):
+                p = os.path.join(tgt, b)
+                with open(p, "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(p, 0o755)
+            wt = os.path.dirname(os.path.dirname(HERE))
+            for env, msg in (
+                (dict(ORACLE_FEED_DRAIN="2"), "ORACLE_FEED_DRAIN must be 0 or 1"),
+                (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="yes"), "ORACLE_FEED_DRAIN must be 0 or 1"),
+                (dict(ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+                (dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+            ):
+                r = subprocess.run(
+                    [RUN_CELL_SH, wt, "oracle-drain-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1", **env
+                    ),
+                )
+                self.assertEqual(r.returncode, 2, (env, r.stderr))
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "oracle-drain-pre-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    def _run_drain_flow(self, mode):
+        """Run run-cell.sh's real bench-end pause block and drain block with
+        python3 stubbed: each health.py call prints the feed's process state
+        (T = SIGSTOPped) and its argv."""
+        pause = self.fn('ORACLE_ALIVE_END=""\n', "\n# ------------------------------------------------"
+                        "---------------- 7. drain")
+        drain = self.fn("# ---------------------------------------------------------------- 7. drain",
+                        "\nsleep 2\n")
+        tmp = tempfile.mkdtemp(prefix="oracle-drain-flow-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # what the (stubbed) health.py runs would have left behind
+        os.makedirs(os.path.join(tmp, "feed-stop-settle"))
+        with open(os.path.join(tmp, "drain.json"), "w") as f:
+            json.dump({"drained": True, "feed_live": {
+                "max_exec_lag": 2, "native_intervals": 4, "single_block_intervals": 3,
+                "native_blocks": 5, "chain_ms": {"p50": 50.0, "p95": 200.0, "max": 200.0}}}, f)
+        with open(os.path.join(tmp, "feed-stop-settle", "drain.json"), "w") as f:
+            json.dump({"drained": True, "elapsed_s": 12.7}, f)
+        script = (
+            self.fn("alive() {", "\nstop_sampler() {")
+            + '\nlog() { echo "LOG $*"; }\n'
+            + "oracle_marks() { echo '{\"markets\":300,\"usable\":300}'; }\n"
+            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n' % tmp
+            + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
+            + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
+            + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
+              "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s T_BENCH1=$(date +%%s)\n" % (tmp, mode)
+            + "METS=(9161 9162 9163)\n"
+            + pause + "\n" + drain
+            + '\ncat "$OUT/py.log"; echo "END $(ps -o stat= -p "$FEED" | cut -c1)"\n'
+            # the real exit-path stop must still end the feed paused after the drain
+            + 'stop_oracle_feed; alive "$FEED" && echo FEED_STILL_ALIVE; echo "STOPPED rc=$ORACLE_RC"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return tmp, r.stdout
+
+    def test_default_drain_flow_is_unchanged(self):
+        out_dir, out = self._run_drain_flow("0")
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        urls = " ".join("http://127.0.0.1:%d/metrics" % p for p in (9161, 9162, 9163))
+        self.assertEqual(
+            py,
+            ["PY T /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s"
+             % (out_dir, urls)],
+        )
+        self.assertIn("LOG oracle feed paused (SIGSTOP) for drain + digest", out)
+        self.assertIn("END T", out)
+        self.assertNotIn("FEED_STILL_ALIVE", out)
+        self.assertIn("STOPPED rc=143", out)
+
+    def test_feed_drain_keeps_the_feed_live_then_pauses_and_settles(self):
+        out_dir, out = self._run_drain_flow("1")
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        self.assertEqual(len(py), 2, out)
+        # live through the drain, judged by the feed-live criterion; the
+        # mempool bound = 2 rounds x 3 validators x ceil(300/256) chunks
+        self.assertTrue(py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0])
+        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12"), py[0])
+        # paused right after it, then a legacy quiet settle before the digest
+        self.assertTrue(
+            py[1].startswith("PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "
+                             "--quiet 10 --urls " % out_dir), py[1])
+        self.assertNotIn("--feed-live", py[1])
+        self.assertTrue(os.path.isdir(os.path.join(out_dir, "feed-stop-settle")))
+        self.assertIn("LOG feed-live drain:", out)
+        self.assertIn("quiet_window_native_block_exec_ms", out)
+        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        self.assertEqual(len(settle), 1, out)
+        self.assertRegex(settle[0], r"settle drained=1 after 12s")
+        self.assertIn("quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
+                      "max=200.0 native_blocks=5 single_block_intervals=3/4", out)
+        self.assertIn("END T", out)
+        self.assertNotIn("FEED_STILL_ALIVE", out)
+        self.assertIn("STOPPED rc=143", out)
+        # the existing exit paths still stop it (TERM + CONT): unchanged
+        self.assertIn('kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src)
+
     def test_bad_walk_env_fails_preflight(self):
         tmp = tempfile.mkdtemp(prefix="oracle-walk-pre-")
         try:
@@ -1879,7 +2004,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=30,
-                    env=dict(os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, **env),
+                    env=dict(
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1", **env
+                    ),
                 )
                 self.assertEqual(r.returncode, rc, (env, r.stderr))
                 self.assertIn(msg, r.stderr)
@@ -1890,6 +2018,106 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+
+
+# ----------------------------------- cells run detached from the caller's shell
+DETACH_SH = os.path.join(HERE, "campaign", "detach.sh")
+
+
+def _in_bench_unit():
+    with open("/proc/self/cgroup") as f:
+        return "/bench-" in f.read()
+
+
+def _have_user_systemd():
+    if not shutil.which("systemd-run"):
+        return False
+    r = subprocess.run(
+        ["systemctl", "--user", "is-system-running"], capture_output=True, text=True
+    )
+    return r.stdout.strip() in ("running", "degraded")
+
+
+class DetachTest(unittest.TestCase):
+    """2026-10-06 ozarchy: three 300-market runs each lost one process (val1,
+    val2, the load generator) to a SIGKILL that was no OOM kill and no
+    kill/tkill/tgkill. The cells ran as descendants of an agent's shell. A cell
+    must run in its own transient systemd --user service (campaign/detach.sh),
+    whose parent is the user manager, not the shell that started it."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="detach-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    @unittest.skipIf(_in_bench_unit(), "test process already runs in a bench unit")
+    def test_run_cell_refuses_outside_a_bench_unit(self):
+        wt = os.path.join(self.d, "wt")
+        os.makedirs(os.path.join(wt, "devnet", "wsl"))
+        results = os.path.join(self.d, "results")
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("BENCH_ALLOW_UNDETACHED", "RUN_CELL_PRINT_PATHS")
+        }
+        env.update(RESULTS_ROOT=results, DATA_ROOT=os.path.join(self.d, "data"))
+        r = subprocess.run(
+            ["bash", RUN_CELL_SH, wt, "probe-label"],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("detach.sh", r.stderr)
+        self.assertFalse(os.path.exists(results), "refused cell must not write results")
+        self.assertFalse(os.path.exists(os.path.join(self.d, "data")))
+
+    def _detach(self, name, script):
+        log = os.path.join(self.d, "out.log")
+        r = subprocess.run(
+            ["bash", DETACH_SH, name, log, "bash", "-c", script],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, DETACH_PROBE="carried"), cwd=self.d,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        deadline = time.time() + 20
+        text = None
+        while time.time() < deadline:
+            if os.path.exists(log):
+                with open(log) as f:
+                    text = f.read()
+                if "DONE" in text:
+                    return text
+            time.sleep(0.2)
+        self.fail("detached command never finished; log: %r" % text)
+
+    @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
+    def test_detach_runs_in_a_bench_service_parented_by_the_user_manager(self):
+        name = "test-detach-%d" % os.getpid()
+        out = self._detach(
+            name,
+            'echo "CG=$(cut -d: -f3 /proc/self/cgroup)"; '
+            'echo "PARENT=$(ps -o comm= -p $PPID)"; '
+            'echo "PROBE=$DETACH_PROBE"; echo "PWD=$PWD"; echo DONE',
+        )
+        kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
+        self.assertEqual(kv["PARENT"], "systemd")
+        self.assertEqual(kv["PROBE"], "carried", "caller's exported env must carry over")
+        self.assertEqual(kv["PWD"], self.d, "caller's working directory must carry over")
+
+    @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
+    def test_run_cell_guard_accepts_a_detached_unit(self):
+        with open(RUN_CELL_SH) as f:
+            line = next(l for l in f if l.startswith("BENCH_UNIT_RE="))
+        out = self._detach(
+            "test-guard-%d" % os.getpid(),
+            line + 'grep -qE "$BENCH_UNIT_RE" /proc/self/cgroup && echo IN=1; echo DONE',
+        )
+        self.assertIn("IN=1", out)
+
+    def test_detach_needs_a_name_a_log_and_a_command(self):
+        r = subprocess.run(["bash", DETACH_SH, "x", "/tmp/x.log"],
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage", r.stderr)
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):

@@ -351,12 +351,39 @@ fn parse_log_row(log: &Value, block_height: i64) -> LogRow {
 }
 
 /// s84: `torus_getBlockBody` `nativeActionStatus`, `None` while unknown.
+/// v2: a `"failed"` action's entry of `nativeActionFailures` is folded into
+/// its stored status: `failed (<reason>): <message>`, plus the first failing
+/// order and the failed-order count for a PlaceOrderBatch.
 fn native_action_status(body: &Value) -> Option<Vec<String>> {
-    body.get("nativeActionStatus")?
+    let mut statuses: Vec<String> = body
+        .get("nativeActionStatus")?
         .as_array()?
         .iter()
         .map(|s| s.as_str().map(str::to_string))
-        .collect()
+        .collect::<Option<_>>()?;
+    let failures = body.get("nativeActionFailures").and_then(Value::as_array);
+    for f in failures.into_iter().flatten() {
+        let Some(status) = f
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|i| statuses.get_mut(i as usize))
+        else {
+            continue;
+        };
+        let reason = val_str(f, "reason");
+        let batch = match (val_u64(f, "order"), val_u64(f, "failedOrders")) {
+            (order, failed) if order > 0 || failed != 1 => {
+                format!(", order {order}, {failed} failed")
+            }
+            _ => String::new(),
+        };
+        *status = format!("failed ({reason}{batch}): {}", val_str(f, "message"));
+    }
+    Some(statuses)
+}
+
+fn val_u64(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 pub fn parse_native_action_row(
@@ -603,6 +630,41 @@ mod tests {
             "a skipped replay does not move the executed tx's row"
         );
         handle.stop().unwrap();
+    }
+
+    /// v2: a failed native action's stored status carries its reason and
+    /// message; executed / skipped stay as they are; a pre-v2 node (no
+    /// `nativeActionFailures`) reads like before.
+    #[test]
+    fn native_action_status_shows_failure_reason() {
+        let body = json!({
+            "nativeActionStatus": ["executed", "failed", "skipped"],
+            "nativeActionFailures": [{"index": 1, "reason": "margin",
+                "message": "insufficient margin: need 5, have 1 (account)",
+                "order": 0, "failedOrders": 1}]
+        });
+        assert_eq!(
+            native_action_status(&body).unwrap(),
+            vec![
+                "executed".to_string(),
+                "failed (margin): insufficient margin: need 5, have 1 (account)".to_string(),
+                "skipped".to_string(),
+            ]
+        );
+        let batch = json!({
+            "nativeActionStatus": ["failed"],
+            "nativeActionFailures": [{"index": 0, "reason": "tick", "message": "off tick",
+                "order": 3, "failedOrders": 2}]
+        });
+        assert_eq!(
+            native_action_status(&batch).unwrap(),
+            vec!["failed (tick, order 3, 2 failed): off tick".to_string()]
+        );
+        let v1 = json!({"nativeActionStatus": ["executed", "skipped"]});
+        assert_eq!(
+            native_action_status(&v1).unwrap(),
+            vec!["executed".to_string(), "skipped".to_string()]
+        );
     }
 
     #[test]

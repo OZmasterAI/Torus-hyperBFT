@@ -87,6 +87,11 @@ pub struct ValidatorState {
     pub jailed_until: Option<u64>,
     /// Block height of last commission change (Phase 3: 3.2.3 cooldown).
     pub last_commission_change_block: Option<u64>,
+    /// s517: the hot oracle signer (`SetOracleSigner`): may submit
+    /// `SubmitOraclePrices` for this validator and nothing else. Serialized
+    /// LAST (Option tag + 20 bytes); the reverse index lives in
+    /// `CF_NATIVE_ORACLE` under `torus_state::cf::oracle_signer_key`.
+    pub oracle_signer: Option<Address>,
 }
 
 impl ValidatorState {
@@ -105,6 +110,13 @@ impl BorshSerialize for ValidatorState {
         BorshSerialize::serialize(&self.status, writer)?;
         BorshSerialize::serialize(&self.jailed_until, writer)?;
         BorshSerialize::serialize(&self.last_commission_change_block, writer)?;
+        match &self.oracle_signer {
+            None => writer.write_all(&[0])?,
+            Some(s) => {
+                writer.write_all(&[1])?;
+                borsh_write_address(s, writer)?;
+            }
+        }
         Ok(())
     }
 }
@@ -120,6 +132,18 @@ impl BorshDeserialize for ValidatorState {
         let status = ValidatorStatus::deserialize_reader(reader)?;
         let jailed_until = Option::<u64>::deserialize_reader(reader)?;
         let last_commission_change_block = Option::<u64>::deserialize_reader(reader)?;
+        let mut tag = [0u8; 1];
+        reader.read_exact(&mut tag)?;
+        let oracle_signer = match tag[0] {
+            0 => None,
+            1 => Some(borsh_read_address(reader)?),
+            x => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid oracle_signer option tag: {x}"),
+                ))
+            }
+        };
         Ok(Self {
             address,
             pubkey,
@@ -129,6 +153,7 @@ impl BorshDeserialize for ValidatorState {
             status,
             jailed_until,
             last_commission_change_block,
+            oracle_signer,
         })
     }
 }
@@ -661,5 +686,45 @@ impl BorshDeserialize for ValidatorWhitelistEntry {
             approved_at_block,
             expires_at_block,
         })
+    }
+}
+
+#[cfg(test)]
+mod oracle_signer_layout_tests {
+    use super::*;
+
+    fn validator(signer: Option<Address>) -> ValidatorState {
+        ValidatorState {
+            address: Address::repeat_byte(1),
+            pubkey: [2; 32],
+            commission_bps: 500,
+            self_stake: U256::from(10u8),
+            total_delegated: U256::from(3u8),
+            status: ValidatorStatus::Active,
+            jailed_until: Some(7),
+            last_commission_change_block: None,
+            oracle_signer: signer,
+        }
+    }
+
+    /// s517 oracle feeder S1: `oracle_signer` is appended to the borsh layout
+    /// (an Option tag, then 20 bytes) and round-trips for Some and None.
+    #[test]
+    fn validator_state_borsh_roundtrip_with_signer() {
+        for signer in [Some(Address::repeat_byte(0x5a)), None] {
+            let v = validator(signer);
+            let bytes = borsh::to_vec(&v).unwrap();
+            let back = ValidatorState::try_from_slice(&bytes).unwrap();
+            assert_eq!(back.oracle_signer, signer);
+            assert_eq!(back.address, v.address);
+            assert_eq!(back.jailed_until, Some(7));
+            match signer {
+                Some(s) => {
+                    assert_eq!(bytes[bytes.len() - 21], 1);
+                    assert_eq!(&bytes[bytes.len() - 20..], s.as_slice());
+                }
+                None => assert_eq!(*bytes.last().unwrap(), 0),
+            }
+        }
     }
 }

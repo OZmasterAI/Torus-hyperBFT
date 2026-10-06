@@ -72,6 +72,10 @@ pub enum Job {
         /// s77 order latency: the block's action nonces, observed at `durable`
         /// once the job's batch is written.
         order_nonces: Vec<u64>,
+        /// v2 action status: the block's executed/skipped/failed record, if
+        /// it has one. W encodes it into the sidecar (`CF_BLOCK_ACTION_STATUS`,
+        /// not hashed, not a root CF) so it joins the block's atomic batch.
+        action_status: Option<torus_state::action_status::BlockActionStatus>,
     },
     /// An empty / non-native block: advance the applied-height marker, in order
     /// behind the previous block's batch. `pending` is the 1-key marker layer the
@@ -378,6 +382,7 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             pending,
             evm_addrs,
             books,
+            action_status,
             ..
         } => {
             // Deferred book save: apply pass 2 (if any) into a sidecar overlay
@@ -390,17 +395,33 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             // drained row bytes move into the sidecar (owned puts, as on E).
             // `exec_save_books_write_seconds` keeps one observation per native
             // block: E observes it on the serial save, W observes it here.
-            let sidecar = books.take().map(|b| {
+            // v2 action status: encoded here, off the exec thread, and put in
+            // the same sidecar (a non-hashed, non-root CF: no root input).
+            let sidecar = (books.is_some() || action_status.is_some()).then(|| {
                 let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
-                let t = std::time::Instant::now();
-                torus_bridge::native_executor::apply_deferred_book_save(
-                    &overlay,
-                    env.metrics.as_deref(),
-                    b,
-                );
-                if let Some(m) = &env.metrics {
-                    m.exec_save_books_write_seconds
-                        .observe(t.elapsed().as_secs_f64());
+                if let Some(b) = books.take() {
+                    let t = std::time::Instant::now();
+                    torus_bridge::native_executor::apply_deferred_book_save(
+                        &overlay,
+                        env.metrics.as_deref(),
+                        b,
+                    );
+                    if let Some(m) = &env.metrics {
+                        m.exec_save_books_write_seconds
+                            .observe(t.elapsed().as_secs_f64());
+                    }
+                }
+                if let Some(status) = action_status.take() {
+                    let bytes =
+                        crate::action_results::encode_status(&status, env.metrics.as_deref());
+                    if let Err(e) = torus_state::StateBackend::put_cf_raw(
+                        &overlay,
+                        torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                        &height.to_be_bytes(),
+                        &bytes,
+                    ) {
+                        tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+                    }
                 }
                 overlay.freeze(*height)
             });

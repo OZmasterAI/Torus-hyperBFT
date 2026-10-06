@@ -11,14 +11,15 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use torus_core::error::CoreError;
-use torus_core::liquidation::LiquidationEngine;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
-    effective_max_leverage, order_initial_margin, MarginTier, MarketMarginConfig,
+    effective_max_leverage, market_margin_config, order_initial_margin, placement_need,
+    position_price, position_terms, AccountView, MarginTier, MarketMarginConfig,
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    reduce_only_allowance, Fill, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions,
+    market_row_shape, reduce_only_allowance, shape_violation, AccountMargins, Fill, MakerAccount,
+    MakerAccountSource, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, ShapeViolation,
     TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
@@ -29,8 +30,9 @@ use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
+use torus_state::action_status::FailureReason;
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
-use torus_state::{PackedCfBatch, StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
     SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
@@ -49,6 +51,10 @@ pub struct NativeActionResult {
     pub success: bool,
     pub error: Option<String>,
     pub gas_used: u64,
+    /// Why it failed, set where the check failed (v2 action status stores
+    /// it; never derived from `error`). `Other` for a success and for any
+    /// failure without a dedicated code.
+    pub reason: FailureReason,
 }
 
 impl NativeActionResult {
@@ -58,18 +64,28 @@ impl NativeActionResult {
             success: true,
             error: None,
             gas_used,
+            reason: FailureReason::Other,
         }
     }
 
     fn err(action_type: &'static str, error: String) -> Self {
+        Self::rejected(action_type, (FailureReason::Other, error))
+    }
+
+    /// A failure with its typed reason.
+    fn rejected(action_type: &'static str, (reason, error): Rejection) -> Self {
         Self {
             action_type,
             success: false,
             error: Some(error),
             gas_used: 0,
+            reason,
         }
     }
 }
+
+/// A refused action: its typed reason and its message.
+type Rejection = (FailureReason, String);
 
 /// Result of executing a batch of native actions.
 #[derive(Clone, Debug)]
@@ -112,6 +128,7 @@ pub struct EpochBoundaryResult {
 /// `save_order_books`, block-end flush) see a fully materialized overlay. Flush order is
 /// over distinct per-sender keys, so it is state-independent of iteration order; the map
 /// is otherwise never iterated.
+#[derive(Default)]
 struct BalanceCache {
     map: HashMap<Address, CachedBalance>,
     dirty: Vec<Address>,
@@ -327,6 +344,15 @@ impl BalanceCache {
     }
 }
 
+// Item 3 (s517): the end-of-block liquidation step (child module: sees the
+// private placement / stop / cancel helpers and `AccountReader`).
+#[path = "liquidation_step.rs"]
+mod liquidation_step;
+
+#[path = "trader_positions.rs"]
+mod trader_positions;
+use trader_positions::TraderPositions;
+
 #[cfg(test)]
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
@@ -339,6 +365,11 @@ mod load_books_parallel_tests;
 // C3 — deterministic parallel Phase-4 settlement: plumbing types
 // ============================================================================
 
+/// B-blind (s92, owner): a non-pool sell is topped up to cover bids up to
+/// its market's start-of-Phase-2 best bid plus this many basis points
+/// ([`NativeExecutor::sell_top_ups`]): `reserve(B0 x (1 + 10 bps), qty)`.
+const SELL_TOP_UP_BPS: i128 = 10;
+
 /// C2/C3: one Phase-2-prepared PlaceOrder flowing through matching (Phase 3)
 /// and settlement (Phase 4). `params` borrows the caller's committed action
 /// slice — no per-order deep clone anywhere in the pipeline.
@@ -348,9 +379,26 @@ struct PreparedOrder<'a> {
     params: &'a PlaceOrderParams,
     order_id: u128,
     margin_reserved: FixedPoint,
-    /// s515 review 4: match-time margin budget (reservation + the sender's
-    /// available balance right after it, Phase-2 view); `None` = unchecked.
-    margin_budget: Option<FixedPoint>,
+    /// F1 (s517): `Some(UPnL − position IM)` of a checked taker's sender
+    /// (pre-batch); `None` = unchecked. Its match-time budget is its own
+    /// reservation + the sender's exclusive pool (D2, see Phase 3).
+    checked_pos_net: Option<FixedPoint>,
+    /// Item 6 M1: the sender's pre-batch (signed position, valuation price)
+    /// in this market as Phase 2 read it (`position_px`; every order with
+    /// an account check, so every checked taker); `None` = not read (a
+    /// reduce-only order). Phase 3 polices and values from it instead of
+    /// reading the position again (the backend is frozen in between).
+    pre_pos: Option<(FixedPoint, FixedPoint)>,
+    /// Option B (s87): a [`NativeExecutor::takes_bid_floor`] sell whose
+    /// sender's D2 pool market is another market — exactly `prepare_one`'s
+    /// bid-floor condition (the pool is fixed by the sender's first accepted
+    /// checked order, so it is known when the order is prepared). B-blind
+    /// (s92) tops these up ([`NativeExecutor::sell_top_ups`]).
+    top_up_candidate: bool,
+    /// s92 (observability only): the price `margin_reserved` was taken at
+    /// (Phase 2's reservation price, raised to a granted top-up's price); the
+    /// sell-cut counters bucket a cut by its hit price minus this.
+    res_price: FixedPoint,
 }
 
 /// C3: everything a settle worker precomputes for ONE prepared order —
@@ -547,13 +595,30 @@ enum EngineMode {
 /// L3-ENG: one Phase-2 outcome for a single flattened PlaceOrder, computed by
 /// a sharded worker and applied by the serial stitch in flat order.
 enum PrepOutcome {
-    /// Margin reserved (possibly ZERO for market orders) and the match-time
-    /// margin budget (s515 review 4, `None` = unchecked) — the stitch
-    /// assigns the global order id and builds the `PreparedOrder`.
-    Pass(FixedPoint, Option<FixedPoint>),
-    /// Rejected pre-book. `reason` selects the funnel counter; `msg` is the
-    /// exact serial-path error string.
-    Reject { reason: RejectReason, msg: String },
+    /// The stitch assigns the global order id and builds the `PreparedOrder`.
+    Pass(PrepPass),
+    /// Rejected pre-book. `funnel` selects the funnel counter; `reason` is
+    /// the result's typed reason, `msg` the exact serial-path error string.
+    Reject { funnel: RejectReason, reason: FailureReason, msg: String },
+}
+
+/// L3-ENG: a passed order's Phase-2 results ([`PreparedOrder`]'s fields).
+struct PrepPass {
+    /// Margin reserved (possibly ZERO for market orders).
+    required: FixedPoint,
+    /// F1 (s517): `Some(UPnL − position IM)` of a checked taker's sender
+    /// (`None` = unchecked).
+    checked_pos_net: Option<FixedPoint>,
+    /// Item 6 M1: [`PreparedOrder::pre_pos`].
+    pre_pos: Option<(FixedPoint, FixedPoint)>,
+    /// [`PreparedOrder::top_up_candidate`].
+    top_up_candidate: bool,
+    /// s92: [`PreparedOrder::res_price`].
+    res_price: FixedPoint,
+    /// Review fix 1: the order's own unchecked excess (what
+    /// [`SenderState::excess_unchecked`] sums; tests' oracle).
+    #[cfg(test)]
+    excess_im: FixedPoint,
 }
 
 /// Open-order count work (trader probes + stops) per worker thread: below
@@ -685,6 +750,16 @@ enum RejectReason {
 }
 
 impl RejectReason {
+    /// The result's reason of a reject counted under this funnel counter
+    /// (the open-order slot check: `OpenLimit` or a state read error).
+    fn failure(self) -> FailureReason {
+        match self {
+            RejectReason::Margin => FailureReason::Margin,
+            RejectReason::OpenLimit => FailureReason::OpenLimit,
+            RejectReason::Other => FailureReason::Other,
+        }
+    }
+
     fn count(self, m: &torus_telemetry::Metrics) {
         match self {
             RejectReason::Margin => m.orders_rejected_margin.inc(),
@@ -713,6 +788,1248 @@ fn takes_open_slot(p: &PlaceOrderParams) -> bool {
             p.order_type,
             OrderType::StopMarket { .. } | OrderType::StopLimit { .. }
         )
+}
+
+/// F1 (s517): read-only inputs of the account-level margin formulas —
+/// shared by placement (single + Phase 2), modify and withdrawals, so every
+/// path computes the same numbers. Only READS state; in Phase 3 the backend
+/// is frozen (write-back caches, flushed after settlement).
+struct AccountReader<'a, T: StateBackend> {
+    positions: &'a PositionManager<T>,
+    oracle: &'a OracleManager<T>,
+    /// The block's header timestamp (s): the clock of the oracle mark rule.
+    now: u64,
+    margin_configs: &'a HashMap<MarketId, MarketMarginConfig>,
+    /// Item 6 C2: the block's mark table (`None`: every `mark` reads the oracle).
+    marks: Option<&'a BlockMarks>,
+    /// Item 6 C3: the block's margin sums cache (`None`: every valuation
+    /// builds over the trader's rows, the reference path).
+    sums: Option<&'a BlockSums>,
+    /// Item 6 C6c: the `execute_batch` call's valuation state (Phase 2 / 3
+    /// reader only; `None` elsewhere).
+    batch: Option<&'a BatchSums>,
+    /// Item 6 M1: `margin_configs`' tiers by market id (batch reader only).
+    dense_tiers: Option<&'a DenseTiers<'a>>,
+}
+
+/// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
+/// [`AccountView`] — exactly `AccountView::build`'s sums over a trader's
+/// positions (same function, same rows: bit-exact by construction) — plus
+/// what liquidation's valuation guard reads (L1, C4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PosSums {
+    upnl: FixedPoint,
+    position_im: FixedPoint,
+    notional: FixedPoint,
+    maintenance: FixedPoint,
+    /// Positions that are not Cross (`build` skips them; liquidation does
+    /// not value such an account). A count (C6b) so a partial re-value can
+    /// add and remove. Read by L1 (C4).
+    isolated: u32,
+    /// Cross positions valued at a mark (not at entry). Read by L1 (C4).
+    marked: u32,
+    /// C6b magnitude guard: Σ |term| of each sum (upnl, position_im,
+    /// notional, maintenance; saturating). At most `i128::MAX` = no partial
+    /// sum of `build` can overflow, in any order of its positions.
+    abs: [u128; 4],
+}
+
+/// C6b: the guard's bound (see [`PosSums::abs`]).
+const ABS_GUARD: u128 = i128::MAX as u128;
+
+/// C6b (A-lite) / item 6 M1: `base` (a trader's sums over some rows) minus
+/// the terms of each changed row's position as it was (`.0`) plus its terms
+/// now (`.1`), valued with `marks` and `tiers`. Exact: the sums are integer
+/// sums of the same [`position_terms`] as `build`, the order does not matter
+/// while nothing overflows, every step is checked, and the guard (Σ |term|
+/// <= `i128::MAX`, see [`PosSums::abs`]) proves `build` over the rows now
+/// cannot overflow either. `None` (the caller builds or drops): the guard
+/// on `base`, a Cross position in a market outside `marks`, an overflow, or
+/// the guard on the result.
+fn sums_with_changes<'t>(
+    base: PosSums,
+    changes: &[trader_positions::Change],
+    marks: &BlockMarks,
+    tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+) -> Option<SumsResult> {
+    if base.abs.iter().any(|a| *a > ABS_GUARD) {
+        return None;
+    }
+    let mut sums = [base.upnl.raw(), base.position_im.raw(), base.notional.raw(), base.maintenance.raw()];
+    let (mut abs, mut isolated, mut marked) = (base.abs, base.isolated, base.marked);
+    // Removals first (exact: `abs` holds no saturated value), then additions.
+    for add in [false, true] {
+        for (resident, current) in changes {
+            let Some(pos) = (if add { current } else { resident }) else {
+                continue;
+            };
+            let step = |n: u32| if add { n.checked_add(1) } else { n.checked_sub(1) };
+            if pos.margin_type != MarginType::Cross {
+                isolated = step(isolated)?;
+                continue;
+            }
+            let mark = marks.get(pos.market_id)?;
+            if mark.is_some() {
+                marked = step(marked)?;
+            }
+            let t = position_terms(pos, mark, tiers(pos.market_id)).ok()?;
+            for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
+                let x = x.raw();
+                if add {
+                    *sum = sum.checked_add(x)?;
+                    *a = a.saturating_add(x.unsigned_abs());
+                } else {
+                    *sum = sum.checked_sub(x)?;
+                    *a = a.checked_sub(x.unsigned_abs())?;
+                }
+            }
+        }
+    }
+    if abs.iter().any(|a| *a > ABS_GUARD) {
+        return None;
+    }
+    let [upnl, position_im, notional, maintenance] = sums.map(FixedPoint::from_raw);
+    Some(Ok(PosSums { upnl, position_im, notional, maintenance, isolated, marked, abs }))
+}
+
+/// C3: `AccountView::build`'s sums over `ps` valued with `mark` / `tiers`
+/// (`Err(())`: `build` overflowed), with the counts and magnitudes of
+/// [`PosSums`].
+fn build_sums<'t>(
+    ps: &[torus_core::position::Position],
+    mark: impl Fn(MarketId) -> Option<FixedPoint>,
+    tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+) -> SumsResult {
+    let marked = std::cell::Cell::new(0u32);
+    let mark = |m: MarketId| {
+        let mark = mark(m);
+        marked.set(marked.get().saturating_add(u32::from(mark.is_some())));
+        mark
+    };
+    let mut abs = [0u128; 4];
+    let seen = |_: &torus_core::position::Position, t: &torus_core::margin::PositionTerms| {
+        for (a, x) in abs.iter_mut().zip(t.parts()) {
+            *a = a.saturating_add(x.raw().unsigned_abs());
+        }
+    };
+    AccountView::build_with(&NativeBalance::default(), ps, mark, tiers, seen)
+        .map(|v| PosSums {
+            upnl: v.upnl,
+            position_im: v.position_im,
+            notional: v.notional,
+            maintenance: v.maintenance,
+            isolated: u32::try_from(ps.iter().filter(|p| p.margin_type != MarginType::Cross).count())
+                .unwrap_or(u32::MAX),
+            marked: marked.get(),
+            abs,
+        })
+        .map_err(|_| ())
+}
+
+impl PosSums {
+    /// Some position is not Cross.
+    fn any_isolated(&self) -> bool {
+        self.isolated > 0
+    }
+
+    /// `build`'s view with balance `bal`: `build` copies the two balance
+    /// fields and adds the position sums, which never read the balance.
+    fn view(&self, bal: &NativeBalance) -> AccountView {
+        AccountView {
+            available: bal.available,
+            order_margin: bal.order_margin,
+            upnl: self.upnl,
+            position_im: self.position_im,
+            notional: self.notional,
+            maintenance: self.maintenance,
+        }
+    }
+}
+
+/// A trader's sums, `Err(())` = `build` overflowed (reproduced as
+/// `CoreError::Overflow("account margin overflows i128")`).
+type SumsResult = Result<PosSums, ()>;
+
+/// Address length: a positions key's trader prefix.
+const TRADER_PREFIX: usize = 20;
+
+/// Item 6 C3: the persistent sums, kept in the resident rows slot and
+/// read-only during a block: each trader's sums over its rows in R, valued
+/// with the mark table / configs of `version`. An entry follows the
+/// trader's rows: a block that writes them moves it on to the rows after the
+/// block or drops it (item 6 M1, [`SumsCarry::trader`]); it is read only
+/// while the version holds (versions are never reused, so an entry at
+/// another version is never read; the map is cleared when the version moves).
+#[derive(Debug, Default)]
+struct SumsCache {
+    version: u64,
+    map: HashMap<Address, SumsResult>,
+    /// Item 6 M1 (tests): entries `end_resident` moved on to a trader's rows
+    /// after the block (instead of dropping them).
+    #[cfg(test)]
+    carried: usize,
+}
+
+/// Item 6 C3: one block's sums state on the context — the slot's cache and
+/// the block's memo (fix 1's pattern: the map lock covers the lookup only,
+/// callers needing the same trader wait on its cell for ONE computation;
+/// safe under parallel Phase 2 / 3). A cell holds `None` when the result may
+/// not be cached (a positions read error, or a mark outside the table):
+/// callers then compute it directly.
+#[derive(Debug, Default)]
+pub(crate) struct BlockSums {
+    cache: SumsCache,
+    /// The mark version the memo's entries are valued at (set by
+    /// `fill_block_marks`; `None`: no table, the cache is not used).
+    memo_version: Option<u64>,
+    memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
+    /// Item 6 C7: R's positions decoded per trader (from the slot; `None`:
+    /// every read goes through the overlay). Read only for a trader with
+    /// nothing pending ([`AccountReader::resident_positions`]).
+    records: Option<TraderPositions>,
+    /// P1 (tests): every cached answer is also computed by the reference
+    /// path; differences are recorded (a panic in a worker would be caught).
+    #[cfg(test)]
+    shadow: bool,
+    #[cfg(test)]
+    shadow_mismatches: std::sync::Mutex<Vec<String>>,
+    #[cfg(test)]
+    counters: SumsCounters,
+}
+
+/// Item 6 M1 / step 1: the slot's sums after a block, while R's decoded
+/// positions follow the block's delta ([`TraderPositions::apply`] reports
+/// each written trader to [`Self::trader`]).
+struct SumsCarry<'a> {
+    cache: SumsCache,
+    /// The block's mark table / configs (and the configs' tiers by market)
+    /// when the entries may be carried; `None`: written traders' entries are
+    /// dropped.
+    table: Option<(&'a BlockMarksState, DenseTiers<'a>)>,
+}
+
+impl SumsCarry<'_> {
+    /// A trader the block wrote under: its entry (sums over R's rows before
+    /// the block, at the table's version) moves on to its rows after the
+    /// block, or is dropped when that is not possible (no entry, no carry,
+    /// `changes` unknown: `None`, a Cross position in a market outside the
+    /// table, an overflow or the guard of [`sums_with_changes`]). Exact: the
+    /// entry is then `build` over R's rows after the block at the version,
+    /// as an entry the next block would compute (used only while the version
+    /// holds, i.e. the same marks and configs). `changes` / `now`: the
+    /// trader's changed positions (before, after) and its positions after
+    /// the block (see [`TraderPositions::apply`]); when re-valuing all of
+    /// `now` costs no more terms than the changes (2 per change), `build`
+    /// over `now` instead (the same sums, exactly).
+    fn trader(&mut self, trader: &Address, report: Option<(&[trader_positions::Change], &[torus_core::position::Position])>) {
+        let moved = (|| {
+            let (t, dense) = self.table.as_ref()?;
+            let (changes, now) = report?;
+            let base = self.cache.map.get(trader)?.ok()?;
+            let tiers = |m: MarketId| {
+                if dense.tiers.is_empty() {
+                    t.configs.get(&m).map(|c| c.tiers.as_slice())
+                } else {
+                    dense.tiers.get(m as usize).copied().flatten()
+                }
+            };
+            if now.len() <= 2 * changes.len() {
+                let in_table = std::cell::Cell::new(true);
+                let mark = |m: MarketId| {
+                    t.marks.get(m).unwrap_or_else(|| {
+                        in_table.set(false);
+                        None
+                    })
+                };
+                let r = build_sums(now, mark, tiers);
+                return in_table.get().then_some(r);
+            }
+            sums_with_changes(base, changes, &t.marks, tiers)
+        })();
+        match moved {
+            Some(r) => {
+                self.cache.map.insert(*trader, r);
+                #[cfg(test)]
+                {
+                    self.cache.carried += 1;
+                }
+            }
+            None => {
+                self.cache.map.remove(trader);
+            }
+        }
+    }
+
+    /// Every trader the block wrote under loses its entry (no decoded
+    /// positions to follow).
+    fn drop_written(&mut self, delta: &torus_state::ResidentDelta) {
+        let mut last: Option<&[u8]> = None;
+        for (key, _) in delta.entries(torus_state::cf::CF_NATIVE_POSITIONS) {
+            let Some(prefix) = key.get(..TRADER_PREFIX) else { continue };
+            if last != Some(prefix) {
+                self.cache.map.remove(&Address::from_slice(prefix));
+                last = Some(prefix);
+            }
+        }
+    }
+}
+
+/// Which path answered each `pos_sums` call (tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SumsCounters {
+    shadow: std::sync::atomic::AtomicUsize,
+    persistent: std::sync::atomic::AtomicUsize,
+    memo: std::sync::atomic::AtomicUsize,
+    computed: std::sync::atomic::AtomicUsize,
+    dirty: std::sync::atomic::AtomicUsize,
+    /// C6b: dirty valuations answered by the partial re-value / by a build.
+    delta: std::sync::atomic::AtomicUsize,
+    delta_fallback: std::sync::atomic::AtomicUsize,
+    /// Full valuations (`build` over a trader's rows: the memo's or a
+    /// direct one; not the shadow check's) per trader.
+    builds: std::sync::Mutex<HashMap<Address, usize>>,
+    /// C6c: valuations per trader — full builds plus partial re-values
+    /// (cache / memo hits are not valuations).
+    valuations: std::sync::Mutex<HashMap<Address, usize>>,
+    /// C4: liquidation valuations through L1 / through the walk (L1 off).
+    l1: std::sync::atomic::AtomicUsize,
+    l1_off: std::sync::atomic::AtomicUsize,
+    /// C7: position reads / memo builds answered by the decoded records.
+    records: std::sync::atomic::AtomicUsize,
+    /// E2: liquidation candidate lists from the slot's trader set.
+    traders_slice: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+fn bump(c: &std::sync::atomic::AtomicUsize) {
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+impl SumsCounters {
+    fn built(&self, trader: &Address) {
+        *self.builds.lock().unwrap().entry(*trader).or_insert(0) += 1;
+        self.valued(trader);
+    }
+
+    fn valued(&self, trader: &Address) {
+        *self.valuations.lock().unwrap().entry(*trader).or_insert(0) += 1;
+    }
+
+    /// Valuations of `trader` so far.
+    pub(crate) fn valuations_of(&self, trader: &Address) -> usize {
+        self.valuations.lock().unwrap().get(trader).copied().unwrap_or(0)
+    }
+
+    /// Full valuations of `trader` so far.
+    pub(crate) fn builds_of(&self, trader: &Address) -> usize {
+        self.builds.lock().unwrap().get(trader).copied().unwrap_or(0)
+    }
+}
+
+impl BlockSums {
+    fn new(cache: SumsCache) -> Self {
+        Self { cache, ..Self::default() }
+    }
+
+    /// The block's mark table was (re)filled: the memo restarts at `version`.
+    fn start(&mut self, version: Option<u64>) {
+        self.memo.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.memo_version = version;
+    }
+
+    /// C6b: `trader`'s sums over R's rows, if already known: the slot's
+    /// entry at `version`, else the block's memo (not computed here). `None`
+    /// also for a build that overflowed (no terms to adjust).
+    fn base(&self, version: u64, trader: &Address) -> Option<PosSums> {
+        if self.cache.version == version {
+            if let Some(r) = self.cache.map.get(trader) {
+                return r.ok();
+            }
+        }
+        let cell = self.memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(trader).cloned()?;
+        let r = (*cell.get()?)?;
+        r.ok()
+    }
+
+    /// End of the block: the memo joins the cache (at the memo's version),
+    /// returned with what [`SumsCarry::trader`] needs to move on the entry of
+    /// each trader the block wrote under (item 6 M1): `table`, the block's
+    /// mark table and configs, when the entries may be carried (see below).
+    fn into_carry(self, table: Option<&BlockMarksState>) -> SumsCarry<'_> {
+        // Node-local policy: carry only while the mark version held across
+        // the previous block (the slot's cache is at this block's version).
+        // A moving version (marks move most blocks) clears the next block's
+        // cache, so carried entries would be thrown away (measured: ~1 ms
+        // per 1k fills of block-end work for nothing at walk 10).
+        let stable = self.memo_version.is_some_and(|v| v == self.cache.version);
+        let mut cache = self.cache;
+        #[cfg(test)]
+        {
+            cache.carried = 0;
+        }
+        if let Some(version) = self.memo_version {
+            if cache.version != version {
+                cache.map.clear();
+                cache.version = version;
+            }
+            let memo = self.memo.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (trader, cell) in memo {
+                if let Some(Some(r)) = cell.get() {
+                    cache.map.insert(trader, *r);
+                }
+            }
+        }
+        // Carry only at the version the entries are valued at.
+        let table = table.filter(|t| {
+            stable && self.memo_version == Some(t.marks.version) && cache.version == t.marks.version
+        });
+        SumsCarry { cache, table: table.map(|t| (t, DenseTiers::of(&t.configs))) }
+    }
+
+    /// P1 shadow check: `cached` == the reference path's answer.
+    #[cfg(test)]
+    fn shadow_check(&self, trader: &Address, cached: &SumsResult, reference: impl FnOnce() -> Result<SumsResult, CoreError>) {
+        if !self.shadow {
+            return;
+        }
+        bump(&self.counters.shadow);
+        let want = reference();
+        if want.as_ref().ok() != Some(cached) {
+            self.shadow_mismatches
+                .lock()
+                .unwrap()
+                .push(format!("{trader}: cached {cached:?}, reference {want:?}"));
+        }
+    }
+}
+
+/// Item 6 C6c (D): one `execute_batch` call's valuation state, on its
+/// Phase 2 / 3 reader. Sound because the backend is frozen while that
+/// reader lives: Phase 2 and Phase 4 write through the balance / position
+/// caches, flushed after settlement (the reader is gone by then), and the
+/// Phase 3 workers only read. Built only with a sums cache attached.
+/// * `dirty`: the traders with own pending position writes, read once
+///   (`layer_keys`) in place of a `layer_touches` lock per (maker, book);
+///   `None` = not available (ask `layer_touches`).
+/// * `memo`: a dirty trader's sums, computed once per call (partial
+///   re-value or build); a cell holding `None` = a read error (the caller
+///   computes it directly and gets the error).
+/// * `id`: keys each Phase 3 worker's maker cache ([`MAKER_FREE`]).
+pub(crate) struct BatchSums {
+    id: u64,
+    dirty: Option<std::collections::HashSet<Address>>,
+    memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
+}
+
+/// C6c: source of [`BatchSums::id`] (process-wide, never reused; 0 unused).
+static BATCH_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl BatchSums {
+    fn new<T: StateBackend>(positions: &PositionManager<T>) -> Self {
+        let dirty = positions.state().layer_keys(torus_state::cf::CF_NATIVE_POSITIONS).map(|keys| {
+            keys.iter()
+                .filter(|k| k.len() >= TRADER_PREFIX)
+                .map(|k| Address::from_slice(&k[..TRADER_PREFIX]))
+                .collect()
+        });
+        Self {
+            id: BATCH_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            dirty,
+            memo: std::sync::Mutex::default(),
+        }
+    }
+}
+
+thread_local! {
+    /// C6c (D): each Phase 3 worker's maker cache, in front of the shared
+    /// memo locks: [`AccountReader::maker_free`] per maker for the batch
+    /// `.0` ([`BatchSums::id`]; another batch clears it). A maker's free
+    /// margin is the same in every market of a batch (frozen backend).
+    static MAKER_FREE: std::cell::RefCell<(u64, HashMap<Address, FixedPoint>)> =
+        std::cell::RefCell::new((0, HashMap::new()));
+}
+
+/// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
+/// read ONCE at the end of [`NativeExecutor::begin_block_oracle`] with the
+/// per-read rule ([`AccountReader::mark`]: `get_price(m, now).usable()`) for
+/// every listed market, every market with a margin config, every market with
+/// an aggregate row (so a delisted market whose last aggregate is still fresh
+/// is in the table too) and every market with a loaded book (as fix 1's memo:
+/// an unlisted market's `None` is not re-read per position). Sound because only `begin_block_oracle` writes
+/// the aggregate rows, before any action of the block, and `now` is the
+/// block's: every read of the block returns the same value. A market outside
+/// the table (no aggregate row at the block start) reads the oracle directly.
+/// Replaces fix 1's per-`execute_batch` memo (`BatchMarks`).
+#[derive(Debug)]
+pub(crate) struct BlockMarks {
+    marks: HashMap<MarketId, Option<FixedPoint>>,
+    /// Item 6 M1: `marks` indexed by market id (`dense[m]` = `marks.get(m)`)
+    /// when every id is below [`DENSE_MARKETS`]; empty otherwise.
+    dense: Vec<Option<Option<FixedPoint>>>,
+    /// Changes exactly when the table or `margin_configs` differ from the
+    /// previous block's ([`BlockMarksState`], kept in the resident rows slot);
+    /// a changed block takes a new process-wide value, never one used before
+    /// (slot absent or rebuilt = changed). Keys the sums cache (C3).
+    version: u64,
+}
+
+/// Item 6 C2: source of new mark versions (process-wide, so a rebuilt or
+/// second holder never meets an old value).
+static MARK_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Item 6 M1: market ids below this get dense (array-indexed) per-market
+/// tables ([`BlockMarks::get`], [`DenseTiers`]); any larger id keeps the map.
+const DENSE_MARKETS: u64 = 4096;
+
+/// Item 6 M1: `map` as an array indexed by market id, when every key is below
+/// [`DENSE_MARKETS`] (else empty: callers use the map).
+fn dense_index<'m, V, W: Clone>(map: &'m HashMap<MarketId, V>, f: impl Fn(&'m V) -> W) -> Vec<Option<W>> {
+    match map.keys().max() {
+        Some(&max) if max < DENSE_MARKETS => {
+            let mut v = vec![None; max as usize + 1];
+            for (m, x) in map {
+                v[*m as usize] = Some(f(x));
+            }
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Item 6 M1: a margin config map's tiers indexed by market id
+/// ([`dense_index`]), built per `execute_batch` call from the map the batch
+/// reader borrows, so it holds exactly the map's tiers.
+struct DenseTiers<'a> {
+    tiers: Vec<Option<&'a [MarginTier]>>,
+}
+
+impl<'a> DenseTiers<'a> {
+    fn of(configs: &'a HashMap<MarketId, MarketMarginConfig>) -> Self {
+        Self { tiers: dense_index(configs, |c| c.tiers.as_slice()) }
+    }
+}
+
+impl BlockMarks {
+    fn new(marks: HashMap<MarketId, Option<FixedPoint>>, version: u64) -> Self {
+        let dense = dense_index(&marks, |m| *m);
+        Self { marks, dense, version }
+    }
+
+    /// `marks.get(m)`, through the dense index when there is one.
+    fn get(&self, m: MarketId) -> Option<Option<FixedPoint>> {
+        if self.dense.is_empty() {
+            return self.marks.get(&m).copied();
+        }
+        self.dense.get(m as usize).copied().flatten()
+    }
+
+    /// The per-read mark rule for each of `markets`.
+    fn read<T: StateBackend>(
+        oracle: &OracleManager<T>,
+        now: u64,
+        markets: impl IntoIterator<Item = MarketId>,
+    ) -> HashMap<MarketId, Option<FixedPoint>> {
+        markets
+            .into_iter()
+            .map(|m| (m, oracle.get_price(m, now).ok().and_then(|p| p.usable())))
+            .collect()
+    }
+
+    /// The table's version (see the field).
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Markets with a mark that are not in `listed`, ascending (normally
+    /// none). Liquidation values only listed markets at their mark
+    /// (`liquidation_step` `Marks` = the table filtered to `listed`), every
+    /// other reader any market with a mark: the two agree iff this is empty.
+    /// The liquidation step (L1, C4) decides with it.
+    pub(crate) fn delisted_marked(&self, listed: &[MarketId]) -> Vec<MarketId> {
+        let mut out: Vec<MarketId> = self
+            .marks
+            .iter()
+            .filter(|(m, mark)| mark.is_some() && !listed.contains(m))
+            .map(|(m, _)| *m)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Item 6 C2: a block's mark table and the margin configs it was valued
+/// with, carried to the next block in the resident rows slot (via
+/// [`ResidentBlock`]) to decide whether the version changes.
+#[derive(Debug)]
+struct BlockMarksState {
+    marks: BlockMarks,
+    configs: HashMap<MarketId, MarketMarginConfig>,
+}
+
+impl<'a, T: StateBackend> AccountReader<'a, T> {
+    fn of(ctx: &'a NativeExecContext<T>) -> Self {
+        Self {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            now: ctx.timestamp,
+            margin_configs: &ctx.margin_configs,
+            marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
+            batch: None,
+            dense_tiers: None,
+        }
+    }
+
+    /// s515 review 4 mark: the aggregated oracle price while usable
+    /// ([`OraclePrice::usable`](torus_core::oracle::OraclePrice::usable):
+    /// time-based, stale 60 s of block time after the last fresh aggregate),
+    /// `None` when absent, stale, non-positive or unreadable. Only oracle
+    /// aggregation writes that row, before any action of the block, so every
+    /// placement of a block (single, batch serial, batch sharded) reads the
+    /// same value on every validator.
+    fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
+        match self.marks.and_then(|t| t.get(market_id)) {
+            Some(mark) => mark,
+            None => self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable()),
+        }
+    }
+
+    fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
+        match self.dense_tiers.filter(|d| !d.tiers.is_empty()) {
+            Some(d) => d.tiers.get(market_id as usize).copied().flatten(),
+            None => self.margin_configs.get(&market_id).map(|c| c.tiers.as_slice()),
+        }
+    }
+
+    /// F1: `trader`'s cross-margin account with balance `bal` — positions at
+    /// the mark, else at entry (s517 decision 2). Item 6 C3: the position
+    /// part from [`Self::pos_sums`].
+    fn view(&self, trader: &Address, bal: &NativeBalance) -> Result<AccountView, CoreError> {
+        Ok(self.pos_sums(trader)?.view(bal))
+    }
+
+    /// F1: UPnL − position IM of `trader` (balance-independent part of `free`).
+    fn pos_net(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
+        Ok(self.view(trader, &NativeBalance::default())?.pos_net())
+    }
+
+    /// Item 6 C3 (plan 2.4): `trader`'s position sums.
+    /// 1. no cache or no mark table: `build` over `positions_for_trader`;
+    /// 2. the block wrote under the trader's positions prefix: the same, over
+    ///    the overlay (own pending + R);
+    /// 3. the slot's entry at the block's mark version;
+    /// 4. else the block's memo, built once over R's rows (the overlay with
+    ///    nothing of the trader pending reads exactly them).
+    ///
+    /// C6b (A-lite): path 2 first tries [`Self::delta_sums`] (the trader's
+    /// sums over R's rows adjusted by this block's changes of its rows).
+    fn pos_sums(&self, trader: &Address) -> Result<PosSums, CoreError> {
+        let r = match (self.sums, self.marks) {
+            (Some(s), Some(table)) if s.memo_version == Some(table.version) => {
+                if self.dirty(trader) {
+                    #[cfg(test)]
+                    bump(&s.counters.dirty);
+                    // C6c: once per `execute_batch` call.
+                    let r = match self.batch {
+                        Some(b) => {
+                            let cell = b
+                                .memo
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .entry(*trader)
+                                .or_default()
+                                .clone();
+                            match *cell.get_or_init(|| self.dirty_sums(s, table, trader).ok()) {
+                                Some(r) => r,
+                                None => self.dirty_sums(s, table, trader)?,
+                            }
+                        }
+                        None => self.dirty_sums(s, table, trader)?,
+                    };
+                    #[cfg(test)]
+                    s.shadow_check(trader, &r, || self.reference_sums(trader));
+                    r
+                } else {
+                    let r = self.cached_sums(s, table.version, trader)?;
+                    #[cfg(test)]
+                    s.shadow_check(trader, &r, || self.reference_sums(trader));
+                    r
+                }
+            }
+            _ => self.direct_sums(trader)?,
+        };
+        r.map_err(|()| CoreError::Overflow("account margin overflows i128".into()))
+    }
+
+    /// Whether the block wrote under `trader`'s positions prefix (own pending
+    /// writes or tombstones): C6c's frozen set on a batch reader, else
+    /// `layer_touches` ("dirty" when R is not attached).
+    fn dirty(&self, trader: &Address) -> bool {
+        match self.batch.and_then(|b| b.dirty.as_ref()) {
+            Some(set) => set.contains(trader),
+            None => self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()),
+        }
+    }
+
+    /// Item 6 C7: `trader`'s positions decoded from R's slot — what the
+    /// overlay reads for a trader with nothing pending. `None` (read the
+    /// overlay): no records, the trader is dirty, or it holds an irregular
+    /// row.
+    fn resident_positions(&self, trader: &Address) -> Option<&'a [torus_core::position::Position]> {
+        let records = self.sums?.records.as_ref()?;
+        if self.dirty(trader) {
+            return None;
+        }
+        records.get(trader)
+    }
+
+    /// `trader`'s position in `market_id`: C7's record when clean, else the
+    /// overlay (`PositionManager::get_position`).
+    fn get_position(
+        &self,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<torus_core::position::Position>, CoreError> {
+        let Some(ps) = self.resident_positions(trader) else {
+            return self.positions.get_position(trader, market_id);
+        };
+        let p = trader_positions::find(ps, market_id).cloned();
+        #[cfg(test)]
+        if let Some(s) = self.sums {
+            bump(&s.counters.records);
+            if s.shadow {
+                let want = format!("{:?}", self.positions.get_position(trader, market_id));
+                let got = format!("{:?}", Ok::<_, CoreError>(p.clone()));
+                if want != got {
+                    s.shadow_mismatches.lock().unwrap().push(format!("get_position {trader} {market_id}: record {got}, overlay {want}"));
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// Path 2: the partial re-value (C6b), else `build` over the overlay.
+    fn dirty_sums(&self, s: &BlockSums, table: &BlockMarks, trader: &Address) -> Result<SumsResult, CoreError> {
+        match self.delta_sums(s, table, trader) {
+            Some(r) => {
+                #[cfg(test)]
+                {
+                    bump(&s.counters.delta);
+                    s.counters.valued(trader);
+                }
+                Ok(r)
+            }
+            None => {
+                #[cfg(test)]
+                bump(&s.counters.delta_fallback);
+                self.direct_sums(trader)
+            }
+        }
+    }
+
+    /// Paths 1 and 2: `build` over the trader's rows as the backend shows them.
+    fn direct_sums(&self, trader: &Address) -> Result<SumsResult, CoreError> {
+        #[cfg(test)]
+        if let Some(s) = self.sums {
+            s.counters.built(trader);
+        }
+        self.reference_sums(trader)
+    }
+
+    /// `build` over the trader's rows (the shadow check's reference; not
+    /// counted as a valuation).
+    fn reference_sums(&self, trader: &Address) -> Result<SumsResult, CoreError> {
+        Ok(self.sums_of(&self.positions.positions_for_trader(trader)?).0)
+    }
+
+    /// C6b (A-lite): `trader`'s sums now = its sums over R's rows (the slot's
+    /// entry or the block's memo, [`BlockSums::base`]) minus the terms of
+    /// each row the block changed under its prefix as R holds it, plus the
+    /// terms of the row now ([`torus_state::StateBackend::resident_changes`]).
+    /// Exact: the sums are integer sums of the same [`position_terms`] as
+    /// `build`, the order does not matter while nothing overflows, every
+    /// step is checked, and the guard (Σ |term| <= `i128::MAX`, see
+    /// [`PosSums::abs`]) proves `build` over the rows now cannot overflow
+    /// either. `None` (the caller builds): no base, no change list, a row
+    /// that does not decode, a Cross position in a market outside the mark
+    /// table, an overflow, or the guard.
+    fn delta_sums(&self, s: &BlockSums, table: &BlockMarks, trader: &Address) -> Option<SumsResult> {
+        let base = s.base(table.version, trader)?;
+        if base.abs.iter().any(|a| *a > ABS_GUARD) {
+            return None;
+        }
+        let changes =
+            self.positions.state().resident_changes(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice())?;
+        // A row that does not decode: `None` (the caller builds).
+        let decode = |row: &Option<Vec<u8>>| -> Option<Option<torus_core::position::Position>> {
+            use borsh::BorshDeserialize;
+            row.as_deref().map_or(Some(None), |r| torus_core::position::Position::try_from_slice(r).ok().map(Some))
+        };
+        let changes = changes
+            .iter()
+            .map(|c| Some((decode(&c.resident)?, decode(&c.current)?)))
+            .collect::<Option<Vec<_>>>()?;
+        sums_with_changes(base, &changes, table, |m| self.tiers(m))
+    }
+
+    /// Paths 3 and 4 (the trader has nothing pending this block).
+    fn cached_sums(&self, s: &BlockSums, version: u64, trader: &Address) -> Result<SumsResult, CoreError> {
+        if s.cache.version == version {
+            if let Some(r) = s.cache.map.get(trader) {
+                #[cfg(test)]
+                bump(&s.counters.persistent);
+                return Ok(*r);
+            }
+        }
+        let cell = s
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*trader)
+            .or_default()
+            .clone();
+        #[cfg(test)]
+        let computed = std::cell::Cell::new(false);
+        let memo = *cell.get_or_init(|| {
+            #[cfg(test)]
+            {
+                computed.set(true);
+                s.counters.built(trader);
+            }
+            // C7: the caller found the trader clean, so its record (if
+            // any) is exactly the overlay's rows.
+            let (r, in_table) = match s.records.as_ref().and_then(|rec| rec.get(trader)) {
+                Some(ps) => {
+                    #[cfg(test)]
+                    bump(&s.counters.records);
+                    self.sums_of(ps)
+                }
+                None => self.sums_of(&self.positions.positions_for_trader(trader).ok()?),
+            };
+            in_table.then_some(r)
+        });
+        #[cfg(test)]
+        bump(if computed.get() { &s.counters.computed } else { &s.counters.memo });
+        match memo {
+            Some(r) => Ok(r),
+            None => self.direct_sums(trader),
+        }
+    }
+
+    /// `AccountView::build`'s sums over `ps` with this reader's marks and
+    /// tiers, and whether every mark it used came from the block's table
+    /// (only then is the result a function of R's rows and the mark version,
+    /// i.e. cacheable; a market outside the table reads the oracle).
+    fn sums_of(&self, ps: &[torus_core::position::Position]) -> (SumsResult, bool) {
+        let in_table = std::cell::Cell::new(true);
+        let mark = |m: MarketId| match self.marks.and_then(|t| t.get(m)) {
+            Some(mark) => mark,
+            None => {
+                in_table.set(false);
+                self.mark(m)
+            }
+        };
+        (build_sums(ps, mark, |m| self.tiers(m)), in_table.get())
+    }
+
+    /// F1: signed position in `market_id` and the price it is valued at
+    /// (mark, else entry; ZERO when flat without a mark).
+    fn position_px(
+        &self,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<(FixedPoint, FixedPoint), CoreError> {
+        let mark = self.mark(market_id);
+        Ok(Self::signed_px(self.get_position(trader, market_id)?.as_ref(), mark))
+    }
+
+    /// [`Self::position_px`] of a position already read, with the market's
+    /// `mark` (item 6 P4: Phase 3 reuses `reduce_only_positions_for`'s read).
+    fn signed_px(p: Option<&torus_core::position::Position>, mark: Option<FixedPoint>) -> (FixedPoint, FixedPoint) {
+        match p {
+            Some(p) => (
+                if p.is_long { p.size } else { -p.size },
+                position_price(p, mark),
+            ),
+            None => (FixedPoint::ZERO, mark.unwrap_or(FixedPoint::ZERO)),
+        }
+    }
+}
+
+impl<T: StateBackend> AccountReader<'_, T> {
+    /// F1 (s517 #4): a maker's snapshot free margin — balance and positions
+    /// from the backend. A read error snapshots as 0 (deterministic).
+    /// C6c: on a batch reader, once per maker per Phase 3 worker
+    /// ([`MAKER_FREE`]).
+    fn maker_free(&self, maker: &Address) -> FixedPoint {
+        let compute = || {
+            self.positions
+                .get_native_balance(maker)
+                .and_then(|b| self.view(maker, &b))
+                .map_or(FixedPoint::ZERO, |v| v.free())
+        };
+        let Some(b) = self.batch else {
+            return compute();
+        };
+        let hit = MAKER_FREE.with(|c| {
+            let c = c.borrow();
+            if c.0 == b.id { c.1.get(maker).copied() } else { None }
+        });
+        if let Some(free) = hit {
+            #[cfg(test)]
+            if let Some(s) = self.sums.filter(|s| s.shadow) {
+                let want = compute();
+                if want != free {
+                    s.shadow_mismatches.lock().unwrap().push(format!("maker_free {maker}: worker cache {free:?}, now {want:?}"));
+                }
+            }
+            return free;
+        }
+        let free = compute();
+        MAKER_FREE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != b.id {
+                *c = (b.id, HashMap::new());
+            }
+            c.1.insert(*maker, free);
+        });
+        free
+    }
+
+    /// F1: `maker`'s signed position in `market_id` and its valuation price;
+    /// a read error snapshots as flat (deterministic).
+    fn maker_position_px(&self, maker: &Address, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+        self.position_px(maker, market_id)
+            .unwrap_or((FixedPoint::ZERO, FixedPoint::ZERO))
+    }
+}
+
+impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
+    /// F1 (s517 #4): a maker's account as the book first sees it — balance
+    /// and positions from the backend (Phase 3: the frozen post-Phase-1
+    /// state; single path: current state). A read error snapshots as free 0
+    /// / flat (deterministic).
+    fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
+        let (signed_pos, px) = self.maker_position_px(maker, market_id);
+        MakerAccount { free: self.maker_free(maker), signed_pos, px }
+    }
+}
+
+/// L3-ENG: one Phase-2 fold — the state of the senders it prepares. Keys
+/// are per sender, so a shard's fold equals the serial fold restricted to
+/// its senders. Item 6 M1: one map entry per sender (was a balance cache and
+/// five maps); std `HashMap`s, never iterated in a way that affects output
+/// ([`Self::finish`] only builds maps). Item 6 cut 2: the projections live
+/// in their sender's state, and the latest sender's state is held out of the
+/// map ([`Self::state`]).
+#[derive(Default)]
+struct SenderFold {
+    senders: HashMap<Address, SenderState>,
+    /// Item 6 cut 2: the previous order's sender and its state, out of
+    /// `senders`. A PlaceOrderBatch's orders, and a sender's actions in a
+    /// sorted list, are adjacent, so most orders need no map lookup.
+    cur: Option<(Address, SenderState)>,
+}
+
+/// Item 6 M1: one sender's Phase-2 state in a [`SenderFold`].
+struct SenderState {
+    /// O1: the sender's balance as Phase 2 left it (read through on first
+    /// use; `None` until read, or after a failed read — retried), and
+    /// whether Phase 2 changed it ([`BalanceCache`] semantics).
+    balance: Option<NativeBalance>,
+    balance_dirty: bool,
+    /// F1: UPnL − position IM (pre-batch, read once).
+    pos_net: Option<FixedPoint>,
+    /// F1 (Decision s517): Σ position IM the sender's earlier accepted
+    /// orders of this batch are projected to RELEASE (their closing parts).
+    /// Credited to `free` only when checking a match-checked order — its
+    /// fills are re-checked against the real position in Phase 3. Never
+    /// part of the Phase-3 pool (the book credits the real release).
+    released: FixedPoint,
+    /// Review fix 1 (s517): Σ position-tier need beyond the order-tier
+    /// reservation of the sender's accepted orders of this batch — committed
+    /// but not debited; off `free` in its later Phase-2 checks.
+    committed: FixedPoint,
+    /// Review fix 1 (s517): Σ of the sender's accepted UNCHECKED orders'
+    /// position-tier need beyond their order-tier reservation (never
+    /// re-checked at match, D7) — off its D2 pool after Phase 2 (was each
+    /// prepared order's `excess_im`, summed over the batches). Checked
+    /// takers add nothing: the book charges their need at match.
+    excess_unchecked: FixedPoint,
+    /// Per-user open-order limit: the sender's slots in this
+    /// `execute_batch` call (see [`NativeExecutor::take_open_slot`]).
+    open_slots: Option<OpenSlots>,
+    /// F1: the sender's markets → the in-batch position projection (item 6
+    /// cut 2: was a map keyed by (sender, market) in the fold).
+    proj: Projections,
+    /// Option B (s87): F1 D2 — the market of the sender's first ACCEPTED
+    /// match-checked order of this batch (flat order), i.e. the market
+    /// Phase 3 gives its pool (was `d2_pool_takers`, a pass over the
+    /// prepared orders: the same first order).
+    pool: Option<MarketId>,
+}
+
+/// F1: (projected signed position, valuation price): the pre-batch
+/// position advanced by the sender's earlier ACCEPTED non-reduce-only
+/// orders of this batch in the market (as if filled — conservative), so a
+/// later order is charged at the projected position's tier; plus the
+/// pre-batch read itself (item 6 M1: [`PreparedOrder::pre_pos`]).
+#[derive(Clone, Copy)]
+struct Projection {
+    signed: FixedPoint,
+    px: FixedPoint,
+    pre: (FixedPoint, FixedPoint),
+}
+
+/// Item 6 cut 2: one sender's [`Projection`]s by market — a short list
+/// (linear search) up to [`Projections::FEW`] markets, then a map. A pure
+/// map: only point lookups and inserts, never iterated.
+enum Projections {
+    Few(Vec<(MarketId, Projection)>),
+    Many(HashMap<MarketId, Projection>),
+}
+
+impl Default for Projections {
+    fn default() -> Self {
+        Self::Few(Vec::new())
+    }
+}
+
+impl Projections {
+    /// Markets kept in the list before it becomes a map.
+    const FEW: usize = 16;
+
+    /// `market`'s projection; when absent, `init()`'s, inserted (an error
+    /// inserts nothing).
+    fn get_or_try_insert<E>(
+        &mut self,
+        market: MarketId,
+        init: impl FnOnce() -> Result<Projection, E>,
+    ) -> Result<&mut Projection, E> {
+        let found = match self {
+            Self::Few(list) => list.iter().position(|(m, _)| *m == market),
+            Self::Many(map) => {
+                return Ok(match map.entry(market) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => v.insert(init()?),
+                })
+            }
+        };
+        if let Some(i) = found {
+            let Self::Few(list) = self else { unreachable!("matched Few above") };
+            return Ok(&mut list[i].1);
+        }
+        let p = init()?;
+        if matches!(self, Self::Few(list) if list.len() >= Self::FEW) {
+            let Self::Few(list) = std::mem::take(self) else { unreachable!("matched Few above") };
+            *self = Self::Many(list.into_iter().collect());
+        }
+        Ok(match self {
+            Self::Few(list) => {
+                list.push((market, p));
+                &mut list.last_mut().expect("just pushed").1
+            }
+            // Absent: it was not in the list.
+            Self::Many(map) => map.entry(market).or_insert(p),
+        })
+    }
+}
+
+/// Item 6 M1: what a Phase-2 fold hands on: the balance cache, each pooled
+/// sender's D2 pool `(market, pos_net)` and each sender's unchecked
+/// `excess_im` sum (> 0 only). Sender-keyed std `HashMap`s, only looked up
+/// or iterated into other maps / the cache's read-through (no output order).
+#[derive(Default)]
+struct FoldOut {
+    cache: BalanceCache,
+    pools: HashMap<Address, (MarketId, FixedPoint)>,
+    excess: HashMap<Address, FixedPoint>,
+}
+
+/// Item 6 M1: one batch market's read-only Phase-2 inputs, looked up once
+/// per order (was a shape map, a bid-floor map, the margin configs three
+/// times and the mark per (sender, market)). Built once per call by
+/// [`NativeExecutor::phase2_markets`], shared by the serial and sharded
+/// prepare paths (Phase 2 touches no book, config or mark).
+#[derive(Clone, Copy)]
+struct Phase2Market<'a> {
+    /// Fix A (s92) / row 42: [`NativeExecutor::book_shape`].
+    shape: (FixedPoint, FixedPoint),
+    /// Option B (s87): the market's best bid after Phase 1 (`None`: no bid).
+    bid_floor: Option<FixedPoint>,
+    cfg: Option<&'a MarketMarginConfig>,
+    /// [`AccountReader::mark`] (read only for a market with an order that
+    /// is not reduce-only, i.e. may need `position_px`).
+    mark: Option<FixedPoint>,
+    /// Item 6 cut 2: the call's PlaceOrders in the market (the capacity of
+    /// its prepared batch: no regrowth while stitching).
+    orders: usize,
+}
+
+impl Phase2Market<'_> {
+    fn tiers(&self) -> Option<&[MarginTier]> {
+        self.cfg.map(|c| c.tiers.as_slice())
+    }
+}
+
+impl FoldOut {
+    /// L3-ENG: absorb a sharded worker's output (sender-disjoint).
+    fn merge_disjoint(&mut self, other: FoldOut) {
+        self.cache.merge_disjoint(other.cache);
+        self.pools.extend(other.pools);
+        self.excess.extend(other.excess);
+    }
+}
+
+/// Item 6 cut 2: [`Projections`] and [`SenderFold::state`] behave as the
+/// maps they replace (`HashMap<(Address, MarketId), Projection>` and
+/// `HashMap<Address, SenderState>` with `entry().or_default()`), on random
+/// interleavings across the list -> map switch, failed inits included.
+#[cfg(test)]
+mod projections_tests {
+    use super::*;
+
+    fn proj(v: i128) -> Projection {
+        let f = FixedPoint::from_raw(v);
+        Projection { signed: f, px: f, pre: (f, f) }
+    }
+
+    #[test]
+    fn projections_and_sender_states_equal_the_maps() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..200 {
+            let markets = [3u64, 12, 40][round % 3];
+            let mut fold = SenderFold::with_capacity(0);
+            let mut want: HashMap<(Address, MarketId), Projection> = HashMap::new();
+            let mut want_released: HashMap<Address, FixedPoint> = HashMap::new();
+            for step in 0..600 {
+                // Runs of one sender, as in a batch, and switches.
+                let sender = Address::repeat_byte(1 + next(4) as u8);
+                let market = 1 + next(markets);
+                let fail = next(7) == 0;
+                let st = fold.state(&sender);
+                st.released += FixedPoint::from_raw(1);
+                *want_released.entry(sender).or_insert(FixedPoint::ZERO) += FixedPoint::from_raw(1);
+                let got = st
+                    .proj
+                    .get_or_try_insert(market, || if fail { Err(()) } else { Ok(proj(step)) })
+                    .map(|p| {
+                        p.signed += FixedPoint::from_raw(1);
+                        *p
+                    });
+                let expect = match want.entry((sender, market)) {
+                    std::collections::hash_map::Entry::Occupied(o) => Ok(o.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        if fail { Err(()) } else { Ok(v.insert(proj(step))) }
+                    }
+                }
+                .map(|p| {
+                    p.signed += FixedPoint::from_raw(1);
+                    *p
+                });
+                assert_eq!(
+                    got.map(|p| (p.signed, p.px, p.pre)),
+                    expect.map(|p| (p.signed, p.px, p.pre)),
+                    "round {round} step {step}"
+                );
+            }
+            if let Some((a, st)) = fold.cur.take() {
+                fold.senders.insert(a, st);
+            }
+            assert_eq!(fold.senders.len(), want_released.len());
+            for (sender, released) in want_released {
+                assert_eq!(fold.senders[&sender].released, released);
+            }
+        }
+    }
+}
+
+impl SenderFold {
+    /// Pre-sized: `senders` expected.
+    fn with_capacity(senders: usize) -> Self {
+        Self { senders: HashMap::with_capacity(senders), cur: None }
+    }
+
+    /// `sender`'s state (default when new), held out of the map until the
+    /// next order of another sender puts it back.
+    fn state(&mut self, sender: &Address) -> &mut SenderState {
+        if !matches!(&self.cur, Some((a, _)) if a == sender) {
+            if let Some((a, st)) = self.cur.take() {
+                self.senders.insert(a, st);
+            }
+            let st = self.senders.remove(sender).unwrap_or_default();
+            self.cur = Some((*sender, st));
+        }
+        &mut self.cur.as_mut().expect("just set").1
+    }
+
+    /// The fold's balances as a [`BalanceCache`] (read entries clean, changed
+    /// ones dirty: the cache `load` / `set` would have left), its pools and
+    /// its excess sums.
+    fn finish(mut self) -> FoldOut {
+        if let Some((a, st)) = self.cur.take() {
+            self.senders.insert(a, st);
+        }
+        let mut out = FoldOut {
+            cache: BalanceCache { map: HashMap::with_capacity(self.senders.len()), dirty: Vec::new() },
+            ..FoldOut::default()
+        };
+        for (sender, st) in self.senders {
+            if let Some(pool) = st.pool {
+                debug_assert!(st.pos_net.is_some(), "a pooled sender passed an account check");
+                out.pools.insert(sender, (pool, st.pos_net.unwrap_or(FixedPoint::ZERO)));
+            }
+            if st.excess_unchecked > FixedPoint::ZERO {
+                out.excess.insert(sender, st.excess_unchecked);
+            }
+            if let Some(balance) = st.balance {
+                if st.balance_dirty {
+                    out.cache.dirty.push(sender);
+                }
+                out.cache.map.insert(sender, CachedBalance { balance, dirty: st.balance_dirty });
+            }
+        }
+        out
+    }
+}
+
+impl Default for SenderState {
+    fn default() -> Self {
+        Self {
+            balance: None,
+            balance_dirty: false,
+            pos_net: None,
+            released: FixedPoint::ZERO,
+            committed: FixedPoint::ZERO,
+            excess_unchecked: FixedPoint::ZERO,
+            open_slots: None,
+            proj: Projections::default(),
+            pool: None,
+        }
+    }
+}
+
+impl SenderState {
+    /// [`BalanceCache::load`] on the sender's own entry (`slot` =
+    /// [`Self::balance`]; a field borrow, so the other fields stay usable).
+    fn load_balance<'s, T: StateBackend>(
+        slot: &'s mut Option<NativeBalance>,
+        positions: &PositionManager<T>,
+        sender: &Address,
+    ) -> Result<&'s mut NativeBalance, CoreError> {
+        if slot.is_none() {
+            *slot = Some(positions.get_native_balance(sender)?);
+        }
+        Ok(slot.get_or_insert_with(NativeBalance::default))
+    }
 }
 
 #[cfg(test)]
@@ -1462,6 +2779,45 @@ fn parse_advance_untouched_toggle(v: Option<String>) -> bool {
 #[derive(Default)]
 pub struct ResidentBooks {
     inner: Option<ResidentInner>,
+    /// Item 6 Phase 1: the resident rows R and the height whose post-state
+    /// they hold. Same guard as the books (take; reuse iff successor and the
+    /// applied marker agrees; `invalidate` drops; `advance_untouched`
+    /// advances), but NOT gated by `TORUS_RESIDENT_BOOKS`: every node keeps R.
+    /// See [`begin_resident`] / [`end_resident`].
+    rows: Option<RowsSlot>,
+    /// Item 6 step 2: the slot being made by [`end_resident_on_worker`] on
+    /// its worker thread (the worker owns R, the delta and the sums; it never
+    /// touches this holder). Joined into `rows` by [`Self::settle_rows`],
+    /// which every reader / writer of `rows` calls first, so nothing can see
+    /// the slot of the block before the worker finished it.
+    rows_pending: Option<PendingRows>,
+    /// Item 6 Phase 1: R builds (cold start or guard trip) and
+    /// `end_resident` calls that found another clone of R alive (test /
+    /// ops introspection).
+    rows_builds: u64,
+    rows_shared_fallbacks: u64,
+}
+
+/// Item 6 step 2: one block's `end_resident` running on a worker thread.
+struct PendingRows {
+    handle: std::thread::JoinHandle<RowsSlot>,
+    height: u64,
+    /// For the wait timer at the join.
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+struct RowsSlot {
+    rows: Arc<torus_state::ResidentRows>,
+    /// C2: the mark table / configs of block `height` (None: that block had
+    /// no table — the next one takes a new version).
+    marks: Option<BlockMarksState>,
+    /// C3: the traders' margin sums over `rows` (plan 2.4). Built empty with
+    /// R, dropped with it.
+    sums: SumsCache,
+    /// C7: `rows`' positions decoded per trader. Built with R, updated by
+    /// each block's delta, dropped with it.
+    positions: TraderPositions,
+    height: u64,
 }
 
 struct ResidentInner {
@@ -1473,9 +2829,86 @@ struct ResidentInner {
 }
 
 impl ResidentBooks {
-    /// Drop any resident state — the next context rebuilds from the DB.
+    /// Drop any resident state (books and rows) — the next block rebuilds
+    /// from the DB. Waits for an `end_resident` worker first (step 2).
     pub fn invalidate(&mut self) {
+        self.settle_rows();
         self.inner = None;
+        self.rows = None;
+    }
+
+    /// Item 6 step 2: wait for the `end_resident` worker (if one runs) and
+    /// put the slot it made into the holder; observes
+    /// `exec_end_resident_wait_seconds` (the time this thread waited). A
+    /// worker that panicked leaves the slot empty: the next native block
+    /// rebuilds R, as after a failed block. Every access to the rows slot
+    /// calls this first.
+    pub fn settle_rows(&mut self) {
+        let Some(PendingRows { handle, height, metrics }) = self.rows_pending.take() else {
+            return;
+        };
+        let timer = std::time::Instant::now();
+        let joined = handle.join();
+        if let Some(m) = metrics.as_deref() {
+            m.exec_end_resident_wait_seconds.observe(timer.elapsed().as_secs_f64());
+        }
+        match joined {
+            Ok(slot) => self.rows = Some(slot),
+            Err(_) => {
+                tracing::error!(
+                    height,
+                    "item 6: end_resident worker panicked — dropping R (next native block rebuilds it)"
+                );
+                self.rows = None;
+            }
+        }
+    }
+
+    /// Item 6 step 2: an `end_resident` worker has not been joined yet
+    /// (test / ops introspection; does not wait).
+    pub fn rows_in_flight(&self) -> bool {
+        self.rows_pending.is_some()
+    }
+
+    /// Item 6 Phase 1: the resident rows R between blocks (None = drained or
+    /// taken by a block in progress). Waits for an `end_resident` worker.
+    pub fn rows(&mut self) -> Option<&torus_state::ResidentRows> {
+        self.settle_rows();
+        self.rows.as_ref().map(|s| &*s.rows)
+    }
+
+    /// Item 6 Phase 1: the block height whose post-state R holds. Waits for
+    /// an `end_resident` worker.
+    pub fn rows_height(&mut self) -> Option<u64> {
+        self.settle_rows();
+        self.rows.as_ref().map(|s| s.height)
+    }
+
+    /// Item 6 Phase 1: R builds so far (1 per process in a normal sequence).
+    pub fn rows_builds(&self) -> u64 {
+        self.rows_builds
+    }
+
+    /// Item 6 Phase 1: `end_resident` calls that could not take R back
+    /// (`Arc::get_mut` failed: a clone was alive). 0 in the normal sequence.
+    pub fn rows_shared_fallbacks(&self) -> u64 {
+        self.rows_shared_fallbacks
+    }
+
+    /// Item 6 C7: whether the slot's decoded positions equal a cold decode
+    /// of its R (`None`: no slot). Test / ops introspection.
+    pub fn trader_positions_match_rows(&mut self) -> Option<bool> {
+        self.settle_rows();
+        self.rows.as_ref().map(|s| s.positions.same_as(&TraderPositions::build(&s.rows)))
+    }
+
+    /// Item 6 C5 (tests): empty the slot's sums cache (R, its decoded
+    /// positions and the mark state stay), so the next block values every
+    /// trader afresh. Returns the entries dropped. Waits for an
+    /// `end_resident` worker. Not called on the node path.
+    pub fn drop_sums_cache(&mut self) -> usize {
+        self.settle_rows();
+        self.rows.as_mut().map_or(0, |s| std::mem::take(&mut s.sums.map).len())
     }
 
     /// Whether the holder currently carries state (test/ops introspection).
@@ -1510,6 +2943,23 @@ impl ResidentBooks {
     /// calls). `enabled == false` is a pure no-op: the holder is neither
     /// advanced nor drained, exactly the pre-candidate sequence.
     pub fn advance_untouched_with(&mut self, enabled: bool, block_height: u64) -> bool {
+        // Item 6 Phase 1: the rows slot advances (or drains) by the same rule,
+        // independent of the books' kill switch (R has no runtime switch).
+        // Step 2: the previous block's slot first (its worker may still run).
+        self.settle_rows();
+        match self.rows.as_mut() {
+            Some(slot) if slot.height + 1 == block_height => slot.height = block_height,
+            Some(slot) => {
+                tracing::warn!(
+                    rows_height = slot.height,
+                    block_height,
+                    "item 6: untouched block is not the resident rows' successor — draining R \
+                     (next native block rebuilds it)"
+                );
+                self.rows = None;
+            }
+            None => {}
+        }
         if !enabled {
             return false;
         }
@@ -1530,6 +2980,405 @@ impl ResidentBooks {
             }
             None => false,
         }
+    }
+}
+
+/// The DB's native applied-height marker as `state` sees it (through an
+/// overlay: own pending -> parent layer -> DB). Staleness-guard input for the
+/// resident books and the resident rows.
+fn applied_marker<B: StateBackend>(state: &B) -> Option<u64> {
+    use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+    let bytes = state
+        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+        .ok()
+        .flatten()?;
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+}
+
+/// Item 6 Phase 1: one block's handle on the resident rows R, from
+/// [`begin_resident`] to [`end_resident`].
+#[derive(Debug)]
+pub struct ResidentBlock {
+    height: u64,
+    attached: bool,
+    rebuilt: bool,
+    /// C2: from `begin_resident`, the previous block's mark state when the
+    /// slot was reused (moved into the context by
+    /// [`NativeExecContext::attach_resident_block`]); from
+    /// [`NativeExecContext::detach_resident_block`], this block's (stashed
+    /// by `end_resident`).
+    marks: Option<BlockMarksState>,
+    /// C3: the slot's sums cache (empty when R was built) and, after
+    /// [`NativeExecContext::detach_resident_block`], this block's memo;
+    /// `end_resident` merges them. `None`: R not attached (no cache).
+    sums: Option<BlockSums>,
+    /// Item 6 cut 5: [`Self::drop_later`].
+    retired: Retired,
+    /// Step 2 tests: runs first inside the `end_resident` worker (hold it,
+    /// or panic in it).
+    #[cfg(test)]
+    worker_hook: Option<WorkerHook>,
+}
+
+/// Item 6 cut 5: values a block no longer needs, never read again, dropped
+/// with its `end_resident` work ([`ResidentBlock::drop_later`]).
+#[derive(Default)]
+struct Retired(Vec<Box<dyn Send>>);
+
+impl std::fmt::Debug for Retired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Retired({})", self.0.len())
+    }
+}
+
+/// Step 2 tests: see [`ResidentBlock::worker_hook`].
+#[cfg(test)]
+pub(crate) struct WorkerHook(pub(crate) Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for WorkerHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerHook")
+    }
+}
+
+impl ResidentBlock {
+    /// R is attached to the block's overlay (false: no holder, or the build
+    /// failed — reads go to the DB, today's path).
+    pub fn attached(&self) -> bool {
+        self.attached
+    }
+
+    /// R was built for this block (cold start or staleness guard trip).
+    pub fn rebuilt(&self) -> bool {
+        self.rebuilt
+    }
+
+    /// Item 6 cut 5: drop `value` with this block's `end_resident` work — on
+    /// its worker under [`end_resident_on_worker`] (off the execution
+    /// thread), else where the block is dropped. For the block's large
+    /// leftovers (the batch results); dropping memory has no other effect.
+    pub fn drop_later(&mut self, value: impl Send + 'static) {
+        self.retired.0.push(Box::new(value));
+    }
+}
+
+/// Item 6 Phase 1: start of a native block. TAKE the holder's rows slot and
+/// reuse it iff it holds the post-state of `height - 1` (slot height + 1 ==
+/// `height`, and the applied marker — read through `overlay`, i.e. pending ->
+/// parent -> DB — equals the slot height when present, and C6a: the overlay's
+/// parent layer, if any, is the slot height's frozen set); otherwise build R from
+/// `overlay` (DB + parent layer: the previous block's post-state). Attach R to
+/// `overlay`, which must not have been cloned yet. `holder: None` = today's
+/// path (nothing attached). Called by app.rs and the harnesses
+/// (`perf_equivalence_golden`, `ubench_econ`).
+///
+/// A block that never reaches [`end_resident`] (fatal, failed hand-off)
+/// leaves the slot empty: the next block rebuilds.
+pub fn begin_resident(
+    holder: Option<&mut ResidentBooks>,
+    overlay: &mut NativeStateOverlay,
+    height: u64,
+    metrics: Option<&torus_telemetry::Metrics>,
+) -> ResidentBlock {
+    let mut block = ResidentBlock {
+        height,
+        attached: false,
+        rebuilt: false,
+        marks: None,
+        sums: None,
+        retired: Retired::default(),
+        #[cfg(test)]
+        worker_hook: None,
+    };
+    let Some(holder) = holder else {
+        return block;
+    };
+    // Step 2: the previous block's slot may still be in its `end_resident`
+    // worker — wait for it here, before the slot is taken (never later).
+    holder.settle_rows();
+    debug_assert!(!overlay.has_resident(), "begin_resident on an overlay that already has R");
+    let reused = holder.rows.take().and_then(|slot| {
+        let marker = applied_marker(&*overlay);
+        let height_ok = slot.height + 1 == height;
+        let marker_ok = marker.is_none_or(|m| m == slot.height);
+        // C6a (B0): the overlay reads R's CFs without its parent layer, so R
+        // must already hold it: the parent (if any) is the block R reflects.
+        let parent_ok = overlay.parent_height().is_none_or(|p| p == slot.height);
+        if height_ok && marker_ok && parent_ok {
+            block.marks = slot.marks;
+            block.sums = Some(BlockSums { records: Some(slot.positions), ..BlockSums::new(slot.sums) });
+            return Some(slot.rows);
+        }
+        tracing::warn!(
+            rows_height = slot.height,
+            height,
+            applied_marker = marker,
+            parent_height = overlay.parent_height(),
+            "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
+        );
+        None
+    });
+    let rows = match reused {
+        Some(rows) => rows,
+        None => {
+            let timer = std::time::Instant::now();
+            match torus_state::ResidentRows::build(&*overlay) {
+                Ok(rows) => {
+                    holder.rows_builds += 1;
+                    block.rebuilt = true;
+                    // C3: an empty sums cache; C7: R's positions decoded.
+                    block.sums =
+                        Some(BlockSums { records: Some(TraderPositions::build(&rows)), ..BlockSums::default() });
+                    if let Some(m) = metrics {
+                        m.exec_resident_rows_rebuilds.inc();
+                        m.exec_resident_rows_build_seconds
+                            .observe(timer.elapsed().as_secs_f64());
+                    }
+                    tracing::info!(
+                        height,
+                        rows = rows.len(),
+                        bytes = rows.bytes(),
+                        build_ms = timer.elapsed().as_secs_f64() * 1e3,
+                        "item 6: resident rows built"
+                    );
+                    Arc::new(rows)
+                }
+                Err(e) => {
+                    // Reads fall through to the DB (today's path) for this block.
+                    tracing::error!(%e, height, "item 6: resident rows build failed — block reads the DB");
+                    return block;
+                }
+            }
+        }
+    };
+    if let Some(m) = metrics {
+        m.exec_resident_rows.set(rows.len() as i64);
+        m.exec_resident_rows_bytes.set(rows.bytes() as i64);
+    }
+    overlay.attach_resident(rows);
+    block.attached = true;
+    block
+}
+
+/// Item 6 Phase 1: end of a native block, after the hand-off (pipelined) or
+/// the flush (serial; `ok` = it succeeded) and after every clone of `overlay`
+/// (the context's managers) was dropped. `delta` = `overlay.own_pending_delta()`
+/// taken before `freeze` / the flush. Detaches R, takes it back with
+/// `Arc::get_mut`, applies `delta` and stashes it at `block`'s height. If a
+/// clone of R is still alive (never in the normal sequence) or `!ok`, the
+/// slot stays empty and the next block rebuilds.
+///
+/// Runs on the calling thread; [`end_resident_on_worker`] is the same work on
+/// a worker thread (app.rs).
+pub fn end_resident(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: impl Into<BlockDelta>,
+    ok: bool,
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
+    let delta = delta.into();
+    holder.settle_rows();
+    let timer = std::time::Instant::now();
+    if let Some(job) = end_resident_take(holder, block, overlay, delta, ok) {
+        holder.rows = Some(job.run(metrics));
+    }
+    // Item 6 step 1: the whole upkeep (the delta and the memo dropped included).
+    if let Some(m) = metrics {
+        m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
+    }
+}
+
+/// Item 6 step 2: [`end_resident`] with its work (R applying `delta`, the
+/// decoded positions and the sums carry) on a new worker thread, so it
+/// overlaps the next block's work up to its [`begin_resident`]. The checks
+/// (`ok`, R attached, no other clone of R alive) run here, on the calling
+/// thread, exactly as in `end_resident`; the worker then owns R, the delta and
+/// the block's sums, and never touches `holder`. The slot it makes enters
+/// `holder` at the next access of the rows slot ([`ResidentBooks::settle_rows`]:
+/// `begin_resident`, `advance_untouched`, `invalidate`, the introspection
+/// methods), so every later block sees exactly the slot `end_resident` would
+/// have stashed. A failed spawn or a panic in the worker leaves the slot
+/// empty (the next native block rebuilds R). `exec_end_resident_seconds` is
+/// observed by the worker (its time plus the checks here).
+pub fn end_resident_on_worker(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: impl Into<BlockDelta>,
+    ok: bool,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+) {
+    let delta = delta.into();
+    holder.settle_rows();
+    let timer = std::time::Instant::now();
+    let Some(job) = end_resident_take(holder, block, overlay, delta, ok) else {
+        if let Some(m) = metrics.as_deref() {
+            m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
+        }
+        return;
+    };
+    let height = job.height;
+    let checks = timer.elapsed();
+    let worker_metrics = metrics.clone();
+    let spawned = std::thread::Builder::new().name("torus-end-resident".into()).spawn(move || {
+        let timer = std::time::Instant::now();
+        let slot = job.run(worker_metrics.as_deref());
+        if let Some(m) = worker_metrics.as_deref() {
+            m.exec_end_resident_seconds.observe((checks + timer.elapsed()).as_secs_f64());
+        }
+        slot
+    });
+    match spawned {
+        Ok(handle) => holder.rows_pending = Some(PendingRows { handle, height, metrics }),
+        Err(e) => {
+            // The job (R included) was dropped with the closure.
+            tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+        }
+    }
+}
+
+/// Item 6 cut 5: the block's own writes and tombstones of R's CFs as
+/// `end_resident` gets them.
+pub enum BlockDelta {
+    /// Taken by the caller (`own_pending_delta`, before `freeze` / the flush).
+    Taken(torus_state::ResidentDelta),
+    /// The block's frozen pending set (the pipelined hand-off's): the delta is
+    /// taken from it where `end_resident` runs — the worker, off the
+    /// execution thread ([`torus_state::FrozenPending::resident_delta`],
+    /// equal to `own_pending_delta` just before the freeze).
+    Frozen(Arc<torus_state::FrozenPending>),
+}
+
+impl From<torus_state::ResidentDelta> for BlockDelta {
+    fn from(delta: torus_state::ResidentDelta) -> Self {
+        Self::Taken(delta)
+    }
+}
+
+impl BlockDelta {
+    fn into_delta(self) -> torus_state::ResidentDelta {
+        match self {
+            Self::Taken(delta) => delta,
+            Self::Frozen(frozen) => frozen.resident_delta(),
+        }
+    }
+}
+
+/// Item 6 step 2: `end_resident`'s inputs once its checks passed — owned by
+/// whichever thread runs [`Self::run`].
+struct EndResidentJob {
+    /// R, with no other clone alive (checked by [`end_resident_take`]).
+    rows: Arc<torus_state::ResidentRows>,
+    height: u64,
+    marks: Option<BlockMarksState>,
+    sums: Option<BlockSums>,
+    delta: BlockDelta,
+    /// Dropped by whichever thread runs the job.
+    retired: Retired,
+    #[cfg(test)]
+    worker_hook: Option<WorkerHook>,
+}
+
+/// `end_resident`'s checks: detach R from `overlay`; `None` (slot stays
+/// empty) if R was not attached, `!ok`, or another clone of R is alive.
+fn end_resident_take(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: BlockDelta,
+    ok: bool,
+) -> Option<EndResidentJob> {
+    let mut rows = overlay.detach_resident()?;
+    if !block.attached || !ok {
+        return None;
+    }
+    if Arc::get_mut(&mut rows).is_none() {
+        holder.rows_shared_fallbacks += 1;
+        tracing::warn!(
+            height = block.height,
+            "item 6: resident rows still shared at end of block — dropping R (next block rebuilds)"
+        );
+        return None;
+    }
+    let ResidentBlock { height, marks, sums, retired, .. } = block;
+    Some(EndResidentJob {
+        rows,
+        height,
+        marks,
+        sums,
+        delta,
+        retired,
+        #[cfg(test)]
+        worker_hook: block.worker_hook,
+    })
+}
+
+impl EndResidentJob {
+    /// R takes the block's delta; the decoded positions and the sums follow.
+    fn run(self, metrics: Option<&torus_telemetry::Metrics>) -> RowsSlot {
+        let EndResidentJob {
+            mut rows,
+            height,
+            marks,
+            sums,
+            delta,
+            retired,
+            #[cfg(test)]
+            worker_hook,
+        } = self;
+        drop(retired);
+        #[cfg(test)]
+        if let Some(hook) = worker_hook {
+            (hook.0)();
+        }
+        let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
+        // C3: the block's memo joins the slot's sums; item 6 M1: every trader
+        // whose positions the block wrote or deleted has its sums moved on to
+        // its rows after the block, else loses them (step 1: while its decoded
+        // positions follow the delta, below).
+        let (mut carry, records) = match sums {
+            Some(mut s) => {
+                let records = s.records.take();
+                (Some(s.into_carry(marks.as_ref())), records)
+            }
+            None => (None, None),
+        };
+        // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
+        let delta = delta.into_delta();
+        let timer = std::time::Instant::now();
+        r.apply(&delta);
+        if let Some(m) = metrics {
+            m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
+            m.exec_resident_rows.set(r.len() as i64);
+            m.exec_resident_rows_bytes.set(r.bytes() as i64);
+        }
+        // C7: the decoded positions follow the delta (decoded cold if the
+        // context kept the block's state).
+        let timer = std::time::Instant::now();
+        let positions = match records {
+            Some(mut p) => {
+                match carry.as_mut() {
+                    Some(c) => p.apply(&delta, r, Some(&mut |t: &Address, report| c.trader(t, report))),
+                    None => p.apply(&delta, r, None),
+                }
+                p
+            }
+            None => {
+                if let Some(c) = carry.as_mut() {
+                    c.drop_written(&delta);
+                }
+                TraderPositions::build(r)
+            }
+        };
+        if let Some(m) = metrics {
+            m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
+        }
+        let sums = carry.map(|c| c.cache).unwrap_or_default();
+        drop(delta);
+        RowsSlot { rows, marks, sums, positions, height }
     }
 }
 
@@ -1574,6 +3423,18 @@ mod cancel_batch_toggle_tests {
 #[cfg(test)]
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
+
+#[cfg(test)]
+#[path = "block_marks_tests.rs"]
+mod block_marks_tests;
+
+#[cfg(test)]
+#[path = "sums_cache_tests.rs"]
+mod sums_cache_tests;
+
+#[cfg(test)]
+#[path = "end_resident_worker_tests.rs"]
+mod end_resident_worker_tests;
 
 #[cfg(test)]
 mod resident_books_toggle_tests {
@@ -1649,6 +3510,15 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub dirty_books: std::collections::HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
+    /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
+    /// (`None` before it, or when it failed: marks read the oracle).
+    block_marks: Option<BlockMarks>,
+    /// Item 6 C2: the previous block's mark state from the resident rows slot
+    /// ([`Self::attach_resident_block`]), consumed by `begin_block_oracle`.
+    prev_marks: Option<BlockMarksState>,
+    /// Item 6 C3: the block's margin sums cache ([`Self::attach_resident_block`]
+    /// to [`Self::detach_resident_block`]; `None`: every valuation builds).
+    sums: Option<BlockSums>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -1826,6 +3696,9 @@ pub struct ExecPhaseAccum {
     /// Parallel settles that fell back to the sequential loop (worker panic
     /// or a position-side fill failure).
     pub settle_fallbacks: u64,
+    /// B-blind (s92): non-pool sells topped up (in full or partly) after
+    /// Phase 2 ([`NativeExecutor::sell_top_ups`]). A count, not a span.
+    pub sell_top_ups: u64,
 }
 
 impl ExecPhaseAccum {
@@ -1862,6 +3735,8 @@ pub struct LoadTimings {
     pub markets: u32,
     pub orders: u64,
     pub levels: u64,
+    /// Item 6 E4: `load_margin_configs` (every context, resident or not).
+    pub margin_configs_ns: u128,
 }
 
 /// L3 save-books attribution (µbench-only): breakdown of the mode-2
@@ -2129,6 +4004,20 @@ impl<T: StateBackend> NativeExecContext<T> {
         let persisted_next_id = Self::load_next_global_order_id(&state);
         let next_global_order_id = scanned_next_id.max(persisted_next_id.unwrap_or(1));
 
+        // Item 3 (F2, F8, D11): margin configs from the market listings. A read
+        // error is a node fault (fatal, like the book load).
+        let margin_configs_timer = std::time::Instant::now();
+        let margin_configs = match Self::load_margin_configs(&state) {
+            Ok(m) => m,
+            Err(e) => {
+                if load_error.is_none() {
+                    load_error = Some(format!("margin configs: {e}"));
+                }
+                HashMap::new()
+            }
+        };
+        load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
+
         Self {
             positions,
             oracle,
@@ -2137,7 +4026,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             state,
             order_books,
             dirty_books: std::collections::HashSet::new(),
-            margin_configs: HashMap::new(),
+            margin_configs,
+            block_marks: None,
+            prev_marks: None,
+            sums: None,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -2176,6 +4068,36 @@ impl<T: StateBackend> NativeExecContext<T> {
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
         }
+    }
+
+    /// Item 6 C2: take the resident rows slot's mark state (the previous
+    /// block's table and configs) from `block` — call before
+    /// [`NativeExecutor::begin_block_oracle`]. Without it (reference path,
+    /// tests) every block's table takes a new version.
+    pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
+        self.prev_marks = block.marks.take();
+        // C3: the slot's sums cache (used once the table is filled).
+        self.sums = block.sums.take();
+    }
+
+    /// Item 6 C2: hand this block's mark table and configs to `block` for
+    /// `end_resident` to stash in the slot — call after the block's last
+    /// action, before the context is dropped. Later mark reads of this
+    /// context go to the oracle.
+    pub fn detach_resident_block(&mut self, block: &mut ResidentBlock) {
+        block.marks = self
+            .block_marks
+            .take()
+            .map(|marks| BlockMarksState { marks, configs: self.margin_configs.clone() });
+        // C3: the sums cache and this block's memo, merged by `end_resident`.
+        if let Some(sums) = self.sums.take() {
+            block.sums = Some(sums);
+        }
+    }
+
+    /// Item 6 C2: the version of the block's mark table (`None`: no table).
+    pub fn mark_version(&self) -> Option<u64> {
+        self.block_marks.as_ref().map(BlockMarks::version)
     }
 
     /// Worker threads the last `save_order_books` drained dirty books on
@@ -2229,12 +4151,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// rank8 staleness guard input: the DB's native applied-height marker.
     fn read_applied_marker(state: &T) -> Option<u64> {
-        use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
-        let bytes = state
-            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-            .ok()
-            .flatten()?;
-        Some(u64::from_be_bytes(bytes.try_into().ok()?))
+        applied_marker(state)
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -2842,6 +4759,24 @@ impl<T: StateBackend> NativeExecContext<T> {
             .ok()
             .flatten()?;
         (bytes.len() == 1).then(|| bytes[0])
+    }
+
+    /// Item 3 (F2, F8, D11): one [`market_margin_config`] per listed market
+    /// (8-byte keys of `CF_NATIVE_MARKETS`; metadata rows skipped). Undecodable
+    /// / non-positive rows get none (default 20x). One scan of <= M rows.
+    fn load_margin_configs(
+        state: &T,
+    ) -> Result<HashMap<MarketId, MarketMarginConfig>, torus_state::error::StateError> {
+        use torus_state::cf::CF_NATIVE_MARKETS;
+        Ok(state
+            .iterate_cf(CF_NATIVE_MARKETS, None)?
+            .into_iter()
+            .filter(|(k, _)| k.len() == 8)
+            .filter_map(|(k, v)| {
+                let m = u64::from_be_bytes(k[..8].try_into().ok()?);
+                market_margin_config(m, &v).map(|c| (m, c))
+            })
+            .collect())
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -3523,12 +5458,15 @@ impl NativeExecutor {
             // never re-enters this arm — no recursion.
             NativeAction::PlaceOrderBatch(orders) => {
                 if !torus_types::batch_len_within_cap(orders.len()) {
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order_batch",
-                        format!(
-                            "batch size {} outside [1, {}] — skipped (deterministic cap)",
-                            orders.len(),
-                            torus_types::NATIVE_ORDERS_PER_BATCH_CAP
+                        (
+                            FailureReason::BatchCap,
+                            format!(
+                                "batch size {} outside [1, {}] — skipped (deterministic cap)",
+                                orders.len(),
+                                torus_types::NATIVE_ORDERS_PER_BATCH_CAP
+                            ),
                         ),
                     );
                 }
@@ -3541,6 +5479,12 @@ impl NativeExecutor {
                     success: ok == total,
                     error: (ok != total).then(|| format!("{ok}/{total} orders placed")),
                     gas_used: batch.total_gas,
+                    // The first failing order's reason.
+                    reason: batch
+                        .results
+                        .iter()
+                        .find(|r| !r.success)
+                        .map_or(FailureReason::Other, |r| r.reason),
                 }
             }
             NativeAction::CancelOrder { order_id } => {
@@ -3618,6 +5562,9 @@ impl NativeExecutor {
             NativeAction::UnjailSelf => Self::exec_unjail_self(ctx, sender),
             NativeAction::RotateValidatorKey { new_pubkey } => {
                 Self::exec_rotate_key(ctx, sender, new_pubkey)
+            }
+            NativeAction::SetOracleSigner { signer, proof } => {
+                Self::exec_set_oracle_signer(ctx, sender, *signer, proof.as_ref())
             }
 
             // ---- Session Keys ----
@@ -3990,7 +5937,28 @@ impl NativeExecutor {
             })
             .collect();
         let basis = Self::phase2_reservation_basis(ctx, &place_orders);
+        // F1 / L3-ENG: read-only state for Phase 2, built from FIELDS so it
+        // coexists with the stitch's `&mut ctx.next_global_order_id`. Item 6
+        // C2: marks from the block's table (fix 1's per-call memo is gone).
+        // C6c: the call's valuation state (the backend is frozen from here
+        // to the cache flush after settlement).
+        let batch_sums = ctx.sums.is_some().then(|| BatchSums::new(&ctx.positions));
+        let dense_tiers = DenseTiers::of(&ctx.margin_configs);
+        let reader = AccountReader {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            now: ctx.timestamp,
+            margin_configs: &ctx.margin_configs,
+            marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
+            batch: batch_sums.as_ref(),
+            dense_tiers: Some(&dense_tiers),
+        };
+        // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
+        // configs and marks: each batch market's, once (item 6 M1).
+        let markets = Self::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
 
+        let mut fold_out: Option<FoldOut> = None;
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
         if engine_threads >= 2
             && (matches!(engine_mode, EngineMode::Force(_))
@@ -4014,19 +5982,11 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
-                match Self::phase2_parallel_prepare(
-                    &ctx.positions,
-                    &ctx.margin_configs,
-                    &open_at_start,
-                    &basis,
-                    &groups,
-                    engine_threads,
-                    n,
-                ) {
-                    Some((outcomes, worker_cache)) => {
-                        // Sender shards are disjoint, so the merged cache is
-                        // exactly the serial loop's cache.
-                        bal_cache.merge_disjoint(worker_cache);
+                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, engine_threads, n) {
+                    Some((outcomes, out)) => {
+                        // Sender shards are disjoint, so the merged output
+                        // is exactly the serial loop's.
+                        fold_out = Some(out);
                         prep_outcomes = Some(outcomes);
                     }
                     None => {
@@ -4042,170 +6002,87 @@ impl NativeExecutor {
             // Serial stitch in flat order: ids go to passing orders exactly
             // as the serial loop assigns them.
             for &i in &place_order_indices {
-                let (sender, entry) = &flat[i];
-                let params: &PlaceOrderParams = match entry {
-                    FlatAction::Place(p) => p,
-                    FlatAction::Other(_) => unreachable!(),
+                let (sender, params) = match &flat[i] {
+                    (s, FlatAction::Place(p)) => (s, *p),
+                    (_, FlatAction::Other(_)) => unreachable!(),
                 };
                 let Some(outcome) = outcomes[i].take() else {
                     unreachable!("every place index has a worker outcome");
                 };
-                match outcome {
-                    PrepOutcome::Pass(margin_reserved, margin_budget) => {
-                        let order_id = ctx.next_global_order_id;
-                        ctx.next_global_order_id += 1;
-                        market_batches
-                            .entry(params.market_id)
-                            .or_default()
-                            .push(PreparedOrder {
-                                index: i,
-                                sender: *sender,
-                                params,
-                                order_id,
-                                margin_reserved,
-                                margin_budget,
-                            });
-                    }
-                    PrepOutcome::Reject { reason, msg } => {
-                        // Funnel (perf A1): same counters as the serial loop.
-                        if let Some(ref m) = ctx.metrics {
-                            reason.count(m);
-                        }
-                        results[i] = NativeActionResult::err("place_order", msg);
-                    }
-                }
-            }
-        } else {
-            let mut open_slots: HashMap<Address, Option<OpenSlots>> = HashMap::new();
-            for &i in &place_order_indices {
-                let (sender, entry) = &flat[i];
-                let params: &PlaceOrderParams = match entry {
-                    FlatAction::Place(p) => p,
-                    FlatAction::Other(_) => unreachable!(),
-                };
-
-                // Open-order limit first: a rejected order reserves nothing.
-                let slots = open_slots.entry(*sender).or_default();
-                let taken = match Self::take_open_slot(
-                    slots,
-                    &ctx.positions,
-                    &open_at_start,
+                Self::stitch_outcome(
+                    &mut ctx.next_global_order_id,
+                    &ctx.metrics,
+                    &markets,
+                    &mut market_batches,
+                    &mut results,
+                    i,
                     sender,
                     params,
-                ) {
-                    Ok(taken) => taken,
-                    Err((reason, msg)) => {
-                        if let Some(ref m) = ctx.metrics {
-                            reason.count(m);
-                        }
-                        results[i] = NativeActionResult::err("place_order", msg);
-                        continue;
-                    }
-                };
-
-                let market_id = params.market_id;
-
-                // s515 (BUG 1): market / stop orders need a positive price cap.
-                // Reduce-only is NOT pre-checked here: Phase 2 only sees
-                // pre-batch positions, so the book polices it at match time
-                // against positions advanced through this batch's earlier
-                // fills (Phase 3) — the freshest position, as in sequential.
-                // (F4: its RESERVATION is bounded by `basis` though.)
-                if let Err(msg) = Self::validate_order_price(params) {
-                    if let Some(ref m) = ctx.metrics {
-                        m.orders_rejected_other.inc();
-                    }
-                    results[i] = NativeActionResult::err("place_order", msg);
-                    continue;
-                }
-
-                // Reserve margin (same logic as exec_place_order Phase 2).
-                // A5: reserve and every later release share reserve_for_qty_cfg.
-                // s515 (BUG 1): every order type reserves (market at the mark
-                // price, the cap without one). F4 / review 4: basis
-                // overrides; F2: an overflowing notional rejects.
-                let (res_price, res_qty) = basis
-                    .get(&i)
-                    .copied()
-                    .unwrap_or((Self::reserve_price(params), params.quantity));
-                let order_margin_required = match Self::try_reserve_for_qty_cfg(
-                    ctx.margin_configs.get(&market_id),
-                    res_price,
-                    res_qty,
-                ) {
-                    Ok(m) => m,
-                    Err(msg) => {
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_other.inc();
-                        }
-                        results[i] = NativeActionResult::err("place_order", msg);
-                        continue;
-                    }
-                };
-
-                // s515 review 4: a checked taker's match-time budget is its
-                // reservation + the available balance left after it (= the
-                // available balance it was reserved from), in this Phase-2
-                // per-sender fold — the view the sharded prepare reproduces.
-                let checked = Self::match_margin_checked(params);
-                let mut margin_budget = None;
-                if order_margin_required > FixedPoint::ZERO || checked {
-                    match bal_cache.load(&ctx.positions, sender) {
-                        Ok(mut bal) => {
-                            if bal.available < order_margin_required {
-                                // Funnel (perf A1): died pre-book on the margin reserve.
-                                if let Some(ref m) = ctx.metrics {
-                                    m.orders_rejected_margin.inc();
-                                }
-                                results[i] = NativeActionResult::err(
-                                    "place_order",
-                                    format!(
-                                        "insufficient margin: need {order_margin_required}, have {}",
-                                        bal.available
-                                    ),
-                                );
-                                continue;
-                            }
-                            if checked {
-                                margin_budget = Some(bal.available);
-                            }
-                            if order_margin_required > FixedPoint::ZERO {
-                                bal.available -= order_margin_required;
-                                bal.order_margin += order_margin_required;
-                                bal_cache.set(sender, bal);
-                            }
-                        }
-                        Err(e) => {
-                            // Funnel (perf A1): died pre-book on a balance read error.
-                            if let Some(ref m) = ctx.metrics {
-                                m.orders_rejected_other.inc();
-                            }
-                            results[i] = NativeActionResult::err("place_order", e.to_string());
-                            continue;
-                        }
-                    }
-                }
-
-                if taken.is_some() {
-                    *slots = taken;
-                }
-
-                // Assign global order ID (monotonic, pre-matching)
-                let order_id = ctx.next_global_order_id;
-                ctx.next_global_order_id += 1;
-
-                market_batches
-                    .entry(market_id)
-                    .or_default()
-                    .push(PreparedOrder {
-                        index: i,
-                        sender: *sender,
-                        params,
-                        order_id,
-                        margin_reserved: order_margin_required,
-                        margin_budget,
-                    });
+                    outcome,
+                );
             }
+        } else {
+            // L3-ENG: the serial loop runs literally the sharded workers'
+            // step ([`Self::prepare_one`]) over one fold, in flat order.
+            // Item 6 M1: pre-sized (senders with slot-taking orders).
+            let mut fold = SenderFold::with_capacity(open_at_start.len());
+            for &i in &place_order_indices {
+                let (sender, params) = match &flat[i] {
+                    (s, FlatAction::Place(p)) => (s, *p),
+                    (_, FlatAction::Other(_)) => unreachable!(),
+                };
+                let outcome = Self::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, sender, params);
+                Self::stitch_outcome(
+                    &mut ctx.next_global_order_id,
+                    &ctx.metrics,
+                    &markets,
+                    &mut market_batches,
+                    &mut results,
+                    i,
+                    sender,
+                    params,
+                    outcome,
+                );
+            }
+            fold_out = Some(fold.finish());
+        }
+        let FoldOut { cache, pools: pool_takers, excess: excess_by_sender } = fold_out.unwrap_or_default();
+        bal_cache.merge_disjoint(cache);
+
+        // F1 (s517, D2): a sender's free margin after ALL its Phase-2
+        // reservations is an EXCLUSIVE budget of the market of its FIRST
+        // checked taker (flat order); in that book its takers share it as a
+        // running budget; its other markets start at 0 — no two market
+        // workers spend the same free margin. Item 6 M1: `pool_takers` =
+        // the fold's first checked market and pos_net per sender (sender
+        // keyed; each pool below is a function of its sender only).
+        // Review fix 1 (s517): unchecked orders' committed-but-undebited
+        // need comes off their sender's pool (exact integer sum, the fold's
+        // `excess_unchecked`).
+        // B-blind (s92): top-ups come off what is left for the pools, so
+        // they run before the pools are read.
+        let [full, partial, none] = Self::sell_top_ups(
+            &ctx.positions,
+            &markets,
+            &basis,
+            &pool_takers,
+            &excess_by_sender,
+            &mut market_batches,
+            &mut bal_cache,
+        );
+        ctx.phase_accum.sell_top_ups += full + partial;
+        if let Some(ref m) = ctx.metrics {
+            m.sell_top_ups_full.inc_by(full);
+            m.sell_top_ups_partial.inc_by(partial);
+            m.sell_top_ups_none.inc_by(none);
+        }
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::with_capacity(pool_takers.len());
+        for (&sender, &(market_id, pos_net)) in &pool_takers {
+            let available = bal_cache
+                .load(&ctx.positions, &sender)
+                .map_or(FixedPoint::ZERO, |b| b.available);
+            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
+            pools.insert((sender, market_id), available + pos_net - excess);
         }
 
         let margin_elapsed = margin_timer.elapsed();
@@ -4221,10 +6098,15 @@ impl NativeExecutor {
             HashMap::new();
 
         for (&market_id, prepared) in &market_batches {
-            let mut book = ctx
-                .order_books
-                .remove(&market_id)
-                .unwrap_or_else(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
+            // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
+            // checked against (`shapes` holds every batch market).
+            let mut book = ctx.order_books.remove(&market_id).unwrap_or_else(|| {
+                let (tick, lot) = markets
+                    .get(&market_id)
+                    .map(|m| m.shape)
+                    .unwrap_or_else(|| Self::market_shape(&ctx.state, market_id));
+                OrderBook::new(market_id, tick, lot)
+            });
 
             // s515 (BUG 2): police reduce-only orders. Positions are loaded
             // as of this point (all Phase-1 effects, none of this batch's
@@ -4232,17 +6114,27 @@ impl NativeExecutor {
             // batch in this market (positions are keyed per market, and only
             // this worker fills this market), so every order is checked
             // against the position left by the block's earlier orders.
-            // Review 5: checked takers (margin budget) are tracked the same
-            // way — their closing fills are free at match time — so every
-            // path frees exactly the position the single path would read.
-            let tracked = |p: &PreparedOrder<'_>| p.params.reduce_only || p.margin_budget.is_some();
-            let has_tracked_sender = prepared.iter().any(tracked);
-            if has_tracked_sender || book.has_reduce_only_orders() {
+            // Review 5: checked takers are tracked the same way — their
+            // closing fills are free at match time — so every path frees
+            // exactly the position the single path would read. F1 (s517):
+            // EVERY sender of the batch in this market is tracked (checked
+            // takers value their position; maker checks need in-batch
+            // positions).
+            // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
+            // same reader, nothing written in between) is not read again.
+            if !prepared.is_empty() || book.has_reduce_only_orders() {
+                let mut known = ReduceOnlyPositions::new();
+                for p in prepared {
+                    if let Some((signed, _)) = p.pre_pos {
+                        known.insert(p.sender, signed);
+                    }
+                }
                 let ro = Self::reduce_only_positions_for(
-                    &ctx.positions,
+                    &reader,
                     &book,
                     market_id,
-                    prepared.iter().filter(|p| tracked(p)).map(|p| p.sender),
+                    prepared.iter().filter(|p| p.pre_pos.is_none()).map(|p| p.sender),
+                    known,
                 );
                 book.set_reduce_only_positions(ro);
             }
@@ -4250,6 +6142,36 @@ impl NativeExecutor {
             // s515 review 4: one shared copy of the market's tiers for the
             // checked takers' match-time margin limits.
             let tiers = Self::margin_tiers(ctx.margin_configs.get(&market_id));
+            // F1 (s517, D2): each checked sender's exclusive pool (0 outside
+            // the market of its first checked taker) and valuation price.
+            let mut am = AccountMargins::new(tiers.clone());
+            for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
+                if am.get(&p.sender).is_none() {
+                    // Item 6 M1: Phase 2's `position_px` (every checked
+                    // taker passed an account check, so it has `pre_pos`).
+                    let px = match p.pre_pos {
+                        Some((_, px)) => px,
+                        None => reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px),
+                    };
+                    #[cfg(test)]
+                    if let Some(s) = reader.sums.filter(|s| s.shadow) {
+                        let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
+                        if want != px || p.pre_pos.is_none() {
+                            s.shadow_mismatches.lock().unwrap().push(format!(
+                                "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
+                                p.sender, p.pre_pos
+                            ));
+                        }
+                    }
+                    // Review fix 4 (s517): only the pool market's entry is
+                    // the sender's account (shared with its makers there).
+                    match pools.get(&(p.sender, market_id)) {
+                        Some(&pool) => am.insert(p.sender, pool, px),
+                        None => am.insert_taker_only(p.sender, px),
+                    }
+                }
+            }
+            book.set_account_margins(am);
             let requests: Vec<MatchRequest<'_>> = prepared
                 .iter()
                 .map(|p| MatchRequest {
@@ -4257,16 +6179,23 @@ impl NativeExecutor {
                     params: p.params,
                     order_id: p.order_id,
                     margin: p
-                        .margin_budget
-                        .map(|budget| Self::taker_margin_limit(&tiers, p.params, budget)),
+                        .checked_pos_net
+                        .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
                 })
                 .collect();
 
             worker_batches.insert(market_id, (book, requests));
         }
 
-        let mut market_results = match MarketWorkerPool::match_parallel(worker_batches, ctx.timestamp)
-        {
+        // F1 (s517 #4): workers only READ the backend through `reader`.
+        // Item 6 C3: a maker's `free` = its balance (frozen backend during
+        // matching) + its position sums, memoised for the block (was fix 1's
+        // per-call `BatchMakerAccounts`): the same value in every market.
+        let mut market_results = match MarketWorkerPool::match_parallel_with(
+            worker_batches,
+            ctx.timestamp,
+            Some(&reader),
+        ) {
             Ok(r) => r,
             Err(panic) => {
                 // T1.5 FAIL-STOP: the panicking worker consumed its market's
@@ -4313,8 +6242,15 @@ impl NativeExecutor {
         let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
         for mbr in market_results.iter_mut() {
             mbr.book.clear_reduce_only_positions();
+            mbr.book.clear_account_margins();
             for r in &mbr.results {
                 triggered.extend(r.result.triggered_stops.iter().cloned());
+            }
+            // s92 counters (aligned with the market's prepared orders).
+            if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
+                for (r, p) in mbr.results.iter().zip(prepared) {
+                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up_candidate);
+                }
             }
         }
         let settle_timer = std::time::Instant::now();
@@ -4412,11 +6348,290 @@ impl NativeExecutor {
         NativeBatchResult { results, total_gas }
     }
 
+    /// L3-ENG: Phase 2 of ONE PlaceOrder — shared by the serial loop and
+    /// the sharded workers so both run literally the same code. s515:
+    /// validation + the reservation formula of `exec_place_order`; F4 /
+    /// review 4: `basis` overrides; F2: an overflowing notional rejects.
+    /// Review 4: a checked taker's match-time budget is its reservation +
+    /// the available balance left after it, in this per-sender fold.
+    /// Reduce-only is NOT pre-checked here: Phase 2 only sees pre-batch
+    /// positions, so the book polices it at match time (Phase 3).
+    /// Option B (s87) bid floor and fix A (s92) shape: `markets` =
+    /// [`phase2_markets`]. Item 6 M1: one `senders` entry and at most one
+    /// `proj` entry per order (same reads, same arithmetic, same order).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_one<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        open_at_start: &HashMap<Address, u32>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        fold: &mut SenderFold,
+        i: usize,
+        sender: &Address,
+        params: &PlaceOrderParams,
+    ) -> PrepOutcome {
+        let st = fold.state(sender);
+        // Open-order limit first: a rejected order reserves nothing.
+        let taken = match Self::take_open_slot(&mut st.open_slots, reader.positions, open_at_start, sender, params) {
+            Ok(taken) => taken,
+            Err((funnel, msg)) => return PrepOutcome::Reject { funnel, reason: funnel.failure(), msg },
+        };
+        if let Err((reason, msg)) = Self::validate_order_price(params) {
+            return PrepOutcome::Reject {
+                funnel: RejectReason::Other,
+                reason,
+                msg,
+            };
+        }
+        // Every market of the batch has an entry (the fallback is never
+        // taken; it reads what the entry would hold).
+        let market = match markets.get(&params.market_id) {
+            Some(m) => *m,
+            None => Phase2Market {
+                shape: (FixedPoint::ONE, FixedPoint::ONE),
+                bid_floor: None,
+                cfg: reader.margin_configs.get(&params.market_id),
+                mark: reader.mark(params.market_id),
+                orders: 0,
+            },
+        };
+        // Fix A (s92): the book's dust / off-tick rejects, before anything
+        // is reserved, projected or pooled.
+        if let Some((reason, msg)) = Self::book_shape_violation(params, market.shape) {
+            return PrepOutcome::Reject {
+                funnel: RejectReason::Other,
+                reason,
+                msg,
+            };
+        }
+        let (base_price, res_qty) = (!basis.is_empty())
+            .then(|| basis.get(&i).copied())
+            .flatten()
+            .unwrap_or((Self::reserve_price(params), params.quantity));
+        let cfg = market.cfg;
+        // Option B (s87): outside its D2 pool market a sell's match-time
+        // budget is only its own reservation (`insert_taker_only`), so it
+        // reserves — and is placement-checked — for the best bid it can hit
+        // at the start of Phase 2 (`max(base, best bid)`, quantity unchanged).
+        // Its hold, resting row and every release stay at the limit (A5).
+        // A best bid whose notional would overflow keeps `base`.
+        let floor_candidate = Self::takes_bid_floor(params) && st.pool.is_some_and(|m| m != params.market_id);
+        let mut res_price = base_price;
+        let mut floored = None;
+        if floor_candidate {
+            if let Some(bid) = market.bid_floor {
+                if bid > res_price {
+                    if let Ok(r) = Self::try_reserve_for_qty_cfg(cfg, bid, res_qty) {
+                        res_price = bid;
+                        floored = Some(r);
+                    }
+                }
+            }
+        }
+        // M1: the floor's reservation is the one at `res_price` (computed once).
+        let required = match floored.map_or_else(|| Self::try_reserve_for_qty_cfg(cfg, res_price, res_qty), Ok) {
+            Ok(r) => r,
+            Err(msg) => {
+                return PrepOutcome::Reject {
+                    funnel: RejectReason::Other,
+                    reason: FailureReason::Price,
+                    msg,
+                }
+            }
+        };
+        let checked = Self::match_margin_checked(params);
+        let needs_account = !params.reduce_only;
+        let mut pos_net = FixedPoint::ZERO;
+        let mut excess = FixedPoint::ZERO;
+        let mut projection: Option<&mut Projection> = None;
+        if required > FixedPoint::ZERO || checked || needs_account {
+            let bal = match SenderState::load_balance(&mut st.balance, reader.positions, sender) {
+                Ok(bal) => bal,
+                Err(e) => {
+                    return PrepOutcome::Reject {
+                        funnel: RejectReason::Other,
+                        reason: FailureReason::Other,
+                        msg: e.to_string(),
+                    }
+                }
+            };
+            // F1 (s517, D1 strict HL): the account check is the ONLY
+            // placement gate — no `available >= reservation`; the debit
+            // below may take `available` negative.
+            if needs_account {
+                let pn = match st.pos_net {
+                    Some(v) => v,
+                    None => match reader.pos_net(sender) {
+                        Ok(v) => *st.pos_net.insert(v),
+                        Err(e) => {
+                            return PrepOutcome::Reject {
+                                funnel: RejectReason::Other,
+                                reason: FailureReason::Other,
+                                msg: e.to_string(),
+                            }
+                        }
+                    },
+                };
+                // `position_px` with the market's mark read once per call.
+                let e = match st.proj.get_or_try_insert(params.market_id, || {
+                    reader.get_position(sender, params.market_id).map(|pos| {
+                        let (signed, px) = AccountReader::<T>::signed_px(pos.as_ref(), market.mark);
+                        Projection { signed, px, pre: (signed, px) }
+                    })
+                }) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return PrepOutcome::Reject {
+                            funnel: RejectReason::Other,
+                            reason: FailureReason::Other,
+                            msg: e.to_string(),
+                        }
+                    }
+                };
+                // Decision s517: only a match-checked order sees the
+                // projected releases of the sender's earlier orders;
+                // unchecked ones (GTC buys, stops) stay strict.
+                let credit = if checked { st.released } else { FixedPoint::ZERO };
+                // Review fix 1: minus what earlier orders committed.
+                let need = match Self::account_check(
+                    market.tiers(),
+                    e.signed,
+                    e.px,
+                    params,
+                    res_price,
+                    bal.available + pn + credit - st.committed,
+                ) {
+                    Ok(need) => need,
+                    Err((reason, msg)) => {
+                        return PrepOutcome::Reject {
+                            funnel: RejectReason::Margin,
+                            reason,
+                            msg,
+                        }
+                    }
+                };
+                // Review fix 1 (s517): the need beyond the reservation
+                // stays committed (the projection advances the position as
+                // if filled).
+                excess = (need - required).max(FixedPoint::ZERO);
+                if excess > FixedPoint::ZERO {
+                    st.committed += excess;
+                }
+                pos_net = pn;
+                projection = Some(e);
+            }
+            if required > FixedPoint::ZERO {
+                bal.available -= required;
+                bal.order_margin += required;
+                st.balance_dirty = true;
+            }
+        }
+        let pre_pos = projection.as_ref().map(|e| e.pre);
+        // F1 (D6): project the accepted order as if filled, valuing an
+        // in-batch position at its first order's price.
+        if !Self::is_stop(params) {
+            if let Some(e) = projection {
+                // Decision s517: the IM its closing part releases (at the
+                // projection's valuation; overflow = no credit).
+                let tiers = market.tiers();
+                let size = if e.signed < FixedPoint::ZERO { -e.signed } else { e.signed };
+                let closing = params.quantity.min(reduce_only_allowance(e.signed, params.is_buy));
+                // Item 6 cut 2: nothing closes -> `b == a`, the IM delta is
+                // 0 and nothing is credited, so it is not computed. Only with
+                // `px > 0`: then `b` is the account check's `before` (same
+                // size and price), whose IM was just computed, so skipping
+                // it cannot skip a 0x-tier panic either.
+                if closing > FixedPoint::ZERO || e.px <= FixedPoint::ZERO {
+                    let release = size
+                        .checked_mul(e.px)
+                        .ok()
+                        .zip((size - closing).checked_mul(e.px).ok())
+                        .map(|(b, a)| -torus_core::margin::im_delta(tiers, b, a));
+                    if let Some(r) = release.filter(|r| *r > FixedPoint::ZERO) {
+                        st.released = st.released.checked_add(r).unwrap_or(st.released);
+                    }
+                }
+                e.signed = if params.is_buy {
+                    e.signed + params.quantity
+                } else {
+                    e.signed - params.quantity
+                };
+                if e.px == FixedPoint::ZERO {
+                    e.px = base_price;
+                }
+            }
+        }
+        // The order passed: it now holds its open-order slot.
+        if taken.is_some() {
+            st.open_slots = taken;
+        }
+        if checked {
+            st.pool.get_or_insert(params.market_id);
+        } else {
+            // Review fix 1: an unchecked order's excess comes off the pool.
+            st.excess_unchecked += excess;
+        }
+        PrepOutcome::Pass(PrepPass {
+            required,
+            checked_pos_net: checked.then_some(pos_net),
+            pre_pos,
+            top_up_candidate: floor_candidate,
+            res_price,
+            #[cfg(test)]
+            excess_im: if checked { FixedPoint::ZERO } else { excess },
+        })
+    }
+
+    /// L3-ENG: apply one Phase-2 outcome in flat order — a pass gets the
+    /// next global order id and joins its market's batch; a reject records
+    /// its funnel counter (`orders_rejected_margin` vs `_other`) and error.
+    /// Field-level borrows, so it coexists with an [`AccountReader`].
+    #[allow(clippy::too_many_arguments)]
+    fn stitch_outcome<'a>(
+        next_id: &mut u128,
+        metrics: &Option<Arc<torus_telemetry::Metrics>>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'a>>>,
+        results: &mut [NativeActionResult],
+        i: usize,
+        sender: &Address,
+        params: &'a PlaceOrderParams,
+        outcome: PrepOutcome,
+    ) {
+        match outcome {
+            PrepOutcome::Pass(pass) => {
+                let order_id = *next_id;
+                *next_id += 1;
+                market_batches
+                    .entry(params.market_id)
+                    .or_insert_with(|| Vec::with_capacity(markets.get(&params.market_id).map_or(0, |m| m.orders)))
+                    .push(PreparedOrder {
+                        index: i,
+                        sender: *sender,
+                        params,
+                        order_id,
+                        margin_reserved: pass.required,
+                        checked_pos_net: pass.checked_pos_net,
+                        pre_pos: pass.pre_pos,
+                        top_up_candidate: pass.top_up_candidate,
+                        res_price: pass.res_price,
+                    });
+            }
+            PrepOutcome::Reject { funnel, reason, msg } => {
+                // Funnel (perf A1): died pre-book.
+                if let Some(ref m) = metrics {
+                    funnel.count(m);
+                }
+                results[i] = NativeActionResult::rejected("place_order", (reason, msg));
+            }
+        }
+    }
+
     /// L3-ENG: sharded Phase-2 prepare. `groups` is the per-sender partition
     /// of the batch's PlaceOrders (each sender's orders in flat order);
     /// workers process disjoint contiguous shards of the sender list, each
     /// replaying its senders' balance folds against a worker-local
-    /// `BalanceCache` (read-through to the shared overlay, which at this
+    /// fold (read-through to the shared overlay, which at this
     /// point holds all Phase-1 effects — exactly what the serial loop reads).
     ///
     /// Determinism (docs/design-parallel-engine.md §3): an order's outcome is
@@ -4424,122 +6639,51 @@ impl NativeExecutor {
     /// trajectory), and the trajectory is a fold over that sender's own
     /// orders only — no other Phase-2 step touches it — so outcomes are
     /// independent of shard assignment and thread count. Returns the
-    /// per-flat-index outcomes plus the merged (sender-disjoint) cache;
-    /// `None` if any worker panicked (caller falls back to the serial loop —
-    /// nothing shared has been mutated).
+    /// per-flat-index outcomes plus the merged (sender-disjoint) fold
+    /// output; `None` if any worker panicked (caller falls back to the
+    /// serial loop — nothing shared has been mutated).
+    #[allow(clippy::too_many_arguments)]
     fn phase2_parallel_prepare<T: StateBackend>(
-        positions: &PositionManager<T>,
-        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        reader: &AccountReader<'_, T>,
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
-    ) -> Option<(Vec<Option<PrepOutcome>>, BalanceCache)> {
+    ) -> Option<(Vec<Option<PrepOutcome>>, FoldOut)> {
         let workers = threads.min(groups.len()).max(1);
         let shard = groups.len().div_ceil(workers);
 
-        type WorkerOut = (Vec<(usize, PrepOutcome)>, BalanceCache);
+        type WorkerOut = (Vec<(usize, PrepOutcome)>, FoldOut);
         let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(shard)
                 .map(|shard_groups| {
                     s.spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut cache = BalanceCache::new();
-                            let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(
-                                shard_groups.iter().map(|(_, o)| o.len()).sum(),
-                            );
+                            let orders: usize = shard_groups.iter().map(|(_, o)| o.len()).sum();
+                            let mut fold = SenderFold::with_capacity(shard_groups.len());
+                            let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(orders);
                             for (sender, orders) in shard_groups {
-                                let mut slots = None;
                                 for &(i, params) in orders {
-                                    let taken = match Self::take_open_slot(
-                                        &mut slots,
-                                        positions,
-                                        open_at_start,
-                                        sender,
-                                        params,
-                                    ) {
-                                        Ok(taken) => taken,
-                                        Err((reason, msg)) => {
-                                            out.push((i, PrepOutcome::Reject { reason, msg }));
-                                            continue;
-                                        }
-                                    };
-                                    // s515: same validation + formula as the
-                                    // serial loop / exec_place_order.
-                                    if let Err(msg) = Self::validate_order_price(params) {
-                                        out.push((i, PrepOutcome::Reject {
-                                            reason: RejectReason::Other,
-                                            msg,
-                                        }));
-                                        continue;
-                                    }
-                                    let (res_price, res_qty) = basis
-                                        .get(&i)
-                                        .copied()
-                                        .unwrap_or((Self::reserve_price(params), params.quantity));
-                                    let required = match Self::try_reserve_for_qty_cfg(
-                                        margin_configs.get(&params.market_id),
-                                        res_price,
-                                        res_qty,
-                                    ) {
-                                        Ok(r) => r,
-                                        Err(msg) => {
-                                            out.push((i, PrepOutcome::Reject {
-                                                reason: RejectReason::Other,
-                                                msg,
-                                            }));
-                                            continue;
-                                        }
-                                    };
-                                    // s515 review 4: same budget as the serial loop.
-                                    let checked = Self::match_margin_checked(params);
-                                    let mut budget = None;
-                                    if required > FixedPoint::ZERO || checked {
-                                        match cache.load(positions, sender) {
-                                            Ok(mut bal) => {
-                                                if bal.available < required {
-                                                    out.push((
-                                                        i,
-                                                        PrepOutcome::Reject {
-                                                            reason: RejectReason::Margin,
-                                                            msg: format!(
-                                                                "insufficient margin: need {required}, have {}",
-                                                                bal.available
-                                                            ),
-                                                        },
-                                                    ));
-                                                    continue;
-                                                }
-                                                if checked {
-                                                    budget = Some(bal.available);
-                                                }
-                                                if required > FixedPoint::ZERO {
-                                                    bal.available -= required;
-                                                    bal.order_margin += required;
-                                                    cache.set(sender, bal);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                out.push((
-                                                    i,
-                                                    PrepOutcome::Reject {
-                                                        reason: RejectReason::Other,
-                                                        msg: e.to_string(),
-                                                    },
-                                                ));
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    if taken.is_some() {
-                                        slots = taken;
-                                    }
-                                    out.push((i, PrepOutcome::Pass(required, budget)));
+                                    // L3-ENG: literally the serial loop's step.
+                                    out.push((
+                                        i,
+                                        Self::prepare_one(
+                                            reader,
+                                            open_at_start,
+                                            basis,
+                                            markets,
+                                            &mut fold,
+                                            i,
+                                            sender,
+                                            params,
+                                        ),
+                                    ));
                                 }
                             }
-                            (out, cache)
+                            (out, fold.finish())
                         }))
                         .map_err(|_| ())
                     })
@@ -4552,14 +6696,14 @@ impl NativeExecutor {
         });
 
         let mut outcomes: Vec<Option<PrepOutcome>> = (0..n).map(|_| None).collect();
-        let mut merged = BalanceCache::new();
+        let mut merged = FoldOut::default();
         for r in worker_results {
             match r {
-                Ok((out, cache)) => {
+                Ok((out, fold)) => {
                     for (i, o) in out {
                         outcomes[i] = Some(o);
                     }
-                    merged.merge_disjoint(cache);
+                    merged.merge_disjoint(fold);
                 }
                 Err(()) => return None,
             }
@@ -4663,9 +6807,9 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
-                            results[prep.index] = NativeActionResult::err(
+                            results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
-                                format!("taker fill failed: {e}"),
+                                (FailureReason::Fill, format!("taker fill failed: {e}")),
                             );
                             fill_failed = true;
                             break;
@@ -4684,9 +6828,9 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
-                            results[prep.index] = NativeActionResult::err(
+                            results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
-                                format!("maker fill failed: {e}"),
+                                (FailureReason::Fill, format!("maker fill failed: {e}")),
                             );
                             fill_failed = true;
                             break;
@@ -5047,7 +7191,8 @@ impl NativeExecutor {
                 }
 
                 if let Some(err) = fill_failed {
-                    results[prep.index] = NativeActionResult::err("place_order", err);
+                    results[prep.index] =
+                        NativeActionResult::rejected("place_order", (FailureReason::Fill, err));
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -5281,6 +7426,30 @@ impl NativeExecutor {
         }
     }
 
+    /// s92 (B-blind observability; nothing reads it back): one book
+    /// outcome's maker margin cancels and reduce-only cuts and, for a SELL
+    /// taker whose match-time margin ran out, its cut — `[non_pool]
+    /// [partial][bucket]`, the bucket of its hit price minus `res_price` (the
+    /// price its reservation was taken at) in ticks of `tick`, rounded up.
+    /// `non_pool`: its budget was the D2 taker-only reservation.
+    fn record_margin_cuts(
+        m: &torus_telemetry::Metrics,
+        is_buy: bool,
+        result: &PlaceResult,
+        res_price: FixedPoint,
+        tick: FixedPoint,
+        non_pool: bool,
+    ) {
+        m.maker_margin_cancels.inc_by(result.margin_cancels.len() as u64);
+        m.reduce_only_cuts.inc_by(result.reduce_only_cuts.len() as u64);
+        if let (false, Some(hit)) = (is_buy, result.margin_cut_price) {
+            let d = hit.raw().saturating_sub(res_price.raw());
+            let ticks = if d <= 0 { 0 } else { (d - 1) / tick.raw().max(1) + 1 };
+            let bucket = torus_telemetry::margin_cut_tick_bucket(ticks);
+            m.sell_margin_cuts[usize::from(non_pool)][usize::from(!result.fills.is_empty())][bucket].inc();
+        }
+    }
+
     /// A5 (maker-fill margin leak): THE reserve/release formula.
     ///
     /// Margin reserved for `qty` of a limit order at `price` in `market_id`:
@@ -5322,12 +7491,15 @@ impl NativeExecutor {
         price: FixedPoint,
         qty: FixedPoint,
     ) -> Result<FixedPoint, String> {
-        if price > FixedPoint::ZERO && qty > FixedPoint::ZERO && price.checked_mul(qty).is_err() {
-            return Err(format!(
-                "order notional overflows: price {price} x quantity {qty}"
-            ));
+        if price <= FixedPoint::ZERO || qty <= FixedPoint::ZERO {
+            return Ok(FixedPoint::ZERO);
         }
-        Ok(Self::reserve_for_qty_cfg(cfg, price, qty))
+        // Item 6 M1: the product once (`reserve_for_qty_cfg`'s `price * qty`
+        // is this `checked_mul`, unwrapped).
+        match price.checked_mul(qty) {
+            Ok(notional) => Ok(order_initial_margin(cfg.map(|c| c.tiers.as_slice()), notional)),
+            Err(_) => Err(format!("order notional overflows: price {price} x quantity {qty}")),
+        }
     }
 
     /// A5: margin releases owed to RESTING (maker) orders that were consumed
@@ -5386,7 +7558,8 @@ impl NativeExecutor {
             }
             // s515: quantity cut from resting reduce-only orders telescopes
             // exactly like consumption by a fill.
-            for c in &r.reduce_only_cuts {
+            // F1 (s517 #4): so does a maker cancelled for margin.
+            for c in r.reduce_only_cuts.iter().chain(&r.margin_cancels) {
                 let e = consumed
                     .entry(c.order_id)
                     .or_insert((c.trader, c.price, FixedPoint::ZERO));
@@ -5433,9 +7606,11 @@ impl NativeExecutor {
     /// sender's first such order in this `execute_batch` call: its open orders
     /// after Phase 1 (`open_at_start`) and the limit from the stored
     /// `cum_volume`. A slot is taken before matching, so an order the book
-    /// then rejects (PostOnly cross, dust, off-tick) keeps it for the call. Returns
+    /// then rejects (e.g. a PostOnly cross) keeps it for the call; dust and
+    /// off-tick orders are rejected before the book (fix A, s92). Returns
     /// the slots with this order counted; the caller stores them only once the
-    /// order also passed its margin reserve, so a rejected order takes no slot.
+    /// order also passed its price / shape checks and margin reserve, so a
+    /// rejected order takes no slot.
     fn take_open_slot<T: StateBackend>(
         slots: &mut Option<OpenSlots>,
         positions: &PositionManager<T>,
@@ -5555,16 +7730,9 @@ impl NativeExecutor {
 
     /// s515 review 4: the mark price of `market_id` — the stake-weighted
     /// median aggregated by the oracle and committed in state — or `None`
-    /// when there is none, it is stale (older than the oracle's max age at
-    /// this block height), non-positive, or unreadable. Only oracle
-    /// aggregation writes that row and no native action runs it, so every
-    /// placement of a block (single, batch serial, batch sharded) reads the
-    /// same value on every validator.
+    /// (F1: one formula, [`AccountReader::mark`]).
     fn mark_price<T: StateBackend>(ctx: &NativeExecContext<T>, market_id: MarketId) -> Option<FixedPoint> {
-        match ctx.oracle.get_price(market_id, ctx.block_height) {
-            Ok(p) if !p.stale && p.price > FixedPoint::ZERO => Some(p.price),
-            _ => None,
-        }
+        AccountReader::of(ctx).mark(market_id)
     }
 
     /// s515 review 4 (Hyperliquid: margin is checked "when orders are placed
@@ -5576,7 +7744,8 @@ impl NativeExecutor {
     /// limit, i.e. within its full reservation. Review 5: an IOC / FOK limit
     /// buy reserves only for its opening part ([`never_rests`]), so it is
     /// checked too. Reduce-only orders are exempt (Hyperliquid: reducing
-    /// needs no margin); stops are checked once triggered.
+    /// needs no margin); stops are checked once triggered. F1 (s517): the
+    /// budget is the reservation + the sender's running free margin.
     fn match_margin_checked(params: &PlaceOrderParams) -> bool {
         !params.reduce_only
             && match params.order_type {
@@ -5584,6 +7753,14 @@ impl NativeExecutor {
                 OrderType::Limit => !params.is_buy || Self::never_rests(params),
                 _ => false,
             }
+    }
+
+    /// Option B (s87): a match-checked sell that can take (not PostOnly) —
+    /// the orders whose batch reservation, outside the sender's D2 pool
+    /// market, is raised to the start-of-batch best bid ([`prepare_one`]).
+    /// Reduce-only orders and stops are not match-checked.
+    fn takes_bid_floor(params: &PlaceOrderParams) -> bool {
+        !params.is_buy && Self::match_margin_checked(params) && params.time_in_force != TimeInForce::PostOnly
     }
 
     /// s515 review 5 (F2): an order that can never rest — market, or an IOC /
@@ -5611,20 +7788,57 @@ impl NativeExecutor {
     }
 
     /// s515 review 4: the book-side match-time margin limit of a checked
-    /// taker with `budget` (its reservation + the available balance after
-    /// it). A GTC limit's remainder can rest and keeps `reserve(limit, left)`,
-    /// so that hold counts against the budget too.
+    /// taker. F1 (s517): `reserved` is the order's own reservation; the book
+    /// adds the sender's running free margin (`AccountMargins`). A GTC
+    /// limit's remainder can rest and keeps `reserve(limit, left)`, so its
+    /// opening part counts against the budget too.
     fn taker_margin_limit(
         tiers: &Option<Arc<[MarginTier]>>,
         params: &PlaceOrderParams,
-        budget: FixedPoint,
+        reserved: FixedPoint,
     ) -> TakerMarginLimit {
         let can_rest = matches!(params.order_type, OrderType::Limit)
             && params.time_in_force == TimeInForce::GTC;
         TakerMarginLimit {
-            budget,
+            budget: reserved,
             tiers: tiers.clone(),
             hold_price: can_rest.then(|| Self::reserve_price(params)),
+        }
+    }
+
+    /// F1 (s517): THE placement gate (strict HL, D1 — there is no
+    /// `available >= reservation` gate any more): the order's need at the
+    /// POSITION-size tier (closing part free) must be `<= 0` (only reduces)
+    /// or `<= free` (available + UPnL − position IM, before this
+    /// reservation; `available` may be negative). Reduce-only orders are
+    /// clamped to the position, so they only reduce and are skipped. A
+    /// pending stop is checked as a resting order at its reservation price
+    /// (it is re-checked when it triggers); without this, stops would have
+    /// no gate at all.
+    fn account_check(
+        tiers: Option<&[MarginTier]>,
+        signed: FixedPoint,
+        px: FixedPoint,
+        params: &PlaceOrderParams,
+        res_price: FixedPoint,
+        free: FixedPoint,
+    ) -> Result<FixedPoint, Rejection> {
+        if params.reduce_only {
+            return Ok(FixedPoint::ZERO);
+        }
+        // A flat (or unmarked) position is valued at the order's own price.
+        let px = if px > FixedPoint::ZERO { px } else { res_price };
+        let can_rest = !Self::never_rests(params); // stops: true
+        match placement_need(tiers, signed, px, params.is_buy, params.quantity, res_price, can_rest) {
+            None => Err((
+                FailureReason::Price,
+                format!("order notional overflows: price {res_price} x quantity {}", params.quantity),
+            )),
+            Some(need) if need > FixedPoint::ZERO && need > free => Err((
+                FailureReason::Margin,
+                format!("insufficient margin: need {need}, have {free} (account)"),
+            )),
+            Some(need) => Ok(need),
         }
     }
 
@@ -5669,13 +7883,16 @@ impl NativeExecutor {
         let sat_add =
             |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
+        // Item 6 M1: the closing allowances are only read by orders that
+        // never rest; without one in the batch they are not tracked (the
+        // map is otherwise only written). Pre-sized: one key per order at most.
+        let track_closing = orders.iter().any(|(_, _, p)| Self::never_rests(p));
         let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
         let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
         let mut closing: HashMap<(Address, MarketId, bool), (Option<FixedPoint>, FixedPoint)> =
-            HashMap::new();
+            HashMap::with_capacity(if track_closing { orders.len() } else { 0 });
         let mut out = HashMap::new();
         for &(i, sender, params) in orders {
-            let book = ctx.order_books.get(&params.market_id);
             let mark = if matches!(params.order_type, OrderType::Market) {
                 *marks
                     .entry(params.market_id)
@@ -5689,7 +7906,7 @@ impl NativeExecutor {
                 // A position read error polices as flat in the book; keep the
                 // full reservation then (conservative).
                 if let Ok(pos) = Self::signed_position(&ctx.positions, &sender, params.market_id) {
-                    let resting = book.map_or(FixedPoint::ZERO, |b| {
+                    let resting = ctx.order_books.get(&params.market_id).map_or(FixedPoint::ZERO, |b| {
                         b.orders_for_trader(&sender)
                             .iter()
                             .filter(|o| !o.reduce_only)
@@ -5714,18 +7931,20 @@ impl NativeExecutor {
             // `(pre-batch allowance, read lazily; quantity of the sender's
             // earlier orders on this side)`. Every order on the side, of any
             // type, uses the allowance up (conservative).
-            let key = (sender, params.market_id, params.is_buy);
-            let (allowance, used) = closing.entry(key).or_insert((None, FixedPoint::ZERO));
-            if Self::never_rests(params) {
-                // A read error frees nothing — charges whole (conservative).
-                let allowance = *allowance.get_or_insert_with(|| {
-                    Self::signed_position(&ctx.positions, &sender, params.market_id)
-                        .map_or(FixedPoint::ZERO, |pos| reduce_only_allowance(pos, params.is_buy))
-                });
-                let left = (allowance - *used).max(FixedPoint::ZERO);
-                qty -= qty.min(left);
+            if track_closing {
+                let key = (sender, params.market_id, params.is_buy);
+                let (allowance, used) = closing.entry(key).or_insert((None, FixedPoint::ZERO));
+                if Self::never_rests(params) {
+                    // A read error frees nothing — charges whole (conservative).
+                    let allowance = *allowance.get_or_insert_with(|| {
+                        Self::signed_position(&ctx.positions, &sender, params.market_id)
+                            .map_or(FixedPoint::ZERO, |pos| reduce_only_allowance(pos, params.is_buy))
+                    });
+                    let left = (allowance - *used).max(FixedPoint::ZERO);
+                    qty -= qty.min(left);
+                }
+                *used = sat_add(*used, params.quantity);
             }
-            *used = sat_add(*used, params.quantity);
             if price != Self::reserve_price(params) || qty != params.quantity {
                 out.insert(i, (price, qty));
             }
@@ -5733,12 +7952,168 @@ impl NativeExecutor {
         out
     }
 
+    /// Item 6 M1: every batch market's read-only Phase-2 inputs
+    /// ([`Phase2Market`]), read once after Phase 1 and shared by the serial
+    /// and sharded prepare paths (the sharded workers have no books; Phase 2
+    /// touches no book, so this is exactly what Phase 3 matches against):
+    /// fix A's [`book_shape`] (row 42: a missing book's market row), Option
+    /// B's best bid (books are consensus state, so every node reads the same
+    /// prices), the margin config and, for a market with an order that is
+    /// not reduce-only, [`AccountReader::mark`]. Field borrows (`books`,
+    /// `state`, the reader's configs), so it coexists with the stitch's
+    /// `&mut ctx.next_global_order_id`.
+    fn phase2_markets<'a, T: StateBackend>(
+        books: &HashMap<MarketId, OrderBook>,
+        state: &T,
+        reader: &AccountReader<'a, T>,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> HashMap<MarketId, Phase2Market<'a>> {
+        let mut out: HashMap<MarketId, (Phase2Market<'a>, bool)> = HashMap::new();
+        for &(_, _, p) in orders {
+            let (market, needs_mark) = out.entry(p.market_id).or_insert_with(|| {
+                let market = Phase2Market {
+                    shape: Self::book_shape(books, state, p.market_id),
+                    bid_floor: books.get(&p.market_id).and_then(OrderBook::best_bid),
+                    cfg: reader.margin_configs.get(&p.market_id),
+                    mark: None,
+                    orders: 0,
+                };
+                (market, false)
+            });
+            market.orders += 1;
+            *needs_mark |= !p.reduce_only;
+        }
+        // Independent reads per market: iteration order is irrelevant.
+        out.into_iter()
+            .map(|(m, (mut market, needs_mark))| {
+                if needs_mark {
+                    market.mark = reader.mark(m);
+                }
+                (m, market)
+            })
+            .collect()
+    }
+
+    /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid
+    /// bound). After the Phase-2 fold each non-pool sell that takes a bid
+    /// floor ([`PreparedOrder::top_up_candidate`]: [`takes_bid_floor`], its
+    /// sender's D2 pool is another market) is topped up towards
+    /// `reserve(B0 x (1 + δ), qty)`: `B0` its market's best bid at the start
+    /// of Phase 2 (none: no top-up), δ = [`SELL_TOP_UP_BPS`]
+    /// ([`sell_top_up_price`]), `qty` its Phase-2 reservation quantity. It
+    /// reads no other trader's order of the batch, so no one can raise a
+    /// reservation, or drain a sender's pool through one: griefing-free.
+    ///
+    /// Soft and partial: the extra comes from the sender's free margin LEFT
+    /// after its whole Phase-2 fold (`available + pos_net − excess`, what
+    /// Phase 3 would give its D2 pool), `min(extra, free left)`, candidates in
+    /// flat batch order (a sender's earlier candidates first). Never a
+    /// placement gate: every Phase-2 outcome is unchanged. It joins
+    /// `margin_reserved` (the taker-only budget); the hold, resting row and
+    /// every release stay at the limit (release = reserved − hold, A5
+    /// exact). Deterministic: a pure function of the Phase-2 outcomes
+    /// (serial == sharded) and the start-of-batch books.
+    ///
+    /// s89 review finding 2 (by design): a top-up is taken AHEAD of the
+    /// sender's own pool-market orders, even those earlier in flat order — it
+    /// comes off the free margin after the whole fold, before Phase 3 hands
+    /// the rest to the pool.
+    ///
+    /// A full top-up moves the order's `res_price` (counters only) to the
+    /// top-up price; a partial one keeps Phase 2's. Returns how many
+    /// candidates that needed a top-up got it `[in full, partly, not at all]`.
+    #[allow(clippy::too_many_arguments)]
+    fn sell_top_ups<T: StateBackend>(
+        positions: &PositionManager<T>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        pools: &HashMap<Address, (MarketId, FixedPoint)>,
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        bal_cache: &mut BalanceCache,
+    ) -> [u64; 3] {
+        let mut counts = [0u64; 3];
+        // (flat index, market, position in its batch), in flat order.
+        let mut wanted: Vec<(usize, MarketId, usize)> = market_batches
+            .iter()
+            .flat_map(|(&m, batch)| {
+                batch.iter().enumerate().filter(|(_, p)| p.top_up_candidate).map(move |(k, p)| (p.index, m, k))
+            })
+            .collect();
+        wanted.sort_unstable_by_key(|w| w.0);
+        for (i, market_id, k) in wanted {
+            let Some(market) = markets.get(&market_id) else { continue };
+            let Some(price) = market.bid_floor.and_then(Self::sell_top_up_price) else { continue };
+            let Some(p) = market_batches.get_mut(&market_id).and_then(|b| b.get_mut(k)) else { continue };
+            let res_qty = basis.get(&i).map_or(p.params.quantity, |b| b.1);
+            let Ok(target) = Self::try_reserve_for_qty_cfg(market.cfg, price, res_qty) else { continue };
+            let extra = target - p.margin_reserved;
+            if extra <= FixedPoint::ZERO {
+                continue;
+            }
+            let Ok(mut bal) = bal_cache.load(positions, &p.sender) else { continue };
+            let pos_net = pools.get(&p.sender).map_or(FixedPoint::ZERO, |v| v.1);
+            let excess = excess_by_sender.get(&p.sender).copied().unwrap_or(FixedPoint::ZERO);
+            let grant = extra.min(bal.available + pos_net - excess);
+            if grant <= FixedPoint::ZERO {
+                counts[2] += 1;
+                continue;
+            }
+            bal.available -= grant;
+            bal.order_margin += grant;
+            bal_cache.set(&p.sender, bal);
+            p.margin_reserved += grant;
+            if grant == extra {
+                p.res_price = price;
+                counts[0] += 1;
+            } else {
+                counts[1] += 1;
+            }
+        }
+        counts
+    }
+
+    /// B-blind (s92): the top-up price `B0 x (1 + SELL_TOP_UP_BPS / 10,000)`
+    /// in exact integer math on the raw value, rounded down; `None` on
+    /// overflow (no top-up).
+    fn sell_top_up_price(b0: FixedPoint) -> Option<FixedPoint> {
+        b0.raw().checked_mul(10_000 + SELL_TOP_UP_BPS).map(|r| FixedPoint::from_raw(r / 10_000))
+    }
+
+    /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of
+    /// the batch in flat order — as `(sender, market, pos_net)`. Item 6 M1:
+    /// Phase 2's fold now keeps it ([`SenderState::pool`]); this pass over
+    /// the prepared orders stays as the tests' oracle.
+    #[cfg(test)]
+    fn d2_pool_takers(
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+    ) -> Vec<(Address, MarketId, FixedPoint)> {
+        let mut checked_takers: Vec<(usize, Address, MarketId, FixedPoint)> = market_batches
+            .values()
+            .flatten()
+            .filter_map(|p| p.checked_pos_net.map(|n| (p.index, p.sender, p.params.market_id, n)))
+            .collect();
+        checked_takers.sort_unstable_by_key(|c| c.0);
+        let mut pooled: BTreeSet<Address> = BTreeSet::new();
+        checked_takers
+            .into_iter()
+            .filter(|c| pooled.insert(c.1))
+            .map(|(_, sender, market_id, pos_net)| (sender, market_id, pos_net))
+            .collect()
+    }
+
     /// s515 (BUG 1): Hyperliquid parity — a market order is an aggressive
     /// IOC limit, so its `price` is a REQUIRED worst-acceptable-price cap
     /// (the book never matches past it). Pre-s515 a market order reserved
     /// zero margin and matched at any price.
-    fn validate_order_price(params: &PlaceOrderParams) -> Result<(), String> {
-        match params.order_type {
+    /// Item 6 M1 (row 41): a `Limit` price must be positive too (the book
+    /// rejects it; checked here so it is rejected before the book).
+    fn validate_order_price(params: &PlaceOrderParams) -> Result<(), Rejection> {
+        let reject = match params.order_type {
+            OrderType::Limit if params.price <= FixedPoint::ZERO => Err(format!(
+                "limit order requires a positive price, got {}",
+                params.price
+            )),
             OrderType::Market | OrderType::StopMarket { .. } if params.price <= FixedPoint::ZERO => {
                 Err(format!(
                     "market order requires a positive price cap (worst acceptable price), got {}",
@@ -5749,7 +8124,58 @@ impl NativeExecutor {
                 "stop-limit order requires a positive limit price, got {limit}"
             )),
             _ => Ok(()),
+        };
+        reject.map_err(|msg| (FailureReason::Price, msg))
+    }
+
+    /// Fix A (s92): the book's dust and off-tick rejects
+    /// (`OrderBook::place_order_with_accounts`, same rules, same order: dust
+    /// for every order type, then the tick for `Limit` only), applied BEFORE
+    /// the book so such an order takes no open-order slot, reserves nothing,
+    /// gets no order id and no in-batch projection / D2 pool. `shape` = the
+    /// market book's `(tick_size, lot_size)`; a market without a book uses
+    /// `(ONE, ONE)`, the book placement would create. The book keeps its own
+    /// checks. Item 6 M1: the rule and its text are
+    /// [`torus_core::order_book::shape_violation`] (shared with the RPC
+    /// intake check), which also checks a `StopLimit`'s limit (row 40).
+    fn book_shape_violation(params: &PlaceOrderParams, (tick, lot): (FixedPoint, FixedPoint)) -> Option<Rejection> {
+        shape_violation(params, tick, lot).map(|v| (Self::shape_reason(&v), v.placement_message()))
+    }
+
+    /// The result's reason of a tick / lot violation (placement and modify).
+    fn shape_reason(v: &ShapeViolation) -> FailureReason {
+        match v {
+            ShapeViolation::OffTick { .. } => FailureReason::Tick,
+            ShapeViolation::BelowLot { .. } => FailureReason::Lot,
         }
+    }
+
+    /// Fix A (s92): a market's `(tick_size, lot_size)` for
+    /// [`book_shape_violation`] — its book's; item 6 M1 (row 42): without a
+    /// book, [`market_shape`] (the tick / lot the book will be created with).
+    fn book_shape<T: StateBackend>(
+        books: &HashMap<MarketId, OrderBook>,
+        state: &T,
+        market_id: MarketId,
+    ) -> (FixedPoint, FixedPoint) {
+        books
+            .get(&market_id)
+            .map_or_else(|| Self::market_shape(state, market_id), |b| (b.tick_size, b.lot_size))
+    }
+
+    /// Item 6 M1 (row 42): the `(tick, lot)` a NEW book of `market_id` is
+    /// created with — its `CF_NATIVE_MARKETS` row's
+    /// ([`market_row_shape`], the row the RPC intake check reads), `(ONE,
+    /// ONE)` when there is no row, it does not decode or the read fails.
+    /// Every node reads the same row (governance / genesis writes only), so
+    /// every path creates the same book. A book that exists keeps its own.
+    fn market_shape<T: StateBackend>(state: &T, market_id: MarketId) -> (FixedPoint, FixedPoint) {
+        state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|row| market_row_shape(&row))
+            .unwrap_or((FixedPoint::ONE, FixedPoint::ONE))
     }
 
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
@@ -5784,18 +8210,30 @@ impl NativeExecutor {
     /// s515 (BUG 2): the positions `book` must police — every trader with a
     /// resting reduce-only order there plus the given reduce-only senders.
     /// A position row that fails to read polices as flat (every node reads
-    /// the same bytes, so this stays deterministic).
+    /// the same bytes, so this stays deterministic). Item 6 C7: read through
+    /// `reader` (decoded records for clean traders).
+    ///
+    /// Item 6 M1: `known` = positions already read (the batch's Phase 2
+    /// reads, [`PreparedOrder::pre_pos`]); only the other traders are read.
     fn reduce_only_positions_for<T: StateBackend>(
-        positions: &PositionManager<T>,
+        reader: &AccountReader<'_, T>,
         book: &OrderBook,
         market_id: MarketId,
         ro_senders: impl Iterator<Item = Address>,
+        known: ReduceOnlyPositions,
     ) -> ReduceOnlyPositions {
         let mut traders: BTreeSet<Address> = book.reduce_only_traders().into_iter().collect();
         traders.extend(ro_senders);
-        let mut out = ReduceOnlyPositions::new();
+        let mut out = known;
         for t in traders {
-            let pos = Self::signed_position(positions, &t, market_id).unwrap_or(FixedPoint::ZERO);
+            if out.get(&t).is_some() {
+                continue;
+            }
+            let pos = match reader.get_position(&t, market_id) {
+                Ok(Some(p)) if p.is_long => p.size,
+                Ok(Some(p)) => -p.size,
+                Ok(None) | Err(_) => FixedPoint::ZERO,
+            };
             out.insert(t, pos);
         }
         out
@@ -5855,7 +8293,7 @@ impl NativeExecutor {
             if let Some(ref m) = ctx.metrics {
                 reason.count(m);
             }
-            return NativeActionResult::err("place_order", msg);
+            return NativeActionResult::rejected("place_order", (reason.failure(), msg));
         }
         let mut triggered = VecDeque::new();
         let result = Self::place_order_inner(ctx, sender, params, None, &mut triggered);
@@ -5912,26 +8350,33 @@ impl NativeExecutor {
         let market_id = params.market_id;
 
         // s515 (BUG 1): market / stop orders need a positive price cap.
+        // Fix A (s92): the book's dust / off-tick rejects, before any
+        // reservation, order id or (missing) book.
         // s515 (BUG 2): reduce-only needs a position it can reduce.
+        // Item 6 M1 (row 42): a missing book is created below with `shape`.
         let mut ro_pos = None;
-        let pre_check = Self::validate_order_price(params).err().or_else(|| {
-            if !params.reduce_only {
-                return None;
-            }
-            match Self::signed_position(&ctx.positions, sender, market_id) {
-                Ok(pos) => {
-                    ro_pos = Some(pos);
-                    Self::reduce_only_violation(pos, params)
+        let shape = Self::book_shape(&ctx.order_books, &ctx.state, market_id);
+        let pre_check = Self::validate_order_price(params)
+            .err()
+            .or_else(|| Self::book_shape_violation(params, shape))
+            .or_else(|| {
+                if !params.reduce_only {
+                    return None;
                 }
-                Err(e) => Some(e.to_string()),
-            }
-        });
-        if let Some(msg) = pre_check {
+                match Self::signed_position(&ctx.positions, sender, market_id) {
+                    Ok(pos) => {
+                        ro_pos = Some(pos);
+                        Self::reduce_only_violation(pos, params).map(|m| (FailureReason::Other, m))
+                    }
+                    Err(e) => Some((FailureReason::Other, e.to_string())),
+                }
+            });
+        if let Some(rejection) = pre_check {
             // Funnel (perf A1): died pre-book on validation.
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
             }
-            return NativeActionResult::err("place_order", msg);
+            return NativeActionResult::rejected("place_order", rejection);
         }
 
         // FIX 2 (ECON-FIND-05): Reserve order margin before placing the order.
@@ -5964,9 +8409,10 @@ impl NativeExecutor {
         } else {
             None
         };
+        let res_price = Self::reservation_price(params, mark);
         let order_margin_required = match Self::try_reserve_for_qty_cfg(
             ctx.margin_configs.get(&market_id),
-            Self::reservation_price(params, mark),
+            res_price,
             reserve_qty,
         ) {
             Ok(m) => m,
@@ -5974,32 +8420,69 @@ impl NativeExecutor {
                 if let Some(ref m) = ctx.metrics {
                     m.orders_rejected_other.inc();
                 }
-                return NativeActionResult::err("place_order", msg);
+                return NativeActionResult::rejected("place_order", (FailureReason::Price, msg));
             }
         };
 
         // s515 review 4: a checked taker's match-time budget — its
-        // reservation + the available balance left after it.
+        // reservation (F1: + the sender's free margin after it, installed
+        // in the book as `AccountMargins` below).
         let checked = Self::match_margin_checked(params);
         let mut margin_budget = None;
-        if order_margin_required > FixedPoint::ZERO || checked {
+        // F1 (s517): read from FIELDS — the book below borrows
+        // `ctx.order_books` mutably.
+        let reader = AccountReader {
+            positions: &ctx.positions,
+            oracle: &ctx.oracle,
+            now: ctx.timestamp,
+            margin_configs: &ctx.margin_configs,
+            marks: ctx.block_marks.as_ref(),
+            sums: ctx.sums.as_ref(),
+            batch: None,
+            dense_tiers: None,
+        };
+        let needs_account = !params.reduce_only;
+        let mut account = None;
+        if order_margin_required > FixedPoint::ZERO || checked || needs_account {
             match ctx.positions.get_native_balance(sender) {
                 Ok(mut bal) => {
-                    if bal.available < order_margin_required {
-                        // Funnel (perf A1): died pre-book on the margin reserve.
-                        if let Some(ref m) = ctx.metrics {
-                            m.orders_rejected_margin.inc();
+                    // F1 (s517, D1 strict HL): the account-level check is
+                    // the ONLY placement gate — the old `available >=
+                    // reservation` rejection is gone, so the debit below may
+                    // take `available` negative (UPnL funds it).
+                    if needs_account {
+                        let acct = reader
+                            .position_px(sender, market_id)
+                            .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)));
+                        let (signed, px, pos_net) = match acct {
+                            Ok(a) => a,
+                            Err(e) => {
+                                // Funnel (perf A1): died pre-book on a state read error.
+                                if let Some(ref m) = ctx.metrics {
+                                    m.orders_rejected_other.inc();
+                                }
+                                return NativeActionResult::err("place_order", e.to_string());
+                            }
+                        };
+                        let free = bal.available + pos_net;
+                        if let Err(rejection) = Self::account_check(
+                            reader.tiers(market_id),
+                            signed,
+                            px,
+                            params,
+                            res_price,
+                            free,
+                        ) {
+                            // Funnel (perf A1): died pre-book on the margin check.
+                            if let Some(ref m) = ctx.metrics {
+                                m.orders_rejected_margin.inc();
+                            }
+                            return NativeActionResult::rejected("place_order", rejection);
                         }
-                        return NativeActionResult::err(
-                            "place_order",
-                            format!(
-                                "insufficient margin: need {order_margin_required}, have {}",
-                                bal.available
-                            ),
-                        );
+                        account = Some((free, px));
                     }
                     if checked {
-                        margin_budget = Some(bal.available);
+                        margin_budget = Some(order_margin_required);
                     }
                     if order_margin_required > FixedPoint::ZERO {
                         bal.available -= order_margin_required;
@@ -6028,7 +8511,7 @@ impl NativeExecutor {
         let book = ctx
             .order_books
             .entry(market_id)
-            .or_insert_with(|| OrderBook::new(market_id, FixedPoint::ONE, FixedPoint::ONE));
+            .or_insert_with(|| OrderBook::new(market_id, shape.0, shape.1));
 
         // s515 (BUG 2): police reduce-only orders against CURRENT positions.
         // Review 5: a checked taker's position too — its closing fills are
@@ -6039,10 +8522,11 @@ impl NativeExecutor {
             // was written since); a failed / skipped read reads it here.
             let reread = track_sender && ro_pos.is_none();
             let mut ro = Self::reduce_only_positions_for(
-                &ctx.positions,
+                &reader,
                 book,
                 market_id,
                 reread.then_some(*sender).into_iter(),
+                ReduceOnlyPositions::new(),
             );
             if let (true, Some(pos)) = (track_sender, ro_pos) {
                 ro.insert(*sender, pos);
@@ -6060,9 +8544,23 @@ impl NativeExecutor {
                 budget,
             )
         });
-        let result =
-            book.place_order_with_margin(params.clone(), *sender, ctx.timestamp, margin_limit.as_ref());
+        // F1 (s517): the sender's free margin after this reservation, for
+        // the match-time check.
+        let mut am = AccountMargins::new(Self::margin_tiers(ctx.margin_configs.get(&market_id)));
+        if let (true, Some((free, px))) = (checked, account) {
+            am.insert(*sender, free - order_margin_required, px);
+        }
+        book.set_account_margins(am);
+        // F1 (s517 #4): makers are checked on every fill (HL marginCanceled).
+        let result = book.place_order_with_accounts(
+            params.clone(),
+            *sender,
+            ctx.timestamp,
+            margin_limit.as_ref(),
+            Some(&reader),
+        );
         book.clear_reduce_only_positions();
+        book.clear_account_margins();
         if forced_id.is_some() {
             book.set_next_order_id(ctx.next_global_order_id);
         } else {
@@ -6075,6 +8573,8 @@ impl NativeExecutor {
         if let Some(ref m) = ctx.metrics {
             m.orders_self_trade_cancels
                 .inc_by(result.self_trade_cancels.len() as u64);
+            // s92: the single path's budget is the account (never non-pool).
+            Self::record_margin_cuts(m, params.is_buy, &result, res_price, book.tick_size, false);
         }
 
         // FIX 2: Release margin for the filled / cancelled portion; keep the
@@ -6128,9 +8628,9 @@ impl NativeExecutor {
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
                     }
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order",
-                        format!("taker fill failed: {e}"),
+                        (FailureReason::Fill, format!("taker fill failed: {e}")),
                     );
                 }
             };
@@ -6154,9 +8654,9 @@ impl NativeExecutor {
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
                     }
-                    return NativeActionResult::err(
+                    return NativeActionResult::rejected(
                         "place_order",
-                        format!("maker fill failed: {e}"),
+                        (FailureReason::Fill, format!("maker fill failed: {e}")),
                     );
                 }
             };
@@ -6292,68 +8792,75 @@ impl NativeExecutor {
         sender: &Address,
         market_id: Option<MarketId>,
     ) -> NativeActionResult {
-        // FIX 2 (ECON-FIND-05): Compute total margin to release from cancelled orders.
-        let mut total_margin_release = FixedPoint::ZERO;
-
-        match market_id {
-            Some(mid) => {
-                if let Some(book) = ctx.order_books.get_mut(&mid) {
-                    let stops = book.pending_stop_count();
-                    let cancelled = book.cancel_all(*sender, Some(mid));
-                    // A removed pending stop must be persisted too.
-                    if book.pending_stop_count() != stops {
-                        ctx.dirty_books.insert(mid);
-                    }
-                    if !cancelled.is_empty() {
-                        ctx.dirty_books.insert(mid);
-                        let cfg = ctx.margin_configs.get(&mid);
-                        for order in &cancelled {
-                            let notional = order.price * order.remaining_qty;
-                            let max_lev = cfg
-                                .map(|c| effective_max_leverage(&c.tiers, notional))
-                                .unwrap_or(20);
-                            total_margin_release +=
-                                Self::margin_at_integer_leverage(notional, max_lev);
-                        }
-                    }
-                }
-            }
-            None => {
-                let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
-                for mid in market_ids {
-                    if let Some(book) = ctx.order_books.get_mut(&mid) {
-                        let stops = book.pending_stop_count();
-                        let cancelled = book.cancel_all(*sender, None);
-                        if book.pending_stop_count() != stops {
-                            ctx.dirty_books.insert(mid);
-                        }
-                        if !cancelled.is_empty() {
-                            ctx.dirty_books.insert(mid);
-                            let cfg = ctx.margin_configs.get(&mid);
-                            for order in &cancelled {
-                                let notional = order.price * order.remaining_qty;
-                                let max_lev = cfg
-                                    .map(|c| effective_max_leverage(&c.tiers, notional))
-                                    .unwrap_or(20);
-                                total_margin_release +=
-                                    Self::margin_at_integer_leverage(notional, max_lev);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if total_margin_release > FixedPoint::ZERO {
-            if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                let release = total_margin_release.min(bal.order_margin);
-                bal.order_margin -= release;
-                bal.available += release;
-                let _ = ctx.positions.put_native_balance(sender, &bal);
-            }
-        }
-
+        // FIX 2 (ECON-FIND-05) + C4 (s517): release what the cancelled orders
+        // AND pending stops reserved.
+        let total_margin_release = Self::cancel_orders_and_stops(ctx, sender, market_id);
+        Self::release_order_margin(ctx, sender, total_margin_release);
         NativeActionResult::ok("cancel_all", 500)
+    }
+
+    /// C4 (s517): cancel `trader`'s resting orders AND pending stops in
+    /// `market` (`None` = every market, ascending id) and return the margin
+    /// they reserved — orders at `price × remaining` (FIX 2), stops at
+    /// [`Self::stop_reservation`]. A market that lost anything is dirty. The
+    /// caller releases the sum (`min(order_margin)`). Shared by the user
+    /// `CancelAll` and the liquidation step.
+    fn cancel_orders_and_stops<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        trader: &Address,
+        market: Option<MarketId>,
+    ) -> FixedPoint {
+        let market_ids: Vec<MarketId> = match market {
+            Some(m) => vec![m],
+            None => {
+                let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+                v.sort_unstable();
+                v
+            }
+        };
+        let mut total = FixedPoint::ZERO;
+        for mid in market_ids {
+            let Some(book) = ctx.order_books.get_mut(&mid) else { continue };
+            let stops = book.take_pending_stops(trader);
+            let cancelled = book.cancel_all(*trader, market);
+            if stops.is_empty() && cancelled.is_empty() {
+                continue;
+            }
+            ctx.dirty_books.insert(mid);
+            let cfg = ctx.margin_configs.get(&mid);
+            total += Self::cancelled_orders_margin(cfg, &cancelled);
+            for &(price, qty) in &stops {
+                total += Self::stop_reservation(cfg, price, qty);
+            }
+        }
+        total
+    }
+
+    /// FIX 2 (ECON-FIND-05): the margin `cancelled` resting orders reserved.
+    fn cancelled_orders_margin(
+        cfg: Option<&MarketMarginConfig>,
+        cancelled: &[torus_core::order_book::Order],
+    ) -> FixedPoint {
+        let mut total = FixedPoint::ZERO;
+        for order in cancelled {
+            let notional = order.price * order.remaining_qty;
+            let max_lev = cfg
+                .map(|c| effective_max_leverage(&c.tiers, notional))
+                .unwrap_or(20);
+            total += Self::margin_at_integer_leverage(notional, max_lev);
+        }
+        total
+    }
+
+    /// C4 (s517): a pending stop's reservation at its `(price, qty)` from
+    /// `take_pending_stops` — exactly what [`Self::run_triggered_stops`]
+    /// releases when it fires; an overflowing legacy row reserved nothing.
+    fn stop_reservation(
+        cfg: Option<&MarketMarginConfig>,
+        price: FixedPoint,
+        qty: FixedPoint,
+    ) -> FixedPoint {
+        Self::try_reserve_for_qty_cfg(cfg, price, qty).unwrap_or(FixedPoint::ZERO)
     }
 
     /// s63: a run of consecutive `CancelAllOrders` (`run` = flat index,
@@ -6379,6 +8886,8 @@ impl NativeExecutor {
         // cancelled[m][k]: the orders action k removed from market_ids[m].
         let mut cancelled: Vec<Vec<Vec<torus_core::order_book::Order>>> =
             Vec::with_capacity(market_ids.len());
+        // C4 (s517): (took a stop?, their reservations) of action k in market_ids[m].
+        let mut stop_release: Vec<Vec<(bool, FixedPoint)>> = Vec::with_capacity(market_ids.len());
         let mut members: Vec<usize> = Vec::with_capacity(run.len());
         let mut senders: Vec<Address> = Vec::with_capacity(run.len());
         for mid in &market_ids {
@@ -6391,18 +8900,24 @@ impl NativeExecutor {
                 }
             }
             let mut per_action = vec![Vec::new(); run.len()];
+            let mut stops_k = vec![(false, FixedPoint::ZERO); run.len()];
             if !senders.is_empty() {
+                let cfg = ctx.margin_configs.get(mid);
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
-                let stops = book.pending_stop_count();
+                // C4: each member's stops first, in run order (a repeated
+                // sender finds none, as its sequential second call would).
+                for &k in &members {
+                    for (price, qty) in book.take_pending_stops(&run[k].1) {
+                        stops_k[k].0 = true;
+                        stops_k[k].1 += Self::stop_reservation(cfg, price, qty);
+                    }
+                }
                 for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
                     per_action[k] = orders;
                 }
-                // Same dirty mark as `exec_cancel_all` for removed stops.
-                if book.pending_stop_count() != stops {
-                    ctx.dirty_books.insert(*mid);
-                }
             }
             cancelled.push(per_action);
+            stop_release.push(stops_k);
         }
 
         let mut results = Vec::with_capacity(run.len());
@@ -6411,27 +8926,16 @@ impl NativeExecutor {
             let mut total_margin_release = FixedPoint::ZERO;
             for (m, mid) in market_ids.iter().enumerate() {
                 let orders = &cancelled[m][k];
-                if orders.is_empty() {
+                let (took_stops, stops) = stop_release[m][k];
+                if orders.is_empty() && !took_stops {
                     continue;
                 }
                 ctx.dirty_books.insert(*mid);
                 let cfg = ctx.margin_configs.get(mid);
-                for order in orders {
-                    let notional = order.price * order.remaining_qty;
-                    let max_lev = cfg
-                        .map(|c| effective_max_leverage(&c.tiers, notional))
-                        .unwrap_or(20);
-                    total_margin_release += Self::margin_at_integer_leverage(notional, max_lev);
-                }
+                total_margin_release += Self::cancelled_orders_margin(cfg, orders);
+                total_margin_release += stops;
             }
-            if total_margin_release > FixedPoint::ZERO {
-                if let Ok(mut bal) = ctx.positions.get_native_balance(sender) {
-                    let release = total_margin_release.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    let _ = ctx.positions.put_native_balance(sender, &bal);
-                }
-            }
+            Self::release_order_margin(ctx, sender, total_margin_release);
             results.push(NativeActionResult::ok("cancel_all", 500));
         }
         results
@@ -6475,6 +8979,7 @@ impl NativeExecutor {
         new_qty: Option<FixedPoint>,
     ) -> NativeActionResult {
         let err = |msg: String| NativeActionResult::err("modify_order", msg);
+        let rejected = |reason, msg: String| NativeActionResult::rejected("modify_order", (reason, msg));
         if new_price.is_none() && new_qty.is_none() {
             return err("nothing to modify: no new price or quantity".to_string());
         }
@@ -6497,7 +9002,7 @@ impl NativeExecutor {
 
         let price = new_price.unwrap_or(old.price);
         if price <= FixedPoint::ZERO {
-            return err(format!("modify rejected: price must be positive, got {price}"));
+            return rejected(FailureReason::Price, format!("modify rejected: price must be positive, got {price}"));
         }
         // s515 review 3: only a NEW price is tick-checked — an order resting
         // off the current tick (tick changed, legacy row) can still be resized.
@@ -6505,23 +9010,19 @@ impl NativeExecutor {
             && book.tick_size > FixedPoint::ZERO
             && price.raw() % book.tick_size.raw() != 0
         {
-            return err(format!(
-                "modify rejected: price {price} is not a multiple of the tick {}",
-                book.tick_size
-            ));
+            let v = ShapeViolation::OffTick { price, tick: book.tick_size };
+            return rejected(Self::shape_reason(&v), format!("modify rejected: {v}"));
         }
         let mut qty = new_qty.unwrap_or(old.remaining_qty);
         if qty <= FixedPoint::ZERO {
-            return err(format!("modify rejected: quantity must be positive, got {qty}"));
+            return rejected(FailureReason::Lot, format!("modify rejected: quantity must be positive, got {qty}"));
         }
         // Placement's convention (s515 review 3): the lot applies to the
         // REQUESTED quantity; the reduce-only clamp below may land under it
         // (it closes the position exactly — placement rests such an order too).
         if new_qty.is_some() && qty < book.lot_size {
-            return err(format!(
-                "modify rejected: quantity {qty} below the lot size {}",
-                book.lot_size
-            ));
+            let v = ShapeViolation::BelowLot { quantity: qty, lot: book.lot_size };
+            return rejected(Self::shape_reason(&v), format!("modify rejected: {v}"));
         }
         let crosses = if is_buy {
             book.best_ask().is_some_and(|ask| price >= ask)
@@ -6556,20 +9057,54 @@ impl NativeExecutor {
             .unwrap_or(FixedPoint::ZERO);
         let new_reserved = match Self::try_reserve_for_qty_cfg(cfg, price, qty) {
             Ok(m) => m,
-            Err(msg) => return err(msg),
+            Err(msg) => return rejected(FailureReason::Price, msg),
         };
         let extra = new_reserved - old_reserved;
+        // F1 (s517, D1 strict HL) + review fixes 3/5: THE modify gate — the
+        // new order's POSITION-tier need (`placement_need`, as at placement;
+        // closing is free) minus what the old order gives back (the larger
+        // of its need and its reservation) must fit the account's free
+        // margin (UPnL counts). No `available >= extra` gate: the debit below may
+        // take `available` negative. Reduce-only orders only reduce.
+        if !old.reduce_only {
+            let reader = AccountReader::of(ctx);
+            let acct = reader
+                .position_px(sender, market_id)
+                .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
+                .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)));
+            let ((signed, px, pos_net), bal) = match acct {
+                Ok(a) => a,
+                Err(e) => return err(e.to_string()),
+            };
+            let px = if px > FixedPoint::ZERO { px } else { price };
+            let tiers = cfg.map(|c| c.tiers.as_slice());
+            let need = |q, p| placement_need(tiers, signed, px, is_buy, q, p, true);
+            let Some(need_new) = need(qty, price) else {
+                return rejected(
+                    FailureReason::Price,
+                    format!("order notional overflows: price {price} x quantity {qty}"),
+                );
+            };
+            // Review fix 5 (s517): cancel-and-replace equivalence — the old
+            // order gives back its whole reservation (>= its need when it
+            // has a closing part, D4); an overflowing old need falls back to
+            // it too (a shrink is never rejected).
+            let old_cost = need(old.remaining_qty, old.price)
+                .map_or(old_reserved, |n| n.max(old_reserved));
+            let delta = need_new - old_cost;
+            let free = bal.available + pos_net;
+            if need_new > FixedPoint::ZERO && delta > FixedPoint::ZERO && delta > free {
+                return rejected(
+                    FailureReason::Margin,
+                    format!("insufficient margin for modify: need {delta}, have {free} (account)"),
+                );
+            }
+        }
         if extra > FixedPoint::ZERO {
             let mut bal = match ctx.positions.get_native_balance(sender) {
                 Ok(bal) => bal,
                 Err(e) => return err(e.to_string()),
             };
-            if bal.available < extra {
-                return err(format!(
-                    "insufficient margin for modify: need {extra}, have {}",
-                    bal.available
-                ));
-            }
             bal.available -= extra;
             bal.order_margin += extra;
             if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
@@ -6890,39 +9425,174 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         prices: &[(MarketId, FixedPoint)],
-        _submission_timestamp: u64,
+        sample_ms: u64,
     ) -> NativeActionResult {
-        // FIX 18 (ECON-FIND-19): Verify sender is an active, non-jailed validator.
-        match ctx.staking.get_validator(sender) {
-            Ok(Some(v)) => {
-                use torus_economics::types::ValidatorStatus;
-                if v.status != ValidatorStatus::Active {
-                    return NativeActionResult::err(
-                        "submit_oracle_prices",
-                        format!("validator {sender} is not active (status: {:?})", v.status),
-                    );
-                }
+        // FIX 18 (ECON-FIND-19): the REPORTER must be an active, non-jailed
+        // validator. s517: the reporter is the sender itself (direct submission)
+        // or the validator whose registered hot oracle signer the sender is.
+        let (reporter, status) = match Self::resolve_oracle_reporter(ctx, sender) {
+            Ok(r) => r,
+            Err(m) => return NativeActionResult::err("submit_oracle_prices", m),
+        };
+        if status != torus_economics::types::ValidatorStatus::Active {
+            return NativeActionResult::err(
+                "submit_oracle_prices",
+                format!("validator {reporter} is not active (status: {status:?})"),
+            );
+        }
+
+        use torus_core::oracle::{
+            valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP, MAX_ORACLE_SAMPLE_SKEW_MS as SKEW,
+        };
+        let err = |m: String| NativeActionResult::err("submit_oracle_prices", m);
+        // Review M1(b): the signed sample time must be within SKEW of the
+        // block's header time (seconds), so a delayed submission never lands
+        // as a fresh price.
+        let block_ms = ctx.timestamp.saturating_mul(1_000);
+        if sample_ms.saturating_add(SKEW) < block_ms || sample_ms > block_ms.saturating_add(SKEW) {
+            return err(format!(
+                "submission sampled at {sample_ms} ms, more than {SKEW} ms from the block time {block_ms} ms"
+            ));
+        }
+        // Item 2: validate EVERY entry before writing any (no per-action rollback)
+        // — the action is all-or-nothing.
+        if prices.is_empty() || prices.len() > CAP {
+            return err(format!("a submission carries 1..={CAP} prices, got {}", prices.len()));
+        }
+        let mut seen = BTreeSet::new();
+        for &(market_id, price) in prices {
+            if !seen.insert(market_id) {
+                return err(format!("duplicate market {market_id} in submission"));
             }
-            Ok(None) => {
-                return NativeActionResult::err(
-                    "submit_oracle_prices",
-                    format!("{sender} is not a registered validator"),
-                );
+            match ctx.governance.market_exists(market_id) {
+                Ok(true) => {}
+                Ok(false) => return err(format!("market {market_id} is not listed")),
+                Err(e) => return err(e.to_string()),
             }
-            Err(e) => {
-                return NativeActionResult::err("submit_oracle_prices", e.to_string());
+            if !valid_oracle_price(price) {
+                return err(format!("invalid oracle price {price} for market {market_id}"));
             }
         }
 
+        // Review M1(b): newest sample wins per (market, validator), whatever
+        // the in-block order: a sample not newer than the stored one is
+        // skipped (an equal one keeps the first in canonical order).
+        let mut newer = Vec::with_capacity(prices.len());
         for &(market_id, price) in prices {
-            if let Err(e) =
-                ctx.oracle
-                    .submit_price(sender, market_id, price, ctx.block_height, ctx.timestamp)
-            {
+            match ctx.oracle.stored_sample_ms(market_id, &reporter) {
+                Ok(Some(stored)) if stored >= sample_ms => {}
+                Ok(_) => newer.push((market_id, price)),
+                Err(e) => return err(e.to_string()),
+            }
+        }
+        for (market_id, price) in newer {
+            if let Err(e) = ctx.oracle.submit_sampled(
+                &reporter,
+                market_id,
+                price,
+                sample_ms,
+                ctx.block_height,
+                ctx.timestamp,
+            ) {
                 return NativeActionResult::err("submit_oracle_prices", e.to_string());
             }
         }
         NativeActionResult::ok("submit_oracle_prices", 1000)
+    }
+
+    /// The validator an oracle submission from `sender` reports for, with its
+    /// status: the sender's own validator record first (direct submission),
+    /// else the hot-signer index cross-checked against that validator's
+    /// record, so a stale index entry never resolves.
+    fn resolve_oracle_reporter<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        sender: &Address,
+    ) -> Result<(Address, torus_economics::types::ValidatorStatus), String> {
+        if let Some(v) = ctx.staking.get_validator(sender).map_err(|e| e.to_string())? {
+            return Ok((*sender, v.status));
+        }
+        let key = torus_state::cf::oracle_signer_key(sender);
+        let raw = ctx.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).map_err(|e| e.to_string())?;
+        if let Some(v) = raw.filter(|b| b.len() == 20).map(|b| Address::from_slice(&b)) {
+            if let Some(rec) = ctx.staking.get_validator(&v).map_err(|e| e.to_string())? {
+                if rec.oracle_signer == Some(*sender) {
+                    return Ok((v, rec.status));
+                }
+            }
+        }
+        Err(format!("{sender} is not a registered validator or oracle signer"))
+    }
+
+    /// `SetOracleSigner` (s517): set, rotate or (with `Address::ZERO`) clear
+    /// the sender validator's hot oracle signer. Every check runs before the
+    /// first write (no per-action rollback). Writes: the old index entry is
+    /// deleted, the new one written, the record updated — rotation invalidates
+    /// the old signer at once.
+    fn exec_set_oracle_signer<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        signer: Address,
+        proof: Option<&torus_types::OracleSignerProof>,
+    ) -> NativeActionResult {
+        use torus_economics::types::ValidatorStatus;
+        use torus_state::cf::{oracle_signer_key, CF_NATIVE_ORACLE};
+        let err = |m: String| NativeActionResult::err("set_oracle_signer", m);
+        let new = (signer != Address::ZERO).then_some(signer);
+        // Review L2: a tombstoned validator may still CLEAR its signer (so the
+        // signer address is freed), but never set or rotate one.
+        let mut v = match ctx.staking.get_validator(sender) {
+            Ok(Some(v)) if v.status != ValidatorStatus::Tombstoned || new.is_none() => v,
+            Ok(Some(_)) => return err(format!("validator {sender} is tombstoned")),
+            Ok(None) => return err(format!("{sender} is not a registered validator")),
+            Err(e) => return err(e.to_string()),
+        };
+        if v.oracle_signer == new {
+            return NativeActionResult::ok("set_oracle_signer", 1000);
+        }
+        if let Some(s) = new {
+            match ctx.staking.get_validator(&s) {
+                Ok(None) => {}
+                Ok(Some(_)) => return err(format!("signer {s} is a validator")),
+                Err(e) => return err(e.to_string()),
+            }
+            // Review M3: proof of possession — the signer key signed
+            // (this validator, chain id, nonce), so nobody can squat a signer
+            // address they do not hold, nor replay another validator's proof.
+            let proven = proof
+                .and_then(|p| torus_types::eip712::recover_oracle_signer_proof(sender, p).ok())
+                == Some(s);
+            if !proven {
+                return err(format!(
+                    "signer {s}: missing or invalid proof of possession for validator {sender}"
+                ));
+            }
+            match ctx.state.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s)) {
+                Ok(None) => {}
+                Ok(Some(owner)) => {
+                    return err(format!(
+                        "signer {s} already serves validator 0x{}",
+                        alloy_primitives::hex::encode(owner)
+                    ))
+                }
+                Err(e) => return err(e.to_string()),
+            }
+        }
+        // Writes (validation complete).
+        if let Some(old) = v.oracle_signer {
+            if let Err(e) = ctx.state.delete_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&old)) {
+                return err(e.to_string());
+            }
+        }
+        if let Some(s) = new {
+            if let Err(e) = ctx.state.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s), sender.as_slice()) {
+                return err(e.to_string());
+            }
+        }
+        v.oracle_signer = new;
+        match ctx.staking.put_validator(sender, &v) {
+            Ok(()) => NativeActionResult::ok("set_oracle_signer", 2000),
+            Err(e) => err(e.to_string()),
+        }
     }
 
     // ========================================================================
@@ -7049,6 +9719,9 @@ impl NativeExecutor {
                 return NativeActionResult::err("withdraw_from_native", "amount overflow".into())
             }
         };
+        if let Err(rejection) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::rejected("withdraw_from_native", rejection);
+        }
         match Lockbox::withdraw_from_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_from_native", 1500),
             Err(e) => NativeActionResult::err("withdraw_from_native", e.to_string()),
@@ -7066,10 +9739,48 @@ impl NativeExecutor {
             Some(fp) => fp,
             None => return NativeActionResult::err("withdraw_to", "amount overflow".into()),
         };
+        if let Err(rejection) = Self::check_withdrawal_margin(ctx, sender, fp_amount) {
+            return NativeActionResult::rejected("withdraw_to", rejection);
+        }
         match Lockbox::withdraw_from_native_to(&ctx.state, sender, to, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
             Err(e) => NativeActionResult::err("withdraw_to", e.to_string()),
         }
+    }
+
+    /// F1 (s517 decision 5, Hyperliquid `transfer_margin_required`): a native
+    /// withdrawal — TransferToSpot, Withdraw, and CoreWriter LockboxWithdraw
+    /// (drains as TransferToSpot) — must leave equity minus order margin >=
+    /// max(Σ position IM, 10% × Σ position notional) (D3, SAFE variant: the
+    /// resting orders' reservations are not collateral for the positions).
+    /// `amount > available` (incl. any amount while `available < 0`) is left
+    /// to the Lockbox's own cash check (error text unchanged).
+    fn check_withdrawal_margin<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        sender: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), Rejection> {
+        let bal = ctx
+            .positions
+            .get_native_balance(sender)
+            .map_err(|e| (FailureReason::Other, e.to_string()))?;
+        if amount <= FixedPoint::ZERO || amount > bal.available {
+            return Ok(());
+        }
+        let view = AccountReader::of(ctx)
+            .view(sender, &bal)
+            .map_err(|e| (FailureReason::Other, e.to_string()))?;
+        if view.withdrawal_allowed(amount) {
+            return Ok(());
+        }
+        Err((
+            FailureReason::Margin,
+            format!(
+                "withdrawal of {amount} would leave the account under-margined: equity after (excl. order margin) {}, required {}",
+                view.equity() - view.order_margin - amount,
+                view.transfer_required()
+            ),
+        ))
     }
 
     // ========================================================================
@@ -7085,6 +9796,15 @@ impl NativeExecutor {
     /// the drain.
     pub fn core_writer_due(state_db: &StateDb, height: u64) -> bool {
         CoreWriterQueue::pending_count(state_db, height).map_or(true, |n| n > 0)
+    }
+
+    /// Item 2: whether this block must run the native phase for the oracle —
+    /// any submission row in `state` (the block's overlay: DB + pipelined parent
+    /// layer). Without rows the block-start step writes nothing, so "aggregate
+    /// every block" == "run it whenever a row exists". Errors propagate (the
+    /// caller fail-stops; never "assume due / not due").
+    pub fn oracle_due<T: StateBackend>(state: &T) -> Result<bool, CoreError> {
+        OracleManager::new(state.clone(), OracleConfig::default()).has_submissions()
     }
 
     /// Drain and execute CoreWriter actions queued from the previous block.
@@ -7145,7 +9865,92 @@ impl NativeExecutor {
         }
     }
 
-    /// Aggregate oracle prices for listed markets after oracle submissions.
+    /// Item 2 (option A) block-start step — runs FIRST in every executed native
+    /// block, before any action: deletes submission rows older than the window
+    /// (all markets), then aggregates every listed market from the rows of
+    /// EARLIER blocks, weighted by the whole-token stake of Active validators,
+    /// at the block timestamp. Nothing else writes the aggregate row, so the
+    /// whole block reads one mark. Per-market errors are results; a storage
+    /// error in the global reads (prune, market list, validator set) is a node
+    /// fault → `fatal_error` (fail-stop, never a silently skipped aggregation).
+    pub fn begin_block_oracle<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Vec<NativeActionResult> {
+        match Self::oracle_inputs(ctx) {
+            Ok((markets, stakes)) => {
+                let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
+                Self::fill_block_marks(ctx, &markets);
+                results
+            }
+            Err(e) => {
+                ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The step's global reads: prune, listed markets (ascending), Active stakes.
+    #[allow(clippy::type_complexity)]
+    fn oracle_inputs<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+    ) -> Result<(Vec<MarketId>, Vec<(Address, FixedPoint)>), String> {
+        ctx.oracle.prune_submissions(ctx.timestamp).map_err(|e| e.to_string())?;
+        let markets = ctx.governance.listed_market_ids().map_err(|e| e.to_string())?;
+        let stakes = ctx
+            .staking
+            .all_validators()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|v| v.status == torus_economics::types::ValidatorStatus::Active)
+            .map(|v| {
+                let power = i128::from(whole_token_power(&v));
+                (v.address, FixedPoint::from_raw(power * FixedPoint::SCALE))
+            })
+            .collect();
+        Ok((markets, stakes))
+    }
+
+    /// Item 6 C2: the end of [`Self::begin_block_oracle`] (after the
+    /// aggregation, before any action): fill the block's mark table for
+    /// `listed`, the margin-config markets, every market with an aggregate
+    /// row and every book market, and set its version against the previous block's state
+    /// ([`NativeExecContext::attach_resident_block`]). A storage error in the
+    /// aggregate-row scan leaves no table (every mark reads the oracle, as
+    /// before C2). Public for the harness that splits the oracle step.
+    pub fn fill_block_marks<T: StateBackend>(ctx: &mut NativeExecContext<T>, listed: &[MarketId]) {
+        let prev = ctx.prev_marks.take();
+        ctx.block_marks = None;
+        // C3: memo entries are valued at one table version.
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(None);
+        }
+        let aggregated = match ctx.oracle.aggregated_market_ids() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(%e, height = ctx.block_height, "item 6: mark table not built (aggregate scan failed) — marks read the oracle");
+                return;
+            }
+        };
+        let markets: BTreeSet<MarketId> = listed
+            .iter()
+            .copied()
+            .chain(ctx.margin_configs.keys().copied())
+            .chain(aggregated)
+            .chain(ctx.order_books.keys().copied())
+            .collect();
+        let marks = BlockMarks::read(&ctx.oracle, ctx.timestamp, markets);
+        let version = match prev {
+            Some(p) if p.marks.marks == marks && p.configs == ctx.margin_configs => p.marks.version,
+            _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        };
+        ctx.block_marks = Some(BlockMarks::new(marks, version));
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(Some(version));
+        }
+    }
+
+    /// Aggregate oracle prices for `markets` at the block timestamp — called by
+    /// [`Self::begin_block_oracle`]. One result per market.
     pub fn aggregate_oracle_prices<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         markets: &[MarketId],
@@ -7155,78 +9960,10 @@ impl NativeExecutor {
         for &market_id in markets {
             match ctx
                 .oracle
-                .aggregate_price(market_id, ctx.block_height, validator_stakes)
+                .aggregate_price(market_id, ctx.block_height, ctx.timestamp, validator_stakes)
             {
                 Ok(_) => results.push(NativeActionResult::ok("oracle_aggregate", 500)),
                 Err(e) => results.push(NativeActionResult::err("oracle_aggregate", e.to_string())),
-            }
-        }
-        results
-    }
-
-    /// Run liquidation checks across all configured markets.
-    pub fn run_liquidation_checks<T: StateBackend>(
-        ctx: &mut NativeExecContext<T>,
-        traders: &[Address],
-        oracle_prices: &[(MarketId, FixedPoint)],
-    ) -> Vec<NativeActionResult> {
-        let mut results = Vec::new();
-
-        // Iterate over a snapshot of config keys to avoid borrow conflict.
-        let market_configs: Vec<(MarketId, MarketMarginConfig)> = ctx
-            .margin_configs
-            .iter()
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-
-        for (market_id, config) in &market_configs {
-            let liquidations = match LiquidationEngine::check_liquidations(
-                &ctx.positions,
-                traders,
-                config,
-                oracle_prices,
-            ) {
-                Ok(liqs) => liqs,
-                Err(e) => {
-                    results.push(NativeActionResult::err("liquidation_check", e.to_string()));
-                    continue;
-                }
-            };
-
-            // FIX 5 (ECON-PF-06): Skip liquidation if no valid oracle price.
-            let oracle_price = match oracle_prices
-                .iter()
-                .find(|(mid, _)| *mid == *market_id)
-                .map(|(_, p)| *p)
-            {
-                Some(p) if p > FixedPoint::ZERO => p,
-                _ => {
-                    tracing::warn!(market_id, "skipping liquidations: no valid oracle price");
-                    continue;
-                }
-            };
-
-            for liq in &liquidations {
-                match LiquidationEngine::execute_liquidation(&ctx.positions, liq, oracle_price) {
-                    Ok(lr) => {
-                        if let Some(ref m) = ctx.metrics {
-                            m.liquidations_triggered.inc();
-                        }
-                        results.push(NativeActionResult::ok("liquidation", 3000));
-                        if lr.remaining_deficit > FixedPoint::ZERO {
-                            let _ = LiquidationEngine::auto_deleverage(
-                                &ctx.positions,
-                                *market_id,
-                                lr.remaining_deficit,
-                                oracle_price,
-                                traders,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        results.push(NativeActionResult::err("liquidation", e.to_string()));
-                    }
-                }
             }
         }
         results
@@ -7323,18 +10060,39 @@ impl NativeExecutor {
         )
     }
 
-    /// Process pending governance proposals.
+    /// Process pending governance proposals: one result per proposal outcome.
+    /// s94: a proposal that failed at execution is an error result carrying
+    /// its id and reason; the others still run. A storage error aborts the
+    /// step as one error result (as before).
     pub fn process_governance<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
+        use torus_economics::governance::ProposalOutcome;
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => outcomes
                 .iter()
-                .map(|_| NativeActionResult::ok("governance_process", 1000))
+                .map(|outcome| match outcome {
+                    ProposalOutcome::Failed(id, reason) => NativeActionResult::err(
+                        "governance_process",
+                        format!("proposal {id} execution failed: {reason}"),
+                    ),
+                    ProposalOutcome::Passed(_)
+                    | ProposalOutcome::Rejected(_)
+                    | ProposalOutcome::Executed(_) => {
+                        NativeActionResult::ok("governance_process", 1000)
+                    }
+                })
                 .collect(),
             Err(e) => vec![NativeActionResult::err("governance_process", e.to_string())],
         }
     }
+}
+
+/// Whole-token voting / oracle power: floor(wei / 10^18), saturating at
+/// u64::MAX (U256 wei would overflow FixedPoint).
+fn whole_token_power(v: &torus_economics::ValidatorState) -> u64 {
+    let wei = U256::from(10u64).pow(U256::from(18u64));
+    (v.total_stake() / wei).try_into().unwrap_or(u64::MAX)
 }
 
 // ============================================================================
@@ -7411,22 +10169,35 @@ pub fn classify_action(action: &NativeAction) -> ActionCategory {
 pub fn sort_native_actions(
     actions: &[(Address, NativeAction)],
 ) -> (Vec<(Address, NativeAction)>, Vec<(Address, NativeAction)>) {
+    let ((pre_evm, _), (post_evm, _)) = sort_native_actions_indexed(actions.to_vec());
+    (pre_evm, post_evm)
+}
+
+/// One sorted list of [`sort_native_actions_indexed`]: the actions, and for
+/// each one its position in the input.
+pub type IndexedActions = (Vec<(Address, NativeAction)>, Vec<u32>);
+
+/// [`sort_native_actions`] by value (no clone of the actions), returning with
+/// each list the input position of every entry, so a per-entry result maps
+/// back to its action by index (item 6 cut 1: the v2 action status).
+///
+/// Same lists as [`sort_native_actions`]: the key is (category, sender,
+/// keccak of the canonical bytes) and the sort is stable, so entries with
+/// equal keys keep their input order.
+pub fn sort_native_actions_indexed(
+    actions: Vec<(Address, NativeAction)>,
+) -> (IndexedActions, IndexedActions) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
-
-    for (sender, action) in actions {
-        let pair = (*sender, action.clone());
-        match classify_action(action) {
-            ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(pair),
-            _ => post_evm.push(pair),
+    for (i, (sender, action)) in actions.into_iter().enumerate() {
+        let key = action_sort_key(&sender, &action);
+        let entry = (key, i as u32, (sender, action));
+        match key.0 {
+            ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(entry),
+            _ => post_evm.push(entry),
         }
     }
-
-    // Deterministic sort: (category, sender, action_content_hash).
-    sort_deterministic(&mut pre_evm);
-    sort_deterministic(&mut post_evm);
-
-    (pre_evm, post_evm)
+    (sort_deterministic(pre_evm), sort_deterministic(post_evm))
 }
 
 /// Deterministic sort key for a native action.
@@ -7439,18 +10210,19 @@ fn action_sort_key(sender: &Address, action: &NativeAction) -> (ActionCategory, 
     (category, *sender, hash)
 }
 
-/// Sort actions deterministically by (category, sender, action_content_hash).
-fn sort_deterministic(actions: &mut Vec<(Address, NativeAction)>) {
-    // Pre-compute sort keys to avoid repeated hashing during sort.
-    let mut keyed: Vec<_> = actions
-        .drain(..)
-        .map(|(s, a)| {
-            let key = action_sort_key(&s, &a);
-            (key, (s, a))
-        })
-        .collect();
+/// An action with its pre-computed sort key and its input position.
+type KeyedAction = (
+    (ActionCategory, Address, B256),
+    u32,
+    (Address, NativeAction),
+);
+
+/// Sort keyed actions deterministically by (category, sender,
+/// action_content_hash), stable (the keys are pre-computed to avoid repeated
+/// hashing during the sort); returns the actions and their input positions.
+fn sort_deterministic(mut keyed: Vec<KeyedAction>) -> IndexedActions {
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    actions.extend(keyed.into_iter().map(|(_, pair)| pair));
+    keyed.into_iter().map(|(_, i, pair)| (pair, i)).unzip()
 }
 
 // ============================================================================
@@ -7692,5 +10464,360 @@ mod integer_margin_tests {
             assert!(old.starts_with("FixedPoint division error"));
             assert_eq!(text(new), old);
         }
+    }
+}
+
+/// Fix 1 (s87) / item 6 C2 / C3: the block mark table and the sums cache
+/// (memo and persistent entries) return exactly what the per-call reads do.
+#[cfg(test)]
+mod maker_accounts_tests {
+    use super::*;
+    use torus_core::position::Position;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// 200 seeded rounds: 1-12 traders with positions in 1-25 markets (long /
+    /// short, random entry, sometimes isolated, one overflow-sized), balances
+    /// with negative `available`, marks fresh / stale / absent per market.
+    /// Every (trader, market) pair, queried in a shuffled order from 4 threads
+    /// through one reader with the block's table and sums cache (item 6 C2 /
+    /// C3: over an overlay with R, first through the block memo, then through
+    /// the persistent entries it leaves), equals `AccountReader::maker_account`
+    /// without cache or table; that reader gives the same `mark` / `view` /
+    /// `pos_net` / `position_px`.
+    #[test]
+    fn cached_reader_maker_accounts_equal_reader_on_random_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let now = 10_000u64;
+        let ctx = NativeExecContext::new(db.clone(), 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let reporters: Vec<(Address, FixedPoint)> = (0..3u8).map(|i| (Address::new([200 + i; 20]), fp(1))).collect();
+        let mut rng = Lcg(0x5EED_0001);
+        let (mut pairs_checked, mut marked, mut overflowed, mut persistent) = (0usize, 0usize, 0usize, 0usize);
+        for round in 0..200u64 {
+            let n_traders = 1 + rng.below(12);
+            let n_markets = 1 + rng.below(25);
+            let markets: Vec<MarketId> = (0..n_markets).map(|i| round * 100 + 1 + i).collect();
+            for &m in &markets {
+                let ts = match rng.below(3) {
+                    0 => continue,  // absent
+                    1 => now - 120, // stale
+                    _ => now - 5,   // fresh
+                };
+                let px = fp(1 + rng.below(50_000) as i64);
+                for (v, _) in &reporters {
+                    ctx.oracle.submit_price(v, m, px, 8, ts).unwrap();
+                }
+                ctx.oracle.aggregate_price(m, 8, ts, &reporters).unwrap();
+            }
+            let traders: Vec<Address> = (0..n_traders)
+                .map(|t| {
+                    let mut b = [0x31u8; 20];
+                    b[12..].copy_from_slice(&(round * 1_000 + t).to_be_bytes());
+                    Address::new(b)
+                })
+                .collect();
+            for (ti, t) in traders.iter().enumerate() {
+                let available = fp(rng.below(2_000_000) as i64 - 500_000);
+                ctx.positions
+                    .put_native_balance(t, &NativeBalance { available, order_margin: fp(rng.below(1_000) as i64) })
+                    .unwrap();
+                for &m in &markets {
+                    if rng.below(4) == 0 {
+                        continue; // flat here
+                    }
+                    let huge = round % 17 == 0 && ti == 0 && m == markets[0];
+                    let size = if huge {
+                        FixedPoint::from_raw(i128::MAX / 3)
+                    } else {
+                        FixedPoint::from_raw(1 + rng.below(500 * FixedPoint::SCALE as u64) as i128)
+                    };
+                    ctx.positions
+                        .put_position(&Position {
+                            trader: *t,
+                            market_id: m,
+                            is_long: rng.below(2) == 0,
+                            size,
+                            entry_price: fp(1 + rng.below(50_000) as i64),
+                            realized_pnl: FixedPoint::ZERO,
+                            isolated_margin: FixedPoint::ZERO,
+                            margin_type: if rng.below(40) == 0 { MarginType::Isolated } else { MarginType::Cross },
+                        })
+                        .unwrap();
+                }
+            }
+            let plain = AccountReader::of(&ctx);
+            let table = BlockMarks::new(BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), 7);
+            // The block's view: an overlay with R (nothing pending), its context.
+            let mut overlay = NativeStateOverlay::new(db.clone());
+            overlay.attach_resident(Arc::new(torus_state::ResidentRows::build(&overlay).unwrap()));
+            let rctx = NativeExecContext::new(overlay, 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            let mut memo_sums = BlockSums { shadow: true, ..BlockSums::default() };
+            memo_sums.start(Some(7));
+            let reader = AccountReader { marks: Some(&table), sums: Some(&memo_sums), ..AccountReader::of(&rctx) };
+            for &m in &markets {
+                assert_eq!(reader.mark(m), plain.mark(m), "round {round}: mark {m}");
+                marked += usize::from(plain.mark(m).is_some());
+            }
+            assert_eq!(reader.mark(u64::MAX), plain.mark(u64::MAX), "outside the table");
+            let pairs: Vec<(Address, MarketId)> =
+                traders.iter().flat_map(|t| markets.iter().map(move |m| (*t, *m))).collect();
+            let want: HashMap<(Address, MarketId), MakerAccount> =
+                pairs.iter().map(|&(t, m)| ((t, m), plain.maker_account(&t, m))).collect();
+            for t in &traders {
+                let bal = ctx.positions.get_native_balance(t).unwrap();
+                let (a, b) = (reader.view(t, &bal), plain.view(t, &bal));
+                overflowed += usize::from(b.is_err());
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "round {round}: view");
+                assert_eq!(format!("{:?}", reader.pos_net(t)), format!("{:?}", plain.pos_net(t)), "round {round}: pos_net");
+                for &m in &markets {
+                    assert_eq!(
+                        format!("{:?}", reader.position_px(t, m)),
+                        format!("{:?}", plain.position_px(t, m)),
+                        "round {round}: position_px"
+                    );
+                }
+            }
+            std::thread::scope(|s| {
+                for w in 0..4u64 {
+                    let mut order = pairs.clone();
+                    let mut shuffle = Lcg(round * 4 + w + 1);
+                    for i in (1..order.len()).rev() {
+                        order.swap(i, shuffle.below(i as u64 + 1) as usize);
+                    }
+                    let (reader, want) = (&reader, &want);
+                    s.spawn(move || {
+                        for (t, m) in order {
+                            assert_eq!(reader.maker_account(&t, m), want[&(t, m)], "round {round}: {t} market {m}");
+                        }
+                    });
+                }
+            });
+            pairs_checked += pairs.len();
+            // The memo, carried as persistent entries into the next block's sums.
+            let c = &memo_sums.counters;
+            let computed = c.computed.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
+            assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
+            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_carry(None).cache) };
+            next.start(Some(7));
+            let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
+            for &(t, m) in &pairs {
+                assert_eq!(carried.maker_account(&t, m), want[&(t, m)], "round {round}: persistent {t} market {m}");
+            }
+            persistent += next.counters.persistent.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(next.counters.computed.load(std::sync::atomic::Ordering::Relaxed), 0, "round {round}: no rebuild");
+            assert!(next.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
+        }
+        assert!(
+            pairs_checked > 1_000 && marked > 100 && overflowed > 0 && persistent > 1_000,
+            "non-vacuous: {pairs_checked} {marked} {overflowed} {persistent}"
+        );
+    }
+}
+
+/// Option B (s87): Phase 2's `SenderFold::pool` must name exactly the market
+/// Phase 3 gives each sender's D2 pool — else B would raise a sell in the
+/// pool market or miss a taker-only one.
+#[cfg(test)]
+mod option_b_fold_pool_tests {
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// 100 seeded batches: 2-8 senders (unfunded / thin / rich), 1-5 markets
+    /// with or without resting bids, orders of every kind — limit / market /
+    /// IOC / FOK / PostOnly / reduce-only / stops, buys and sells, some
+    /// invalid (market price 0) — so senders' first checked orders are often
+    /// rejected (margin, validation). The serial fold's `pool` equals the
+    /// keys of Phase 3's pools ([`NativeExecutor::d2_pool_takers`]), and the
+    /// sharded prepare's outcomes give the same pools.
+    #[test]
+    fn fold_pool_equals_phase3_pool() {
+        let mut rng = Lcg(0x5EED_0B0B);
+        let (mut pooled, mut first_rejected, mut raised) = (0usize, 0usize, 0usize);
+        let (mut candidates, mut held_positions) = (0usize, 0usize);
+        for round in 0..100u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let mut ctx = NativeExecContext::new(db, 9, 10_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            let n_senders = 2 + rng.below(7);
+            let n_markets = 1 + rng.below(5);
+            let senders: Vec<Address> = (0..n_senders).map(|i| Address::new([10 + i as u8; 20])).collect();
+            for s in &senders {
+                let available = fp([0, 30, 60, 1_000_000][rng.below(4) as usize]);
+                ctx.positions
+                    .put_native_balance(s, &NativeBalance { available, order_margin: FixedPoint::ZERO })
+                    .unwrap();
+            }
+            let maker = Address::new([200; 20]);
+            for m in 1..=n_markets {
+                if rng.below(3) > 0 {
+                    let mut b = OrderBook::new(m, FixedPoint::ONE, FixedPoint::ONE);
+                    let bid = PlaceOrderParams {
+                        market_id: m,
+                        is_buy: true,
+                        price: fp(95 + rng.below(15) as i64),
+                        quantity: fp(5),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    };
+                    b.place_order(bid, maker, 1);
+                    ctx.order_books.insert(m, b);
+                }
+            }
+            let orders: Vec<(Address, PlaceOrderParams)> = (0..2 + rng.below(30))
+                .map(|_| {
+                    let s = senders[rng.below(n_senders) as usize];
+                    let price = fp(90 + rng.below(20) as i64);
+                    let mut p = PlaceOrderParams {
+                        market_id: 1 + rng.below(n_markets),
+                        is_buy: rng.below(2) == 0,
+                        price,
+                        quantity: fp(1 + rng.below(10) as i64),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    };
+                    match rng.below(12) {
+                        0 => p.order_type = OrderType::Market,
+                        1 => {
+                            p.order_type = OrderType::Market;
+                            p.price = FixedPoint::ZERO; // validation reject
+                        }
+                        2 => p.time_in_force = TimeInForce::IOC,
+                        3 => p.time_in_force = TimeInForce::FOK,
+                        4 => p.time_in_force = TimeInForce::PostOnly,
+                        5 => p.reduce_only = true,
+                        6 => p.order_type = OrderType::StopLimit { trigger: price, limit: price },
+                        _ => {}
+                    }
+                    (s, p)
+                })
+                .collect();
+            let place_orders: Vec<(usize, Address, &PlaceOrderParams)> =
+                orders.iter().enumerate().map(|(i, (s, p))| (i, *s, p)).collect();
+            let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
+            let open_at_start = HashMap::new();
+            let reader = AccountReader::of(&ctx);
+            let markets = NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
+
+            let mut fold = SenderFold::default();
+            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut results: Vec<NativeActionResult> =
+                (0..orders.len()).map(|_| NativeActionResult::ok("pending", 0)).collect();
+            let mut next_id = 1u128;
+            let mut first_seen: HashMap<Address, bool> = HashMap::new();
+            let mut want_excess: HashMap<Address, FixedPoint> = HashMap::new();
+            for (i, (s, p)) in orders.iter().enumerate() {
+                let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, s, p);
+                if let PrepOutcome::Pass(pass) = &outcome {
+                    let base = basis.get(&i).map_or(NativeExecutor::reserve_price(p), |b| b.0);
+                    let qty = basis.get(&i).map_or(p.quantity, |b| b.1);
+                    if pass.required > NativeExecutor::reserve_for_qty_cfg(None, base, qty) {
+                        raised += 1;
+                    }
+                    if pass.excess_im > FixedPoint::ZERO {
+                        *want_excess.entry(*s).or_insert(FixedPoint::ZERO) += pass.excess_im;
+                    }
+                }
+                if NativeExecutor::match_margin_checked(p) && !first_seen.contains_key(s) {
+                    first_seen.insert(*s, true);
+                    if matches!(outcome, PrepOutcome::Reject { .. }) {
+                        first_rejected += 1;
+                    }
+                }
+                NativeExecutor::stitch_outcome(&mut next_id, &None, &markets, &mut batches, &mut results, i, s, p, outcome);
+            }
+            // M1 cut 5: the fold's pools = the old pass over the batches
+            // (first checked taker per sender, its market and pos_net).
+            let want: HashMap<Address, (MarketId, FixedPoint)> =
+                NativeExecutor::d2_pool_takers(&batches).into_iter().map(|(s, m, n)| (s, (m, n))).collect();
+            let serial = fold.finish();
+            assert_eq!(serial.pools, want, "round {round}: serial fold");
+            assert_eq!(serial.excess, want_excess, "round {round}: serial excess");
+            pooled += want.len();
+            for p in batches.values().flatten() {
+                // M1 cut 2: the candidate flag is the old top-up condition.
+                let old = NativeExecutor::takes_bid_floor(p.params)
+                    && want.get(&p.sender).is_some_and(|(m, _)| *m != p.params.market_id);
+                assert_eq!(p.top_up_candidate, old, "round {round}: order {}", p.index);
+                candidates += usize::from(old);
+                // M1 cut 8: pre_pos = `position_px` (every order with an
+                // account check; checked takers always).
+                assert_eq!(p.pre_pos.is_some(), !p.params.reduce_only, "round {round}");
+                if let Some(pre) = p.pre_pos {
+                    assert_eq!(Ok(pre), reader.position_px(&p.sender, p.params.market_id).map_err(|e| e.to_string()));
+                    held_positions += usize::from(pre.0 != FixedPoint::ZERO);
+                }
+            }
+
+            // Sharded prepare (2 workers): its outcomes stitched in flat order.
+            let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
+            for (i, (s, p)) in orders.iter().enumerate() {
+                match groups.iter_mut().find(|g| g.0 == *s) {
+                    Some(g) => g.1.push((i, p)),
+                    None => groups.push((*s, vec![(i, p)])),
+                }
+            }
+            let (mut outcomes, sharded_out) =
+                NativeExecutor::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, 2, orders.len())
+                    .expect("no worker panic");
+            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut next_id = 1u128;
+            for (i, (s, p)) in orders.iter().enumerate() {
+                let o = outcomes[i].take().unwrap();
+                NativeExecutor::stitch_outcome(&mut next_id, &None, &markets, &mut sharded, &mut results, i, s, p, o);
+            }
+            let got: HashMap<Address, (MarketId, FixedPoint)> =
+                NativeExecutor::d2_pool_takers(&sharded).into_iter().map(|(s, m, n)| (s, (m, n))).collect();
+            assert_eq!(got, want, "round {round}: sharded");
+            assert_eq!(sharded_out.pools, want, "round {round}: sharded fold");
+            assert_eq!(sharded_out.excess, serial.excess, "round {round}: sharded excess");
+            let cache = |c: &BalanceCache| {
+                let mut v: Vec<_> =
+                    c.map.iter().map(|(a, b)| (*a, b.balance.available, b.balance.order_margin, b.dirty)).collect();
+                v.sort_unstable_by_key(|x| x.0);
+                let mut d = c.dirty.clone();
+                d.sort_unstable();
+                (v, d)
+            };
+            assert_eq!(cache(&sharded_out.cache), cache(&serial.cache), "round {round}: caches");
+            let key = |b: &HashMap<MarketId, Vec<PreparedOrder<'_>>>| {
+                let mut v: Vec<_> = b
+                    .values()
+                    .flatten()
+                    .map(|p| (p.index, p.order_id, p.margin_reserved, p.checked_pos_net, p.pre_pos, p.top_up_candidate, p.res_price))
+                    .collect();
+                v.sort_unstable_by_key(|x| x.0);
+                v
+            };
+            assert_eq!(key(&sharded), key(&batches), "round {round}: prepared orders");
+        }
+        assert!(candidates > 20 && held_positions == 0, "non-vacuous: {candidates} candidates");
+        assert!(pooled > 100 && first_rejected > 10 && raised > 10, "non-vacuous");
     }
 }

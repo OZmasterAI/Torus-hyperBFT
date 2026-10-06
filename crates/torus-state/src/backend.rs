@@ -8,6 +8,7 @@ use rocksdb::WriteBatch;
 use crate::cf::{CF_ACCOUNTS, CF_SESSIONS};
 use crate::db::{decode_account_info, encode_account_info, StateDb};
 use crate::error::StateError;
+use crate::resident_rows::{ResidentChange, ResidentDelta, ResidentRows, RESIDENT_CFS};
 
 pub enum AtomicWriteOp<'a> {
     Put {
@@ -41,6 +42,56 @@ pub trait StateBackend: Clone + Send + Sync {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError>;
+
+    /// Review H3 (s517): the first `limit` live entries with key `>= start`, in
+    /// key order — a bounded seek (`StateDb` and `NativeStateOverlay` never
+    /// materialise the CF). Equals `iterate_cf(cf, None)` filtered to
+    /// `k >= start`, truncated to `limit`.
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        Ok(self
+            .iterate_cf(cf, None)?
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() >= start)
+            .take(limit)
+            .collect())
+    }
+
+    /// Whether any key starting with `prefix` exists — `!iterate_cf(prefix)
+    /// .is_empty()`. `StateDb` and `NativeStateOverlay` stop at the first live
+    /// key instead of loading every row.
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        Ok(!self.iterate_cf(cf, Some(prefix))?.is_empty())
+    }
+
+    /// Item 6 Phase 1: whether THIS block's own writes or tombstones may touch
+    /// keys of `cf` starting with `prefix` (anything below them is already in
+    /// the resident rows). Default `true` = "assume dirty"; a
+    /// [`NativeStateOverlay`] with resident rows attached answers exactly.
+    fn layer_touches(&self, _cf: &str, _prefix: &[u8]) -> bool {
+        true
+    }
+
+    /// Item 6 C6b: with resident rows attached and `cf` one of their CFs,
+    /// every key under `prefix` that THIS block's own pending set writes or
+    /// deletes, with R's row and the current row (any order). Default
+    /// `None` = not available (callers recompute from the current rows).
+    fn resident_changes(&self, _cf: &str, _prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        None
+    }
+
+    /// Item 6 C6c: with resident rows attached and `cf` one of their CFs,
+    /// every key of `cf` THIS block's own pending set writes or deletes,
+    /// sorted (`layer_touches(cf, p)` iff one of them starts with `p`).
+    /// Default `None` = not available (callers ask `layer_touches`).
+    fn layer_keys(&self, _cf: &str) -> Option<Vec<Vec<u8>>> {
+        None
+    }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
 
@@ -143,6 +194,45 @@ impl StateBackend for StateDb {
             }
         }
         Ok(results)
+    }
+
+    /// Review H3: RocksDB seek to `start`, at most `limit` rows read.
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        for item in db.iterator_cf(cf_handle, mode) {
+            let (key, value) = item?;
+            out.push((key.to_vec(), value.to_vec()));
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// First key at/after `prefix` only (keys are sorted: if it does not
+    /// start with `prefix`, none does).
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        match crate::db::prefix_iter(db, &cf_handle, prefix).next() {
+            Some(item) => Ok(item?.0.starts_with(prefix)),
+            None => Ok(false),
+        }
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
@@ -270,6 +360,18 @@ impl CfPending {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fix 3 (s87) work count: layer keys `PendingState::overlay_into` visited.
+    static OVERLAY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn overlay_visit() {
+    #[cfg(test)]
+    OVERLAY_VISITS.with(|c| c.set(c.get() + 1));
+}
+
 struct PendingState {
     /// Indexed by [`CfId`] — one bucket per registered CF.
     cfs: [CfPending; NUM_CFS],
@@ -314,25 +416,50 @@ impl PendingState {
         None
     }
 
+    /// Fix 3 (s87): this layer's tombstones under `prefix`, in key order — a
+    /// `range` from the prefix cut at the first key without it (the empty
+    /// prefix is the whole CF), never a walk over the layer's other keys.
+    fn deletes_under<'a>(&'a self, id: CfId, prefix: &'a [u8]) -> impl Iterator<Item = &'a Vec<u8>> {
+        self.cf(id)
+            .deletes
+            .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .take_while(move |k| k.starts_with(prefix))
+    }
+
+    /// s89 fix B: whether this set deletes oracle submission rows (the prune).
+    fn deletes_oracle_submissions(&self) -> bool {
+        intern_cf(crate::cf::CF_NATIVE_ORACLE).is_some_and(|id| {
+            self.deletes_under(id, crate::cf::ORACLE_SUBMISSION_PREFIX)
+                .next()
+                .is_some()
+        })
+    }
+
+    /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
+    fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
+        writes_under(&self.cf(id).writes, prefix).next().is_some()
+            || self.deletes_under(id, prefix).next().is_some()
+    }
+
     /// Apply this layer's writes/tombstones (under `prefix`) on top of `merged`.
+    /// Fix 3 (s87): visits only the layer's keys under `prefix` (range lookup).
     fn overlay_into(
         &self,
         id: CfId,
         prefix: Option<&[u8]>,
         merged: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     ) {
-        let cfp = self.cf(id);
-        for key in cfp
-            .deletes
-            .iter()
-            .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
-        {
+        let prefix = prefix.unwrap_or(&[]);
+        for key in self.deletes_under(id, prefix).inspect(|_| overlay_visit()) {
             merged.remove(key);
         }
-        for (key, value) in cfp
+        let range = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
+        for (key, value) in self
+            .cf(id)
             .writes
-            .iter()
-            .filter(|(k, _)| prefix.is_none_or(|p| k.starts_with(p)))
+            .range::<[u8], _>(range)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .inspect(|_| overlay_visit())
         {
             merged.insert(key.clone(), value.clone());
         }
@@ -712,10 +839,31 @@ pub struct FrozenPending {
     state: PendingState,
 }
 
+/// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
+fn resident_delta_of(state: &PendingState) -> ResidentDelta {
+    let mut delta = ResidentDelta::default();
+    for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+        let id = intern_cf(cf).expect("resident CF is registered");
+        delta.cfs[slot] = cf_stream(state.cf(id))
+            .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+            .collect();
+    }
+    delta
+}
+
 impl FrozenPending {
     /// The block height whose post-state this set completes.
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
+    /// CFs — exactly [`NativeStateOverlay::own_pending_delta`] taken just
+    /// before [`NativeStateOverlay::freeze`] (freeze moves the pending set
+    /// here unchanged; only its journal and checkpoints are cleared). Lets
+    /// the end-of-block upkeep take it off the execution thread.
+    pub fn resident_delta(&self) -> ResidentDelta {
+        resident_delta_of(&self.state)
     }
 
     /// A 1-key frozen set holding only the native applied-height marker
@@ -848,6 +996,15 @@ pub struct NativeStateOverlay {
     /// between this overlay's own pending set and the DB on every read. `None`
     /// on the serial path (exact-today: own pending -> DB).
     parent: Option<Arc<FrozenPending>>,
+    /// Item 6 Phase 1: resident rows R (the previous block's post-state of
+    /// `RESIDENT_CFS`). When set, every read of
+    /// R's CFs goes own pending -> R and never reaches the DB; a key
+    /// absent from R is absent. C6a (B0): nor the parent layer — R already
+    /// holds it (`end_resident` applied the parent block's own delta; a
+    /// rebuild reads DB + parent; `begin_resident` reuses R only when the
+    /// parent is the block R reflects). Set by [`Self::attach_resident`]
+    /// BEFORE the overlay is cloned (clones made earlier do not see it).
+    resident: Option<Arc<ResidentRows>>,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -855,8 +1012,18 @@ impl std::fmt::Debug for NativeStateOverlay {
         f.debug_struct("NativeStateOverlay")
             .field("pending_writes", &self.pending_write_count())
             .field("parent_height", &self.parent_height())
+            .field("resident_rows", &self.resident.as_ref().map(|r| r.len()))
             .finish()
     }
+}
+
+/// [`CfId`] -> slot in [`crate::resident_rows::RESIDENT_CFS`].
+#[inline]
+fn resident_slot_of(id: CfId) -> Option<usize> {
+    static IDS: OnceLock<[CfId; crate::resident_rows::RESIDENT_CFS.len()]> = OnceLock::new();
+    IDS.get_or_init(|| RESIDENT_CFS.map(|cf| intern_cf(cf).expect("resident CF is registered")))
+        .iter()
+        .position(|x| *x == id)
 }
 
 impl NativeStateOverlay {
@@ -872,12 +1039,45 @@ impl NativeStateOverlay {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
             parent,
+            resident: None,
         }
     }
 
     /// Height of the layered parent, if any (debug assertions / tests).
     pub fn parent_height(&self) -> Option<u64> {
         self.parent.as_ref().map(|p| p.height)
+    }
+
+    /// Item 6 Phase 1: read `CF_NATIVE_POSITIONS` / `CF_NATIVE_BALANCES` from
+    /// `rows` in place of the DB (see the `resident` field). Call before the
+    /// overlay is cloned into a context.
+    pub fn attach_resident(&mut self, rows: Arc<ResidentRows>) {
+        self.resident = Some(rows);
+    }
+
+    /// Drop this overlay's handle on the resident rows (the end of the block
+    /// takes R back with `Arc::get_mut`); reads fall back to the DB.
+    pub fn detach_resident(&mut self) -> Option<Arc<ResidentRows>> {
+        self.resident.take()
+    }
+
+    /// Whether resident rows are attached.
+    pub fn has_resident(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    /// The resident rows of `id`, if R is attached and `id` is one of its CFs.
+    #[inline]
+    fn resident_rows(&self, id: CfId) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
+        let rows = self.resident.as_ref()?;
+        resident_slot_of(id).map(|s| rows.slot(s))
+    }
+
+    /// Item 6 Phase 1: this overlay's OWN pending writes and tombstones of R's
+    /// CFs (the parent layer is already in R), key-sorted. Take it before
+    /// [`Self::freeze`] (which moves the pending set out) or the flush.
+    pub fn own_pending_delta(&self) -> ResidentDelta {
+        resident_delta_of(&self.pending.read().unwrap())
     }
 
     /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged
@@ -1090,7 +1290,7 @@ impl NativeStateOverlay {
     }
 
     /// The native-root dirty `(cf_tag, key) -> Option<value>` set this overlay would flush — writes
-    /// (`Some`) and deletes (`None`) hitting the 6 native-root CFs only (mirrors `dirty_evm_accounts`).
+    /// (`Some`) and deletes (`None`) hitting the 7 native-root CFs only (mirrors `dirty_evm_accounts`).
     /// Fed to the bucketed native trie (A2.2) so it tracks the committed native state. Non-root CFs
     /// (nonces, governance, markets, …) are excluded — they are not part of the native root.
     pub fn dirty_native_keys(&self) -> BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> {
@@ -1193,6 +1393,31 @@ impl NativeStateOverlay {
             crate::native_trie::native_trie_maintenance_enabled(),
         )
     }
+}
+
+/// Per-`cf_tag` count of the native-root entries `state` plus `sidecar` would put
+/// in the dirty map, without building it (maintenance off). Equal to counting the
+/// keys of the merged [`PendingState::native_dirty_ref`] maps: a CF's writes and
+/// deletes are disjoint by invariant, and a sidecar key already in the main set is
+/// counted once.
+fn native_dirty_counts(state: &PendingState, sidecar: Option<&PendingState>) -> [usize; 7] {
+    let mut counts = [0usize; 7];
+    for (idx, cfp) in state.cfs.iter().enumerate() {
+        let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
+            continue;
+        };
+        let mut n = cfp.writes.len() + cfp.deletes.len();
+        if let Some(side) = sidecar {
+            let sp = &side.cfs[idx];
+            let in_main = |k: &Vec<u8>| cfp.writes.contains_key(k) || cfp.deletes.contains(k);
+            n += sp.writes.keys().filter(|k| !in_main(k)).count();
+            n += sp.deletes.iter().filter(|k| !in_main(k)).count();
+        }
+        if let Some(slot) = counts.get_mut(tag as usize) {
+            *slot += n;
+        }
+    }
+    counts
 }
 
 /// Running state hash: blocks with at least this many pending entries digest
@@ -1301,13 +1526,18 @@ fn flush_pending_after_batch(
         // Native-root dirty map, folded into the SAME batch. BORROWED from the
         // pending maps (s450): `state`'s read guard is held for this whole
         // function and the trie only reads the set, so nothing is copied out.
-        let mut dirty = state.native_dirty_ref();
-        // Deferred book save: the sidecar's root-CF entries enter the ROOT
-        // computation exactly as if the exec thread had written them into its
-        // overlay (same canonical (tag, key) order — BTreeMap merge).
-        if let Some(side) = sidecar {
-            dirty.extend(side.native_dirty_ref());
-        }
+        // Built only when the trie is maintained; with maintenance off the
+        // metric and the stale marker need just the per-CF counts.
+        let dirty = maintain_trie.then(|| {
+            let mut dirty = state.native_dirty_ref();
+            // Deferred book save: the sidecar's root-CF entries enter the ROOT
+            // computation exactly as if the exec thread had written them into its
+            // overlay (same canonical (tag, key) order — BTreeMap merge).
+            if let Some(side) = sidecar {
+                dirty.extend(side.native_dirty_ref());
+            }
+            dirty
+        });
         // r7: the batch BUILD (serializing the pending maps) is a different
         // lever from the RocksDB WRITE (WAL + memtable), so keep the two
         // timers apart instead of summing them into one `write_seconds`.
@@ -1339,34 +1569,29 @@ fn flush_pending_after_batch(
             member_misses: 0,
             member_evictions: 0,
             member_resident_buckets: 0,
-            dirty_entries_by_cf: [0; 6],
+            dirty_entries_by_cf: [0; 7],
             state_hash_seconds: 0.0,
             state_hash_entries: 0,
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
-        for (tag, _) in dirty.keys() {
-            if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
-                *slot += 1;
+        match &dirty {
+            Some(dirty) => {
+                for (tag, _) in dirty.keys() {
+                    if let Some(slot) = stats.dirty_entries_by_cf.get_mut(*tag as usize) {
+                        *slot += 1;
+                    }
+                }
             }
+            None => stats.dirty_entries_by_cf = native_dirty_counts(state, sidecar),
         }
-        let trie_result = if dirty.is_empty() {
+        let has_native_writes = stats.dirty_entries_by_cf.iter().any(|&n| n > 0);
+        let trie_result = if !has_native_writes {
             Ok(())
-        } else if !maintain_trie {
-            // s83 Option 0 (`TORUS_NATIVE_TRIE_MAINTENANCE=0`): no trie/mirror ops; instead mark
-            // the trie stale in the SAME batch, so state, marker and sentinel commit together. The
-            // caches are left untouched — they are only reachable through `apply_native_dirty`,
-            // which the once-per-process mode never calls, and a boot rebuild moves the persisted
-            // root they self-authenticate against.
-            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
-                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
-            })?;
-            batch.put_cf(cf, crate::cf::META_NATIVE_TRIE_STALE, [1u8]);
-            Ok(())
-        } else {
+        } else if let Some(dirty) = &dirty {
             match crate::native_trie::apply_native_dirty(
                 target,
                 &mut batch,
-                &dirty,
+                dirty,
                 trie_cache.as_deref_mut(),
                 member_cache.as_deref_mut(),
                 parallel,
@@ -1390,6 +1615,17 @@ fn flush_pending_after_batch(
                     Err(e)
                 }
             }
+        } else {
+            // Maintenance off (the default; `TORUS_NATIVE_TRIE_MAINTENANCE=1` turns it on): no
+            // trie/mirror ops; instead mark the trie stale in the SAME batch, so state, marker
+            // and sentinel commit together. The caches are left untouched — they are only reachable through `apply_native_dirty`,
+            // which the once-per-process mode never calls, and a boot rebuild moves the persisted
+            // root they self-authenticate against.
+            let cf = raw.cf_handle(crate::cf::CF_CONSENSUS_META).ok_or_else(|| {
+                StateError::MissingColumnFamily(crate::cf::CF_CONSENSUS_META.to_string())
+            })?;
+            batch.put_cf(cf, crate::cf::META_NATIVE_TRIE_STALE, [1u8]);
+            Ok(())
         };
         stats.root_seconds = root_timer.elapsed().as_secs_f64();
 
@@ -1480,6 +1716,13 @@ fn flush_pending_after_batch(
                 return Err(e.into());
             }
         }
+        // s89 fix B: the batch is durable; if it pruned oracle submissions,
+        // compact their range off this thread (node-local, never fails here).
+        if state.deletes_oracle_submissions()
+            || sidecar.is_some_and(PendingState::deletes_oracle_submissions)
+        {
+            target.compact_pruned_submissions_in_background();
+        }
         // L3 #2: record post-flush residency for the eviction-pressure gauge.
         if let Some(c) = member_cache.as_deref() {
             stats.member_resident_buckets = c.len();
@@ -1523,7 +1766,7 @@ pub struct NativeFlushStats {
     /// 3c: native-root dirty entries per cf_tag this flush (frozen
     /// NATIVE_ROOT_CFS order) — funnel attribution of the dirty-set
     /// composition.
-    pub dirty_entries_by_cf: [usize; 6],
+    pub dirty_entries_by_cf: [usize; 7],
     /// Running state hash: time to digest the block's consensus write set (0
     /// when the flush carries no applied height). Large blocks digest on a
     /// scoped thread overlapped with the batch build, so this is compute time,
@@ -1531,6 +1774,114 @@ pub struct NativeFlushStats {
     pub state_hash_seconds: f64,
     /// Running state hash: hashed entries this flush.
     pub state_hash_entries: usize,
+}
+
+/// A layer's pending-write keys starting with `prefix`, in key order.
+fn writes_under<'a>(
+    writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+    prefix: &'a [u8],
+) -> impl Iterator<Item = &'a Vec<u8>> {
+    writes
+        .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        .map(|(k, _)| k)
+        .take_while(move |k| k.starts_with(prefix))
+}
+
+/// Review H3: the merged `iterate_cf` from `start` — a k-way merge of `base`
+/// (the DB iterator seeked to `start`, or R's range) and the parent / pending
+/// write ranges; each candidate key resolves by the layered point-read rule
+/// (pending, then parent, then `base`), so tombstones in either layer hide it.
+/// Reads at most `limit` live rows plus the tombstoned base keys in between.
+#[allow(clippy::type_complexity)]
+fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+    pending: &PendingState,
+    parent: Option<&PendingState>,
+    id: CfId,
+    start: &[u8],
+    limit: usize,
+    mut base: impl Iterator<Item = Result<(K, V), StateError>>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+    let mut out = Vec::new();
+    let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+    let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
+    let mut aw = parent
+        .into_iter()
+        .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
+        .peekable();
+    let mut bh = base.next().transpose()?;
+    while out.len() < limit {
+        let heads = [
+            pw.peek().map(|(k, _)| k.as_slice()),
+            aw.peek().map(|(k, _)| k.as_slice()),
+            bh.as_ref().map(|(k, _)| k.as_ref()),
+        ];
+        let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
+            break;
+        };
+        let value = match pending.lookup(id, &key) {
+            Some(hit) => hit.map(<[u8]>::to_vec),
+            None => match parent.and_then(|s| s.lookup(id, &key)) {
+                Some(hit) => hit.map(<[u8]>::to_vec),
+                None => bh
+                    .as_ref()
+                    .filter(|(k, _)| k.as_ref() == key.as_slice())
+                    .map(|(_, v)| v.as_ref().to_vec()),
+            },
+        };
+        if pw.peek().is_some_and(|(k, _)| **k == key) {
+            pw.next();
+        }
+        if aw.peek().is_some_and(|(k, _)| **k == key) {
+            aw.next();
+        }
+        if bh.as_ref().is_some_and(|(k, _)| k.as_ref() == key.as_slice()) {
+            bh = base.next().transpose()?;
+        }
+        if let Some(v) = value {
+            out.push((key, v));
+        }
+    }
+    Ok(out)
+}
+
+/// Item 6 C6a: `base` (R's rows under `prefix`, key order) with one pending
+/// layer `cfp` on top — its writes override, its tombstones remove — merged
+/// straight into the result. Same answer as collecting `base` into a map and
+/// applying `PendingState::overlay_into`.
+fn overlay_sorted<'a>(
+    cfp: &CfPending,
+    prefix: &[u8],
+    base: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut writes = cfp
+        .writes
+        .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .inspect(|_| overlay_visit())
+        .peekable();
+    let mut base = base.peekable();
+    let mut out = Vec::new();
+    loop {
+        let take_base = match (base.peek(), writes.peek()) {
+            (None, None) => break,
+            (Some((bk, _)), Some((wk, _))) => bk < wk,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+        };
+        if take_base {
+            let (k, v) = base.next().expect("peeked");
+            if !cfp.deletes.contains(k) {
+                out.push((k.clone(), v.clone()));
+            }
+        } else {
+            let (k, v) = writes.next().expect("peeked");
+            if base.peek().is_some_and(|(bk, _)| *bk == k) {
+                base.next();
+            }
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
 }
 
 impl StateBackend for NativeStateOverlay {
@@ -1545,6 +1896,11 @@ impl StateBackend for NativeStateOverlay {
                 if let Some(hit) = state.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
+            }
+            // Item 6 Phase 1: R replaces the DB for its CFs; C6a (B0):
+            // and the parent layer, which R already holds.
+            if let Some(rows) = self.resident_rows(id) {
+                return Ok(rows.get(key).cloned());
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes).
             if let Some(parent) = &self.parent {
@@ -1608,19 +1964,176 @@ impl StateBackend for NativeStateOverlay {
             // (the DB reports MissingColumnFamily, same as pre-C2).
             return StateBackend::iterate_cf(&self.db, cf, prefix);
         };
+        let p = prefix.unwrap_or(&[]);
+        // Item 6 Phase 1: R's prefix range stands in for the DB rows of its
+        // CFs. C6a (B0): R already holds the parent layer, so only this
+        // overlay's own pending set goes on top — merged straight into the
+        // result (no intermediate Vec / BTreeMap).
+        if let Some(rows) = self.resident_rows(id) {
+            let base = rows
+                .range::<[u8], _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(p));
+            let state = self.pending.read().unwrap();
+            if !state.touches(id, p) {
+                return Ok(base.map(|(k, v)| (k.clone(), v.clone())).collect());
+            }
+            return Ok(overlay_sorted(state.cf(id), p, base));
+        }
         // Merge RocksDB entries with pending: RocksDB first, then the parent
         // layer (bl2 exec pipeline; absent on the serial path), then this
         // overlay's own pending set — each layer's tombstones remove and its
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
-        if let Some(parent) = &self.parent {
-            parent.state.overlay_into(id, prefix, &mut merged);
-        }
+        let parent = self.parent.as_ref().map(|f| &f.state);
         let state = self.pending.read().unwrap();
+        // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
+        // as they are (already sorted and unique under the bytewise comparator).
+        if !state.touches(id, p) && !parent.is_some_and(|s| s.touches(id, p)) {
+            return Ok(db_entries);
+        }
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
+        if let Some(parent) = parent {
+            parent.overlay_into(id, prefix, &mut merged);
+        }
         state.overlay_into(id, prefix, &mut merged);
         drop(state);
         Ok(merged.into_iter().collect())
+    }
+
+    /// Review H3: the merged `iterate_cf` from `start`, without materialising
+    /// it — a k-way merge of the DB iterator (seeked to `start`) and the
+    /// parent / pending write ranges; each candidate key resolves by the
+    /// layered point-read rule (pending, then parent, then DB), so tombstones
+    /// in either layer hide it. Reads at most `limit` live rows plus the
+    /// tombstoned DB keys in between.
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            return StateBackend::iterate_cf_from(&self.db, cf, start, limit);
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+        let pending = self.pending.read().unwrap();
+        // Item 6 Phase 1: R's range stands in for the RocksDB iterator; C6a
+        // (B0): R already holds the parent layer.
+        if let Some(rows) = self.resident_rows(id) {
+            let base = rows
+                .range::<[u8], _>(range)
+                .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
+            return merge_from(&pending, None, id, start, limit, base);
+        }
+        let parent = self.parent.as_ref().map(|p| &p.state);
+        let db = self.db.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let dbi = db
+            .iterator_cf(
+                cf_handle,
+                rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+            )
+            .map(|item| item.map_err(StateError::from));
+        merge_from(&pending, parent, id, start, limit, dbi)
+    }
+
+    /// Same answer as the merged `iterate_cf`, without materialising it: a key
+    /// is live per the layered point-read rule (pending, then parent, then DB).
+    /// Checks pending / parent writes under `prefix`, then walks DB keys and
+    /// stops at the first one no layer tombstones — it skips at most the
+    /// tombstones under `prefix`.
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            return StateBackend::prefix_exists(&self.db, cf, prefix);
+        };
+        // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
+        let rows = self.resident_rows(id);
+        let parent = self.parent.as_ref().filter(|_| rows.is_none());
+        let live = |key: &[u8]| -> bool {
+            if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
+                return hit.is_some();
+            }
+            match parent.and_then(|p| p.state.lookup(id, key)) {
+                Some(hit) => hit.is_some(),
+                None => true,
+            }
+        };
+        if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
+            return Ok(true);
+        }
+        if let Some(parent) = parent {
+            if writes_under(&parent.state.cf(id).writes, prefix).any(|k| live(k)) {
+                return Ok(true);
+            }
+        }
+        // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
+        if let Some(rows) = rows {
+            return Ok(rows
+                .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .any(|(k, _)| live(k)));
+        }
+        let db = self.db.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if live(&key) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// With R attached and `cf` one of its CFs: this overlay's own pending set
+    /// holds a write or tombstone under `prefix`. Otherwise "assume dirty".
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        match intern_cf(cf) {
+            Some(id) if self.resident_rows(id).is_some() => {
+                self.pending.read().unwrap().touches(id, prefix)
+            }
+            _ => true,
+        }
+    }
+
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        let id = intern_cf(cf)?;
+        self.resident_rows(id)?;
+        let state = self.pending.read().unwrap();
+        let cfp = state.cf(id);
+        let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
+        keys.sort_unstable();
+        Some(keys)
+    }
+
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        let id = intern_cf(cf)?;
+        let rows = self.resident_rows(id)?;
+        let state = self.pending.read().unwrap();
+        let change = |key: &Vec<u8>, current: Option<&Vec<u8>>| ResidentChange {
+            key: key.clone(),
+            resident: rows.get(key).cloned(),
+            current: current.cloned(),
+        };
+        let cfp = state.cf(id);
+        let range = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
+        let mut out: Vec<ResidentChange> = cfp
+            .writes
+            .range::<[u8], _>(range)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| change(k, Some(v)))
+            .collect();
+        out.extend(state.deletes_under(id, prefix).map(|k| change(k, None)));
+        Some(out)
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
@@ -1668,6 +2181,258 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
         (db, dir)
+    }
+
+    /// `prefix_exists` == `!iterate_cf(prefix).is_empty()` for every layering
+    /// of two keys over DB / parent (frozen) / pending: absent, write, tombstone.
+    #[test]
+    fn prefix_exists_matches_iterate_cf_over_every_layering() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        // per key: (in DB, parent op, pending op); op 0 = none, 1 = write, 2 = delete
+        let states: Vec<(bool, u8, u8)> = (0..18u8).map(|i| (i % 2 == 1, (i / 2) % 3, i / 6)).collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k]].concat();
+        let combos: Vec<[(bool, u8, u8); 2]> =
+            states.iter().flat_map(|&a| states.iter().map(move |&b| [a, b])).collect();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), b"db").unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: usize| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &key(c, k as u8), b"w").unwrap(),
+                        2 => ov.delete_cf_raw(cf, &key(c, k as u8)).unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        apply(&parent, 0);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+        apply(&overlay, 1);
+        let (mut yes, mut no) = (0, 0);
+        for (c, combo) in combos.iter().enumerate() {
+            let p = prefix(c);
+            let want = !overlay.iterate_cf(cf, Some(&p)).unwrap().is_empty();
+            assert_eq!(overlay.prefix_exists(cf, &p).unwrap(), want, "overlay combo {c}: {combo:?}");
+            let want_db = !StateBackend::iterate_cf(&db, cf, Some(&p)).unwrap().is_empty();
+            assert_eq!(StateBackend::prefix_exists(&db, cf, &p).unwrap(), want_db, "db combo {c}");
+            if want { yes += 1 } else { no += 1 }
+        }
+        assert!(yes > 0 && no > 0, "non-vacuous: {yes} / {no}");
+        assert!(!overlay.prefix_exists(cf, b"q").unwrap(), "no key under the prefix");
+    }
+
+    /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`
+    /// entries of the merged `iterate_cf` with key >= `start`, for every
+    /// layering of two keys over DB / parent (frozen) / pending (absent, write,
+    /// tombstone), many starts (before / on / between / after keys) and
+    /// limits — on the overlay and on the bare DB.
+    #[test]
+    fn iterate_cf_from_matches_iterate_cf_over_every_layering() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let states: Vec<(bool, u8, u8)> = (0..18u8).map(|i| (i % 2 == 1, (i / 2) % 3, i / 6)).collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k * 2 + 1]].concat();
+        let combos: Vec<[(bool, u8, u8); 2]> =
+            states.iter().flat_map(|&a| states.iter().map(move |&b| [a, b])).collect();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), &[b'd', c as u8, k as u8]).unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: u8| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &key(c, k as u8), &[b'w', layer, c as u8, k as u8]).unwrap(),
+                        2 => ov.delete_cf_raw(cf, &key(c, k as u8)).unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        apply(&parent, 0);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+        apply(&overlay, 1);
+        let all = overlay.iterate_cf(cf, None).unwrap();
+        let all_db = StateBackend::iterate_cf(&db, cf, None).unwrap();
+        assert!(!all.is_empty() && all.len() < combos.len() * 2, "non-vacuous");
+        let expect = |rows: &[(Vec<u8>, Vec<u8>)], start: &[u8], limit: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+            rows.iter().filter(|(k, _)| k.as_slice() >= start).take(limit).cloned().collect()
+        };
+        let mut starts: Vec<Vec<u8>> = vec![Vec::new(), b"q".to_vec()];
+        for c in (0..combos.len()).step_by(7) {
+            for k in 0..5u8 {
+                starts.push([prefix(c), vec![k]].concat()); // before / on / between keys
+            }
+        }
+        for start in &starts {
+            for limit in [0usize, 1, 2, 3, 17, usize::MAX] {
+                assert_eq!(
+                    overlay.iterate_cf_from(cf, start, limit).unwrap(),
+                    expect(&all, start, limit),
+                    "overlay start {start:?} limit {limit}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_from(&db, cf, start, limit).unwrap(),
+                    expect(&all_db, start, limit),
+                    "db start {start:?} limit {limit}"
+                );
+            }
+        }
+    }
+
+    /// Fix 3 (s87) RED: a prefix scan through the overlay visits only the
+    /// layer keys under the prefix — not every write and tombstone of the CF
+    /// in the parent and pending layers (c93c579: ~102k visits).
+    #[test]
+    fn overlay_prefix_scan_visits_only_the_prefix() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        db.put_cf_raw(cf, b"p\x03", b"db").unwrap();
+        db.put_cf_raw(cf, b"p\x04", b"db").unwrap();
+        let shape = |ov: &NativeStateOverlay, v: &[u8]| {
+            for i in 0..25_000u32 {
+                ov.put_cf_raw(cf, &[b"a".as_slice(), &i.to_be_bytes()].concat(), v).unwrap();
+                ov.put_cf_raw(cf, &[b"z".as_slice(), &i.to_be_bytes()].concat(), v).unwrap();
+            }
+            for i in 0..500u32 {
+                ov.delete_cf_raw(cf, &[b"b".as_slice(), &i.to_be_bytes()].concat()).unwrap();
+                ov.delete_cf_raw(cf, &[b"y".as_slice(), &i.to_be_bytes()].concat()).unwrap();
+            }
+            ov.put_cf_raw(cf, b"p\x01", v).unwrap();
+            ov.put_cf_raw(cf, b"p\x02", v).unwrap();
+            ov.delete_cf_raw(cf, b"p\x03").unwrap();
+        };
+        let parent = NativeStateOverlay::new(db.clone());
+        shape(&parent, b"parent");
+        let overlay = NativeStateOverlay::with_parent(db, Some(parent.freeze(1)));
+        shape(&overlay, b"pending");
+        OVERLAY_VISITS.with(|c| c.set(0));
+        let rows = overlay.iterate_cf(cf, Some(b"p")).unwrap();
+        let visits = OVERLAY_VISITS.with(|c| c.get());
+        assert_eq!(
+            rows,
+            vec![
+                (b"p\x01".to_vec(), b"pending".to_vec()),
+                (b"p\x02".to_vec(), b"pending".to_vec()),
+                (b"p\x04".to_vec(), b"db".to_vec()),
+            ]
+        );
+        assert!(visits <= 6 + 6, "overlay_into visited {visits} layer keys for 3 + 3 under the prefix");
+    }
+
+    /// Fix 3 (s87) guard: the overlay's `iterate_cf` equals a reference model
+    /// (DB, then parent, then pending; tombstones remove, writes override) over
+    /// random layerings of keys from a small alphabet — keys equal to the
+    /// prefix, `prefix ‖ ff`, successor prefixes, keys shorter than the
+    /// prefix — for `None`, the empty prefix and every prefix of every key;
+    /// and agrees with `iterate_cf_from` (cut at the prefix) and `prefix_exists`.
+    #[test]
+    fn overlay_iterate_cf_equals_reference_over_random_layers() {
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let mut seed: u64 = 0x5EED_F1C3;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        const ALPHABET: [u8; 5] = [0x00, 0x01, 0x7f, 0xfe, 0xff];
+        let (mut checked, mut non_empty) = (0usize, 0usize);
+        for round in 0..500 {
+            let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for _ in 0..1 + rnd(16) {
+                let len = 1 + rnd(4) as usize;
+                keys.insert((0..len).map(|_| ALPHABET[rnd(5) as usize]).collect());
+            }
+            // (key, in DB, parent op, pending op); op 0 none, 1 put, 2 delete
+            let ops: Vec<(Vec<u8>, bool, u64, u64)> =
+                keys.iter().map(|k| (k.clone(), rnd(2) == 1, rnd(3), rnd(3))).collect();
+            let mut reference: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for (k, in_db, _, _) in &ops {
+                if *in_db {
+                    db.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+                    reference.insert(k.clone(), [b"db".as_slice(), k].concat());
+                }
+            }
+            let with_parent = round % 4 != 0;
+            let apply = |ov: &NativeStateOverlay, reference: &mut BTreeMap<Vec<u8>, Vec<u8>>, layer: u8| {
+                for (k, _, pa, pe) in &ops {
+                    let v = [&[layer], k.as_slice()].concat();
+                    match if layer == 0 { *pa } else { *pe } {
+                        1 => {
+                            ov.put_cf_raw(cf, k, &v).unwrap();
+                            reference.insert(k.clone(), v);
+                        }
+                        2 => {
+                            ov.delete_cf_raw(cf, k).unwrap();
+                            reference.remove(k);
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let parent = with_parent.then(|| {
+                let p = NativeStateOverlay::new(db.clone());
+                apply(&p, &mut reference, 0);
+                p.freeze(1)
+            });
+            let overlay = NativeStateOverlay::with_parent(db.clone(), parent);
+            apply(&overlay, &mut reference, 1);
+            let mut prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+            prefixes.insert(Vec::new());
+            for k in &keys {
+                for l in 1..=k.len() {
+                    prefixes.insert(k[..l].to_vec());
+                }
+                prefixes.insert([k.as_slice(), &[0xff]].concat());
+                if let Some(last) = k.iter().rposition(|&b| b != 0xff) {
+                    let mut succ = k[..=last].to_vec();
+                    succ[last] += 1;
+                    prefixes.insert(succ);
+                }
+            }
+            for _ in 0..4 {
+                let len = rnd(5) as usize;
+                prefixes.insert((0..len).map(|_| ALPHABET[rnd(5) as usize]).collect());
+            }
+            let all: Vec<(Vec<u8>, Vec<u8>)> = reference.clone().into_iter().collect();
+            assert_eq!(overlay.iterate_cf(cf, None).unwrap(), all, "round {round}: None");
+            for p in &prefixes {
+                let want: Vec<(Vec<u8>, Vec<u8>)> =
+                    all.iter().filter(|(k, _)| k.starts_with(p)).cloned().collect();
+                let got = overlay.iterate_cf(cf, Some(p)).unwrap();
+                assert_eq!(got, want, "round {round}: prefix {p:?} ops {ops:?}");
+                let from: Vec<(Vec<u8>, Vec<u8>)> = overlay
+                    .iterate_cf_from(cf, p, usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .collect();
+                assert_eq!(from, want, "round {round}: iterate_cf_from {p:?}");
+                assert_eq!(overlay.prefix_exists(cf, p).unwrap(), !want.is_empty(), "round {round}: exists {p:?}");
+                checked += 1;
+                non_empty += usize::from(!want.is_empty());
+            }
+            for (k, in_db, _, _) in &ops {
+                if *in_db {
+                    db.delete_cf_raw(cf, k).unwrap();
+                }
+            }
+        }
+        assert!(non_empty > checked / 4 && non_empty < checked, "non-vacuous: {non_empty} / {checked}");
     }
 
     #[test]
@@ -1754,6 +2519,7 @@ mod tests {
 
     #[test]
     fn owned_put_parent_reads_and_frozen_flush_match_borrowed_root_and_rows() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         let (old_db, _old_dir) = temp_db();
         let (owned_db, _owned_dir) = temp_db();
         for (db, owned) in [(&old_db, false), (&owned_db, true)] {
@@ -2157,6 +2923,7 @@ mod tests {
     /// native root equal to the full scan, in one atomic batch. Non-root CFs (nonces) are excluded.
     #[test]
     fn flush_with_native_trie_maintains_root() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{CF_NATIVE_NONCES, CF_STAKING_VALIDATORS};
         let (db, _dir) = temp_db();
         crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
@@ -2192,6 +2959,7 @@ mod tests {
     /// finds the native balance AND the marker, and the marker is byte-for-byte the height's BE bytes.
     #[test]
     fn flush_with_native_trie_and_marker_writes_marker_atomically() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{CF_CONSENSUS_META, CF_STAKING_VALIDATORS, META_NATIVE_APPLIED_HEIGHT};
         let (db, _dir) = temp_db();
         crate::native_trie::build_native_trie_to_cf(&db).unwrap(); // empty base
@@ -2767,6 +3535,7 @@ mod tests {
     /// it), and neither frozen set is mutated by the flush (read-only / Sync).
     #[test]
     fn sidecar_flush_identical_to_combined_overlay_flush() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         use crate::cf::{
             CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
             META_NATIVE_APPLIED_HEIGHT,
@@ -3005,6 +3774,103 @@ mod tests {
         crate::native_trie::build_native_trie_to_cf(&db).unwrap();
         assert!(!is_native_trie_stale(&db).unwrap());
         assert_eq!(persisted_native_root(&db).unwrap(), native_root_full(&db).unwrap());
+    }
+
+    /// Off -> on across a real restart: blocks flushed with maintenance off (the default) leave a
+    /// stale trie on disk; the DB is closed and reopened, and the boot helper with maintenance on
+    /// (`TORUS_NATIVE_TRIE_MAINTENANCE=1`) rebuilds it to the root of a run maintained throughout.
+    #[test]
+    fn maintenance_off_then_on_after_reopen_rebuilds_to_maintained_root() {
+        use crate::native_trie::{
+            ensure_native_trie_built, is_native_trie_stale, native_root_full, persisted_native_root,
+        };
+        let (db_on, _a) = temp_db();
+        s83_seed(&db_on);
+        s83_blocks(&db_on, 1, 4, true);
+        let maintained_root = persisted_native_root(&db_on).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = StateDb::open(dir.path()).unwrap();
+            s83_seed(&db);
+            s83_blocks(&db, 1, 4, false);
+            assert!(is_native_trie_stale(&db).unwrap());
+            assert_ne!(persisted_native_root(&db).unwrap(), maintained_root, "trie lags state");
+        }
+        let db = StateDb::open(dir.path()).unwrap();
+        assert!(is_native_trie_stale(&db).unwrap(), "stale marker survives the restart");
+        assert!(ensure_native_trie_built(&db, true).unwrap(), "ON at boot: rebuild");
+        assert!(!is_native_trie_stale(&db).unwrap());
+        assert_eq!(persisted_native_root(&db).unwrap(), maintained_root);
+        assert_eq!(maintained_root, native_root_full(&db).unwrap());
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(s83_dump(&db_on, cf), s83_dump(&db, cf), "CF {cf}");
+        }
+    }
+
+    /// Maintenance off: a block with NO native-root writes (only a non-root nonce) writes no stale
+    /// marker; the first block with native-root writes does.
+    #[test]
+    fn maintenance_off_stale_marker_only_with_native_writes() {
+        use crate::cf::{CF_CONSENSUS_META, CF_NATIVE_NONCES, META_NATIVE_TRIE_STALE};
+        use crate::native_trie::is_native_trie_stale;
+        let (db, _d) = temp_db();
+        s83_seed(&db);
+
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.put_cf_raw(CF_NATIVE_NONCES, b"\x01", b"n").unwrap();
+        let stats = {
+            let state = ov.pending.read().unwrap();
+            flush_pending_with_native_trie_stats(&state, None, &db, Some(1), None, None, false)
+                .unwrap()
+        };
+        assert!(!is_native_trie_stale(&db).unwrap(), "no native writes: no marker");
+        assert_eq!(
+            StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_TRIE_STALE).unwrap(),
+            None
+        );
+        assert_eq!(stats.dirty_entries_by_cf, [0; 7]);
+
+        s83_blocks(&db, 2, 2, false);
+        assert!(is_native_trie_stale(&db).unwrap(), "native writes: marker written");
+    }
+
+    /// Maintenance off still fills `dirty_entries_by_cf`, with the same values maintain mode
+    /// reports, including the deferred-book sidecar (whose keys may repeat the main set's).
+    #[test]
+    fn maintenance_off_dirty_entries_metric_matches_maintained() {
+        use crate::cf::{CF_NATIVE_NONCES, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS};
+        let run = |maintain: bool| {
+            let (db, _d) = temp_db();
+            s83_seed(&db);
+            let ov = NativeStateOverlay::new(db.clone());
+            ov.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01a", b"1").unwrap();
+            ov.put_cf_raw(CF_NATIVE_BALANCES, b"\x00\x01b", b"2").unwrap();
+            ov.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book1", b"x").unwrap();
+            ov.delete_cf_raw(CF_NATIVE_POSITIONS, b"\x00\x02gone").unwrap();
+            ov.put_cf_raw(CF_NATIVE_NONCES, b"\x01", b"n").unwrap();
+            let side = NativeStateOverlay::new(db.clone());
+            // `book1` repeats a main-set key (counted once); `book2` is new; a delete too.
+            side.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book1", b"y").unwrap();
+            side.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book2", b"z").unwrap();
+            side.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book3").unwrap();
+            let state = ov.pending.read().unwrap();
+            let side_state = side.pending.read().unwrap();
+            flush_pending_with_native_trie_stats(
+                &state,
+                Some(&side_state),
+                &db,
+                Some(1),
+                None,
+                None,
+                maintain,
+            )
+            .unwrap()
+            .dirty_entries_by_cf
+        };
+        let off = run(false);
+        assert_eq!(off, [2, 3, 1, 0, 0, 0, 0]);
+        assert_eq!(off, run(true));
     }
 
     // ======================================================================
@@ -3517,7 +4383,7 @@ mod tests {
                     }
                 }
                 let t = std::time::Instant::now();
-                // Root skip (TORUS_NATIVE_TRIE_MAINTENANCE=0): the configuration
+                // Root skip (maintenance off, the default): the configuration
                 // the running hash replaces the per-block root for.
                 // Odd heights hash (applied height set), even ones flush the
                 // same-sized set without any applied height into the
@@ -3558,5 +4424,107 @@ mod tests {
                 samples.len()
             );
         }
+    }
+}
+
+/// s89 fix B: the background compaction of the pruned oracle submission range
+/// is node-local and can never fail a flush.
+#[cfg(test)]
+mod submission_compaction_tests {
+    use super::*;
+    use crate::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
+
+    fn temp_db() -> (StateDb, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        (db, dir)
+    }
+
+    fn sub_key(market: u64) -> Vec<u8> {
+        [ORACLE_SUBMISSION_PREFIX, &market.to_be_bytes(), &[7u8; 20]].concat()
+    }
+
+    fn seed(db: &StateDb, markets: u64) {
+        let ov = NativeStateOverlay::new(db.clone());
+        for m in 1..=markets {
+            ov.put_cf_raw(CF_NATIVE_ORACLE, &sub_key(m), b"price").unwrap();
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None).unwrap();
+    }
+
+    fn prune(db: &StateDb, markets: u64) {
+        let ov = NativeStateOverlay::new(db.clone());
+        for m in 1..=markets {
+            ov.delete_cf_raw(CF_NATIVE_ORACLE, &sub_key(m)).unwrap();
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None)
+            .expect("a prune flush succeeds whatever the compaction does");
+    }
+
+    fn sub_tombstones_walked(db: &StateDb) -> u64 {
+        use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut ctx = PerfContext::default();
+        ctx.reset();
+        assert!(!StateBackend::prefix_exists(db, CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX).unwrap());
+        let n = ctx.metric(PerfMetric::InternalDeleteSkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        n
+    }
+
+    #[test]
+    fn failed_compaction_does_not_affect_execution() {
+        let (db, _dir) = temp_db();
+        db.fail_background_compaction(true);
+        seed(&db, 50);
+        prune(&db, 50);
+        assert_eq!(db.wait_background_compaction(), (0, 1), "one run, failed");
+        // State and later blocks are untouched by the failure.
+        assert!(StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))
+            .unwrap()
+            .is_empty());
+        assert_eq!(sub_tombstones_walked(&db), 50, "nothing was compacted");
+        seed(&db, 10);
+        assert_eq!(
+            StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))
+                .unwrap()
+                .len(),
+            10
+        );
+        // The job is not wedged by the failure: the next prune compacts.
+        db.fail_background_compaction(false);
+        prune(&db, 10);
+        assert_eq!(db.wait_background_compaction(), (1, 1));
+        assert_eq!(sub_tombstones_walked(&db), 0);
+    }
+
+    #[test]
+    fn only_a_submission_prune_schedules_a_compaction() {
+        let (db, _dir) = temp_db();
+        seed(&db, 20);
+        // Writes, and deletes outside the submission prefix: no compaction.
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, b"agg-other").unwrap();
+        ov.put_cf_raw(CF_NATIVE_ORACLE, &sub_key(99), b"price").unwrap();
+        ov.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        assert_eq!(db.wait_background_compaction(), (0, 0));
+        // The pipelined path (frozen set) schedules like the serial one.
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, &sub_key(1)).unwrap();
+        ov.freeze(1)
+            .flush_with_native_trie_stats(&db, None, None, None)
+            .unwrap();
+        assert_eq!(db.wait_background_compaction(), (1, 0));
+    }
+
+    #[test]
+    fn requests_while_running_coalesce() {
+        let (db, _dir) = temp_db();
+        for _ in 0..20 {
+            db.compact_pruned_submissions_in_background();
+        }
+        let (done, failed) = db.wait_background_compaction();
+        assert_eq!(failed, 0);
+        assert!((1..=20).contains(&done), "{done} runs for 20 requests");
     }
 }

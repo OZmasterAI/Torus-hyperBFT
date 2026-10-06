@@ -30,3 +30,7 @@ alloy-rlp = { workspace = true }
 revm = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Item 3 (s517) liquidation tests: seed positions / name the vault.
+# s517 oracle feeder review M1(b): decode oracle submission rows in tests.
+torus-core = { workspace = true }
+borsh = { workspace = true }

@@ -34,7 +34,7 @@ fn now_ms() -> u64 {
 
 pub use crate::error::MempoolError;
 pub use crate::evm_pool::EvmPoolEntry;
-pub use crate::native_pool::is_cancel;
+pub use crate::native_pool::{is_cancel, is_oracle_submission, is_priority};
 
 /// Timing of one [`Mempool::get_native_da_batch_timed`] call (s76).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,7 +248,7 @@ impl Mempool {
         let Some(limiter) = self.addr_limiter.get() else {
             return Ok(());
         };
-        if funded::is_validator_duty_of_validator(&self.state, sender, action) {
+        if self.is_duty_exempt(sender, action) {
             return Ok(());
         }
         // Traded volume via the same accessor the open-order limit uses; a
@@ -294,13 +294,17 @@ impl Mempool {
     }
 
     /// True when the native pool already holds at least the admission limit
-    /// of NON-cancels: new non-cancels would likely expire before inclusion.
+    /// of NORMAL entries: new ones would likely expire before inclusion.
     /// Pooled cancels are not counted (anti-spam): item C caps them at a share
     /// of each block, so they never delay orders by more than that share, and
     /// counting them let funded cancel spam make ingress shed every order.
+    /// Pooled oracle submissions are not counted either (merge with the crab
+    /// stack): at most ORACLE_PENDING_PER_VALIDATOR per validator, and they
+    /// bypass this screen themselves, so counting them could only let oracle
+    /// traffic shed orders.
     pub fn native_admission_backlogged(&self) -> bool {
         self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().non_cancel_size() >= limit)
+            .is_some_and(|limit| self.native.read().unwrap().normal_size() >= limit)
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -734,14 +738,48 @@ impl Mempool {
         action: SignedNativeAction,
         cache_key: Option<B256>,
     ) -> Result<(), MempoolError> {
-        self.check_funded(&sender, &action.action)?;
+        // A registered validator's duty actions (and its oracle signer's
+        // price submissions) skip item A and are not counted by item B (the
+        // state reads happen only for duty kinds).
+        let duty_exempt = self.is_duty_exempt(&sender, &action.action);
+        self.check_funded(&sender, &action.action, duty_exempt)?;
         let weight = rate_limit::order_count(&action.action) as u64;
-        // A registered validator's duty actions are not counted by item B
-        // (the validator-table read happens only for duty kinds).
-        let charge_b = self.addr_limiter.get().is_some()
-            && !funded::is_validator_duty_of_validator(&self.state, &sender, &action.action);
+        let charge_b = self.addr_limiter.get().is_some() && !duty_exempt;
+        // s517: oracle submissions get pool priority, so only an Active
+        // validator or its registered hot signer may pool one, at most
+        // ORACLE_PENDING_PER_VALIDATOR per validator (own address + signer).
+        // Every insert path (RPC, presigned, gossip recover/trusted) ends here.
+        let oracle_accounts = if crate::native_pool::is_oracle_submission(&action.action) {
+            match self.oracle_reporter(&sender) {
+                Some(accounts) => Some(accounts),
+                None => {
+                    return Err(MempoolError::NativeValidationFailed(format!(
+                        "oracle submission from {sender}: not an active validator or its signer"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         {
             let mut pool = self.native.write().unwrap();
+            if let Some(accounts) = &oracle_accounts {
+                // Count + evict + insert under one write lock: the cap cannot
+                // be raced. Review M1(a): at the cap the NEWEST submissions are
+                // kept — a newer one evicts the validator's oldest pooled one.
+                // A duplicate (gossip echo) evicts nothing (the insert reports
+                // it); one older than every pooled one is rejected.
+                if pool.oracle_pending(accounts) >= crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR
+                    && !pool.contains(&sender, &action)
+                    && !pool.evict_oldest_oracle_older_than(accounts, action.nonce)
+                {
+                    return Err(MempoolError::NativeValidationFailed(format!(
+                        "oracle pending cap {} reached for validator {} (all pooled submissions are newer)",
+                        crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
+                        accounts[0]
+                    )));
+                }
+            }
             let result = pool.insert_with_restash_key(sender, action, cache_key);
             self.publish_native_pool_size(&pool);
             result?;
@@ -762,6 +800,47 @@ impl Mempool {
         Ok(())
     }
 
+    /// Validator duties that skip anti-spam items A and B: any duty kind from
+    /// a registered validator (any status, so a jailed one can unjail —
+    /// [`funded::is_validator_duty_of_validator`]), and a `SubmitOraclePrices`
+    /// from an Active validator's registered oracle signer
+    /// ([`Self::oracle_reporter`]; merge with the crab stack). A signer can
+    /// only act for its validator in oracle submissions (exec's
+    /// `resolve_oracle_reporter`), so its other duty kinds get no exemption.
+    fn is_duty_exempt(&self, sender: &Address, action: &torus_types::NativeAction) -> bool {
+        funded::is_validator_duty_of_validator(&self.state, sender, action)
+            || (crate::native_pool::is_oracle_submission(action)
+                && self.oracle_reporter(sender).is_some())
+    }
+
+    /// The accounts whose pooled oracle submissions count against `sender`'s
+    /// validator: `[validator, signer?]` for an Active validator sender,
+    /// `[validator, sender]` for its registered hot signer, `None` otherwise.
+    /// At most 2 point reads; the signer index is cross-checked against the
+    /// validator record exactly like exec (`resolve_oracle_reporter`), so a
+    /// stale index entry never resolves.
+    fn oracle_reporter(&self, sender: &Address) -> Option<Vec<Address>> {
+        use torus_economics::ValidatorStatus;
+        let staking = torus_economics::StakingManager::new(self.state.clone());
+        if let Some(v) = staking.get_validator(sender).ok()? {
+            if v.status != ValidatorStatus::Active {
+                return None;
+            }
+            let mut accounts = vec![*sender];
+            accounts.extend(v.oracle_signer);
+            return Some(accounts);
+        }
+        let key = torus_state::cf::oracle_signer_key(sender);
+        let raw = self.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).ok()??;
+        if raw.len() != 20 {
+            return None;
+        }
+        let validator = Address::from_slice(&raw);
+        let rec = staking.get_validator(&validator).ok()??;
+        (rec.status == ValidatorStatus::Active && rec.oracle_signer == Some(*sender))
+            .then(|| vec![validator, *sender])
+    }
+
     /// Anti-spam item A: refuse a non-exempt action whose sender holds less
     /// than `ingress_min_collateral_trs` (see [`funded`]). Runs on every
     /// ingress path (RPC, gossip, forward) AFTER the sender is known — the
@@ -771,11 +850,12 @@ impl Mempool {
         &self,
         sender: &Address,
         action: &torus_types::NativeAction,
+        duty_exempt: bool,
     ) -> Result<(), MempoolError> {
         let min_trs = self.config.ingress_min_collateral_trs;
         if min_trs == 0
             || funded::is_exempt(action)
-            || funded::is_validator_duty_of_validator(&self.state, sender, action)
+            || duty_exempt
             || funded::is_funded(&self.state, sender, min_trs)
         {
             return Ok(());
@@ -820,7 +900,8 @@ impl Mempool {
         self.native.read().unwrap().size()
     }
 
-    /// True when the native pool is at capacity (every admit will fail).
+    /// True when the native pool is at capacity (every admit but an oracle
+    /// submission, which may evict a normal entry, will fail).
     pub fn native_pool_is_full(&self) -> bool {
         self.native.read().unwrap().is_full()
     }
@@ -3397,6 +3478,255 @@ mod tests {
         assert_eq!(pool.evm_pool_size(), 1);
     }
 
+    // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----
+
+    fn put_oracle_validator(
+        state: &StateDb,
+        v: Address,
+        status: torus_economics::ValidatorStatus,
+        signer: Option<Address>,
+    ) {
+        torus_economics::StakingManager::new(state.clone())
+            .put_validator(
+                &v,
+                &torus_economics::ValidatorState {
+                    address: v,
+                    pubkey: [1; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: signer,
+                },
+            )
+            .unwrap();
+        if let Some(s) = signer {
+            state
+                .put_cf_raw(
+                    torus_state::cf::CF_NATIVE_ORACLE,
+                    &torus_state::cf::oracle_signer_key(&s),
+                    v.as_slice(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn oracle_from(k: &SigningKey, nonce: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(1, torus_types::FixedPoint::ONE)],
+                timestamp: 0,
+            }),
+            nonce,
+            k,
+        )
+    }
+
+    const GATE_MSG: &str = "not an active validator or its signer";
+
+    fn assert_gate_rejects(r: Result<(), MempoolError>, who: &str) {
+        match r {
+            Err(MempoolError::NativeValidationFailed(m)) => {
+                assert!(m.contains(GATE_MSG), "{who}: {m}")
+            }
+            other => panic!("{who}: expected the oracle gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_admission_requires_active_validator_or_its_signer() {
+        use torus_economics::ValidatorStatus::{Active, Jailed};
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, ks) = (key(31), key(32));
+        let (v, s) = (address_from_key(&kv), address_from_key(&ks));
+        put_oracle_validator(&state, v, Active, Some(s));
+        let now = now_ms();
+
+        // Admitted: V itself (RPC path) and S through every insert path.
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now)).unwrap();
+        pool.add_native_action_presigned(s, oracle_from(&ks, now + 1)).unwrap();
+        assert_eq!(pool.drain_native(100).len(), 3, "stay under the per-validator cap");
+        pool.add_native_action_from_gossip(s, oracle_from(&ks, now + 2)).unwrap();
+        pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3)).unwrap();
+        assert_eq!(pool.native_pool_size(), 2);
+
+        // Rejected: a jailed validator and its signer.
+        let (kj, kjs) = (key(33), key(34));
+        let (j, js) = (address_from_key(&kj), address_from_key(&kjs));
+        put_oracle_validator(&state, j, Jailed, Some(js));
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kj, now)), "jailed validator");
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kjs, now)), "jailed validator's signer");
+        // A stranger, on every path.
+        let kx = key(35);
+        let x = address_from_key(&kx);
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kx, now)), "stranger");
+        assert_gate_rejects(pool.add_native_action_presigned(x, oracle_from(&kx, now)), "stranger presigned");
+        assert_gate_rejects(pool.add_native_action_from_gossip(x, oracle_from(&kx, now)), "stranger gossip");
+        assert_gate_rejects(pool.add_native_action_from_gossip_trusted(x, oracle_from(&kx, now)), "stranger trusted");
+        // A stale index entry: "sgn"||T -> V while V.oracle_signer == Some(S).
+        let kt = key(36);
+        let t = address_from_key(&kt);
+        state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .unwrap();
+        assert_gate_rejects(pool.add_native_action(oracle_from(&kt, now)), "stale index entry");
+        assert_eq!(pool.native_pool_size(), 2);
+        // Non-oracle actions are not gated.
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kx))
+            .unwrap();
+    }
+
+    /// Review M1(a): at the cap of 4 per validator (own address + signer), a
+    /// NEWER submission evicts the validator's OLDEST pooled one instead of
+    /// being rejected. A duplicate (gossip echo) or a submission older than
+    /// all pooled ones evicts nothing.
+    #[test]
+    fn oracle_cap_evicts_the_validators_oldest_submission() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, ks, kw) = (key(41), key(42), key(43));
+        let (v, s, w) = (address_from_key(&kv), address_from_key(&ks), address_from_key(&kw));
+        put_oracle_validator(&state, v, Active, Some(s));
+        put_oracle_validator(&state, w, Active, None);
+        let now = now_ms();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now + 2)).unwrap();
+        pool.add_native_action(oracle_from(&ks, now + 3)).unwrap();
+        assert_eq!(pool.native_pool_size(), 4);
+        // A gossip echo of a pooled submission: duplicate, nothing evicted.
+        assert!(matches!(
+            pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3)),
+            Err(MempoolError::DuplicateNativeAction)
+        ));
+        // Older than everything pooled: rejected, nothing evicted.
+        match pool.add_native_action(oracle_from(&kv, now - 5)) {
+            Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("oracle pending cap"), "{m}"),
+            other => panic!("expected the cap, got {other:?}"),
+        }
+        // Newer: evicts V's oldest (nonce `now`), admitted.
+        pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
+        assert_eq!(pool.native_pool_size(), 4);
+        // Another validator is unaffected; V's non-oracle actions are not capped.
+        pool.add_native_action(oracle_from(&kw, now)).unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
+            .unwrap();
+        let mut vs: Vec<u64> = pool
+            .drain_native(100)
+            .into_iter()
+            .filter(|a| crate::native_pool::is_oracle_submission(&a.action))
+            .filter(|a| a.recover_sender().map(|x| x == v || x == s).unwrap_or(false))
+            .map(|a| a.nonce)
+            .collect();
+        vs.sort_unstable();
+        assert_eq!(vs, vec![now + 1, now + 2, now + 3, now + 10], "the oldest (now) was evicted");
+    }
+
+    /// M4: the deepest pacing tier selects cancels, then oracle submissions;
+    /// everything else stays pooled.
+    #[test]
+    fn priority_only_tier_selects_cancels_then_oracle() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let (kv, kc) = (key(51), key(52));
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        let now = now_ms();
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
+            .unwrap();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::CancelOrder { order_id: 3 },
+            now + 1,
+            &kc,
+        ))
+        .unwrap();
+        let sel = pool.select_native_cancels_for_block_with_senders_excluding(
+            100,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 2);
+        assert!(is_cancel(&sel[0].1.action));
+        assert_eq!(sel[1].0, v);
+        assert!(crate::native_pool::is_oracle_submission(&sel[1].1.action));
+        assert_eq!(pool.native_pool_size(), 3, "the ClaimRewards stays pooled");
+    }
+
+    /// Merge with the crab stack (item 6 sync 2): with the pool FULL of cancel
+    /// spam and cancels at the item-C share, an Active validator's oracle
+    /// submission is still admitted (it evicts the last cancel) and is
+    /// selected into the next block, right after the capped cancel prefix.
+    #[test]
+    fn oracle_selected_next_block_under_full_pool_of_cancel_spam() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_pool_max_size: 40,
+            native_cancel_block_share_pct: 25,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), cfg);
+        let now = now_ms();
+        for i in 0..40u8 {
+            let k = key(100 + i);
+            pool.add_native_action_presigned(address_from_key(&k), cancel_all(&k, now))
+                .unwrap();
+        }
+        assert!(pool.native_pool_is_full());
+        let kv = key(61);
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        pool.add_native_action(oracle_from(&kv, now)).expect("oracle admitted into a full pool");
+        assert_eq!(pool.native_pool_size(), 40);
+        let sel = pool.select_native_for_block(20);
+        assert!(sel[..5].iter().all(|a| is_cancel(&a.action)), "ceil(25% of 20) cancels");
+        assert!(crate::native_pool::is_oracle_submission(&sel[5].action), "oracle right after the cap");
+        let paced = pool.select_native_cancels_for_block_with_senders_excluding(
+            20,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(paced[5].0, v, "the pacing tier keeps the oracle lane too");
+    }
+
+    /// Merge with the crab stack: pooled oracle submissions (bounded per
+    /// validator) are not admission backlog, so they never make ingress shed
+    /// orders — only normal entries count.
+    #[test]
+    fn pooled_oracle_submissions_do_not_count_as_admission_backlog() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let cfg = MempoolConfig {
+            native_admission_horizon_ms: 1,
+            native_admission_floor: 2,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), cfg);
+        let kv = key(62);
+        put_oracle_validator(&state, address_from_key(&kv), Active, None);
+        let now = now_ms();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
+        let kc = key(63);
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
+            .unwrap();
+        assert_eq!(pool.native_pool_size(), 3);
+        assert!(!pool.native_admission_backlogged(), "1 normal entry < limit 2");
+        let kd = key(64);
+        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kd))
+            .unwrap();
+        assert!(pool.native_admission_backlogged(), "2 normal entries reach the limit");
+    }
+
     // ---- Anti-spam item A: funded-account check ----
 
     fn funded_cfg(min_trs: u64) -> MempoolConfig {
@@ -3713,6 +4043,111 @@ mod tests {
         assert!(pool
             .addr_rate_admits(&xa, &attest(&x, t0 + 9).action)
             .is_err());
+    }
+
+    /// A pool with the funded check (A, 1 TRS) and the per-address limit
+    /// (B, buffer 4) both on.
+    fn antispam_pool() -> (TempDir, Mempool) {
+        let (dir, state) = setup();
+        let pool = Mempool::new(state, funded_cfg(1));
+        pool.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            4,
+            std::collections::HashSet::new(),
+            1_000,
+        )));
+        (dir, pool)
+    }
+
+    /// Merge with the crab stack (sync 2 step 5): a SubmitOraclePrices signed
+    /// by an Active validator's registered oracle signer skips A and B like
+    /// the validator's own, even when the signer holds no TRS and has used
+    /// its whole allowance.
+    #[test]
+    fn oracle_signer_submission_skips_funded_check_and_addr_limit() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, pool) = antispam_pool();
+        let (kv, ks) = (key(71), key(72));
+        let (v, s) = (address_from_key(&kv), address_from_key(&ks));
+        put_oracle_validator(&pool.state, v, Active, Some(s));
+        let t0 = now_ms();
+        // S exhausts its allowance through gossip (B counts, never refuses there).
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&ks, t0, 4))
+            .unwrap_err(); // A refuses the unfunded signer's order batch...
+        put_native(&pool.state, &s, ONE_TRS, 0);
+        pool.add_native_action_from_gossip_trusted(s, order_batch(&ks, t0, 4))
+            .unwrap();
+        put_native(&pool.state, &s, 0, 0); // ...so fund, exhaust, then unfund
+        assert_eq!(used(&pool, &ks), 4);
+        assert!(pool.addr_rate_admits(&s, &order_batch(&ks, t0 + 1, 1).action).is_err());
+        // The signer's oracle submissions: never refused by B at RPC, admitted
+        // unfunded by A on every path, and not charged.
+        for i in 0..3 {
+            let a = oracle_from(&ks, t0 + 10 + i);
+            pool.addr_rate_admits(&s, &a.action)
+                .expect("signer's oracle submission never refused by B");
+            pool.add_native_action_presigned(s, a)
+                .expect("signer's oracle submission skips A");
+        }
+        pool.add_native_action_from_gossip(s, oracle_from(&ks, t0 + 20))
+            .expect("gossip path too");
+        assert_eq!(used(&pool, &ks), 4, "oracle submissions are not charged");
+        // The exemption is for oracle submissions only: the signer's other
+        // duty kinds are not validator duties of a validator.
+        assert!(matches!(
+            pool.add_native_action_presigned(s, attest(&ks, t0 + 30)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+    }
+
+    /// The same action from a key that is neither a validator nor a
+    /// registered signer gets no exemption: A refuses it (unfunded), and B
+    /// counts it and refuses it at RPC once the allowance is used.
+    #[test]
+    fn oracle_submission_from_unregistered_key_gets_no_exemption() {
+        use torus_economics::ValidatorStatus::{Active, Jailed};
+        let (_dir, pool) = antispam_pool();
+        let kx = key(73);
+        let x = address_from_key(&kx);
+        let t0 = now_ms();
+        assert!(matches!(
+            pool.add_native_action_presigned(x, oracle_from(&kx, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // B: with A off, once the stranger has used its allowance (here on
+        // an order batch), RPC refuses its oracle submission too.
+        let (_dir2, state) = setup();
+        let b_only = Mempool::new(state, MempoolConfig::default());
+        b_only.set_addr_rate_limiter(std::sync::Arc::new(addr_rate::AddrRateLimiter::new(
+            1,
+            std::collections::HashSet::new(),
+            1_000,
+        )));
+        b_only
+            .add_native_action_from_gossip(x, order_batch(&kx, t0, 1))
+            .unwrap();
+        assert!(b_only
+            .addr_rate_admits(&x, &oracle_from(&kx, t0 + 1).action)
+            .is_err());
+        // A jailed validator's signer is not exempt either (the oracle gate
+        // and exec accept only Active validators' signers).
+        let (kj, kjs) = (key(74), key(75));
+        let (j, js) = (address_from_key(&kj), address_from_key(&kjs));
+        put_oracle_validator(&pool.state, j, Jailed, Some(js));
+        assert!(matches!(
+            pool.add_native_action_presigned(js, oracle_from(&kjs, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
+        // A stale signer index entry resolves to nothing.
+        let (kv, ks, kt) = (key(76), key(77), key(78));
+        let (v, t) = (address_from_key(&kv), address_from_key(&kt));
+        put_oracle_validator(&pool.state, v, Active, Some(address_from_key(&ks)));
+        pool.state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .unwrap();
+        assert!(matches!(
+            pool.add_native_action_presigned(t, oracle_from(&kt, t0)),
+            Err(MempoolError::UnfundedSender { .. })
+        ));
     }
 
     // ---- Anti-spam item B: counted on pool entry, enforced at RPC ----

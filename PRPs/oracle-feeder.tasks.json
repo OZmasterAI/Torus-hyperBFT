@@ -1,0 +1,360 @@
+{
+  "prp": "oracle-feeder",
+  "revision": 2,
+  "created": "2026-10-01T00:00:00Z",
+  "plan": "docs/plans/oracle-feeder-impl.md",
+  "design": "docs/plans/oracle-feeder.md",
+  "branch": "feat/oracle-feeder",
+  "base": "feat/oracle-aggregation@d4fe69c",
+  "worktree": "/home/crab/projects/Torus-hyperBFT-wt-feeder",
+  "cargo": "every cargo command: CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target via /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh",
+  "decisions": "rev2: HL-style hot oracle signer address on the validator record, set/rotated by SetOracleSigner signed by the validator EVM key, oracle-only, no expiry, one validator per signer (consensus, lockstep, own commit); session keys dropped; mempool order cancels -> oracle -> rest, priority only for Active validators/their signers, max 4 pending per validator; USDT/USDC=USD default, optional Kraken USDT/USD; >=3 sources AND >=50% weight; MATIC->POL; 3 s cadence; devnet unchanged",
+  "commits": {
+    "1": "oracle signer, consensus (S1-S4)",
+    "2": "mempool priority (M1-M4)",
+    "3": "rpc oracleSigner + ingress checks (R1-R2)",
+    "4": "wallet lib + set-oracle-signer (W1)",
+    "5": "feeder core (F1-F7)",
+    "6": "feeder binary + health + e2e (F8-F10)",
+    "7": "docs (D1)"
+  },
+  "open_questions": [
+    "Q-S1 hard-block all non-oracle actions FROM a signer address (strict) vs authority-scoped default D-S1",
+    "Q-S2 allow setting signer while Candidate (planned yes)"
+  ],
+  "tasks": [
+    {
+      "id": "S1",
+      "name": "OWN COMMIT 1 (consensus, lockstep): NativeAction::SetOracleSigner{signer} appended (tag 27, EIP-712 SetOracleSigner(address signer,uint64 nonce), requires_eip712, excluded from SessionScope::Full); ValidatorState.oracle_signer: Option<Address> (borsh appended, 10 literals); cf::oracle_signer_key = \"sgn\"||signer in CF_NATIVE_ORACLE",
+      "files": [
+        "crates/torus-types/src/lib.rs",
+        "crates/torus-types/src/eip712.rs",
+        "crates/torus-economics/src/types.rs",
+        "crates/torus-economics/src/staking.rs",
+        "crates/torus-state/src/cf.rs",
+        "crates/torus-genesis/src/lib.rs",
+        "crates/torus-consensus/src/app.rs",
+        "crates/torus-bridge/tests/oracle_block_tests.rs",
+        "crates/torus-integration-tests/tests/chaos.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-types && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-economics --lib && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-state --lib oracle_signer_key && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check -j6 --workspace --all-targets",
+      "depends_on": [],
+      "commit": 1,
+      "own_commit": true,
+      "status": "pending"
+    },
+    {
+      "id": "S2",
+      "name": "exec_set_oracle_signer: validator (not Tombstoned) only; signer != sender, not a validator, serves one validator; same = no-op; ZERO clears; rotation deletes old index; validate-then-write",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/oracle_signer_tests.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test oracle_signer_tests",
+      "depends_on": [
+        "S1"
+      ],
+      "commit": 1,
+      "status": "pending"
+    },
+    {
+      "id": "S3",
+      "name": "exec_submit_oracle_prices resolves reporter (validator record first, else sgn index + oracle_signer cross-check); Active check, row key and stake use the validator; tests: keyed+weighted by validator, unknown/jailed rejected, old signer rejected after rotation, signer cannot act for validator (state byte-identical)",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/oracle_signer_tests.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test oracle_signer_tests && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge --test oracle_block_tests && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge",
+      "depends_on": [
+        "S2"
+      ],
+      "commit": 1,
+      "status": "pending"
+    },
+    {
+      "id": "S4",
+      "name": "consensus pins: signer-signed submissions aggregate through whole blocks; same-block rotation counts old signer once then rejects; serial == crash replay with sgn rows",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle_signer && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib oracle && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-integration-tests --test chaos",
+      "depends_on": [
+        "S3"
+      ],
+      "commit": 1,
+      "status": "pending"
+    },
+    {
+      "id": "M1",
+      "name": "OWN COMMIT 2 (mempool priority): classes cancel=0, oracle=1, other=2; oracle evicts normal entry when full; priority-only walk; oracle_pending(accounts); is_oracle_submission/is_priority; ORACLE_PENDING_PER_VALIDATOR=4",
+      "files": [
+        "crates/torus-mempool/src/native_pool.rs",
+        "crates/torus-mempool/src/rate_limit.rs",
+        "crates/torus-mempool/src/lib.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-mempool --lib native_pool",
+      "depends_on": [
+        "S1"
+      ],
+      "commit": 2,
+      "own_commit": true,
+      "status": "pending"
+    },
+    {
+      "id": "M2",
+      "name": "mempool gate in submit_native_action_inner: oracle only from Active validator or its registered signer (sgn index + cross-check); cap 4 pending per validator across validator+signer under one write lock; torus-economics dep",
+      "files": [
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-mempool/Cargo.toml"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-mempool --lib oracle && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-mempool",
+      "depends_on": [
+        "M1"
+      ],
+      "commit": 2,
+      "status": "pending"
+    },
+    {
+      "id": "M3",
+      "name": "rpc backlog + pool-full pre-verify screens pass is_priority (torus.rs:456, :1122); tests: validator and signer oracle admitted under backlog/full, stranger rejected by gate",
+      "files": [
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc --lib admission_backlog && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc --lib pool_full",
+      "depends_on": [
+        "M2"
+      ],
+      "commit": 2,
+      "status": "pending"
+    },
+    {
+      "id": "M4",
+      "name": "pin priority-only pacing tier (cancels then oracle); app.rs wording only",
+      "files": [
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-mempool --lib priority_only && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib pacing && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib deferred_exec_counts_toward_pacing_backlog",
+      "depends_on": [
+        "M1",
+        "M2"
+      ],
+      "commit": 2,
+      "status": "pending"
+    },
+    {
+      "id": "R1",
+      "name": "rpc getValidators adds optional oracleSigner",
+      "files": [
+        "crates/torus-rpc/src/types.rs",
+        "crates/torus-rpc/src/torus.rs",
+        "crates/torus-rpc/src/lib.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc --lib get_validators && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc --test torus_staking_gov_rpc_tests",
+      "depends_on": [
+        "M3"
+      ],
+      "commit": 3,
+      "status": "pending"
+    },
+    {
+      "id": "R2",
+      "name": "rpc ingress oracle checks in validate_known_markets (1..=256, no dup, listed, valid_oracle_price) mirroring exec",
+      "files": [
+        "crates/torus-rpc/src/torus.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc --lib oracle && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc",
+      "depends_on": [
+        "R1"
+      ],
+      "commit": 3,
+      "status": "pending"
+    },
+    {
+      "id": "W1",
+      "name": "wallet lib+bin (lib exports keystore) + `validator set-oracle-signer --signer <addr> | --clear` (EIP-712 by validator keystore, run once by operator)",
+      "files": [
+        "tools/wallet/Cargo.toml",
+        "tools/wallet/src/lib.rs",
+        "tools/wallet/src/main.rs",
+        "tools/wallet/src/commands/validator.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-wallet",
+      "depends_on": [
+        "S1"
+      ],
+      "commit": 4,
+      "status": "pending"
+    },
+    {
+      "id": "F1",
+      "name": "OWN COMMIT 5 (feeder core): tools/price-feeder crate + config.rs (HL defaults, signer keystore|key file, quote_mode par|kraken_usdt, validation) + feeder.example.toml (MATIC->POL)",
+      "files": [
+        "Cargo.toml",
+        "tools/price-feeder/Cargo.toml",
+        "tools/price-feeder/src/lib.rs",
+        "tools/price-feeder/src/config.rs",
+        "tools/price-feeder/feeder.example.toml"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib config",
+      "depends_on": [],
+      "commit": 5,
+      "own_commit": true,
+      "status": "pending"
+    },
+    {
+      "id": "F2",
+      "name": "price.rs: parse_price, mid, lower weighted median, aggregate (5 s freshness, >=3 sources AND >=50% weight, quote modes)",
+      "files": [
+        "tools/price-feeder/src/price.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib price",
+      "depends_on": [
+        "F1"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F3",
+      "name": "exchange.rs: 7 venue URL builders + pure parsers over recorded fixtures (no network), HttpGet + ReqwestGet (4 MiB cap)",
+      "files": [
+        "tools/price-feeder/src/exchange.rs",
+        "tools/price-feeder/tests/fixtures/"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib exchange",
+      "depends_on": [
+        "F2"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F4",
+      "name": "fetch.rs: JoinSet fetch, per-venue backoff (1s doubling, 60s cap), last-good cache, Clock + fakes",
+      "files": [
+        "tools/price-feeder/src/fetch.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib fetch",
+      "depends_on": [
+        "F3"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F5",
+      "name": "submit.rs: build_submissions (listed + valid, BTreeMap, chunks of 256), property test vs exec rules, NonceGen, EIP-712 sign with signer key, error classification",
+      "files": [
+        "tools/price-feeder/src/submit.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib submit",
+      "depends_on": [
+        "F1"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F6",
+      "name": "node.rs: NodeApi + RpcNode (getMarkets paged, getValidators w/ oracleSigner, submitNativeAction) + startup_check (signer registered for validator, active, baseAsset/USD, key perms)",
+      "files": [
+        "tools/price-feeder/src/node.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib node",
+      "depends_on": [
+        "F5"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F7",
+      "name": "feeder.rs run_cycle + run loop",
+      "files": [
+        "tools/price-feeder/src/feeder.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib feeder && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder",
+      "depends_on": [
+        "F4",
+        "F6"
+      ],
+      "commit": 5,
+      "status": "pending"
+    },
+    {
+      "id": "F8",
+      "name": "OWN COMMIT 6 (feeder binary): health.rs ok/degraded/down, /health + /metrics",
+      "files": [
+        "tools/price-feeder/src/health.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib health",
+      "depends_on": [
+        "F7"
+      ],
+      "commit": 6,
+      "own_commit": true,
+      "status": "pending"
+    },
+    {
+      "id": "F9",
+      "name": "CLI keygen (wallet keystore; prints set-oracle-signer command) | address | check (never submits) | run; keyfile 0600",
+      "files": [
+        "tools/price-feeder/src/main.rs",
+        "tools/price-feeder/src/keyfile.rs"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --lib keyfile && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh build -j6 -p torus-price-feeder",
+      "depends_on": [
+        "F8",
+        "W1"
+      ],
+      "commit": 6,
+      "status": "pending"
+    },
+    {
+      "id": "F10",
+      "name": "e2e: real RpcServer+Mempool, Active validator with registered signer -> feeder cycle admitted with sender = signer; backlogged variant; unregistered signer fails startup_check",
+      "files": [
+        "tools/price-feeder/tests/rpc_e2e.rs",
+        "tools/price-feeder/Cargo.toml"
+      ],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder --test rpc_e2e",
+      "depends_on": [
+        "F9",
+        "M3",
+        "R1",
+        "R2"
+      ],
+      "commit": 6,
+      "status": "pending"
+    },
+    {
+      "id": "D1",
+      "name": "docs: price-feeder README runbook (keygen, set-oracle-signer once, config, check, systemd, health, rotation), design status, parity doc rows (oracle signer, mempool priority, lockstep)",
+      "files": [
+        "tools/price-feeder/README.md",
+        "docs/plans/oracle-feeder.md",
+        "docs/parity-audit-fixes-s515.md"
+      ],
+      "validate": "true",
+      "depends_on": [
+        "F10",
+        "S4"
+      ],
+      "commit": 7,
+      "status": "pending"
+    },
+    {
+      "id": "V",
+      "name": "verification (lead): per-crate suites, 11-crate run vs baseline recorded before S1, workspace check, clippy",
+      "files": [],
+      "validate": "cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-types && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-economics && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-bridge && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-consensus --lib && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-mempool && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-rpc && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-wallet && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh test -j6 -p torus-price-feeder && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh check --workspace --all-targets && cd /home/crab/projects/Torus-hyperBFT-wt-feeder && CARGO_TARGET_DIR=/home/crab/projects/Torus-hyperBFT-wt-feeder/target /tmp/claude-1000/-home-crab-projects-Torus-hyperBFT/3494bc74-14e1-46bc-8bdd-c0275a4443cf/scratchpad/cargo-serial.sh clippy -p torus-price-feeder -p torus-mempool -p torus-wallet -- -D warnings",
+      "depends_on": [
+        "D1"
+      ],
+      "commit": null,
+      "status": "pending"
+    }
+  ]
+}

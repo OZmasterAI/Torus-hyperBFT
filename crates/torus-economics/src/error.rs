@@ -18,6 +18,9 @@ pub enum EconomicsError {
     #[error("validator {0} already registered")]
     ValidatorAlreadyRegistered(Address),
 
+    #[error("{0} serves as a validator's oracle signer; that validator must clear it first")]
+    ServingOracleSigner(Address),
+
     #[error("delegation not found: {delegator} -> {validator}")]
     DelegationNotFound {
         delegator: Address,
@@ -166,4 +169,8 @@ pub enum EconomicsError {
     // Governance market listing
     #[error("market id {0} already exists")]
     MarketIdInUse(u64),
+
+    /// A listing's tick_size or lot_size is <= 0 (books are built from the row).
+    #[error("market listing {field} must be > 0")]
+    MarketListingNotPositive { field: &'static str },
 }

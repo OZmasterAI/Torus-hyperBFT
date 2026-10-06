@@ -174,7 +174,7 @@ fn call_get_order_book(db: &StateDb, market_id: MarketId) -> Result<Vec<Vec<u128
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&market_id.to_be_bytes());
     input.extend_from_slice(&word);
-    execute_precompile(&address, &input, &addr(0), db, 100)
+    execute_precompile(&address, &input, &addr(0), db, 100, 0)
         .map(|out| decode_u128_arrays(&out, 4))
         .map_err(|e| e.to_string())
 }

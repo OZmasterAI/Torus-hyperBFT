@@ -1,0 +1,273 @@
+{
+  "prp": "oracle-aggregation",
+  "revision": 3,
+  "created": "2026-09-30T00:00:00Z",
+  "plan": "docs/plans/oracle-aggregation-impl.md",
+  "design": "docs/plans/oracle-aggregation.md",
+  "branch": "feat/oracle-aggregation",
+  "base": "fix/parity-audit-bugs@3e9365e",
+  "decisions": "time-based oracle (window 10 s, stale 60 s after last fresh aggregate, header timestamps); R9 kept; C1+C2 kept; T0 epoch-skip first as its own commit; rev3: T0b block-timestamp validation (parent <= ts <= local+5s on proposal/body path only; proposer ts = max(now, parent)) as its own commit after T0; oracle ages clamp at 0; precompile time rule in the same commit as T2",
+  "baseline": "11-crate run: 1528 pass / 2 known torus-core fails; expected after: ~1571 pass / same 2 fails (recount at T11)",
+  "tasks": [
+    {
+      "id": 0,
+      "name": "OWN COMMIT, FIRST: consensus epoch processing on every boundary block (RED test: empty boundary block skips process_epoch_boundary; drop fix if GREEN) + single run_native flag incl. marker branch (C2)",
+      "status": "pending",
+      "own_commit": true,
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-consensus --lib epoch_boundary_block && cargo test -j6 -p torus-consensus --lib exec_pipeline && cargo test -j6 -p torus-consensus --lib crash",
+      "depends_on": [],
+      "commit": 1
+    },
+    {
+      "id": "0b",
+      "name": "OWN COMMIT, SECOND: block-timestamp validation (reject ts < parent ts or > local clock + 5 s) in finish_validate via effective_ts_rule on the proposal/body path only (validate_block); skipped for validate_block_for_sync, history (height <= local tip), execution and crash replay; proposer ts = max(now, parent ts); FLAG: header-first voting means the rule runs after the vote",
+      "status": "pending",
+      "own_commit": true,
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-consensus --lib timestamp && cargo test -j6 -p torus-consensus --lib async_validate && cargo test -j6 -p torus-consensus --lib crash && cargo test -j6 -p torus-consensus --lib oracle_clock",
+      "depends_on": [
+        0
+      ],
+      "commit": 2
+    },
+    {
+      "id": 1,
+      "name": "verify & pin: committed header timestamp reaches execution identically (serial, dispatch, crash replay); oracle test helpers; timestamp finding + safety flag (unvalidated timestamp) recorded in design doc",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs",
+        "docs/plans/oracle-aggregation.md"
+      ],
+      "validate": "cargo test -j6 -p torus-consensus --lib oracle_clock",
+      "depends_on": [
+        "0b"
+      ],
+      "commit": 2
+    },
+    {
+      "id": 2,
+      "name": "core: time-based oracle (window_secs 10, max_age_secs 60, agg row stores fresh-aggregate timestamp), one submission row per (market, validator), OraclePrice::usable, prune by time, bounds (price, entries), exact 3xMAD (R9); compile ripple: AccountReader now, set_mark x4, stale test, RPC now from latest header; ages clamp at 0 (test); COMMITTED TOGETHER WITH T8",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/oracle.rs",
+        "crates/torus-core/tests/oracle_tests.rs",
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/account_margin_tests.rs",
+        "crates/torus-bridge/tests/market_order_margin_tests.rs",
+        "crates/torus-bridge/tests/modify_order_tests.rs",
+        "crates/torus-bridge/tests/engine_parallel_tests.rs",
+        "crates/torus-rpc/src/torus.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-core --test oracle_tests && cargo test -j6 -p torus-core --lib oracle::tests && cargo test -j6 -p torus-bridge --test market_order_margin_tests && cargo test -j6 -p torus-bridge --test account_margin_tests && cargo test -j6 -p torus-bridge --test modify_order_tests && cargo check --workspace --all-targets",
+      "depends_on": [
+        1
+      ],
+      "commit": 3
+    },
+    {
+      "id": 3,
+      "name": "economics: GovernanceManager::listed_market_ids (8-byte keys ascending) + pub market_exists; next_market_id uses it",
+      "status": "pending",
+      "files": [
+        "crates/torus-economics/src/governance.rs",
+        "crates/torus-economics/tests/governance_tests.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-economics --test governance_tests",
+      "depends_on": [],
+      "commit": 4
+    },
+    {
+      "id": 4,
+      "name": "bridge: SubmitOraclePrices hardening, all-or-nothing (1..=256 entries, listed market, 0 < price <= 10^12, no duplicate market)",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/oracle_block_tests.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-bridge --test oracle_block_tests submission && cargo test -j6 -p torus-bridge --test oracle_block_tests only_active",
+      "depends_on": [
+        2,
+        3
+      ],
+      "commit": 5
+    },
+    {
+      "id": 5,
+      "name": "bridge: begin_block_oracle (prune by time + aggregate listed markets at ctx.timestamp, whole-token Active stakes, per-market results, storage fault -> fatal_error), oracle_due, whole_token_power",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/oracle_block_tests.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-bridge --test oracle_block_tests && cargo test -j6 -p torus-bridge --test market_order_margin_tests && cargo test -j6 -p torus-bridge --test account_margin_tests",
+      "depends_on": [
+        2,
+        3,
+        4
+      ],
+      "commit": 6
+    },
+    {
+      "id": 6,
+      "name": "consensus: wire begin_block_oracle before execute_batch(pre_evm); overlay built before the gate; oracle_due (layered read, fail-stop on error) added to run_native (C1)",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-consensus --lib oracle_e2e && cargo test -j6 -p torus-consensus --lib exec_pipeline && cargo test -j6 -p torus-consensus --lib crash",
+      "depends_on": [
+        5
+      ],
+      "commit": 7
+    },
+    {
+      "id": 7,
+      "name": "determinism gates: serial = pipelined (parked flush worker) = crash replay (all CFs + native root); chaos incremental root == full scan with the oracle step",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs",
+        "crates/torus-integration-tests/tests/chaos.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-consensus --lib oracle_determinism && cargo test -j6 -p torus-integration-tests --test chaos oracle",
+      "depends_on": [
+        6
+      ],
+      "commit": 8
+    },
+    {
+      "id": 8,
+      "name": "SAME COMMIT AS T2: precompiles 0x0802 (stale flag) / 0x0800 (UPnL) on the time-based usable rule; block timestamp threaded through execute_precompile* and TorusPrecompiles (block_cfg.timestamp); 36-byte agg row decode; clamp test (clock behind row)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/precompiles.rs",
+        "crates/torus-core/tests/precompile_tests.rs",
+        "crates/torus-evm/src/precompile_provider.rs",
+        "crates/torus-evm/src/executor.rs",
+        "crates/torus-integration-tests/tests/cross_vm_read.rs",
+        "crates/torus-integration-tests/tests/cross_vm_write.rs",
+        "crates/torus-bridge/tests/book_read_modes_tests.rs",
+        "crates/torus-bridge/tests/claim_unbonded_tests.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-core --test precompile_tests && cargo test -j6 -p torus-evm && cargo test -j6 -p torus-integration-tests --test cross_vm_read --test cross_vm_write && cargo check --workspace --all-targets",
+      "depends_on": [
+        2
+      ],
+      "commit": 3
+    },
+    {
+      "id": 9,
+      "name": "rpc: tests for getMarkPrice (stale = absent 0/0/0) and getPosition (UPnL at usable mark else entry) on header time",
+      "status": "pending",
+      "files": [
+        "crates/torus-rpc/src/lib.rs",
+        "crates/torus-rpc/src/torus.rs"
+      ],
+      "validate": "cargo test -j6 -p torus-rpc --lib mark_price && cargo test -j6 -p torus-rpc --lib get_position",
+      "depends_on": [
+        2
+      ],
+      "commit": 9
+    },
+    {
+      "id": 10,
+      "name": "docs: parity-audit-fixes-s515 known-deferred + behaviour table (oracle, epoch) + deployment; design doc decisions rev. 2",
+      "status": "pending",
+      "files": [
+        "docs/parity-audit-fixes-s515.md",
+        "docs/plans/oracle-aggregation.md"
+      ],
+      "validate": "true",
+      "depends_on": [
+        6,
+        8,
+        9
+      ],
+      "commit": 10
+    },
+    {
+      "id": 11,
+      "name": "end-to-end verification (lead): per-crate suites, chaos + cross_vm, 11-crate run (recount), cargo check --workspace --all-targets, engine_parallel_bench before/after",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -j6 -p torus-types -p torus-state -p torus-evm -p torus-core -p torus-consensus -p torus-bridge -p torus-rpc -p torus-mempool -p torus-economics -p torus-genesis -p torus-telemetry && cargo test -j6 -p torus-integration-tests --test chaos --test cross_vm_read --test cross_vm_write && cargo check --workspace --all-targets",
+      "depends_on": [
+        7,
+        8,
+        9,
+        10
+      ]
+    }
+  ],
+  "commits": [
+    {
+      "commit": 1,
+      "name": "epoch",
+      "tasks": [
+        0
+      ]
+    },
+    {
+      "commit": 2,
+      "name": "timestamp",
+      "tasks": [
+        "0b",
+        1
+      ]
+    },
+    {
+      "commit": 3,
+      "name": "oracle core",
+      "tasks": [
+        2,
+        8
+      ]
+    },
+    {
+      "commit": 4,
+      "tasks": [
+        3
+      ]
+    },
+    {
+      "commit": 5,
+      "tasks": [
+        4
+      ]
+    },
+    {
+      "commit": 6,
+      "tasks": [
+        5
+      ]
+    },
+    {
+      "commit": 7,
+      "tasks": [
+        6
+      ]
+    },
+    {
+      "commit": 8,
+      "tasks": [
+        7
+      ]
+    },
+    {
+      "commit": 9,
+      "tasks": [
+        9
+      ]
+    },
+    {
+      "commit": 10,
+      "tasks": [
+        10
+      ]
+    }
+  ]
+}

@@ -10,7 +10,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES, TRADE_WRITER,
-                    DrainTracker, acceptance, assess_liveness, parse_metrics)
+                    CHAIN_SUM, CHAIN_COUNT, DrainTracker, acceptance, assess_liveness,
+                    feed_live_rows, feed_live_summary, parse_metrics)
 from test_harness import BENCH_START, run_summarize, write_agreement, write_cell
 from collect_logs import collect
 
@@ -86,6 +87,98 @@ class DrainTest(unittest.TestCase):
         self.assertEqual(parse_metrics(''), {})
         self.assertEqual(parse_metrics(f'{MEMPOOL} NaN\n{COMMITTED} inf\n'), {})
         self.assertEqual(parse_metrics(f'{MEMPOOL} 0\n'), {MEMPOOL: 0.0})
+
+
+def feed(t, commits=100, mempool=None, exec_queue=None, flow=1000):
+    """A live oracle feed: native actions climb, the mempool holds 0..3 oracle
+    chunks, the exec queue runs 0..2 behind commit; order counters stay put."""
+    s = sample(commits + t, mempool=t % 4 if mempool is None else mempool,
+               exec_queue=t % 3 if exec_queue is None else exec_queue, flow=flow)
+    s[FLOW[2]] = 5000 + 3*t
+    return s
+
+
+class FeedLiveDrainTest(unittest.TestCase):
+    """ORACLE_FEED_DRAIN=1: the feed keeps submitting through the drain, so
+    native actions, the mempool and the exec queue never go quiet. Done = order
+    counters quiet, mempool within the feed's own footprint, no flush or
+    trade-writer work, exec lag <= max_lag, commits on every node."""
+
+    def test_live_feed_drains_only_in_feed_live_mode(self):
+        live, legacy = DrainTracker(10, feed_live=True, feed_mempool_max=6), DrainTracker(10)
+        for t in range(10):
+            nodes = [feed(t) for _ in NODES]
+            self.assertFalse(legacy.observe(t, nodes)['drained'])
+            self.assertFalse(live.observe(t, nodes)['drained'])
+        nodes = [feed(10) for _ in NODES]
+        self.assertFalse(legacy.observe(10, nodes)['drained'])
+        self.assertTrue(live.observe(10, nodes)['drained'])
+
+    def test_exec_lag_above_bound_restarts_the_window(self):
+        for max_lag, drained in ((2, False), (4, True)):
+            tracker = DrainTracker(10, feed_live=True, feed_mempool_max=6, max_lag=max_lag)
+            results = [tracker.observe(t, [feed(t, exec_queue=3 if t == 5 else None)
+                                           for _ in NODES]) for t in range(16)]
+            self.assertEqual(results[-1]['drained'], drained, max_lag)
+
+    def test_order_flow_mempool_flush_or_trade_writer_restart_the_window(self):
+        for fault in ('flow', 'mempool', 'flush', 'trade_writer'):
+            tracker = DrainTracker(10, feed_live=True, feed_mempool_max=6)
+            for t in range(16):
+                nodes = [feed(t) for _ in NODES]
+                if t == 9:
+                    if fault == 'flow':
+                        nodes[1] = feed(t, flow=1001)
+                    elif fault == 'mempool':
+                        nodes[1][MEMPOOL] = 7
+                    elif fault == 'flush':
+                        nodes[1][FLUSH] = 1
+                    else:
+                        nodes[1][TRADE_WRITER] = 1
+                self.assertFalse(tracker.observe(t, nodes)['drained'], (fault, t))
+
+    def test_live_mode_still_needs_commit_progress_on_every_node(self):
+        tracker = DrainTracker(10, feed_live=True, feed_mempool_max=6)
+        for t in range(30):
+            nodes = [feed(t) for _ in NODES]
+            nodes[2][COMMITTED] = 100
+            self.assertFalse(tracker.observe(t, nodes)['drained'])
+
+    def test_summary_reports_max_lag_and_native_block_exec_ms(self):
+        rows = [{'elapsed_s': t, 'node': 'val0', 'exec_lag': lag, 'chain_blocks': blocks,
+                 'chain_ms': ms} for t, lag, blocks, ms in
+                [(1, 9, 1, 999.0), (2, 1, 1, 40.0), (3, 2, 2, 50.0), (4, 0, 0, None),
+                 (5, 1, 1, 60.0), (6, 2, 1, 200.0)]]
+        out = feed_live_summary(rows, since=1)
+        self.assertEqual(out['max_exec_lag'], 2)
+        self.assertEqual(out['native_intervals'], 4)
+        self.assertEqual(out['single_block_intervals'], 3)
+        self.assertEqual(out['native_blocks'], 5)
+        self.assertEqual(out['chain_ms'], {'p50': 50.0, 'p95': 200.0, 'max': 200.0})
+        self.assertIsNone(feed_live_summary(rows, since=None)['max_exec_lag'])
+        self.assertIsNone(feed_live_summary(rows, since=6)['chain_ms'])
+
+    def test_sample_that_started_the_window_never_leaks_into_the_summary(self):
+        # Review of 37ff2af: rows rounded elapsed to ms while tracker.since is
+        # raw, so the window's first sample (its interval precedes the window:
+        # the last bench block, 900 ms here) leaked in whenever rounding went up.
+        def chain(count, secs):
+            return [dict(feed(0), **{CHAIN_COUNT: count, CHAIN_SUM: secs}) for _ in NODES]
+        for since in (5.0006, 5.0004, 5.0005, 7.123456789):
+            tracker_rows = feed_live_rows(since - 1, [{}]*3, chain(10, 1.0), 0)
+            tracker_rows += feed_live_rows(since, chain(10, 1.0), chain(11, 1.9), 0)
+            for k in range(1, 4):
+                tracker_rows += feed_live_rows(since + k, chain(10+k, 1.9 + 0.04*(k-1)),
+                                               chain(11+k, 1.9 + 0.04*k), k)
+            out = feed_live_summary(tracker_rows, since)
+            self.assertEqual(out['chain_ms'], {'p50': 40.0, 'p95': 40.0, 'max': 40.0}, since)
+            self.assertEqual((out['native_intervals'], out['native_blocks']), (9, 9), since)
+
+    def test_parse_metrics_keeps_exec_chain_series_only_when_asked(self):
+        text = f'{CHAIN_SUM} 1.5\n{CHAIN_COUNT} 3\n{MEMPOOL} 0\n'
+        self.assertEqual(parse_metrics(text), {MEMPOOL: 0.0})
+        self.assertEqual(parse_metrics(text, (CHAIN_SUM, CHAIN_COUNT)),
+                         {MEMPOOL: 0.0, CHAIN_SUM: 1.5, CHAIN_COUNT: 3.0})
 
 
 def histories(height=lambda t: t, backlog=lambda t: 1):
@@ -230,6 +323,55 @@ class DrainHttpTest(unittest.TestCase):
                 result = subprocess.run(command, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertFalse(json.loads((Path(directory)/'drain.json').read_text())['drained'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+class FeedLiveHttpTest(unittest.TestCase):
+    def test_cli_drains_under_a_live_feed_and_records_exec_lag_and_chain_ms(self):
+        class Metrics(BaseHTTPRequestHandler):
+            ticks = {}
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                t = self.ticks[self.path] = self.ticks.get(self.path, 0) + 1
+                # one oracle-only native block per scrape, 40 ms each
+                values = dict(feed(t), **{CHAIN_SUM: 0.04*t, CHAIN_COUNT: t})
+                body = ''.join(f'{k} {v}\n' for k, v in values.items()).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Metrics)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                command = ['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                           '--out', directory, '--timeout', '6', '--quiet', '2', '--urls',
+                           *[f'http://127.0.0.1:{server.server_port}/{n}' for n in NODES]]
+                legacy = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                self.assertEqual(legacy.returncode, 1, legacy.stderr)
+                self.assertFalse((Path(directory)/'drain-feed-live.tsv').exists())
+                self.assertNotIn('feed_live', json.loads((Path(directory)/'drain.json').read_text()))
+                live = subprocess.run(command + ['--feed-live', '--feed-mempool-max', '6',
+                                                 '--max-lag', '2'],
+                                      capture_output=True, text=True, timeout=20)
+                self.assertEqual(live.returncode, 0, live.stderr)
+                drain = json.loads((Path(directory)/'drain.json').read_text())
+                self.assertTrue(drain['drained'])
+                summary = drain['feed_live']
+                self.assertEqual((summary['max_lag_bound'], summary['feed_mempool_max']), (2, 6))
+                self.assertLessEqual(summary['max_exec_lag'], 2)
+                self.assertEqual(summary['chain_ms']['p50'], 40.0)
+                self.assertEqual(summary['chain_ms']['max'], 40.0)
+                lines = (Path(directory)/'drain-feed-live.tsv').read_text().splitlines()
+                self.assertEqual(lines[0].split('\t'), ['elapsed_s', 'node', 'committed',
+                                                        'exec_lag', 'mempool', 'chain_blocks',
+                                                        'chain_ms', 'quiet_elapsed_s'])
+                self.assertGreater(len(lines), 3*2)
+                self.assertIn('feed_live', live.stdout)
         finally:
             server.shutdown()
             server.server_close()

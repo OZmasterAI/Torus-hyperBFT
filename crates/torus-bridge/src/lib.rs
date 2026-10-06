@@ -16,7 +16,7 @@ pub use committer::BlockCommitter;
 pub use decode::{decode_all_txs, decode_rlp_tx, decode_txs_lossy, DecodedTx};
 pub use error::BridgeError;
 pub use native_executor::{
-    sort_native_actions, ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,
+    sort_native_actions, sort_native_actions_indexed, ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,
     NativeExecutor,
 };
 pub use proposer::{genesis_parent_header, BlockProposer, ProposedBlock};

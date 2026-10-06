@@ -33,7 +33,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions, BlockCommitter, BlockProposer, BlockValidator, BundleState,
+    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
     NativeExecContext, NativeExecutor,
 };
 use torus_economics::{EpochManager, SlashReason, StakingManager};
@@ -313,9 +313,11 @@ enum PacedSelectionCaps {
         bytes_cap: usize,
         orders_cap: usize,
     },
-    /// Deepest tier: propose ONLY pooled cancels — zero new orders enter the
-    /// exec pipeline while it digests the backlog (risk-reducing actions keep
-    /// flowing; selection stays non-destructive so nothing is shed).
+    /// Deepest tier: propose ONLY pooled cancels, then oracle submissions
+    /// (s517) — zero new orders enter the exec pipeline while it digests the
+    /// backlog (risk-reducing actions and the mark keep flowing; selection
+    /// stays non-destructive so nothing is shed). Name kept from the
+    /// cancels-only era.
     CancelsOnly,
 }
 
@@ -626,10 +628,21 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Item 6 Phase 1 (step 0.4): test-only reference switch — `true` runs
+    /// every native block without the resident rows R (`begin_resident(None,
+    /// ..)` = today's path: R's CFs are read from the DB). The node has no
+    /// runtime flag for R (D16).
+    #[cfg(test)]
+    test_no_resident_rows: bool,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
     test_crash_after_evm_section: bool,
+    /// Test-only stand-in for `TORUS_PARALLEL_ENGINE` (a process-global
+    /// `OnceLock`): `Some(n)` runs native batches through
+    /// `execute_batch_engine_mode(n)`; `None` = production `execute_batch`.
+    #[cfg(test)]
+    test_engine_threads: Option<usize>,
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1456,6 +1469,18 @@ fn check_parent_link(
         }
     };
     let expected = alloy_primitives::keccak256(parent.canonical_header_bytes());
+    // T0b (rebase s87): the timestamp never regresses below the parent's. A
+    // pure header comparison, so it holds the same on every replica and runs
+    // before the vote and on insertion alike.
+    if header.timestamp < parent.timestamp {
+        tracing::warn!(
+            height = header.height,
+            timestamp = header.timestamp,
+            parent_timestamp = parent.timestamp,
+            "REJECTED -- block timestamp regresses below its parent's"
+        );
+        return BlockDataCheck::Invalid;
+    }
     if header.height == parent.height + 1 && header.parent_hash == expected {
         return BlockDataCheck::Held;
     }
@@ -1467,6 +1492,33 @@ fn check_parent_link(
         "REJECTED -- header does not link to its parent block's header (ancestry violation)"
     );
     BlockDataCheck::Invalid
+}
+
+/// T0b: max seconds a proposal's header timestamp may run ahead of this
+/// node's clock before it refuses to VOTE for it (pre-vote only, see
+/// [`check_timestamp_drift`]).
+pub(crate) const MAX_BLOCK_TIMESTAMP_DRIFT_SECS: u64 = 5;
+
+/// T0b (rebase s87, owner option A): the local-clock half of the timestamp
+/// rule. Pre-vote ONLY (`check_proposal_data`, reached from hotstuff's
+/// `check_block_data` before every vote): clocks differ between replicas, so
+/// it must never reject a block at insertion, on block sync, at execution or
+/// in crash replay — a certified far-future block is accepted there.
+fn check_timestamp_drift(ts: u64, local_now: u64) -> Result<(), String> {
+    if ts > local_now.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_SECS) {
+        return Err(format!(
+            "timestamp {ts} > local clock {local_now} + {MAX_BLOCK_TIMESTAMP_DRIFT_SECS}s"
+        ));
+    }
+    Ok(())
+}
+
+/// This node's wall clock, UNIX seconds (the header timestamp unit).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---- Execution pipeline ----
@@ -1868,33 +1920,60 @@ impl ExecutionContext {
         // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
         // value is already burned, so a stranded credit is lost value).
         let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
-        let run_native = has_native
+        // bl2 exec pipeline: the overlay is built BEFORE verify so that the
+        // session lookup and the nonce replay guard below read through it —
+        // on the fast path its parent layer is the previous block's (possibly
+        // not yet durable) pending set, which is where a session created or a
+        // nonce consumed by block N−1 lives. On the serial path the overlay is
+        // empty with no parent, so every read is exactly the DB read it was.
+        // Item 2 (C1): it is built before the native gate so the oracle
+        // due-check reads DB + the pipelined parent layer (block h−1's rows may
+        // not be durable yet) — never `self.state_db` alone, which would diverge.
+        let parent = if pipelined {
+            self.last_job.lock().unwrap().clone()
+        } else {
+            None
+        };
+        debug_assert!(
+            parent.as_ref().is_none_or(|p| p.height() + 1 == height),
+            "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
+            parent.as_ref().map(|p| p.height())
+        );
+        let mut overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        // C2: the ONE flag for "this block ran the native phase" (marker / books below).
+        // Item 2 (C1): while submission rows exist the block-start oracle step is
+        // due — read only when nothing else runs the native phase (review L1).
+        // Item 3: so is the liquidation step while a cooldown or cursor row
+        // exists (a pending chunk / a cut pass must not wait for activity).
+        // A read error is a node fault: fail-stop (C4), never "assume".
+        // Bug (b): every boundary block runs it too (validator-set plans).
+        let run_native = if has_native
             || computed_fee_revenue > 0
             || core_writer_due
-            || EpochManager::is_epoch_boundary(height, self.epoch_length);
+            || EpochManager::is_epoch_boundary(height, self.epoch_length)
+        {
+            true
+        } else {
+            match NativeExecutor::oracle_due(&overlay)
+                .and_then(|due| Ok(due || NativeExecutor::liquidation_due(&overlay)?))
+            {
+                Ok(due) => due,
+                Err(e) => {
+                    tracing::error!(%e, height, "FATAL: oracle / liquidation due-check read failed — halting execution pipeline (fail-stop)");
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    if fold_header {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
+                    return;
+                }
+            }
+        };
 
         // ---- Native execution ----
         if run_native {
             // One verification pass resolves every sender too (EIP-712 ecrecover or
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
-            // bl2 exec pipeline: the overlay is built BEFORE verify so that the
-            // session lookup and the nonce replay guard below read through it —
-            // on the fast path its parent layer is the previous block's (possibly
-            // not yet durable) pending set, which is where a session created or a
-            // nonce consumed by block N−1 lives. On the serial path the overlay is
-            // empty with no parent, so every read is exactly the DB read it was.
-            let parent = if pipelined {
-                self.last_job.lock().unwrap().clone()
-            } else {
-                None
-            };
-            debug_assert!(
-                parent.as_ref().is_none_or(|p| p.height() + 1 == height),
-                "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
-                parent.as_ref().map(|p| p.height())
-            );
-            let overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
             overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
             let verify_timer = std::time::Instant::now();
             let resolved_senders = if has_native {
@@ -1961,6 +2040,9 @@ impl ExecutionContext {
 
             let replay_guard_timer = std::time::Instant::now();
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
+            // v2 action status: body position of each `sender_actions` entry.
+            let mut sender_body_index: Vec<u32> =
+                Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             let mut dropped_invalid: u64 = 0;
             // Defense-in-depth replay guard. The non-destructive mempool selection ×
@@ -2006,6 +2088,7 @@ impl ExecutionContext {
                 }
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
+                sender_body_index.push(i as u32);
             }
             if dropped_invalid > 0 {
                 // FIX 2: surface the count of dropped-at-exec actions (state-dependent
@@ -2025,23 +2108,6 @@ impl ExecutionContext {
                     .inc_by(sender_actions.len() as u64);
             }
 
-            // s84: the executed/skipped record rides this block's flush batch
-            // (or its frozen set on the pipelined path). Not a hashed or
-            // native-root CF, so state hash and root are untouched.
-            if has_native || has_evm {
-                let status = torus_state::action_status::BlockActionStatus {
-                    evm_skipped: std::mem::take(&mut evm_skipped),
-                    native_skipped,
-                };
-                if let Err(e) = overlay.put_cf_raw(
-                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
-                    &height.to_be_bytes(),
-                    &status.encode(),
-                ) {
-                    tracing::error!(%e, height, "failed to stage the executed/skipped record");
-                }
-            }
-
             overlay.seed_from_bundle(&bundle);
             // r3: header record rides the flush batch (see `fold_header`).
             let mut header_folded = false;
@@ -2053,7 +2119,13 @@ impl ExecutionContext {
                 }
             }
 
-            let (pre_evm, post_evm) = sort_native_actions(&sender_actions);
+            // Item 6 cut 1: the actions move into the sort (no second clone),
+            // which returns each entry's position in `sender_actions` for the
+            // action status below. Tests keep a copy for the pre-cut oracle.
+            #[cfg(test)]
+            let oracle_executed = sender_actions.clone();
+            let ((pre_evm, pre_index), (post_evm, post_index)) =
+                sort_native_actions_indexed(sender_actions);
             // rank8: books come from the resident holder when
             // TORUS_RESIDENT_BOOKS=1 (and its staleness guard passes);
             // otherwise this is exactly the classic per-block reload.
@@ -2061,6 +2133,28 @@ impl ExecutionContext {
                 .resident_books
                 .lock()
                 .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+            // Item 6 Phase 1: take (or build) the resident rows R — the
+            // previous block's post-state of CF_NATIVE_POSITIONS /
+            // CF_NATIVE_BALANCES — and attach them before the overlay is
+            // cloned into the context (`new_env` below); every read of the two
+            // CFs in this block is then served from memory. Not gated by
+            // TORUS_RESIDENT_BOOKS. Step 2: this is as late as R can be taken,
+            // so the previous block's `end_resident` worker overlaps everything
+            // above (verify, the replay guard, the bundle seed, the action
+            // sort); `begin_resident` waits for it first. Nothing above reads
+            // R's CFs through this overlay (the oracle / liquidation
+            // due-checks, sessions, nonces); a read of them before the attach
+            // would go to DB + parent layer, the same post-(h−1) content.
+            #[cfg(test)]
+            let no_resident_rows = self.test_no_resident_rows;
+            #[cfg(not(test))]
+            let no_resident_rows = false;
+            let mut resident_rows = torus_bridge::native_executor::begin_resident(
+                (!no_resident_rows).then_some(&mut *resident_books),
+                &mut overlay,
+                height,
+                self.metrics.as_deref(),
+            );
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -2124,12 +2218,17 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_load_books_seconds
                     .observe(load_books_timer.elapsed().as_secs_f64());
+                m.exec_margin_configs_seconds
+                    .observe(ctx.load_timings.margin_configs_ns as f64 / 1e9);
                 m.exec_resting_orders.set(ctx.resting_order_count() as i64);
                 if ctx.resident_rebuilt() {
                     m.exec_resident_rebuilds.inc();
                 }
             }
             ctx.metrics = self.metrics.clone();
+            // Item 6 C2: the slot's previous mark table / configs decide the
+            // version of this block's table (filled by begin_block_oracle).
+            ctx.attach_resident_block(&mut resident_rows);
             // O3 + s77: exec only records the block's fills; their packed
             // trade-history rows (node-local, non-root CFs) are encoded and
             // written after the flush below (background writer, or inline).
@@ -2143,8 +2242,24 @@ impl ExecutionContext {
             ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
 
             let engine_timer = std::time::Instant::now();
-            NativeExecutor::execute_batch(&mut ctx, &pre_evm);
-            NativeExecutor::execute_batch(&mut ctx, &post_evm);
+            // Item 2: aggregate every listed market BEFORE any action, at the block
+            // timestamp — the whole block (placements, modify, withdrawals,
+            // CoreWriter) reads one mark. A storage fault sets `fatal_error`
+            // (the fail-stop check after the batches catches it).
+            let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+            #[cfg(test)]
+            let engine_threads = self.test_engine_threads;
+            #[cfg(not(test))]
+            let engine_threads: Option<usize> = None;
+            let run_batch =
+                |ctx: &mut NativeExecContext<_>, list: &[(Address, torus_types::NativeAction)]| {
+                    match engine_threads {
+                        Some(n) => NativeExecutor::execute_batch_engine_mode(ctx, list, n),
+                        None => NativeExecutor::execute_batch(ctx, list),
+                    }
+                };
+            let mut pre_results = run_batch(&mut ctx, &pre_evm);
+            let mut post_results = run_batch(&mut ctx, &post_evm);
             // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
             // was consumed and this block's post-state is unreconstructable.
             // Do NOT run the remaining phases, do NOT flush the overlay or
@@ -2179,6 +2294,24 @@ impl ExecutionContext {
             // execute_batch phase timer — time it separately.
             let tail_timer = std::time::Instant::now();
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
+            // Item 3: the liquidation step — end of the block, on the block-start
+            // mark (`begin_block_oracle` above). The EVM ran before this phase:
+            // precompile readers see a block's liquidations from the next block.
+            let _ = NativeExecutor::run_liquidations(&mut ctx);
+            // F11: a storage fault in the step (or in CoreWriter) fail-stops
+            // exactly like the batches' check above.
+            if let Some(reason) = ctx.fatal_error.take() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native liquidation step failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
@@ -2222,6 +2355,57 @@ impl ExecutionContext {
                     .observe(secs(accum.cache_flush_ns));
                 m.exec_post_engine_tail_seconds.observe(tail_secs);
                 m.exec_engine_untimed_seconds.observe(untimed_secs);
+            }
+
+            // v2 action status: the executed/skipped record plus the native
+            // failures, mapped to body positions here (only the failing
+            // entries; their messages are moved, not copied). Encoded and
+            // written where the block's batch is built: the flush worker on
+            // the pipelined path, the flush below on the serial one. Not a
+            // hashed or native-root CF, so state hash and root are untouched.
+            // Item 6 cut 1: failures map to body positions by the sort's
+            // index (timed: `exec_action_status_seconds`).
+            #[cfg(test)]
+            let oracle_results = (pre_results.clone(), post_results.clone());
+            let action_status_timer = std::time::Instant::now();
+            let action_status = (has_native || has_evm).then(|| {
+                torus_state::action_status::BlockActionStatus {
+                    evm_skipped: std::mem::take(&mut evm_skipped),
+                    native_failed: crate::action_results::native_failures(
+                        &sender_body_index,
+                        [
+                            (&pre_evm, &pre_index, &mut pre_results),
+                            (&post_evm, &post_index, &mut post_results),
+                        ],
+                    ),
+                    native_skipped,
+                }
+            });
+            // Item 6 cut 5: the results (one entry per order, rejected
+            // orders' messages included) are dropped on the end_resident
+            // worker, not here.
+            resident_rows.drop_later((pre_results, post_results));
+            if let Some(ref m) = self.metrics {
+                m.exec_action_status_seconds
+                    .observe(action_status_timer.elapsed().as_secs_f64());
+            }
+            // Every exec-mode test checks the stored record against the
+            // pre-cut content match, byte for byte.
+            #[cfg(test)]
+            if let Some(status) = &action_status {
+                let oracle = torus_state::action_status::BlockActionStatus {
+                    native_failed: crate::action_results::native_failures_by_content(
+                        &oracle_executed,
+                        &sender_body_index,
+                        [(&pre_evm, oracle_results.0), (&post_evm, oracle_results.1)],
+                    ),
+                    ..status.clone()
+                };
+                assert_eq!(
+                    status.encode(),
+                    oracle.encode(),
+                    "cut 1: index mapping != content match at height {height}"
+                );
             }
 
             let save_books_timer = std::time::Instant::now();
@@ -2293,7 +2477,25 @@ impl ExecutionContext {
             let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
             // s80: `extras` is empty unless a stream wanted this block's fills.
             let (fills, extras) = ctx.take_pending_fills_and_extras();
+            // Item 6 C2: this block's mark table / configs ride the block's
+            // handle to `end_resident` (into the slot with R).
+            ctx.detach_resident_block(&mut resident_rows);
 
+            // Item 6 Phase 1: this block's own writes / tombstones of R's
+            // CFs, taken before the flush (serial). Nothing writes those CFs
+            // after this. Item 6 cut 5: pipelined, the end_resident worker
+            // takes them from the frozen set instead (identical: `freeze`
+            // moves the pending set out unchanged), off this thread.
+            let mut resident_delta: torus_bridge::native_executor::BlockDelta =
+                if resident_rows.attached() && !pipelined {
+                    overlay.own_pending_delta().into()
+                } else {
+                    torus_state::ResidentDelta::default().into()
+                };
+            #[cfg(test)]
+            let test_delta_before_freeze =
+                (pipelined && resident_rows.attached()).then(|| overlay.own_pending_delta());
+            let resident_ok;
             if pipelined {
                 debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
@@ -2310,16 +2512,42 @@ impl ExecutionContext {
                 let evm_addrs = overlay.dirty_evm_accounts();
                 drop(ctx);
                 let frozen = overlay.freeze(height);
+                if resident_rows.attached() {
+                    #[cfg(test)]
+                    assert_eq!(
+                        Some(frozen.resident_delta()),
+                        test_delta_before_freeze,
+                        "cut 5: the frozen set's delta is the one before freeze"
+                    );
+                    resident_delta =
+                        torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
+                }
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Flush {
                     height,
                     pending: frozen,
                     evm_addrs,
                     books: deferred_books,
                     order_nonces: order_nonces.clone(),
+                    action_status,
                 }) {
                     return;
                 }
+                resident_ok = true;
             } else {
+            if let Some(status) = &action_status {
+                let bytes =
+                    crate::action_results::encode_status(status, self.metrics.as_deref());
+                if let Err(e) = overlay.put_cf_raw(
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &bytes,
+                ) {
+                    tracing::error!(%e, height, "failed to stage the action status record");
+                }
+            }
+            // Item 6 Phase 1: the context's overlay clones hold R; drop them
+            // so `end_resident` can take R back.
+            drop(ctx);
             // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
             // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
             // marker fold is the crash-safety fix: native state and "this height is applied" now
@@ -2361,6 +2589,7 @@ impl ExecutionContext {
                     member_opt,
                 )
             };
+            resident_ok = flush_stats.is_ok();
             match &flush_stats {
                 Ok(stats) => {
                     if let Some(ref m) = self.metrics {
@@ -2435,6 +2664,29 @@ impl ExecutionContext {
                 m.observe_order_ages(OrderStage::Durable, order_nonces.iter().copied());
             }
             } // end serial flush
+
+            // Item 6 Phase 1: after the hand-off / the flush, R takes this
+            // block's delta and goes back to the holder at `height`. A failed
+            // flush (or an early return above: fatal block, failed hand-off)
+            // leaves the slot empty, so the next native block rebuilds R.
+            // Step 2: the work runs on a worker thread that owns R (the lock
+            // is held only to hand the job over); the next access of the
+            // rows slot — the next native block's `begin_resident` or an
+            // untouched block's `advance_untouched` — joins it first.
+            {
+                let mut holder = self
+                    .resident_books
+                    .lock()
+                    .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+                torus_bridge::native_executor::end_resident_on_worker(
+                    &mut holder,
+                    resident_rows,
+                    &mut overlay,
+                    resident_delta,
+                    resident_ok,
+                    self.metrics.clone(),
+                );
+            }
 
             // O3: hand this block's fills to the background writer, which
             // encodes and writes their trade-history rows — off the execution thread, after the atomic state flush
@@ -2553,7 +2805,8 @@ impl ExecutionContext {
         }
 
         // ---- Update tracking ----
-        // T156-F1: when the native execution path ran (native actions and/or fee revenue), the
+        // T156-F1: when the native execution path ran (`run_native`: native actions, fee revenue,
+        // a due CoreWriter row, an epoch boundary or oracle submission rows), the
         // applied-height marker was already folded into that path's atomic flush batch above
         // (flush_with_native_trie_and_marker), so native state and the marker committed together.
         // Only blocks that skipped the native path entirely (no native actions AND no fee revenue —
@@ -2566,6 +2819,7 @@ impl ExecutionContext {
             let status = torus_state::action_status::BlockActionStatus {
                 evm_skipped: std::mem::take(&mut evm_skipped),
                 native_skipped: vec![],
+                native_failed: vec![],
             };
             match self
                 .state_db
@@ -2574,7 +2828,7 @@ impl ExecutionContext {
                 Ok(cf) => evm_batch.get_or_insert_with(Default::default).put_cf(
                     cf,
                     height.to_be_bytes(),
-                    status.encode(),
+                    crate::action_results::encode_status(&status, self.metrics.as_deref()),
                 ),
                 Err(e) => {
                     tracing::error!(%e, height, "failed to stage the executed/skipped record")
@@ -2800,6 +3054,9 @@ pub struct TorusApp {
     epoch_length: u64,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
+    /// Tests: the local clock (UNIX s) the pre-vote timestamp check reads.
+    #[cfg(test)]
+    test_now_secs: Option<u64>,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     in_flight_hashes: InFlightHashLedger,
@@ -3666,7 +3923,11 @@ impl TorusApp {
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
+            test_no_resident_rows: false,
+            #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_engine_threads: None,
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -3678,11 +3939,13 @@ impl TorusApp {
         // Phase A A2.2: same for the native bucketed-Merkle trie. No-op after first boot; keeps the
         // incremental native root's base ready while the full-scan native root stays primary until
         // TORUS_INCREMENTAL_STATE_ROOT is enabled.
-        // s83 Option 0: also rebuilds a trie left stale by a `TORUS_NATIVE_TRIE_MAINTENANCE=0` run;
-        // with maintenance off it does nothing (stale => readers take the full-scan root).
+        // Maintenance is OFF by default (the maintained root has no production reader): then this
+        // does nothing (absent / stale => readers take the full-scan root). With
+        // `TORUS_NATIVE_TRIE_MAINTENANCE=1` it builds a missing trie and rebuilds one left stale by
+        // an earlier maintenance-off run, once, before replay.
         let maintain_trie = torus_state::native_trie::native_trie_maintenance_enabled();
         if !maintain_trie {
-            tracing::info!("native trie maintenance DISABLED (TORUS_NATIVE_TRIE_MAINTENANCE=0): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
+            tracing::info!("native trie maintenance off (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
         }
         if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db, maintain_trie) {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
@@ -3764,6 +4027,8 @@ impl TorusApp {
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
+            #[cfg(test)]
+            test_now_secs: None,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             in_flight_hashes: InFlightHashLedger::default(),
@@ -4390,6 +4655,15 @@ impl TorusApp {
         }
     }
 
+    /// The local clock the pre-vote timestamp check reads (T0b).
+    fn local_now_secs(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.test_now_secs {
+            return now;
+        }
+        unix_now_secs()
+    }
+
     fn hash_datum(bytes: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -4930,6 +5204,12 @@ impl TorusApp {
         if link != BlockDataCheck::Held {
             return link;
         }
+        // T0b (rebase s87): refuse to vote for a block too far ahead of this
+        // node's clock. Vote-time only: `validate_block` never applies it.
+        if let Err(reason) = check_timestamp_drift(header.timestamp, self.local_now_secs()) {
+            tracing::warn!(height = header.height, %reason, "not voting -- block timestamp");
+            return BlockDataCheck::Invalid;
+        }
         let Some(compact) = compact.filter(|c| !c.native_action_hashes.is_empty()) else {
             return BlockDataCheck::Held;
         };
@@ -4966,10 +5246,8 @@ impl TorusApp {
         // covers mempool selection, DA mirror, attestation, construction, encode.
         let build_timer = std::time::Instant::now();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // T0b: never below the parent (validators reject a regressing timestamp).
+        let timestamp = unix_now_secs().max(parent_header.timestamp);
 
         let gas_limit = if parent_header.evm_gas_limit == 0 {
             torus_evm::DEFAULT_BLOCK_GAS_LIMIT
@@ -5123,15 +5401,7 @@ impl App<RocksKVStore> for TorusApp {
                     let datums = parent_block.data.vec();
                     datums
                         .first()
-                        .and_then(|d| {
-                            bincode::deserialize::<TorusBlock>(d.bytes())
-                                .map(|b| b.header)
-                                .or_else(|_| {
-                                    bincode::deserialize::<CompactBlock>(d.bytes())
-                                        .map(|cb| cb.header)
-                                })
-                                .ok()
-                        })
+                        .and_then(|d| datum_header(d.bytes()))
                         .unwrap_or_else(|| self.last_header.clone())
                 } else {
                     self.last_header.clone()
@@ -5577,7 +5847,7 @@ impl TorusApp {
                 tracing::warn!(
                     exec_backlog,
                     tier,
-                    "exec-backlog pacing: deepest tier — proposing CANCELS ONLY \
+                    "exec-backlog pacing: deepest tier — proposing CANCELS + ORACLE ONLY \
                      (new orders stay pooled until execution catches up)"
                 );
                 mempool.select_native_cancels_for_block_with_senders_excluding(
@@ -8386,6 +8656,7 @@ mod crash_recovery_tests {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             staking.put_validator(&leader, &row).unwrap();
 
@@ -8499,6 +8770,7 @@ mod crash_recovery_tests {
                     status: ValidatorStatus::Active,
                     jailed_until: None,
                     last_commission_change_block: None,
+                    oracle_signer: None,
                 };
                 staking.put_validator(&addr, &row).unwrap();
             }
@@ -10472,7 +10744,11 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
+            test_no_resident_rows: false,
+            #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_engine_threads: None,
         }
     }
 
@@ -10793,11 +11069,23 @@ mod crash_recovery_tests {
                 "replica {replica} fail-stopped"
             );
 
+            // v2: both ClaimRewards execute (nonce consumed) and fail —
+            // nothing to claim — so they also carry a failure record.
+            let no_rewards = |index: u32, sender: Address| {
+                torus_state::action_status::NativeActionFailure::new(
+                    index,
+                    0,
+                    1,
+                    torus_state::action_status::FailureReason::Other,
+                    format!("no rewards to claim for {sender}"),
+                )
+            };
             assert_eq!(
                 action_status(&state_db, 1),
                 Some(torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![],
                     native_skipped: vec![false],
+                    native_failed: vec![no_rewards(0, k256_address(&key_a))],
                 })
             );
             assert_eq!(
@@ -10805,8 +11093,9 @@ mod crash_recovery_tests {
                 Some(torus_state::action_status::BlockActionStatus {
                     evm_skipped: vec![true, false],
                     native_skipped: vec![true, true, true, false],
+                    native_failed: vec![no_rewards(3, k256_address(&key_c))],
                 }),
-                "replica {replica}: replay, forged and expired skipped; valid executed"
+                "replica {replica}: replay, forged and expired skipped; valid executed (and failed)"
             );
             assert!(nonce_consumed(&state_db, k256_address(&key_a), 1));
             assert!(
@@ -10834,6 +11123,458 @@ mod crash_recovery_tests {
         }
         assert_dumps_equal(&dumps[0], &dumps[1], "replica 0 vs 1");
         assert_dumps_equal(&dumps[0], &dumps[2], "replica 0 vs 2");
+    }
+
+    // ---- v2 action status: per-action execution failures ----
+
+    /// Blocks for the failure-record tests (market 1, tick = lot = 1):
+    ///   1  fund A, B
+    ///   2  0 A sell 100x1 GTC                       executes (rests)
+    ///      1 B buy 100x1000 GTC                     fails: margin
+    ///      2 A sell 100.5x1 GTC                     fails: off-tick
+    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   fails: order 1 off-tick, 2 failed
+    ///      4 replay of block 1's A action           skipped
+    ///      5 A cancel unknown order id              fails (pre-EVM list)
+    ///      6 B IOC buy 100.5x1                      fails: off-tick (pre-EVM list)
+    ///      7 A sell 100x1 GTC (same as 0, new nonce) executes
+    ///   3  A sell 120x1 GTC                         executes (v1 record)
+    fn failure_fixture_blocks() -> Vec<TorusBlock> {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[72u8; 32]).unwrap();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty: i128| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: FixedPoint::from_raw(qty * FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let place = |o: torus_types::PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let fund_a = sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_a);
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![
+                    fund_a.clone(),
+                    sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_b),
+                ],
+            ),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 1000, 1)), 2, &k_a),
+                    sign(place(order(true, 1000, 1000)), 2, &k_b),
+                    sign(place(order(false, 1005, 1)), 3, &k_a),
+                    sign(
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(true, 900, 1),
+                            order(true, 905, 1),
+                            order(true, 910, 1),
+                            order(true, 915, 1),
+                        ]),
+                        3,
+                        &k_b,
+                    ),
+                    fund_a,
+                    sign(NativeAction::CancelOrder { order_id: 999_999 }, 4, &k_a),
+                    sign(
+                        place(torus_types::PlaceOrderParams {
+                            time_in_force: torus_types::TimeInForce::IOC,
+                            ..order(true, 1005, 1)
+                        }),
+                        4,
+                        &k_b,
+                    ),
+                    sign(place(order(false, 1000, 1)), 5, &k_a),
+                ],
+            ),
+            make_block(3, vec![sign(place(order(false, 1200, 1)), 6, &k_a)]),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Runs the failure fixture on a fresh DB: `engine_threads` pins the
+    /// engine (`None` = production `execute_batch`), `pipelined` hands the
+    /// flush to the worker. Returns the DB after every block is durable.
+    fn run_failure_fixture(engine_threads: Option<usize>, pipelined: bool) -> StateDb {
+        run_fixture_blocks(failure_fixture_blocks(), engine_threads, pipelined)
+    }
+
+    /// [`run_failure_fixture`] over `blocks` (block 1 = the funding block:
+    /// each of its senders gets an EVM balance first).
+    fn run_fixture_blocks(
+        blocks: Vec<TorusBlock>,
+        engine_threads: Option<usize>,
+        pipelined: bool,
+    ) -> StateDb {
+        let (_c, state_db) = make_test_config_and_db();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        for signed in &blocks[0].native_actions {
+            fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
+        }
+        let mut ctx = pipeline_ctx(&state_db, pipelined, None);
+        ctx.test_engine_threads = engine_threads;
+        for block in &blocks {
+            dispatch_and_execute(&ctx, &state_db, block);
+        }
+        assert!(ctx.pipeline_barrier(), "flush worker drained");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+        if pipelined {
+            assert_eq!(
+                ctx.flush_worker.as_ref().map(|w| w.durable_height()),
+                Some(blocks.len() as u64),
+                "every block went through the flush worker"
+            );
+        }
+        drop(ctx);
+        state_db
+    }
+
+    /// v2: margin-rejected, off-tick (single, IOC and inside a batch) and
+    /// unknown-cancel actions show failed with a reason, at their body
+    /// position, in every exec mode (production auto, engine threads 0/2/4)
+    /// and on both the serial and the pipelined flush; successes stay
+    /// executed, the replay stays skipped, and every run writes identical
+    /// bytes to every CF.
+    ///
+    /// RED before v2: the record only knew executed/skipped (no failures).
+    #[test]
+    fn execution_failures_are_recorded_identically_in_every_exec_mode() {
+        use torus_state::action_status::FailureReason;
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_failure_fixture(threads, pipelined);
+                let status = action_status(&db, 2).expect("block 2 record");
+                assert_eq!(
+                    status.native_skipped,
+                    vec![false, false, false, false, true, false, false, false],
+                    "{label}"
+                );
+                let got: Vec<(u32, u32, u32, FailureReason)> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| (f.index, f.order, f.failed_orders, f.reason))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        (1, 0, 1, FailureReason::Margin),
+                        (2, 0, 1, FailureReason::Tick),
+                        (3, 1, 2, FailureReason::Tick),
+                        (5, 0, 1, FailureReason::Other),
+                        (6, 0, 1, FailureReason::Tick),
+                    ],
+                    "{label}: {:?}",
+                    status.native_failed
+                );
+                assert!(
+                    status.native_failed[0]
+                        .message
+                        .starts_with("insufficient margin"),
+                    "{label}"
+                );
+                let labels: Vec<&str> = (0..8).map(|i| status.native_label(i)).collect();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "executed", "failed", "failed", "failed", "skipped", "failed", "failed",
+                        "executed"
+                    ],
+                    "{label}"
+                );
+                // Block 1 and 3: nothing failed -> the compact v1 record.
+                for h in [1u64, 3] {
+                    let raw = db
+                        .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &h.to_be_bytes())
+                        .unwrap()
+                        .expect("record");
+                    assert_eq!(raw[0], 0x01, "{label}: height {h} keeps v1");
+                    assert!(action_status(&db, h).unwrap().native_failed.is_empty());
+                }
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
+    }
+
+    /// Typed reasons, one action per reason code (market 1, tick = lot = 1):
+    ///   1  fund A, B, C
+    ///   2  0 A sell 100.5x1 GTC                       tick
+    ///      1 A stop-limit buy, limit 100.5             tick (row 40)
+    ///      2 A buy 100x0.5                             lot
+    ///      3 A buy 0x1 GTC                             price (row 41)
+    ///      4 A market buy, cap 0                       price
+    ///      5 B buy 100x1000 GTC                        margin
+    ///      6 C batch of 1001 buys 1x1                  open_limit at order 1000, 1 failed
+    ///      7 A empty PlaceOrderBatch                   batch_cap (0 failed orders)
+    ///      8 A cancel unknown order id                 other
+    ///      9 A sell 100x1 GTC                          executes
+    fn reason_fixture_blocks() -> Vec<TorusBlock> {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[81u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[82u8; 32]).unwrap();
+        let k_c = k256::ecdsa::SigningKey::from_slice(&[83u8; 32]).unwrap();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty_tenths: i128| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: px(qty_tenths),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let place = |o: PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let fund = |k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k);
+        let mut blocks = vec![
+            make_block(1, vec![fund(&k_a), fund(&k_b), fund(&k_c)]),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 1005, 10)), 2, &k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::StopLimit {
+                                trigger: px(1200),
+                                limit: px(1005),
+                            },
+                            ..order(true, 0, 10)
+                        }),
+                        3,
+                        &k_a,
+                    ),
+                    sign(place(order(true, 1000, 5)), 4, &k_a),
+                    sign(place(order(true, 0, 10)), 5, &k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::Market,
+                            time_in_force: TimeInForce::IOC,
+                            ..order(true, 0, 10)
+                        }),
+                        6,
+                        &k_a,
+                    ),
+                    sign(place(order(true, 1000, 10_000)), 2, &k_b),
+                    sign(
+                        NativeAction::PlaceOrderBatch(vec![order(true, 10, 10); 1001]),
+                        2,
+                        &k_c,
+                    ),
+                    sign(NativeAction::PlaceOrderBatch(vec![]), 7, &k_a),
+                    sign(NativeAction::CancelOrder { order_id: 999_999 }, 8, &k_a),
+                    sign(place(order(false, 1000, 10)), 9, &k_a),
+                ],
+            ),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Typed reasons: every reason code the executor can produce from a
+    /// block is stored as the executor's own reason (M1's tick / lot texts
+    /// included), at its body position, in every exec mode and on both
+    /// flushes, with identical bytes in every CF. `fill` needs a state
+    /// fault at settlement (bridge code path only).
+    #[test]
+    fn typed_reasons_are_stored_for_every_reason_code() {
+        use torus_state::action_status::FailureReason as R;
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_fixture_blocks(reason_fixture_blocks(), threads, pipelined);
+                let status = action_status(&db, 2).expect("block 2 record");
+                assert_eq!(status.native_skipped, vec![false; 10], "{label}");
+                let got: Vec<(u32, u32, u32, R)> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| (f.index, f.order, f.failed_orders, f.reason))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        (0, 0, 1, R::Tick),
+                        (1, 0, 1, R::Tick),
+                        (2, 0, 1, R::Lot),
+                        (3, 0, 1, R::Price),
+                        (4, 0, 1, R::Price),
+                        (5, 0, 1, R::Margin),
+                        (6, 1000, 1, R::OpenLimit),
+                        (7, 0, 0, R::BatchCap),
+                        (8, 0, 1, R::Other),
+                    ],
+                    "{label}: {:?}",
+                    status.native_failed
+                );
+                let msgs: Vec<&str> =
+                    status.native_failed.iter().map(|f| f.message.as_str()).collect();
+                for (i, want) in [
+                    "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
+                    "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
+                    "order rejected: quantity 0.50000000 below the lot size 1.00000000",
+                    "limit order requires a positive price",
+                    "market order requires a positive price cap",
+                    "insufficient margin",
+                    "open order limit reached: 1000 open orders, limit 1000",
+                    "PlaceOrderBatch skipped: 0 orders",
+                    "order 999999 not found",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert!(msgs[i].starts_with(want), "{label} #{i}: {:?}", msgs[i]);
+                }
+                assert_eq!(status.native_label(9), "executed", "{label}");
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
+    }
+
+    /// Item 6 cut 1: random blocks 2..=5 (three funded senders; repeated
+    /// identical orders of one sender under new nonces, off-tick / lot /
+    /// margin failures, PlaceOrderBatch with bad orders, empty batches, IOC
+    /// and cancels, replays skipped), in every exec mode and on both flushes.
+    /// Each block's stored record is checked against the pre-cut content
+    /// match byte for byte inside the exec path (`#[cfg(test)]` oracle);
+    /// here every run writes identical bytes to every CF and the blocks do
+    /// fail actions that share a sender and content.
+    #[test]
+    fn random_blocks_store_the_content_match_record_in_every_exec_mode() {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let keys: Vec<k256::ecdsa::SigningKey> = (91u8..94)
+            .map(|b| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap())
+            .collect();
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let px = |tenths: i128| FixedPoint::from_raw(tenths * FixedPoint::SCALE / 10);
+        let order = |is_buy: bool, tenths: i128, qty_tenths: i128, tif| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: px(tenths),
+            quantity: px(qty_tenths),
+            order_type: OrderType::Limit,
+            time_in_force: tif,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let mut seed = 0x51_7cc1_b727_220au64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut nonces = vec![1u64; keys.len()];
+        let mut blocks = vec![make_block(
+            1,
+            keys.iter()
+                .map(|k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k))
+                .collect(),
+        )];
+        let mut signed_so_far = blocks[0].native_actions.clone();
+        for height in 2..=5u64 {
+            let mut actions = Vec::new();
+            for _ in 0..24 {
+                let who = next(keys.len() as u64) as usize;
+                // A replay of an earlier action (skipped by the guard).
+                if next(10) == 0 {
+                    let i = next(signed_so_far.len() as u64) as usize;
+                    actions.push(signed_so_far[i].clone());
+                    continue;
+                }
+                // Few distinct contents, so one sender repeats them.
+                let buy = next(2) == 0;
+                let price = [995, 1000, 1005][next(3) as usize];
+                let qty = [10, 5, 100_000][next(3) as usize];
+                let tif = if next(4) == 0 {
+                    TimeInForce::IOC
+                } else {
+                    TimeInForce::GTC
+                };
+                let action = match next(7) {
+                    0 => NativeAction::CancelOrder {
+                        order_id: 999_999 + next(2) as u128,
+                    },
+                    1 => NativeAction::PlaceOrderBatch(
+                        (0..next(4))
+                            .map(|k| {
+                                order(buy, [1000, 1005][(k % 2) as usize], 10, TimeInForce::GTC)
+                            })
+                            .collect(),
+                    ),
+                    _ => NativeAction::PlaceOrder(order(buy, price, qty, tif)),
+                };
+                nonces[who] += 1;
+                actions.push(sign(action, nonces[who], &keys[who]));
+            }
+            signed_so_far.extend(actions.iter().cloned());
+            blocks.push(make_block(height, actions));
+        }
+        link_blocks(&mut blocks);
+        // Per block, per body position: does the sender have another action
+        // with the same content in the block? (Recovered once: slow in debug.)
+        let has_twin: Vec<Vec<bool>> = blocks
+            .iter()
+            .map(|block| {
+                let keyed: Vec<(Address, Vec<u8>)> = block
+                    .native_actions
+                    .iter()
+                    .map(|a| (a.recover_sender().unwrap(), a.action.canonical_bytes()))
+                    .collect();
+                keyed
+                    .iter()
+                    .map(|k| keyed.iter().filter(|o| *o == k).count() > 1)
+                    .collect()
+            })
+            .collect();
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_fixture_blocks(blocks.clone(), threads, pipelined);
+                let mut shared_content_failures = 0;
+                for (h, twin) in has_twin.iter().enumerate().skip(1) {
+                    let status = action_status(&db, h as u64 + 1).expect("record");
+                    assert!(status.native_skipped.iter().any(|&s| s), "{label}: replays");
+                    shared_content_failures += status
+                        .native_failed
+                        .iter()
+                        .filter(|f| twin[f.index as usize])
+                        .count();
+                }
+                assert!(
+                    shared_content_failures > 3,
+                    "{label}: failures among one sender's identical actions \
+                     ({shared_content_failures})"
+                );
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
     }
 
     // ---- s84 decision 2: the parent link is checked before the vote ----
@@ -11049,6 +11790,7 @@ mod crash_recovery_tests {
             Some(torus_state::action_status::BlockActionStatus {
                 evm_skipped: vec![true],
                 native_skipped: vec![],
+                native_failed: vec![],
             })
         );
         assert_eq!(action_status(&state_db, 2), None);
@@ -11674,6 +12416,7 @@ mod crash_recovery_tests {
             "torus_exec_block_seconds",
             "torus_exec_evm_seconds",
             "torus_exec_load_books_seconds",
+            "torus_exec_margin_configs_seconds",
             "torus_exec_body_persist_seconds",
         ] {
             assert!(
@@ -13110,6 +13853,7 @@ mod crash_recovery_tests {
     /// Run the fixture OFF (serial) or ON (pipeline), drain, return the full state
     /// dump + persisted native root + the ctx's fail-stop latch.
     fn run_pipeline_fixture(on: bool) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let gate = crate::exec_pipeline::WorkerGate::new();
@@ -13225,6 +13969,7 @@ mod crash_recovery_tests {
     /// consensus state.
     #[test]
     fn trade_history_off_writes_no_trade_rows_and_leaves_state_identical() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let run = |history: bool| {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
@@ -13282,6 +14027,7 @@ mod crash_recovery_tests {
         history: bool,
         sink_wants: Option<bool>,
     ) -> (Vec<CfDump>, torus_types::B256, Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
         let mut ctx = pipeline_ctx(&state_db, on, None);
@@ -13772,6 +14518,7 @@ mod crash_recovery_tests {
     ///       fail-stop, so restart-replay re-executes from the marker.
     #[test]
     fn exec_pipeline_deferred_books_atomic_and_match_serial() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         use torus_bridge::native_executor::{
             BookMode, NativeExecContext, NativeExecutor, ResidentBooks,
         };
@@ -13922,6 +14669,7 @@ mod crash_recovery_tests {
                     evm_addrs: vec![],
                     books: Some(save),
                     order_nonces: vec![],
+                    action_status: None,
                 })
                 .unwrap();
             assert!(worker.wait_idle());
@@ -13939,6 +14687,7 @@ mod crash_recovery_tests {
                 evm_addrs: vec![],
                 books: Some(save3.unwrap()),
                 order_nonces: vec![],
+                action_status: None,
             })
             .unwrap();
         assert!(gate.wait_received(3), "W must have taken job 3");
@@ -13977,6 +14726,7 @@ mod crash_recovery_tests {
                 evm_addrs: vec![],
                 books: save,
                 order_nonces: vec![],
+                action_status: None,
             })
             .unwrap();
         assert!(!worker_c.wait_idle(), "wait_idle must report the failure");
@@ -14123,6 +14873,7 @@ mod crash_recovery_tests {
         on: bool,
         mode: torus_bridge::native_executor::BookMode,
     ) -> (StateDb, Vec<CfDump>, torus_types::B256, Vec<u64>) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_book_fixture(&state_db);
         let gate = crate::exec_pipeline::WorkerGate::new();
@@ -14487,6 +15238,17 @@ mod crash_recovery_tests {
         to: alloy_primitives::TxKind,
         input: Vec<u8>,
     ) -> Vec<u8> {
+        signed_eip1559_with_value(key, nonce, to, input, U256::ZERO)
+    }
+
+    /// [`signed_eip1559`] carrying `value` wei.
+    fn signed_eip1559_with_value(
+        key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+        value: U256,
+    ) -> Vec<u8> {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
         use alloy_rlp::Encodable;
         let tx = TxEip1559 {
@@ -14496,7 +15258,7 @@ mod crash_recovery_tests {
             max_priority_fee_per_gas: 0,
             gas_limit: 300_000,
             to,
-            value: U256::ZERO,
+            value,
             input: alloy_primitives::Bytes::from(input),
             access_list: Default::default(),
         };
@@ -14770,6 +15532,7 @@ mod crash_recovery_tests {
                 status: torus_economics::types::ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             staking.put_validator(&addr, &v).unwrap();
         }
@@ -15104,6 +15867,7 @@ mod crash_recovery_tests {
                 status: ValidatorStatus::Active,
                 jailed_until: None,
                 last_commission_change_block: None,
+                oracle_signer: None,
             };
             staking.put_validator(&addr, &row).unwrap();
         }
@@ -15535,5 +16299,1984 @@ mod crash_recovery_tests {
         }
         assert!(parse_failstop(Some("1".to_string())));
         assert!(parse_failstop(Some(" 1 ".to_string())));
+    }
+
+    // ---- T0: epoch processing on EVERY boundary block ----
+
+    /// What the T0 fixture observed. `rewarded`: validator inflation reached the
+    /// validators at boundary 4. `validators`: (address, status, stake) after the
+    /// run. `vs_updates_at`: whether consensus-side `epoch_validator_set_updates`
+    /// emitted a validator-set change at boundaries 4 and 8 (a spurious diff
+    /// switches hotstuff out of the 2-chain Generic commit, memory d8e0cf6b).
+    #[derive(Debug, PartialEq)]
+    struct EpochOutcome {
+        rewarded: bool,
+        validators: Vec<(Address, torus_economics::ValidatorStatus, U256)>,
+        vs_updates_at: [bool; 2],
+    }
+
+    /// T0: epoch processing (permanent-stake rewards, validator inflation,
+    /// native-side rotation) lives in the native phase, which is skipped for a
+    /// block with no native action, fee or due CoreWriter row. HL runs epochs by
+    /// round count: an EMPTY boundary block must still run it. Four Active
+    /// validators (the BFT minimum), so the consensus-side rotation check is
+    /// not vacuous.
+    fn epoch_fixture(boundary_action: bool) -> EpochOutcome {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let staking = StakingManager::new(db.clone());
+        let vals: Vec<Address> = (1..=4u8).map(|i| Address::new([0x50 + i; 20])).collect();
+        for (i, v) in vals.iter().enumerate() {
+            let pubkey = ed25519_dalek::SigningKey::from_bytes(&[0x50 + i as u8; 32])
+                .verifying_key()
+                .to_bytes();
+            staking
+                .put_validator(v, &torus_economics::ValidatorState {
+                    address: *v,
+                    pubkey,
+                    commission_bps: 500,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION * U256::from(100 + i as u64),
+                    total_delegated: U256::ZERO,
+                    status: torus_economics::ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: None,
+                })
+                .unwrap();
+        }
+        // Consensus side: genesis set from staking, as on a real node
+        // (`Genesis::initialize` records it; consensus bug (b): the first
+        // execution-planned rotation diffs against it).
+        let genesis_set = EpochManager::compute_new_validator_set(&staking, u32::MAX, 0).unwrap();
+        staking.record_genesis_epoch_set(&genesis_set).unwrap();
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3u64 {
+            let root_before = torus_state::native_trie::persisted_native_root(&db).unwrap();
+            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            // Empty NON-boundary blocks keep skipping the native phase: marker
+            // only, native root untouched, no epoch side effect.
+            assert_eq!(read_native_applied_height(&db), Some(h));
+            assert_eq!(
+                torus_state::native_trie::persisted_native_root(&db).unwrap(),
+                root_before,
+                "empty non-boundary block {h} must not touch native state"
+            );
+            assert!(vals.iter().all(|v| staking.get_pending_rewards(v).unwrap().is_none()));
+        }
+        // Block 4 = epoch boundary; its proposal asks for the set change first.
+        let at4 = app.epoch_validator_set_updates(4).expect("plan ready at 4").is_some();
+        let actions = if boundary_action { vec![sign_claim_rewards(4)] } else { vec![] };
+        ctx.execute_committed_block(&make_block(4, actions), vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(4));
+        let rewarded = vals.iter().all(|v| {
+            staking.get_pending_rewards(v).unwrap().is_some_and(|r| r.amount > U256::ZERO)
+        });
+        // Blocks 5-7 empty, linked to the persisted block 4 (non-empty in the
+        // control); the rotation at boundary 8 then reads 4's post-state + 5-7.
+        let stored4 = db.get_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes()).unwrap().unwrap();
+        let mut parent_hash = B256::from_slice(&stored4[..32]);
+        for h in 5..=7u64 {
+            let mut b = make_block(h, vec![]);
+            b.header.parent_hash = parent_hash;
+            parent_hash = alloy_primitives::keccak256(b.header.canonical_header_bytes());
+            ctx.execute_committed_block(&b, vec![]);
+            assert_eq!(read_native_applied_height(&db), Some(h));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        let at8 = app.epoch_validator_set_updates(8).expect("plan ready at 8").is_some();
+        drop(ctx);
+        let validators = staking
+            .all_validators()
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.address, v.status, v.total_stake()))
+            .collect();
+        EpochOutcome { rewarded, validators, vs_updates_at: [at4, at8] }
+    }
+
+    /// Control (GREEN today): a NON-empty boundary block credits inflation and
+    /// changes nothing on the consensus side (unchanged set -> no updates).
+    #[test]
+    fn nonempty_epoch_boundary_block_runs_epoch_processing() {
+        let out = epoch_fixture(true);
+        assert!(out.rewarded, "control: inflation must be non-zero for this fixture");
+        assert_eq!(out.vs_updates_at, [false, false], "no validator-set diff: {out:?}");
+        assert!(out
+            .validators
+            .iter()
+            .all(|(_, s, _)| *s == torus_economics::ValidatorStatus::Active));
+    }
+
+    /// T0: the EMPTY boundary block runs the same epoch processing and yields the
+    /// SAME validator statuses / stakes / consensus-side updates as the control.
+    #[test]
+    fn empty_epoch_boundary_block_runs_epoch_processing() {
+        let empty = epoch_fixture(false);
+        assert!(empty.rewarded, "empty boundary block 4 must distribute validator inflation");
+        assert_eq!(empty, epoch_fixture(true), "empty vs non-empty boundary must match");
+    }
+
+    // ---- T0b: block timestamp rule (rebase s87, owner option A) ----
+
+    #[test]
+    fn proposal_timestamp_drift_bound() {
+        assert!(check_timestamp_drift(1_005, 1_000).is_ok(), "drift 5");
+        assert!(check_timestamp_drift(1_006, 1_000).is_err(), "drift 6");
+        assert!(check_timestamp_drift(0, 0).is_ok(), "first block after genesis (ts 0)");
+        assert!(check_timestamp_drift(50, 1_000).is_ok(), "behind the clock");
+        assert!(check_timestamp_drift(u64::MAX, u64::MAX).is_ok(), "no overflow");
+    }
+
+    /// The parent-timestamp source reads the header of either datum format.
+    #[test]
+    fn proposal_timestamp_datum_header_decodes_full_and_compact() {
+        let mut b = make_block(7, vec![sign_claim_rewards(7)]);
+        b.header.timestamp = 123_456;
+        for compact in [false, true] {
+            let h = datum_header(&encode_proposal_datum(&b, compact)).unwrap();
+            assert_eq!(h.canonical_header_bytes(), b.header.canonical_header_bytes(), "compact={compact}");
+        }
+    }
+
+    fn ts_app(now: u64) -> TorusApp {
+        let (config, db) = make_test_config_and_db();
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        app.test_now_secs = Some(now);
+        app
+    }
+
+    fn child_of(parent: &TorusBlock, ts: u64) -> TorusBlock {
+        let h = parent.header.height + 1;
+        let mut b = make_block(h, vec![]);
+        b.header.parent_hash = alloy_primitives::keccak256(parent.header.canonical_header_bytes());
+        b.header.timestamp = ts;
+        b
+    }
+
+    fn tip_2000() -> TorusBlock {
+        let mut parent = make_block(4, vec![]);
+        parent.header.timestamp = 2_000;
+        parent
+    }
+
+    /// `check_proposal_data` (the pre-vote check) of `block` on the parent
+    /// header `parent` (a non-genesis justify).
+    fn pre_vote(app: &mut TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        app.check_proposal_data(&hs_block(block, justify_for(&hs_parent)), move |_| {
+            ParentHeader::Header(Box::new(header))
+        })
+    }
+
+    /// A far-future proposal gets no vote: the pre-vote check refuses a
+    /// timestamp more than MAX_BLOCK_TIMESTAMP_DRIFT_SECS ahead of the local
+    /// clock; at the bound it votes.
+    #[test]
+    fn far_future_proposal_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_015)), BlockDataCheck::Held);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_016)), BlockDataCheck::Invalid);
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 9_999_999)),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// No wedge: the same far-future block, once certified, is accepted
+    /// wherever it is inserted — validate_block's link check (insertion /
+    /// header + body / full proposal), the datum path (also block sync), and
+    /// execution / crash replay never read the local clock.
+    #[test]
+    fn far_future_block_is_accepted_at_insertion_sync_execution_and_replay() {
+        let parent = tip_2000();
+        let far = child_of(&parent, 9_999_999);
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &far), BlockDataCheck::Invalid, "no vote");
+
+        // Insertion: validate_block's parent-link check, then the datum path.
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        assert_eq!(
+            check_parent_link(&far.header, &justify_for(&hs_parent), move |_| {
+                ParentHeader::Header(Box::new(header))
+            }),
+            BlockDataCheck::Held
+        );
+        let datum = encode_proposal_datum(&far, false);
+        assert!(matches!(
+            app.validate_datum(&datum, &data_hash_of(&datum)),
+            ValidateBlockResponse::Valid { .. }
+        ));
+
+        // Execution and crash replay.
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut b1 = make_block(1, vec![]);
+            b1.header.timestamp = 9_999_999;
+            if replay {
+                persist_committed_block_durably(&db, &b1);
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                ctx.execute_committed_block(&b1, vec![]);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "replay={replay}");
+        }
+    }
+
+    /// A regressing timestamp is refused before the vote and by
+    /// `check_parent_link` (so also on insertion: a certified block never
+    /// regresses, because a quorum ran the same pure header check).
+    #[test]
+    fn regressing_timestamp_is_refused_before_the_vote_and_by_the_parent_link() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_000)), BlockDataCheck::Held);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 1_999)), BlockDataCheck::Invalid);
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        for (ts, want) in [(2_000, BlockDataCheck::Held), (1_999, BlockDataCheck::Invalid)] {
+            let header = parent.header.clone();
+            assert_eq!(
+                check_parent_link(&child_of(&parent, ts).header, &justify_for(&hs_parent), move |_| {
+                    ParentHeader::Header(Box::new(header))
+                }),
+                want,
+                "ts {ts}"
+            );
+        }
+    }
+
+    /// Genesis / first block: parent = genesis_parent_header (ts 0): only the
+    /// drift bound can refuse it.
+    #[test]
+    fn proposal_timestamp_first_block_only_has_the_drift_bound() {
+        let mut app = ts_app(1_700_000_000);
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let mut b1 = make_block(1, vec![]);
+        b1.header.timestamp = 1_700_000_000;
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Held
+        );
+        b1.header.timestamp = 1_700_000_006;
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// The proposer never emits a timestamp below its parent's, even when the
+    /// parent's is ahead of the local clock (within drift), and the block it
+    /// produces passes the pre-vote rule on a validator with the same clock.
+    #[test]
+    fn proposal_timestamp_from_proposer_after_future_ish_parent_is_valid() {
+        let (config, db) = make_test_config_and_db();
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        let now = unix_now_secs();
+        let mut parent = app.last_header.clone();
+        parent.timestamp = now + 3;
+        let _ = app.build_proposal(parent.clone());
+        let produced = &app.pending_proposals[&(parent.height + 1)].block;
+        assert!(produced.header.timestamp >= parent.timestamp, "never below the parent");
+        assert!(check_timestamp_drift(produced.header.timestamp, now).is_ok());
+    }
+
+    /// Committed history is accepted as-is: execution and crash replay never
+    /// check the timestamp (a regressing one included).
+    #[test]
+    fn proposal_timestamp_execution_and_replay_accept_committed_history() {
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut blocks = vec![
+                make_block(1, vec![sign_claim_rewards(1)]),
+                make_block(2, vec![sign_claim_rewards(2)]),
+            ];
+            blocks[0].header.timestamp = 5_000;
+            blocks[1].header.timestamp = 4_000;
+            link_blocks(&mut blocks);
+            if replay {
+                for b in &blocks {
+                    persist_committed_block_durably(&db, b);
+                }
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                for b in &blocks {
+                    ctx.execute_committed_block(b, vec![]);
+                }
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(2), "replay={replay}");
+        }
+    }
+
+    // ---- item 2: oracle helpers ----
+
+    const ORACLE_MARKET: u64 = 1;
+    /// (signing-key seed, stake multiple of MIN_SELF_DELEGATION).
+    const ORACLE_VALIDATORS: [(u8, u64); 3] = [(61, 1), (62, 1), (63, 3)];
+
+    fn oracle_key(seed: u8) -> k256::ecdsa::SigningKey {
+        k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap()
+    }
+
+    fn oracle_addr(seed: u8) -> Address {
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 0, &oracle_key(seed))
+            .recover_sender()
+            .unwrap()
+    }
+
+    fn oracle_put_validator(db: &StateDb, seed: u8, mult: u64, status: torus_economics::ValidatorStatus) {
+        StakingManager::new(db.clone())
+            .put_validator(
+                &oracle_addr(seed),
+                &torus_economics::ValidatorState {
+                    address: oracle_addr(seed),
+                    pubkey: [seed; 32],
+                    commission_bps: 0,
+                    self_stake: torus_economics::MIN_SELF_DELEGATION * U256::from(mult),
+                    total_delegated: U256::ZERO,
+                    status,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: None,
+                },
+            )
+            .unwrap();
+    }
+
+    /// 3 Active validators, market 1 listed, epoch length 1000 (no boundary).
+    fn oracle_fixture_db() -> (ChainConfig, StateDb) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000;
+        for (seed, mult) in ORACLE_VALIDATORS {
+            oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
+        }
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &ORACLE_MARKET.to_be_bytes(), b"listed")
+            .unwrap();
+        (config, db)
+    }
+
+    fn px(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    /// Heights 1..=rounds.len() (ts = 1000 + h: one second per block); round i =
+    /// the (seed, price) submissions of block i+1; linked to actual parents.
+    fn oracle_blocks(rounds: &[&[(u8, i64)]]) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> = rounds
+            .iter()
+            .enumerate()
+            .map(|(i, subs)| {
+                let h = i as u64 + 1;
+                let actions = subs
+                    .iter()
+                    .map(|&(seed, price)| {
+                        torus_types::eip712::sign_native_action(
+                            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                                prices: vec![(ORACLE_MARKET, px(price))],
+                                // review M1(b): sampled at the block's time (ms)
+                                timestamp: (1_000 + h) * 1_000,
+                            }),
+                            h * 1_000 + seed as u64,
+                            &oracle_key(seed),
+                        )
+                    })
+                    .collect();
+                make_block(h, actions)
+            })
+            .collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn oracle_sub_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_ORACLE, Some(b"sub")).unwrap()
+    }
+
+    /// T1: the oracle clock is the COMMITTED header timestamp. The submission
+    /// row stores it (last 8 bytes of the value) — identical on the live
+    /// dispatch path, execute_committed_block and crash replay.
+    #[test]
+    fn oracle_clock_is_the_committed_header_timestamp_on_every_path() {
+        for path in ["serial", "dispatch", "replay"] {
+            let (config, db) = oracle_fixture_db();
+            let ctx = make_exec_ctx(&config, &db);
+            // review M1(b): the sample must be within 5 s of the block time.
+            let sub = torus_types::eip712::sign_native_action(
+                NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                    prices: vec![(ORACLE_MARKET, px(100))],
+                    timestamp: 777_777_000,
+                }),
+                1_061,
+                &oracle_key(61),
+            );
+            let mut blocks = vec![make_block(1, vec![sub])];
+            blocks[0].header.timestamp = 777_777; // height 1: parent is the genesis header
+            match path {
+                "serial" => ctx.execute_committed_block(&blocks[0], vec![]),
+                "dispatch" => dispatch_and_execute(&ctx, &db, &blocks[0]),
+                _ => {
+                    persist_committed_block_durably(&db, &blocks[0]);
+                    let (_, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{path}");
+                }
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{path}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "{path}");
+            let rows = oracle_sub_rows(&db);
+            assert_eq!(rows.len(), 1, "{path}");
+            let v = &rows[0].1;
+            assert_eq!(u64::from_be_bytes(v[v.len() - 8..].try_into().unwrap()), 777_777, "{path}");
+        }
+    }
+
+    /// The mark as AccountReader::mark sees it at block timestamp `now` (+ stamp block).
+    fn mark_at(db: &StateDb, now: u64) -> Option<(FixedPoint, u64)> {
+        let ctx = torus_bridge::native_executor::NativeExecContext::new(
+            db.clone(), 0, now, 0, 1_000, 4, Address::ZERO, Address::ZERO, Address::ZERO,
+        );
+        let p = ctx.oracle.get_price(ORACLE_MARKET, now).ok()?;
+        p.usable().map(|m| (m, p.block_number))
+    }
+
+    /// Signed submissions through committed blocks (ts = 1000 + h). Block 2 has
+    /// NO native action and still aggregates (rows exist -> the step is due).
+    #[test]
+    fn oracle_e2e_three_validators_set_the_mark_from_the_next_block() {
+        let (config, db) = oracle_fixture_db();
+        oracle_put_validator(&db, 65, 1, torus_economics::ValidatorStatus::Candidate);
+        let ctx = make_exec_ctx(&config, &db);
+        let blocks = oracle_blocks(&[
+            &[(61, 100), (62, 101), (63, 102), (64, 999), (65, 999)], // 64 unregistered, 65 Candidate
+            &[],
+            &[(61, 200), (62, 200), (63, 200)],
+            &[],
+        ]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(oracle_sub_rows(&db).len(), 3, "only Active validators' rows are stored");
+        assert_eq!(mark_at(&db, 1_001), None, "block 1's submissions are not aggregated in block 1");
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(mark_at(&db, 1_002), Some((px(102), 2)), "stake-weighted (simple median 101)");
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "block 3's prices count from block 4");
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        assert_eq!(mark_at(&db, 1_004), Some((px(200), 4)));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(4));
+    }
+
+    /// 1: V1..V3 @100; 2..=11 empty (fresh through ts 1011, age 10); 12: V1, V2
+    /// @150 -> 2 reporters: last price kept, stamp stays (11, 1011); rows gone at
+    /// 23 (block 12's rows, ts 1012, age 11); usable through ts 1071, stale at 1072.
+    #[test]
+    fn oracle_e2e_two_reporters_keep_the_last_price_until_stale() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let mut rounds: Vec<&[(u8, i64)]> = vec![&[(61, 100), (62, 100), (63, 100)]];
+        rounds.extend(std::iter::repeat_n(&[][..], 10)); // 2..=11
+        rounds.push(&[(61, 150), (62, 150)]); // 12
+        rounds.extend(std::iter::repeat_n(&[][..], 12)); // 13..=24
+        let blocks = oracle_blocks(&rounds);
+        for b in &blocks[..11] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert_eq!(mark_at(&db, 1_011), Some((px(100), 11)));
+        for b in &blocks[11..13] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert_eq!(mark_at(&db, 1_013), Some((px(100), 11)), "2 reporters: last price, stamp kept");
+        for b in &blocks[13..] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(oracle_sub_rows(&db).is_empty());
+        assert_eq!(read_native_applied_height(&db), Some(24));
+        assert_eq!(mark_at(&db, 1_071), Some((px(100), 11)), "age 60: usable");
+        assert_eq!(mark_at(&db, 1_072), None, "age 61: stale -> no mark");
+    }
+
+    /// A block that runs the native phase ONLY for the oracle keeps the resident
+    /// books (T0's single flag: no second, untouched-block advance).
+    #[test]
+    fn oracle_e2e_oracle_only_block_keeps_the_resident_books() {
+        let (config, db) = oracle_fixture_db();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_book_mode = Some(torus_bridge::native_executor::BookMode::Classic);
+        let blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[]]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(1));
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(mark_at(&db, 1_002), Some((px(100), 2)));
+        assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(2), "holder not drained");
+    }
+
+    /// 1: V1..V3 @100; 2 empty; 3: V1..V3 @200; 4..=6 empty; 7: V1 @300, V2 @310;
+    /// 8..=14 empty (ts = 1000 + h).
+    fn oracle_determinism_blocks() -> Vec<TorusBlock> {
+        let full = |p: i64| vec![(61u8, p), (62, p), (63, p)];
+        let (r1, r3) = (full(100), full(200));
+        // 300 / 310 keeps the fixture away from the 3 x MAD boundary.
+        let r7: Vec<(u8, i64)> = vec![(61, 300), (62, 310)];
+        let e: &[(u8, i64)] = &[];
+        oracle_blocks(&[&r1[..], e, &r3[..], e, e, e, &r7[..], e, e, e, e, e, e, e])
+    }
+
+    enum OracleRun {
+        Serial,
+        /// Flush worker ON and PARKED inside job 1: block 2's due-check and
+        /// aggregation see block 1's rows only through the parent layer.
+        PipelinedParked,
+        /// Blocks 1..=4 executed; 5..=14 committed durably, then boot replay.
+        Replay,
+    }
+
+    /// Item 3 (T9): `fixture` builds the starting DB (oracle tests:
+    /// `oracle_fixture_db`; liquidation: `liq_det_fixture`).
+    fn run_fixture(
+        mode: OracleRun,
+        blocks: &[TorusBlock],
+        fixture: fn() -> (ChainConfig, StateDb),
+    ) -> (Vec<CfDump>, torus_types::B256, StateDb) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let (config, db) = fixture();
+        match mode {
+            OracleRun::Serial => {
+                let ctx = make_exec_ctx(&config, &db);
+                for b in blocks {
+                    dispatch_and_execute(&ctx, &db, b);
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            }
+            OracleRun::PipelinedParked => {
+                let gate = crate::exec_pipeline::WorkerGate::new();
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.attach_flush_worker(Some(gate.clone()));
+                gate.hold();
+                dispatch_and_execute(&ctx, &db, &blocks[0]);
+                assert!(gate.wait_received(1));
+                let (db2, rest) = (db.clone(), blocks[1..].to_vec());
+                let t = std::thread::spawn(move || {
+                    for b in &rest {
+                        dispatch_and_execute(&ctx, &db2, b);
+                    }
+                    ctx
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                gate.release();
+                let ctx = t.join().unwrap();
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                drop(ctx); // drains + joins W
+            }
+            OracleRun::Replay => {
+                let ctx = make_exec_ctx(&config, &db);
+                for b in &blocks[..4] {
+                    dispatch_and_execute(&ctx, &db, b);
+                }
+                for b in &blocks[4..] {
+                    persist_committed_block_durably(&db, b);
+                }
+                let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                assert_eq!(parked, None);
+                assert_eq!(last.height, blocks.len() as u64);
+            }
+        }
+        assert_eq!(read_native_applied_height(&db), Some(blocks.len() as u64));
+        let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+        (dump_all_cfs(&db), root, db)
+    }
+
+    #[test]
+    fn oracle_determinism_serial_pipelined_and_replay_are_identical() {
+        let blocks = oracle_determinism_blocks();
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, oracle_fixture_db);
+        // Non-vacuous: 8..=13: V1 300, V2 310 (ts 1007), V3 200 (ts 1003, 3x) in the
+        // window through ts 1013 -> stake-weighted 200, re-stamped; 14: V3's row
+        // (age 11) pruned -> 2 reporters, stamp stays 13; block 7's 2 rows remain.
+        assert_eq!(mark_at(&db_s, 1_014), Some((px(200), 13)));
+        assert_eq!(oracle_sub_rows(&db_s).len(), 2);
+        assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "oracle: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    /// Correction s517 (T7): the final dump above cannot see a skipped block-2
+    /// aggregation (block 3 re-aggregates the same rows and overwrites it).
+    /// Here block 3's timestamp jumps to 1012: block 1's rows (ts 1001, age 11)
+    /// are pruned unaggregated, so block 2's aggregate — due ONLY through the
+    /// parked parent layer on the pipelined path — is the final mark.
+    #[test]
+    fn oracle_determinism_parent_layer_due_check_is_observable() {
+        let mut blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[], &[]]);
+        blocks[2].header.timestamp = 1_012; // last block: no child to relink
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        assert_eq!(mark_at(&db_s, 1_012), Some((px(100), 2)), "block 2's aggregate survives");
+        assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
+        assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
+        assert_eq!(root_s, root_p);
+    }
+
+    // ---- item 3: liquidation helpers ----
+
+    /// oracle_fixture_db + T (seed 71) long `size` @ 1,000 against S (72); T funded
+    /// `collateral`, S and maker M (73) funded 10^7. Seeded through PositionManager.
+    fn liq_fixture_db(size: i64, collateral: i64) -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, collateral), (72, 10_000_000), (73, 10_000_000)] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        pm.apply_fill(&oracle_addr(71), ORACLE_MARKET, true, px(size), px(1_000), MarginType::Cross).unwrap();
+        pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(size), px(1_000), MarginType::Cross).unwrap();
+        (config, db)
+    }
+
+    fn oracle_sub(seed: u8, h: u64, price: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(ORACLE_MARKET, px(price))],
+                timestamp: (1_000 + h) * 1_000, // review M1(b): sampled at the block's time (ms)
+            }),
+            h * 1_000 + seed as u64,
+            &oracle_key(seed),
+        )
+    }
+
+    fn signed_bid(seed: u8, nonce: u64, price: i64, qty: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: true,
+                price: px(price),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            nonce,
+            &oracle_key(seed),
+        )
+    }
+
+    /// Heights 1..=rounds.len() (ts = 1000 + h), linked.
+    fn liq_blocks(rounds: Vec<Vec<SignedNativeAction>>) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> =
+            rounds.into_iter().enumerate().map(|(i, a)| make_block(i as u64 + 1, a)).collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn signed_pos_of(db: &StateDb, who: &Address) -> FixedPoint {
+        match torus_core::position::PositionManager::new(db.clone()).get_position(who, ORACLE_MARKET).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        }
+    }
+
+    /// Item 3 T8: the step runs at the END of the block (block 2's own bid fills
+    /// the chunk) on the block-start mark; the cooldown / pending rows make an
+    /// EMPTY block (no submission rows left) run the native phase.
+    /// T long 200 @ 1,000, collateral 5,500, mark 990: stage 1, 20% chunks.
+    /// HL parity (s88): in the 30 s cooldown after a chunk, stage 1 orders the
+    /// ENTIRE position. Block 2: M bids 40 @ 985 and 50 @ 970; the chunk (40)
+    /// takes the 985 bid -> 160, cooldown from ts 1002. Block 3 (empty, ts
+    /// 1003): the full-position order (cap 965.25) takes the 970 bid -> 110
+    /// (AV 2,300 < MM 2,722.5: still stage 1, still due). Blocks 4..=31: empty
+    /// book, nothing fills. Block 32 (ts 1032, cooldown over): a chunk again,
+    /// 20% of 110 = 22 -> 88.
+    #[test]
+    fn liquidation_e2e_chunks_at_block_end_and_cooldown_drives_empty_blocks() {
+        let (config, db) = liq_fixture_db(200, 5_500);
+        let ctx = make_exec_ctx(&config, &db);
+        let t = oracle_addr(71);
+        let mut rounds = vec![
+            vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)], // 1 (ts 1001)
+            vec![signed_bid(73, 2_073, 985, 40), signed_bid(73, 2_074, 970, 50)],           // 2 (mark 990)
+        ];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 29)); // 3..=31 (ts 1003..=1031)
+        rounds.push(vec![signed_bid(73, 32_073, 985, 100)]); // 32 (ts 1032)
+        let blocks = liq_blocks(rounds);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(200), "block 1: no mark yet");
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(160), "block 2: chunk 1 filled by block 2's own 985 bid");
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(signed_pos_of(&db, &t), px(110), "block 3 (empty, cooldown): the entire position is ordered");
+        for b in &blocks[3..31] {
+            ctx.execute_committed_block(b, vec![]); // 4..=31 (ts <= 1031)
+        }
+        assert_eq!(signed_pos_of(&db, &t), px(110), "cooldown: empty book, nothing fills");
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned");
+        ctx.execute_committed_block(&blocks[31], vec![]); // 32, ts 1032
+        assert_eq!(signed_pos_of(&db, &t), px(88), "cooldown over: chunk 2 = 20% of 110");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(32));
+    }
+
+    /// T1 (71) long 10 @ 100, collateral 40; T2 (74) long 10 @ 100, collateral 50;
+    /// S (72) short 20 @ 100; maker M (73). 1: V @100 + M bid 10 @ 95;
+    /// 3: V @97 -> block 4: T1 backstop (AV 10 < 16.17), T2 stage 1 (AV 20) into
+    /// M's bid; 5: V @80 -> block 6: vault AV 10 - 170 < 0 -> ADL vs S at 97.
+    fn liq_det_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, 40), (74, 50), (72, 1_000_000), (73, 1_000_000)] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        for long in [71u8, 74] {
+            pm.apply_fill(&oracle_addr(long), ORACLE_MARKET, true, px(10), px(100), MarginType::Cross).unwrap();
+            pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(10), px(100), MarginType::Cross).unwrap();
+        }
+        (config, db)
+    }
+
+    fn liq_det_blocks() -> Vec<TorusBlock> {
+        let subs = |h: u64, p: i64| vec![oracle_sub(61, h, p), oracle_sub(62, h, p), oracle_sub(63, h, p)];
+        let mut r1 = subs(1, 100);
+        r1.push(signed_bid(73, 1_073, 95, 10));
+        let mut rounds = vec![r1, vec![], subs(3, 97), vec![], subs(5, 80)];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 9)); // 6..=14
+        liq_blocks(rounds)
+    }
+
+    #[test]
+    fn liquidation_determinism_serial_pipelined_and_replay_are_identical() {
+        use torus_core::liquidation::LIQUIDATOR_VAULT;
+        let blocks = liq_det_blocks();
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, liq_det_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, liq_det_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, liq_det_fixture);
+        // Non-vacuous: all three mechanisms ran.
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(71)), FixedPoint::ZERO, "T1 backstopped");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(74)), FixedPoint::ZERO, "T2 sold into the book");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(73)), px(10), "M bought T2's 10 @ 95");
+        assert_eq!(signed_pos_of(&db_s, &LIQUIDATOR_VAULT), FixedPoint::ZERO, "vault ADL'd");
+        assert_eq!(signed_pos_of(&db_s, &oracle_addr(72)), -px(10));
+        assert_dumps_equal(&serial, &piped, "liquidation: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "liquidation: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    /// Item 6 C4 (plan Step 4, P3): the liquidation fixture (backstop, stage
+    /// 1, vault ADL) with L1 (R + sums cache, the node path) and with the
+    /// reference walk (`test_no_resident_rows`), serial and pipelined:
+    /// identical liquidation / position / balance rows after every block,
+    /// identical per-block consensus write sets (`h_n`), running hash and
+    /// final dump.
+    #[test]
+    fn liquidation_l1_and_reference_walk_identical_every_block() {
+        use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS};
+        let blocks = liq_det_blocks();
+        let run = |pipelined: bool, no_r: bool| {
+            let (config, db) = liq_det_fixture();
+            torus_state::running_hash::capture_begin(&db);
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.test_no_resident_rows = no_r;
+            if pipelined {
+                ctx.attach_flush_worker(None);
+            }
+            let mut per_block = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "pipelined={pipelined} no_r={no_r}");
+                if let Some(w) = ctx.flush_worker.as_ref() {
+                    assert!(w.wait_idle());
+                }
+                let rows: Vec<CfDump> = [CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+                    .iter()
+                    .map(|cf| (*cf, StateBackend::iterate_cf(&db, cf, None).unwrap()))
+                    .collect();
+                per_block.push(rows);
+            }
+            assert_eq!(ctx.resident_books.lock().unwrap().rows_builds(), u64::from(!no_r));
+            drop(ctx);
+            let captured = torus_state::running_hash::capture_take(&db);
+            let stored = torus_state::running_hash::read_running_hash(&db);
+            (per_block, captured, stored, dump_all_cfs(&db))
+        };
+        for pipelined in [false, true] {
+            let what = format!("pipelined={pipelined}");
+            let (rows_ref, cap_ref, hash_ref, dump_ref) = run(pipelined, true);
+            let (rows_l1, cap_l1, hash_l1, dump_l1) = run(pipelined, false);
+            for (h, (a, b)) in rows_ref.iter().zip(rows_l1.iter()).enumerate() {
+                assert_dumps_equal(a, b, &format!("{what}: rows after block {}", h + 1));
+            }
+            assert_write_sets_equal(&cap_ref, &cap_l1, &format!("{what}: walk vs L1"));
+            assert!(hash_l1.is_some());
+            assert_eq!(hash_ref, hash_l1, "{what}: running hash");
+            assert_dumps_equal(&dump_ref, &dump_l1, &format!("{what}: final dump"));
+        }
+    }
+
+    /// Option B (s87): GTC limits `(market, is_buy, price, qty)` as one
+    /// PlaceOrderBatch of `seed`.
+    fn signed_limits(seed: u8, nonce: u64, orders: &[(u64, bool, i64, i64)]) -> SignedNativeAction {
+        let orders = orders
+            .iter()
+            .map(|&(market_id, is_buy, price, qty)| torus_types::PlaceOrderParams {
+                market_id,
+                is_buy,
+                price: px(price),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            })
+            .collect();
+        torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &oracle_key(seed))
+    }
+
+    /// Option B: T (71) funded 101.0505 (101 + B-blind's δ top-up of its
+    /// market-2 sell, s92, taken ahead of its market-1 pool), maker M (73)
+    /// rich.
+    fn option_b_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        for (seed, amt) in [(71u8, px(101) + FixedPoint::from_raw(px(505).raw() / 10_000)), (73, px(1_000_000))] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: amt, order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        (config, db)
+    }
+
+    /// Option B (s87): block 1: M bids 10 @101 in markets 1 and 2; block 5
+    /// (inside the replayed range): T sells 10 @100 in both in one batch —
+    /// the market-2 sell (T's non-pool market) reserves at the start-of-batch
+    /// best bid 101 and fills. Serial, pipelined (parked) and crash replay
+    /// give identical state.
+    #[test]
+    fn option_b_serial_pipelined_and_replay_are_identical() {
+        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10)])]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
+        rounds.push(vec![signed_limits(71, 5_071, &[(1, false, 100, 10), (2, false, 100, 10)])]); // 5
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
+        let blocks = liq_blocks(rounds);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, option_b_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, option_b_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, option_b_fixture);
+        let pm = torus_core::position::PositionManager::new(db_s.clone());
+        for m in [1u64, 2] {
+            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!((p.is_long, p.size), (false, px(10)), "market {m}: filled @101");
+        }
+        assert_dumps_equal(&serial, &piped, "option B: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "option B: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    /// Same-batch bid (B-blind, s92): T (71) 1,000, B (74) 1,000, M (73) rich.
+    fn same_batch_bid_fixture() -> (ChainConfig, StateDb) {
+        let (config, db) = option_b_fixture();
+        let pm = torus_core::position::PositionManager::new(db.clone());
+        for seed in [71u8, 74] {
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &torus_core::position::NativeBalance { available: px(1_000), order_margin: FixedPoint::ZERO },
+            )
+            .unwrap();
+        }
+        (config, db)
+    }
+
+    /// Same-batch bid under B-blind (s92; was the s87 bound): block 1: M bids
+    /// 10 @101 in markets 1 and 2 and asks 10 @110 in market 2; block 5: B
+    /// bids 10 @105 in market 2, then T sells 10 @100 in both — the market-2
+    /// sell (non-pool) is topped up to reserve(101.101, 10) only (B's bid is
+    /// not read), fills 2 @105 and is cut. Serial, pipelined (parked) and
+    /// crash replay give identical state.
+    #[test]
+    fn same_batch_bid_serial_pipelined_and_replay_are_identical() {
+        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10), (2, false, 110, 10)])]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
+        rounds.push(vec![
+            signed_limits(74, 5_074, &[(2, true, 105, 10)]),
+            signed_limits(71, 5_071, &[(1, false, 100, 10), (2, false, 100, 10)]),
+        ]); // 5
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
+        let blocks = liq_blocks(rounds);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, same_batch_bid_fixture);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, same_batch_bid_fixture);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, same_batch_bid_fixture);
+        let pm = torus_core::position::PositionManager::new(db_s.clone());
+        for (m, size) in [(1u64, 10), (2, 2)] {
+            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!((p.is_long, p.size), (false, px(size)), "market {m}: T filled");
+        }
+        let b = pm.get_position(&oracle_addr(74), 2).unwrap().expect("B long");
+        assert_eq!((b.is_long, b.size), (true, px(2)), "B's same-batch bid filled 2 (beyond δ)");
+        assert_dumps_equal(&serial, &piped, "same-batch bid: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "same-batch bid: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    fn signed_stop_limit_buy(seed: u8, nonce: u64, trigger: i64, limit: i64, qty: i64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: true,
+                price: px(limit),
+                quantity: px(qty),
+                order_type: torus_types::OrderType::StopLimit { trigger: px(trigger), limit: px(limit) },
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            nonce,
+            &oracle_key(seed),
+        )
+    }
+
+    /// Review M2 (s517): an account left under MM after its stage-1 action
+    /// keeps the step DUE (pending row) — without new actions, oracle rows,
+    /// cooldown or cursor. T long 10 @ 1,000, collateral 300, mark 990 (AV
+    /// 200, MM 247.5: stage 1, 9,900 < 100k: no chunk). Block 13 (oracle rows
+    /// pruned at 12): M bids 4 @ 966 and places a stop-limit buy 6 @ 966
+    /// (trigger 960). The step sells 4 into the bid; that trade fires M's stop,
+    /// which RESTS at 966 after T's IOC remainder is gone. T: AV 104 < MM
+    /// 148.5 -> still stage 1. Block 14 is empty: only the pending row makes
+    /// it run; T sells the last 6 into the stop's bid. Then nothing is due.
+    #[test]
+    fn liquidation_e2e_partial_stage1_keeps_the_step_due() {
+        let (config, db) = liq_fixture_db(10, 300);
+        let ctx = make_exec_ctx(&config, &db);
+        let (t, m) = (oracle_addr(71), oracle_addr(73));
+        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 11)); // 2..=12
+        rounds.push(vec![signed_bid(73, 13_073, 966, 4), signed_stop_limit_buy(73, 13_074, 960, 966, 6)]); // 13
+        rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 14, 15
+        let blocks = liq_blocks(rounds);
+        for b in &blocks[..13] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: no oracle-due");
+        assert_eq!(signed_pos_of(&db, &t), px(6), "block 13: partial (4 sold)");
+        ctx.execute_committed_block(&blocks[13], vec![]); // 14: empty
+        assert_eq!(signed_pos_of(&db, &t), FixedPoint::ZERO, "block 14 re-ran the step");
+        assert_eq!(signed_pos_of(&db, &m), px(10));
+        assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "flat: nothing pending");
+        ctx.execute_committed_block(&blocks[14], vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    // ---- s517 oracle feeder S4: the hot oracle signer through whole blocks ----
+
+    /// The hot signer key of validator `seed` (a separate address).
+    fn signer_key(seed: u8) -> k256::ecdsa::SigningKey {
+        oracle_key(seed.wrapping_add(100))
+    }
+
+    fn key_addr(key: &k256::ecdsa::SigningKey) -> Address {
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 0, key)
+            .recover_sender()
+            .unwrap()
+    }
+
+    /// `SetOracleSigner` from validator `seed`; `signer` = the new signer's key
+    /// (its proof of possession, review M3) or `None` to clear.
+    fn set_signer_action(h: u64, seed: u8, signer: Option<&k256::ecdsa::SigningKey>) -> SignedNativeAction {
+        let nonce = h * 1_000 + 500 + seed as u64;
+        let action = match signer {
+            None => NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None },
+            Some(k) => NativeAction::SetOracleSigner {
+                signer: key_addr(k),
+                proof: Some(torus_types::eip712::sign_oracle_signer_proof(&oracle_addr(seed), nonce, k)),
+            },
+        };
+        torus_types::eip712::sign_native_action(action, nonce, &oracle_key(seed))
+    }
+
+    fn signer_submit(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64) -> SignedNativeAction {
+        signer_submit_at(h, key, tag, price, (1_000 + h) * 1_000)
+    }
+
+    fn signer_submit_at(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64, sample_ms: u64) -> SignedNativeAction {
+        torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                prices: vec![(ORACLE_MARKET, px(price))],
+                timestamp: sample_ms,
+            }),
+            h * 1_000 + tag as u64,
+            key,
+        )
+    }
+
+    /// Heights 1..=n (ts = 1000 + h), linked to their actual parents.
+    fn blocks_of(rounds: Vec<Vec<SignedNativeAction>>) -> Vec<TorusBlock> {
+        let mut blocks: Vec<TorusBlock> = rounds
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| make_block(i as u64 + 1, a))
+            .collect();
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    fn signer_index_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_ORACLE, Some(b"sgn")).unwrap()
+    }
+
+    /// Block 1: every validator registers its signer (EIP-712, validator key).
+    /// Block 2: the SIGNERS submit 100 / 101 / 102. Block 3: the stake-weighted
+    /// mark (V3 = 3x) is 102 (simple median 101). Exercises batch signature
+    /// recovery -> sender = signer -> resolution to the validator.
+    #[test]
+    fn oracle_signer_signed_submissions_aggregate_through_whole_blocks() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let set: Vec<_> = ORACLE_VALIDATORS
+            .iter()
+            .map(|&(s, _)| set_signer_action(1, s, Some(&signer_key(s))))
+            .collect();
+        let subs: Vec<_> = [(61u8, 100i64), (62, 101), (63, 102)]
+            .iter()
+            .map(|&(s, p)| signer_submit(2, &signer_key(s), s, p))
+            .collect();
+        let blocks = blocks_of(vec![set, subs, vec![]]);
+        for b in &blocks {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(signer_index_rows(&db).len(), 3);
+        let rows = oracle_sub_rows(&db);
+        assert_eq!(rows.len(), 3, "one row per VALIDATOR");
+        for (seed, _) in ORACLE_VALIDATORS {
+            assert!(rows.iter().any(|(k, _)| &k[11..31] == oracle_addr(seed).as_slice()));
+        }
+        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "stake-weighted by the validators");
+    }
+
+    /// Block 2 carries V61's rotation AND a submission from its OLD signer: the
+    /// oracle category runs before `Other`, so the row is written. Block 3: the
+    /// old signer adds nothing; block 4: the new signer updates the row.
+    #[test]
+    fn oracle_signer_rotation_in_block_counts_old_signer_once_then_rejects_it() {
+        let (config, db) = oracle_fixture_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let (old, new) = (signer_key(61), oracle_key(222));
+        let blocks = blocks_of(vec![
+            vec![set_signer_action(1, 61, Some(&old))],
+            vec![set_signer_action(2, 61, Some(&new)), signer_submit(2, &old, 1, 100)],
+            vec![signer_submit(3, &old, 1, 500)],
+            vec![signer_submit(4, &new, 2, 700)],
+        ]);
+        ctx.execute_committed_block(&blocks[0], vec![]);
+        ctx.execute_committed_block(&blocks[1], vec![]);
+        let after_rotation = oracle_sub_rows(&db);
+        assert_eq!(after_rotation.len(), 1, "same-block: the old signer still counts once");
+        assert_eq!(&after_rotation[0].0[11..31], oracle_addr(61).as_slice());
+        assert_eq!(
+            signer_index_rows(&db),
+            vec![(
+                torus_state::cf::oracle_signer_key(&key_addr(&new)).to_vec(),
+                oracle_addr(61).to_vec()
+            )]
+        );
+        ctx.execute_committed_block(&blocks[2], vec![]);
+        assert_eq!(oracle_sub_rows(&db), after_rotation, "old signer rejected from the next block");
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        let rows = oracle_sub_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows, after_rotation, "the new signer's submission replaces the row");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    /// Determinism: a chain with SetOracleSigner (set, rotate, clear) and signer
+    /// submissions gives identical CF dumps + native roots serially, pipelined
+    /// (parked) and through crash replay.
+    #[test]
+    fn oracle_signer_blocks_replay_identically() {
+        let new61 = oracle_key(222);
+        let set: Vec<_> = ORACLE_VALIDATORS
+            .iter()
+            .map(|&(s, _)| set_signer_action(1, s, Some(&signer_key(s))))
+            .collect();
+        let subs = |h: u64, p: i64| -> Vec<SignedNativeAction> {
+            ORACLE_VALIDATORS.iter().map(|&(s, _)| signer_submit(h, &signer_key(s), s, p)).collect()
+        };
+        let mut b4 = subs(4, 300);
+        b4.push(set_signer_action(4, 61, Some(&new61)));
+        let blocks = blocks_of(vec![
+            set,
+            subs(2, 100),
+            vec![],
+            b4,
+            vec![signer_submit(5, &signer_key(61), 61, 900), signer_submit(5, &new61, 1, 310)],
+            vec![set_signer_action(6, 62, None)],
+            subs(7, 400), // 62's cleared signer is rejected
+            // review M1(b): two samples of V63 in one block; the newer (450)
+            // must win whatever the in-block order.
+            vec![
+                signer_submit_at(8, &signer_key(63), 1, 450, 1_008_000),
+                signer_submit_at(8, &signer_key(63), 2, 999, 1_007_500),
+            ],
+        ]);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, oracle_fixture_db);
+        // Non-vacuous: 61 -> new signer, 62 cleared, 63 unchanged.
+        let idx = signer_index_rows(&db_s);
+        assert_eq!(idx.len(), 2, "{idx:?}");
+        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&new61).as_slice() && v[..] == *oracle_addr(61).as_slice()));
+        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&signer_key(63)).as_slice() && v[..] == *oracle_addr(63).as_slice()));
+        assert!(mark_at(&db_s, 1_008).is_some());
+        let v63 = oracle_sub_rows(&db_s)
+            .into_iter()
+            .map(|(_, v)| <torus_core::oracle::OracleSubmission as borsh::BorshDeserialize>::try_from_slice(&v).unwrap())
+            .find(|r| r.validator == oracle_addr(63))
+            .unwrap();
+        assert_eq!(v63.price, px(450), "newest sample of the block wins");
+        assert_dumps_equal(&serial, &piped, "oracle signer: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "oracle signer: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
+    // ======================================================================
+    // Item 6 Phase 1 (C1): resident rows R on the committed-block path
+    // ======================================================================
+
+    /// R between blocks (holder slot) as per-CF dumps; `None` = slot empty.
+    fn resident_rows_dump(ctx: &ExecutionContext) -> Option<Vec<CfDump>> {
+        let mut holder = ctx.resident_books.lock().unwrap();
+        holder.rows().map(|r| {
+            torus_state::resident_rows::RESIDENT_CFS
+                .iter()
+                .map(|cf| (*cf, r.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+                .collect()
+        })
+    }
+
+    /// R's two CFs scanned from the DB.
+    fn resident_cfs_in_db(db: &StateDb) -> Vec<CfDump> {
+        torus_state::resident_rows::RESIDENT_CFS
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+            .collect()
+    }
+
+    /// With R on: after block `h` (W drained when pipelined) the holder's R is
+    /// at `h` and equals the DB scan of both CFs.
+    fn assert_resident_rows_track_db(ctx: &ExecutionContext, db: &StateDb, h: u64, what: &str) {
+        if let Some(w) = ctx.flush_worker.as_ref() {
+            assert!(w.wait_idle(), "{what}: W failed");
+        }
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(h), "{what}: R height after {h}");
+        let rows = resident_rows_dump(ctx).expect("R stashed");
+        assert_dumps_equal(&rows, &resident_cfs_in_db(db), &format!("{what}: R vs DB after {h}"));
+        // Item 6 C7: the slot's decoded positions == a cold decode of R.
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().trader_positions_match_rows(),
+            Some(true),
+            "{what}: decoded positions vs R after {h}"
+        );
+    }
+
+    /// Run the book fixture in `mode`, serial or pipelined, with R
+    /// (`no_r = false`, checked against the DB after every block) or without
+    /// (`test_no_resident_rows`, today's path), restarting after the heights
+    /// in `restart_after`. Returns the full dump, the per-block consensus
+    /// write sets (`h_n` inputs), the stored running hash and R's builds.
+    #[allow(clippy::type_complexity)]
+    fn run_book_fixture_r(
+        on: bool,
+        mode: torus_bridge::native_executor::BookMode,
+        no_r: bool,
+        restart_after: &[u64],
+    ) -> (Vec<CfDump>, CapturedWrites, Option<(u64, [u8; 32])>, u64) {
+        let (_cfg, state_db) = make_test_config_and_db();
+        fund_book_fixture(&state_db);
+        torus_state::running_hash::capture_begin(&state_db);
+        let new_ctx = || {
+            let mut c = book_pipeline_ctx(&state_db, on, None, mode);
+            c.test_no_resident_rows = no_r;
+            c
+        };
+        let mut ctx = new_ctx();
+        let mut builds = 0;
+        for b in &book_fixture_blocks() {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &state_db, b);
+            let what = format!("{mode:?} on={on} no_r={no_r} restarts={restart_after:?}");
+            assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "{what}: fail-stop at {h}");
+            if no_r {
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: no R");
+            } else {
+                assert_resident_rows_track_db(&ctx, &state_db, h, &what);
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}");
+            }
+            if restart_after.contains(&h) {
+                builds += ctx.resident_books.lock().unwrap().rows_builds();
+                drop(ctx);
+                ctx = new_ctx();
+            }
+        }
+        builds += ctx.resident_books.lock().unwrap().rows_builds();
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&state_db);
+        let stored = torus_state::running_hash::read_running_hash(&state_db);
+        (dump_all_cfs(&state_db), captured, stored, builds)
+    }
+
+    /// Item 6 C1: R == the DB scan of both CFs after every block, serial and
+    /// pipelined (sessions, claim rewards, empties advancing R, epoch
+    /// boundaries), built once, never shared at the end of a block.
+    #[test]
+    fn resident_rows_equal_db_scan_after_every_block_serial_and_pipelined() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let ctx = pipeline_ctx(&state_db, on, None);
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+                assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+                assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on}"));
+            }
+            let mut holder = ctx.resident_books.lock().unwrap();
+            assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
+            assert_eq!(holder.rows_shared_fallbacks(), 0, "on={on}: Arc::get_mut never fails");
+            assert!(holder.rows().unwrap().len() > 2, "non-vacuous");
+        }
+    }
+
+    /// Item 6 step 2: on the committed-block path, serial and pipelined, each
+    /// native block hands `end_resident` to a worker (in flight when the
+    /// block returns); the next block (native: `begin_resident`, untouched:
+    /// `advance_untouched`) joins it, so R still equals the DB after every
+    /// block; the end timer and the join's wait timer count once per worker.
+    /// Prints the worker's time vs the exposed wait (18c sanity, tiny blocks).
+    #[test]
+    fn end_resident_runs_on_a_worker_joined_by_the_next_block() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            ctx.metrics = Some(metrics.clone());
+            let mut spawned = 0.0;
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+                assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+                let in_flight = ctx.resident_books.lock().unwrap().rows_in_flight();
+                spawned += f64::from(u8::from(in_flight));
+                // Odd heights: the next block joins the worker itself.
+                if b.header.height.is_multiple_of(2) {
+                    assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("worker on={on}"));
+                }
+            }
+            ctx.resident_books.lock().unwrap().settle_rows();
+            let text = metrics.encode();
+            let v = |name: &str| metric_value(&text, name);
+            assert!(spawned >= 4.0, "on={on}: native blocks ran on the worker ({spawned})");
+            assert_eq!(v("torus_exec_end_resident_seconds_count"), spawned, "on={on}");
+            assert_eq!(v("torus_exec_end_resident_wait_seconds_count"), spawned, "on={on}: one join per worker");
+            println!(
+                "STEP2 on={on} workers={spawned} end_resident_ms_sum={:.3} wait_ms_sum={:.3}",
+                v("torus_exec_end_resident_seconds_sum") * 1e3,
+                v("torus_exec_end_resident_wait_seconds_sum") * 1e3
+            );
+        }
+    }
+
+    /// Item 6 C1: the same block sequence with and without R lands identical
+    /// CF dumps, identical per-block consensus write sets (`h_n`) and the same
+    /// running hash, in all four BookModes, serial and pipelined; R also
+    /// survives restarts (rebuilt cold) with the same result.
+    #[test]
+    fn resident_rows_on_off_identical_state_and_running_hash_every_book_mode() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            for on in [false, true] {
+                let what = format!("{mode:?} on={on}");
+                let (dump_off, cap_off, hash_off, builds_off) = run_book_fixture_r(on, mode, true, &[]);
+                let (dump_on, cap_on, hash_on, builds_on) = run_book_fixture_r(on, mode, false, &[]);
+                assert_eq!((builds_off, builds_on), (0, 1), "{what}");
+                assert_dumps_equal(&dump_off, &dump_on, &format!("{what}: without vs with R"));
+                assert_write_sets_equal(&cap_off, &cap_on, &format!("{what}: without vs with R"));
+                assert!(hash_on.is_some());
+                assert_eq!(hash_off, hash_on, "{what}: running hash");
+                let (dump_rs, cap_rs, hash_rs, builds_rs) = run_book_fixture_r(on, mode, false, &[3, 7]);
+                assert_eq!(builds_rs, 3, "{what}: one build per (re)start");
+                assert_dumps_equal(&dump_off, &dump_rs, &format!("{what}: with R + restarts"));
+                assert_write_sets_equal(&cap_off, &cap_rs, &format!("{what}: with R + restarts"));
+                assert_eq!(hash_off, hash_rs, "{what}: running hash with restarts");
+            }
+        }
+    }
+
+    /// Item 6 C1, guard P7 on the committed-block path: a fatal block (wrong
+    /// book mode -> load error -> fail-stop before the flush) leaves R taken,
+    /// so its re-execution rebuilds; a height applied by another exec context
+    /// (the holder skipped it) rebuilds too. R is never stale: it equals the
+    /// DB after each step and the final state equals a run without R.
+    #[test]
+    fn resident_rows_guard_fatal_block_and_skipped_height_rebuild() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use torus_bridge::native_executor::BookMode;
+        let blocks = book_fixture_blocks();
+        let first5 = &blocks[..5];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_book_fixture(&db_ref);
+        let mut ctx_ref = book_pipeline_ctx(&db_ref, false, None, BookMode::Classic);
+        ctx_ref.test_no_resident_rows = true;
+        for b in first5 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let mut ctx = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        let builds = |ctx: &ExecutionContext| ctx.resident_books.lock().unwrap().rows_builds();
+        dispatch_and_execute(&ctx, &db, &first5[0]);
+        dispatch_and_execute(&ctx, &db, &first5[1]);
+        assert_resident_rows_track_db(&ctx, &db, 2, "after 2");
+        assert_eq!(builds(&ctx), 1);
+
+        // Fatal block 3: the context loads in a mode the DB was not written in.
+        ctx.test_book_mode = Some(BookMode::OrderRows);
+        dispatch_and_execute(&ctx, &db, &first5[2]);
+        assert!(ctx.exec_failed.load(SeqCst), "mode mismatch must fail-stop");
+        assert_eq!(read_native_applied_height(&db), Some(2), "nothing of 3 durable");
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "R taken by the fatal block");
+        assert_eq!(builds(&ctx), 1, "the fatal block reused R (successor of 2)");
+
+        // Re-execute 3 (latch cleared, right mode): R rebuilds from the DB.
+        ctx.test_book_mode = Some(BookMode::Classic);
+        ctx.exec_failed.store(false, SeqCst);
+        dispatch_and_execute(&ctx, &db, &first5[2]);
+        assert!(!ctx.exec_failed.load(SeqCst));
+        assert_eq!(builds(&ctx), 2, "re-executed 3 rebuilt R");
+        assert_resident_rows_track_db(&ctx, &db, 3, "after re-executed 3");
+
+        // Block 4 applied by another exec context: this holder skipped it.
+        let ctx2 = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        dispatch_and_execute(&ctx2, &db, &first5[3]);
+        assert!(!ctx2.exec_failed.load(SeqCst));
+        drop(ctx2);
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(3));
+        dispatch_and_execute(&ctx, &db, &first5[4]);
+        assert!(!ctx.exec_failed.load(SeqCst));
+        assert_eq!(builds(&ctx), 3, "R at 3 vs block 5: rebuilt");
+        assert_resident_rows_track_db(&ctx, &db, 5, "after 5");
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0);
+        drop(ctx);
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db), "guard sequence with R vs without R");
+    }
+
+    /// Item 6 C1: an EVM lockbox deposit (0x0820) in block 1 is credited by
+    /// block 2's CoreWriter drain (a write of `CF_NATIVE_BALANCES` through the
+    /// block overlay, so R takes it); orders in 2 (placed before the drain)
+    /// and 3 (on the credited balance) — identical state with and without R,
+    /// serial and pipelined.
+    #[test]
+    fn resident_rows_lockbox_deposit_then_orders_identical_without_r() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let trader = k256_address(&key);
+        let amount_wei: u128 = 1_000 * 10u128.pow(18); // 1000 native units
+        let mut calldata = alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&U256::from(amount_wei).to_be_bytes::<32>());
+        let lockbox = torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let order = |price: i128| {
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: 1,
+                is_buy: true,
+                price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+                quantity: FixedPoint::ONE,
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            })
+        };
+        let mut blocks = vec![
+            make_block(1, vec![]),
+            make_block(2, vec![torus_types::eip712::sign_native_action(order(90), 1, &key)]),
+            make_block(3, vec![torus_types::eip712::sign_native_action(order(95), 2, &key)]),
+        ];
+        blocks[0].evm_transactions = vec![signed_eip1559_with_value(
+            &key,
+            0,
+            alloy_primitives::TxKind::Call(lockbox),
+            calldata,
+            U256::from(amount_wei),
+        )];
+        blocks[0].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            for no_r in [true, false] {
+                let (_cfg, db) = make_test_config_and_db();
+                db.put_account(
+                    &trader,
+                    &revm::state::AccountInfo {
+                        balance: U256::from(10u128.pow(22)),
+                        nonce: 0,
+                        code_hash: KECCAK_EMPTY_CODE,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+                let mut ctx = pipeline_ctx(&db, on, None);
+                ctx.test_no_resident_rows = no_r;
+                let pm = torus_core::position::PositionManager::new(db.clone());
+                let mut seen = Vec::new();
+                for b in &blocks {
+                    dispatch_and_execute(&ctx, &db, b);
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} no_r={no_r}");
+                    if let Some(w) = ctx.flush_worker.as_ref() {
+                        assert!(w.wait_idle());
+                    }
+                    let bal = pm.get_native_balance(&trader).unwrap();
+                    seen.push((bal.available + bal.order_margin, bal.order_margin));
+                    if !no_r {
+                        assert_resident_rows_track_db(&ctx, &db, b.header.height, "lockbox");
+                    }
+                }
+                let credit = FixedPoint::from_raw(1_000 * FixedPoint::SCALE);
+                assert_eq!(seen[0].0, FixedPoint::ZERO, "block 1: deposit queued, not credited");
+                assert_eq!(seen[1].0, credit, "block 2: credited by the drain");
+                assert_eq!(seen[1].1, FixedPoint::ZERO, "block 2's order ran before the drain: rejected");
+                assert!(seen[2].1 > FixedPoint::ZERO, "block 3's order rests on the credited balance");
+                drop(ctx);
+                dumps.push(dump_all_cfs(&db));
+            }
+        }
+        for d in &dumps[1..] {
+            assert_dumps_equal(&dumps[0], d, "lockbox sequence: with/without R, serial/pipelined");
+        }
+    }
+
+    /// Item 6 C1, P6: crash between E's hand-off and W's write with R on —
+    /// block 3 ran on R carried from block 1 (advanced over the empty 2) on
+    /// top of pending(2); W's write of 2 fails, nothing of 2/3 is durable,
+    /// R is not stashed. A restarted node (fresh holder: R rebuilt cold)
+    /// replays 2 and 3 and lands exactly the state of a run without R.
+    #[test]
+    fn resident_rows_crash_between_handoff_and_write_restart_identical() {
+        let blocks = pipeline_fixture_blocks();
+        let first3 = &blocks[..3];
+
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_pipeline_fixture(&db_ref);
+        let mut ctx_ref = pipeline_ctx(&db_ref, false, None);
+        ctx_ref.test_no_resident_rows = true;
+        for b in first3 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, state_db) = make_test_config_and_db();
+        fund_pipeline_fixture(&state_db);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+        dispatch_and_execute(&ctx, &state_db, &first3[0]);
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(1));
+
+        gate.hold();
+        dispatch_and_execute(&ctx, &state_db, &first3[1]); // empty: Marker(2) parked, R advanced
+        assert!(gate.wait_received(2));
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(2));
+        let db_t = state_db.clone();
+        let b3 = first3[2].clone();
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b3); // engine(3) on R + pending(2); hand-off blocks
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished());
+        gate.fail_next();
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        {
+            let mut holder = ctx.resident_books.lock().unwrap();
+            assert_eq!(holder.rows_builds(), 1, "block 3 reused R (no rebuild)");
+            assert_eq!(holder.rows_height(), None, "failed hand-off: R not stashed");
+        }
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+
+        let ctx2 = pipeline_ctx(&state_db, false, None);
+        let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
+        assert_eq!(parked, None);
+        assert!(!ctx2.exec_failed.load(Ordering::SeqCst));
+        assert_resident_rows_track_db(&ctx2, &state_db, 3, "after the replay");
+        assert_eq!(ctx2.resident_books.lock().unwrap().rows_builds(), 1, "restart: R built cold once");
+        drop(ctx2);
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "crash + restart with R vs serial without R");
+    }
+
+    // ======================================================================
+    // Item 6 Phase 1 C5 (plan Step 5, P5): warm == cold
+    // ======================================================================
+
+    /// Blocks fed, epoch length (boundaries at 50 / 100 / 150 / 200) and the
+    /// restart period of the cold replica (7 does not divide 50).
+    const C5_BLOCKS: u64 = 210;
+    const C5_EPOCH: u64 = 50;
+    const C5_RESTART_EVERY: u64 = 7;
+    const C5_MARKETS: [u64; 3] = [1, 2, 3];
+    /// Traders (signing-key seeds): 81 / 82 also move funds EVM <-> perp,
+    /// 84 is thin (margin cuts). Makers quote every market.
+    const C5_TRADERS: [u8; 6] = [81, 82, 83, 84, 85, 86];
+    const C5_MAKERS: [u8; 2] = [89, 90];
+    /// Seeded before block 1: V1 long 10 @100 in market 1 (collateral 40),
+    /// V2 short 10 @100 in market 2 (collateral 60): backstop after the
+    /// shocks; V3 long 1,100 @100 in market 3 (collateral 6,200; notional
+    /// over the chunk threshold, MM 5,500 at 100): stage 1 on the walk, 20%
+    /// chunks into bids far thinner than its size (cooldown and pending
+    /// rows); S their counterparty.
+    const C5_V1: u8 = 91;
+    const C5_V2: u8 = 93;
+    const C5_V3: u8 = 94;
+    const C5_S: u8 = 92;
+    const C5_EVM_FUNDING: u128 = 10_000;
+
+    /// splitmix64: the generator's only source of variety (fixed seed, no clock).
+    struct C5Rng(u64);
+
+    impl C5Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// 3 Active oracle validators; market 1 a placeholder row (no margin
+    /// config / shape: defaults), markets 2 and 3 governance-layout rows
+    /// (lot 0.001, tick 0.01, initial margin 5% / 10%); traders, makers and
+    /// the seeded thin positions funded; 81 / 82 hold EVM balance.
+    fn c5_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = C5_EPOCH;
+        for (seed, mult) in ORACLE_VALIDATORS {
+            oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
+        }
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"listed").unwrap();
+        for (m, im) in [(2u64, 5i64), (3, 10)] {
+            let row = (
+                "BTC".to_string(),
+                "USDC".to_string(),
+                FixedPoint::SCALE / 1_000,
+                FixedPoint::SCALE / 100,
+                px(im).raw(),
+            );
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &borsh::to_vec(&row).unwrap())
+                .unwrap();
+        }
+        let pm = PositionManager::new(db.clone());
+        let fund = |seed: u8, amt: i64| {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap()
+        };
+        for (i, seed) in C5_TRADERS.into_iter().enumerate() {
+            fund(seed, if seed == 84 { 150 } else { 3_000 + 1_000 * i as i64 });
+        }
+        for seed in C5_MAKERS.into_iter().chain([C5_S]) {
+            fund(seed, 1_000_000);
+        }
+        fund(C5_V1, 40);
+        fund(C5_V2, 60);
+        fund(C5_V3, 6_200);
+        let (v1, v2, s) = (oracle_addr(C5_V1), oracle_addr(C5_V2), oracle_addr(C5_S));
+        pm.apply_fill(&v1, 1, true, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 1, false, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&v2, 2, false, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 2, true, px(10), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&oracle_addr(C5_V3), 3, true, px(1_100), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&s, 3, false, px(1_100), px(100), MarginType::Cross).unwrap();
+        for seed in [81u8, 82] {
+            fund_evm_balance(&db, oracle_addr(seed), U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128));
+        }
+        (config, db)
+    }
+
+    /// What the generator fed (non-vacuity of the input side).
+    #[derive(Debug, Default)]
+    struct C5Fed {
+        empty: u64,
+        mark_rounds: u64,
+        non_pool_sell_batches: u64,
+        cancels: u64,
+        transfers: u64,
+    }
+
+    /// The P5 sequence: heights 1..=C5_BLOCKS (ts 1000 + h), linked. Oracle
+    /// rounds (all 3 validators, all 3 markets) every 5th block plus at
+    /// random, marks walking +-2 per round with two shocks (market 1 -15% at
+    /// 60: V1 under water; market 2 +18% at 120: V2); a maker requoting
+    /// every market each non-empty block (cancel-all every 6th); 1-3 trader
+    /// actions: resting limits, crossing limits, two-market sell batches
+    /// crossing the bid (the second is a non-pool sell: B-blind top-up),
+    /// cancel-alls, EVM <-> perp transfers; ~1/5 of the other blocks empty.
+    fn c5_blocks() -> (Vec<TorusBlock>, C5Fed) {
+        let mut rng = C5Rng(0xC5_0005);
+        let mut fed = C5Fed::default();
+        let mut mark = [100i64; 3];
+        let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
+        let mut sign = |seed: u8, action: NativeAction| {
+            let n = nonces.entry(seed).or_insert(0);
+            *n += 1;
+            torus_types::eip712::sign_native_action(action, *n, &oracle_key(seed))
+        };
+        let order = |m: u64, is_buy: bool, price: i64, qty: i64| torus_types::PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: px(price),
+            quantity: px(qty),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let units = |v: u128| U256::from(v * FixedPoint::ONE.raw() as u128);
+        let mut blocks = Vec::new();
+        for h in 1..=C5_BLOCKS {
+            let mut actions = Vec::new();
+            let shock = h == 60 || h == 120;
+            let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
+            if mark_round {
+                fed.mark_rounds += 1;
+                match h {
+                    1 => {}
+                    60 => mark[0] = mark[0] * 85 / 100,
+                    120 => mark[1] = mark[1] * 118 / 100,
+                    _ => {
+                        for p in &mut mark {
+                            *p = (*p + rng.below(5) as i64 - 2).max(50);
+                        }
+                    }
+                }
+                for (seed, _) in ORACLE_VALIDATORS {
+                    let prices = C5_MARKETS.iter().zip(mark).map(|(m, p)| (*m, px(p))).collect();
+                    actions.push(torus_types::eip712::sign_native_action(
+                        NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                            prices,
+                            timestamp: (1_000 + h) * 1_000,
+                        }),
+                        h * 1_000 + seed as u64,
+                        &oracle_key(seed),
+                    ));
+                }
+            }
+            if !mark_round && rng.below(5) == 0 {
+                fed.empty += 1;
+                blocks.push(make_block(h, actions));
+                continue;
+            }
+            let maker = C5_MAKERS[(h % 2) as usize];
+            if h % 6 == 0 {
+                actions.push(sign(maker, NativeAction::CancelAllOrders { market_id: None }));
+                fed.cancels += 1;
+            }
+            let mut quotes = Vec::new();
+            for (i, m) in C5_MARKETS.into_iter().enumerate() {
+                let q = 2 + rng.below(4) as i64;
+                quotes.push(order(m, true, mark[i] - 1 - rng.below(2) as i64, q));
+                quotes.push(order(m, false, mark[i] + 1 + rng.below(2) as i64, q));
+            }
+            actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
+            for _ in 0..1 + rng.below(3) {
+                let t = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                let mi = rng.below(3) as usize;
+                let (m, p) = (C5_MARKETS[mi], mark[mi]);
+                let qty = 1 + rng.below(4) as i64;
+                let action = match rng.below(10) {
+                    0..=3 => {
+                        let is_buy = rng.below(2) == 0;
+                        let off = 1 + rng.below(3) as i64;
+                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p - off } else { p + off }, qty))
+                    }
+                    4 | 5 => {
+                        let is_buy = rng.below(2) == 0;
+                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p + 2 } else { p - 2 }, qty))
+                    }
+                    6 => {
+                        let mj = (mi + 1 + rng.below(2) as usize) % 3;
+                        fed.non_pool_sell_batches += 1;
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(m, false, p - 2, qty),
+                            order(C5_MARKETS[mj], false, mark[mj] - 2, qty),
+                        ])
+                    }
+                    7 => {
+                        fed.cancels += 1;
+                        NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) }
+                    }
+                    8 if t == 81 || t == 82 => {
+                        fed.transfers += 1;
+                        if rng.below(2) == 0 {
+                            NativeAction::TransferToPerp { amount: units(100) }
+                        } else {
+                            NativeAction::TransferToSpot { amount: units(50) }
+                        }
+                    }
+                    _ => {
+                        let mj = (mi + 1) % 3;
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(m, true, p - 1 - rng.below(3) as i64, qty),
+                            order(C5_MARKETS[mj], false, mark[mj] + 1 + rng.below(3) as i64, qty),
+                        ])
+                    }
+                };
+                actions.push(sign(t, action));
+            }
+            blocks.push(make_block(h, actions));
+        }
+        link_blocks(&mut blocks);
+        (blocks, fed)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum C5Replica {
+        /// One context for every block.
+        Warm,
+        /// Context dropped and recreated after every `C5_RESTART_EVERY`th
+        /// block: R, its decoded positions, the sums cache and the books
+        /// rebuilt cold.
+        Restarted,
+        /// One context; the sums cache emptied before every block.
+        SumsDropped,
+    }
+
+    struct C5Run {
+        db: StateDb,
+        dump: Vec<CfDump>,
+        captured: CapturedWrites,
+        hash: Option<(u64, [u8; 32])>,
+        builds: u64,
+        restarts: u64,
+        sums_dropped: usize,
+        r_rows: usize,
+        /// Blocks after which an oracle mark price differed from the block before.
+        mark_moves: u64,
+        mark_moves_after_last_epoch: u64,
+        /// Blocks after which `CF_NATIVE_LIQUIDATION` held cooldown / pending rows.
+        liq_row_blocks: u64,
+        metrics: Arc<torus_telemetry::Metrics>,
+    }
+
+    /// Feed `blocks` through the committed-block path on a fresh
+    /// `c5_fixture` DB as `replica`. After every block: no fail-stop, R ==
+    /// the DB scan of its CFs and decoded positions == a cold decode
+    /// (`assert_resident_rows_track_db`; a restarted context has no R until
+    /// its first native block), no shared fallback.
+    fn c5_run(
+        blocks: &[TorusBlock],
+        replica: C5Replica,
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+    ) -> C5Run {
+        use torus_state::cf::{CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE};
+        let (config, db) = c5_fixture();
+        torus_state::running_hash::capture_begin(&db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let what = format!("{replica:?} pipelined={pipelined} {mode:?}");
+        let new_ctx = || {
+            let mut c = make_exec_ctx(&config, &db);
+            c.test_book_mode = mode;
+            c.metrics = Some(metrics.clone());
+            if pipelined {
+                c.attach_flush_worker(None);
+            }
+            c
+        };
+        let mark_prices = |db: &StateDb| -> Vec<(Vec<u8>, Vec<u8>)> {
+            StateBackend::iterate_cf(db, CF_NATIVE_ORACLE, Some(b"agg"))
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| (k, v[..16].to_vec()))
+                .collect()
+        };
+        let mut ctx = new_ctx();
+        let (mut builds, mut restarts, mut sums_dropped) = (0, 0, 0);
+        let (mut mark_moves, mut mark_moves_after_last_epoch, mut liq_row_blocks) = (0, 0, 0);
+        let mut prev_marks = Vec::new();
+        let last = blocks.last().expect("blocks").header.height;
+        for b in blocks {
+            let h = b.header.height;
+            if replica == C5Replica::SumsDropped {
+                sums_dropped += ctx.resident_books.lock().unwrap().drop_sums_cache();
+            }
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: fail-stop at {h}");
+            if ctx.resident_books.lock().unwrap().rows_builds() == 0 {
+                assert_eq!(replica, C5Replica::Restarted, "{what}: R never built by {h}");
+                if let Some(w) = ctx.flush_worker.as_ref() {
+                    assert!(w.wait_idle(), "{what}: W failed");
+                }
+                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: {h}");
+            } else {
+                assert_resident_rows_track_db(&ctx, &db, h, &what);
+            }
+            assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}: {h}");
+            let marks = mark_prices(&db);
+            if marks != prev_marks {
+                mark_moves += 1;
+                mark_moves_after_last_epoch += u64::from(h > (last / C5_EPOCH) * C5_EPOCH);
+                prev_marks = marks;
+            }
+            // Cooldown / pending rows: tag + trader (the 9-byte previous-mark rows persist).
+            liq_row_blocks += u64::from(
+                StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, None).unwrap().iter().any(|(k, _)| k.len() == 21),
+            );
+            if replica == C5Replica::Restarted && h % C5_RESTART_EVERY == 0 && h < last {
+                builds += ctx.resident_books.lock().unwrap().rows_builds();
+                restarts += 1;
+                drop(ctx);
+                ctx = new_ctx();
+            }
+        }
+        let r_rows = ctx.resident_books.lock().unwrap().rows().map_or(0, |r| r.len());
+        builds += ctx.resident_books.lock().unwrap().rows_builds();
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        let hash = torus_state::running_hash::read_running_hash(&db);
+        let dump = dump_all_cfs(&db);
+        C5Run {
+            db,
+            dump,
+            captured,
+            hash,
+            builds,
+            restarts,
+            sums_dropped,
+            r_rows,
+            mark_moves,
+            mark_moves_after_last_epoch,
+            liq_row_blocks,
+            metrics,
+        }
+    }
+
+    /// Item 6 C5 (plan Step 5, P5): warm == cold in one configuration. The
+    /// 210 blocks (4 epoch boundaries) through three replicas, each on its
+    /// own DB: warm (one context), restarted every 7 blocks (R, decoded
+    /// positions, sums cache, marks and books rebuilt cold) and sums-dropped
+    /// (cache emptied before every block). R == DB after every block on
+    /// each (`c5_run`); identical per-block consensus write sets (every
+    /// `h_n`), running hash and full dump; the sequence is non-vacuous.
+    /// Returns the warm run.
+    fn c5_warm_equals_cold(pipelined: bool, mode: Option<torus_bridge::native_executor::BookMode>) -> C5Run {
+        let started = std::time::Instant::now();
+        let what = format!("pipelined={pipelined} {mode:?}");
+        let (blocks, fed) = c5_blocks();
+        assert_eq!(blocks.len() as u64, C5_BLOCKS);
+        let warm = c5_run(&blocks, C5Replica::Warm, pipelined, mode);
+        let restarted = c5_run(&blocks, C5Replica::Restarted, pipelined, mode);
+        let dropped = c5_run(&blocks, C5Replica::SumsDropped, pipelined, mode);
+
+        assert_eq!((warm.builds, dropped.builds), (1, 1), "{what}: R built once");
+        assert_eq!(restarted.restarts, (C5_BLOCKS - 1) / C5_RESTART_EVERY, "{what}");
+        assert_eq!(restarted.builds, restarted.restarts + 1, "{what}: one cold build per (re)start");
+        assert_eq!(
+            warm.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=C5_BLOCKS).collect::<Vec<_>>(),
+            "{what}: every height through the hashed flush"
+        );
+        assert!(warm.hash.is_some());
+        assert_eq!(warm.hash, Some(fold_captured(&warm.captured)), "{what}");
+        for (name, other) in [("restarted", &restarted), ("sums dropped", &dropped)] {
+            assert_write_sets_equal(&warm.captured, &other.captured, &format!("{what}: warm vs {name}"));
+            assert_eq!(warm.hash, other.hash, "{what}: running hash, warm vs {name}");
+            assert_dumps_equal(&warm.dump, &other.dump, &format!("{what}: warm vs {name}"));
+        }
+
+        // Non-vacuous (the warm replica; the others equal it).
+        let pm = torus_core::position::PositionManager::new(warm.db.clone());
+        let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap().len();
+        let liquidations = warm.metrics.liquidations_triggered.get();
+        let top_ups = warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
+        let v1 = signed_pos_of(&warm.db, &oracle_addr(C5_V1));
+        let v2 = pm.get_position(&oracle_addr(C5_V2), 2).unwrap().map(|p| p.size);
+        let v3 = pm.get_position(&oracle_addr(C5_V3), 3).unwrap().map(|p| p.size);
+        let funded = U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128);
+        let evm_moved = [81u8, 82].iter().filter(|&&s| read_evm_balance(&warm.db, oracle_addr(s)) != funded).count();
+        println!(
+            "C5 {what}: fed {fed:?}; fills {fills}, liquidations {liquidations}, top-ups {top_ups}, \
+             mark moves {} ({} after the last epoch boundary), blocks with cooldown / pending rows {}, \
+             R rows {}, V1 {v1:?}, V2 {v2:?}, V3 {v3:?}, EVM balances moved {evm_moved}, sums entries dropped {}, \
+             restarts {} / builds {}; {:.1} s",
+            warm.mark_moves,
+            warm.mark_moves_after_last_epoch,
+            warm.liq_row_blocks,
+            warm.r_rows,
+            dropped.sums_dropped,
+            restarted.restarts,
+            restarted.builds,
+            started.elapsed().as_secs_f64(),
+        );
+        assert!(fed.empty >= 10 && fed.cancels >= 20 && fed.transfers >= 2 && fed.non_pool_sell_batches >= 10, "{fed:?}");
+        assert!(fills >= 200, "{what}: fills {fills}");
+        assert!(liquidations >= 2, "{what}: liquidations {liquidations}");
+        assert!(top_ups >= 20, "{what}: B-blind top-ups {top_ups}");
+        assert!(warm.mark_moves >= 50 && warm.mark_moves_after_last_epoch >= 1, "{what}: mark moves");
+        assert!(warm.liq_row_blocks >= 1, "{what}: cooldown / pending rows");
+        assert!(warm.r_rows >= 30, "{what}: R rows {}", warm.r_rows);
+        assert_eq!(v1, FixedPoint::ZERO, "{what}: V1 liquidated");
+        assert_eq!(v2, None, "{what}: V2 liquidated");
+        assert_ne!(v3, Some(px(1_100)), "{what}: V3 liquidated");
+        assert_eq!(evm_moved, 2, "{what}: deposits / withdrawals moved EVM balances");
+        assert!(dropped.sums_dropped >= 500, "{what}: the cache held entries ({})", dropped.sums_dropped);
+        warm
+    }
+
+    #[test]
+    fn warm_equals_cold_every_block_serial() {
+        c5_warm_equals_cold(false, None);
+    }
+
+    /// Also serial == pipelined (one more warm run).
+    #[test]
+    fn warm_equals_cold_every_block_pipelined() {
+        let piped = c5_warm_equals_cold(true, None);
+        let serial = c5_run(&c5_blocks().0, C5Replica::Warm, false, None);
+        assert_write_sets_equal(&serial.captured, &piped.captured, "serial vs pipelined");
+        assert_eq!(serial.hash, piped.hash, "serial vs pipelined");
+        assert_dumps_equal(&serial.dump, &piped.dump, "serial vs pipelined");
+    }
+
+    #[test]
+    fn warm_equals_cold_every_block_pipelined_level_authority_chunked() {
+        c5_warm_equals_cold(true, Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked));
     }
 }

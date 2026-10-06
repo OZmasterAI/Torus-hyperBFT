@@ -27,6 +27,8 @@ use trader_orders::TraderOrders;
 
 #[cfg(test)]
 mod matching_entry_tests;
+#[cfg(test)]
+mod account_margins_p1_tests;
 
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,
@@ -135,6 +137,14 @@ pub struct PlaceResult {
     /// cap, reduce-only re-check against the position AT TRIGGER TIME,
     /// margin, settlement of its fills).
     pub triggered_stops: Vec<TriggeredStop>,
+    /// F1 (s517 #4, HL `marginCanceled`): resting makers cancelled WHOLE at
+    /// match time because their account could not afford the fill. Released
+    /// by the executor exactly like reduce-only cuts (A5 telescoping).
+    pub margin_cancels: Vec<ReduceOnlyCut>,
+    /// s92 (observability only): the level price at which this taker's
+    /// match-time margin ([`TakerMarginLimit`]) ran out — it was cancelled
+    /// there, after the fills that fitted (`Cancelled`); `None` otherwise.
+    pub margin_cut_price: Option<FixedPoint>,
 }
 
 impl PlaceResult {
@@ -147,6 +157,8 @@ impl PlaceResult {
             rested_qty: FixedPoint::ZERO,
             reduce_only_cuts: vec![],
             triggered_stops: vec![],
+            margin_cancels: vec![],
+            margin_cut_price: None,
         }
     }
 }
@@ -177,8 +189,10 @@ pub struct TriggeredStop {
 /// again when they match"): the match-time margin limit of ONE taker order,
 /// computed by the executor from placement-time data only.
 ///
-/// `budget` = the order's placement reservation + the sender's available
-/// balance right after it. Before each fill the book requires
+/// `budget` = the order's own placement reservation; F1 (s517): the book adds
+/// the sender's running free margin from [`AccountMargins`] (absent = 0, i.e.
+/// the pre-F1 budget) and charges the IM DELTA of the taker's position at its
+/// position-size tier (see `need`). Pre-F1 wording: before each fill the book requires
 /// `IM(charged fill notional so far + this fill's charged part + hold_price ×
 /// quantity left after it) <= budget` (`IM` =
 /// [`crate::margin::order_initial_margin`] with `tiers`); the hold term is
@@ -208,49 +222,70 @@ pub struct TakerMarginLimit {
 }
 
 impl TakerMarginLimit {
-    fn im(&self, notional: FixedPoint) -> FixedPoint {
-        crate::margin::order_initial_margin(self.tiers.as_deref(), notional)
-    }
-
-    /// Margin committed after filling `q` at `price` on top of `charged`
-    /// (the charged fill notional so far) with `left_before` of the order
-    /// still to fill, the first `free` of `q` closing the taker's position;
-    /// `None` when the notional overflows (never affordable).
+    /// F1 (s517): IM delta of this taker's market (position-size tier) after
+    /// filling `q` at `price` on top of the fills so far: the position
+    /// valued at `px` shrinks by what the fills closed, the opening fills
+    /// add their notional, and — for an order that can rest — the part of
+    /// the remainder that would OPEN adds `hold_price` × it (resting closing
+    /// quantity needs no margin, HL). `free` is the live closing capacity
+    /// (the book's position map). `None` on overflow. Without an account
+    /// (`px` 0, see [`AccountMargins`]) this is the pre-F1 per-order need
+    /// `IM(charged + price × opening + hold)`.
     fn need(
         &self,
-        charged: FixedPoint,
+        m: &MatchMargin<'_>,
         price: FixedPoint,
         q: FixedPoint,
         free: FixedPoint,
         left_before: FixedPoint,
     ) -> Option<FixedPoint> {
-        let opening = q - q.min(free);
-        let mut notional = charged.checked_add(price.checked_mul(opening).ok()?).ok()?;
+        debug_assert!(std::ptr::eq(self, m.limit), "need of the taker's own limit");
+        let closing = q.min(free);
+        let closed = m.allowance0 - free + closing;
+        let before = m.before?;
+        let mut after = (m.size0 - closed)
+            .checked_mul(m.px)
+            .ok()?
+            .checked_add(m.charged)
+            .ok()?
+            .checked_add(price.checked_mul(q - closing).ok()?)
+            .ok()?;
         if let Some(hp) = self.hold_price {
-            notional = notional.checked_add(hp.checked_mul(left_before - q).ok()?).ok()?;
+            let open_rest = ((left_before - q) - (free - closing)).max(FixedPoint::ZERO);
+            after = after.checked_add(hp.checked_mul(open_rest).ok()?).ok()?;
         }
-        Some(self.im(notional))
+        // `im_delta(tiers, before, after)`, IM(after) first as there; P3:
+        // IM(before) once per taker (same value, computed at the same first
+        // call, so even a 0x tier panics where it did).
+        let tiers = self.tiers.as_deref();
+        let im_after = crate::margin::order_initial_margin(tiers, after);
+        let im_before = *m
+            .im_before
+            .get_or_init(|| crate::margin::order_initial_margin(tiers, before));
+        Some(im_after - im_before)
     }
 
-    /// Largest quantity `<= q` (all of `q`, or a multiple of `lot`) that fits
-    /// the budget. Binary search over lot counts: `lo` always fits.
+    /// Largest quantity `<= q` (all of `q`, or a multiple of the lot) that
+    /// fits: a purely closing quantity (`<= free`) always does (HL: reducing
+    /// needs no margin, even under water); beyond it the need must be
+    /// `<= budget`. Beyond the closing part the need is non-decreasing
+    /// (checked takers fill at prices >= their hold), so the quantities that
+    /// fit are one interval from zero; `lo` = 0 always fits.
     fn affordable(
         &self,
-        charged: FixedPoint,
+        m: &MatchMargin<'_>,
         price: FixedPoint,
         q: FixedPoint,
         free: FixedPoint,
         left_before: FixedPoint,
-        lot: FixedPoint,
     ) -> FixedPoint {
         let fits = |q: FixedPoint| {
-            self.need(charged, price, q, free, left_before)
-                .is_some_and(|n| n <= self.budget)
+            q <= free || self.need(m, price, q, free, left_before).is_some_and(|n| m.fits(n))
         };
         if fits(q) {
             return q;
         }
-        let step = if lot > FixedPoint::ZERO { lot.raw() } else { 1 };
+        let step = if m.lot > FixedPoint::ZERO { m.lot.raw() } else { 1 };
         let (mut lo, mut hi) = (0i128, q.raw() / step + 1);
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
@@ -269,9 +304,50 @@ impl TakerMarginLimit {
 struct MatchMargin<'a> {
     limit: &'a TakerMarginLimit,
     lot: FixedPoint,
+    /// F1 (s517): |position| at the taker's start, the price it is valued
+    /// at, and its closing capacity then (opposite-side size; 0 if same side).
+    size0: FixedPoint,
+    px: FixedPoint,
+    allowance0: FixedPoint,
+    /// Item 6 P3: `size0 × px` (`None` on overflow) and its IM at the
+    /// limit's tiers (filled by the first `need`) — constant per taker.
+    before: Option<FixedPoint>,
+    im_before: std::cell::OnceCell<FixedPoint>,
+    /// F1: `limit.budget` + the sender's running free margin.
+    budget: FixedPoint,
     /// Notional of the charged (non-closing) part of the fills so far.
     charged: FixedPoint,
     exhausted: bool,
+    /// s92: the level price where `exhausted` was set.
+    cut_at: Option<FixedPoint>,
+    /// B2 (s87): the sender's entry here is a taker-only budget (D2
+    /// non-pool market), which gets the makers' rounding allowance.
+    taker_only: bool,
+}
+
+impl MatchMargin<'_> {
+    /// B2 (s87): what a need costs the sender's running free margin beyond
+    /// the order's own reservation. Each IM difference is floored, so a
+    /// taker adding to a same-side position can need its reservation + 1 raw
+    /// (floor(A + x) − floor(A) = floor(x) + 1) at no price improvement —
+    /// rounding, not cost. As for makers ([`maker_fill_fits`]), a taker-only
+    /// budget does not pay that unit: it was cancelled with 0 fills at its
+    /// own limit price for it. Shared accounts (single path, D2 pool market)
+    /// are unchanged.
+    fn over_reservation(&self, need: FixedPoint) -> FixedPoint {
+        let over = need - self.limit.budget;
+        if self.taker_only && over == FixedPoint::from_raw(1) {
+            FixedPoint::ZERO
+        } else {
+            over
+        }
+    }
+
+    /// Whether `need` fits: its part beyond the reservation must fit the
+    /// running free margin (`budget − limit.budget`).
+    fn fits(&self, need: FixedPoint) -> bool {
+        need <= self.budget || self.over_reservation(need) <= self.budget - self.limit.budget
+    }
 }
 
 /// s515: signed positions (+long / -short) in this book's market of the
@@ -284,9 +360,13 @@ struct MatchMargin<'a> {
 /// every reduce-only sender — flat traders as zero. Review 5: also every
 /// taker with a [`TakerMarginLimit`], whose closing fills are free; absent,
 /// it is charged as if flat (conservative).
+///
+/// Item 6 P1: a `HashMap` — only point reads and writes, never iterated
+/// (iteration order would be per-process random), so nothing it decides
+/// depends on an order.
 #[derive(Clone, Debug, Default)]
 pub struct ReduceOnlyPositions {
-    positions: BTreeMap<Address, FixedPoint>,
+    positions: HashMap<Address, FixedPoint>,
 }
 
 impl ReduceOnlyPositions {
@@ -327,6 +407,242 @@ pub fn reduce_only_allowance(signed_pos: FixedPoint, is_buy: bool) -> FixedPoint
         signed_pos
     } else {
         FixedPoint::ZERO
+    }
+}
+
+/// Item 6 M1 (review rows 40-42): why a placement breaks its market's tick or
+/// lot. One text for the executor's pre-book reject, the RPC's intake check
+/// and (after "modify rejected: ") the modify path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeViolation {
+    /// `quantity < lot` (every order type).
+    BelowLot { quantity: FixedPoint, lot: FixedPoint },
+    /// A `Limit` price, or a `StopLimit` limit, off a positive tick.
+    OffTick { price: FixedPoint, tick: FixedPoint },
+}
+
+impl std::fmt::Display for ShapeViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BelowLot { quantity, lot } => write!(f, "quantity {quantity} below the lot size {lot}"),
+            Self::OffTick { price, tick } => write!(f, "price {price} is not a multiple of the tick {tick}"),
+        }
+    }
+}
+
+impl ShapeViolation {
+    /// The placement reject text (executor and RPC).
+    pub fn placement_message(&self) -> String {
+        format!("order rejected: {self}")
+    }
+}
+
+/// Item 6 M1: the placement shape rule of a market with `tick` / `lot` —
+/// [`OrderBook::place_order_with_accounts`]'s dust and tick rejects, same
+/// order (lot first, for every order type; then the tick when `tick > 0`
+/// for a `Limit` price), plus (row 40) a `StopLimit`'s limit, which is the
+/// `Limit` price it is placed at when triggered.
+pub fn shape_violation(params: &PlaceOrderParams, tick: FixedPoint, lot: FixedPoint) -> Option<ShapeViolation> {
+    if params.quantity < lot {
+        return Some(ShapeViolation::BelowLot { quantity: params.quantity, lot });
+    }
+    let price = match params.order_type {
+        OrderType::Limit => params.price,
+        OrderType::StopLimit { limit, .. } => limit,
+        OrderType::Market | OrderType::StopMarket { .. } => return None,
+    };
+    (tick > FixedPoint::ZERO && price.raw() % tick.raw() != 0).then_some(ShapeViolation::OffTick { price, tick })
+}
+
+/// Item 6 M1 (row 42): `(tick, lot)` of a `CF_NATIVE_MARKETS` row in the
+/// genesis / governance layout (base `String`, quote `String`, lot `i128`,
+/// tick `i128`, initial margin `i128`, borsh), as stored. `None` when the
+/// row does not decode exactly (e.g. test placeholders).
+pub fn market_row_shape(row: &[u8]) -> Option<(FixedPoint, FixedPoint)> {
+    let (_base, _quote, lot, tick, _im) = <(String, String, i128, i128, i128)>::try_from_slice(row).ok()?;
+    Some((FixedPoint::from_raw(tick), FixedPoint::from_raw(lot)))
+}
+
+#[cfg(test)]
+mod shape_tests;
+
+/// F1 (s517): account-level margin state of ONE book for the current
+/// placement / batch — the running free margin (and position valuation
+/// price) of each trader whose fills the book must check. Installed by the
+/// executor, advanced by the book, cleared with the reduce-only map. A
+/// trader ABSENT from it is checked as before F1 (book-only callers).
+#[derive(Clone, Debug, Default)]
+pub struct AccountMargins {
+    /// The market's leverage tiers (maker check).
+    tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>,
+    /// Item 6 P1: ONE entry per trader (was three `BTreeMap` / `BTreeSet`
+    /// keyed by trader: `accounts`, `makers`, `taker_only`), so a maker
+    /// fill finds and commits its running margin with one lookup. A
+    /// `HashMap`: point reads and writes only, never iterated.
+    traders: HashMap<Address, TraderMargins>,
+}
+
+/// Item 6 P1: one trader's part of [`AccountMargins`] — the three former
+/// maps' entries, unchanged in meaning.
+#[derive(Clone, Copy, Debug, Default)]
+struct TraderMargins {
+    /// Its taker's running budget (installed by the executor; D2 pools) —
+    /// was `accounts`.
+    taker: Option<AccountMargin>,
+    /// Review fix 4 (s517): `taker` is only a taker budget of 0 (D2: a
+    /// sender's markets other than its pool market) — NOT its account, so
+    /// its makers keep the snapshot. Any other `taker` entry IS the
+    /// sender's running account in this book and is shared by its takers
+    /// and its makers. Was the `taker_only` set (never cleared by `insert`).
+    taker_only: bool,
+    /// Review fix 2 (s517): its makers' running free margin, loaded from
+    /// the D8 snapshot — kept apart from the taker pool (a sender's pool is
+    /// 0 outside its first checked taker's market, which is not its maker
+    /// free margin). Was `makers`.
+    maker: Option<AccountMargin>,
+}
+
+/// F1 (s517): one trader's entry in [`AccountMargins`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountMargin {
+    /// Running free margin (may be negative).
+    pub free: FixedPoint,
+    /// Price the trader's position here is valued at (mark, else entry;
+    /// ZERO = use the book's last trade price).
+    pub px: FixedPoint,
+}
+
+impl AccountMargins {
+    pub fn new(tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>) -> Self {
+        Self {
+            tiers,
+            traders: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, trader: Address, free: FixedPoint, px: FixedPoint) {
+        self.traders.entry(trader).or_default().taker = Some(AccountMargin { free, px });
+    }
+
+    /// Review fix 4 (s517): a taker budget of 0 that is NOT `trader`'s
+    /// account (D2 non-pool market): its takers fill within their own
+    /// reservation; its makers are checked against their snapshot.
+    pub fn insert_taker_only(&mut self, trader: Address, px: FixedPoint) {
+        let e = self.traders.entry(trader).or_default();
+        e.taker = Some(AccountMargin { free: FixedPoint::ZERO, px });
+        e.taker_only = true;
+    }
+
+    pub fn get(&self, trader: &Address) -> Option<AccountMargin> {
+        self.traders.get(trader).and_then(|e| e.taker)
+    }
+
+    /// `trader`'s taker entry and whether it is a taker-only budget (one
+    /// lookup).
+    fn taker(&self, trader: &Address) -> (Option<AccountMargin>, bool) {
+        self.traders.get(trader).map_or((None, false), |e| (e.taker, e.taker_only))
+    }
+
+    fn set_free(&mut self, trader: &Address, free: FixedPoint) {
+        if let Some(a) = self.traders.get_mut(trader).and_then(|e| e.taker.as_mut()) {
+            a.free = free;
+        }
+    }
+}
+
+/// F1 (s517 #4): `trader`'s running margin as a maker — its shared account
+/// in the book holding it (review fix 4: single path, D2 pool market; a
+/// maker shares the running entry its takers spend), else its snapshot,
+/// loaded from `src` the first time it is needed in this placement / batch
+/// (also seeding its position in `ro` when the book does not track it
+/// yet). Item 6 P1: one lookup; the caller commits through the slot.
+fn maker_slot<'m>(
+    traders: &'m mut HashMap<Address, TraderMargins>,
+    trader: Address,
+    market_id: MarketId,
+    src: &dyn MakerAccountSource,
+    ro: &mut ReduceOnlyPositions,
+) -> &'m mut AccountMargin {
+    match traders.entry(trader).or_default() {
+        TraderMargins { taker: Some(a), taker_only: false, .. } => a,
+        TraderMargins { maker, .. } => maker.get_or_insert_with(|| {
+            let m = src.maker_account(&trader, market_id);
+            if ro.get(&trader).is_none() {
+                ro.insert(trader, m.signed_pos);
+            }
+            AccountMargin { free: m.free, px: m.px }
+        }),
+    }
+}
+
+/// F1 (s517 #4): where the book gets a maker's account the first time it
+/// fills in this placement / batch. MUST be deterministic and read-only
+/// (the executor reads the frozen pre-batch state); `Sync` for workers.
+pub trait MakerAccountSource: Sync {
+    fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount;
+}
+
+/// F1 (s517 #4): a maker's account snapshot — free margin (available +
+/// UPnL − position IM), signed position in this market and the price it
+/// is valued at (mark, else entry; ZERO = the fill price).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MakerAccount {
+    pub free: FixedPoint,
+    pub signed_pos: FixedPoint,
+    pub px: FixedPoint,
+}
+
+/// F1 (s517 #4, HL `marginCanceled`): can `maker` take a fill of `q` at
+/// `price` on its order resting `rem`? Its IM delta (position tier, closing
+/// part free and releasing IM) minus this fill's share of the order's
+/// reservation (the A5 telescoping piece) must fit its running free margin;
+/// a purely closing fill always fits. Commits the running free on success.
+/// Shared by matching and the FOK pre-check.
+#[allow(clippy::too_many_arguments)]
+fn maker_fill_fits(
+    accounts: &mut AccountMargins,
+    ro: &mut ReduceOnlyPositions,
+    src: &dyn MakerAccountSource,
+    market_id: MarketId,
+    maker: Address,
+    maker_is_buy: bool,
+    price: FixedPoint,
+    q: FixedPoint,
+    rem: FixedPoint,
+) -> bool {
+    // Item 6 P1 / P3: split borrow — the slot, and the tiers without an
+    // Arc clone per fill.
+    let AccountMargins { tiers, traders } = accounts;
+    let slot = maker_slot(traders, maker, market_id, src, ro);
+    let a = *slot;
+    let s = ro.get(&maker).unwrap_or(FixedPoint::ZERO);
+    let size = if s < FixedPoint::ZERO { -s } else { s };
+    let closing = q.min(reduce_only_allowance(s, maker_is_buy));
+    let px = if a.px > FixedPoint::ZERO { a.px } else { price };
+    let t = tiers.as_deref();
+    let delta = (|| {
+        let before = size.checked_mul(px).ok()?;
+        let after = (size - closing)
+            .checked_mul(px)
+            .ok()?
+            .checked_add(price.checked_mul(q - closing).ok()?)
+            .ok()?;
+        let share = crate::margin::order_initial_margin(t, price.checked_mul(rem).ok()?)
+            - crate::margin::order_initial_margin(t, price.checked_mul(rem - q).ok()?);
+        Some(crate::margin::im_delta(t, before, after) - share)
+    })();
+    // Review fix 2 (s517): each IM difference is floored, so without a tier
+    // change `delta` can be +1 raw unit (floor(B + x) − floor(B) = floor(x)
+    // + 1 while the share is floor(x)). That is rounding, not cost.
+    let delta = delta.map(|d| if d == FixedPoint::from_raw(1) { FixedPoint::ZERO } else { d });
+    match delta {
+        Some(d) if closing == q || d <= a.free => {
+            // The entry `maker_slot` read: its shared account, else its
+            // snapshot (always present after the load).
+            slot.free = a.free - d;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -525,6 +841,9 @@ pub struct OrderBook {
     /// Positions of the traders policed during the current placement(s);
     /// empty = no reduce-only enforcement. See [`ReduceOnlyPositions`].
     reduce_only_positions: ReduceOnlyPositions,
+    /// F1 (s517): account margins of the current placement(s) — in-RAM
+    /// only, never serialized. See [`AccountMargins`].
+    account_margins: AccountMargins,
 
     // ---- Per-order-row persistence state (journal-in-book, 3c) ----
     //
@@ -610,6 +929,7 @@ impl OrderBook {
             last_trade_price: None,
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
+            account_margins: AccountMargins::default(),
             order_seq: HashMap::new(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
@@ -663,6 +983,20 @@ impl OrderBook {
         trader: Address,
         timestamp: u64,
         margin: Option<&TakerMarginLimit>,
+    ) -> PlaceResult {
+        self.place_order_with_accounts(params, trader, timestamp, margin, None)
+    }
+
+    /// [`Self::place_order_with_margin`] with, F1 (s517 #4), the source of
+    /// makers' accounts: every maker fill is checked ([`MakerAccountSource`],
+    /// HL `marginCanceled`); `None` = makers unchecked.
+    pub fn place_order_with_accounts(
+        &mut self,
+        params: PlaceOrderParams,
+        trader: Address,
+        timestamp: u64,
+        margin: Option<&TakerMarginLimit>,
+        makers: Option<&dyn MakerAccountSource>,
     ) -> PlaceResult {
         let order_id = self.alloc_id();
         let side = if params.is_buy { Side::Buy } else { Side::Sell };
@@ -804,14 +1138,61 @@ impl OrderBook {
         // monotonic in their notional: fitting at the end means fitting
         // throughout). Review 5: the closing part (the first `free` units it
         // fills) is not charged, exactly as in matching.
+        // F1 (s517): the taker's account (absent ⇒ pre-F1 check: no position
+        // valuation, budget = the limit's own). Position from the policed /
+        // tracked map.
+        let mut match_margin = margin.map(|limit| {
+            let signed = self.reduce_only_positions.get(&trader).unwrap_or(FixedPoint::ZERO);
+            let (acct, taker_only) = self.account_margins.taker(&trader);
+            let px = match acct {
+                Some(a) if a.px > FixedPoint::ZERO => a.px,
+                Some(_) => self.last_trade_price.unwrap_or(FixedPoint::ZERO),
+                None => FixedPoint::ZERO,
+            };
+            let size0 = if signed < FixedPoint::ZERO { -signed } else { signed };
+            MatchMargin {
+                limit,
+                lot: self.lot_size,
+                size0,
+                px,
+                allowance0: reduce_only_allowance(signed, params.is_buy),
+                before: size0.checked_mul(px).ok(),
+                im_before: std::cell::OnceCell::new(),
+                budget: limit.budget + acct.map_or(FixedPoint::ZERO, |a| a.free),
+                charged: FixedPoint::ZERO,
+                exhausted: false,
+                cut_at: None,
+                taker_only,
+            }
+        });
         if params.time_in_force == TimeInForce::FOK {
             let free = self.reduce_only_positions.get(&trader).map_or(FixedPoint::ZERO, |p| {
                 reduce_only_allowance(p, params.is_buy)
             });
-            let fits = match self.can_fill_completely(side, params.price, quantity, trader, free) {
+            // F1 (s517 #4): the pre-check skips makers matching would
+            // cancel — on CLONES, so it never mutates the book.
+            let mut acc_c = makers.map(|_| self.account_margins.clone());
+            let mut ro_c = makers.map(|_| self.reduce_only_positions.clone());
+            let pre = match (makers, acc_c.as_mut(), ro_c.as_mut()) {
+                (Some(src), Some(acc), Some(ro)) => Some((src, acc, ro)),
+                _ => None,
+            };
+            let fits = match self.can_fill_completely(side, params.price, quantity, trader, free, pre) {
                 None => false,
-                Some(notional) => margin.is_none_or(|m| {
-                    notional.is_some_and(|n| m.im(n) <= m.budget)
+                // F1: a purely closing FOK always fits; otherwise the
+                // complete fill's need (closing releases IM) must fit.
+                Some(notional) => match_margin.as_ref().is_none_or(|m| {
+                    quantity <= free
+                        || notional.is_some_and(|n| {
+                            let closing = quantity.min(free);
+                            let before = m.before;
+                            let after = (m.size0 - closing)
+                                .checked_mul(m.px)
+                                .ok()
+                                .and_then(|x| x.checked_add(n).ok());
+                            matches!((before, after), (Some(b), Some(a))
+                                if m.fits(crate::margin::im_delta(m.limit.tiers.as_deref(), b, a)))
+                        })
                 }),
             };
             if !fits {
@@ -820,15 +1201,10 @@ impl OrderBook {
         }
 
         // Execute matching
-        let mut match_margin = margin.map(|limit| MatchMargin {
-            limit,
-            lot: self.lot_size,
-            charged: FixedPoint::ZERO,
-            exhausted: false,
-        });
-        let (fills, self_trade_cancels, mut reduce_only_cuts) =
-            self.execute_match(&mut order, match_margin.as_mut());
-        let margin_exhausted = match_margin.is_some_and(|m| m.exhausted);
+        let (fills, self_trade_cancels, mut reduce_only_cuts, margin_cancels) =
+            self.execute_match(&mut order, match_margin.as_mut(), makers);
+        let margin_exhausted = match_margin.as_ref().is_some_and(|m| m.exhausted);
+        let margin_cut_price = match_margin.as_ref().and_then(|m| m.cut_at);
 
         if let Some(last_fill) = fills.last() {
             self.last_trade_price = Some(last_fill.price);
@@ -840,7 +1216,7 @@ impl OrderBook {
                 self.reduce_only_index.remove(&(o.trader, o.id));
             }
         }
-        for c in &reduce_only_cuts {
+        for c in reduce_only_cuts.iter().chain(&margin_cancels) {
             self.reduce_only_index.remove(&(c.trader, c.order_id));
         }
         // ...and so do fully filled ones (F6: a stale entry kept
@@ -909,6 +1285,40 @@ impl OrderBook {
             }
         };
 
+        // F1 (s517): what this taker committed comes off the sender's
+        // running free margin. The executor releases its reservation except
+        // what the resting remainder keeps (`reserve(hold, rested)`, the
+        // same formula), and the fills moved the position's IM (the need
+        // WITHOUT the hold: `left_before = free_now` rests nothing that
+        // opens). So the account keeps `free + reservation − kept − ΔIM`.
+        if let Some(m) = match_margin.as_ref() {
+            if let Some(a) = self.account_margins.get(&trader) {
+                let free_now = self
+                    .reduce_only_positions
+                    .get(&trader)
+                    .map_or(FixedPoint::ZERO, |p| reduce_only_allowance(p, params.is_buy));
+                // Every fill's need was computed checked; on overflow count
+                // the whole budget as spent.
+                let spent = m
+                    .limit
+                    .need(m, FixedPoint::ZERO, FixedPoint::ZERO, free_now, free_now)
+                    .and_then(|d| {
+                        let kept = match m.limit.hold_price {
+                            Some(hp) => crate::margin::order_initial_margin(
+                                m.limit.tiers.as_deref(),
+                                hp.checked_mul(rested_qty).ok()?,
+                            ),
+                            None => FixedPoint::ZERO,
+                        };
+                        d.checked_add(kept).ok()
+                    })
+                    .unwrap_or(m.budget);
+                // B2 (s87): a forgiven rounding unit never reaches the free.
+                self.account_margins
+                    .set_free(&trader, a.free - m.over_reservation(spent));
+            }
+        }
+
         // Stops fired by these fills go back to the caller (s515).
         let triggered_stops = if fills.is_empty() {
             Vec::new()
@@ -924,6 +1334,8 @@ impl OrderBook {
             rested_qty,
             reduce_only_cuts,
             triggered_stops,
+            margin_cancels,
+            margin_cut_price,
         }
     }
 
@@ -1009,6 +1421,20 @@ impl OrderBook {
         self.reduce_only_positions = ReduceOnlyPositions::default();
     }
 
+    /// F1 (s517): install the account margins for the next placement(s);
+    /// cleared ([`Self::clear_account_margins`]) with the reduce-only map.
+    pub fn set_account_margins(&mut self, a: AccountMargins) {
+        self.account_margins = a;
+    }
+
+    pub fn clear_account_margins(&mut self) {
+        self.account_margins = AccountMargins::default();
+    }
+
+    pub fn account_margins(&self) -> &AccountMargins {
+        &self.account_margins
+    }
+
     /// Drop every reduce-only index entry of `trader` (cancel-all paths).
     fn forget_reduce_only_trader(&mut self, trader: &Address) {
         let keys: Vec<(Address, OrderId)> = self
@@ -1076,6 +1502,27 @@ impl OrderBook {
             seq,
         );
         Ok(order)
+    }
+
+    /// C4 (s517): remove `trader`'s PENDING STOPS (same mutation as
+    /// `cancel_all`'s `retain`: the survivors keep their relative order, so
+    /// `pending_stops` stays id-ascending) and return each removed stop's
+    /// reservation inputs `(price, quantity)` — the price its triggered order
+    /// would carry (the limit, else the cap; see `trigger_stops`). The caller
+    /// releases their reservations; `cancel_all` alone does not report stops.
+    pub fn take_pending_stops(&mut self, trader: &Address) -> Vec<(FixedPoint, FixedPoint)> {
+        if !self.pending_stops.iter().any(|s| s.trader == *trader) {
+            return Vec::new();
+        }
+        let (taken, kept): (Vec<StopOrder>, Vec<StopOrder>) =
+            std::mem::take(&mut self.pending_stops)
+                .into_iter()
+                .partition(|s| s.trader == *trader);
+        self.pending_stops = kept;
+        taken
+            .into_iter()
+            .map(|s| (s.limit_price.unwrap_or(s.price_cap), s.quantity))
+            .collect()
     }
 
     /// Cancel all orders for a trader, pending stops included. Returns the
@@ -1436,14 +1883,18 @@ impl OrderBook {
     /// s515 review 4: with a `margin` limit every fill is first checked
     /// against it ([`TakerMarginLimit`]); matching stops at the first fill
     /// that does not fit (after taking the part of it that does).
+    #[allow(clippy::type_complexity)]
     fn execute_match(
         &mut self,
         taker: &mut Order,
         mut margin: Option<&mut MatchMargin<'_>>,
-    ) -> (Vec<Fill>, Vec<Order>, Vec<ReduceOnlyCut>) {
+        makers: Option<&dyn MakerAccountSource>,
+    ) -> (Vec<Fill>, Vec<Order>, Vec<ReduceOnlyCut>, Vec<ReduceOnlyCut>) {
         let mut fills = Vec::new();
         let mut self_trade_cancels = Vec::new();
         let mut reduce_only_cuts = Vec::new();
+        let mut margin_cancels = Vec::new();
+        let market_id = self.market_id;
         let cache_on = self.level_hash_cache.is_some();
         let chunked_on = self.level_hash_chunked;
 
@@ -1480,6 +1931,10 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                         margin.as_deref_mut(),
+                        &mut self.account_margins,
+                        makers,
+                        market_id,
+                        &mut margin_cancels,
                     );
                     if level.get().is_empty() {
                         level.remove_entry();
@@ -1518,6 +1973,10 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                         margin.as_deref_mut(),
+                        &mut self.account_margins,
+                        makers,
+                        market_id,
+                        &mut margin_cancels,
                     );
                     if level.get().is_empty() {
                         level.remove_entry();
@@ -1526,7 +1985,7 @@ impl OrderBook {
             }
         }
 
-        (fills, self_trade_cancels, reduce_only_cuts)
+        (fills, self_trade_cancels, reduce_only_cuts, margin_cancels)
     }
 
     /// Match taker against orders at a single price level.
@@ -1551,6 +2010,10 @@ impl OrderBook {
         dirty_chunks: &mut BTreeSet<(u8, i128, u64)>,
         chunked_on: bool,
         mut margin: Option<&mut MatchMargin<'_>>,
+        accounts: &mut AccountMargins,
+        makers: Option<&dyn MakerAccountSource>,
+        market_id: MarketId,
+        margin_cancels: &mut Vec<ReduceOnlyCut>,
     ) {
         let tag = crate::book_rows::side_tag(maker_side);
         let raw_price = price.raw();
@@ -1620,32 +2083,71 @@ impl OrderBook {
             let maker_id = maker.id;
             let maker_addr = maker.trader;
             let maker_side = maker.side;
+            let maker_remaining = maker.remaining_qty;
 
             let mut fill_qty = taker.remaining_qty.min(maker_fillable);
             // s515 review 4: the taker's match-time margin check. Review 5:
             // the part of the fill that reduces the taker's current position
             // (policed map, advanced through its own fills) is free.
+            // F1 (s517): at the position-size tier, closing releasing IM,
+            // against the reservation + the sender's running free margin.
+            // The taker state is committed only after the maker passed.
+            let mut taker_cut = None;
             if let Some(m) = margin.as_deref_mut() {
                 let free = ro_positions.get(&taker.trader).map_or(FixedPoint::ZERO, |p| {
                     reduce_only_allowance(p, taker.side == Side::Buy)
                 });
-                let fits = m.limit.affordable(
-                    m.charged,
-                    price,
-                    fill_qty,
-                    free,
-                    taker.remaining_qty,
-                    m.lot,
-                );
-                if fits < fill_qty {
-                    m.exhausted = true;
-                    fill_qty = fits;
-                }
+                let lim = m.limit;
+                let fits = lim.affordable(m, price, fill_qty, free, taker.remaining_qty);
+                let exhausted = fits < fill_qty;
+                fill_qty = fits;
                 if fill_qty <= FixedPoint::ZERO {
+                    m.exhausted = true;
+                    m.cut_at = Some(price);
                     break;
                 }
-                // Cannot overflow: `affordable` only returns a quantity whose
-                // charged notional it computed with checked arithmetic.
+                taker_cut = Some((exhausted, free));
+            }
+            // F1 (s517 #4, HL `marginCanceled`): the maker is checked on the
+            // actual fill; one that cannot afford it is cancelled whole and
+            // the taker moves on to the next maker.
+            if let Some(src) = makers {
+                if !maker_fill_fits(
+                    accounts,
+                    ro_positions,
+                    src,
+                    market_id,
+                    maker_addr,
+                    maker_side == Side::Buy,
+                    price,
+                    fill_qty,
+                    maker_remaining,
+                ) {
+                    let cut = queue.pop_front().unwrap();
+                    order_index.remove(&cut.id);
+                    if let Some(ids) = trader_orders.get_mut(&cut.trader) {
+                        ids.remove(cut.id);
+                    }
+                    let seq = order_seq.remove(&cut.id);
+                    Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
+                    row_journal.insert(cut.id);
+                    margin_cancels.push(ReduceOnlyCut {
+                        order_id: cut.id,
+                        trader: cut.trader,
+                        price: cut.price,
+                        qty: cut.remaining_qty,
+                    });
+                    continue;
+                }
+            }
+            if let (Some(m), Some((exhausted, free))) = (margin.as_deref_mut(), taker_cut) {
+                if exhausted {
+                    m.exhausted = true;
+                    m.cut_at = Some(price);
+                }
+                // Cannot overflow: `affordable` returned a purely closing
+                // quantity (charges nothing) or one whose notional it
+                // computed checked.
                 m.charged += price * (fill_qty - fill_qty.min(free));
             }
             if !ro_positions.is_empty() {
@@ -1798,6 +2300,7 @@ impl OrderBook {
         qty: FixedPoint,
         trader: Address,
         mut free: FixedPoint,
+        mut makers: Option<(&dyn MakerAccountSource, &mut AccountMargins, &mut ReduceOnlyPositions)>,
     ) -> Option<Option<FixedPoint>> {
         let mut remaining = qty;
         let mut notional = Some(FixedPoint::ZERO);
@@ -1821,6 +2324,27 @@ impl OrderBook {
                     fillable = fillable.min(reduce_only_allowance(pos, order.side == Side::Buy));
                 }
                 let take = remaining.min(fillable);
+                // F1 (s517 #4): skip a maker matching would cancel (same
+                // `maker_fill_fits`, on the caller's clones).
+                if let Some((src, acc, ro)) = makers.as_mut() {
+                    if take > FixedPoint::ZERO {
+                        let is_buy = order.side == Side::Buy;
+                        if !maker_fill_fits(
+                            acc,
+                            ro,
+                            *src,
+                            self.market_id,
+                            order.trader,
+                            is_buy,
+                            order.price,
+                            take,
+                            order.remaining_qty,
+                        ) {
+                            continue;
+                        }
+                        ro.apply_fill(&order.trader, is_buy, take);
+                    }
+                }
                 if let Some(pos) = pos {
                     let signed = if order.side == Side::Buy { take } else { -take };
                     walked.insert(order.trader, pos + signed);
@@ -3165,6 +3689,7 @@ impl BorshDeserialize for OrderBook {
             last_trade_price,
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
+            account_margins: AccountMargins::default(),
             order_seq: HashMap::new(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
@@ -5607,6 +6132,32 @@ mod taker_margin_limit_tests {
         assert_eq!(b.orders_for_trader(&addr(3))[0].remaining_qty, fp(2));
     }
 
+    /// s92: `margin_cut_price` is the level price where the taker's margin ran
+    /// out: mid-level (2 of 4 @100), before a level it cannot afford (@90),
+    /// at the first level with zero fills; `None` when every fill fits or the
+    /// taker has no margin limit.
+    #[test]
+    fn margin_cut_price_is_the_level_the_taker_ran_out_at() {
+        let cases: [(&[(i64, i64)], Option<FixedPoint>, Option<i64>, usize); 5] = [
+            (&[(100, 4)], Some(fp(12)), Some(100), 1),
+            (&[(100, 2), (90, 2)], Some(fp(12)), Some(90), 1),
+            (&[(100, 4)], Some(fp(4)), Some(100), 0),
+            (&[(100, 4)], Some(fp(20)), None, 1),
+            (&[(100, 4)], None, None, 1),
+        ];
+        for (bids, budget, cut, fills) in cases {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            for &(p, q) in bids {
+                b.place_order(order(true, fp(p), fp(q)), addr(1), 1);
+            }
+            let lim = budget.map(|x| limit(x, None));
+            let r = b.place_order_with_margin(market_sell(fp(4)), addr(2), 2, lim.as_ref());
+            let what = format!("bids {bids:?} budget {budget:?}");
+            assert_eq!(r.margin_cut_price, cut.map(fp), "{what}");
+            assert_eq!(r.fills.len(), fills, "{what}");
+        }
+    }
+
     /// GTC sell 4 @50 against bid 100 x 1, budget 16: filling 1 costs 5 plus
     /// the 7.5 hold of the 3 left — it fits, is not exhausted, and the rest
     /// RESTS normally. Against bid 100 x 4 it stops after 2 and cancels.
@@ -5751,5 +6302,293 @@ mod taker_margin_limit_tests {
         let r = b.place_order_with_margin(order(false, fp(50), fp(3)), addr(2), 2, Some(&lim));
         assert_eq!(filled(&r), FixedPoint::ZERO);
         assert_eq!(r.status, OrderStatus::Cancelled);
+    }
+    fn fp_c(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * (FixedPoint::SCALE / 100))
+    }
+
+    fn tiers_20_then_5() -> std::sync::Arc<[crate::margin::MarginTier]> {
+        std::sync::Arc::from(vec![
+            crate::margin::MarginTier { max_notional: fp(1_000), max_leverage: 20 },
+            crate::margin::MarginTier { max_notional: FixedPoint::MAX, max_leverage: 5 },
+        ])
+    }
+
+    fn with_account(
+        b: &mut OrderBook,
+        t: Address,
+        free: FixedPoint,
+        px: FixedPoint,
+        tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>,
+    ) {
+        let mut am = AccountMargins::new(tiers);
+        am.insert(t, free, px);
+        b.set_account_margins(am);
+    }
+
+    fn market_buy(qty: FixedPoint) -> PlaceOrderParams {
+        PlaceOrderParams {
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::IOC,
+            ..order(true, fp(1_000), qty)
+        }
+    }
+
+    /// F1 (s517): an increase is charged at the POSITION's tier. Long 10
+    /// valued at 100 (IM 50 at 20x), asks 100 x 5, market buy 5 with
+    /// reservation 25: unit k makes the position 1,000 + 100k at 5x → +170 …
+    /// +250. Free 225 (budget 250) fits all 5; free 224 fits 4 (+230).
+    /// Per-order margin (IM(100k) <= 25) filled 5 in both.
+    #[test]
+    fn f1_increase_is_charged_at_the_position_tier() {
+        for (free, fills) in [(fp(225), 5), (fp(224), 4)] {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            b.place_order(order(false, fp(100), fp(5)), addr(1), 1);
+            let mut pos = ReduceOnlyPositions::new();
+            pos.insert(addr(2), fp(10));
+            b.set_reduce_only_positions(pos);
+            with_account(&mut b, addr(2), free, fp(100), Some(tiers_20_then_5()));
+            let lim = TakerMarginLimit { budget: fp(25), tiers: Some(tiers_20_then_5()), hold_price: None };
+            let r = b.place_order_with_margin(market_buy(fp(5)), addr(2), 2, Some(&lim));
+            assert_eq!(filled(&r), fp(fills), "free {free}");
+        }
+    }
+
+    /// F1 (s517): closing releases the position's IM for the flip. Long 20
+    /// valued at 100 (IM 100); budget = 0.5 reservation + free −50.5 = −50:
+    /// sell 30 — 20 close, 10 open short (IM 50): 50 − 100 = −50 fits → 30.
+    /// Free −51.5: 29 (45 − 100). Per-order margin (budget 0.5) filled only 20.
+    #[test]
+    fn f1_closing_releases_position_im_for_the_flip() {
+        for (free, fills) in [(fp_c(-5050), 30), (fp_c(-5150), 29)] {
+            let mut b = book_with_taker_pos(fp(20));
+            with_account(&mut b, addr(2), free, fp(100), None);
+            let r = b.place_order_with_margin(market_sell(fp(30)), addr(2), 2, Some(&limit(fp_c(50), None)));
+            assert_eq!(filled(&r), fp(fills), "free {free}");
+        }
+    }
+
+    /// F1 (s517): one sender's takers in one book share a RUNNING free margin
+    /// (the batch's exclusive pool). Free 98: sell A (reservation 1) fills 19
+    /// (IM 95 <= 99) and leaves 4; sell B (reservation 1) is short 19 at the
+    /// book's last price 100 and fills 1 more (5 <= 1 + 4). Free ends at 0.
+    #[test]
+    fn f1_running_free_is_shared_by_one_senders_takers() {
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        b.place_order(order(true, fp(100), fp(40)), addr(1), 1);
+        let mut pos = ReduceOnlyPositions::new();
+        pos.insert(addr(2), FixedPoint::ZERO);
+        b.set_reduce_only_positions(pos);
+        with_account(&mut b, addr(2), fp(98), FixedPoint::ZERO, None);
+        let r1 = b.place_order_with_margin(market_sell(fp(20)), addr(2), 2, Some(&limit(fp(1), None)));
+        let r2 = b.place_order_with_margin(market_sell(fp(20)), addr(2), 3, Some(&limit(fp(1), None)));
+        assert_eq!((filled(&r1), filled(&r2)), (fp(19), fp(1)));
+        assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, FixedPoint::ZERO);
+    }
+
+    /// F1 (s517): a purely closing fill always fits, even with the account
+    /// under water (HL: reducing needs no margin).
+    #[test]
+    fn f1_closing_fills_fit_an_under_margined_account() {
+        let mut b = book_with_taker_pos(fp(20));
+        with_account(&mut b, addr(2), -fp(500), fp(100), None);
+        let r = b.place_order_with_margin(market_sell(fp(20)), addr(2), 2, Some(&limit(FixedPoint::ZERO, None)));
+        assert_eq!(filled(&r), fp(20));
+    }
+
+    /// F1 (s517) FOK: the complete fill is judged by the same need (closing
+    /// releases IM): free −50.5 → the flip fits (−50 <= −50); free −51.5 →
+    /// rejected whole even though the fill lowers the need (it opens 10 short).
+    #[test]
+    fn f1_fok_uses_the_account_need() {
+        let mut p = market_sell(fp(30));
+        p.order_type = OrderType::Limit;
+        p.price = fp(100);
+        p.time_in_force = TimeInForce::FOK;
+        for (free, fills) in [(fp_c(-5050), 30), (fp_c(-5150), 0)] {
+            let mut b = book_with_taker_pos(fp(20));
+            with_account(&mut b, addr(2), free, fp(100), None);
+            let r = b.place_order_with_margin(p.clone(), addr(2), 2, Some(&limit(fp_c(50), None)));
+            assert_eq!(filled(&r), fp(fills), "free {free}");
+        }
+    }
+
+    /// F1 (Correction s517, T4 write-back): a resting remainder KEEPS its
+    /// reservation (`reserve(hold, rested)`), so it must not flow back into
+    /// the running free margin. Flat, free 100, GTC sell 10 @100 against no
+    /// bids (reservation 50): it rests whole, free stays 100 (was 150).
+    #[test]
+    fn f1_resting_remainder_keeps_its_reservation_out_of_running_free() {
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        let mut pos = ReduceOnlyPositions::new();
+        pos.insert(addr(2), FixedPoint::ZERO);
+        b.set_reduce_only_positions(pos);
+        with_account(&mut b, addr(2), fp(100), FixedPoint::ZERO, None);
+        let r = b.place_order_with_margin(order(false, fp(100), fp(10)), addr(2), 2, Some(&limit(fp(50), Some(fp(100)))));
+        assert_eq!(r.rested_qty, fp(10));
+        assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, fp(100));
+    }
+
+    struct Src(Vec<(Address, MakerAccount)>);
+    impl MakerAccountSource for Src {
+        fn maker_account(&self, maker: &Address, _market_id: MarketId) -> MakerAccount {
+            self.0.iter().find(|(a, _)| a == maker).map(|(_, m)| *m).unwrap_or(MakerAccount {
+                free: fp(1_000_000),
+                signed_pos: FixedPoint::ZERO,
+                px: FixedPoint::ZERO,
+            })
+        }
+    }
+
+    fn acct(free: FixedPoint, signed_pos: FixedPoint, px: FixedPoint) -> MakerAccount {
+        MakerAccount { free, signed_pos, px }
+    }
+
+    /// F1 (s517 #4): bid 10 @100 of an under-water maker (free −95) cannot
+    /// take the fill (IM 50 − its share 50 = 0 > −95): it is cancelled whole
+    /// (`margin_cancels`, so its reservation is released) and the taker
+    /// fills the next bid. With free 0 it fills.
+    #[test]
+    fn f1_under_margined_maker_is_cancelled_and_the_taker_moves_on() {
+        for (free, cancelled) in [(-fp(95), true), (FixedPoint::ZERO, false)] {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            let id = b.place_order(order(true, fp(100), fp(10)), addr(1), 1).order_id;
+            b.place_order(order(true, fp(99), fp(10)), addr(3), 1);
+            let src = Src(vec![(addr(1), acct(free, FixedPoint::ZERO, FixedPoint::ZERO))]);
+            let r = b.place_order_with_accounts(market_sell(fp(10)), addr(2), 2, None, Some(&src));
+            assert_eq!(filled(&r), fp(10));
+            let maker = if cancelled { addr(3) } else { addr(1) };
+            assert!(r.fills.iter().all(|f| f.maker == maker), "free {free}");
+            if cancelled {
+                assert_eq!(
+                    r.margin_cancels,
+                    vec![ReduceOnlyCut { order_id: id, trader: addr(1), price: fp(100), qty: fp(10) }]
+                );
+                assert!(b.orders_for_trader(&addr(1)).is_empty());
+            } else {
+                assert!(r.margin_cancels.is_empty());
+            }
+        }
+    }
+
+    /// F1 (s517 #4): a maker fill that only CLOSES its position always fits.
+    #[test]
+    fn f1_closing_maker_fill_is_never_cancelled() {
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        b.place_order(order(true, fp(100), fp(10)), addr(1), 1);
+        let src = Src(vec![(addr(1), acct(-fp(1_000), -fp(10), fp(100)))]);
+        let r = b.place_order_with_accounts(market_sell(fp(10)), addr(2), 2, None, Some(&src));
+        assert_eq!(filled(&r), fp(10));
+        assert!(r.margin_cancels.is_empty());
+    }
+
+    /// F1 (s517 #4) FOK: the pre-check skips the maker matching would
+    /// cancel. FOK sell 10 @99 fills 10 from addr 3 (addr 1 cancelled); FOK
+    /// sell 20 @99 is rejected and changes nothing (addr 1 still rests).
+    #[test]
+    fn f1_fok_precheck_mirrors_maker_cancels() {
+        for (qty, fills) in [(10, 10), (20, 0)] {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            b.place_order(order(true, fp(100), fp(10)), addr(1), 1);
+            b.place_order(order(true, fp(99), fp(10)), addr(3), 1);
+            let src = Src(vec![(addr(1), acct(-fp(95), FixedPoint::ZERO, FixedPoint::ZERO))]);
+            let mut p = order(false, fp(99), fp(qty));
+            p.time_in_force = TimeInForce::FOK;
+            let r = b.place_order_with_accounts(p, addr(2), 2, None, Some(&src));
+            assert_eq!(filled(&r), fp(fills), "qty {qty}");
+            assert_eq!(b.orders_for_trader(&addr(1)).is_empty(), qty == 10, "qty {qty}");
+        }
+    }
+
+    /// Review fix 2 (s517): floor rounding alone must not cancel a maker.
+    /// Default 20x (no tier change). Maker long 1 valued at 100 + 19 raw
+    /// (notional ≡ 19 mod 20 raw), bid 1 @(100 + 1 raw) filled whole:
+    /// floor((B + x)/20) − floor(B/20) = floor(x/20) + 1 while its share is
+    /// floor(x/20) — a +1 raw delta that used to cancel it at free 0.
+    #[test]
+    fn f1_maker_fill_rounding_does_not_cancel_at_free_zero() {
+        let one = FixedPoint::from_raw(1);
+        let mut b = OrderBook::new(1, one, one);
+        let px = FixedPoint::from_raw(fp(100).raw() + 1);
+        b.place_order(order(true, px, fp(1)), addr(1), 1);
+        let src = Src(vec![(addr(1), acct(FixedPoint::ZERO, fp(1), FixedPoint::from_raw(fp(100).raw() + 19)))]);
+        let r = b.place_order_with_accounts(market_sell(fp(1)), addr(2), 2, None, Some(&src));
+        assert_eq!(filled(&r), fp(1));
+        assert!(r.margin_cancels.is_empty());
+    }
+
+    /// B2 (s87): the bench's at-limit case. T short 1 valued at 100 + 19
+    /// raw (notional ≡ 19 mod 20 raw) sells q = 1 + 1 raw @101 into a bid at
+    /// exactly 101: x = 101 q ≡ 1 mod 20 raw, so its need IM(A + x) − IM(A)
+    /// is floor(x/20) + 1 raw while its budget (its reservation) is
+    /// floor(x/20). `(taker_only, tif, account free)` → filled: a taker-only
+    /// budget (D2 non-pool market) gets the makers' +1 raw rounding
+    /// allowance (GTC and the FOK pre-check); a shared account at free 0 and
+    /// a taker-only one already below 0 do not.
+    #[test]
+    fn b2_taker_only_rounding_does_not_cancel_at_the_limit() {
+        let one = FixedPoint::from_raw(1);
+        let q = fp(1) + one;
+        let px = fp(101);
+        let reserve = FixedPoint::from_raw((px * q).raw() / 20);
+        for (taker_only, tif, free, fills) in [
+            (true, TimeInForce::GTC, FixedPoint::ZERO, true),
+            (true, TimeInForce::FOK, FixedPoint::ZERO, true),
+            (true, TimeInForce::GTC, -one, false),
+            (false, TimeInForce::GTC, FixedPoint::ZERO, false),
+            (false, TimeInForce::FOK, FixedPoint::ZERO, false),
+        ] {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            b.place_order(order(true, px, q), addr(1), 1);
+            let mut pos = ReduceOnlyPositions::new();
+            pos.insert(addr(2), -fp(1));
+            b.set_reduce_only_positions(pos);
+            let mut am = AccountMargins::new(None);
+            let entry = FixedPoint::from_raw(fp(100).raw() + 19);
+            if taker_only {
+                am.insert_taker_only(addr(2), entry);
+                am.set_free(&addr(2), free);
+            } else {
+                am.insert(addr(2), free, entry);
+            }
+            b.set_account_margins(am);
+            let p = PlaceOrderParams { time_in_force: tif, ..order(false, px, q) };
+            let hold = (tif == TimeInForce::GTC).then_some(px);
+            let r = b.place_order_with_margin(p, addr(2), 2, Some(&limit(reserve, hold)));
+            let what = format!("taker_only={taker_only} {tif:?} free={free}");
+            assert_eq!(filled(&r), if fills { q } else { FixedPoint::ZERO }, "{what}");
+            if fills {
+                // The forgiven raw unit does not leak into the running free.
+                assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, free, "{what}");
+            }
+        }
+    }
+
+    /// B2 (s87): the allowance is per taker, like the makers' per fill, and
+    /// the forgiven unit never leaks into the running free: a second such
+    /// sell of the same sender in the same taker-only book fills too.
+    #[test]
+    fn b2_taker_only_rounding_allowance_is_per_taker() {
+        let one = FixedPoint::from_raw(1);
+        let px = fp(101);
+        let entry = FixedPoint::from_raw(fp(100).raw() + 19);
+        let im = |n: FixedPoint| crate::margin::order_initial_margin(None, n);
+        let (q1, q2) = (fp(1) + one, fp(1) + one + one);
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        b.place_order(order(true, px, q1 + q2), addr(1), 1);
+        let mut pos = ReduceOnlyPositions::new();
+        pos.insert(addr(2), -fp(1));
+        b.set_reduce_only_positions(pos);
+        let mut am = AccountMargins::new(None);
+        am.insert_taker_only(addr(2), entry);
+        b.set_account_margins(am);
+        for (id, size0, q) in [(2u64, fp(1), q1), (3, fp(2) + one, q2)] {
+            // Precondition: each sell's need is exactly its reservation + 1 raw.
+            let (a, x) = (size0 * entry, px * q);
+            assert_eq!(im(a + x) - im(a), im(x) + one, "sell {id}");
+            let r = b.place_order_with_margin(order(false, px, q), addr(2), id, Some(&limit(im(x), Some(px))));
+            assert_eq!(filled(&r), q, "sell {id}");
+            assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, FixedPoint::ZERO, "sell {id}");
+        }
     }
 }

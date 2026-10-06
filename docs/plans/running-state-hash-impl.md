@@ -7,7 +7,8 @@ local `main` @ e4273ec; line numbers as of that commit.
 
 ## Why
 
-Root skip (`TORUS_NATIVE_TRIE_MAINTENANCE=0`, e4273ec) removes the per-block
+Root skip (`TORUS_NATIVE_TRIE_MAINTENANCE=0`, e4273ec; the default since 2026-10-05,
+where only `=1` maintains) removes the per-block
 native trie: +12% matched/s at 100 markets, +31% at 300 (uniform load). What it
 gives up is a per-block fingerprint of state. The running hash brings that back
 at O(changed rows) cost. Tree maintenance stays a node-local option; the running
@@ -281,6 +282,7 @@ EXCEPT the rows marked **OUT** below.
 | cf_native_pending, cf_native_shards | node-local (DA) | mempool / network | no (excluded) |
 | cf_trie_nodes, cf_trie_accounts, cf_trie_storage, cf_hashed_accounts, cf_hashed_storage, cf_native_trie, cf_native_hashed | derived | EVM incremental commit, `resync_evm_accounts` (`app.rs:2167`), native trie in the batch | mixed (excluded) |
 | cf_state_hash_votes (NEW, Task 5) | consensus | overlay (`AttestStateHash`) | yes |
+| cf_native_liquidation (s517 item 3, hashed id 23, appended on rebase s87) | consensus | overlay (liquidation step, end of the native phase) | yes |
 
 ### Out-of-batch consensus writes (flagged) and how they enter the hash
 

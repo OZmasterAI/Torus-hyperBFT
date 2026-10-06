@@ -156,6 +156,71 @@ Options considered for that failure, and why:
 | Stricter cancel allowance in B | Rejected: departs from Hyperliquid and hurts market makers, who cancel a lot |
 | E, per-address block share | Deferred (section 6, d): reads trade history, overlaps item 6 Phase 3 |
 
+### Merge with the crab stack (item 6 sync point 2, 2026-10-04)
+
+`main` (this record, `92a02ed`) was merged into `perf/item6-phase1`
+(`81a9567`: crab stack s87/s89, oracle signer, price feeder, liquidation,
+item 6 C1) on `merge/item6-sync2`. The crab stack adds an oracle lane to the
+native pool: `SubmitOraclePrices` sorts between cancels and everything else
+(`PRIO_CANCEL` 0 < `PRIO_ORACLE` 1 < `PRIO_NORMAL` 2), only an Active
+validator or its registered hot signer may pool one
+(`Mempool::oracle_reporter`), at most `ORACLE_PENDING_PER_VALIDATOR` (4) per
+validator, and at that cap a newer submission evicts the validator's oldest.
+
+Where the oracle lane sits under A-D. Requirement: neither C nor B may crowd
+oracle submissions out, and neither the admission backlog nor a full pool
+may shed them.
+
+| Path | Rule after the merge | Why |
+|---|---|---|
+| Block selection (C) | Cancels up to `ceil(limit * pct / 100)`, then oracle submissions, then normal entries, then leftover cancels. Oracle submissions do not count against the cancel share | `FIRST_NON_CANCEL` is `(PRIO_ORACLE, ..)`, so C's phase 2 starts with the oracle lane. The lane is bounded by the per-validator cap (4 x validators), so it cannot crowd orders out either |
+| Priority-only pacing tier | Same three phases, phase 2 ending before the first normal key (`select_entries_before(.., Excluded(FIRST_NORMAL))`) | Was all cancels first, unbounded: cancel spam filling `limit` would have kept prices out of the deepest pacing tier. With no oracle submission pooled the result is identical to the old walk (work-conserving phase 3) |
+| Full pool | Cancels and normal entries are refused (C). An oracle submission evicts the last normal entry, or, with none left, the last pooled cancel. Oracle submissions never evict each other | Crab's design already let oracle submissions evict normals. A pool full of cancel spam would otherwise refuse prices until it drained. The churn is bounded: an insert at the per-validator cap evicts the validator's own oldest first, so only a validator below 4 pooled can displace a cancel |
+| RPC pre-verify screen | Full pool: only oracle submissions proceed to verify. Backlog: cancels and oracle submissions proceed | C sheds cancels at a full pool; crab's oracle bypass is kept |
+| Admission backlog | `native_admission_backlogged` compares `NativePool::normal_size()` (entries that are neither cancels nor oracle submissions) with the limit | Oracle submissions bypass the screen themselves; counting them could only let oracle traffic shed orders. Their bound (4 x validators) means they cannot hide a real backlog |
+| A and B | See "Oracle signers" below | |
+
+Tests: `oracle_lane_follows_the_capped_cancel_prefix`,
+`full_pool_of_cancels_oracle_evicts_the_last_cancel`,
+`normal_size_tracks_inserts_and_every_removal` (`native_pool.rs`);
+`oracle_selected_next_block_under_full_pool_of_cancel_spam` (pool of 40
+cancels from 40 keys, full, C at 25%: the validator's submission is admitted
+and is the 6th action of the next 20-slot block, on the normal and the pacing
+path) and `pooled_oracle_submissions_do_not_count_as_admission_backlog`
+(`lib.rs`). Crab's `full_pool_of_priority_entries_rejects_oracle` was
+replaced by the cancel-eviction test above.
+
+Oracle signers (A and B). The round-3 exemption (validator duties skip A
+and B only for a sender with a validator row) now also accepts a
+`SubmitOraclePrices` whose sender is an Active validator's registered oracle
+signer (`SetOracleSigner`). `Mempool::is_duty_exempt` (`lib.rs`) =
+`funded::is_validator_duty_of_validator` OR (oracle submission AND crab's
+`Mempool::oracle_reporter` resolves the sender). It is used by A
+(`check_funded`), by B's pool-entry charge and by B's RPC check
+(`addr_rate_admits`). Decisions:
+
+- **Oracle submissions only.** A signer acts for its validator only in
+  `SubmitOraclePrices` (exec's `resolve_oracle_reporter`); its other duty
+  kinds execute as the signer's own account, which is not a validator, so
+  they keep A and B.
+- **Active validators' signers only.** `oracle_reporter` cross-checks the
+  signer index against the validator record and requires Active, as the
+  mempool's oracle gate and exec do. A jailed validator's signer could not
+  pool a submission anyway. Other duty kinds keep the any-status rule, so a
+  jailed validator can still unjail.
+- **A runs before the oracle gate.** A key that is neither validator nor
+  signer gets the non-retryable `unfunded` reply rather than the oracle
+  gate's message; a funded stranger still meets the gate.
+
+Tests: `oracle_signer_submission_skips_funded_check_and_addr_limit` (signer
+with 0 TRS and an exhausted allowance: admitted on the RPC/presigned and
+gossip paths, never refused by B, not charged; its `AttestStateHash` is
+still refused by A; failed before the change with
+`Requests { used: 4, allowance: 4 }`) and
+`oracle_submission_from_unregistered_key_gets_no_exemption` (stranger,
+jailed validator's signer and a stale signer index entry are refused by A;
+the stranger is refused by B at RPC once its allowance is used).
+
 ## 5. Bench results so far
 
 ozarchy, 10 markets, rate 76000, `--retry-busy`, n=1 per cell, all cells
@@ -299,12 +364,11 @@ environment variable has no effect.
    **Deploy note:** behind a reverse proxy on the same host every client
    looks like loopback, which is exempt by default, so D is off; set
    `TORUS_RPC_IP_EXEMPT=` (empty) and limit at the proxy.
-4. **Merge with the crab stack** (`perf/s87-crab-fixes`): it changes the same
-   files (`native_pool.rs` oracle lane, mempool `lib.rs`, `torus-rpc`
-   `lib.rs` and `torus.rs`), and it adds oracle signer addresses
-   (`SetOracleSigner`). After that merge, the validator-duty exemption must
-   also accept a validator's registered oracle signer; crab has an
-   active-validator-or-signer helper in `torus-mempool`.
+4. Done 2026-10-04: **merge with the crab stack** (`perf/item6-phase1` via
+   `merge/item6-sync2`; section 4, "Merge with the crab stack"). The oracle
+   lane sits after C's cancel share, a full pool or a backlog does not shed
+   oracle submissions, and the A/B validator-duty exemption accepts an
+   Active validator's registered oracle signer for `SubmitOraclePrices`.
 5. Coordinate deferred items a-c, d (E, after item 6; ask for a per-address
    maker-volume counter in item 6's per-trader state) and g (activation fee,
    with e) with 18c.

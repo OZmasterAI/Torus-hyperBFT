@@ -197,6 +197,13 @@ pub trait App<K: KVStore>: Send {
     /// Otherwise the block is certified and the replicas that voted for it
     /// cannot insert it, which wedges the chain.
     ///
+    /// It runs before EVERY vote for a proposal: a header-first body, a block
+    /// already in the tree, and a full proposal right after its insertion. So
+    /// it may also hold vote-time-only rules (rebase s87: the local-clock
+    /// bound on the block timestamp) that `validate_block` must NOT apply: a
+    /// replica then refuses to vote for such a block, but still inserts it if
+    /// the others certify it.
+    ///
     /// `block_tree` serves lookups of other blocks, e.g. the parent
     /// `block.justify.block` to check the block's link to it before the vote
     /// (s84 decision 2): return [`BlockDataCheck::Missing`] while it is not in

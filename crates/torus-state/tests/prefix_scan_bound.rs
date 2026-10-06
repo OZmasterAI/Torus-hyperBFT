@@ -94,9 +94,19 @@ fn check_all_prefixes(
         let want = model_scan(db_model, &p);
         let got = StateBackend::iterate_cf(db, CF_NATIVE_ORACLE, Some(&p)).unwrap();
         assert_eq!(got, want, "round {round}: StateDb::iterate_cf prefix {p:02x?}");
+        assert_eq!(
+            StateBackend::prefix_exists(db, CF_NATIVE_ORACLE, &p).unwrap(),
+            !want.is_empty(),
+            "round {round}: StateDb::prefix_exists prefix {p:02x?}"
+        );
         let want_ov = model_scan(ov_model, &p);
         let got_ov = overlay.iterate_cf(CF_NATIVE_ORACLE, Some(&p)).unwrap();
         assert_eq!(got_ov, want_ov, "round {round}: overlay iterate_cf prefix {p:02x?}");
+        assert_eq!(
+            overlay.prefix_exists(CF_NATIVE_ORACLE, &p).unwrap(),
+            !want_ov.is_empty(),
+            "round {round}: overlay prefix_exists prefix {p:02x?}"
+        );
     }
 }
 
@@ -272,15 +282,18 @@ fn prefix_scan_skips_no_tombstones_past_prefix() {
             "{tag}: StateDb::iterate_cf(market 1) walked {skipped} of the {n_tomb} tombstones after its prefix"
         );
 
-        // Market 2 is fully pruned: its scan skips its own 3 tombstones, not
-        // those of markets 3.. as well.
+        // Market 2 is fully pruned: existence checks must not walk markets 3.. either.
         let p2 = sub_prefix(2);
         let skipped = deletes_skipped(|| {
-            assert!(StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(&p2)).unwrap().is_empty());
+            assert!(!StateBackend::prefix_exists(&db, CF_NATIVE_ORACLE, &p2).unwrap());
         });
-        assert_eq!(skipped, REPORTERS as u64, "{tag}: StateDb::iterate_cf(market 2)");
+        assert_eq!(skipped, REPORTERS as u64, "{tag}: StateDb::prefix_exists(market 2)");
 
         let overlay = NativeStateOverlay::new(db.clone());
+        let skipped = deletes_skipped(|| {
+            assert!(!overlay.prefix_exists(CF_NATIVE_ORACLE, &p2).unwrap());
+        });
+        assert_eq!(skipped, REPORTERS as u64, "{tag}: NativeStateOverlay::prefix_exists(market 2)");
         let skipped = deletes_skipped(|| {
             let rows = overlay.iterate_cf(CF_NATIVE_ORACLE, Some(&p1)).unwrap();
             assert_eq!(rows.len(), REPORTERS as usize);

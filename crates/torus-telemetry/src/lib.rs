@@ -34,6 +34,10 @@ pub struct Metrics {
     // Transaction metrics
     pub evm_txs_processed: Counter,
     pub native_actions_processed: Counter,
+    /// v2 action status: native actions recorded as failed at execution.
+    pub exec_action_failures: Counter,
+    /// v2 action status: bytes written to `cf_block_action_status`.
+    pub exec_action_status_bytes: Counter,
 
     // Consensus metrics
     pub consensus_rounds: Counter,
@@ -86,6 +90,26 @@ pub struct Metrics {
     /// Orders that died on other error paths: balance read/write failures,
     /// fill-application failures.
     pub orders_rejected_other: Counter,
+    /// s92 (B-blind observability): SELL takers whose match-time margin ran
+    /// out (the book's `margin_cut_price`), indexed `[non_pool][partial]
+    /// [bucket]`: `non_pool` 1 = the sender's D2 taker-only budget (its pool
+    /// is another market), `partial` 1 = fills before the cut, `bucket` =
+    /// [`margin_cut_tick_bucket`] of (hit price - reservation price) in
+    /// ticks. Names: [`sell_cut_metric_names`].
+    pub sell_margin_cuts: [[[Counter; 6]; 2]; 2],
+    /// s92: resting makers cancelled whole at match time because their
+    /// account could not afford the fill (HL `marginCanceled`).
+    pub maker_margin_cancels: Counter,
+    /// s92: reduce-only cuts (a resting reduce-only order cut at match time
+    /// or shrunk / cancelled by the post-fill sweep), one per cut.
+    pub reduce_only_cuts: Counter,
+    /// s92 B-blind: non-pool sells topped up to `reserve(B0 x (1 + 10 bps))`
+    /// in full / partly (the sender's free margin left after the Phase-2
+    /// fold ran out) / not at all (none left). Sells that needed no top-up
+    /// are not counted.
+    pub sell_top_ups_full: Counter,
+    pub sell_top_ups_partial: Counter,
+    pub sell_top_ups_none: Counter,
 
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
@@ -300,8 +324,8 @@ pub struct Metrics {
     /// 3c: per-cf-tag native-root dirty entries per flush (funnel attribution
     /// of the post-3c dirty-set composition). Indexed by the frozen cf_tag
     /// order: balances / order_books / positions / oracle / staking_delegations
-    /// / staking_validators.
-    pub exec_dirty_entries_by_cf: [Counter; 6],
+    /// / staking_validators / liquidation.
+    pub exec_dirty_entries_by_cf: [Counter; 7],
     /// 3c mode 2: node-local order-row store writes/deletes per block.
     pub exec_book_rows_written: Counter,
     pub exec_book_rows_deleted: Counter,
@@ -320,6 +344,13 @@ pub struct Metrics {
     /// block — previously buried in the unattributed residual because it runs
     /// BEFORE `exec_engine_seconds` starts.
     pub exec_load_books_seconds: Histogram,
+    /// Item 6 E4: the context's margin-config load (one scan of the market
+    /// rows plus their decode), a part of `exec_load_books_seconds`.
+    pub exec_margin_configs_seconds: Histogram,
+    /// Item 6 cut 1: the v2 action status built on the exec thread after the
+    /// engine (the native failures mapped to body positions), once per
+    /// native block.
+    pub exec_action_status_seconds: Histogram,
     /// PROFILER (s470): commit-callback persistence — block-body JSON write to
     /// CF_BLOCK_BODIES (+ standalone applied-height marker on non-native blocks).
     pub exec_body_persist_seconds: Histogram,
@@ -389,6 +420,36 @@ pub struct Metrics {
     /// exec thread; the pipeline advances the holder across untouched blocks so
     /// this should stay at 1 (startup) per process under a normal sequence.
     pub exec_resident_rebuilds: Counter,
+    /// Item 6 Phase 1: rows in the resident rows R (`CF_NATIVE_POSITIONS` +
+    /// `CF_NATIVE_BALANCES` held in memory across blocks), set per native block.
+    pub exec_resident_rows: Gauge,
+    /// Item 6 Phase 1: key + value bytes in R.
+    pub exec_resident_rows_bytes: Gauge,
+    /// Item 6 Phase 1: native blocks that (re)built R from the DB + parent
+    /// layer (startup, staleness guard, a fatal / failed block before). One
+    /// per process in a normal sequence.
+    pub exec_resident_rows_rebuilds: Counter,
+    /// Item 6 Phase 1: time to build R (a full scan of both CFs).
+    pub exec_resident_rows_build_seconds: Histogram,
+    /// Item 6 step 1: `end_resident` (R's end-of-block upkeep on the exec
+    /// thread, after the flush / hand-off), once per call. Before this it
+    /// landed in summarize.py's `residual_untimed`.
+    pub exec_end_resident_seconds: Histogram,
+    /// Item 6 step 1: inside `end_resident`, `ResidentRows::apply` (R takes
+    /// the block's delta).
+    pub exec_end_resident_rows_seconds: Histogram,
+    /// Item 6 step 1: inside `end_resident`, the decoded positions following
+    /// the delta (`TraderPositions`) plus the sums carry that rides that pass
+    /// (M1 cut 4). rows + positions + the memo merge / drops ==
+    /// `exec_end_resident_seconds` (item 6 cut 5: pipelined, the rest also
+    /// holds taking the block's delta from its frozen set, and dropping the
+    /// block's batch results).
+    pub exec_end_resident_positions_seconds: Histogram,
+    /// Item 6 step 2: time the exec thread waited for the `end_resident`
+    /// worker at the join (next block's `begin_resident`, or an untouched
+    /// block's advance), once per worker joined: the part of
+    /// `exec_end_resident_seconds` still on the critical path.
+    pub exec_end_resident_wait_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -798,6 +859,20 @@ impl Metrics {
             native_actions_processed.clone(),
         );
 
+        let exec_action_failures = Counter::default();
+        registry.register(
+            "torus_exec_action_failures",
+            "Native actions recorded as failed at execution (v2 action status)",
+            exec_action_failures.clone(),
+        );
+
+        let exec_action_status_bytes = Counter::default();
+        registry.register(
+            "torus_exec_action_status_bytes",
+            "Bytes written to cf_block_action_status",
+            exec_action_status_bytes.clone(),
+        );
+
         let consensus_rounds = Counter::default();
         registry.register(
             "torus_consensus_rounds",
@@ -916,6 +991,36 @@ impl Metrics {
             "IOC/FOK/Market orders cancelled on arrival with zero fills",
             orders_rejected_cancelled.clone(),
         );
+
+        let sell_margin_cuts: [[[Counter; 6]; 2]; 2] = Default::default();
+        for (name, c) in sell_cut_metric_names().iter().zip(sell_margin_cuts.iter().flatten().flatten()) {
+            registry.register(
+                name,
+                "Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92)",
+                c.clone(),
+            );
+        }
+        let maker_margin_cancels = Counter::default();
+        registry.register(
+            "torus_maker_margin_cancels",
+            "Resting makers cancelled whole at match time for margin (HL marginCanceled)",
+            maker_margin_cancels.clone(),
+        );
+        let reduce_only_cuts = Counter::default();
+        registry.register(
+            "torus_reduce_only_cuts",
+            "Reduce-only order cuts at match time or by the post-fill sweep",
+            reduce_only_cuts.clone(),
+        );
+
+        let [sell_top_ups_full, sell_top_ups_partial, sell_top_ups_none]: [Counter; 3] = Default::default();
+        for (name, c) in ["full", "partial", "none"].iter().zip([&sell_top_ups_full, &sell_top_ups_partial, &sell_top_ups_none]) {
+            registry.register(
+                format!("torus_sell_top_ups_{name}"),
+                "B-blind non-pool sell top-ups to reserve(B0 x (1 + 10 bps)): granted in full / partly / not at all (s92)",
+                c.clone(),
+            );
+        }
 
         let orders_cancelled_partial_fill = Counter::default();
         registry.register(
@@ -1439,7 +1544,7 @@ impl Metrics {
         );
 
         // 3c: per-cf-tag dirty-entry attribution (frozen NATIVE_ROOT_CFS order).
-        let exec_dirty_entries_by_cf: [Counter; 6] = Default::default();
+        let exec_dirty_entries_by_cf: [Counter; 7] = Default::default();
         for (i, suffix) in [
             "balances",
             "order_books",
@@ -1447,6 +1552,7 @@ impl Metrics {
             "oracle",
             "staking_delegations",
             "staking_validators",
+            "liquidation",
         ]
         .iter()
         .enumerate()
@@ -1503,6 +1609,18 @@ impl Metrics {
             "Exec phase: per-block order-book load + rebuild from cf_native_order_books \
              (O(total resting depth); classic blob or C4 rows depending on TORUS_BOOK_ROWS)",
             exec_load_books_seconds.clone(),
+        );
+        let exec_margin_configs_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_exec_margin_configs_seconds",
+            "Item 6 E4: the context's margin-config load (market rows scan + decode), part of load_books",
+            exec_margin_configs_seconds.clone(),
+        );
+        let exec_action_status_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_exec_action_status_seconds",
+            "Item 6 cut 1: the v2 action status (native failures mapped to body positions), exec thread",
+            exec_action_status_seconds.clone(),
         );
 
         let exec_body_persist_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
@@ -1629,6 +1747,55 @@ impl Metrics {
             "rank8 resident-mode blocks that rebuilt the order books from persisted state \
              (holder empty/drained or staleness guard tripped) — full reload on the exec thread",
             exec_resident_rebuilds.clone(),
+        );
+
+        let exec_resident_rows = Gauge::default();
+        registry.register(
+            "torus_exec_resident_rows",
+            "Item 6: rows of cf_native_positions + cf_native_balances resident in memory (R)",
+            exec_resident_rows.clone(),
+        );
+        let exec_resident_rows_bytes = Gauge::default();
+        registry.register(
+            "torus_exec_resident_rows_bytes",
+            "Item 6: key + value bytes of the resident rows R",
+            exec_resident_rows_bytes.clone(),
+        );
+        let exec_resident_rows_rebuilds = Counter::default();
+        registry.register(
+            "torus_exec_resident_rows_rebuilds",
+            "Item 6: native blocks that rebuilt the resident rows R from the DB + parent layer",
+            exec_resident_rows_rebuilds.clone(),
+        );
+        let exec_resident_rows_build_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_resident_rows_build_seconds",
+            "Item 6: time to build the resident rows R (full scan of both CFs)",
+            exec_resident_rows_build_seconds.clone(),
+        );
+        let exec_end_resident_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_seconds",
+            "Item 6: end_resident (resident rows R end-of-block upkeep on the exec thread)",
+            exec_end_resident_seconds.clone(),
+        );
+        let exec_end_resident_rows_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_rows_seconds",
+            "Item 6: end_resident, R applying the block's delta (ResidentRows::apply)",
+            exec_end_resident_rows_seconds.clone(),
+        );
+        let exec_end_resident_positions_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_positions_seconds",
+            "Item 6: end_resident, decoded positions following the delta plus the sums carry",
+            exec_end_resident_positions_seconds.clone(),
+        );
+        let exec_end_resident_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_exec_end_resident_wait_seconds",
+            "Item 6: exec thread waiting for the end_resident worker at the join (exposed end_resident)",
+            exec_end_resident_wait_seconds.clone(),
         );
 
         let exec_queue_depth = Gauge::default();
@@ -2041,6 +2208,8 @@ impl Metrics {
             block_build_encode_seconds,
             evm_txs_processed,
             native_actions_processed,
+            exec_action_failures,
+            exec_action_status_bytes,
             consensus_rounds,
             consensus_view,
             state_root_compute_seconds,
@@ -2061,6 +2230,12 @@ impl Metrics {
             orders_cancelled_partial_fill,
             orders_self_trade_cancels,
             orders_rejected_other,
+            sell_margin_cuts,
+            maker_margin_cancels,
+            reduce_only_cuts,
+            sell_top_ups_full,
+            sell_top_ups_partial,
+            sell_top_ups_none,
             pruner_blocks_removed,
             rpc_requests_total,
             rpc_request_duration_seconds,
@@ -2141,6 +2316,8 @@ impl Metrics {
             exec_block_seconds,
             exec_evm_seconds,
             exec_load_books_seconds,
+            exec_margin_configs_seconds,
+            exec_action_status_seconds,
             exec_body_persist_seconds,
             commit_persist_seconds,
             vote_state_write_seconds,
@@ -2161,6 +2338,14 @@ impl Metrics {
             mempool_remove_committed_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
+            exec_resident_rows,
+            exec_resident_rows_bytes,
+            exec_resident_rows_rebuilds,
+            exec_resident_rows_build_seconds,
+            exec_end_resident_seconds,
+            exec_end_resident_rows_seconds,
+            exec_end_resident_positions_seconds,
+            exec_end_resident_wait_seconds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2350,6 +2535,37 @@ pub async fn serve_metrics(
     }
 }
 
+/// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
+pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
+
+/// s92: the [`MARGIN_CUT_TICK_BUCKETS`] index of a cut `ticks` above the
+/// reservation price: `<= 0`, 1-2, 3-5, 6-10, 11-30, more.
+pub fn margin_cut_tick_bucket(ticks: i128) -> usize {
+    match ticks {
+        ..=0 => 0,
+        1..=2 => 1,
+        3..=5 => 2,
+        6..=10 => 3,
+        11..=30 => 4,
+        _ => 5,
+    }
+}
+
+/// s92: the names of [`Metrics::sell_margin_cuts`] in its index order
+/// (`torus_sell_cuts_{pool|nonpool}_{zero|partial}_{bucket}`; the exporter
+/// adds `_total`).
+pub fn sell_cut_metric_names() -> Vec<String> {
+    let mut out = Vec::with_capacity(24);
+    for pool in ["pool", "nonpool"] {
+        for fill in ["zero", "partial"] {
+            for bucket in MARGIN_CUT_TICK_BUCKETS {
+                out.push(format!("torus_sell_cuts_{pool}_{fill}_{bucket}"));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2372,6 +2588,34 @@ mod tests {
                 "{stage} series must exist at 0:\n{text}"
             );
         }
+    }
+
+    /// s92 (B-blind observability): every sell-cut series exists from
+    /// start-up under the names `run-cell.sh` samples, indexed
+    /// `[non_pool][partial][bucket]`; the tick buckets split at 0 / 2 / 5 /
+    /// 10 / 30; maker margin cancels and reduce-only cuts are counters.
+    #[test]
+    fn margin_cut_counters_are_exported_and_bucketed() {
+        let m = Metrics::new();
+        m.sell_margin_cuts[1][0][2].inc();
+        m.maker_margin_cancels.inc_by(2);
+        m.reduce_only_cuts.inc_by(3);
+        let text = m.encode();
+        let names = sell_cut_metric_names();
+        assert_eq!(names.len(), 24);
+        for name in &names {
+            let want = if name == "torus_sell_cuts_nonpool_zero_t3_5" { 1 } else { 0 };
+            assert!(text.contains(&format!("{name}_total {want}\n")), "{name}:\n{text}");
+        }
+        assert!(text.contains("torus_maker_margin_cancels_total 2\n"), "{text}");
+        assert!(text.contains("torus_reduce_only_cuts_total 3\n"), "{text}");
+        m.sell_top_ups_partial.inc();
+        let text = m.encode();
+        for (name, want) in [("full", 0), ("partial", 1), ("none", 0)] {
+            assert!(text.contains(&format!("torus_sell_top_ups_{name}_total {want}\n")), "{name}:\n{text}");
+        }
+        let buckets: Vec<usize> = [-5, 0, 1, 2, 3, 5, 6, 10, 11, 30, 31, 1_000].map(margin_cut_tick_bucket).to_vec();
+        assert_eq!(buckets, vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
     }
 
     #[test]
@@ -2436,12 +2680,22 @@ mod tests {
             "torus_exec_block_seconds",
             "torus_exec_evm_seconds",
             "torus_exec_load_books_seconds",
+            "torus_exec_margin_configs_seconds",
+            "torus_exec_action_status_seconds",
             "torus_exec_body_persist_seconds",
             "torus_commit_persist_seconds",
             "torus_commit_body_encode_seconds",
             "torus_commit_persist_write_seconds",
             "torus_exec_resting_orders",
             "torus_exec_resident_rebuilds",
+            "torus_exec_resident_rows",
+            "torus_exec_resident_rows_bytes",
+            "torus_exec_resident_rows_rebuilds",
+            "torus_exec_resident_rows_build_seconds",
+            "torus_exec_end_resident_seconds",
+            "torus_exec_end_resident_rows_seconds",
+            "torus_exec_end_resident_positions_seconds",
+            "torus_exec_end_resident_wait_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
             "torus_exec_dispatch_deferred",

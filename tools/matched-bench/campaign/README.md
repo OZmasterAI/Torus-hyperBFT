@@ -138,7 +138,8 @@ DRY_RUN=1 $T/ab-driver.sh "$C"
 $T/start-warmup.sh "$C"
 ```
 
-Detached (`setsid nohup`); returns at once. Logs: `$C/<label>.log` (run-cell.sh),
+Detached as its own systemd --user service (`detach.sh`, unit
+`bench-<campaign>-warmup.service`; stop with `systemctl --user stop <unit>`); returns at once. Logs: `$C/<label>.log` (run-cell.sh),
 `$C/<label>.driver.log` (run_cell.py), `$C/campaign.log`, `$C/warmup.nohup`. Done
 when `$C/warmup.done` exists: `CAMPAIGN DONE <time>` from the driver plus `exit=N`.
 Check the warm-up's `summary.json` (agreement AGREE, liveness PASS) before going on.
@@ -210,6 +211,10 @@ state digest, then stopped. Results: `oracle-feed.log`, `oracle-feed-stats.json`
 `ORACLE_WALK_BP=N` (default 0, item 6) moves every market's price N bp per feed round
 around `ORACLE_PRICE` (bounded at ±8N bp; `oracle-feed --walk-bp`), so the marks
 change during the cell; N > 0 needs an arm whose `bench-throughput` has `--walk-bp`.
+`ORACLE_FEED_DRAIN=1` (default 0, needs `ORACLE_FEED=1`) keeps the feed running through
+the drain (`health.py drain --feed-live`), so oracle-only blocks execute with live marks;
+per-sample exec lag and ms per native block go to `drain-feed-live.tsv`, the summary to
+`drain.json .feed_live`. The feed is paused only before the after-snapshots and the digest.
 
 Requirements:
 - The arm's `bench-throughput` must have the `oracle-feed` subcommand. main does

@@ -115,10 +115,31 @@ COUNTERS = {
 COMMIT_BUCKETS = [("0.1", 0), ("0.2", 50), ("0.4", 100), ("+Inf", 100)]
 
 
-def write_fixture(out, include_r6=True, bl1="serial"):
-    """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary)."""
+# Item 6 step 1: end_resident and its two subs (per native block).
+END_RESIDENT = {
+    "exec_end_resident_seconds": 0.030,
+    "exec_end_resident_rows_seconds": 0.012,
+    "exec_end_resident_positions_seconds": 0.010,
+}
+
+
+# Item 6 step 2: the exec thread's wait at the end_resident worker's join.
+END_RESIDENT_WAIT = {"exec_end_resident_wait_seconds": 0.008}
+# Its buckets over the window (10 joins: 5 at or below 4 ms, all at or below
+# 16 ms => p50 = 4 ms, p90 = 8 + 8 * (9 - 5) / 5 = 14.4 ms).
+WAIT_BUCKETS = [("0.004", 5), ("0.008", 5), ("0.016", 10), ("+Inf", 10)]
+
+
+def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_resident_worker=False):
+    """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary).
+    end_resident: the binary times end_resident (item 6 step 1);
+    end_resident_worker: it runs on a worker, with a join wait (step 2)."""
     extra = {"serial": BL1_SERIAL, "pipelined": BL1_PIPELINED, "none": {}}[bl1]
     per_blk = dict(PER_BLK)
+    if end_resident:
+        per_blk.update(END_RESIDENT)
+    if end_resident_worker:
+        per_blk.update(END_RESIDENT_WAIT)
     if bl1 == "none":
         for k in ("exec_save_books_drain_seconds", "exec_save_books_write_seconds"):
             per_blk.pop(k)
@@ -172,6 +193,13 @@ def write_fixture(out, include_r6=True, bl1="serial"):
                         "%d,%s,torus_commit_interval_seconds_bucket,%s,%d\n"
                         % (1000 + SPAN, node, le, cum)
                     )
+                if end_resident_worker:
+                    for ts, scale in ((1000, 0), (1000 + SPAN, 1)):
+                        for le, cum in WAIT_BUCKETS:
+                            f.write(
+                                "%d,%s,torus_exec_end_resident_wait_seconds_bucket,%s,%d\n"
+                                % (ts, node, le, cum * scale)
+                            )
 
 
 def run(out):
@@ -596,6 +624,63 @@ def main_s58():
     print("test_summarize.py: OK")
 
 
+def main_end_resident():
+    """Item 6 step 1: a binary that times end_resident reports it as an
+    exec-thread phase (with its two subs) and residual_untimed drops by it;
+    an older binary reports 0.0 and keeps its residual."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        er = p0["phases"]["end_resident"]
+        close(er["ms"], 30.0, "end_resident ms/blk")
+        close(er["end_resident_rows_ms"], 12.0, "end_resident_rows_ms")
+        close(er["end_resident_positions_ms"], 10.0, "end_resident_positions_ms")
+        assert er["off_chain"] is False, "end_resident runs on the exec thread"
+        check_phase_accounting(p0, worker=True)
+        close(p0["phases"]["residual_untimed"]["ms"], 15.0, "residual (pipelined, end_resident timed)")
+        ci = p0["chain_identity"]
+        assert "end_resident" in ci["e_phases"], ci
+        close(ci["e_phase_sum_ms"], 840.0, "e_phase_sum_ms (end_resident timed)")
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined")
+        p0 = run(out)["phase_by_node"]["val0"]
+        close(p0["phases"]["end_resident"]["ms"], 0.0, "end_resident on an older binary")
+        close(p0["phases"]["residual_untimed"]["ms"], 45.0, "residual (older binary)")
+        assert "end_resident" in p0["chain_identity"]["e_phases"]
+        close(p0["phases"]["end_resident_wait"]["ms"], 0.0, "no wait before step 2")
+        assert p0["end_resident_wait_ms_p50"] is None
+
+
+def main_end_resident_worker():
+    """Item 6 step 2: end_resident on a worker is an OFF-chain phase (its ms
+    still reported, no share of the exec block); the exec thread's join wait
+    is the on-chain phase in its place, in residual accounting and the chain
+    identity; its p50 / p90 come from the wait buckets."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        er = p0["phases"]["end_resident"]
+        close(er["ms"], 30.0, "end_resident ms/blk (worker)")
+        close(er["end_resident_rows_ms"], 12.0, "end_resident_rows_ms (worker)")
+        assert er["off_chain"] is True, er
+        assert er["pct_of_block"] is None, er
+        assert "end_resident" in p0["off_chain_phases"], p0["off_chain_phases"]
+        w = p0["phases"]["end_resident_wait"]
+        close(w["ms"], 8.0, "end_resident_wait ms/blk")
+        assert w["off_chain"] is False, w
+        check_phase_accounting(p0, worker=True)
+        # 45 untimed before step 1, 15 with end_resident on the thread; now
+        # only the 8 ms wait is on the thread: 45 - 8.
+        close(p0["phases"]["residual_untimed"]["ms"], 37.0, "residual (end_resident on a worker)")
+        ci = p0["chain_identity"]
+        assert "end_resident_wait" in ci["e_phases"] and "end_resident" not in ci["e_phases"], ci
+        close(ci["e_phase_sum_ms"], 818.0, "e_phase_sum_ms (840 - 30 + 8)")
+        close(p0["end_resident_wait_ms_p50"], 4.0, "wait p50")
+        close(p0["end_resident_wait_ms_p90"], 14.4, "wait p90")
+
+
 if __name__ == "__main__":
     main()
+    main_end_resident()
+    main_end_resident_worker()
     main_s58()

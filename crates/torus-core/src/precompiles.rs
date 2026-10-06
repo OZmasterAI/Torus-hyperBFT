@@ -204,6 +204,13 @@ pub mod abi {
         encode_u128(fp.raw() as u128)
     }
 
+    /// F1/D1 (s517): a balance that may be negative, as a `uint128`:
+    /// negative → 0 (the ABI stays `uint128`; a raw cast would wrap it to
+    /// ~2^128).
+    pub fn encode_balance_as_u128(fp: FixedPoint) -> [u8; 32] {
+        encode_u128(fp.raw().max(0) as u128)
+    }
+
     pub fn encode_fp_as_i128(fp: FixedPoint) -> [u8; 32] {
         encode_i128(fp.raw())
     }
@@ -257,14 +264,26 @@ fn selector_for(sig: &str) -> u32 {
 ///   a per-tx journaled overlay so writer side effects only become durable on tx success
 ///   (reads fall through to the base DB, preserving read-your-writes within the tx)
 /// * `current_block` — current block number
+/// * `current_timestamp` — current block's header timestamp (seconds): the clock
+///   of the oracle staleness rule (0x0802 stale flags, 0x0800 UPnL)
 pub fn execute_precompile(
     address: &Address,
     input: &[u8],
     caller: &Address,
     state_db: &impl StateBackend,
     current_block: u64,
+    current_timestamp: u64,
 ) -> Result<Vec<u8>, CoreError> {
-    execute_precompile_inner(address, input, caller, U256::ZERO, state_db, current_block, false)
+    execute_precompile_inner(
+        address,
+        input,
+        caller,
+        U256::ZERO,
+        state_db,
+        current_block,
+        current_timestamp,
+        false,
+    )
 }
 
 /// [`execute_precompile`] for a call that carries EVM value.
@@ -282,8 +301,18 @@ pub fn execute_precompile_with_value(
     call_value: U256,
     state_db: &impl StateBackend,
     current_block: u64,
+    current_timestamp: u64,
 ) -> Result<Vec<u8>, CoreError> {
-    execute_precompile_inner(address, input, caller, call_value, state_db, current_block, false)
+    execute_precompile_inner(
+        address,
+        input,
+        caller,
+        call_value,
+        state_db,
+        current_block,
+        current_timestamp,
+        false,
+    )
 }
 
 /// Read-only variant for eth_call / eth_estimateGas simulation.
@@ -300,10 +329,21 @@ pub fn execute_precompile_read_only(
     caller: &Address,
     state_db: &impl StateBackend,
     current_block: u64,
+    current_timestamp: u64,
 ) -> Result<Vec<u8>, CoreError> {
-    execute_precompile_inner(address, input, caller, U256::ZERO, state_db, current_block, true)
+    execute_precompile_inner(
+        address,
+        input,
+        caller,
+        U256::ZERO,
+        state_db,
+        current_block,
+        current_timestamp,
+        true,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_precompile_inner(
     address: &Address,
     input: &[u8],
@@ -311,6 +351,7 @@ fn execute_precompile_inner(
     call_value: U256,
     state_db: &impl StateBackend,
     current_block: u64,
+    current_timestamp: u64,
     read_only: bool,
 ) -> Result<Vec<u8>, CoreError> {
     let bytes = address.as_slice();
@@ -338,9 +379,9 @@ fn execute_precompile_inner(
     }
 
     match id {
-        ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db),
+        ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db, current_timestamp),
         ADDR_BALANCE_READER => balance_reader(input, state_db),
-        ADDR_ORACLE_READER => oracle_reader(input, state_db, current_block),
+        ADDR_ORACLE_READER => oracle_reader(input, state_db, current_timestamp),
         ADDR_STAKING_READER => staking_reader(input, state_db),
         ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
         ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
@@ -355,7 +396,11 @@ fn execute_precompile_inner(
 // OrderBookReader (0x0800) — tasks 2.4.1
 // ============================================================================
 
-fn order_book_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+fn order_book_reader(
+    input: &[u8],
+    state_db: &impl StateBackend,
+    now: u64,
+) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getOrderBook(bytes32)") {
@@ -364,7 +409,7 @@ fn order_book_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u
     } else if sel == selector_for("getPosition(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_position(state_db, &trader, market_id)
+        read_position(state_db, &trader, market_id, now)
     } else if sel == selector_for("getOpenOrders(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
@@ -450,10 +495,14 @@ fn read_order_book(
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
+///
+/// Item 2: UPnL uses the oracle price only while usable at `now` (block
+/// timestamp, s) — the rule of `OraclePrice::usable`; otherwise 0.
 fn read_position(
     state_db: &impl StateBackend,
     trader: &Address,
     market_id: MarketId,
+    now: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let key = crate::position::position_key(trader, market_id);
     let pos = match state_db.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
@@ -471,7 +520,7 @@ fn read_position(
     };
 
     // Compute unrealized PnL using oracle price
-    let unrealized_pnl = match get_oracle_price_fp(state_db, market_id) {
+    let unrealized_pnl = match get_oracle_price_fp(state_db, market_id, now) {
         Ok(mark) => pos.unrealized_pnl(mark),
         Err(_) => FixedPoint::ZERO,
     };
@@ -565,11 +614,12 @@ fn read_balances(state_db: &impl StateBackend, trader: &Address) -> Result<Vec<u
     };
 
     let mut out = Vec::with_capacity(128);
-    out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.available));
+    // F1/D1 (s517): `available` may be negative — reported as 0.
+    out.extend_from_slice(&abi::encode_balance_as_u128(native_bal.available));
     out.extend_from_slice(&abi::encode_u128(evm_balance));
     out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.order_margin));
     // available = native_available (native balance not locked in orders)
-    out.extend_from_slice(&abi::encode_fp_as_u128(native_bal.available));
+    out.extend_from_slice(&abi::encode_balance_as_u128(native_bal.available));
     Ok(out)
 }
 
@@ -596,20 +646,34 @@ fn read_markets(state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
 // ============================================================================
 
 // FIX MED-NEW-13: Use shared constant from oracle module.
-use crate::oracle::DEFAULT_MAX_ORACLE_AGE;
+use crate::oracle::DEFAULT_MAX_ORACLE_AGE_SECS;
 
+/// Aggregate row: price(16) ‖ block(8) ‖ reporters(4) ‖ ts(8). Stale iff
+/// now − ts > DEFAULT_MAX_ORACLE_AGE_SECS (saturating: age clamps at 0) — the
+/// rule of `OraclePrice::usable`. `None` for a short (undecodable) row.
+fn decode_agg(data: &[u8], now: u64) -> Option<(FixedPoint, u64, bool)> {
+    if data.len() < 36 {
+        return None;
+    }
+    let price = FixedPoint::from_raw(i128::from_be_bytes(data[..16].try_into().unwrap()));
+    let block = u64::from_be_bytes(data[16..24].try_into().unwrap());
+    let ts = u64::from_be_bytes(data[28..36].try_into().unwrap());
+    Some((price, block, now.saturating_sub(ts) > DEFAULT_MAX_ORACLE_AGE_SECS))
+}
+
+/// `now` = the block's header timestamp (s); outputs keep their ABI.
 fn oracle_reader(
     input: &[u8],
     state_db: &impl StateBackend,
-    current_block: u64,
+    now: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getPrice(bytes32)") {
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
-        read_oracle_price(state_db, market_id, current_block)
+        read_oracle_price(state_db, market_id, now)
     } else if sel == selector_for("getAllPrices()") {
-        read_all_oracle_prices(state_db, current_block)
+        read_all_oracle_prices(state_db, now)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -619,29 +683,28 @@ fn oracle_reader(
 fn read_oracle_price(
     state_db: &impl StateBackend,
     market_id: MarketId,
-    current_block: u64,
+    now: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let key = oracle_agg_key(market_id);
-    match state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
-        Some(data) if data.len() >= 28 => {
-            let price = FixedPoint::from_raw(i128::from_be_bytes(data[..16].try_into().unwrap()));
-            let block_number = u64::from_be_bytes(data[16..24].try_into().unwrap());
-            let stale = current_block.saturating_sub(block_number) > DEFAULT_MAX_ORACLE_AGE;
-
+    match state_db
+        .get_cf_raw(CF_NATIVE_ORACLE, &key)?
+        .and_then(|data| decode_agg(&data, now))
+    {
+        Some((price, block_number, stale)) => {
             let mut out = Vec::with_capacity(96);
             out.extend_from_slice(&abi::encode_fp_as_u128(price));
             out.extend_from_slice(&abi::encode_u64(block_number));
             out.extend_from_slice(&abi::encode_bool(stale));
             Ok(out)
         }
-        _ => Err(CoreError::NoOraclePrice(market_id)),
+        None => Err(CoreError::NoOraclePrice(market_id)),
     }
 }
 
 /// getAllPrices → (bytes32[] market_ids, uint128[] prices, bool[] stale_flags)
 fn read_all_oracle_prices(
     state_db: &impl StateBackend,
-    current_block: u64,
+    now: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let prefix = b"agg";
     let entries = state_db.iterate_cf(CF_NATIVE_ORACLE, Some(prefix))?;
@@ -651,11 +714,11 @@ fn read_all_oracle_prices(
     let mut stale_flags = Vec::new();
 
     for (key, value) in &entries {
-        if key.len() == 11 && value.len() >= 28 {
+        if key.len() != 11 {
+            continue;
+        }
+        if let Some((price, _, stale)) = decode_agg(value, now) {
             let mid = u64::from_be_bytes(key[3..11].try_into().unwrap());
-            let price = FixedPoint::from_raw(i128::from_be_bytes(value[..16].try_into().unwrap()));
-            let block_number = u64::from_be_bytes(value[16..24].try_into().unwrap());
-            let stale = current_block.saturating_sub(block_number) > DEFAULT_MAX_ORACLE_AGE;
 
             market_ids.push(abi::encode_market_id(mid));
             prices.push(abi::encode_fp_as_u128(price));
@@ -678,16 +741,20 @@ fn oracle_agg_key(market_id: MarketId) -> Vec<u8> {
     key
 }
 
-/// Read the oracle price as FixedPoint (helper for other precompiles).
+/// The usable oracle price at `now` (helper for other precompiles): `Ok` only
+/// if the aggregate is not stale and > 0 — the rule of `OraclePrice::usable`.
 fn get_oracle_price_fp(
     state_db: &impl StateBackend,
     market_id: MarketId,
+    now: u64,
 ) -> Result<FixedPoint, CoreError> {
     let key = oracle_agg_key(market_id);
-    match state_db.get_cf_raw(CF_NATIVE_ORACLE, &key)? {
-        Some(data) if data.len() >= 16 => Ok(FixedPoint::from_raw(i128::from_be_bytes(
-            data[..16].try_into().unwrap(),
-        ))),
+    match state_db
+        .get_cf_raw(CF_NATIVE_ORACLE, &key)?
+        .and_then(|data| decode_agg(&data, now))
+    {
+        Some((_, _, true)) => Err(CoreError::StaleOraclePrice(market_id)),
+        Some((price, _, false)) if price > FixedPoint::ZERO => Ok(price),
         _ => Err(CoreError::NoOraclePrice(market_id)),
     }
 }

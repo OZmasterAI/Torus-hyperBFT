@@ -7,14 +7,14 @@ use torus_state::StateBackend;
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
-use crate::position::{MarginType, Position, PositionManager};
+use crate::position::{MarginType, NativeBalance, Position, PositionManager};
 
 // ============================================================================
 // Margin Tiers — leverage limits by notional size
 // ============================================================================
 
 /// A single margin tier: positions with notional <= max_notional can use up to max_leverage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarginTier {
     pub max_notional: FixedPoint,
     pub max_leverage: u32,
@@ -74,12 +74,223 @@ pub fn order_initial_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) 
         .expect("FixedPoint division error")
 }
 
+/// Item 3 (HL): maintenance margin = half the initial margin at max leverage
+/// (position-size tier), truncating — THE formula of liquidation.
+pub fn maintenance_margin(tiers: Option<&[MarginTier]>, notional: FixedPoint) -> FixedPoint {
+    FixedPoint::from_raw(order_initial_margin(tiers, notional).raw() / 2)
+}
+
+// ============================================================================
+// Account-level margin (F1, s517) — Hyperliquid cross margin, computed
+// ============================================================================
+
+/// F1: the price a position is valued at — the market's mark, else its entry
+/// price (s517 decision 2: UPnL 0 and IM at entry notional without a mark).
+pub fn position_price(pos: &Position, mark: Option<FixedPoint>) -> FixedPoint {
+    mark.unwrap_or(pos.entry_price)
+}
+
+/// F1: IM change when one market's (position [+ resting]) notional goes from
+/// `before` to `after`, both at their own POSITION-size tier. < 0 = released.
+pub fn im_delta(tiers: Option<&[MarginTier]>, before: FixedPoint, after: FixedPoint) -> FixedPoint {
+    order_initial_margin(tiers, after) - order_initial_margin(tiers, before)
+}
+
+/// F1: margin need of placing `qty` on side `is_buy` against signed position
+/// `signed` (valued at `px`), priced at `price`: the larger of the IM delta of
+/// a complete fill (the closing part releases IM) and — for an order that can
+/// rest — of resting its opening part. `<= 0`: it only reduces. `None` on
+/// overflow. The book's match-time need is the same notional arithmetic.
+pub fn placement_need(
+    tiers: Option<&[MarginTier]>,
+    signed: FixedPoint,
+    px: FixedPoint,
+    is_buy: bool,
+    qty: FixedPoint,
+    price: FixedPoint,
+    can_rest: bool,
+) -> Option<FixedPoint> {
+    let size = if signed < FixedPoint::ZERO { -signed } else { signed };
+    let closing = qty.min(crate::order_book::reduce_only_allowance(signed, is_buy));
+    let opening_notional = price.checked_mul(qty - closing).ok()?;
+    let before = size.checked_mul(px).ok()?;
+    // Item 6 cut 2: nothing closes (the common case: an order on the
+    // position's side, or flat) -> `left == before`, so the complete fill and
+    // the rest are the same notional and one IM delta; IM(before) once. The
+    // same values and overflow checks as `placement_need_reference`.
+    let left = if closing == FixedPoint::ZERO {
+        before
+    } else {
+        (size - closing).checked_mul(px).ok()?
+    };
+    let after_fill = left.checked_add(opening_notional).ok()?;
+    let im_after_fill = order_initial_margin(tiers, after_fill);
+    let im_before = order_initial_margin(tiers, before);
+    let filled = im_after_fill - im_before;
+    if !can_rest || closing == FixedPoint::ZERO {
+        return Some(filled);
+    }
+    let rested = order_initial_margin(tiers, before.checked_add(opening_notional).ok()?) - im_before;
+    Some(filled.max(rested))
+}
+
+/// [`placement_need`] before item 6 cut 2 (two full IM deltas): the test
+/// oracle.
+#[cfg(test)]
+pub(crate) fn placement_need_reference(
+    tiers: Option<&[MarginTier]>,
+    signed: FixedPoint,
+    px: FixedPoint,
+    is_buy: bool,
+    qty: FixedPoint,
+    price: FixedPoint,
+    can_rest: bool,
+) -> Option<FixedPoint> {
+    let size = if signed < FixedPoint::ZERO { -signed } else { signed };
+    let closing = qty.min(crate::order_book::reduce_only_allowance(signed, is_buy));
+    let opening_notional = price.checked_mul(qty - closing).ok()?;
+    let before = size.checked_mul(px).ok()?;
+    let left = (size - closing).checked_mul(px).ok()?;
+    let filled = im_delta(tiers, before, left.checked_add(opening_notional).ok()?);
+    if !can_rest {
+        return Some(filled);
+    }
+    let rested = im_delta(tiers, before, before.checked_add(opening_notional).ok()?);
+    Some(filled.max(rested))
+}
+
+/// F1: one trader's cross-margin account (never stored — decision 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountView {
+    pub available: FixedPoint,
+    pub order_margin: FixedPoint,
+    /// Σ unrealized PnL at [`position_price`].
+    pub upnl: FixedPoint,
+    /// Σ position IM at [`position_price`], each at its market's position-size tier.
+    pub position_im: FixedPoint,
+    /// Σ |size| × [`position_price`].
+    pub notional: FixedPoint,
+    /// Item 3: Σ [`maintenance_margin`] at [`position_price`], each market's tiers.
+    pub maintenance: FixedPoint,
+}
+
+/// Item 6 C6b: one Cross position's contribution to each of
+/// [`AccountView`]'s position sums — THE formula of [`AccountView::build`]
+/// (also used by the executor's in-block partial re-value, which subtracts
+/// and adds these terms). Exact integers: the sums do not depend on the
+/// order the terms are added in, as long as no partial sum overflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionTerms {
+    pub upnl: FixedPoint,
+    pub notional: FixedPoint,
+    pub position_im: FixedPoint,
+    pub maintenance: FixedPoint,
+}
+
+impl PositionTerms {
+    /// The four terms, in [`AccountView`] field order (upnl, position_im,
+    /// notional, maintenance).
+    pub fn parts(&self) -> [FixedPoint; 4] {
+        [self.upnl, self.position_im, self.notional, self.maintenance]
+    }
+}
+
+/// [`PositionTerms`] of `pos` valued at `mark` (else entry, see
+/// [`position_price`]) with its market's `tiers`. `Err` = overflow.
+pub fn position_terms(
+    pos: &Position,
+    mark: Option<FixedPoint>,
+    tiers: Option<&[MarginTier]>,
+) -> Result<PositionTerms, CoreError> {
+    let of = |_| CoreError::Overflow("account margin overflows i128".into());
+    let px = position_price(pos, mark);
+    let n = pos.size.checked_mul(px).map_err(of)?;
+    let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
+    Ok(PositionTerms {
+        upnl: diff.checked_mul(pos.size).map_err(of)?,
+        notional: n,
+        position_im: order_initial_margin(tiers, n),
+        maintenance: maintenance_margin(tiers, n),
+    })
+}
+
+impl AccountView {
+    /// Cross positions only (every production position is Cross).
+    pub fn build<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+    ) -> Result<Self, CoreError> {
+        Self::build_with(bal, positions, mark, tiers, |_, _| {})
+    }
+
+    /// [`Self::build`], handing each Cross position's [`PositionTerms`] to
+    /// `seen` (in order, before they are added). Item 6 C6b: the executor's
+    /// sums cache records what its partial re-value needs through it.
+    pub fn build_with<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+        mut seen: impl FnMut(&Position, &PositionTerms),
+    ) -> Result<Self, CoreError> {
+        let of = |_| CoreError::Overflow("account margin overflows i128".into());
+        let mut v = Self {
+            available: bal.available,
+            order_margin: bal.order_margin,
+            upnl: FixedPoint::ZERO,
+            position_im: FixedPoint::ZERO,
+            notional: FixedPoint::ZERO,
+            maintenance: FixedPoint::ZERO,
+        };
+        for pos in positions.iter().filter(|p| p.margin_type == MarginType::Cross) {
+            let t = position_terms(pos, mark(pos.market_id), tiers(pos.market_id))?;
+            seen(pos, &t);
+            v.upnl = v.upnl.checked_add(t.upnl).map_err(of)?;
+            v.notional = v.notional.checked_add(t.notional).map_err(of)?;
+            v.position_im = v.position_im.checked_add(t.position_im).map_err(of)?;
+            v.maintenance = v.maintenance.checked_add(t.maintenance).map_err(of)?;
+        }
+        Ok(v)
+    }
+
+    /// Collateral + UPnL.
+    pub fn equity(&self) -> FixedPoint {
+        self.available + self.order_margin + self.upnl
+    }
+
+    /// What the positions add to (or take from) free margin: UPnL − IM.
+    pub fn pos_net(&self) -> FixedPoint {
+        self.upnl - self.position_im
+    }
+
+    /// equity − (position IM + order margin) = available + [`Self::pos_net`].
+    pub fn free(&self) -> FixedPoint {
+        self.available + self.pos_net()
+    }
+
+    /// HL `transfer_margin_required`: max(Σ IM, 10% × Σ notional).
+    pub fn transfer_required(&self) -> FixedPoint {
+        self.position_im.max(FixedPoint::from_raw(self.notional.raw() / 10))
+    }
+
+    /// s517 decision 5, SAFE variant (user, s517): the cash bound
+    /// `amount <= available` AND equity WITHOUT the resting orders'
+    /// reservations (`available + upnl`) after the withdrawal covers
+    /// [`Self::transfer_required`]. A negative `available` withdraws nothing.
+    pub fn withdrawal_allowed(&self, amount: FixedPoint) -> bool {
+        amount <= self.available
+            && self.equity() - self.order_margin - amount >= self.transfer_required()
+    }
+}
+
 // ============================================================================
 // Market configuration for margin
 // ============================================================================
 
 /// Per-market margin configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketMarginConfig {
     pub market_id: MarketId,
     pub max_leverage: u32,
@@ -98,6 +309,28 @@ impl MarketMarginConfig {
             tiers: default_margin_tiers(),
         }
     }
+}
+
+/// Item 3 (F2, F8, D11, s517): the margin config of a `CF_NATIVE_MARKETS` row
+/// (borsh `(base, quote, lot raw, tick raw, initial_margin raw percent)`, the
+/// whole row): ONE flat tier at `max_leverage = max(1, floor(100 /
+/// initial_margin %))` (u32, saturating), `maintenance_factor_bps` 5000.
+/// An undecodable row (test fixtures) or `initial_margin <= 0` ⇒ `None` (the
+/// default 20x applies).
+pub fn market_margin_config(market_id: MarketId, row: &[u8]) -> Option<MarketMarginConfig> {
+    let (_, _, _, _, im) =
+        <(String, String, i128, i128, i128) as borsh::BorshDeserialize>::try_from_slice(row)
+            .ok()?;
+    if im <= 0 {
+        return None;
+    }
+    let lev = ((100 * FixedPoint::SCALE) / im).clamp(1, i128::from(u32::MAX)) as u32;
+    Some(MarketMarginConfig {
+        market_id,
+        max_leverage: lev,
+        maintenance_factor_bps: 5000,
+        tiers: vec![MarginTier { max_notional: FixedPoint::MAX, max_leverage: lev }],
+    })
 }
 
 // ============================================================================
@@ -152,8 +385,12 @@ impl MarginEngine {
             MarginType::Cross => {
                 // Cross: available + sum(unrealized PnL) - sum(maintenance) >= initial
                 let equity = Self::cross_margin_equity(positions, trader, oracle_prices)?;
-                let maint =
-                    Self::total_maintenance_margin(positions, trader, config, oracle_prices)?;
+                let maint = Self::total_maintenance_margin(
+                    positions,
+                    trader,
+                    |_| Some(config.tiers.as_slice()),
+                    oracle_prices,
+                )?;
                 let free_margin = equity - maint;
                 if free_margin < required_initial {
                     return Err(CoreError::InsufficientMargin {
@@ -197,7 +434,8 @@ impl MarginEngine {
         )
     }
 
-    /// Compute cross-margin equity: balance + sum(unrealized PnL across all positions).
+    /// F1: [`AccountView::equity`] — collateral (available + order margin) + UPnL
+    /// at the mark, entry price without one.
     pub fn cross_margin_equity(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
@@ -205,49 +443,33 @@ impl MarginEngine {
     ) -> Result<FixedPoint, CoreError> {
         let bal = positions.get_native_balance(trader)?;
         let all_pos = positions.positions_for_trader(trader)?;
-
-        // FIX 3 (ECON-FIND-08): Subtract order_margin to avoid double-counting
-        // funds committed to open orders as free equity.
-        let mut equity = bal.available - bal.order_margin;
-        for pos in &all_pos {
-            if pos.margin_type != MarginType::Cross {
-                continue;
-            }
-            if let Some(mark) = oracle_price_for(oracle_prices, pos.market_id) {
-                equity += pos.unrealized_pnl(mark);
-            }
-        }
-        Ok(equity)
+        let view = AccountView::build(
+            &bal,
+            &all_pos,
+            |m| oracle_price_for(oracle_prices, m),
+            |_| None,
+        )?;
+        Ok(view.equity())
     }
 
-    /// Total maintenance margin required across all cross-margin positions.
-    pub fn total_maintenance_margin(
+    /// Item 3 (F6): [`AccountView::maintenance`] — Σ [`maintenance_margin`] of
+    /// cross positions at [`position_price`], each at ITS market's `tiers`
+    /// (was: one config's tiers × `maintenance_factor_bps` for every position).
+    pub fn total_maintenance_margin<'t>(
         positions: &PositionManager<impl StateBackend>,
         trader: &Address,
-        config: &MarketMarginConfig,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
         oracle_prices: &[(MarketId, FixedPoint)],
     ) -> Result<FixedPoint, CoreError> {
+        let bal = positions.get_native_balance(trader)?;
         let all_pos = positions.positions_for_trader(trader)?;
-        let mut total = FixedPoint::ZERO;
-
-        for pos in &all_pos {
-            if pos.margin_type != MarginType::Cross {
-                continue;
-            }
-            if let Some(mark) = oracle_price_for(oracle_prices, pos.market_id) {
-                let notional = pos.notional(mark);
-                let max_lev = effective_max_leverage(&config.tiers, notional);
-                let lev_fp = FixedPoint::from_raw(max_lev as i128 * FixedPoint::SCALE);
-                let initial = notional / lev_fp;
-                // Maintenance = initial * maintenance_factor_bps / 10000
-                // FIX 4 (ECON-PF-10): Scale maint_num correctly as a FixedPoint value
-                let maint_num =
-                    FixedPoint::from_raw(config.maintenance_factor_bps as i128 * FixedPoint::SCALE);
-                let bps_denom = FixedPoint::from_raw(10_000 * FixedPoint::SCALE);
-                total += initial * maint_num / bps_denom;
-            }
-        }
-        Ok(total)
+        let view = AccountView::build(
+            &bal,
+            &all_pos,
+            |m| oracle_price_for(oracle_prices, m),
+            tiers,
+        )?;
+        Ok(view.maintenance)
     }
 
     /// Check maintenance margin for a specific isolated position.
@@ -441,9 +663,11 @@ mod tests {
         assert_eq!(effective_max_leverage(&tiers, fp(50_000_000)), 5);
     }
 
-    // FIX 3: Cross-margin equity subtracts order_margin
+    // F1 (s517): equity counts collateral once — `available` is already net of
+    // `order_margin` (every reservation moves it out of `available`), so the
+    // old FIX 3 subtraction counted reserved collateral as a loss.
     #[test]
-    fn cross_margin_equity_deducts_order_margin() {
+    fn cross_margin_equity_counts_order_margin_once() {
         let (_dir, pm) = setup();
         let trader = addr(1);
 
@@ -458,8 +682,8 @@ mod tests {
 
         let oracle_prices: Vec<(u64, FixedPoint)> = vec![];
         let equity = MarginEngine::cross_margin_equity(&pm, &trader, &oracle_prices).unwrap();
-        // equity = available - order_margin = 10000 - 3000 = 7000
-        assert_eq!(equity, fp(7_000));
+        // equity = available + order_margin = 10000 + 3000 = 13000
+        assert_eq!(equity, fp(13_000));
     }
 
     // FIX 4: Maintenance margin BPS scaling is correct
@@ -494,8 +718,14 @@ mod tests {
         // maintenance_factor_bps = 5000 (50%)
         let oracle_prices = vec![(1u64, fp(50_000))];
 
-        let maint =
-            MarginEngine::total_maintenance_margin(&pm, &trader, &config, &oracle_prices).unwrap();
+        // Item 3: per-market tiers closure (signature only; value unchanged).
+        let maint = MarginEngine::total_maintenance_margin(
+            &pm,
+            &trader,
+            |_| Some(config.tiers.as_slice()),
+            &oracle_prices,
+        )
+        .unwrap();
 
         // Notional = 1 * 50000 = 50000
         // Tier: 50000 <= 100000 → max_leverage = 50
@@ -536,5 +766,64 @@ mod tests {
             fp(50_000),
             &config
         ));
+    }
+
+    /// Item 6 cut 2: `placement_need` (one IM delta when nothing closes,
+    /// IM(before) once) equals the pre-cut formula on random inputs: every
+    /// side vs position sign, flat / long / short, closing none / part /
+    /// all / more, rest or not, prices and sizes up to overflow, no tiers /
+    /// default tiers / a one-tier list.
+    #[test]
+    fn placement_need_matches_the_reference_formula() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+            fn val(&mut self, zero_ok: bool) -> FixedPoint {
+                const SCALES: [i128; 5] = [
+                    1,
+                    FixedPoint::SCALE,
+                    1_000 * FixedPoint::SCALE,
+                    1_000_000_000 * FixedPoint::SCALE,
+                    i128::MAX / 3,
+                ];
+                if zero_ok && self.next(5) == 0 {
+                    return FixedPoint::ZERO;
+                }
+                let s = SCALES[self.next(5) as usize];
+                FixedPoint::from_raw((self.next(1_000_000) as i128).saturating_mul((s / 1_000).max(1)).max(1))
+            }
+        }
+        let mut rng = Rng(0x0dd1_5eed_c0ff_ee11);
+        let defaults = default_margin_tiers();
+        let one = [MarginTier { max_notional: FixedPoint::from_raw(i128::MAX), max_leverage: 3 }];
+        let tier_sets: [Option<&[MarginTier]>; 3] = [None, Some(&defaults), Some(&one)];
+        let mut overflows = 0;
+        let mut closing_cases = 0;
+        for i in 0..200_000 {
+            let tiers = tier_sets[i % 3];
+            let size = rng.val(true);
+            let signed = if rng.next(2) == 0 { size } else { -size };
+            let is_buy = rng.next(2) == 0;
+            // Often exactly the position (closing all) or a part of it.
+            let qty = match rng.next(4) {
+                0 => size.max(FixedPoint::from_raw(1)),
+                1 => FixedPoint::from_raw((size.raw() / 2).max(1)),
+                _ => rng.val(false),
+            };
+            let (px, price, can_rest) = (rng.val(true), rng.val(false), rng.next(2) == 0);
+            let got = placement_need(tiers, signed, px, is_buy, qty, price, can_rest);
+            let want = placement_need_reference(tiers, signed, px, is_buy, qty, price, can_rest);
+            assert_eq!(got, want, "{signed:?} {px:?} {is_buy} {qty:?} {price:?} {can_rest}");
+            overflows += usize::from(want.is_none());
+            closing_cases += usize::from(
+                qty.min(crate::order_book::reduce_only_allowance(signed, is_buy)) > FixedPoint::ZERO,
+            );
+        }
+        assert!(overflows > 1_000 && closing_cases > 10_000, "{overflows} {closing_cases}");
     }
 }

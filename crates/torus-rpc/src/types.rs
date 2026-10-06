@@ -476,6 +476,10 @@ pub struct RpcValidatorInfo {
     pub power: String,
     pub commission_bps: u16,
     pub status: String,
+    /// s517: the registered hot oracle signer (`SetOracleSigner`); omitted
+    /// when none is set. The price feeder checks its registration here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_signer: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -556,6 +560,44 @@ pub struct RpcLeaderInfo {
 // Block Body Response (for explorer indexing)
 // ============================================================================
 
+/// v2: one native action that executed and failed (`torus_getBlockBody`).
+/// For a PlaceOrderBatch, `order` is the first failing order's position in
+/// the batch (whose reason / message these are) and `failedOrders` how many of
+/// its orders failed; a batch skipped whole (empty / over the cap) has
+/// `failedOrders` 0. Any other action: `order` 0, `failedOrders` 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcActionFailure {
+    pub index: u32,
+    pub reason: String,
+    pub message: String,
+    pub order: u32,
+    pub failed_orders: u32,
+}
+
+/// Per native action `"executed"` / `"skipped"` / `"failed"`.
+pub fn native_action_labels(s: &torus_state::action_status::BlockActionStatus) -> Vec<String> {
+    (0..s.native_skipped.len())
+        .map(|i| s.native_label(i).to_string())
+        .collect()
+}
+
+/// The record's native failures, RPC-shaped.
+pub fn native_action_failures(
+    s: &torus_state::action_status::BlockActionStatus,
+) -> Vec<RpcActionFailure> {
+    s.native_failed
+        .iter()
+        .map(|f| RpcActionFailure {
+            index: f.index,
+            reason: f.reason.as_str().to_string(),
+            message: f.message.clone(),
+            order: f.order,
+            failed_orders: f.failed_orders,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcBlockBody {
@@ -567,8 +609,14 @@ pub struct RpcBlockBody {
     /// or session, replayed nonce; no state change). `null` while the block
     /// has not executed on this node, or for a block executed before the
     /// record existed.
+    /// v2: `"failed"` too — executed, but the executor refused it (margin,
+    /// open-order limit, off-tick price, ...); see `native_action_failures`.
     #[serde(default)]
     pub native_action_status: Option<Vec<String>>,
+    /// v2: every `"failed"` native action, ascending `index`. `null` like
+    /// `native_action_status`; empty for a block recorded before v2.
+    #[serde(default)]
+    pub native_action_failures: Option<Vec<RpcActionFailure>>,
     /// s84: every EVM transaction of the body, in body order, executed or
     /// skipped (the eth methods list only the executed ones). Each is the eth
     /// transaction object with `transactionIndex` = body position (NOT the eth
@@ -582,4 +630,41 @@ pub struct RpcBlockBody {
     /// `null` like `native_action_status`.
     #[serde(default)]
     pub evm_transaction_status: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod action_failure_tests {
+    use super::*;
+    use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure};
+
+    /// Every stored reason code reaches `nativeActionFailures` as its stable
+    /// name, read from the record (not from the message).
+    #[test]
+    fn every_reason_code_is_visible_by_name() {
+        let all = [
+            (FailureReason::Other, "other"),
+            (FailureReason::Margin, "margin"),
+            (FailureReason::OpenLimit, "open_limit"),
+            (FailureReason::Tick, "tick"),
+            (FailureReason::Lot, "lot"),
+            (FailureReason::Price, "price"),
+            (FailureReason::BatchCap, "batch_cap"),
+            (FailureReason::Fill, "fill"),
+        ];
+        let status = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false; all.len()],
+            native_failed: all
+                .iter()
+                .enumerate()
+                .map(|(i, (r, _))| NativeActionFailure::new(i as u32, 0, 1, *r, "msg".into()))
+                .collect(),
+        };
+        let stored = BlockActionStatus::decode(&status.encode()).unwrap();
+        let rpc = native_action_failures(&stored);
+        let names: Vec<&str> = rpc.iter().map(|f| f.reason.as_str()).collect();
+        let want: Vec<&str> = all.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names, want);
+        assert!(native_action_labels(&stored).iter().all(|l| l == "failed"));
+    }
 }

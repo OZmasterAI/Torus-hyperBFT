@@ -30,6 +30,7 @@ RUNNER_ENV_KEYS = {
     "ORACLE_PRICE",
     "ORACLE_INTERVAL_MS",
     "ORACLE_WALK_BP",
+    "ORACLE_FEED_DRAIN",
 }
 p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter

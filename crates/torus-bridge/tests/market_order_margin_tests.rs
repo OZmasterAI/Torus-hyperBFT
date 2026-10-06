@@ -474,7 +474,7 @@ fn set_mark(ctx: &NativeExecContext, market_id: MarketId, price: FixedPoint) {
     let stakes: Vec<(Address, FixedPoint)> = reporters.iter().map(|v| (*v, fp(1))).collect();
     let agg = ctx
         .oracle
-        .aggregate_price(market_id, ctx.block_height, &stakes)
+        .aggregate_price(market_id, ctx.block_height, ctx.timestamp, &stakes)
         .unwrap();
     assert_eq!(agg, price, "test oracle aggregates to the mark");
 }
@@ -549,7 +549,8 @@ fn market_order_without_oracle_reserves_at_cap() {
     }
 }
 
-/// A STALE oracle price (older than the max oracle age) is no mark either.
+/// A STALE oracle price is no mark either: 61 s (block time) after the
+/// aggregate it is stale.
 #[test]
 fn market_order_with_stale_oracle_reserves_at_cap() {
     for path in PATHS {
@@ -557,7 +558,7 @@ fn market_order_with_stale_oracle_reserves_at_cap() {
         let taker = addr(2);
         let (_d, mut ctx) = fresh(path, &[maker]);
         set_mark(&ctx, 1, fp(100));
-        ctx.block_height += 1_000;
+        ctx.timestamp += 61; // 61 s after the aggregate: stale
         fund_native(&ctx, &taker, fp(60));
         let r = run(&mut ctx, path, &[place(maker, limit(1, false, 100, 10))]);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
@@ -851,7 +852,13 @@ fn batch_resting_high_bid_ahead_is_bounded_at_match_time() {
 /// `taker` ends up at signed position `size` (+long / -short) in market 1 at
 /// 100 against `cp`, then holds `avail` available with 95 of order margin in
 /// a resting order that never interacts (long: ask 10 @190; short: bid
-/// 190 @10). The counterparty's order is fully consumed.
+/// 20 @95). The counterparty's order is fully consumed.
+///
+/// F1 (s517): the short lock was a bid 190 @10 — filled, it would open a
+/// 170 long, so the account-level placement check now (correctly, HL)
+/// charges its opening part (IM(2,000 + 1,700) − IM(2,000) = 85 > free 0)
+/// and rejects it. The fixture only needs "95 locked, never matched": a
+/// purely closing bid 20 @95 reserves exactly 95 and sits below every ask.
 fn open_then_lock(
     ctx: &mut NativeExecContext,
     path: Path,
@@ -867,7 +874,7 @@ fn open_then_lock(
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     assert_eq!(pos(ctx, &taker), fp(size), "{path:?}: position opened");
     fund_native(ctx, &taker, avail + fp(95));
-    let lock = if long { limit(1, false, 190, 10) } else { limit(1, true, 10, 190) };
+    let lock = if long { limit(1, false, 190, 10) } else { limit(1, true, 95, 20) };
     let r = run(ctx, path, &[place(taker, lock)]);
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     assert_bal(ctx, &taker, avail, fp(95), "after lock");
@@ -1073,5 +1080,48 @@ fn batch_second_sell_beyond_the_allowance_is_charged() {
         assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{what}: closed, nothing opened");
         assert_eq!(resting(&ctx, &maker), vec![fp(20)], "{what}: only 20 filled");
         assert_bal(&ctx, &taker, fp(5), fp(95), &what);
+    }
+}
+
+/// C4 (s517, liquidation plan T3): CancelAll also cancels the sender's PENDING
+/// STOPS and releases their reservation — without a resting order (the book
+/// returned early: stops survived) and with one (stops dropped, margin leaked).
+/// Two consecutive CancelAlls = the batched `exec_cancel_all_run` path. The
+/// removal survives save + reload.
+#[test]
+fn cancel_all_cancels_pending_stops_and_releases_their_margin() {
+    for path in PATHS {
+        for with_resting in [false, true] {
+            for target in [None, Some(1)] {
+                let t = addr(1);
+                let what = format!("{path:?} resting={with_resting} target={target:?}");
+                let (_d, mut ctx) = fresh(path, &[t, addr(2)]);
+                // stop buy 1, trigger 110, cap 120 -> reserves 6 (20x); bid 1 @ 90 -> 4.5
+                let mut acts = vec![place(t, stop_market(1, true, 110, fp(120), 1))];
+                if with_resting {
+                    acts.push(place(t, limit(1, true, 90, 1)));
+                }
+                assert!(run(&mut ctx, path, &acts).iter().all(|r| r.success), "{what}");
+                assert!(bal(&ctx, &t).order_margin > FixedPoint::ZERO, "{what}: reserved");
+                let r = run(
+                    &mut ctx,
+                    path,
+                    &[
+                        (t, NativeAction::CancelAllOrders { market_id: target }),
+                        (addr(2), NativeAction::CancelAllOrders { market_id: None }),
+                    ],
+                );
+                assert!(r.iter().all(|r| r.success), "{what}");
+                assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{what}");
+                assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, &what);
+                ctx.save_order_books();
+                let reloaded = make_ctx(ctx.state.clone());
+                assert_eq!(
+                    reloaded.order_books.get(&1).map_or(0, |b| b.pending_stop_count()),
+                    0,
+                    "{what}: persisted"
+                );
+            }
+        }
     }
 }

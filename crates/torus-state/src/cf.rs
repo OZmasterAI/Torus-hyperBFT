@@ -27,9 +27,10 @@ pub const CF_BLOCK_HASH_TO_NUMBER: &str = "cf_block_hash_to_number";
 /// the committed-but-not-yet-executed window.
 pub const CF_COMMIT_MANIFEST: &str = "cf_commit_manifest";
 
-/// Per-block executed/skipped record keyed by 8-byte BE height (s84): which
-/// native actions and EVM txs of the block execution skipped. Node-local
-/// derived data, never hashed; see [`crate::action_status`].
+/// Per-block action status record keyed by 8-byte BE height (s84, v2): which
+/// native actions and EVM txs of the block execution skipped, and which native
+/// actions executed and failed (reason + message). Node-local derived data,
+/// never hashed, not a native-root CF; see [`crate::action_status`].
 pub const CF_BLOCK_ACTION_STATUS: &str = "cf_block_action_status";
 
 // Receipts and logs
@@ -77,6 +78,11 @@ pub const CF_DEV_POOL: &str = "cf_dev_pool";
 
 // Oracle
 pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
+/// Prefix of the oracle price-submission rows in [`CF_NATIVE_ORACLE`]:
+/// `"sub" ‖ market_id(8) ‖ validator(20)` (torus-core `oracle.rs`). A flush
+/// that deletes rows under it (the submission prune) schedules a background
+/// compaction of the range (s89 fix B, [`crate::StateDb::compact_pruned_submissions_in_background`]).
+pub const ORACLE_SUBMISSION_PREFIX: &[u8] = b"sub";
 /// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_NATIVE_USER_TRADES: &str = "cf_native_user_trades";
@@ -99,6 +105,20 @@ pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 
     let mut key = [0u8; 28];
     key[..20].copy_from_slice(sender.as_slice());
     key[20..28].copy_from_slice(&nonce.to_be_bytes());
+    key
+}
+
+/// Build the hot-oracle-signer reverse-index key in [`CF_NATIVE_ORACLE`]:
+/// `"sgn" ‖ signer(20)` -> validator(20) (s517, `SetOracleSigner`).
+///
+/// Single source of truth for exec (`exec_set_oracle_signer`, reporter
+/// resolution) and mempool admission. The prefix cannot collide with the
+/// oracle's `"sub"` / `"agg"` rows. It lives here and not in
+/// `CF_STAKING_VALIDATORS`, whose every value `all_validators` decodes.
+pub fn oracle_signer_key(signer: &alloy_primitives::Address) -> [u8; 23] {
+    let mut key = [0u8; 23];
+    key[..3].copy_from_slice(b"sgn");
+    key[3..].copy_from_slice(signer.as_slice());
     key
 }
 
@@ -142,7 +162,7 @@ pub const CF_CONSENSUS_META: &str = "cf_consensus_meta";
 pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 
 /// Key in CF_CONSENSUS_META: present (`[1]`) iff native state advanced without native-trie
-/// maintenance (`TORUS_NATIVE_TRIE_MAINTENANCE=0`), so CF_NATIVE_TRIE / CF_NATIVE_HASHED lag it.
+/// maintenance (off unless `TORUS_NATIVE_TRIE_MAINTENANCE=1`), so CF_NATIVE_TRIE / CF_NATIVE_HASHED lag it.
 /// Written in the flush's atomic batch; cleared only by a full `build_native_trie_to_cf`.
 pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
 
@@ -195,14 +215,25 @@ pub const CF_HASHED_STORAGE: &str = "cf_hashed_storage";
 // Native incremental state root — bucketed Merkle tree (Phase A, Stage A2).
 /// Persisted native bucketed-Merkle tree nodes. Keys: leaf `0x00 ++ bucket(2 BE)`, internal
 /// `0x01 ++ level(1) ++ index(2 BE)`, root marker `0x02`. Only non-default nodes are stored.
-/// Replaces the O(total) flat keccak over the 6 native CFs with an O(changed)/block root.
+/// Replaces the O(total) flat keccak over the 7 native CFs with an O(changed)/block root.
 pub const CF_NATIVE_TRIE: &str = "cf_native_trie";
-/// Bucket-ordered mirror of the 6 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
+/// Bucket-ordered mirror of the 7 native-root CFs (analog of `CF_HASHED_*` for the EVM trie).
 /// Key: `bucket_id(2 BE) ++ cf_tag(1) ++ native_key` -> `keccak256(native value)` (32 B —
 /// hash-only mirror, 3c preimage round). A prefix-scan on a 2-byte bucket id yields that bucket's
 /// members in `(cf_tag, key)` order, so a changed bucket re-hashes in O(bucket) instead of
 /// O(total). Phase A.
 pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
+
+/// Item 3 (liquidation, s517): native-root CF (tag 6) of the liquidation step's state.
+/// Rows exist only once the step has run (ordinary trading writes none):
+/// * `0x01` — unused / reserved (no account index, C1)
+/// * `0x02 ‖ trader(20)` -> u64 BE: last stage-1 chunk block timestamp (cooldown)
+/// * `0x03 ‖ market(8 BE)` -> i128 BE raw: previous mark (ADL price)
+/// * `0x04` -> trader(20): round-robin scan cursor (only while a pass was cut)
+/// * `0x05 ‖ …` — reserved: vault deposits / shares (later branch)
+/// * `0x06 ‖ trader(20)` -> `[1]`: still under MM after its last liquidation action (keeps
+///   the step due, review M2)
+pub const CF_NATIVE_LIQUIDATION: &str = "cf_native_liquidation";
 
 /// All column family names. RocksDB requires these at open time.
 pub const ALL_CF_NAMES: &[&str] = &[
@@ -252,4 +283,23 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_BOOK_ORDER_ROWS,
     CF_STATE_HASH_VOTES,
     CF_BLOCK_ACTION_STATUS,
+    CF_NATIVE_LIQUIDATION,
 ];
+
+#[cfg(test)]
+mod oracle_signer_key_tests {
+    use super::*;
+
+    /// s517 oracle feeder S1: the signer reverse index key is `"sgn" ‖ signer`
+    /// and cannot collide with the oracle `"sub"` / `"agg"` prefixes.
+    #[test]
+    fn oracle_signer_key_layout() {
+        let a = alloy_primitives::Address::repeat_byte(0x5a);
+        let k = oracle_signer_key(&a);
+        assert_eq!(k.len(), 23);
+        assert_eq!(&k[..3], b"sgn");
+        assert_eq!(&k[3..], a.as_slice());
+        assert_ne!(&k[..3], b"sub");
+        assert_ne!(&k[..3], b"agg");
+    }
+}

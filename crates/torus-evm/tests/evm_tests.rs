@@ -487,6 +487,45 @@ fn precompile_balance_reader_via_evm() {
     );
 }
 
+/// Item 2 (T8): the EVM hands the block's header timestamp to the precompiles —
+/// 0x0802 getPrice is stale iff `block_cfg.timestamp − aggregate ts > 60`.
+#[test]
+fn precompile_oracle_reader_uses_the_block_timestamp() {
+    let block_cfg = default_block_cfg(); // number 1, timestamp 1_000_000
+    for (row_ts, want_stale) in [(block_cfg.timestamp - 60, 0u8), (block_cfg.timestamp - 61, 1)] {
+        let (_dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+            .unwrap();
+        // aggregate row: price(16) || block(8) || reporters(4) || ts(8)
+        let mut row = Vec::with_capacity(36);
+        row.extend_from_slice(&(50_000i128 * 100_000_000).to_be_bytes());
+        row.extend_from_slice(&500u64.to_be_bytes()); // block number: ignored by the rule
+        row.extend_from_slice(&3u32.to_be_bytes());
+        row.extend_from_slice(&row_ts.to_be_bytes());
+        db.put_cf_raw("cf_native_oracle", &[b"agg".as_slice(), &1u64.to_be_bytes()].concat(), &row)
+            .unwrap();
+        let mut calldata = alloy_primitives::keccak256("getPrice(bytes32)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&U256::from(1u8).to_be_bytes::<32>());
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit: 100_000,
+            gas_price: block_cfg.base_fee as u128,
+            // OracleReader precompile at 0x0802.
+            kind: TxKind::Call(Address::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x02,
+            ])),
+            data: Bytes::from(calldata),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        let (result, _bundle) =
+            EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(&db, &block_cfg, tx).unwrap();
+        assert!(result.success, "row ts {row_ts}");
+        assert_eq!(result.output.len(), 96);
+        assert_eq!(result.output[95], want_stale, "row ts {row_ts}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 10. Torus precompile: unknown selector reverts
 // ---------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+[
+ {
+  "symbol": "POLUSDT",
+  "bidPrice": "0.11153",
+  "bidQty": "985.80",
+  "askPrice": "0.11156",
+  "askQty": "1918.90"
+ },
+ {
+  "symbol": "ETHUSDT",
+  "bidPrice": "2683.68",
+  "bidQty": "0.29406",
+  "askPrice": "2683.75",
+  "askQty": "0.06129"
+ },
+ {
+  "symbol": "BTCUSDT",
+  "bidPrice": "83505.02",
+  "bidQty": "0.00047200",
+  "askPrice": "83505.03",
+  "askQty": "7.81202013"
+ }
+]

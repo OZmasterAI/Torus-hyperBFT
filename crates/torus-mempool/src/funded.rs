@@ -82,8 +82,9 @@ pub fn is_exempt(action: &NativeAction) -> bool {
 
 /// Validator-duty kinds. Exempt from the funded check and from the
 /// per-address limit (item B) only when the sender is a registered validator
-/// ([`is_registered_validator`]); from anyone else the executor rejects them,
-/// so they get no exemption.
+/// ([`is_registered_validator`]), or, for `SubmitOraclePrices` only, an
+/// Active validator's registered oracle signer (`Mempool::is_duty_exempt`);
+/// from anyone else the executor rejects them, so they get no exemption.
 pub fn is_validator_duty(action: &NativeAction) -> bool {
     matches!(
         action,

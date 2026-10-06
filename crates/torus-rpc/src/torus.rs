@@ -256,6 +256,74 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
     bincode::deserialize(bytes).map_err(|e| format!("invalid action encoding: {e}"))
 }
 
+/// Reads an ingress payload's action tag from its first bytes without
+/// decoding the rest; `None` when the tag cannot be read. Only the bincode
+/// format has one (JSON ingress passes no peek and always fully decodes).
+type PeekFn = fn(&str) -> Option<u32>;
+
+/// `NativeAction` variant count: bincode tags are `0..NATIVE_ACTION_TAGS`
+/// (declaration order; variants are only ever appended).
+const NATIVE_ACTION_TAGS: u32 = 29;
+/// bincode tags of the actions that pass the pre-verify shed
+/// (`torus_mempool::is_cancel` / `is_oracle_submission`).
+const TAG_CANCEL_ORDER: u32 = 2;
+const TAG_CANCEL_ALL_ORDERS: u32 = 3;
+const TAG_SUBMIT_ORACLE_PRICES: u32 = 15;
+
+/// bincode ingress tag peek. `SignedNativeAction.action` is the first field
+/// and bincode 1 (fixint) writes an enum variant as a little-endian u32, so
+/// the tag is the first 4 bytes = the first 8 hex characters (after an
+/// optional `0x`, as in `parse_bytes`).
+fn peek_bin_tag(signed_action: &str) -> Option<u32> {
+    let s = signed_action.strip_prefix("0x").unwrap_or(signed_action);
+    let mut tag = [0u8; 4];
+    hex::decode_to_slice(s.get(..8)?, &mut tag).ok()?;
+    Some(u32::from_le_bytes(tag))
+}
+
+/// Pre-verify screen for one payload while the pool sheds (full pool or
+/// admission backlog): `Ok` = proceed to full verification, `Err` = the
+/// per-item rejection. Oracle submissions always proceed, cancels only when
+/// `cancels_pass`; everything else gets `shed_msg`.
+fn screen_payload(
+    signed_action: &str,
+    decode: DecodeFn,
+    peek_tag: Option<PeekFn>,
+    shed_msg: &str,
+    cancels_pass: bool,
+) -> Result<(), String> {
+    // Cut 6: decide from the tag alone when it names a refused action, so a
+    // shed request is never hex- or bincode-decoded. A pass-through tag
+    // (oracle; cancels when `cancels_pass`), an unreadable tag or an unknown
+    // one falls through to the full decode below, unchanged.
+    //
+    // THE ONE DELIBERATE EXCEPTION (owner decision, s92): while shedding, a
+    // payload with a refused tag and a malformed body (bad hex past the tag,
+    // odd length, truncated or invalid bincode) gets `shed_msg` and is
+    // counted under the shed label (`backlog_preverify` /
+    // `pool_full_preverify`) instead of its decode error and `verify_failed`.
+    // Outside shedding this screen does not run and the same payload still
+    // gets its decode error. Pinned by
+    // `malformed_body_with_refused_tag_is_shed_while_shedding`.
+    if let Some(tag) = peek_tag.and_then(|peek| peek(signed_action)) {
+        let passes = tag == TAG_SUBMIT_ORACLE_PRICES
+            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS));
+        if tag < NATIVE_ACTION_TAGS && !passes {
+            return Err(shed_msg.to_string());
+        }
+    }
+    let action = parse_bytes(signed_action)
+        .map_err(|e| format!("invalid hex: {e}"))
+        .and_then(|bytes| decode(&bytes))?;
+    if torus_mempool::is_oracle_submission(&action.action)
+        || (cancels_pass && torus_mempool::is_cancel(&action.action))
+    {
+        Ok(())
+    } else {
+        Err(shed_msg.to_string())
+    }
+}
+
 /// RPC-only ingress guard (non-consensus; O2 design Open Question 2): reject
 /// PlaceOrder / PlaceOrderBatch actions referencing a market_id with no row
 /// in CF_NATIVE_MARKETS — closing the phantom-book trap where a typo'd id
@@ -263,30 +331,85 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
 /// (native_executor.rs:656; exec-side fix is a separate consensus item).
 /// Point-gets on the 8-byte BE market key; the order-id counter row in the
 /// same CF has a 24-byte key (NEXT_GLOBAL_ORDER_ID_KEY) so it never collides.
-/// Cheap: runs BEFORE signature verify; batches dedup market ids first.
+/// Cheap: runs BEFORE signature verify; batches read each market row once.
+///
+/// s92 item B: orders also get the book's placement tick and lot rules
+/// (`OrderBook::place_order_with_accounts`), with the market row's tick/lot,
+/// so they are refused here instead of being silently rejected by the book.
+/// Item 6 M1: the rule, the text and the row decoder are the executor's
+/// (`torus_core::order_book::{shape_violation, market_row_shape}`), and the
+/// executor creates a missing book with the row's tick / lot (row 42).
+/// A batch is one signed action, so one bad order rejects all of it.
 pub(crate) fn validate_known_markets(
     action: &torus_types::NativeAction,
     state_db: &torus_state::StateDb,
 ) -> Result<(), String> {
-    let check = |mid: u64| -> Result<(), String> {
+    // `(tick, lot)` of a listed market (item 6 M1: the decoder the executor
+    // creates books with); `None` when the row does not decode as a market
+    // (placeholder rows): only existence is checked then.
+    let spec = |mid: u64| -> Result<Option<(FixedPoint, FixedPoint)>, String> {
         match state_db.get_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes()) {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(row)) => Ok(torus_core::order_book::market_row_shape(&row)),
             Ok(None) => Err(format!("unknown market_id {mid}")),
             Err(e) => Err(format!("market lookup failed: {e}")),
         }
     };
+    let check = |mid: u64| spec(mid).map(|_| ());
     match action {
-        torus_types::NativeAction::PlaceOrder(p) => check(p.market_id),
+        torus_types::NativeAction::PlaceOrder(p) => check_tick_lot(p, spec(p.market_id)?),
         torus_types::NativeAction::PlaceOrderBatch(orders) => {
-            let mut seen = std::collections::BTreeSet::new();
+            let mut specs = std::collections::BTreeMap::new();
             for p in orders {
-                if seen.insert(p.market_id) {
-                    check(p.market_id)?;
+                let s = match specs.entry(p.market_id) {
+                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::btree_map::Entry::Vacant(e) => *e.insert(spec(p.market_id)?),
+                };
+                check_tick_lot(p, s)?;
+            }
+            Ok(())
+        }
+        // s517: the exec submission rules (NE exec_submit_oracle_prices) at
+        // ingress, so a feeder gets an error instead of a silent exec failure.
+        // Ingress-only: exec re-checks everything.
+        torus_types::NativeAction::SubmitOraclePrices(sub) => {
+            use torus_core::oracle::{valid_oracle_price, MAX_ORACLE_PRICES_PER_SUBMISSION as CAP};
+            if sub.prices.is_empty() || sub.prices.len() > CAP {
+                return Err(format!(
+                    "oracle submission carries 1..={CAP} prices, got {}",
+                    sub.prices.len()
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for &(mid, price) in &sub.prices {
+                if !seen.insert(mid) {
+                    return Err(format!("duplicate market {mid} in oracle submission"));
+                }
+                check(mid)?;
+                if !valid_oracle_price(price) {
+                    return Err(format!("invalid oracle price {price} for market {mid}"));
                 }
             }
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// The executor's pre-book placement shape check (item 6 M1:
+/// `torus_core::order_book::shape_violation`, the same rule and text): the
+/// lot applies to every order type (`qty < lot`, so lot 0 admits any qty >=
+/// 0); the tick to a `Limit` price and a `StopLimit` limit, only when tick >
+/// 0. Message = the executor's ("order rejected: ...").
+fn check_tick_lot(
+    p: &torus_types::PlaceOrderParams,
+    spec: Option<(FixedPoint, FixedPoint)>,
+) -> Result<(), String> {
+    let Some((tick, lot)) = spec else {
+        return Ok(());
+    };
+    match torus_core::order_book::shape_violation(p, tick, lot) {
+        Some(v) => Err(v.placement_message()),
+        None => Ok(()),
     }
 }
 
@@ -389,6 +512,22 @@ enum SubmitSlot {
 }
 
 impl RpcState {
+    /// Item 2: the oracle aggregate of `mid` if USABLE ([`OraclePrice::usable`]:
+    /// time-based, stale 60 s of block time after the last fresh aggregate)
+    /// at the header timestamp of the EXECUTED head (s89): the aggregate is
+    /// read from executed state, so its age is judged at the block that state
+    /// reflects — the eth view's head, min(applied, committed). The committed
+    /// head runs ahead under exec lag and made every mark read stale. No
+    /// header (or an unreadable one) ⇒ no mark.
+    fn usable_oracle_price(&self, mid: u64) -> Option<torus_core::oracle::OraclePrice> {
+        let executed = crate::eth::eth_head(self);
+        let (header, _, _) = crate::eth::get_header_with_hash(self, executed).ok().flatten()?;
+        OracleManager::new(self.state.clone(), OracleConfig::default())
+            .get_price(mid, header.timestamp)
+            .ok()
+            .filter(|op| op.usable().is_some())
+    }
+
     /// Anti-spam item B: refuse `action` when `sender` has used its
     /// per-address allowance. Runs after verify (the sender is unknown
     /// before) and before pool admission; a refusal is counted by reason and
@@ -418,12 +557,14 @@ impl RpcState {
     }
 
     /// Shared batch-submit pipeline: cap check → permit → pool-full prescreen
-    /// (decode-only shed) → blocking-pool verify → admit + leader-forward.
+    /// (decode-only shed; bincode sheds by tag peek, `screen_payload`) →
+    /// blocking-pool verify → admit + leader-forward.
     /// `decode` fixes the wire format; everything downstream is format-agnostic.
     async fn run_submit_pipeline(
         &self,
         signed_actions: Vec<String>,
         decode: DecodeFn,
+        peek_tag: Option<PeekFn>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
         if signed_actions.len() > crate::SUBMIT_BATCH_MAX {
             return Err(ErrorObjectOwned::from(RpcError::InvalidParams(format!(
@@ -447,9 +588,12 @@ impl RpcState {
         }
 
         // Sprint 5 (C): when the native pool is already full, every action
-        // is doomed at admission — shed it after a decode-only pass instead
-        // of paying signature verification. Anti-spam item C: cancels too,
-        // since a full pool no longer lets a cancel evict an order.
+        // but an oracle submission is doomed at admission — shed it after a
+        // decode-only pass instead of paying signature verification.
+        // Anti-spam item C: cancels too, since a full pool no longer lets a
+        // cancel evict an order. s517: oracle submissions proceed to full
+        // verification (admission evicts a normal entry to make room; the
+        // mempool's oracle gate admits only Active validators and signers).
         // s65 item B: the same pre-verify shed when the pool already holds
         // more than the admission limit (recent commit rate x horizon), with a
         // retryable "busy" instead of "pool full" — there cancels still pass
@@ -466,16 +610,14 @@ impl RpcState {
                 signed_actions
                     .into_iter()
                     .map(|signed_action| {
-                        let decoded = parse_bytes(&signed_action)
-                            .map_err(|e| format!("invalid hex: {e}"))
-                            .and_then(|bytes| decode(&bytes));
-                        match decoded {
-                            Ok(action)
-                                if cancels_pass && torus_mempool::is_cancel(&action.action) =>
-                            {
-                                SubmitSlot::Proceed(signed_action)
-                            }
-                            Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),
+                        match screen_payload(
+                            &signed_action,
+                            decode,
+                            peek_tag,
+                            shed_msg,
+                            cancels_pass,
+                        ) {
+                            Ok(()) => SubmitSlot::Proceed(signed_action),
                             Err(e) => SubmitSlot::Rejected(e),
                         }
                     })
@@ -921,13 +1063,10 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Compute unrealized PnL using oracle price; fall back to entry price.
-                let current_block = self.latest_height.load(Ordering::Relaxed);
-                let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
-                let mark_price = oracle
-                    .get_price(mid, current_block)
-                    .map(|op| op.price)
-                    .unwrap_or(p.entry_price);
+                // Compute unrealized PnL at the usable oracle price; fall back to entry price.
+                let mark_price = self
+                    .usable_oracle_price(mid)
+                    .map_or(p.entry_price, |op| op.price);
                 let unrealized = p.unrealized_pnl(mark_price);
 
                 // Simplified liquidation price estimate.
@@ -1230,9 +1369,8 @@ impl TorusApiServer for RpcState {
         let result = validators
             .into_iter()
             .map(|v| {
-                let status = all_states
-                    .iter()
-                    .find(|s| s.address == v.address)
+                let state = all_states.iter().find(|s| s.address == v.address);
+                let status = state
                     .map(|s| match s.status {
                         ValidatorStatus::Candidate => "candidate",
                         ValidatorStatus::Active => "active",
@@ -1247,6 +1385,7 @@ impl TorusApiServer for RpcState {
                     power: hex_u64(v.power),
                     commission_bps: v.commission_bps,
                     status: status.to_string(),
+                    oracle_signer: state.and_then(|s| s.oracle_signer).map(hex_address),
                 }
             })
             .collect();
@@ -1295,13 +1434,14 @@ impl TorusApiServer for RpcState {
                 ErrorObjectOwned::from(RpcError::Internal("server overloaded, try again".into()))
             })?;
         // s65 item B: this endpoint honours the admission limit too, with the
-        // same decode-only screen as the batch pipeline (cancels still pass).
+        // same decode-only screen as the batch pipeline (priority actions —
+        // cancels and, s517, oracle submissions — still pass).
         if self.mempool.native_admission_backlogged() {
-            let is_cancel = parse_bytes(&signed_action)
+            let is_priority = parse_bytes(&signed_action)
                 .ok()
                 .and_then(|bytes| decode_action_json(&bytes).ok())
-                .is_some_and(|a| torus_mempool::is_cancel(&a.action));
-            if !is_cancel {
+                .is_some_and(|a| torus_mempool::is_priority(&a.action));
+            if !is_priority {
                 self.count_admit_reject("backlog_preverify");
                 return Err(ErrorObjectOwned::from(RpcError::Internal(
                     ADMISSION_BUSY_MSG.into(),
@@ -1353,7 +1493,7 @@ impl TorusApiServer for RpcState {
         &self,
         signed_actions: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
-        self.run_submit_pipeline(signed_actions, decode_action_json)
+        self.run_submit_pipeline(signed_actions, decode_action_json, None)
             .await
     }
 
@@ -1361,7 +1501,8 @@ impl TorusApiServer for RpcState {
         &self,
         payloads: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
-        self.run_submit_pipeline(payloads, decode_action_bin).await
+        self.run_submit_pipeline(payloads, decode_action_bin, Some(peek_bin_tag))
+            .await
     }
 
     // === 2.9.5: Governance ===
@@ -1583,7 +1724,8 @@ impl TorusApiServer for RpcState {
             block_number: hex_u64(block_number),
             native_actions,
             native_action_count: body.native_actions.len() as u32,
-            native_action_status: status.as_ref().map(|s| labels(&s.native_skipped)),
+            native_action_status: status.as_ref().map(crate::types::native_action_labels),
+            native_action_failures: status.as_ref().map(crate::types::native_action_failures),
             evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
         }))
@@ -1831,12 +1973,10 @@ impl TorusApiServer for RpcState {
 
     async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
-        let current_block = self.latest_height.load(Ordering::Relaxed);
 
-        let oracle = OracleManager::new(self.state.clone(), OracleConfig::default());
-        let (mark_price, index_price, timestamp) = match oracle.get_price(mid, current_block) {
-            Ok(op) => (op.price, op.price, op.block_number),
-            Err(_) => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
+        let (mark_price, index_price, timestamp) = match self.usable_oracle_price(mid) {
+            Some(op) => (op.price, op.price, op.block_number),
+            None => (FixedPoint::ZERO, FixedPoint::ZERO, 0),
         };
 
         // Last trade price from the order book. Under the row layouts it lives
@@ -2092,6 +2232,7 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalStatus::Rejected => "Rejected",
         ProposalStatus::Executed => "Executed",
         ProposalStatus::Expired => "Expired",
+        ProposalStatus::Failed => "Failed",
     };
 
     RpcProposal {
@@ -2151,9 +2292,40 @@ fn parse_proposal_status(s: &str) -> Result<ProposalStatus, RpcError> {
         "rejected" => Ok(ProposalStatus::Rejected),
         "executed" => Ok(ProposalStatus::Executed),
         "expired" => Ok(ProposalStatus::Expired),
+        "failed" => Ok(ProposalStatus::Failed),
         _ => Err(RpcError::InvalidParams(format!(
             "unknown proposal status: {s}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod proposal_status_tests {
+    use super::*;
+
+    /// s94: a proposal that failed at execution is `"Failed"` over RPC and
+    /// can be filtered with `"failed"` (any case, like the other statuses).
+    #[test]
+    fn failed_status_maps_and_parses() {
+        let p = torus_economics::governance::Proposal {
+            id: 3,
+            proposer: alloy_primitives::Address::ZERO,
+            title: "t".into(),
+            description: "d".into(),
+            proposal_type: ProposalType::MarketListing,
+            status: ProposalStatus::Failed,
+            votes_for: alloy_primitives::U256::ZERO,
+            votes_against: alloy_primitives::U256::ZERO,
+            start_block: 0,
+            end_block: 0,
+            executable_after: 0,
+            snapshot_block: 0,
+            execution_payload: None,
+        };
+        assert_eq!(map_proposal(p).status, "Failed");
+        for s in ["failed", "Failed", "FAILED"] {
+            assert_eq!(parse_proposal_status(s).unwrap(), ProposalStatus::Failed);
+        }
     }
 }
 
@@ -2347,6 +2519,314 @@ mod ack_scratch_tests {
     }
 }
 
+
+/// s517 oracle feeder R2: ingress applies the exec submission rules to
+/// `SubmitOraclePrices` (the feeder gets an error instead of a silent exec failure).
+#[cfg(test)]
+mod oracle_ingress_tests {
+    use super::*;
+    use torus_core::oracle::{MAX_ORACLE_PRICES_PER_SUBMISSION, MAX_ORACLE_PRICE_RAW};
+    use torus_types::{FixedPoint, MarketId, NativeAction, OracleSubmission};
+
+    const NOW: u64 = 1_000_000;
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn verify(state: &torus_state::StateDb, prices: Vec<(MarketId, FixedPoint)>) -> Result<(), String> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::SubmitOraclePrices(OracleSubmission { prices, timestamp: 0 }),
+            NOW,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+        verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, state, NOW).map(|_| ())
+    }
+
+    #[test]
+    fn oracle_submission_ingress_checks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        state.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market").unwrap();
+        let over = FixedPoint::from_raw(MAX_ORACLE_PRICE_RAW + 1);
+        let many: Vec<_> = (0..=MAX_ORACLE_PRICES_PER_SUBMISSION as u64).map(|m| (m, fp(1))).collect();
+        let cases: Vec<(Vec<(MarketId, FixedPoint)>, &str)> = vec![
+            (vec![(1, fp(100)), (2, fp(100))], "unknown market_id 2"),
+            (vec![(1, fp(100)), (1, fp(101))], "duplicate market 1"),
+            (vec![(1, FixedPoint::ZERO)], "invalid oracle price"),
+            (vec![(1, fp(-5))], "invalid oracle price"),
+            (vec![(1, over)], "invalid oracle price"),
+            (vec![], "1..=256"),
+            (many, "1..=256"),
+        ];
+        for (prices, needle) in cases {
+            let e = verify(&state, prices).expect_err(needle);
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        verify(&state, vec![(1, fp(100))]).unwrap();
+        verify(&state, vec![(1, FixedPoint::from_raw(MAX_ORACLE_PRICE_RAW))]).unwrap();
+    }
+}
+
+/// s92 item B: ingress applies the book's placement tick and lot rules
+/// (`OrderBook::place_order_with_accounts`) using the market row's tick/lot,
+/// so an off-tick Limit or a sub-lot order gets an error instead of a silent
+/// book reject reported as executed.
+#[cfg(test)]
+mod tick_lot_ingress_tests {
+    use super::*;
+    use torus_types::{MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+    const NOW: u64 = 1_000_000;
+
+    /// A market row in the genesis / governance borsh layout (`StoredMarket`).
+    fn list(state: &torus_state::StateDb, mid: MarketId, tick_raw: i128, lot_raw: i128) {
+        use borsh::BorshSerialize;
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        lot_raw.serialize(&mut row).unwrap();
+        tick_raw.serialize(&mut row).unwrap();
+        (5 * FixedPoint::SCALE).serialize(&mut row).unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row)
+            .unwrap();
+    }
+
+    fn order(
+        mid: MarketId,
+        price_raw: i128,
+        qty_raw: i128,
+        order_type: OrderType,
+    ) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: mid,
+            is_buy: true,
+            price: FixedPoint::from_raw(price_raw),
+            quantity: FixedPoint::from_raw(qty_raw),
+            order_type,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    fn place(state: &torus_state::StateDb, p: PlaceOrderParams) -> Result<(), String> {
+        validate_known_markets(&NativeAction::PlaceOrder(p), state)
+    }
+
+    fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    const S: i128 = FixedPoint::SCALE;
+
+    #[test]
+    fn off_tick_limit_rejected_with_executor_message() {
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S); // tick 0.5, lot 1
+        let e = place(&state, order(1, 100 * S + S / 4, S, OrderType::Limit)).unwrap_err();
+        assert_eq!(
+            e,
+            "order rejected: price 100.25000000 is not a multiple of the tick 0.50000000"
+        );
+    }
+
+    #[test]
+    fn on_tick_limit_passes() {
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S);
+        place(&state, order(1, 100 * S + S / 2, S, OrderType::Limit)).unwrap();
+    }
+
+    /// A Market order's price is a slippage cap and a StopMarket has no
+    /// limit: neither is tick-checked. Item 6 M1 (row 40): a StopLimit's
+    /// LIMIT is (it rests at it once triggered); its trigger and its own
+    /// `price` field are not.
+    #[test]
+    fn only_limit_prices_and_stop_limit_limits_are_tick_checked() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let odd = 100 * S + 7;
+        place(&state, order(1, odd, S, OrderType::Market)).unwrap();
+        place(
+            &state,
+            order(
+                1,
+                odd,
+                S,
+                OrderType::StopMarket {
+                    trigger: FixedPoint::from_raw(odd),
+                },
+            ),
+        )
+        .unwrap();
+        let odd_fp = FixedPoint::from_raw(odd);
+        let e = place(
+            &state,
+            order(1, 100 * S, S, OrderType::StopLimit { trigger: odd_fp, limit: odd_fp }),
+        )
+        .unwrap_err();
+        assert_eq!(e, "order rejected: price 100.00000007 is not a multiple of the tick 1.00000000");
+        let on_tick = FixedPoint::from_raw(100 * S);
+        place(
+            &state,
+            order(1, odd, S, OrderType::StopLimit { trigger: odd_fp, limit: on_tick }),
+        )
+        .unwrap();
+    }
+
+    /// Item 6 M1 (row 42): the RPC intake check and the executor (which now
+    /// creates books from the same market row) give the same answer and the
+    /// same text on a market whose tick / lot are not 1, for every order
+    /// type: an order the RPC admits passes the executor's pre-book check.
+    #[test]
+    fn rpc_and_executor_agree_on_a_non_one_tick_market() {
+        use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+        use torus_core::position::NativeBalance;
+        let (_d, state) = db();
+        list(&state, 1, S / 2, S / 10); // tick 0.5, lot 0.1
+        let mut ctx = NativeExecContext::new(
+            state.clone(),
+            1,
+            1000,
+            0,
+            100,
+            10,
+            alloy_primitives::Address::repeat_byte(99),
+            alloy_primitives::Address::repeat_byte(100),
+            alloy_primitives::Address::repeat_byte(101),
+        );
+        let trader = alloy_primitives::Address::repeat_byte(1);
+        let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&trader, &bal).unwrap();
+        let fpr = FixedPoint::from_raw;
+        let trig = fpr(200 * S);
+        let orders = [
+            order(1, 100 * S + S / 2, S / 5, OrderType::Limit),     // ok
+            order(1, 100 * S + S / 4, S, OrderType::Limit),         // off tick
+            order(1, 100 * S, S / 20, OrderType::Limit),            // below lot
+            order(1, 100 * S + 3, S, OrderType::Market),            // cap not checked (no liquidity: book rejects)
+            order(1, 0, S, OrderType::StopLimit { trigger: trig, limit: fpr(150 * S + 1) }), // off tick
+            order(1, 0, S, OrderType::StopLimit { trigger: trig, limit: fpr(150 * S) }),     // ok
+            order(1, 100 * S + 1, S / 20, OrderType::StopMarket { trigger: trig }),         // below lot
+        ];
+        for (i, p) in orders.into_iter().enumerate() {
+            let rpc = place(&state, p.clone());
+            let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
+            match rpc {
+                Err(e) => assert_eq!(exec.error.as_deref(), Some(e.as_str()), "#{i}"),
+                Ok(()) => assert!(
+                    exec.error.as_deref().is_none_or(|e| !e.contains("tick") && !e.contains("lot size")),
+                    "#{i}: {:?}",
+                    exec.error
+                ),
+            }
+        }
+        let book = &ctx.order_books[&1];
+        assert_eq!((book.tick_size, book.lot_size), (fpr(S / 2), fpr(S / 10)));
+    }
+
+    #[test]
+    fn qty_below_lot_rejected_for_every_order_type_and_equal_passes() {
+        let (_d, state) = db();
+        list(&state, 1, S, S / 10); // tick 1, lot 0.1
+        let trig = FixedPoint::from_raw(90 * S);
+        for ot in [
+            OrderType::Limit,
+            OrderType::Market,
+            OrderType::StopMarket { trigger: trig },
+            OrderType::StopLimit {
+                trigger: trig,
+                limit: trig,
+            },
+        ] {
+            let e = place(&state, order(1, 100 * S, S / 10 - 1, ot)).unwrap_err();
+            assert_eq!(
+                e, "order rejected: quantity 0.09999999 below the lot size 0.10000000",
+                "{ot:?}"
+            );
+            place(&state, order(1, 100 * S, S / 10, ot)).unwrap();
+        }
+    }
+
+    /// Executor: tick <= 0 disables the tick check (no division); the dust
+    /// check is a plain `qty < lot`, so lot 0 admits any qty >= 0.
+    #[test]
+    fn zero_tick_and_zero_lot_match_the_book() {
+        let (_d, state) = db();
+        list(&state, 1, 0, 0);
+        place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
+        place(&state, order(1, 100 * S + 7, 0, OrderType::Limit)).unwrap();
+        let e = place(&state, order(1, 100 * S, -1, OrderType::Limit)).unwrap_err();
+        assert_eq!(e, "order rejected: quantity -0.00000001 below the lot size 0.00000000");
+    }
+
+    /// A batch is one signed action: one bad order rejects the whole action
+    /// (as an unknown market does today), each market's row read once.
+    #[test]
+    fn batch_with_one_bad_order_is_rejected_whole() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        list(&state, 2, S / 2, S);
+        let good = vec![
+            order(1, 100 * S, S, OrderType::Limit),
+            order(2, 100 * S + S / 2, S, OrderType::Limit),
+        ];
+        validate_known_markets(&NativeAction::PlaceOrderBatch(good.clone()), &state).unwrap();
+        let mut bad = good.clone();
+        bad.push(order(1, 100 * S + S / 2, S, OrderType::Limit));
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(bad), &state).unwrap_err();
+        assert_eq!(
+            e,
+            "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000"
+        );
+        let mut dust = good;
+        dust.insert(0, order(2, 100 * S, S - 1, OrderType::Limit));
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(dust), &state).unwrap_err();
+        assert_eq!(e, "order rejected: quantity 0.99999999 below the lot size 1.00000000");
+    }
+
+    /// The rejection reaches the client through the normal ingress path
+    /// (per-item error string from `verify_one_action`).
+    #[test]
+    fn verify_one_action_surfaces_the_tick_error() {
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let signed = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(order(1, 100 * S + 1, S, OrderType::Limit)),
+            NOW,
+            &key,
+        );
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+        let e = verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, NOW)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "order rejected: price 100.00000001 is not a multiple of the tick 1.00000000"
+        );
+    }
+
+    /// Rows that do not decode as a market (test fixtures seed placeholders)
+    /// keep today's behaviour: the market exists, nothing else is checked.
+    #[test]
+    fn undecodable_row_only_checks_existence() {
+        let (_d, state) = db();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
+            .unwrap();
+        place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
+        let e = place(&state, order(9, 100 * S, S, OrderType::Limit)).unwrap_err();
+        assert_eq!(e, "unknown market_id 9");
+    }
+}
+
 #[cfg(test)]
 mod order_book_decode_tests {
     //! S444 / S395 RED-first: `torus_getOrderBook` must decode the PRODUCTION
@@ -2428,5 +2908,507 @@ mod order_book_decode_tests {
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].quantity, dec_fp(FixedPoint::from_raw(42)));
         assert_eq!(asks.len(), 0);
+    }
+}
+
+/// Cut 6 (ozarchy section 17.4): the shed screen peeks the bincode tag
+/// instead of decoding the whole payload. Every test compares against the
+/// pre-change screen (`old_screen`, full decode first).
+#[cfg(test)]
+mod shed_peek_tests {
+    use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use torus_types::{
+        ActionSignature, Ed25519Sig, MarketListing, MarketParams, NativeAction, OracleSubmission,
+        OrderType, PlaceOrderParams, Proposal, ProposalAction, PublicKey, SessionScope, Signature,
+        SignedNativeAction, TimeInForce, VoteOption,
+    };
+
+    /// (shed message, cancels_pass) of the two shedding modes.
+    const MODES: [(&str, bool); 2] = [(POOL_FULL_PREVERIFY_MSG, false), (ADMISSION_BUSY_MSG, true)];
+
+    /// The pre-change screen, verbatim: full hex + action decode, then decide.
+    fn old_screen(
+        signed_action: &str,
+        decode: DecodeFn,
+        shed_msg: &str,
+        cancels_pass: bool,
+    ) -> Result<(), String> {
+        let decoded = parse_bytes(signed_action)
+            .map_err(|e| format!("invalid hex: {e}"))
+            .and_then(|bytes| decode(&bytes));
+        match decoded {
+            Ok(action)
+                if torus_mempool::is_oracle_submission(&action.action)
+                    || (cancels_pass && torus_mempool::is_cancel(&action.action)) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(shed_msg.to_string()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn new_screen(
+        payload: &str,
+        binary: bool,
+        shed_msg: &str,
+        cancels_pass: bool,
+    ) -> Result<(), String> {
+        if binary {
+            screen_payload(
+                payload,
+                decode_action_bin,
+                Some(peek_bin_tag),
+                shed_msg,
+                cancels_pass,
+            )
+        } else {
+            screen_payload(payload, decode_action_json, None, shed_msg, cancels_pass)
+        }
+    }
+
+    fn decode_for(binary: bool) -> DecodeFn {
+        if binary {
+            decode_action_bin
+        } else {
+            decode_action_json
+        }
+    }
+
+    /// Declaration index of every variant. Exhaustive on purpose: a new
+    /// variant fails to compile here until it is added to `samples()` too.
+    fn variant_index(a: &NativeAction) -> u32 {
+        match a {
+            NativeAction::PlaceOrder(_) => 0,
+            NativeAction::PlaceOrderBatch(_) => 1,
+            NativeAction::CancelOrder { .. } => 2,
+            NativeAction::CancelAllOrders { .. } => 3,
+            NativeAction::ModifyOrder { .. } => 4,
+            NativeAction::TransferToPerp { .. } => 5,
+            NativeAction::TransferToSpot { .. } => 6,
+            NativeAction::Withdraw { .. } => 7,
+            NativeAction::Delegate { .. } => 8,
+            NativeAction::Undelegate { .. } => 9,
+            NativeAction::PermanentStake { .. } => 10,
+            NativeAction::ClaimRewards => 11,
+            NativeAction::TopUpSelfStake { .. } => 12,
+            NativeAction::SubmitProposal(_) => 13,
+            NativeAction::Vote { .. } => 14,
+            NativeAction::SubmitOraclePrices(_) => 15,
+            NativeAction::RegisterValidator { .. } => 16,
+            NativeAction::UpdateCommission { .. } => 17,
+            NativeAction::JailVote { .. } => 18,
+            NativeAction::UnjailSelf => 19,
+            NativeAction::RotateValidatorKey { .. } => 20,
+            NativeAction::CreateSession { .. } => 21,
+            NativeAction::RevokeSession { .. } => 22,
+            NativeAction::UpdateMarketParams { .. } => 23,
+            NativeAction::ListMarket(_) => 24,
+            NativeAction::DelistMarket { .. } => 25,
+            NativeAction::AttestStateHash { .. } => 26,
+            NativeAction::ClaimUnbonded => 27,
+            NativeAction::SetOracleSigner { .. } => 28,
+        }
+    }
+
+    fn order(i: u64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: i,
+            is_buy: i.is_multiple_of(2),
+            price: FixedPoint::from_raw(1_000 + i as i128),
+            quantity: FixedPoint::from_raw(7),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: Some(i),
+        }
+    }
+
+    /// At least one sample of every `NativeAction` variant.
+    fn samples() -> Vec<NativeAction> {
+        let params = MarketParams {
+            tick_size: FixedPoint::from_raw(1),
+            lot_size: FixedPoint::from_raw(1),
+            max_leverage: 20,
+            maintenance_margin_bps: 50,
+            max_funding_rate_bps: 10,
+        };
+        let listing = MarketListing {
+            base_asset: "BTC".into(),
+            quote_asset: "USD".into(),
+            tick_size: FixedPoint::from_raw(1),
+            lot_size: FixedPoint::from_raw(1),
+            max_leverage: 20,
+            maintenance_margin_bps: 50,
+        };
+        vec![
+            NativeAction::PlaceOrder(order(1)),
+            NativeAction::PlaceOrderBatch(vec![]),
+            NativeAction::PlaceOrderBatch((0..50).map(order).collect()),
+            NativeAction::CancelOrder { order_id: 7 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::CancelAllOrders { market_id: Some(3) },
+            NativeAction::ModifyOrder {
+                order_id: 7,
+                new_price: Some(FixedPoint::from_raw(5)),
+                new_qty: None,
+            },
+            NativeAction::TransferToPerp {
+                amount: U256::from(5),
+            },
+            NativeAction::TransferToSpot { amount: U256::MAX },
+            NativeAction::Withdraw {
+                amount: U256::from(1),
+                to: Address::repeat_byte(3),
+            },
+            NativeAction::Delegate {
+                validator: Address::repeat_byte(4),
+                amount: U256::from(9),
+            },
+            NativeAction::Undelegate {
+                validator: Address::repeat_byte(5),
+                amount: U256::from(9),
+            },
+            NativeAction::PermanentStake {
+                amount: U256::from(2),
+            },
+            NativeAction::ClaimRewards,
+            NativeAction::TopUpSelfStake {
+                amount: U256::from(2),
+            },
+            NativeAction::SubmitProposal(Proposal {
+                title: "t".into(),
+                description: "d".into(),
+                action: ProposalAction::ParameterChange {
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+            }),
+            NativeAction::Vote {
+                proposal_id: 1,
+                option: VoteOption::Yes,
+            },
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![],
+                timestamp: 0,
+            }),
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![
+                    (1, FixedPoint::from_raw(100)),
+                    (2, FixedPoint::from_raw(200)),
+                ],
+                timestamp: 9,
+            }),
+            NativeAction::RegisterValidator {
+                pubkey: PublicKey([7; 32]),
+                commission: 100,
+            },
+            NativeAction::UpdateCommission { new_rate: 50 },
+            NativeAction::JailVote {
+                target: Address::repeat_byte(8),
+            },
+            NativeAction::UnjailSelf,
+            NativeAction::RotateValidatorKey {
+                new_pubkey: PublicKey([9; 32]),
+            },
+            NativeAction::CreateSession {
+                session_pubkey: [10; 32],
+                expiry: 99,
+                scope: SessionScope::Trading,
+            },
+            NativeAction::RevokeSession {
+                session_pubkey: [10; 32],
+            },
+            NativeAction::UpdateMarketParams {
+                market_id: 1,
+                params,
+            },
+            NativeAction::ListMarket(listing),
+            NativeAction::DelistMarket { market_id: 1 },
+            NativeAction::AttestStateHash {
+                height: 100,
+                hash: B256::repeat_byte(11),
+            },
+            NativeAction::ClaimUnbonded,
+            NativeAction::SetOracleSigner {
+                signer: Address::repeat_byte(11),
+                proof: None,
+            },
+        ]
+    }
+
+    fn signed(action: NativeAction, session: bool) -> SignedNativeAction {
+        SignedNativeAction {
+            action,
+            nonce: 1_000_000,
+            signature: if session {
+                ActionSignature::Session {
+                    session_pubkey: [17; 32],
+                    sig: Ed25519Sig([29; 64]),
+                }
+            } else {
+                ActionSignature::Eip712(Signature {
+                    v: 28,
+                    r: [31; 32],
+                    s: [43; 32],
+                })
+            },
+        }
+    }
+
+    /// Hex body (no prefix) of a signed sample in the given format.
+    fn body(action: &NativeAction, session: bool, binary: bool) -> String {
+        let s = signed(action.clone(), session);
+        hex::encode(if binary {
+            bincode::serialize(&s).unwrap()
+        } else {
+            serde_json::to_vec(&s).unwrap()
+        })
+    }
+
+    fn is_pass_tag(tag: u32, cancels_pass: bool) -> bool {
+        tag == TAG_SUBMIT_ORACLE_PRICES
+            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS))
+    }
+
+    /// Payloads broken after a readable tag (all fail the full decode).
+    fn malformed_after_tag(h: &str) -> Vec<String> {
+        vec![
+            h[..8].to_string(),                   // tag only: truncated
+            h[..h.len() - 2].to_string(),         // truncated body
+            h[..h.len() - 1].to_string(),         // odd length
+            format!("{}g", &h[..h.len() - 1]),    // bad hex at the end
+            format!("{}zz{}", &h[..8], &h[10..]), // bad hex right after the tag
+            format!("{}é{}", &h[..8], &h[10..]),  // non-ASCII after the tag
+        ]
+    }
+
+    #[test]
+    fn samples_cover_every_variant_and_bin_tags_are_variant_indices() {
+        let mut seen = std::collections::BTreeSet::new();
+        for a in samples() {
+            let idx = variant_index(&a);
+            seen.insert(idx);
+            for session in [false, true] {
+                let h = body(&a, session, true);
+                for p in [h.clone(), format!("0x{h}")] {
+                    assert_eq!(peek_bin_tag(&p), Some(idx), "{a:?}");
+                }
+            }
+            assert_eq!(
+                torus_mempool::is_cancel(&a),
+                idx == TAG_CANCEL_ORDER || idx == TAG_CANCEL_ALL_ORDERS
+            );
+            assert_eq!(
+                torus_mempool::is_oracle_submission(&a),
+                idx == TAG_SUBMIT_ORACLE_PRICES
+            );
+        }
+        assert_eq!(seen, (0..NATIVE_ACTION_TAGS).collect());
+        // The first tag past the last variant is not an action.
+        let mut bytes = bincode::serialize(&signed(NativeAction::ClaimUnbonded, false)).unwrap();
+        bytes[..4].copy_from_slice(&NATIVE_ACTION_TAGS.to_le_bytes());
+        assert!(decode_action_bin(&bytes).is_err());
+    }
+
+    /// Well-formed payloads of every variant, both formats, both signature
+    /// kinds, with and without `0x`, both shedding modes: same decision.
+    #[test]
+    fn well_formed_every_variant_same_decision_as_full_decode() {
+        let mut proceeds = 0;
+        for a in samples() {
+            for binary in [false, true] {
+                for session in [false, true] {
+                    let h = body(&a, session, binary);
+                    for p in [h.clone(), format!("0x{h}")] {
+                        for (msg, cancels_pass) in MODES {
+                            let old = old_screen(&p, decode_for(binary), msg, cancels_pass);
+                            assert_eq!(
+                                new_screen(&p, binary, msg, cancels_pass),
+                                old,
+                                "{a:?} binary={binary} cancels_pass={cancels_pass}"
+                            );
+                            assert_eq!(old.is_ok(), is_pass_tag(variant_index(&a), cancels_pass));
+                            proceeds += usize::from(old.is_ok());
+                        }
+                    }
+                }
+            }
+        }
+        // 2 oracle samples x both modes + 3 cancel samples x busy mode,
+        // each x 2 formats x 2 signatures x 2 prefixes.
+        assert_eq!(proceeds, (2 * 2 + 3) * 8);
+    }
+
+    /// Pass-through tags (2, 3, 15) are never decided by the peek: a broken
+    /// body gets the same decode error as before, and a well-formed one
+    /// proceeds to the unchanged full verify (which still rejects bad content).
+    #[test]
+    fn pass_through_tags_are_still_fully_decoded_and_validated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let pass = [
+            NativeAction::CancelOrder { order_id: 7 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![],
+                timestamp: 0,
+            }),
+        ];
+        for a in &pass {
+            for (msg, cancels_pass) in MODES {
+                if !is_pass_tag(variant_index(a), cancels_pass) {
+                    continue;
+                }
+                let h = body(a, false, true);
+                for bad in malformed_after_tag(&h) {
+                    for p in [bad.clone(), format!("0x{bad}")] {
+                        let old = old_screen(&p, decode_action_bin, msg, cancels_pass);
+                        assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                        assert_eq!(new_screen(&p, true, msg, cancels_pass), old, "{p}");
+                    }
+                }
+                // Unregistered session key: decodes fine, must fail verify.
+                let p = format!("0x{}", body(a, true, true));
+                assert_eq!(new_screen(&p, true, msg, cancels_pass), Ok(()));
+                let verified = verify_one_action_with(
+                    decode_action_bin,
+                    &p,
+                    torus_types::eip712::TORUS_CHAIN_ID,
+                    &state,
+                    1_000_000,
+                    &mut Vec::new(),
+                );
+                let err = verified.expect_err("bogus content / signature must fail verify");
+                assert!(
+                    err.starts_with("oracle submission carries")
+                        || err.starts_with("signature verification failed"),
+                    "{a:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// An unreadable tag (short, empty, non-hex, wrong prefix) or an unknown
+    /// one falls back to the full decode: the same error as before, in both
+    /// formats and both modes.
+    #[test]
+    fn unreadable_or_unknown_tag_falls_back_to_full_decode() {
+        let claim = body(&NativeAction::ClaimRewards, false, true);
+        let mut cases: Vec<String> = [
+            "",
+            "0x",
+            "0",
+            "0x0",
+            "00",
+            "0x1234567",
+            "0X0b000000",
+            "zz000000",
+            "0x0g000000",
+            "0b00000",
+            "é",
+            "0x0b0000é0",
+            "0x0x0b000000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for tag in [NATIVE_ACTION_TAGS, NATIVE_ACTION_TAGS + 1, u32::MAX] {
+            let t = hex::encode(tag.to_le_bytes());
+            cases.push(format!("{t}{}", &claim[8..]));
+            cases.push(format!("0x{t}{}", &claim[8..]));
+            cases.push(format!("0x{t}"));
+        }
+        for p in &cases {
+            for binary in [false, true] {
+                for (msg, cancels_pass) in MODES {
+                    let old = old_screen(p, decode_for(binary), msg, cancels_pass);
+                    assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                    assert_eq!(
+                        new_screen(p, binary, msg, cancels_pass),
+                        old,
+                        "{p:?} binary={binary}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE ONE DELIBERATE EXCEPTION (cut 6): while shedding, a bincode
+    /// payload whose readable tag is a refused action but whose body is
+    /// malformed gets the shed reply (counted under the shed label) instead
+    /// of its decode error. Outside shedding the same payload still gets its
+    /// decode error (`malformed_input_outside_shedding_is_unchanged`).
+    #[test]
+    fn malformed_body_with_refused_tag_is_shed_while_shedding() {
+        let mut checked = 0;
+        for a in samples() {
+            for (msg, cancels_pass) in MODES {
+                if is_pass_tag(variant_index(&a), cancels_pass) {
+                    continue;
+                }
+                let h = body(&a, false, true);
+                for bad in malformed_after_tag(&h) {
+                    for p in [bad.clone(), format!("0x{bad}")] {
+                        let old = old_screen(&p, decode_action_bin, msg, cancels_pass);
+                        assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                        assert_eq!(
+                            new_screen(&p, true, msg, cancels_pass),
+                            Err(msg.to_string())
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+        // JSON ingress has no tag peek: unchanged there.
+        let h = body(&NativeAction::ClaimRewards, false, false);
+        let bad = &h[..h.len() - 2];
+        for (msg, cancels_pass) in MODES {
+            assert_eq!(
+                new_screen(bad, false, msg, cancels_pass),
+                old_screen(bad, decode_action_json, msg, cancels_pass)
+            );
+        }
+    }
+
+    /// Outside shedding the screen does not run; the verify path decodes as
+    /// before, so malformed input keeps its exact decode error.
+    #[test]
+    fn malformed_input_outside_shedding_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        for binary in [false, true] {
+            let decode = decode_for(binary);
+            let h = body(
+                &NativeAction::PlaceOrderBatch((0..3).map(order).collect()),
+                false,
+                binary,
+            );
+            let mut cases = malformed_after_tag(&h);
+            cases.extend(["".into(), "0x".into(), "0x0".into(), "zz".into()]);
+            for p in cases {
+                let expected = parse_bytes(&p)
+                    .map_err(|e| format!("invalid hex: {e}"))
+                    .and_then(|b| decode(&b))
+                    .expect_err("malformed");
+                let got = verify_one_action_with(
+                    decode,
+                    &p,
+                    torus_types::eip712::TORUS_CHAIN_ID,
+                    &state,
+                    1_000_000,
+                    &mut Vec::new(),
+                )
+                .expect_err("malformed");
+                assert_eq!(got, expected, "{p:?} binary={binary}");
+                assert!(
+                    got.starts_with("invalid hex: ")
+                        || got.starts_with("invalid action encoding: ")
+                );
+            }
+        }
     }
 }

@@ -31,7 +31,7 @@ use rocksdb::WriteBatch;
 
 use crate::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_HASHED, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRIE, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
+    CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS, CF_NATIVE_TRIE, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS,
 };
 use crate::db::StateDb;
 use crate::error::StateError;
@@ -40,20 +40,22 @@ use crate::trie::EMPTY_ROOT_HASH;
 /// Tree depth in bits = number of buckets is `1 << TREE_DEPTH`. 16 bits → 65536 buckets.
 pub const TREE_DEPTH: usize = 16;
 
-/// The 6 authoritative native-root CFs and their **FROZEN** 1-byte tags. NEVER reorder or renumber:
+/// The 7 authoritative native-root CFs and their **FROZEN** 1-byte tags. NEVER reorder or renumber:
 /// the `cf_tag` is part of the consensus root preimage (bucket assignment + leaf framing). The set
 /// must stay equal to the CFs hashed by `compute_native_state_root` (the consensus-authoritative
 /// full scan).
-pub const NATIVE_ROOT_CFS: [(&str, u8); 6] = [
+pub const NATIVE_ROOT_CFS: [(&str, u8); 7] = [
     (CF_NATIVE_BALANCES, 0),
     (CF_NATIVE_ORDER_BOOKS, 1),
     (CF_NATIVE_POSITIONS, 2),
     (CF_NATIVE_ORACLE, 3),
     (CF_STAKING_DELEGATIONS, 4),
     (CF_STAKING_VALIDATORS, 5),
+    // Item 3 (s517): appended; tags 0-5 unchanged.
+    (CF_NATIVE_LIQUIDATION, 6),
 ];
 
-/// `cf_tag` for a CF name, or `None` if it is not one of the 6 native-root CFs.
+/// `cf_tag` for a CF name, or `None` if it is not one of the 7 native-root CFs.
 pub fn cf_tag(cf_name: &str) -> Option<u8> {
     NATIVE_ROOT_CFS
         .iter()
@@ -196,7 +198,7 @@ fn put_node(batch: &mut WriteBatch, trie_cf: &rocksdb::ColumnFamily, key: &[u8; 
     }
 }
 
-/// Collect the non-empty bucket leaf hashes from the live 6 native CFs (pure; no persisted trie).
+/// Collect the non-empty bucket leaf hashes from the live 7 native CFs (pure; no persisted trie).
 /// Entries accumulate in `(cf_tag, key)` order because the CFs are visited in tag order and each CF
 /// iterates in key order — the canonical bucket-hash input.
 fn leaves_from_db(db: &StateDb) -> Result<BTreeMap<u16, B256>, StateError> {
@@ -292,8 +294,9 @@ pub fn build_native_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 /// Ensure the native trie + mirror exist and are current, building them if absent OR marked stale
 /// (idempotent boot helper). Returns `true` iff a build was performed. The trie CF always holds at
 /// least the root marker once built (even for empty native state), so its emptiness is the reliable
-/// "not yet built" signal. `maintain == false` (`TORUS_NATIVE_TRIE_MAINTENANCE=0`) does no trie
-/// work at all: an absent or stale trie stays so (readers fall back to [`native_root_full`]).
+/// "not yet built" signal. `maintain == false` (the default; see
+/// [`native_trie_maintenance_enabled`]) does no trie work at all: an absent or stale trie stays
+/// so (readers fall back to [`native_root_full`]).
 pub fn ensure_native_trie_built(db: &StateDb, maintain: bool) -> Result<bool, StateError> {
     if !maintain || (is_native_trie_built(db)? && !is_native_trie_stale(db)?) {
         return Ok(false);
@@ -313,19 +316,50 @@ pub fn is_native_trie_stale(db: &StateDb) -> Result<bool, StateError> {
         .is_some())
 }
 
-/// s83 Option 0: `TORUS_NATIVE_TRIE_MAINTENANCE=0` skips per-block native trie/mirror maintenance
-/// (the maintained root has no live consumer); unset / `"1"` / anything else maintains exactly as
-/// today. Read once per process — the mode cannot flip mid-run.
+/// Per-block native trie/mirror maintenance is OFF by default: the maintained root has no
+/// production reader (s450, item 6 section 8.1), so each native block only writes the
+/// `META_NATIVE_TRIE_STALE` marker. `TORUS_NATIVE_TRIE_MAINTENANCE=1` turns it on (any other
+/// value leaves it off); a stale trie is then rebuilt once at boot ([`ensure_native_trie_built`]).
+/// Read once per process — in production the mode cannot flip mid-run.
 pub fn native_trie_maintenance_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        parse_native_trie_maintenance(std::env::var("TORUS_NATIVE_TRIE_MAINTENANCE").ok())
-    })
+    match MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed) {
+        MAINTENANCE_ON => true,
+        MAINTENANCE_OFF => false,
+        _ => {
+            let on =
+                parse_native_trie_maintenance(std::env::var("TORUS_NATIVE_TRIE_MAINTENANCE").ok());
+            let v = if on { MAINTENANCE_ON } else { MAINTENANCE_OFF };
+            // First resolution wins; a concurrent force-on is kept.
+            let _ = MAINTENANCE.compare_exchange(
+                MAINTENANCE_UNRESOLVED,
+                v,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed) == MAINTENANCE_ON
+        }
+    }
 }
 
-/// Pure parse: only `"0"` disables.
+/// TEST-ONLY process-wide switch: turn native trie maintenance on, whatever the env says, for
+/// tests that read [`persisted_native_root`] after a flush through the env-resolved wrappers.
+/// One switch for every test in the process (tests run in parallel, so per-test env would race);
+/// it only ever turns maintenance ON, so the one possible flip is off -> on, which leaves a
+/// stale trie marked stale until a rebuild. Never called by production code.
+#[doc(hidden)]
+pub fn force_native_trie_maintenance_on_for_tests() {
+    MAINTENANCE.store(MAINTENANCE_ON, std::sync::atomic::Ordering::Relaxed);
+}
+
+const MAINTENANCE_UNRESOLVED: u8 = 0;
+const MAINTENANCE_OFF: u8 = 1;
+const MAINTENANCE_ON: u8 = 2;
+static MAINTENANCE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(MAINTENANCE_UNRESOLVED);
+
+/// Pure parse: only `"1"` (trimmed) enables; unset or anything else is off.
 fn parse_native_trie_maintenance(v: Option<String>) -> bool {
-    !matches!(v.as_deref().map(str::trim), Some("0"))
+    matches!(v.as_deref().map(str::trim), Some("1"))
 }
 
 /// `true` if the native bucketed trie has been built (cheap probe: `CF_NATIVE_TRIE` is non-empty —
@@ -1534,6 +1568,34 @@ mod tests {
         }
     }
 
+    /// Item 3: the liquidation CF is native-root tag 6 (0-5 frozen and
+    /// unchanged); its rows move the incremental AND the full root, and an
+    /// empty CF contributes nothing.
+    #[test]
+    fn liquidation_cf_is_native_root_tag_6_incremental_equals_full() {
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
+        use crate::cf::CF_NATIVE_LIQUIDATION;
+        assert_eq!(cf_tag(CF_NATIVE_LIQUIDATION), Some(6));
+        let tags: Vec<u8> = NATIVE_ROOT_CFS.iter().map(|(_, t)| *t).collect();
+        assert_eq!(tags, vec![0, 1, 2, 3, 4, 5, 6]);
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        build_native_trie_to_cf(&db).unwrap();
+        let empty = persisted_native_root(&db).unwrap();
+        let key = [0x02u8; 21];
+        let ov = crate::NativeStateOverlay::new(db.clone());
+        crate::StateBackend::put_cf_raw(&ov, CF_NATIVE_LIQUIDATION, &key, &1_001u64.to_be_bytes()).unwrap();
+        ov.flush_with_native_trie(&db).unwrap();
+        let root = persisted_native_root(&db).unwrap();
+        assert_ne!(root, empty, "a liquidation row moves the native root");
+        assert_eq!(root, native_root_full(&db).unwrap());
+        let ov = crate::NativeStateOverlay::new(db.clone());
+        crate::StateBackend::delete_cf_raw(&ov, CF_NATIVE_LIQUIDATION, &key).unwrap();
+        ov.flush_with_native_trie(&db).unwrap();
+        assert_eq!(persisted_native_root(&db).unwrap(), empty);
+        assert_eq!(native_root_full(&db).unwrap(), empty);
+    }
+
     /// A2.1 determinism gate: the persisted bucketed root must equal the full-scan oracle over a
     /// corpus, be idempotent, and actually persist nodes.
     #[test]
@@ -1792,15 +1854,17 @@ mod tests {
         }
     }
 
-    /// s83 Option 0: maintenance defaults ON (exact-today); only `"0"` skips it.
+    /// Maintenance defaults OFF (the maintained root has no production reader); only `"1"`
+    /// turns it on, anything else (including `"0"`) leaves it off.
     #[test]
-    fn native_trie_maintenance_default_on_only_zero_disables() {
-        assert!(parse_native_trie_maintenance(None));
+    fn native_trie_maintenance_default_off_only_one_enables() {
+        assert!(!parse_native_trie_maintenance(None));
         assert!(parse_native_trie_maintenance(Some("1".to_string())));
+        assert!(parse_native_trie_maintenance(Some(" 1 ".to_string())));
         assert!(!parse_native_trie_maintenance(Some("0".to_string())));
         assert!(!parse_native_trie_maintenance(Some(" 0 ".to_string())));
-        for v in ["false", "off", "", "no", "2", "00"] {
-            assert!(parse_native_trie_maintenance(Some(v.to_string())), "{v}");
+        for v in ["true", "on", "", "yes", "2", "01", "11"] {
+            assert!(!parse_native_trie_maintenance(Some(v.to_string())), "{v}");
         }
     }
 
@@ -2521,11 +2585,15 @@ mod tests {
     /// Dense buckets per CF in the char-pin corpus.
     const CHARPIN_BUCKETS_PER_CF: usize = 120;
 
-    /// Flat `(cf_index, key)` corpus over all 6 native-root CFs, every key living
-    /// in a bucket shared with `CHARPIN_PER_BUCKET - 1` others of the same CF.
+    /// Flat `(cf_index, key)` corpus over the 6 ORIGINAL native-root CFs (tags
+    /// 0-5), every key living in a bucket shared with `CHARPIN_PER_BUCKET - 1`
+    /// others of the same CF. Item 3 (s517) appended tag 6 (liquidation); the
+    /// corpus stays on tags 0-5 so these pins keep proving that the 0-5
+    /// preimages did not move (tag 6 is covered by
+    /// `liquidation_cf_is_native_root_tag_6_incremental_equals_full`).
     fn charpin_corpus() -> Vec<(usize, Vec<u8>)> {
         let mut out = Vec::new();
-        for (cfi, (_, tag)) in NATIVE_ROOT_CFS.iter().enumerate() {
+        for (cfi, (_, tag)) in NATIVE_ROOT_CFS.iter().take(6).enumerate() {
             for (_, keys) in dense_buckets(*tag, 100_000, CHARPIN_BUCKETS_PER_CF, CHARPIN_PER_BUCKET)
             {
                 for k in keys {

@@ -1,0 +1,198 @@
+{
+  "prp": "account-level-margin-f1",
+  "created": "2026-09-30T00:00:00Z",
+  "plan": "docs/plans/account-level-margin-f1-impl.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "core: account-margin formulas (position_price, im_delta, placement_need, AccountView; SAFE withdrawal rule D3)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/margin.rs",
+        "crates/torus-core/tests/margin_tests.rs"
+      ],
+      "validate": "cargo test -p torus-core --test margin_tests account_",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "core: MarginEngine equity counts order_margin once; maintenance at entry; liquidation deficit on available+order_margin (D1)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/margin.rs",
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-core/tests/margin_tests.rs",
+        "crates/torus-core/tests/liquidation_tests.rs"
+      ],
+      "validate": "cargo test -p torus-core --lib margin::tests && cargo test -p torus-core --test margin_tests && cargo test -p torus-core --test liquidation_tests",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "name": "bridge: AccountReader + SAFE withdrawal rule (D3) on TransferToSpot / Withdraw / CoreWriter LockboxWithdraw",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/account_margin_tests.rs",
+        "crates/torus-bridge/tests/lockbox_queue_tests.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test account_margin_tests withdraw && cargo test -p torus-bridge --test lockbox_queue_tests",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 4,
+      "name": "core book: taker need at position tier, closing releases IM, AccountMargins running free",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/order_book.rs"
+      ],
+      "validate": "cargo test -p torus-core --lib taker_margin_limit_tests",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "name": "bridge single path: account check is the ONLY placement gate (D1 strict HL, stops included) + running free at match + negative-available tests",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/account_margin_tests.rs",
+        "crates/torus-bridge/tests/market_order_margin_tests.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test account_margin_tests single && cargo test -p torus-bridge --test market_order_margin_tests && cargo test -p torus-bridge --test reduce_only_tests",
+      "depends_on": [
+        1,
+        3,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "name": "bridge refactor: one prepare_one/stitch_outcome for serial and sharded Phase 2 (no behaviour change)",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test engine_parallel_tests && cargo test -p torus-bridge --test market_order_margin_tests && cargo test -p torus-bridge --test reduce_only_tests",
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 7,
+      "name": "bridge batch: F1 in prepare_one (cash gate removed D1, pos_net, projection), exclusive per-sender pools, Phase-3 AccountMargins",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test account_margin_tests && cargo test -p torus-bridge --test market_order_margin_tests && cargo test -p torus-bridge --test engine_parallel_tests && cargo test -p torus-bridge --test reduce_only_tests",
+      "depends_on": [
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "name": "core book: maker check at fill (MakerAccountSource, margin_cancels, FOK pre-check mirror)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/order_book.rs"
+      ],
+      "validate": "cargo test -p torus-core --lib taker_margin_limit_tests && cargo test -p torus-core --lib order_book",
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 9,
+      "name": "bridge: wire maker source (single path + market workers) and release margin_cancels",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/src/market_workers.rs",
+        "crates/torus-bridge/tests/account_margin_tests.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test account_margin_tests maker && cargo test -p torus-bridge --test maker_margin_release_tests && cargo test -p torus-bridge --test parallel_matching_tests",
+      "depends_on": [
+        7,
+        8
+      ]
+    },
+    {
+      "id": 10,
+      "name": "bridge: modify gate is the account check only (D1), UPnL can fund the extra",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/tests/modify_order_tests.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test modify_order_tests",
+      "depends_on": [
+        3,
+        5
+      ]
+    },
+    {
+      "id": 11,
+      "name": "determinism: F1 shapes byte-identical across engine thread counts",
+      "status": "pending",
+      "files": [
+        "crates/torus-bridge/tests/engine_parallel_tests.rs"
+      ],
+      "validate": "cargo test -p torus-bridge --test engine_parallel_tests && cargo test -p torus-bridge --test parallel_settle_tests",
+      "depends_on": [
+        7,
+        9
+      ]
+    },
+    {
+      "id": 12,
+      "name": "docs: parity-audit-fixes-s515 F1 rows (D1 strict HL, D3 safe) + design status",
+      "status": "pending",
+      "files": [
+        "docs/parity-audit-fixes-s515.md",
+        "docs/plans/account-level-margin-f1.md"
+      ],
+      "validate": "git diff --stat -- docs/",
+      "depends_on": [
+        2,
+        3,
+        7,
+        9,
+        10,
+        14
+      ]
+    },
+    {
+      "id": 13,
+      "name": "end-to-end verification: torus-core, torus-bridge, 11-crate run, workspace check, engine bench",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo test -p torus-core && cargo test -p torus-core --test precompile_tests && cargo test -p torus-bridge && cargo test -p torus-types -p torus-state -p torus-evm -p torus-core -p torus-consensus -p torus-bridge -p torus-rpc -p torus-mempool -p torus-economics -p torus-genesis -p torus-telemetry && cargo check --workspace --all-targets",
+      "depends_on": [
+        11,
+        12,
+        14
+      ]
+    },
+    {
+      "id": 14,
+      "name": "core: 0x0801 getBalances clamps a negative available to 0 (no uint128 wrap, D1 consumer fix)",
+      "status": "pending",
+      "files": [
+        "crates/torus-core/src/precompiles.rs",
+        "crates/torus-core/tests/precompile_tests.rs"
+      ],
+      "validate": "cargo test -p torus-core --test precompile_tests balance_reader",
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}

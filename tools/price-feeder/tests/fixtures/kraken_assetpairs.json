@@ -1,0 +1,29 @@
+{
+ "error": [],
+ "result": {
+  "POLUSD": {
+   "altname": "POLUSD",
+   "wsname": "POL/USD",
+   "base": "POL",
+   "quote": "ZUSD"
+  },
+  "USDTZUSD": {
+   "altname": "USDTUSD",
+   "wsname": "USDT/USD",
+   "base": "USDT",
+   "quote": "ZUSD"
+  },
+  "XETHZUSD": {
+   "altname": "ETHUSD",
+   "wsname": "ETH/USD",
+   "base": "XETH",
+   "quote": "ZUSD"
+  },
+  "XXBTZUSD": {
+   "altname": "XBTUSD",
+   "wsname": "XBT/USD",
+   "base": "XXBT",
+   "quote": "ZUSD"
+  }
+ }
+}
