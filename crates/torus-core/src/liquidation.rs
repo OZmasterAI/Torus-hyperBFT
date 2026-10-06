@@ -526,12 +526,13 @@ pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<
     Ok(true)
 }
 
-/// Telemetry (node-local, read-only): the number of pending rows — paged
-/// prefix seeks over the `0x06` tag, nothing collected.
-pub fn pending_count<T: StateBackend>(state: &T) -> Result<u64, CoreError> {
-    let (mut n, mut start) = (0u64, vec![PENDING_TAG]);
+/// Telemetry (node-local, read-only): the number of rows of `tag` (the
+/// pending rows `0x06`, the ADL obligation rows `0x07`) — paged prefix seeks,
+/// nothing collected.
+pub fn tag_count<T: StateBackend>(state: &T, tag: u8) -> Result<u64, CoreError> {
+    let (mut n, mut start) = (0u64, vec![tag]);
     loop {
-        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[PENDING_TAG], &start, SCAN_PAGE)?;
+        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[tag], &start, SCAN_PAGE)?;
         n += page.len() as u64;
         match page.last() {
             Some((k, _)) if page.len() == SCAN_PAGE => start = [k.as_slice(), &[0u8]].concat(),

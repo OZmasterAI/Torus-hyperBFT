@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use torus_core::liquidation::{self as liq, Health, LIQUIDATOR_VAULT};
 use torus_core::margin::maintenance_margin;
 use torus_core::position::Position;
-use torus_state::cf::CF_NATIVE_LIQUIDATION;
+use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS};
 
 type Marks = BTreeMap<MarketId, FixedPoint>;
 
@@ -42,6 +42,9 @@ struct LiqStats {
     adl_work: u64,
     adl_dust: i128,
     adl_pairing: i128,
+    /// The step's marks (A7: the escrow gauges and the value sum value at
+    /// them).
+    marks: Marks,
 }
 
 impl NativeExecutor {
@@ -72,7 +75,85 @@ impl NativeExecutor {
             }
         };
         Self::liquidation_telemetry(ctx, &stats, started.elapsed());
+        if ctx.liq_value_sum && ctx.metrics.is_some() && ctx.fatal_error.is_none() {
+            Self::liquidation_value_sum(ctx, &stats.marks);
+        }
         out
+    }
+
+    /// adl-budget A7, proof-only (`ctx.liq_value_sum`, metrics attached;
+    /// after the step's timer): Σ over ALL accounts (vault and escrows
+    /// included) of available + order margin + UPnL at the step's marks
+    /// (unmarked: entry) — a paged walk of every balance and position row.
+    /// With OI symmetric it does not depend on the marks, so it stays
+    /// constant across a drain without transfers (within the escrow dust).
+    /// Sets the gauge and logs `liquidation: value sum`; a read error skips
+    /// it.
+    fn liquidation_value_sum<T: StateBackend>(ctx: &NativeExecContext<T>, marks: &Marks) {
+        const PAGE: usize = 1_024;
+        let of = |_| CoreError::Overflow("liquidation value sum overflows i128".into());
+        let borsh = |e: std::io::Error| CoreError::Borsh(e.to_string());
+        let walk = || -> Result<FixedPoint, CoreError> {
+            let mut sum = FixedPoint::ZERO;
+            for cf in [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS] {
+                let mut start = Vec::new();
+                loop {
+                    let page = ctx.state.iterate_cf_from(cf, &start, PAGE)?;
+                    for (k, v) in &page {
+                        let x = if cf == CF_NATIVE_BALANCES {
+                            if k.len() != 20 {
+                                continue;
+                            }
+                            let b = <NativeBalance as borsh::BorshDeserialize>::try_from_slice(v).map_err(borsh)?;
+                            b.available.checked_add(b.order_margin).map_err(of)?
+                        } else {
+                            if k.len() != 28 {
+                                continue;
+                            }
+                            let p = <Position as borsh::BorshDeserialize>::try_from_slice(v).map_err(borsh)?;
+                            torus_core::margin::position_terms(&p, marks.get(&p.market_id).copied(), None)?.upnl
+                        };
+                        sum = sum.checked_add(x).map_err(of)?;
+                    }
+                    match page.last() {
+                        Some((k, _)) if page.len() == PAGE => start = [k.as_slice(), &[0u8]].concat(),
+                        _ => break,
+                    }
+                }
+            }
+            Ok(sum)
+        };
+        match walk() {
+            Ok(sum) => {
+                if let Some(ref m) = ctx.metrics {
+                    m.liquidation_value_sum.set(sum.raw() as f64 / FixedPoint::SCALE as f64);
+                }
+                tracing::info!(height = ctx.block_height, value_sum = %sum, "liquidation: value sum");
+            }
+            Err(e) => tracing::debug!(%e, "liquidation telemetry: value sum unreadable"),
+        }
+    }
+
+    /// adl-budget A7 (metrics only, read-only): the obligation rows, and Σ
+    /// over both escrows of |size| x mark (notional) and of available + UPnL
+    /// at the step's marks (the queue's deficit; unmarked: entry).
+    fn adl_queue_telemetry<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        marks: &Marks,
+    ) -> Result<(u64, FixedPoint, FixedPoint), CoreError> {
+        let of = |_| CoreError::Overflow("adl escrow telemetry overflows i128".into());
+        let rows = liq::tag_count(&ctx.state, liq::ADL_OBLIGATION_TAG)?;
+        let (mut notional, mut deficit) = (FixedPoint::ZERO, FixedPoint::ZERO);
+        for e in [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
+            let b = ctx.positions.get_native_balance(&e)?;
+            deficit = deficit.checked_add(b.available).and_then(|d| d.checked_add(b.order_margin)).map_err(of)?;
+            for p in ctx.positions.positions_for_trader(&e)? {
+                let t = torus_core::margin::position_terms(&p, marks.get(&p.market_id).copied(), None)?;
+                notional = notional.checked_add(t.notional).map_err(of)?;
+                deficit = deficit.checked_add(t.upnl).map_err(of)?;
+            }
+        }
+        Ok((rows, notional, deficit))
     }
 
     /// Node-local telemetry of one step (after its timer stopped): the
@@ -94,7 +175,7 @@ impl NativeExecutor {
                 use std::sync::atomic::Ordering::Relaxed;
                 let cached = m.liquidation_pending_rows_cache.load(Relaxed);
                 let rows = if s.pending_changed || cached < 0 {
-                    liq::pending_count(&ctx.state)
+                    liq::tag_count(&ctx.state, liq::PENDING_TAG)
                 } else {
                     Ok(cached as u64)
                 };
@@ -122,6 +203,20 @@ impl NativeExecutor {
             m.liquidation_deferred.set(s.deferred.len() as i64);
             if let Some(p) = pending {
                 m.liquidation_pending.set(p as i64);
+            }
+            let tokens = |raw: i128| raw as f64 / FixedPoint::SCALE as f64;
+            m.liquidation_adl_work_total.inc_by(s.adl_work);
+            m.liquidation_adl_dust.inc_by(tokens(s.adl_dust));
+            m.liquidation_adl_pairing.inc_by(tokens(s.adl_pairing));
+            if ctx.fatal_error.is_none() {
+                match Self::adl_queue_telemetry(ctx, &s.marks) {
+                    Ok((rows, notional, deficit)) => {
+                        m.liquidation_adl_queue.set(rows as i64);
+                        m.liquidation_adl_escrow_notional.set(tokens(notional.raw()));
+                        m.liquidation_adl_queue_deficit.set(tokens(deficit.raw()));
+                    }
+                    Err(e) => tracing::debug!(%e, "liquidation telemetry: ADL queue unreadable"),
+                }
             }
         }
         let ms = took.as_secs_f64() * 1e3;
@@ -286,6 +381,7 @@ impl NativeExecutor {
                 m.liquidator_vault_deficit.set(deficit);
             }
         }
+        stats.marks = marks;
         Ok(results)
     }
 

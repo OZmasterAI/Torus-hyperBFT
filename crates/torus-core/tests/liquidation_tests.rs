@@ -504,13 +504,14 @@ fn put_obligation_rejects_a_negative_size_or_a_non_positive_price() {
     assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(o), "row kept");
 }
 
-/// Telemetry: `pending_count` counts exactly the pending rows across seek
+/// Telemetry: `tag_count` counts exactly the pending rows across seek
 /// pages (1,030 rows > one 1,024-row page), ignoring the other tags (a
 /// cooldown row, the cursor); `pending_among` counts the rows of a sorted
 /// trader list only. `set_pending` reports whether it changed the row.
 #[test]
 fn pending_rows_are_counted_across_pages() {
-    use torus_core::liquidation::{pending_among, pending_count, put_cursor, set_cooldown, set_pending};
+    use torus_core::liquidation::{pending_among, put_cursor, set_cooldown, set_pending, tag_count, PENDING_TAG};
+    let pending_count = |db: &StateDb| tag_count(db, PENDING_TAG);
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     assert_eq!(pending_count(&db).unwrap(), 0);

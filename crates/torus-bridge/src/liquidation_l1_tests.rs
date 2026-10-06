@@ -112,6 +112,10 @@ struct BlockOut {
     markets: String,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     triggered: u64,
+    /// adl-budget A7: `liquidation_adl_work_total` after the block (drain
+    /// work units: a ranking examines `liq_traders_after(None, MAX)`, the
+    /// slot list on the L1 path, the walk on the reference path).
+    adl_work: u64,
 }
 
 /// Counters of the L1 run (non-vacuous checks).
@@ -384,7 +388,8 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
         let mut rows = liq_rows;
         rows.extend(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap());
         rows.extend(overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
-        out.push(BlockOut { results, markets, rows, triggered: metrics.liquidations_triggered.get() });
+        let adl_work = metrics.liquidation_adl_work_total.get();
+        out.push(BlockOut { results, markets, rows, triggered: metrics.liquidations_triggered.get(), adl_work });
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
@@ -407,6 +412,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
 #[test]
 fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     let mut stats = Stats::default();
+    let mut drain_blocks = 0;
     for seed in 1..=6u64 {
         let with_l1 = run(seed * 0x517C_C1B7, true, &mut stats);
         let reference = run(seed * 0x517C_C1B7, false, &mut Stats::default());
@@ -415,9 +421,13 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
             assert_eq!(a.markets, b.markets, "seed {seed} block {}: margin configs / listed markets", h + 1);
             assert!(a.rows == b.rows, "seed {seed} block {}: liquidation / position / balance rows", h + 1);
             assert_eq!(a.triggered, b.triggered, "seed {seed} block {}: liquidations_triggered", h + 1);
+            assert_eq!(a.adl_work, b.adl_work, "seed {seed} block {}: ADL drain work units", h + 1);
+            let prev = if h == 0 { 0 } else { with_l1[h - 1].adl_work };
+            drain_blocks += usize::from(a.adl_work > prev);
         }
     }
-    println!("LIQ_L1 P3 {stats:?}");
+    println!("LIQ_L1 P3 {stats:?} drain_blocks={drain_blocks}");
+    assert!(drain_blocks >= 6, "blocks with ADL drain work: {drain_blocks}");
     let s = &stats;
     assert!(s.stage1 > 20 && s.backstop > 20 && s.adl > 5 && s.vault_adl > 0, "every class met: {s:?}");
     assert!(s.skipped > 100 && s.cuts > 10 && s.cooldowns > 5, "skips, cursor cuts, chunks: {s:?}");

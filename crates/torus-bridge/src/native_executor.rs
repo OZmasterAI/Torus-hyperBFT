@@ -3582,6 +3582,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 
     /// Optional metrics handle for Prometheus instrumentation.
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
+    /// adl-budget A7, node-local and proof-only (the node sets it from
+    /// `TORUS_LIQ_VALUE_SUM=1`): with metrics attached, every liquidation step
+    /// also walks all balances and positions for the value-sum gauge and log
+    /// line. Never read by execution. Default false.
+    pub liq_value_sum: bool,
 
     /// T1.5: set (never cleared) when a market worker panicked mid-matching.
     /// The panicking worker consumed its market's `OrderBook`, so this block's
@@ -4056,6 +4061,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             inline_fills_written: 0,
             fill_effects_scratch: Vec::new(),
             metrics: None,
+            liq_value_sum: false,
             fatal_error: load_error,
             book_mode,
             book_mode_marker_present,

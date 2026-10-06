@@ -159,7 +159,7 @@ fn place(ctx: &mut NativeExecContext, t: &Address, p: PlaceOrderParams) {
 }
 
 /// The aggregated mark of `m` at the context's block (3 equal reporters).
-fn set_mark(ctx: &NativeExecContext, m: MarketId, price: FixedPoint) {
+fn set_mark<T: StateBackend>(ctx: &NativeExecContext<T>, m: MarketId, price: FixedPoint) {
     let reporters = [addr(150), addr(151), addr(152)];
     for v in &reporters {
         ctx.oracle.submit_price(v, m, price, ctx.block_height, ctx.timestamp).unwrap();
@@ -1318,6 +1318,7 @@ fn p2_exhausted_counterparties_pair_the_escrows() {
     let pairing = ev.events("liquidation: ADL escrow pairing");
     assert_eq!(pairing.len(), 1);
     assert_eq!(pairing[0]["vault"], fp(400).to_string());
+    assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_pairing.get(), 400.0, "A7 gauge");
     assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
@@ -1914,8 +1915,36 @@ fn telemetry_pending_counts_work_the_act_budget_deferred() {
     assert_eq!(tel, want);
 }
 
+/// A P2 run over a counting backend: blocks 1-5 of [`p2_fixture`] (W = 19,
+/// a multi-block drain), with or without metrics and the value-sum flag.
+/// Returns the step results and the touched CFs per block, and the
+/// `CF_NATIVE_BALANCES` iterations the steps made.
+fn p2_telemetry_run(metrics: bool, value_sum: bool) -> (Vec<String>, Vec<Vec<Vec<(Vec<u8>, Vec<u8>)>>>, usize) {
+    let (_d, db) = p2_fixture();
+    let state = CountingBackend::new(db.clone());
+    let met = metrics.then(|| std::sync::Arc::new(torus_telemetry::Metrics::new()));
+    let (mut results, mut rows) = (Vec::new(), Vec::new());
+    state.arm_storage_probe();
+    for (h, mark) in [(1u64, 1_000), (2, 900), (3, 900), (4, 900), (5, 900)] {
+        let mut c = NativeExecContext::new(state.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+        for m in 1..=4 {
+            set_mark(&c, m, fp(mark));
+        }
+        c.metrics = met.clone();
+        c.liq_value_sum = value_sum;
+        results.push(format!("{:?}", NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, 19)));
+        assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        rows.push([CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, CF_NATIVE_LIQUIDATION].map(|cf| db.iterate_cf(cf, None).unwrap()).to_vec());
+    }
+    state.disarm_storage_probe();
+    let walks = state.take_layer_calls().iter().filter(|((cf, op), _)| *cf == CF_NATIVE_BALANCES && op.starts_with("iterate")).map(|(_, n)| n).sum();
+    (results, rows, walks)
+}
+
 /// Node-local: attaching metrics changes neither the step's results nor any
 /// state row (every CF the step touches, dumped after the three blocks).
+/// adl-budget A7: neither does the value sum; without metrics or with the
+/// flag off the step walks no `CF_NATIVE_BALANCES` (a P2 multi-block drain).
 #[test]
 fn telemetry_does_not_change_results_or_state() {
     let (_d1, db1, _, r1) = budget_fixture(true);
@@ -1923,6 +1952,80 @@ fn telemetry_does_not_change_results_or_state() {
     assert_eq!(r1, r2, "step results");
     for cf in [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS, CF_NATIVE_LIQUIDATION] {
         assert_eq!(db1.iterate_cf(cf, None).unwrap(), db2.iterate_cf(cf, None).unwrap(), "{cf}");
+    }
+    let (r_on, rows_on, walks_on) = p2_telemetry_run(true, true);
+    assert!(walks_on > 0, "the value sum walks the balances");
+    for (metrics, flag) in [(true, false), (false, true), (false, false)] {
+        let (r, rows, walks) = p2_telemetry_run(metrics, flag);
+        assert_eq!(r, r_on, "results, metrics {metrics} flag {flag}");
+        assert!(rows == rows_on, "rows, metrics {metrics} flag {flag}");
+        assert_eq!(walks, 0, "no value-sum walk, metrics {metrics} flag {flag}");
+    }
+}
+
+/// adl-budget A7 (node-local): with metrics the step reports the ADL queue
+/// (obligation ROWS), the escrows' notional at the step's marks, the queue
+/// deficit (Σ over both escrows of available + UPnL at the marks), the
+/// drain's work units and the swept dust (cumulative, signed); with
+/// `liq_value_sum` on, the value sum over ALL accounts (= the test's
+/// `total_value` after every block, constant across the drain within the
+/// dust bound). B = block 2 with W = 0: 8 rows, the long escrow long 2 in
+/// each market (8 x 900 notional); then W = 19: block 3 drains 3 rows for 20
+/// units (9 + 2 + 9, A = 7), and later blocks the rest.
+#[test]
+fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
+    let (_d, db) = p2_fixture();
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let step = |h: u64, mark: i64, w: u64| {
+        let mut c = ctx_at(db.clone(), h);
+        for m in 1..=4 {
+            set_mark(&c, m, fp(mark));
+        }
+        c.metrics = Some(met.clone());
+        c.liq_value_sum = true;
+        NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
+        assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        c
+    };
+    let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;
+    let escrows = |c: &NativeExecContext| {
+        [ADL_ESCROW_LONG, ADL_ESCROW_SHORT].iter().fold(FixedPoint::ZERO, |s, e| {
+            let held = c.positions.positions_for_trader(e).unwrap();
+            held.iter().fold(s + bal(c, e).available, |s, p| s + p.unrealized_pnl(fp(900)))
+        })
+    };
+    drop(step(1, 1_000, 0));
+    let c = step(2, 900, 0);
+    assert_eq!(met.liquidation_adl_queue.get(), 8, "rows");
+    assert_eq!(met.liquidation_adl_escrow_notional.get(), 7_200.0);
+    let deficit = escrows(&c);
+    assert_eq!(met.liquidation_adl_queue_deficit.get(), tokens(deficit));
+    let owed = obligations(&c).iter().fold(FixedPoint::ZERO, |s, o| s + fp(900) - o.price);
+    assert!((deficit - owed).raw().abs() <= 1, "≈ Σ (900 - price) over the rows: {deficit:?} vs {owed:?}");
+    assert_eq!(met.liquidation_adl_work_total.get(), 0, "W = 0: no drain");
+    let before = total_value(&c, &p2_marks(900));
+    assert_eq!(met.liquidation_value_sum.get(), tokens(before));
+    drop(c);
+    let mut h = 3;
+    loop {
+        let c = step(h, 900, 19);
+        if h == 3 {
+            assert_eq!((met.liquidation_adl_work_total.get(), met.liquidation_adl_queue.get()), (20, 5));
+        }
+        assert_eq!(met.liquidation_adl_queue.get(), obligations(&c).len() as i64, "block {h}");
+        let now = total_value(&c, &p2_marks(900));
+        assert_eq!(met.liquidation_value_sum.get(), tokens(now), "block {h}");
+        assert!((now - before).raw().abs() <= P2_DUST_BOUND, "block {h}: constant within the dust bound");
+        if obligations(&c).is_empty() {
+            assert_eq!(met.liquidation_adl_escrow_notional.get(), 0.0);
+            assert_eq!(met.liquidation_adl_queue_deficit.get(), 0.0);
+            let dust = bal(&c, &LIQUIDATOR_VAULT).available; // D9 at B = 0 (the B test)
+            assert!(dust != FixedPoint::ZERO);
+            assert_eq!(met.liquidation_adl_dust.get(), tokens(dust));
+            break;
+        }
+        h += 1;
+        assert!(h < 10, "drained");
     }
 }
 

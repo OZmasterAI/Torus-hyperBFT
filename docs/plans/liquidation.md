@@ -291,6 +291,13 @@ left unclassified (an upper bound; counting exactly would mean classifying up to
 accounts on every budget-cut block) and `torus_liquidation_deferred` (that second part alone).
 The pending rows are re-counted only on a step that changed one (or the first step after a
 start); `adl` counts ADL runs (an ADL'd account, or the vault, also when nothing closes).
+adl-budget A7: gauges `torus_liquidation_adl_queue` (obligation rows),
+`torus_liquidation_adl_queue_deficit` (Σ over both escrows of available + UPnL at the marks),
+`torus_liquidation_adl_escrow_notional`, the cumulative `torus_liquidation_adl_dust` /
+`torus_liquidation_adl_pairing`, counter `torus_liquidation_adl_work_total`; with
+`TORUS_LIQ_VALUE_SUM=1` (proof runs) the gauge `torus_liquidation_value_sum` and an info line
+`liquidation: value sum` per step (Σ over all accounts at the marks; a full balance + position
+walk).
 Logs: one info line per step that acted (height, scanned, acted, per-class counts, deferred,
 pending, the drain's rows / work units / dust / pairing, ms), debug otherwise; one info line per
 ADL'd (account, market) (`liquidation: ADL to escrow`: size, base, bankruptcy, price), each
