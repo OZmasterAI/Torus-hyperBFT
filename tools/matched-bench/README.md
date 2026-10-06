@@ -136,12 +136,18 @@ python3 tools/matched-bench/test_harness.py
    even-index senders lose on every position (with `MPS` set, sides follow
    owner rank instead; run-cell warns). With either set, the liquidator vault
    joins the digest accounts, `vault-val<i>.json` holds each node's
-   `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter
-   and vault deficit. `liq_stress.py <cell>` writes `liq-stress.json`
-   (liquidations per node, vault, shock height, first / last liquidation, exec
-   lag around the shock). Not measurable without node instrumentation:
-   liquidation step ms per block, blocks until no liquidatable account
-   remains (only a lower bound), and ADL'd counterparties.
+   `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter,
+   vault deficit and (feat/liq-telemetry) the step timer, per-class / scanned /
+   acted counters and the pending / deferred gauges. `liq_stress.py <cell>`
+   writes `liq-stress.json` (liquidations per node and per class, vault, shock
+   height, first / last liquidation, step ms per block (baseline, window,
+   window max), the pending timeline and `blocks_shock_to_pending_zero`, exec
+   lag around the shock). `torus_liquidation_pending` is an upper bound
+   (pending rows plus the scan-window candidates the act budget left
+   unclassified; see `docs/monitoring-setup.md`). On a binary without the
+   telemetry it falls back to the lower bound from the triggered counter.
+   ADL counterparties are in the node logs (`liquidation: ADL close`), not
+   parsed.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`

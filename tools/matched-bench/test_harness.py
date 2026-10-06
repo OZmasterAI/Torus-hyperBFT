@@ -2455,7 +2455,12 @@ class LiqStressHarnessTest(unittest.TestCase):
         r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="400")
         self.assertEqual(
             r.stdout.strip(),
-            "a b torus_liquidations_triggered_total torus_liquidator_vault_deficit",
+            "a b torus_liquidations_triggered_total torus_liquidator_vault_deficit"
+            " torus_liquidation_step_seconds_sum torus_liquidation_step_seconds_count"
+            " torus_liquidations_stage1_total torus_liquidations_backstop_total"
+            " torus_liquidations_adl_total torus_liquidation_scanned_total"
+            " torus_liquidation_acted_total torus_liquidation_pending"
+            " torus_liquidation_deferred",
             r.stderr,
         )
 

@@ -195,7 +195,9 @@
 #                (LIQUIDATOR_VAULT) joins the state digest accounts, each node's
 #                torus_getLiquidatorVault is saved as vault-val<i>.json, and
 #                torus_liquidations_triggered_total / torus_liquidator_vault_deficit
-#                are sampled at 1 Hz; otherwise the cell is unchanged. Analysis:
+#                and the liquidation telemetry (step timer _sum/_count, per-class /
+#                scanned / acted counters, pending / deferred gauges) are sampled
+#                at 1 Hz; otherwise the cell is unchanged. Analysis:
 #                tools/matched-bench/liq_stress.py <results-dir>.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
@@ -839,6 +841,10 @@ BUCKET_METRICS="torus_commit_interval_seconds_bucket torus_exec_chain_seconds_bu
 # cells keep today's columns).
 if liq_stress_on; then
     WIDE_COLS="$WIDE_COLS torus_liquidations_triggered_total torus_liquidator_vault_deficit"
+    # feat/liq-telemetry: step timer, per-class / scanned / acted counters,
+    # pending and deferred gauges (zeros on an older binary; liq_stress.py
+    # checks metrics-after-*.txt for the timer).
+    WIDE_COLS="$WIDE_COLS torus_liquidation_step_seconds_sum torus_liquidation_step_seconds_count torus_liquidations_stage1_total torus_liquidations_backstop_total torus_liquidations_adl_total torus_liquidation_scanned_total torus_liquidation_acted_total torus_liquidation_pending torus_liquidation_deferred"
 fi
 WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
