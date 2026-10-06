@@ -343,17 +343,20 @@ fn screen_payload(
 /// Item 6 M1: the rule, the text and the row decoder are the executor's
 /// (`torus_core::order_book::{shape_violation, market_row_shape}`), and the
 /// executor creates a missing book with the row's tick / lot (row 42).
+/// Row 44 (s94 B): a row that does not decode gets the executor's 1 / 1
+/// (`NativeExecutor::market_shape`).
 /// A batch is one signed action, so one bad order rejects all of it.
 pub(crate) fn validate_known_markets(
     action: &torus_types::NativeAction,
     state_db: &torus_state::StateDb,
 ) -> Result<(), String> {
     // `(tick, lot)` of a listed market (item 6 M1: the decoder the executor
-    // creates books with); `None` when the row does not decode as a market
-    // (placeholder rows): only existence is checked then.
-    let spec = |mid: u64| -> Result<Option<(FixedPoint, FixedPoint)>, String> {
+    // creates books with); `(ONE, ONE)` when the row does not decode as a
+    // market (placeholder rows), as the executor does (row 44).
+    let spec = |mid: u64| -> Result<(FixedPoint, FixedPoint), String> {
         match state_db.get_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes()) {
-            Ok(Some(row)) => Ok(torus_core::order_book::market_row_shape(&row)),
+            Ok(Some(row)) => Ok(torus_core::order_book::market_row_shape(&row)
+                .unwrap_or((FixedPoint::ONE, FixedPoint::ONE))),
             Ok(None) => Err(format!("unknown market_id {mid}")),
             Err(e) => Err(format!("market lookup failed: {e}")),
         }
@@ -441,13 +444,15 @@ fn check_price_band(
 /// lot applies to every order type (`qty < lot`, so lot 0 admits any qty >=
 /// 0); the tick to a `Limit` price and a `StopLimit` limit, only when tick >
 /// 0. Message = the executor's ("order rejected: ...").
+/// Row 46 (s94 B): first, as the executor does (`validate_order_price`,
+/// same text), a `Limit` price must be positive.
 fn check_tick_lot(
     p: &torus_types::PlaceOrderParams,
-    spec: Option<(FixedPoint, FixedPoint)>,
+    (tick, lot): (FixedPoint, FixedPoint),
 ) -> Result<(), String> {
-    let Some((tick, lot)) = spec else {
-        return Ok(());
-    };
+    if matches!(p.order_type, torus_types::OrderType::Limit) && p.price <= FixedPoint::ZERO {
+        return Err(format!("limit order requires a positive price, got {}", p.price));
+    }
     match torus_core::order_book::shape_violation(p, tick, lot) {
         Some(v) => Err(v.placement_message()),
         None => Ok(()),
@@ -2915,15 +2920,70 @@ mod tick_lot_ingress_tests {
         );
     }
 
-    /// Rows that do not decode as a market (test fixtures seed placeholders)
-    /// keep today's behaviour: the market exists, nothing else is checked.
+    /// Row 46 (s94 B): a Limit with a price <= 0 is refused at intake with
+    /// the executor's text (`validate_order_price`), checked before the
+    /// tick / lot as the executor does (a sub-lot one gets the price text).
     #[test]
-    fn undecodable_row_only_checks_existence() {
+    fn limit_price_not_positive_is_refused_with_the_executors_text() {
+        use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+        use torus_core::position::NativeBalance;
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let rb = alloy_primitives::Address::repeat_byte;
+        let mut ctx = NativeExecContext::new(state.clone(), 1, 1000, 0, 100, 10, rb(99), rb(100), rb(101));
+        let trader = rb(1);
+        let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&trader, &bal).unwrap();
+        for (price, qty, want) in [
+            (0, S, "limit order requires a positive price, got 0.00000000"),
+            (-S, S, "limit order requires a positive price, got -1.00000000"),
+            (0, S / 2, "limit order requires a positive price, got 0.00000000"),
+        ] {
+            let p = order(1, price, qty, OrderType::Limit);
+            assert_eq!(place(&state, p.clone()).unwrap_err(), want);
+            let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
+            assert_eq!(exec.error.as_deref(), Some(want));
+        }
+        let batch = vec![order(1, 100 * S, S, OrderType::Limit), order(1, 0, S, OrderType::Limit)];
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap_err();
+        assert_eq!(e, "limit order requires a positive price, got 0.00000000");
+    }
+
+    /// Row 44 (s94 B): a row that does not decode as a market (test fixtures
+    /// seed placeholders) gets the executor's tick / lot 1 / 1
+    /// (`NativeExecutor::market_shape`), so the RPC and the executor give the
+    /// same answer and text for every order; an unknown market still fails.
+    #[test]
+    fn undecodable_row_applies_the_executors_one_one() {
+        use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+        use torus_core::position::NativeBalance;
         let (_d, state) = db();
         state
             .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
             .unwrap();
-        place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
+        let rb = alloy_primitives::Address::repeat_byte;
+        let mut ctx = NativeExecContext::new(state.clone(), 1, 1000, 0, 100, 10, rb(99), rb(100), rb(101));
+        let trader = rb(1);
+        let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&trader, &bal).unwrap();
+        let fpr = FixedPoint::from_raw;
+        let trig = fpr(200 * S);
+        let orders = [
+            (order(1, 100 * S, S, OrderType::Limit), None),
+            (order(1, 100 * S + 7, S, OrderType::Limit), Some("order rejected: price 100.00000007 is not a multiple of the tick 1.00000000")),
+            (order(1, 100 * S, 1, OrderType::Limit), Some("order rejected: quantity 0.00000001 below the lot size 1.00000000")),
+            (order(1, 0, S, OrderType::StopLimit { trigger: trig, limit: fpr(150 * S + 1) }), Some("order rejected: price 150.00000001 is not a multiple of the tick 1.00000000")),
+            (order(1, 300 * S, S / 2, OrderType::StopMarket { trigger: trig }), Some("order rejected: quantity 0.50000000 below the lot size 1.00000000")),
+        ];
+        for (i, (p, want)) in orders.into_iter().enumerate() {
+            let rpc = place(&state, p.clone());
+            assert_eq!(rpc.as_ref().err().map(String::as_str), want, "#{i}");
+            let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
+            match want {
+                Some(e) => assert_eq!(exec.error.as_deref(), Some(e), "#{i}"),
+                None => assert!(exec.error.is_none(), "#{i}: {:?}", exec.error),
+            }
+        }
         let e = place(&state, order(9, 100 * S, S, OrderType::Limit)).unwrap_err();
         assert_eq!(e, "unknown market_id 9");
     }

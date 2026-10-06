@@ -308,6 +308,28 @@ fn reduce_only_modify_is_clamped_to_position() {
     }
 }
 
+/// Row 52 (s94 B): modifying a reduce-only order when the position is gone
+/// is refused with its own reason, `ReduceOnly` (was `Other`).
+#[test]
+fn reduce_only_modify_without_position_has_its_own_reason() {
+    use torus_state::action_status::FailureReason;
+    for path in PATHS {
+        let t = addr(1);
+        let maker = addr(2);
+        let (_d, mut ctx) = fresh(&[t, maker]);
+        place_one(&mut ctx, path, maker, limit(1, false, 100, 5));
+        let r = run(&mut ctx, path, &[place(t, limit(1, true, 100, 5))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        let ro = place_one(&mut ctx, path, t, PlaceOrderParams { reduce_only: true, ..limit(1, false, 200, 2) });
+        // The position is gone; the resting reduce-only order is not re-policed yet.
+        ctx.positions.delete_position(&t, 1).unwrap();
+        let r = run(&mut ctx, path, &[modify(t, ro, None, Some(fp(1)))]);
+        assert!(!r[0].success, "{path:?}: must be rejected");
+        assert_eq!(r[0].error.as_deref(), Some("reduce-only order rejected: no position to reduce"), "{path:?}");
+        assert_eq!(r[0].reason, FailureReason::ReduceOnly, "{path:?}");
+    }
+}
+
 /// Reserve, modify (up, down, reprice), cancel: the order's whole reservation
 /// comes back — order_margin returns exactly to 0, no drift.
 #[test]

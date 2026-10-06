@@ -45,8 +45,9 @@ pub const MAX_MESSAGE_BYTES: usize = 96;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FailureReason {
-    /// Anything without its own code (unknown order, ownership, reduce-only,
-    /// staking / governance / oracle / session errors, state read errors).
+    /// Anything without its own code (unknown order, ownership, staking /
+    /// governance / oracle / session errors, state read errors). Records
+    /// written before row 52 also hold reduce-only rejects here.
     Other = 0,
     /// An account margin check: placement, modify, withdrawal.
     Margin = 1,
@@ -66,6 +67,11 @@ pub enum FailureReason {
     /// s94: an order price outside the price band around the market's
     /// reference price (placement, modify; HL `oracleRejected`).
     PriceBand = 8,
+    /// Row 52 (s94 B): a reduce-only order that cannot reduce the position
+    /// (no position, or the increasing side), at placement or modify
+    /// (HL `reduceOnlyRejected`; the row 50 status maps it). Before row 52
+    /// stored as `Other`; an older reader reads code 9 as `Other`.
+    ReduceOnly = 9,
 }
 
 impl FailureReason {
@@ -80,6 +86,7 @@ impl FailureReason {
             6 => Self::BatchCap,
             7 => Self::Fill,
             8 => Self::PriceBand,
+            9 => Self::ReduceOnly,
             _ => Self::Other,
         }
     }
@@ -96,6 +103,7 @@ impl FailureReason {
             Self::BatchCap => "batch_cap",
             Self::Fill => "fill",
             Self::PriceBand => "price_band",
+            Self::ReduceOnly => "reduce_only",
         }
     }
 }
@@ -384,6 +392,7 @@ mod tests {
             (FailureReason::BatchCap, 6, "batch_cap"),
             (FailureReason::Fill, 7, "fill"),
             (FailureReason::PriceBand, 8, "price_band"),
+            (FailureReason::ReduceOnly, 9, "reduce_only"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");

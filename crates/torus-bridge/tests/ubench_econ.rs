@@ -9,6 +9,11 @@
 //! submit the mid (`TARGET * LEV`) for every market each block, so
 //! `begin_block_oracle` aggregates a usable mark (a fed chain: margin and the
 //! liquidation scan value accounts). Default: no listed market, no marks.
+//! Row 69 (s94 B): the listed markets get genesis-layout rows (tick / lot 1,
+//! one 5% tier) by default; `UB_REAL_MARKETS=0` gives the `b"listed"`
+//! placeholders of earlier runs. UB_MARKS=1 numbers from before row 69 are
+//! only comparable with `UB_REAL_MARKETS=0` (`common/econ_load.rs`
+//! `real_markets`).
 //! `UB_MARK_WALK=<bp>` (with `UB_MARKS=1`, item 6 step 0.5): the submitted
 //! mark of every market walks `±bp` per block around the mid (bounded, mean-
 //! reverting, deterministic: `common/econ_load.rs` `MarkWalk`), so the mark
@@ -32,7 +37,7 @@
 #[path = "common/econ_load.rs"]
 mod econ_load;
 
-use econ_load::{base_mark, env, feed_setup, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
+use econ_load::{base_mark, env, feed_setup, real_markets, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
 use std::collections::HashMap;
 use std::sync::Arc;
 use torus_bridge::native_executor::{
@@ -107,7 +112,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         }
     }
     if fed {
-        feed_setup(&db, markets);
+        feed_setup(&db, markets, real_markets());
     }
     let metrics = Arc::new(torus_telemetry::Metrics::new());
     let mut gen = Gen {
@@ -308,8 +313,9 @@ fn ubench_econ() {
         per_run.push(per1k);
     }
     println!(
-        "UB marks={} walk_bp={} resident_rows={} r_worker={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
+        "UB marks={} real_markets={} walk_bp={} resident_rows={} r_worker={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
         env("UB_MARKS", 0) == 1,
+        env("UB_MARKS", 0) == 1 && real_markets(),
         env("UB_MARK_WALK", 0),
         env("UB_NO_R", 0) != 1,
         env("UB_R_WORKER", 0) == 1,
@@ -344,4 +350,26 @@ fn mark_walk_zero_is_the_mid_and_offsets_are_pinned() {
         }
     }
     assert_eq!(market_1, [10, 0, -10, -20, -30, -20, -10, 0, -10, -20, -10, 0]);
+}
+
+/// Row 69 (s94 B): listed markets get genesis-layout rows by default (tick /
+/// lot 1, one 5% tier = 20x, as on a node); `UB_REAL_MARKETS=0` gives back
+/// the `b"listed"` placeholders of the runs before row 69, which decode as
+/// no market (default tiers, 1 / 1) and cost a failed borsh decode per read.
+#[test]
+fn market_rows_are_real_by_default_and_zero_gives_the_placeholders() {
+    use econ_load::{market_row, real_markets};
+    let row = market_row(true);
+    assert_eq!(torus_core::order_book::market_row_shape(&row), Some((FixedPoint::ONE, FixedPoint::ONE)));
+    assert_eq!(torus_core::margin::market_margin_config(1, &row).map(|c| c.max_leverage), Some(20));
+    assert_eq!(market_row(false), b"listed");
+    assert!(torus_core::margin::market_margin_config(1, &market_row(false)).is_none());
+    // One test in this binary touches the variable (the µbench is ignored).
+    std::env::remove_var("UB_REAL_MARKETS");
+    assert!(real_markets(), "default: real rows");
+    std::env::set_var("UB_REAL_MARKETS", "0");
+    assert!(!real_markets(), "UB_REAL_MARKETS=0: placeholders");
+    std::env::set_var("UB_REAL_MARKETS", "1");
+    assert!(real_markets());
+    std::env::remove_var("UB_REAL_MARKETS");
 }

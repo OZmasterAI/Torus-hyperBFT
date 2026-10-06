@@ -1141,7 +1141,7 @@ mod tests {
             market_id,
             is_buy: true,
             price: torus_types::FixedPoint::from_raw(6_500_000_000_000),
-            quantity: torus_types::FixedPoint::from_raw(10_000_000),
+            quantity: torus_types::FixedPoint::from_raw(100_000_000), // 1.0: the placeholder row gets lot 1 (row 44)
             order_type: torus_types::OrderType::Limit,
             time_in_force: torus_types::TimeInForce::GTC,
             reduce_only: false,
@@ -1360,7 +1360,8 @@ mod tests {
                 .map(|i| torus_types::PlaceOrderParams {
                     market_id: 1,
                     is_buy: i % 2 == 0,
-                    price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
+                    // On tick 1: the placeholder row gets tick / lot 1 / 1 (row 44).
+                    price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128 * 100_000_000),
                     quantity: torus_types::FixedPoint::from_raw(100_000_000),
                     order_type: torus_types::OrderType::Limit,
                     time_in_force: torus_types::TimeInForce::GTC,

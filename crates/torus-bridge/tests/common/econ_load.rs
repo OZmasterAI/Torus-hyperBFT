@@ -57,8 +57,31 @@ pub fn base_mark() -> FixedPoint {
     FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE)
 }
 
-/// `UB_MARKS=1`: three Active validators and markets `1..=markets` listed.
-pub fn feed_setup(db: &StateDb, markets: u64) {
+/// Row 69 (s94 B): `UB_REAL_MARKETS` (default 1): listed markets get
+/// genesis-layout rows ([`market_row`]). `UB_REAL_MARKETS=0`: the `b"listed"`
+/// placeholders of every run before row 69, for comparisons with those runs.
+/// The two are NOT comparable: a placeholder decodes as no market (default
+/// margin tiers instead of one 20x tier) and each read of it costs a failed
+/// borsh decode (~20 us, up to 1 MiB allocated; ~6 ms of ctx per block at
+/// 300 markets in `ubench_epoch`).
+pub fn real_markets() -> bool {
+    env("UB_REAL_MARKETS", 1) != 0
+}
+
+/// A listed market's `CF_NATIVE_MARKETS` row: the genesis / governance layout
+/// (base, quote, lot 1, tick 1, initial margin 5% = one 20x tier) when
+/// `real`, else the `b"listed"` placeholder (see [`real_markets`]).
+pub fn market_row(real: bool) -> Vec<u8> {
+    if !real {
+        return b"listed".to_vec();
+    }
+    let one = FixedPoint::ONE.raw();
+    borsh::to_vec(&("BASE".to_string(), "USDC".to_string(), one, one, 5 * one)).unwrap()
+}
+
+/// `UB_MARKS=1`: three Active validators and markets `1..=markets` listed
+/// with [`market_row`]`(real)`.
+pub fn feed_setup(db: &StateDb, markets: u64, real: bool) {
     for n in REPORTERS {
         StakingManager::new(db.clone())
             .put_validator(
@@ -77,8 +100,9 @@ pub fn feed_setup(db: &StateDb, markets: u64) {
             )
             .unwrap();
     }
+    let row = market_row(real);
     for m in 1..=markets {
-        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
     }
 }
 
