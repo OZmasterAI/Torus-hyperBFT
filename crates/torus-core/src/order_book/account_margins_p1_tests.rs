@@ -359,8 +359,11 @@ fn random_book_run(seed: u64, h: &mut u64, counts: &mut [u32; 6]) {
             counts[3] += u32::from(r.status == OrderStatus::Cancelled && lim.is_some());
             counts[4] += r.reduce_only_cuts.len() as u32;
             // s92: `margin_cut_price` is observability only and not in the
-            // pre-P1 golden: it is left out of the hashed text.
-            let r = format!("{:?}", PlaceResult { margin_cut_price: None, ..r }).replace(", margin_cut_price: None", "");
+            // pre-P1 golden: it is left out of the hashed text. Row 50's
+            // `reject` (a label of the status, checked by
+            // `zero_fill_outcomes_carry_their_reason`) likewise.
+            let r = format!("{:?}", PlaceResult { margin_cut_price: None, reject: None, ..r })
+                .replace(", margin_cut_price: None, reject: None", "");
             fnv(h, &format!("{seed}/{batch}/{k} {r}"));
         }
         for t in 0..N {

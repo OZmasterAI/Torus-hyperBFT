@@ -23,7 +23,7 @@ use alloy_primitives::Address;
 #[cfg(test)]
 use torus_bridge::native_executor::classify_action;
 use torus_bridge::NativeBatchResult;
-use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure};
+use torus_state::action_status::{BlockActionStatus, FailureReason, NativeActionFailure, Outcome};
 use torus_types::NativeAction;
 
 /// Result entries `action` contributes to `execute_batch`: one per order of a
@@ -42,8 +42,21 @@ fn flat_len(action: &NativeAction) -> usize {
 }
 
 /// A failing action of one list: (list position, order, failed orders,
-/// the first failing entry's reason and message).
-type ListFailure = (usize, u32, u32, FailureReason, String);
+/// the first failing entry's outcome, reason and message).
+type ListFailure = (usize, u32, u32, Outcome, FailureReason, String);
+
+/// Row 50: an order placement refused for a reason with an HL `*Rejected`
+/// status is `Rejected` (the book's refusals and zero-fill cancels, and the
+/// placement margin / reduce-only checks); anything else that did not
+/// execute `Failed`.
+fn outcome(action: &NativeAction, reason: FailureReason) -> Outcome {
+    let placement = matches!(action, NativeAction::PlaceOrder(_) | NativeAction::PlaceOrderBatch(_));
+    if placement && reason.hl_rejected_name().is_some() {
+        Outcome::Rejected
+    } else {
+        Outcome::Failed
+    }
+}
 
 /// Failures of one `execute_batch` over `list`, by list position. `None` when
 /// the result count does not match the flatten (never expected; the caller
@@ -66,6 +79,7 @@ fn list_failures(
                     pos,
                     0,
                     0,
+                    Outcome::Failed,
                     FailureReason::BatchCap,
                     format!(
                         "PlaceOrderBatch skipped: {} orders, cap {}",
@@ -87,13 +101,14 @@ fn list_failures(
                 .error
                 .take()
                 .unwrap_or_else(|| "failed".to_string());
-            out.push((pos, first as u32, failed_orders, reason, message));
+            out.push((pos, first as u32, failed_orders, outcome(action, reason), reason, message));
         }
     }
     Some(out)
 }
 
-/// The block's native execution failures, ascending body index.
+/// The block's native execution failures and order rejections, ascending
+/// body index.
 ///
 /// `body_index[k]` = body position of the k-th action handed to
 /// `sort_native_actions_indexed` (body order, the replay guard's skips
@@ -117,7 +132,7 @@ pub fn native_failures(
             );
             continue;
         };
-        for (pos, order, failed_orders, reason, message) in failures {
+        for (pos, order, failed_orders, outcome, reason, message) in failures {
             // Both lookups always hit (the sort returns one input position
             // per entry); a miss records nothing, like the content match did.
             let Some(&index) = executed_index
@@ -126,13 +141,10 @@ pub fn native_failures(
             else {
                 continue;
             };
-            out.push(NativeActionFailure::new(
-                index,
-                order,
-                failed_orders,
-                reason,
-                message,
-            ));
+            out.push(NativeActionFailure {
+                outcome,
+                ..NativeActionFailure::new(index, order, failed_orders, reason, message)
+            });
         }
     }
     out.sort_by_key(|f| f.index);
@@ -155,7 +167,7 @@ pub(crate) fn native_failures_by_content(
         let Some(failures) = list_failures(list, &mut result) else {
             continue;
         };
-        for (pos, order, failed_orders, reason, message) in failures {
+        for (pos, order, failed_orders, outcome, reason, message) in failures {
             let by_sender = by_sender.get_or_insert_with(|| {
                 let mut m: HashMap<Address, Vec<usize>> = HashMap::new();
                 for (k, (sender, _)) in executed.iter().enumerate() {
@@ -164,13 +176,10 @@ pub(crate) fn native_failures_by_content(
                 m
             });
             if let Some(k) = body_position(executed, by_sender, list, pos) {
-                out.push(NativeActionFailure::new(
-                    body_index[k],
-                    order,
-                    failed_orders,
-                    reason,
-                    message,
-                ));
+                out.push(NativeActionFailure {
+                    outcome,
+                    ..NativeActionFailure::new(body_index[k], order, failed_orders, reason, message)
+                });
             }
         }
     }
@@ -339,6 +348,55 @@ mod tests {
                 (3, 0, 1, FailureReason::OpenLimit),
                 (4, 0, 0, FailureReason::BatchCap),
             ]
+        );
+    }
+
+    /// Row 50: an order placement refused for an HL rejection reason is
+    /// recorded `Rejected`; any other failure (and a modify refused for
+    /// margin) stays `Failed`. A batch records its first order that did not
+    /// execute, with that order's outcome, and counts every such order.
+    #[test]
+    fn order_rejections_are_recorded_rejected() {
+        use torus_state::action_status::Outcome;
+        let a = Address::repeat_byte(1);
+        let list = vec![
+            (a, NativeAction::PlaceOrder(order(1))),
+            (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3), order(4)])),
+            (a, NativeAction::ModifyOrder { order_id: 1, new_price: None, new_qty: None }),
+            (a, NativeAction::PlaceOrder(order(2))),
+            (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2)])),
+        ];
+        let result = batch(vec![
+            err(FailureReason::IocCancel, "ioc"),
+            ok(),
+            err(FailureReason::BadAloPx, "alo"),
+            err(FailureReason::Tick, "tick"),
+            ok(),
+            err(FailureReason::Margin, "modify margin"),
+            err(FailureReason::Margin, "insufficient margin"),
+            err(FailureReason::Tick, "tick"),
+            err(FailureReason::FokCancel, "fok"),
+        ]);
+        let failures =
+            native_failures(&[0, 1, 2, 3, 4], [(&list, &[0, 1, 2, 3, 4], &mut result.clone()), (&[], &[], &mut batch(vec![]))]);
+        let got: Vec<_> = failures
+            .iter()
+            .map(|f| (f.index, f.order, f.failed_orders, f.outcome, f.reason, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 0, 1, Outcome::Rejected, FailureReason::IocCancel, "ioc"),
+                (1, 1, 2, Outcome::Rejected, FailureReason::BadAloPx, "alo"),
+                (2, 0, 1, Outcome::Failed, FailureReason::Margin, "modify margin"),
+                (3, 0, 1, Outcome::Rejected, FailureReason::Margin, "insufficient margin"),
+                (4, 0, 2, Outcome::Failed, FailureReason::Tick, "tick"),
+            ]
+        );
+        assert!(failures.iter().all(|f| f.orders.is_empty()), "per-order statuses not written yet");
+        assert_eq!(
+            failures,
+            native_failures_by_content(&list, &[0, 1, 2, 3, 4], [(&list, result), (&[], batch(vec![]))])
         );
     }
 

@@ -6,8 +6,11 @@
 //! check (unresolvable signature or session, replayed or duplicate nonce,
 //! undecodable EVM tx, a tx revm refuses). A native action that passes those
 //! checks executes, and the executor may still refuse it (margin, open-order
-//! limit, off-tick price, ...): it then FAILED. This record says which, so the
-//! RPC and the explorer show every action as executed, skipped or failed.
+//! limit, off-tick price, ...): it then FAILED. Row 50: an order refused with
+//! a Hyperliquid `*Rejected` status (the book refused it or cancelled it
+//! without a fill, or the placement margin / reduce-only check) was REJECTED.
+//! This record says which, so the RPC and the explorer show every action as
+//! executed, skipped, failed or rejected.
 //!
 //! One row per executed block that carries at least one native action or EVM
 //! tx, keyed by 8-byte BE height, written in the block's flush batch (same
@@ -27,15 +30,26 @@
 //! bitmap`, each bitmap `ceil(count / 8)` bytes, bit `i % 8` (LSB first) of
 //! byte `i / 8` set = action `i` skipped.
 //!
-//! Encoding v2 (at least one failure): `0x02 ‖ <v1 body after the version
-//! byte> ‖ failure_count u32 BE ‖ failures`, each failure `index u32 BE ‖
-//! order u32 BE ‖ failed_orders u32 BE ‖ reason u8 ‖ msg_len u8 ‖ msg`, in
-//! ascending `index` order, `msg` UTF-8 cut to at most [`MAX_MESSAGE_BYTES`].
+//! Encoding v2 (s92 to row 50, read only): `0x02 ‖ <v1 body after the
+//! version byte> ‖ failure_count u32 BE ‖ failures`, each failure `index u32
+//! BE ‖ order u32 BE ‖ failed_orders u32 BE ‖ reason u8 ‖ msg_len u8 ‖ msg`,
+//! in ascending `index` order, `msg` UTF-8 cut to at most
+//! [`MAX_MESSAGE_BYTES`]. Every v2 entry is [`Outcome::Failed`].
+//!
+//! Encoding v3 (row 50, written whenever an action failed or was rejected):
+//! v2 with each entry `index u32 BE ‖ order u32 BE ‖ failed_orders u32 BE ‖
+//! outcome u8 ‖ reason u8 ‖ msg_len u8 ‖ msg ‖ order_count u32 BE ‖ orders`,
+//! each order `outcome u8 ‖ reason u8 ‖ msg_len u8 ‖ msg`. `outcome` is
+//! [`Outcome::Failed`] or [`Outcome::Rejected`] for an entry. The per-order
+//! list is the room for HL-style per-order statuses (one per order of a
+//! PlaceOrderBatch): written empty today; a reader already decodes it.
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
-/// First byte of a v2 record (v1 + native execution failures).
+/// First byte of a v2 record (v1 + native execution failures; read only).
 const ACTION_STATUS_V2: u8 = 0x02;
+/// First byte of a v3 record (v2 + outcome per entry + per-order statuses).
+const ACTION_STATUS_V3: u8 = 0x03;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -72,6 +86,21 @@ pub enum FailureReason {
     /// (HL `reduceOnlyRejected`; the row 50 status maps it). Before row 52
     /// stored as `Other`; an older reader reads code 9 as `Other`.
     ReduceOnly = 9,
+    /// Row 50: an IOC limit order that found nothing to fill against (HL
+    /// `iocCancelRejected`).
+    IocCancel = 10,
+    /// Row 50: a PostOnly (ALO) order that would have crossed the book (HL
+    /// `badAloPxRejected`).
+    BadAloPx = 11,
+    /// Row 50: a market order with nothing to fill against within its cap
+    /// (HL `marketOrderNoLiquidityRejected`).
+    MarketNoLiquidity = 12,
+    /// Row 50: a FOK order the book could not fill whole (no HL equivalent:
+    /// `fokCancelRejected`, named like `iocCancelRejected`).
+    FokCancel = 13,
+    /// Row 50: a stop whose trigger is on the wrong side of the last trade
+    /// (HL `badTriggerPxRejected`).
+    BadTriggerPx = 14,
 }
 
 impl FailureReason {
@@ -87,6 +116,11 @@ impl FailureReason {
             7 => Self::Fill,
             8 => Self::PriceBand,
             9 => Self::ReduceOnly,
+            10 => Self::IocCancel,
+            11 => Self::BadAloPx,
+            12 => Self::MarketNoLiquidity,
+            13 => Self::FokCancel,
+            14 => Self::BadTriggerPx,
             _ => Self::Other,
         }
     }
@@ -104,18 +138,88 @@ impl FailureReason {
             Self::Fill => "fill",
             Self::PriceBand => "price_band",
             Self::ReduceOnly => "reduce_only",
+            Self::IocCancel => "ioc_cancel",
+            Self::BadAloPx => "bad_alo_px",
+            Self::MarketNoLiquidity => "market_no_liquidity",
+            Self::FokCancel => "fok_cancel",
+            Self::BadTriggerPx => "bad_trigger_px",
+        }
+    }
+
+    /// Row 50: the Hyperliquid `orderStatus` name of an ORDER refused for
+    /// this reason, `None` for a reason that is not an order rejection. An
+    /// order placement refused for one of these is recorded
+    /// [`Outcome::Rejected`] (the rest stay [`Outcome::Failed`]).
+    pub fn hl_rejected_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Margin => "perpMarginRejected",
+            Self::ReduceOnly => "reduceOnlyRejected",
+            Self::IocCancel => "iocCancelRejected",
+            Self::BadAloPx => "badAloPxRejected",
+            Self::MarketNoLiquidity => "marketOrderNoLiquidityRejected",
+            Self::FokCancel => "fokCancelRejected",
+            Self::BadTriggerPx => "badTriggerPxRejected",
+            _ => return None,
+        })
+    }
+}
+
+/// Row 50: what an executed native action (or one order of a batch) came
+/// to. The `u8` codes are stored: never renumber, only add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Outcome {
+    /// Only in a per-order list: this order executed (rests, filled, or
+    /// partly filled with the rest cancelled).
+    Executed = 0,
+    /// The executor refused it (state, limits, shape; not an HL order
+    /// status).
+    Failed = 1,
+    /// An order refused with an HL `*Rejected` status (the book refused or
+    /// cancelled it without a fill, or a placement margin / reduce-only
+    /// check): see [`FailureReason::hl_rejected_name`].
+    Rejected = 2,
+}
+
+impl Outcome {
+    /// Unknown codes (a newer writer) read as `Failed`.
+    fn from_u8(code: u8) -> Self {
+        match code {
+            0 => Self::Executed,
+            2 => Self::Rejected,
+            _ => Self::Failed,
+        }
+    }
+
+    /// `"executed"`, `"failed"` or `"rejected"` (RPC / explorer).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
         }
     }
 }
 
-/// One native action the executor refused, by body position.
+/// Row 50 (v3): one order's status inside an entry (see
+/// [`NativeActionFailure::orders`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderOutcome {
+    pub outcome: Outcome,
+    pub reason: FailureReason,
+    pub message: String,
+}
+
+/// One native action the executor refused (failed) or rejected, by body
+/// position.
 ///
-/// A PlaceOrderBatch is one action of many orders: it fails if ANY of its
-/// orders failed; `order` is the position (inside the batch) of the first
-/// failing order, whose reason and message are the ones recorded, and
-/// `failed_orders` counts its failed orders (the others executed). A batch
-/// skipped wholesale (empty / over the cap) has `failed_orders = 0`. For any
-/// other action `order = 0`, `failed_orders = 1`.
+/// A PlaceOrderBatch is one action of many orders: it has an entry if ANY of
+/// its orders did not execute; `order` is the position (inside the batch) of
+/// the first such order, whose outcome, reason and message are the ones
+/// recorded, and `failed_orders` counts its orders that did not execute
+/// (failed or rejected; the others executed). A batch skipped wholesale
+/// (empty / over the cap) has `failed_orders = 0`. For any other action
+/// `order = 0`, `failed_orders = 1`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeActionFailure {
     pub index: u32,
@@ -123,6 +227,11 @@ pub struct NativeActionFailure {
     pub failed_orders: u32,
     pub reason: FailureReason,
     pub message: String,
+    /// Row 50 (v3): `Failed` or `Rejected` (v1 / v2 entries: `Failed`).
+    pub outcome: Outcome,
+    /// Row 50 (v3): per-order statuses of a batch, in order; empty = not
+    /// recorded (every record written today).
+    pub orders: Vec<OrderOutcome>,
 }
 
 impl NativeActionFailure {
@@ -139,6 +248,8 @@ impl NativeActionFailure {
             failed_orders,
             reason,
             message,
+            outcome: Outcome::Failed,
+            orders: Vec::new(),
         }
     }
 }
@@ -149,8 +260,8 @@ impl NativeActionFailure {
 pub struct BlockActionStatus {
     pub evm_skipped: Vec<bool>,
     pub native_skipped: Vec<bool>,
-    /// Native actions that executed and failed, ascending `index`; never a
-    /// skipped one.
+    /// Native actions that executed and failed or were rejected, ascending
+    /// `index`; never a skipped one.
     pub native_failed: Vec<NativeActionFailure>,
 }
 
@@ -194,15 +305,28 @@ fn take_u8(bytes: &mut &[u8]) -> Option<u8> {
     take(bytes, 1).map(|b| b[0])
 }
 
+/// `msg_len u8 ‖ msg`, cut to [`MAX_MESSAGE_BYTES`].
+fn push_message(out: &mut Vec<u8>, message: &str) {
+    let msg = truncate_utf8(message, MAX_MESSAGE_BYTES);
+    out.push(msg.len() as u8);
+    out.extend_from_slice(msg.as_bytes());
+}
+
+fn take_message(bytes: &mut &[u8]) -> Option<String> {
+    let len = take_u8(bytes)? as usize;
+    Some(std::str::from_utf8(take(bytes, len)?).ok()?.to_string())
+}
+
 impl BlockActionStatus {
-    /// v1 when nothing failed (the s84 bytes exactly), else v2.
+    /// v1 when nothing failed or was rejected (the s84 bytes exactly), else
+    /// v3.
     pub fn encode(&self) -> Vec<u8> {
         let failures = !self.native_failed.is_empty();
         let mut out = Vec::with_capacity(
             9 + self.evm_skipped.len().div_ceil(8) + self.native_skipped.len().div_ceil(8),
         );
         out.push(if failures {
-            ACTION_STATUS_V2
+            ACTION_STATUS_V3
         } else {
             ACTION_STATUS_V1
         });
@@ -216,10 +340,15 @@ impl BlockActionStatus {
                 out.extend_from_slice(&f.index.to_be_bytes());
                 out.extend_from_slice(&f.order.to_be_bytes());
                 out.extend_from_slice(&f.failed_orders.to_be_bytes());
+                out.push(f.outcome as u8);
                 out.push(f.reason as u8);
-                let msg = truncate_utf8(&f.message, MAX_MESSAGE_BYTES);
-                out.push(msg.len() as u8);
-                out.extend_from_slice(msg.as_bytes());
+                push_message(&mut out, &f.message);
+                out.extend_from_slice(&(f.orders.len() as u32).to_be_bytes());
+                for o in &f.orders {
+                    out.push(o.outcome as u8);
+                    out.push(o.reason as u8);
+                    push_message(&mut out, &o.message);
+                }
             }
         }
         out
@@ -228,7 +357,7 @@ impl BlockActionStatus {
     /// `None` for an unknown version or a truncated / overlong record.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&version, mut rest) = bytes.split_first()?;
-        if version != ACTION_STATUS_V1 && version != ACTION_STATUS_V2 {
+        if !matches!(version, ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3) {
             return None;
         }
         let evm_count = take_u32(&mut rest)? as usize;
@@ -236,16 +365,31 @@ impl BlockActionStatus {
         let evm_bits = take(&mut rest, evm_count.div_ceil(8))?;
         let native_bits = take(&mut rest, native_count.div_ceil(8))?;
         let mut native_failed = Vec::new();
-        if version == ACTION_STATUS_V2 {
+        if version != ACTION_STATUS_V1 {
+            let v3 = version == ACTION_STATUS_V3;
             let count = take_u32(&mut rest)?;
             for _ in 0..count {
                 let index = take_u32(&mut rest)?;
                 let order = take_u32(&mut rest)?;
                 let failed_orders = take_u32(&mut rest)?;
+                let outcome = if v3 {
+                    Outcome::from_u8(take_u8(&mut rest)?)
+                } else {
+                    Outcome::Failed
+                };
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
-                let len = take_u8(&mut rest)? as usize;
-                let message = std::str::from_utf8(take(&mut rest, len)?).ok()?.to_string();
-                if index as usize >= native_count {
+                let message = take_message(&mut rest)?;
+                let mut orders = Vec::new();
+                if v3 {
+                    for _ in 0..take_u32(&mut rest)? {
+                        orders.push(OrderOutcome {
+                            outcome: Outcome::from_u8(take_u8(&mut rest)?),
+                            reason: FailureReason::from_u8(take_u8(&mut rest)?),
+                            message: take_message(&mut rest)?,
+                        });
+                    }
+                }
+                if index as usize >= native_count || outcome == Outcome::Executed {
                     return None;
                 }
                 native_failed.push(NativeActionFailure {
@@ -254,6 +398,8 @@ impl BlockActionStatus {
                     failed_orders,
                     reason,
                     message,
+                    outcome,
+                    orders,
                 });
             }
         }
@@ -267,14 +413,13 @@ impl BlockActionStatus {
         })
     }
 
-    /// Native action `i`'s label: `"skipped"`, `"failed"` or `"executed"`.
+    /// Native action `i`'s label: `"skipped"`, `"failed"`, `"rejected"` or
+    /// `"executed"`.
     pub fn native_label(&self, i: usize) -> &'static str {
         if self.native_skipped.get(i).copied().unwrap_or(false) {
             "skipped"
-        } else if self.failure(i).is_some() {
-            "failed"
         } else {
-            "executed"
+            self.failure(i).map_or(Outcome::Executed, |f| f.outcome).as_str()
         }
     }
 
@@ -329,8 +474,95 @@ mod tests {
         assert_eq!(status.native_label(2), "skipped");
     }
 
+    /// Row 50: a v3 record round-trips failed and rejected entries and the
+    /// per-order statuses (written empty today; a later writer fills one per
+    /// order of a batch, HL style, with no new version).
     #[test]
-    fn v2_round_trips_failures() {
+    fn v3_round_trips_rejections_and_per_order_statuses() {
+        let rejected = |index, order, count, reason| NativeActionFailure {
+            outcome: Outcome::Rejected,
+            ..failure(index, order, count, reason, "order rejected: x")
+        };
+        let mut batch = rejected(2, 1, 2, FailureReason::IocCancel);
+        batch.orders = vec![
+            OrderOutcome { outcome: Outcome::Executed, reason: FailureReason::Other, message: String::new() },
+            OrderOutcome { outcome: Outcome::Rejected, reason: FailureReason::IocCancel, message: "ioc".into() },
+            OrderOutcome { outcome: Outcome::Failed, reason: FailureReason::Tick, message: "tick".into() },
+        ];
+        let status = BlockActionStatus {
+            evm_skipped: vec![true],
+            native_skipped: vec![false, false, false, true, false],
+            native_failed: vec![
+                failure(0, 0, 1, FailureReason::Tick, "off tick"),
+                rejected(1, 0, 1, FailureReason::BadAloPx),
+                batch,
+                rejected(4, 0, 1, FailureReason::Margin),
+            ],
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V3, "any entry writes v3");
+        let back = BlockActionStatus::decode(&bytes).expect("v3 decodes");
+        assert_eq!(back, status);
+        let labels: Vec<_> = (0..5).map(|i| back.native_label(i)).collect();
+        assert_eq!(labels, ["failed", "rejected", "rejected", "skipped", "rejected"]);
+        assert_eq!(back.failure(2).unwrap().orders.len(), 3);
+        // An entry can never be "executed".
+        let mut bad = bytes.clone();
+        // version 1 + counts 8 + bitmaps 1+1 + entry count 4 + index, order,
+        // count 12 -> the first entry's outcome byte.
+        assert_eq!(bad[27], Outcome::Failed as u8);
+        bad[27] = Outcome::Executed as u8;
+        assert_eq!(BlockActionStatus::decode(&bad), None);
+    }
+
+    /// The exact bytes the v2 writer produced (s92 to row 50) still read:
+    /// every entry is a failure, no per-order statuses.
+    #[test]
+    fn v2_records_written_before_v3_still_read() {
+        let v2 = [
+            0x02, 0, 0, 0, 0, 0, 0, 0, 2, 0b10, // v1 body: 0 evm, 2 native, #1 skipped
+            0, 0, 0, 1, // one failure
+            0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 1, 2, b'n', b'o', // #0, order 3, 2 failed, margin, "no"
+        ];
+        let status = BlockActionStatus::decode(&v2).expect("v2 decodes");
+        assert_eq!(status.native_skipped, vec![false, true]);
+        assert_eq!(
+            status.native_failed,
+            vec![failure(0, 3, 2, FailureReason::Margin, "no")],
+            "a v2 entry reads as failed, without per-order statuses"
+        );
+        assert_eq!(status.native_failed[0].outcome, Outcome::Failed);
+        assert_eq!(status.native_label(0), "failed");
+        assert_eq!(status.native_label(1), "skipped");
+    }
+
+    /// Row 50: the rejection reasons and their Hyperliquid status names
+    /// (`orderStatus`; FOK has none in HL: `fokCancelRejected`, named like
+    /// `iocCancelRejected`). Every other reason has no rejected name.
+    #[test]
+    fn rejected_reasons_have_hyperliquid_names() {
+        let named = [
+            (FailureReason::Margin, "perpMarginRejected"),
+            (FailureReason::ReduceOnly, "reduceOnlyRejected"),
+            (FailureReason::IocCancel, "iocCancelRejected"),
+            (FailureReason::BadAloPx, "badAloPxRejected"),
+            (FailureReason::MarketNoLiquidity, "marketOrderNoLiquidityRejected"),
+            (FailureReason::FokCancel, "fokCancelRejected"),
+            (FailureReason::BadTriggerPx, "badTriggerPxRejected"),
+        ];
+        for (reason, name) in named {
+            assert_eq!(reason.hl_rejected_name(), Some(name));
+        }
+        for code in 0..=255u8 {
+            let reason = FailureReason::from_u8(code);
+            if !named.iter().any(|(r, _)| *r == reason) {
+                assert_eq!(reason.hl_rejected_name(), None, "{reason:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn v3_round_trips_failures() {
         let status = BlockActionStatus {
             evm_skipped: vec![],
             native_skipped: vec![true, false, false, false],
@@ -352,8 +584,8 @@ mod tests {
             ],
         };
         let bytes = status.encode();
-        assert_eq!(bytes[0], ACTION_STATUS_V2);
-        let back = BlockActionStatus::decode(&bytes).expect("v2 decodes");
+        assert_eq!(bytes[0], ACTION_STATUS_V3);
+        let back = BlockActionStatus::decode(&bytes).expect("v3 decodes");
         assert_eq!(back, status);
         assert_eq!(back.native_failed[0].reason, FailureReason::Margin);
         assert_eq!(back.native_failed[1].reason, FailureReason::OpenLimit);
@@ -393,6 +625,11 @@ mod tests {
             (FailureReason::Fill, 7, "fill"),
             (FailureReason::PriceBand, 8, "price_band"),
             (FailureReason::ReduceOnly, 9, "reduce_only"),
+            (FailureReason::IocCancel, 10, "ioc_cancel"),
+            (FailureReason::BadAloPx, 11, "bad_alo_px"),
+            (FailureReason::MarketNoLiquidity, 12, "market_no_liquidity"),
+            (FailureReason::FokCancel, 13, "fok_cancel"),
+            (FailureReason::BadTriggerPx, 14, "bad_trigger_px"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");
@@ -425,7 +662,7 @@ mod tests {
         }
         .encode();
         let mut wrong_version = bytes.clone();
-        wrong_version[0] = 0x03;
+        wrong_version[0] = 0x04;
         assert_eq!(BlockActionStatus::decode(&wrong_version), None);
         assert_eq!(BlockActionStatus::decode(&bytes[..bytes.len() - 1]), None);
         let mut overlong = bytes.clone();

@@ -2,6 +2,7 @@
 
 use alloy_primitives::{Address, Bloom, B256, U256};
 use serde::{Deserialize, Serialize};
+use torus_state::action_status::Outcome;
 use torus_types::FixedPoint;
 
 use crate::error::RpcError;
@@ -581,24 +582,32 @@ pub struct RpcLeaderInfo {
 /// the batch (whose reason / message these are) and `failedOrders` how many of
 /// its orders failed; a batch skipped whole (empty / over the cap) has
 /// `failedOrders` 0. Any other action: `order` 0, `failedOrders` 1.
+/// Row 50: or one that was rejected — `status` `"failed"` or `"rejected"`
+/// (the action's `nativeActionStatus`); a rejected entry's `reason` is the
+/// Hyperliquid `orderStatus` name (`iocCancelRejected`, ...), a failed one's
+/// the stable lowercase name (`margin`, `tick`, ...). `failedOrders` counts
+/// a batch's orders that did not execute, failed or rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcActionFailure {
     pub index: u32,
+    /// Row 50: `"failed"` or `"rejected"`; absent from a pre-row-50 node.
+    #[serde(default)]
+    pub status: String,
     pub reason: String,
     pub message: String,
     pub order: u32,
     pub failed_orders: u32,
 }
 
-/// Per native action `"executed"` / `"skipped"` / `"failed"`.
+/// Per native action `"executed"` / `"skipped"` / `"failed"` / `"rejected"`.
 pub fn native_action_labels(s: &torus_state::action_status::BlockActionStatus) -> Vec<String> {
     (0..s.native_skipped.len())
         .map(|i| s.native_label(i).to_string())
         .collect()
 }
 
-/// The record's native failures, RPC-shaped.
+/// The record's native failures and rejections, RPC-shaped.
 pub fn native_action_failures(
     s: &torus_state::action_status::BlockActionStatus,
 ) -> Vec<RpcActionFailure> {
@@ -606,7 +615,12 @@ pub fn native_action_failures(
         .iter()
         .map(|f| RpcActionFailure {
             index: f.index,
-            reason: f.reason.as_str().to_string(),
+            status: f.outcome.as_str().to_string(),
+            reason: match f.outcome {
+                Outcome::Rejected => f.reason.hl_rejected_name().unwrap_or(f.reason.as_str()),
+                _ => f.reason.as_str(),
+            }
+            .to_string(),
             message: f.message.clone(),
             order: f.order,
             failed_orders: f.failed_orders,
@@ -627,9 +641,13 @@ pub struct RpcBlockBody {
     /// record existed.
     /// v2: `"failed"` too — executed, but the executor refused it (margin,
     /// open-order limit, off-tick price, ...); see `native_action_failures`.
+    /// Row 50: `"rejected"` — an order refused with an HL `*Rejected`
+    /// status (IOC / market / FOK without a fill, crossing PostOnly,
+    /// reduce-only that cannot reduce, margin, bad stop trigger).
     #[serde(default)]
     pub native_action_status: Option<Vec<String>>,
-    /// v2: every `"failed"` native action, ascending `index`. `null` like
+    /// v2: every `"failed"` (row 50: and `"rejected"`) native action,
+    /// ascending `index`. `null` like
     /// `native_action_status`; empty for a block recorded before v2.
     #[serde(default)]
     pub native_action_failures: Option<Vec<RpcActionFailure>>,
@@ -683,6 +701,44 @@ mod action_failure_tests {
         let names: Vec<&str> = rpc.iter().map(|f| f.reason.as_str()).collect();
         let want: Vec<&str> = all.iter().map(|(_, n)| *n).collect();
         assert_eq!(names, want);
+        assert!(rpc.iter().all(|f| f.status == "failed"));
         assert!(native_action_labels(&stored).iter().all(|l| l == "failed"));
+    }
+
+    /// Row 50: a rejected entry reaches the RPC as status `"rejected"` with
+    /// its Hyperliquid `orderStatus` name as the reason; a failed one keeps
+    /// the stable lowercase name (a margin failure of a modify stays
+    /// `"margin"`).
+    #[test]
+    fn rejected_entries_carry_hyperliquid_names() {
+        use torus_state::action_status::Outcome;
+        let rejected = [
+            (FailureReason::IocCancel, "iocCancelRejected"),
+            (FailureReason::BadAloPx, "badAloPxRejected"),
+            (FailureReason::MarketNoLiquidity, "marketOrderNoLiquidityRejected"),
+            (FailureReason::ReduceOnly, "reduceOnlyRejected"),
+            (FailureReason::Margin, "perpMarginRejected"),
+            (FailureReason::FokCancel, "fokCancelRejected"),
+            (FailureReason::BadTriggerPx, "badTriggerPxRejected"),
+        ];
+        let mut native_failed: Vec<_> = rejected
+            .iter()
+            .enumerate()
+            .map(|(i, (r, _))| NativeActionFailure {
+                outcome: Outcome::Rejected,
+                ..NativeActionFailure::new(i as u32, 0, 1, *r, "msg".into())
+            })
+            .collect();
+        native_failed.push(NativeActionFailure::new(7, 0, 1, FailureReason::Margin, "modify".into()));
+        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 9], native_failed };
+        let stored = BlockActionStatus::decode(&status.encode()).unwrap();
+        let rpc = native_action_failures(&stored);
+        let got: Vec<(&str, &str)> = rpc.iter().map(|f| (f.status.as_str(), f.reason.as_str())).collect();
+        let mut want: Vec<(&str, &str)> = rejected.iter().map(|(_, n)| ("rejected", *n)).collect();
+        want.push(("failed", "margin"));
+        assert_eq!(got, want);
+        let labels = native_action_labels(&stored);
+        assert_eq!(labels[..7], ["rejected"; 7]);
+        assert_eq!(labels[7..], ["failed", "executed"]);
     }
 }

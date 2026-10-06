@@ -354,6 +354,9 @@ fn parse_log_row(log: &Value, block_height: i64) -> LogRow {
 /// v2: a `"failed"` action's entry of `nativeActionFailures` is folded into
 /// its stored status: `failed (<reason>): <message>`, plus the first failing
 /// order and the failed-order count for a PlaceOrderBatch.
+/// Row 50: a `"rejected"` entry likewise: `rejected (<HL reason>): <message>`
+/// (a batch: `, order N, M not executed`); an entry without `status` (a
+/// pre-row-50 node) is a failure.
 fn native_action_status(body: &Value) -> Option<Vec<String>> {
     let mut statuses: Vec<String> = body
         .get("nativeActionStatus")?
@@ -371,13 +374,19 @@ fn native_action_status(body: &Value) -> Option<Vec<String>> {
             continue;
         };
         let reason = val_str(f, "reason");
+        let rejected = f.get("status").and_then(Value::as_str) == Some("rejected");
+        let (label, count) = if rejected {
+            ("rejected", "not executed")
+        } else {
+            ("failed", "failed")
+        };
         let batch = match (val_u64(f, "order"), val_u64(f, "failedOrders")) {
             (order, failed) if order > 0 || failed != 1 => {
-                format!(", order {order}, {failed} failed")
+                format!(", order {order}, {failed} {count}")
             }
             _ => String::new(),
         };
-        *status = format!("failed ({reason}{batch}): {}", val_str(f, "message"));
+        *status = format!("{label} ({reason}{batch}): {}", val_str(f, "message"));
     }
     Some(statuses)
 }
@@ -664,6 +673,26 @@ mod tests {
         assert_eq!(
             native_action_status(&v1).unwrap(),
             vec!["executed".to_string(), "skipped".to_string()]
+        );
+        // Row 50: a rejected action shows its status and HL reason.
+        let rejected = json!({
+            "nativeActionStatus": ["rejected", "rejected", "failed"],
+            "nativeActionFailures": [
+                {"index": 0, "status": "rejected", "reason": "iocCancelRejected",
+                    "message": "order rejected: IOC", "order": 0, "failedOrders": 1},
+                {"index": 1, "status": "rejected", "reason": "badAloPxRejected",
+                    "message": "order rejected: ALO", "order": 2, "failedOrders": 3},
+                {"index": 2, "status": "failed", "reason": "tick",
+                    "message": "off tick", "order": 0, "failedOrders": 1}
+            ]
+        });
+        assert_eq!(
+            native_action_status(&rejected).unwrap(),
+            vec![
+                "rejected (iocCancelRejected): order rejected: IOC".to_string(),
+                "rejected (badAloPxRejected, order 2, 3 not executed): order rejected: ALO".to_string(),
+                "failed (tick): off tick".to_string(),
+            ]
         );
     }
 
