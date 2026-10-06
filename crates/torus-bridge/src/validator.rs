@@ -165,7 +165,10 @@ impl BlockValidator {
                 )));
             }
 
-            let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+            let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
             if computed_fee_revenue != block.header.evm_fee_revenue {
                 return Err(BridgeError::InvalidBlock(format!(
                     "fee revenue mismatch: header={}, computed={}",
@@ -267,7 +270,10 @@ impl BlockValidator {
             )));
         }
 
-        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
         if computed_fee_revenue != block.header.evm_fee_revenue {
             return Err(BridgeError::InvalidBlock(format!(
                 "fee revenue mismatch: header={}, computed={}",
@@ -435,7 +441,10 @@ impl BlockValidator {
             )));
         }
 
-        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
         if computed_fee_revenue != block.header.evm_fee_revenue {
             return Err(BridgeError::InvalidBlock(format!(
                 "fee revenue mismatch: header={}, computed={}",
