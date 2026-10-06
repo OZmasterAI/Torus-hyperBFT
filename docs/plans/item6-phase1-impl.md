@@ -648,3 +648,44 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
 | 63 | step 2 / harnesses | golden runs inline / worker / off; ubench_econ inline unless `UB_R_WORKER=1`; ubench_epoch, storage_reads, liquidation_l1 inline | none | as described | `2333ba4` |
 | 64 | step 2 / accounting | a join on a block without a native phase counts in that block's wall | none (rare) | noted in `summarize.py` | `2333ba4` |
 | 65 | step 1 / harness gap | `run-cell.sh` never sampled the `end_resident` timers (summary.json showed 0; ozarchy section 16) | none | columns added, pinned by a test | `e65411d` |
+| 66 | E2 / cooldown + pending rows | plan: read once per block as a set; built: the liquidation CF moved into R | OK? (reuses R's tested guards, no per-trader reasoning) | built | `b2641cf` |
+| 67 | E3 / E4 / R scope | R now holds five CFs (positions, balances, liquidation, oracle, market rows) | none (rule: any future writer of these CFs outside the block overlay must invalidate R) | metrics count all five | `8b0673d` `ecf4aec` |
+| 68 | E4 / margin-config cache | ~0.4 ms per block left with real market rows | none | not built (needs the context constructor changed at five call sites) | - |
+| 69 | bench fixture | `b"listed"` market rows add ~6 ms of fake ctx per block in `ubench_epoch` / `ubench_econ` (failed borsh decode allocates 1 MiB); ozarchy section 7.3's ctx was mostly this | default to real rows (breaks comparison with past runs) or a length guard in `market_margin_config`? (s92 suggestion: real rows by default, note the break) | `UB_REAL_MARKETS=1` added | `ecf4aec` |
+| 70 | E1 | oracle step now 1.8-2.0 ms per empty block | none | dropped | - |
+| 71 | liquidation skip (section 17 cut 3) | no exact whole-pass skip: the pass writes the hashed cursor and clears cooldown / pending rows; per-trader "healthy at mark version V" certificate is exact but saves ~1 ms per empty block after E2 | none (s92: dropped) | not built | - |
+
+### 9.10 Zero-fill sell cuts at 300 markets (s92, owner decisions)
+- Finding (ozarchy section 18 + 18c read-only checks): at 300 markets ~8% of placed orders are GTC sell
+  takers in a non-pool market cancelled with zero fills by match-time taker margin exhaustion
+  (`orders_rejected_cancelled`, ~1.7M per cell; main 0), although accounts have ~100M free. Cause:
+  the s89 same-batch bound counts earlier same-batch sells as ask depth, so it almost never fires;
+  the sell is cut at its first unaffordable bid. Knock-on: unhit bids rest, senders hit the
+  1000 open-order limit, crab fills 0.77x main per native block (matched/s 0.832x while
+  crab's per-block execution is faster than main).
+- Options compared: A second pass (design 3.6 "option D"), B better sell reservation, C bench-only
+  `OPEN_ORDER_BUDGET`, D accept. Hyperliquid: one sequential engine, whole-account checks.
+- Decided: **B-blind** next (after the Phase-2 fold, top up each non-pool sell to
+  `reserve(B0 x (1 + 10 bps))` from leftover free margin, PARTIAL top-up, never blocks a placement;
+  no input from other traders, so no griefing; replaces the s89 bound and deletes PF1's depth sums;
+  counter bucketing cut sells by hit price minus reservation price). **A** only if the residual after
+  B exceeds 0.5% of placed (ozarchy), first scope zero-fill sells, exact settled-state budget, retries
+  lose time priority, Phase-3 stops before retry stops. Keep the D2 pool (owner Q6: complement).
+  Golden A re-pinned per commit; golden B must not change.
+- Not chosen: C (fixes nothing for users), D (well-funded orders fail where HL fills them), B-bid
+  (counts same-batch bids; reopens griefing, breaks the s89 tests' intent).
+
+### 9.11 Open owner question: maker over-commit across markets in one batch (s92)
+- Crab matches markets in parallel. A maker's fills are checked against a snapshot of its free margin
+  taken at batch start (D8), tracked per book only; each market's book loads its own copy. A maker
+  resting in many markets can be filled in several markets in one batch, each assuming the full free
+  margin, so the account can end the batch using more margin than it has; liquidation catches it in
+  the next block. Hyperliquid (sequential, live account) would margin-cancel the later fills.
+- Not a Gate 2 issue (bench makers are well funded). A risk / bad-debt question before mainnet:
+  a small account spread over many markets can over-commit for one block.
+- Options (each with a cost): split each maker's free margin across the markets it rests in (safe,
+  stricter than HL); reconcile after the parallel pass (fills cannot be undone: flag or cancel
+  remaining orders only); serialise makers resting in several markets (closest to HL, costs parallel
+  speed).
+- Not in item 6 (item 6 keeps parallel matching by design). s92: tracked as its own backlog item,
+  decide with a risk view before mainnet.
