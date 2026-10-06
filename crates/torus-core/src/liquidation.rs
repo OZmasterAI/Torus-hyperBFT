@@ -542,46 +542,74 @@ pub fn clear_cooldown<T: StateBackend>(state: &T, t: &Address) -> Result<(), Cor
     Ok(())
 }
 
-/// D10: the previous mark rows of `markets` (absent rows omitted).
-pub fn prev_marks<T: StateBackend>(
-    state: &T,
-    markets: impl IntoIterator<Item = MarketId>,
-) -> Result<BTreeMap<MarketId, FixedPoint>, CoreError> {
-    let mut out = BTreeMap::new();
-    for m in markets {
-        if let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? {
-            let raw = i128::from_be_bytes(v.as_slice().try_into().map_err(|_| malformed("prev mark"))?);
-            out.insert(m, FixedPoint::from_raw(raw));
-        }
-    }
-    Ok(out)
+/// Rule H (owner s96, changes D10): `0x03 ‖ m` -> last(16) ‖ [prev(16)]: the
+/// market's last usable mark and the mark before it that DIFFERED from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkRow {
+    pub last: FixedPoint,
+    pub prev: Option<FixedPoint>,
 }
 
-/// D10 + review H1: store this step's marks as the next step's previous
-/// marks (only rows whose value changed); a listed market WITHOUT a usable
-/// mark loses its row, so a previous mark is always the immediately
-/// preceding usable mark — never one from before an oracle outage.
-pub fn put_prev_marks<T: StateBackend>(
+/// The rows of `markets` and each marked market's pre-clamp ADL base this
+/// step: the old `last` when the mark changed, else `prev` (absent: the
+/// caller uses the mark, D10's fallback).
+pub fn adl_bases<T: StateBackend>(
+    state: &T,
+    markets: &[MarketId],
+    marks: &BTreeMap<MarketId, FixedPoint>,
+) -> Result<(BTreeMap<MarketId, FixedPoint>, BTreeMap<MarketId, MarkRow>), CoreError> {
+    let raw = |b: &[u8]| -> Result<FixedPoint, CoreError> {
+        Ok(FixedPoint::from_raw(i128::from_be_bytes(b.try_into().map_err(|_| malformed("prev mark"))?)))
+    };
+    let (mut bases, mut rows) = (BTreeMap::new(), BTreeMap::new());
+    for &m in markets {
+        let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? else { continue };
+        let row = match v.len() {
+            16 => MarkRow { last: raw(&v)?, prev: None },
+            32 => MarkRow { last: raw(&v[..16])?, prev: Some(raw(&v[16..])?) },
+            _ => return Err(malformed("prev mark")),
+        };
+        if let Some(mark) = marks.get(&m) {
+            if let Some(b) = if *mark != row.last { Some(row.last) } else { row.prev } {
+                bases.insert(m, b);
+            }
+        }
+        rows.insert(m, row);
+    }
+    Ok((bases, rows))
+}
+
+/// Rule H: a listed market with a usable mark that differs from its row's
+/// `last` (or has no row) gets (last = mark, prev = old last); an unchanged
+/// mark writes nothing; a listed market without a usable mark loses its row
+/// (review H1: never a base from before an oracle outage). Returns the writes.
+pub fn put_mark_rows<T: StateBackend>(
     state: &T,
     listed: &[MarketId],
     marks: &BTreeMap<MarketId, FixedPoint>,
-    prev: &BTreeMap<MarketId, FixedPoint>,
-) -> Result<(), CoreError> {
+    rows: &BTreeMap<MarketId, MarkRow>,
+) -> Result<usize, CoreError> {
+    let mut writes = 0;
     for m in listed {
         let k = prev_mark_key(*m);
-        match marks.get(m) {
-            Some(p) if prev.get(m) != Some(p) => {
-                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &p.raw().to_be_bytes())?
-            }
-            Some(_) => {}
-            None => {
-                if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
-                    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        match (marks.get(m), rows.get(m)) {
+            (Some(p), Some(r)) if r.last == *p => {}
+            (Some(p), r) => {
+                let mut v = p.raw().to_be_bytes().to_vec();
+                if let Some(r) = r {
+                    v.extend_from_slice(&r.last.raw().to_be_bytes());
                 }
+                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+                writes += 1;
             }
+            (None, Some(_)) => {
+                state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+                writes += 1;
+            }
+            (None, None) => {}
         }
     }
-    Ok(())
+    Ok(writes)
 }
 
 /// D5: the round-robin scan cursor (the last trader scanned by a cut pass).

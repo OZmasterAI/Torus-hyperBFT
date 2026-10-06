@@ -297,6 +297,26 @@ fn adl_candidates_are_every_opposite_holder_except_the_escrows() {
     assert_eq!(longs.iter().map(|c| c.trader).collect::<Vec<_>>(), vec![addr(1), addr(4), addr(5)]);
 }
 
+/// H (owner s96): row `0x03 ‖ m` = last ‖ [prev]; the pre-clamp ADL base is the
+/// last mark DIFFERENT from the current one; a step with the same mark writes
+/// nothing; without a usable mark the row goes (and the next mark has no base).
+#[test]
+fn adl_base_is_the_last_different_mark() {
+    use std::collections::BTreeMap;
+    use torus_core::liquidation::{adl_bases, put_mark_rows};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let (mut bases_seen, mut writes_seen) = (Vec::new(), Vec::new());
+    for mark in [Some(990), Some(990), Some(900), Some(900), Some(880), None, Some(870)] {
+        let marks: BTreeMap<u64, FixedPoint> = mark.map(|p| (1u64, fp(p))).into_iter().collect();
+        let (bases, rows) = adl_bases(&db, &[1], &marks).unwrap();
+        bases_seen.push(bases.get(&1).copied());
+        writes_seen.push(put_mark_rows(&db, &[1], &marks, &rows).unwrap());
+    }
+    assert_eq!(bases_seen, vec![None, None, Some(fp(990)), Some(fp(990)), Some(fp(900)), None, None]);
+    assert_eq!(writes_seen, vec![1, 0, 1, 0, 1, 1, 1], "a write only when the mark changes or goes");
+}
+
 /// Telemetry: `pending_count` counts exactly the pending rows across seek
 /// pages (1,030 rows > one 1,024-row page), ignoring the other tags (a
 /// cooldown row, the cursor); `pending_among` counts the rows of a sorted

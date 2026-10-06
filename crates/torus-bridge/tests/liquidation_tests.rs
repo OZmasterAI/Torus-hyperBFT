@@ -769,6 +769,78 @@ fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
     assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
+/// Records `(account, price)` of every `liquidation: ADL` info event (the
+/// only event with a `counterparties` field).
+struct AdlPrices(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl tracing::Subscriber for AdlPrices {
+    fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+        *m.level() <= tracing::Level::INFO
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, e: &tracing::Event<'_>) {
+        struct V(BTreeMap<&'static str, String>);
+        impl tracing::field::Visit for V {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.insert(f.name(), format!("{v:?}"));
+            }
+        }
+        if e.metadata().fields().field("counterparties").is_some() {
+            let mut v = V(BTreeMap::new());
+            e.record(&mut v);
+            self.0.lock().unwrap().push((v.0["account"].clone(), v.0["price"].clone()));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Rule H (owner s96), the S=750-like case: u1 and u2 long 10 @ 1,000
+/// (collateral 1,000 each), S short 20. Block 1 at 1,000: healthy. u1 cut to
+/// 600, block 2 at 900 with scan 1 / act 1: only u1 is reached (ADL). u2 cut
+/// to 600, block 3 at 900 again (no mark change): u2 ADL. Both get the base
+/// 1,000 (the last DIFFERENT mark) clamped to their bankruptcy price 940; with
+/// D10 (the previous step's mark) u2 got base 900.
+#[test]
+fn same_mark_interval_gives_the_same_pre_clamp_price() {
+    use torus_core::liquidation::{adl_price, bankruptcy_price};
+    let (_d, db) = liq_db(&[1]);
+    let (u1, u2, s) = (addr(1), addr(2), addr(3));
+    let c = ctx_at(db.clone(), 1);
+    for (who, a) in [(u1, 1_000), (u2, 1_000), (s, 10_000_000)] {
+        fund(&c, &who, fp(a));
+    }
+    open_pair(&c, &u1, &s, 1, 10, 1_000);
+    open_pair(&c, &u2, &s, 1, 10, 1_000);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let step = |h: u64, mark: i64, cut: Option<&Address>, budgets: Option<(usize, usize)>| {
+        let mut c = ctx_at(db.clone(), h);
+        if let Some(t) = cut {
+            fund(&c, t, fp(600));
+        }
+        set_mark(&c, 1, fp(mark));
+        tracing::subscriber::with_default(AdlPrices(seen.clone()), || match budgets {
+            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut c, scan, act),
+            None => NativeExecutor::run_liquidations(&mut c),
+        });
+        assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        c
+    };
+    let c1 = step(1, 1_000, None, None);
+    assert_eq!((pos(&c1, &u1, 1), pos(&c1, &u2, 1)), (fp(10), fp(10)), "healthy");
+    let c2 = step(2, 900, Some(&u1), Some((1, 1)));
+    assert_eq!((pos(&c2, &u1, 1), pos(&c2, &u2, 1)), (FixedPoint::ZERO, fp(10)), "only u1 reached");
+    let c3 = step(3, 900, Some(&u2), None);
+    assert_eq!(pos(&c3, &u2, 1), FixedPoint::ZERO);
+    let want = adl_price(fp(1_000), bankruptcy_price(fp(600), true, fp(10), fp(1_000)), fp(900), true);
+    assert_eq!(want, fp(940));
+    assert_eq!(*seen.lock().unwrap(), vec![(u1.to_string(), want.to_string()), (u2.to_string(), want.to_string())]);
+}
+
 // ---- T7e: budgets, carry-over, due, stops ----
 
 /// D5: 5 underwater accounts, an empty book (stage-1 orders do not fill, so

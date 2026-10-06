@@ -527,41 +527,47 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// (8, 0) unchanged; top-ups (full, partial, none) = (393, 0, 2). The marks
 /// here walk up to ±900 per block (3% of the mid), so same-batch bids sit
 /// far above the start bid B0: the s89 bound followed them, B-blind covers
-/// B0 + 30 ticks only.
+/// B0 + 30 ticks only. Re-pinned by adl-budget A3 (rule H): from block 2 (the
+/// first mark change) the `0x03` rows are `last ‖ prev`; every block's
+/// results and position / balance / liquidation rows (the `0x03` values cut
+/// to `last`) checked equal to the D10 digests' run before re-pinning.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0x2284087928a8c8753efa5355fb90d3993a781ccd6dc93642fea91528732cbdad",
-    "0xbd5bd04f2e1e9b445ec102b461fbf506a92a2054b1301013d42f11af2adff0f8",
-    "0x26775ae3d5baec11446832b8dbcecdf1f2ca3286ab23c6a12d824c029c28b6c9",
-    "0x366884dbde98bcf0308d6248644d0ac91ebf211e42a99c15c4c5c673f932744f",
-    "0x04b7be2cb2d2c80957563a8fc0855b4f3212a6ea96f5088537988324a8f9a11a",
-    "0x5ba4d2fdaa7c9f95e1182c11fdc08391ee44e0b9e0dc485b72ca5b0cc54d9bed",
-    "0xba8206944edc83ec4f0d4aa8d6d906905bcd462df719282dfd497fd8145c4b5e",
-    "0x079961f4d69af475d3724614f78c3c05d3002c2d5a76dbad6deb91a519f50086",
-    "0x580ac36cac8cf8295e1f711152502335c55b0d59187ecf7b951f5dd5806027e6",
-    "0x1151116c5cc5f7a22af8f0299d36f89864d0ba505a3676ada8696c5c116a0599",
-    "0x1456c3b4d0de478bcefd4bed519c5288d9946861e7c37914e99e327e9187f923",
+    "0x7960e867a35c8fdce5f56e5d3d6661162f8a96b14a350628d83604b434cf3e59",
+    "0x0deec3de2ab24b612cca75d3c47e0011738c35dabe404af3a65a43577c261fc0",
+    "0x129722e4f2903ebe050545391ae83abcad213281ec8c23be16d8b3bc9d8bf433",
+    "0xcdbdfe174f649470f76be10c682bbe8303cea0d95d185cf47687df2fc90b6756",
+    "0x721844dce07776e4592fff8226d4a4b43276ca41dcf09b499de02ad48356713c",
+    "0x5604445b0b78069641ee2b8c7672c1618a1453099204819edca910f679920db9",
+    "0x964a678de1c4ea0e0b9e41105df3869f1f8b485933624e205f9db2329d776285",
+    "0x19463cac6e154c0a1ffba1373e36fe9075a51d42e9681baf0442fc63cab47fc1",
+    "0xbf6055429f8f1a82473be75c259f142c1332e4cf11396afe861f1cf8c58f96c2",
+    "0x92fe19c4cec83034d4ea3837faf04d350798c12eb8d2cdcba6f85240452a0970",
+    "0x214002d6bcf9c104b7361973e1b70e9712d334c55ca4829d32483374496b4047",
 ];
-/// Scenario B on c93c579.
+/// Scenario B on c93c579; re-pinned by adl-budget A3 (rule H): from block 6
+/// (the first mark change) the `0x03` rows are `last ‖ prev`; every block's
+/// results and position / balance / liquidation rows (the `0x03` values cut
+/// to `last`) checked equal to the D10 digests' run before re-pinning.
 const GOLDEN_B: [&str; 18] = [
     "0x01ad98e2504ea6d07d86d94eb488ea2f620b593effec4284b1cb37a3cf07cdbd",
     "0xd5ce9dd0a968a2016bb69dc20bc5e12ba6e9bf600539c7cc2989087b49e98562",
     "0xd8abb0cf2659f07e75b8727065ad904f5216d93f0ea257066e0c0b35336e9268",
     "0x4993dfb40e8b399bd26259a06dcf3b3cc8863a3234b2a4470cdbfefd3156f85e",
     "0xdad5dd048374e566c584bd587745d949e7aa053bd1b0e36e43d36e61c76010f2",
-    "0xc0d047fa5ae5b4641924063d9d67f203c2788a0a91e2301e6e9e3634b5ddc7dc",
-    "0x82219ea69717ef004a6b291d775c328fc12af6c33ff6eec3f703e8ee5ae87b6f",
-    "0x7f639e61703da2cce928adbad2b036b139c94e620fee028f7850e821982a51ca",
-    "0xd4399be1f08f404e26c96ae4cebdd280bf211e0c81f809ab0179c23b06dd0f20",
-    "0xda0330908ca7cf9b53873f0e5b0786c2dfb49d1b260c1c705ff320d6d6157179",
-    "0xe199aa106ea73caf7a394cf3a3a139f159083e336835dc5d713604cc8c74e91f",
-    "0x977df580684dafa431097fd40494ef5e9c13b619e16cc64e51c2787ceb96170b",
-    "0x931b70afb6c0dda49742a5cfd88efd5e838f59656f0f46ea9cceeef8d1d25050",
-    "0xaf52e01b7f6e0024dba69213f932e4925b7af4e0b4b235402f5c3e16b314f1f6",
-    "0x0d8de3f9c2113cb5fbd1cba0e6f284d96b585bed9948671fde57f1db0369477d",
-    "0x9f21b7d6fab6f78ae5b753fa3751fcd8ff462332e777063692ef0974024a0fa8",
-    "0x1661b87681327eea7728c912ef4a63965082b2e15fb24ca6b4f071ff5eb974b7",
-    "0xddb569290db77e72f597a706895d10fca15687cefd1b1f053d2aa878fa819545",
+    "0x08d89c1339ddf8b3da9246c698dd2673ad0398da8d70bdfa0985c17ae9604636",
+    "0xb86de24be5bbd879d94fbef2787cb3d24813d99e7d141e570b23d0917a83a4be",
+    "0xad7ac32e8676ccfd0c0cccb60958cc3f43fe0cb7ba11c9ade2ad593d2d771459",
+    "0x8a178f231b7f33b9c4905f24fa8812bd660c5e0a1cf68bdd42e17497e24c9f93",
+    "0x3c1bacdee3a90b7aaf75755438a875b907d4b774dc8e638eaaaf38d1e6bc1cca",
+    "0x8e31b7263a2494e1aec20d6518e04bcd11ff25ec4ddf20e374665d4d0c2d2e06",
+    "0xada97eb07d210bdce4b48d7a9e7117615ca32d39549ff35c3e59c3bc76c48761",
+    "0xf339e719e6c6722ce064e52d7287b62018d2e0ca78dc39d5b11266ba3b1e9e1a",
+    "0xe48d734ea1e8ec53227434f01f1610470e1f0dc5a24c604fa3c2ba65bdb967d9",
+    "0xb0101d1d8449da2845ca76b2031899fc016220a840caa232cca1471dcd5e9b3f",
+    "0x98665ba8d8c117f778ece4b88f9141e13ff1f4d4e80ea3b22ca72f5f8b89cbc1",
+    "0x962a22ffa52706025d38f7574de7407eff52726313ceb8ad5c63bef635592094",
+    "0xdb59e96e9759fd5ded1d021307f62616ad505bb8d3fbdd46c4e434ea27f204ed",
 ];
 
 fn check(name: &str, got: &[String], want: &[&str]) {

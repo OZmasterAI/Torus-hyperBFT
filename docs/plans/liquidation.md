@@ -50,15 +50,15 @@ C5 recorded as known limitations.
   positions (the backstop still moves all collateral). An account with no marked position is
   not liquidated. Orders in unmarked markets are not blocked (devnet has no feeder).
 
-* **H1 — ADL at the bankruptcy price.** The ADL close price is the previous mark (or the mark)
-  CLAMPED to the account's bankruptcy price (`entry ∓ (collateral + other UPnL) / size`, other
+* **H1 — ADL at the bankruptcy price.** The ADL close price is the rule-H base (the last mark
+  different from the current one, or the mark; adl-budget §8) CLAMPED to the account's bankruptcy price (`entry ∓ (collateral + other UPnL) / size`, other
   positions marked at the mark, unmarked at entry) on the side unfavourable to the bankrupt
   account; exact integer math, rounded against the trader (`ceil(rest × SCALE / size)` off the
   entry), so a close never leaves it positive. A non-vault account without marked positions then
-  hands its remaining collateral (rounding dust, or the deficit when the previous mark was worse)
-  to the vault: it ends at exactly 0; the counterparties are paid the difference. A previous-mark
-  row is deleted whenever a step sees the market without a usable mark, so it is always the
-  immediately preceding usable mark.
+  hands its remaining collateral (rounding dust, or the deficit when the base was worse)
+  to the vault: it ends at exactly 0; the counterparties are paid the difference. A mark row is
+  deleted whenever a step sees the market without a usable mark, so a base never comes from
+  before an oracle outage.
 
 * **H3 — bounded scans.** `StateBackend::iterate_cf_from(cf, start, limit)` (StateDb: RocksDB
   seek; overlay: merge of DB / parent / pending honouring tombstones). The candidate walk seeks
@@ -140,7 +140,7 @@ C5 recorded as known limitations.
 ### Block step `NativeExecutor::run_liquidations(ctx)` (after `drain_core_writer`)
 
 1. **Marks** for listed markets (`governance.listed_market_ids()`, ascending) into a `BTreeMap`;
-   **previous marks** from the liquidation CF.
+   **mark rows** (rule H: the ADL bases) from the liquidation CF.
 2. **Candidates**: distinct traders of `CF_NATIVE_POSITIONS` (ascending; consecutive keys of
    one trader deduplicated), strictly after the stored cursor, the vault excluded. Up to
    `SCAN` = 2048 accounts valued, up to `ACT` = 64 acted on; when a budget stops the pass, the
@@ -221,7 +221,7 @@ For each position of the underwater account `U` (ascending market):
 |---|---|---|
 | `0x01` | — | unused / reserved (no account index, C1) |
 | `0x02 ‖ trader(20)` | u64 BE | last stage-1 chunk timestamp (cooldown) |
-| `0x03 ‖ market(8)` | i128 BE raw | previous mark (ADL price) |
+| `0x03 ‖ market(8)` | `last` i128 BE raw ‖ [`prev` i128 BE raw] | rule H: the last usable mark and the mark before it that differed from it (ADL base) |
 | `0x04` | trader(20) | scan cursor (only while a pass was cut) |
 | `0x05 ‖ …` | — | reserved: vault deposits / shares (later branch) |
 | `0x06 ‖ trader(20)` | `[1]` | still under MM after its last action — keeps the step due (review M2) |
@@ -289,7 +289,7 @@ change through native actions or CoreWriter, so no other trigger is needed.
 | D7 | Stops triggered by liquidation fills | run them (`run_triggered_stops`, FIFO) right after each liquidation order | Same as any fill; bounded by the pending set. |
 | D8 | Vault's own margin | exempt from stage 1 / backstop; ADL when its AV < 0 | It is the backstop; nothing else can take its positions. |
 | D9 | Residual deficit of a flat account (after stage 1 / ADL) | moves to the vault balance | Conserves value; no write-off, no socialization (decision 6). |
-| D10 | Previous mark | the mark the previous liquidation step stored per market; current mark if none | Deterministic, no oracle row-layout change. |
+| D10 | Previous mark (ADL base) | **changed by rule H (owner s96, adl-budget §8):** the last mark DIFFERENT from the current one (the stored `last` if the mark changed this step, else `prev`); current mark if none. Cursor-independent within one mark interval only | Deterministic, no oracle row-layout change. |
 | D11 | Margin configs | flat single tier at the listing's max leverage; MM fixed at half of IM | Zero IM change for current 20x markets; HL's "half". |
 
 ## Decisions (user, s517), known limitations, flags
@@ -309,7 +309,7 @@ change through native actions or CoreWriter, so no other trigger is needed.
 * **C6 — `CF_NATIVE_MARKETS` is off-root** but now drives margin (oracle R6, same exposure as
   governance ids).
 * **C7 — ranking AV uses entry fallback** for counterparties' unmarked markets (ranking only;
-  the execution price is the previous mark of the ADL market).
+  the execution price is the rule-H base of the ADL market).
 * **C8 — no liquidation flag in trade rows** (fills look like normal trades in history).
 * **C9 — governance `maintenance_margin_bps` / `max_leverage` params** stay validated-but-unread
   (`UpdateMarketParams` is text-only); out of scope.

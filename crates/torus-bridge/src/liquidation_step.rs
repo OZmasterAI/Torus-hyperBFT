@@ -161,7 +161,7 @@ impl NativeExecutor {
             let reader = AccountReader::of(ctx);
             listed.iter().filter_map(|&m| reader.mark(m).map(|p| (m, p))).collect()
         };
-        let prev = liq::prev_marks(&ctx.state, marks.keys().copied())?;
+        let (prev, mark_rows) = liq::adl_bases(&ctx.state, &listed, &marks)?;
         let l1 = Self::l1_on(ctx, &listed);
         // C1 (decided, s517): no separate index — walk CF_NATIVE_POSITIONS
         // (sorted by trader) from the round-robin cursor. SCAN + 2: the vault
@@ -248,7 +248,7 @@ impl NativeExecutor {
         let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)?
             .is_some_and(|v| liq::classify(&v) == Some(Health::Adl));
         stats.pending_changed |= liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
-        liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
+        liq::put_mark_rows(&ctx.state, &listed, &marks, &mark_rows)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
         // Metric: the vault's deficit (negative cash it absorbed, D9). A pure
         // point read, only with metrics attached; a read error skips the update
@@ -508,9 +508,10 @@ impl NativeExecutor {
             .map_err(|_| CoreError::Overflow("liquidation notional overflows i128".into()))
     }
 
-    /// Decision 5 + D10 + review H1: close every MARKED position of `u`
+    /// Decision 5 + rule H + review H1: close every MARKED position of `u`
     /// (ascending market) against ranked opposite-side counterparties at the
-    /// previous mark (the current mark without one) clamped to `u`'s
+    /// rule-H base (the last mark different from the current one; the current
+    /// mark without one) clamped to `u`'s
     /// bankruptcy price ([`liq::adl_price`]). Afterwards a non-vault account
     /// without marked positions hands its remaining collateral (rounding dust,
     /// or the deficit when the previous mark was worse than bankruptcy) to
