@@ -879,14 +879,23 @@ fn budgets_carry_over_through_the_cursor_round_robin() {
     assert!(NativeExecutor::liquidation_due(&db).unwrap());
 }
 
-/// `liquidation_due`: false on an empty CF, true with a cooldown row.
+/// `liquidation_due`: false on an empty CF, true with a cooldown row; P2: true
+/// with an ADL obligation row (`0x07`), false again once its size is 0.
 #[test]
 fn liquidation_due_reads_cooldown_and_cursor_rows() {
+    use torus_core::liquidation::{put_obligation, Obligation};
     let (_d, db) = liq_db(&[1]);
     assert!(!NativeExecutor::liquidation_due(&db).unwrap());
-    db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x02u8].as_slice(), &[7u8; 20]].concat(), &1_001u64.to_be_bytes())
-        .unwrap();
+    let cooldown = [[0x02u8].as_slice(), &[7u8; 20]].concat();
+    db.put_cf_raw(CF_NATIVE_LIQUIDATION, &cooldown, &1_001u64.to_be_bytes()).unwrap();
     assert!(NativeExecutor::liquidation_due(&db).unwrap());
+    db.delete_cf_raw(CF_NATIVE_LIQUIDATION, &cooldown).unwrap();
+    assert!(!NativeExecutor::liquidation_due(&db).unwrap());
+    let o = Obligation { height: 2, market: 1, is_long: true, trader: addr(7), size: fp(3), price: fp(950) };
+    put_obligation(&db, &o).unwrap();
+    assert!(NativeExecutor::liquidation_due(&db).unwrap(), "an obligation row keeps the step due");
+    put_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..o }).unwrap();
+    assert!(!NativeExecutor::liquidation_due(&db).unwrap());
 }
 
 /// D7: a stop fired by a liquidation fill runs in the same step. X's

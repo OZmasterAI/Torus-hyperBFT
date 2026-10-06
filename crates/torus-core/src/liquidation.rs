@@ -67,6 +67,11 @@ pub const CURSOR_KEY: [u8; 1] = [0x04];
 /// Review M2 (s517): `0x06 ‖ trader` — the account was still under MM after
 /// its last liquidation action (keeps the step due; 0x05 is reserved).
 pub const PENDING_TAG: u8 = 0x06;
+/// P2 (s96): `0x07 ‖ height(8) ‖ market(8) ‖ side(1: 1 long) ‖ trader(20)` ->
+/// `size raw (16, BE) ‖ price raw (16, BE)`: what the escrow of `is_long`
+/// still owes for `trader`'s position taken at block `height` at `price`
+/// (per account: H1's clamp).
+pub const ADL_OBLIGATION_TAG: u8 = 0x07;
 
 // ============================================================================
 // Pure parts
@@ -317,22 +322,23 @@ pub fn backstop<T: StateBackend>(
     Ok(())
 }
 
-/// Decision 5 (ADL): close `u`'s position in `m` at `price` against `ranked`
-/// in order, `q = min(remaining, candidate size)` each (a candidate whose
-/// position vanished or changed side is skipped). Returns the closes in
-/// order, `(counterparty, size)` (the caller logs them).
+/// Decision 5 (ADL): close at most `qty` of `u`'s position in `m` at `price`
+/// against `ranked` in order, `q = min(remaining, candidate size)` each (a
+/// candidate whose position vanished or changed side is skipped). Returns
+/// the closes in order, `(counterparty, size)` (the caller logs them).
 pub fn adl_close<T: StateBackend>(
     pm: &PositionManager<T>,
     u: &Address,
     m: MarketId,
     price: FixedPoint,
+    qty: FixedPoint,
     ranked: &[AdlCandidate],
 ) -> Result<Vec<(Address, FixedPoint)>, CoreError> {
     let mut closes = Vec::new();
     let Some(up) = pm.get_position(u, m)? else {
         return Ok(closes);
     };
-    let mut remaining = up.size;
+    let mut remaining = up.size.min(qty);
     for c in ranked {
         if remaining <= FixedPoint::ZERO {
             break;
@@ -350,6 +356,28 @@ pub fn adl_close<T: StateBackend>(
         remaining -= q;
     }
     Ok(closes)
+}
+
+/// P2 edge (real holders exhausted): escrow long sells `q` at `p_long`, escrow
+/// short buys `q` at `p_short`. Two prices realize (p_long - p_short) x q more
+/// than one shared price would; the vault pays it, so value is conserved.
+/// Returns the vault's change (+ = credited).
+pub fn cross_close<T: StateBackend>(
+    pm: &PositionManager<T>,
+    m: MarketId,
+    q: FixedPoint,
+    p_long: FixedPoint,
+    p_short: FixedPoint,
+    vault: &Address,
+) -> Result<FixedPoint, CoreError> {
+    let of = |_| CoreError::Overflow("adl cross close overflows i128".into());
+    pm.apply_fill(&ADL_ESCROW_LONG, m, false, q, p_long, MarginType::Cross)?;
+    pm.apply_fill(&ADL_ESCROW_SHORT, m, true, q, p_short, MarginType::Cross)?;
+    let paid = p_short.checked_sub(p_long).map_err(of)?.checked_mul(q).map_err(of)?;
+    let mut vb = pm.get_native_balance(vault)?;
+    vb.available = vb.available.checked_add(paid).map_err(of)?;
+    pm.put_native_balance(vault, &vb)?;
+    Ok(paid)
 }
 
 /// Q1 (s96): ADL counterparties = every position on side `want_long` of
@@ -610,6 +638,69 @@ pub fn put_mark_rows<T: StateBackend>(
         }
     }
     Ok(writes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Obligation {
+    pub height: u64,
+    pub market: MarketId,
+    pub is_long: bool,
+    pub trader: Address,
+    pub size: FixedPoint,
+    pub price: FixedPoint,
+}
+
+impl Obligation {
+    /// The row key (see [`ADL_OBLIGATION_TAG`]). Unique per obligation: an
+    /// account leaves liquidation flat in its bankruptcy block, so a
+    /// re-bankruptcy of the same trader gets a new (later) height — never a
+    /// key collision ([`put_obligation`] rejects one).
+    pub fn key(&self) -> [u8; 38] {
+        let mut k = [0u8; 38];
+        k[0] = ADL_OBLIGATION_TAG;
+        k[1..9].copy_from_slice(&self.height.to_be_bytes());
+        k[9..17].copy_from_slice(&self.market.to_be_bytes());
+        k[17] = u8::from(self.is_long);
+        k[18..].copy_from_slice(self.trader.as_slice());
+        k
+    }
+}
+
+/// Write `o` as a new row (size > 0) or delete its row (size <= 0). A new row
+/// over an existing key is an error (never an overwrite: see
+/// [`Obligation::key`]).
+pub fn put_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
+    let k = o.key();
+    if o.size <= FixedPoint::ZERO {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        return Ok(());
+    }
+    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
+        return Err(CoreError::InvalidInput(format!("adl obligation row exists: {o:?}")));
+    }
+    let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+    Ok(())
+}
+
+/// The first obligation at or after `start` (the bare tag, or a key + 0x00).
+pub fn next_obligation<T: StateBackend>(state: &T, start: &[u8]) -> Result<Option<Obligation>, CoreError> {
+    let Some((k, v)) = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[ADL_OBLIGATION_TAG], start, 1)?.pop()
+    else {
+        return Ok(None);
+    };
+    if k.len() != 38 || v.len() != 32 || k[17] > 1 {
+        return Err(malformed("adl obligation"));
+    }
+    let raw = |b: &[u8]| i128::from_be_bytes(b.try_into().expect("16 bytes"));
+    Ok(Some(Obligation {
+        height: u64::from_be_bytes(k[1..9].try_into().expect("8 bytes")),
+        market: MarketId::from_be_bytes(k[9..17].try_into().expect("8 bytes")),
+        is_long: k[17] == 1,
+        trader: Address::from_slice(&k[18..]),
+        size: FixedPoint::from_raw(raw(&v[..16])),
+        price: FixedPoint::from_raw(raw(&v[16..])),
+    }))
 }
 
 /// D5: the round-robin scan cursor (the last trader scanned by a cut pass).

@@ -138,13 +138,15 @@ impl NativeExecutor {
     /// Item 3: whether the liquidation step has pending work without any new
     /// action — a cooldown row (a chunked account: whole-position orders for
     /// 30 s, then the next chunk), the cursor row
-    /// (a cut pass) or, review M2, a pending row (an account left under MM by
-    /// its last action, e.g. a thin book). Reads the block's overlay (DB +
-    /// parent layer).
+    /// (a cut pass), review M2, a pending row (an account left under MM by
+    /// its last action, e.g. a thin book) or, adl-budget P2, an ADL
+    /// obligation row (escrow still to drain). Reads the block's overlay (DB
+    /// + parent layer).
     pub fn liquidation_due<T: StateBackend>(state: &T) -> Result<bool, CoreError> {
         Ok(state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::COOLDOWN_TAG])?
             || state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::PENDING_TAG])?
-            || state.get_cf_raw(CF_NATIVE_LIQUIDATION, &liq::CURSOR_KEY)?.is_some())
+            || state.get_cf_raw(CF_NATIVE_LIQUIDATION, &liq::CURSOR_KEY)?.is_some()
+            || state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_OBLIGATION_TAG])?)
     }
 
     fn liquidation_pass<T: StateBackend>(
@@ -530,7 +532,7 @@ impl NativeExecutor {
                 .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
             let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
             let (cands, _) = Self::adl_candidates_of(ctx, m, !p.is_long)?;
-            let closes = liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
+            let closes = liq::adl_close(&ctx.positions, u, m, px, p.size, &liq::adl_rank(mark, cands))?;
             // Telemetry: one info line per (account, market), each close at debug.
             let mut size = FixedPoint::ZERO;
             for (c, q) in &closes {
