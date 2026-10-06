@@ -316,5 +316,6 @@ change through native actions or CoreWriter, so no other trigger is needed.
 
 ## Out of scope
 
-HLP deposits / vault strategy; mark = HL formula (item C); funding; isolated margin;
-liquidation fees; RPC liquidation endpoints.
+HLP deposits / vault strategy; mark = HL formula (item C); funding (when added: the ADL escrow
+positions are excluded, `docs/plans/adl-budget.md` §8); isolated margin; liquidation fees; RPC
+liquidation endpoints.

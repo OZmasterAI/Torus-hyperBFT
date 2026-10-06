@@ -1,130 +1,194 @@
-# Implementation Plan: ADL per-block budget (P0 before testnet)
+# Implementation Plan: ADL per-block budget, P2 escrow + rule H (P0 before testnet)
 
-Design: `docs/plans/adl-budget.md` (Q1-Q5 decided by the owner, 18c s96). Liquidation
-semantics: `docs/plans/liquidation.md` (H1, H2, H3, M2, D4, D8, D9, D10, invariants).
-Branch `perf/adl-budget` (worktree `/home/oz/projects/wt/adl-budget`, off main aae6b9b).
-Build dir: `CARGO_TARGET_DIR=/home/oz/.cargo-target-adl-budget` (one cargo build at a time on
-the host: check `pgrep -a cargo` first).
+Design: `docs/plans/adl-budget.md`, sections 1-7 and **section 8 (FINAL, owner 18c s96)**:
+* Q1-Q4 as recommended: C1, one ranking per (block, market), W = candidates examined + closes,
+  FIFO.
+* **Q6 = P2:** terms fixed at B, two ADL escrows.
+* **Q5 freeze dropped.**
+* **H1 clamp kept unchanged.**
+* **H:** the previous mark = the last mark different from the current one.
+* **Funding:** doc-only.
+* **Conservation:** a node-local sum.
+* **W:** an HL-sized event closes in one block.
 
-**Q6 is being re-discussed (owner, s18 follow-up) for Hyperliquid parity.** This plan therefore
-has two phases. **Phase A** does not depend on Q6. **Phase B** holds every Q6-dependent part as
-separate, swappable tasks that run last. Phase A puts the Q6-dependent choices behind one seam
-(`adl_market`, task A4): Phase A keeps today's rule there, and Phase B or a snapshot variant
-replaces only that function and the tasks marked Q6. Nothing Q6-specific is final until the
-owner decides.
+Liquidation semantics: `docs/plans/liquidation.md` (H1, H2, H3, M2, D4, D8, D9, D10,
+invariants). Branch `perf/adl-budget` (worktree `/home/oz/projects/wt/adl-budget`, off main
+aae6b9b). P2 and H change block results, so they need a fresh genesis (M1: no activation height;
+fine pre-testnet).
 
 ```bash
-export CARGO_TARGET_DIR=/home/oz/.cargo-target-adl-budget
+export CARGO_TARGET_DIR=/home/oz/.cargo-target-adl-budget   # one cargo build at a time: pgrep -a cargo
 F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"
 ```
 
 ## Design Decision
 
-* **Q1, C1: candidates come from point reads over the whole trader set.** A ranking of market `m`
-  for side `s` reads `get_position(t, m)` for every trader `t` of
-  `NativeExecutor::liq_traders_after(ctx, None, usize::MAX)`. That list is the E2 sorted set
-  merged with the block's dirty traders when the records are attached. Without records it is
-  the `liq::traders_after` walk. Reads go through `AccountReader::get_position` (the record for a
-  clean trader, the overlay for a dirty one). The ranking keeps every holder on side `s`, and
-  `adl_rank` stays unchanged. `ADL_MAX_SCAN_ROWS` and the 65,536-row window go away. The cost of
-  one ranking is the number of traders examined.
-* **Q4: a FIFO queue in `CF_NATIVE_LIQUIDATION`.** Rows are `0x07 ‖ height(8 BE) ‖ trader(20)`
-  → `[1]` and `0x08 ‖ trader` → `height(8 BE)`.
-  * The regular pass, when it classifies an account ADL, runs D4 (cancel orders and stops) and
-    then **enqueues** the account.
-  * The pass **skips** an account that is already queued. The skip still uses a slot in the scan
-    window (open question 6).
-  * The vault (D8) is enqueued when its AV < 0 and it is not queued yet.
-  * The pass then **drains** the queue in key order under `W` work units. For each account it
-    closes the marked positions in ascending market. When no marked position is left, it applies
-    today's `adl_account` tail (non-vault: `move_collateral` to the vault, D9) and dequeues the
-    account.
-  * `liquidation_due` also checks the `0x07` prefix.
-* **Q3: the budget.** One unit is one trader examined by a ranking, one close, or one queued
-  account visited (the visit unit is open question 1). A step is one (account, market) ADL. It
-  starts only while `used < W` and runs to the end once started, so a block overshoots by at most
-  one step. The constant `ADL_WORK_PER_BLOCK` comes from measurement (task A6).
-* **M2 and the queue.** A queued account holds **no** pending row: the queue row keeps the step
-  due. On enqueue, `set_pending(false)`. On dequeue, a non-vault account gets
-  `mark_pending(ctx, marks, l1, u)` (set iff the account can still be valued and is not healthy).
-  The vault gets `set_pending(false)`, because the vault is exempt from stage 1 and backstop, so a
-  pending row for it would keep every block due. The vault-only pending code
-  (`liquidation_step.rs:247-250`) goes away.
-* **Q6 seam (kept as today in Phase A).** At a deferred close, the price is the drain block's
-  previous mark clamped to the bankruptcy price at that step (H1/D10). The ranking is computed
-  when the step runs. In the common case the drain finishes in the enqueue block, and the result
-  then equals today's rule except for one change: ADL now runs after the regular pass instead of
-  inside it.
-* **Where the Q2 cache lives (B1, Q6-dependent).** A local
-  `BTreeMap<(MarketId, bool), Vec<AdlCandidate>>` in `adl_drain`, dropped when the drain returns.
-  It is never node state or a context field. Steps that reuse it **re-walk the ranked list from
-  the start**. `adl_close` already re-reads each candidate and skips a vanished or flipped
-  position, so no index has to be stored. This is deterministic, and the extra reads are bounded:
-  a fully consumed candidate was closed by an earlier step of the same block (already counted),
-  and during the drain no position grows or appears, because only ADL transfers run and they only
-  reduce sizes.
-* **Q5, freeze (B3, Q6-dependent).** One `prefix_exists(0x07)` per context, held in
-  `ctx.adl_queue_on: Option<bool>`. A membership read per action happens only when the queue is
-  non-empty. The checks sit at the three entry points that do not share a path (see B3). The new
-  code is `FailureReason::Liquidating = 9` (`"liquidating"`).
+**At B** (the block where an account classifies ADL, or the vault's AV < 0), in the regular
+pass:
+1. D4: cancel the account's orders and stops.
+2. For each **marked** position, in ascending market:
+   `price = liq::adl_price(base, bankruptcy_price(adl_rest(..)), mark, is_long)`. This is
+   today's one-sided H1 clamp, computed sequentially, so a later market sees the PnL the
+   earlier transfers realized. `base` comes from rule H. `liq::transfer` moves the position to
+   the escrow of its side at that price, and the pass writes an obligation row. No candidates
+   are needed.
+3. D9 / `move_collateral` as today: the non-vault account's remaining collateral (any sign:
+   deficit, or a rare surplus) moves to the vault. The account ends flat at exactly 0 and
+   leaves liquidation in B. The vault keeps its own balance (D8, as today).
+
+**Rule H (changes D10).** Row `0x03 ‖ market` → `last(16 BE) ‖ [prev(16 BE)]`.
+* At each step with a usable mark `M`:
+  * no row → write `last = M` (no `prev`);
+  * `M ≠ last` → write `(last = M, prev = old last)`;
+  * `M == last` → no write.
+* No usable mark → delete the row (as today).
+* The pre-clamp base of this step = the old `last` if the mark changed this step, else `prev`;
+  with neither, the mark (D10's fallback).
+* A 16-byte row still decodes (no `prev`), so today's fixtures and `liq_rows(.., 0x03)` checks
+  are unchanged for a first mark.
+* The result: every account of a market gets the same pre-clamp price **within one mark
+  interval**, whatever block the scan reaches it in. Across mark changes this is not true: at
+  100k accounts the 2,048-per-block scan can span several (follow-up C2, noted in
+  `adl-budget.md` §8).
+
+**Escrows.** `ADL_ESCROW_LONG = b"torus-adl-escrow-lng"` takes bankrupt longs and
+`ADL_ESCROW_SHORT = b"torus-adl-escrow-sht"` takes bankrupt shorts. They are protocol accounts
+with no key, fixed like `LIQUIDATOR_VAULT`.
+* One aggregated position per (market, side); the sides never net.
+* Never classified: the pass skips them like the vault.
+* No margin checks: they never place orders or withdraw.
+* Never ADL candidates (`liq::adl_candidates` skips them). The vault stays a candidate.
+
+**Obligation queue (FIFO).** `CF_NATIVE_LIQUIDATION` row
+`0x07 ‖ height(8 BE) ‖ market(8 BE) ‖ side(1: 1 = long) ‖ trader(20)` → `size raw (i128 BE) ‖
+price raw (i128 BE)`. The trader stays in the key because the clamp makes prices per account.
+Invariant: for each (side, market), the escrow's size equals the sum of that side's row sizes.
+
+**Drain** (after the pass and the vault step):
+* Rows are drained in key order under `W`, with one ranking per **(block, market, side)** from a
+  local cache.
+* `liq::adl_close` closes the escrow against the ranked opposite holders at the **row's stored
+  price**, with `q = min(row remaining, candidate size)`. The row is rewritten with the
+  remainder, or deleted at 0.
+* A step is one row. It starts only while `used < W` and runs to the end once started, so a
+  block overshoots by at most one step.
+* Units: traders examined by a ranking (the first use of a cache key in the block) + closes +
+  rows scanned by the edge pairing.
+
+**Edge: real holders exhausted** (both escrows hold the market). The row is paired with the
+opposite side's rows of the same market, in key order. The two escrows close against each other,
+**each at its own stored price**, and the vault pays `(p_long − p_short) × q`: `liq::cross_close`.
+The amount is tested and reported (log + gauge).
+
+**Dust sweep.** At the end of a drain, a flat escrow's balance (dust from weighted-average
+entries, any sign) moves to the vault. It is reported separately (log + gauge) and must stay
+within the *Dust bound*.
+
+**Where the Q2 cache lives.** A local `BTreeMap<(MarketId, bool), Vec<AdlCandidate>>` in
+`adl_drain`, dropped when the drain returns. It is never node state or a context field. Each row
+**re-walks the ranked list from the start**, and `adl_close` re-reads every candidate and skips
+a vanished or emptied one. That keeps it deterministic, and no index has to be stored. The extra
+reads are bounded: during the drain only ADL closes run, and they only shrink real positions. A
+fully used candidate was closed (and counted) earlier in the same block.
+
+**M2.** The pass's post-steps run as today (`settle_flat_deficit`, `clear_cooldown`,
+`mark_pending`). The account is flat after B, so its pending row clears. The vault keeps its rule
+(pending while ADL-able), which is false once its marked positions are in escrow. The `0x07`
+rows keep the step due (`liquidation_due`).
+
+**W.** One constant, `liq::ADL_WORK_PER_BLOCK`, chosen so an HL-sized event (300 account-markets
+over ~100 markets at N = 5,000 traders) closes the escrows **in its own block**. Only S=750-type
+storms spill over. A8 measures it and reports ms per block.
+
+**Conservation sum.** A node-local sum over **all** accounts (vault and escrows included) of
+available + order margin + UPnL at the mark (unmarked: at entry).
+* It is computed after every liquidation step while `ctx.liq_value_sum` is on (the node sets it
+  from `TORUS_LIQ_VALUE_SUM=1`; a proof-only flag) and metrics are attached, after the step
+  timer stops.
+* It sets a gauge and logs one info line `liquidation: value sum` that the harness can parse
+  from cell logs.
+* With OI symmetric and every market marked, the sum does not depend on the mark
+  (Σ UPnL = −Σ signed size × entry), so it must stay constant across a drain without deposits,
+  withdrawals or fee debits.
+
+### Dust bound
+
+`apply_fill` (`position.rs:515-519`) averages the entry with
+`(entry × size + price × qty) / new_size`, truncating. Each average is off by < 1 raw price unit,
+and that error applies to the escrow's **whole** size afterwards. Each close truncates by < 1 raw
+value unit. Per escrow and market, in raw value units (SCALE = 10^8):
+
+`|dust| ≤ Σ over rows received ((escrow size after receiving it).raw() / SCALE + 3) + number of closes`
+
+This is the owner's "size × 1 raw per obligation", taken with the aggregated size (open question
+2). Tests assert the bound. Production logs an error above the bound and sweeps anyway.
+
+## Funding requirement (owner decision 5; doc-only, no funding on main)
+
+Recorded in `adl-budget.md` §8 and pointed at from `liquidation.md` *Out of scope* (done in this
+plan's commit):
+* the positions of both escrows are excluded from funding (otherwise an escrow could not end at
+  0);
+* counterparties keep paying and receiving funding until their row is drained (a storm-only
+  difference from HL; HL parity backlog item).
 
 ## Success Criteria
 
-1. With more than 65,536 position rows, the top-ranked counterparty at a **high** address is
-   closed first (fails on 7ec5eb2).
-2. The C1 records path equals the fallback walk. This includes traders written in the block:
-   the shadow check reports no mismatch, and the L1 seeded test stays green.
-3. The budget stops at `W` (± one step). The next block resumes in FIFO order (height, then
-   address). Two runs produce identical rows in every native-root CF, and the e2e native roots
-   are equal.
-4. Over a multi-block drain, after every block: OI is symmetric in each market, total value is
-   conserved (Σ available + order margin + UPnL at the mark, vault included), and each ADL'd
-   account ends at exactly 0 (`available + order_margin == 0`, flat).
-5. The vault is enqueued when its AV < 0. `liquidation_due` is true while the queue is not empty.
-6. Backstop and stage 1 are unchanged: every existing test in `tests/liquidation_tests.rs`, the L1
-   seeded test, and `offmark_bad_debt_tests` pass with their expectations unchanged. GOLDEN_B is
-   re-pinned only for ADL blocks (A4).
-7. `ubench_adl`: per-block ADL time ≤ target (A6). `W` is written into `adl-budget.md` with the
-   measurement.
-8. Phase B (once Q6 is decided): re-classification dequeues on recovery; the freeze rejects every
-   frozen action kind with `liquidating`, credits deposits, and does no membership read when the
-   queue is empty; the gauges report queue size and deficit.
-
-## Q6 dependency map
-
-| Part | Task | Why it depends on Q6 |
-|---|---|---|
-| Price at a deferred close (previous mark of the drain block, clamped to bankruptcy at the step) | A4 seam `adl_market` (today's lines kept) | A snapshot variant would use the enqueue block's price |
-| Ranking timing (per step in Phase A, per (block, market) in B1) | B1 | A snapshot ranks once, at enqueue |
-| Re-classification (AV ≥ 0 → dequeue) | B2 | A snapshot keeps the ADL decision final (HL) |
-| Freeze semantics | B3 | Needed or not, and how strict, depends on how long accounts stay queued |
-| Gauges (queue size, deficit) | B4 | The deficit definition (−AV now, or fixed at enqueue) |
-| `W` target | A6 (measurement Q6-neutral; the chosen value is not) | The "W large enough to finish typical events in one block" option |
+1. With more than 65,536 position rows, the top-ranked counterparty at a high address is closed
+   first (fails on 7ec5eb2).
+2. The C1 records path equals the fallback walk (shadow; the L1 seeded test is green).
+3. Rule H:
+   * the base changes only when the mark changes;
+   * two accounts of one market liquidated in consecutive blocks without a mark change get the
+     same pre-clamp price (an S=750-like case);
+   * a market without a usable mark deletes the row.
+4. Every ADL'd account is flat at exactly 0 at B. The escrow holds its marked positions at the
+   clamped prices, with one row each. The vault received exactly the D9 amount (any sign).
+5. The drain stops at W (± one step), resumes in key order, and has one ranking per
+   (block, market, side). Two runs give identical rows and native roots.
+6. After every block of a multi-block drain:
+   * OI is symmetric (escrows included);
+   * Σ value over ALL accounts (vault and escrows included) is conserved (exact for
+     exact-average fixtures, within the dust bound otherwise);
+   * escrow size = Σ rows.
+7. After the drain, the escrows have 0 positions and 0 balance once the dust is swept. The vault
+   = D9 at B + dust + pairing amounts. The escrow-vs-escrow pairing conserves value.
+8. Escrows are never classified and never candidates.
+9. An HL-sized event closes in its own block with the default W (unit test, plus a ubench at
+   N = 5,000).
+10. Backstop, stage 1 and the H1 clamp are unchanged: every existing liquidation test passes
+    unchanged. GOLDEN_B is re-pinned for ADL blocks only.
+11. The Phase C final proof list holds.
 
 ## Tasks
 
-Phase A (Q6-independent): A1 → A2 → A3 → A4 → A5 → A6.
-Phase B (Q6-dependent, swappable, last): B1-B4, each needs A4 only.
-Phase C: the proof.
+Order: A1+A2 (one commit) → A3 → A4 → A5+A6 (**one commit**: the existing ADL tests need the
+drain) → A7 → A8 → Phase C. A3 is independent of A1/A2.
+
+The docs part (adl-budget.md §8, the liquidation.md funding pointer) is in this plan's commit.
+The remaining `liquidation.md` updates (H3 window, *ADL* section, D10 → H, the row table, the
+escrows) land with the code task they describe.
 
 ---
 
-### Task A1: core `adl_candidates` over a trader set (Q1)
+### Task A1: core `adl_candidates` over a trader set, escrows excluded (Q1)
 
 **Test first** (`crates/torus-core/tests/liquidation_tests.rs`). Replace
-`adl_candidates_scan_at_most_max_rows` (:274-290) with:
+`adl_candidates_scan_at_most_max_rows` (:274-290):
 
 ```rust
 /// Q1 (s96): ADL counterparties = every holder on side `want_long` among
-/// `traders` (each read through `get`), in `traders` order; the bankrupt
-/// account is never on the opposite side of its own position, the vault is an
-/// ordinary holder. Reads every trader once (the ranking's work units).
+/// `traders`, read through `get`, in `traders` order. The vault is an
+/// ordinary holder; the two ADL escrows are never candidates (P2). One read
+/// per non-escrow trader.
 #[test]
-fn adl_candidates_are_every_opposite_holder_of_the_trader_set() {
+fn adl_candidates_are_every_opposite_holder_except_the_escrows() {
+    use torus_core::liquidation::{ADL_ESCROW_LONG, ADL_ESCROW_SHORT};
     let (_d, pm) = setup();
     open_pair(&pm, &addr(1), &addr(2), 1, 3, 100);
     open_pair(&pm, &addr(5), &addr(3), 1, 1, 100);
     open_pair(&pm, &addr(4), &LIQUIDATOR_VAULT, 1, 2, 100);
+    open_pair(&pm, &ADL_ESCROW_LONG, &ADL_ESCROW_SHORT, 1, 7, 100);
     open_pair(&pm, &addr(7), &addr(6), 2, 1, 100); // market 2 only
     let traders = traders_after(pm.state(), None, usize::MAX).unwrap();
     let reads = std::cell::Cell::new(0);
@@ -134,25 +198,41 @@ fn adl_candidates_are_every_opposite_holder_of_the_trader_set() {
         shorts.iter().map(|c| (c.trader, c.size)).collect::<Vec<_>>(),
         vec![(addr(2), fp(3)), (addr(3), fp(1)), (LIQUIDATOR_VAULT, fp(2))]
     );
-    assert_eq!(reads.get(), traders.len(), "one read per trader");
+    assert_eq!(reads.get(), traders.len() - 2, "escrows are not read");
     let longs = adl_candidates(&traders, true, |t| pm.get_position(t, 1), |_| Ok(fp(1))).unwrap();
     assert_eq!(longs.iter().map(|c| c.trader).collect::<Vec<_>>(), vec![addr(1), addr(4), addr(5)]);
 }
 ```
 
-It fails to compile on 7ec5eb2 (the signature changes), which is the RED step.
-
 **Implementation** (`crates/torus-core/src/liquidation.rs`):
-* Delete `ADL_MAX_SCAN_ROWS` (:41-45). Keep `SCAN_PAGE`, because `pending_count` uses it.
-* Replace `adl_candidates` (:340-384) with the pure filter below. `exclude` goes away: the
-  bankrupt account's own position is on the wanted side's opposite, and `adl_close` (:325)
-  still skips `u`.
+* Delete `ADL_MAX_SCAN_ROWS` (:41-45). `SCAN_PAGE` stays (`pending_count`).
+* After `LIQUIDATOR_VAULT` (:28):
 
 ```rust
-/// Q1 (s96, `docs/plans/adl-budget.md`): ADL counterparties = every position on
-/// side `want_long` of `traders` (ascending, each once), `get` reading a
+/// adl-budget P2 (owner s96): the ADL escrows — protocol accounts (no known
+/// key) that take a bankrupt account's positions at their ADL price in the
+/// bankruptcy block, one per side so opposite obligations never net. Never
+/// classified, never ADL candidates, excluded from funding (adl-budget §8).
+pub const ADL_ESCROW_LONG: Address = Address::new(*b"torus-adl-escrow-lng");
+pub const ADL_ESCROW_SHORT: Address = Address::new(*b"torus-adl-escrow-sht");
+
+/// The escrow that takes a bankrupt position of side `is_long`.
+pub fn adl_escrow(is_long: bool) -> Address {
+    if is_long { ADL_ESCROW_LONG } else { ADL_ESCROW_SHORT }
+}
+
+pub fn is_adl_escrow(a: &Address) -> bool {
+    *a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT
+}
+```
+
+* Replace `adl_candidates` (:340-384):
+
+```rust
+/// Q1 (s96): ADL counterparties = every position on side `want_long` of
+/// `traders` (ascending, each once; the escrows skipped), `get` reading a
 /// trader's position in the ADL market, `av` valuing a holder (ranking only,
-/// C7). The caller's work units for the ranking = `traders.len()` (Q3).
+/// C7). The ranking's work units are `traders.len()` (Q3).
 pub fn adl_candidates(
     traders: &[Address],
     want_long: bool,
@@ -160,52 +240,43 @@ pub fn adl_candidates(
     mut av: impl FnMut(&Address) -> Result<FixedPoint, CoreError>,
 ) -> Result<Vec<AdlCandidate>, CoreError> {
     let mut out = Vec::new();
-    for t in traders {
+    for t in traders.iter().filter(|t| !is_adl_escrow(t)) {
         let Some(p) = get(t)? else { continue };
         if p.is_long != want_long || p.size <= FixedPoint::ZERO {
             continue;
         }
-        out.push(AdlCandidate {
-            trader: *t,
-            is_long: p.is_long,
-            size: p.size,
-            entry_price: p.entry_price,
-            account_value: av(t)?,
-        });
+        out.push(AdlCandidate { trader: *t, is_long: p.is_long, size: p.size, entry_price: p.entry_price, account_value: av(t)? });
     }
     Ok(out)
 }
 ```
 
-* Remove the `CF_NATIVE_POSITIONS` import if it becomes unused (`traders_after` still uses it).
-* Update the doc on H3 in `docs/plans/liquidation.md` (the window paragraph, :63-68) and on *ADL*
-  (:199). Write "every opposite-side holder (C1 point reads over the trader set, adl-budget
-  Q1)".
+* `liquidation.md` H3 (:63-68): the window is superseded by adl-budget Q1.
 
 **Verify:** `cargo nextest run -p torus-core liquidation $F` and `cargo check --workspace --tests -q`.
-The bridge breaks at `liquidation_step.rs:505` and `ubench_adl.rs:34,189`. A2 fixes both; land
-A1 and A2 together.
+The bridge breaks at `liquidation_step.rs:505` and `ubench_adl.rs:34,189`; commit together with
+A2.
 **Depends on:** none.
 
 ---
 
-### Task A2: bridge C1 wiring + the fairness test (Q1)
+### Task A2: bridge C1 wiring + the fairness test (Q1; still today's ADL flow)
 
 **Test first.**
-
-1. `crates/torus-bridge/tests/liquidation_tests.rs`, new section `// ---- adl-budget Q1 ----`.
-   It fails on 7ec5eb2: the window ends before `top`, so the step closes against `pad(0..4)`.
+1. `crates/torus-bridge/tests/liquidation_tests.rs`. It fails on 7ec5eb2: the window ends before
+   `top`, so the step closes against `pad(0..4)`. It still passes after A6, because the drain
+   runs in B with the default W.
 
 ```rust
 /// Q1 (s96): ADL counterparties = EVERY opposite-side holder. 230 padding
-/// traders (low addresses) x 301 rows = 69,230 rows > 65,536; each is short 1
-/// in market 1 with a huge AV (ranks low). `top` (0xFF.., highest address) is
-/// short 4 with AV 500 at 900 -> rank (1000/900) x (3600/500) = 8: first. U
-/// long 4 @ 1,000, collateral 200: AV -200 at 900 -> ADL; closes 4 against top.
+/// traders (low addresses) x 301 rows = 69,230 rows > 65,536, each short 1 in
+/// market 1 with a huge AV (ranks low). `top` (0xFF.., highest address) is
+/// short 4 with AV 500 at 900 -> rank (1000/900) x (3600/500) = 8: first.
+/// U long 4 @ 1,000, collateral 200: AV -200 at 900 -> ADL; 4 close against top.
 #[test]
 fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
     let (_d, db) = liq_db(&[1]);
-    let ctx = ctx_at(db.clone(), 2);
+    let ctx = ctx_at(db.clone(), 1);
     let pad = |i: u32| {
         let mut a = [0x01u8; 20];
         a[16..].copy_from_slice(&i.to_be_bytes());
@@ -236,38 +307,26 @@ fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
 }
 ```
 
-   `total_value` indexes `marks[&p.market_id]`. For this test, a variant that values unmarked
-   markets at entry (UPnL 0) is needed: add `.get(..).map_or(ZERO, ..)` to the helper, which
-   keeps every existing caller unchanged.
+   `total_value` (:102-114) values an unmarked market at entry
+   (`marks.get(&p.market_id).map_or(ZERO, |mk| p.unrealized_pnl(*mk))`). The existing callers
+   are unchanged.
+2. `crates/torus-bridge/src/liquidation_l1_tests.rs`: add `adl_rankings` to `Stats` (:118-144),
+   collected at :360-368. Change :426 to
+   `assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_rankings, "E2: pass + ADL rankings from the slot: {s:?}")`
+   and add `assert!(s.adl_rankings > 0)`. The shadow checks in `liq_traders_after` (:284-292)
+   and `AccountReader::get_position` (NE:1499-1509) then cover every ranking, dirty traders
+   included.
 
-2. `crates/torus-bridge/src/liquidation_l1_tests.rs`:
-   * add `adl_rankings: usize` to `Stats` (:118-144) and collect it at :360-368;
-   * change :426 to
-     `assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_rankings, "E2: every L1 block's candidates (pass + ADL rankings) from the slot: {s:?}");`
-     and add `assert!(s.adl_rankings > 0, "ADL rankings ran through the slot: {s:?}");`.
-     The seeded run then shadow-checks every ranking's trader list (`liq_traders_after`
-     :284-292) and every record read (`AccountReader::get_position` NE:1499-1509), including
-     traders the block wrote.
-   * New focused test `adl_candidates_records_equal_walk_with_dirty_traders`. Two blocks through
-     `begin_resident` / `end_resident`: block 1 opens shorts for `trader(1..6)` against a long
-     `trader(0)` and freezes them into R. Block 2 changes `trader(2)` (reduce) and `trader(4)`
-     (close), and opens `trader(7)` (new) in the overlay. Then
-     `NativeExecutor::adl_candidates_of(&ctx, 1, false)` with R attached (shadow on) must equal
-     the same call on a context built with `begin_resident(None, ..)` over the same DB and
-     overlay rows. The test asserts the lists are equal, `shadow_mismatches` is empty, and
-     `counters.records > 0`.
-
-**Implementation** (`crates/torus-bridge/src/liquidation_step.rs`; NE = `native_executor.rs`):
-* NE:1100: add `adl_rankings: std::sync::atomic::AtomicUsize` to `SumsCounters` (doc: "C1: ADL
-  rankings over the slot's trader set").
-* New method next to `liq_traders_after` (:273):
+**Implementation:**
+* NE:1100 `SumsCounters`: add `adl_rankings: std::sync::atomic::AtomicUsize`.
+* `liquidation_step.rs`, after `liq_traders_after` (:295):
 
 ```rust
 /// adl-budget Q1 (C1): `m`'s counterparties on side `want_long` — a point
 /// read of every trader of the positions CF (the slot's sorted set merged
 /// with the block's dirty traders, else the walk), through the records for a
-/// clean trader and the overlay for a dirty one. Returns the candidates and
-/// the traders examined (the ranking's work units, Q3).
+/// clean trader and the overlay for a dirty one; escrows skipped. Returns the
+/// candidates and the traders examined (the ranking's work units, Q3).
 fn adl_candidates_of<T: StateBackend>(
     ctx: &NativeExecContext<T>,
     m: MarketId,
@@ -275,8 +334,8 @@ fn adl_candidates_of<T: StateBackend>(
 ) -> Result<(Vec<liq::AdlCandidate>, u64), CoreError> {
     let traders = Self::liq_traders_after(ctx, None, usize::MAX)?;
     let reader = AccountReader::of(ctx);
-    // C7: ranking AV with entry fallback for unmarked markets. An
-    // overflowing valuation ranks last (AV 0); a storage error stays an error.
+    // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
+    // storage error stays an error (fail-stop).
     let cands = liq::adl_candidates(&traders, want_long, |t| reader.get_position(t, m), |t| {
         let bal = ctx.positions.get_native_balance(t)?;
         let v = match reader.view(t, &bal) {
@@ -294,692 +353,750 @@ fn adl_candidates_of<T: StateBackend>(
 }
 ```
 
-* In `adl_account` (:501-517), replace the `liq::adl_candidates(.., ADL_MAX_SCAN_ROWS, ..)`
-  call with `let (cands, _) = Self::adl_candidates_of(ctx, m, !p.is_long)?;`. That removes the
-  local `reader` and the `av` closure there. Ranking and close are otherwise unchanged.
-* `crates/torus-bridge/tests/ubench_adl.rs`: drop the `ADL_MAX_SCAN_ROWS` import (:34) and the
-  window note (:129-133). In `parts` (:183-208), time
-  `liq::adl_candidates(&liq::traders_after(&ctx.state, None, usize::MAX)?, false, |t| ctx.positions.get_position(t, m), |_| Ok(ZERO))`
-  (the fallback walk cost, labelled "walk"). The records path is timed by the step itself.
+* `adl_account` (:501-517): `let (cands, _) = Self::adl_candidates_of(ctx, m, !p.is_long)?;`
+  replaces the window call. A5 replaces `adl_account`.
+* `ubench_adl.rs`: drop `ADL_MAX_SCAN_ROWS` (:34, :129-133). `parts` (:183-208) times the
+  fallback walk:
+  `liq::adl_candidates(&liq::traders_after(&ctx.state, None, usize::MAX)?, false, |t| ctx.positions.get_position(t, m), |_| Ok(ZERO))`.
 
-**Verify:**
-`cargo nextest run -p torus-bridge adl_reaches_a_top_ranked $F` (RED on 7ec5eb2, GREEN after),
+**Verify:** `cargo nextest run -p torus-bridge adl_reaches_a_top_ranked $F` (RED, then GREEN),
 `cargo nextest run -p torus-bridge liquidation $F`, and
 `cargo nextest run -p torus-bridge scenario_b_liquidation_digests $F`. GOLDEN_B must stay
-**unchanged** here: below 65,536 rows the candidate set is the same, and `adl_rank` is a total
-order, so the closes are identical.
+**unchanged**: the candidate set is the same below 65,536 rows, and `adl_rank` is total.
 **Depends on:** A1.
 
 ---
 
-### Task A3: queue rows + `liquidation_due` (Q4)
+### Task A3: rule H — previous mark = last different mark (D10 change)
 
-**Test first:**
-* `crates/torus-core/tests/liquidation_tests.rs`:
+**Test first.**
+* Core (`liquidation_tests.rs`):
 
 ```rust
-/// Q4 (s96): `0x07 ‖ height ‖ trader` -> [1] (FIFO: height, then address) and
-/// `0x08 ‖ trader` -> height. Enqueue is idempotent (keeps the first height);
-/// dequeue deletes both rows; `adl_queue_next` pages in key order.
+/// H (owner s96): row `0x03 ‖ m` = last ‖ [prev]; the pre-clamp ADL base is the
+/// last mark DIFFERENT from the current one; a step with the same mark writes
+/// nothing; without a usable mark the row goes (and the next mark has no base).
 #[test]
-fn adl_queue_is_fifo_by_height_then_address() {
-    use torus_core::liquidation::{adl_dequeue, adl_enqueue, adl_queue_key, adl_queue_next, adl_queue_nonempty, adl_queued, ADL_QUEUE_TAG};
+fn adl_base_is_the_last_different_mark() {
+    use std::collections::BTreeMap;
+    use torus_core::liquidation::{adl_bases, put_mark_rows};
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
-    assert!(!adl_queue_nonempty(&db).unwrap());
-    assert!(adl_enqueue(&db, &addr(9), 5).unwrap());
-    assert!(adl_enqueue(&db, &addr(8), 5).unwrap());
-    assert!(adl_enqueue(&db, &addr(1), 6).unwrap());
-    assert!(!adl_enqueue(&db, &addr(9), 7).unwrap(), "already queued: height 5 kept");
-    let mut order = Vec::new();
-    let mut start = vec![ADL_QUEUE_TAG];
-    while let Some((h, t)) = adl_queue_next(&db, &start).unwrap() {
-        order.push((h, t));
-        start = [adl_queue_key(h, &t).as_slice(), &[0]].concat();
+    let (mut bases_seen, mut writes_seen) = (Vec::new(), Vec::new());
+    for mark in [Some(990), Some(990), Some(900), Some(900), Some(880), None, Some(870)] {
+        let marks: BTreeMap<u64, FixedPoint> = mark.map(|p| (1u64, fp(p))).into_iter().collect();
+        let (bases, rows) = adl_bases(&db, &[1], &marks).unwrap();
+        bases_seen.push(bases.get(&1).copied());
+        writes_seen.push(put_mark_rows(&db, &[1], &marks, &rows).unwrap());
     }
-    assert_eq!(order, vec![(5, addr(8)), (5, addr(9)), (6, addr(1))]);
-    assert!(adl_queued(&db, &addr(9)).unwrap());
-    assert!(adl_dequeue(&db, &addr(9)).unwrap());
-    assert!(!adl_dequeue(&db, &addr(9)).unwrap(), "absent: no write");
-    assert!(!adl_queued(&db, &addr(9)).unwrap());
-    assert_eq!(adl_queue_next(&db, &[ADL_QUEUE_TAG]).unwrap(), Some((5, addr(8))));
-    assert!(db.get_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x08u8].as_slice(), addr(9).as_slice()].concat()).unwrap().is_none());
+    assert_eq!(bases_seen, vec![None, None, Some(fp(990)), Some(fp(990)), Some(fp(900)), None, None]);
+    assert_eq!(writes_seen, vec![1, 0, 1, 0, 1, 1, 1], "a write only when the mark changes or goes");
 }
 ```
 
-* `crates/torus-bridge/tests/liquidation_tests.rs`: extend `liquidation_due_reads_cooldown_and_cursor_rows`
-  (:773-780). After the cooldown row is deleted, `adl_enqueue(&db, &addr(7), 3)` must make it
-  due, and `adl_dequeue` must make it not due again.
+* Bridge (`tests/liquidation_tests.rs`), the S=750-like case:
+  `same_mark_interval_gives_the_same_pre_clamp_price`.
+  * u1 and u2 are long 10 @ 1,000 in market 1 with collateral 1,000 each; S is short 20.
+  * Block 1, mark 1,000: both healthy.
+  * Before block 2: u1's balance is set to 600 (ADL at 900). Block 2, mark 900, run with
+    `scan = 1`, `act = 1`: only u1 is reached.
+  * Before block 3: u2's balance is set to 600. Block 3, mark still 900 (no change).
+  * Both ADL prices must be `adl_price(1_000, bankruptcy(u), 900, true)`: base 1,000 for both.
+    With today's D10, u2 would get base 900.
+  * Until A5 exists, the test reads the price from the `liquidation: ADL` info line (a tracing
+    capture like `AdlClock`). A5 switches it to the obligation rows (W = 0).
+* The existing `a_prev_mark_older_than_the_previous_usable_mark_is_ignored` (:845-865: the row
+  is deleted when the mark goes) and :392-403 (a first mark writes a 16-byte row) pass
+  **unchanged**.
 
-**Implementation** (`crates/torus-core/src/liquidation.rs`, after `PENDING_TAG` :54 and after
-`pending_key` :462):
+**Implementation** (`liquidation.rs`, replacing `prev_marks` / `put_prev_marks` :549-589):
 
 ```rust
-/// adl-budget Q4 (s96): `0x07 ‖ height(8, BE) ‖ trader(20)` -> `[1]` — the ADL
-/// queue, FIFO by the height the account was classified ADL, then address.
-pub const ADL_QUEUE_TAG: u8 = 0x07;
-/// Q4: `0x08 ‖ trader(20)` -> height (8, BE) — queue membership.
-pub const ADL_MEMBER_TAG: u8 = 0x08;
-
-pub fn adl_queue_key(h: u64, t: &Address) -> [u8; 29] {
-    let mut k = [0u8; 29];
-    k[0] = ADL_QUEUE_TAG;
-    k[1..9].copy_from_slice(&h.to_be_bytes());
-    k[9..].copy_from_slice(t.as_slice());
-    k
+/// Rule H (owner s96, changes D10): `0x03 ‖ m` -> last(16) ‖ [prev(16)]: the
+/// market's last usable mark and the mark before it that DIFFERED from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkRow {
+    pub last: FixedPoint,
+    pub prev: Option<FixedPoint>,
 }
 
-fn member_key(t: &Address) -> [u8; 21] {
-    let mut k = [0u8; 21];
-    k[0] = ADL_MEMBER_TAG;
-    k[1..].copy_from_slice(t.as_slice());
-    k
-}
-
-/// Q4: queue `t` at `height` unless queued (then nothing is written).
-pub fn adl_enqueue<T: StateBackend>(state: &T, t: &Address, height: u64) -> Result<bool, CoreError> {
-    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &member_key(t))?.is_some() {
-        return Ok(false);
-    }
-    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &adl_queue_key(height, t), &[1])?;
-    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &member_key(t), &height.to_be_bytes())?;
-    Ok(true)
-}
-
-/// Q4: remove `t` from the queue (both rows); `false` when not queued.
-pub fn adl_dequeue<T: StateBackend>(state: &T, t: &Address) -> Result<bool, CoreError> {
-    let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &member_key(t))? else {
-        return Ok(false);
+/// The rows of `markets` and each marked market's pre-clamp ADL base this
+/// step: the old `last` when the mark changed, else `prev` (absent: the
+/// caller uses the mark, D10's fallback).
+pub fn adl_bases<T: StateBackend>(
+    state: &T,
+    markets: &[MarketId],
+    marks: &BTreeMap<MarketId, FixedPoint>,
+) -> Result<(BTreeMap<MarketId, FixedPoint>, BTreeMap<MarketId, MarkRow>), CoreError> {
+    let raw = |b: &[u8]| -> Result<FixedPoint, CoreError> {
+        Ok(FixedPoint::from_raw(i128::from_be_bytes(b.try_into().map_err(|_| malformed("prev mark"))?)))
     };
-    let h = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| malformed("adl member"))?);
-    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &adl_queue_key(h, t))?;
-    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &member_key(t))?;
-    Ok(true)
-}
-
-pub fn adl_queued<T: StateBackend>(state: &T, t: &Address) -> Result<bool, CoreError> {
-    Ok(state.get_cf_raw(CF_NATIVE_LIQUIDATION, &member_key(t))?.is_some())
-}
-
-pub fn adl_queue_nonempty<T: StateBackend>(state: &T) -> Result<bool, CoreError> {
-    Ok(state.prefix_exists(CF_NATIVE_LIQUIDATION, &[ADL_QUEUE_TAG])?)
-}
-
-/// Q4: the first queued account at or after `start` (the bare tag, or a
-/// queue key followed by 0x00).
-pub fn adl_queue_next<T: StateBackend>(state: &T, start: &[u8]) -> Result<Option<(u64, Address)>, CoreError> {
-    let Some((k, _)) = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[ADL_QUEUE_TAG], start, 1)?.pop() else {
-        return Ok(None);
-    };
-    if k.len() != 29 {
-        return Err(malformed("adl queue"));
+    let (mut bases, mut rows) = (BTreeMap::new(), BTreeMap::new());
+    for &m in markets {
+        let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? else { continue };
+        let row = match v.len() {
+            16 => MarkRow { last: raw(&v)?, prev: None },
+            32 => MarkRow { last: raw(&v[..16])?, prev: Some(raw(&v[16..])?) },
+            _ => return Err(malformed("prev mark")),
+        };
+        if let Some(mark) = marks.get(&m) {
+            if let Some(b) = if *mark != row.last { Some(row.last) } else { row.prev } {
+                bases.insert(m, b);
+            }
+        }
+        rows.insert(m, row);
     }
-    Ok(Some((u64::from_be_bytes(k[1..9].try_into().expect("8 bytes")), Address::from_slice(&k[9..]))))
+    Ok((bases, rows))
+}
+
+/// Rule H: a listed market with a usable mark that differs from its row's
+/// `last` (or has no row) gets (last = mark, prev = old last); an unchanged
+/// mark writes nothing; a listed market without a usable mark loses its row
+/// (review H1: never a base from before an oracle outage). Returns the writes.
+pub fn put_mark_rows<T: StateBackend>(
+    state: &T,
+    listed: &[MarketId],
+    marks: &BTreeMap<MarketId, FixedPoint>,
+    rows: &BTreeMap<MarketId, MarkRow>,
+) -> Result<usize, CoreError> {
+    let mut writes = 0;
+    for m in listed {
+        let k = prev_mark_key(*m);
+        match (marks.get(m), rows.get(m)) {
+            (Some(p), Some(r)) if r.last == *p => {}
+            (Some(p), r) => {
+                let mut v = p.raw().to_be_bytes().to_vec();
+                if let Some(r) = r {
+                    v.extend_from_slice(&r.last.raw().to_be_bytes());
+                }
+                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+                writes += 1;
+            }
+            (None, Some(_)) => {
+                state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+                writes += 1;
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(writes)
 }
 ```
 
-* `liquidation_step.rs:144-148` `liquidation_due`: add
-  `|| state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_QUEUE_TAG])?` and extend the doc
-  comment. Update the table in `docs/plans/liquidation.md` (:220-227) with the `0x07` and `0x08`
-  rows.
+* `liquidation_step.rs:164` and `:251`:
+  `let (prev, mark_rows) = liq::adl_bases(&ctx.state, &listed, &marks)?;` and
+  `liq::put_mark_rows(&ctx.state, &listed, &marks, &mark_rows)?;`. `prev` keeps its type
+  (`Marks`), so the ADL code is unchanged: `prev.get(&m)`, else the mark.
+* `liquidation.md`: the D10 row (:292), the table (:225), and H1's "previous mark" wording →
+  rule H, adl-budget §8 (cursor-independent within one mark interval only).
 
-**Verify:** `cargo nextest run -p torus-core adl_queue $F`,
-`cargo nextest run -p torus-bridge liquidation_due $F`, and `cargo check --workspace --tests -q`.
-**Depends on:** none (independent of A1/A2; can land before them).
+**Verify:** `cargo nextest run -p torus-core adl_base $F`, `cargo nextest run -p torus-bridge liquidation $F`,
+`cargo nextest run -p torus-bridge unmarked $F` (s87 Fix 2a rows), and the L1 seeded test.
+GOLDEN_B: scenario B may have a block whose mark repeats before its ADL. Re-pin only if the
+first changed digest is such a block.
+**Depends on:** none.
 
 ---
 
-### Task A4: enqueue in the pass, drain under `W` (Q3, Q4, D8)
+### Task A4: core obligation rows, `adl_close` limit, `cross_close`, `liquidation_due`
 
-**Test first** (`crates/torus-bridge/tests/liquidation_tests.rs`, section `// ---- adl-budget Q3/Q4 ----`).
-Shared fixture: listed markets `1..=4`, constant mark 900 in every block (the previous mark after
-block 1 equals the mark, so total value at the mark is conserved across blocks).
-`u1 = addr(0x29)` and `u2 = addr(0x28)` are long 1 @ 1,000 in every market with collateral 100
-(AV = 100 − 400 < 0 → ADL in block 1). `u3 = addr(0x21)` has the same positions but collateral
-1,000 (healthy at 900); block 2 sets its balance to 100 so it is classified at height 2. The
-counterparties `c(i) = addr(0x40 + i)`, `i ∈ 0..4`, are each short 3 in every market, with
-10,000,000 collateral. `sink = addr(0x60)` is long 9 in every market with 10,000,000 collateral,
-which makes OI per market 3 + 9 = 12 long and 12 short. Trader count `A` = 8. The vault holds no
-position here, because D9 only moves cash. A step costs `A + 1` units (one ranking, one close:
-the top counterparty's 3 covers a size of 1) plus 1 per account visit.
+**Test first** (`crates/torus-core/tests/liquidation_tests.rs`):
 
 ```rust
-/// Run block `h` of the queue fixture with budget `w`; returns the context.
-fn queue_block(db: &StateDb, h: u64, w: u64) -> NativeExecContext {
+/// P2 (s96): obligation rows `0x07 ‖ height ‖ market ‖ side ‖ trader` ->
+/// size ‖ price, read in key order (height, market, side short-before-long,
+/// trader); size 0 deletes the row.
+#[test]
+fn adl_obligations_are_fifo_rows() {
+    use torus_core::liquidation::{next_obligation, put_obligation, Obligation, ADL_OBLIGATION_TAG};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let o = |h, market, is_long, n, size, price| Obligation { height: h, market, is_long, trader: addr(n), size: fp(size), price: fp(price) };
+    for x in [o(6, 1, true, 1, 2, 950), o(5, 2, true, 9, 1, 990), o(5, 2, false, 9, 3, 1_010), o(5, 1, true, 8, 4, 940)] {
+        put_obligation(&db, &x).unwrap();
+    }
+    let mut got = Vec::new();
+    let mut start = vec![ADL_OBLIGATION_TAG];
+    while let Some(x) = next_obligation(&db, &start).unwrap() {
+        start = [x.key().as_slice(), &[0]].concat();
+        got.push(x);
+    }
+    assert_eq!(got, vec![o(5, 1, true, 8, 4, 940), o(5, 2, false, 9, 3, 1_010), o(5, 2, true, 9, 1, 990), o(6, 1, true, 1, 2, 950)]);
+    put_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..got[0] }).unwrap();
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(got[1]));
+}
+
+/// P2 edge: escrow long sells q at p_long, escrow short buys q at p_short;
+/// the vault pays (p_long - p_short) x q (credited +400 here). OI -q on both
+/// sides; value at the mark conserved (escrows + vault).
+#[test]
+fn cross_close_conserves_value_through_the_vault() {
+    use torus_core::liquidation::{cross_close, ADL_ESCROW_LONG as EL, ADL_ESCROW_SHORT as ES};
+    let (_d, pm) = setup();
+    pm.apply_fill(&EL, 1, true, fp(10), fp(950), MarginType::Cross).unwrap();
+    pm.apply_fill(&ES, 1, false, fp(10), fp(990), MarginType::Cross).unwrap();
+    let who = [EL, ES, LIQUIDATOR_VAULT];
+    let before = value(&pm, &who, 1, fp(900));
+    assert_eq!(cross_close(&pm, 1, fp(10), fp(950), fp(990), &LIQUIDATOR_VAULT).unwrap(), fp(400));
+    assert!(pm.get_position(&EL, 1).unwrap().is_none() && pm.get_position(&ES, 1).unwrap().is_none());
+    assert_eq!(pm.get_native_balance(&LIQUIDATOR_VAULT).unwrap().available, fp(400));
+    assert_eq!(value(&pm, &who, 1, fp(900)), before);
+}
+```
+
+Also:
+* `adl_close_pairs_against_ranked_counterparties_at_the_price` (:188-211): pass `fp(4)` as the
+  limit;
+* new `adl_close_stops_at_the_qty_limit` (limit `fp(2)` → `[(s2, fp(2))]`, U keeps 2);
+* bridge `liquidation_due_reads_cooldown_and_cursor_rows` (:773-780): a `put_obligation` makes it
+  due, and size 0 makes it not due.
+
+**Implementation** (`liquidation.rs`):
+
+```rust
+/// P2 (s96): `0x07 ‖ height(8) ‖ market(8) ‖ side(1: 1 long) ‖ trader(20)` ->
+/// `size raw (16, BE) ‖ price raw (16, BE)`: what the escrow of `is_long`
+/// still owes for `trader`'s position taken at block `height` at `price`
+/// (per account: H1's clamp).
+pub const ADL_OBLIGATION_TAG: u8 = 0x07;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Obligation {
+    pub height: u64,
+    pub market: MarketId,
+    pub is_long: bool,
+    pub trader: Address,
+    pub size: FixedPoint,
+    pub price: FixedPoint,
+}
+
+impl Obligation {
+    pub fn key(&self) -> [u8; 38] {
+        let mut k = [0u8; 38];
+        k[0] = ADL_OBLIGATION_TAG;
+        k[1..9].copy_from_slice(&self.height.to_be_bytes());
+        k[9..17].copy_from_slice(&self.market.to_be_bytes());
+        k[17] = u8::from(self.is_long);
+        k[18..].copy_from_slice(self.trader.as_slice());
+        k
+    }
+}
+
+/// Write `o` (size > 0) or delete its row (size <= 0).
+pub fn put_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
+    if o.size <= FixedPoint::ZERO {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &o.key())?;
+        return Ok(());
+    }
+    let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &o.key(), &v)?;
+    Ok(())
+}
+
+/// The first obligation at or after `start` (the bare tag, or a key + 0x00).
+pub fn next_obligation<T: StateBackend>(state: &T, start: &[u8]) -> Result<Option<Obligation>, CoreError> {
+    let Some((k, v)) = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[ADL_OBLIGATION_TAG], start, 1)?.pop() else {
+        return Ok(None);
+    };
+    if k.len() != 38 || v.len() != 32 || k[17] > 1 {
+        return Err(malformed("adl obligation"));
+    }
+    let raw = |b: &[u8]| i128::from_be_bytes(b.try_into().expect("16 bytes"));
+    Ok(Some(Obligation {
+        height: u64::from_be_bytes(k[1..9].try_into().expect("8 bytes")),
+        market: MarketId::from_be_bytes(k[9..17].try_into().expect("8 bytes")),
+        is_long: k[17] == 1,
+        trader: Address::from_slice(&k[18..]),
+        size: FixedPoint::from_raw(raw(&v[..16])),
+        price: FixedPoint::from_raw(raw(&v[16..])),
+    }))
+}
+
+/// P2 edge (real holders exhausted): escrow long sells `q` at `p_long`, escrow
+/// short buys `q` at `p_short`. Two prices realize (p_long - p_short) x q more
+/// than one shared price would; the vault pays it, so value is conserved.
+/// Returns the vault's change (+ = credited).
+pub fn cross_close<T: StateBackend>(
+    pm: &PositionManager<T>,
+    m: MarketId,
+    q: FixedPoint,
+    p_long: FixedPoint,
+    p_short: FixedPoint,
+    vault: &Address,
+) -> Result<FixedPoint, CoreError> {
+    let of = |_| CoreError::Overflow("adl cross close overflows i128".into());
+    pm.apply_fill(&ADL_ESCROW_LONG, m, false, q, p_long, MarginType::Cross)?;
+    pm.apply_fill(&ADL_ESCROW_SHORT, m, true, q, p_short, MarginType::Cross)?;
+    let paid = p_short.checked_sub(p_long).map_err(of)?.checked_mul(q).map_err(of)?;
+    let mut vb = pm.get_native_balance(vault)?;
+    vb.available = vb.available.checked_add(paid).map_err(of)?;
+    pm.put_native_balance(vault, &vb)?;
+    Ok(paid)
+}
+```
+
+* `adl_close` (:309-338) gains `qty: FixedPoint` after `price`:
+  `let mut remaining = up.size.min(qty);`.
+* `liquidation_step.rs:144-148` `liquidation_due`:
+  `|| state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_OBLIGATION_TAG])?`.
+
+**Verify:** `cargo nextest run -p torus-core liquidation $F`, `cargo nextest run -p torus-bridge liquidation_due $F`,
+`cargo check --workspace --tests -q`. Bridge :517 passes `p.size` as the limit until A5.
+**Depends on:** A1 (escrow constants).
+
+---
+
+### Task A5: at B — positions to the escrows, obligations, D9 (P2)
+
+**Test first** (`tests/liquidation_tests.rs`, section `// ---- adl-budget P2 ----`). All tests
+here run the step with **W = 0** (no drain).
+
+Fixture `p2_fixture`, a shock from 1,000 to 900 so that the clamp binds:
+* listed markets `1..=4`; block 1 at mark 1,000, then 900 from block 2 on;
+* `u1 = addr(0x29)`: collateral 100 (AV 100 ≥ MM 100 at 1,000; −300 at 900);
+* `u2 = addr(0x28)`: collateral 137.00000001, so its market-3 price 962.99999999 makes the
+  escrow's average inexact (dust);
+* `u3 = addr(0x21)`: 1,000 (healthy at 900; cut to 100 before block 3 → ADL at 3, same mark
+  interval, base 1,000);
+* u1, u2 and u3 are each long 1 @ 1,000 in every market;
+* `c(i) = addr(0x40+i)`, `i < 4`: short 3 in every market, 10^7 each;
+* `sink = addr(0x60)`: long 9 in every market, 10^7 (OI 12 / 12).
+
+```rust
+fn step(db: &StateDb, h: u64, mark: i64, w: u64) -> NativeExecContext {
     let mut c = ctx_at(db.clone(), h);
-    set_mark_all(&c, &[1, 2, 3, 4], fp(900));
+    for m in 1..=4 {
+        set_mark(&c, m, fp(mark));
+    }
     NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
     c
 }
 
-fn queue(ctx: &NativeExecContext) -> Vec<(u64, Address)> {
-    liq_rows(ctx, 0x07).iter().map(|(k, _)| (u64::from_be_bytes(k[1..9].try_into().unwrap()), Address::from_slice(&k[9..]))).collect()
+fn obligations(ctx: &NativeExecContext) -> Vec<Obligation> {
+    let (mut out, mut start) = (Vec::new(), vec![ADL_OBLIGATION_TAG]);
+    while let Some(o) = next_obligation(&ctx.state, &start).unwrap() {
+        start = [o.key().as_slice(), &[0]].concat();
+        out.push(o);
+    }
+    out
 }
 
-fn invariants(ctx: &NativeExecContext, before: FixedPoint) {
-    for m in 1..=4 { let (l, s) = oi(ctx, m); assert_eq!(l, s, "OI symmetric in {m}"); }
-    assert_eq!(total_value(ctx, &marks(&[(1, 900), (2, 900), (3, 900), (4, 900)])), before, "value conserved (vault incl.)");
+/// OI symmetric (escrows included), escrow size = Σ rows per (market, side),
+/// Σ value over ALL accounts within `tol` raw of `before` (mark-independent
+/// under OI symmetry, so comparable across blocks).
+fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint, tol: i128) {
+    for m in 1..=4 {
+        let (l, s) = oi(ctx, m);
+        assert_eq!(l, s, "OI symmetric in {m}");
+        for side in [true, false] {
+            let owed = obligations(ctx).iter().filter(|o| o.market == m && o.is_long == side).fold(FixedPoint::ZERO, |a, o| a + o.size);
+            assert_eq!(pos(ctx, &adl_escrow(side), m).abs(), owed, "escrow {side} in {m} = Σ rows");
+        }
+    }
+    let now = total_value(ctx, &marks(&[(1, mark), (2, mark), (3, mark), (4, mark)]));
+    assert!((now - before).raw().abs() <= tol, "Σ over ALL accounts (vault, escrows): {now:?} vs {before:?}");
 }
 ```
 
-1. `adl_budget_stops_at_w_and_resumes_in_fifo_order`: `W = 2·(A+1) + 1` (one visit + two steps;
-   the second step starts at `used = A+2 < W`).
-   * Block 1: `queue == [(1,u2),(1,u1)]` before the drain, so u2 is drained first (same height,
-     lower address). After block 1, u2 holds 2 of its 4 positions. In block 2 u3 becomes ADL and
-     is enqueued at `(2,u3)`, behind u1 despite its lower address.
-   * Per block, assert exactly two positions closed in total: the first queued account's lowest
-     remaining markets.
-   * Drain order across blocks: u2 (m1, m2 | m3, m4), then u1, then u3.
-   * After each block, run `invariants`. At the end: queue empty; `ab(u) == (0, 0)` and no
-     position for u1, u2, u3; `liquidation_due` false (counterparties healthy, so no pending
-     row).
-2. `adl_budget_overshoots_by_at_most_one_step`: `W = A + 3`. The first step starts (`1 < W`)
-   and ends at `A + 2 < W`, so a second step starts and the block ends at `2A + 3`. Assert that
-   exactly 2 markets closed. With `W = A + 2` the second step does not start, so assert that
-   exactly 1 market closed.
-3. `adl_queue_drain_is_deterministic`: run the whole fixture twice from fresh DBs (default `W`
-   and `W = A+2`). After every block, `iterate_cf` of `CF_NATIVE_POSITIONS`,
-   `CF_NATIVE_BALANCES` and `CF_NATIVE_LIQUIDATION` must be equal between the two runs of the
-   same `W`.
-4. `the_vault_is_enqueued_when_its_value_goes_negative`: reuse the setup of
-   `the_vault_is_adld_when_its_value_goes_negative` (:711-732). Block 2 runs with `W = 1`, which
-   allows only the visit and no step: the vault keeps long 10, `queue == [(2, LIQUIDATOR_VAULT)]`,
-   and `liquidation_due` is true. Block 3 runs with the default `W` and the queue empties. The
-   vault has no pending row, OI is `(0, 0)`, and total value is conserved. **The price is
-   Q6-dependent.** In block 3 the previous mark is block 2's 900, and
-   `adl_price(900, bankruptcy 970, long)` = 900. So the vault closes at 900:
-   `available = 50 − 10 × 75 = −700`, and S is paid 10 × 100. The existing same-block test
-   closes at 970. A snapshot or escrow variant would close at 970 here too. When Q6 is decided,
-   this is the assertion that changes.
-5. `an_adl_account_is_enqueued_after_its_orders_are_cancelled`: with `W = 1`, block 1 cancels the
-   account's resting bid and its stop (D4: reservations released, `order_margin == 0`), and the
-   account holds a `0x07` row and **no** `0x06` row. In block 2 the regular pass skips it: with
-   `scan = 1`, the cursor moves past it, and no second `liquidations_adl` count happens.
-6. Existing ADL tests stay unchanged and pass with the default `W`, because the drain finishes in
-   the classification block: `adl_closes_against_ranked_counterparties_at_the_previous_mark`,
-   `adl_without_a_previous_mark_uses_the_mark_and_the_deficit_goes_to_the_vault`,
-   `the_liquidation_step_publishes_the_vault_deficit`, `the_vault_is_adld_when_its_value_goes_negative`,
-   `telemetry_counts_an_adl_account`, `telemetry_counts_the_vault_adl_outside_the_act_budget`.
-   (`set_mark_all` is a 3-line helper looping `set_mark`.)
+1. `p2_a_bankrupt_account_is_flat_with_zero_collateral_at_b` (block 1 at 1,000 with W = 0, then
+   block 2 at 900 with W = 0):
+   * u1 and u2 have no position, `ab == (0, 0)`, and no `0x06` row.
+   * `ESCROW_LONG` is long 2 in every market.
+   * There are 8 rows `(2, m, long, u)`. Each price is
+     `adl_price(1_000, bankruptcy_price(rest, true, 1, 1_000), 900, true)`, computed by the test
+     sequentially. For u1 the prices are 1,000, 1,000, 1,000, 900 (the clamp binds at m4). For
+     u2 they are 1,000, 1,000, 962.99999999, 900.
+   * The vault's available = the D9 amounts: 0 for both. Under H the deficit is ~0, as the S=750
+     explanation predicts.
+   * `invariants(.., 900, before, 0)`; `liquidation_due` is true; `liquidations_adl == 2`.
+2. `p2_a_positive_remainder_goes_to_the_vault`: a rare surplus with the one-sided clamp.
+   * T is long 4 @ 1,000 in market 1 (marked) and has a second long in market 2 whose mark is
+     unusable at B. That position is valued at entry in `adl_rest` and not acted on (H2).
+   * T also has an order-margin reservation that D4 releases.
+   * Choose exact numbers so that T's cash after the market-1 transfer is **> 0**.
+   * Assert: `move_collateral` moves the surplus to the vault (the vault shows `+surplus`), T's
+     cash ends at `ab == (0, 0)`, and its unmarked position stays (H2).
+   * The test doc explains why the surplus is rare under the clamp.
+3. `p2_escrows_are_never_classified`: blocks 1 and 2 with W = 0, then block 3 with W = 0,
+   metered.
+   * Neither escrow has a `0x06` or `0x02` row, and neither appears in `liquidation_scanned` or
+     `liquidation_acted`.
+   * The escrows' positions are unchanged by the pass, although their AV at 900 is negative.
+4. `p2_the_vault_moves_its_positions_to_the_escrow`: the setup of
+   `the_vault_is_adld_when_its_value_goes_negative` (:711-732), block 2 with W = 0.
+   * The vault is flat. `ESCROW_LONG` is long 10 @ 970, with the row
+     `(2, 1, long, VAULT) → (10, 970)`.
+   * The vault's available = 0. There is no `move_collateral` for the vault.
+5. `same_mark_interval_gives_the_same_pre_clamp_price` (from A3) switches to reading the rows.
 
-**Implementation:**
-
-* `crates/torus-core/src/liquidation.rs`: add the constant. Its value stays a placeholder until
-  A6:
+**Implementation** (`liquidation_step.rs`):
+* :166-181: `scan.saturating_add(4)`, because the vault and both escrows are skipped. Use
+  `let not_protocol = |a: &&Address| **a != LIQUIDATOR_VAULT && !liq::is_adl_escrow(a);` for
+  `not_vault` (:174, :175, :181).
+* Replace `adl_account` (:481-544) with `adl_to_escrow` (call sites :222, :244):
 
 ```rust
-/// adl-budget Q3 (s96): ADL work units per block — traders examined by a
-/// ranking + closes + queued accounts visited. Set from the A6 measurement
-/// (ns / unit on the rig) so ADL adds <= ~20 ms per block.
-pub const ADL_WORK_PER_BLOCK: u64 = 100_000; // placeholder, A6 sets it
-```
-
-* `liquidation_step.rs:44-67`: `run_liquidations` passes `liq::ADL_WORK_PER_BLOCK`.
-  `run_liquidations_with(ctx, scan, act, work)` gains `work: u64` and threads it into
-  `liquidation_pass`. That makes 12 mechanical call-site edits: `liquidation_l1_tests.rs:339`,
-  `tests/liquidation_tests.rs` ×8, and `tests/perf_equivalence_golden.rs:218`
-  (pass `liq::ADL_WORK_PER_BLOCK`).
-* `liquidation_pass` (:150-266):
-  * after `let cursor = …` (:170): `let queue_on = liq::adl_queue_nonempty(&ctx.state)?;`
-  * :185-187 becomes `scanned += 1; last = Some(trader); if queue_on && liq::adl_queued(&ctx.state, &trader)? { continue; } stats.scanned += 1;`
-    The skip uses a window slot. If it did not, a window full of queued accounts would end the
-    loop without hitting a budget, the cursor would be deleted, and the traders after them would
-    starve.
-  * :219-237: after D4 (:219-220), `Health::Adl` now runs
-    `liq::adl_enqueue(&ctx.state, &trader, ctx.block_height)?; stats.pending_changed |= liq::set_pending(&ctx.state, &trader, false)?; results.push(NativeActionResult::ok("liquidation", 3000)); continue;`.
-    It skips `settle_flat_deficit`, `clear_cooldown` and `mark_pending` (the drain does them on
-    dequeue). Backstop and stage 1 are untouched.
-  * Replace the vault block :238-250 with:
-
-```rust
-        // D8 + adl-budget Q4: the vault is exempt from stage 1 / backstop and
-        // enters the ADL queue like any account when its AV < 0.
-        if !liq::adl_queued(&ctx.state, &LIQUIDATOR_VAULT)?
-            && Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)?
-                .is_some_and(|v| liq::classify(&v) == Some(Health::Adl))
-        {
-            liq::adl_enqueue(&ctx.state, &LIQUIDATOR_VAULT, ctx.block_height)?;
-            stats.pending_changed |= liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, false)?;
-            stats.adl += 1;
-            stats.vault_adl = true;
-        }
-        if !marks.is_empty() {
-            Self::adl_drain(ctx, &marks, &prev, l1, work, stats)?;
-        }
-```
-
-    With no usable mark there is nothing to close. The queue waits, so an oracle outage never
-    triggers a D9 that empties a queued account.
-* Replace `adl_account` (:481-544) with `adl_drain` + `adl_market` + `adl_finish`:
-
-```rust
-    /// adl-budget Q3/Q4: drain the ADL queue in key order (FIFO: height, then
-    /// address) under `work` units. Per account: its marked positions in
-    /// ascending market, one step each (atomic; starts only while used < work,
-    /// so a block overshoots by at most one step); with no marked position
-    /// left: [`Self::adl_finish`]. Each market is stepped at most once per
-    /// account per block (OI symmetry closes it; a position left open is a
-    /// bug and waits for the next block instead of looping).
-    fn adl_drain<T: StateBackend>(
+    /// adl-budget P2 (owner s96): terms fixed at B. Every MARKED position of
+    /// `u` (ascending market) moves to the escrow of its side at its ADL price
+    /// — the rule-H base (the mark without one) clamped one-sided to `u`'s
+    /// bankruptcy price (review H1, unchanged; sequential, so a later market
+    /// sees the PnL the earlier transfers realized) — and its obligation is
+    /// queued. A non-vault account without marked positions then hands its
+    /// remaining collateral (any sign) to the vault (D9): flat, exactly 0.
+    fn adl_to_escrow<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
         prev: &Marks,
-        l1: bool,
+        u: &Address,
+    ) -> Result<(), CoreError> {
+        for p in ctx.positions.positions_for_trader(u)? {
+            let m = p.market_id;
+            let Some(&mark) = marks.get(&m) else { continue };
+            let px = prev.get(&m).copied().unwrap_or(mark);
+            let bankruptcy = Self::adl_rest(ctx, marks, u, m)?
+                .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
+            let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
+            liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
+            let o = liq::Obligation { height: ctx.block_height, market: m, is_long: p.is_long, trader: *u, size: p.size, price: px };
+            liq::put_obligation(&ctx.state, &o)?;
+            tracing::info!(height = ctx.block_height, account = %u, market = m, size = %p.size, price = %px, "liquidation: ADL to escrow");
+        }
+        if *u != LIQUIDATOR_VAULT
+            && !ctx.positions.positions_for_trader(u)?.iter().any(|p| marks.contains_key(&p.market_id))
+        {
+            liq::move_collateral(&ctx.positions, u, &LIQUIDATOR_VAULT)?;
+        }
+        Ok(())
+    }
+```
+
+* `run_liquidations_with(ctx, scan, act, work: u64)`: thread `work` through to
+  `liquidation_pass`. `run_liquidations` passes `liq::ADL_WORK_PER_BLOCK`. That is 12 call
+  sites: `liquidation_l1_tests.rs:339`, `tests/liquidation_tests.rs` ×8 and
+  `perf_equivalence_golden.rs:218`, all passing `liq::ADL_WORK_PER_BLOCK`.
+* `liquidation.rs`: `pub const ADL_WORK_PER_BLOCK: u64 = 1_000_000;` with the doc "Q3: traders
+  examined by a ranking + closes (+ edge rows) per block; chosen (A8) so an HL-sized event (a
+  few hundred account-markets) closes the escrows in its own block; one constant." Placeholder
+  until A8.
+* `liquidation.md` *ADL* (:194-208) and *Vault*: the P2 flow, the escrows, and a pointer here.
+
+**Verify:** `cargo nextest run -p torus-bridge p2_ $F`, `cargo nextest run -p torus-bridge same_mark_interval $F`.
+The existing ADL tests stay RED until A6 (same commit).
+**Depends on:** A2, A3, A4.
+
+---
+
+### Task A6: the drain under W (Q2, Q3, P2), edge pairing, dust sweep
+
+**Test first** (`tests/liquidation_tests.rs`, `p2_fixture`; `A = traders(ctx).len()` at drain
+time: escrows are in the list, and the flat accounts are not):
+1. `p2_drain_stops_at_w_and_resumes_in_fifo_order`.
+   * Block 2 at 900 with `W = A + 3`: `(2,1,L,u2)` ranks `(1, short)` and costs `A + 1`;
+     `(2,1,L,u1)` hits the cache and costs `+1`, reaching `A + 2`; `(2,2,L,u2)` ranks again and
+     reaches `2A + 3` → stop. The remaining keys = the original list minus its first 3.
+   * Block 3 (u3 classified; its height-3 rows sort after every height-2 row): the next 3 keys
+     are gone.
+   * `invariants(.., 900, before, bound)` after every block. Run until the queue is empty:
+     u3's rows go last.
+2. `p2_drain_overshoots_by_at_most_one_step`: `W = A + 1` drains exactly one row; `W = A + 2`
+   drains two.
+3. `p2_ranks_each_market_side_once_per_block` (`liquidation_l1_tests.rs`, which has the
+   counters): with a large W, block 2's `counters.adl_rankings` = 4, one per (market, short),
+   not 8.
+4. `p2_escrows_end_flat_with_zero_balance_and_the_vault_holds_the_deficit` (default W):
+   * after the drain, both escrows have no position and `ab == (0, 0)`;
+   * `dust = vault − D9_at_B`, and `|dust| ≤` the *Dust bound* (u2's 962.99999999 makes market
+     3's average inexact, so the dust is not 0 by construction);
+   * `invariants` within `|dust|`.
+5. `p2_counterparties_are_paid_at_the_stored_price`: rows written at B with W = 0. The next block
+   has mark 800 and the default W, and the closes still use the stored prices (terms fixed at
+   B). Each counterparty's realized PnL = `(entry − price) × q`.
+6. `p2_exhausted_counterparties_pair_the_escrows`: market 1 only. A long 10 @ 1,000 and B short
+   10 @ 800 are the only holders.
+   * Block 1 at 990 with both funded 10,000. Before block 2 both are set to 500. Block 2 at 900:
+     both are ADL with base 990. A: `min(990, 950)` = 950. B: `max(990, 810)` = 990.
+   * D9: A ends at 0; B at −1,400, which goes to the vault.
+   * Drain: the short row sorts first and has no real long holder, so it pairs with A's row:
+     q = 10, and the vault receives (990 − 950) × 10 = +400, ending at −1,000.
+   * Both escrows end flat with balance 0, no rows are left, and OI is (0, 0).
+   * Total value over A, B, the vault and the escrows is unchanged at −1,000. The pairing amount
+     shows in the stats and the log (A7 gauge).
+7. `p2_drain_is_deterministic`: two fresh runs of `p2_fixture` (default W and `W = A + 3`). Per
+   block, `iterate_cf` of `CF_NATIVE_POSITIONS`, `CF_NATIVE_BALANCES` and
+   `CF_NATIVE_LIQUIDATION` are equal.
+8. `an_hl_sized_event_closes_in_its_own_block` (default W): 200 traders hold positions in 100
+   listed markets, and 3 accounts long in all 100 markets go bankrupt in one block
+   (300 account-markets). After that one step: no `0x07` row, both escrows flat at 0 balance,
+   every ADL'd account at 0, OI symmetric, value conserved. The ubench repeats this at
+   N = 5,000 (A8).
+9. The existing tests pass **unchanged** with the default W: the clamp and rule H give the same
+   prices for a first mark change, and the drain finishes in B.
+   * `adl_closes_against_ranked_counterparties_at_the_previous_mark`: escrow entry 950, closes at
+     950, 0 realized.
+   * `adl_without_a_previous_mark_…`, `the_liquidation_step_publishes_the_vault_deficit`,
+     `the_vault_is_adld_when_its_value_goes_negative`, `telemetry_counts_an_adl_account`,
+     `telemetry_counts_the_vault_adl_outside_the_act_budget`,
+     `a_prev_mark_older_than_the_previous_usable_mark_is_ignored`.
+   * The L1 seeded test and `offmark_bad_debt_tests` (:14, :278, :350, :357).
+
+**Implementation** (`liquidation_step.rs`):
+* After the vault block (:238-250, with `adl_to_escrow` in place of `adl_account`):
+  `if work > 0 && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG])?.is_some() { Self::adl_drain(ctx, &marks, work, stats)?; }`.
+  An empty queue costs one seek.
+
+```rust
+    /// adl-budget P2 / Q2 / Q3: drain the obligation rows in key order under
+    /// `work` units. One step = one row (atomic; starts only while used <
+    /// work, so a block overshoots by at most one step): the escrow of its
+    /// side closes against the opposite holders of its market, ranked once
+    /// per (block, market, side) (the local `ranked`; each row re-walks it
+    /// from the start — `adl_close` re-reads every candidate), at the row's
+    /// stored price; real holders exhausted -> [`Self::adl_cross`]. A market
+    /// without a mark this block waits (open question 4). Then a flat escrow's
+    /// balance (dust) goes to the vault.
+    fn adl_drain<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        marks: &Marks,
         work: u64,
         stats: &mut LiqStats,
     ) -> Result<(), CoreError> {
-        let mut used = 0u64;
-        let mut start = vec![liq::ADL_QUEUE_TAG];
+        let mut ranked: BTreeMap<(MarketId, bool), Vec<liq::AdlCandidate>> = BTreeMap::new();
+        let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
         while used < work {
-            let Some((h, u)) = liq::adl_queue_next(&ctx.state, &start)? else { break };
-            start = [liq::adl_queue_key(h, &u).as_slice(), &[0]].concat();
-            used += 1; // the visit (open question 1)
-            // [B2 seam: re-classification]
-            let mut after: Option<MarketId> = None;
-            loop {
-                let next = ctx.positions.positions_for_trader(&u)?.into_iter().find(|p| {
-                    marks.contains_key(&p.market_id) && after.is_none_or(|a| p.market_id > a)
-                });
-                let Some(p) = next else { break };
-                if used >= work {
-                    stats.adl_work = used;
-                    return Ok(());
+            let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
+            start = [o.key().as_slice(), &[0]].concat();
+            let Some(&mark) = marks.get(&o.market) else { continue };
+            let key = (o.market, o.is_long);
+            if !ranked.contains_key(&key) {
+                let (c, examined) = Self::adl_candidates_of(ctx, o.market, !o.is_long)?;
+                used += examined;
+                ranked.insert(key, liq::adl_rank(mark, c));
+            }
+            let escrow = liq::adl_escrow(o.is_long);
+            let closes = liq::adl_close(&ctx.positions, &escrow, o.market, o.price, o.size, &ranked[&key])?;
+            used += closes.len() as u64;
+            for (c, q) in &closes {
+                tracing::debug!(market = o.market, account = %o.trader, counterparty = %c, size = %q, price = %o.price, "liquidation: ADL close");
+                o.size -= *q;
+            }
+            if o.size > FixedPoint::ZERO {
+                used += Self::adl_cross(ctx, &mut o, stats)?;
+            }
+            liq::put_obligation(&ctx.state, &o)?; // deletes at 0
+            stats.adl_obligations += 1;
+            if o.size > FixedPoint::ZERO {
+                tracing::error!(?o, "liquidation: ADL obligation left open (OI asymmetry?) — retried next block");
+            }
+        }
+        for e in [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
+            if ctx.positions.positions_for_trader(&e)?.is_empty() {
+                let dust = liq::move_collateral(&ctx.positions, &e, &LIQUIDATOR_VAULT)?;
+                if dust != FixedPoint::ZERO {
+                    stats.adl_dust += dust;
+                    tracing::info!(escrow = %e, %dust, "liquidation: ADL escrow dust to the vault");
                 }
-                used += Self::adl_market(ctx, marks, prev, &u, &p)?;
-                after = Some(p.market_id);
             }
-            let open = ctx.positions.positions_for_trader(&u)?.iter().any(|p| marks.contains_key(&p.market_id));
-            if open {
-                tracing::error!(account = %u, "liquidation: ADL left a marked position open (OI asymmetry?) — retried next block");
-                continue;
-            }
-            Self::adl_finish(ctx, marks, l1, &u, stats)?;
         }
         stats.adl_work = used;
         Ok(())
     }
 
-    /// Decision 5 + D10 + review H1: one ADL step — `u`'s position `p` closed
-    /// against the ranked opposite holders. Returns its work units (traders
-    /// examined + closes).
-    /// Q6 SEAM: price = this block's previous mark (else the mark) clamped to
-    /// `u`'s bankruptcy price now; ranking computed now (B1: cached per block
-    /// and market). A snapshot variant replaces exactly these lines.
-    fn adl_market<T: StateBackend>(
+    /// P2 edge: the real opposite holders of `o.market` are exhausted (both
+    /// escrows hold it). Pair `o` with the opposite side's rows of the same
+    /// market in key order; each escrow closes at its own row's price, the
+    /// vault pays the difference (`liq::cross_close`). Returns the rows
+    /// scanned (work units).
+    fn adl_cross<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
-        marks: &Marks,
-        prev: &Marks,
-        u: &Address,
-        p: &Position,
-    ) -> Result<u64, CoreError> {
-        let m = p.market_id;
-        let mark = marks[&m];
-        let px = prev.get(&m).copied().unwrap_or(mark);
-        let bankruptcy = Self::adl_rest(ctx, marks, u, m)?
-            .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
-        let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
-        let (cands, examined) = Self::adl_candidates_of(ctx, m, !p.is_long)?;
-        let closes = liq::adl_close(&ctx.positions, u, m, px, &liq::adl_rank(mark, cands))?;
-        // telemetry: today's per-(account, market) info line + debug per close (:518-532)
-        Ok(examined + closes.len() as u64)
-    }
-
-    /// The account has no marked position left (today's `adl_account` tail +
-    /// the pass's post-action steps): a non-vault account hands its remaining
-    /// collateral to the vault (H1/D9: it ends at exactly 0), loses its
-    /// cooldown row when flat, leaves the queue; M2 pending row recomputed
-    /// (never for the vault: exempt from stage 1 / backstop).
-    fn adl_finish<T: StateBackend>(
-        ctx: &mut NativeExecContext<T>,
-        marks: &Marks,
-        l1: bool,
-        u: &Address,
+        o: &mut liq::Obligation,
         stats: &mut LiqStats,
-    ) -> Result<(), CoreError> {
-        if *u != LIQUIDATOR_VAULT {
-            liq::move_collateral(&ctx.positions, u, &LIQUIDATOR_VAULT)?;
+    ) -> Result<u64, CoreError> {
+        let (mut units, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        while o.size > FixedPoint::ZERO {
+            let Some(mut x) = liq::next_obligation(&ctx.state, &start)? else { break };
+            start = [x.key().as_slice(), &[0]].concat();
+            units += 1;
+            if x.market != o.market || x.is_long == o.is_long {
+                continue;
+            }
+            let q = o.size.min(x.size);
+            let (pl, ps) = if o.is_long { (o.price, x.price) } else { (x.price, o.price) };
+            let paid = liq::cross_close(&ctx.positions, o.market, q, pl, ps, &LIQUIDATOR_VAULT)?;
+            stats.adl_pairing += paid;
+            tracing::info!(market = o.market, size = %q, p_long = %pl, p_short = %ps, vault = %paid, "liquidation: ADL escrow pairing");
+            o.size -= q;
+            x.size -= q;
+            liq::put_obligation(&ctx.state, &x)?;
         }
-        if ctx.positions.positions_for_trader(u)?.is_empty() {
-            liq::clear_cooldown(&ctx.state, u)?;
-        }
-        liq::adl_dequeue(&ctx.state, u)?;
-        stats.pending_changed |= if *u == LIQUIDATOR_VAULT {
-            liq::set_pending(&ctx.state, u, false)?
-        } else {
-            Self::mark_pending(ctx, marks, l1, u)?
-        };
-        Ok(())
+        Ok(units)
     }
 ```
 
-* `LiqStats` (:22-38): add `adl_work: u64` (log only). Add `adl_work` to the info line
-  (:120-132).
-* `perf_equivalence_golden.rs` GOLDEN_B (:546): scenario B contains an ADL (:441, :451). The
-  queue rows are written and deleted in the same block, which leaves tombstones in the running
-  hash, and ADL now runs after the pass. Re-capture with `GOLDEN_PRINT=1`, and only after
-  checking that the first changed digest is the first ADL block. Note this in the commit message
-  (a change made on purpose, adl-budget Q4).
+* `LiqStats` (:22-38): add `adl_obligations: u64`, `adl_work: u64`, `adl_dust: FixedPoint`
+  and `adl_pairing: FixedPoint`. Add them to the info line (:120-132); `adl_obligations > 0`
+  counts as `happened`.
+* `GOLDEN_B` (`perf_equivalence_golden.rs:546`): scenario B has an ADL (:441, :451). Rows are
+  written and deleted (tombstones in the running hash), and escrow balance rows appear.
+  Re-capture with `GOLDEN_PRINT=1` only after checking that the first changed digest is the
+  first ADL block. The commit message says it is a change made on purpose (P2).
 
-**Verify:** `cargo nextest run -p torus-bridge adl_ $F`, `cargo nextest run -p torus-bridge liquidation $F`,
-`cargo nextest run -p torus-bridge offmark_bad_debt $F`, `cargo nextest run -p torus-bridge perf_equivalence $F`,
-`cargo nextest run -p torus-bridge storage_reads $F`.
-**Depends on:** A2, A3.
+**Verify:** `cargo nextest run -p torus-bridge p2_ $F`, `cargo nextest run -p torus-bridge an_hl_sized $F`,
+`cargo nextest run -p torus-bridge liquidation $F`, `cargo nextest run -p torus-bridge offmark_bad_debt $F`,
+`cargo nextest run -p torus-bridge perf_equivalence $F`, `cargo nextest run -p torus-bridge storage_reads $F`.
+Then the full workspace before the A5+A6 commit.
+**Depends on:** A5.
 
 ---
 
-### Task A5: e2e: the queue keeps blocks due; roots agree (Q4)
+### Task A7: e2e, gauges, conservation sum (node-local)
 
-**Test first** (`crates/torus-consensus/src/app.rs`, after
-`liquidation_e2e_partial_stage1_keeps_the_step_due` :17414):
+**Test first.**
+1. `crates/torus-consensus/src/app.rs`, after :17433:
 
 ```rust
-/// adl-budget Q4: the ADL queue keeps the step DUE. T (71) long 10 @ 1,000,
-/// collateral 50, plus 13 more accounts (seeds 80..=92) seeded the same way
-/// against S (72, short 140). Mark 970 (block 1's submissions aggregate at
-/// 2): AV 50 - 300 < 0 -> all 14 ADL at height 2 (FIFO = address order).
-/// `test_adl_work = 2`: one visit + one step per block, so one account drains
-/// per block in blocks 2..=15. The oracle rows are pruned at 12 (as in the M2
-/// test), so blocks 13..=15 carry no action, no oracle row, no cursor and no
-/// pending row: only the 0x07 rows run them.
+/// adl-budget P2: obligation rows keep the step DUE. T (71) long 10 @ 1,000,
+/// collateral 50, plus 13 accounts (seeds 80..=92) seeded the same way against
+/// S (72, short 140). Mark 970 (block 1's submissions aggregate at 2): all 14
+/// flat at B = 2 (14 rows, ESCROW_LONG long 140). `test_adl_work = 2`: one row
+/// per block (a ranking costs >= 2), blocks 2..=15. Oracle rows are pruned at
+/// 12, so blocks 13..=15 carry no action, oracle row, cursor or pending row:
+/// only the 0x07 rows run them. Two runs: equal native root and dumps.
 #[test]
-fn liquidation_e2e_adl_queue_drains_over_empty_blocks() { … }
+fn liquidation_e2e_adl_obligations_drain_over_empty_blocks() { … }
 ```
 
-The body follows `liquidation_e2e_partial_stage1_keeps_the_step_due` (:17415-17433):
-`liq_fixture_db(10, 50)`, the 13 extra accounts seeded through `PositionManager`, and
-`ctx.test_adl_work = Some(2)`. The assertions:
-* after block 12: `oracle_sub_rows(&db).is_empty()`;
-* per block h: exactly one more account is flat, in address order;
-* after block 15: `liquidation_due == false`, S is flat, and the vault holds the summed deficit;
-* no `exec_failed`. A second run of the same blocks must give the same `persisted_native_root` and
-`dump_all_cfs` (the `liquidation_telemetry_does_not_change_block_results_or_state` pattern,
-:17442-17462).
+   Body shape: `liquidation_e2e_partial_stage1_keeps_the_step_due` (:17415-17433) and
+   :17442-17462 for the two runs.
+2. `tests/liquidation_tests.rs`, `telemetry_reports_the_adl_queue_escrow_and_value_sum`:
+   * `p2_fixture` at B with W = 0: `torus_liquidation_adl_queue == 8` and
+     `torus_liquidation_adl_escrow_notional == 8 × 900` tokens.
+   * After the drain: both are 0, `torus_liquidation_adl_dust` equals the swept dust, and in the
+     edge test `torus_liquidation_adl_pairing == 400`.
+   * With `ctx.liq_value_sum = true`, `torus_liquidation_value_sum` equals the test's
+     `total_value(..)` after every drain block, and is constant across the drain (within the
+     dust bound).
+   * Without metrics, or with the flag off: identical rows and results (extend
+     `telemetry_does_not_change_results_or_state` :1143), and no value-sum walk
+     (`CountingBackend`: no `CF_NATIVE_BALANCES` iteration).
 
 **Implementation:**
-* `app.rs:645` (next to `test_engine_threads`): add
-  `#[cfg(test)] test_adl_work: Option<u64>`, initialized `None` at :3984 and :10815.
-* `app.rs:2339`: under `#[cfg(test)]`, if `self.test_adl_work` is `Some(w)`, call
-  `NativeExecutor::run_liquidations_with(&mut ctx, liq::LIQ_SCAN_PER_BLOCK, liq::LIQ_ACT_PER_BLOCK, w)`.
-  Production is unchanged. Use the same `#[cfg(test)]` / `#[cfg(not(test))]` shape as
-  `engine_threads` at :2287-2291.
-* `app.rs:1966-1969`: update the comment ("… cooldown, cursor, pending or ADL-queue row").
+* `app.rs:645`: add `#[cfg(test)] test_adl_work: Option<u64>`, initialized `None` at :3984 and
+  :10815. At :2339, under `#[cfg(test)]`, if it is `Some(w)`, call `run_liquidations_with(.., w)`
+  (the shape of `engine_threads` :2287-2291). Update the comment at :1966-1969.
+* Also in `app.rs`: a `liq_value_sum: bool` field on `TorusApp`, read once from
+  `TORUS_LIQ_VALUE_SUM` at construction and copied into `ctx.liq_value_sum` per block.
+* NE:3588: `pub liq_value_sum: bool` (node-local, never read by execution), `false` at NE:~4057.
+* `torus-telemetry/src/lib.rs`, next to `liquidation_deferred` (:91, :1042-1047, :2335):
+  * `liquidation_adl_queue: Gauge` (rows);
+  * `liquidation_adl_escrow_notional: Gauge<f64, AtomicU64>`;
+  * `liquidation_adl_dust: Gauge<f64, AtomicU64>` (cumulative, signed);
+  * `liquidation_adl_pairing: Gauge<f64, AtomicU64>` (cumulative, signed);
+  * `liquidation_value_sum: Gauge<f64, AtomicU64>`.
+* `liq::pending_count` (:485-495) becomes `tag_count(state, tag)`, with two call sites.
+* `liquidation_telemetry` (:73-136), only with metrics: the row count, plus the escrow notional
+  from both escrows' positions at the step's marks.
+* When `ctx.liq_value_sum` is on, every step runs `value_sum(ctx, marks)`: a paged walk of
+  `CF_NATIVE_BALANCES` (20-byte keys) and `CF_NATIVE_POSITIONS`, with UPnL at the marks
+  (unmarked: entry). It sets the gauge and logs
+  `info!(height, value_sum, "liquidation: value sum")`. A read error skips it.
+* `docs/monitoring-setup.md` rows; the `liquidation.md` telemetry paragraph.
 
-**Verify:** `cargo nextest run -p torus-consensus liquidation_e2e $F`.
-**Depends on:** A4.
+**Verify:** `cargo nextest run -p torus-consensus liquidation_e2e $F`, `cargo nextest run -p torus-bridge telemetry_ $F`.
+**Depends on:** A6.
 
 ---
 
-### Task A6: measure ns/unit, set `W` (Q3)
+### Task A8: measure, set `W`, prove an HL-sized event closes in one block
 
-**Test first** (`crates/torus-bridge/tests/ubench_adl.rs`, still `#[ignore]`):
-* After block 2, keep running blocks 3, 4, … with the same mark until `liq::adl_queue_nonempty`
-  is false (cap 100,000 blocks). `UB_ADL_WORK` (default `liq::ADL_WORK_PER_BLOCK`) goes to
-  `run_liquidations_with(ctx, LIQ_SCAN, LIQ_ACT, w)`.
-* Per block, print: the ADL wall time (the step's timer minus the regular pass; the `adl_work`
-  field of the info line goes through `AdlClock` (:47-63), extended to record that field) and the
-  units used. Summary: blocks to drain, ms per block (p50/p90/max), ns/unit (Σ ms / Σ units).
-* Assertions: `blocks_to_drain >= 1`; every block's units ≤ `W + A + K_max + 1` (at most one
-  step of overshoot); after the drain, OI is symmetric in all 300 markets and each bankrupt
-  account has `ab == (0, 0)`.
-* `report` (:211-231): the "one ADL event per (account, market)" assertion holds over the
-  **sum** of all blocks.
+**Test first** (`crates/torus-bridge/tests/ubench_adl.rs`, still ignored):
+* Run blocks until `next_obligation(..)` is `None` (cap 100,000), with `UB_ADL_WORK` (default
+  `ADL_WORK_PER_BLOCK`).
+* Per block, print the drain ms and units (the `adl_work` field of the info line, recorded by
+  `AdlClock` :47-63). Summary: blocks to drain, ms per block (p50/p90/max), ns/unit.
+* An **HL mode** (`UB_ADL_HL=1`): N = 5,000 traders in 300 markets, 3 bankrupt accounts in 100
+  markets each (300 account-markets). It asserts the escrows are closed after the bankruptcy
+  block with the default W, and prints that block's units and ms.
+* Assertions: per-block units ≤ `W + A + (largest close count of one row)` (one step of
+  overshoot); afterwards, OI is symmetric everywhere, the escrows are flat at 0, and every
+  bankrupt account is flat at 0.
 
-**Implementation / measurement:**
-1. On a quiet box (ozarchy, release): run `UB_ADL_TRADERS=1000` and `5000`, with
-   `UB_ADL_BANKRUPT=1` and `10`, and `UB_ADL_WORK=10^6` (unbounded per block). Take ns/unit from
-   these runs.
-2. `W = floor(20 ms / (ns_per_unit × rig_factor))`. `rig_factor` = rig ms/step ÷ quiet-box
-   ms/step from the same build: ~26 / 13.8 ≈ 1.9 in s18; re-measure if possible, else use 2.
-   Round down to a multiple of 1,000.
-3. Re-run with `UB_ADL_WORK=W`: p90 ADL ms per block × rig_factor ≤ 20.
-4. Write the constant in `liquidation.rs` and add a section "8. Budget measurement" to
-   `docs/plans/adl-budget.md`: the table (N, K, ns/unit, W, ms/block p50/p90, blocks to drain)
-   and the command lines. Hand the runs to the `bench-runner` agent (perf campaign rule).
+**Measurement** (bench-runner, quiet box, release, then rig_factor ≈ 1.9-2):
+* the HL mode's units `U_hl` and ms;
+* the S=750 mode (N = 5,000, K = 10, 270 markets) at `UB_ADL_WORK = W`.
 
-**Verify:** `cargo nextest run -p torus-bridge liquidation $F` (green with the final `W`), then
-`UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=10 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture`
-(bench-runner).
-**Depends on:** A4. The final `W` value is Q6-sensitive: under the "W large enough to finish
-typical events in one block" option, the target changes but the measurement does not.
+Set `W = U_hl × 1.25`, rounded up to a multiple of 10,000. Report the ms per block for the HL
+event and for W (× rig_factor), plus the S=750-mode blocks to drain, in
+`docs/plans/adl-budget.md` §9 *Budget measurement*, with the commands. If ms(W) on the rig is
+well above Q3's ~20 ms, report it as a finding for the owner (open question 6).
+
+**Verify:** `cargo nextest run -p torus-bridge an_hl_sized $F`, then
+`UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture`
+and `UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=10 …` (bench-runner).
+**Depends on:** A6.
 
 ---
 
-## Phase B — Q6-dependent (swappable; do not start until Q6 is final)
+## Phase C: verification end-to-end (proof)
 
-Each B task is self-contained against A4 and can be dropped or replaced on its own.
-
-### Task B1: rank once per (block, market) (Q2; ranking timing = Q6)
-
-**Test first** (`liquidation_l1_tests.rs`, which has access to the counters):
-`adl_ranks_each_market_once_per_block`. Three queued accounts are long in market 1. Per block,
-`counters.adl_rankings` must equal the number of distinct `(market, side)` pairs stepped. The
-closes must equal a reference run without the cache when every counterparty's AV is unchanged
-in the block. The test also uses one counterparty whose AV changes between two steps: it is
-ranked with the AV from the first step, as decided.
-**Implementation:** in `adl_drain`, keep a local
-`let mut ranked: BTreeMap<(MarketId, bool), Vec<liq::AdlCandidate>> = BTreeMap::new();` and pass
-`&mut ranked` to `adl_market`. On a miss: `adl_candidates_of` + `adl_rank` + insert, and units +=
-examined. On a hit: units += 0 before the closes. Then `adl_close(.., &ranked[&key])`, which
-re-walks from the start and re-reads each candidate. Units += closes. Why re-walk and not a
-stored index: see Design Decision.
-**Verify:** `cargo nextest run -p torus-bridge adl_ $F`. Re-run A6's ubench and check that
-ns/unit is unchanged.
-**Depends on:** A4.
-
-### Task B2: re-classification dequeues on recovery (Q4 step 2; Q6)
-
-**Test first** (`tests/liquidation_tests.rs`): `a_queued_account_that_recovers_leaves_the_queue`.
-u1 is queued with `W = 1` in block 1 (visit only). In block 2 the mark moves to 1,000:
-AV ≥ 0 → dequeued. Its positions are untouched, no counterparty moved, and the regular pass of
-block 2 or later classifies it. If AV < MM, `mark_pending` sets the `0x06` row. The vault
-variant: a vault that recovers is dequeued and gets **no** pending row.
-**Implementation:** at the `[B2 seam]` in `adl_drain`:
-
-```rust
-            match Self::liq_view(ctx, marks, &u, l1)?.map(|v| liq::classify(&v)) {
-                Some(Some(Health::Adl)) => {}
-                // AV >= 0 (marks moved): the regular pass handles it from now.
-                Some(Some(_)) => {
-                    liq::adl_dequeue(&ctx.state, &u)?;
-                    stats.pending_changed |= if u == LIQUIDATOR_VAULT {
-                        liq::set_pending(&ctx.state, &u, false)?
-                    } else {
-                        Self::mark_pending(ctx, marks, l1, &u)?
-                    };
-                    continue;
-                }
-                // No marked position / overflow / isolated: the close loop finds
-                // nothing to step and `adl_finish` runs (today's tail).
-                _ => {}
-            }
-```
-
-**Verify:** `cargo nextest run -p torus-bridge adl_ $F`.
-**Depends on:** A4.
-
-### Task B3: freeze queued accounts (Q5; strictness = Q6)
-
-**Signed-action entry points** (`native_executor.rs`, NE):
-
-| Path | Where | Reaches `execute_action`? | Check |
-|---|---|---|---|
-| Single action (`execute`; crash-replay batches; RPC simulation `torus-rpc/src/torus.rs:2822`) | NE:5421 → `execute_action` NE:5450 | yes | top of `execute_action` |
-| Batch Phase 1 non-place actions | NE:5831, :5872 → `execute` | yes | (covered) |
-| CoreWriter drain (PlaceOrder, Cancel, CancelAll, Delegate, Undelegate, ClaimRewards, LockPermanent, ClaimUnbonded, LockboxWithdraw→TransferToSpot) | `drain_core_writer` NE:9936-9972 → `execute` NE:9965; mapping `core_writer_to_native` NE:~10362-10409 | yes | (covered) |
-| Batch PlaceOrder / PlaceOrderBatch (Phase 2 serial and sharded prepare, Phase 3/4) | flatten NE:5771-5804 | **no** | at flatten |
-| Cancel-all runs (`TORUS_CANCEL_BATCH`) | NE:5852-5869 → `exec_cancel_all_run` NE:8947 | **no** | at flatten |
-| Individual handlers behind `execute_action` | place NE:8338, cancel NE:8814, cancel-all NE:8861, modify NE:9045, TransferToSpot NE:9831, Withdraw NE:9852, staking NE:9253-9306, governance NE:9722-9781, oracle NE:9544, validator NE:9316-9429, sessions NE:9450-9514 | via the above | — |
-| Credits (allowed) | CoreWriter `LockboxDeposit` → `exec_settle_lockbox_deposit` NE:9978 (not via `execute`); `TransferToPerp` → `exec_deposit_to_native` NE:9816 (signed by the account: open question 3) | — | not frozen |
-
-No leverage or margin-change action exists (`NativeAction`, `torus-types/src/lib.rs:609-…`), and
-no native-to-native transfer exists. `Withdraw{to}` credits the **EVM** balance of `to`
-(`lockbox.rs:146-190`), so there is no "incoming native transfer" path to keep open.
-
-**Test first** (`tests/liquidation_tests.rs`, new section):
-* `a_queued_account_is_frozen`: queue `u` (`W = 1`). In the next block run one `execute_batch`
-  with u's PlaceOrder (plain and reduce-only), PlaceOrderBatch(2), CancelOrder,
-  CancelAllOrders (once with `execute_batch_cancel_mode(.., true)`, once with `false`),
-  ModifyOrder, TransferToSpot, Withdraw, Delegate. Every result has `!success`,
-  `reason == FailureReason::Liquidating`, and an error that starts with "liquidating". The batch
-  gives 2 results for the batch. Also queue a CoreWriter `CancelAll` and a `LockboxWithdraw`
-  for u; after `drain_core_writer` both are rejected with `Liquidating`. `LockboxDeposit` and
-  `TransferToPerp` credit u's `available`. Another sender's actions in the same batch succeed.
-  u's rows in positions, balances (except credits) and books are unchanged.
-* `no_freeze_read_when_the_queue_is_empty`: with `CountingBackend`
-  (`tests/common/counting_backend.rs`), `execute_batch` of 100 actions from 10 senders on an
-  empty queue performs exactly **one** `CF_NATIVE_LIQUIDATION` read (the `prefix_exists`) and
-  no `0x08` reads.
-* `crates/torus-state/src/action_status.rs:380-390` and `crates/torus-rpc/src/types.rs:660-670`:
-  add `(FailureReason::Liquidating, 9, "liquidating")` to the round-trip tables (RED until the
-  variant exists).
-
-**Implementation:**
-* `torus-state/src/action_status.rs:47-100`: `Liquidating = 9` (doc: "adl-budget Q5: the sender
-  is in the ADL queue"), `from_u8` 9, `as_str` "liquidating".
-* NE:3588: add the field `pub(crate) adl_queue_on: Option<bool>` (doc: one `prefix_exists(0x07)`
-  per context; `run_liquidations` resets it to `None` at its end, because the step changes the
-  queue). Initialize it `None` at NE:~4057.
-* New `NativeExecutor::adl_frozen(ctx, sender) -> bool`. On first use it computes
-  `liq::adl_queue_nonempty`; when that is true it reads `liq::adl_queued(sender)`. A read error
-  sets `ctx.fatal_error` (fail-stop) and returns `false`.
-* `execute_action` NE:5450: first line
-  `if !matches!(action, NativeAction::TransferToPerp { .. }) && Self::adl_frozen(ctx, sender) { return Self::liquidating(); }`.
-  The exempt list depends on open questions 2 and 3.
-* Flatten NE:5771-5804: add `FlatAction::Frozen`. For a frozen sender, push `Frozen` instead of
-  `Place` (one per order of a valid batch; an over-cap batch is still skipped first) and instead
-  of `Other`, so a frozen cancel-all never joins a run. In both Phase 1 loops (NE:5827-5836 and
-  5845-5878; in the run's inner loop treat it like `Place`: no state touched),
-  `results[i] = Self::liquidating()`.
-* `fn liquidating() -> NativeActionResult { NativeActionResult::rejected("liquidating", (FailureReason::Liquidating, "liquidating: account is in the ADL queue".into())) }`
-* `docs/api/` action-status docs: add the reason (grep `price_band`).
-
-**Verify:** `cargo nextest run -p torus-bridge frozen $F`,
-`cargo nextest run -p torus-state action_status $F`, `cargo nextest run -p torus-rpc failure_reason $F`,
-`cargo check --workspace --tests -q`.
-**Depends on:** A4 (and A3 for the rows).
-
-### Task B4: queue gauges (Q6)
-
-**Test first** (`tests/liquidation_tests.rs`): `telemetry_reports_the_adl_queue`. Two accounts are
-queued with `W = 1`. After the step, `torus_liquidation_adl_queue == 2` and
-`torus_liquidation_adl_queue_deficit == Σ −AV` (exact tokens from the fixture). After the drain
-both gauges are 0. Without metrics: identical rows (extend
-`telemetry_does_not_change_results_or_state` :1143).
-**Implementation:**
-* `torus-telemetry/src/lib.rs`: fields next to `liquidation_deferred` (:91):
-  `liquidation_adl_queue: Gauge` and
-  `liquidation_adl_queue_deficit: Gauge<f64, AtomicU64>`. Register them at :1042-1047
-  (`torus_liquidation_adl_queue`, `torus_liquidation_adl_queue_deficit`) and add them to the
-  struct literal (:2335).
-* `liquidation_telemetry` (:73-136): only with metrics and no fatal error, page the `0x07` rows
-  (a 3-line loop over `adl_queue_next`). For each row: `liq_view_walk` → `max(0, −AV)`, summed
-  in tokens. A read error skips the update, the same rule as the pending gauge.
-* `docs/monitoring-setup.md` metric rows; `docs/plans/liquidation.md` telemetry paragraph.
-
-**Verify:** `cargo nextest run -p torus-bridge telemetry_ $F`.
-**Depends on:** A4.
-
----
-
-## Verification end-to-end (Phase C)
-
-1. Unit / integration: every task's Verify command, then
-   `cargo nextest run -E 'rdeps(torus-core)' $F` (the core crate changed).
-2. Before each commit:
-   `cargo nextest run --workspace $F > /tmp/claude-1000/…/nextest.log 2>&1` (in the background)
-   plus the doc-test command from `TESTING.md`. A `flaky` count above 0 is reported. Before
-   merging to main: one full `cargo test --workspace -q` (TESTING.md).
-3. ubench (bench-runner): `ubench_adl` before (7ec5eb2: ms/step 12-17 at N=5000) and after (ms
-   per block at `W`, ns/unit, blocks to drain) for N ∈ {1000, 5000}, K ∈ {1, 10}, with R and
-   without R.
-4. **Proof phase** (separate, bench-runner, after Phase A merges; again after Phase B):
-   * harness fixes from s17 first (`liq_stress.py` `_count` KeyError, stale test genesis in the
-     worktree, reflink-seeded stale binaries);
-   * **S=750**: liveness PASS (no commit gap above the cadence bound), liquidation step ≤ the W
-     target in every block, **drain time in blocks** until the `0x07` prefix is empty, AGREE,
-     vault deficit identical on all nodes, **conservation of total balances** (Σ available +
-     order margin + UPnL at the mark over all accounts incl. the vault, sampled per block over
-     the drain);
-   * **S=400 unchanged**: 100 BACKSTOP, vault +19,984,975.69, step times in the same range.
+1. Per task, the Verify commands. For the core crate also run
+   `cargo nextest run -E 'rdeps(torus-core)' $F`.
+2. Before each commit: `cargo nextest run --workspace $F` (in the background, output to a file)
+   + the doc-test command from `TESTING.md`. A `flaky` count above 0 is reported. Before
+   merging to main: one full `cargo test --workspace -q`.
+3. ubench (bench-runner): 7ec5eb2 vs after (ms per block at W, ns/unit, the HL event's block,
+   S=750-mode blocks to drain), with and without R.
+4. **Final proof list (owner 18c s96)**, from liquidation-stress cells (bench-runner; s17
+   harness fixes first: `liq_stress.py` `_count`, stale genesis, reflink-stale binaries), run
+   with `TORUS_LIQ_VALUE_SUM=1`, plus one run without it for the timing figures:
+   1. **Every ADL'd account ends at exactly 0**: unit tests A5/A6; at S=750, a balance and
+      position read of the 100 thin accounts after B.
+   2. **S=750: the vault gets ~0 from ADL**, because all 100 accounts clamp under H (was
+      26,516,805.13; `adl-budget.md` §8).
+   3. **Escrows end at 0 positions / 0 balance**; the dust is reported separately (gauge + log),
+      and so is the pairing amount.
+   4. **S=400 unchanged:** 100 BACKSTOP, vault +19,984,975.69, step times in the same range.
+   5. **An HL-sized event closes in one block:** unit test A6 #8, the ubench HL mode (A8), and a
+      cell if cheap (S=750's setup with ~3 thin accounts over ~100 markets).
+   6. **Conservation sum checked in every drain block:** the `liquidation: value sum` line is
+      constant from the block before B to the last drain block (no transfers in the window).
+   7. **S=750 liveness PASS + drain time in blocks** until no `0x07` row is left; AGREE, with
+      the vault and escrow balances identical on every node.
 
 ## Rollback
 
-* Docs and the plan only until A1 lands. Each task is its own commit on `perf/adl-budget`; a
-  failing task is reverted with `git revert <sha>`, never with `reset --hard`.
-* Phase B tasks are independent of each other. Dropping one (for example after a Q6 decision)
-  reverts that commit only. The A4 seam keeps today's semantics.
-* Consensus: every A/B task changes block results (fresh genesis, M1). No migration is needed
-  because pre-testnet chains restart from genesis. Rolling back after a deploy means redeploying
-  the previous binary and restarting from genesis.
+* One commit per task (A1+A2 together, A5+A6 together), on `perf/adl-budget`. A failing task
+  is reverted with `git revert <sha>`, never with `reset --hard`.
+* Consensus: A2 changes ADL only above 65,536 rows; A3 and A5-A6 change block results (fresh
+  genesis, M1). Rolling back after a deploy means redeploying the previous binary from genesis
+  (pre-testnet).
+* A7's gauges and value sum are node-local.
 
-## Q6 variants (not final; what each would change in this plan)
+## Open questions (recommendation in brackets)
 
-**V1: snapshot at enqueue.** In the enqueue block, for each marked position, store the
-previous-mark price clamped to the bankruptcy price, and possibly the ranking, in the queue row.
-* A3: the row value goes from `[1]` to a borsh `Vec<(MarketId, price)>` (~24 B per market; 270
-  markets ≈ 6.5 KB per account, root-hashed). Storing the **ranking** is not feasible:
-  S=750 is ~2,500 candidates × 20 B × 270 markets ≈ 13.5 MB per account in consensus state. The
-  realistic V1 therefore stores **prices only** and still ranks at drain time (B1 stays).
-* Bankruptcy prices for all markets have to be defined jointly at enqueue (each market with the
-  others at the mark). Today, each step sees the state the previous closes left. The account
-  may then not end at exactly 0; the D9 tail (`move_collateral`) absorbs the remainder.
-* A4: `adl_market` reads the price from the row instead of `prev`/`adl_rest`. Computing the
-  prices at enqueue costs one `adl_rest` per marked position (~P × O(P) reads, cheap) and is not
-  budgeted.
-* B2 is dropped, because the ADL decision is final, as in HL. B3 stays and gets stricter: the
-  positions must not change before the close. B4's deficit is fixed at enqueue
-  (Σ (entry − price) × size), not −AV.
-* The A4 vault test closes at 970 instead of 900.
-
-**V2: P2 escrow.** Memory `d88cc443` (18c, s96, 21:46) records this as **the owner decision**.
-The coordinator's later message says Q6 is still under discussion, so it is not adopted here.
-In the bankruptcy block, positions move at their ADL prices to a dedicated escrow account, the
-account goes flat at that block, and the escrow drains by market under `W`. What changes:
-* A1 and A2: unchanged, except that the escrow is excluded as a candidate (an explicit filter in
-  `adl_candidates_of`).
-* A3: the queue is keyed by **market** (`0x07 ‖ height ‖ market`, or simply the escrow's
-  position rows act as the queue), not by account. `0x08` membership is dropped.
-* A4: the pass replaces enqueue with a backstop-like transfer (`liq::transfer` at the clamped
-  ADL price) to the escrow, then the D9 `move_collateral`. That reuses
-  `backstop(.., |m| price(m))` with a new destination and price closure. The drain steps the
-  escrow's positions in market order against ranked counterparties at the stored price. With
-  several accounts in one market at different prices, the escrow's single netted position
-  averages the entries. Matching HL's final balances per counterparty then needs per-lot rows
-  (`0x09 ‖ market ‖ height ‖ account` → `(side, size, price)`), not the escrow's position.
-  Open point to settle before coding.
-* The escrow is exempt from scan, margin and stage 1 / backstop, like the vault: the
-  `not_vault` filter (:174) generalizes to "protocol accounts".
-* B2 and B3 are dropped (the account is flat at B; the freeze is not needed). B4 becomes the
-  escrow's position count and UPnL. B1 is unchanged.
-* A5 is unchanged in shape: escrow rows keep the step due.
-* Proof adds: the escrow ends with 0 positions and 0 balance, and the S=750 26.5M vault deficit
-  is explained under the clamp.
-
-## Open questions (for the owner; recommendation in brackets)
-
-1. **Units for a visit.** Re-classification and the visit cost 1 unit each. Without this, a queue
-   of accounts that all recovered (B2) would be dequeued in a single block without bound. [Count
-   1 per visited account, as written in A4.]
-2. **Freeze scope.** The literal Q5 reading is "every signed action". That includes
-   `SubmitOraclePrices`, `AttestStateHash`, `JailVote`, staking, governance and session
-   actions, and none of them touches the perp account (staking has its own balance). Freezing
-   them stops a validator's oracle and attestation duties while it is being ADL'd. [Freeze only
-   the perp-account actions: orders (incl. batch and reduce-only), cancels, cancel-all, modify,
-   TransferToSpot, Withdraw, and their CoreWriter forms.]
-3. **`TransferToPerp`** is signed by the queued account, and it is a deposit. [Allowed:
-   "deposits are credited".]
-4. **Same-block order change.** ADL closes now run after the regular pass instead of inside it.
-   An account classified later in the same pass therefore sees its counterparties' state before
-   this block's ADL closes. [Accept; it is deterministic and GOLDEN_B is re-pinned.]
-5. **Drain cost at S=750.** Rankings are per account in FIFO order. The Q2 cache saves work only
-   when queued accounts share markets inside one block. With `W` ≈ 10 rankings per block,
-   ~26.8k rankings take ~2,700 blocks. [Measure in A6 and the proof. If the drain is too slow,
-   consider C2 (holders index) or a per-market drain order; the latter is a Q4/Q6 change.]
-6. **Skipped queued accounts use a scan slot.** They do not count in
-   `torus_liquidation_scanned`. [As written: otherwise the cursor logic breaks.]
-7. **Unmarked remainder.** A queued account whose remaining positions are all unmarked goes
-   through D9 (collateral to the vault) and is dequeued, which is today's `adl_account` tail.
-   With no mark at all, the drain is skipped. [Keep.]
-8. **Q6 status conflict.** Memory `d88cc443` says Q6 = P2 escrow (decided, with Q5's freeze
-   dropped and the drain ordered by market). The coordinator says Q6 is still open. [Owner to
-   confirm. If P2 is final, A3/A4 take the V2 shape before coding, and B2/B3 are dropped.]
+1. **Edge-pairing cost.** `adl_cross` scans the queue from its start for opposite rows of the
+   same market: O(queue) per paired row, counted in units. [Accept: rare; add an index only if
+   the proof shows it.]
+2. **Dust bound wording.** "Size × 1 raw per obligation" holds only with the escrow's
+   **aggregated** size after each row: an average's error applies to the whole position. [Use
+   the formula in *Dust bound*.]
+3. **Dust above the bound in production.** [Log an error, sweep anyway, and report it in the
+   gauge. Never fail-stop: value is still conserved through the vault.]
+4. **A market without a usable mark in a drain block.** Its rows wait (skipped; the rest
+   proceeds), because `adl_rank` needs the mark. [Skip; or rank at the stored price if the owner
+   prefers no wait.]
+5. **The value sum and fees.** Deposits, withdrawals and possibly per-action gas fees change it
+   (`total_native_fees` NE:3542, distributed NE:10100: check whether it debits
+   `CF_NATIVE_BALANCES`). [Compare over a window with no user transfers; confirm the fee path in
+   A7.]
+6. **W vs the ~20 ms ADL budget.** An HL-sized event at N = 5,000 is ~100 rankings × 5,000
+   traders ≈ 500k units. At s18's ~0.1-0.4 µs per unit that is roughly 50-200 ms in one block,
+   above Q3's ~20 ms. [Measure in A8. The owner's rule (the HL event in one block) sets W; if the
+   rig time is too high, C2 (market index) cuts a ranking to the holders of the market.]
+7. **The vault as a candidate** can take escrow rows and later be ADL'd itself (new rows).
+   [Accept: D8 unchanged.]
+8. **Unmarked positions at B** stay with the account (H2), and D9 still moves all of its
+   collateral, as today. "Every ADL'd account ends at exactly 0" therefore means its cash and its
+   marked positions. [Keep.]
+9. **Rule H after an outage.** A market whose mark disappears loses its row, so the first mark
+   after the gap has no base (the mark fallback). [Keep: H1's "never a base from before an
+   outage".]

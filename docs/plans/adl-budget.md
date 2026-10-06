@@ -1,7 +1,9 @@
 # ADL per-block budget (P0 before testnet)
 
-**Status (s18, ozarchy):** design **decided** (owner 18c s96: Q1-Q6 = the recommendations in
-section 7, unchanged). Implementation plan: `docs/plans/adl-budget-impl.md`. Branch
+**Status (s18, ozarchy):** design **decided** (owner 18c s96). Q1-Q4 are the recommendations in
+section 7. **Q5 (freeze) is dropped and Q6 = P2 (terms fixed at B, ADL escrow)**, plus the new
+previous-mark rule **H**; see section 8, which supersedes sections 4 and 5 where they differ.
+Implementation plan: `docs/plans/adl-budget-impl.md`. Branch
 `perf/adl-budget` off main aae6b9b (profiling test b60bdff). It changes who gets ADL'd, so it
 needs a fresh genesis (fine pre-testnet). Liquidation design: `docs/plans/liquidation.md`.
 
@@ -202,5 +204,67 @@ accounts incl. the vault) across the whole drain.
 | Q2 | Ranking refresh | once per (block, market), candidates re-read at close |
 | Q3 | Budget unit | candidates examined + closes; W from the measurement (≤ ~20 ms ADL per block) |
 | Q4 | Queue order | FIFO `0x07 ‖ height ‖ trader` in `CF_NATIVE_LIQUIDATION` |
-| Q5 | Queued account actions | frozen: every signed action rejected with `liquidating`; deposits / incoming transfers credited |
-| Q6 | Deficit in between | unrealized on the account, realized at flat (D9); add the two gauges; no move-to-vault |
+| Q5 | Queued account actions | **dropped** (s96 final): the account is flat at B, nothing to freeze |
+| Q6 | Deficit in between | **P2** (s96 final): terms fixed at B, positions to two ADL escrows, deficit to the vault at B (section 8) |
+| H | Previous mark (D10 change) | the last mark **different** from the current one, per market (section 8) |
+| 5 | Funding | escrow positions excluded (section 8; doc-only, no funding on main) |
+
+## 8. Final design (owner 18c s96): P2 escrow, rule H, funding
+
+**P2: terms fixed at B.** In the block B where an account classifies ADL (or the vault's
+AV < 0), the pass does the following:
+1. D4: cancel the account's orders and stops.
+2. For each marked position, in ascending market: compute the ADL price exactly as H1 does today
+   (the previous mark, rule H below, clamped one-sided to the account's bankruptcy price:
+   `liq::adl_price`, `bankruptcy_price`, `adl_rest`, unchanged), then transfer the position to
+   an **ADL escrow** at that price.
+3. D9: the account's remaining collateral (any sign) moves to the vault. The account ends flat
+   at exactly 0 and leaves liquidation in B.
+
+The escrows:
+* There are two protocol accounts with no key: `ADL_ESCROW_LONG` takes bankrupt longs and
+  `ADL_ESCROW_SHORT` takes bankrupt shorts, so obligations of opposite sides at different
+  prices never net.
+* Each holds one aggregated position per (market, side).
+* They are never classified, have no margin checks, and are never ADL candidates. The vault
+  stays a candidate.
+
+The queue:
+* Each obligation is a row `0x07 ‖ height(8) ‖ market(8) ‖ side(1) ‖ trader(20)` →
+  (size, price). The trader stays in the key because the clamp makes prices per account.
+* The drain runs in key order under W, with one ranking per (block, market, side). The escrow
+  closes against the ranked opposite holders at the obligation's stored price.
+* When the real holders are exhausted (both escrows in one market), the two escrows close
+  against each other, each at its own stored price, and the vault pays the difference.
+* A flat escrow's remaining balance (dust from averaged entries) is swept to the vault and
+  reported separately.
+
+W is one constant, high enough that an HL-sized event (a few hundred account-markets) closes the
+escrows in its own block. Only S=750-type storms spill over several blocks. HL's Oct 10 2025 ADL
+(raw node_fills) closed every (account, coin) fully in one block.
+
+**H: the previous mark.** Row `0x03 ‖ market` holds `last(16) ‖ [prev(16)]`. When the step's mark
+differs from `last`, the row becomes (`last` = mark, `prev` = old `last`). An unchanged mark
+leaves the row as it is, and a market without a usable mark deletes it (as today). The
+pre-clamp ADL price is `last` when the mark changed this step, else `prev`; with neither, it is
+the mark (D10's fallback). So every account of a market gets the same pre-clamp price
+regardless of which block of one mark interval the scan reaches it in. That holds within one
+mark interval only: at 100k accounts the 2,048-per-block scan spans several mark changes
+(follow-up: C2 market index).
+
+**S=750 deficit (26,516,805.13) explained.** The shock lands at 788.
+* Block 788's batch (47 accounts) used a previous mark from before the shock. The clamp to the
+  bankruptcy price then bounds each loss, so their deficits are ~0.
+* Blocks 789 and 790 (53 accounts) used a previous mark that was already after the shock (D10
+  stored 788's mark), so the clamp did not bind. That gives 26,516,805 (the model gives
+  26,488,513; the 28k residual is walk PnL).
+* The vault gauge went 0 → 9.99M → 26.5M.
+
+Under H, all 100 accounts get the pre-shock base (no mark change between 788 and 790), so the
+deficit is the clamped ~0 for all of them.
+
+**Funding (owner decision 5).** Main has no funding mechanism yet (only `max_funding_rate_bps`
+params). The future funding item **must exclude the positions of `ADL_ESCROW_LONG` /
+`ADL_ESCROW_SHORT`**: they neither pay nor receive, otherwise an escrow could not end at 0.
+Counterparties keep paying and receiving funding until their obligation is drained. This is a
+small difference from HL that only shows during a storm (HL parity backlog item).
