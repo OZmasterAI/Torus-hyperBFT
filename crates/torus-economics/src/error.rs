@@ -174,3 +174,45 @@ pub enum EconomicsError {
     #[error("market listing {field} must be > 0")]
     MarketListingNotPositive { field: &'static str },
 }
+
+impl EconomicsError {
+    /// Row 74: a LOCAL fault — this node's storage failed, or bytes it stored
+    /// do not decode — so its post-state for the block cannot be trusted and
+    /// the node must fail-stop. Every other variant is a validation, user or
+    /// invariant error that every validator hits alike on the same state;
+    /// halting on those would stop the whole chain.
+    pub fn is_local_fault(&self) -> bool {
+        matches!(self, Self::State(_) | Self::Borsh(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_storage_and_decode_errors_are_local_faults() {
+        assert!(EconomicsError::State(StateError::InvalidData("x".into())).is_local_fault());
+        assert!(EconomicsError::Borsh("x".into()).is_local_fault());
+        let deterministic = [
+            EconomicsError::GovernanceNotInitialized,
+            EconomicsError::InsufficientBalance {
+                have: U256::ZERO,
+                need: U256::from(1u8),
+            },
+            EconomicsError::ValidatorNotFound(Address::ZERO),
+            EconomicsError::ProposalNotFound(1),
+            EconomicsError::InvalidParameterValue {
+                key: "k".into(),
+                reason: "r".into(),
+            },
+            EconomicsError::InsufficientTreasury {
+                have: U256::ZERO,
+                need: U256::from(1u8),
+            },
+        ];
+        for e in deterministic {
+            assert!(!e.is_local_fault(), "{e}");
+        }
+    }
+}
