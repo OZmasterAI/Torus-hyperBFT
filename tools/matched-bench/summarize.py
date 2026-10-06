@@ -1139,6 +1139,9 @@ summary = {
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
+             # None = unset on the nodes = jsonrpsee's 10 MiB default.
+             "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
+                                     if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),
              "open_order_budget": int(A.open_order_budget) if A.open_order_budget else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},

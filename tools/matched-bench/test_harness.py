@@ -304,6 +304,15 @@ class SummarizeTest(unittest.TestCase):
             "tail_url": "http://127.0.0.1:8647", "tail_fetched": 3600,
             "tail_errors": 12, "tail_missed": 1})
 
+    def test_rpc_max_response_mb_comes_from_the_node_env(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        s, _ = run_summarize(self.d, extra=[
+            "--node-env", json.dumps({"TORUS_RPC_MAX_RESPONSE_MB": "64"})])
+        self.assertEqual(s["cell"]["rpc_max_response_mb"], 64)
+        s, _ = run_summarize(self.d)
+        self.assertIsNone(s["cell"]["rpc_max_response_mb"], "unset = node default 10 MiB")
+
     def test_uncapped_legacy_cell_reports_none_for_the_new_fields(self):
         write_cell(self.d, 1_000, 1_000)  # bench.log: legacy one-liner, no rate
         write_agreement(self.d, ["same"] * 3)
@@ -806,7 +815,7 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn("--max-in-flight \"$(j '.cell.max_in_flight // \"\"')\"", res)
         self.assertIn("--open-order-budget \"$(j '.cell.open_order_budget // \"\"')\"", res)
         lines = [l for l in src.splitlines() if "MAX_IN_FLIGHT" in l
-                 and not l.lstrip().startswith(("#", "log ", "--", "python3"))]
+                 and not l.lstrip().startswith(("#", "log ", "--", "python3", "if "))]
         snippet = ("RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
                    "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"')
 
@@ -824,6 +833,24 @@ class CrashKillGuardTest(unittest.TestCase):
             r = run(MAX_IN_FLIGHT=bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
             self.assertIn("FATAL", r.stderr)
+
+    def test_max_in_flight_raises_the_node_rpc_response_cap(self):
+        """Loaded torus_getBlockBody replies pass jsonrpsee's 10 MiB default
+        (~68 KB per 400-order batch), and the cap's block tail would then miss
+        every body and free slots only at nonce + 70 s. MAX_IN_FLIGHT therefore
+        exports TORUS_RPC_MAX_RESPONSE_MB=64 to the nodes (after the TORUS_*
+        clean, before EXTRA_ENV so a cell can still override it) and logs it;
+        summary.json records it as cell.rpc_max_response_mb."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        on = src.index('if [ -n "$MAX_IN_FLIGHT" ]; then\n    export TORUS_RPC_MAX_RESPONSE_MB')
+        block = src[on : src.index("\nfi", on)]
+        self.assertIn("export TORUS_RPC_MAX_RESPONSE_MB=64", block)
+        self.assertIn("log ", block)
+        self.assertLess(src.index("for v in $(env | grep -oE '^TORUS_"), on)
+        self.assertLess(on, src.index("for kv in $EXTRA_ENV; do export"))
+        self.assertLess(on, src.index("NODE_ENV_JSON=$("))
+        self.assertIn("TORUS_RPC_MAX_RESPONSE_MB=64", src[: src.index("set -uo pipefail")])
 
     def test_spam_cancel_reaches_the_bench_only_when_set(self):
         """SPAM_CANCEL_KEYS / SPAM_CANCEL_RATE / SPAM_CANCEL_FUNDED=1 -> bench

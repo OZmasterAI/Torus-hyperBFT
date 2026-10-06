@@ -42,8 +42,12 @@
 #                by the RPC, or past nonce + 70 s); the shared block-body tail
 #                reads val2 (--in-flight-watch-rpc), never val0, which takes all
 #                ingress under BENCH_RPCS=0. With OPEN_ORDER_BUDGET the estimate
-#                counts orders since the last COMMITTED cancel-all. Positive
-#                integer; unset (default) = flags omitted. Recorded as
+#                counts orders since the last COMMITTED cancel-all. Also
+#                exports TORUS_RPC_MAX_RESPONSE_MB=64 to the nodes: loaded
+#                torus_getBlockBody replies pass jsonrpsee's 10 MiB default
+#                (~68 KB per 400-order batch) and the tail would miss them
+#                (EXTRA_ENV can override; summary cell.rpc_max_response_mb).
+#                Positive integer; unset (default) = flags omitted. Recorded as
 #                cell.max_in_flight in summary.json.
 #   ANTISPAM=1   turn the node anti-spam limits ON (devnet/wsl/env.sh has them
 #                OFF): TORUS_INGRESS_MIN_COLLATERAL=1, TORUS_ADDR_RATE_LIMIT=1,
@@ -577,6 +581,10 @@ for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
 if [ "$ANTISPAM" = 1 ]; then
     export TORUS_INGRESS_MIN_COLLATERAL=1 TORUS_ADDR_RATE_LIMIT=1 TORUS_RPC_IP_WEIGHT_PER_MIN=1200
+fi
+if [ -n "$MAX_IN_FLIGHT" ]; then
+    export TORUS_RPC_MAX_RESPONSE_MB=64
+    log "MAX_IN_FLIGHT=$MAX_IN_FLIGHT: TORUS_RPC_MAX_RESPONSE_MB=64 on the nodes (loaded torus_getBlockBody replies pass the 10 MiB default)"
 fi
 for kv in $EXTRA_ENV; do export "$kv"; done
 # HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged

@@ -4,17 +4,20 @@
 //! UNIT: one signed native action — what the econ sender loop signs and
 //! submits (a `PlaceOrderBatch` of `--batch-size` orders, a `PlaceOrder`, or a
 //! `CancelAllOrders`). A sender may fire only while its in-flight count is
-//! below N; a fire of `--submit-batch` actions takes that many slots (with the
-//! harness default `SUBMIT=1` one fire = one action = one slot).
+//! below N; a fire of `--submit-batch` S actions takes S slots, so in flight
+//! can reach N-1+S (with the harness default `SUBMIT=1` one fire = one action
+//! = one slot, and in flight never passes N).
 //!
 //! A slot is released when the action
 //!   * is seen COMMITTED: one shared watcher ([`run_tail`]) tails every new
 //!     block body (`torus_getBlockBody`) from ONE validator and releases by
 //!     action identity (nonce + signature, [`action_key`]; the body carries no
 //!     sender address and recovering it would cost an ecrecover per action);
-//!   * is REFUSED by the RPC: a whole-call error, or the per-item error of a
-//!     partially accepted batch. With `--retry-busy` a BUSY reply is retried
-//!     and the slot is held until the final outcome;
+//!   * is REFUSED by the RPC: an error reply, nothing admitted, or the
+//!     per-item error of a partially accepted batch. With `--retry-busy` a
+//!     BUSY reply is retried and the slot is held until the final outcome. A
+//!     transport failure (no reply / unreadable reply) is NOT a refusal — the
+//!     node may hold the action — so commit or timeout releases it;
 //!   * TIMES OUT: `nonce + NONCE_WINDOW_MS + TIMEOUT_MARGIN_MS` has passed
 //!     (the mempool evicts an admitted action whose nonce is older than the
 //!     60 s window, invisibly to the bench; a block the tail missed ends here
@@ -75,22 +78,34 @@ pub fn action_shape(action: &NativeAction) -> (u64, bool) {
 /// The committed actions of one `torus_getBlockBody` result: `(key, ok)` per
 /// native action, where `ok` is false only for a `"skipped"` or `"failed"`
 /// status. `None` when the reply has no action list.
-pub fn body_action_keys(result: &serde_json::Value) -> Option<Vec<(u64, bool)>> {
-    let actions = result.get("nativeActions")?.as_array()?;
-    let status = result.get("nativeActionStatus").and_then(|s| s.as_array());
+pub fn body_action_keys(reply: &[u8]) -> Option<Vec<(u64, bool)>> {
+    // Only what the tail needs: unknown fields (the action itself, the EVM
+    // list, ...) are skipped by the parser, never built into a Value tree.
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        result: Option<Body>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body {
+        native_actions: Vec<Action>,
+        #[serde(default)]
+        native_action_status: Option<Vec<String>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Action {
+        nonce: u64,
+        signature: ActionSignature,
+    }
+    let body = serde_json::from_slice::<Reply>(reply).ok()?.result?;
+    let status = body.native_action_status.unwrap_or_default();
     Some(
-        actions
+        body.native_actions
             .iter()
             .enumerate()
-            .filter_map(|(i, a)| {
-                let nonce = a.get("nonce")?.as_u64()?;
-                let sig: ActionSignature =
-                    serde_json::from_value(a.get("signature")?.clone()).ok()?;
-                let ok = status
-                    .and_then(|s| s.get(i))
-                    .and_then(|s| s.as_str())
-                    .is_none_or(|s| s == "executed");
-                Some((action_key(nonce, &sig), ok))
+            .map(|(i, a)| {
+                let ok = status.get(i).is_none_or(|s| s == "executed");
+                (action_key(a.nonce, &a.signature), ok)
             })
             .collect(),
     )
@@ -196,6 +211,8 @@ impl Tracker {
         result: &Result<Vec<Option<String>>, String>,
     ) -> Vec<usize> {
         let refused: Vec<u64> = match result {
+            // Unknown outcome: commit or timeout releases it.
+            Err(e) if is_transport_error(e) => Vec::new(),
             Err(_) => keys.to_vec(),
             // Items past the reply's length stay in flight (commit/timeout).
             Ok(items) => keys
@@ -268,6 +285,27 @@ impl Tracker {
         self.released[cause as usize] += 1;
         Some((p.sender, p))
     }
+}
+
+/// A transport failure (no reply, or an unreadable one): the node may have
+/// admitted the action, so it is not a refusal.
+pub fn is_transport_error(err: &str) -> bool {
+    // The prefixes submit_native_action[s_items] put on reqwest send/read and
+    // JSON decode failures; RPC replies are "rpc: ..." or "0 accepted ...".
+    err.starts_with("http: ") || err.starts_with("parse: ")
+}
+
+/// End-of-run warning when the tail failed to read bodies.
+pub fn tail_warning(tail: &TailStats, url: &str) -> Option<String> {
+    let errors = tail.errors.load(Ordering::Relaxed);
+    let missed = tail.missed.load(Ordering::Relaxed);
+    (errors > 0 || missed > 0).then(|| {
+        format!(
+            "WARNING: in-flight block tail {url}: errors={errors} missed={missed} — unread bodies \
+             free their slots only at nonce + {} s (check TORUS_RPC_MAX_RESPONSE_MB on the node)",
+            (torus_types::eip712::NONCE_WINDOW_MS + TIMEOUT_MARGIN_MS) / 1000
+        )
+    })
 }
 
 /// Watcher counters.
@@ -448,6 +486,22 @@ pub fn cap_plan(
     Ok(Some((max_in_flight, url.to_string())))
 }
 
+/// Raw `torus_getBlockBody` JSON-RPC reply bytes (`None` on a transport error).
+async fn fetch_body_reply(
+    client: &reqwest::Client,
+    url: &str,
+    block_number: u64,
+) -> Option<Vec<u8>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torus_getBlockBody",
+        "params": [block_number],
+        "id": 1
+    });
+    let resp = client.post(url).json(&body).send().await.ok()?;
+    Some(resp.bytes().await.ok()?.to_vec())
+}
+
 /// The shared block-body tail: every `TAIL_POLL` expire timed-out actions,
 /// read the watch node's height and process every new body in order. A body
 /// that cannot be read is retried on the next poll (the cursor stays on it)
@@ -474,11 +528,16 @@ pub async fn run_tail(
             continue;
         };
         while next <= height && Instant::now() < stop {
-            match super::fetch_block_body_json(&client, &cap.url, next)
-                .await
-                .as_ref()
-                .and_then(body_action_keys)
-            {
+            // Multi-MB bodies under load: parse off the async workers so the
+            // senders' fire timing does not jitter.
+            let keys = match fetch_body_reply(&client, &cap.url, next).await {
+                Some(reply) => tokio::task::spawn_blocking(move || body_action_keys(&reply))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            match keys {
                 Some(actions) => {
                     let woken = cap.tracker.lock().unwrap().on_block(&actions);
                     cap.wake(woken);
@@ -562,12 +621,50 @@ mod tests {
         t.submit(0, 1, 1_000, 400, false);
         t.submit(0, 2, 1_001, 0, true);
         assert!(!t.ready(0, 400, 0));
-        let woken = t.apply_result(&[1, 2], &Err("http: connection refused".into()));
+        let woken = t.apply_result(&[1, 2], &Err("rpc: mempool: native pool full".into()));
         assert_eq!(woken, vec![0, 0]);
         assert_eq!(t.in_flight(0), 0);
         assert_eq!(t.released, [0, 2, 0]);
         assert_eq!(t.estimate(0), 0, "refused places never land");
         assert!(!t.cancel_pending(0));
+    }
+
+    // A transport failure (no reply, or an unreadable one) says nothing about
+    // admission: the node may hold the action. The slot and its places stay
+    // until the action is seen committed or times out.
+    #[test]
+    fn transport_errors_leave_the_slot_to_commit_or_timeout() {
+        for err in [
+            "http: error sending request for url (http://127.0.0.1:8645/): operation timed out",
+            "http: error sending request for url (http://127.0.0.1:8645/)",
+            "parse: error decoding response body",
+        ] {
+            assert!(is_transport_error(err), "{err}");
+            let mut t = Tracker::new(1, 1, T);
+            t.submit(0, 1, 1_000, 400, false);
+            assert!(
+                t.apply_result(&[1], &Err(err.to_string())).is_empty(),
+                "{err}"
+            );
+            assert_eq!(t.in_flight(0), 1);
+            assert_eq!(t.estimate(0), 400);
+            assert_eq!(t.released, [0, 0, 0]);
+            assert_eq!(t.on_block(&[(1, true)]), vec![0], "released by its commit");
+            t.submit(0, 2, 2_000, 400, false);
+            t.apply_result(&[2], &Err(err.to_string()));
+            assert_eq!(t.expire(2_000 + T + 1), vec![0], "or by timeout");
+            assert_eq!(t.released, [1, 0, 1]);
+        }
+        // RPC-level refusals: an error reply, nothing admitted, a BUSY shed.
+        for err in [
+            "rpc: rate limited: IP request weight over 1200/min, retry later",
+            "0 accepted (1 sent): \"mempool: busy, admission limit reached (pre-verify), retry later\"",
+        ] {
+            assert!(!is_transport_error(err), "{err}");
+            let mut t = Tracker::new(1, 1, T);
+            t.submit(0, 1, 1_000, 400, false);
+            assert_eq!(t.apply_result(&[1], &Err(err.to_string())), vec![0], "{err}");
+        }
     }
 
     #[test]
@@ -686,12 +783,20 @@ mod tests {
         let a = signed(1_000, place(3));
         let b = signed(1_001, NativeAction::CancelAllOrders { market_id: None });
         // What torus_getBlockBody returns: serde_json::to_value per action.
-        let body = serde_json::json!({
+        // The tail parses the raw JSON-RPC reply bytes (only nonce and
+        // signature per action; the orders are skipped, never built).
+        let reply = |result: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                .unwrap()
+        };
+        let body = reply(serde_json::json!({
             "blockNumber": "0x5",
             "nativeActions": [serde_json::to_value(&a).unwrap(), serde_json::to_value(&b).unwrap()],
             "nativeActionCount": 2,
             "nativeActionStatus": ["executed", "failed"],
-        });
+            "nativeActionFailures": [],
+            "evmTransactions": [],
+        }));
         let keys = body_action_keys(&body).unwrap();
         assert_eq!(
             keys,
@@ -705,10 +810,21 @@ mod tests {
         let c = signed(1_002, place(3));
         assert_ne!(action_key(c.nonce, &c.signature), keys[0].0);
         // No status list (old node / not executed yet): every action ok.
-        let body = serde_json::json!({"nativeActions": [serde_json::to_value(&a).unwrap()]});
+        let body = reply(serde_json::json!({"nativeActions": [serde_json::to_value(&a).unwrap()]}));
         assert_eq!(body_action_keys(&body).unwrap(), vec![(keys[0].0, true)]);
+        // Status not recorded yet: null.
+        let body = reply(serde_json::json!({
+            "nativeActions": [serde_json::to_value(&a).unwrap()], "nativeActionStatus": null}));
+        assert_eq!(body_action_keys(&body).unwrap(), vec![(keys[0].0, true)]);
+        // No body yet (null result), an error reply, garbage: retry later.
+        assert_eq!(body_action_keys(&reply(serde_json::Value::Null)), None);
         assert_eq!(
-            body_action_keys(&serde_json::json!({"nativeActionCount": 0})),
+            body_action_keys(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#),
+            None
+        );
+        assert_eq!(body_action_keys(b"<html>"), None);
+        assert_eq!(
+            body_action_keys(&reply(serde_json::json!({"nativeActionCount": 0}))),
             None
         );
     }
@@ -750,6 +866,24 @@ mod tests {
             "Econ mix (load-gen accepted): place 0 (0.0%) | cancel-all 0 (0.0%) \
              [sent: place 0 cancel-all 0]"
         );
+    }
+
+    #[test]
+    fn tail_warning_only_when_the_tail_lost_bodies() {
+        let tail = TailStats::default();
+        tail.fetched.store(10, Ordering::Relaxed);
+        assert_eq!(tail_warning(&tail, "http://v2"), None);
+        tail.errors.store(3, Ordering::Relaxed);
+        assert_eq!(
+            tail_warning(&tail, "http://v2").unwrap(),
+            "WARNING: in-flight block tail http://v2: errors=3 missed=0 — unread bodies \
+             free their slots only at nonce + 70 s (check TORUS_RPC_MAX_RESPONSE_MB on the node)"
+        );
+        tail.errors.store(0, Ordering::Relaxed);
+        tail.missed.store(1, Ordering::Relaxed);
+        assert!(tail_warning(&tail, "http://v2")
+            .unwrap()
+            .contains("errors=0 missed=1"));
     }
 
     #[test]

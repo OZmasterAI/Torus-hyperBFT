@@ -182,10 +182,12 @@ enum Command {
         retry_busy: bool,
         /// econ: per-sender in-flight cap in signed native actions (one
         /// PlaceOrderBatch / PlaceOrder / CancelAllOrders each; a fire of
-        /// --submit-batch actions takes that many slots). A sender fires only
+        /// --submit-batch S actions takes S slots, so in flight can reach
+        /// N-1+S). A sender fires only
         /// while fewer than N of its actions are in flight and otherwise waits
         /// for a slot; a slot frees when the action is seen committed (one
-        /// shared block-body tail), refused by the RPC, or past its nonce +
+        /// shared block-body tail), refused by the RPC (a transport error is
+        /// not a refusal), or past its nonce +
         /// 60 s window + 10 s. With --open-order-budget the estimate becomes
         /// the orders placed since the last COMMITTED cancel-all, in-flight
         /// places included. 0 (default) = off, so prior cells stay
@@ -1059,11 +1061,14 @@ mod econ_shape_tests {
         actions.iter().map(|a| bincode::serialize(a).unwrap()).collect()
     }
 
-    // --max-in-flight off: a Legacy fire is exactly today's loop of
+    // --max-in-flight off: the sender loop plans each fire with
+    // FireBudget::Legacy, which must be exactly today's loop of
     // econ_action_budgeted (same rng stream, same open-order estimate), with
-    // and without a budget, for one and several actions per fire.
+    // and without a budget, for one and several actions per fire. Signing,
+    // encoding and the wire are unchanged code, so the payloads match too
+    // (nonces are wall-clock ms either way).
     #[test]
-    fn max_in_flight_zero_is_byte_identical() {
+    fn legacy_fire_is_todays_action_stream() {
         for (budget, batch, submit) in [(0u64, 400usize, 1usize), (900, 400, 1), (900, 32, 3), (0, 1, 2)] {
             let mut shape = EconShape::new(1500, 0, 5, 0.5, 0.05);
             shape.open_order_budget = budget;
@@ -2621,19 +2626,18 @@ fn action_identity(action: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-/// The raw `torus_getBlockBody` result (`None` on any error or a missing body).
-async fn fetch_block_body_json(
+async fn fetch_block_body(
     client: &reqwest::Client,
     url: &str,
     block_number: u64,
-) -> Option<serde_json::Value> {
+) -> Option<(u64, Vec<u64>)> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "torus_getBlockBody",
         "params": [block_number],
         "id": 1
     });
-    let mut resp: serde_json::Value = client
+    let resp: serde_json::Value = client
         .post(url)
         .json(&body)
         .send()
@@ -2642,18 +2646,7 @@ async fn fetch_block_body_json(
         .json()
         .await
         .ok()?;
-    match resp.get_mut("result")?.take() {
-        serde_json::Value::Null => None,
-        r => Some(r),
-    }
-}
-
-async fn fetch_block_body(
-    client: &reqwest::Client,
-    url: &str,
-    block_number: u64,
-) -> Option<(u64, Vec<u64>)> {
-    let result = &fetch_block_body_json(client, url, block_number).await?;
+    let result = resp.get("result")?;
     // Prefer the action list: identities enable cross-block dedup (the
     // "included" metric otherwise overcounts ~3x under 3-chain commit lag).
     if let Some(actions) = result.get("nativeActions").and_then(|a| a.as_array()) {
@@ -4084,6 +4077,9 @@ async fn run_consensus(
             h.abort();
         }
         println!("{}", c.report());
+        if let Some(w) = in_flight::tail_warning(&c.tail, &c.url) {
+            println!("{w}");
+        }
     }
     if let Some(p) = &spam {
         println!("{}", spam_report(p, &spam_stats));
