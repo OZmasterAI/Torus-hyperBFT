@@ -239,26 +239,27 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   | A4 positions hold no collateral | DONE | `ca06c8c` (F1: account-level free margin; withdraw and transfer check position margin) |
   | A5 market orders reserve no margin | DONE | `bd830af` (price cap + margin), `03c40ac` (reserve at the mark, re-check at match) |
   | A7 lockbox decimals, revm cache clobber | DONE | `f572012` (18-dec EVM units, queued 0x0820); clobber test `ffcf596` |
-  | A8 session expiry seconds vs ms | OPEN | the block paths still pass the header time in seconds to `resolve_sender` (`validator.rs` ~376, `proposer.rs` ~216); only session creation converts (`exec_create_session`) |
+  | A8 session expiry seconds vs ms | DONE (s94 batch) | `5509c72`: milliseconds everywhere (block, proposer, mempool, RPC). Was: the block paths still pass the header time in seconds to `resolve_sender` (`validator.rs` ~376, `proposer.rs` ~216); only session creation converts (`exec_create_session`) |
   | A9 unbonded funds never released | DONE | `01133f9` (`ClaimUnbonded` action), `c743829` (all-or-nothing) |
-  | EVM gas fees credited twice | OPEN | no fix commit; `compute_fee_revenue` and `distribute_fees` unchanged |
-  | Inflation pays self-stake share to delegators | OPEN | no fix commit in `torus-economics` |
-  | CoreWriter fake order id, stop types as limits | OPEN | `placeOrder` still returns a synthetic id (block and queue sequence); `decode_order_type` maps 2 and 3 to Limit |
-  | Read precompiles flat gas | OPEN | `GAS_PRECOMPILE_READ` 2,600 flat for 0x0800–0x0803 |
-  | Nonce window only at the mempool | OPEN | window checked in mempool / RPC only, not in block validation |
+  | EVM gas fees credited twice | DONE (s94 batch) | `71e0f1b`: tip to the proposer via revm, the fee distributor gets the base-fee part only. Was: no fix commit; `compute_fee_revenue` and `distribute_fees` unchanged |
+  | Inflation pays self-stake share to delegators | DONE (s94 batch) | `cbb97b6`: self-stake gets its pro-rata share, commission only on the delegators' share. Was: no fix commit in `torus-economics` |
+  | CoreWriter fake order id, stop types as limits | DONE (s94 batch) | `ebec041`: `placeOrder` returns bytes32(0) (fire and forget, like HL), stop types revert. Was: `placeOrder` still returns a synthetic id (block and queue sequence); `decode_order_type` maps 2 and 3 to Limit |
+  | Read precompiles flat gas | DONE (s94 batch) | `6f8c507`: 2,600 + 50 per unit (row / 32 B), work bounded by gas paid; 50 is a placeholder, microbench before testnet. Was: `GAS_PRECOMPILE_READ` 2,600 flat for 0x0800–0x0803 |
+  | Nonce window only at the mempool | DONE (s94 batch) | `e3a7821`: enforced against the block time in execution (out-of-window actions skipped, like bad signatures). Was: window checked in mempool / RPC only, not in block validation |
   | Unknown market ids create books | PARTLY | RPC rejects them; the executor still creates a book (now with the market row's tick/lot, `e81aa2e`, or 1/1 with no row). Consensus check is P1 item 2. |
   | Stop orders bypass the order cap | DONE | per-user open-order limit counts pending stops (`007fce6`, `0b20364`, `60f219f`; merge `2567e56`) |
   | Block timestamps not validated | PARTLY | `61832ec` (not below parent, at most 5 s ahead). Lower bound open (review M2, needs validate-before-voting; 9.13 backlog). |
-  | Full-scope session keys do validator / governance actions | OPEN | `SessionScope::Full` still allows them; only staking moves, withdraw, sessions, `ClaimUnbonded` and `SetOracleSigner` are excluded |
-  | EIP-712 domain has no network field | OPEN | domain is still name/version/chainId 7778/zero address |
+  | Full-scope session keys do validator / governance actions | DONE (s94 batch) | `7935014`: session keys may only trade (place / cancel / modify). Was: `SessionScope::Full` still allows them; only staking moves, withdraw, sessions, `ClaimUnbonded` and `SetOracleSigner` are excluded |
+  | EIP-712 domain has no network field | DONE (s94 batch) | `034adf2`: chain id from genesis (default 7778, byte-identical); wallet / feeder / bench `--chain-id`. Testnet / mainnet genesis need distinct ids. Was: domain is still name/version/chainId 7778/zero address |
 
   Also fixed since the report (in `README.md` §3, not listed above): local-view equivocation slashing (`1d5cdff`), the two epoch staking writers (`732c78e`, `285d344`), governance `ListMarket` id 0 (`d68bde1`, P1).
-- **New P0 item: bad-debt route through fills far from the mark.** Confirmed by probe `77a3b21` (tests only): account A buys at 2x the mark from account B (same owner, 20x, each funded 100). A's account value goes to -900, ADL moves the -900 to the liquidator vault, and the owner withdraws 1,100 through B for 200 deposited. Fills are valued at the fill price and nothing bounds the price against the mark, so at 20x bad debt starts about ±5% off the mark. Fix in progress on `fix/offmark-bad-debt` (s94 owner go):
+- **New P0 item: bad-debt route through fills far from the mark. DONE (s94 batch): `f6b0f4c` (off-mark loss charged at fill) + `45e6de0` (price band, governance key `price_band_bps`, default 5000).** Confirmed by probe `77a3b21` (tests only): account A buys at 2x the mark from account B (same owner, 20x, each funded 100). A's account value goes to -900, ADL moves the -900 to the liquidator vault, and the owner withdraws 1,100 through B for 200 deposited. Fills are valued at the fill price and nothing bounds the price against the mark, so at 20x bad debt starts about ±5% off the mark. Fix in progress on `fix/offmark-bad-debt` (s94 owner go):
   1. Charge the off-mark loss at fill time, to maker and taker. Fills near the mark are unchanged.
   2. A chain-wide price band: ±50% of the mark by default. With a stale mark, the reference is median(best bid, best ask, last trade) clamped to ±10% of the last fresh mark. With no reference, the band is skipped.
 
   The band is pulled forward from P2 item 3. The slippage cap, OI caps and max notional stay in P2.
 - **Governance, pre-existing (plan 9.13):**
+  - Row 75: DONE (s94 batch) `720805e`: TreasurySpend / PermanentUnlock apply all-or-nothing (one RocksDB write batch with the status row).
   - Row 74: a governance storage error does not halt the node (`app.rs` drops `process_governance`'s results; liquidation does halt). Owner decision, before mainnet.
   - Row 75: TreasurySpend and PermanentUnlock write more than once, so a storage error after the first write can pay twice on retry. Make both all-or-nothing. In progress on `fix/governance-atomic-writes`.
 - **Plan:** One PR per bug, each RED-first through the **real executor**. Today no test runs modify or a triggered stop end to end. Use the round-4 fix designs in `findings.md` (e.g. modify becomes ownership check, then validate, then margin pre-check, then `exec_cancel_order` + `exec_place_order`). Gate behaviour changes behind P0.0. Close the open Astra round-2 audit findings in the same pass.
@@ -315,7 +316,7 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   - Decide on stablecoin collateral and quote currency (today TRS). This is a product decision, so make it before building P5 assets.
   - Subaccounts.
   - A backstop/HLP vault that takes liquidations before ADL, plus user vaults.
-    - **Interim rule, needed before testnet (s94):** today's system `LIQUIDATOR_VAULT` has no capital and cannot unwind positions, so a deficit moved there sits unnoticed (the bad-debt probe left it at -900). Interim: record and expose the vault's deficit (a metric and an RPC field), and decide who covers it. Full fix: an HLP-style vault with capital.
+    - **Interim rule, needed before testnet (s94; monitoring DONE in the s94 batch: gauge `torus_liquidator_vault_deficit` `c46156b`, RPC `torus_getLiquidatorVault` `86c42f4`; who covers a deficit is still open):** today's system `LIQUIDATOR_VAULT` has no capital and cannot unwind positions, so a deficit moved there sits unnoticed (the bad-debt probe left it at -900). Interim: record and expose the vault's deficit (a metric and an RPC field), and decide who covers it. Full fix: an HLP-style vault with capital.
   - Native spot (token registry, spot book, `spotSend`) and an external-chain bridge with validator-signed withdrawals.
   - Multisig accounts.
   - Permissionless validator entry with automated downtime jailing, once T1.4 has landed.
