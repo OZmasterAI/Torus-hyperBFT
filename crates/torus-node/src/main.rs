@@ -558,6 +558,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         gas_limit = chain_config.evm_gas_limit,
         "chain configuration loaded"
     );
+    // Every native action this node signs or verifies uses this network's
+    // EIP-712 domain (genesis `chain_id`, devnet 7778). Set before any
+    // component exists; fails if anything already used another id.
+    torus_types::eip712::set_network_chain_id(chain_config.chain_id)
+        .map_err(|e| format!("EIP-712 network chain id: {e}"))?;
 
     // Node-local override: `--exec-trust-cache` enables the exec trust-cache read
     // path (default off). It is deterministic (a HIT equals a fresh recover), so

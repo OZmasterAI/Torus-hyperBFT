@@ -48,6 +48,11 @@ const HARDHAT_KEYS: [&str; 20] = [
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Chain id of the target network (its genesis `chain_id`): native
+    /// actions are EIP-712-signed for it. 7778 = devnet, also every node
+    /// built before per-network chain ids.
+    #[arg(long, global = true, default_value_t = torus_types::eip712::TORUS_CHAIN_ID)]
+    chain_id: u64,
 }
 
 #[derive(Subcommand)]
@@ -3916,6 +3921,8 @@ fn run_gen_accounts(offset: usize, count: usize, secret_keys: bool) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    torus_types::eip712::set_network_chain_id(cli.chain_id)
+        .unwrap_or_else(|e| panic!("--chain-id {}: {e}", cli.chain_id));
 
     match cli.command {
         Command::MatchingEngine {

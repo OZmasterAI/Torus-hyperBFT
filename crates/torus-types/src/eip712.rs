@@ -20,8 +20,30 @@ use crate::{
 // Constants
 // ============================================================================
 
-/// Torus chain ID embedded in the EIP-712 domain separator.
+/// The devnet chain id, and the EIP-712 chain id of a network whose genesis
+/// sets none. Each network's own id comes from its genesis `chain_id`
+/// ([`set_network_chain_id`]).
 pub const TORUS_CHAIN_ID: u64 = 7778;
+
+static NETWORK_CHAIN_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set this process's network chain id — the `chainId` of the EIP-712 domain
+/// every default sign/verify function here uses — once, at startup, before
+/// anything signs or verifies (node: genesis `chain_id`; clients:
+/// `--chain-id`). Fails if the process already uses a different id, so a
+/// late or conflicting setting can never mix two domains in one process.
+pub fn set_network_chain_id(chain_id: u64) -> Result<(), Eip712Error> {
+    match *NETWORK_CHAIN_ID.get_or_init(|| chain_id) {
+        got if got == chain_id => Ok(()),
+        got => Err(Eip712Error::ChainIdMismatch { expected: chain_id, got }),
+    }
+}
+
+/// This process's network chain id: the value set by
+/// [`set_network_chain_id`], else (and from then on) [`TORUS_CHAIN_ID`].
+pub fn network_chain_id() -> u64 {
+    *NETWORK_CHAIN_ID.get_or_init(|| TORUS_CHAIN_ID)
+}
 
 /// Maximum allowed nonce drift from current time (60 seconds).
 pub const NONCE_WINDOW_MS: u64 = 60_000;
@@ -171,18 +193,24 @@ fn encode_string(s: &str) -> [u8; 32] {
 // Domain Separator
 // ============================================================================
 
-/// Compute the EIP-712 domain separator for Torus.
+/// The EIP-712 domain separator of this process's network
+/// ([`network_chain_id`]; devnet 7778 unless set).
+pub fn eip712_domain_separator() -> B256 {
+    eip712_domain_separator_for_chain(network_chain_id())
+}
+
+/// Compute the EIP-712 domain separator for Torus on `chain_id`.
 ///
 /// ```text
 /// keccak256(
 ///   typeHash("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 ///   || keccak256("Torus")
 ///   || keccak256("1")
-///   || uint256(7778)
+///   || uint256(chain_id)        // 7778 on devnet
 ///   || address(0x0)
 /// )
 /// ```
-pub fn eip712_domain_separator() -> B256 {
+pub fn eip712_domain_separator_for_chain(chain_id: u64) -> B256 {
     let type_hash = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
     );
@@ -190,7 +218,7 @@ pub fn eip712_domain_separator() -> B256 {
     buf.extend_from_slice(&type_hash.0);
     buf.extend_from_slice(&encode_string("Torus"));
     buf.extend_from_slice(&encode_string("1"));
-    buf.extend_from_slice(&encode_u256(&U256::from(TORUS_CHAIN_ID)));
+    buf.extend_from_slice(&encode_u256(&U256::from(chain_id)));
     buf.extend_from_slice(&encode_address(&Address::ZERO));
     keccak256(&buf)
 }
@@ -492,14 +520,15 @@ fn hash_set_oracle_signer(signer: &Address, proof: Option<&crate::OracleSignerPr
 }
 
 /// EIP-712 signing hash of the oracle-signer proof of possession (review M3).
-fn oracle_signer_proof_hash(validator: &Address, nonce: u64) -> B256 {
+/// `chain_id` is bound twice: in the struct and in the domain.
+fn oracle_signer_proof_hash(chain_id: u64, validator: &Address, nonce: u64) -> B256 {
     let th = keccak256("OracleSignerProof(address validator,uint64 chainId,uint64 nonce)");
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(validator));
-    buf.extend_from_slice(&encode_u64(TORUS_CHAIN_ID));
+    buf.extend_from_slice(&encode_u64(chain_id));
     buf.extend_from_slice(&encode_u64(nonce));
-    eip712_signing_hash(eip712_domain_separator(), keccak256(&buf))
+    eip712_signing_hash(eip712_domain_separator_for_chain(chain_id), keccak256(&buf))
 }
 
 /// The signer key's proof of possession for registering it as `validator`'s
@@ -511,7 +540,10 @@ pub fn sign_oracle_signer_proof(
 ) -> crate::OracleSignerProof {
     crate::OracleSignerProof {
         nonce,
-        signature: sign_prehash(&oracle_signer_proof_hash(validator, nonce), signer_key),
+        signature: sign_prehash(
+            &oracle_signer_proof_hash(network_chain_id(), validator, nonce),
+            signer_key,
+        ),
     }
 }
 
@@ -521,7 +553,10 @@ pub fn recover_oracle_signer_proof(
     validator: &Address,
     proof: &crate::OracleSignerProof,
 ) -> Result<Address, Eip712Error> {
-    ecrecover(&oracle_signer_proof_hash(validator, proof.nonce), &proof.signature)
+    ecrecover(
+        &oracle_signer_proof_hash(network_chain_id(), validator, proof.nonce),
+        &proof.signature,
+    )
 }
 
 // ---------- governance ----------
@@ -778,13 +813,24 @@ fn ecrecover(hash: &B256, sig: &Signature) -> Result<Address, Eip712Error> {
 // ============================================================================
 
 /// Sign a [`NativeAction`] with a secp256k1 private key, producing a
-/// [`SignedNativeAction`] with an EIP-712 signature.
+/// [`SignedNativeAction`] with an EIP-712 signature for this process's
+/// network ([`network_chain_id`]).
 pub fn sign_native_action(
     action: NativeAction,
     nonce: u64,
     key: &SigningKey,
 ) -> SignedNativeAction {
-    let domain = eip712_domain_separator();
+    sign_native_action_for_chain(network_chain_id(), action, nonce, key)
+}
+
+/// [`sign_native_action`] for an explicit `chain_id`.
+pub fn sign_native_action_for_chain(
+    chain_id: u64,
+    action: NativeAction,
+    nonce: u64,
+    key: &SigningKey,
+) -> SignedNativeAction {
+    let domain = eip712_domain_separator_for_chain(chain_id);
     let struct_hash = eip712_struct_hash(&action, nonce);
     let signing_hash = eip712_signing_hash(domain, struct_hash);
     SignedNativeAction {
@@ -822,8 +868,18 @@ pub fn sign_native_action_with_session(
     nonce: u64,
     session_key: &ed25519_dalek::SigningKey,
 ) -> SignedNativeAction {
+    sign_native_action_with_session_for_chain(network_chain_id(), action, nonce, session_key)
+}
+
+/// [`sign_native_action_with_session`] for an explicit `chain_id`.
+pub fn sign_native_action_with_session_for_chain(
+    chain_id: u64,
+    action: NativeAction,
+    nonce: u64,
+    session_key: &ed25519_dalek::SigningKey,
+) -> SignedNativeAction {
     use ed25519_dalek::Signer;
-    let domain = eip712_domain_separator();
+    let domain = eip712_domain_separator_for_chain(chain_id);
     let struct_hash = eip712_struct_hash(&action, nonce);
     let signing_hash = eip712_signing_hash(domain, struct_hash);
     let sig = session_key.sign(signing_hash.as_slice());
@@ -853,9 +909,15 @@ impl SignedNativeAction {
     /// Recover the sender's Ethereum address from the EIP-712 signature.
     /// Returns error if the signature is a session key (use `resolve_sender` with state instead).
     pub fn recover_sender(&self) -> Result<Address, Eip712Error> {
+        self.recover_sender_for_chain(network_chain_id())
+    }
+
+    /// [`Self::recover_sender`] on an explicit `chain_id`. A signature made
+    /// for another chain recovers to an unrelated address, never its signer.
+    pub fn recover_sender_for_chain(&self, chain_id: u64) -> Result<Address, Eip712Error> {
         match &self.signature {
             ActionSignature::Eip712(sig) => {
-                let domain = eip712_domain_separator();
+                let domain = eip712_domain_separator_for_chain(chain_id);
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 ecrecover(&signing_hash, sig)
@@ -902,9 +964,23 @@ impl SignedNativeAction {
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
+        self.resolve_sender_for_chain(network_chain_id(), current_time_ms, session_lookup)
+    }
+
+    /// [`Self::resolve_sender`] on an explicit `chain_id`: a session signature
+    /// made for another chain fails ed25519 verification.
+    pub fn resolve_sender_for_chain<F>(
+        &self,
+        chain_id: u64,
+        current_time_ms: u64,
+        session_lookup: F,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+    {
+        let domain = eip712_domain_separator_for_chain(chain_id);
         match &self.signature {
             ActionSignature::Eip712(sig) => {
-                let domain = eip712_domain_separator();
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 ecrecover(&signing_hash, sig)
@@ -919,7 +995,6 @@ impl SignedNativeAction {
                 let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
                 let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
-                let domain = eip712_domain_separator();
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 vk.verify(signing_hash.as_slice(), &ed_sig)
@@ -939,19 +1014,14 @@ impl SignedNativeAction {
     /// Full validation: chain ID guard, nonce freshness, and sender recovery.
     ///
     /// `current_time_ms` — current wall-clock time in milliseconds.
-    /// `expected_chain_id` — the chain ID this node is configured for.
+    /// `expected_chain_id` — the chain ID this component is configured for;
+    /// it must be this process's [`network_chain_id`] (the domain verified).
     pub fn validate(
         &self,
         current_time_ms: u64,
         expected_chain_id: u64,
     ) -> Result<Address, Eip712Error> {
-        if expected_chain_id != TORUS_CHAIN_ID {
-            return Err(Eip712Error::ChainIdMismatch {
-                expected: TORUS_CHAIN_ID,
-                got: expected_chain_id,
-            });
-        }
-
+        check_network_chain_id(expected_chain_id)?;
         check_nonce_window(self.nonce, current_time_ms)?;
         self.recover_sender()
     }
@@ -966,16 +1036,19 @@ impl SignedNativeAction {
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
-        if expected_chain_id != TORUS_CHAIN_ID {
-            return Err(Eip712Error::ChainIdMismatch {
-                expected: TORUS_CHAIN_ID,
-                got: expected_chain_id,
-            });
-        }
-
+        check_network_chain_id(expected_chain_id)?;
         check_nonce_window(self.nonce, current_time_ms)?;
         self.resolve_sender(current_time_ms, session_lookup)
     }
+}
+
+/// A component's configured chain id must be the process's network chain id.
+fn check_network_chain_id(configured: u64) -> Result<(), Eip712Error> {
+    let expected = network_chain_id();
+    if configured != expected {
+        return Err(Eip712Error::ChainIdMismatch { expected, got: configured });
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1871,6 +1944,83 @@ mod tests {
         let signed = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
         let addr = signed.validate(TEST_NONCE, TORUS_CHAIN_ID).unwrap();
         assert_eq!(addr, signer_address(&key));
+    }
+
+    /// Commit 4: the devnet (7778) domain separator is byte-identical to the
+    /// one every existing signature, fixture and client was made with
+    /// (tests/fixtures/eip712_vectors.json, the trading app's DOMAIN).
+    #[test]
+    fn domain_separator_for_7778_is_pinned() {
+        let pinned = "c17bc08f8d2e5d76651f1d3a5c156a7cfc34b56bb732b24997bfc22da5f4a257";
+        assert_eq!(alloy_primitives::hex::encode(eip712_domain_separator_for_chain(7778)), pinned);
+        assert_eq!(TORUS_CHAIN_ID, 7778);
+        // This process never sets a network chain id: the default is devnet.
+        assert_eq!(network_chain_id(), TORUS_CHAIN_ID);
+        assert_eq!(alloy_primitives::hex::encode(eip712_domain_separator()), pinned);
+        assert_ne!(
+            eip712_domain_separator_for_chain(7779),
+            eip712_domain_separator_for_chain(7778)
+        );
+    }
+
+    /// Commit 4: an action signed for one network never verifies as its
+    /// signer on another — EIP-712 (recovers a different address) and session
+    /// (ed25519 rejects) — in both directions; on its own network it does.
+    #[test]
+    fn action_signed_for_one_chain_never_verifies_on_another() {
+        let key = test_key();
+        let signer = signer_address(&key);
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[47u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x47; 20]);
+        let session = SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: SessionScope::Trading,
+            created_at: 0,
+        };
+        let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+        let cancel = NativeAction::CancelOrder { order_id: 1 };
+        for (signed_on, verified_on) in [(TORUS_CHAIN_ID, 9_999), (9_999, TORUS_CHAIN_ID)] {
+            let ecdsa = sign_native_action_for_chain(signed_on, cancel.clone(), TEST_NONCE, &key);
+            assert_eq!(ecdsa.recover_sender_for_chain(signed_on), Ok(signer));
+            assert_ne!(
+                ecdsa.recover_sender_for_chain(verified_on).ok(),
+                Some(signer),
+                "signed on {signed_on}, replayed on {verified_on}"
+            );
+            let sess =
+                sign_native_action_with_session_for_chain(signed_on, cancel.clone(), TEST_NONCE, &ed_key);
+            assert_eq!(sess.resolve_sender_for_chain(signed_on, TEST_NONCE, lookup), Ok(owner));
+            assert_eq!(
+                sess.resolve_sender_for_chain(verified_on, TEST_NONCE, lookup),
+                Err(Eip712Error::SessionSignatureInvalid),
+                "session signed on {signed_on}, replayed on {verified_on}"
+            );
+            // The oracle-signer proof binds the chain id too.
+            assert_ne!(
+                oracle_signer_proof_hash(signed_on, &signer, 1),
+                oracle_signer_proof_hash(verified_on, &signer, 1)
+            );
+        }
+        // Devnet defaults are the explicit 7778 functions, byte for byte.
+        assert_eq!(
+            sign_native_action(cancel.clone(), TEST_NONCE, &key).signature,
+            sign_native_action_for_chain(TORUS_CHAIN_ID, cancel, TEST_NONCE, &key).signature
+        );
+    }
+
+    /// The network chain id is set once per process (node: genesis
+    /// `chain_id`; clients: `--chain-id`) and never changes after first use.
+    #[test]
+    fn network_chain_id_is_set_once() {
+        // Only the devnet value is set here: tests share the process.
+        assert_eq!(set_network_chain_id(TORUS_CHAIN_ID), Ok(()));
+        assert_eq!(
+            set_network_chain_id(9_999),
+            Err(Eip712Error::ChainIdMismatch { expected: 9_999, got: TORUS_CHAIN_ID })
+        );
+        assert_eq!(network_chain_id(), TORUS_CHAIN_ID);
     }
 
     // --- signature encoding ---
