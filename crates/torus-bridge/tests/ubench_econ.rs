@@ -22,7 +22,9 @@
 //! `UB_R_WORKER=1` (item 6 step 2): `end_resident_on_worker` instead of
 //! `end_resident`, joined by the next block's `begin_resident` (`end_resident/blk` is
 //! then the hand-over only; `timer/blk` and `wait/blk` come from the
-//! worker's and the join's timers). The harness has no pre-native work
+//! worker's and the join's timers). Item 6 cut 5: the worker takes the
+//! block's delta from the frozen set, as app.rs does pipelined (`r_end/blk`
+//! then holds no `own_pending_delta`). The harness has no pre-native work
 //! between the blocks, so this shows equal results, not the node's overlap.
 //!
 //!   cargo test -p torus-bridge --release --test ubench_econ -- --ignored --nocapture
@@ -175,10 +177,17 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         drop(ctx);
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let t2 = std::time::Instant::now();
-        let delta = if rows.attached() { overlay.own_pending_delta() } else { Default::default() };
+        // Item 6 cut 5: with the worker, the delta comes from the frozen set
+        // on the worker (app.rs, pipelined); inline, before the freeze.
+        let delta = if rows.attached() && !worker { overlay.own_pending_delta() } else { Default::default() };
         let frozen = overlay.freeze(h);
         let t3 = std::time::Instant::now();
         if worker {
+            let delta = if rows.attached() {
+                torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone())
+            } else {
+                delta.into()
+            };
             end_resident_on_worker(&mut holder, rows, &mut overlay, delta, true, Some(metrics.clone()));
         } else {
             end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));

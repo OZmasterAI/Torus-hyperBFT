@@ -245,7 +245,7 @@ fn every_rows_access_waits_for_the_worker() {
     let (mut holder, ()) = blocked_until_release(holder, release, started, "second end", move |h| {
         let mut overlay = NativeStateOverlay::new(db2.clone());
         let rb = begin_resident(None, &mut overlay, 3, None);
-        end_resident(h, rb, &mut overlay, Default::default(), true, None);
+        end_resident(h, rb, &mut overlay, torus_state::ResidentDelta::default(), true, None);
     });
     assert_eq!(holder.rows_height(), Some(2), "the R-less end leaves the joined slot");
 }
@@ -370,4 +370,65 @@ fn worker_and_join_observe_their_timers_once_per_block() {
     assert_eq!(count("exec_end_resident_rows"), 3.0);
     assert_eq!(count("exec_end_resident_positions"), 3.0);
     assert_eq!(count("exec_end_resident_wait"), 3.0, "begin of 2, begin of 3, the final read");
+}
+
+/// Item 6 cut 5, pipelined shape: the worker takes the block's delta from the
+/// frozen set (`BlockDelta::Frozen`, app.rs's hand-off) and its slot equals
+/// the inline slot from the delta taken before the freeze, and the DB, after
+/// every block; a value given to `drop_later` is dropped on the worker
+/// thread, not the calling one.
+#[test]
+fn frozen_delta_on_the_worker_equals_the_delta_before_freeze() {
+    struct OnDrop(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            self.0.lock().unwrap().push(name);
+        }
+    }
+    let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (_d1, db_inline) = open_db();
+    let (_d2, db_worker) = open_db();
+    seed(&db_inline);
+    seed(&db_worker);
+    let mut inline = ResidentBooks::default();
+    let mut worker = ResidentBooks::default();
+    for h in 1..=16u64 {
+        for (db, holder, mode) in [(&db_inline, &mut inline, Mode::Inline), (&db_worker, &mut worker, Mode::Worker)] {
+            let mut overlay = NativeStateOverlay::new(db.clone());
+            let mut rb = begin_resident(Some(holder), &mut overlay, h, None);
+            assert!(rb.attached(), "block {h}: R attached");
+            let t = (h % 9) as u8 + 1;
+            overlay.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'w', h as u8]).unwrap();
+            overlay.put_cf_raw(CF_NATIVE_BALANCES, &[0x40 + h as u8; 20], b"new").unwrap();
+            overlay.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1)).unwrap();
+            overlay
+                .put_cf_raw(torus_state::cf::CF_CONSENSUS_META, torus_state::cf::META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes())
+                .unwrap();
+            rb.drop_later(OnDrop(dropped.clone()));
+            match mode {
+                Mode::Inline => {
+                    let delta = overlay.own_pending_delta();
+                    let frozen = overlay.freeze(h);
+                    end_resident(holder, rb, &mut overlay, delta, true, None);
+                    frozen.flush_with_native_trie_stats(db, None, None, None).unwrap();
+                }
+                Mode::Worker => {
+                    let frozen = overlay.freeze(h);
+                    end_resident_on_worker(holder, rb, &mut overlay, BlockDelta::Frozen(frozen.clone()), true, None);
+                    assert!(holder.rows_in_flight(), "block {h}: end_resident deferred to the worker");
+                    frozen.flush_with_native_trie_stats(db, None, None, None).unwrap();
+                }
+            }
+        }
+        assert_eq!(dump_db(&db_inline), dump_db(&db_worker), "block {h}: state");
+        let want = dump_rows(inline.rows().unwrap());
+        assert_eq!(dump_rows(worker.rows().unwrap()), want, "block {h}: worker slot != inline slot");
+        assert_eq!(want, dump_db(&db_worker), "block {h}: R != DB");
+        assert_eq!(worker.trader_positions_match_rows(), Some(true), "block {h}: decoded positions");
+    }
+    assert_eq!((inline.rows_builds(), worker.rows_builds()), (1, 1), "R built once");
+    let dropped = dropped.lock().unwrap();
+    assert_eq!(dropped.len(), 32);
+    assert_eq!(dropped.iter().filter(|n| *n == "torus-end-resident").count(), 16, "{dropped:?}");
 }

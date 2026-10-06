@@ -255,12 +255,15 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
         // As app.rs on the pipelined path: the marker rides the frozen set (the
         // next block's guard reads it through the parent layer).
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
-        let delta = overlay.own_pending_delta();
+        // Inline: the delta taken before the freeze; worker: item 6 cut 5,
+        // the worker takes it from the frozen set (app.rs, pipelined).
+        let delta = (r != R::Worker).then(|| overlay.own_pending_delta());
         let frozen = overlay.freeze(h);
         if r == R::Worker {
+            let delta = torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
             end_resident_on_worker(&mut holder, rows, &mut overlay, delta, true, Some(metrics.clone()));
         } else {
-            end_resident(&mut holder, rows, &mut overlay, delta, true, Some(&metrics));
+            end_resident(&mut holder, rows, &mut overlay, delta.unwrap_or_default(), true, Some(&metrics));
         }
         if let Some(p) = parent.take() {
             flush(p, &outputs, &mut digests);

@@ -565,3 +565,55 @@ fn resident_cfs_are_the_native_hot_cfs() {
         vec![CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_MARKETS]
     );
 }
+
+/// Item 6 cut 5: the frozen set's delta (`FrozenPending::resident_delta`, the
+/// worker's) equals the overlay's own delta taken just before `freeze`, on
+/// random writes and tombstones of R's CFs and others, over a parent layer,
+/// with nested checkpoints rolled back and committed.
+#[test]
+fn frozen_resident_delta_equals_the_delta_before_freeze() {
+    let (db, _dir) = temp_db();
+    let mut seed = 0xa409_3822_299f_31d0u64;
+    let mut rnd = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_MARKETS, CF_NATIVE_ORDERS];
+    let mut nonempty = 0;
+    for round in 0..200u64 {
+        let parent = (round % 3 != 0).then(|| {
+            let p = NativeStateOverlay::new(db.clone());
+            for _ in 0..rnd(20) {
+                let cf = cfs[rnd(cfs.len() as u64) as usize];
+                p.put_cf_raw(cf, &pos_key(rnd(5) as u8, rnd(4)), b"parent").unwrap();
+            }
+            p.freeze(round)
+        });
+        let overlay = NativeStateOverlay::with_parent(db.clone(), parent);
+        for step in 0..rnd(60) {
+            let cf = cfs[rnd(cfs.len() as u64) as usize];
+            let key = if rnd(8) == 0 { odd_keys()[rnd(5) as usize].clone() } else { pos_key(rnd(6) as u8, rnd(5)) };
+            match rnd(5) {
+                0 => overlay.delete_cf_raw(cf, &key).unwrap(),
+                1 => {
+                    overlay.checkpoint();
+                    overlay.put_cf_raw(cf, &key, b"rolled back").unwrap();
+                    overlay.revert_to_checkpoint();
+                }
+                2 => {
+                    overlay.checkpoint();
+                    overlay.put_cf_raw(cf, &key, b"committed").unwrap();
+                    overlay.commit_checkpoint();
+                }
+                _ => overlay.put_cf_raw(cf, &key, &step.to_be_bytes()).unwrap(),
+            }
+        }
+        let before = overlay.own_pending_delta();
+        nonempty += usize::from(!before.is_empty());
+        let frozen = overlay.freeze(round + 1);
+        assert_eq!(frozen.resident_delta(), before, "round {round}");
+    }
+    assert!(nonempty > 100, "{nonempty}");
+}

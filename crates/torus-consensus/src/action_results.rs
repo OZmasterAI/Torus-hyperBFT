@@ -50,7 +50,7 @@ type ListFailure = (usize, u32, u32, FailureReason, String);
 /// then records no failure for the list rather than a wrong one).
 fn list_failures(
     list: &[(Address, NativeAction)],
-    mut result: NativeBatchResult,
+    result: &mut NativeBatchResult,
 ) -> Option<Vec<ListFailure>> {
     let total: usize = list.iter().map(|(_, a)| flat_len(a)).sum();
     if result.results.len() != total {
@@ -100,11 +100,13 @@ fn list_failures(
 /// removed); `batches` = each sorted list, the input position of each of its
 /// entries (the sort's index list) and its `execute_batch` result. A failure
 /// maps to its body position by index (item 6 cut 1; the pre-cut content
-/// match is kept as the test oracle [`native_failures_by_content`]).
+/// match is kept as the test oracle [`native_failures_by_content`]). The
+/// failing entries' messages are moved out of the results; the caller drops
+/// the rest (item 6 cut 5: off the execution thread).
 #[allow(clippy::type_complexity)]
 pub fn native_failures(
     body_index: &[u32],
-    batches: [(&[(Address, NativeAction)], &[u32], NativeBatchResult); 2],
+    batches: [(&[(Address, NativeAction)], &[u32], &mut NativeBatchResult); 2],
 ) -> Vec<NativeActionFailure> {
     let mut out = Vec::new();
     for (list, executed_index, result) in batches {
@@ -149,8 +151,8 @@ pub(crate) fn native_failures_by_content(
     let mut out = Vec::new();
     // Built on the first failure only: executed positions by sender.
     let mut by_sender: Option<HashMap<Address, Vec<usize>>> = None;
-    for (list, result) in batches {
-        let Some(failures) = list_failures(list, result) else {
+    for (list, mut result) in batches {
+        let Some(failures) = list_failures(list, &mut result) else {
             continue;
         };
         for (pos, order, failed_orders, reason, message) in failures {
@@ -314,8 +316,8 @@ mod tests {
         let failures = native_failures(
             &body_index,
             [
-                (&list, &[3, 1, 0, 2], result.clone()),
-                (&[], &[], batch(vec![])),
+                (&list, &[3, 1, 0, 2], &mut result.clone()),
+                (&[], &[], &mut batch(vec![])),
             ],
         );
         assert_eq!(
@@ -350,12 +352,12 @@ mod tests {
                 (
                     &executed,
                     &[0],
-                    batch(vec![
+                    &mut batch(vec![
                         err(FailureReason::Other, "x"),
                         err(FailureReason::Other, "y"),
                     ]),
                 ),
-                (&[], &[], batch(vec![])),
+                (&[], &[], &mut batch(vec![])),
             ],
         );
         assert!(failures.is_empty());
@@ -455,8 +457,8 @@ mod tests {
             let new = native_failures(
                 &body_index,
                 [
-                    (&pre, &pre_idx, to_batch(&pre_spec)),
-                    (&post, &post_idx, to_batch(&post_spec)),
+                    (&pre, &pre_idx, &mut to_batch(&pre_spec)),
+                    (&post, &post_idx, &mut to_batch(&post_spec)),
                 ],
             );
             let old = native_failures_by_content(
@@ -542,6 +544,7 @@ mod tests {
         let (mut old_ms, mut new_ms) = (Vec::new(), Vec::new());
         let (mut old_map_ms, mut new_map_ms) = (Vec::new(), Vec::new());
         let mut n_failures = 0;
+        let mut drop_ms = Vec::new();
         for _ in 0..iters {
             let (a, b) = (r_pre.clone(), r_post.clone());
             let t = std::time::Instant::now();
@@ -552,25 +555,32 @@ mod tests {
             old_ms.push(t.elapsed().as_secs_f64() * 1e3);
             drop((pre, post));
 
-            let (a, b) = (r_pre.clone(), r_post.clone());
+            let (mut a, mut b) = (r_pre.clone(), r_post.clone());
             let owned = executed.clone();
             let t = std::time::Instant::now();
             let ((pre, pre_i), (post, post_i)) = sort_native_actions_indexed(owned);
             let t_map = std::time::Instant::now();
-            let new = native_failures(&body_index, [(&pre, &pre_i, a), (&post, &post_i, b)]);
+            let new = native_failures(&body_index, [(&pre, &pre_i, &mut a), (&post, &post_i, &mut b)]);
             new_map_ms.push(t_map.elapsed().as_secs_f64() * 1e3);
             new_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            // Item 6 cut 5: the node drops the results on the end_resident
+            // worker.
+            let t_drop = std::time::Instant::now();
+            drop((a, b));
+            drop_ms.push(t_drop.elapsed().as_secs_f64() * 1e3);
             assert_eq!(new, old);
             n_failures = new.len();
         }
         println!(
             "UB failure_mapping actions={} orders/action={orders} failures={n_failures} \
-             sort+map ms: old={:.2} new={:.2} | map only ms: old={:.2} new={:.3}",
+             sort+map ms: old={:.2} new={:.2} | map only ms: old={:.2} (results dropped) \
+             new={:.3} (results kept) | results drop ms={:.3} (cut 5: on the end_resident worker)",
             executed.len(),
             median(old_ms),
             median(new_ms),
             median(old_map_ms),
             median(new_map_ms),
+            median(drop_ms),
         );
     }
 }

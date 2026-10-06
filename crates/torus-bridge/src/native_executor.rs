@@ -3101,10 +3101,23 @@ pub struct ResidentBlock {
     /// [`NativeExecContext::detach_resident_block`], this block's memo;
     /// `end_resident` merges them. `None`: R not attached (no cache).
     sums: Option<BlockSums>,
+    /// Item 6 cut 5: [`Self::drop_later`].
+    retired: Retired,
     /// Step 2 tests: runs first inside the `end_resident` worker (hold it,
     /// or panic in it).
     #[cfg(test)]
     worker_hook: Option<WorkerHook>,
+}
+
+/// Item 6 cut 5: values a block no longer needs, never read again, dropped
+/// with its `end_resident` work ([`ResidentBlock::drop_later`]).
+#[derive(Default)]
+struct Retired(Vec<Box<dyn Send>>);
+
+impl std::fmt::Debug for Retired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Retired({})", self.0.len())
+    }
 }
 
 /// Step 2 tests: see [`ResidentBlock::worker_hook`].
@@ -3128,6 +3141,14 @@ impl ResidentBlock {
     /// R was built for this block (cold start or staleness guard trip).
     pub fn rebuilt(&self) -> bool {
         self.rebuilt
+    }
+
+    /// Item 6 cut 5: drop `value` with this block's `end_resident` work — on
+    /// its worker under [`end_resident_on_worker`] (off the execution
+    /// thread), else where the block is dropped. For the block's large
+    /// leftovers (the batch results); dropping memory has no other effect.
+    pub fn drop_later(&mut self, value: impl Send + 'static) {
+        self.retired.0.push(Box::new(value));
     }
 }
 
@@ -3155,6 +3176,7 @@ pub fn begin_resident(
         rebuilt: false,
         marks: None,
         sums: None,
+        retired: Retired::default(),
         #[cfg(test)]
         worker_hook: None,
     };
@@ -3242,10 +3264,11 @@ pub fn end_resident(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
     overlay: &mut NativeStateOverlay,
-    delta: torus_state::ResidentDelta,
+    delta: impl Into<BlockDelta>,
     ok: bool,
     metrics: Option<&torus_telemetry::Metrics>,
 ) {
+    let delta = delta.into();
     holder.settle_rows();
     let timer = std::time::Instant::now();
     if let Some(job) = end_resident_take(holder, block, overlay, delta, ok) {
@@ -3273,10 +3296,11 @@ pub fn end_resident_on_worker(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
     overlay: &mut NativeStateOverlay,
-    delta: torus_state::ResidentDelta,
+    delta: impl Into<BlockDelta>,
     ok: bool,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
 ) {
+    let delta = delta.into();
     holder.settle_rows();
     let timer = std::time::Instant::now();
     let Some(job) = end_resident_take(holder, block, overlay, delta, ok) else {
@@ -3305,6 +3329,33 @@ pub fn end_resident_on_worker(
     }
 }
 
+/// Item 6 cut 5: the block's own writes and tombstones of R's CFs as
+/// `end_resident` gets them.
+pub enum BlockDelta {
+    /// Taken by the caller (`own_pending_delta`, before `freeze` / the flush).
+    Taken(torus_state::ResidentDelta),
+    /// The block's frozen pending set (the pipelined hand-off's): the delta is
+    /// taken from it where `end_resident` runs — the worker, off the
+    /// execution thread ([`torus_state::FrozenPending::resident_delta`],
+    /// equal to `own_pending_delta` just before the freeze).
+    Frozen(Arc<torus_state::FrozenPending>),
+}
+
+impl From<torus_state::ResidentDelta> for BlockDelta {
+    fn from(delta: torus_state::ResidentDelta) -> Self {
+        Self::Taken(delta)
+    }
+}
+
+impl BlockDelta {
+    fn into_delta(self) -> torus_state::ResidentDelta {
+        match self {
+            Self::Taken(delta) => delta,
+            Self::Frozen(frozen) => frozen.resident_delta(),
+        }
+    }
+}
+
 /// Item 6 step 2: `end_resident`'s inputs once its checks passed — owned by
 /// whichever thread runs [`Self::run`].
 struct EndResidentJob {
@@ -3313,7 +3364,9 @@ struct EndResidentJob {
     height: u64,
     marks: Option<BlockMarksState>,
     sums: Option<BlockSums>,
-    delta: torus_state::ResidentDelta,
+    delta: BlockDelta,
+    /// Dropped by whichever thread runs the job.
+    retired: Retired,
     #[cfg(test)]
     worker_hook: Option<WorkerHook>,
 }
@@ -3324,7 +3377,7 @@ fn end_resident_take(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
     overlay: &mut NativeStateOverlay,
-    delta: torus_state::ResidentDelta,
+    delta: BlockDelta,
     ok: bool,
 ) -> Option<EndResidentJob> {
     let mut rows = overlay.detach_resident()?;
@@ -3339,13 +3392,14 @@ fn end_resident_take(
         );
         return None;
     }
-    let ResidentBlock { height, marks, sums, .. } = block;
+    let ResidentBlock { height, marks, sums, retired, .. } = block;
     Some(EndResidentJob {
         rows,
         height,
         marks,
         sums,
         delta,
+        retired,
         #[cfg(test)]
         worker_hook: block.worker_hook,
     })
@@ -3360,9 +3414,11 @@ impl EndResidentJob {
             marks,
             sums,
             delta,
+            retired,
             #[cfg(test)]
             worker_hook,
         } = self;
+        drop(retired);
         #[cfg(test)]
         if let Some(hook) = worker_hook {
             (hook.0)();
@@ -3379,6 +3435,8 @@ impl EndResidentJob {
             }
             None => (None, None),
         };
+        // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
+        let delta = delta.into_delta();
         let timer = std::time::Instant::now();
         r.apply(&delta);
         if let Some(m) = metrics {

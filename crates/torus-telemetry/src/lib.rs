@@ -421,7 +421,9 @@ pub struct Metrics {
     /// Item 6 step 1: inside `end_resident`, the decoded positions following
     /// the delta (`TraderPositions`) plus the sums carry that rides that pass
     /// (M1 cut 4). rows + positions + the memo merge / drops ==
-    /// `exec_end_resident_seconds`.
+    /// `exec_end_resident_seconds` (item 6 cut 5: pipelined, the rest also
+    /// holds taking the block's delta from its frozen set, and dropping the
+    /// block's batch results).
     pub exec_end_resident_positions_seconds: Histogram,
     /// Item 6 step 2: time the exec thread waited for the `end_resident`
     /// worker at the join (next block's `begin_resident`, or an untouched

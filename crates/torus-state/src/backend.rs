@@ -839,10 +839,31 @@ pub struct FrozenPending {
     state: PendingState,
 }
 
+/// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
+fn resident_delta_of(state: &PendingState) -> ResidentDelta {
+    let mut delta = ResidentDelta::default();
+    for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+        let id = intern_cf(cf).expect("resident CF is registered");
+        delta.cfs[slot] = cf_stream(state.cf(id))
+            .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+            .collect();
+    }
+    delta
+}
+
 impl FrozenPending {
     /// The block height whose post-state this set completes.
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
+    /// CFs — exactly [`NativeStateOverlay::own_pending_delta`] taken just
+    /// before [`NativeStateOverlay::freeze`] (freeze moves the pending set
+    /// here unchanged; only its journal and checkpoints are cleared). Lets
+    /// the end-of-block upkeep take it off the execution thread.
+    pub fn resident_delta(&self) -> ResidentDelta {
+        resident_delta_of(&self.state)
     }
 
     /// A 1-key frozen set holding only the native applied-height marker
@@ -1056,15 +1077,7 @@ impl NativeStateOverlay {
     /// CFs (the parent layer is already in R), key-sorted. Take it before
     /// [`Self::freeze`] (which moves the pending set out) or the flush.
     pub fn own_pending_delta(&self) -> ResidentDelta {
-        let state = self.pending.read().unwrap();
-        let mut delta = ResidentDelta::default();
-        for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
-            let id = intern_cf(cf).expect("resident CF is registered");
-            delta.cfs[slot] = cf_stream(state.cf(id))
-                .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
-                .collect();
-        }
-        delta
+        resident_delta_of(&self.pending.read().unwrap())
     }
 
     /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged

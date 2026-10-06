@@ -2258,8 +2258,8 @@ impl ExecutionContext {
                         None => NativeExecutor::execute_batch(ctx, list),
                     }
                 };
-            let pre_results = run_batch(&mut ctx, &pre_evm);
-            let post_results = run_batch(&mut ctx, &post_evm);
+            let mut pre_results = run_batch(&mut ctx, &pre_evm);
+            let mut post_results = run_batch(&mut ctx, &post_evm);
             // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
             // was consumed and this block's post-state is unreconstructable.
             // Do NOT run the remaining phases, do NOT flush the overlay or
@@ -2374,13 +2374,17 @@ impl ExecutionContext {
                     native_failed: crate::action_results::native_failures(
                         &sender_body_index,
                         [
-                            (&pre_evm, &pre_index, pre_results),
-                            (&post_evm, &post_index, post_results),
+                            (&pre_evm, &pre_index, &mut pre_results),
+                            (&post_evm, &post_index, &mut post_results),
                         ],
                     ),
                     native_skipped,
                 }
             });
+            // Item 6 cut 5: the results (one entry per order, rejected
+            // orders' messages included) are dropped on the end_resident
+            // worker, not here.
+            resident_rows.drop_later((pre_results, post_results));
             if let Some(ref m) = self.metrics {
                 m.exec_action_status_seconds
                     .observe(action_status_timer.elapsed().as_secs_f64());
@@ -2477,14 +2481,20 @@ impl ExecutionContext {
             // handle to `end_resident` (into the slot with R).
             ctx.detach_resident_block(&mut resident_rows);
 
-            // Item 6 Phase 1: this block's own writes / tombstones of R's two
-            // CFs, taken before `freeze` moves the pending set out (pipelined)
-            // or the flush (serial). Nothing writes those CFs after this.
-            let resident_delta = if resident_rows.attached() {
-                overlay.own_pending_delta()
-            } else {
-                Default::default()
-            };
+            // Item 6 Phase 1: this block's own writes / tombstones of R's
+            // CFs, taken before the flush (serial). Nothing writes those CFs
+            // after this. Item 6 cut 5: pipelined, the end_resident worker
+            // takes them from the frozen set instead (identical: `freeze`
+            // moves the pending set out unchanged), off this thread.
+            let mut resident_delta: torus_bridge::native_executor::BlockDelta =
+                if resident_rows.attached() && !pipelined {
+                    overlay.own_pending_delta().into()
+                } else {
+                    torus_state::ResidentDelta::default().into()
+                };
+            #[cfg(test)]
+            let test_delta_before_freeze =
+                (pipelined && resident_rows.attached()).then(|| overlay.own_pending_delta());
             let resident_ok;
             if pipelined {
                 debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
@@ -2502,6 +2512,16 @@ impl ExecutionContext {
                 let evm_addrs = overlay.dirty_evm_accounts();
                 drop(ctx);
                 let frozen = overlay.freeze(height);
+                if resident_rows.attached() {
+                    #[cfg(test)]
+                    assert_eq!(
+                        Some(frozen.resident_delta()),
+                        test_delta_before_freeze,
+                        "cut 5: the frozen set's delta is the one before freeze"
+                    );
+                    resident_delta =
+                        torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
+                }
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Flush {
                     height,
                     pending: frozen,
