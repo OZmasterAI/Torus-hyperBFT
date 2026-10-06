@@ -114,6 +114,42 @@ pub fn placement_need(
     let closing = qty.min(crate::order_book::reduce_only_allowance(signed, is_buy));
     let opening_notional = price.checked_mul(qty - closing).ok()?;
     let before = size.checked_mul(px).ok()?;
+    // Item 6 cut 2: nothing closes (the common case: an order on the
+    // position's side, or flat) -> `left == before`, so the complete fill and
+    // the rest are the same notional and one IM delta; IM(before) once. The
+    // same values and overflow checks as `placement_need_reference`.
+    let left = if closing == FixedPoint::ZERO {
+        before
+    } else {
+        (size - closing).checked_mul(px).ok()?
+    };
+    let after_fill = left.checked_add(opening_notional).ok()?;
+    let im_after_fill = order_initial_margin(tiers, after_fill);
+    let im_before = order_initial_margin(tiers, before);
+    let filled = im_after_fill - im_before;
+    if !can_rest || closing == FixedPoint::ZERO {
+        return Some(filled);
+    }
+    let rested = order_initial_margin(tiers, before.checked_add(opening_notional).ok()?) - im_before;
+    Some(filled.max(rested))
+}
+
+/// [`placement_need`] before item 6 cut 2 (two full IM deltas): the test
+/// oracle.
+#[cfg(test)]
+pub(crate) fn placement_need_reference(
+    tiers: Option<&[MarginTier]>,
+    signed: FixedPoint,
+    px: FixedPoint,
+    is_buy: bool,
+    qty: FixedPoint,
+    price: FixedPoint,
+    can_rest: bool,
+) -> Option<FixedPoint> {
+    let size = if signed < FixedPoint::ZERO { -signed } else { signed };
+    let closing = qty.min(crate::order_book::reduce_only_allowance(signed, is_buy));
+    let opening_notional = price.checked_mul(qty - closing).ok()?;
+    let before = size.checked_mul(px).ok()?;
     let left = (size - closing).checked_mul(px).ok()?;
     let filled = im_delta(tiers, before, left.checked_add(opening_notional).ok()?);
     if !can_rest {
@@ -730,5 +766,64 @@ mod tests {
             fp(50_000),
             &config
         ));
+    }
+
+    /// Item 6 cut 2: `placement_need` (one IM delta when nothing closes,
+    /// IM(before) once) equals the pre-cut formula on random inputs: every
+    /// side vs position sign, flat / long / short, closing none / part /
+    /// all / more, rest or not, prices and sizes up to overflow, no tiers /
+    /// default tiers / a one-tier list.
+    #[test]
+    fn placement_need_matches_the_reference_formula() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+            fn val(&mut self, zero_ok: bool) -> FixedPoint {
+                const SCALES: [i128; 5] = [
+                    1,
+                    FixedPoint::SCALE,
+                    1_000 * FixedPoint::SCALE,
+                    1_000_000_000 * FixedPoint::SCALE,
+                    i128::MAX / 3,
+                ];
+                if zero_ok && self.next(5) == 0 {
+                    return FixedPoint::ZERO;
+                }
+                let s = SCALES[self.next(5) as usize];
+                FixedPoint::from_raw((self.next(1_000_000) as i128).saturating_mul((s / 1_000).max(1)).max(1))
+            }
+        }
+        let mut rng = Rng(0x0dd1_5eed_c0ff_ee11);
+        let defaults = default_margin_tiers();
+        let one = [MarginTier { max_notional: FixedPoint::from_raw(i128::MAX), max_leverage: 3 }];
+        let tier_sets: [Option<&[MarginTier]>; 3] = [None, Some(&defaults), Some(&one)];
+        let mut overflows = 0;
+        let mut closing_cases = 0;
+        for i in 0..200_000 {
+            let tiers = tier_sets[i % 3];
+            let size = rng.val(true);
+            let signed = if rng.next(2) == 0 { size } else { -size };
+            let is_buy = rng.next(2) == 0;
+            // Often exactly the position (closing all) or a part of it.
+            let qty = match rng.next(4) {
+                0 => size.max(FixedPoint::from_raw(1)),
+                1 => FixedPoint::from_raw((size.raw() / 2).max(1)),
+                _ => rng.val(false),
+            };
+            let (px, price, can_rest) = (rng.val(true), rng.val(false), rng.next(2) == 0);
+            let got = placement_need(tiers, signed, px, is_buy, qty, price, can_rest);
+            let want = placement_need_reference(tiers, signed, px, is_buy, qty, price, can_rest);
+            assert_eq!(got, want, "{signed:?} {px:?} {is_buy} {qty:?} {price:?} {can_rest}");
+            overflows += usize::from(want.is_none());
+            closing_cases += usize::from(
+                qty.min(crate::order_book::reduce_only_allowance(signed, is_buy)) > FixedPoint::ZERO,
+            );
+        }
+        assert!(overflows > 1_000 && closing_cases > 10_000, "{overflows} {closing_cases}");
     }
 }

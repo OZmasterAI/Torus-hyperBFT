@@ -386,6 +386,39 @@ fn ask_depth_equals_the_per_order_walk_on_random_books() {
     }
 }
 
+/// Item 6 cut 2: `reaches` (stops summing at the need, resumes the level
+/// later) answers `walk >= need`, and `upto` stays the walk's depth, in any
+/// interleaving of the two, needs from 1 to past the whole depth.
+#[test]
+fn ask_depth_reaches_equals_the_walk_compared_to_the_need() {
+    let mut early = 0;
+    for seed in 0..400u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let levels = rng.below(30);
+        let (depth, huge) = (1 + rng.below(120), rng.chance(30));
+        let book = random_book(&mut rng, 1, levels, depth, huge);
+        let mut depth = AskDepth::new(book.ask_queues());
+        for _ in 0..60 {
+            let price = FixedPoint::from_raw((BASE - 3 + rng.below(2 * levels + 8) as i128) * S + rng.below(3) as i128);
+            let walk = walk_depth(&book, price);
+            if rng.chance(30) {
+                assert_eq!(depth.upto(price), walk, "seed {seed} price {price}");
+                continue;
+            }
+            let need = match rng.below(4) {
+                0 => FixedPoint::from_raw(1),
+                1 => walk,
+                2 => FixedPoint::from_raw(walk.raw().saturating_add(1)),
+                _ => FixedPoint::from_raw(1 + (rng.below(1_000) as i128) * S),
+            };
+            let summed = depth.through.len();
+            assert_eq!(depth.reaches(price, need), walk >= need, "seed {seed} price {price} need {need}");
+            early += usize::from(depth.open.is_some() && depth.through.len() == summed && walk > need);
+        }
+    }
+    assert!(early > 100, "queries that stopped inside a level: {early}");
+}
+
 #[test]
 fn ask_depth_saturates_like_the_walk() {
     let mut book = new_book(1);
