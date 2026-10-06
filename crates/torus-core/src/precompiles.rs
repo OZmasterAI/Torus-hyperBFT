@@ -38,12 +38,28 @@ pub const ADDR_LOCKBOX: u16 = 0x0820;
 /// FIX EVM-PF-10: Gas costs for Torus precompiles.
 /// Read-only queries (cold SLOAD equivalent).
 pub const GAS_PRECOMPILE_READ: u64 = 2_600;
+/// HL-parity (read precompiles charged flat gas for unbounded output): a reader
+/// (0x0800-0x0803) also pays this per 32-byte word it returns, so its gas scales
+/// with the rows it read. 2 words per book level = 100 gas per level (the s9
+/// top-N figure). Tunable before a network freezes its gas schedule.
+pub const GAS_PRECOMPILE_READ_PER_WORD: u64 = 50;
 /// State-mutating writes (SSTORE equivalent range).
 pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
-/// Gas cost for a precompile by address ID.
+/// Gas of a reader call (0x0800-0x0803) that returned `output_len` bytes: the
+/// base [`GAS_PRECOMPILE_READ`] plus [`GAS_PRECOMPILE_READ_PER_WORD`] per
+/// 32-byte word, so a call that reads N rows pays for N rows. Charged by the
+/// EVM provider after the call (the length is known only then); a call whose
+/// limit does not cover it runs out of gas.
+pub const fn reader_gas(output_len: usize) -> u64 {
+    let words = (output_len as u64).div_ceil(32);
+    GAS_PRECOMPILE_READ.saturating_add(GAS_PRECOMPILE_READ_PER_WORD.saturating_mul(words))
+}
+
+/// Base gas cost for a precompile by address ID (a reader's full cost is
+/// [`reader_gas`] of its output).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
         0x0800..=0x0803 => GAS_PRECOMPILE_READ,
@@ -439,10 +455,11 @@ type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
 ///   `torus-bridge/tests/book_read_modes_tests.rs::
 ///   classic_precompile_behaviour_is_unchanged`.
 ///
-/// GAS: `precompile_gas(0x0800)` is FLAT (`GAS_PRECOMPILE_READ`) while the
-/// returned level count is unbounded — see the top-N + metered-gas work on
-/// `feat/precompile-0800-topn-gas`. That bound must land before mode 1/2
-/// chains expose this selector to untrusted EVM traffic.
+/// GAS: metered per returned word ([`reader_gas`]: 100 gas per level), so the
+/// caller pays for the depth it gets. The node still reads the whole book
+/// before the charge is known: bounding that work (top-N levels, the
+/// `feat/precompile-0800-topn-gas` work) must land before mode 1/2 chains
+/// expose this selector to untrusted EVM traffic.
 fn read_order_book(
     state_db: &impl StateBackend,
     market_id: MarketId,

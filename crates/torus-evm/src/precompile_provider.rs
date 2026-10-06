@@ -14,7 +14,7 @@ use revm::primitives::{Address, Bytes, U256};
 use torus_core::error::CoreError;
 use torus_core::precompiles::{
     execute_precompile_read_only, execute_precompile_with_value, is_precompile,
-    is_reader_precompile, precompile_gas, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
+    is_reader_precompile, precompile_gas, reader_gas, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::NativeStateOverlay;
 
@@ -175,6 +175,13 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                 }
             }
             other => other,
+        };
+
+        // HL-parity: a reader that answered pays per returned word on top of the
+        // base (its output length is known only now); a revert pays the base.
+        let gas_required = match &result {
+            Ok(output) if is_reader_precompile(id) => reader_gas(output.len()),
+            _ => gas_required,
         };
 
         // Build InterpreterResult.

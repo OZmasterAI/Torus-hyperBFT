@@ -609,6 +609,58 @@ fn precompile_charges_correct_gas() {
     );
 }
 
+/// HL-parity: a reader precompile's gas scales with the data it returns (the
+/// rows it read), not a flat 2,600. `getMarkets()` returns 2 words per market:
+/// 200 markets cost exactly 400 x GAS_PRECOMPILE_READ_PER_WORD more than none,
+/// and a gas limit that only covers the empty answer runs out of gas.
+#[test]
+fn reader_precompile_gas_scales_with_returned_words() {
+    use torus_core::precompiles::GAS_PRECOMPILE_READ_PER_WORD;
+    let block_cfg = default_block_cfg();
+    let get_markets = |db: &StateDb, gas_limit: u64| {
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit,
+            gas_price: block_cfg.base_fee as u128,
+            // BalanceReader precompile at 0x0801.
+            kind: TxKind::Call(Address::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01,
+            ])),
+            data: Bytes::from(alloy_primitives::keccak256("getMarkets()".as_bytes())[..4].to_vec()),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(db, &block_cfg, tx).unwrap().0
+    };
+    let funded_db = |markets: u64| {
+        let (dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();
+        for m in 1..=markets {
+            db.put_cf_raw("cf_native_markets", &m.to_be_bytes(), &[1u8]).unwrap();
+        }
+        (dir, db)
+    };
+
+    let (_d0, empty) = funded_db(0);
+    let r0 = get_markets(&empty, 1_000_000);
+    assert!(r0.success);
+    assert_eq!(r0.output.len(), 4 * 32, "two empty arrays: 2 offsets + 2 lengths");
+
+    let (_d1, full) = funded_db(200);
+    let r1 = get_markets(&full, 1_000_000);
+    assert!(r1.success);
+    assert_eq!(r1.output.len(), (4 + 400) * 32);
+    assert_eq!(
+        r1.gas_used - r0.gas_used,
+        400 * GAS_PRECOMPILE_READ_PER_WORD,
+        "gas grows by the per-word price for every returned word"
+    );
+
+    let (_d2, full2) = funded_db(200);
+    let short = get_markets(&full2, r0.gas_used + 1_000);
+    assert!(!short.success, "gas for the empty answer does not pay for 200 markets");
+}
+
 // ---------------------------------------------------------------------------
 // 12. Standard Ethereum precompile (ecrecover) still works
 // ---------------------------------------------------------------------------
