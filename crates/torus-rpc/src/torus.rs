@@ -114,6 +114,10 @@ pub trait TorusApi {
     #[method(name = "getUserLimits")]
     async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
+    /// The liquidator vault's committed cash, deficit and open positions.
+    #[method(name = "getLiquidatorVault")]
+    async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault>;
+
     // --- 2.9.2: Market info ---
     #[method(name = "getMarkets")]
     async fn get_markets(
@@ -1140,6 +1144,35 @@ impl TorusApiServer for RpcState {
             total_margin_used: dec_fp(total_margin),
             available_balance: dec_fp(native_bal.available),
             permanent_stake,
+        })
+    }
+
+    async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault> {
+        let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+        let pm = PositionManager::new(self.state.clone());
+        let available = pm
+            .get_native_balance(&vault)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?
+            .available;
+        let open_positions = pm
+            .positions_for_trader(&vault)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?
+            .iter()
+            .filter(|p| p.size != FixedPoint::ZERO)
+            .count() as u64;
+        // Same definition as the torus_liquidator_vault_deficit gauge.
+        let deficit = if available < FixedPoint::ZERO {
+            -available
+        } else {
+            FixedPoint::ZERO
+        };
+        Ok(RpcLiquidatorVault {
+            address: hex_address(vault),
+            available_balance: dec_fp(available),
+            deficit: dec_fp(deficit),
+            open_positions,
         })
     }
 
