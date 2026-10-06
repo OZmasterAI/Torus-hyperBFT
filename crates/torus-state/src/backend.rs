@@ -62,6 +62,35 @@ pub trait StateBackend: Clone + Send + Sync {
             .collect())
     }
 
+    /// Length of the value under `key` (`None` if absent) — what
+    /// `get_cf_raw(..).map(|v| v.len())` returns. `StateDb` and
+    /// `NativeStateOverlay` answer it without copying the value (a reader
+    /// precompile sizes a whole-book blob before paying for it).
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        Ok(self.get_cf_raw(cf, key)?.map(|v| v.len()))
+    }
+
+    /// [`Self::iterate_cf_from`] restricted to keys starting with `prefix`
+    /// (`start >= prefix`): at most `limit` rows, ending at the prefix end.
+    /// `StateDb` and `NativeStateOverlay` give RocksDB an iterate upper bound
+    /// at the prefix end, so nothing past it (rows or tombstones) is read.
+    /// Deletion markers INSIDE the prefix are still stepped over (they return
+    /// no row; how many there are is bounded only by compaction).
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        Ok(self
+            .iterate_cf_from(cf, start, limit)?
+            .into_iter()
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .collect())
+    }
+
     /// Whether any key starting with `prefix` exists — `!iterate_cf(prefix)
     /// .is_empty()`. `StateDb` and `NativeStateOverlay` stop at the first live
     /// key instead of loading every row.
@@ -147,6 +176,21 @@ pub trait StateBackend: Clone + Send + Sync {
     }
 }
 
+/// Read options whose iterate upper bound is the end of `prefix` (the smallest
+/// key above every key starting with it); none when no such key exists.
+fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
+    let mut opts = rocksdb::ReadOptions::default();
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            opts.set_iterate_upper_bound(end);
+            break;
+        }
+    }
+    opts
+}
+
 // ============================================================================
 // StateBackend for StateDb — thin delegation to existing methods
 // ============================================================================
@@ -154,6 +198,44 @@ pub trait StateBackend: Clone + Send + Sync {
 impl StateBackend for StateDb {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         StateDb::get_cf_raw(self, cf, key)
+    }
+
+    /// Pinned get: the value stays in RocksDB's block, only its length is read.
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        Ok(db.get_pinned_cf(cf_handle, key)?.map(|v| v.len()))
+    }
+
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let db = self.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        for item in db.iterator_cf_opt(cf_handle, prefix_read_options(prefix), mode) {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
@@ -2042,6 +2124,69 @@ impl StateBackend for NativeStateOverlay {
         merge_from(&pending, parent, id, start, limit, dbi)
     }
 
+    /// The layered point-read rule (pending, R, parent, DB) on lengths only.
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        if let Some(id) = intern_cf(cf) {
+            {
+                let state = self.pending.read().unwrap();
+                if let Some(hit) = state.lookup(id, key) {
+                    return Ok(hit.map(<[u8]>::len));
+                }
+            }
+            if let Some(rows) = self.resident_rows(id) {
+                return Ok(rows.get(key).map(Vec::len));
+            }
+            if let Some(parent) = &self.parent {
+                if let Some(hit) = parent.state.lookup(id, key) {
+                    return Ok(hit.map(<[u8]>::len));
+                }
+            }
+        }
+        StateBackend::get_cf_len(&self.db, cf, key)
+    }
+
+    /// [`Self::iterate_cf_from`] with the DB iterator bounded at the prefix
+    /// end; the merge's rows past the prefix (layer writes) are cut.
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let Some(id) = intern_cf(cf) else {
+            return StateBackend::iterate_cf_prefix_from(&self.db, cf, prefix, start, limit);
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cut = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+            rows.into_iter().take_while(|(k, _)| k.starts_with(prefix)).collect()
+        };
+        let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+        let pending = self.pending.read().unwrap();
+        if let Some(rows) = self.resident_rows(id) {
+            let base = rows
+                .range::<[u8], _>(range)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
+            return merge_from(&pending, None, id, start, limit, base).map(cut);
+        }
+        let parent = self.parent.as_ref().map(|p| &p.state);
+        let db = self.db.inner();
+        let cf_handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        let dbi = db
+            .iterator_cf_opt(
+                cf_handle,
+                prefix_read_options(prefix),
+                rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+            )
+            .map(|item| item.map_err(StateError::from));
+        merge_from(&pending, parent, id, start, limit, dbi).map(cut)
+    }
+
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
     /// is live per the layered point-read rule (pending, then parent, then DB).
     /// Checks pending / parent writes under `prefix`, then walks DB keys and
@@ -2292,6 +2437,73 @@ mod tests {
                 );
             }
         }
+
+        // Reader precompile work bound: `iterate_cf_prefix_from` = the same
+        // rows cut at the prefix end (RocksDB bounded there; prefix ending in
+        // 0xff included: c = 255), and `get_cf_len` = the point read's length.
+        let in_prefix = |rows: &[(Vec<u8>, Vec<u8>)], p: &[u8], start: &[u8], limit: usize| {
+            rows.iter()
+                .filter(|(k, _)| k.as_slice() >= start && k.starts_with(p))
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut cs: Vec<usize> = (0..combos.len()).step_by(7).collect();
+        cs.push(255);
+        for c in cs {
+            let p = prefix(c);
+            for start in [p.clone(), [p.clone(), vec![2]].concat(), [p.clone(), vec![3]].concat()] {
+                for limit in [0usize, 1, 2, 17, usize::MAX] {
+                    assert_eq!(
+                        overlay.iterate_cf_prefix_from(cf, &p, &start, limit).unwrap(),
+                        in_prefix(&all, &p, &start, limit),
+                        "overlay prefix {p:?} start {start:?} limit {limit}"
+                    );
+                    assert_eq!(
+                        StateBackend::iterate_cf_prefix_from(&db, cf, &p, &start, limit).unwrap(),
+                        in_prefix(&all_db, &p, &start, limit),
+                        "db prefix {p:?} start {start:?} limit {limit}"
+                    );
+                }
+            }
+            for k in 0..2u8 {
+                let key = key(c, k);
+                let len = |v: Option<Vec<u8>>| v.map(|v| v.len());
+                assert_eq!(overlay.get_cf_len(cf, &key).unwrap(), len(overlay.get_cf_raw(cf, &key).unwrap()));
+                assert_eq!(
+                    StateBackend::get_cf_len(&db, cf, &key).unwrap(),
+                    len(StateBackend::get_cf_raw(&db, cf, &key).unwrap())
+                );
+            }
+        }
+
+        // Final review N2: the empty prefix (no upper bound: the whole CF from
+        // `start`) and an all-0xff prefix (no key above it: no upper bound
+        // either), with rows under it in the DB and the overlay.
+        db.put_cf_raw(cf, &[0xff, 0xff, 1], b"db").unwrap();
+        overlay.put_cf_raw(cf, &[0xff, 0xff, 2], b"ov").unwrap();
+        let all = overlay.iterate_cf(cf, None).unwrap();
+        let all_db = StateBackend::iterate_cf(&db, cf, None).unwrap();
+        for (p, start) in [
+            (Vec::new(), Vec::new()),
+            (Vec::new(), prefix(100)),
+            (vec![0xff, 0xff], vec![0xff, 0xff]),
+            (vec![0xff, 0xff], vec![0xff, 0xff, 2]),
+        ] {
+            for limit in [0usize, 1, 2, 17, usize::MAX] {
+                assert_eq!(
+                    overlay.iterate_cf_prefix_from(cf, &p, &start, limit).unwrap(),
+                    in_prefix(&all, &p, &start, limit),
+                    "overlay prefix {p:?} start {start:?} limit {limit}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_prefix_from(&db, cf, &p, &start, limit).unwrap(),
+                    in_prefix(&all_db, &p, &start, limit),
+                    "db prefix {p:?} start {start:?} limit {limit}"
+                );
+            }
+        }
+        assert_eq!(overlay.iterate_cf_prefix_from(cf, &[0xff, 0xff], &[0xff, 0xff], 10).unwrap().len(), 2);
     }
 
     /// Fix 3 (s87) RED: a prefix scan through the overlay visits only the
