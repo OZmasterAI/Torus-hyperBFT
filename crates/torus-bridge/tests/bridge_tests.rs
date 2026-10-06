@@ -708,6 +708,80 @@ fn gas_accounting_base_fee_burned() {
     );
 }
 
+// 13b. Gas is credited once: revm pays the tip to the proposer, so the fee
+// revenue handed to the native fee distributor (`evm_fee_revenue`, what
+// `distribute_fees` receives) is the base-fee part only. Supply over the EVM
+// block plus the fee distribution falls by exactly the distributor's burn.
+// Before the fix the tip was paid twice (revm, then the distributor's split
+// of gas_used * effective_gas_price), so the block minted supply.
+#[test]
+fn gas_is_credited_once_across_revm_and_fee_distribution() {
+    use torus_economics::{RewardDistributor, StakingManager};
+
+    let h = TestHarness::new();
+    let sk = test_signing_key(1);
+    let alice = signing_key_address(&sk);
+    let bob = Address::new([0xBB; 20]);
+    let proposer = Address::new([0xFF; 20]);
+    let treasury = Address::new([0x7E; 20]);
+    let dev_pool = Address::new([0xDE; 20]);
+
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    h.db.put_account(&alice, &test_account(ten_eth)).unwrap();
+
+    let tip: u128 = 2_000_000_000;
+    let max_fee: u128 = h.parent_header.base_fee_per_gas as u128 + tip;
+    let rlp = build_signed_transfer_with_tip(&sk, bob, U256::from(1u64), 0, max_fee, tip);
+
+    let proposed = h.propose(vec![rlp], proposer);
+    let block_base_fee = proposed.block.header.base_fee_per_gas;
+    let validated = h
+        .validator
+        .validate_block(&proposed.block, &h.db, &h.executor)
+        .unwrap();
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
+
+    let revenue = proposed.block.header.evm_fee_revenue;
+    assert_eq!(
+        revenue,
+        21_000u128 * block_base_fee as u128,
+        "the distributor gets the base-fee part only (the tip already went to the proposer)"
+    );
+
+    // Epoch 0: burn 10%, validator 0%, treasury 45%, dev pool 45% (balances).
+    let staking = StakingManager::new(h.db.clone());
+    RewardDistributor::distribute_block_fees(
+        &staking,
+        proposer,
+        U256::from(revenue),
+        0,
+        treasury,
+        dev_pool,
+    )
+    .unwrap();
+
+    let bal = |a: &Address| h.db.get_account(a).unwrap().map(|x| x.balance).unwrap_or_default();
+    let total_after = [alice, bob, proposer, treasury, dev_pool].iter().map(bal).sum::<U256>();
+    let burn = U256::from(revenue) * U256::from(torus_economics::types::FEE_START_BURN_BPS)
+        / U256::from(10_000u64);
+    assert_eq!(
+        total_after,
+        ten_eth - burn,
+        "supply falls by exactly the distributor's burn: no gas is credited twice"
+    );
+    assert_eq!(
+        bal(&proposer),
+        U256::from(21_000u128) * U256::from(max_fee - block_base_fee as u128),
+        "the proposer is paid the tip once (by revm)"
+    );
+}
+
 // 14. Base fee updates correctly block-over-block following EIP-1559 formula
 //
 // Block 1 is built from genesis parent (gas_used=0 → base_fee decreases 12.5%).

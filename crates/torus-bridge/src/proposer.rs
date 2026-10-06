@@ -153,7 +153,7 @@ impl BlockProposer {
                 receipts_root,
                 logs_bloom: exec_result.logs_bloom,
                 evm_gas_used: exec_result.gas_used,
-                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts),
+                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts, next_base_fee),
                 evm_gas_limit: gas_limit,
                 native_action_count: 0,
                 evm_tx_count: evm_transactions.len() as u32,
@@ -287,7 +287,7 @@ impl BlockProposer {
                 receipts_root,
                 logs_bloom: exec_result.logs_bloom,
                 evm_gas_used: exec_result.gas_used,
-                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts),
+                evm_fee_revenue: compute_fee_revenue(&exec_result.receipts, next_base_fee),
                 evm_gas_limit: gas_limit,
                 native_action_count: signed_native_actions.len() as u32,
                 evm_tx_count: evm_transactions.len() as u32,
@@ -392,10 +392,16 @@ pub fn verify_sig_attestation(
     proposer_pubkey.verify(&digest, &sig).is_ok()
 }
 
-pub fn compute_fee_revenue(receipts: &[Receipt]) -> u128 {
+/// EVM gas revenue handed to the native fee distributor (`distribute_fees`):
+/// the BASE-FEE part only, `sum(gas_used * min(effective_gas_price, base_fee))`.
+/// revm already paid the tip (`effective_gas_price - base_fee`) to the block
+/// beneficiary (the proposer) and removed the base-fee part from supply, so the
+/// distributor redistributes exactly what revm did not credit to anyone; gas is
+/// credited once (HL-parity report: "EVM gas fees credited twice").
+pub fn compute_fee_revenue(receipts: &[Receipt], base_fee: u64) -> u128 {
     receipts
         .iter()
-        .map(|r| r.gas_used as u128 * r.effective_gas_price as u128)
+        .map(|r| r.gas_used as u128 * r.effective_gas_price.min(base_fee) as u128)
         .sum()
 }
 

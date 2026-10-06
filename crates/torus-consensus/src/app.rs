@@ -1828,7 +1828,10 @@ impl ExecutionContext {
                         }
                     }
                     computed_fee_revenue =
-                        torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                        torus_bridge::proposer::compute_fee_revenue(
+                            &validated.receipts,
+                            torus_block.header.base_fee_per_gas,
+                        );
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
