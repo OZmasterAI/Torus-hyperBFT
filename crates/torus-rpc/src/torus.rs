@@ -444,10 +444,15 @@ fn check_price_band(
 /// lot applies to every order type (`qty < lot`, so lot 0 admits any qty >=
 /// 0); the tick to a `Limit` price and a `StopLimit` limit, only when tick >
 /// 0. Message = the executor's ("order rejected: ...").
+/// Row 46 (s94 B): first, as the executor does (`validate_order_price`,
+/// same text), a `Limit` price must be positive.
 fn check_tick_lot(
     p: &torus_types::PlaceOrderParams,
     (tick, lot): (FixedPoint, FixedPoint),
 ) -> Result<(), String> {
+    if matches!(p.order_type, torus_types::OrderType::Limit) && p.price <= FixedPoint::ZERO {
+        return Err(format!("limit order requires a positive price, got {}", p.price));
+    }
     match torus_core::order_book::shape_violation(p, tick, lot) {
         Some(v) => Err(v.placement_message()),
         None => Ok(()),
@@ -2913,6 +2918,35 @@ mod tick_lot_ingress_tests {
             e,
             "order rejected: price 100.00000001 is not a multiple of the tick 1.00000000"
         );
+    }
+
+    /// Row 46 (s94 B): a Limit with a price <= 0 is refused at intake with
+    /// the executor's text (`validate_order_price`), checked before the
+    /// tick / lot as the executor does (a sub-lot one gets the price text).
+    #[test]
+    fn limit_price_not_positive_is_refused_with_the_executors_text() {
+        use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
+        use torus_core::position::NativeBalance;
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let rb = alloy_primitives::Address::repeat_byte;
+        let mut ctx = NativeExecContext::new(state.clone(), 1, 1000, 0, 100, 10, rb(99), rb(100), rb(101));
+        let trader = rb(1);
+        let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&trader, &bal).unwrap();
+        for (price, qty, want) in [
+            (0, S, "limit order requires a positive price, got 0.00000000"),
+            (-S, S, "limit order requires a positive price, got -1.00000000"),
+            (0, S / 2, "limit order requires a positive price, got 0.00000000"),
+        ] {
+            let p = order(1, price, qty, OrderType::Limit);
+            assert_eq!(place(&state, p.clone()).unwrap_err(), want);
+            let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
+            assert_eq!(exec.error.as_deref(), Some(want));
+        }
+        let batch = vec![order(1, 100 * S, S, OrderType::Limit), order(1, 0, S, OrderType::Limit)];
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap_err();
+        assert_eq!(e, "limit order requires a positive price, got 0.00000000");
     }
 
     /// Row 44 (s94 B): a row that does not decode as a market (test fixtures
