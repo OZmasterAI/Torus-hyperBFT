@@ -43,6 +43,8 @@ pub struct Counts {
     /// Always on: rows any read returned (a point-read hit counts 1, a scan
     /// its rows), any CF. Precompile work-bound tests read it.
     pub rows_read: AtomicUsize,
+    /// Always on: value bytes any read returned (point reads and scans).
+    pub bytes_read: AtomicUsize,
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
     /// count, answered by a layer or not.
     layer_calls: Mutex<HashMap<(&'static str, &'static str), usize>>,
@@ -104,6 +106,15 @@ fn probed_cf(cf: &str) -> Option<&'static str> {
 }
 
 impl<T: StateBackend> CountingBackend<T> {
+    #[allow(clippy::type_complexity)]
+    fn count_rows(&self, out: &Result<Vec<(Vec<u8>, Vec<u8>)>, StateError>) {
+        if let Ok(rows) = out {
+            self.counts.rows_read.fetch_add(rows.len(), Ordering::SeqCst);
+            let bytes: usize = rows.iter().map(|(_, v)| v.len()).sum();
+            self.counts.bytes_read.fetch_add(bytes, Ordering::SeqCst);
+        }
+    }
+
     pub fn new(inner: T) -> Self {
         Self { inner, counts: Arc::new(Counts::default()) }
     }
@@ -202,8 +213,9 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
             self.counts.oracle_reads.fetch_add(1, Ordering::SeqCst);
         }
         let out = self.probe(cf, "get_cf_raw", || self.inner.get_cf_raw(cf, key));
-        if let Ok(Some(_)) = &out {
+        if let Ok(Some(v)) = &out {
             self.counts.rows_read.fetch_add(1, Ordering::SeqCst);
+            self.counts.bytes_read.fetch_add(v.len(), Ordering::SeqCst);
         }
         out
     }
@@ -232,17 +244,31 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
             self.counts.scans.lock().unwrap().push(scan);
         }
         let out = self.probe(cf, "iterate_cf", || self.inner.iterate_cf(cf, prefix));
-        if let Ok(rows) = &out {
-            self.counts.rows_read.fetch_add(rows.len(), Ordering::SeqCst);
-        }
+        self.count_rows(&out);
         out
     }
 
     fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         let out = self.probe(cf, "iterate_cf_from", || self.inner.iterate_cf_from(cf, start, limit));
-        if let Ok(rows) = &out {
-            self.counts.rows_read.fetch_add(rows.len(), Ordering::SeqCst);
-        }
+        self.count_rows(&out);
+        out
+    }
+
+    /// A length probe reads no value bytes (it is what the precompile uses to
+    /// size a blob before paying for it).
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        self.inner.get_cf_len(cf, key)
+    }
+
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let out = self.inner.iterate_cf_prefix_from(cf, prefix, start, limit);
+        self.count_rows(&out);
         out
     }
 

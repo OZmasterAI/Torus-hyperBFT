@@ -721,6 +721,36 @@ fn tight_stipend_reader_calls_run_out_of_gas() {
     assert_eq!(ok, 20, "with enough gas every call succeeds");
 }
 
+/// Re-review: the exact boundary through the EVM. getMarkets over 200 markets
+/// is 200 rows + 404 words = 604 units: a stipend of exactly 2,600 + 604 x 50
+/// succeeds, one gas less runs out of gas.
+#[test]
+fn reader_stipend_exact_boundary() {
+    use torus_core::precompiles::{GAS_PRECOMPILE_READ, GAS_PRECOMPILE_READ_PER_UNIT};
+    let block_cfg = default_block_cfg();
+    let contract = Address::with_last_byte(0x78);
+    let exact = (GAS_PRECOMPILE_READ + 604 * GAS_PRECOMPILE_READ_PER_UNIT) as u32;
+    for (stipend, want) in [(exact, 1u64), (exact - 1, 0)] {
+        let (_dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();
+        for m in 1..=200u64 {
+            db.put_cf_raw("cf_native_markets", &m.to_be_bytes(), &[1u8]).unwrap();
+        }
+        install_contract(&db, &contract, &get_markets_loop_code(1, stipend));
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit: 1_000_000,
+            gas_price: block_cfg.base_fee as u128,
+            kind: TxKind::Call(contract),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        let r = EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(&db, &block_cfg, tx).unwrap().0;
+        assert!(r.success);
+        assert_eq!(U256::from_be_slice(&r.output).to::<u64>(), want, "stipend {stipend}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 12. Standard Ethereum precompile (ecrecover) still works
 // ---------------------------------------------------------------------------
