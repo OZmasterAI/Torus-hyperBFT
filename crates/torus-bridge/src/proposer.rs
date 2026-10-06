@@ -410,6 +410,37 @@ mod tests {
     use super::*;
     use torus_types::{ActionSignature, NativeAction, Signature};
 
+    fn receipt(gas_used: u64, effective_gas_price: u64) -> Receipt {
+        Receipt {
+            tx_hash: Default::default(),
+            block_number: 1,
+            block_hash: Default::default(),
+            tx_index: 0,
+            cumulative_gas_used: gas_used,
+            gas_used,
+            contract_address: None,
+            logs: vec![],
+            logs_bloom: Default::default(),
+            status: true,
+            effective_gas_price,
+        }
+    }
+
+    /// Review nit (EVM gas credited once): the distributor gets the base-fee
+    /// part only, for every tx kind. A legacy tx's effective price is its whole
+    /// gas_price (revm pays gas_price - base_fee to the proposer), an EIP-1559
+    /// tx's is base + tip; either way only gas_used * base_fee is redistributed.
+    /// With base_fee 0 everything was a tip paid by revm: revenue 0.
+    #[test]
+    fn fee_revenue_is_the_base_fee_part_for_legacy_and_zero_base_fee() {
+        let base = 1_000_000_000u64;
+        // legacy at 3 gwei, EIP-1559 at base + 2 gwei, one exactly at base
+        let receipts = [receipt(21_000, 3 * base), receipt(50_000, base + 2 * base), receipt(30_000, base)];
+        assert_eq!(compute_fee_revenue(&receipts, base), 101_000u128 * base as u128);
+        assert_eq!(compute_fee_revenue(&receipts, 0), 0, "base fee 0: all of it was tip");
+        assert_eq!(compute_fee_revenue(&[], base), 0);
+    }
+
     fn make_test_signed_action(nonce: u64) -> SignedNativeAction {
         SignedNativeAction {
             action: NativeAction::ClaimRewards,
