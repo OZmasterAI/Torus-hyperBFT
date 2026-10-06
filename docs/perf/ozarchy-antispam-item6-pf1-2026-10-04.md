@@ -2403,13 +2403,27 @@ position). The vault and 50 thin senders are in the digest. Driver
   at 787-789 from 18:12:37 to 18:24:14 (~11.6 min). State stayed identical
   (AGREE). ADL has no per-block work budget: one large move can halt block
   production for minutes. **P0 before testnet.**
+- **ADL root cause (s18, profiled):** every ADL step runs `adl_candidates`,
+  which walks the first `ADL_MAX_SCAN_ROWS` = 65,536 rows of
+  `CF_NATIVE_POSITIONS` from the empty key whatever the market. Microbench
+  `ubench_adl` (real `run_liquidations` with R): 12-16 ms per step once the
+  CF holds > 65,536 rows, 38 ms without R; perf: `adl_candidates` = 97.7% of
+  the step. Also a fairness defect: counterparties come only from the ~200
+  lowest-address traders. `LIQ_ACT_PER_BLOCK` = 64 counts accounts, not
+  steps. Design + options: `docs/plans/adl-budget.md` (`perf/adl-budget`).
 - **The vault deficit at S=750 is the expected finding** (nothing refills
   it): identical in `torus_liquidator_vault_deficit`, `torus_getLiquidatorVault`
   on all 3 nodes and the digest.
 - **S=400 went straight to backstop** (0 stage 1), although a 4% loss against
-  a 5% initial margin was expected to land in stage 1. Unexplained: the thin
-  accounts may be deeper than modelled, or classification differs from the
-  design.
+  a 5% initial margin was expected to land in stage 1. **Explained (s18):**
+  stage 1 is only `2/3 MM <= AV < MM` (`liquidation.rs` `classify`). A thin
+  account holds ~20M notional (19.89-20.07M over 257-279 markets, from the
+  S=750 ADL lines) on 1M collateral, MM = notional / 40 ~ 500k, so AV/MM ~ 2.0
+  before the shock and ~0.40 after a 400 bp loss (1M - 0.04 x 20M = 200k),
+  below 2/3. Measured: vault +19,984,975.69 over 100 backstops = mean AV
+  199,850 at liquidation; the per-account spread (~0.38-0.42) is derived (the
+  logs print counts only). The walk (cap +-80 bp) alone never reaches the band;
+  a shock of 251-333 bp would land in it. At S=750 AV ~ -500k, hence all ADL.
 - **Who:** exactly the 100 even-index thin senders (balances 0 after S=400;
   the ADL lines name the same 100 at S=750); no ADL'd account outside the
   thin set (counterparty identities are only in the debug-level close lines).
@@ -2520,10 +2534,11 @@ position). The vault and 50 thin senders are in the digest. Driver
 - **P0 before testnet: ADL has no per-block work budget** (section 23.2): at
   S=750, 100 accounts x ~270 markets of ADL took 332 / 123 / 241 s on three
   blocks and froze consensus ~11.6 min. Needs a budget (account-markets or
-  closes per block) with carry-over, and cheaper per-close work.
-- Liquidation stress at S=400 classified every account as backstop, none as
-  stage 1 (section 23.2): check the thin accounts' margin at the shock and
-  the classification.
+  closes per block) with carry-over, and cheaper per-close work. Profiled and
+  designed in s18 (`docs/plans/adl-budget.md`, owner decisions Q1-Q6 pending).
+- Liquidation stress at S=400: all backstop is explained (section 23.2, AV/MM
+  ~0.40 after the shock). A stage-1 cell needs a shock of ~290 bp on this
+  shape.
 - Harness: fix `liq_stress.py` (`_count` column), keep harness tests from
   writing `testnet/genesis-weighted-full.json` into the worktree, and avoid
   stale binaries from reflink-seeded target dirs (section 23.2).
