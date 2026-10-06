@@ -81,6 +81,11 @@ pub enum CoreError {
     #[error("invalid precompile input: {0}")]
     InvalidPrecompileInput(String),
 
+    /// A reader precompile's work would exceed the budget its caller's gas
+    /// pays for ([`crate::precompiles::ReadMeter`]); the EVM call runs out of gas.
+    #[error("precompile out of gas")]
+    PrecompileOutOfGas,
+
     #[error("unknown precompile function selector: {0:#010x}")]
     UnknownSelector(u32),
 
