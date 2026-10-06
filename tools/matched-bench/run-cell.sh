@@ -883,17 +883,15 @@ if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" 
 T_DRAIN=$(date +%s)
 log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and drain-samples.jsonl)"
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
-    log "feed-live drain: $(jq -r '.feed_live | "max_exec_lag=\(.max_exec_lag) oracle_block_exec_ms p50=\(.chain_ms.p50) p95=\(.chain_ms.p95) max=\(.chain_ms.max) native_blocks=\(.native_blocks) single_block_intervals=\(.single_block_intervals)/\(.native_intervals)"' "$OUT/drain.json" 2>/dev/null || echo MISSING) (drain-feed-live.tsv)"
+    log "feed-live drain: $(jq -r '.feed_live | "max_exec_lag=\(.max_exec_lag) quiet_window_native_block_exec_ms (oracle-only proxy) p50=\(.chain_ms.p50) p95=\(.chain_ms.p95) max=\(.chain_ms.max) native_blocks=\(.native_blocks) single_block_intervals=\(.single_block_intervals)/\(.native_intervals)"' "$OUT/drain.json" 2>/dev/null || echo MISSING) (drain-feed-live.tsv)"
     # The digest and the after-snapshots need quiet counters: pause the feed
     # now and prove quiescence with the default criterion before them.
     kill -STOP "$ORACLE_PID" 2>/dev/null
     mkdir -p "$OUT/feed-stop-settle"
-    if python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout 60 --quiet "$QUIET_S" \
-        --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1; then
-        log "oracle feed paused (SIGSTOP) for the digest; quiet again (feed-stop-settle/drain.json)"
-    else
-        log "WARNING: oracle feed paused but the chain was not quiet within 60 s (feed-stop-settle/drain.json) — the digest quiescence check decides"
-    fi
+    SETTLED=0
+    python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout 60 --quiet "$QUIET_S" \
+        --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1 && SETTLED=1
+    log "oracle feed paused (SIGSTOP) for the digest; settle drained=$SETTLED after $(jq -r '.elapsed_s // "?" | if type == "number" then floor else . end' "$OUT/feed-stop-settle/drain.json" 2>/dev/null || echo '?')s (feed-stop-settle/drain.json$([ "$SETTLED" = 1 ] || echo '; NOT quiet within 60 s: the digest quiescence check decides'))"
 fi
 sleep 2
 stop_sampler || die "metrics sampler failed (see sampler.log)"

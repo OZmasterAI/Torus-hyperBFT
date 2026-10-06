@@ -124,7 +124,9 @@ python3 tools/matched-bench/test_harness.py
    `--max-lag` (2) on every sample. No metric splits the mempool by action
    kind, so "bench pool empty" is that proxy. `drain-feed-live.tsv` holds the
    per-sample exec lag and mean ms per native block (`torus_exec_chain_seconds`);
-   `drain.json .feed_live` its summary over the final quiet window.
+   `drain.json .feed_live` its summary over the final quiet window. The feed
+   is then paused and the default drain re-run (`feed-stop-settle/`, up to
+   60 s), so this step can take `DRAIN_TIMEOUT` + ~60 s.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`

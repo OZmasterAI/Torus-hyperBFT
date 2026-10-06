@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES, TRADE_WRITER,
                     CHAIN_SUM, CHAIN_COUNT, DrainTracker, acceptance, assess_liveness,
-                    feed_live_summary, parse_metrics)
+                    feed_live_rows, feed_live_summary, parse_metrics)
 from test_harness import BENCH_START, run_summarize, write_agreement, write_cell
 from collect_logs import collect
 
@@ -157,6 +157,22 @@ class FeedLiveDrainTest(unittest.TestCase):
         self.assertEqual(out['chain_ms'], {'p50': 50.0, 'p95': 200.0, 'max': 200.0})
         self.assertIsNone(feed_live_summary(rows, since=None)['max_exec_lag'])
         self.assertIsNone(feed_live_summary(rows, since=6)['chain_ms'])
+
+    def test_sample_that_started_the_window_never_leaks_into_the_summary(self):
+        # Review of 37ff2af: rows rounded elapsed to ms while tracker.since is
+        # raw, so the window's first sample (its interval precedes the window:
+        # the last bench block, 900 ms here) leaked in whenever rounding went up.
+        def chain(count, secs):
+            return [dict(feed(0), **{CHAIN_COUNT: count, CHAIN_SUM: secs}) for _ in NODES]
+        for since in (5.0006, 5.0004, 5.0005, 7.123456789):
+            tracker_rows = feed_live_rows(since - 1, [{}]*3, chain(10, 1.0), 0)
+            tracker_rows += feed_live_rows(since, chain(10, 1.0), chain(11, 1.9), 0)
+            for k in range(1, 4):
+                tracker_rows += feed_live_rows(since + k, chain(10+k, 1.9 + 0.04*(k-1)),
+                                               chain(11+k, 1.9 + 0.04*k), k)
+            out = feed_live_summary(tracker_rows, since)
+            self.assertEqual(out['chain_ms'], {'p50': 40.0, 'p95': 40.0, 'max': 40.0}, since)
+            self.assertEqual((out['native_intervals'], out['native_blocks']), (9, 9), since)
 
     def test_parse_metrics_keeps_exec_chain_series_only_when_asked(self):
         text = f'{CHAIN_SUM} 1.5\n{CHAIN_COUNT} 3\n{MEMPOOL} 0\n'

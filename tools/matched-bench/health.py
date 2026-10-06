@@ -179,10 +179,12 @@ def feed_live_rows(elapsed, previous, samples, quiet_elapsed):
             blocks = int(s[CHAIN_COUNT]-prev[CHAIN_COUNT])
             if blocks > 0:
                 ms = round(1000*(s[CHAIN_SUM]-prev[CHAIN_SUM])/blocks, 3)
-        rows.append({'elapsed_s': round(elapsed, 3), 'node': node,
+        # elapsed_s stays raw: feed_live_summary compares it with the tracker's
+        # raw `since`; only the TSV writer rounds.
+        rows.append({'elapsed_s': elapsed, 'node': node,
                      'committed': s.get(COMMITTED), 'exec_lag': s.get(EXEC_QUEUE),
                      'mempool': s.get(MEMPOOL), 'chain_blocks': blocks, 'chain_ms': ms,
-                     'quiet_elapsed_s': round(quiet_elapsed, 3)})
+                     'quiet_elapsed_s': quiet_elapsed})
     return rows
 
 
@@ -252,8 +254,9 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
     if feed_live:
         with (out/'drain-feed-live.tsv').open('w') as tsv:
             tsv.write('\t'.join(FEED_LIVE_COLUMNS)+'\n')
-            tsv.writelines('\t'.join('' if r[k] is None else str(r[k]) for k in FEED_LIVE_COLUMNS)
-                           + '\n' for r in rows)
+            tsv.writelines('\t'.join('' if r[k] is None else
+                                     str(round(r[k], 3) if isinstance(r[k], float) else r[k])
+                                     for k in FEED_LIVE_COLUMNS) + '\n' for r in rows)
         result['feed_live'] = dict(feed_live_summary(rows, tracker.since), max_lag_bound=max_lag,
                                    feed_mempool_max=feed_mempool_max)
     (out/'drain.json').write_text(json.dumps(result, indent=2)+'\n')

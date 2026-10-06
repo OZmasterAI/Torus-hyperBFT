@@ -1913,8 +1913,16 @@ class OracleFeedHarnessTest(unittest.TestCase):
                         "\nsleep 2\n")
         tmp = tempfile.mkdtemp(prefix="oracle-drain-flow-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # what the (stubbed) health.py runs would have left behind
+        os.makedirs(os.path.join(tmp, "feed-stop-settle"))
+        with open(os.path.join(tmp, "drain.json"), "w") as f:
+            json.dump({"drained": True, "feed_live": {
+                "max_exec_lag": 2, "native_intervals": 4, "single_block_intervals": 3,
+                "native_blocks": 5, "chain_ms": {"p50": 50.0, "p95": 200.0, "max": 200.0}}}, f)
+        with open(os.path.join(tmp, "feed-stop-settle", "drain.json"), "w") as f:
+            json.dump({"drained": True, "elapsed_s": 12.7}, f)
         script = (
-            self.fn("alive() {", "\n# Idempotent;")
+            self.fn("alive() {", "\nstop_sampler() {")
             + '\nlog() { echo "LOG $*"; }\n'
             + "oracle_marks() { echo '{\"markets\":300,\"usable\":300}'; }\n"
             + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n' % tmp
@@ -1925,6 +1933,8 @@ class OracleFeedHarnessTest(unittest.TestCase):
             + "METS=(9161 9162 9163)\n"
             + pause + "\n" + drain
             + '\ncat "$OUT/py.log"; echo "END $(ps -o stat= -p "$FEED" | cut -c1)"\n'
+            # the real exit-path stop must still end the feed paused after the drain
+            + 'stop_oracle_feed; alive "$FEED" && echo FEED_STILL_ALIVE; echo "STOPPED rc=$ORACLE_RC"\n'
         )
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1941,6 +1951,8 @@ class OracleFeedHarnessTest(unittest.TestCase):
         )
         self.assertIn("LOG oracle feed paused (SIGSTOP) for drain + digest", out)
         self.assertIn("END T", out)
+        self.assertNotIn("FEED_STILL_ALIVE", out)
+        self.assertIn("STOPPED rc=143", out)
 
     def test_feed_drain_keeps_the_feed_live_then_pauses_and_settles(self):
         out_dir, out = self._run_drain_flow("1")
@@ -1957,7 +1969,15 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertNotIn("--feed-live", py[1])
         self.assertTrue(os.path.isdir(os.path.join(out_dir, "feed-stop-settle")))
         self.assertIn("LOG feed-live drain:", out)
+        self.assertIn("quiet_window_native_block_exec_ms", out)
+        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        self.assertEqual(len(settle), 1, out)
+        self.assertRegex(settle[0], r"settle drained=1 after 12s")
+        self.assertIn("quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
+                      "max=200.0 native_blocks=5 single_block_intervals=3/4", out)
         self.assertIn("END T", out)
+        self.assertNotIn("FEED_STILL_ALIVE", out)
+        self.assertIn("STOPPED rc=143", out)
         # the existing exit paths still stop it (TERM + CONT): unchanged
         self.assertIn('kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src)
 
