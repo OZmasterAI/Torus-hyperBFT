@@ -36,6 +36,8 @@ RUNNER_ENV_KEYS = {
     "ORACLE_SHOCK_ROUND",
     "LIQ_THIN",
     "LIQ_THIN_AVAIL",
+    "EXPECT_NODE_MD5",
+    "EXPECT_BENCH_MD5",
 }
 p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter

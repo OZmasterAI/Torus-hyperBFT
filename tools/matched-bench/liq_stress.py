@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""liq_stress.py <cell-dir> — row 76 liquidation-stress report for one cell.
+"""liq_stress.py <cell-dir> [out.json] — row 76 liquidation-stress report for one cell.
 
 Reads what run-cell.sh leaves in a LIQ_THIN / ORACLE_SHOCK_BP cell:
   summary.json                      cell.liq_thin(_avail), oracle_feed.shock_bp/_round
@@ -8,14 +8,18 @@ Reads what run-cell.sh leaves in a LIQ_THIN / ORACLE_SHOCK_BP cell:
                                     per-class / scanned / acted counters
   sampler.csv                       1 Hz per node: block height, exec lag
                                     (torus_exec_queue_depth), post-engine tail
-                                    timer, and (stress cells only) the
-                                    liquidation counters, vault deficit, step
-                                    timer (_sum/_count), pending and deferred
+                                    timer (_sum; per-block divisor: its _count,
+                                    else torus_exec_engine_seconds_count), and
+                                    (stress cells only) the liquidation
+                                    counters, vault deficit, step timer
+                                    (_sum/_count), pending and deferred, and
+                                    the ADL-budget gauges when the node has them
   vault-val<i>.json                 torus_getLiquidatorVault at the digest
   oracle-feed.log                   "[oracle-feed] shock round R at <ms> ms"
 
-Writes <cell-dir>/liq-stress.json and prints the same JSON. Anything the cell
-cannot show is listed under "missing", never guessed. The step timer, the
+Writes out.json (default <cell-dir>/liq-stress.json) and prints the same JSON.
+Every sampler column is optional: a missing one yields null, never a crash.
+Anything the cell cannot show is listed under "missing", never guessed. The step timer, the
 per-class counters and the pending gauge come from feat/liq-telemetry; a
 binary without them falls back to the lower bounds of
 torus_liquidations_triggered_total (and says so).
@@ -35,10 +39,17 @@ HEIGHT = "torus_block_height"
 LAG = "torus_exec_queue_depth"
 TAIL_SUM = "torus_exec_post_engine_tail_seconds_sum"
 TAIL_CNT = "torus_exec_post_engine_tail_seconds_count"
+# Observed in the same block as the tail timer (torus-consensus app.rs, one
+# `if let Some(ref m) = self.metrics` block), so the same count. sampler.csv
+# had only the tail _sum up to s17.
+ENGINE_CNT = "torus_exec_engine_seconds_count"
 STEP_SUM = "torus_liquidation_step_seconds_sum"
 STEP_CNT = "torus_liquidation_step_seconds_count"
 PENDING = "torus_liquidation_pending"
 DEFERRED = "torus_liquidation_deferred"
+# ADL budget (docs/plans/adl-budget.md): reported only when the node exports them.
+ADL_Q = "torus_liquidation_adl_queue"
+ADL_QD = "torus_liquidation_adl_queue_deficit"
 CLASS = {
     "stage1": "torus_liquidations_stage1_total",
     "backstop": "torus_liquidations_backstop_total",
@@ -80,6 +91,11 @@ NOTES = [
     "no budget cut deferred are not counted.",
     "torus_liquidations_adl_total includes the liquidator vault's own ADL, which "
     "torus_liquidation_acted_total (the budgeted actions) does not.",
+    "Total-balance conservation is NOT computable from a cell dir: the state digest "
+    "covers only the digest accounts (digest-accounts.txt, ~50 of 100k+) with available "
+    "and margin balances, no positions or unrealized PnL, and no fee or insurance "
+    "totals; summing available + order margin over them is not conservation. Only the "
+    "vault's own deficit (vault-val<i>.json, torus_liquidator_vault_deficit) is shown.",
 ]
 
 
@@ -132,20 +148,25 @@ def read_sampler(path):
     return rows, header
 
 
-def tail_ms(a, b):
-    """Mean post-engine tail ms per native block between two sampler rows."""
-    if a is None or b is None or TAIL_SUM not in a or TAIL_SUM not in b:
+def per_block_ms(a, b, s, c):
+    """Mean ms per block of the timer _sum `s` over the count `c` between two
+    sampler rows; None if a row or either column is missing."""
+    if a is None or b is None or c is None or any(k not in x for k in (s, c) for x in (a, b)):
         return None
-    dn = b[TAIL_CNT] - a[TAIL_CNT]
-    return round((b[TAIL_SUM] - a[TAIL_SUM]) * 1000 / dn, 4) if dn > 0 else None
+    dn = b[c] - a[c]
+    return round((b[s] - a[s]) * 1000 / dn, 4) if dn > 0 else None
 
 
 def step_ms(a, b):
     """Mean liquidation step ms per native block between two sampler rows."""
-    if a is None or b is None or STEP_SUM not in a or STEP_SUM not in b:
+    return per_block_ms(a, b, STEP_SUM, STEP_CNT)
+
+
+def sum_ms(a, b, s):
+    """Timer `s` ms accrued between two sampler rows; None if missing."""
+    if a is None or b is None or s not in a or s not in b:
         return None
-    dn = b[STEP_CNT] - a[STEP_CNT]
-    return round((b[STEP_SUM] - a[STEP_SUM]) * 1000 / dn, 4) if dn > 0 else None
+    return round((b[s] - a[s]) * 1000, 4)
 
 
 def analyze(d):
@@ -211,12 +232,16 @@ def analyze(d):
     rows, header = read_sampler(os.path.join(d, "sampler.csv"))
     # sample_metrics.py writes "0" for a metric the node does not export: the
     # telemetry columns count only if the node's after-snapshot has the timer.
-    tel = any(
-        metric(os.path.join(d, "metrics-after-%s.txt" % n), STEP_CNT) is not None
-        for n in NODES
-    )
-    if not tel:
+    def exported(name):
+        return any(
+            metric(os.path.join(d, "metrics-after-%s.txt" % n), name) is not None
+            for n in NODES
+        )
+
+    if not exported(STEP_CNT):
         header = [c for c in header if c not in (STEP_SUM, STEP_CNT, PENDING, DEFERRED)]
+    header = [c for c in header if c not in (ADL_Q, ADL_QD) or exported(c)]
+    has_step = STEP_SUM in header and STEP_CNT in header
     r["per_sample"] = LIQ in header
     if not r["per_sample"]:
         missing.append(
@@ -245,7 +270,7 @@ def analyze(d):
     r["last_liquidation"] = point(rises[-1]) if rises else None
     r["blocks_shock_to_last_liquidation"] = (
         r["last_liquidation"]["height"] - r["shock_height"]
-        if rises and r["shock_height"] is not None
+        if rises and r["shock_height"] is not None and r["last_liquidation"]["height"] is not None
         else None
     )
 
@@ -291,6 +316,39 @@ def analyze(d):
                     }
                 )
 
+    # ADL-budget gauges (val0), only when the node exports them: from the shock
+    # (or the first sample) on, the max, the last sample, and the drain time =
+    # the first sample back at 0 after an adl_queue > 0.
+    after = [x for x in v0 if shock_ts is None or x["ts"] >= shock_ts]
+    gpt = lambda x, k: {"ts": num(x["ts"]), "height": num(x.get(HEIGHT)), "value": num(x[k])}  # noqa: E731
+    if ADL_Q in header:
+        q = {k: None for k in ("max", "last", "first_up", "zero", "drain_blocks", "blocks_shock_to_zero")}
+        qa = [x for x in after if ADL_Q in x]
+        if qa:
+            q["max"], q["last"] = gpt(max(qa, key=lambda x: x[ADL_Q]), ADL_Q), gpt(qa[-1], ADL_Q)
+        up = next((i for i, x in enumerate(qa) if x[ADL_Q] > 0), None)
+        if up is not None:
+            q["first_up"] = point(qa[up])
+            z = next((x for x in qa[up:] if x[ADL_Q] == 0), None)
+            if z is not None:
+                q["zero"] = point(z)
+                if z.get(HEIGHT) is not None and qa[up].get(HEIGHT) is not None:
+                    q["drain_blocks"] = num(z[HEIGHT] - qa[up][HEIGHT])
+                if z.get(HEIGHT) is not None and r["shock_height"] is not None:
+                    q["blocks_shock_to_zero"] = num(z[HEIGHT]) - r["shock_height"]
+            else:
+                missing.append(
+                    "adl_queue never returned to 0 by the last sample (%s): the ADL "
+                    "queue was not drained" % (q["last"],)
+                )
+        r["adl_queue"] = q
+    if ADL_QD in header:
+        qd = [x for x in after if ADL_QD in x]
+        r["adl_queue_deficit"] = {
+            "max": gpt(max(qd, key=lambda x: x[ADL_QD]), ADL_QD) if qd else None,
+            "last": gpt(qd[-1], ADL_QD) if qd else None,
+        }
+
     # Window: shock (or first liquidation) .. pending back at 0 (else the last
     # liquidation; else the end of sampling).
     w_start = shock_ts if shock_ts is not None else (rises[0]["ts"] if rises else None)
@@ -298,6 +356,8 @@ def analyze(d):
     r["window"] = {"start_ts": num(w_start), "end_ts": num(w_end)}
     r["post_engine_tail_ms_per_block"], r["exec_lag"] = {}, {}
     r["liquidation_step_ms_per_block"] = {}
+    tail_cnt = next((c for c in (TAIL_CNT, ENGINE_CNT) if c in header), None)
+    r["post_engine_tail_count_source"] = tail_cnt
     for n in NODES:
         s = (rows or {}).get(n) or []
         if not s:
@@ -308,11 +368,13 @@ def analyze(d):
         base_rows = [x for x in s if w_start is None or x["ts"] < w_start]
         win_rows = [x for x in s if w_start is not None and w_start <= x["ts"] <= end]
         base_last = base_rows[-1] if base_rows else None
+        win_last = win_rows[-1] if win_rows else None
         r["post_engine_tail_ms_per_block"][n] = {
-            "baseline": tail_ms(s[0], base_last),
-            "window": tail_ms(base_last, win_rows[-1]) if win_rows else None,
+            "baseline": per_block_ms(s[0], base_last, TAIL_SUM, tail_cnt),
+            "window": per_block_ms(base_last, win_last, TAIL_SUM, tail_cnt),
+            "window_sum_ms": sum_ms(base_last, win_last, TAIL_SUM),
         }
-        if STEP_SUM in header:
+        if has_step:
             span = ([base_last] if base_last else []) + win_rows
             per = [step_ms(a, b) for a, b in zip(span, span[1:])]
             per = [v for v in per if v is not None]
@@ -332,7 +394,12 @@ def analyze(d):
         }
     if rows is None:
         missing.append("sampler.csv missing")
-    if STEP_SUM not in header:
+    if TAIL_SUM in header and tail_cnt is None:
+        missing.append(
+            "post_engine_tail_ms_per_block: sampler.csv has no %s or %s column, so no "
+            "per-block mean (window_sum_ms only)" % (TAIL_CNT, ENGINE_CNT)
+        )
+    if not has_step:
         missing.append(NO_TIMER)
     if not has_pending:
         missing.append(NO_PENDING)
@@ -342,11 +409,12 @@ def analyze(d):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
     r = analyze(sys.argv[1])
     out = json.dumps(r, indent=1, sort_keys=True)
-    with open(os.path.join(sys.argv[1], "liq-stress.json"), "w") as f:
+    path = sys.argv[2] if len(sys.argv) == 3 else os.path.join(sys.argv[1], "liq-stress.json")
+    with open(path, "w") as f:
         f.write(out + "\n")
     print(out)
 

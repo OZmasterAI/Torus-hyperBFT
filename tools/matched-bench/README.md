@@ -63,12 +63,19 @@ python3 tools/matched-bench/test_harness.py
 2. Stages `$TARGET_DIR/release/torus-node` (default `$HOME/.cargo-target-matched`)
    into `<worktree>/target/release/torus-node` (`devnet/wsl/env.sh` hardcodes that
    path) and logs md5 of source and copy — abort on mismatch (stale-binary trap).
+   `EXPECT_NODE_MD5=H` / `EXPECT_BENCH_MD5=H` (full md5 or 8+ hex prefix, as
+   recorded by the build) abort when the node / bench binary differs, printing
+   both (s17: a reflink-seeded target dir kept a stale bench).
    Records the worktree commit + dirty count. NOTE: the runner cannot prove the
    binary was built from that commit — build first, then run.
 3. Generates a `MARKETS`-market genesis via `devnet/wsl/gen-3val-genesis.sh`
    (`MARKETS=N OUT=<worktree>/devnet/wsl/genesis-3val.json`) from THIS repo's
    weighted 100k-account genesis: first N pre-seeded markets (ids 1..N), or
    synthetic `S<k>-USD` rows past the base's 100. Funded accounts untouched.
+   The generator reuses an existing (gitignored) `testnet/genesis-weighted-full.json`
+   as-is, so the cell first refuses one with a non-`0x`+40-hex address or fewer
+   `bulk-test` rows than `SENDERS` (s17: a stub-bench test run left 61 rows with
+   address `oracle-feed`); move it away or set `FORCE=1` to rebuild it.
 4. `CLEAN=1 launch-3val.sh` with the RE-PROOF5 record-cell env
    (`TORUS_BOOK_ROWS=3 TORUS_RESIDENT_BOOKS=1 TORUS_NATIVE_ROOT_CACHE=1
    TORUS_PARALLEL_SETTLE=1 TORUS_PARALLEL_BUCKET_HASH=8
@@ -138,8 +145,12 @@ python3 tools/matched-bench/test_harness.py
    joins the digest accounts, `vault-val<i>.json` holds each node's
    `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter,
    vault deficit and (feat/liq-telemetry) the step timer, per-class / scanned /
-   acted counters and the pending / deferred gauges. `liq_stress.py <cell>`
-   writes `liq-stress.json` (liquidations per node and per class, vault, shock
+   acted counters, the pending / deferred gauges, the post-engine tail `_count`
+   and the ADL-budget gauges `torus_liquidation_adl_queue(_deficit)` (reported
+   only when the node exports them: max, last, drain blocks to queue 0).
+   `liq_stress.py <cell> [out.json]` writes `liq-stress.json` (or out.json;
+   every sampler column optional, the tail divisor falls back to
+   `torus_exec_engine_seconds_count`) (liquidations per node and per class, vault, shock
    height, first / last liquidation, step ms per block (baseline, window,
    window max), the pending timeline and `blocks_shock_to_pending_zero`, exec
    lag around the shock). `torus_liquidation_pending` is an upper bound

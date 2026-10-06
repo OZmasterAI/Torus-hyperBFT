@@ -18,6 +18,11 @@
 # Optional env overrides:
 #   TARGET_DIR   cargo target dir holding torus-node + bench-throughput
 #                (default $HOME/.cargo-target-matched)
+#   EXPECT_NODE_MD5=H  EXPECT_BENCH_MD5=H  md5 (or its first 8+ hex chars) the
+#                build recorded for this cell's torus-node / bench-throughput.
+#                Step 1 refuses a binary whose md5 differs and prints both
+#                (s17: a reflink-seeded target dir kept a stale bench). Unset
+#                (default) = only logged, as before.
 #   RESULTS_ROOT (default $HOME/bench-results-matched)
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
@@ -251,6 +256,8 @@ if [ "${BENCH_ALLOW_UNDETACHED:-0}" != 1 ] && ! grep -qE "$BENCH_UNIT_RE" /proc/
     exit 2
 fi
 TARGET_DIR=${TARGET_DIR:-$HOME/.cargo-target-matched}
+EXPECT_NODE_MD5=${EXPECT_NODE_MD5:-}
+EXPECT_BENCH_MD5=${EXPECT_BENCH_MD5:-}
 RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}
 SENDERS=${SENDERS:-5000}
@@ -462,6 +469,9 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
+    [[ -z "${!v}" || "${!v}" =~ ^[0-9a-f]{8,32}$ ]] || { echo "FATAL: $v must be 8-32 lowercase hex chars of an md5 (got '${!v}')" >&2; exit 2; }
+done
 [[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
     || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
 [[ "$LIQ_THIN" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: LIQ_THIN must be a non-negative integer (got '$LIQ_THIN')" >&2; exit 2; }
@@ -546,6 +556,25 @@ liq_thin_patch() {
         return 1
     fi
     echo "$got"
+}
+
+# weighted_full_check <file> <senders>: gen-3val-genesis.sh REUSES an existing
+# testnet/genesis-weighted-full.json (gitignored, never checked). Prints why and
+# returns 1 unless it parses, every native address is 0x + 40 hex, and at least
+# <senders> rows carry a "bulk-test N" note (the load senders). s17: a test run
+# with a stub bench left one with 61 balances and the address 'oracle-feed'.
+weighted_full_check() {
+    local f=$1 n=$2 why
+    [ -e "$f" ] || return 0
+    why=$(jq -r --argjson n "$n" '
+        [.native_balances[]?.address | select(type != "string" or (test("^0x[0-9a-f]{40}$") | not))] as $bad
+        | ([.native_balances[]? | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length) as $bulk
+        | if ($bad | length) > 0 then "\($bad | length) native address(es) not 0x + 40 hex, e.g. \($bad[0:3] | tojson)"
+          elif $bulk < $n then "\($bulk) bulk-test rows < SENDERS=\($n)"
+          else empty end' "$f" 2>&1) || why="jq cannot check it: ${why:0:200}"
+    [ -z "$why" ] && return 0
+    echo "$f is stale: $why. gen-3val-genesis.sh would reuse it as-is; move it away (it is rebuilt) or set FORCE=1"
+    return 1
 }
 
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
@@ -633,10 +662,14 @@ cp -f "$SRC_NODE" "$DST_NODE" || die "copy failed"
 MD5_SRC=$(md5sum "$SRC_NODE" | cut -d' ' -f1)
 MD5_DST=$(md5sum "$DST_NODE" | cut -d' ' -f1)
 MD5_BENCH=$(md5sum "$BENCH" | cut -d' ' -f1)
-log "torus-node md5 src=$MD5_SRC ($SRC_NODE, mtime $(date -r "$SRC_NODE" +%FT%T))"
+log "torus-node md5 src=$MD5_SRC ($SRC_NODE, mtime $(date -r "$SRC_NODE" +%FT%T))${EXPECT_NODE_MD5:+ expected $EXPECT_NODE_MD5}"
 log "torus-node md5 dst=$MD5_DST ($DST_NODE)"
 [ "$MD5_SRC" = "$MD5_DST" ] || die "md5 mismatch after copy (stale-binary trap)"
-log "bench-throughput md5=$MD5_BENCH ($BENCH, mtime $(date -r "$BENCH" +%FT%T))"
+log "bench-throughput md5=$MD5_BENCH ($BENCH, mtime $(date -r "$BENCH" +%FT%T))${EXPECT_BENCH_MD5:+ expected $EXPECT_BENCH_MD5}"
+[ "${MD5_SRC:0:${#EXPECT_NODE_MD5}}" = "$EXPECT_NODE_MD5" ] \
+    || die "torus-node md5 $MD5_SRC != EXPECT_NODE_MD5 $EXPECT_NODE_MD5 ($SRC_NODE is not the binary built for this cell: stale-binary trap)"
+[ "${MD5_BENCH:0:${#EXPECT_BENCH_MD5}}" = "$EXPECT_BENCH_MD5" ] \
+    || die "bench-throughput md5 $MD5_BENCH != EXPECT_BENCH_MD5 $EXPECT_BENCH_MD5 ($BENCH is not the binary built for this cell: stale-binary trap)"
 
 # ---------------------------------------------------------------- 2. genesis
 log "generating $MARKETS-market 3-val genesis -> $GENESIS"
@@ -645,6 +678,9 @@ log "generating $MARKETS-market 3-val genesis -> $GENESIS"
 # Absent => the generator's default.
 GEN_TIMEOUT_BASE_MS=""
 for kv in $EXTRA_ENV; do case $kv in TIMEOUT_BASE_MS=*) GEN_TIMEOUT_BASE_MS=${kv#*=} ;; esac; done
+if [ "${FORCE:-0}" != 1 ]; then
+    WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
+fi
 TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS MARKETS=$MARKETS OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
     || die "genesis generation failed (see run.log)"
 log "genesis timeout_base_ms=$(jq '.consensus.timeout_base_ms' "$GENESIS")"
@@ -845,6 +881,9 @@ if liq_stress_on; then
     # pending and deferred gauges (zeros on an older binary; liq_stress.py
     # checks metrics-after-*.txt for the timer).
     WIDE_COLS="$WIDE_COLS torus_liquidation_step_seconds_sum torus_liquidation_step_seconds_count torus_liquidations_stage1_total torus_liquidations_backstop_total torus_liquidations_adl_total torus_liquidation_scanned_total torus_liquidation_acted_total torus_liquidation_pending torus_liquidation_deferred"
+    # liq_stress.py: the post-engine tail per-block divisor, and the ADL-budget
+    # gauges (docs/plans/adl-budget.md; zeros until a node exports them).
+    WIDE_COLS="$WIDE_COLS torus_exec_post_engine_tail_seconds_count torus_liquidation_adl_queue torus_liquidation_adl_queue_deficit"
 fi
 WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"

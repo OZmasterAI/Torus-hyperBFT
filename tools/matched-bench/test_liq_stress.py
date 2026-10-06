@@ -20,6 +20,7 @@ COLS = [
     "torus_exec_queue_depth",
     "torus_exec_post_engine_tail_seconds_sum",
     "torus_exec_post_engine_tail_seconds_count",
+    "torus_exec_engine_seconds_count",
     "torus_liquidations_triggered_total",
     "torus_liquidator_vault_deficit",
     "torus_liquidation_step_seconds_sum",
@@ -35,12 +36,18 @@ COLS = [
 ]
 # The liquidation-telemetry columns (feat/liq-telemetry); older binaries lack them.
 TEL = [c for c in COLS if c.startswith("torus_liquidation_") or c.startswith("torus_liquidations_") and c != "torus_liquidations_triggered_total"]
+ADL_Q = "torus_liquidation_adl_queue"
+ADL_QD = "torus_liquidation_adl_queue_deficit"
+# The ADL-budget gauges (adl=True): queue 0 before s=22, 6 at s=22 falling by
+# 2 per second to 0 at s=25 (height 250); deficit 30 at s=22 falling with it.
+ADL = {22: 6, 23: 4, 24: 2}
 # Pending after each sample s (val0 and the others alike): 0 before the shock,
 # 40 at s=21 falling by 4 per second, 0 again from s=30 (height 300).
 PENDING = {s: 40 - 4 * (s - 21) for s in range(21, 30)}
 
 
-def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pending_tail=None):
+def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pending_tail=None,
+                      drop=(), adl=False, adl_tail=None):
 
     """60 s at 10 blk/s. Shock at T0+20; liquidations +5/s on T0+21..T0+30
     (last increase at height 300, shock at height 200 -> 100 blocks). Post
@@ -53,6 +60,9 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
     cols = COLS if liq_col else [c for c in COLS if "liquid" not in c]
     if not tel_col:
         cols = [c for c in cols if c not in TEL]
+    cols = [c for c in cols if c not in drop]
+    if adl:
+        cols = cols[:-1] + [ADL_Q, ADL_QD, "scrape_valid"]
     tail_s, tail_n = 0.0, 0
     step_s = 0.0
     with open(os.path.join(d, "sampler.csv"), "w") as f:
@@ -74,6 +84,9 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
                 "torus_exec_queue_depth": 7 if s == 25 else (3 if in_window else 1),
                 "torus_exec_post_engine_tail_seconds_sum": "%.6f" % tail_s,
                 "torus_exec_post_engine_tail_seconds_count": tail_n,
+                # observed in the same block as the tail timer (app.rs), so the
+                # same count
+                "torus_exec_engine_seconds_count": tail_n,
                 "torus_liquidations_triggered_total": liqs,
                 "torus_liquidator_vault_deficit": "12.5" if s > 25 else "0",
                 "torus_liquidation_step_seconds_sum": "%.6f" % step_s,
@@ -85,6 +98,8 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
                 "torus_liquidation_acted_total": 5 * k,
                 "torus_liquidation_pending": pend,
                 "torus_liquidation_deferred": 12 if s in (21, 22) else 0,
+                ADL_Q: ADL.get(s, adl_tail if s >= 25 and adl_tail is not None else 0),
+                ADL_QD: 5 * ADL.get(s, 0),
                 "scrape_valid": 1,
             }
             for n in ("val0", "val1", "val2"):
@@ -112,6 +127,8 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
                     "torus_liquidations_adl_total 10\ntorus_liquidation_scanned_total 207\n"
                     "torus_liquidation_acted_total 50\ntorus_liquidation_step_seconds_count 600\n"
                 )
+            if adl:
+                f.write("%s 0\n%s 0\n" % (ADL_Q, ADL_QD))
         if vault:
             with open(os.path.join(d, "vault-val%d.json" % i), "w") as f:
                 json.dump(
@@ -273,6 +290,119 @@ class LiqStressTest(unittest.TestCase):
             on_disk = json.load(f)
         self.assertEqual(json.loads(p.stdout), on_disk)
         self.assertEqual(on_disk["blocks_shock_to_last_liquidation"], 90)
+
+    def test_sampler_without_the_tail_count_uses_the_engine_count(self):
+        # Real sampler.csv (s17): torus_exec_post_engine_tail_seconds_sum only.
+        # torus_exec_engine_seconds is observed in the same block (app.rs), so
+        # its _count is the per-block divisor.
+        write_stress_cell(self.d, drop=("torus_exec_post_engine_tail_seconds_count",))
+        r = analyze(self.d)
+        tail = r["post_engine_tail_ms_per_block"]["val0"]
+        self.assertAlmostEqual(tail["baseline"], 2.0, places=3)
+        self.assertAlmostEqual(tail["window"], 10.0, places=3)
+        self.assertEqual(r["post_engine_tail_count_source"], "torus_exec_engine_seconds_count")
+
+    def test_sampler_with_the_tail_count_uses_it(self):
+        write_stress_cell(self.d)
+        r = analyze(self.d)
+        self.assertEqual(
+            r["post_engine_tail_count_source"], "torus_exec_post_engine_tail_seconds_count"
+        )
+
+    def test_no_count_column_reports_the_tail_sum_only(self):
+        write_stress_cell(
+            self.d,
+            drop=("torus_exec_post_engine_tail_seconds_count", "torus_exec_engine_seconds_count"),
+        )
+        r = analyze(self.d)
+        tail = r["post_engine_tail_ms_per_block"]["val0"]
+        self.assertIsNone(tail["baseline"])
+        self.assertIsNone(tail["window"])
+        # 10 s in the window x 10 blocks x 10 ms
+        self.assertAlmostEqual(tail["window_sum_ms"], 1000.0, places=3)
+        self.assertIsNone(r["post_engine_tail_count_source"])
+        self.assertIn("post_engine_tail", " ".join(r["missing"]))
+
+    def test_missing_optional_columns_never_crash(self):
+        for drop in (
+            ("torus_liquidation_step_seconds_count",),
+            ("torus_liquidation_step_seconds_sum",),
+            ("torus_exec_post_engine_tail_seconds_sum",),
+            ("torus_block_height",),
+            ("torus_exec_queue_depth",),
+            ("torus_liquidation_deferred",),
+        ):
+            with self.subTest(drop=drop):
+                shutil.rmtree(self.d)
+                os.makedirs(self.d)
+                write_stress_cell(self.d, drop=drop)
+                r = analyze(self.d)
+                json.dumps(r)
+
+    def test_step_timer_without_count_is_absent_not_a_crash(self):
+        write_stress_cell(self.d, drop=("torus_liquidation_step_seconds_count",))
+        r = analyze(self.d)
+        self.assertIsNone(r["liquidation_step_ms_per_block"]["val0"])
+        self.assertIn("liquidation step timer", " ".join(r["missing"]))
+
+    def test_adl_queue_gauges_when_the_node_exports_them(self):
+        write_stress_cell(self.d, adl=True)
+        r = analyze(self.d)
+        q = r["adl_queue"]
+        self.assertEqual(q["max"], {"ts": T0 + 22, "height": 220, "value": 6})
+        self.assertEqual(q["last"], {"ts": T0 + 60, "height": 600, "value": 0})
+        self.assertEqual(q["first_up"], {"ts": T0 + 22, "height": 220})
+        self.assertEqual(q["zero"], {"ts": T0 + 25, "height": 250})
+        self.assertEqual(q["drain_blocks"], 30)
+        self.assertEqual(q["blocks_shock_to_zero"], 40)
+        d = r["adl_queue_deficit"]
+        self.assertEqual(d["max"], {"ts": T0 + 22, "height": 220, "value": 30})
+        self.assertEqual(d["last"], {"ts": T0 + 60, "height": 600, "value": 0})
+
+    def test_adl_queue_that_never_drains_is_reported(self):
+        write_stress_cell(self.d, adl=True, adl_tail=1)
+        r = analyze(self.d)
+        self.assertIsNone(r["adl_queue"]["zero"])
+        self.assertIsNone(r["adl_queue"]["drain_blocks"])
+        self.assertIn("adl_queue never returned to 0", " ".join(r["missing"]))
+
+    def test_adl_queue_absent_is_skipped_silently(self):
+        write_stress_cell(self.d)
+        r = analyze(self.d)
+        self.assertNotIn("adl_queue", r)
+        self.assertNotIn("adl_queue_deficit", r)
+        self.assertNotIn("adl_queue", " ".join(r["missing"]))
+
+    def test_zero_filled_adl_columns_without_the_gauge_are_skipped(self):
+        write_stress_cell(self.d, adl=True)
+        for i in range(3):
+            p = os.path.join(self.d, "metrics-after-val%d.txt" % i)
+            with open(p) as f:
+                keep = [l for l in f if not l.startswith("torus_liquidation_adl_queue")]
+            with open(p, "w") as f:
+                f.writelines(keep)
+        r = analyze(self.d)
+        self.assertNotIn("adl_queue", r)
+
+    def test_conservation_is_stated_as_not_computable(self):
+        write_stress_cell(self.d)
+        r = analyze(self.d)
+        self.assertIn("conservation", " ".join(r["notes"]))
+
+    def test_cli_out_path_leaves_the_cell_dir_alone(self):
+        write_stress_cell(self.d)
+        out = os.path.join(self.d, "elsewhere", "x.json")
+        os.makedirs(os.path.dirname(out))
+        p = subprocess.run(
+            [sys.executable, os.path.join(HERE, "liq_stress.py"), self.d, out],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.d, "liq-stress.json")))
+        with open(out) as f:
+            self.assertEqual(json.load(f), json.loads(p.stdout))
 
 
 if __name__ == "__main__":

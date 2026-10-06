@@ -41,6 +41,8 @@ DIGEST_SH = os.path.join(HERE, "digest-node.sh")
 CRASH_KILL_SH = os.path.join(HERE, "crash-kill.sh")
 SUMMARIZE = os.path.join(HERE, "summarize.py")
 RUN_CELL_SH = os.path.join(HERE, "run-cell.sh")
+REPO = os.path.dirname(os.path.dirname(HERE))
+WEIGHTED_FULL = os.path.join(REPO, "testnet", "genesis-weighted-full.json")
 
 
 def jq_compact(obj):
@@ -1912,7 +1914,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("#!/bin/sh\nexit 0\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, msg in (
                 (dict(ORACLE_FEED="yes"), "ORACLE_FEED must be"),
                 (dict(ORACLE_FEED="1", ORACLE_PRICE="-5"), "ORACLE_PRICE must be"),
@@ -1922,12 +1924,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 ),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-pre-x"],
+                    [script, wt, "oracle-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1", **env
                     ),
                 )
@@ -1983,7 +1985,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("#!/bin/sh\nexit 0\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, msg in (
                 (dict(ORACLE_FEED_DRAIN="2"), "ORACLE_FEED_DRAIN must be 0 or 1"),
                 (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="yes"), "ORACLE_FEED_DRAIN must be 0 or 1"),
@@ -1991,12 +1993,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 (dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-drain-pre-x"],
+                    [script, wt, "oracle-drain-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1", **env
                     ),
                 )
@@ -2098,7 +2100,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     # an oracle-feed without --walk-bp (an older binary)
                     f.write("#!/bin/sh\necho 'Usage: oracle-feed --price <PRICE>'\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, rc, msg in (
                 (dict(ORACLE_FEED="1", ORACLE_WALK_BP="x"), 2, "ORACLE_WALK_BP must be"),
                 (dict(ORACLE_FEED="1", ORACLE_WALK_BP="1250"), 2, "ORACLE_WALK_BP must be"),
@@ -2106,12 +2108,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 (dict(ORACLE_FEED="1", ORACLE_WALK_BP="10"), 1, "has no --walk-bp"),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-walk-pre-x"],
+                    [script, wt, "oracle-walk-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
+                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1", **env
                     ),
                 )
@@ -2129,6 +2131,29 @@ class OracleFeedHarnessTest(unittest.TestCase):
 LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
 
 
+def sandbox_repo(tmp):
+    """A throwaway harness tree for running run-cell.sh: (run-cell.sh, worktree).
+
+    run-cell.sh resolves MAINREPO from its own path, so a copy started from
+    THIS checkout writes testnet/genesis-weighted-full.json (through
+    gen-3val-genesis.sh) and target/release/torus-node here as soon as a
+    preflight lets it through. s17: a red test-first run did, with a stub
+    bench, and the stale file (61 balances, address 'oracle-feed') broke a
+    later cell's genesis. Preflight tests therefore run a copy in `tmp`."""
+    repo = os.path.join(tmp, "repo")
+    tools = os.path.join(repo, "tools", "matched-bench")
+    wsl = os.path.join(repo, "devnet", "wsl")
+    os.makedirs(tools)
+    os.makedirs(wsl)
+    shutil.copy2(RUN_CELL_SH, tools)
+    shutil.copy2(os.path.join(REPO, "devnet", "wsl", "bench-validator-keys.json"), wsl)
+    for p in (os.path.join(tools, "digest-node.sh"), os.path.join(wsl, "launch-3val.sh")):
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    return os.path.join(tools, "run-cell.sh"), repo
+
+
 def fake_target(tmp, help_text="Usage: oracle-feed --price <PRICE> --walk-bp <N>"):
     """TARGET_DIR with stub torus-node / bench-throughput binaries."""
     tgt = os.path.join(tmp, "release")
@@ -2138,6 +2163,162 @@ def fake_target(tmp, help_text="Usage: oracle-feed --price <PRICE> --walk-bp <N>
         with open(p, "w") as f:
             f.write("#!/bin/sh\necho '%s'\n" % help_text)
         os.chmod(p, 0o755)
+
+
+def _stat(path):
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except FileNotFoundError:
+        return None
+
+
+class StaleArtifactGuardTest(unittest.TestCase):
+    """run-cell.sh refuses stale artifacts before it generates a genesis:
+    an untracked testnet/genesis-weighted-full.json that gen-3val-genesis.sh
+    would reuse as-is (s17: a stub-bench test left one with 61 balances and
+    the address 'oracle-feed'), and a node / bench binary whose md5 is not
+    the one recorded for the cell (EXPECT_NODE_MD5 / EXPECT_BENCH_MD5; s17: a
+    reflink-seeded target dir kept a stale bench). Runs a sandbox copy whose
+    gen-3val-genesis.sh only records that it was called."""
+
+    def setUp(self):
+        self.real_full = _stat(WEIGHTED_FULL)
+        self.tmp = tempfile.mkdtemp(prefix="stale-guard-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        fake_target(self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>")
+        self.script, self.wt = sandbox_repo(self.tmp)
+        self.called = os.path.join(self.tmp, "generator-called")
+        gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
+        with open(gen, "w") as f:
+            f.write("#!/bin/sh\ntouch '%s'\n" % self.called)
+        os.chmod(gen, 0o755)
+        self.full = os.path.join(self.wt, "testnet", "genesis-weighted-full.json")
+        os.makedirs(os.path.dirname(self.full))
+        # pgrep finds nothing: a cargo build or bench elsewhere on the host
+        # must not end the sandbox cell before the step under test.
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "pgrep"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
+
+    def tearDown(self):
+        self.assertEqual(_stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched")
+
+    def write_full(self, rows):
+        base = [{"address": "0x%040x" % i, "available": "1.0", "note": "bench sender %d" % i}
+                for i in range(3)]
+        with open(self.full, "w") as f:
+            json.dump({"native_balances": base + rows, "accounts": []}, f)
+
+    @staticmethod
+    def bulk(n):
+        return [{"address": "0x%040x" % (60 + i), "available": "100000000.0",
+                 "note": "bulk-test %d" % (60 + i)} for i in range(n)]
+
+    def run_cell(self, **env):
+        e = {k: v for k, v in os.environ.items()
+             if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_")) and k not in ("FORCE", "SENDERS")}
+        e.update(PATH=self.bin + os.pathsep + os.environ["PATH"], TARGET_DIR=self.tmp,
+                 RESULTS_ROOT=os.path.join(self.tmp, "results"),
+                 DATA_ROOT=os.path.join(self.tmp, "data"), BENCH_ALLOW_UNDETACHED="1",
+                 SENDERS="5", **env)
+        r = subprocess.run([self.script, self.wt, "guard-x"], capture_output=True,
+                           text=True, timeout=60, env=e)
+        try:
+            with open(os.path.join(self.tmp, "results", "guard-x", "run.log")) as f:
+                log = f.read()
+        except OSError:
+            log = ""
+        return r, log
+
+    def test_stale_weighted_full_genesis_fails_before_the_generator(self):
+        # the s17 file: the stub bench's help line became one "bulk" row
+        self.write_full([{"address": "oracle-feed", "available": "100000000.0",
+                          "note": "bulk-test Usage:"}])
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("FATAL", log)
+        self.assertIn(self.full, log)
+        self.assertIn("oracle-feed", log)
+        self.assertFalse(os.path.exists(self.called), "generator must not run")
+
+    def test_weighted_full_with_too_few_bulk_senders_fails(self):
+        self.write_full(self.bulk(3))
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("3 bulk-test rows < SENDERS=5", log)
+        self.assertFalse(os.path.exists(self.called))
+
+    def test_unparsable_weighted_full_fails(self):
+        with open(self.full, "w") as f:
+            f.write("{truncated")
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(self.full, log)
+        self.assertFalse(os.path.exists(self.called))
+
+    def test_good_or_absent_weighted_full_reaches_the_generator(self):
+        for rows in (self.bulk(5), None):
+            with self.subTest(rows=rows is not None):
+                if rows is None:
+                    os.remove(self.full)
+                else:
+                    self.write_full(rows)
+                r, log = self.run_cell(OVERWRITE="1")
+                self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr)
+                self.assertNotIn("genesis-weighted-full.json is stale", log)
+                os.remove(self.called)
+
+    def test_force_regenerates_instead_of_failing(self):
+        self.write_full([{"address": "oracle-feed", "note": "bulk-test Usage:"}])
+        r, _ = self.run_cell(FORCE="1")
+        self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr)
+
+    def md5(self, name):
+        with open(os.path.join(self.tmp, "release", name), "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+
+    def test_expected_md5_mismatch_refuses_and_prints_both(self):
+        self.write_full(self.bulk(5))
+        for var, name in (("EXPECT_BENCH_MD5", "bench-throughput"), ("EXPECT_NODE_MD5", "torus-node")):
+            with self.subTest(var=var):
+                r, log = self.run_cell(OVERWRITE="1", **{var: "0123abcd"})
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                fatal = [l for l in log.splitlines() if "FATAL" in l]
+                self.assertEqual(len(fatal), 1, log)
+                self.assertIn(name, fatal[0])
+                self.assertIn(self.md5(name), fatal[0])
+                self.assertIn("0123abcd", fatal[0])
+                self.assertFalse(os.path.exists(self.called), "must stop before the genesis")
+
+    def test_expected_md5_match_proceeds(self):
+        self.write_full(self.bulk(5))
+        r, log = self.run_cell(EXPECT_BENCH_MD5=self.md5("bench-throughput")[:8],
+                               EXPECT_NODE_MD5=self.md5("torus-node"))
+        self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr + log)
+        self.assertIn("bench-throughput md5=%s" % self.md5("bench-throughput"), log)
+        self.assertIn("expected %s" % self.md5("bench-throughput")[:8], log)
+
+    def test_bad_expected_md5_fails_preflight(self):
+        for v in ("xyz", "0123abc", "0123ABCD"):
+            with self.subTest(v=v):
+                r, _ = self.run_cell(EXPECT_BENCH_MD5=v)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("EXPECT_BENCH_MD5 must be", r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
+    def test_expected_md5_knobs_documented_and_allowlisted(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        head = src[: src.index("set -uo pipefail")]
+        self.assertIn("#   EXPECT_NODE_MD5", head)
+        self.assertIn("EXPECT_BENCH_MD5", head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            allow = f.read()
+        for k in ("EXPECT_NODE_MD5", "EXPECT_BENCH_MD5"):
+            self.assertIn('"%s",' % k, allow)
 
 
 class LiqStressHarnessTest(unittest.TestCase):
@@ -2286,7 +2467,7 @@ class LiqStressHarnessTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="liq-pre-")
         try:
             fake_target(tmp)  # an oracle-feed without --shock-bp (an older binary)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, rc, msg in (
                 (dict(LIQ_THIN="x"), 2, "LIQ_THIN must be"),
                 (dict(LIQ_THIN="-1"), 2, "LIQ_THIN must be"),
@@ -2330,7 +2511,7 @@ class LiqStressHarnessTest(unittest.TestCase):
                 ),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "liq-pre-x"],
+                    [script, wt, "liq-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -2338,6 +2519,7 @@ class LiqStressHarnessTest(unittest.TestCase):
                         os.environ,
                         TARGET_DIR=tmp,
                         RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1",
                         **env,
                     ),
@@ -2460,7 +2642,9 @@ class LiqStressHarnessTest(unittest.TestCase):
             " torus_liquidations_stage1_total torus_liquidations_backstop_total"
             " torus_liquidations_adl_total torus_liquidation_scanned_total"
             " torus_liquidation_acted_total torus_liquidation_pending"
-            " torus_liquidation_deferred",
+            " torus_liquidation_deferred"
+            " torus_exec_post_engine_tail_seconds_count"
+            " torus_liquidation_adl_queue torus_liquidation_adl_queue_deficit",
             r.stderr,
         )
 
