@@ -1,8 +1,9 @@
 # ADL per-block budget (P0 before testnet)
 
-**Status (s18, ozarchy):** design + options, **no production code yet**. Owner decisions needed
-on Q1-Q6 below before tests / code. Branch `perf/adl-budget` off main aae6b9b (profiling test
-b60bdff only). Liquidation design: `docs/plans/liquidation.md`.
+**Status (s18, ozarchy):** design **decided** (owner 18c s96: Q1-Q6 = the recommendations in
+section 7, unchanged). Implementation plan: `docs/plans/adl-budget-impl.md`. Branch
+`perf/adl-budget` off main aae6b9b (profiling test b60bdff). It changes who gets ADL'd, so it
+needs a fresh genesis (fine pre-testnet). Liquidation design: `docs/plans/liquidation.md`.
 
 ## 1. Problem (measured)
 
@@ -189,13 +190,17 @@ Unit / integration (torus-core `liquidation_tests.rs`, bridge `liquidation_l1_te
 * Harness fixes from s17 first (liq_stress.py `_count` KeyError, stale test genesis in the
   worktree, reflink-seeded stale binaries).
 
-## 7. Decisions needed
+Added by the owner (s96): the S=750 **drain time in blocks** until the queue is fully empty, and
+**conservation of total balances** (Σ available + order margin + UPnL at the mark over all
+accounts incl. the vault) across the whole drain.
 
-| # | Question | Recommendation |
+## 7. Decisions (owner 18c s96: all = the recommendation)
+
+| # | Question | Decision |
 |---|---|---|
 | Q1 | Candidate source | C1 now (no format change); C2 if a 100k-account sweep shows ranking dominates; C3 only as a later consensus item |
 | Q2 | Ranking refresh | once per (block, market), candidates re-read at close |
 | Q3 | Budget unit | candidates examined + closes; W from the measurement (≤ ~20 ms ADL per block) |
 | Q4 | Queue order | FIFO `0x07 ‖ height ‖ trader` in `CF_NATIVE_LIQUIDATION` |
-| Q5 | Queued account actions | frozen, deposits allowed |
+| Q5 | Queued account actions | frozen: every signed action rejected with `liquidating`; deposits / incoming transfers credited |
 | Q6 | Deficit in between | unrealized on the account, realized at flat (D9); add the two gauges; no move-to-vault |
