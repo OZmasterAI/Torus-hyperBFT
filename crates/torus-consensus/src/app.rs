@@ -17143,13 +17143,15 @@ mod crash_recovery_tests {
         torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &oracle_key(seed))
     }
 
-    /// Option B: T (71) funded 101, maker M (73) rich.
+    /// Option B: T (71) funded 101.0505 (101 + B-blind's δ top-up of its
+    /// market-2 sell, s92, taken ahead of its market-1 pool), maker M (73)
+    /// rich.
     fn option_b_fixture() -> (ChainConfig, StateDb) {
         use torus_core::position::{NativeBalance, PositionManager};
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
-        for (seed, amt) in [(71u8, 101), (73, 1_000_000)] {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+        for (seed, amt) in [(71u8, px(101) + FixedPoint::from_raw(px(505).raw() / 10_000)), (73, px(1_000_000))] {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: amt, order_margin: FixedPoint::ZERO })
                 .unwrap();
         }
         (config, db)
@@ -17181,7 +17183,7 @@ mod crash_recovery_tests {
         assert_eq!(root_s, root_r);
     }
 
-    /// Same-batch bid bound: T (71) 1,000, B (74) 1,000, M (73) rich.
+    /// Same-batch bid (B-blind, s92): T (71) 1,000, B (74) 1,000, M (73) rich.
     fn same_batch_bid_fixture() -> (ChainConfig, StateDb) {
         let (config, db) = option_b_fixture();
         let pm = torus_core::position::PositionManager::new(db.clone());
@@ -17195,11 +17197,12 @@ mod crash_recovery_tests {
         (config, db)
     }
 
-    /// Same-batch bid bound (s87): block 1: M bids 10 @101 in markets 1 and 2
-    /// and asks 10 @110 in market 2; block 5: B bids 10 @105 in market 2,
-    /// then T sells 10 @100 in both — the market-2 sell (non-pool) is topped
-    /// up for B's earlier bid and fills 10 @105. Serial, pipelined (parked)
-    /// and crash replay give identical state.
+    /// Same-batch bid under B-blind (s92; was the s87 bound): block 1: M bids
+    /// 10 @101 in markets 1 and 2 and asks 10 @110 in market 2; block 5: B
+    /// bids 10 @105 in market 2, then T sells 10 @100 in both — the market-2
+    /// sell (non-pool) is topped up to reserve(101.101, 10) only (B's bid is
+    /// not read), fills 2 @105 and is cut. Serial, pipelined (parked) and
+    /// crash replay give identical state.
     #[test]
     fn same_batch_bid_serial_pipelined_and_replay_are_identical() {
         let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10), (2, false, 110, 10)])]];
@@ -17214,12 +17217,12 @@ mod crash_recovery_tests {
         let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, same_batch_bid_fixture);
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, same_batch_bid_fixture);
         let pm = torus_core::position::PositionManager::new(db_s.clone());
-        for m in [1u64, 2] {
+        for (m, size) in [(1u64, 10), (2, 2)] {
             let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
-            assert_eq!((p.is_long, p.size), (false, px(10)), "market {m}: T filled");
+            assert_eq!((p.is_long, p.size), (false, px(size)), "market {m}: T filled");
         }
         let b = pm.get_position(&oracle_addr(74), 2).unwrap().expect("B long");
-        assert_eq!((b.is_long, b.size), (true, px(10)), "B's same-batch bid filled");
+        assert_eq!((b.is_long, b.size), (true, px(2)), "B's same-batch bid filled 2 (beyond δ)");
         assert_dumps_equal(&serial, &piped, "same-batch bid: serial vs pipelined (parked)");
         assert_dumps_equal(&serial, &replay, "same-batch bid: serial vs crash replay");
         assert_eq!(root_s, root_p);

@@ -52,7 +52,7 @@ S92_COUNTERS = [
     for fill in ("zero", "partial")
     for bucket in ("t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p")
 ] + ["torus_maker_margin_cancels", "torus_reduce_only_cuts"]
-S92_TOP_UPS = []
+S92_TOP_UPS = [f"torus_sell_top_ups_{k}" for k in ("full", "partial", "none")]
 S92_COUNTERS += S92_TOP_UPS
 
 

@@ -1490,57 +1490,74 @@ fn option_b_shapes_identical() {
     }
 }
 
-/// Same-batch bid bound (s87): non-pool sells topped up for a funded bid
-/// placed earlier in the batch (bench shape), capped at the start best ask
-/// (a bid that eats the asks and rests), not counted for griefer bids
-/// (unfunded, IOC, off-tick) or bids that never rest (s89: a crossing GTC
-/// bid eaten whole, a PostOnly bid crossing the start ask or an earlier
-/// same-batch ask) and all-or-nothing for a tight sender — byte-identical
-/// for threads {off, 2, 4, 8}.
+/// B-blind (s92): non-pool sells topped up to reserve(B0 x (1 + 10 bps))
+/// from the free margin left after the Phase-2 fold — the old s87 / s89
+/// same-batch bound shapes (funded bid beyond δ, a bid that lifts the start
+/// ask and rests, griefer bids: unfunded, IOC, off-tick, a GTC bid eaten
+/// whole, PostOnly bids crossing the start ask or an earlier same-batch ask,
+/// tight senders) re-pinned, plus a sell filling at a same-batch bid within
+/// δ, a partial top-up (flat order) and senders with no free margin left —
+/// byte-identical, counters included, for threads {off, 2, 4, 8}.
 #[test]
-fn same_batch_bid_shapes_identical() {
+fn b_blind_shapes_identical() {
     let mk = addr(51);
     let (t1, t2, t3, t4, b, x, y) = (addr(52), addr(53), addr(54), addr(55), addr(56), addr(57), addr(58));
     let (t5, t6, t7, z) = (addr(59), addr(60), addr(61), addr(62));
+    let (t8, t9, t10) = (addr(63), addr(64), addr(65));
     let post_only = |m: MarketId, p: i64| order(m, true, fp(p), fp(1), TimeInForce::PostOnly);
     let mut b1: Vec<_> = [1u64, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15].iter().map(|&m| place(mk, gtc(m, true, 101, 10))).collect();
     b1.extend(
         [(2u64, 110), (4, 102), (5, 130), (7, 130), (11, 102), (13, 102), (15, 110)].map(|(m, p)| place(mk, gtc(m, false, p, 10))),
     );
+    b1.extend((16u64..=20).map(|m| place(mk, gtc(m, true, 1_000, 1))));
     let b2 = vec![
         place(t1, gtc(1, false, 200, 1)), // t1's pool (rests)
         place(b, gtc(2, true, 105, 10)),  // funded, rests below the ask 110
         place(t2, gtc(3, false, 100, 10)), // t2's pool: fills @101 from the pool
         place(y, gtc(5, true, 120, 10)),  // unfunded: rejected
-        place(t1, gtc(2, false, 100, 10)), // topped up: fills 10 @105
-        place(x, gtc(4, true, 104, 1)),   // eaten by the ask 102, never rests: not counted (s89)
+        place(t1, gtc(2, false, 100, 10)), // beyond δ: fills 2 @105, cut
+        place(x, gtc(4, true, 104, 1)),   // eaten by the ask 102, never rests
         place(x, order(5, true, fp(120), fp(10), TimeInForce::IOC)),
         place(x, order(5, true, FixedPoint::from_raw(fp(120).raw() + 1), fp(10), TimeInForce::GTC)), // off-tick
-        place(t2, gtc(4, false, 100, 10)), // cap: top-up 0.5, both t2 sells fill
+        place(t2, gtc(4, false, 100, 10)), // δ top-up: both t2 sells fill
         place(t3, gtc(6, false, 200, 1)), // t3's pool (rests)
-        place(t3, gtc(5, false, 100, 10)), // griefers: no top-up, fills @101
+        place(t3, gtc(5, false, 100, 10)), // griefers: fills @101
         place(t4, gtc(8, false, 200, 1)), // t4's pool (rests)
         place(b, gtc(7, true, 105, 10)),
-        place(t4, gtc(7, false, 100, 10)), // tight: no top-up, fills 2 @105
+        place(t4, gtc(7, false, 100, 10)), // beyond δ: fills 2 @105
         place(t4, gtc(9, false, 100, 10)),
-        place(t5, gtc(10, false, 100, 10)), // t5's pool: fills @101 from the pool
-        place(x, post_only(11, 104)),        // (P) crosses the ask 102: book reject, not counted
-        place(t5, gtc(11, false, 100, 10)), // no top-up: both t5 sells fill 10
+        place(t5, gtc(10, false, 100, 10)), // t5's pool: the δ top-up in m11 comes first, fills 8
+        place(x, post_only(11, 104)),        // crosses the ask 102: book reject
+        place(t5, gtc(11, false, 100, 10)), // fills 10
         place(t6, gtc(12, false, 100, 10)), // t6's pool
-        place(x, gtc(13, true, 104, 11)),   // eats the ask 102 and rests 1 @104: counted at 102
-        place(t6, gtc(13, false, 100, 10)), // topped up 0.5: fills 1 @104 + 9 @101
+        place(x, gtc(13, true, 104, 11)),   // eats the ask 102 and rests 1 @104
+        place(t6, gtc(13, false, 100, 10)), // not topped up for it: fills 1 @104 + 7 @101
         place(t7, gtc(14, false, 100, 10)), // t7's pool
         place(z, gtc(15, false, 104, 1)),   // same-batch ask, rests below the start ask 110
-        place(x, post_only(15, 104)),        // crosses z's ask: book reject, not counted
-        place(t7, gtc(15, false, 100, 10)), // no top-up: both t7 sells fill 10
+        place(x, post_only(15, 104)),        // crosses z's ask: book reject
+        place(t7, gtc(15, false, 100, 10)), // both t7 sells fill 10
+        place(t8, gtc(6, false, 200, 1)),   // t8's pool (rests)
+        place(b, gtc(16, true, 1_001, 1)),
+        place(b, gtc(17, true, 1_001, 1)),
+        place(b, gtc(18, true, 1_001, 1)),
+        place(t8, gtc(16, false, 999, 1)), // within δ: topped up to 50.05, fills @1,001
+        place(t9, gtc(6, false, 200, 1)),  // t9's pool (rests)
+        place(t9, gtc(17, false, 999, 1)), // full top-up (0.05): fills @1,001
+        place(t9, gtc(18, false, 999, 1)), // partial (0.03): cut at 1,001
+        place(t10, gtc(6, false, 200, 1)), // t10's pool (rests)
+        place(t10, gtc(19, false, 999, 1)), // no free margin left: no top-up, fills @1,000
+        place(t10, gtc(20, false, 999, 1)),
     ];
-    let run = |threads: usize| -> (RunFingerprint, Vec<FixedPoint>) {
+    let run = |threads: usize| -> (RunFingerprint, Vec<FixedPoint>, Vec<u64>) {
         let (_dir, db) = open_test_db();
         let mut ctx = make_ctx(db);
+        let metrics = Arc::new(Metrics::new());
+        ctx.metrics = Some(metrics.clone());
         fund_native(&ctx, &mk, fp(1_000_000));
-        for (t, a) in [(t1, 1_000), (t2, 102), (t3, 1_000), (t4, 112), (b, 1_000), (x, 1_000), (t5, 101), (t6, 102), (t7, 102), (z, 1_000)] {
+        for (t, a) in [(t1, 1_000), (t2, 102), (t3, 1_000), (t4, 112), (b, 1_000), (x, 1_000), (t5, 101), (t6, 102), (t7, 102), (z, 1_000), (t8, 1_000), (t10, 110)] {
             fund_native(&ctx, &t, fp(a));
         }
+        fund_native(&ctx, &t9, FixedPoint::from_raw(fp(110).raw() + fp(8).raw() / 100));
         let mut results = Vec::new();
         let mut total_gas = Vec::new();
         for batch in [b1.clone(), b2.clone()] {
@@ -1570,7 +1587,15 @@ fn same_batch_bid_shapes_identical() {
             pos(&x, 13),
             pos(&t7, 14),
             pos(&t7, 15),
+            pos(&t8, 16),
+            pos(&t9, 17),
+            pos(&t9, 18),
+            pos(&t10, 19),
+            pos(&t10, 20),
         ];
+        let mut counters =
+            vec![metrics.sell_top_ups_full.get(), metrics.sell_top_ups_partial.get(), metrics.sell_top_ups_none.get()];
+        counters.extend(metrics.sell_margin_cuts.iter().flatten().flatten().map(|c| c.get()));
         ctx.save_order_books();
         let fp_run = RunFingerprint {
             cf_dump: state_dump(&ctx),
@@ -1580,33 +1605,42 @@ fn same_batch_bid_shapes_identical() {
             next_global_order_id: ctx.next_global_order_id,
             state_root: compute_native_state_root(&ctx.state).expect("state root"),
         };
-        (fp_run, positions)
+        (fp_run, positions, counters)
     };
-    let (golden, positions) = run(0);
+    let (golden, positions, counters) = run(0);
+    let (one, zero) = (fp(1), FixedPoint::ZERO);
     assert_eq!(
         positions,
         vec![
+            -fp(2),
+            fp(2),
             -fp(10),
-            fp(10),
             -fp(10),
-            -fp(10),
-            fp(1),
+            one,
             -fp(10),
             -fp(2),
             -fp(10),
+            -fp(8),
             -fp(10),
             -fp(10),
-            -fp(10),
-            -fp(10),
+            -fp(8),
             fp(11),
             -fp(10),
             -fp(10),
+            -one,
+            -one,
+            zero,
+            -one,
+            -one,
         ],
-        "same-batch bound shapes"
+        "B-blind shapes"
     );
+    assert_eq!(counters[..3], [10, 1, 2], "top-ups [full, partial, none]");
     for threads in [2usize, 4, 8] {
         for _ in 0..5 {
-            assert_eq!(golden, run(threads).0, "threads={threads}");
+            let (got, _, c) = run(threads);
+            assert_eq!(golden, got, "threads={threads}");
+            assert_eq!(counters, c, "threads={threads}: counters");
         }
     }
 }

@@ -75,7 +75,7 @@ fn path_of_stack(stack: &Backtrace) -> &'static str {
     const MARKERS: &[(&str, &str)] = &[
         ("prepare_one", "margin"),
         ("phase2_", "margin"),
-        ("same_batch_bid_top_ups", "margin"),
+        ("sell_top_ups", "margin"),
         ("d2_pool_takers", "margin"),
         ("match_parallel", "match"),
         ("reduce_only_positions_for", "match"),

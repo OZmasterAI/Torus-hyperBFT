@@ -233,6 +233,22 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         .zip(subs0)
         .map(|(n, a)| Some((hist_sum(&metrics, n)? - a?) * 1e3))
         .collect();
+    // s92 (B-blind): whole run, warm-up included.
+    let cuts = |np: usize, partial: usize| metrics.sell_margin_cuts[np][partial].iter().map(|c| c.get()).collect::<Vec<_>>();
+    println!(
+        "UB s92 seed={seed} (whole run) sell_cuts by tick bucket {:?}: pool zero {:?} partial {:?} non_pool zero {:?} partial {:?} \
+         top_ups full={} partial={} none={} maker_margin_cancels={} reduce_only_cuts={}",
+        torus_telemetry::MARGIN_CUT_TICK_BUCKETS,
+        cuts(0, 0),
+        cuts(0, 1),
+        cuts(1, 0),
+        cuts(1, 1),
+        metrics.sell_top_ups_full.get(),
+        metrics.sell_top_ups_partial.get(),
+        metrics.sell_top_ups_none.get(),
+        metrics.maker_margin_cancels.get(),
+        metrics.reduce_only_cuts.get(),
+    );
     (samples, rc_measured, placed_measured, resting as u64, r_build, subs)
 }
 

@@ -302,11 +302,16 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             .map(|by_fill| by_fill.iter().map(|b| b.iter().map(|c| c.get()).sum()).collect())
             .collect();
         println!(
-            "s92 threads={threads:?}: sell_cuts pool(zero, partial)={:?} non_pool(zero, partial)={:?} maker_margin_cancels={} reduce_only_cuts={}",
+            "s92 threads={threads:?}: sell_cuts pool(zero, partial)={:?} non_pool(zero, partial)={:?} maker_margin_cancels={} reduce_only_cuts={} top_ups(full, partial, none)=({}, {}, {}) non_pool zero by bucket={:?} partial by bucket={:?}",
             cuts[0],
             cuts[1],
             metrics.maker_margin_cancels.get(),
             metrics.reduce_only_cuts.get(),
+            metrics.sell_top_ups_full.get(),
+            metrics.sell_top_ups_partial.get(),
+            metrics.sell_top_ups_none.get(),
+            metrics.sell_margin_cuts[1][0].iter().map(|c| c.get()).collect::<Vec<_>>(),
+            metrics.sell_margin_cuts[1][1].iter().map(|c| c.get()).collect::<Vec<_>>(),
         );
     }
     digests
@@ -511,20 +516,29 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// rounding allowance) and again at the same-batch bid bound (s87: a
 /// non-pool sell topped up for an earlier funded bid of the batch) and at
 /// s89 (only a bid that will rest counts). Fixes 1-3 were proven against
-/// the c93c579 digests.
+/// the c93c579 digests. Re-pinned at B-blind (s92, owner decision: a
+/// non-pool sell is topped up to reserve(B0 x (1 + 10 bps)) from the free
+/// margin left after Phase 2, partially, never from other traders' bids;
+/// replaces the s89 same-batch bound). Serial and engine (4) equal; vs s89:
+/// fills 1,069 -> 1,075, accepted 1,702 -> 1,707, rejected_cancelled 179 ->
+/// 180, non-pool sell cuts (zero, partial) (35, 14) -> (40, 7), pool cuts
+/// (8, 0) unchanged; top-ups (full, partial, none) = (393, 0, 2). The marks
+/// here walk up to ±900 per block (3% of the mid), so same-batch bids sit
+/// far above the start bid B0: the s89 bound followed them, B-blind covers
+/// B0 + 30 ticks only.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0x97a019f723fb8016a94c49312d448c7c8fa6d2e45748dcb4649138e0725700f2",
-    "0x97c1282cfdb652cfcfdbcf1f1155799cbb011e46d5daf7b151ba5ce83e9e6f8f",
-    "0x06450e4e4e1c31b5729d78dbac7f9ea2f7d3161d15279458ad23801794da79b6",
-    "0xa5aab2785754a1e668f4eaa79fcf9ac3d565a455f24d4d45914ab31752933507",
-    "0x4996a489bb3207f83fa0a127c1873050d3f22930e6ab1a4ef0c06922912c2f39",
-    "0x2f5418ceb2e9eca4385956d9e6efcd3be4c381d7d97d683c3a3425ebb20c2d3d",
-    "0x48cf96c5b583acec83956b7f61229c8910bb92c98810614a6322228c62b78319",
-    "0x7824fbf515d4783bf927a467247860ac159435ff2851f8242382c2f375219d58",
-    "0xc08ef3af59ecf2a543b2aa6b0dd03699f8c45380ac958e51b493a26bad5d7d81",
-    "0xc6a1af67cef5e0de8f5cf4abcb9845283be4ebf8873ba764df35391dd30b54d8",
-    "0x3364950b3ec91c2603d8cb459f1eb373cca74868062407a60673a67597774e93",
+    "0x2284087928a8c8753efa5355fb90d3993a781ccd6dc93642fea91528732cbdad",
+    "0xbd5bd04f2e1e9b445ec102b461fbf506a92a2054b1301013d42f11af2adff0f8",
+    "0x26775ae3d5baec11446832b8dbcecdf1f2ca3286ab23c6a12d824c029c28b6c9",
+    "0x366884dbde98bcf0308d6248644d0ac91ebf211e42a99c15c4c5c673f932744f",
+    "0x04b7be2cb2d2c80957563a8fc0855b4f3212a6ea96f5088537988324a8f9a11a",
+    "0x5ba4d2fdaa7c9f95e1182c11fdc08391ee44e0b9e0dc485b72ca5b0cc54d9bed",
+    "0xba8206944edc83ec4f0d4aa8d6d906905bcd462df719282dfd497fd8145c4b5e",
+    "0x079961f4d69af475d3724614f78c3c05d3002c2d5a76dbad6deb91a519f50086",
+    "0x580ac36cac8cf8295e1f711152502335c55b0d59187ecf7b951f5dd5806027e6",
+    "0x1151116c5cc5f7a22af8f0299d36f89864d0ba505a3676ada8696c5c116a0599",
+    "0x1456c3b4d0de478bcefd4bed519c5288d9946861e7c37914e99e327e9187f923",
 ];
 /// Scenario B on c93c579.
 const GOLDEN_B: [&str; 18] = [

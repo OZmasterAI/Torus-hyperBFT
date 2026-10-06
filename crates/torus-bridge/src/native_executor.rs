@@ -357,88 +357,6 @@ use trader_positions::TraderPositions;
 #[path = "balance_cache_tests.rs"]
 mod balance_cache_tests;
 
-/// PF1 (item 6): resting ask depth of one book for `same_batch_bid_top_ups`.
-/// `upto(price)` = saturating sum of `remaining_qty` over every resting ask
-/// priced <= `price`. Levels are summed lazily, once, by the first query that
-/// reaches them, in the same order as a per-order walk (levels ascending, queue
-/// order), so each prefix is that walk's accumulator after its level: equal bit
-/// for bit. A query costs a binary search, not a walk over every resting ask.
-/// Item 6 cut 2: [`Self::reaches`] stops summing once the depth reaches what
-/// the query needs; the level it stopped in stays open and a later query
-/// resumes it.
-struct AskDepth<'a, I: Iterator<Item = (&'a FixedPoint, &'a VecDeque<torus_core::order_book::Order>)>> {
-    levels: std::iter::Peekable<I>,
-    /// (level price, depth through that level), ascending: levels summed whole.
-    through: Vec<(FixedPoint, FixedPoint)>,
-    /// The level being summed: its price, its asks not yet added and the
-    /// depth so far (every lower level included).
-    open: Option<(FixedPoint, std::collections::vec_deque::Iter<'a, torus_core::order_book::Order>, FixedPoint)>,
-}
-
-impl<'a, I: Iterator<Item = (&'a FixedPoint, &'a VecDeque<torus_core::order_book::Order>)>> AskDepth<'a, I> {
-    fn new(levels: I) -> Self {
-        Self { levels: levels.peekable(), through: Vec::new(), open: None }
-    }
-
-    /// The depth through `price` (the tests' whole-sum query).
-    #[cfg(test)]
-    fn upto(&mut self, price: FixedPoint) -> FixedPoint {
-        self.sum(price, None)
-    }
-
-    /// Whether the depth through `price` is at least `need`. Resting asks
-    /// have a positive `remaining_qty`, so the partial sums only grow: the
-    /// first one at `need` decides, and below `need` the depth is summed
-    /// whole (the same accumulator as [`Self::upto`]).
-    fn reaches(&mut self, price: FixedPoint, need: FixedPoint) -> bool {
-        self.sum(price, Some(need)) >= need
-    }
-
-    /// The depth through `price`, or (with `need`) a partial sum through
-    /// `price` that is already `>= need`.
-    fn sum(&mut self, price: FixedPoint, need: Option<FixedPoint>) -> FixedPoint {
-        loop {
-            if let Some((level, asks, acc)) = &mut self.open {
-                if *level > price {
-                    break;
-                }
-                if need.is_some_and(|n| *acc >= n) {
-                    return *acc;
-                }
-                for a in asks.by_ref() {
-                    debug_assert!(a.remaining_qty > FixedPoint::ZERO, "a resting ask has quantity left");
-                    *acc = FixedPoint::from_raw(acc.raw().saturating_add(a.remaining_qty.raw()));
-                    if need.is_some_and(|n| *acc >= n) {
-                        return *acc;
-                    }
-                }
-                self.through.push((*level, *acc));
-                self.open = None;
-            }
-            match self.levels.next_if(|(p, _)| **p <= price) {
-                Some((&level, asks)) => {
-                    let acc = self.through.last().map_or(FixedPoint::ZERO, |t| t.1);
-                    if need.is_some_and(|n| acc >= n) {
-                        // The lower levels already reach it.
-                        self.open = Some((level, asks.iter(), acc));
-                        return acc;
-                    }
-                    self.open = Some((level, asks.iter(), acc));
-                }
-                None => break,
-            }
-        }
-        match self.through.partition_point(|(p, _)| *p <= price) {
-            0 => FixedPoint::ZERO,
-            n => self.through[n - 1].1,
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "same_batch_depth_tests.rs"]
-mod same_batch_depth_tests;
-
 #[cfg(test)]
 #[path = "load_books_parallel_tests.rs"]
 mod load_books_parallel_tests;
@@ -446,6 +364,11 @@ mod load_books_parallel_tests;
 // ============================================================================
 // C3 — deterministic parallel Phase-4 settlement: plumbing types
 // ============================================================================
+
+/// B-blind (s92, owner): a non-pool sell is topped up to cover bids up to
+/// its market's start-of-Phase-2 best bid plus this many basis points
+/// ([`NativeExecutor::sell_top_ups`]): `reserve(B0 x (1 + 10 bps), qty)`.
+const SELL_TOP_UP_BPS: i128 = 10;
 
 /// C2/C3: one Phase-2-prepared PlaceOrder flowing through matching (Phase 3)
 /// and settlement (Phase 4). `params` borrows the caller's committed action
@@ -466,43 +389,16 @@ struct PreparedOrder<'a> {
     /// reduce-only order). Phase 3 polices and values from it instead of
     /// reading the position again (the backend is frozen in between).
     pre_pos: Option<(FixedPoint, FixedPoint)>,
-    /// Item 6 M1: what `same_batch_bid_top_ups` reads, copied while Phase 2
-    /// has the params hot.
-    top_up: TopUpShape,
+    /// Option B (s87): a [`NativeExecutor::takes_bid_floor`] sell whose
+    /// sender's D2 pool market is another market — exactly `prepare_one`'s
+    /// bid-floor condition (the pool is fixed by the sender's first accepted
+    /// checked order, so it is known when the order is prepared). B-blind
+    /// (s92) tops these up ([`NativeExecutor::sell_top_ups`]).
+    top_up_candidate: bool,
     /// s92 (observability only): the price `margin_reserved` was taken at
     /// (Phase 2's reservation price, raised to a granted top-up's price); the
     /// sell-cut counters bucket a cut by its hit price minus this.
     res_price: FixedPoint,
-}
-
-/// Item 6 M1: an order's fields `same_batch_bid_top_ups` reads (its params
-/// are cold by then), set from the params in Phase 2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TopUpShape {
-    price: FixedPoint,
-    quantity: FixedPoint,
-    is_buy: bool,
-    /// [`NativeExecutor::can_rest_shape`].
-    can_rest: bool,
-    post_only: bool,
-    /// Option B (s87): a [`NativeExecutor::takes_bid_floor`] sell whose
-    /// sender's D2 pool market is another market — exactly `prepare_one`'s
-    /// bid-floor condition (the pool is fixed by the sender's first accepted
-    /// checked order, so it is known when the order is prepared).
-    candidate: bool,
-}
-
-impl TopUpShape {
-    fn of(params: &PlaceOrderParams, candidate: bool) -> Self {
-        Self {
-            price: params.price,
-            quantity: params.quantity,
-            is_buy: params.is_buy,
-            can_rest: NativeExecutor::can_rest_shape(params),
-            post_only: params.time_in_force == TimeInForce::PostOnly,
-            candidate,
-        }
-    }
 }
 
 /// C3: everything a settle worker precomputes for ONE prepared order —
@@ -715,7 +611,7 @@ struct PrepPass {
     checked_pos_net: Option<FixedPoint>,
     /// Item 6 M1: [`PreparedOrder::pre_pos`].
     pre_pos: Option<(FixedPoint, FixedPoint)>,
-    /// Item 6 M1: [`TopUpShape::candidate`].
+    /// [`PreparedOrder::top_up_candidate`].
     top_up_candidate: bool,
     /// s92: [`PreparedOrder::res_price`].
     res_price: FixedPoint,
@@ -3791,9 +3687,9 @@ pub struct ExecPhaseAccum {
     /// Parallel settles that fell back to the sequential loop (worker panic
     /// or a position-side fill failure).
     pub settle_fallbacks: u64,
-    /// Same-batch bid bound (s87): non-pool sells topped up after Phase 2
-    /// ([`NativeExecutor::same_batch_bid_top_ups`]). A count, not a span.
-    pub same_batch_top_ups: u64,
+    /// B-blind (s92): non-pool sells topped up (in full or partly) after
+    /// Phase 2 ([`NativeExecutor::sell_top_ups`]). A count, not a span.
+    pub sell_top_ups: u64,
 }
 
 impl ExecPhaseAccum {
@@ -6154,18 +6050,23 @@ impl NativeExecutor {
         // Review fix 1 (s517): unchecked orders' committed-but-undebited
         // need comes off their sender's pool (exact integer sum, the fold's
         // `excess_unchecked`).
-        // Same-batch bid bound (s87): top-ups come off what is left for the
-        // pools, so they run before the pools are read.
-        ctx.phase_accum.same_batch_top_ups += Self::same_batch_bid_top_ups(
+        // B-blind (s92): top-ups come off what is left for the pools, so
+        // they run before the pools are read.
+        let [full, partial, none] = Self::sell_top_ups(
             &ctx.positions,
-            &ctx.order_books,
-            &ctx.margin_configs,
+            &markets,
             &basis,
             &pool_takers,
             &excess_by_sender,
             &mut market_batches,
             &mut bal_cache,
         );
+        ctx.phase_accum.sell_top_ups += full + partial;
+        if let Some(ref m) = ctx.metrics {
+            m.sell_top_ups_full.inc_by(full);
+            m.sell_top_ups_partial.inc_by(partial);
+            m.sell_top_ups_none.inc_by(none);
+        }
         let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::with_capacity(pool_takers.len());
         for (&sender, &(market_id, pos_net)) in &pool_takers {
             let available = bal_cache
@@ -6339,7 +6240,7 @@ impl NativeExecutor {
             // s92 counters (aligned with the market's prepared orders).
             if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
                 for (r, p) in mbr.results.iter().zip(prepared) {
-                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up.candidate);
+                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up_candidate);
                 }
             }
         }
@@ -6703,7 +6604,7 @@ impl NativeExecutor {
                         margin_reserved: pass.required,
                         checked_pos_net: pass.checked_pos_net,
                         pre_pos: pass.pre_pos,
-                        top_up: TopUpShape::of(params, pass.top_up_candidate),
+                        top_up_candidate: pass.top_up_candidate,
                         res_price: pass.res_price,
                     });
             }
@@ -8084,167 +7985,90 @@ impl NativeExecutor {
             .collect()
     }
 
-    /// Same-batch bid bound (s87, owner decision 1). After Phase 2, a
-    /// non-pool sell (Option B: [`takes_bid_floor`], its sender's D2 pool
-    /// is another market) is topped up to `reserve(bound, qty)`. `bound` is
-    /// the highest bid placed EARLIER in this batch in its market that will
-    /// REST: accepted in Phase 2 (so funded) and [`can_rest_shape`] (a GTC /
-    /// PostOnly `Limit`, not reduce-only, price > 0 on the tick, quantity >=
-    /// lot), and, s89 review (option b), not consumed by the ask side — the
-    /// start-of-batch book asks plus the asks placed earlier in this batch
-    /// that are accepted and [`can_rest_shape`] (over-estimated opposing
-    /// depth: fewer bids count, never a bid that does not rest). A PostOnly
-    /// bid counts only below the lowest of those asks (else the book rejects
-    /// it, at no cost to its sender); a GTC bid only if its quantity exceeds
-    /// the ask quantity at prices <= its price (else the asks eat it whole).
-    /// A counted bid is capped at the market's best ask at the start of the
-    /// batch; with no ask nothing counts. Review 4 F-1: unfunded, IOC / FOK /
-    /// market, stop, off-tick, dust and reduce-only bids never count, and no
-    /// bid counts above the start best ask.
+    /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid
+    /// bound). After the Phase-2 fold each non-pool sell that takes a bid
+    /// floor ([`PreparedOrder::top_up_candidate`]: [`takes_bid_floor`], its
+    /// sender's D2 pool is another market) is topped up towards
+    /// `reserve(B0 x (1 + δ), qty)`: `B0` its market's best bid at the start
+    /// of Phase 2 (none: no top-up), δ = [`SELL_TOP_UP_BPS`]
+    /// ([`sell_top_up_price`]), `qty` its Phase-2 reservation quantity. It
+    /// reads no other trader's order of the batch, so no one can raise a
+    /// reservation, or drain a sender's pool through one: griefing-free.
     ///
-    /// Soft: never a placement gate, so every Phase-2 outcome is unchanged
-    /// and no bid can get an honest order rejected. The top-up comes only
-    /// from the sender's free margin left after its WHOLE Phase-2 fold
-    /// (`available + pos_net − excess`, what Phase 3 would give its D2
-    /// pool), all or nothing, in flat order. It joins `margin_reserved` (the
-    /// taker-only budget) and is released after matching like the rest
-    /// (release = reserved − hold at the limit, A5 exact). Deterministic: a
-    /// pure function of the Phase-2 outcomes (serial == sharded) and the
-    /// start-of-batch books.
+    /// Soft and partial: the extra comes from the sender's free margin LEFT
+    /// after its whole Phase-2 fold (`available + pos_net − excess`, what
+    /// Phase 3 would give its D2 pool), `min(extra, free left)`, candidates in
+    /// flat batch order (a sender's earlier candidates first). Never a
+    /// placement gate: every Phase-2 outcome is unchanged. It joins
+    /// `margin_reserved` (the taker-only budget); the hold, resting row and
+    /// every release stay at the limit (release = reserved − hold, A5
+    /// exact). Deterministic: a pure function of the Phase-2 outcomes
+    /// (serial == sharded) and the start-of-batch books.
     ///
     /// s89 review finding 2 (by design): a top-up is taken AHEAD of the
-    /// sender's own pool-market orders, even those earlier in flat order —
-    /// it comes off the free margin after the whole fold, before Phase 3
-    /// hands the rest to the pool, so a top-up can leave the sender's
-    /// earlier pool-market taker less to match with.
+    /// sender's own pool-market orders, even those earlier in flat order — it
+    /// comes off the free margin after the whole fold, before Phase 3 hands
+    /// the rest to the pool.
     ///
-    /// Item 6 M1: reads each order's [`TopUpShape`] (copied in Phase 2)
-    /// instead of its cold params, and scans a market only up to its last
-    /// candidate sell (a bound only matters for a candidate after it; a
-    /// market without one adds nothing). `pools` = the D2 pools of Phase 2's
-    /// fold (sender → (market, pos_net)).
-    ///
-    /// Returns the number of sells topped up (instrumentation only).
+    /// A full top-up moves the order's `res_price` (counters only) to the
+    /// top-up price; a partial one keeps Phase 2's. Returns how many
+    /// candidates that needed a top-up got it `[in full, partly, not at all]`.
     #[allow(clippy::too_many_arguments)]
-    fn same_batch_bid_top_ups<T: StateBackend>(
+    fn sell_top_ups<T: StateBackend>(
         positions: &PositionManager<T>,
-        books: &HashMap<MarketId, OrderBook>,
-        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         pools: &HashMap<Address, (MarketId, FixedPoint)>,
         excess_by_sender: &HashMap<Address, FixedPoint>,
         market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
         bal_cache: &mut BalanceCache,
-    ) -> u64 {
-        let sat_add = |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
-        let mut topped_up = 0;
-        // (flat index, market, position in its batch, bound)
-        let mut wanted: Vec<(usize, MarketId, usize, FixedPoint)> = Vec::new();
-        for (&market_id, batch) in market_batches.iter() {
-            let Some(last) = batch.iter().rposition(|p| p.top_up.candidate) else { continue };
-            let Some(book) = books.get(&market_id) else { continue };
-            let Some(ask) = book.best_ask() else { continue };
-            let mut bound: Option<FixedPoint> = None;
-            // PF1: resting ask depth, each level summed once per batch.
-            let mut book_depth = AskDepth::new(book.ask_queues());
-            // s89: asks placed earlier in this batch that can rest, by price.
-            // Item 6 cut 2: filled lazily — an ask goes to `new_asks` and its
-            // price into `lowest`; the map takes them only when a bid needs
-            // the depth (quantities are positive, so the saturating sum does
-            // not depend on the order they are added in).
-            let mut batch_asks: std::collections::BTreeMap<FixedPoint, FixedPoint> = std::collections::BTreeMap::new();
-            let mut new_asks: Vec<(FixedPoint, FixedPoint)> = Vec::new();
-            let mut lowest: Option<FixedPoint> = None;
-            for (k, p) in batch[..=last].iter().enumerate() {
-                let o = &p.top_up;
-                debug_assert_eq!(*o, TopUpShape::of(p.params, o.candidate), "Phase 2 copied the params");
-                debug_assert!(
-                    !o.can_rest || Self::book_shape_violation(p.params, (book.tick_size, book.lot_size)).is_none(),
-                    "Phase 2 rejects dust and off-tick orders"
-                );
-                debug_assert!(
-                    !o.candidate || pools.get(&p.sender).is_some_and(|(m, _)| *m != market_id),
-                    "a candidate's pool is another market"
-                );
-                if !o.is_buy {
-                    if o.can_rest {
-                        new_asks.push((o.price, o.quantity));
-                        lowest = Some(lowest.map_or(o.price, |l| l.min(o.price)));
-                    }
-                    if let Some(b) = bound {
-                        if o.candidate {
-                            wanted.push((p.index, market_id, k, b));
-                        }
-                    }
-                    continue;
-                }
-                if !o.can_rest {
-                    continue;
-                }
-                // Item 6 cut 2: a bid that cannot raise the bound (bids do
-                // not change the batch asks, and `AskDepth` is a memo) needs
-                // no rest test.
-                if Some(o.price.min(ask)) <= bound {
-                    continue;
-                }
-                let lowest_ask = lowest.map_or(ask, |a| a.min(ask));
-                let rests = if o.price < lowest_ask {
-                    true
-                } else if o.post_only {
-                    false
-                } else {
-                    for (price, qty) in new_asks.drain(..) {
-                        let q = batch_asks.entry(price).or_insert(FixedPoint::ZERO);
-                        *q = sat_add(*q, qty);
-                    }
-                    // Item 6 cut 2: `quantity > book + batch` (saturating;
-                    // every quantity is positive, so the sums only grow): the
-                    // batch asks first, then the book only until it reaches
-                    // the rest of the quantity.
-                    let batch_depth = batch_asks.range(..=o.price).fold(FixedPoint::ZERO, |acc, (_, q)| sat_add(acc, *q));
-                    batch_depth < o.quantity && !book_depth.reaches(o.price, o.quantity - batch_depth)
-                };
-                if rests {
-                    bound = bound.max(Some(o.price.min(ask)));
-                }
-            }
-        }
+    ) -> [u64; 3] {
+        let mut counts = [0u64; 3];
+        // (flat index, market, position in its batch), in flat order.
+        let mut wanted: Vec<(usize, MarketId, usize)> = market_batches
+            .iter()
+            .flat_map(|(&m, batch)| {
+                batch.iter().enumerate().filter(|(_, p)| p.top_up_candidate).map(move |(k, p)| (p.index, m, k))
+            })
+            .collect();
         wanted.sort_unstable_by_key(|w| w.0);
-        for (i, market_id, k, bound) in wanted {
+        for (i, market_id, k) in wanted {
+            let Some(market) = markets.get(&market_id) else { continue };
+            let Some(price) = market.bid_floor.and_then(Self::sell_top_up_price) else { continue };
             let Some(p) = market_batches.get_mut(&market_id).and_then(|b| b.get_mut(k)) else { continue };
-            let res_qty = basis.get(&i).map_or(p.top_up.quantity, |b| b.1);
-            let Ok(need) = Self::try_reserve_for_qty_cfg(margin_configs.get(&market_id), bound, res_qty) else {
-                continue;
-            };
-            let extra = need - p.margin_reserved;
+            let res_qty = basis.get(&i).map_or(p.params.quantity, |b| b.1);
+            let Ok(target) = Self::try_reserve_for_qty_cfg(market.cfg, price, res_qty) else { continue };
+            let extra = target - p.margin_reserved;
             if extra <= FixedPoint::ZERO {
                 continue;
             }
             let Ok(mut bal) = bal_cache.load(positions, &p.sender) else { continue };
             let pos_net = pools.get(&p.sender).map_or(FixedPoint::ZERO, |v| v.1);
             let excess = excess_by_sender.get(&p.sender).copied().unwrap_or(FixedPoint::ZERO);
-            if bal.available + pos_net - excess < extra {
+            let grant = extra.min(bal.available + pos_net - excess);
+            if grant <= FixedPoint::ZERO {
+                counts[2] += 1;
                 continue;
             }
-            bal.available -= extra;
-            bal.order_margin += extra;
+            bal.available -= grant;
+            bal.order_margin += grant;
             bal_cache.set(&p.sender, bal);
-            p.margin_reserved += extra;
-            p.res_price = bound;
-            topped_up += 1;
+            p.margin_reserved += grant;
+            if grant == extra {
+                p.res_price = price;
+                counts[0] += 1;
+            } else {
+                counts[1] += 1;
+            }
         }
-        topped_up
+        counts
     }
 
-    /// Same-batch bid bound (s87): `o`'s shape can rest — a GTC / PostOnly
-    /// `Limit`, not reduce-only, price > 0 (on the tick with quantity >= lot:
-    /// Phase 2 rejected the rest, fix A). Whether it does also depends on
-    /// the opposing side (s89).
-    fn can_rest_shape(o: &PlaceOrderParams) -> bool {
-        matches!(o.order_type, OrderType::Limit)
-            && matches!(o.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly)
-            && !o.reduce_only
-            && o.price > FixedPoint::ZERO
+    /// B-blind (s92): the top-up price `B0 x (1 + SELL_TOP_UP_BPS / 10,000)`
+    /// in exact integer math on the raw value, rounded down; `None` on
+    /// overflow (no top-up).
+    fn sell_top_up_price(b0: FixedPoint) -> Option<FixedPoint> {
+        b0.raw().checked_mul(10_000 + SELL_TOP_UP_BPS).map(|r| FixedPoint::from_raw(r / 10_000))
     }
 
     /// F1 (s517, D2): each sender's pool taker — its FIRST checked taker of
@@ -10917,7 +10741,7 @@ mod option_b_fold_pool_tests {
                 // M1 cut 2: the candidate flag is the old top-up condition.
                 let old = NativeExecutor::takes_bid_floor(p.params)
                     && want.get(&p.sender).is_some_and(|(m, _)| *m != p.params.market_id);
-                assert_eq!(p.top_up, TopUpShape::of(p.params, old), "round {round}: order {}", p.index);
+                assert_eq!(p.top_up_candidate, old, "round {round}: order {}", p.index);
                 candidates += usize::from(old);
                 // M1 cut 8: pre_pos = `position_px` (every order with an
                 // account check; checked takers always).
@@ -10963,7 +10787,7 @@ mod option_b_fold_pool_tests {
                 let mut v: Vec<_> = b
                     .values()
                     .flatten()
-                    .map(|p| (p.index, p.order_id, p.margin_reserved, p.checked_pos_net, p.pre_pos, p.top_up, p.res_price))
+                    .map(|p| (p.index, p.order_id, p.margin_reserved, p.checked_pos_net, p.pre_pos, p.top_up_candidate, p.res_price))
                     .collect();
                 v.sort_unstable_by_key(|x| x.0);
                 v

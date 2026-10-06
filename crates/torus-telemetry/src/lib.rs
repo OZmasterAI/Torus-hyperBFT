@@ -103,6 +103,13 @@ pub struct Metrics {
     /// s92: reduce-only cuts (a resting reduce-only order cut at match time
     /// or shrunk / cancelled by the post-fill sweep), one per cut.
     pub reduce_only_cuts: Counter,
+    /// s92 B-blind: non-pool sells topped up to `reserve(B0 x (1 + 10 bps))`
+    /// in full / partly (the sender's free margin left after the Phase-2
+    /// fold ran out) / not at all (none left). Sells that needed no top-up
+    /// are not counted.
+    pub sell_top_ups_full: Counter,
+    pub sell_top_ups_partial: Counter,
+    pub sell_top_ups_none: Counter,
 
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
@@ -1005,6 +1012,15 @@ impl Metrics {
             "Reduce-only order cuts at match time or by the post-fill sweep",
             reduce_only_cuts.clone(),
         );
+
+        let [sell_top_ups_full, sell_top_ups_partial, sell_top_ups_none]: [Counter; 3] = Default::default();
+        for (name, c) in ["full", "partial", "none"].iter().zip([&sell_top_ups_full, &sell_top_ups_partial, &sell_top_ups_none]) {
+            registry.register(
+                format!("torus_sell_top_ups_{name}"),
+                "B-blind non-pool sell top-ups to reserve(B0 x (1 + 10 bps)): granted in full / partly / not at all (s92)",
+                c.clone(),
+            );
+        }
 
         let orders_cancelled_partial_fill = Counter::default();
         registry.register(
@@ -2217,6 +2233,9 @@ impl Metrics {
             sell_margin_cuts,
             maker_margin_cancels,
             reduce_only_cuts,
+            sell_top_ups_full,
+            sell_top_ups_partial,
+            sell_top_ups_none,
             pruner_blocks_removed,
             rpc_requests_total,
             rpc_request_duration_seconds,
@@ -2590,6 +2609,11 @@ mod tests {
         }
         assert!(text.contains("torus_maker_margin_cancels_total 2\n"), "{text}");
         assert!(text.contains("torus_reduce_only_cuts_total 3\n"), "{text}");
+        m.sell_top_ups_partial.inc();
+        let text = m.encode();
+        for (name, want) in [("full", 0), ("partial", 1), ("none", 0)] {
+            assert!(text.contains(&format!("torus_sell_top_ups_{name}_total {want}\n")), "{name}:\n{text}");
+        }
         let buckets: Vec<usize> = [-5, 0, 1, 2, 3, 5, 6, 10, 11, 30, 31, 1_000].map(margin_cut_tick_bucket).to_vec();
         assert_eq!(buckets, vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
     }

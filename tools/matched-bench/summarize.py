@@ -78,12 +78,14 @@ def worst60_blk(rs):
 # s92 (B-blind observability): the executor's margin-cut counters — sell
 # takers cut by match-time margin by budget (pool / non-pool), fills before
 # the cut (zero / partial) and hit minus reservation price in ticks; maker
-# margin cancels; reduce-only cuts. Reported as deltas over the bench window
+# margin cancels; reduce-only cuts; B-blind top-ups granted in full / partly /
+# not at all. Reported as deltas over the bench window
 # (0 on an older binary).
 S92_COUNTERS = ["sell_cuts_%s_%s_%s_total" % (pool, fill, b)
                 for pool in ("pool", "nonpool") for fill in ("zero", "partial")
                 for b in ("t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p")] + [
-    "maker_margin_cancels_total", "reduce_only_cuts_total"]
+    "maker_margin_cancels_total", "reduce_only_cuts_total",
+    "sell_top_ups_full_total", "sell_top_ups_partial_total", "sell_top_ups_none_total"]
 
 funnel = {}
 for node, rs in rows.items():
