@@ -239,6 +239,13 @@ position rows), so RPC / precompile readers see it unchanged. Exempt from stage 
 and backstop; ADL when its AV < 0. Deposits later: share rows under `0x05` plus deposit /
 withdraw actions; nothing in this design depends on the vault having no depositors.
 
+Monitoring (s17, `fix/liq-oracle-metrics`): a vault with negative cash and no positions is
+never acted on (ADL needs positions), so its deficit is exported. Gauge
+`torus_liquidator_vault_deficit` (negative cash in tokens, 0 otherwise; set after each
+liquidation pass, 0 after a restart until the next pass) and RPC `torus_getLiquidatorVault`
+(`address`, signed `availableBalance`, `deficit`, `openPositions`; reads committed state, see
+`docs/api/liquidator-vault.md`).
+
 ### Margin configs (F2, F8)
 
 `NativeExecContext` constructors load `margin_configs` from `CF_NATIVE_MARKETS` rows
