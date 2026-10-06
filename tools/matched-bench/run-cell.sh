@@ -37,6 +37,18 @@
 #                the cancel fraction (without it, overloaded small-cap cells
 #                admit almost only cancel-alls and placement starves). Unset
 #                (default) = flag omitted.
+#   MAX_IN_FLIGHT=N  bench --max-in-flight N: each sender keeps at most N
+#                signed actions in flight (released when seen committed, refused
+#                by the RPC, or past nonce + 70 s); the shared block-body tail
+#                reads val2 (--in-flight-watch-rpc), never val0, which takes all
+#                ingress under BENCH_RPCS=0. With OPEN_ORDER_BUDGET the estimate
+#                counts orders since the last COMMITTED cancel-all. Also
+#                exports TORUS_RPC_MAX_RESPONSE_MB=64 to the nodes: loaded
+#                torus_getBlockBody replies pass jsonrpsee's 10 MiB default
+#                (~68 KB per 400-order batch) and the tail would miss them
+#                (EXTRA_ENV can override; summary cell.rpc_max_response_mb).
+#                Positive integer; unset (default) = flags omitted. Recorded as
+#                cell.max_in_flight in summary.json.
 #   ANTISPAM=1   turn the node anti-spam limits ON (devnet/wsl/env.sh has them
 #                OFF): TORUS_INGRESS_MIN_COLLATERAL=1, TORUS_ADDR_RATE_LIMIT=1,
 #                TORUS_RPC_IP_WEIGHT_PER_MIN=1200. Exported before EXTRA_ENV,
@@ -227,6 +239,7 @@ CROSS_FRACTION=${CROSS_FRACTION:-0.5}
 CANCEL_FRACTION=${CANCEL_FRACTION:-0.05}
 OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}
 RETRY_BUSY=${RETRY_BUSY:-}
+MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-}
 ANTISPAM=${ANTISPAM:-}
 SPAM_CANCEL_KEYS=${SPAM_CANCEL_KEYS:-}
 SPAM_CANCEL_RATE=${SPAM_CANCEL_RATE:-}
@@ -409,6 +422,7 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [[ "$BAND" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BAND must be a positive integer" >&2; exit 2; }
 [ -z "$OPEN_ORDER_BUDGET" ] || [[ "$OPEN_ORDER_BUDGET" =~ ^[0-9]+$ ]] || { echo "FATAL: OPEN_ORDER_BUDGET must be an integer" >&2; exit 2; }
 [ -z "$RETRY_BUSY" ] || [ "$RETRY_BUSY" = 1 ] || { echo "FATAL: RETRY_BUSY must be 1 or unset" >&2; exit 2; }
+[ -z "$MAX_IN_FLIGHT" ] || [[ "$MAX_IN_FLIGHT" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: MAX_IN_FLIGHT must be a positive integer" >&2; exit 2; }
 [ -z "$ANTISPAM" ] || [ "$ANTISPAM" = 1 ] || { echo "FATAL: ANTISPAM must be 1 or unset" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_KEYS" ] || [[ "$SPAM_CANCEL_KEYS" =~ ^[0-9]+$ ]] || { echo "FATAL: SPAM_CANCEL_KEYS must be an integer" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_RATE" ] || [[ "$SPAM_CANCEL_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FATAL: SPAM_CANCEL_RATE must be a number (actions/s)" >&2; exit 2; }
@@ -525,7 +539,7 @@ trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -567,6 +581,10 @@ for kv in "${RECORD_ENV[@]}"; do export "$kv"; done
 for kv in "${BLOCK_CAP_ENV[@]}"; do export "$kv"; done
 if [ "$ANTISPAM" = 1 ]; then
     export TORUS_INGRESS_MIN_COLLATERAL=1 TORUS_ADDR_RATE_LIMIT=1 TORUS_RPC_IP_WEIGHT_PER_MIN=1200
+fi
+if [ -n "$MAX_IN_FLIGHT" ]; then
+    export TORUS_RPC_MAX_RESPONSE_MB=64
+    log "MAX_IN_FLIGHT=$MAX_IN_FLIGHT: TORUS_RPC_MAX_RESPONSE_MB=64 on the nodes (loaded torus_getBlockBody replies pass the 10 MiB default)"
 fi
 for kv in $EXTRA_ENV; do export "$kv"; done
 # HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged
@@ -770,6 +788,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 [ -n "$OPEN_ORDER_BUDGET" ] && BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")
 [ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
+[ -n "$MAX_IN_FLIGHT" ] && BENCH_CMD+=(--max-in-flight "$MAX_IN_FLIGHT" --in-flight-watch-rpc "${RPCS[2]}")
 [ -n "$SPAM_CANCEL_KEYS" ] && BENCH_CMD+=(--spam-cancel-keys "$SPAM_CANCEL_KEYS")
 [ -n "$SPAM_CANCEL_RATE" ] && BENCH_CMD+=(--spam-cancel-rate "$SPAM_CANCEL_RATE")
 [ "$SPAM_CANCEL_FUNDED" = 1 ] && BENCH_CMD+=(--spam-cancel-funded)
@@ -1076,6 +1095,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     --evicted "$EVICTED" --bench-submitted "${BENCH_SUBMITTED:-0}" \
     --block-cap "${BLOCK_CAP:-}" --dissem "$DISSEM" \
     --drain-timeout "$DRAIN_TIMEOUT" --markets-per-sender "${MPS:-}" \
+    --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}

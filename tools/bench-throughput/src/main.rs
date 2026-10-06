@@ -15,6 +15,7 @@ use torus_types::{
     TimeInForce,
 };
 
+mod in_flight;
 mod oracle_feed;
 
 const HARDHAT_KEYS: [&str; 20] = [
@@ -184,6 +185,24 @@ enum Command {
         /// cells stay reproducible.
         #[arg(long, default_value_t = false)]
         retry_busy: bool,
+        /// econ: per-sender in-flight cap in signed native actions (one
+        /// PlaceOrderBatch / PlaceOrder / CancelAllOrders each; a fire of
+        /// --submit-batch S actions takes S slots, so in flight can reach
+        /// N-1+S). A sender fires only
+        /// while fewer than N of its actions are in flight and otherwise waits
+        /// for a slot; a slot frees when the action is seen committed (one
+        /// shared block-body tail), refused by the RPC (a transport error is
+        /// not a refusal), or past its nonce +
+        /// 60 s window + 10 s. With --open-order-budget the estimate becomes
+        /// the orders placed since the last COMMITTED cancel-all, in-flight
+        /// places included. 0 (default) = off, so prior cells stay
+        /// reproducible.
+        #[arg(long, default_value_t = 0)]
+        max_in_flight: usize,
+        /// --max-in-flight: the node whose block bodies the shared tail reads.
+        /// Default: the last --rpc-urls entry.
+        #[arg(long, default_value = "")]
+        in_flight_watch_rpc: String,
         /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
         /// so a 1-lot order's margin lands exactly on target.
         #[arg(long, default_value_t = 0)]
@@ -747,6 +766,59 @@ fn econ_action_budgeted(
     action
 }
 
+/// The open-order state one econ fire plans against.
+enum FireBudget<'a> {
+    /// No --max-in-flight: today's estimate (orders since the sender's last
+    /// SENT cancel-all), updated in place by `econ_action_budgeted`.
+    Legacy(&'a mut u64),
+    /// --max-in-flight: `estimate` = orders placed since the last COMMITTED
+    /// cancel-all incl. in-flight places (`in_flight::Tracker::estimate`);
+    /// `cancel_pending` = one of the sender's cancel-alls is in flight.
+    Capped { estimate: u64, cancel_pending: bool },
+}
+
+/// One fire's actions (up to `submit_batch`). `Legacy` is exactly today's
+/// loop of `econ_action_budgeted`. `Capped` sends a cancel-all when the
+/// estimate plus the next batch would cross the budget; random cancel-alls
+/// and in-flight ones do not lower the estimate (it drops only on commit), so
+/// once a cancel-all is pending the fire stops instead of adding a second.
+fn econ_fire(
+    rng: &mut impl Rng,
+    sender_idx: usize,
+    plan: MarketPlan,
+    batch_size: usize,
+    shape: &EconShape,
+    submit_batch: usize,
+    budget: &mut FireBudget,
+) -> Vec<NativeAction> {
+    let (mut estimate, mut cancel_pending) = match budget {
+        FireBudget::Legacy(open) => {
+            return (0..submit_batch)
+                .map(|_| econ_action_budgeted(rng, sender_idx, plan, batch_size, shape, open))
+                .collect();
+        }
+        FireBudget::Capped { estimate, cancel_pending } => (*estimate, *cancel_pending),
+    };
+    let limit = shape.open_order_budget;
+    let mut out = Vec::with_capacity(submit_batch);
+    for _ in 0..submit_batch {
+        if limit > 0 && estimate + batch_size.max(1) as u64 > limit {
+            if cancel_pending {
+                break;
+            }
+            out.push(NativeAction::CancelAllOrders { market_id: None });
+            cancel_pending = true;
+            continue;
+        }
+        let action = econ_action(rng, sender_idx, plan, batch_size, shape);
+        let (places, cancel) = in_flight::action_shape(&action);
+        estimate += places;
+        cancel_pending |= cancel;
+        out.push(action);
+    }
+    out
+}
+
 #[cfg(test)]
 mod econ_shape_tests {
     use super::*;
@@ -988,6 +1060,108 @@ mod econ_shape_tests {
                 );
             }
         }
+    }
+
+    fn ser(actions: &[NativeAction]) -> Vec<Vec<u8>> {
+        actions.iter().map(|a| bincode::serialize(a).unwrap()).collect()
+    }
+
+    // --max-in-flight off: the sender loop plans each fire with
+    // FireBudget::Legacy, which must be exactly today's loop of
+    // econ_action_budgeted (same rng stream, same open-order estimate), with
+    // and without a budget, for one and several actions per fire. Signing,
+    // encoding and the wire are unchanged code, so the payloads match too
+    // (nonces are wall-clock ms either way).
+    #[test]
+    fn legacy_fire_is_todays_action_stream() {
+        for (budget, batch, submit) in [(0u64, 400usize, 1usize), (900, 400, 1), (900, 32, 3), (0, 1, 2)] {
+            let mut shape = EconShape::new(1500, 0, 5, 0.5, 0.05);
+            shape.open_order_budget = budget;
+            let mut a = StdRng::seed_from_u64(41);
+            let mut b = a.clone();
+            let (mut open_a, mut open_b) = (0u64, 0u64);
+            for _ in 0..300 {
+                let fire = econ_fire(
+                    &mut a,
+                    5,
+                    MarketPlan::uniform(10),
+                    batch,
+                    &shape,
+                    submit,
+                    &mut FireBudget::Legacy(&mut open_a),
+                );
+                let want: Vec<NativeAction> = (0..submit)
+                    .map(|_| {
+                        econ_action_budgeted(&mut b, 5, MarketPlan::uniform(10), batch, &shape, &mut open_b)
+                    })
+                    .collect();
+                assert_eq!(ser(&fire), ser(&want));
+                assert_eq!(open_a, open_b);
+            }
+        }
+    }
+
+    // Capped with budget 0 draws the plain econ_action stream.
+    #[test]
+    fn capped_fire_without_budget_is_the_econ_stream() {
+        let shape = default_shape();
+        let mut a = StdRng::seed_from_u64(42);
+        let mut b = a.clone();
+        for _ in 0..200 {
+            let fire = econ_fire(
+                &mut a,
+                3,
+                MarketPlan::uniform(10),
+                400,
+                &shape,
+                2,
+                &mut FireBudget::Capped { estimate: 5_000, cancel_pending: true },
+            );
+            let want: Vec<NativeAction> =
+                (0..2).map(|_| econ_action(&mut b, 3, MarketPlan::uniform(10), 400, &shape)).collect();
+            assert_eq!(ser(&fire), ser(&want));
+        }
+    }
+
+    // Capped with a budget: cancel-all when estimate + batch > budget, a
+    // place otherwise; a pending cancel-all stops the fire instead of
+    // queueing a second one.
+    #[test]
+    fn capped_fire_cancels_on_the_committed_estimate() {
+        let mut shape = EconShape::new(1500, 0, 5, 0.5, 0.0);
+        shape.open_order_budget = 900;
+        let mut rng = StdRng::seed_from_u64(43);
+        let fire = |rng: &mut StdRng, estimate, cancel_pending, submit| {
+            econ_fire(
+                rng,
+                7,
+                MarketPlan::uniform(10),
+                400,
+                &shape,
+                submit,
+                &mut FireBudget::Capped { estimate, cancel_pending },
+            )
+        };
+        let kinds = |v: &[NativeAction]| -> Vec<&'static str> {
+            v.iter()
+                .map(|a| match a {
+                    NativeAction::CancelAllOrders { market_id: None } => "C",
+                    NativeAction::PlaceOrderBatch(o) if o.len() == 400 => "P",
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(kinds(&fire(&mut rng, 0, false, 1)), ["P"]);
+        assert_eq!(kinds(&fire(&mut rng, 500, false, 1)), ["P"], "500 + 400 = 900 fits");
+        assert_eq!(kinds(&fire(&mut rng, 501, false, 1)), ["C"]);
+        // An in-flight cancel-all does not reset the estimate, places still
+        // fit under it.
+        assert_eq!(kinds(&fire(&mut rng, 400, true, 1)), ["P"]);
+        assert!(fire(&mut rng, 800, true, 1).is_empty(), "wait for the pending cancel-all");
+        // Several actions per fire: the fire's own places count, one
+        // cancel-all at most.
+        assert_eq!(kinds(&fire(&mut rng, 0, false, 4)), ["P", "P", "C"]);
+        assert_eq!(kinds(&fire(&mut rng, 100, true, 4)), ["P", "P"]);
     }
 }
 
@@ -1707,6 +1881,66 @@ async fn submit_native_actions_batch(
     id: u64,
     bin: bool,
 ) -> Result<usize, String> {
+    submit_native_actions_items(client, url, payloads, id, bin)
+        .await
+        .map(|items| accepted_count(&items))
+}
+
+fn accepted_count(items: &[Option<String>]) -> usize {
+    items.iter().filter(|e| e.is_none()).count()
+}
+
+/// Per-item outcome of one `torus_submitNativeActions[Bin]` reply: `None` =
+/// admitted (the item carries a `hash`), `Some(err)` = refused (its JSON
+/// `error`). `Err` = the call failed or admitted nothing, with the same text
+/// `submit_native_actions_batch` has always returned.
+fn parse_batch_reply(resp: &serde_json::Value, sent: usize) -> Result<Vec<Option<String>>, String> {
+    if let Some(err) = resp.get("error") {
+        return Err(format!(
+            "rpc: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
+        ));
+    }
+    let items = resp["result"].as_array();
+    let outcome: Vec<Option<String>> = items
+        .map(|its| {
+            its.iter()
+                .map(|i| match i.get("hash") {
+                    Some(_) => None,
+                    None => Some(
+                        i.get("error")
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| i.to_string()),
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if outcome.iter().all(|e| e.is_some()) {
+        // Surface WHY nothing landed — a per-item error or an unexpected shape.
+        // A silent 0-accepted is exactly the misread session signing exists to avoid.
+        let reason = items
+            .and_then(|its| {
+                its.iter()
+                    .find_map(|i| i.get("error").map(|e| e.to_string()))
+            })
+            .unwrap_or_else(|| resp["result"].to_string());
+        return Err(format!("0 accepted ({sent} sent): {reason}"));
+    }
+    Ok(outcome)
+}
+
+/// `torus_submitNativeActions[Bin]` with the per-item outcome
+/// (`parse_batch_reply`).
+async fn submit_native_actions_items(
+    client: &reqwest::Client,
+    url: &str,
+    payloads: &[String],
+    id: u64,
+    bin: bool,
+) -> Result<Vec<Option<String>>, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": if bin {
@@ -1726,31 +1960,7 @@ async fn submit_native_actions_batch(
         .json()
         .await
         .map_err(|e| format!("parse: {e}"))?;
-
-    if let Some(err) = resp.get("error") {
-        return Err(format!(
-            "rpc: {}",
-            err.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown")
-        ));
-    }
-    let items = resp["result"].as_array();
-    let accepted = items
-        .map(|its| its.iter().filter(|i| i.get("hash").is_some()).count())
-        .unwrap_or(0);
-    if accepted == 0 {
-        // Surface WHY nothing landed — a per-item error or an unexpected shape.
-        // A silent 0-accepted is exactly the misread session signing exists to avoid.
-        let reason = items
-            .and_then(|its| {
-                its.iter()
-                    .find_map(|i| i.get("error").map(|e| e.to_string()))
-            })
-            .unwrap_or_else(|| resp["result"].to_string());
-        return Err(format!("0 accepted ({} sent): {reason}", payloads.len()));
-    }
-    Ok(accepted)
+    parse_batch_reply(&resp, payloads.len())
 }
 
 /// Count of submit errors surfaced so far — we print only the first few so a
@@ -1782,12 +1992,27 @@ async fn submit_once(
     req_id: u64,
     bin: bool,
 ) -> Result<usize, String> {
+    submit_items(client, url, payloads, req_id, bin)
+        .await
+        .map(|items| accepted_count(&items))
+}
+
+/// One submission of `payloads` with the per-item outcome (`None` =
+/// admitted). A lone JSON action uses the legacy single endpoint; anything
+/// else (or any bincode payload) goes through the batch endpoint.
+async fn submit_items(
+    client: &reqwest::Client,
+    url: &str,
+    payloads: &[String],
+    req_id: u64,
+    bin: bool,
+) -> Result<Vec<Option<String>>, String> {
     if payloads.len() == 1 && !bin {
         submit_native_action(client, url, &payloads[0], req_id)
             .await
-            .map(|()| 1usize)
+            .map(|()| vec![None])
     } else {
-        submit_native_actions_batch(client, url, payloads, req_id, bin).await
+        submit_native_actions_items(client, url, payloads, req_id, bin).await
     }
 }
 
@@ -1807,14 +2032,14 @@ fn is_busy_reject(err: &str) -> bool {
 
 /// Call `submit` until it is not a busy reject, sleeping `backoff` between
 /// tries; returns the last result once a retry would end after `give_up`.
-async fn submit_until_admitted<F, Fut>(
+async fn submit_until_admitted<T, F, Fut>(
     mut submit: F,
     backoff: Duration,
     give_up: Instant,
-) -> Result<usize, String>
+) -> Result<T, String>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<usize, String>>,
+    Fut: std::future::Future<Output = Result<T, String>>,
 {
     loop {
         match submit().await {
@@ -1841,6 +2066,23 @@ fn record_submit(result: Result<usize, String>, submitted: &AtomicU64) {
             }
         }
     }
+}
+
+/// Book one econ fire's outcome: slots (with --max-in-flight), the
+/// place/cancel-all mix, and the accepted count.
+fn record_econ_fire(
+    result: &Result<Vec<Option<String>>, String>,
+    keys: &[u64],
+    cancels: &[bool],
+    cap: Option<&in_flight::Cap>,
+    mix: &in_flight::MixStats,
+    submitted: &AtomicU64,
+) {
+    if let Some(c) = cap {
+        c.apply_result(keys, result);
+    }
+    mix.record(cancels, result);
+    record_submit(result.as_ref().map(|i| accepted_count(i)).map_err(Clone::clone), submitted);
 }
 
 #[cfg(test)]
@@ -1921,6 +2163,50 @@ mod busy_retry_tests {
         assert!(r.is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
         assert!((2..=6).contains(&calls.load(Ordering::Relaxed)));
+    }
+}
+
+#[cfg(test)]
+mod max_in_flight_tests {
+    use super::*;
+
+    fn flags(extra: &[&str]) -> (usize, String) {
+        let cli = Cli::try_parse_from(["bench-throughput", "consensus"].iter().chain(extra).copied())
+            .expect("parses");
+        let Command::Consensus { max_in_flight, in_flight_watch_rpc, .. } = cli.command else {
+            panic!("consensus subcommand")
+        };
+        (max_in_flight, in_flight_watch_rpc)
+    }
+
+    #[test]
+    fn max_in_flight_defaults_off_and_parses() {
+        assert_eq!(flags(&[]), (0, String::new()));
+        assert_eq!(
+            flags(&["--econ", "--max-in-flight", "1", "--in-flight-watch-rpc", "http://127.0.0.1:8647"]),
+            (1, "http://127.0.0.1:8647".to_string())
+        );
+        assert!(Cli::try_parse_from(["bench-throughput", "consensus", "--max-in-flight", "x"]).is_err());
+    }
+
+    // Partial accepts keep the per-item errors (they release slots); an
+    // all-refused or failed call keeps today's error text.
+    #[test]
+    fn batch_reply_keeps_per_item_errors() {
+        let busy = serde_json::json!("mempool: busy, admission limit reached (pre-verify), retry later");
+        let partial = serde_json::json!({"result": [{"hash": "0x1"}, {"error": busy}, {"hash": "0x2"}]});
+        assert_eq!(
+            parse_batch_reply(&partial, 3),
+            Ok(vec![None, Some(busy.to_string()), None])
+        );
+        let none = serde_json::json!({"result": [{"error": busy}]});
+        let e = parse_batch_reply(&none, 1).unwrap_err();
+        assert_eq!(e, format!("0 accepted (1 sent): {busy}"));
+        assert!(is_busy_reject(&e));
+        let rpc = serde_json::json!({"error": {"message": "boom"}});
+        assert_eq!(parse_batch_reply(&rpc, 2), Err("rpc: boom".to_string()));
+        let odd = serde_json::json!({"result": 5});
+        assert_eq!(parse_batch_reply(&odd, 2), Err("0 accepted (2 sent): 5".to_string()));
     }
 }
 
@@ -2860,6 +3146,7 @@ async fn run_consensus(
     metrics_urls_str: &str,
     sweep_bodies: bool,
     spam: Option<SpamCancel>,
+    cap_plan: Option<(usize, String)>,
 ) {
     // Locality plan: 0 = today's uniform draw over 1..=markets (default).
     let plan = MarketPlan::new(markets, markets_per_sender);
@@ -2963,6 +3250,13 @@ async fn run_consensus(
         } else {
             println!("Rate: unbounded (burst)");
         }
+    }
+    if let Some((n, url)) = &cap_plan {
+        println!(
+            "In-flight cap: {n} action(s)/sender (released on commit seen in {url} block bodies, \
+             RPC refusal, or nonce + {}s)",
+            (torus_types::eip712::NONCE_WINDOW_MS + in_flight::TIMEOUT_MARGIN_MS) / 1000
+        );
     }
     if pre_sign > 0 {
         println!(
@@ -3178,6 +3472,19 @@ async fn run_consensus(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rpc_urls = Arc::new(rpc_urls);
 
+    // --max-in-flight: the shared cap state and its one block-body tail.
+    let cap: Option<Arc<in_flight::Cap>> =
+        cap_plan.map(|(n, url)| Arc::new(in_flight::Cap::new(num_senders, n, url)));
+    let tail_handle = cap.as_ref().map(|c| {
+        tokio::spawn(in_flight::run_tail(
+            c.clone(),
+            client.clone(),
+            start_block,
+            deadline + Duration::from_secs(5),
+        ))
+    });
+    let mix = Arc::new(in_flight::MixStats::default());
+
     // Live block monitor. #34/#35: it polls ONLY cheap endpoints inside the
     // timed window — block height (for block-time stats) and, when enabled, the
     // node /metrics counters. It NEVER fetches full block bodies during the
@@ -3325,6 +3632,8 @@ async fn run_consensus(
         let submitted = submitted.clone();
         let semaphore = semaphore.clone();
         let url_count = urls.len();
+        let cap = cap.clone();
+        let mix = mix.clone();
         let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
@@ -3362,25 +3671,47 @@ async fn run_consensus(
                         }
                         next_fire = next_fire.max(now) + iv;
                     }
+                    // --max-in-flight: wait (no spin) for a free slot. A
+                    // deferred fire goes out on release and the cadence
+                    // restarts from there (no catch-up burst).
+                    let mut budget = match &cap {
+                        None => FireBudget::Legacy(&mut open_orders),
+                        Some(c) => {
+                            let Some((estimate, cancel_pending, waited)) = c
+                                .wait_ready(
+                                    sender_idx,
+                                    batch_size.max(1) as u64,
+                                    shape.open_order_budget,
+                                    deadline,
+                                )
+                                .await
+                            else {
+                                break;
+                            };
+                            if let (true, Some(iv)) = (waited, econ_pace) {
+                                next_fire = Instant::now() + iv;
+                            }
+                            FireBudget::Capped { estimate, cancel_pending }
+                        }
+                    };
+                    let actions =
+                        econ_fire(&mut rng, sender_idx, plan, batch_size, &shape, submit_batch, &mut budget);
+                    if actions.is_empty() {
+                        continue; // ready() rules this out; never spin on it
+                    }
                     // Generate inline (cheap), sign+encode on the blocking pool
                     // (the expensive ECDSA/serialize part). Nonces are wall-clock
                     // ms, strictly increasing per sender.
-                    let mut batch_actions = Vec::with_capacity(submit_batch);
-                    for _ in 0..submit_batch {
-                        let action = econ_action_budgeted(
-                            &mut rng,
-                            sender_idx,
-                            plan,
-                            batch_size,
-                            &shape,
-                            &mut open_orders,
-                        );
+                    let mut batch_actions = Vec::with_capacity(actions.len());
+                    let mut shapes = Vec::with_capacity(actions.len());
+                    for action in actions {
                         let base = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
                         let nonce = base.max(last_nonce + 1);
                         last_nonce = nonce;
+                        shapes.push((nonce, in_flight::action_shape(&action)));
                         batch_actions.push((action, nonce));
                     }
                     let sign_key = key.clone();
@@ -3390,20 +3721,31 @@ async fn run_consensus(
                             .into_iter()
                             .map(|(action, nonce)| {
                                 let s = sign_one(action, nonce, &sign_key, &sign_session, sign_mode);
+                                let id = in_flight::action_key(nonce, &s.signature);
                                 let bytes = if bin {
                                     bincode::serialize(&s).unwrap()
                                 } else {
                                     serde_json::to_vec(&s).unwrap()
                                 };
-                                format!("0x{}", hex::encode(&bytes))
+                                (format!("0x{}", hex::encode(&bytes)), id)
                             })
-                            .collect::<Vec<String>>()
+                            .collect::<Vec<(String, u64)>>()
                     })
                     .await;
-                    let payloads = match signed {
-                        Ok(p) => p,
+                    let (payloads, keys): (Vec<String>, Vec<u64>) = match signed {
+                        Ok(p) => p.into_iter().unzip(),
                         Err(_) => break, // signer panicked — stop this sender
                     };
+                    let cancels: Vec<bool> = shapes.iter().map(|(_, (_, c))| *c).collect();
+                    if let Some(c) = &cap {
+                        // Registered BEFORE the send, so a fast commit finds it.
+                        let entries: Vec<(u64, u64, u64, bool)> = keys
+                            .iter()
+                            .zip(&shapes)
+                            .map(|(k, (nonce, (places, cancel)))| (*k, *nonce, *places, *cancel))
+                            .collect();
+                        c.submit(sender_idx, &entries);
+                    }
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let url = urls[url_idx % url_count].clone();
                     url_idx += 1;
@@ -3413,27 +3755,30 @@ async fn run_consensus(
                         // once this one is admitted (or given up on), so the
                         // admitted mix keeps the generated cancel fraction.
                         // A concurrency permit is held per attempt, never
-                        // across the backoff sleep.
+                        // across the backoff sleep. The in-flight slot is held
+                        // across every BUSY retry until the final outcome.
                         drop(permit);
                         let give_up = deadline.min(Instant::now() + RETRY_BUSY_MAX_AGE);
                         let (sem, client, url, payloads) = (&semaphore, &client, &url, &payloads);
                         let result = submit_until_admitted(
                             || async move {
                                 let _permit = sem.acquire().await.unwrap();
-                                submit_once(client, url, payloads, req_id, bin).await
+                                submit_items(client, url, payloads, req_id, bin).await
                             },
                             RETRY_BUSY_BACKOFF,
                             give_up,
                         )
                         .await;
-                        record_submit(result, &submitted);
+                        record_econ_fire(&result, &keys, &cancels, cap.as_deref(), &mix, &submitted);
                         continue;
                     }
                     let client = client.clone();
                     let submitted = submitted.clone();
+                    let (cap, mix) = (cap.clone(), mix.clone());
                     tokio::spawn(async move {
                         let _permit = permit;
-                        submit_payloads(&client, &url, &payloads, req_id, bin, &submitted).await;
+                        let result = submit_items(&client, &url, &payloads, req_id, bin).await;
+                        record_econ_fire(&result, &keys, &cancels, cap.as_deref(), &mix, &submitted);
                     });
                 }
                 return;
@@ -3729,6 +4074,18 @@ async fn run_consensus(
         format_num(final_submitted),
         submit_rate,
     );
+    if econ.is_some() {
+        println!("{}", mix.report());
+    }
+    if let Some(c) = &cap {
+        if let Some(h) = tail_handle {
+            h.abort();
+        }
+        println!("{}", c.report());
+        if let Some(w) = in_flight::tail_warning(&c.tail, &c.url) {
+            println!("{w}");
+        }
+    }
     if let Some(p) = &spam {
         println!("{}", spam_report(p, &spam_stats));
     }
@@ -3954,6 +4311,8 @@ async fn main() {
             cancel_fraction,
             open_order_budget,
             retry_busy,
+            max_in_flight,
+            in_flight_watch_rpc,
             econ_mid,
             band,
             rate_total,
@@ -3992,6 +4351,13 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
+            let cap = match in_flight::cap_plan(max_in_flight, econ, &in_flight_watch_rpc, &rpc_urls) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
             let econ_shape = econ.then(|| EconShape {
                 open_order_budget,
                 retry_busy,
@@ -4016,6 +4382,7 @@ async fn main() {
                 &metrics_urls,
                 sweep_bodies,
                 spam,
+                cap,
             )
             .await
         }

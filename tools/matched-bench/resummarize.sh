@@ -17,6 +17,8 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --bench-submitted "$(j .ingest.bench_submitted_actions)" \
   --block-cap "$(j '.cell.block_cap // ""')" --dissem "$(j '.dissemination.raw // ""')" \
   --markets-per-sender "$(j '.cell.markets_per_sender // ""')" \
+  --max-in-flight "$(j '.cell.max_in_flight // ""')" \
+  --open-order-budget "$(j '.cell.open_order_budget // ""')" \
   --drain-timeout "$(j '.timing.drain_timeout_s // ""')" \
   --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
   --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \

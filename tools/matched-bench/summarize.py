@@ -22,7 +22,7 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
-          "drain-timeout", "markets-per-sender"]:
+          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -315,20 +315,31 @@ BROWS = read_buckets(os.path.join(OUT, "buckets.csv"))
 BUCKETS = bucket_deltas(BROWS, t0, td)          # exec-phase percentiles (bench+drain)
 BUCKETS_LOAD = bucket_deltas(BROWS, t0, t1)     # cadence under load
 BUCKETS_DRAIN = bucket_deltas(BROWS, t1, td)    # cadence while draining
-phase = {}
-for node, rs in rows.items():
-    if not rs:
-        continue
-    sel = [r for r in rs if t0 <= r["ts"] <= td]
+def _feed_drain():
+    """ORACLE_FEED_DRAIN=1 cell: health.py drain --feed-live writes `feed_live`."""
+    try:
+        with open(os.path.join(OUT, "drain.json")) as f:
+            return "feed_live" in json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+FEED_DRAIN = _feed_drain()
+def node_phase(node, rs, hi, buckets, window):
+    """One node's exec-phase table and bl1 chain ruler over [t_bench0, hi]
+    (per NATIVE block; percentiles from `buckets`). Cadence (load / drain /
+    incl_drain) and order age keep their own fixed windows. None when the
+    window holds no native block."""
+    sel = [r for r in rs if t0 <= r["ts"] <= hi]
     if len(sel) < 2:
-        continue
+        return None
     a, b = sel[0], sel[-1]
     nall = m(b, "exec_block_seconds_count") - m(a, "exec_block_seconds_count")   # every committed block
     nblk = m(b, "exec_engine_seconds_count") - m(a, "exec_engine_seconds_count")  # native (loaded) blocks only
     ncommit = m(b, "blocks_committed_total") - m(a, "blocks_committed_total")
     span = b["ts"] - a["ts"]
     if nblk <= 0:
-        continue
+        return None
     def dsum(k):
         return m(b, "exec_" + k + "_seconds_sum") - m(a, "exec_" + k + "_seconds_sum")
     def per_blk(k):
@@ -360,7 +371,7 @@ for node, rs in rows.items():
     cad_all = cadence(rs, t0, td, BUCKETS, node)
     p = {"cadence_window": "load [t_bench0, t_bench1]",
          "block_ms": round(tot, 2),
-         "phase_window": "bench+drain [t_bench0, t_drain]",
+         "phase_window": window,
          "phase_window_s": span,
          "phase_window_native_blocks": nblk,
          "phase_window_all_exec_blocks": nall,
@@ -458,7 +469,7 @@ for node, rs in rows.items():
         return m(b, name + "_count") - m(a, name + "_count")
 
     def pctl(metric, q):
-        v = hist_quantile(BUCKETS.get((node, metric)), q)
+        v = hist_quantile(buckets.get((node, metric)), q)
         return round(v * 1000.0, 1) if v is not None else None
 
     nchain = craw("exec_chain_seconds")
@@ -567,7 +578,36 @@ for node, rs in rows.items():
     # s77: over bench+drain, so orders submitted late in the window still
     # reach every stage.
     p["order_age_ms"] = order_age(BUCKETS, node)
-    phase[node] = p
+    return p
+
+
+# Keys of the bench+drain table kept beside a feed-drain cell's load-window one.
+BENCH_DRAIN_KEYS = ("phase_window", "phase_window_native_blocks", "block_ms", "chain_ms",
+                    "gap_to_100ms", "pipelined_ms", "handoff_wait_ms", "empty_block_ms",
+                    "fills_per_native_block", "engine_ms_per_1k_fills", "chain_ms_p50",
+                    "chain_ms_p95")
+phase = {}
+for node, rs in rows.items():
+    if not rs:
+        continue
+    if FEED_DRAIN:
+        # ORACLE_FEED_DRAIN=1: the live feed keeps adding ORACLE-ONLY native
+        # blocks through the drain (350-630 per node on the 300-market walk
+        # cells), which dilutes every per-native-block number over bench+drain
+        # (22-33k fills/blk vs 67k with the feed paused). The whole exec-phase
+        # table and chain ruler (and its identity gate) move to the LOAD window
+        # so no field mixes windows; the bench+drain ruler stays in
+        # `bench_drain`. Default mode is unchanged.
+        p = node_phase(node, rs, t1, BUCKETS_LOAD,
+                       "load [t_bench0, t_bench1] (ORACLE_FEED_DRAIN=1: the live feed's oracle-only "
+                       "drain blocks are excluded; bench+drain in `bench_drain`)")
+        pb = node_phase(node, rs, td, BUCKETS, "bench+drain [t_bench0, t_drain]")
+        if p is not None and pb is not None:
+            p["bench_drain"] = {k: pb[k] for k in BENCH_DRAIN_KEYS}
+    else:
+        p = node_phase(node, rs, td, BUCKETS, "bench+drain [t_bench0, t_drain]")
+    if p is not None:
+        phase[node] = p
 
 # ---------------------------------------------------------------- consensus (metrics-before/after)
 # Per-view consensus-thread means from the WHOLE-RUN metrics-before/after
@@ -1020,6 +1060,36 @@ def parse_dissem(raw):
         out[node] = d
     return out
 
+def parse_bench_log(path):
+    """bench.log end-of-run lines -> (submit rate actions/s, econ mix, in-flight
+    releases); each None when its line is absent (older bench, cap off)."""
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, None, None
+    m = re.search(r"Submitted \(load-gen accepted\): [0-9,]+ native actions \(([0-9.]+)/s\)", text)
+    rate = float(m.group(1)) if m else None
+    m = re.search(r"Econ mix \(load-gen accepted\): place (\d+) \(([0-9.]+)%\) \| "
+                  r"cancel-all (\d+) \(([0-9.]+)%\) \[sent: place (\d+) cancel-all (\d+)\]", text)
+    mix = None if not m else {
+        "place": int(m.group(1)), "cancel_all": int(m.group(3)),
+        "place_share": round(float(m.group(2)) / 100, 4),
+        "cancel_all_share": round(float(m.group(4)) / 100, 4),
+        "sent_place": int(m.group(5)), "sent_cancel_all": int(m.group(6))}
+    m = re.search(r"In-flight cap (\d+) action\(s\)/sender: released committed=(\d+) "
+                  r"refused=(\d+) timeout=(\d+) \| in flight at end (\d+) \| block tail (\S+): "
+                  r"fetched=(\d+) errors=(\d+) missed=(\d+)", text)
+    inflight = None if not m else {
+        "cap": int(m.group(1)), "released_committed": int(m.group(2)),
+        "released_refused": int(m.group(3)), "released_timeout": int(m.group(4)),
+        "in_flight_at_end": int(m.group(5)), "tail_url": m.group(6),
+        "tail_fetched": int(m.group(7)), "tail_errors": int(m.group(8)),
+        "tail_missed": int(m.group(9))}
+    return rate, mix, inflight
+
+
+bench_submit_rate, econ_mix, in_flight = parse_bench_log(os.path.join(OUT, "bench.log"))
 dissem = parse_dissem(A.dissem)
 if dissem:
     dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
@@ -1079,6 +1149,11 @@ summary = {
     "cell": {"markets": int(A.markets), "duration_s": int(A.dur), "rate_total": int(A.rate), "senders": int(A.senders),
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
+             "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
+             # None = unset on the nodes = jsonrpsee's 10 MiB default.
+             "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
+                                     if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),
+             "open_order_budget": int(A.open_order_budget) if A.open_order_budget else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
@@ -1126,6 +1201,9 @@ summary = {
         "crash_gate": crash.get("verdict") if crash else None,
     },
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
+               "bench_submit_rate": bench_submit_rate,
+               "econ_mix": econ_mix,
+               "in_flight": in_flight,
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],
                "note": "NONCE_WINDOW_MS=60s: backlog older than 60 s is evicted silently; submitted-processed gap = expiry"},
