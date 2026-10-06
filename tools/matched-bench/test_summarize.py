@@ -679,8 +679,89 @@ def main_end_resident_worker():
         close(p0["end_resident_wait_ms_p90"], 14.4, "wait p90")
 
 
+def add_oracle_drain(out, blocks, secs):
+    """ORACLE_FEED_DRAIN=1 shape: after the load window, the live feed keeps
+    producing ORACLE-ONLY native blocks through the drain — every per-block
+    series counts them (`secs` each), no order fills. One more sampler row per
+    node at 1000 + SPAN + 20 (the drain end)."""
+    path = os.path.join(out, "sampler.csv")
+    with open(path) as f:
+        lines = f.read().splitlines()
+    cols = lines[0].split(",")
+    extra = []
+    for line in lines[1:]:
+        row = line.split(",")
+        if row[0] != str(1000 + SPAN):
+            continue
+        row[0] = str(1000 + SPAN + 20)
+        for i, c in enumerate(cols[2:], start=2):
+            v = float(row[i])
+            if c.endswith("_count") or c in ("torus_exec_native_blocks_total",
+                                             "torus_blocks_committed_total",
+                                             "torus_block_height"):
+                v += blocks
+            elif c.endswith("_sum"):
+                v += blocks * secs
+            row[i] = "%r" % v
+        extra.append(",".join(row))
+    with open(path, "w") as f:
+        f.write("\n".join(lines + extra) + "\n")
+
+
+def run_drain(out):
+    """`run` with a 20 s drain after the load window."""
+    cmd = [sys.executable, SUMMARIZE, "--out", out, "--label", "fixture",
+           "--t-bench0", "1000", "--t-bench1", str(1000 + SPAN),
+           "--t-drain", str(1000 + SPAN + 20), "--markets", "10", "--dur", "10",
+           "--rate", "1000", "--senders", "1", "--bench-rc", "0"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode == 0, "summarize.py failed:\n%s\n%s" % (r.stdout, r.stderr)
+    with open(os.path.join(out, "summary.json")) as f:
+        return json.load(f)
+
+
+def main_feed_drain():
+    """ORACLE_FEED_DRAIN=1 (drain.json carries `feed_live`): fills per native
+    block and chain ms cover the LOAD window only — the 30 oracle-only native
+    blocks the live feed adds to the drain would otherwise dilute fills/blk
+    (15000/40 = 375 instead of 1500) and the chain mean. The bench+drain
+    values are kept beside them. Default mode (no feed_live) is unchanged."""
+    oracle_blocks, oracle_secs = 30, 0.005
+    with tempfile.TemporaryDirectory() as d:
+        write_fixture(d)
+        add_oracle_drain(d, oracle_blocks, oracle_secs)
+        p0 = run_drain(d)["phase_by_node"]["val0"]
+        # Default mode: both stay on bench+drain, exactly as before.
+        nb = BLOCKS + oracle_blocks
+        close(p0["fills_per_native_block"], 15000 / nb, "default fills/blk (bench+drain)")
+        bd_chain = (BL1_SERIAL["exec_chain_seconds"] * BLOCKS + oracle_blocks * oracle_secs) / nb * 1000
+        close(p0["chain_ms"], bd_chain, "default chain_ms (bench+drain)")
+        assert "chain_fills_window" not in p0 and "bench_drain" not in p0, sorted(p0)
+        default_keys = sorted(p0)
+
+        with open(os.path.join(d, "drain.json"), "w") as f:
+            json.dump({"drained": True, "feed_live": {"native_blocks": oracle_blocks}}, f)
+        s = run_drain(d)
+        p0 = s["phase_by_node"]["val0"]
+        close(p0["fills_per_native_block"], 1500.0, "feed-drain fills/blk (load window)")
+        close(p0["chain_ms"], 1080.0, "feed-drain chain_ms (load window)")
+        close(p0["gap_to_100ms"], 980.0, "feed-drain gap_to_100ms follows chain_ms")
+        assert p0["chain_fills_window"].startswith("load [t_bench0, t_bench1]"), p0["chain_fills_window"]
+        bd = p0["bench_drain"]
+        close(bd["fills_per_native_block"], 15000 / nb, "kept bench+drain fills/blk")
+        close(bd["chain_ms"], bd_chain, "kept bench+drain chain_ms")
+        close(bd["gap_to_100ms"], bd_chain - 100, "kept bench+drain gap")
+        h = s["headline"]
+        close(h["chain_ms"], 1080.0, "headline chain_ms")
+        close(h["fills_per_native_block"], 1500.0, "headline fills/blk")
+        # Only the two fields (+ gap), a label and the kept values change.
+        assert sorted(set(p0) - {"chain_fills_window", "bench_drain"}) == default_keys
+    print("test_summarize.py feed-drain: OK")
+
+
 if __name__ == "__main__":
     main()
     main_end_resident()
     main_end_resident_worker()
     main_s58()
+    main_feed_drain()

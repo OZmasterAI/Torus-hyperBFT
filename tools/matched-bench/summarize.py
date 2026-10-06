@@ -315,6 +315,16 @@ BROWS = read_buckets(os.path.join(OUT, "buckets.csv"))
 BUCKETS = bucket_deltas(BROWS, t0, td)          # exec-phase percentiles (bench+drain)
 BUCKETS_LOAD = bucket_deltas(BROWS, t0, t1)     # cadence under load
 BUCKETS_DRAIN = bucket_deltas(BROWS, t1, td)    # cadence while draining
+def _feed_drain():
+    """ORACLE_FEED_DRAIN=1 cell: health.py drain --feed-live writes `feed_live`."""
+    try:
+        with open(os.path.join(OUT, "drain.json")) as f:
+            return "feed_live" in json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+FEED_DRAIN = _feed_drain()
 phase = {}
 for node, rs in rows.items():
     if not rs:
@@ -567,6 +577,25 @@ for node, rs in rows.items():
     # s77: over bench+drain, so orders submitted late in the window still
     # reach every stage.
     p["order_age_ms"] = order_age(BUCKETS, node)
+    # ORACLE_FEED_DRAIN=1: the live feed keeps adding ORACLE-ONLY native blocks
+    # through the drain (350-630 per node on the 300-market walk cells), which
+    # dilutes fills per native block and the chain mean over bench+drain
+    # (22-33k fills/blk vs 67k with the feed paused). In that mode both cover
+    # the LOAD window [t_bench0, t_bench1]; the bench+drain values stay under
+    # `bench_drain`. Default mode is unchanged.
+    if FEED_DRAIN:
+        lw = [r for r in rs if t0 <= r["ts"] <= t1]
+        la, lb = (lw[0], lw[-1]) if len(lw) >= 2 else (None, None)
+        lnb = (m(lb, "exec_engine_seconds_count") - m(la, "exec_engine_seconds_count")) if la else 0
+        p["bench_drain"] = {k: p[k] for k in ("chain_ms", "fills_per_native_block", "gap_to_100ms")}
+        lchain = (round((m(lb, "exec_chain_seconds_sum") - m(la, "exec_chain_seconds_sum")) / lnb * 1000.0, 2)
+                  if bl1 and lnb > 0 else None)
+        p["chain_ms"] = lchain
+        p["gap_to_100ms"] = round(lchain - 100.0, 2) if lchain is not None else None
+        p["fills_per_native_block"] = (round((m(lb, "orders_matched_total") - m(la, "orders_matched_total")) / lnb, 1)
+                                       if lnb > 0 else None)
+        p["chain_fills_window"] = ("load [t_bench0, t_bench1] (ORACLE_FEED_DRAIN=1: the live feed's "
+                                   "oracle-only drain blocks are excluded; bench+drain in `bench_drain`)")
     phase[node] = p
 
 # ---------------------------------------------------------------- consensus (metrics-before/after)
