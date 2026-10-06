@@ -330,7 +330,7 @@ impl NativeExecutor {
             };
             // Exactly `exec_place_order` (D7: stops fired by its fills run).
             let mut queue = VecDeque::new();
-            let r = Self::place_order_inner(ctx, trader, &params, None, &mut queue);
+            let r = Self::place_order_inner(ctx, trader, &params, None, &mut queue, true);
             Self::run_triggered_stops(ctx, queue);
             if !r.success {
                 results.push(r);

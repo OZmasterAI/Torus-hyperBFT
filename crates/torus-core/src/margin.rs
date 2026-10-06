@@ -90,6 +90,63 @@ pub fn position_price(pos: &Position, mark: Option<FixedPoint>) -> FixedPoint {
     mark.unwrap_or(pos.entry_price)
 }
 
+/// s94 option 1: one fill's loss against the market's reference price (the
+/// mark), as the match-time margin checks charge it. A fill is valued at its
+/// own price by the IM checks, while the account is valued at the mark right
+/// after it; a fill worse than the mark loses `loss` = `a × q` at once (`a` =
+/// `price − mark` for a buy, `mark − price` for a sell; 0 at or better than
+/// the mark). Part of that loss is tolerated, so fills near the mark are
+/// checked exactly as before:
+///
+/// - `tol_open` = `IM(price × q_open) − MM(mark × q_open)`: the opening part's
+///   own IM (which the checks already charge) above its maintenance at the
+///   mark;
+/// - the closing part's `IM(mark × q_close) − MM(mark × q_close)`;
+/// - `charge` = `max(0, loss − both)`. `charge == 0`: the existing check and
+///   commit, unchanged. `charge > 0`: the fill is checked on `loss` (see
+///   [`crate::order_book`]) and `charge` is what it commits beyond the IM
+///   delta.
+///
+/// `closing` = the part of `q` that reduces the trader's position. Each
+/// tolerance is clamped at 0. `None` on overflow (the caller treats the fill
+/// as not fitting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkLoss {
+    pub loss: FixedPoint,
+    pub tol_open: FixedPoint,
+    pub charge: FixedPoint,
+}
+
+impl MarkLoss {
+    /// No loss (no mark, or a fill at or better than it).
+    pub const NONE: Self = Self { loss: FixedPoint::ZERO, tol_open: FixedPoint::ZERO, charge: FixedPoint::ZERO };
+}
+
+pub fn mark_loss(
+    tiers: Option<&[MarginTier]>,
+    mark: FixedPoint,
+    is_buy: bool,
+    price: FixedPoint,
+    q: FixedPoint,
+    closing: FixedPoint,
+) -> Option<MarkLoss> {
+    let a = if is_buy { price.checked_sub(mark).ok()? } else { mark.checked_sub(price).ok()? };
+    if a <= FixedPoint::ZERO || q <= FixedPoint::ZERO {
+        return Some(MarkLoss::NONE);
+    }
+    let loss = a.checked_mul(q).ok()?;
+    let closing = closing.min(q).max(FixedPoint::ZERO);
+    let opening = q - closing;
+    let tol = |n_im: FixedPoint, n_mm: FixedPoint| {
+        (order_initial_margin(tiers, n_im) - maintenance_margin(tiers, n_mm)).max(FixedPoint::ZERO)
+    };
+    let tol_open = tol(price.checked_mul(opening).ok()?, mark.checked_mul(opening).ok()?);
+    let n_close = mark.checked_mul(closing).ok()?;
+    let tol_close = tol(n_close, n_close);
+    let charge = (loss.checked_sub(tol_open).ok()?.checked_sub(tol_close).ok()?).max(FixedPoint::ZERO);
+    Some(MarkLoss { loss, tol_open, charge })
+}
+
 /// F1: IM change when one market's (position [+ resting]) notional goes from
 /// `before` to `after`, both at their own POSITION-size tier. < 0 = released.
 pub fn im_delta(tiers: Option<&[MarginTier]>, before: FixedPoint, after: FixedPoint) -> FixedPoint {
@@ -519,6 +576,47 @@ mod tests {
 
     fn fp(v: i64) -> FixedPoint {
         FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn cents(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * (FixedPoint::SCALE / 100))
+    }
+
+    /// s94 option 1: mark 100, q 10, default 20x (IM 5%, MM 2.5%). Opening
+    /// buy at p: loss 10 (p − 100), tolerance IM(10p) − MM(1,000) = p/2 −
+    /// 25: the charge starts above 102.63 (the probe's "healthy" bound: an
+    /// account funded at the IM stays >= MM). Sell at p: loss 10 (100 − p),
+    /// tolerance p/2 − 25: from below 97.62. At or better than the mark: 0.
+    /// Closing part: tolerance IM − MM of its notional at the mark (25).
+    #[test]
+    fn mark_loss_charges_only_beyond_the_fills_own_margin() {
+        let m = fp(100);
+        let q = fp(10);
+        // (is_buy, price in cents, closing, loss, tol_open, charge) in cents
+        let cases = [
+            (true, 10_000, 0, 0, 0, 0),
+            (true, 9_000, 0, 0, 0, 0),
+            (false, 11_000, 0, 0, 0, 0),
+            (true, 10_200, 0, 2_000, 2_600, 0),
+            (true, 10_262, 0, 2_620, 2_631, 0),
+            (true, 10_264, 0, 2_640, 2_632, 8),
+            (true, 10_300, 0, 3_000, 2_650, 350),
+            (true, 12_000, 0, 20_000, 3_500, 16_500),
+            (true, 20_000, 0, 100_000, 7_500, 92_500),
+            (false, 9_800, 0, 2_000, 2_400, 0),
+            (false, 9_700, 0, 3_000, 2_350, 650),
+            (false, 5_000, 0, 50_000, 0, 50_000),
+            // Closing 10 of a short (buy) at 103: tolerance 50 − 25 = 25.
+            (true, 10_300, 10, 3_000, 0, 500),
+            // Closing 4, opening 6 at 103: 30.9 − 15 + 20 − 10.
+            (true, 10_300, 4, 3_000, 1_590, 410),
+        ];
+        for (is_buy, px, closing, loss, tol_open, charge) in cases {
+            let got = mark_loss(None, m, is_buy, cents(px), q, fp(closing)).unwrap();
+            let want = MarkLoss { loss: cents(loss), tol_open: cents(tol_open), charge: cents(charge) };
+            assert_eq!(got, want, "is_buy={is_buy} price={px} closing={closing}");
+        }
+        assert_eq!(mark_loss(None, m, true, FixedPoint::MAX, q, FixedPoint::ZERO), None, "overflow");
     }
 
     #[test]

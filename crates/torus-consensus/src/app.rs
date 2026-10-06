@@ -17278,22 +17278,21 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
-    /// s94 bad-debt probe (tests only; `crates/torus-bridge/tests/
-    /// offmark_bad_debt_tests.rs` has the executor-level cases). Through
+    /// s94 bad-debt route (`crates/torus-bridge/tests/
+    /// offmark_bad_debt_tests.rs` has the executor-level cases), through
     /// committed blocks on the live dispatch path. A (seed 75) and B (76),
     /// one owner, each funded 100 = the IM of 10 at 200 (20x).
-    /// Block 1 (no mark yet): oracle 100 x 3; A's GTC bid 10 @200 rests
-    /// (reserves 100). Block 2 (mark 100): B's IOC sell 10 @200 (pre-EVM
-    /// batch) fills against it; B's TransferToSpot 100 (post-EVM batch, so
-    /// AFTER the fill, same block) succeeds (equity 1,100 covers the transfer
-    /// margin; UPnL is not cash). End of block 2: A (AV -900) is ADL'd
-    /// against B at the mark 100 (no previous mark), A's -900 goes to the
-    /// vault, B holds 1,000 cash. Block 3: B withdraws the 1,000. B moved
-    /// 1,100 to the EVM side for 200 deposited by A and B; the vault is at
-    /// -900.
-    // DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+    /// Probe (77a3b21): B's IOC sell filled A's bid @200 in block 2, A was
+    /// ADL'd at the block's end with -900 left in the vault, and B moved
+    /// 1,100 to the EVM side for 200 deposited.
+    /// Fixed (option 1, the mark charge): block 1 (no mark yet): A's GTC bid
+    /// 10 @200 rests (reserves 100). Block 2 (mark 100): B's IOC sell meets
+    /// it; A cannot pay the fill's loss against the mark (1,000 − tolerance
+    /// 75) and is margin-cancelled (its 100 released); B's IOC fills
+    /// nothing, and B's TransferToSpot 100 takes back its own deposit.
+    /// Block 3: B's 1,000 is refused. The vault stays at 0.
     #[test]
-    fn offmark_fill_e2e_counterparty_withdraws_1100_and_the_vault_takes_900() {
+    fn offmark_fill_e2e_is_refused_and_the_counterparty_gets_back_only_its_deposit() {
         use torus_core::liquidation::LIQUIDATOR_VAULT;
         use torus_core::position::{NativeBalance, PositionManager};
         let (config, db) = oracle_fixture_db();
@@ -17334,16 +17333,16 @@ mod crash_recovery_tests {
         dispatch_and_execute(&ctx, &db, &blocks[0]);
         assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
         dispatch_and_execute(&ctx, &db, &blocks[1]);
-        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: filled, then ADL'd at the block's end");
-        assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO, "B was the ADL counterparty");
-        assert_eq!(native(&a), (FixedPoint::ZERO, FixedPoint::ZERO));
-        assert_eq!(native(&b), (px(1_000), FixedPoint::ZERO), "B: 100 - 100 withdrawn + (200 - 100) x 10");
-        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "same block, after the fill");
-        assert_eq!(native(&LIQUIDATOR_VAULT).0, px(-900), "A's deficit");
+        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: A margin-cancelled, no fill");
+        assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO);
+        assert_eq!(native(&a), (px(100), FixedPoint::ZERO), "A's reservation released");
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
         dispatch_and_execute(&ctx, &db, &blocks[2]);
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
-        assert_eq!(read_evm_balance(&db, b), U256::from(px(1_100).raw() as u128), "block 3: the gain withdrawn");
-        assert_eq!(native(&LIQUIDATOR_VAULT).0, px(-900));
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "block 3: nothing more");
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(3));
     }

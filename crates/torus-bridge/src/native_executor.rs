@@ -6145,6 +6145,12 @@ impl NativeExecutor {
             // F1 (s517, D2): each checked sender's exclusive pool (0 outside
             // the market of its first checked taker) and valuation price.
             let mut am = AccountMargins::new(tiers.clone());
+            // s94 option 1: every fill's loss against the mark is charged.
+            // An unchecked taker (GTC buy, reduce-only) pays a charge from
+            // its pool here, else its snapshot — the pre-batch state, which
+            // still holds its own reservation (the book takes it off).
+            am.set_mark(reader.mark(market_id));
+            am.set_pre_batch_snapshots(true);
             for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
                 if am.get(&p.sender).is_none() {
                     // Item 6 M1: Phase 2's `position_px` (every checked
@@ -8296,7 +8302,7 @@ impl NativeExecutor {
             return NativeActionResult::rejected("place_order", (reason.failure(), msg));
         }
         let mut triggered = VecDeque::new();
-        let result = Self::place_order_inner(ctx, sender, params, None, &mut triggered);
+        let result = Self::place_order_inner(ctx, sender, params, None, &mut triggered, false);
         Self::run_triggered_stops(ctx, triggered);
         result
     }
@@ -8324,7 +8330,7 @@ impl NativeExecutor {
             )
             .unwrap_or(FixedPoint::ZERO);
             Self::release_order_margin(ctx, &stop.trader, reserved);
-            let r = Self::place_order_inner(ctx, &stop.trader, &stop.params, Some(stop.id), &mut queue);
+            let r = Self::place_order_inner(ctx, &stop.trader, &stop.params, Some(stop.id), &mut queue, false);
             if !r.success {
                 tracing::debug!(
                     stop_id = stop.id,
@@ -8339,13 +8345,16 @@ impl NativeExecutor {
 
     /// One PlaceOrder through the single-action path. `forced_id` places a
     /// triggered stop under its own id; stops fired by this order's fills are
-    /// appended to `triggered`.
+    /// appended to `triggered`. `liquidation`: a stage-1 liquidation order
+    /// (s94 option 1: its fills carry no mark charge — the liquidation step
+    /// bounds them by its slippage cap and must not be cut).
     fn place_order_inner<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         sender: &Address,
         params: &PlaceOrderParams,
         forced_id: Option<OrderId>,
         triggered: &mut VecDeque<TriggeredStop>,
+        liquidation: bool,
     ) -> NativeActionResult {
         let market_id = params.market_id;
 
@@ -8549,6 +8558,10 @@ impl NativeExecutor {
         let mut am = AccountMargins::new(Self::margin_tiers(ctx.margin_configs.get(&market_id)));
         if let (true, Some((free, px))) = (checked, account) {
             am.insert(*sender, free - order_margin_required, px);
+        }
+        // s94 option 1: every fill's loss against the mark is charged.
+        if !liquidation {
+            am.set_mark(reader.mark(market_id));
         }
         book.set_account_margins(am);
         // F1 (s517 #4): makers are checked on every fill (HL marginCanceled).

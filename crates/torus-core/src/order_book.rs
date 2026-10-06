@@ -29,6 +29,8 @@ use trader_orders::TraderOrders;
 mod matching_entry_tests;
 #[cfg(test)]
 mod account_margins_p1_tests;
+#[cfg(test)]
+mod mark_charge_tests;
 
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,
@@ -271,6 +273,17 @@ impl TakerMarginLimit {
     /// `<= budget`. Beyond the closing part the need is non-decreasing
     /// (checked takers fill at prices >= their hold), so the quantities that
     /// fit are one interval from zero; `lo` = 0 always fits.
+    ///
+    /// s94 option 1: the earlier fills' mark charges (`m.adverse`) count
+    /// against the budget too; a fill with a charge of its own
+    /// ([`crate::margin::mark_loss`]) is checked on its loss: `need + adverse
+    /// + loss − tol_open <= budget` when it opens, and when it only closes
+    /// `need + adverse + loss` must fit the budget or stay within the need
+    /// before it (the released IM pays the loss; an under-water account may
+    /// close as long as it does not get worse). Both are non-decreasing in
+    /// the fill beyond the point where they first fail, so the binary search
+    /// stays exact (flat tiers; with several tiers it still only returns a
+    /// quantity that fits).
     fn affordable(
         &self,
         m: &MatchMargin<'_>,
@@ -279,24 +292,24 @@ impl TakerMarginLimit {
         free: FixedPoint,
         left_before: FixedPoint,
     ) -> FixedPoint {
-        let fits = |q: FixedPoint| {
-            q <= free || self.need(m, price, q, free, left_before).is_some_and(|n| m.fits(n))
-        };
-        if fits(q) {
+        if m.prechecked {
             return q;
         }
-        let step = if m.lot > FixedPoint::ZERO { m.lot.raw() } else { 1 };
-        let (mut lo, mut hi) = (0i128, q.raw() / step + 1);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            let cand = FixedPoint::from_raw(mid * step);
-            if cand < q && fits(cand) {
-                lo = mid;
-            } else {
-                hi = mid;
+        let fits = |q: FixedPoint| {
+            let Some(l) = m.loss(price, q, free) else { return false };
+            let need = || self.need(m, price, q, free, left_before)?.checked_add(m.adverse).ok();
+            if l.charge == FixedPoint::ZERO {
+                return q <= free || need().is_some_and(|n| m.fits(n));
             }
-        }
-        FixedPoint::from_raw(lo * step)
+            let Some(n) = need().and_then(|n| n.checked_add(l.loss).ok()) else { return false };
+            if q > free {
+                n.checked_sub(l.tol_open).is_ok_and(|n| m.fits(n))
+            } else {
+                let before = self.need(m, price, FixedPoint::ZERO, free, left_before);
+                m.fits(n) || before.and_then(|b| b.checked_add(m.adverse).ok()).is_some_and(|b| n <= b)
+            }
+        };
+        largest_fit(q, m.lot, fits)
     }
 }
 
@@ -323,9 +336,27 @@ struct MatchMargin<'a> {
     /// B2 (s87): the sender's entry here is a taker-only budget (D2
     /// non-pool market), which gets the makers' rounding allowance.
     taker_only: bool,
+    /// s94 option 1: the book's mark ([`AccountMargins::mark`]), the
+    /// taker's side, and the mark charges of its fills so far.
+    mark: Option<FixedPoint>,
+    is_buy: bool,
+    adverse: FixedPoint,
+    /// s94 option 1: a FOK order whose complete fill passed the pre-check
+    /// with a mark charge — it fills without per-fill checks (the pre-check
+    /// judged the whole fill; a closing step can be dearer than the end).
+    prechecked: bool,
 }
 
 impl MatchMargin<'_> {
+    /// s94 option 1: the mark loss of a fill of `q` at `price` with `free`
+    /// closing capacity left (`None` on overflow).
+    fn loss(&self, price: FixedPoint, q: FixedPoint, free: FixedPoint) -> Option<crate::margin::MarkLoss> {
+        match self.mark {
+            Some(mk) => crate::margin::mark_loss(self.limit.tiers.as_deref(), mk, self.is_buy, price, q, q.min(free)),
+            None => Some(crate::margin::MarkLoss::NONE),
+        }
+    }
+
     /// B2 (s87): what a need costs the sender's running free margin beyond
     /// the order's own reservation. Each IM difference is floored, so a
     /// taker adding to a same-side position can need its reservation + 1 raw
@@ -480,6 +511,15 @@ pub struct AccountMargins {
     /// fill finds and commits its running margin with one lookup. A
     /// `HashMap`: point reads and writes only, never iterated.
     traders: HashMap<Address, TraderMargins>,
+    /// s94 option 1: the market's reference price the fills' loss is
+    /// charged against ([`crate::margin::mark_loss`]); `None` = no charge
+    /// (the pre-s94 checks).
+    mark: Option<FixedPoint>,
+    /// s94 option 1: the snapshots ([`MakerAccountSource`]) are the
+    /// pre-batch state (`execute_batch`), so an unchecked taker's own
+    /// reservation is still in its snapshot free; `false`: read after it
+    /// (the single path).
+    pre_batch: bool,
 }
 
 /// Item 6 P1: one trader's part of [`AccountMargins`] — the three former
@@ -517,7 +557,24 @@ impl AccountMargins {
         Self {
             tiers,
             traders: HashMap::new(),
+            mark: None,
+            pre_batch: false,
         }
+    }
+
+    /// s94 option 1: the snapshots are pre-batch (see the field).
+    pub fn set_pre_batch_snapshots(&mut self, on: bool) {
+        self.pre_batch = on;
+    }
+
+    /// s94 option 1: charge the fills of the next placement(s) against
+    /// `mark` (`None`: no charge).
+    pub fn set_mark(&mut self, mark: Option<FixedPoint>) {
+        self.mark = mark;
+    }
+
+    pub fn mark(&self) -> Option<FixedPoint> {
+        self.mark
     }
 
     pub fn insert(&mut self, trader: Address, free: FixedPoint, px: FixedPoint) {
@@ -597,7 +654,8 @@ pub struct MakerAccount {
 /// part free and releasing IM) minus this fill's share of the order's
 /// reservation (the A5 telescoping piece) must fit its running free margin;
 /// a purely closing fill always fits. Commits the running free on success.
-/// Shared by matching and the FOK pre-check.
+/// Shared by matching and the FOK pre-check. s94 option 1: plus the fill's
+/// loss against the mark ([`account_fill`]).
 #[allow(clippy::too_many_arguments)]
 fn maker_fill_fits(
     accounts: &mut AccountMargins,
@@ -610,16 +668,85 @@ fn maker_fill_fits(
     q: FixedPoint,
     rem: FixedPoint,
 ) -> bool {
+    account_fill(accounts, ro, src, market_id, maker, maker_is_buy, price, q, Some((price, rem)), None, true)
+}
+
+/// The running-margin check of one fill of `trader` against its entry in
+/// [`AccountMargins`] ([`maker_slot`]: its shared account, else its
+/// snapshot): a maker (F1), or, s94 option 1, a taker the executor does not
+/// match-check ([`TakerMarginLimit`] absent: GTC / PostOnly buys and
+/// reduce-only orders), which is checked only when the fill has a mark
+/// charge. `share` = `(price, remaining)` of the reservation the fill
+/// releases its share of (`None`: none). `d` = IM delta − share.
+/// `taker` = `Some(reserved)` for an unchecked taker: it spends its shared
+/// account in this book (the D2 pool) when it has one, else its snapshot —
+/// less `reserved`, its own reservation, when the snapshot is pre-batch.
+///
+/// Option 1 ([`crate::margin::mark_loss`], with the book's
+/// [`AccountMargins::mark`]): with no charge, the F1 rule unchanged (a
+/// purely closing fill always fits, else `d <= free`; commit `d`). With a
+/// charge, the fill's loss against the mark counts: `d + loss − tol_open <=
+/// free` when it opens, `d + loss <= max(free, 0)` when it only closes (the
+/// released IM pays the loss; an under-water account may close as long as
+/// its free margin does not drop); commit `d + charge`. `commit` = false
+/// checks without committing (a taker's binary search).
+#[allow(clippy::too_many_arguments)]
+fn account_fill(
+    accounts: &mut AccountMargins,
+    ro: &mut ReduceOnlyPositions,
+    src: &dyn MakerAccountSource,
+    market_id: MarketId,
+    trader: Address,
+    is_buy: bool,
+    price: FixedPoint,
+    q: FixedPoint,
+    share: Option<(FixedPoint, FixedPoint)>,
+    taker: Option<FixedPoint>,
+    commit: bool,
+) -> bool {
     // Item 6 P1 / P3: split borrow — the slot, and the tiers without an
     // Arc clone per fill.
-    let AccountMargins { tiers, traders } = accounts;
-    let slot = maker_slot(traders, maker, market_id, src, ro);
-    let a = *slot;
-    let s = ro.get(&maker).unwrap_or(FixedPoint::ZERO);
-    let size = if s < FixedPoint::ZERO { -s } else { s };
-    let closing = q.min(reduce_only_allowance(s, maker_is_buy));
-    let px = if a.px > FixedPoint::ZERO { a.px } else { price };
+    let AccountMargins { tiers, traders, mark, pre_batch } = accounts;
     let t = tiers.as_deref();
+    let loss_of = |closing: FixedPoint| match *mark {
+        Some(m) => crate::margin::mark_loss(t, m, is_buy, price, q, closing),
+        None => Some(crate::margin::MarkLoss::NONE),
+    };
+    if taker.is_some() {
+        // Option 1: a taker without a charge is not checked (and its entry
+        // is not loaded). Its position may be unknown yet: a charge that is
+        // 0 both all-closing and all-opening is 0 for every split.
+        let charged = |c: FixedPoint| loss_of(c).is_none_or(|l| l.charge > FixedPoint::ZERO);
+        let none = match ro.get(&trader) {
+            Some(s) => !charged(q.min(reduce_only_allowance(s, is_buy))),
+            None => !charged(FixedPoint::ZERO) && !charged(q),
+        };
+        if none {
+            return true;
+        }
+    }
+    // A taker spends its shared account here when it has one (single path
+    // checked sender, the batch's D2 pool market), else its snapshot — less
+    // its own reservation when the snapshot is pre-batch (still in it).
+    let shared = |e: &TraderMargins| e.taker.is_some() && !e.taker_only;
+    let mut offset = FixedPoint::ZERO;
+    let slot = if taker.is_some() && traders.get(&trader).is_some_and(shared) {
+        match traders.get_mut(&trader).and_then(|e| e.taker.as_mut()) {
+            Some(e) => e,
+            None => return false,
+        }
+    } else {
+        if let (Some(r), true) = (taker, *pre_batch) {
+            offset = r;
+        }
+        maker_slot(traders, trader, market_id, src, ro)
+    };
+    let a = *slot;
+    let free = a.free - offset;
+    let s = ro.get(&trader).unwrap_or(FixedPoint::ZERO);
+    let size = if s < FixedPoint::ZERO { -s } else { s };
+    let closing = q.min(reduce_only_allowance(s, is_buy));
+    let px = if a.px > FixedPoint::ZERO { a.px } else { price };
     let delta = (|| {
         let before = size.checked_mul(px).ok()?;
         let after = (size - closing)
@@ -627,23 +754,87 @@ fn maker_fill_fits(
             .ok()?
             .checked_add(price.checked_mul(q - closing).ok()?)
             .ok()?;
-        let share = crate::margin::order_initial_margin(t, price.checked_mul(rem).ok()?)
-            - crate::margin::order_initial_margin(t, price.checked_mul(rem - q).ok()?);
+        let share = match share {
+            Some((sp, rem)) => {
+                crate::margin::order_initial_margin(t, sp.checked_mul(rem).ok()?)
+                    - crate::margin::order_initial_margin(t, sp.checked_mul(rem - q).ok()?)
+            }
+            None => FixedPoint::ZERO,
+        };
         Some(crate::margin::im_delta(t, before, after) - share)
     })();
     // Review fix 2 (s517): each IM difference is floored, so without a tier
     // change `delta` can be +1 raw unit (floor(B + x) − floor(B) = floor(x)
     // + 1 while the share is floor(x)). That is rounding, not cost.
     let delta = delta.map(|d| if d == FixedPoint::from_raw(1) { FixedPoint::ZERO } else { d });
-    match delta {
-        Some(d) if closing == q || d <= a.free => {
-            // The entry `maker_slot` read: its shared account, else its
-            // snapshot (always present after the load).
-            slot.free = a.free - d;
+    let (Some(d), Some(l)) = (delta, loss_of(closing)) else {
+        return false;
+    };
+    let cost = if l.charge == FixedPoint::ZERO {
+        if taker.is_some() {
+            return true;
+        }
+        (closing == q || d <= free).then_some(d)
+    } else {
+        let fits = if closing < q {
+            d.checked_add(l.loss).and_then(|x| x.checked_sub(l.tol_open)).is_ok_and(|x| x <= free)
+        } else {
+            d.checked_add(l.loss).is_ok_and(|x| x <= free.max(FixedPoint::ZERO))
+        };
+        fits.then(|| d.checked_add(l.charge).ok()).flatten()
+    };
+    match cost {
+        Some(c) => {
+            if commit {
+                // The entry `maker_slot` read: its shared account, else its
+                // snapshot (always present after the load).
+                slot.free = a.free - c;
+            }
             true
         }
-        _ => false,
+        None => false,
     }
+}
+
+/// s94 option 1: a taker the executor does not match-check
+/// ([`TakerMarginLimit`] absent) in a book with a mark: its fills with a mark
+/// charge are checked against its running account ([`account_fill`]); one
+/// that does not fit is cut to the largest lot multiple that does and the
+/// order stops matching (its remainder is cancelled, as a checked taker's).
+#[derive(Clone, Copy, Debug)]
+struct UncheckedTaker {
+    lot: FixedPoint,
+    /// The price its reservation is held at when it can rest (`None`: it
+    /// never rests — its reservation is released whole after matching).
+    share_price: Option<FixedPoint>,
+    /// Its own reservation while it is still in a pre-batch snapshot
+    /// ([`AccountMargins::set_pre_batch_snapshots`]; 0 otherwise): IM at the
+    /// limit of its quantity when it can rest (an upper bound for a clamped
+    /// reduce-only order), 0 when it never rests (reduce-only: nothing
+    /// opens, nothing reserved).
+    reserved: FixedPoint,
+    exhausted: bool,
+    cut_at: Option<FixedPoint>,
+}
+
+/// Largest quantity `<= q` (all of `q`, or a multiple of `lot`) that `fits`,
+/// for a `fits` true at 0 and true on one interval from 0 (binary search).
+fn largest_fit(q: FixedPoint, lot: FixedPoint, mut fits: impl FnMut(FixedPoint) -> bool) -> FixedPoint {
+    if fits(q) {
+        return q;
+    }
+    let step = if lot > FixedPoint::ZERO { lot.raw() } else { 1 };
+    let (mut lo, mut hi) = (0i128, q.raw() / step + 1);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let cand = FixedPoint::from_raw(mid * step);
+        if cand < q && fits(cand) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    FixedPoint::from_raw(lo * step)
 }
 
 /// Order placement outcome.
@@ -1163,36 +1354,78 @@ impl OrderBook {
                 exhausted: false,
                 cut_at: None,
                 taker_only,
+                mark: self.account_margins.mark,
+                is_buy: params.is_buy,
+                adverse: FixedPoint::ZERO,
+                prechecked: false,
             }
         });
+        // s94 option 1: a taker without a margin limit is checked on its
+        // fills' mark charges against its running account (needs the
+        // makers' account source and a mark).
+        let mut unchecked = match (&match_margin, makers, self.account_margins.mark) {
+            (None, Some(_), Some(_)) => {
+                let share_price = (matches!(params.order_type, OrderType::Limit)
+                    && matches!(params.time_in_force, TimeInForce::GTC | TimeInForce::PostOnly))
+                .then_some(params.price);
+                let reserved = match (share_price, self.account_margins.pre_batch) {
+                    (Some(p), true) => p
+                        .checked_mul(params.quantity)
+                        .map_or(FixedPoint::MAX, |n| crate::margin::order_initial_margin(self.account_margins.tiers.as_deref(), n)),
+                    _ => FixedPoint::ZERO,
+                };
+                Some(UncheckedTaker { lot: self.lot_size, share_price, reserved, exhausted: false, cut_at: None })
+            }
+            _ => None,
+        };
         if params.time_in_force == TimeInForce::FOK {
             let free = self.reduce_only_positions.get(&trader).map_or(FixedPoint::ZERO, |p| {
                 reduce_only_allowance(p, params.is_buy)
             });
             // F1 (s517 #4): the pre-check skips makers matching would
-            // cancel — on CLONES, so it never mutates the book.
+            // cancel — on CLONES, so it never mutates the book. s94 option
+            // 1: an unchecked taker's charged fills are checked there too.
             let mut acc_c = makers.map(|_| self.account_margins.clone());
             let mut ro_c = makers.map(|_| self.reduce_only_positions.clone());
             let pre = match (makers, acc_c.as_mut(), ro_c.as_mut()) {
                 (Some(src), Some(acc), Some(ro)) => Some((src, acc, ro)),
                 _ => None,
             };
-            let fits = match self.can_fill_completely(side, params.price, quantity, trader, free, pre) {
+            let taker_mark = match_margin.as_ref().and_then(|m| m.mark);
+            let walk = self.can_fill_completely(
+                side,
+                params.price,
+                quantity,
+                trader,
+                free,
+                pre,
+                unchecked.map(|u| u.reserved),
+                taker_mark.map(|mk| (mk, match_margin.as_ref().and_then(|m| m.limit.tiers.clone()))),
+            );
+            let fits = match walk {
                 None => false,
                 // F1: a purely closing FOK always fits; otherwise the
                 // complete fill's need (closing releases IM) must fit.
-                Some(notional) => match_margin.as_ref().is_none_or(|m| {
-                    quantity <= free
-                        || notional.is_some_and(|n| {
-                            let closing = quantity.min(free);
-                            let before = m.before;
-                            let after = (m.size0 - closing)
-                                .checked_mul(m.px)
-                                .ok()
-                                .and_then(|x| x.checked_add(n).ok());
-                            matches!((before, after), (Some(b), Some(a))
-                                if m.fits(crate::margin::im_delta(m.limit.tiers.as_deref(), b, a)))
-                        })
+                // s94 option 1: with a mark charge, its loss counts (as
+                // per fill in `affordable`, for the complete fill).
+                Some((notional, l)) => match_margin.as_mut().is_none_or(|m| {
+                    let need = || {
+                        let n = notional?;
+                        let closing = quantity.min(free);
+                        let after = (m.size0 - closing).checked_mul(m.px).ok()?.checked_add(n).ok()?;
+                        Some(crate::margin::im_delta(m.limit.tiers.as_deref(), m.before?, after))
+                    };
+                    if l.charge == FixedPoint::ZERO {
+                        return quantity <= free || need().is_some_and(|n| m.fits(n));
+                    }
+                    let Some(n) = need().and_then(|n| n.checked_add(l.loss).ok()) else { return false };
+                    let ok = if quantity > free {
+                        n.checked_sub(l.tol_open).is_ok_and(|n| m.fits(n))
+                    } else {
+                        m.fits(n) || n <= FixedPoint::ZERO
+                    };
+                    m.prechecked = ok;
+                    ok
                 }),
             };
             if !fits {
@@ -1202,9 +1435,13 @@ impl OrderBook {
 
         // Execute matching
         let (fills, self_trade_cancels, mut reduce_only_cuts, margin_cancels) =
-            self.execute_match(&mut order, match_margin.as_mut(), makers);
-        let margin_exhausted = match_margin.as_ref().is_some_and(|m| m.exhausted);
-        let margin_cut_price = match_margin.as_ref().and_then(|m| m.cut_at);
+            self.execute_match(&mut order, match_margin.as_mut(), unchecked.as_mut(), makers);
+        let margin_exhausted = match_margin.as_ref().is_some_and(|m| m.exhausted)
+            || unchecked.as_ref().is_some_and(|u| u.exhausted);
+        let margin_cut_price = match_margin
+            .as_ref()
+            .and_then(|m| m.cut_at)
+            .or_else(|| unchecked.as_ref().and_then(|u| u.cut_at));
 
         if let Some(last_fill) = fills.last() {
             self.last_trade_price = Some(last_fill.price);
@@ -1310,7 +1547,8 @@ impl OrderBook {
                             ),
                             None => FixedPoint::ZERO,
                         };
-                        d.checked_add(kept).ok()
+                        // s94 option 1: plus its fills' mark charges.
+                        d.checked_add(kept).ok()?.checked_add(m.adverse).ok()
                     })
                     .unwrap_or(m.budget);
                 // B2 (s87): a forgiven rounding unit never reaches the free.
@@ -1888,6 +2126,7 @@ impl OrderBook {
         &mut self,
         taker: &mut Order,
         mut margin: Option<&mut MatchMargin<'_>>,
+        mut unchecked: Option<&mut UncheckedTaker>,
         makers: Option<&dyn MakerAccountSource>,
     ) -> (Vec<Fill>, Vec<Order>, Vec<ReduceOnlyCut>, Vec<ReduceOnlyCut>) {
         let mut fills = Vec::new();
@@ -1902,6 +2141,7 @@ impl OrderBook {
             Side::Buy => {
                 while taker.remaining_qty > FixedPoint::ZERO
                     && !margin.as_ref().is_some_and(|m| m.exhausted)
+                    && !unchecked.as_ref().is_some_and(|u| u.exhausted)
                 {
                     let mut level = match self.asks.first_entry() {
                         Some(entry) => entry,
@@ -1931,6 +2171,7 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                         margin.as_deref_mut(),
+                        unchecked.as_deref_mut(),
                         &mut self.account_margins,
                         makers,
                         market_id,
@@ -1944,6 +2185,7 @@ impl OrderBook {
             Side::Sell => {
                 while taker.remaining_qty > FixedPoint::ZERO
                     && !margin.as_ref().is_some_and(|m| m.exhausted)
+                    && !unchecked.as_ref().is_some_and(|u| u.exhausted)
                 {
                     let mut level = match self.bids.last_entry() {
                         Some(entry) => entry,
@@ -1973,6 +2215,7 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                         margin.as_deref_mut(),
+                        unchecked.as_deref_mut(),
                         &mut self.account_margins,
                         makers,
                         market_id,
@@ -2010,6 +2253,7 @@ impl OrderBook {
         dirty_chunks: &mut BTreeSet<(u8, i128, u64)>,
         chunked_on: bool,
         mut margin: Option<&mut MatchMargin<'_>>,
+        mut unchecked: Option<&mut UncheckedTaker>,
         accounts: &mut AccountMargins,
         makers: Option<&dyn MakerAccountSource>,
         market_id: MarketId,
@@ -2108,6 +2352,25 @@ impl OrderBook {
                 }
                 taker_cut = Some((exhausted, free));
             }
+            // s94 option 1: an unchecked taker's charged fill is checked on
+            // its running account (cut to what fits; committed below, once
+            // the maker passed).
+            let mut unchecked_cut = None;
+            if let (Some(u), Some(src)) = (unchecked.as_deref_mut(), makers) {
+                let taker_buy = taker.side == Side::Buy;
+                let share = u.share_price.map(|sp| (sp, taker.remaining_qty));
+                let fits = largest_fit(fill_qty, u.lot, |q| {
+                    account_fill(accounts, ro_positions, src, market_id, taker.trader, taker_buy, price, q, share, Some(u.reserved), false)
+                });
+                let exhausted = fits < fill_qty;
+                fill_qty = fits;
+                if fill_qty <= FixedPoint::ZERO {
+                    u.exhausted = true;
+                    u.cut_at = Some(price);
+                    break;
+                }
+                unchecked_cut = Some((exhausted, share));
+            }
             // F1 (s517 #4, HL `marginCanceled`): the maker is checked on the
             // actual fill; one that cannot afford it is cancelled whole and
             // the taker moves on to the next maker.
@@ -2148,7 +2411,19 @@ impl OrderBook {
                 // Cannot overflow: `affordable` returned a purely closing
                 // quantity (charges nothing) or one whose notional it
                 // computed checked.
+                // s94 option 1: and its mark charge (computed checked there).
+                if let Some(l) = m.loss(price, fill_qty, free) {
+                    m.adverse += l.charge;
+                }
                 m.charged += price * (fill_qty - fill_qty.min(free));
+            }
+            if let (Some(u), Some(src), Some((exhausted, share))) = (unchecked.as_deref_mut(), makers, unchecked_cut) {
+                if exhausted {
+                    u.exhausted = true;
+                    u.cut_at = Some(price);
+                }
+                let taker_buy = taker.side == Side::Buy;
+                account_fill(accounts, ro_positions, src, market_id, taker.trader, taker_buy, price, fill_qty, share, Some(u.reserved), true);
             }
             if !ro_positions.is_empty() {
                 ro_positions.apply_fill(&taker.trader, taker.side == Side::Buy, fill_qty);
@@ -2190,7 +2465,7 @@ impl OrderBook {
                 }
                 order_seq.remove(&filled.id);
             }
-            if margin.as_ref().is_some_and(|m| m.exhausted) {
+            if margin.as_ref().is_some_and(|m| m.exhausted) || unchecked.as_ref().is_some_and(|u| u.exhausted) {
                 break;
             }
         }
@@ -2293,6 +2568,13 @@ impl OrderBook {
     /// `None` = not completely fillable; `Some(notional)` = fillable, with the
     /// complete fill's notional (Σ price × qty, `None` on overflow) for the
     /// FOK margin check (s515 review 4).
+    ///
+    /// s94 option 1: `taker_mark` = `(mark, tiers)` of a checked taker:
+    /// the walk also returns the Σ of its fills' [`crate::margin::MarkLoss`]
+    /// (overflow = not fillable). `unchecked`: the taker's charged fills are
+    /// checked as in matching ([`account_fill`], on the clones); one that
+    /// does not fit makes the order not fillable.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn can_fill_completely(
         &self,
         side: Side,
@@ -2301,9 +2583,12 @@ impl OrderBook {
         trader: Address,
         mut free: FixedPoint,
         mut makers: Option<(&dyn MakerAccountSource, &mut AccountMargins, &mut ReduceOnlyPositions)>,
-    ) -> Option<Option<FixedPoint>> {
+        unchecked: Option<FixedPoint>,
+        taker_mark: Option<(FixedPoint, Option<std::sync::Arc<[crate::margin::MarginTier]>>)>,
+    ) -> Option<(Option<FixedPoint>, crate::margin::MarkLoss)> {
         let mut remaining = qty;
         let mut notional = Some(FixedPoint::ZERO);
+        let mut loss = crate::margin::MarkLoss::NONE;
         // Maker positions moved by earlier makers of this walk (policed only).
         let mut walked: BTreeMap<Address, FixedPoint> = BTreeMap::new();
         let levels: Box<dyn Iterator<Item = (&FixedPoint, &VecDeque<Order>)>> = match side {
@@ -2343,6 +2628,26 @@ impl OrderBook {
                             continue;
                         }
                         ro.apply_fill(&order.trader, is_buy, take);
+                        // s94 option 1: the unchecked taker's side of it.
+                        if let Some(reserved) = unchecked {
+                            let taker_buy = side == Side::Buy;
+                            if !account_fill(
+                                acc,
+                                ro,
+                                *src,
+                                self.market_id,
+                                trader,
+                                taker_buy,
+                                order.price,
+                                take,
+                                None,
+                                Some(reserved),
+                                true,
+                            ) {
+                                return None;
+                            }
+                            ro.apply_fill(&trader, taker_buy, take);
+                        }
                     }
                 }
                 if let Some(pos) = pos {
@@ -2352,6 +2657,14 @@ impl OrderBook {
                 // s515 review 5: only the part beyond the taker's closing
                 // allowance (`free`, consumed first) counts.
                 let closing = take.min(free);
+                if let Some((mk, tiers)) = &taker_mark {
+                    let l = crate::margin::mark_loss(tiers.as_deref(), *mk, side == Side::Buy, order.price, take, closing)?;
+                    loss = crate::margin::MarkLoss {
+                        loss: loss.loss.checked_add(l.loss).ok()?,
+                        tol_open: loss.tol_open.checked_add(l.tol_open).ok()?,
+                        charge: loss.charge.checked_add(l.charge).ok()?,
+                    };
+                }
                 free -= closing;
                 notional = notional.and_then(|n| {
                     order
@@ -2362,7 +2675,7 @@ impl OrderBook {
                 });
                 remaining -= take;
                 if remaining <= FixedPoint::ZERO {
-                    return Some(notional);
+                    return Some((notional, loss));
                 }
             }
         }

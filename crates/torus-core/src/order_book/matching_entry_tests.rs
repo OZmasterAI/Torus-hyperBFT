@@ -45,6 +45,7 @@ impl OrderBook {
                         &mut self.dirty_chunks,
                         chunked_on,
                         None,
+                        None,
                         &mut AccountMargins::default(),
                         None,
                         self.market_id,
@@ -83,6 +84,7 @@ impl OrderBook {
                         cache_on,
                         &mut self.dirty_chunks,
                         chunked_on,
+                        None,
                         None,
                         &mut AccountMargins::default(),
                         None,
@@ -191,7 +193,7 @@ fn assert_match(actual: &mut OrderBook, expected: &mut OrderBook, taker: Order, 
     let taker = if market { unbounded(taker) } else { taker };
     let mut new_taker = taker.clone();
     let mut old_taker = taker;
-    let (new_fills, new_stp, new_cuts, _) = actual.execute_match(&mut new_taker, None, None);
+    let (new_fills, new_stp, new_cuts, _) = actual.execute_match(&mut new_taker, None, None, None);
     assert!(new_cuts.is_empty());
     let (old_fills, old_stp) = expected.execute_match_legacy(&mut old_taker, market);
     assert_eq!(new_taker, old_taker);
@@ -280,7 +282,7 @@ fn occupied_matching_preserves_partial_state_when_matching_panics() {
             new_taker.remaining_qty = FixedPoint::MAX;
             let mut old_taker = new_taker.clone();
             let new = catch_unwind(AssertUnwindSafe(|| {
-                actual.execute_match(&mut new_taker, None, None)
+                actual.execute_match(&mut new_taker, None, None, None)
             }))
             .unwrap_err();
             let old = catch_unwind(AssertUnwindSafe(|| {

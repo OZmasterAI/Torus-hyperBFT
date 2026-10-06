@@ -1,25 +1,24 @@
-//! s94 bad-debt probe (TESTS ONLY, evidence for an owner decision; plan 9.11
-//! design check, route (1)): fills far from the mark.
+//! s94 bad-debt route (plan 9.11 design check, route (1)): fills far from
+//! the mark. Probe 77a3b21 pinned the bug; these tests pin the fix.
 //!
-//! Suspected route: placement and match-time margin value a fill at its FILL
+//! The route: placement and match-time margin valued a fill at its FILL
 //! price (`order_book.rs` `maker_fill_fits` / `TakerMarginLimit::need`,
 //! `native_executor.rs` `account_check` at the limit price), while the
-//! account is valued at the MARK afterwards; no placement price band vs the
-//! mark exists (RPC intake checks market / tick / lot only). Two accounts of
-//! one owner: A buys at 2x the mark from B. A reserves IM at the fill price
-//! but loses (fill - mark) x qty at the mark; B holds the matching gain.
+//! account is valued at the MARK afterwards, and nothing banded the order
+//! price against the mark. Two accounts of one owner: A buys at 2x the mark
+//! from B; A reserved IM at the fill price but lost (fill − mark) × qty at
+//! the mark, B held the matching gain.
 //!
-//! These tests pin the CURRENT behaviour. Tests marked
-//! `DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe)` assert the bug and are
-//! expected to flip when a price band (or fills valued at the mark) lands.
+//! Probe numbers (market 1, 20x default tiers: IM 5%, MM 2.5% of notional;
+//! mark 100; qty 10; A and B each funded exactly the IM at the fill price):
+//! buy @200: A AV 100 − 1,000 = −900 (−9x its margin), ADL'd at block end,
+//! its −900 left in the liquidator vault; B withdrew 1,100 for 200
+//! deposited. Bad debt from +5.3% (buy) / −4.8% (sell).
 //!
-//! Numbers (market 1, 20x default tiers: IM 5%, MM 2.5% of notional; mark
-//! 100; qty 10; A and B each funded exactly the IM at the fill price):
-//!   buy @200: A AV 100 - 1,000 = -900 (= -9x its margin), B AV +1,100.
-//!   End-of-block step: A is ADL'd at the mark (no previous mark / previous
-//!   mark 100 < bankruptcy 190), its -900 goes to the liquidator vault; B
-//!   (the only short) closes at 100 and holds 1,100 cash = 100 deposit + A's
-//!   100 + the vault's 900.
+//! Fix, option 1 (s94): every fill's loss against the mark beyond its own IM
+//! above maintenance is charged at match time (`margin::mark_loss`): a maker
+//! that cannot pay it is margin-cancelled, a taker is cut to what it can
+//! pay. With A funded at the IM, A only fills where it stays healthy.
 //!
 //! Helpers copied from liquidation_tests.rs and account_margin_tests.rs.
 
@@ -239,45 +238,73 @@ fn off_mark_fill(path: Path, a_buys: bool, price: i64, a_maker: bool) -> (tempfi
 }
 
 // ============================================================================
-// Q1: accepted at placement, executed
+// Q1: off-mark fills are refused (option 1: the mark charge at match time)
 // ============================================================================
 
-/// Q1: a buy at 2x the mark (200) and a sell at 0.5x (50) are accepted and
-/// FILL at that price on all three PlaceOrder paths, A maker or taker.
-/// Afterwards, at the mark: buy @200: A equity 100 - 1,000 = -900, free
-/// -950 (IM at the mark 50), class ADL; B equity 1,100. Sell @50: A equity
-/// 25 - 500 = -475, free -525; B equity 525.
-// DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+/// The probe's attack prices and nearer ones: (a_buys, price). Buy 2x / 1.2x
+/// / 1.06x, sell 0.5x / 0.8x / 0.94x; all beyond the healthy bound (buy >
+/// 102.63, sell < 97.62).
+const OFF_MARK: [(bool, i64); 6] = [(true, 200), (true, 120), (true, 106), (false, 50), (false, 80), (false, 94)];
+
+/// Was `fills_at_2x_and_half_the_mark_are_accepted_and_executed_on_every_path`
+/// (probe: A filled 10 @200 → AV −900; @50 → AV −475). Now, on every
+/// PlaceOrder path, A maker or taker, nothing fills: as a maker (its GTC
+/// bid / ask) A is margin-cancelled whole (its reservation released); as a
+/// GTC buy taker (not match-checked before s94) it is cut at once and its
+/// order cancelled; as a GTC sell taker (match-checked) its reservation is
+/// all held by its own fill + remainder (IM(10p)), so nothing is left for
+/// the loss. A stays healthy and the end-of-block step leaves the vault at
+/// 0. (A taker that never rests fills what its reservation pays: see the
+/// IOC test below.)
 #[test]
-fn fills_at_2x_and_half_the_mark_are_accepted_and_executed_on_every_path() {
-    // (a_buys, price, A equity, A free, B equity)
-    let cases = [(true, 200, -900, -950, 1_100), (false, 50, -475, -525, 525)];
+fn off_mark_fills_are_refused_on_every_path() {
     for path in PATHS {
-        for (a_buys, price, a_eq, a_free, b_eq) in cases {
+        for (a_buys, price) in OFF_MARK {
             for a_maker in [true, false] {
                 let what = format!("{path:?} a_buys={a_buys} price={price} a_maker={a_maker}");
-                let (_d, ctx) = off_mark_fill(path, a_buys, price, a_maker);
-                let sign = if a_buys { 1 } else { -1 };
-                assert_eq!(pos(&ctx, &a(), M), fp(sign * Q), "{what}: A filled");
-                assert_eq!(pos(&ctx, &b(), M), fp(-sign * Q), "{what}: B filled");
-                assert_eq!(entry(&ctx, &a(), M), fp(price), "{what}: at the off-mark price");
-                assert_eq!(ab(&ctx, &a()), (im_at(price), FixedPoint::ZERO), "{what}: A's cash, no order margin left");
+                let (_d, mut ctx) = off_mark_fill(path, a_buys, price, a_maker);
+                assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO, "{what}: A's fill");
+                assert_eq!(pos(&ctx, &b(), M), FixedPoint::ZERO, "{what}: B's fill");
+                assert_eq!(ab(&ctx, &a()).1, FixedPoint::ZERO, "{what}: A holds no order margin (cancelled)");
                 let va = view(&ctx, &a());
-                assert_eq!(va.equity(), fp(a_eq), "{what}: A equity at the mark");
-                assert_eq!(va.free(), fp(a_free), "{what}: A free margin at the mark");
-                assert_eq!(va.maintenance, fp_cents(2_500), "{what}: A MM at the mark");
-                assert_eq!(classify(&va), Some(Health::Adl), "{what}");
-                assert_eq!(view(&ctx, &b()).equity(), fp(b_eq), "{what}: B equity at the mark");
+                assert!(va.equity() >= va.maintenance, "{what}: A healthy at the mark: {va:?}");
+                assert_eq!(classify(&va), Some(Health::Healthy), "{what}");
+                NativeExecutor::run_liquidations(&mut ctx);
+                assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+                assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "{what}: vault");
+                assert_eq!(ab(&ctx, &a()), (im_at(price), FixedPoint::ZERO), "{what}: A keeps its deposit");
             }
         }
     }
 }
 
+/// Option 1, a checked IOC buy taker: IOC buy 10 @120 against B's ask 10
+/// @120, A funded its reservation IM(1,200) = 60. Per unit: IM 6 + loss 20
+/// − tolerance 3.5 = 22.5 → 2 units fit (45 <= 60), the rest is cancelled.
+/// A: long 2 @120, AV 60 − 40 = 20 >= MM 5. Every path.
+#[test]
+fn a_checked_ioc_buy_through_the_mark_fills_what_its_reservation_pays() {
+    for path in PATHS {
+        let (_d, db) = liq_db(&[M]);
+        let mut ctx = ctx_at(db, 1);
+        set_mark(&ctx, M, fp(MARK));
+        fund(&ctx, &a(), im_at(120));
+        fund(&ctx, &b(), im_at(120));
+        fund(&ctx, &filler(), fp(1_000));
+        assert!(run(&mut ctx, path, b(), limit(M, false, 120, Q)).success, "{path:?}");
+        let ioc = PlaceOrderParams { time_in_force: TimeInForce::IOC, ..limit(M, true, 120, Q) };
+        assert!(run(&mut ctx, path, a(), ioc).success, "{path:?}");
+        assert_eq!(pos(&ctx, &a(), M), fp(2), "{path:?}");
+        let va = view(&ctx, &a());
+        assert_eq!(va.equity(), fp(20), "{path:?}");
+        assert_eq!(classify(&va), Some(Health::Healthy), "{path:?}");
+    }
+}
+
 /// Q1, the partial block: the book itself. With an innocent ask resting at
 /// 101, A's bid at 200 takes it AT 101 (price-time priority): A ends long
-/// 10 @101, healthy (equity 90 >= MM 25). The route needs the opposite side
-/// of the book EMPTY between the mark and the attack price (a thin market),
-/// or the attacker must first buy everything in between.
+/// 10 @101, healthy (equity 90 >= MM 25): a fill near the mark is not
+/// charged (loss 10 <= tolerance 50.5 − 25).
 #[test]
 fn a_through_mark_bid_takes_resting_asks_near_the_mark_first() {
     for path in PATHS {
@@ -296,86 +323,65 @@ fn a_through_mark_bid_takes_resting_asks_near_the_mark_first() {
 }
 
 // ============================================================================
-// Q2 + Q3 + Q4: liquidation, who pays, what B can withdraw
+// Q3 + Q4: nothing for the vault, nothing extra for B
 // ============================================================================
 
-/// Q3 + Q4 (block path, A maker): right after the fill (before the end-of-
-/// block step) B withdraws its whole deposit (100: equity 1,100 - 100 >=
-/// transfer margin max(50, 100)); 1 more is refused by the CASH bound
-/// (available 0; UPnL is not cash). The step ADLs A (AV -900 < 0) against B,
-/// the only short, at the mark 100 (no previous mark; bankruptcy price 190
-/// is better for A, so no clamp): B closes +1,000 -> available 1,000; A ends
-/// (0, 0); A's -900 moves to the LIQUIDATOR VAULT. Next block B withdraws
-/// the 1,000. Total out: 1,100 for 200 deposited (A 100 + B 100); the
-/// vault is left at -900 (value conserved, the deficit sits in the vault).
-// DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+/// Was `counterparty_withdraws_1100_of_200_deposited_and_the_vault_is_left_at_minus_900`.
+/// Block path, A maker @200: A's bid is margin-cancelled when B's sell
+/// arrives (its 100 released), B's sell rests holding B's 100. B cannot take
+/// out more than it put in: nothing while its order rests; after cancelling,
+/// its 100 and not 1 more. The step leaves the vault at 0; value conserved.
 #[test]
-fn counterparty_withdraws_1100_of_200_deposited_and_the_vault_is_left_at_minus_900() {
+fn the_counterparty_gets_back_only_its_deposit_and_the_vault_stays_at_zero() {
     let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
-    let r = to_spot(&mut ctx, &b(), fp(100));
-    assert!(r.success, "B's deposit, at once: {:?}", r.error);
-    let r = to_spot(&mut ctx, &b(), fp(1));
-    assert!(!r.success, "unrealized gain is not cash");
-    assert!(r.error.as_deref().unwrap_or("").to_lowercase().contains("insufficient"), "{:?}", r.error);
+    assert_eq!(ab(&ctx, &a()), (fp(100), FixedPoint::ZERO), "A's bid cancelled, reservation released");
+    assert_eq!(ab(&ctx, &b()), (FixedPoint::ZERO, fp(100)), "B's sell rests");
+    assert!(!to_spot(&mut ctx, &b(), fp(1)).success, "B's deposit is in its resting order");
     let marks: BTreeMap<MarketId, FixedPoint> = [(M, fp(MARK))].into();
     let before = total_value(&ctx, &marks);
-    NativeExecutor::run_liquidations(&mut ctx); // end of the fill block
+    NativeExecutor::run_liquidations(&mut ctx);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO, "A ADL'd in the fill block");
-    assert_eq!(pos(&ctx, &b(), M), FixedPoint::ZERO, "B was the ADL counterparty");
-    assert_eq!(ab(&ctx, &a()), (FixedPoint::ZERO, FixedPoint::ZERO));
-    assert_eq!(ab(&ctx, &b()), (fp(1_000), FixedPoint::ZERO), "closed at the mark 100");
-    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, fp(-900), "the vault takes A's deficit");
+    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
     assert_eq!(total_value(&ctx, &marks), before, "value conserved");
-    assert!(liq_rows(&ctx, 0x06).is_empty(), "the vault's -900 (no positions: not valued) leaves no pending row");
-    let mut next = ctx_at(ctx.state.clone(), 2);
-    let r = to_spot(&mut next, &b(), fp(1_000));
-    assert!(r.success, "next block: B withdraws the gain: {:?}", r.error);
-    assert_eq!(ab(&next, &b()), (FixedPoint::ZERO, FixedPoint::ZERO));
-    assert_eq!(bal(&next, &LIQUIDATOR_VAULT).available, fp(-900));
+    let cancel = NativeAction::CancelAllOrders { market_id: None };
+    assert!(NativeExecutor::execute(&mut ctx, &b(), &cancel).success);
+    assert!(to_spot(&mut ctx, &b(), fp(100)).success, "B's own deposit");
+    let r = to_spot(&mut ctx, &b(), fp(1));
+    assert!(!r.success, "nothing more: {:?}", r.error);
+    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
 }
 
-/// Q4, who pays with an innocent short in the market: C short 10 @100 (vs
-/// D long), funded 200 -> ADL rank 1 x 1,000 / 200 = 5 > B's 2 x 1,000 /
-/// 1,100: C is ADL'd FIRST, at the mark 100 = its entry: C realizes 0 and
-/// loses its position (no money). B keeps short 10 @200 (UPnL +1,000). The
-/// vault still takes A's -900. A previous mark (100, stored by a step at
-/// block 1) gives the same price (100 < bankruptcy 190).
-// DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+/// Was `an_innocent_higher_ranked_short_is_adld_at_the_mark_and_the_vault_still_pays_900`:
+/// with A's fill refused nobody is under water, so the end-of-block step
+/// ADLs no one — the innocent short C keeps its position — and the vault
+/// stays at 0.
 #[test]
-fn an_innocent_higher_ranked_short_is_adld_at_the_mark_and_the_vault_still_pays_900() {
+fn an_innocent_short_keeps_its_position_and_the_vault_pays_nothing() {
     let d_ = addr(0x0D);
     let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
     fund(&ctx, &c(), fp(200));
     fund(&ctx, &d_, fp(1_000));
     ctx.positions.apply_fill(&d_, M, true, fp(Q), fp(MARK), MarginType::Cross).unwrap();
     ctx.positions.apply_fill(&c(), M, false, fp(Q), fp(MARK), MarginType::Cross).unwrap();
-    // A previous mark row (as every live block after the first has).
     ctx.state
         .put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x03u8].as_slice(), &M.to_be_bytes()].concat(), &fp(MARK).raw().to_be_bytes())
         .unwrap();
     NativeExecutor::run_liquidations(&mut ctx);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO);
-    assert_eq!(pos(&ctx, &c(), M), FixedPoint::ZERO, "C ranked first: closed");
-    assert_eq!(ab(&ctx, &c()), (fp(200), FixedPoint::ZERO), "C closed at its entry: no PnL");
-    assert_eq!(pos(&ctx, &b(), M), fp(-Q), "B keeps its short");
-    assert_eq!(view(&ctx, &b()).equity(), fp(1_100));
-    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, fp(-900));
+    assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO, "A never filled");
+    assert_eq!(pos(&ctx, &c(), M), fp(-Q), "C untouched");
+    assert_eq!(ab(&ctx, &c()), (fp(200), FixedPoint::ZERO));
+    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
 }
 
-/// Q4, the round-robin (production budgets LIQ_SCAN_PER_BLOCK 2,048 /
-/// LIQ_ACT_PER_BLOCK 64, no touched-first priority): 64 stage-1 accounts
-/// whose keys sort before A use the whole act budget of the fill block's
-/// step, so A is NOT liquidated in the fill block (cursor = the 64th). In
-/// the gap B withdraws its deposit; the next block's step ADLs A (against B
-/// at the previous mark 100) and the vault still ends at -900. A's delay is
-/// one block per 64 under-MM accounts ahead of it in the round.
+/// Was `with_64_under_mm_accounts_ahead_the_buyer_is_liquidated_one_block_later`
+/// (the round-robin delay is a liquidation property, unchanged): 64 stage-1
+/// decoys sorting before A still use the fill block's whole act budget
+/// (cursor = the 64th), but A has nothing to liquidate (its fill was
+/// refused), and after two steps the vault is still at 0.
 #[test]
-fn with_64_under_mm_accounts_ahead_the_buyer_is_liquidated_one_block_later() {
+fn with_64_under_mm_accounts_ahead_nothing_is_left_for_the_vault() {
     let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
-    // Decoys in market 2 (mark 990): long 10 @1,000 on 345 -> AV 245 < MM
-    // 247.5, >= 2/3 MM: stage 1 into an empty book (stays under MM).
     ctx.state.put_cf_raw(CF_NATIVE_MARKETS, &2u64.to_be_bytes(), b"listed").unwrap();
     let s = addr(0x50);
     fund(&ctx, &s, fp(10_000_000));
@@ -393,94 +399,119 @@ fn with_64_under_mm_accounts_ahead_the_buyer_is_liquidated_one_block_later() {
     }
     set_mark(&ctx, 2, fp(990));
     assert!(decoys.iter().all(|t| *t < a()), "the decoys sort before A");
-    NativeExecutor::run_liquidations(&mut ctx); // end of the fill block
+    NativeExecutor::run_liquidations(&mut ctx);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    assert_eq!(pos(&ctx, &a(), M), fp(Q), "act budget used up before A: not liquidated");
     let cursor = liq_rows(&ctx, 0x04).first().map(|(_, v)| Address::from_slice(v));
     assert_eq!(cursor, Some(decoys[63]), "the pass was cut after the 64th decoy");
-    assert!(to_spot(&mut ctx, &b(), fp(100)).success, "in the gap: B's deposit");
-    NativeExecutor::run_liquidations(&mut ctx); // next block's step
+    assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO, "A never filled");
+    NativeExecutor::run_liquidations(&mut ctx);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    assert_eq!(pos(&ctx, &a(), M), FixedPoint::ZERO, "next block: A ADL'd");
-    assert_eq!(ab(&ctx, &b()), (fp(1_000), FixedPoint::ZERO), "B closed at the previous mark 100");
-    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, fp(-900));
+    assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
 }
 
 // ============================================================================
-// Q5: where it starts to bite, both sides
+// Q5: where fills stop, both sides
 // ============================================================================
 
-/// Expected outcome of the end-of-block step for A.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum After {
-    /// A untouched.
-    Kept,
-    /// Stage 1 into an empty book: nothing fills, A keeps the position, pending.
-    Pending,
-    /// Backstop: position (at the mark) + collateral to the vault.
-    Vault,
-    /// ADL: closed against B at the mark, deficit to the vault.
-    Deleveraged,
-}
-
-/// Q5 sweep (block path, A maker, mark 100, A funded exactly the IM at the
-/// fill price). Buy at p: A's AV = p/2 - 10 (p - 100) = 1,000 - 9.5p, MM
-/// 25: healthy to p <= 102.63 (+2.6%), stage 1 to 103.51, backstop to
-/// 105.26 (+5.3%), ADL (bad debt) above. Sell at p: AV = 10.5p - 1,000:
-/// healthy from 97.62 (-2.4%), ADL below 95.24 (-4.8%). Vault after the
-/// step: backstop -> A's position at the mark (A realizes the loss) + A's
-/// remaining collateral = A's AV (>= 0); ADL -> A's AV (negative): 1.2x:
-/// -140; 0.8x: -160; 2x: -900; 0.5x: -475.
-// DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+/// Was `deviation_sweep_bad_debt_starts_above_5_percent_off_the_mark` (probe:
+/// healthy to +2.6% / −2.4%, stage 1, backstop, ADL with vault 106: −7, 120:
+/// −140, 200: −900, 95: −2.5, 80: −160, 50: −475). Block path, A maker
+/// funded exactly the IM at the fill price: A fills while the fill keeps it
+/// healthy at the mark (buy <= 102, sell >= 98: the charge is 0 there) and
+/// is margin-cancelled beyond (the charge needs free margin A has not got).
+/// The vault stays at 0 at every price.
 #[test]
-fn deviation_sweep_bad_debt_starts_above_5_percent_off_the_mark() {
-    use After::*;
-    use Health::{Adl, Backstop, Healthy, Stage1};
-    // (a_buys, price, class, A AV in cents, after, vault available in cents)
-    let cases: [(bool, i64, Health, i64, After, i64); 14] = [
-        (true, 102, Healthy, 3_100, Kept, 0),
-        (true, 103, Stage1, 2_150, Pending, 0),
-        (true, 104, Backstop, 1_200, Vault, 1_200),
-        (true, 105, Backstop, 250, Vault, 250),
-        (true, 106, Adl, -700, Deleveraged, -700),
-        (true, 120, Adl, -14_000, Deleveraged, -14_000),
-        (true, 200, Adl, -90_000, Deleveraged, -90_000),
-        (false, 98, Healthy, 2_900, Kept, 0),
-        (false, 97, Stage1, 1_850, Pending, 0),
-        (false, 96, Backstop, 800, Vault, 800),
-        (false, 95, Adl, -250, Deleveraged, -250),
-        (false, 94, Adl, -1_300, Deleveraged, -1_300),
-        (false, 80, Adl, -16_000, Deleveraged, -16_000),
-        (false, 50, Adl, -47_500, Deleveraged, -47_500),
+fn deviation_sweep_fills_stop_where_the_account_would_turn_unhealthy() {
+    // (a_buys, price, A fills, A AV after in cents)
+    let cases: [(bool, i64, bool, i64); 14] = [
+        (true, 102, true, 3_100),
+        (true, 103, false, 5_150),
+        (true, 104, false, 5_200),
+        (true, 105, false, 5_250),
+        (true, 106, false, 5_300),
+        (true, 120, false, 6_000),
+        (true, 200, false, 10_000),
+        (false, 98, true, 2_900),
+        (false, 97, false, 4_850),
+        (false, 96, false, 4_800),
+        (false, 95, false, 4_750),
+        (false, 94, false, 4_700),
+        (false, 80, false, 4_000),
+        (false, 50, false, 2_500),
     ];
     let mut table = String::new();
-    for (a_buys, price, class, av, after, vault) in cases {
+    for (a_buys, price, fills, av) in cases {
         let what = format!("a_buys={a_buys} price={price}");
         let (_d, mut ctx) = off_mark_fill(Path::Batch, a_buys, price, true);
+        let sign = if a_buys { 1 } else { -1 };
+        assert_eq!(pos(&ctx, &a(), M), fp(if fills { sign * Q } else { 0 }), "{what}");
         let va = view(&ctx, &a());
-        assert_eq!(classify(&va), Some(class), "{what}");
         assert_eq!(va.equity(), fp_cents(av), "{what}: A's AV at the mark");
+        assert_eq!(classify(&va), Some(Health::Healthy), "{what}");
         NativeExecutor::run_liquidations(&mut ctx);
         assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
-        let sign = if a_buys { 1 } else { -1 };
-        let a_pos = pos(&ctx, &a(), M);
-        match after {
-            Kept | Pending => assert_eq!(a_pos, fp(sign * Q), "{what}: A keeps its position"),
-            Vault => {
-                assert_eq!(a_pos, FixedPoint::ZERO, "{what}");
-                assert_eq!(pos(&ctx, &LIQUIDATOR_VAULT, M), fp(sign * Q), "{what}: the vault holds it");
-                assert_eq!(entry(&ctx, &LIQUIDATOR_VAULT, M), fp(MARK), "{what}: at the mark");
-            }
-            Deleveraged => {
-                assert_eq!(a_pos, FixedPoint::ZERO, "{what}");
-                assert_eq!(pos(&ctx, &b(), M), FixedPoint::ZERO, "{what}: B closed against A");
-                let gain = fp((price - MARK).abs() * Q);
-                assert_eq!(bal(&ctx, &b()).available, im_at(price) + gain, "{what}: B realized |p - mark| x q");
-            }
-        }
-        assert_eq!(liq_rows(&ctx, 0x06).iter().any(|(k, _)| k[1..] == *a().as_slice()), after == Pending, "{what}: A pending");
-        assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, fp_cents(vault), "{what}: vault");
-        table.push_str(&format!("{what}: {class:?} AV {} -> {after:?}, vault {}\n", va.equity(), fp_cents(vault)));
+        assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "{what}: vault");
+        table.push_str(&format!("{what}: filled {fills} AV {}\n", va.equity()));
     }
     println!("{table}");
+}
+
+// ============================================================================
+// 9.11 interaction: one batch, several books, one maker snapshot each
+// ============================================================================
+
+/// Option 1 lets a maker's fill draw its free margin (the mark charge), and
+/// each book of a batch checks makers against their OWN copy of the
+/// snapshot (plan 9.11): across k books one batch can charge up to k x the
+/// snapshot free. Pinned: maker M, flat, bids 10 @103 in markets 1, 2, 3
+/// (mark 100 each; reservations 3 x 51.5), free 3.5 left. One batch with a
+/// sell into each: every book sees free 3.5 and charges its 3.5 (loss 30 −
+/// tolerance 26.5) — 10.5 in total, 7 = (k − 1) x 3.5 more than M's free.
+/// With free 3.49 no book fills. M ends long 3 x 10 @103: AV 158 − 90 = 68,
+/// MM 75 (stage 1, not under water). The band (option 2) caps a fill's loss
+/// at 50% of its notional, which caps what one fill can charge.
+#[test]
+fn one_batch_charges_a_makers_snapshot_free_once_per_book() {
+    let mk = addr(0x4D);
+    let markets: [MarketId; 3] = [1, 2, 3];
+    for (free, fills) in [(fp_cents(350), true), (fp_cents(349), false)] {
+        for threads in [1usize, 4] {
+            let what = format!("free {free} threads {threads}");
+            let (_d, db) = liq_db(&markets);
+            let mut ctx = ctx_at(db, 1);
+            for m in markets {
+                set_mark(&ctx, m, fp(MARK));
+            }
+            fund(&ctx, &mk, fp_cents(3 * 5_150) + free);
+            let bids: Vec<PlaceOrderParams> = markets.iter().map(|&m| limit(m, true, 103, Q)).collect();
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &[(mk, NativeAction::PlaceOrderBatch(bids))], 1);
+            assert!(r.results.iter().all(|r| r.success), "{what}: {:?}", r.results);
+            assert_eq!(ab(&ctx, &mk), (free, fp_cents(3 * 5_150)), "{what}: three bids rest");
+            let sells: Vec<(Address, NativeAction)> = markets
+                .iter()
+                .map(|&m| {
+                    let s = addr(0x60 + m as u8);
+                    fund(&ctx, &s, fp(1_000));
+                    (s, NativeAction::PlaceOrder(limit(m, false, 103, Q)))
+                })
+                .collect();
+            let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &sells, threads);
+            assert!(r.results.iter().all(|r| r.success), "{what}: {:?}", r.results);
+            for m in markets {
+                assert_eq!(pos(&ctx, &mk, m), if fills { fp(Q) } else { FixedPoint::ZERO }, "{what}: market {m}");
+            }
+            let ps = ctx.positions.positions_for_trader(&mk).unwrap();
+            let v = AccountView::build(&bal(&ctx, &mk), &ps, |_| Some(fp(MARK)), |m| {
+                ctx.margin_configs.get(&m).map(|c| c.tiers.as_slice())
+            })
+            .unwrap();
+            if fills {
+                assert_eq!(v.equity(), fp(68), "{what}");
+                assert_eq!(v.free(), fp(-82), "{what}: 3 x 3.5 charged against 3.5");
+                assert_eq!(classify(&v), Some(Health::Stage1), "{what}");
+            } else {
+                assert_eq!(v.equity(), fp_cents(3 * 5_150) + free, "{what}: all three cancelled, nothing lost");
+            }
+        }
+    }
 }
