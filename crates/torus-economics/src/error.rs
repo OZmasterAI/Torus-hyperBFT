@@ -173,6 +173,12 @@ pub enum EconomicsError {
     /// A listing's tick_size or lot_size is <= 0 (books are built from the row).
     #[error("market listing {field} must be > 0")]
     MarketListingNotPositive { field: &'static str },
+
+    /// Row 74 review: a U256 overflow in an economics sum. Every validator
+    /// hits it alike, so it is NOT a local fault. The text keeps the old
+    /// `State(InvalidData)` message so action results stay byte-identical.
+    #[error("state error: invalid data: {0}")]
+    Overflow(String),
 }
 
 impl EconomicsError {
@@ -210,6 +216,7 @@ mod tests {
                 have: U256::ZERO,
                 need: U256::from(1u8),
             },
+            EconomicsError::Overflow("x".into()),
         ];
         for e in deterministic {
             assert!(!e.is_local_fault(), "{e}");

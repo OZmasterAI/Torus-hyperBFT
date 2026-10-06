@@ -247,11 +247,9 @@ impl<T: StateBackend> StakingManager<T> {
     /// The resulting rows are exactly what `process_unbonding` per validator
     /// writes (fully drained record deleted, else rewritten).
     pub fn claim_unbonded(&self, delegator: Address, current_block: u64) -> Result<U256> {
-        let overflow = || {
-            EconomicsError::State(torus_state::StateError::InvalidData(
-                "claim_unbonded: released amount overflows".to_string(),
-            ))
-        };
+        // Deterministic (same on every node): not a local fault (row 74).
+        let overflow =
+            || EconomicsError::Overflow("claim_unbonded: released amount overflows".to_string());
         let mut total = U256::ZERO;
         let mut rows: Vec<([u8; 40], Option<Vec<u8>>)> = Vec::new();
         for mut d in self.delegations_for_delegator(&delegator)? {
