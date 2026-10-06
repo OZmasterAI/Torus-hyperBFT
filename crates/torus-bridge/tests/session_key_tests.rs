@@ -489,8 +489,10 @@ fn block_validation_rejects_nonce_outside_window_of_header_time() {
     }
 }
 
+/// Commit 3: session keys may only trade, so a TransfersOnly session can sign
+/// nothing — transfers need the owner's EIP-712 key, trading is out of scope.
 #[test]
-fn session_scope_transfers_only_blocks_trading() {
+fn session_scope_transfers_only_allows_nothing() {
     let (_dir, state_db) = open_test_db();
     let owner = addr(1);
     let session_key = make_ed25519_key();
@@ -505,13 +507,16 @@ fn session_scope_transfers_only_blocks_trading() {
     };
     state_db.put_session(&pubkey, &session_data).unwrap();
 
-    // TransferToPerp should work
+    // TransferToPerp needs the owner key.
     let transfer = NativeAction::TransferToPerp {
         amount: U256::from(100),
     };
     let signed = sign_with_session(transfer, timestamp, &session_key);
     let result = signed.resolve_sender(timestamp, |pk| state_db.get_session(pk).ok().flatten());
-    assert_eq!(result.unwrap(), owner);
+    assert_eq!(
+        result.unwrap_err(),
+        torus_types::eip712::Eip712Error::RequiresEip712
+    );
 
     // PlaceOrder should fail
     let order = place_order_action();

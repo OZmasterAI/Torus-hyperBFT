@@ -843,20 +843,10 @@ pub const MAX_SESSION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Maximum active sessions per address.
 pub const MAX_SESSIONS_PER_ADDRESS: usize = 5;
 
-/// Actions that MUST use EIP-712 signature (cannot use session keys).
+/// Actions that MUST use EIP-712 signature (cannot use session keys): every
+/// action that is not trading. Session keys may only trade.
 pub fn requires_eip712(action: &NativeAction) -> bool {
-    matches!(
-        action,
-        NativeAction::CreateSession { .. }
-            | NativeAction::RevokeSession { .. }
-            | NativeAction::Withdraw { .. }
-            | NativeAction::Delegate { .. }
-            | NativeAction::Undelegate { .. }
-            | NativeAction::PermanentStake { .. }
-            | NativeAction::ClaimRewards
-            | NativeAction::ClaimUnbonded
-            | NativeAction::SetOracleSigner { .. }
-    )
+    !action.is_trading()
 }
 
 impl SignedNativeAction {
@@ -1321,6 +1311,148 @@ mod tests {
             SessionScope::Full,
         ] {
             assert!(!scope.allows(&a), "{scope:?} must not allow SetOracleSigner");
+        }
+    }
+
+    /// Commit 3: a session key, whatever its scope, may only trade (place,
+    /// batch, cancel, cancel-all, modify; not under TransfersOnly). Every
+    /// other family needs the owner's EIP-712 signature, on the ingress
+    /// (`resolve_sender`) and the exec (`batch_verify`) path alike. RED
+    /// before: a Full-scope session could vote, stake, transfer, run a
+    /// validator and submit oracle prices.
+    #[test]
+    fn session_keys_may_only_trade_in_every_scope() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[46u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x46; 20]);
+        let amount = U256::from(1_000u64);
+        let order = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ONE,
+            quantity: FixedPoint::ONE,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let trading = [
+            NativeAction::PlaceOrder(order.clone()),
+            NativeAction::PlaceOrderBatch(vec![order.clone(), order]),
+            NativeAction::CancelOrder { order_id: 1 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::ModifyOrder { order_id: 1, new_price: Some(FixedPoint::ONE), new_qty: None },
+        ];
+        let families: [(&str, Vec<NativeAction>); 6] = [
+            (
+                "transfer",
+                vec![
+                    NativeAction::TransferToPerp { amount },
+                    NativeAction::TransferToSpot { amount },
+                    NativeAction::Withdraw { amount, to: owner },
+                ],
+            ),
+            (
+                "staking",
+                vec![
+                    NativeAction::Delegate { validator: owner, amount },
+                    NativeAction::Undelegate { validator: owner, amount },
+                    NativeAction::PermanentStake { amount },
+                    NativeAction::ClaimRewards,
+                    NativeAction::ClaimUnbonded,
+                    NativeAction::TopUpSelfStake { amount },
+                ],
+            ),
+            (
+                "governance",
+                vec![
+                    NativeAction::SubmitProposal(Proposal {
+                        title: "t".into(),
+                        description: "d".into(),
+                        action: ProposalAction::DelistMarket { market_id: 1 },
+                    }),
+                    NativeAction::Vote { proposal_id: 1, option: VoteOption::Yes },
+                    NativeAction::UpdateMarketParams {
+                        market_id: 1,
+                        params: MarketParams {
+                            tick_size: FixedPoint::ONE,
+                            lot_size: FixedPoint::ONE,
+                            max_leverage: 20,
+                            maintenance_margin_bps: 500,
+                            max_funding_rate_bps: 100,
+                        },
+                    },
+                    NativeAction::ListMarket(MarketListing {
+                        base_asset: "BTC".into(),
+                        quote_asset: "USD".into(),
+                        tick_size: FixedPoint::ONE,
+                        lot_size: FixedPoint::ONE,
+                        max_leverage: 50,
+                        maintenance_margin_bps: 300,
+                    }),
+                    NativeAction::DelistMarket { market_id: 1 },
+                ],
+            ),
+            (
+                "validator",
+                vec![
+                    NativeAction::RegisterValidator { pubkey: PublicKey([1; 32]), commission: 500 },
+                    NativeAction::UpdateCommission { new_rate: 300 },
+                    NativeAction::JailVote { target: owner },
+                    NativeAction::UnjailSelf,
+                    NativeAction::RotateValidatorKey { new_pubkey: PublicKey([2; 32]) },
+                    NativeAction::AttestStateHash { height: 100, hash: B256::ZERO },
+                ],
+            ),
+            (
+                "oracle",
+                vec![
+                    NativeAction::SubmitOraclePrices(OracleSubmission {
+                        prices: vec![(1, FixedPoint::ONE)],
+                        timestamp: TEST_NONCE,
+                    }),
+                    NativeAction::SetOracleSigner { signer: owner, proof: None },
+                ],
+            ),
+            (
+                "session",
+                vec![
+                    NativeAction::CreateSession {
+                        session_pubkey: [3; 32],
+                        expiry: TEST_NONCE + 1,
+                        scope: SessionScope::Trading,
+                    },
+                    NativeAction::RevokeSession { session_pubkey: [3; 32] },
+                ],
+            ),
+        ];
+        for scope in [SessionScope::Trading, SessionScope::TransfersOnly, SessionScope::Full] {
+            let session = SessionData { owner, expiry: u64::MAX, scope, created_at: 0 };
+            let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+            let both_paths = |action: &NativeAction| {
+                let signed = sign_action_with_session(action.clone(), TEST_NONCE, &ed_key);
+                (
+                    signed.resolve_sender(TEST_NONCE, lookup),
+                    batch_verify_native_actions(std::slice::from_ref(&signed), TEST_NONCE, lookup)[0],
+                )
+            };
+            let trades = scope != SessionScope::TransfersOnly;
+            for action in &trading {
+                let want = if trades { Ok(owner) } else { Err(Eip712Error::SessionScopeViolation) };
+                assert_eq!(both_paths(action), (want.clone(), want.ok()), "{scope:?} {action:?}");
+                assert_eq!(scope.allows(action), trades, "{scope:?} allows {action:?}");
+            }
+            for (family, actions) in &families {
+                for action in actions {
+                    assert!(requires_eip712(action), "{family} {action:?} needs the owner key");
+                    assert_eq!(
+                        both_paths(action),
+                        (Err(Eip712Error::RequiresEip712), None),
+                        "{scope:?} session must not sign {family} {action:?}"
+                    );
+                    assert!(!scope.allows(action), "{scope:?} allows {family} {action:?}");
+                }
+            }
         }
     }
 
