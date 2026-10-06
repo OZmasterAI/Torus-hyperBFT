@@ -19,6 +19,9 @@
 //! above maintenance is charged at match time (`margin::mark_loss`): a maker
 //! that cannot pay it is margin-cancelled, a taker is cut to what it can
 //! pay. With A funded at the IM, A only fills where it stays healthy.
+//! Option 2: orders more than ±50% from the reference are rejected at
+//! placement, so the probe's 2x / 0.5x prices never reach the book
+//! (price_band_tests.rs); the tests here use prices inside the band.
 //!
 //! Helpers copied from liquidation_tests.rs and account_margin_tests.rs.
 
@@ -241,10 +244,11 @@ fn off_mark_fill(path: Path, a_buys: bool, price: i64, a_maker: bool) -> (tempfi
 // Q1: off-mark fills are refused (option 1: the mark charge at match time)
 // ============================================================================
 
-/// The probe's attack prices and nearer ones: (a_buys, price). Buy 2x / 1.2x
-/// / 1.06x, sell 0.5x / 0.8x / 0.94x; all beyond the healthy bound (buy >
-/// 102.63, sell < 97.62).
-const OFF_MARK: [(bool, i64); 6] = [(true, 200), (true, 120), (true, 106), (false, 50), (false, 80), (false, 94)];
+/// Off-mark prices inside the band: (a_buys, price). Buy 1.5x / 1.2x /
+/// 1.06x, sell 0.5x (the band's edge) / 0.8x / 0.94x; all beyond the healthy
+/// bound (buy > 102.63, sell < 97.62). The probe's 2x is refused at
+/// placement by the band (price_band_tests.rs).
+const OFF_MARK: [(bool, i64); 6] = [(true, 150), (true, 120), (true, 106), (false, 50), (false, 80), (false, 94)];
 
 /// Was `fills_at_2x_and_half_the_mark_are_accepted_and_executed_on_every_path`
 /// (probe: A filled 10 @200 → AV −900; @50 → AV −475). Now, on every
@@ -302,7 +306,8 @@ fn a_checked_ioc_buy_through_the_mark_fills_what_its_reservation_pays() {
 }
 
 /// Q1, the partial block: the book itself. With an innocent ask resting at
-/// 101, A's bid at 200 takes it AT 101 (price-time priority): A ends long
+/// 101, A's bid at 150 (the probe's 200 is outside the band now) takes it AT
+/// 101 (price-time priority): A ends long
 /// 10 @101, healthy (equity 90 >= MM 25): a fill near the mark is not
 /// charged (loss 10 <= tolerance 50.5 − 25).
 #[test]
@@ -315,7 +320,7 @@ fn a_through_mark_bid_takes_resting_asks_near_the_mark_first() {
         fund(&ctx, &c(), fp(1_000));
         fund(&ctx, &filler(), fp(1_000));
         assert!(run(&mut ctx, path, c(), limit(M, false, 101, Q)).success);
-        assert!(run(&mut ctx, path, a(), limit(M, true, 200, Q)).success);
+        assert!(run(&mut ctx, path, a(), limit(M, true, 150, Q)).success);
         assert_eq!(pos(&ctx, &a(), M), fp(Q), "{path:?}");
         assert_eq!(entry(&ctx, &a(), M), fp(101), "{path:?}: filled at the resting ask");
         assert_eq!(classify(&view(&ctx, &a())), Some(Health::Healthy), "{path:?}");
@@ -327,15 +332,16 @@ fn a_through_mark_bid_takes_resting_asks_near_the_mark_first() {
 // ============================================================================
 
 /// Was `counterparty_withdraws_1100_of_200_deposited_and_the_vault_is_left_at_minus_900`.
-/// Block path, A maker @200: A's bid is margin-cancelled when B's sell
-/// arrives (its 100 released), B's sell rests holding B's 100. B cannot take
-/// out more than it put in: nothing while its order rests; after cancelling,
-/// its 100 and not 1 more. The step leaves the vault at 0; value conserved.
+/// Block path, A maker @120 (the probe used 200, now refused by the band):
+/// A's bid is margin-cancelled when B's sell arrives (its 60 released), B's
+/// sell rests holding B's 60. B cannot take out more than it put in:
+/// nothing while its order rests; after cancelling, its 60 and not 1 more.
+/// The step leaves the vault at 0; value conserved.
 #[test]
 fn the_counterparty_gets_back_only_its_deposit_and_the_vault_stays_at_zero() {
-    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
-    assert_eq!(ab(&ctx, &a()), (fp(100), FixedPoint::ZERO), "A's bid cancelled, reservation released");
-    assert_eq!(ab(&ctx, &b()), (FixedPoint::ZERO, fp(100)), "B's sell rests");
+    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 120, true);
+    assert_eq!(ab(&ctx, &a()), (fp(60), FixedPoint::ZERO), "A's bid cancelled, reservation released");
+    assert_eq!(ab(&ctx, &b()), (FixedPoint::ZERO, fp(60)), "B's sell rests");
     assert!(!to_spot(&mut ctx, &b(), fp(1)).success, "B's deposit is in its resting order");
     let marks: BTreeMap<MarketId, FixedPoint> = [(M, fp(MARK))].into();
     let before = total_value(&ctx, &marks);
@@ -345,20 +351,20 @@ fn the_counterparty_gets_back_only_its_deposit_and_the_vault_stays_at_zero() {
     assert_eq!(total_value(&ctx, &marks), before, "value conserved");
     let cancel = NativeAction::CancelAllOrders { market_id: None };
     assert!(NativeExecutor::execute(&mut ctx, &b(), &cancel).success);
-    assert!(to_spot(&mut ctx, &b(), fp(100)).success, "B's own deposit");
+    assert!(to_spot(&mut ctx, &b(), fp(60)).success, "B's own deposit");
     let r = to_spot(&mut ctx, &b(), fp(1));
     assert!(!r.success, "nothing more: {:?}", r.error);
     assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
 }
 
 /// Was `an_innocent_higher_ranked_short_is_adld_at_the_mark_and_the_vault_still_pays_900`:
-/// with A's fill refused nobody is under water, so the end-of-block step
+/// (A @120 now) with A's fill refused nobody is under water, so the end-of-block step
 /// ADLs no one — the innocent short C keeps its position — and the vault
 /// stays at 0.
 #[test]
 fn an_innocent_short_keeps_its_position_and_the_vault_pays_nothing() {
     let d_ = addr(0x0D);
-    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
+    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 120, true);
     fund(&ctx, &c(), fp(200));
     fund(&ctx, &d_, fp(1_000));
     ctx.positions.apply_fill(&d_, M, true, fp(Q), fp(MARK), MarginType::Cross).unwrap();
@@ -381,7 +387,7 @@ fn an_innocent_short_keeps_its_position_and_the_vault_pays_nothing() {
 /// refused), and after two steps the vault is still at 0.
 #[test]
 fn with_64_under_mm_accounts_ahead_nothing_is_left_for_the_vault() {
-    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 200, true);
+    let (_d, mut ctx) = off_mark_fill(Path::Batch, true, 120, true);
     ctx.state.put_cf_raw(CF_NATIVE_MARKETS, &2u64.to_be_bytes(), b"listed").unwrap();
     let s = addr(0x50);
     fund(&ctx, &s, fp(10_000_000));
@@ -415,7 +421,8 @@ fn with_64_under_mm_accounts_ahead_nothing_is_left_for_the_vault() {
 
 /// Was `deviation_sweep_bad_debt_starts_above_5_percent_off_the_mark` (probe:
 /// healthy to +2.6% / −2.4%, stage 1, backstop, ADL with vault 106: −7, 120:
-/// −140, 200: −900, 95: −2.5, 80: −160, 50: −475). Block path, A maker
+/// −140, 200: −900, 95: −2.5, 80: −160, 50: −475; 200 is now refused at
+/// placement by the band, 50 is its edge). Block path, A maker
 /// funded exactly the IM at the fill price: A fills while the fill keeps it
 /// healthy at the mark (buy <= 102, sell >= 98: the charge is 0 there) and
 /// is margin-cancelled beyond (the charge needs free margin A has not got).
@@ -424,13 +431,14 @@ fn with_64_under_mm_accounts_ahead_nothing_is_left_for_the_vault() {
 fn deviation_sweep_fills_stop_where_the_account_would_turn_unhealthy() {
     // (a_buys, price, A fills, A AV after in cents)
     let cases: [(bool, i64, bool, i64); 14] = [
+        // (true, 200, ..): outside the band, see price_band_tests.rs
         (true, 102, true, 3_100),
         (true, 103, false, 5_150),
         (true, 104, false, 5_200),
         (true, 105, false, 5_250),
         (true, 106, false, 5_300),
         (true, 120, false, 6_000),
-        (true, 200, false, 10_000),
+        (true, 150, false, 7_500),
         (false, 98, true, 2_900),
         (false, 97, false, 4_850),
         (false, 96, false, 4_800),

@@ -494,8 +494,111 @@ pub fn market_row_shape(row: &[u8]) -> Option<(FixedPoint, FixedPoint)> {
     Some((FixedPoint::from_raw(tick), FixedPoint::from_raw(lot)))
 }
 
+/// s94 option 2 (HL "Order price too far from oracle"): a price band of
+/// ± `bps` (basis points) around a market's reference price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceBand {
+    pub reference: FixedPoint,
+    pub bps: u64,
+}
+
+impl PriceBand {
+    /// `floor(reference × bps / 10,000)`, exact without overflow.
+    fn half_width(&self) -> i128 {
+        let (r, bps) = (self.reference.raw(), i128::from(self.bps));
+        (r / 10_000) * bps + (r % 10_000) * bps / 10_000
+    }
+
+    /// `|price − reference| <= reference × bps / 10,000`.
+    pub fn contains(&self, price: FixedPoint) -> bool {
+        price.raw().abs_diff(self.reference.raw()) <= self.half_width().unsigned_abs()
+    }
+}
+
+/// s94 option 2: an order price outside its market's [`PriceBand`]. One text
+/// for the executor's pre-book reject, the RPC intake check and (after
+/// "modify rejected: ") the modify path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceBandViolation {
+    pub price: FixedPoint,
+    pub band: PriceBand,
+}
+
+impl std::fmt::Display for PriceBandViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "price {} is more than {}.{:02}% from the reference price {}",
+            self.price,
+            self.band.bps / 100,
+            self.band.bps % 100,
+            self.band.reference
+        )
+    }
+}
+
+impl PriceBandViolation {
+    /// The placement reject text (executor and RPC).
+    pub fn placement_message(&self) -> String {
+        format!("order rejected: {self}")
+    }
+}
+
+/// s94 option 2: the band rule — a `Limit` price (any time in force), a
+/// `StopLimit`'s limit then its trigger and a `StopMarket`'s trigger must lie
+/// inside `band`; a `Market` order's price (its slippage cap) is not banded
+/// (out of scope: the P2 slippage cap). Returns the first price outside.
+pub fn price_band_violation(params: &PlaceOrderParams, band: PriceBand) -> Option<PriceBandViolation> {
+    let prices = match params.order_type {
+        OrderType::Limit => [Some(params.price), None],
+        OrderType::StopLimit { trigger, limit } => [Some(limit), Some(trigger)],
+        OrderType::StopMarket { trigger } => [Some(trigger), None],
+        OrderType::Market => [None, None],
+    };
+    prices.into_iter().flatten().find(|p| !band.contains(*p)).map(|price| PriceBandViolation { price, band })
+}
+
+/// s94 option 2: a market's band reference — and option 1's mark for the
+/// fills' charge. The usable `mark` when there is one; else (stale / missing
+/// mark; HL's deployer-oracle fallback, local mark = median(best bid, best
+/// ask, last trade)) the median of the book's best bid, best ask and last
+/// trade price that exist (the mid of two, the one of one, `last_mark` of
+/// none), clamped to ± [`torus_types::PRICE_BAND_FALLBACK_CLAMP_BPS`] of
+/// `last_mark`, the market's last aggregated oracle price. No `last_mark`
+/// either (a market never marked): `None` — no band, no charge. Block state
+/// only, so every node computes the same value.
+pub fn band_reference(
+    mark: Option<FixedPoint>,
+    last_mark: Option<FixedPoint>,
+    best_bid: Option<FixedPoint>,
+    best_ask: Option<FixedPoint>,
+    last_trade: Option<FixedPoint>,
+) -> Option<FixedPoint> {
+    if let Some(m) = mark.filter(|m| *m > FixedPoint::ZERO) {
+        return Some(m);
+    }
+    let last = last_mark.filter(|m| *m > FixedPoint::ZERO)?;
+    let mut c: Vec<i128> = [best_bid, best_ask, last_trade]
+        .into_iter()
+        .flatten()
+        .filter(|p| *p > FixedPoint::ZERO)
+        .map(|p| p.raw())
+        .collect();
+    c.sort_unstable();
+    let median = match c.as_slice() {
+        [] => last.raw(),
+        [a] => *a,
+        [a, b] => a / 2 + b / 2 + (a % 2 + b % 2) / 2,
+        [_, b, ..] => *b,
+    };
+    let d = PriceBand { reference: last, bps: torus_types::PRICE_BAND_FALLBACK_CLAMP_BPS }.half_width();
+    Some(FixedPoint::from_raw(median.clamp(last.raw() - d, last.raw() + d)))
+}
+
 #[cfg(test)]
 mod shape_tests;
+#[cfg(test)]
+mod price_band_tests;
 
 /// F1 (s517): account-level margin state of ONE book for the current
 /// placement / batch — the running free margin (and position valuation
@@ -2001,6 +2104,12 @@ impl OrderBook {
     /// Last trade price.
     pub fn last_trade_price(&self) -> Option<FixedPoint> {
         self.last_trade_price
+    }
+
+    /// s94 option 2: this market's band reference ([`band_reference`]) with
+    /// the book's best bid, best ask and last trade price.
+    pub fn band_reference(&self, mark: Option<FixedPoint>, last_mark: Option<FixedPoint>) -> Option<FixedPoint> {
+        band_reference(mark, last_mark, self.best_bid(), self.best_ask(), self.last_trade_price)
     }
 
     /// All resting orders belonging to a specific trader.

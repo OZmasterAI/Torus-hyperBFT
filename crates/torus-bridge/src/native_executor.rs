@@ -18,9 +18,9 @@ use torus_core::margin::{
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    market_row_shape, reduce_only_allowance, shape_violation, AccountMargins, Fill, MakerAccount,
-    MakerAccountSource, OrderBook, OrderStatus, PlaceResult, ReduceOnlyPositions, ShapeViolation,
-    TakerMarginLimit, TriggeredStop,
+    band_reference, market_row_shape, price_band_violation, reduce_only_allowance, shape_violation, AccountMargins,
+    Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult, PriceBand, ReduceOnlyPositions,
+    ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
@@ -1860,9 +1860,12 @@ struct Phase2Market<'a> {
     /// Option B (s87): the market's best bid after Phase 1 (`None`: no bid).
     bid_floor: Option<FixedPoint>,
     cfg: Option<&'a MarketMarginConfig>,
-    /// [`AccountReader::mark`] (read only for a market with an order that
-    /// is not reduce-only, i.e. may need `position_px`).
+    /// [`AccountReader::mark`].
     mark: Option<FixedPoint>,
+    /// s94 option 2: the market's price band ([`NativeExecutor::price_band`],
+    /// from the books after Phase 1); its reference is also option 1's mark
+    /// for the fills' charge. `None`: no reference (never marked).
+    band: Option<PriceBand>,
     /// Item 6 cut 2: the call's PlaceOrders in the market (the capacity of
     /// its prepared batch: no regrowth while stitching).
     orders: usize,
@@ -6149,7 +6152,7 @@ impl NativeExecutor {
             // An unchecked taker (GTC buy, reduce-only) pays a charge from
             // its pool here, else its snapshot — the pre-batch state, which
             // still holds its own reservation (the book takes it off).
-            am.set_mark(reader.mark(market_id));
+            am.set_mark(markets.get(&market_id).and_then(|m| m.band).map(|b| b.reference));
             am.set_pre_batch_snapshots(true);
             for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
                 if am.get(&p.sender).is_none() {
@@ -6398,6 +6401,7 @@ impl NativeExecutor {
                 bid_floor: None,
                 cfg: reader.margin_configs.get(&params.market_id),
                 mark: reader.mark(params.market_id),
+                band: None,
                 orders: 0,
             },
         };
@@ -6408,6 +6412,14 @@ impl NativeExecutor {
                 funnel: RejectReason::Other,
                 reason,
                 msg,
+            };
+        }
+        // s94 option 2: the price band, same place and effect as fix A.
+        if let Some(v) = market.band.and_then(|b| price_band_violation(params, b)) {
+            return PrepOutcome::Reject {
+                funnel: RejectReason::Other,
+                reason: FailureReason::PriceBand,
+                msg: v.placement_message(),
             };
         }
         let (base_price, res_qty) = (!basis.is_empty())
@@ -7974,30 +7986,70 @@ impl NativeExecutor {
         reader: &AccountReader<'a, T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
     ) -> HashMap<MarketId, Phase2Market<'a>> {
-        let mut out: HashMap<MarketId, (Phase2Market<'a>, bool)> = HashMap::new();
+        let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::new();
         for &(_, _, p) in orders {
-            let (market, needs_mark) = out.entry(p.market_id).or_insert_with(|| {
-                let market = Phase2Market {
+            out.entry(p.market_id)
+                .or_insert_with(|| Phase2Market {
                     shape: Self::book_shape(books, state, p.market_id),
                     bid_floor: books.get(&p.market_id).and_then(OrderBook::best_bid),
                     cfg: reader.margin_configs.get(&p.market_id),
                     mark: None,
+                    band: None,
                     orders: 0,
-                };
-                (market, false)
-            });
-            market.orders += 1;
-            *needs_mark |= !p.reduce_only;
+                })
+                .orders += 1;
         }
+        // s94 option 2: the band of every batch market (its mark from the
+        // block table; the stale fallback reads the books after Phase 1).
+        let bps = Self::price_band_bps(state);
         // Independent reads per market: iteration order is irrelevant.
         out.into_iter()
-            .map(|(m, (mut market, needs_mark))| {
-                if needs_mark {
-                    market.mark = reader.mark(m);
-                }
+            .map(|(m, mut market)| {
+                market.mark = reader.mark(m);
+                market.band = Self::price_band(reader, books.get(&m), m, market.mark, bps);
                 (m, market)
             })
             .collect()
+    }
+
+    /// s94 option 2: the band width in force — governance key
+    /// [`torus_types::PRICE_BAND_PARAM`] in `CF_FEE_CONFIG` (default ±50%).
+    fn price_band_bps<T: StateBackend>(state: &T) -> u64 {
+        let stored = state
+            .get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::PRICE_BAND_PARAM.as_bytes())
+            .ok()
+            .flatten();
+        torus_types::price_band_bps(stored.as_deref())
+    }
+
+    /// s94 option 2: `market_id`'s band — its usable `mark`, else the book
+    /// fallback ([`band_reference`]) clamped to the last aggregated oracle
+    /// price (read only when the mark is not usable); `None` when the market
+    /// was never marked (no band, no option-1 charge).
+    fn price_band<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        book: Option<&OrderBook>,
+        market_id: MarketId,
+        mark: Option<FixedPoint>,
+        bps: u64,
+    ) -> Option<PriceBand> {
+        let last = match mark {
+            Some(_) => None,
+            None => reader.oracle.get_price(market_id, reader.now).ok().map(|p| p.price),
+        };
+        let reference = match book {
+            Some(b) => b.band_reference(mark, last),
+            None => band_reference(mark, last, None, None, None),
+        }?;
+        Some(PriceBand { reference, bps })
+    }
+
+    /// s94 option 2: [`Self::price_band`] on the single-action path (the
+    /// context's current book and mark).
+    fn market_band<T: StateBackend>(ctx: &NativeExecContext<T>, market_id: MarketId) -> Option<PriceBand> {
+        let reader = AccountReader::of(ctx);
+        let mark = reader.mark(market_id);
+        Self::price_band(&reader, ctx.order_books.get(&market_id), market_id, mark, Self::price_band_bps(&ctx.state))
     }
 
     /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid
@@ -8365,9 +8417,15 @@ impl NativeExecutor {
         // Item 6 M1 (row 42): a missing book is created below with `shape`.
         let mut ro_pos = None;
         let shape = Self::book_shape(&ctx.order_books, &ctx.state, market_id);
+        // s94 option 2: the band (its reference is also option 1's mark).
+        let band = Self::market_band(ctx, market_id);
         let pre_check = Self::validate_order_price(params)
             .err()
             .or_else(|| Self::book_shape_violation(params, shape))
+            .or_else(|| {
+                let v = price_band_violation(params, band?)?;
+                Some((FailureReason::PriceBand, v.placement_message()))
+            })
             .or_else(|| {
                 if !params.reduce_only {
                     return None;
@@ -8561,7 +8619,7 @@ impl NativeExecutor {
         }
         // s94 option 1: every fill's loss against the mark is charged.
         if !liquidation {
-            am.set_mark(reader.mark(market_id));
+            am.set_mark(band.map(|b| b.reference));
         }
         book.set_account_margins(am);
         // F1 (s517 #4): makers are checked on every fill (HL marginCanceled).
@@ -9026,6 +9084,23 @@ impl NativeExecutor {
             let v = ShapeViolation::OffTick { price, tick: book.tick_size };
             return rejected(Self::shape_reason(&v), format!("modify rejected: {v}"));
         }
+        // s94 option 2: a NEW price must lie in the band too.
+        if price != old.price {
+            let probe = PlaceOrderParams {
+                market_id,
+                is_buy,
+                price,
+                quantity: old.remaining_qty,
+                order_type: OrderType::Limit,
+                time_in_force: old.time_in_force,
+                reduce_only: old.reduce_only,
+                client_order_id: None,
+            };
+            if let Some(v) = Self::market_band(ctx, market_id).and_then(|b| price_band_violation(&probe, b)) {
+                return rejected(FailureReason::PriceBand, format!("modify rejected: {v}"));
+            }
+        }
+        let book = &ctx.order_books[&market_id];
         let mut qty = new_qty.unwrap_or(old.remaining_qty);
         if qty <= FixedPoint::ZERO {
             return rejected(FailureReason::Lot, format!("modify rejected: quantity must be positive, got {qty}"));

@@ -63,6 +63,9 @@ pub enum FailureReason {
     BatchCap = 6,
     /// A fill could not be applied at settlement.
     Fill = 7,
+    /// s94: an order price outside the price band around the market's
+    /// reference price (placement, modify; HL `oracleRejected`).
+    PriceBand = 8,
 }
 
 impl FailureReason {
@@ -76,6 +79,7 @@ impl FailureReason {
             5 => Self::Price,
             6 => Self::BatchCap,
             7 => Self::Fill,
+            8 => Self::PriceBand,
             _ => Self::Other,
         }
     }
@@ -91,6 +95,7 @@ impl FailureReason {
             Self::Price => "price",
             Self::BatchCap => "batch_cap",
             Self::Fill => "fill",
+            Self::PriceBand => "price_band",
         }
     }
 }
@@ -378,6 +383,7 @@ mod tests {
             (FailureReason::Price, 5, "price"),
             (FailureReason::BatchCap, 6, "batch_cap"),
             (FailureReason::Fill, 7, "fill"),
+            (FailureReason::PriceBand, 8, "price_band"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");

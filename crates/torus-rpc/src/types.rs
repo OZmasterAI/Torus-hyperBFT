@@ -650,6 +650,7 @@ mod action_failure_tests {
             (FailureReason::Price, "price"),
             (FailureReason::BatchCap, "batch_cap"),
             (FailureReason::Fill, "fill"),
+            (FailureReason::PriceBand, "price_band"),
         ];
         let status = BlockActionStatus {
             evm_skipped: vec![],

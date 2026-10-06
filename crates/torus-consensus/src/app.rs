@@ -17285,12 +17285,12 @@ mod crash_recovery_tests {
     /// Probe (77a3b21): B's IOC sell filled A's bid @200 in block 2, A was
     /// ADL'd at the block's end with -900 left in the vault, and B moved
     /// 1,100 to the EVM side for 200 deposited.
-    /// Fixed (option 1, the mark charge): block 1 (no mark yet): A's GTC bid
-    /// 10 @200 rests (reserves 100). Block 2 (mark 100): B's IOC sell meets
-    /// it; A cannot pay the fill's loss against the mark (1,000 − tolerance
-    /// 75) and is margin-cancelled (its 100 released); B's IOC fills
-    /// nothing, and B's TransferToSpot 100 takes back its own deposit.
-    /// Block 3: B's 1,000 is refused. The vault stays at 0.
+    /// Fixed: block 1 (no mark yet, never marked: no band): A's GTC bid 10
+    /// @200 rests (reserves 100). Block 2 (mark 100): B's IOC sell @200 is
+    /// rejected at placement by the price band (option 2: more than 50% from
+    /// the mark; had it matched, option 1 would margin-cancel A's bid: loss
+    /// 1,000 − tolerance 75 > A's free 0). B's TransferToSpot 100 takes back
+    /// its own deposit. Block 3: B's 1,000 is refused. The vault stays at 0.
     #[test]
     fn offmark_fill_e2e_is_refused_and_the_counterparty_gets_back_only_its_deposit() {
         use torus_core::liquidation::LIQUIDATOR_VAULT;
@@ -17333,9 +17333,9 @@ mod crash_recovery_tests {
         dispatch_and_execute(&ctx, &db, &blocks[0]);
         assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
         dispatch_and_execute(&ctx, &db, &blocks[1]);
-        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: A margin-cancelled, no fill");
+        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: no fill (B's sell refused by the band)");
         assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO);
-        assert_eq!(native(&a), (px(100), FixedPoint::ZERO), "A's reservation released");
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "A's bid still rests");
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
