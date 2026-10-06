@@ -148,6 +148,21 @@
 #                the fixed price and the flag is not passed (older
 #                bench-throughput binaries keep working); N > 0 needs a binary
 #                whose oracle-feed has --walk-bp.
+#   ORACLE_FEED_DRAIN=1  with ORACLE_FEED=1 (else FATAL): keep the feed RUNNING
+#                through the drain, so oracle-only blocks are executed with live
+#                marks, as on a real chain whose feed never stops. 0 (default) =
+#                the feed is SIGSTOPped before the drain, as above. When 1 the
+#                drain is `health.py drain --feed-live`: done once the order
+#                counters (placed/matched/resting) are quiet, every native
+#                mempool holds at most the feed's own footprint (2 rounds x 3
+#                validators x ceil(MARKETS/256) chunks), no flush/trade-writer
+#                work, exec lag (torus_exec_queue_depth) <= 2 on every sample,
+#                for QUIET_S with commits on every node. Per sample and node:
+#                exec lag and mean exec ms per native block
+#                (torus_exec_chain_seconds) -> drain-feed-live.tsv; summary in
+#                drain.json .feed_live and run.log. Then the feed is SIGSTOPped
+#                and the default quiet drain re-run (feed-stop-settle/, 60 s)
+#                before the after-snapshots and the state digest.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -231,6 +246,7 @@ ORACLE_FEED=${ORACLE_FEED:-0}
 ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
 ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
+ORACLE_FEED_DRAIN=${ORACLE_FEED_DRAIN:-0}
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
@@ -404,6 +420,11 @@ done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
 [[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
     || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
+case "$ORACLE_FEED_DRAIN" in
+    0) ;;
+    1) [ "$ORACLE_FEED" = 1 ] || { echo "FATAL: ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1" >&2; exit 2; } ;;
+    *) echo "FATAL: ORACLE_FEED_DRAIN must be 0 or 1 (got '$ORACLE_FEED_DRAIN')" >&2; exit 2 ;;
+esac
 case "$ORACLE_FEED" in
     0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
     1)
@@ -834,8 +855,12 @@ if [ "$ORACLE_FEED" = 1 ]; then
     ORACLE_MEND=$(oracle_marks "$ORACLE_H0")
     printf '%s\n' "$ORACLE_MEND" > "$OUT/oracle-marks-bench-end.json"
     log "oracle marks at bench end: $ORACLE_MEND"
-    kill -STOP "$ORACLE_PID" 2>/dev/null
-    log "oracle feed paused (SIGSTOP) for drain + digest"
+    if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
+        log "oracle feed kept RUNNING through the drain (ORACLE_FEED_DRAIN=1); paused before the digest"
+    else
+        kill -STOP "$ORACLE_PID" 2>/dev/null
+        log "oracle feed paused (SIGSTOP) for drain + digest"
+    fi
 fi
 
 # ---------------------------------------------------------------- 7. drain
@@ -846,11 +871,28 @@ fi
 QUIET_S=${QUIET_S:-10}
 log "draining (quiet counters, no pending work, per-node commit progress for ${QUIET_S}s; timeout ${DRAIN_TIMEOUT}s)"
 DRAINED=0
+DRAIN_URLS=("http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics")
+FEED_DRAIN_ARGS=()
+if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
+    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )))
+    log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= 2; the feed's actions may move)"
+fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
-    --urls "http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics" \
+    --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" \
     >>"$OUT/run.log" 2>&1; then DRAINED=1; fi
 T_DRAIN=$(date +%s)
 log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and drain-samples.jsonl)"
+if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
+    log "feed-live drain: $(jq -r '.feed_live | "max_exec_lag=\(.max_exec_lag) quiet_window_native_block_exec_ms (oracle-only proxy) p50=\(.chain_ms.p50) p95=\(.chain_ms.p95) max=\(.chain_ms.max) native_blocks=\(.native_blocks) single_block_intervals=\(.single_block_intervals)/\(.native_intervals)"' "$OUT/drain.json" 2>/dev/null || echo MISSING) (drain-feed-live.tsv)"
+    # The digest and the after-snapshots need quiet counters: pause the feed
+    # now and prove quiescence with the default criterion before them.
+    kill -STOP "$ORACLE_PID" 2>/dev/null
+    mkdir -p "$OUT/feed-stop-settle"
+    SETTLED=0
+    python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout 60 --quiet "$QUIET_S" \
+        --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1 && SETTLED=1
+    log "oracle feed paused (SIGSTOP) for the digest; settle drained=$SETTLED after $(jq -r '.elapsed_s // "?" | if type == "number" then floor else . end' "$OUT/feed-stop-settle/drain.json" 2>/dev/null || echo '?')s (feed-stop-settle/drain.json$([ "$SETTLED" = 1 ] || echo '; NOT quiet within 60 s: the digest quiescence check decides'))"
+fi
 sleep 2
 stop_sampler || die "metrics sampler failed (see sampler.log)"
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""
