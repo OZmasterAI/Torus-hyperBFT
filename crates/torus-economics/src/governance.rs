@@ -547,6 +547,20 @@ impl<T: StateBackend> GovernanceManager<T> {
         &self.state
     }
 
+    /// Row 43: a market listing needs tick_size > 0 and lot_size > 0. New books
+    /// are built from the market row; a lot of 0 accepts zero-quantity orders
+    /// and a tick of 0 turns the tick check off. Checked at submission and
+    /// again at execution.
+    fn validate_tick_lot(tick_size: FixedPoint, lot_size: FixedPoint) -> Result<()> {
+        if tick_size.raw() <= 0 {
+            return Err(EconomicsError::MarketListingNotPositive { field: "tick_size" });
+        }
+        if lot_size.raw() <= 0 {
+            return Err(EconomicsError::MarketListingNotPositive { field: "lot_size" });
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // FIX 13: Parameter change validation (ECON-PF-12)
     // ========================================================================
@@ -739,7 +753,14 @@ impl<T: StateBackend> GovernanceManager<T> {
 
         // An explicit (nonzero) listing id must not collide with a live market.
         // Re-checked at execution (another listing may take it during the vote).
-        if let Some(ExecutionPayload::MarketListing { market_id, .. }) = &execution_payload {
+        if let Some(ExecutionPayload::MarketListing {
+            market_id,
+            tick_size,
+            lot_size,
+            ..
+        }) = &execution_payload
+        {
+            Self::validate_tick_lot(*tick_size, *lot_size)?;
             if *market_id != 0 && self.market_exists(*market_id)? {
                 return Err(EconomicsError::MarketIdInUse(*market_id));
             }
@@ -1093,6 +1114,8 @@ impl<T: StateBackend> GovernanceManager<T> {
                 tick_size,
                 initial_margin,
             } => {
+                // Row 43: re-checked at execution (defense-in-depth), before any write.
+                Self::validate_tick_lot(*tick_size, *lot_size)?;
                 // market_id 0 = auto-assign at EXECUTION time: max existing market
                 // id + 1. Deterministic (same CF contents on every validator), and
                 // two proposals executing in one block get distinct ids because

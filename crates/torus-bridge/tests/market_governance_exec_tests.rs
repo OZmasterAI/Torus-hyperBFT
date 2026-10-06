@@ -182,3 +182,102 @@ fn submit_listing_rejects_zero_max_leverage() {
     let ctx = make_ctx(&db);
     assert!(ctx.governance.get_proposal(1).unwrap().is_none());
 }
+
+// ----------------------------------------------------------------------------
+// Row 43: tick_size > 0 and lot_size > 0 (consensus). Books are built from the
+// market row; a lot of 0 accepts zero-quantity orders, a tick of 0 turns the
+// tick check off.
+// ----------------------------------------------------------------------------
+
+fn listing_tick_lot(tick_raw: i128, lot_raw: i128) -> MarketListing {
+    MarketListing {
+        tick_size: FixedPoint::from_raw(tick_raw),
+        lot_size: FixedPoint::from_raw(lot_raw),
+        ..sample_listing(20, 300)
+    }
+}
+
+#[test]
+fn submit_listing_rejects_zero_tick_or_lot() {
+    let (_dir, db) = open_test_db();
+    let proposer = setup_proposer(&db);
+    for (tick, lot, field) in [
+        (0, 1_000_000, "tick_size"),
+        (1_000_000, 0, "lot_size"),
+        (-1_000_000, 1_000_000, "tick_size"),
+    ] {
+        let mut ctx = make_ctx(&db);
+        let r = NativeExecutor::execute(
+            &mut ctx,
+            &proposer,
+            &NativeAction::SubmitProposal(Proposal {
+                title: "List ETH".into(),
+                description: "d".into(),
+                action: ProposalAction::ListMarket(listing_tick_lot(tick, lot)),
+            }),
+        );
+        assert!(!r.success, "tick {tick} lot {lot} must be refused");
+        assert_eq!(
+            r.error.as_deref(),
+            Some(format!("market listing {field} must be > 0").as_str())
+        );
+    }
+    let ctx = make_ctx(&db);
+    assert!(ctx.governance.get_proposal(1).unwrap().is_none(), "nothing stored");
+    // Both > 0 is accepted, and gets proposal id 1 (refusals consumed none).
+    assert!(submit_listing(&db, &proposer, listing_tick_lot(1, 1)));
+    assert!(make_ctx(&db).governance.get_proposal(1).unwrap().is_some());
+}
+
+#[test]
+fn direct_list_market_with_zero_tick_or_lot_is_rejected_and_changes_nothing() {
+    let (_dir, db) = open_test_db();
+    let before = markets_snapshot(&db);
+    let mut ctx = make_ctx(&db);
+    for l in [listing_tick_lot(0, 1), listing_tick_lot(1, 0)] {
+        let r = NativeExecutor::execute(&mut ctx, &addr(7), &NativeAction::ListMarket(l));
+        assert!(!r.success);
+        assert!(r.error.as_deref().unwrap_or("").contains("governance-only"));
+    }
+    assert_eq!(markets_snapshot(&db), before, "CF_NATIVE_MARKETS unchanged");
+}
+
+/// A bad listing that reaches execution anyway (stored payload overwritten,
+/// bypassing submission) is not applied: the per-block governance step records
+/// the error and writes no market row.
+#[test]
+fn governance_execution_of_zero_tick_or_lot_listing_writes_no_market() {
+    use torus_state::cf::CF_GOVERNANCE_PROPOSALS;
+    for (tick, lot, field) in [(0, 1, "tick_size"), (1, 0, "lot_size")] {
+        let (_dir, db) = open_test_db();
+        let proposer = setup_proposer(&db);
+        assert!(submit_listing(&db, &proposer, sample_listing(20, 300)));
+        let mut ctx = make_ctx(&db);
+        ctx.governance.cast_vote(proposer, 1, true, 10).unwrap();
+        ctx.governance.finalize_proposal(1, 102).unwrap();
+        let mut p = ctx.governance.get_proposal(1).unwrap().unwrap();
+        match p.execution_payload.as_mut() {
+            Some(ExecutionPayload::MarketListing {
+                tick_size, lot_size, ..
+            }) => {
+                *tick_size = FixedPoint::from_raw(tick);
+                *lot_size = FixedPoint::from_raw(lot);
+            }
+            other => panic!("expected MarketListing payload, got {other:?}"),
+        }
+        db.put_cf_raw(CF_GOVERNANCE_PROPOSALS, &1u64.to_be_bytes(), &borsh::to_vec(&p).unwrap())
+            .unwrap();
+        let before = markets_snapshot(&db);
+
+        ctx.block_height = 200; // past the 10-block timelock
+        let results = NativeExecutor::process_governance(&mut ctx);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert_eq!(results[0].action_type, "governance_process");
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some(format!("market listing {field} must be > 0").as_str())
+        );
+        assert_eq!(markets_snapshot(&db), before, "no market row ({field})");
+    }
+}

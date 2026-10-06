@@ -48,6 +48,8 @@ pub enum GenesisError {
     InvalidPubkey(String),
     #[error("invalid balance/amount: {0}")]
     InvalidAmount(String),
+    #[error("invalid market: {0}")]
+    InvalidMarket(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +329,19 @@ impl Genesis {
     /// 3. Seeds validator stakes into `CF_STAKING_VALIDATORS`
     /// 4. Computes and returns the state root
     pub fn initialize(&self, state_db: &StateDb) -> Result<B256, GenesisError> {
+        // 0. Row 43: every market needs tick_size > 0 and lot_size > 0 (books are
+        //    built from the market row). Checked before any write.
+        for market in &self.markets {
+            for (field, value) in [("tick_size", &market.tick_size), ("lot_size", &market.lot_size)] {
+                if parse_fixedpoint_raw(value)? <= 0 {
+                    return Err(GenesisError::InvalidMarket(format!(
+                        "market {} {field} must be > 0",
+                        market.market_id
+                    )));
+                }
+            }
+        }
+
         // 1. Seed plain accounts
         for account in &self.accounts {
             let address = parse_address(&account.address)?;
@@ -1014,5 +1029,42 @@ mod tests {
             FixedPoint::from_raw(1_000_000_000i128 * FixedPoint::SCALE)
         );
         assert_eq!(bal.order_margin, FixedPoint::ZERO);
+    }
+
+    /// Row 43: a genesis market with tick_size or lot_size <= 0 is refused
+    /// before anything is written.
+    #[test]
+    fn initialize_refuses_market_with_zero_tick_or_lot() {
+        use torus_state::StateBackend;
+        for (tick, lot, field) in [
+            ("0", "1.0", "tick_size"),
+            ("0.01", "0.0", "lot_size"),
+            ("-0.01", "1.0", "tick_size"),
+        ] {
+            let mut v: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            v["markets"] = serde_json::json!([
+                { "market_id": 1, "base_asset": "BTC", "quote_asset": "USD",
+                  "lot_size": "1.0", "tick_size": "1.0", "initial_margin": "5.0" },
+                { "market_id": 2, "base_asset": "ETH", "quote_asset": "USD",
+                  "lot_size": lot, "tick_size": tick, "initial_margin": "5.0" }
+            ]);
+            let genesis = Genesis::from_json(&v.to_string()).unwrap();
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let err = genesis.initialize(&db).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("invalid market: market 2 {field} must be > 0"),
+                "tick {tick} lot {lot}"
+            );
+            assert!(
+                db.iterate_cf(CF_NATIVE_MARKETS, None).unwrap().is_empty(),
+                "nothing seeded"
+            );
+            assert!(
+                db.iterate_cf(CF_STAKING_VALIDATORS, None).unwrap().is_empty(),
+                "refused before any write"
+            );
+        }
     }
 }

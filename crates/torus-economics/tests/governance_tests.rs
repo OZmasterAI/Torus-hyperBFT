@@ -7,7 +7,7 @@ use torus_economics::governance::{
     ProposalType,
 };
 use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
-use torus_state::cf::{CF_FEE_CONFIG, CF_NATIVE_MARKETS};
+use torus_state::cf::{CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS};
 use torus_state::{StateBackend, StateDb};
 use torus_types::FixedPoint;
 
@@ -848,4 +848,86 @@ fn listed_market_ids_are_the_8_byte_keys_ascending() {
     assert_eq!(gov.listed_market_ids().unwrap(), vec![1, 9, 300]);
     assert!(gov.market_exists(9).unwrap());
     assert!(!gov.market_exists(2).unwrap());
+}
+
+// ============================================================================
+// Row 43: a listing needs tick_size > 0 and lot_size > 0. Books are built from
+// the market row; a lot of 0 accepts zero-quantity orders and a tick of 0 turns
+// the tick check off.
+// ============================================================================
+
+fn listing_tick_lot(tick_raw: i128, lot_raw: i128) -> ExecutionPayload {
+    ExecutionPayload::MarketListing {
+        market_id: 0,
+        base_asset: "ETH".into(),
+        quote_asset: "USDC".into(),
+        lot_size: FixedPoint::from_raw(lot_raw),
+        tick_size: FixedPoint::from_raw(tick_raw),
+        initial_margin: FixedPoint::from_raw(500_000_000),
+    }
+}
+
+fn assert_not_positive<T: std::fmt::Debug>(r: Result<T, EconomicsError>, field: &str) {
+    match r {
+        Err(e @ EconomicsError::MarketListingNotPositive { .. }) => {
+            assert_eq!(e.to_string(), format!("market listing {field} must be > 0"));
+        }
+        other => panic!("expected MarketListingNotPositive({field}), got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_market_listing_rejects_zero_or_negative_tick_or_lot() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let submit = |p| gov.submit_proposal(addr(2), "List".into(), "D".into(), Some(p), 0);
+
+    assert_not_positive(submit(listing_tick_lot(0, 1_000_000)), "tick_size");
+    assert_not_positive(submit(listing_tick_lot(-1, 1_000_000)), "tick_size");
+    assert_not_positive(submit(listing_tick_lot(1_000_000, 0)), "lot_size");
+    assert_not_positive(submit(listing_tick_lot(1_000_000, -1)), "lot_size");
+    assert_not_positive(submit(listing_tick_lot(0, 0)), "tick_size");
+
+    // Refused proposals are not stored and consume no proposal id.
+    assert!(gov.get_proposal(1).unwrap().is_none());
+    assert_eq!(submit(listing_tick_lot(1, 1)).unwrap(), 1);
+    assert_eq!(
+        gov.get_proposal(1).unwrap().unwrap().proposal_type,
+        ProposalType::MarketListing
+    );
+}
+
+#[test]
+fn execute_market_listing_rejects_zero_tick_or_lot_without_writing_a_market() {
+    for (tick, lot, field) in [(0, 1, "tick_size"), (1, 0, "lot_size")] {
+        let (_dir, gov, staking) = setup();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+        // Pass a valid listing, then overwrite the stored payload (bypassing
+        // submission) so a bad listing reaches execution.
+        let id = submit_and_pass(&gov, listing(0, "ETH"));
+        gov.finalize_proposal(id, 101).unwrap();
+        let mut p = gov.get_proposal(id).unwrap().unwrap();
+        p.execution_payload = Some(listing_tick_lot(tick, lot));
+        gov.state()
+            .put_cf_raw(
+                CF_GOVERNANCE_PROPOSALS,
+                &id.to_be_bytes(),
+                &borsh::to_vec(&p).unwrap(),
+            )
+            .unwrap();
+
+        // Same as any failed execution: error, no market row, still Passed.
+        assert_not_positive(gov.execute_proposal(id, 120), field);
+        assert!(market_ids(gov.state()).is_empty(), "no market row ({field})");
+        assert_eq!(
+            gov.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Passed
+        );
+        // The per-block path reports the same error.
+        assert_not_positive(gov.process_pending_proposals(120), field);
+        assert!(market_ids(gov.state()).is_empty(), "no market row ({field})");
+    }
 }
