@@ -63,6 +63,11 @@ pub struct Metrics {
     // Trading metrics
     pub orders_matched: Counter,
     pub liquidations_triggered: Counter,
+    /// The liquidator vault's deficit in tokens: `-available` when its cash is
+    /// negative (flat-account deficits it absorbed, D9), else 0. Set after
+    /// every liquidation step. Node-local observability, never read by
+    /// execution.
+    pub liquidator_vault_deficit: Gauge<f64, std::sync::atomic::AtomicU64>,
 
     // Order-funnel metrics (perf A1) — where PlaceOrder actions die inside
     // execute_batch. Observability only: incremented in torus-bridge's
@@ -130,6 +135,9 @@ pub struct Metrics {
     /// Outbound native actions dropped because the gossip channel was full.
     /// Must stay 0 under load — drops mean pre-spread is silently failing.
     pub native_gossip_dropped_full: Counter,
+    /// Pooled oracle submissions evicted by a NEWER submission of the same
+    /// validator at the per-validator cap (review M1(a)). Node-local.
+    pub mempool_oracle_evicted: Counter,
     /// Outbound native actions dropped from pre-spread because a single action
     /// exceeds the receivers' gossip cap (`max_tx_message_size`) — it could never
     /// be delivered and would get the forwarder penalized (s339 validator ban).
@@ -950,6 +958,13 @@ impl Metrics {
             liquidations_triggered.clone(),
         );
 
+        let liquidator_vault_deficit = Gauge::<f64, std::sync::atomic::AtomicU64>::default();
+        registry.register(
+            "torus_liquidator_vault_deficit",
+            "Liquidator vault deficit (negative cash, tokens) after the last liquidation step",
+            liquidator_vault_deficit.clone(),
+        );
+
         let orders_placed_accepted = Counter::default();
         registry.register(
             "torus_orders_placed_accepted",
@@ -1097,6 +1112,13 @@ impl Metrics {
             "torus_native_gossip_dropped_full",
             "Outbound native actions dropped on full gossip channel",
             native_gossip_dropped_full.clone(),
+        );
+
+        let mempool_oracle_evicted = Counter::default();
+        registry.register(
+            "torus_mempool_oracle_evicted",
+            "Pooled oracle submissions evicted by a newer one of the same validator (per-validator cap)",
+            mempool_oracle_evicted.clone(),
         );
 
         let native_gossip_dropped_oversized = Counter::default();
@@ -2221,6 +2243,7 @@ impl Metrics {
             validator_set_size,
             orders_matched,
             liquidations_triggered,
+            liquidator_vault_deficit,
             orders_placed_accepted,
             orders_resting,
             orders_rejected_margin,
@@ -2244,6 +2267,7 @@ impl Metrics {
             native_gossip_published_actions,
             native_gossip_received_actions,
             native_gossip_dropped_full,
+            mempool_oracle_evicted,
             native_gossip_dropped_oversized,
             verified_sender_cache_hits,
             verified_sender_cache_misses,

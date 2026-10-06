@@ -689,6 +689,21 @@ fn adl_without_a_previous_mark_uses_the_mark_and_the_deficit_goes_to_the_vault()
     assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
+/// Metric: the liquidator vault's deficit (its negative cash, `-available`
+/// when < 0, in tokens) is published after every liquidation step. The step
+/// of the test above leaves the vault at -200.
+#[test]
+fn the_liquidation_step_publishes_the_vault_deficit() {
+    let (_d, db, _) = adl_fixture();
+    let m = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let mut c = ctx_at(db.clone(), 2);
+    c.metrics = Some(m.clone());
+    set_mark(&c, 1, fp(900));
+    NativeExecutor::run_liquidations(&mut c);
+    assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, -fp(200));
+    assert_eq!(m.liquidator_vault_deficit.get(), 200.0);
+}
+
 /// D8: the vault (exempt from stage 1 / backstop) is ADL'd when its AV < 0:
 /// backstop at 975 (block 1), mark 900 (block 2): vault AV 50 - 750 < 0 ->
 /// closes long 10 against S. Review H1: at the previous mark 975 clamped to
