@@ -2405,8 +2405,11 @@ Phase 2 items.
 - Anti-spam D (per-IP RPC limit) has no validator exemption; no metric for
   oracle submissions evicted inside the pool.
 - Liquidation-stress cell before testnet: no full-node cell has fired a
-  liquidation (walk 10 bp stays within +-80 bp, section 21.1). Needs a
-  larger walk or accounts seeded near maintenance.
+  liquidation (walk 10 bp stays within +-80 bp, section 21.1). No walk can
+  on the standard shape (each sender 150 long / 150 short over 300 markets on
+  100M TRS; the walk is bounded at +-8 steps). Proposed design (thin senders
+  + a parity-signed price shock + the vault in the digest) awaits 18c:
+  `docs/buildlist-fixes-s17.md`.
 - Slow first oracle-only block after the load (20-49 ms) and ~2.5 ms empty
   blocks while the feed is live (section 21.1): look at both in the Phase 2
   step 0 profile.
