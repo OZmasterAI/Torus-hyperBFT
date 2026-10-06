@@ -1128,10 +1128,12 @@ fn core_writer(
         if side > 1 {
             return Err(CoreError::InvalidInput(format!("invalid side: {side}")));
         }
-        // OrderType: 0=Limit, 1=Market, 2=StopMarket, 3=StopLimit
-        if order_type > 3 {
+        // OrderType: 0=Limit, 1=Market. HL-parity: StopMarket (2) / StopLimit (3)
+        // are rejected — this ABI carries no trigger price, and the drain used to
+        // run them as plain Limit orders.
+        if order_type > 1 {
             return Err(CoreError::InvalidInput(format!(
-                "invalid order_type: {order_type}"
+                "invalid order_type: {order_type} (0=Limit, 1=Market; stop orders are not supported)"
             )));
         }
         // TimeInForce: 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
@@ -1163,10 +1165,12 @@ fn core_writer(
             block_queued: current_block,
         };
 
-        let seq = CoreWriterQueue::enqueue(state_db, &action)?;
-        // Return a deterministic order ID: block(8) + seq(8) packed into u128
-        let order_id: u128 = ((current_block + 1) as u128) << 64 | seq as u128;
-        Ok(abi::encode_order_id(order_id).to_vec())
+        CoreWriterQueue::enqueue(state_db, &action)?;
+        // HL-parity: no order id. The executor assigns the real one from the
+        // global counter when the queue drains next block, so it cannot be known
+        // here (the old `(block + 1) << 64 | seq` never matched it). Contracts
+        // read their orders back via getOpenOrders (0x0800).
+        Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
         let order_id = abi::decode_order_id(&abi::word(input, 0)?);
 

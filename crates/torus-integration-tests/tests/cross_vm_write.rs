@@ -222,6 +222,40 @@ fn test_execution_ordering_native_vs_core_writer() {
     assert!(drained_51[0].success);
 }
 
+/// HL-parity: a queued StopMarket / StopLimit order (a row queued before the
+/// precompile rejected them) fails at drain instead of running as a plain
+/// Limit order; the order after it still executes.
+#[test]
+fn drained_stop_order_types_are_rejected_not_run_as_limit() {
+    let h = TestHarness::new();
+    let trader = TestHarness::addr(3);
+    let current_block = 40u64;
+    h.fund_native(&trader, TestHarness::fp(1_000_000));
+
+    let place = |order_type: u8| QueuedAction {
+        trader,
+        kind: QueuedActionKind::PlaceOrder {
+            market_id: 1,
+            side: 0,
+            order_type,
+            price: TestHarness::fp(40000),
+            quantity: TestHarness::fp(1),
+            time_in_force: 0,
+        },
+        block_queued: current_block,
+    };
+    for order_type in [2u8, 3, 0] {
+        CoreWriterQueue::enqueue(&h.state_db, &place(order_type)).unwrap();
+    }
+
+    let mut ctx = h.exec_context(current_block + 1);
+    let results = NativeExecutor::drain_core_writer(&mut ctx).unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(!results[0].success, "StopMarket must not run as Limit");
+    assert!(!results[1].success, "StopLimit must not run as Limit");
+    assert!(results[2].success, "the Limit order after them still executes");
+}
+
 /// Invalid CoreWriter action fails without affecting other queued actions.
 #[test]
 fn test_invalid_core_writer_action_isolation() {

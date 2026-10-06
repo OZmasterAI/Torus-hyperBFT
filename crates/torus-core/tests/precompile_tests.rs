@@ -513,6 +513,48 @@ fn core_writer_place_order_queues_action() {
     assert_eq!(count_current, 0);
 }
 
+fn place_order_input(order_type: u8) -> Vec<u8> {
+    build_input(
+        "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)",
+        &[
+            encode_market_id(1),
+            abi::encode_u8(0),
+            abi::encode_u8(order_type),
+            abi::encode_u128(fp(50_000).raw() as u128),
+            abi::encode_u128(fp(5).raw() as u128),
+            abi::encode_u8(0),
+        ],
+    )
+}
+
+/// HL-parity: the real order id is assigned by the native executor when the
+/// queue drains next block (global counter), so it cannot be known here. The
+/// precompile used to return a synthetic `(block + 1) << 64 | seq` that never
+/// matched it (a later cancelOrder with it cancelled nothing). It now returns
+/// zero: no id; contracts read their orders back via getOpenOrders.
+#[test]
+fn core_writer_place_order_returns_no_synthetic_order_id() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_CORE_WRITER);
+    let output = execute_precompile(&address, &place_order_input(0), &addr(1), &db, 100, 0).unwrap();
+    assert_eq!(output, vec![0u8; 32], "no fabricated order id");
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 1, "still queued");
+}
+
+/// HL-parity: placeOrder carries no trigger price, so StopMarket (2) and
+/// StopLimit (3) cannot be expressed; they used to be queued and run as plain
+/// Limit orders. They are rejected (the EVM call reverts) and nothing queues.
+#[test]
+fn core_writer_rejects_stop_order_types() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_CORE_WRITER);
+    for order_type in [2u8, 3] {
+        let err = execute_precompile(&address, &place_order_input(order_type), &addr(1), &db, 100, 0);
+        assert!(err.is_err(), "order_type {order_type} must be rejected");
+    }
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 0, "nothing queued");
+}
+
 #[test]
 fn core_writer_cancel_order_queues_action() {
     let (_dir, db) = setup();
@@ -581,16 +623,23 @@ fn writer_precompile_journals_through_overlay() {
         ],
     );
 
-    // Two placeOrder calls in the same journal: read-your-writes gives seq 0 then 1.
-    // (order_id = (block+1) << 64 | seq, so the low 64 bits carry the sequence.)
-    let out0 = execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
-    let out1 = execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
-    let id0 = u128::from_be_bytes(out0[16..32].try_into().unwrap());
-    let id1 = u128::from_be_bytes(out1[16..32].try_into().unwrap());
-    assert_eq!(id0 & u64::MAX as u128, 0, "first enqueue gets seq 0");
+    // Two placeOrder calls in the same journal: read-your-writes gives seq 0 then
+    // 1 (queue key = target block(8 BE) ‖ seq(8 BE)). placeOrder returns no id
+    // since the HL-parity fix, so read the journaled rows' keys.
+    execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
+    execute_precompile(&address, &input, &caller, &overlay, 100, 0).unwrap();
+    let seqs: Vec<u64> = torus_state::StateBackend::iterate_cf(
+        &overlay,
+        torus_state::cf::CF_CORE_WRITER_QUEUE,
+        Some(&101u64.to_be_bytes()),
+    )
+    .unwrap()
+    .iter()
+    .map(|(k, _)| u64::from_be_bytes(k[8..16].try_into().unwrap()))
+    .collect();
     assert_eq!(
-        id1 & u64::MAX as u128,
-        1,
+        seqs,
+        vec![0, 1],
         "second enqueue must see the first one's journal write and get seq 1"
     );
 
