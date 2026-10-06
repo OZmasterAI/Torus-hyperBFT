@@ -2126,6 +2126,361 @@ class OracleFeedHarnessTest(unittest.TestCase):
 
 
 
+LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
+
+
+def fake_target(tmp, help_text="Usage: oracle-feed --price <PRICE> --walk-bp <N>"):
+    """TARGET_DIR with stub torus-node / bench-throughput binaries."""
+    tgt = os.path.join(tmp, "release")
+    os.makedirs(tgt)
+    for b in ("torus-node", "bench-throughput"):
+        p = os.path.join(tgt, b)
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\necho '%s'\n" % help_text)
+        os.chmod(p, 0o755)
+
+
+class LiqStressHarnessTest(unittest.TestCase):
+    """Row 76 liquidation-stress cell: LIQ_THIN thin-seeds the first N load
+    senders in the genesis, ORACLE_SHOCK_BP/ROUND pass a parity-signed price
+    shock to the oracle feed, and the liquidator vault joins the digest (and
+    is read per node) only when either is on. Defaults leave the cell as it
+    was."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def fn(self, start, end_marker):
+        i = self.src.index(start)
+        return self.src[i : self.src.index(end_marker, i) + len(end_marker)]
+
+    def test_defaults_docs_and_allowlist(self):
+        for var, default in (
+            ("LIQ_THIN", "0"),
+            ("LIQ_THIN_AVAIL", "1000000.0"),
+            ("ORACLE_SHOCK_BP", "0"),
+            ("ORACLE_SHOCK_ROUND", "0"),
+        ):
+            self.assertIn(f"{var}=${{{var}:-{default}}}", self.src)
+        head = self.src[: self.src.index("set -uo pipefail")]
+        for doc in ("#   LIQ_THIN=N", "#   ORACLE_SHOCK_BP=S"):
+            self.assertIn(doc, head)
+        self.assertIn(f"LIQUIDATOR_VAULT={LIQUIDATOR_VAULT}", self.src)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            allow = f.read()
+        for k in (
+            "LIQ_THIN",
+            "LIQ_THIN_AVAIL",
+            "ORACLE_SHOCK_BP",
+            "ORACLE_SHOCK_ROUND",
+        ):
+            self.assertIn(f'"{k}",', allow)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            res = f.read()
+        self.assertIn('--liq-thin "$(j \'.cell.liq_thin // ""\')"', res)
+        self.assertIn('--liq-thin-avail "$(j \'.cell.liq_thin_avail // ""\')"', res)
+
+    def _genesis(self, d):
+        nb = [
+            {"address": "0xbase%d" % i, "available": "5.0", "note": "hardhat %d" % i}
+            for i in range(3)
+        ]
+        nb.append({"address": "0xnonote", "available": "7.0"})
+        nb += [
+            {
+                "address": "0x%040x" % i,
+                "available": "100000000.0",
+                "note": "bulk-test %d" % i,
+            }
+            for i in range(58, 70)
+        ]
+        g = {
+            "markets": [{"market_id": 1}],
+            "native_balances": nb,
+            "accounts": [{"note": "bulk-test 60", "balance": "1"}],
+        }
+        p = os.path.join(d, "genesis.json")
+        with open(p, "w") as f:
+            json.dump(g, f)
+        return p, g
+
+    def test_liq_thin_patch_sets_available_on_exactly_the_first_n_load_senders(self):
+        fn = self.fn("liq_thin_patch() {", "\n}\n")
+        tmp = tempfile.mkdtemp(prefix="liq-thin-")
+        try:
+            p, before = self._genesis(tmp)
+            r = subprocess.run(
+                ["bash", "-c", fn + 'liq_thin_patch "$1" 4 1000000.0', "x", p],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "4"), r.stderr)
+            with open(p) as f:
+                after = json.load(f)
+            thin = {"bulk-test %d" % i for i in range(60, 64)}
+            for b, a in zip(before["native_balances"], after["native_balances"]):
+                want = dict(b, available="1000000.0") if b.get("note") in thin else b
+                self.assertEqual(a, want)
+            self.assertEqual(
+                after["accounts"], before["accounts"], "EVM balances untouched"
+            )
+            self.assertEqual(after["markets"], before["markets"])
+            # More thin senders than the genesis funds: FATAL, genesis untouched.
+            with open(p) as f:
+                ok = f.read()
+            r = subprocess.run(
+                ["bash", "-c", fn + 'liq_thin_patch "$1" 11 1.0', "x", p],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            with open(p) as f:
+                self.assertEqual(f.read(), ok)
+            self.assertEqual(
+                sorted(os.listdir(tmp)), ["genesis.json"], "no temp file left"
+            )
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_liq_thin_patch_runs_before_the_genesis_md5_and_only_when_set(self):
+        call = self.src.index('liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL"')
+        self.assertLess(
+            self.src.index('"$MAINREPO/devnet/wsl/gen-3val-genesis.sh"'), call
+        )
+        self.assertLess(call, self.src.index('GEN_MD5=$(md5sum "$GENESIS"'))
+        gate = self.src.rindex('if [ "$LIQ_THIN" -gt 0 ]; then', 0, call)
+        self.assertNotIn("\nfi\n", self.src[gate:call])
+
+    def test_shock_reaches_the_feed_only_when_set(self):
+        block = self.fn("    ORACLE_CMD=(", '\n    log "oracle feed: ${ORACLE_CMD[*]}"')
+        for bp, rnd, want in (
+            ("0", "0", []),
+            ("400", "30", ["--shock-bp", "400", "--shock-round", "30"]),
+        ):
+            script = (
+                "BENCH=bt RPCS=(r0 r1) ORACLE_KEYS=k MARKETS=3 ORACLE_PRICE=30000 "
+                "ORACLE_INTERVAL_MS=2000 OUT=o ORACLE_WALK_BP=10 ORACLE_SHOCK_BP=%s ORACLE_SHOCK_ROUND=%s\n"
+                % (bp, rnd)
+                + block.rsplit("\n", 1)[0]
+                + '\nprintf "%s\\n" "${ORACLE_CMD[@]}"\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = r.stdout.split("\n")[:-1]
+            self.assertEqual(
+                argv[-len(want) :] if want else argv[-2:],
+                want or ["--walk-bp", "10"],
+                argv,
+            )
+            self.assertEqual(argv.count("--shock-bp"), len(want) // 4, argv)
+        self.assertIn("'shock_bp': int(shock_bp)", self.src)
+        self.assertIn("'shock_round': int(shock_round)", self.src)
+
+    def test_bad_liq_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-pre-")
+        try:
+            fake_target(tmp)  # an oracle-feed without --shock-bp (an older binary)
+            wt = os.path.dirname(os.path.dirname(HERE))
+            for env, rc, msg in (
+                (dict(LIQ_THIN="x"), 2, "LIQ_THIN must be"),
+                (dict(LIQ_THIN="-1"), 2, "LIQ_THIN must be"),
+                (dict(LIQ_THIN="6", SENDERS="5"), 2, "must not exceed SENDERS"),
+                (dict(LIQ_THIN="5", LIQ_THIN_AVAIL="0"), 2, "LIQ_THIN_AVAIL must be"),
+                (dict(LIQ_THIN="5", LIQ_THIN_AVAIL="abc"), 2, "LIQ_THIN_AVAIL must be"),
+                (
+                    dict(LIQ_THIN="5", LIQ_THIN_AVAIL="1.123456789"),
+                    2,
+                    "LIQ_THIN_AVAIL must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="x"),
+                    2,
+                    "ORACLE_SHOCK_BP must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="10000"),
+                    2,
+                    "ORACLE_SHOCK_BP must be",
+                ),
+                (
+                    dict(
+                        ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="r"
+                    ),
+                    2,
+                    "ORACLE_SHOCK_ROUND must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_ROUND="30"),
+                    2,
+                    "ORACLE_SHOCK_ROUND needs ORACLE_SHOCK_BP",
+                ),
+                (dict(ORACLE_SHOCK_BP="400"), 2, "needs ORACLE_FEED=1"),
+                (
+                    dict(
+                        ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"
+                    ),
+                    1,
+                    "has no --shock-bp",
+                ),
+            ):
+                r = subprocess.run(
+                    [RUN_CELL_SH, wt, "liq-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, rc, (env, r.stderr))
+                self.assertIn(msg, r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-pre-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    def _run(self, script, **env):
+        base = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_SHOCK"))
+        }
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=dict(base, **env),
+        )
+
+    def test_vault_joins_the_digest_only_when_enabled(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn(
+            '"$BENCH" gen-accounts --offset 60 --count 50',
+            'DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")',
+        )
+        tmp = tempfile.mkdtemp(prefix="liq-dig-")
+        try:
+            bench = os.path.join(tmp, "bt")
+            with open(bench, "w") as f:
+                f.write("#!/bin/sh\necho '60 0xaaa'\necho '61 0xbbb'\n")
+            os.chmod(bench, 0o755)
+            script = (
+                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=%s\nBENCH=%s\nOUT=%s\n'
+                % (LIQUIDATOR_VAULT, bench, tmp)
+                + on
+                + block
+                + '\necho "$DIG_ACCTS"\n'
+            )
+            for env, accts in (
+                (dict(LIQ_THIN="0", ORACLE_SHOCK_BP="0"), ["0xaaa", "0xbbb"]),
+                (
+                    dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0"),
+                    ["0xaaa", "0xbbb", LIQUIDATOR_VAULT],
+                ),
+                (
+                    dict(LIQ_THIN="0", ORACLE_SHOCK_BP="400"),
+                    ["0xaaa", "0xbbb", LIQUIDATOR_VAULT],
+                ),
+            ):
+                r = self._run(script, **env)
+                self.assertEqual(
+                    (r.returncode, r.stdout.strip()),
+                    (0, str(len(accts))),
+                    (env, r.stderr),
+                )
+                with open(os.path.join(tmp, "digest-accounts.txt")) as f:
+                    self.assertEqual(f.read().split(), accts, env)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_vault_is_read_per_node_only_when_enabled(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn(
+            "if liq_stress_on; then\n    for i in 0 1 2; do\n        rpc ", "\nfi\n"
+        )
+        self.assertIn("torus_getLiquidatorVault", block)
+        # After the digests and their quiescence snapshot.
+        at = self.src.index(block)
+        self.assertLess(self.src.index('wait "${DIG_PIDS[@]}"'), at)
+        self.assertLess(self.src.index("if Q_AFTER=$(funnel_snapshot)"), at)
+        tmp = tempfile.mkdtemp(prefix="liq-vault-")
+        try:
+            script = (
+                'log() { echo "$*" >&2; }\nRPCS=(u0 u1 u2)\nOUT=%s\n'
+                'rpc() { [ "$1" = u1 ] && return 7; echo \'{"result":{"address":"0x74","deficit":"5.0","openPositions":3}}\'; }\n'
+                % tmp
+                + on
+                + block
+            )
+            r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(os.listdir(tmp), [])
+            r = self._run(script, LIQ_THIN="3", ORACLE_SHOCK_BP="0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                sorted(os.listdir(tmp)),
+                ["vault-val0.json", "vault-val1.json", "vault-val2.json"],
+            )
+            with open(os.path.join(tmp, "vault-val0.json")) as f:
+                self.assertEqual(
+                    json.load(f),
+                    {"address": "0x74", "deficit": "5.0", "openPositions": 3},
+                )
+            with open(os.path.join(tmp, "vault-val1.json")) as f:
+                self.assertEqual(json.load(f), "RPC_ERR")
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_liquidation_metrics_are_sampled_only_when_enabled(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("if liq_stress_on; then\n    WIDE_COLS=")
+        block = self.src[i : self.src.index("\nfi\n", i) + 4]
+        self.assertLess(i, self.src.index('WIDE_COLS="$WIDE_COLS scrape_valid"'))
+        script = "WIDE_COLS='a b'\n" + on + block + 'echo "$WIDE_COLS"\n'
+        r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+        self.assertEqual(r.stdout.strip(), "a b", r.stderr)
+        r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="400")
+        self.assertEqual(
+            r.stdout.strip(),
+            "a b torus_liquidations_triggered_total torus_liquidator_vault_deficit",
+            r.stderr,
+        )
+
+    def test_summary_records_liq_thin(self):
+        d = tempfile.mkdtemp(prefix="liq-sum-")
+        try:
+            write_cell(d, 1000, 1000)
+            write_agreement(d, ["same"] * 3)
+            s, _ = run_summarize(d)
+            self.assertEqual(
+                (s["cell"]["liq_thin"], s["cell"]["liq_thin_avail"]), (0, None)
+            )
+            s, _ = run_summarize(
+                d, extra=("--liq-thin", "200", "--liq-thin-avail", "1000000.0")
+            )
+            self.assertEqual(
+                (s["cell"]["liq_thin"], s["cell"]["liq_thin_avail"]), (200, "1000000.0")
+            )
+        finally:
+            shutil.rmtree(d)
+        self.assertIn(
+            '--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL"', self.src
+        )
+
+
 # ----------------------------------- cells run detached from the caller's shell
 DETACH_SH = os.path.join(HERE, "campaign", "detach.sh")
 

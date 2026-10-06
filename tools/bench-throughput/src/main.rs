@@ -311,6 +311,14 @@ enum Command {
         /// (deterministic, mean-reverting, bounded at ±8N bp); 0 = fixed price.
         #[arg(long, default_value_t = 0)]
         walk_bp: u64,
+        /// Liquidation stress (row 76): from round --shock-round on, odd
+        /// markets are priced +S bp and even markets -S bp off the walk, so
+        /// even-index load senders lose on every position. 0 = no shock.
+        #[arg(long, default_value_t = 0)]
+        shock_bp: u64,
+        /// First shocked feed round (rounds count from 1; 0 = round 1).
+        #[arg(long, default_value_t = 0)]
+        shock_round: u64,
         #[arg(long, default_value_t = 2_000)]
         interval_ms: u64,
         #[arg(long, default_value = "oracle-feed-stats.json")]
@@ -4403,6 +4411,8 @@ async fn main() {
             markets,
             price,
             walk_bp,
+            shock_bp,
+            shock_round,
             interval_ms,
             stats_file,
         } => {
@@ -4412,6 +4422,8 @@ async fn main() {
                 markets,
                 price,
                 walk_bp,
+                shock_bp,
+                shock_round,
                 interval_ms,
                 stats_file: &stats_file,
             };

@@ -22,7 +22,8 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
-          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget"]:
+          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget",
+          "liq-thin", "liq-thin-avail"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -1154,6 +1155,9 @@ summary = {
              "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
                                      if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),
              "open_order_budget": int(A.open_order_budget) if A.open_order_budget else None,
+             # Row 76 liquidation stress: load senders 0..liq_thin-1 seeded thin (0 = off).
+             "liq_thin": int(A.liq_thin or 0),
+             "liq_thin_avail": A.liq_thin_avail if int(A.liq_thin or 0) > 0 else None,
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,

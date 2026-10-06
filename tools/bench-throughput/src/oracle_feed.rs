@@ -98,6 +98,9 @@ pub struct PriceWalk {
     walk_bp: i64,
     offsets_bp: BTreeMap<MarketId, i64>,
     rounds: u64,
+    /// [`Self::with_shock`]: 0 = no shock.
+    shock_bp: i64,
+    shock_round: u64,
 }
 
 /// SplitMix64 finaliser: one round's draw for one market.
@@ -122,7 +125,32 @@ impl PriceWalk {
             walk_bp: walk_bp as i64,
             offsets_bp: markets.iter().map(|&m| (m, 0)).collect(),
             rounds: 0,
+            shock_bp: 0,
+            shock_round: 0,
         })
+    }
+
+    /// Liquidation stress (row 76, `--shock-bp S --shock-round R`): from round
+    /// R on (rounds count from 1; R = 0 is round 1) every ODD market's price is
+    /// the walk price x (10000 + S) / 10000 and every EVEN market's x (10000 −
+    /// S) / 10000. Under the uniform econ shape a sender buys a market iff
+    /// (local sender index + market id) is even, so EVEN-index senders (long
+    /// even, short odd) lose on every position and odd-index senders gain on
+    /// every one. S = 0 is exactly the unshocked stream. Err when S >= 10000
+    /// (an even market's price would reach 0).
+    pub fn with_shock(mut self, shock_bp: u64, shock_round: u64) -> Result<Self, String> {
+        if shock_bp >= 10_000 {
+            return Err(format!("--shock-bp {shock_bp}: must stay below 10000 bp"));
+        }
+        self.shock_bp = shock_bp as i64;
+        self.shock_round = shock_round.max(1);
+        Ok(self)
+    }
+
+    /// True right after the [`Self::next_round`] call that applied the shock
+    /// for the first time.
+    pub fn shock_starts_this_round(&self) -> bool {
+        self.shock_bp > 0 && self.rounds == self.shock_round
     }
 
     /// Advance one round and return its prices.
@@ -137,9 +165,18 @@ impl PriceWalk {
                 *x += if down { -w } else { w };
             }
         }
+        let shock = if self.shock_bp > 0 && self.rounds >= self.shock_round { self.shock_bp } else { 0 };
         self.base
             .iter()
-            .map(|(&m, p)| (m, FixedPoint::from_raw(p.raw() * i128::from(10_000 + self.offsets_bp[&m]) / 10_000)))
+            .map(|(&m, p)| {
+                let walked = p.raw() * i128::from(10_000 + self.offsets_bp[&m]) / 10_000;
+                let raw = match shock {
+                    0 => walked,
+                    s if m % 2 == 1 => walked * i128::from(10_000 + s) / 10_000,
+                    s => walked * i128::from(10_000 - s) / 10_000,
+                };
+                (m, FixedPoint::from_raw(raw))
+            })
             .collect()
     }
 }
@@ -288,6 +325,10 @@ pub struct FeedArgs<'a> {
     pub price: u64,
     /// [`PriceWalk`] step per round in basis points (0 = fixed `price`).
     pub walk_bp: u64,
+    /// [`PriceWalk::with_shock`]: parity-signed shock in bp (0 = none) from
+    /// round `shock_round` on.
+    pub shock_bp: u64,
+    pub shock_round: u64,
     pub interval_ms: u64,
     pub stats_file: &'a Path,
 }
@@ -304,7 +345,7 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
     }
     let nodes: Vec<RpcNode> = urls.iter().map(|u| RpcNode::new(u)).collect::<Result<_, _>>()?;
     let listed = listed_markets(&nodes[0], a.markets).await?;
-    let mut walk = PriceWalk::new(&listed, a.price, a.walk_bp)?;
+    let mut walk = PriceWalk::new(&listed, a.price, a.walk_bp)?.with_shock(a.shock_bp, a.shock_round)?;
     let probe_market = *listed.first().expect("non-empty");
     let probe_client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().map_err(|e| e.to_string())?;
     let mut nonces = vec![NonceGen::default(); keys.len()];
@@ -321,6 +362,14 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
         listed.len().div_ceil(torus_core::oracle::MAX_ORACLE_PRICES_PER_SUBMISSION),
         a.interval_ms
     );
+    if a.shock_bp > 0 {
+        println!(
+            "[oracle-feed] shock armed: from round {} odd markets +{} bp, even markets -{} bp (even-index senders lose)",
+            a.shock_round.max(1),
+            a.shock_bp,
+            a.shock_bp
+        );
+    }
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("SIGTERM handler: {e}"))?;
@@ -342,6 +391,15 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
         }
         let now = now_ms();
         let prices = walk.next_round();
+        if walk.shock_starts_this_round() {
+            // liq_stress.py maps this wall-clock ms to a block height.
+            println!(
+                "[oracle-feed] shock round {} at {now} ms: odd markets +{} bp, even markets -{} bp",
+                a.shock_round.max(1),
+                a.shock_bp,
+                a.shock_bp
+            );
+        }
         let mut set = tokio::task::JoinSet::new();
         for (i, k) in keys.iter().enumerate() {
             let signed = round(&prices, &listed, &k.key, &mut nonces[i], now);
@@ -544,6 +602,93 @@ mod tests {
         let base = 30_000 * FixedPoint::SCALE;
         let got: Vec<i128> = (0..12).map(|_| (w.next_round()[&1].raw() - base) * 10_000 / base).collect();
         assert_eq!(got, WALK_10BP_MARKET_1);
+    }
+
+    /// Liquidation stress (row 76): `--shock-bp 0` (the default) is exactly the
+    /// unshocked stream, whatever `--shock-round` says.
+    #[test]
+    fn shock_zero_is_the_unshocked_stream() {
+        let m = markets(300);
+        for walk_bp in [0, 10] {
+            let mut plain = PriceWalk::new(&m, 30_000, walk_bp).unwrap();
+            let mut zero = PriceWalk::new(&m, 30_000, walk_bp).unwrap().with_shock(0, 5).unwrap();
+            for round in 0..200 {
+                assert_eq!(zero.next_round(), plain.next_round(), "walk {walk_bp} round {round}");
+                assert!(!zero.shock_starts_this_round());
+            }
+        }
+    }
+
+    /// From round R on (rounds count from 1), odd markets are the walk price
+    /// x (1 + S/10000) and even markets x (1 - S/10000); before R the stream is
+    /// the unshocked one. Exactly one round reports the shock's start.
+    #[test]
+    fn shock_applies_from_round_r_with_the_parity_sign() {
+        let m = markets(10);
+        for walk_bp in [0, 10] {
+            let mut plain = PriceWalk::new(&m, 30_000, walk_bp).unwrap();
+            let mut shocked = PriceWalk::new(&m, 30_000, walk_bp).unwrap().with_shock(400, 5).unwrap();
+            let mut starts = Vec::new();
+            for round in 1..=60u64 {
+                let (p, s) = (plain.next_round(), shocked.next_round());
+                if shocked.shock_starts_this_round() {
+                    starts.push(round);
+                }
+                for (id, w) in &p {
+                    let want = if round < 5 {
+                        w.raw()
+                    } else if id % 2 == 1 {
+                        w.raw() * 10_400 / 10_000
+                    } else {
+                        w.raw() * 9_600 / 10_000
+                    };
+                    assert_eq!(s[id].raw(), want, "walk {walk_bp} round {round} market {id}");
+                }
+            }
+            assert_eq!(starts, vec![5], "walk {walk_bp}");
+        }
+        // R = 0 and R = 1 both shock the first round.
+        for r in [0, 1] {
+            let mut w = PriceWalk::new(&m, 30_000, 0).unwrap().with_shock(100, r).unwrap();
+            let p = w.next_round();
+            assert!(w.shock_starts_this_round());
+            assert_eq!(p[&1].raw(), 30_300 * FixedPoint::SCALE);
+            assert_eq!(p[&2].raw(), 29_700 * FixedPoint::SCALE);
+        }
+    }
+
+    /// A shock of 10000 bp or more would zero (or negate) the even markets:
+    /// rejected. The largest accepted shock on the largest walk keeps every
+    /// price > 0, even at a 1 TRS base.
+    #[test]
+    fn shock_bounds_keep_every_price_positive() {
+        let m = markets(10);
+        assert!(PriceWalk::new(&m, 30_000, 0).unwrap().with_shock(10_000, 1).is_err());
+        assert!(PriceWalk::new(&m, 30_000, 0).unwrap().with_shock(u64::MAX, 1).is_err());
+        let mut w = PriceWalk::new(&m, 1, 1_249).unwrap().with_shock(9_999, 1).unwrap();
+        for round in 0..2_000 {
+            for (id, p) in w.next_round() {
+                assert!(p.raw() > 0, "round {round} market {id}: {p:?}");
+            }
+        }
+    }
+
+    /// The parity that loses: under the uniform econ shape a sender's side is
+    /// buy iff (local sender index + market id) is even (`econ_side_is_buy`).
+    /// Odd markets go up and even markets go down, so an EVEN local index (long
+    /// even markets, short odd markets) loses on every position and an odd
+    /// local index gains on every one. `--sender-offset 60` is even, so the
+    /// genesis note index ("bulk-test 60+i") has the same parity as i.
+    #[test]
+    fn even_local_senders_lose_on_every_shocked_position() {
+        for sender in 0..40usize {
+            for market in 1..=300u64 {
+                let long = crate::econ_side_is_buy(sender, market);
+                let up = market % 2 == 1;
+                let gains = long == up;
+                assert_eq!(gains, sender % 2 == 1, "sender {sender} market {market}");
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --markets-per-sender "$(j '.cell.markets_per_sender // ""')" \
   --max-in-flight "$(j '.cell.max_in_flight // ""')" \
   --open-order-budget "$(j '.cell.open_order_budget // ""')" \
+  --liq-thin "$(j '.cell.liq_thin // ""')" \
+  --liq-thin-avail "$(j '.cell.liq_thin_avail // ""')" \
   --drain-timeout "$(j '.timing.drain_timeout_s // ""')" \
   --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
   --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \
