@@ -647,6 +647,13 @@ impl NativeExecutor {
         let ps = ctx.positions.positions_for_trader(u)?;
         // `build`'s terms per position (adl_rest's `build`); None = overflow
         // -> no bankruptcy price (adl_rest's None).
+        // Review L2 (accepted, no behavior change): one position's UPnL
+        // overflow makes `total` None, so `rest` is None for EVERY later
+        // position too, while `adl_rest` excludes only the overflowing one.
+        // Production then clamps those to the mark instead of a bankruptcy
+        // price (`adl_price`'s fallback: still never a positive D9
+        // remainder); only the test-only shadow assert below would differ.
+        // It needs ~1e30-token notional: unreachable.
         let upnl = |p: &Position| {
             torus_core::margin::position_terms(p, marks.get(&p.market_id).copied(), None).ok().map(|t| t.upnl)
         };
@@ -728,9 +735,11 @@ impl NativeExecutor {
     /// up, so later rows continue where the last one stopped), plus the
     /// candidates `adl_close` read, plus edge rows. The escrow of the row's
     /// side closes at the row's stored price; real holders exhausted ->
-    /// [`Self::adl_cross`]. A listed market without a usable mark waits; a
-    /// delisted one ranks at the stored price (owner s96). Then a flat
-    /// escrow's balance (dust) goes to the vault.
+    /// [`Self::adl_cross`] (one pairing position per market and block); a
+    /// row still open after both breaks escrow size = Σ rows and is fatal
+    /// (review M1). A listed market without a usable mark waits; a delisted
+    /// one ranks at the stored price (owner s96). Then a flat escrow's
+    /// balance (dust) goes to the vault.
     fn adl_drain<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         listed: &[MarketId],
@@ -739,6 +748,7 @@ impl NativeExecutor {
         stats: &mut LiqStats,
     ) -> Result<(), CoreError> {
         let mut ranked: BTreeMap<(MarketId, bool), (Vec<liq::AdlCandidate>, usize)> = BTreeMap::new();
+        let mut paired: BTreeMap<MarketId, Vec<u8>> = BTreeMap::new();
         let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
         while used < work {
             let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
@@ -766,15 +776,20 @@ impl NativeExecutor {
                 o.size -= *q;
             }
             if o.size > FixedPoint::ZERO {
-                used += Self::adl_cross(ctx, &mut o, stats)?;
+                let from = paired.entry(o.market).or_default();
+                used += Self::adl_cross(ctx, &mut o, from, stats)?;
+            }
+            if o.size > FixedPoint::ZERO {
+                // Review M1: the escrow holds Σ rows and OI is symmetric, so
+                // the holders plus the pairing always cover a row.
+                return Err(CoreError::InvalidInput(format!(
+                    "ADL obligation left open after the holders and the escrow pairing (OI asymmetry): {o:?}"
+                )));
             }
             if o.size != owed {
-                liq::update_obligation(&ctx.state, &o)?; // the remainder; deleted at 0
+                liq::update_obligation(&ctx.state, &o)?; // deleted at 0
             }
             stats.adl_obligations += 1;
-            if o.size > FixedPoint::ZERO {
-                tracing::error!(?o, "liquidation: ADL obligation left open (OI asymmetry?), retried next block");
-            }
         }
         for e in [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
             if ctx.positions.positions_for_trader(&e)?.is_empty() {
@@ -798,17 +813,28 @@ impl NativeExecutor {
     /// market in key order; each escrow closes at its own row's price, the
     /// vault pays the difference (`liq::cross_close`, which refuses to flip an
     /// escrow). Returns the rows scanned (work units).
+    ///
+    /// Review M2: `from` is the market's pairing position in this block
+    /// (empty: none yet). The scan starts at the later of `from` and just
+    /// after `o`: an opposite row before `o` was visited first and closed
+    /// (it paired forward, `o` included, or the step went fatal), and rows
+    /// an earlier scan of the market passed are not read again. It ends at
+    /// the last partner (re-read next time when only partly used) or after
+    /// it, so the units are linear in the queue per market and block.
     fn adl_cross<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         o: &mut liq::Obligation,
+        from: &mut Vec<u8>,
         stats: &mut LiqStats,
     ) -> Result<u64, CoreError> {
-        let (mut units, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        let mut units = 0u64;
+        let mut start = std::mem::take(from).max([o.key().as_slice(), &[0]].concat());
         while o.size > FixedPoint::ZERO {
             let Some(mut x) = liq::next_obligation(&ctx.state, &start)? else { break };
-            start = [x.key().as_slice(), &[0]].concat();
             units += 1;
+            let after = [x.key().as_slice(), &[0]].concat();
             if x.market != o.market || x.is_long == o.is_long {
+                start = after;
                 continue;
             }
             let q = o.size.min(x.size);
@@ -819,7 +845,9 @@ impl NativeExecutor {
             o.size -= q;
             x.size -= q;
             liq::update_obligation(&ctx.state, &x)?;
+            start = if x.size > FixedPoint::ZERO { x.key().to_vec() } else { after };
         }
+        *from = start;
         Ok(units)
     }
 }

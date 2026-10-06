@@ -430,6 +430,25 @@ fn update_obligation_overwrites_and_deletes() {
     assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), None);
 }
 
+/// Review L1: a stored `0x07` value with size <= 0 or price <= 0 is malformed
+/// (the writers never store one: `put_obligation` / `update_obligation`
+/// reject it), so reading it is an error (fatal in the step), never a row
+/// the drain would act on.
+#[test]
+fn next_obligation_rejects_a_stored_size_or_price_at_or_below_zero() {
+    use torus_core::liquidation::{next_obligation, Obligation, ADL_OBLIGATION_TAG};
+    use torus_state::cf::CF_NATIVE_LIQUIDATION;
+    let o = Obligation { height: 5, market: 1, is_long: true, trader: addr(8), size: fp(4), price: fp(940) };
+    for (size, price) in [(0, 940), (-1, 940), (4, 0), (4, -1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let v = [fp(size).raw().to_be_bytes(), fp(price).raw().to_be_bytes()].concat();
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &o.key(), &v).unwrap();
+        let got = next_obligation(&db, &[ADL_OBLIGATION_TAG]);
+        assert!(got.as_ref().is_err_and(|e| e.to_string().contains("malformed")), "({size}, {price}): {got:?}");
+    }
+}
+
 /// P2 edge: escrow long sells q at p_long, escrow short buys q at p_short;
 /// the vault pays (p_short - p_long) x q. Entries differ from the close
 /// prices (realized PnL != 0) and q is fractional (a partial close): EL long

@@ -1342,6 +1342,63 @@ fn p2_a_pairing_beyond_the_escrows_size_is_fatal() {
     assert!(c.fatal_error.as_deref().is_some_and(|e| e.contains("cross")), "{:?}", c.fatal_error);
 }
 
+/// Review M1: a row still open after the ranked holders AND the escrow
+/// pairing are exhausted breaks the invariant escrow size = Σ rows (OI
+/// symmetry): fatal, never a row retried every block. A long row of 3 @ 950,
+/// a real short holder with 10+; the long escrow holds (a) nothing
+/// (`adl_close` closes nothing) or (b) 1 of the 3; no short row to pair.
+#[test]
+fn p2_a_row_left_open_after_the_holders_and_the_pairing_is_fatal() {
+    use torus_core::liquidation::put_obligation;
+    for held in [0, 1] {
+        let (_d, db) = liq_db(&[1]);
+        let (y, x) = (addr(0x0A), addr(0x0B));
+        let c = ctx_at(db.clone(), 1);
+        fund(&c, &y, fp(10_000));
+        fund(&c, &x, fp(10_000));
+        open_pair(&c, &y, &x, 1, 10, 1_000);
+        if held > 0 {
+            open_pair(&c, &ADL_ESCROW_LONG, &x, 1, held, 950);
+        }
+        let o = Obligation { height: 1, market: 1, is_long: true, trader: addr(0x10), size: fp(3), price: fp(950) };
+        put_obligation(&db, &o).unwrap();
+        drop(c);
+        let c = step_marks(&db, 2, &[(1, 900)], ADL_WORK_PER_BLOCK);
+        assert!(c.fatal_error.as_deref().is_some_and(|e| e.contains("left open")), "held {held}: {:?}", c.fatal_error);
+    }
+}
+
+/// Review M2: a market's pairing scan continues where its last one stopped
+/// (a per-block position, never before the row itself), not at the queue
+/// head. K short rows (990) and K long rows (950) of size 1 in one market, no
+/// real holder, each escrow holding K. Units: K visits (the long rows go as
+/// partners before the drain reaches them) + one ranking of the 2 traders
+/// (the escrows) + the pairing reads: the first scan reads the K - 1 other
+/// short rows and l1, each later one only its partner: 3K + 1, linear (from
+/// the head it was K + 2 + K(K + 1)/2 + K).
+#[test]
+fn p2_escrow_pairing_units_are_linear_in_the_rows() {
+    use torus_core::liquidation::put_obligation;
+    const K: u8 = 20;
+    let (_d, db) = liq_db(&[1]);
+    let c = ctx_at(db.clone(), 1);
+    c.positions.apply_fill(&ADL_ESCROW_LONG, 1, true, fp(K as i64), fp(950), MarginType::Cross).unwrap();
+    c.positions.apply_fill(&ADL_ESCROW_SHORT, 1, false, fp(K as i64), fp(990), MarginType::Cross).unwrap();
+    for i in 0..K {
+        for (is_long, price) in [(true, 950), (false, 990)] {
+            let o = Obligation { height: 1, market: 1, is_long, trader: addr(0x20 + i), size: fp(1), price: fp(price) };
+            put_obligation(&db, &o).unwrap();
+        }
+    }
+    drop(c);
+    let c = step_marks(&db, 2, &[(1, 900)], ADL_WORK_PER_BLOCK);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert!(obligations(&c).is_empty());
+    assert_eq!(oi(&c, 1), (FixedPoint::ZERO, FixedPoint::ZERO));
+    let k = u64::from(K);
+    assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_work_total.get(), 3 * k + 1);
+}
+
 /// Per block: the positions, balances and liquidation rows of a P2 run
 /// (blocks 1-5 at W; u3 cut before block 3).
 fn p2_run(w: u64) -> Vec<Vec<Vec<(Vec<u8>, Vec<u8>)>>> {

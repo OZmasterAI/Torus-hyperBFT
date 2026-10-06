@@ -733,6 +733,7 @@ pub fn update_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(
 }
 
 /// The first obligation at or after `start` (the bare tag, or a key + 0x00).
+/// A malformed row (lengths, side byte, size or price <= 0) is an error.
 pub fn next_obligation<T: StateBackend>(state: &T, start: &[u8]) -> Result<Option<Obligation>, CoreError> {
     let Some((k, v)) = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[ADL_OBLIGATION_TAG], start, 1)?.pop()
     else {
@@ -742,13 +743,18 @@ pub fn next_obligation<T: StateBackend>(state: &T, start: &[u8]) -> Result<Optio
         return Err(malformed("adl obligation"));
     }
     let raw = |b: &[u8]| i128::from_be_bytes(b.try_into().expect("16 bytes"));
+    let (size, price) = (FixedPoint::from_raw(raw(&v[..16])), FixedPoint::from_raw(raw(&v[16..])));
+    // Review L1: the writers never store size <= 0 or price <= 0.
+    if size <= FixedPoint::ZERO || price <= FixedPoint::ZERO {
+        return Err(malformed("adl obligation (size or price <= 0)"));
+    }
     Ok(Some(Obligation {
         height: u64::from_be_bytes(k[1..9].try_into().expect("8 bytes")),
         market: MarketId::from_be_bytes(k[9..17].try_into().expect("8 bytes")),
         is_long: k[17] == 1,
         trader: Address::from_slice(&k[18..]),
-        size: FixedPoint::from_raw(raw(&v[..16])),
-        price: FixedPoint::from_raw(raw(&v[16..])),
+        size,
+        price,
     }))
 }
 
