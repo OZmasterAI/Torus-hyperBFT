@@ -17278,6 +17278,76 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
+    /// s94 bad-debt probe (tests only; `crates/torus-bridge/tests/
+    /// offmark_bad_debt_tests.rs` has the executor-level cases). Through
+    /// committed blocks on the live dispatch path. A (seed 75) and B (76),
+    /// one owner, each funded 100 = the IM of 10 at 200 (20x).
+    /// Block 1 (no mark yet): oracle 100 x 3; A's GTC bid 10 @200 rests
+    /// (reserves 100). Block 2 (mark 100): B's IOC sell 10 @200 (pre-EVM
+    /// batch) fills against it; B's TransferToSpot 100 (post-EVM batch, so
+    /// AFTER the fill, same block) succeeds (equity 1,100 covers the transfer
+    /// margin; UPnL is not cash). End of block 2: A (AV -900) is ADL'd
+    /// against B at the mark 100 (no previous mark), A's -900 goes to the
+    /// vault, B holds 1,000 cash. Block 3: B withdraws the 1,000. B moved
+    /// 1,100 to the EVM side for 200 deposited by A and B; the vault is at
+    /// -900.
+    // DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+    #[test]
+    fn offmark_fill_e2e_counterparty_withdraws_1100_and_the_vault_takes_900() {
+        use torus_core::liquidation::LIQUIDATOR_VAULT;
+        use torus_core::position::{NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        let (a, b) = (oracle_addr(75), oracle_addr(76));
+        for t in [a, b] {
+            pm.put_native_balance(&t, &NativeBalance { available: px(100), order_margin: FixedPoint::ZERO }).unwrap();
+        }
+        let ioc_sell = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: false,
+                price: px(200),
+                quantity: px(10),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::IOC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            2_076,
+            &oracle_key(76),
+        );
+        let to_spot = |nonce: u64, amount: i64| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToSpot { amount: U256::from(px(amount).raw() as u128) },
+                nonce,
+                &oracle_key(76),
+            )
+        };
+        let mut r1: Vec<SignedNativeAction> = (61..=63).map(|s| oracle_sub(s, 1, 100)).collect();
+        r1.push(signed_bid(75, 1_075, 200, 10));
+        let blocks = liq_blocks(vec![r1, vec![ioc_sell, to_spot(2_176, 100)], vec![to_spot(3_076, 1_000)]]);
+        let ctx = make_exec_ctx(&config, &db);
+        let native = |t: &Address| {
+            let x = pm.get_native_balance(t).unwrap();
+            (x.available, x.order_margin)
+        };
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: filled, then ADL'd at the block's end");
+        assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO, "B was the ADL counterparty");
+        assert_eq!(native(&a), (FixedPoint::ZERO, FixedPoint::ZERO));
+        assert_eq!(native(&b), (px(1_000), FixedPoint::ZERO), "B: 100 - 100 withdrawn + (200 - 100) x 10");
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "same block, after the fill");
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, px(-900), "A's deficit");
+        dispatch_and_execute(&ctx, &db, &blocks[2]);
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(1_100).raw() as u128), "block 3: the gain withdrawn");
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, px(-900));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(3));
+    }
+
     // ---- s517 oracle feeder S4: the hot oracle signer through whole blocks ----
 
     /// The hot signer key of validator `seed` (a separate address).

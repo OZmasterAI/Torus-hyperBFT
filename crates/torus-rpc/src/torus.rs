@@ -2825,6 +2825,35 @@ mod tick_lot_ingress_tests {
         let e = place(&state, order(9, 100 * S, S, OrderType::Limit)).unwrap_err();
         assert_eq!(e, "unknown market_id 9");
     }
+
+    /// s94 bad-debt probe (Q1, RPC intake): with a usable mark of 100 in the
+    /// state, a signed buy at 200 (2x the mark) and a sell at 50 (0.5x) pass
+    /// the whole ingress path (`verify_one_action`: decode, market / tick /
+    /// lot, signature). Ingress reads no mark: there is no price band.
+    // DOCUMENTS CURRENT BEHAVIOUR (s94 bad-debt probe): expected to flip when a price band lands
+    #[test]
+    fn orders_at_2x_and_half_the_mark_pass_ingress() {
+        use torus_bridge::native_executor::NativeExecContext;
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let rb = alloy_primitives::Address::repeat_byte;
+        let ctx = NativeExecContext::new(state.clone(), 1, NOW / 1_000, 0, 100, 10, rb(99), rb(100), rb(101));
+        let mark = FixedPoint::from_raw(100 * S);
+        let reporters = [rb(150), rb(151), rb(152)];
+        for v in &reporters {
+            ctx.oracle.submit_price(v, 1, mark, ctx.block_height, ctx.timestamp).unwrap();
+        }
+        let stakes: Vec<_> = reporters.iter().map(|v| (*v, FixedPoint::from_raw(S))).collect();
+        assert_eq!(ctx.oracle.aggregate_price(1, ctx.block_height, ctx.timestamp, &stakes).unwrap(), mark);
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        for (i, (is_buy, px)) in [(true, 200), (false, 50)].into_iter().enumerate() {
+            let p = PlaceOrderParams { is_buy, ..order(1, px * S, S, OrderType::Limit) };
+            let signed = torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(p), NOW + i as u64, &key);
+            let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+            let r = verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+            assert!(r.is_ok(), "is_buy={is_buy} price={px}: {:?}", r.map(|_| ()));
+        }
+    }
 }
 
 #[cfg(test)]
