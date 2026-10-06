@@ -28,7 +28,11 @@
 //! outside the block's timing, R advances). `UB_NO_R=1`: without R.
 //! C2: the split oracle step ends with `fill_block_marks` (the block mark
 //! table, `marks=` in the per-block line), and the slot carries its version.
-//! UB_REAL_MARKETS=1 (item 6 E4): genesis-layout market rows instead of `b"listed"`.
+//! UB_REAL_MARKETS (item 6 E4; row 69, s94 B: default 1): genesis-layout
+//! market rows; `UB_REAL_MARKETS=0`: the `b"listed"` placeholders, the
+//! default before row 69. Runs from before row 69 are only comparable with
+//! `UB_REAL_MARKETS=0` (a placeholder adds ~6 ms of ctx per block at 300
+//! markets; `common/econ_load.rs` `real_markets`).
 //! UB_SEED_TRADERS>0 replaces the econ load with directly written positions
 //! (UB_SEED_POS per trader) for scaling runs. Sizes: UB_SENDERS (5000),
 //! UB_MARKETS (300), UB_ACTIONS (60), UB_LOAD (150), UB_DRAIN_TO (420).
@@ -39,7 +43,7 @@
 mod econ_load;
 
 use alloy_primitives::{Address, U256};
-use econ_load::MarkWalk;
+use econ_load::{market_row, real_markets, MarkWalk};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -101,15 +105,13 @@ fn feed_setup(db: &StateDb, markets: u64) {
             )
             .unwrap();
     }
-    // Item 6 E4: `UB_REAL_MARKETS=1` lists markets with genesis-layout rows
-    // (one 5% tier, tick / lot 1) as on a node; the default `b"listed"`
-    // rows fail the margin-config decode, which costs ~20 us per row (borsh
-    // allocates and zeroes up to 1 MiB for the bogus string length).
-    let real = env("UB_REAL_MARKETS", 0) == 1;
-    let one = FixedPoint::ONE.raw();
-    let row = borsh::to_vec(&("BASE".to_string(), "USDC".to_string(), one, one, 5 * one)).unwrap();
+    // Item 6 E4 / row 69: genesis-layout rows (one 5% tier, tick / lot 1) as
+    // on a node unless `UB_REAL_MARKETS=0`; the `b"listed"` rows fail the
+    // margin-config decode, which costs ~20 us per row (borsh allocates and
+    // zeroes up to 1 MiB for the bogus string length).
+    let row = market_row(real_markets());
     for m in 1..=markets {
-        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), if real { &row } else { b"listed" }).unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
     }
 }
 fn econ_order(rng: &mut Lcg, s: u64, m: u64) -> PlaceOrderParams {
@@ -388,8 +390,9 @@ fn run() {
     }
     let holders = liq::traders_after(&db, None, usize::MAX).unwrap().len();
     println!(
-        "UBENCH mode={mode} load={:.1}s position_holders={holders} markets={markets} resident_rows={resident} R rows={} bytes={} builds={}",
+        "UBENCH mode={mode} load={:.1}s position_holders={holders} markets={markets} real_markets={} resident_rows={resident} R rows={} bytes={} builds={}",
         t_load.elapsed().as_secs_f64(),
+        real_markets(),
         chain.holder.rows().map_or(0, |r| r.len()),
         chain.holder.rows().map_or(0, |r| r.bytes()),
         chain.holder.rows_builds()

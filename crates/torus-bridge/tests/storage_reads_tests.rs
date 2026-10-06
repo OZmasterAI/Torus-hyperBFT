@@ -113,7 +113,7 @@ fn setup(db: &StateDb) {
             )
             .unwrap();
     }
-    feed_setup(db, MARKETS);
+    feed_setup(db, MARKETS, false); // placeholder rows, as before row 69
 }
 
 /// Every key of both probed CFs sits in the active memtable (no SST): the

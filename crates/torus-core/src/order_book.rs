@@ -1313,11 +1313,15 @@ impl OrderBook {
             return PlaceResult::rejected(order_id);
         }
 
-        // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders
-        if matches!(params.order_type, OrderType::Limit)
-            && self.tick_size > FixedPoint::ZERO
-            && params.price.raw() % self.tick_size.raw() != 0
-        {
+        // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders.
+        // Row 45 (s94 B): and a StopLimit's limit, a second guard: every
+        // executor path rejects it before the book (`shape_violation`).
+        let tick_price = match params.order_type {
+            OrderType::Limit => Some(params.price),
+            OrderType::StopLimit { limit, .. } => Some(limit),
+            OrderType::Market | OrderType::StopMarket { .. } => None,
+        };
+        if tick_price.is_some_and(|p| self.tick_size > FixedPoint::ZERO && p.raw() % self.tick_size.raw() != 0) {
             return PlaceResult::rejected(order_id);
         }
 
@@ -5608,6 +5612,30 @@ mod tests {
         let mut ob = OrderBook::new(1, fp(1), fp_frac(0, 1));
         let r = ob.place_order(limit_sell(fp(100), fp(10)), addr(1), 1);
         assert_eq!(r.status, OrderStatus::Resting);
+    }
+
+    /// Row 45 (s94 B): the book itself tick-checks a StopLimit's limit (a
+    /// second guard; every executor path checks it before the book). The
+    /// reject keeps today's shape: an id is used, nothing is stored.
+    #[test]
+    fn reject_stop_limit_with_off_tick_limit() {
+        let mut ob = OrderBook::new(1, fp(1), fp_frac(0, 1));
+        let stop = |limit| PlaceOrderParams {
+            market_id: 1,
+            is_buy: false,
+            price: FixedPoint::ZERO,
+            quantity: fp(5),
+            order_type: OrderType::StopLimit { trigger: fp(95), limit },
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let r = ob.place_order(stop(fp_frac(90, FixedPoint::SCALE as i64 / 2)), addr(2), 1);
+        assert_eq!(r.status, OrderStatus::Rejected);
+        assert_eq!(ob.pending_stop_count(), 0);
+        let r = ob.place_order(stop(fp(90)), addr(2), 2);
+        assert_eq!(r.status, OrderStatus::PendingTrigger);
+        assert_eq!(ob.pending_stop_count(), 1);
     }
 
     // ====================================================================

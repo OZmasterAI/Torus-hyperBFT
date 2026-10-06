@@ -560,15 +560,15 @@ reviews it.
 | 41 | fix A / Limit price <= 0 | still reaches the book, holds a slot and margin, reports ok (`validate_order_price` checks only Market / Stop) | owner s92: YES, reject before the book | M1 | - |
 | 42 | ozarchy B / tick source | RPC (`fix/rpc-tick-check` `44b7473`) reads tick / lot from the market row; the executor creates every book with ONE / ONE (`native_executor.rs` ~5313, ~7561) and never reads the row; all markets today 1 / 1 | none (s92: fix in M1) | M1: create books from the market row; align RPC and executor messages | - |
 | 43 | M1 / listing validation | governance market listings do not check tick > 0 and lot > 0; since row 42 a lot of 0 makes a book that accepts zero-quantity orders and a tick of 0 turns the tick check off | validate at proposal time? (consensus change) | s94 owner: yes. Built: refused at proposal creation and at execution (no market row), genesis refuses; native `ListMarket` / `UpdateMarketParams` already governance-only; no 0 market in any repo genesis / fixture (128 checked) | `8d449f5` |
-| 44 | M1 / undecodable market row | executor uses 1 / 1, RPC only checks the market exists (test placeholders only) | should the RPC also apply 1 / 1? | not built (recommendation: yes) | - |
-| 45 | M1 / book guard | the book itself does not tick-check a StopLimit's limit; every executor path checks it before the book | add it to the book as a second guard? | not built (recommendation: yes) | - |
-| 46 | M1 / RPC price <= 0 | RPC does not reject a Limit with price <= 0 at intake; the executor rejects it before the book | add it at intake? (node-local) | not built (recommendation: yes) | - |
+| 44 | M1 / undecodable market row | executor uses 1 / 1, RPC only checks the market exists (test placeholders only) | should the RPC also apply 1 / 1? | built (B batch): `validate_known_markets` gives an undecodable row the executor's 1 / 1 (`market_shape`); two torus-rpc fixtures on placeholder rows moved onto tick / lot 1 | `9ab2837` |
+| 45 | M1 / book guard | the book itself does not tick-check a StopLimit's limit; every executor path checks it before the book | add it to the book as a second guard? | built (B batch): `place_order_with_accounts` tick-checks a StopLimit's limit; never fires on today's paths (goldens unchanged) | `d9e3c19` |
+| 46 | M1 / RPC price <= 0 | RPC does not reject a Limit with price <= 0 at intake; the executor rejects it before the book | add it at intake? (node-local) | built (B batch): `check_tick_lot` refuses it first, with the executor's text (`validate_order_price`) | `457fd70` |
 | 47 | M1 cut 4 / end-of-block cost | 18c estimate ~8.6 ms/block; **ozarchy section 14: +29.7 ms/block** (`end_resident` 67 -> 97, untimed; `BlockSums::into_cache` ~18) | count in the gates or move off the execution thread? | step 1 (reuse C7's decoded positions + timer), then step 2 if the overlap check pays (section 9.7) | `b9959e2` |
 | 48 | M1 / hasher | a faster per-process-seeded hasher (foldhash / ahash) would be a new direct dependency; not measured; s82 A/B found no gain from ahash on the exec maps | add? | not added (recommendation: no) | - |
 | 49 | M1 / client-visible | RPC messages now start with "order rejected: "; off-tick StopLimit limits rejected at intake | none (heads-up for clients) | built | `7c365d4` |
 | 50 | C / zero-fill IOC, crossing PostOnly | still report executed (success); recording them needs the settle loop to return a result per order | failed with new codes, or a separate "canceled" status like HL? | unchanged | `4a26653` |
 | 51 | C / typed reasons | three reasons differ from C's text parser: modify price <= 0 `other` -> `price`, modify qty <= 0 `other` -> `lot`, withdrawal refused by margin `other` -> `margin` | confirm, or revert those three to `other`? | built | `4a26653` |
-| 52 | C / reduce-only rejects | stored as `other` | dedicated code (next free value 8)? | not built | - |
+| 52 | C / reduce-only rejects | stored as `other` | dedicated code (next free value 8)? | built (B batch): `FailureReason::ReduceOnly` = **9** (8 was already `PriceBand`), name `reduce_only`, for HL `reduceOnlyRejected` (row 50); set in `exec_place_order` and `exec_modify_order`. Node-local record only; old records keep `other` (0), an older reader reads 9 as `other`. Found: in a block, reduce-only placement rejects come from the book on the `execute_batch` path and report executed (row 50's per-order results), so the record sees 9 from ModifyOrder | `860da7d` |
 
 ## 9. s92 decisions: options considered, chosen, not chosen, and why
 
@@ -663,7 +663,7 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
 | 66 | E2 / cooldown + pending rows | plan: read once per block as a set; built: the liquidation CF moved into R | OK? (reuses R's tested guards, no per-trader reasoning) | built | `b2641cf` |
 | 67 | E3 / E4 / R scope | R now holds five CFs (positions, balances, liquidation, oracle, market rows) | none (rule: any future writer of these CFs outside the block overlay must invalidate R) | metrics count all five | `8b0673d` `ecf4aec` |
 | 68 | E4 / margin-config cache | ~0.4 ms per block left with real market rows | none | not built (needs the context constructor changed at five call sites) | - |
-| 69 | bench fixture | `b"listed"` market rows add ~6 ms of fake ctx per block in `ubench_epoch` / `ubench_econ` (failed borsh decode allocates 1 MiB); ozarchy section 7.3's ctx was mostly this | default to real rows (breaks comparison with past runs) or a length guard in `market_margin_config`? (s92 suggestion: real rows by default, note the break) | `UB_REAL_MARKETS=1` added | `ecf4aec` |
+| 69 | bench fixture | `b"listed"` market rows add ~6 ms of fake ctx per block in `ubench_epoch` / `ubench_econ` (failed borsh decode allocates 1 MiB); ozarchy section 7.3's ctx was mostly this | default to real rows (breaks comparison with past runs) or a length guard in `market_margin_config`? (s92 suggestion: real rows by default, note the break) | `UB_REAL_MARKETS=1` added; B batch: real rows by default in BOTH `ubench_epoch` and `ubench_econ` (`common/econ_load.rs` `real_markets` / `market_row`), `UB_REAL_MARKETS=0` gives the placeholders. **Comparability break:** runs before `553aa51` are only comparable with `UB_REAL_MARKETS=0` (noted in both bench headers; summary lines print `real_markets=`). `storage_reads_tests` keeps the placeholders | `ecf4aec`, `553aa51` |
 | 70 | E1 | oracle step now 1.8-2.0 ms per empty block | none | dropped | - |
 | 71 | liquidation skip (section 17 cut 3) | no exact whole-pass skip: the pass writes the hashed cursor and clears cooldown / pending rows; per-trader "healthy at mark version V" certificate is exact but saves ~1 ms per empty block after E2 | none (s92: dropped) | not built | - |
 | 72 | C5 coverage | cooldown / pending rows appear in 2 of 210 blocks (one seeded account, 1,100 @100 over the 100k chunk threshold) | none | covered thinly; a dedicated cooldown sequence can follow | `6571a76` |
@@ -818,7 +818,8 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 | bench load: open-limit rejects (section 20.3) | `bench/max-in-flight` merged; standard shape `MAX_IN_FLIGHT=4` + `OPEN_ORDER_BUDGET=900` |
 | rows 77-78 slow first block, empty block with the feed live | profiled (results doc section 22): flush-worker wait (77, Phase 3) and `run_liquidations_with` sums (78, Phase 2 P2-4 design check) |
 | 9.14 D row 48 (faster hasher) | `hash_one` / SipHash showed (~13% of execution self time): Phase 2 P2-5 (`item6-phase2-impl.md` 9.5) |
-| 9.14 B batch (rows 44, 45, 46, 52, 69), row 50 "canceled", 9.11 counter, anti-spam eviction metric | unchanged; build after row 74 (they touch `order_book.rs` / RPC) |
+| 9.14 B batch (rows 44, 45, 46, 52, 69) | built on `fix/s94-b-batch` (`9ab2837`, `d9e3c19`, `457fd70`, `860da7d`, `553aa51`); not merged yet |
+| row 50 "canceled", 9.11 counter, anti-spam eviction metric | unchanged; row 50 next |
 | `/tmp` test-folder leak (`app.rs`) | unchanged; after the merge (now unblocked) |
 | compiler warnings (ozarchy s17): `swarm.rs` 3047 `enqueue_body_fetch_traced` and 3210 `handle_consensus_direct` unused; `bench-throughput` `main.rs` 1592 needless `mut`, `in_flight.rs` 152 unused | new; small cleanup, anytime |
 | other 9.13 rows (native root 9.3, oracle M2, anti-spam D, runbook, C5 cooldown, trading app `"Failed"`) | unchanged |
@@ -826,5 +827,5 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 Item 6 Phase 2: full plan with owner decisions in `item6-phase2-impl.md` (`docs/item6-phase2-plan`);
 base and gate reference main `35e69b3`.
 
-Build queue on 18c (s96): row 74 done -> next: B batch (44, 45, 46, 52, 69) -> row 50 -> 9.11 counter + pin
+Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> next: row 50 -> 9.11 counter + pin
 tests -> anti-spam eviction metric; Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.

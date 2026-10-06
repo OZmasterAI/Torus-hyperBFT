@@ -73,9 +73,19 @@ struct SubmissionCompaction {
     idle: std::sync::Condvar,
     /// Finished runs: `(done, failed)`.
     runs: std::sync::Mutex<(u64, u64)>,
+    /// Set by [`CompactionOwner`]'s drop: start no run and no re-run.
+    shutdown: std::sync::atomic::AtomicBool,
+    /// The last worker thread, joined by [`CompactionOwner`]'s drop.
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Test hook: every run fails (logged, counted) instead of compacting.
     #[cfg(test)]
     fail: std::sync::atomic::AtomicBool,
+    /// Test hook: runs that took their strong `Arc<DB>`.
+    #[cfg(test)]
+    started: std::sync::atomic::AtomicU64,
+    /// Test hook: each run keeps its strong `Arc<DB>` this many ms before compacting.
+    #[cfg(test)]
+    hold_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SubmissionCompaction {
@@ -88,6 +98,12 @@ impl SubmissionCompaction {
         let Some(db) = db.upgrade() else {
             return Ok(());
         };
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.started.fetch_add(1, Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(self.hold_ms.load(Relaxed)));
+        }
         let cf = db
             .cf_handle(CF_NATIVE_ORACLE)
             .ok_or_else(|| format!("missing column family {CF_NATIVE_ORACLE}"))?;
@@ -120,12 +136,37 @@ impl SubmissionCompaction {
     }
 }
 
+/// The owners' side of the [`SubmissionCompaction`] job, shared by every clone
+/// of one `StateDb` (the worker holds only the job). Its drop runs once, with
+/// the last clone and before that clone's `Arc<DB>`: it cancels any re-run and
+/// joins the worker. The worker upgrades its `Weak<DB>` for a whole run, so
+/// without this it could hold the last `Arc<DB>` and close RocksDB on its own
+/// thread during process exit, after RocksDB's static mutexes are destroyed
+/// (teardown SIGABRT "pthread lock: Invalid argument").
+#[derive(Default)]
+struct CompactionOwner(Arc<SubmissionCompaction>);
+
+impl Drop for CompactionOwner {
+    fn drop(&mut self) {
+        self.0.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worker = self.0.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Central RocksDB database handle for the Torus node.
 ///
 /// Opens all column families defined in section 6.1. Provides typed accessors
 /// for EVM state (accounts, storage, code) and implements `revm::DatabaseRef`.
 #[derive(Clone)]
 pub struct StateDb {
+    /// s89 fix B: the background compaction of the pruned oracle submission
+    /// range, shared by every clone of this handle (one in flight per DB).
+    /// Declared before `db`: fields drop in order, so the last clone joins the
+    /// worker while it still holds its own `Arc<DB>`.
+    submission_compaction: Arc<CompactionOwner>,
     db: Arc<DB>,
     /// The DB-wide `Options` the instance was opened with, kept alive so the
     /// RocksDB `Statistics` object it owns (tickers + histograms) can be read
@@ -135,9 +176,6 @@ pub struct StateDb {
     /// 2 = tickers + histograms). Decides which parts of `runtime_stats` are
     /// meaningful.
     stats_level: u8,
-    /// s89 fix B: the background compaction of the pruned oracle submission
-    /// range, shared by every clone of this handle (one in flight per DB).
-    submission_compaction: Arc<SubmissionCompaction>,
 }
 
 /// r3 exec-write-stall-attribution: node-local RocksDB tuning read once at DB
@@ -593,7 +631,7 @@ impl StateDb {
     /// when it ends. A failure is logged and counted, never returned. Node-
     /// local: a compaction changes no read result, state, root or hash.
     pub fn compact_pruned_submissions_in_background(&self) {
-        let job = Arc::clone(&self.submission_compaction);
+        let job = &self.submission_compaction.0;
         {
             let mut state = job.lock_state();
             if state.0 {
@@ -604,10 +642,15 @@ impl StateDb {
         }
         // Weak: a pending compaction never keeps a closed DB (and its LOCK) alive.
         let db = Arc::downgrade(&self.db);
-        let worker = Arc::clone(&job);
+        let worker = Arc::clone(job);
         let spawned = std::thread::Builder::new()
             .name("torus-oracle-compact".into())
             .spawn(move || loop {
+                // The last owner is dropping (and joining): no run, no re-run.
+                if worker.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    worker.finish(&mut worker.lock_state());
+                    break;
+                }
                 let started = std::time::Instant::now();
                 match worker.run(&db) {
                     Ok(()) => {
@@ -630,10 +673,16 @@ impl StateDb {
                 worker.finish(&mut state);
                 break;
             });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "could not start the oracle submission compaction (ignored)");
-            job.lock_runs().1 += 1;
-            job.finish(&mut job.lock_state());
+        match spawned {
+            // Replaces the handle of an earlier worker, which already finished.
+            Ok(handle) => {
+                *job.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start the oracle submission compaction (ignored)");
+                job.lock_runs().1 += 1;
+                job.finish(&mut job.lock_state());
+            }
         }
     }
 
@@ -641,7 +690,7 @@ impl StateDb {
     /// flight; returns the finished runs `(done, failed)` so far. Tests and
     /// benches only — the node never waits for it.
     pub fn wait_background_compaction(&self) -> (u64, u64) {
-        let job = &self.submission_compaction;
+        let job = &self.submission_compaction.0;
         let mut state = job.lock_state();
         while state.0 {
             state = job.idle.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -654,8 +703,15 @@ impl StateDb {
     #[cfg(test)]
     pub(crate) fn fail_background_compaction(&self, fail: bool) {
         self.submission_compaction
+            .0
             .fail
             .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test hook: the compaction job shared with the worker thread.
+    #[cfg(test)]
+    fn compaction_job(&self) -> Arc<SubmissionCompaction> {
+        Arc::clone(&self.submission_compaction.0)
     }
 
     /// Get a shared handle to the underlying RocksDB instance.
@@ -1485,5 +1541,80 @@ mod sync_wal_tests {
         wo.set_low_pri(true);
         db.write_with(batch, &wo).expect("low-pri write");
         assert_eq!(db.get_cf_raw(CF_ACCOUNTS, b"lp").unwrap(), Some(b"v".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod compaction_drop_tests {
+    //! Teardown SIGABRT (s18): the compaction worker upgrades its `Weak<DB>`
+    //! for the whole run, so it could hold the LAST `Arc<DB>` and close
+    //! RocksDB on its own thread during process exit. The last `StateDb`
+    //! owner must wait for it instead.
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+
+    /// Start a compaction that keeps its strong `Arc<DB>` for `hold_ms`;
+    /// returns once the worker holds it.
+    fn start_held_compaction(db: &StateDb, hold_ms: u64) -> Arc<SubmissionCompaction> {
+        let job = db.compaction_job();
+        job.hold_ms.store(hold_ms, Relaxed);
+        let before = job.started.load(Relaxed);
+        db.compact_pruned_submissions_in_background();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while job.started.load(Relaxed) == before {
+            assert!(Instant::now() < deadline, "worker never took the DB");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        job
+    }
+
+    #[test]
+    fn last_drop_waits_for_the_compaction_and_closes_the_db_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let weak = Arc::downgrade(&db.db);
+        let job = start_held_compaction(&db, 300);
+        drop(db);
+        assert!(
+            weak.upgrade().is_none(),
+            "the last StateDb drop must close RocksDB on its own thread, not leave the last Arc<DB> to the worker"
+        );
+        assert_eq!(*job.lock_runs(), (1, 0), "drop returned before the run finished");
+        assert!(!job.lock_state().0, "job still marked running after drop");
+        assert_eq!(Arc::strong_count(&job), 1, "the worker thread is still alive");
+        StateDb::open(dir.path()).expect("reopen right after drop (LOCK released)");
+    }
+
+    #[test]
+    fn drop_with_a_pending_rerun_skips_it_and_returns_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let job = start_held_compaction(&db, 200);
+        db.compact_pruned_submissions_in_background();
+        assert!(job.lock_state().1, "second request must be queued as a re-run");
+        let t = Instant::now();
+        drop(db);
+        let took = t.elapsed();
+        assert_eq!(*job.lock_runs(), (1, 0), "the re-run must not start after the owner dropped");
+        assert_eq!(job.started.load(Relaxed), 1);
+        assert_eq!(Arc::strong_count(&job), 1, "the worker thread is still alive");
+        assert!(took < Duration::from_secs(5), "drop took {took:?}");
+    }
+
+    #[test]
+    fn dropping_a_clone_does_not_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let weak = Arc::downgrade(&db.db);
+        let clone = db.clone();
+        let job = start_held_compaction(&db, 300);
+        let t = Instant::now();
+        drop(clone);
+        assert!(t.elapsed() < Duration::from_millis(150), "a clone drop waited {:?}", t.elapsed());
+        assert!(job.lock_state().0, "the compaction should still be running");
+        drop(db);
+        assert!(weak.upgrade().is_none(), "the last drop must close RocksDB itself");
+        assert_eq!(*job.lock_runs(), (1, 0));
     }
 }
