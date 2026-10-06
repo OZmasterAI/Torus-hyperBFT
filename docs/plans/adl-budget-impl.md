@@ -112,10 +112,12 @@ Invariant: for each (side, market), the escrow's size equals the sum of that sid
     visit per block, and keep the step due.
   * **delisted** (not in `listed_market_ids()`; it will never get a mark again): its rows are
     ranked with the row's **stored price** standing in for the mark (`adl_rank(o.price, …)`),
-    and closed at the stored price as usual. This is the simplest deterministic rule that lets
-    the escrow go flat. It changes semantics (ranking without a mark), so it is an open
-    question for 18c. The alternative is to leave the rows and report them via the queue gauge,
-    in which case the escrow never goes flat for that market.
+    and closed at the stored price as usual, so the escrow can go flat. **Decided (owner 18c,
+    after dbb683c).** Note: delisting is text-only today (`ProposalAction::DelistMarket`
+    executes nothing, `native_executor.rs` ~9761), so this path cannot occur yet. When
+    delisting is built (likely a final settlement price for every position, HL-style), the
+    escrows' positions in that market must be settled with them (their rows closed at the
+    settlement).
 
 **Edge: real holders exhausted** (both escrows hold the market). The row is paired with the
 opposite side's rows of the same market, in key order. The two escrows close against each other,
@@ -190,7 +192,9 @@ This is the owner's "size × 1 raw per obligation", taken with the aggregated si
   persisted, and nothing would survive a restart.
 * Production logs every sweep at info and adds it to the dust gauge. It logs an **error** when
   `|dust| ≥ 1 token` (10^8 raw). That is a coarse, node-local invariant alarm, many orders above
-  any real dust (size × 1 raw ≈ size / 10^8 tokens). Production always sweeps.
+  any real dust (size × 1 raw ≈ size / 10^8 tokens). Production always sweeps. **Decided (owner
+  18c, after dbb683c):** the error line at ≥ 1 token, nothing persisted, the exact bound asserted
+  in tests only.
 
 ## Funding requirement (owner decision 5; doc-only, no funding on main)
 
@@ -889,6 +893,19 @@ fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint, tol: i128)
 The existing ADL tests stay RED until A6 (same commit).
 **Depends on:** A2, A3, A4.
 
+**As built (dfa170c, one commit with A6), deviations:**
+* #1 asserts Σ value within **1 raw**, not 0: the escrow's market-3 average
+  `(962.99999999 + 1,000) / 2` truncates, so its UPnL at 900 is off by 1 raw at B already
+  (checked: with 0 the test fails by exactly 1 raw).
+* #2: the running-`rest` shadow is `#[cfg(test)]` inside the bridge library, so it cannot run
+  in the `tests/liquidation_tests.rs` binary. It runs in the lib's seeded L1 test
+  (`liquidation_l1_equals_reference_walk_on_seeded_sequences`: 78 ADL classifications over
+  6 seeds, every market of every ADL'd account); #2 checks the rest.
+* 18c review of A1-A4 landed here: `cross_close` refuses q ≤ 0 or an escrow without ≥ q on its
+  side (a node fault in the step); `put_obligation` / `update_obligation` delete only at size 0
+  and reject size < 0 or price ≤ 0; the `cross_close` test has entries ≠ close prices, a
+  fractional q and a partial close; a malformed `0x03` row is fatal (test).
+
 ---
 
 ### Task A6: the drain under W (Q2, Q3, P2), edge pairing, dust sweep
@@ -1114,7 +1131,19 @@ time: escrows are in the list, and the flat accounts are not):
 Then the full workspace before the A5+A6 commit.
 **Depends on:** A5.
 
----
+**As built (dfa170c), deviations:**
+* #10 uses heights 70-72 (block 2's aggregate stays usable for 60 s, so "market 1 stale at
+  block 3" needs a later block).
+* #3 (`p2_ranks_each_market_side_once_per_block`) uses its own two-block fixture in
+  `liquidation_l1_tests.rs` (P2's shape, R and the slot attached): rankings per block [0, 4].
+* The drain rewrites a row only when its size changed (a row whose closes found nothing
+  writes nothing).
+* GOLDEN_B: the first changed digest is block 8, the first ADL block (adl 0 → 2 on 56318a9).
+  `golden_repins_change_only_rule_h_and_p2_rows` pins reduced digests (the hashed CFs without
+  `CF_CONSENSUS_META`, which holds the running hash and the native trie's nodes; `0x03` values
+  cut to 16 bytes; no `0x07` rows and no escrow position or balance rows; plus every block's
+  outputs) captured on 56318a9 (D10, no P2). They are equal on the new code for every block of
+  scenarios A and B, so the A3 and A5/A6 re-pins changed only those rows.
 
 ### Task A7: e2e, gauges, conservation sum (node-local)
 
@@ -1197,6 +1226,15 @@ fn liquidation_e2e_adl_obligations_drain_over_empty_blocks() { … }
 **Verify:** `cargo nextest run -p torus-consensus liquidation_e2e $F`, `cargo nextest run -p torus-bridge telemetry_ $F`.
 **Depends on:** A6.
 
+**As built (a21a21e), deviations:**
+* `liq_value_sum` lives on `ExecutionContext` (where the block's context is built), read once
+  from `TORUS_LIQ_VALUE_SUM=1` at construction.
+* The e2e test does not read `AccountReader::mark` (private to the bridge). The last row
+  drains in block 15, which proves the mark was usable (rows of a listed market without a
+  mark wait).
+* Open question 5 confirmed: `total_native_fees` is never incremented (no native fee debits
+  `CF_NATIVE_BALANCES`), so only deposits, withdrawals and transfers move the value sum.
+
 ---
 
 ### Task A8: measure, set `W`, prove an HL-sized event closes in one block
@@ -1223,6 +1261,16 @@ fn liquidation_e2e_adl_obligations_drain_over_empty_blocks() { … }
   for the S=750 mode (100 accounts × 270 markets) and for the HL mode. B's work is outside W
   (bounded by the act budget of 64 accounts), so it must be measured separately; it was ~0.7 s
   per block with the O(P²) `adl_rest`.
+
+Note (after A5): `AdlClock` (`ubench_adl.rs`) keys on the `counterparties` field of the old
+`liquidation: ADL` line, which A5 removed; time block B with the `liquidation: ADL to escrow`
+events (one per account-market) and the drain with the `liquidation step` line's `adl_work`
+and `ms` fields.
+
+**Block B outside W: the condition (owner 18c, after dbb683c).** Block B's cost (moving the
+positions to the escrows) stays outside W, bounded by the 64-account act budget × O(P) with the
+running `rest`, **on condition**: if A8 measures block B above the W budget (~250 ms for an
+HL-sized event), it is charged into W, or a lower per-block act limit for ADL accounts is used.
 
 Set `W = max(U_hl × 1.25, 100 × (5,000 + 3) + 300 × 2)`, rounded up to a multiple of 10,000.
 The case is N = 5,000, one side (all long), 100 (market, side) keys and 300 rows; the second
@@ -1281,7 +1329,8 @@ and `UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=10 …` (bench-runner).
 
 ## Open questions (recommendation in brackets)
 
-1. **Delisted market (for 18c: this changes semantics).** Rows of a market that is no longer
+1. **Delisted market — DECIDED (owner 18c): rank at the stored price** (see *Drain*; delisting
+   is text-only today). Rows of a market that is no longer
    listed would never get a mark, so the escrow would never go flat.
    [Rank them with the row's **stored price** standing in for the mark, and close at the stored
    price (A6 #11). A listed market without a usable mark keeps waiting at 1 unit per row visit
@@ -1290,7 +1339,7 @@ and `UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=10 …` (bench-runner).
 2. **Dust bound wording.** "Size × 1 raw per obligation" holds only with the escrow's
    **aggregated** size after each row: an average's error applies to the whole position. [Use
    the formula in *Dust bound*, as a test-only assertion.]
-3. **The production dust alarm.** [An error log at |dust| ≥ 1 token, node-local, no persisted
+3. **The production dust alarm — DECIDED (owner 18c): as recommended.** [An error log at |dust| ≥ 1 token, node-local, no persisted
    counters; always sweep. Never fail-stop: value is still conserved through the vault.]
 4. **Edge-pairing cost.** `adl_cross` scans the queue from its start for opposite rows of the
    same market: O(queue) per paired row, counted in units. [Accept: rare; add an index only if
@@ -1312,8 +1361,9 @@ and `UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=10 …` (bench-runner).
 9. **Rule H after an outage.** A market whose mark disappears loses its row, so the first mark
    after the gap has no base (the mark fallback). [Keep: H1's "never a base from before an
    outage".]
-10. **Block-B cost is outside W.** It is bounded by the act budget (64 accounts per block) ×
-    O(P) transfers. [Accept, with the running `rest`. A8 reports the block-B ms for S=750; if it
+10. **Block-B cost is outside W — DECIDED (owner 18c): accepted on the A8 condition** (charged
+    into W or a lower ADL act limit if block B measures above ~250 ms). It is bounded by the act
+    budget (64 accounts per block) × O(P) transfers. [Accept, with the running `rest`. A8 reports the block-B ms for S=750; if it
     is too high, the act budget is the lever.]
 11. **Positive D9 remainder.** Impossible under the one-sided clamp (Design step 3). [An error
     log as an invariant alarm; no special handling.]
