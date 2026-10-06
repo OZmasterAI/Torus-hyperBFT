@@ -208,6 +208,8 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 
 ## Product-parity track — P0 to P5 *(runs alongside Tiers 1–4)*
 
+> **Status 2026-10-06 (s94):** the crab stack and item 6 Phase 1 are merged into main (`59fa407`); the pre-F1 parity fixes came earlier (`bf87991`). For this track that delivered: account-level margin, HL cross model (F1, `ca06c8c`); oracle aggregation at every block start with a stake quorum (`454a9bb`, `b657903`); HL-style liquidation and ADL at the end of every block (`b360813`); the validator oracle signer and price feeder (`22872d4`, `d1112a8`); the block timestamp rule (`61832ec`); listings with tick or lot 0 refused (`8d449f5`, plan row 43); and a `Failed` status for proposals that fail at execution (`e439982`, row 73). Most of the P0 A-list and much of P1 is now done; most of the other P0 bugs are still open (per-bug status in P0). New since then: a bad-debt route through fills far from the mark (P0). Sources: `plans/item6-phase1-impl.md` 9.11–9.13 and review rows 72–79, `parity-audit-fixes-s515.md`.
+
 > **Why a separate track:** Tiers 0–4 make the chain fast and live. They do not make it an exchange. The 2026-10-01 product-parity sprint (`reports/hl-parity-2026-10-01/`) found that the matching engine is sound, but liquidation, oracle aggregation, margin configs, fees, funding, the market registry and unbonding release are missing, stubbed or **never called**. It also found several money-losing bugs. 200k orders/s of an exchange that cannot liquidate is not parity. Almost every P item changes the state transition, so most are **[LOCKSTEP]**. That is why P0.0 comes first.
 >
 > **Interaction with the perf tiers:** P0 runs in parallel with Tier 1 and is a hard gate before any public trading. P1–P2 add per-block work (oracle aggregation, liquidation sweep, funding, fee debits), so **T0.3's harness must gain a trading-semantics mix** (stops, modifies, liquidations, multi-market) before Tier 4 numbers are trusted. Today's benches send only GTC limits, which is why the P0 bugs went unseen.
@@ -228,6 +230,37 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   - **A8:** session-key expiry is checked in seconds against milliseconds, so expired sessions are never rejected in blocks.
   - **A9:** unbonded funds are never released.
   - **Others:** EVM gas fees are credited twice; inflation pays the self-stake share to delegators; CoreWriter returns a fake order id and runs stop types as plain limits; read precompiles charge flat gas for unbounded output; the nonce window is enforced only at the mempool; unknown market ids auto-create books outside RPC; stop orders bypass the order cap; block timestamps are never validated; Full-scope session keys can perform validator and governance actions; the EIP-712 domain has no network field, so actions replay across networks.
+- **Status 2026-10-06 (s94), checked on main `59fa407`:**
+
+  | Bug | Status | Commit / note |
+  |---|---|---|
+  | A1 ModifyOrder | DONE | `710dde7` (ownership), `8cad442` (validate, margin first), `bb19aba` (tick check). A modify that would cross is rejected, not matched (HL would match). |
+  | A2 triggered stop fills dropped | DONE | `bd830af` (fired stops placed and settled through the normal path) |
+  | A4 positions hold no collateral | DONE | `ca06c8c` (F1: account-level free margin; withdraw and transfer check position margin) |
+  | A5 market orders reserve no margin | DONE | `bd830af` (price cap + margin), `03c40ac` (reserve at the mark, re-check at match) |
+  | A7 lockbox decimals, revm cache clobber | DONE | `f572012` (18-dec EVM units, queued 0x0820); clobber test `ffcf596` |
+  | A8 session expiry seconds vs ms | OPEN | the block paths still pass the header time in seconds to `resolve_sender` (`validator.rs` ~376, `proposer.rs` ~216); only session creation converts (`exec_create_session`) |
+  | A9 unbonded funds never released | DONE | `01133f9` (`ClaimUnbonded` action), `c743829` (all-or-nothing) |
+  | EVM gas fees credited twice | OPEN | no fix commit; `compute_fee_revenue` and `distribute_fees` unchanged |
+  | Inflation pays self-stake share to delegators | OPEN | no fix commit in `torus-economics` |
+  | CoreWriter fake order id, stop types as limits | OPEN | `placeOrder` still returns a synthetic id (block and queue sequence); `decode_order_type` maps 2 and 3 to Limit |
+  | Read precompiles flat gas | OPEN | `GAS_PRECOMPILE_READ` 2,600 flat for 0x0800–0x0803 |
+  | Nonce window only at the mempool | OPEN | window checked in mempool / RPC only, not in block validation |
+  | Unknown market ids create books | PARTLY | RPC rejects them; the executor still creates a book (now with the market row's tick/lot, `e81aa2e`, or 1/1 with no row). Consensus check is P1 item 2. |
+  | Stop orders bypass the order cap | DONE | per-user open-order limit counts pending stops (`007fce6`, `0b20364`, `60f219f`; merge `2567e56`) |
+  | Block timestamps not validated | PARTLY | `61832ec` (not below parent, at most 5 s ahead). Lower bound open (review M2, needs validate-before-voting; 9.13 backlog). |
+  | Full-scope session keys do validator / governance actions | OPEN | `SessionScope::Full` still allows them; only staking moves, withdraw, sessions, `ClaimUnbonded` and `SetOracleSigner` are excluded |
+  | EIP-712 domain has no network field | OPEN | domain is still name/version/chainId 7778/zero address |
+
+  Also fixed since the report (in `README.md` §3, not listed above): local-view equivocation slashing (`1d5cdff`), the two epoch staking writers (`732c78e`, `285d344`), governance `ListMarket` id 0 (`d68bde1`, P1).
+- **New P0 item: bad-debt route through fills far from the mark.** Confirmed by probe `77a3b21` (tests only): account A buys at 2x the mark from account B (same owner, 20x, each funded 100). A's account value goes to -900, ADL moves the -900 to the liquidator vault, and the owner withdraws 1,100 through B for 200 deposited. Fills are valued at the fill price and nothing bounds the price against the mark, so at 20x bad debt starts about ±5% off the mark. Fix in progress on `fix/offmark-bad-debt` (s94 owner go):
+  1. Charge the off-mark loss at fill time, to maker and taker. Fills near the mark are unchanged.
+  2. A chain-wide price band: ±50% of the mark by default. With a stale mark, the reference is median(best bid, best ask, last trade) clamped to ±10% of the last fresh mark. With no reference, the band is skipped.
+
+  The band is pulled forward from P2 item 3. The slippage cap, OI caps and max notional stay in P2.
+- **Governance, pre-existing (plan 9.13):**
+  - Row 74: a governance storage error does not halt the node (`app.rs` drops `process_governance`'s results; liquidation does halt). Owner decision, before mainnet.
+  - Row 75: TreasurySpend and PermanentUnlock write more than once, so a storage error after the first write can pay twice on retry. Make both all-or-nothing. In progress on `fix/governance-atomic-writes`.
 - **Plan:** One PR per bug, each RED-first through the **real executor**. Today no test runs modify or a triggered stop end to end. Use the round-4 fix designs in `findings.md` (e.g. modify becomes ownership check, then validate, then margin pre-check, then `exec_cancel_order` + `exec_place_order`). Gate behaviour changes behind P0.0. Close the open Astra round-2 audit findings in the same pass.
 - **Acceptance:** Each bug has a failing-first executor-level test. A trading-semantics proptest checks book invariants (`verify_invariants`), margin conservation and position/fill agreement after random place, modify, cancel and stop sequences.
 - **Effort:** mostly S–M each, ~1.5–3k LOC total including tests. **Risk:** low per item. **Impact:** without it the exchange loses user funds.
@@ -238,6 +271,10 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   1. Extend the existing deterministic per-block tail (`app.rs` ~1937–1940: `drain_core_writer` → `process_governance` → `distribute_fees` → `process_epoch_boundary`). Add, in this order: oracle aggregation, then the margin-config load, then the liquidation sweep, then the matured-unbonding sweep. Bound the work per block and sort every iteration.
   2. Build a real market registry: List, Delist and UpdateMarketParams write per-market tick, lot, max leverage, margin tiers and status. Reject unknown market ids **in consensus**, not only at RPC. Fix governance id assignment and the dead `ParameterChange` write.
   3. Build a validator oracle publisher sidecar: fetch CEX prices, publish one vote per validator per block, and cap and prune submissions. Fix cross liquidation applying one market's config to every position.
+- **Status 2026-10-06 (s94):** done on main: oracle aggregation at every block start (`454a9bb`), margin configs from market listings (`01b30f6`), the liquidation step at the end of every block (`b360813`), governance listing ids assigned at execution (`d68bde1`), the oracle signer and price feeder (`22872d4`, `d1112a8`). Matured unbonding is released by a `ClaimUnbonded` action (`01133f9`) instead of a sweep. Still open: governance Delist / UpdateParams have no executor effect, and unknown market ids are rejected only at RPC (see P0).
+- **Follow-ups (s94):**
+  - **Liquidation: check accounts touched this block first.** Today the step is round-robin over position holders (`LIQ_SCAN_PER_BLOCK` 2,048 valued, `LIQ_ACT_PER_BLOCK` 64 acted on per block) with no priority, so an account made unhealthy in this block can wait for its turn. From the s94 design check of plan 9.11 (owner: P1 follow-up); decide before mainnet.
+  - **Liquidation stress cell at full-node load** (plan row 76). No bench cell has fired a liquidation yet; correctness is covered by `liquidation_tests` and C5. One ozarchy cell before testnet: a larger price walk, or accounts seeded near maintenance.
 - **Acceptance:** A devnet scenario covers oracle move → under-margined account → liquidation in the same block on every node, with identical state roots. A listed market's per-asset leverage is enforced. Orders on an unlisted market are rejected by validators.
 - **Effort:** large (~1.5–2.5k LOC). **Risk:** medium (new per-block work; determinism tests are mandatory). **Impact:** the exchange can enforce risk.
 
@@ -245,7 +282,7 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 - **Plan, in order:**
   1. Flat maker/taker fees debited at settlement, credited to a treasury, and shown on fills (200–400 LOC).
   2. Mark price: HL-style median of oracle+basis, book and external. Use it for margin, liquidation and stop triggers (450–900 LOC).
-  3. Price bands, market-order slippage cap, per-market OI cap and max order notional (250–650 LOC).
+  3. Price bands, market-order slippage cap, per-market OI cap and max order notional (250–650 LOC). *s94: the chain-wide price band moved to P0 (bad-debt fix). Remaining here: the market-order slippage cap, the per-market OI cap (HL `TooAggressiveAtOpenInterestCap`), max order notional and per-market band overrides.*
   4. `reduce_only` enforcement at placement, a match-time clamp, auto-cancel and a stop-trigger re-check (350–650 LOC).
   5. Funding engine: premium sampling from impact prices, hourly settlement, a cumulative index per market and a snapshot per position (600–850 LOC).
   6. Isolated margin plus `updateLeverage` and `updateIsolatedMargin` actions on the existing `MarginType` model (650–1000 LOC).
@@ -278,13 +315,14 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   - Decide on stablecoin collateral and quote currency (today TRS). This is a product decision, so make it before building P5 assets.
   - Subaccounts.
   - A backstop/HLP vault that takes liquidations before ADL, plus user vaults.
+    - **Interim rule, needed before testnet (s94):** today's system `LIQUIDATOR_VAULT` has no capital and cannot unwind positions, so a deficit moved there sits unnoticed (the bad-debt probe left it at -900). Interim: record and expose the vault's deficit (a metric and an RPC field), and decide who covers it. Full fix: an HLP-style vault with capital.
   - Native spot (token registry, spot book, `spotSend`) and an external-chain bridge with validator-signed withdrawals.
   - Multisig accounts.
   - Permissionless validator entry with automated downtime jailing, once T1.4 has landed.
 - **Effort:** XL each. Sequence by product priority.
 
 ### Trading UI *(parallel, not on the critical path)*
-- The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` was never created. Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3.
+- The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` exists on crab (`/home/crab/projects/torus-trading-app`, last commit 2026-09-28; this line said "never created" until s94). Its proposal status type lacks `"Failed"`, which the RPC can return since `e439982`: add it (plan row 79). Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3.
 
 ---
 
