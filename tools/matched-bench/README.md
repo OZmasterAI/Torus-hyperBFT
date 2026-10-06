@@ -19,14 +19,25 @@ restores the old behaviour, `TOOLS_DIR=<dir>` pins it, and
 devnet. `resummarize.sh <cell-dir>` re-scores an existing cell in place from its
 own `summary.json` provenance.
 
+**Start every cell detached:** `run-cell.sh` refuses to run outside a
+`bench-*.service` unit. Start it, or the script that drives several cells,
+with `campaign/detach.sh NAME LOGFILE CMD...`: the command then runs as its own
+transient systemd --user service, parented by the user manager rather than
+your shell. On 2026-10-06 three 300-market runs on ozarchy, started as
+descendants of an agent's shell, each lost one process to an outside SIGKILL
+(no OOM kill, no kill/tkill/tgkill). `systemd-run --scope` is not enough: a
+scope keeps the caller as parent. `BENCH_ALLOW_UNDETACHED=1` overrides for a
+deliberate one-off. Wait for the cell through its files (`summary.json`, a
+done marker), and stop it with `systemctl --user stop bench-NAME.service`.
+
 Example (record-cell shape, 5 min, 10 markets):
 
 ```
 # Build separately: a combined build unifies features and changes the node.
 CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p torus-node
 CARGO_TARGET_DIR=/home/18c/.cargo-target-matched cargo build --release -p bench-throughput
-tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench base-10m-r1 10 300 76000
-tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench nosettle-r1 10 300 76000 'TORUS_PARALLEL_SETTLE=0'
+tools/matched-bench/campaign/detach.sh base-10m-r1 ~/bench-results-matched/base-10m-r1.log \
+  tools/matched-bench/run-cell.sh /home/18c/projects/wt/matched-bench base-10m-r1 10 300 76000
 ```
 
 300-market cell (locality shape, 3 markets per sender):

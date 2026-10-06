@@ -17,5 +17,6 @@ ORDER=${ORDER_OVERRIDE:-$(awk -F'\t' '$1=="ORDER"{o=$2} END{print o}' "$C/arms.c
 [ -n "$ORDER" ] || { echo "no measured (non-r0) items in ORDER" >&2; exit 1; }
 cd "$C"
 env -u RELAX_QUIET_R0 -u DONE_FILE ORDER_OVERRIDE="$ORDER" \
-  setsid nohup bash -c '"$1" "$2"; echo "exit=$?" >> "$2/campaign.done"' _ "$D/ab-driver.sh" "$C" > "$C/campaign.nohup" 2>&1 < /dev/null &
-echo "started measured-rounds driver (pid $!) ORDER='$ORDER'; progress: $C/progress.tsv $C/campaign.log $C/quiet-checks.log; done marker: $C/campaign.done"
+  "$D/detach.sh" "$(basename "$C")-rounds" "$C/campaign.nohup" \
+  bash -c '"$1" "$2"; echo "exit=$?" >> "$2/campaign.done"' _ "$D/ab-driver.sh" "$C"
+echo "started measured-rounds driver (unit bench-$(basename "$C")-rounds.service) ORDER='$ORDER'; progress: $C/progress.tsv $C/campaign.log $C/quiet-checks.log; done marker: $C/campaign.done"
