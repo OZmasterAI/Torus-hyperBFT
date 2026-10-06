@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
-use torus_core::liquidation::LIQUIDATOR_VAULT;
+use torus_core::liquidation::{
+    adl_escrow, next_obligation, Obligation, ADL_ESCROW_LONG, ADL_ESCROW_SHORT, ADL_OBLIGATION_TAG, ADL_WORK_PER_BLOCK,
+    LIQUIDATOR_VAULT,
+};
 use torus_core::position::{MarginType, NativeBalance, Position};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS};
 use torus_state::{StateBackend, StateDb};
@@ -769,13 +772,31 @@ fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
     assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
 }
 
-/// Records `(account, price)` of every `liquidation: ADL` info event (the
-/// only event with a `counterparties` field).
-struct AdlPrices(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+/// Every tracing event (all levels): its level and fields (`message`
+/// included), the values as recorded (`%` Display, `?` Debug).
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, BTreeMap<&'static str, String>)>>>);
 
-impl tracing::Subscriber for AdlPrices {
-    fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
-        *m.level() <= tracing::Level::INFO
+impl Captured {
+    fn with<R>(&self, f: impl FnOnce() -> R) -> R {
+        tracing::subscriber::with_default(self.clone(), f)
+    }
+
+    /// The fields of every event whose message is `msg`.
+    fn events(&self, msg: &str) -> Vec<BTreeMap<&'static str, String>> {
+        let all = self.0.lock().unwrap();
+        all.iter().filter(|(_, f)| f.get("message").is_some_and(|m| m == msg)).map(|(_, f)| f.clone()).collect()
+    }
+
+    fn errors(&self) -> Vec<BTreeMap<&'static str, String>> {
+        let all = self.0.lock().unwrap();
+        all.iter().filter(|(l, _)| *l == tracing::Level::ERROR).map(|(_, f)| f.clone()).collect()
+    }
+}
+
+impl tracing::Subscriber for Captured {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -789,11 +810,9 @@ impl tracing::Subscriber for AdlPrices {
                 self.0.insert(f.name(), format!("{v:?}"));
             }
         }
-        if e.metadata().fields().field("counterparties").is_some() {
-            let mut v = V(BTreeMap::new());
-            e.record(&mut v);
-            self.0.lock().unwrap().push((v.0["account"].clone(), v.0["price"].clone()));
-        }
+        let mut v = V(BTreeMap::new());
+        e.record(&mut v);
+        self.0.lock().unwrap().push((*e.metadata().level(), v.0));
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
@@ -804,7 +823,8 @@ impl tracing::Subscriber for AdlPrices {
 /// 600, block 2 at 900 with scan 1 / act 1: only u1 is reached (ADL). u2 cut
 /// to 600, block 3 at 900 again (no mark change): u2 ADL. Both get the base
 /// 1,000 (the last DIFFERENT mark) clamped to their bankruptcy price 940; with
-/// D10 (the previous step's mark) u2 got base 900.
+/// D10 (the previous step's mark) u2 got base 900. Read from the obligation
+/// rows (W = 0: no drain).
 #[test]
 fn same_mark_interval_gives_the_same_pre_clamp_price() {
     use torus_core::liquidation::{adl_price, bankruptcy_price};
@@ -816,29 +836,666 @@ fn same_mark_interval_gives_the_same_pre_clamp_price() {
     }
     open_pair(&c, &u1, &s, 1, 10, 1_000);
     open_pair(&c, &u2, &s, 1, 10, 1_000);
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let step = |h: u64, mark: i64, cut: Option<&Address>, budgets: Option<(usize, usize)>| {
+    let step = |h: u64, mark: i64, cut: Option<&Address>, scan: usize, act: usize| {
         let mut c = ctx_at(db.clone(), h);
         if let Some(t) = cut {
             fund(&c, t, fp(600));
         }
         set_mark(&c, 1, fp(mark));
-        tracing::subscriber::with_default(AdlPrices(seen.clone()), || match budgets {
-            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut c, scan, act),
-            None => NativeExecutor::run_liquidations(&mut c),
-        });
+        NativeExecutor::run_liquidations_with(&mut c, scan, act, 0);
         assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
         c
     };
-    let c1 = step(1, 1_000, None, None);
+    let c1 = step(1, 1_000, None, 2_048, 64);
     assert_eq!((pos(&c1, &u1, 1), pos(&c1, &u2, 1)), (fp(10), fp(10)), "healthy");
-    let c2 = step(2, 900, Some(&u1), Some((1, 1)));
+    let c2 = step(2, 900, Some(&u1), 1, 1);
     assert_eq!((pos(&c2, &u1, 1), pos(&c2, &u2, 1)), (FixedPoint::ZERO, fp(10)), "only u1 reached");
-    let c3 = step(3, 900, Some(&u2), None);
+    let c3 = step(3, 900, Some(&u2), 2_048, 64);
     assert_eq!(pos(&c3, &u2, 1), FixedPoint::ZERO);
     let want = adl_price(fp(1_000), bankruptcy_price(fp(600), true, fp(10), fp(1_000)), fp(900), true);
     assert_eq!(want, fp(940));
-    assert_eq!(*seen.lock().unwrap(), vec![(u1.to_string(), want.to_string()), (u2.to_string(), want.to_string())]);
+    let o = |height, trader| Obligation { height, market: 1, is_long: true, trader, size: fp(10), price: want };
+    assert_eq!(obligations(&c3), vec![o(2, u1), o(3, u2)]);
+}
+
+/// 18c review nit: a `0x03` row of a bad length is malformed state — the
+/// step is a node fault (`fatal_error`), never a silent reset.
+#[test]
+fn a_malformed_mark_row_is_fatal() {
+    let (_d, db) = liq_db(&[1]);
+    db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[[0x03u8].as_slice(), &1u64.to_be_bytes()].concat(), &[1, 2, 3]).unwrap();
+    let mut c = ctx_at(db.clone(), 1);
+    set_mark(&c, 1, fp(1_000));
+    NativeExecutor::run_liquidations(&mut c);
+    assert!(c.fatal_error.as_deref().is_some_and(|e| e.contains("malformed")), "{:?}", c.fatal_error);
+}
+
+// ---- adl-budget P2 ----
+
+/// `c(i)`, i < 4: short 3 in every market of [`p2_fixture`].
+fn p2c(i: u8) -> Address {
+    addr(0x40 + i)
+}
+
+/// [`p2_fixture`]'s accounts: u1, u2 (ADL at block 2), u3 (ADL once cut).
+fn p2_bankrupt() -> [Address; 3] {
+    [addr(0x29), addr(0x28), addr(0x21)]
+}
+
+/// Markets 1..=4 listed; block 1 at mark 1,000, then 900 (the clamp binds).
+/// u1 (0x29) collateral 100 (AV 100 >= MM 100 at 1,000; -300 at 900); u2
+/// (0x28) 137.00000001 (its market-3 price 962.99999999 makes the escrow's
+/// average inexact: dust); u3 (0x21) 1,000 (healthy at 900; a test cuts it
+/// to 100 for an ADL at block 3: same mark interval, base 1,000); each long
+/// 1 @ 1,000 in every market. c(i) short 3 and sink (0x60) long 9 in every
+/// market, 10^7 each (OI 12 / 12).
+fn p2_fixture() -> (tempfile::TempDir, StateDb) {
+    let (d, db) = liq_db(&[1, 2, 3, 4]);
+    let ctx = ctx_at(db.clone(), 1);
+    let [u1, u2, u3] = p2_bankrupt();
+    let sink = addr(0x60);
+    fund(&ctx, &u1, fp(100));
+    fund(&ctx, &u2, FixedPoint::from_raw(fp(137).raw() + 1));
+    fund(&ctx, &u3, fp(1_000));
+    fund(&ctx, &sink, fp(10_000_000));
+    for i in 0..4 {
+        fund(&ctx, &p2c(i), fp(10_000_000));
+    }
+    for m in 1..=4 {
+        for u in [u1, u2, u3] {
+            open_pair(&ctx, &u, &p2c(0), m, 1, 1_000);
+        }
+        for i in 1..4 {
+            open_pair(&ctx, &sink, &p2c(i), m, 3, 1_000);
+        }
+    }
+    (d, db)
+}
+
+/// One step at block `h` with the marks `mv` and drain budget `w`, metrics
+/// attached (fresh per block). The caller checks `fatal_error`.
+fn step_marks(db: &StateDb, h: u64, mv: &[(MarketId, i64)], w: u64) -> NativeExecContext {
+    let mut c = ctx_at(db.clone(), h);
+    for &(m, p) in mv {
+        set_mark(&c, m, fp(p));
+    }
+    c.metrics = Some(std::sync::Arc::new(torus_telemetry::Metrics::new()));
+    NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
+    c
+}
+
+/// [`step_marks`] with markets 1..=4 at `mark`; no fatal error.
+fn step(db: &StateDb, h: u64, mark: i64, w: u64) -> NativeExecContext {
+    let c = step_marks(db, h, &[(1, mark), (2, mark), (3, mark), (4, mark)], w);
+    assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+    c
+}
+
+fn p2_marks(mark: i64) -> BTreeMap<MarketId, FixedPoint> {
+    marks(&[(1, mark), (2, mark), (3, mark), (4, mark)])
+}
+
+fn obligations(ctx: &NativeExecContext) -> Vec<Obligation> {
+    let (mut out, mut start) = (Vec::new(), vec![ADL_OBLIGATION_TAG]);
+    while let Some(o) = next_obligation(&ctx.state, &start).unwrap() {
+        start = [o.key().as_slice(), &[0]].concat();
+        out.push(o);
+    }
+    out
+}
+
+/// The queue's keys `(height, market, trader)` in order.
+fn keys(ctx: &NativeExecContext) -> Vec<(u64, MarketId, Address)> {
+    obligations(ctx).iter().map(|o| (o.height, o.market, o.trader)).collect()
+}
+
+/// The dust bound (plan *Dust bound*) for [`p2_fixture`], in raw units: per
+/// market the long escrow receives at most 3 rows (sizes after receiving
+/// 1, 2, 3: (1 + 3) + (2 + 3) + (3 + 3)) and closes at most 3 times.
+const P2_DUST_BOUND: i128 = 4 * ((1 + 3) + (2 + 3) + (3 + 3) + 3);
+
+/// OI symmetric (escrows included), escrow size = Σ rows per (market, side),
+/// Σ value over ALL accounts within `tol` raw of `before` (mark-independent
+/// under OI symmetry, so comparable across blocks).
+fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint, tol: i128) {
+    let rows = obligations(ctx);
+    for m in 1..=4 {
+        let (l, s) = oi(ctx, m);
+        assert_eq!(l, s, "OI symmetric in {m}");
+        for side in [true, false] {
+            let owed = rows.iter().filter(|o| o.market == m && o.is_long == side).fold(FixedPoint::ZERO, |a, o| a + o.size);
+            let held = pos(ctx, &adl_escrow(side), m);
+            assert_eq!(if side { held } else { -held }, owed, "escrow {side} in {m} = Σ rows");
+        }
+    }
+    let now = total_value(ctx, &p2_marks(mark));
+    assert!((now - before).raw().abs() <= tol, "Σ over ALL accounts (vault, escrows): {now:?} vs {before:?}");
+}
+
+/// No position and (available, order margin) == (0, 0).
+fn flat_at_zero(ctx: &NativeExecContext, t: &Address) {
+    assert!(ctx.positions.positions_for_trader(t).unwrap().is_empty(), "{t}: positions");
+    assert_eq!(ab(ctx, t), (FixedPoint::ZERO, FixedPoint::ZERO), "{t}: cash");
+}
+
+fn has_row(ctx: &NativeExecContext, tag: u8, t: &Address) -> bool {
+    ctx.state.get_cf_raw(CF_NATIVE_LIQUIDATION, &[[tag].as_slice(), t.as_slice()].concat()).unwrap().is_some()
+}
+
+/// P2 at B (W = 0): u1 and u2 are flat at exactly 0; the long escrow holds 2
+/// in every market, one row per (account, market) at the clamped price the
+/// test computes sequentially (`rest` = cash + the other positions at 900):
+/// u1 1,000, 1,000, 1,000, 900 (the clamp binds at m4); u2 1,000, 1,000,
+/// 962.99999999, 900. D9 = 0 for both (under H the deficit is ~0). Σ value
+/// within 1 raw: the escrow's market-3 average (962.99999999 + 1,000) / 2
+/// truncates by half a raw unit x size 2 (plan: 0; the dust starts at B).
+#[test]
+fn p2_a_bankrupt_account_is_flat_with_zero_collateral_at_b() {
+    use torus_core::liquidation::{adl_price, bankruptcy_price};
+    let (_d, db) = p2_fixture();
+    let [u1, u2, _] = p2_bankrupt();
+    let before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+    step(&db, 1, 1_000, 0);
+    let c = step(&db, 2, 900, 0);
+    for u in [u1, u2] {
+        flat_at_zero(&c, &u);
+        assert!(!has_row(&c, 0x06, &u), "{u}: not pending");
+    }
+    for m in 1..=4 {
+        assert_eq!(pos(&c, &ADL_ESCROW_LONG, m), fp(2), "m{m}");
+    }
+    let prices = |collateral: FixedPoint| -> Vec<FixedPoint> {
+        let mut cash = collateral;
+        (0..4i64)
+            .map(|k| {
+                let rest = cash + fp(-100 * (3 - k));
+                let px = adl_price(fp(1_000), bankruptcy_price(rest, true, fp(1), fp(1_000)), fp(900), true);
+                cash += px - fp(1_000);
+                px
+            })
+            .collect()
+    };
+    let (p1, p2) = (prices(fp(100)), prices(FixedPoint::from_raw(fp(137).raw() + 1)));
+    assert_eq!(p1, vec![fp(1_000), fp(1_000), fp(1_000), fp(900)]);
+    assert_eq!(p2, vec![fp(1_000), fp(1_000), FixedPoint::from_raw(fp(963).raw() - 1), fp(900)]);
+    let row = |m: MarketId, trader, price| Obligation { height: 2, market: m, is_long: true, trader, size: fp(1), price };
+    let want: Vec<Obligation> =
+        (1..=4).flat_map(|m| [row(m, u2, p2[m as usize - 1]), row(m, u1, p1[m as usize - 1])]).collect();
+    assert_eq!(obligations(&c), want);
+    assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "D9: 0 for both");
+    invariants(&c, 900, before, 1);
+    assert!(NativeExecutor::liquidation_due(&c.state).unwrap(), "rows keep the step due");
+    assert_eq!(c.metrics.as_ref().unwrap().liquidations_adl.get(), 2);
+}
+
+/// Design step 3: under the one-sided clamp the D9 remainder is never
+/// positive. 50 accounts (seeded), each ADL'd at its own block B (W = 0)
+/// with positions of both sides in markets 1..=4 at random entries, one in
+/// market 5 (listed, never marked: valued at entry in `rest`, not acted on,
+/// H2), a resting bid whose order margin D4 releases, and random marks per
+/// block (some repeated, so rule H's base is the old `last` or `prev`, above
+/// and below the mark). Per account: the vault's delta at B <= 0, the
+/// account's cash (0, 0) with only the unmarked position left, and no
+/// error line. (The running-`rest` shadow is `#[cfg(test)]` inside the
+/// bridge: it runs in the lib's seeded L1 test, not in this binary.)
+#[test]
+fn p2_d9_remainder_is_never_positive() {
+    let (_d, db) = liq_db(&[1, 2, 3, 4, 5]);
+    let x = addr(0xF0);
+    let acct = |k: u8| addr(0x80 + k);
+    let mut rng = 0x5EED_u64;
+    let mut next = |n: u64| {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 33) % n
+    };
+    {
+        let mut c = ctx_at(db.clone(), 1);
+        fund(&c, &x, fp(1_000_000_000));
+        for k in 0..50 {
+            let a = acct(k);
+            fund(&c, &a, fp(1_000_000));
+            for m in 1..=5 {
+                let (qty, px) = (1 + next(3) as i64, 900 + next(200) as i64);
+                if next(2) == 0 {
+                    open_pair(&c, &a, &x, m, qty, px);
+                } else {
+                    open_pair(&c, &x, &a, m, qty, px);
+                }
+            }
+            place(&mut c, &a, limit(1 + next(4), true, 500, 1));
+        }
+        for m in 1..=4 {
+            set_mark(&c, m, fp(1_000));
+        }
+        NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, 0);
+        assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        c.save_order_books();
+    }
+    // Rule H mirror per market: (last, prev).
+    let (mut last, mut prev) = ([1_000i64; 5], [None::<i64>; 5]);
+    let (mut above, mut below, mut deficits) = (0, 0, 0);
+    let events = Captured::default();
+    for k in 0..50u8 {
+        let (h, a) = (k as u64 + 2, acct(k));
+        let mv: Vec<(MarketId, i64)> =
+            (1..=4).map(|m| (m, if next(3) == 0 { last[m as usize] } else { 850 + next(300) as i64 })).collect();
+        for &(m, mk) in &mv {
+            let m = m as usize;
+            match if mk != last[m] { Some(last[m]) } else { prev[m] } {
+                Some(b) if b > mk => above += 1,
+                Some(b) if b < mk => below += 1,
+                _ => {}
+            }
+            if mk != last[m] {
+                (prev[m], last[m]) = (Some(last[m]), mk);
+            }
+        }
+        let mut c = ctx_at(db.clone(), h);
+        for &(m, mk) in &mv {
+            set_mark(&c, m, fp(mk));
+        }
+        let at = marks(&mv);
+        let b = bal(&c, &a);
+        let upnl = c.positions.positions_for_trader(&a).unwrap().iter().fold(FixedPoint::ZERO, |s, p| {
+            s + at.get(&p.market_id).map_or(FixedPoint::ZERO, |mk| p.unrealized_pnl(*mk))
+        });
+        assert!(b.order_margin > FixedPoint::ZERO, "{a}: a resting bid");
+        let av = -fp(1 + next(300) as i64);
+        c.positions
+            .put_native_balance(&a, &NativeBalance { available: av - b.order_margin - upnl, order_margin: b.order_margin })
+            .unwrap();
+        let vault = bal(&c, &LIQUIDATOR_VAULT).available;
+        events.with(|| NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, 0));
+        assert!(c.fatal_error.is_none(), "{a}: {:?}", c.fatal_error);
+        let d9 = bal(&c, &LIQUIDATOR_VAULT).available - vault;
+        assert!(d9 <= FixedPoint::ZERO, "{a}: D9 remainder {d9:?} > 0");
+        deficits += usize::from(d9 < FixedPoint::ZERO);
+        assert_eq!(ab(&c, &a), (FixedPoint::ZERO, FixedPoint::ZERO), "{a}: cash");
+        let left: Vec<MarketId> = c.positions.positions_for_trader(&a).unwrap().iter().map(|p| p.market_id).collect();
+        assert_eq!(left, vec![5], "{a}: marked positions flat, the unmarked one stays (H2)");
+        assert!((1..=4).all(|m| c.order_books[&m].orders_for_trader(&a).is_empty()), "{a}: D4");
+        c.save_order_books();
+    }
+    assert!(events.errors().is_empty(), "no error line: {:?}", events.errors());
+    assert_eq!(events.events("liquidation: ADL to escrow").len(), 50 * 4);
+    assert!(above > 10 && below > 10, "rule-H base above ({above}) and below ({below}) the mark");
+    println!("p2 D9: {deficits} of 50 accounts handed a deficit to the vault");
+}
+
+/// Plan invariant 8: the escrows are never classified. Blocks 1-3 (W = 0):
+/// `liquidation_scanned` / `liquidation_acted` count exactly the
+/// non-protocol accounts (8 / 0, 8 / 2, then 6 / 0: u3, c0..c3, sink); the
+/// escrows get no `0x06` / `0x02` row and their positions stay, although
+/// the long escrow's AV at 900 is negative.
+#[test]
+fn p2_escrows_are_never_classified() {
+    let (_d, db) = p2_fixture();
+    let counters = |c: &NativeExecContext| {
+        let m = c.metrics.as_ref().unwrap();
+        (m.liquidation_scanned.get(), m.liquidation_acted.get())
+    };
+    assert_eq!(counters(&step(&db, 1, 1_000, 0)), (8, 0));
+    let c2 = step(&db, 2, 900, 0);
+    assert_eq!(counters(&c2), (8, 2));
+    let held = c2.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap();
+    assert_eq!(held.len(), 4);
+    let rows = |c: &NativeExecContext| c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().iter().map(|p| format!("{p:?}")).collect::<Vec<_>>();
+    let held_rows = rows(&c2);
+    let av = held.iter().fold(bal(&c2, &ADL_ESCROW_LONG).available, |s, p| s + p.unrealized_pnl(fp(900)));
+    assert!(av < FixedPoint::ZERO, "the long escrow's AV at 900: {av:?}");
+    drop(c2);
+    let c3 = step(&db, 3, 900, 0);
+    assert_eq!(counters(&c3), (6, 0));
+    assert_eq!(rows(&c3), held_rows, "unchanged by the pass");
+    for e in [ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
+        assert!(!has_row(&c3, 0x06, &e) && !has_row(&c3, 0x02, &e), "{e}: no pending / cooldown row");
+    }
+}
+
+/// D8 under P2: the setup of `the_vault_is_adld_when_its_value_goes_negative`,
+/// block 2 with W = 0: the vault's long 10 moves to the long escrow at 970
+/// (base 975 clamped to the vault's bankruptcy price 975 - 50 / 10), one row;
+/// the vault keeps its own balance (0, no D9 for the vault).
+#[test]
+fn p2_the_vault_moves_its_positions_to_the_escrow() {
+    let (_d, db) = liq_db(&[1]);
+    let (t, s) = (addr(1), addr(2));
+    let mut c1 = ctx_at(db.clone(), 1);
+    fund(&c1, &t, fp(300));
+    fund(&c1, &s, fp(1_000_000));
+    open_pair(&c1, &t, &s, 1, 10, 1_000);
+    set_mark(&c1, 1, fp(975));
+    NativeExecutor::run_liquidations(&mut c1);
+    assert_eq!(pos(&c1, &LIQUIDATOR_VAULT, 1), fp(10));
+    let c2 = step_marks(&db, 2, &[(1, 900)], 0);
+    assert!(c2.fatal_error.is_none(), "{:?}", c2.fatal_error);
+    assert_eq!(pos(&c2, &LIQUIDATOR_VAULT, 1), FixedPoint::ZERO);
+    let e = c2.positions.get_position(&ADL_ESCROW_LONG, 1).unwrap().unwrap();
+    assert_eq!((e.is_long, e.size, e.entry_price), (true, fp(10), fp(970)));
+    let row = Obligation { height: 2, market: 1, is_long: true, trader: LIQUIDATOR_VAULT, size: fp(10), price: fp(970) };
+    assert_eq!(obligations(&c2), vec![row]);
+    assert_eq!(bal(&c2, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
+}
+
+/// Q2 / Q3 (A6), W = 19. A row costs 1 (visit) + A_h if it is the first row
+/// of its (market, side) in block h (the ranking cache is per block) + 1
+/// read (each row is size 1; the top-ranked short always has >= 1 left).
+/// A_2 = 7 (c0..c3, sink, u3, the long escrow); A_3.. = 6 (u3 flat at B = 3).
+/// * Block 2: (2,1,u2) 9, (2,1,u1) 11, (2,2,u2) 20 >= 19: 3 rows.
+/// * Block 3 (u3's rows at height 3 sort after every height-2 row): (2,2,u1)
+///   8, (2,3,u2) 16, (2,3,u1) 18, (2,4,u2) 26: 4 rows.
+/// * Block 4: (2,4,u1) 8, (3,1,u3) 16, (3,2,u3) 24: 3 rows.
+/// * Block 5: (3,3,u3), (3,4,u3): the queue is empty.
+#[test]
+fn p2_drain_stops_at_w_and_resumes_in_fifo_order() {
+    let (_d, db) = p2_fixture();
+    let [u1, u2, u3] = p2_bankrupt();
+    let mut before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+    step(&db, 1, 1_000, 19);
+    let c = step(&db, 2, 900, 19);
+    assert_eq!(traders(&c).len(), 7, "A_2");
+    assert_eq!(keys(&c), vec![(2, 2, u1), (2, 3, u2), (2, 3, u1), (2, 4, u2), (2, 4, u1)]);
+    invariants(&c, 900, before, P2_DUST_BOUND);
+    drop(c);
+    fund(&ctx_at(db.clone(), 3), &u3, fp(100));
+    before -= fp(900);
+    let c = step(&db, 3, 900, 19);
+    assert_eq!(traders(&c).len(), 6, "A_3");
+    assert_eq!(keys(&c), vec![(2, 4, u1), (3, 1, u3), (3, 2, u3), (3, 3, u3), (3, 4, u3)]);
+    invariants(&c, 900, before, P2_DUST_BOUND);
+    drop(c);
+    let c = step(&db, 4, 900, 19);
+    assert_eq!(keys(&c), vec![(3, 3, u3), (3, 4, u3)]);
+    invariants(&c, 900, before, P2_DUST_BOUND);
+    drop(c);
+    let c = step(&db, 5, 900, 19);
+    assert_eq!(keys(&c), vec![]);
+    invariants(&c, 900, before, P2_DUST_BOUND);
+    assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty());
+}
+
+/// A step starts only while used < W and then runs to its end: block 2 (A =
+/// 7), W = A + 2 = 9 drains exactly one row (it costs 9; 9 is not < 9); W =
+/// A + 3 = 10 drains two (the second starts at 9 and ends at 11).
+#[test]
+fn p2_drain_overshoots_by_at_most_one_step() {
+    for (w, drained) in [(9u64, 1usize), (10, 2)] {
+        let (_d, db) = p2_fixture();
+        step(&db, 1, 1_000, w);
+        let c = step(&db, 2, 900, w);
+        assert_eq!(obligations(&c).len(), 8 - drained, "W {w}");
+    }
+}
+
+/// Default W: the drain finishes in B; both escrows end with no position
+/// and (0, 0); the vault holds D9 at B (0, see the B test) + the swept dust,
+/// within the dust bound and not 0 (u2's 962.99999999 makes market 3's
+/// average inexact); Σ value within |dust|.
+#[test]
+fn p2_escrows_end_flat_with_zero_balance_and_the_vault_holds_the_deficit() {
+    let (_d, db) = p2_fixture();
+    let before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+    step(&db, 1, 1_000, ADL_WORK_PER_BLOCK);
+    let ev = Captured::default();
+    let c = ev.with(|| step(&db, 2, 900, ADL_WORK_PER_BLOCK));
+    assert!(obligations(&c).is_empty());
+    for e in [ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
+        flat_at_zero(&c, &e);
+    }
+    let dust = bal(&c, &LIQUIDATOR_VAULT).available;
+    assert!(dust != FixedPoint::ZERO && dust.raw().abs() <= P2_DUST_BOUND, "dust {dust:?}");
+    assert_eq!(ev.events("liquidation: ADL escrow dust to the vault").len(), 1);
+    invariants(&c, 900, before, dust.raw().abs());
+}
+
+/// Terms fixed at B: rows written at B (W = 0, mark 900); the next block has
+/// mark 800 and the default W, and every close is at the row's stored price:
+/// each counterparty (short 3 @ 1,000) gains (1,000 - price) x q per close.
+#[test]
+fn p2_counterparties_are_paid_at_the_stored_price() {
+    let (_d, db) = p2_fixture();
+    step(&db, 1, 1_000, 0);
+    let c2 = step(&db, 2, 900, 0);
+    let price_of: BTreeMap<String, FixedPoint> = obligations(&c2).iter().map(|o| (o.price.to_string(), o.price)).collect();
+    let cash: Vec<FixedPoint> = (0..4).map(|i| bal(&c2, &p2c(i)).available).collect();
+    let sink = bal(&c2, &addr(0x60)).available;
+    drop(c2);
+    let ev = Captured::default();
+    let c = ev.with(|| step(&db, 3, 800, ADL_WORK_PER_BLOCK));
+    assert!(obligations(&c).is_empty());
+    let closes = ev.events("liquidation: ADL close");
+    assert_eq!(closes.len(), 8, "one close per row");
+    let mut total = FixedPoint::ZERO;
+    for i in 0..4 {
+        let t = p2c(i);
+        let paid = closes.iter().filter(|e| e["counterparty"] == t.to_string()).fold(FixedPoint::ZERO, |s, e| {
+            assert_eq!(e["size"], fp(1).to_string());
+            s + fp(1_000) - price_of[&e["price"]]
+        });
+        assert_eq!(bal(&c, &t).available - cash[i as usize], paid, "{t}: (entry - stored price) x q");
+        total += paid;
+    }
+    assert_eq!(total, FixedPoint::from_raw(fp(237).raw() + 1), "Σ (1,000 - price) over the 8 rows");
+    assert_eq!(bal(&c, &addr(0x60)).available, sink, "the long sink is never a counterparty");
+}
+
+/// P2 edge: real holders exhausted. Market 1 only: A long 10 @ 1,000 and B
+/// short 10 @ 800 are its only holders (X sold 10 @ 1,000 to A and bought
+/// 10 @ 800 from B: X is flat, +2,000). Block 1 at 990 (all funded 10,000);
+/// A and B cut to 500; block 2 at 900: both ADL with base 990. A: bankruptcy
+/// 950 -> min(990, 950) = 950, cash 0. B: bankruptcy 850 -> max(990, 850) =
+/// 990, cash -1,400 -> the vault (D9). The drain: the short row sorts first
+/// and has no real long holder, so it pairs with A's row: q = 10, the vault
+/// gets (990 - 950) x 10 = +400 and ends at -1,000. Both escrows flat at 0,
+/// no row, OI (0, 0), Σ value unchanged.
+#[test]
+fn p2_exhausted_counterparties_pair_the_escrows() {
+    let (_d, db) = liq_db(&[1]);
+    let (a, b, x) = (addr(0x0A), addr(0x0B), addr(0x0C));
+    let c = ctx_at(db.clone(), 1);
+    for t in [a, b, x] {
+        fund(&c, &t, fp(10_000));
+    }
+    open_pair(&c, &a, &x, 1, 10, 1_000);
+    open_pair(&c, &x, &b, 1, 10, 800);
+    assert!(c.positions.get_position(&x, 1).unwrap().is_none(), "X flat");
+    drop(c);
+    assert!(step_marks(&db, 1, &[(1, 990)], ADL_WORK_PER_BLOCK).fatal_error.is_none());
+    let c = ctx_at(db.clone(), 2);
+    fund(&c, &a, fp(500));
+    fund(&c, &b, fp(500));
+    let before = total_value(&c, &marks(&[(1, 900)]));
+    drop(c);
+    let ev = Captured::default();
+    let c = ev.with(|| step_marks(&db, 2, &[(1, 900)], ADL_WORK_PER_BLOCK));
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    for t in [a, b, ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
+        flat_at_zero(&c, &t);
+    }
+    assert!(obligations(&c).is_empty());
+    assert_eq!(oi(&c, 1), (FixedPoint::ZERO, FixedPoint::ZERO));
+    assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, -fp(1_000), "D9 -1,400 + pairing +400");
+    let pairing = ev.events("liquidation: ADL escrow pairing");
+    assert_eq!(pairing.len(), 1);
+    assert_eq!(pairing[0]["vault"], fp(400).to_string());
+    assert_eq!(total_value(&c, &marks(&[(1, 900)])), before);
+}
+
+/// 18c review: the pairing never flips an escrow. Rows claiming 5 per side
+/// while each escrow holds 1 (state inconsistent with the invariant escrow
+/// size = Σ rows), no real holder: `cross_close` refuses q = 5 and the step
+/// latches `fatal_error` (a node fault, never a silent flip).
+#[test]
+fn p2_a_pairing_beyond_the_escrows_size_is_fatal() {
+    use torus_core::liquidation::put_obligation;
+    let (_d, db) = liq_db(&[1]);
+    let c = ctx_at(db.clone(), 1);
+    c.positions.apply_fill(&ADL_ESCROW_LONG, 1, true, fp(1), fp(950), MarginType::Cross).unwrap();
+    c.positions.apply_fill(&ADL_ESCROW_SHORT, 1, false, fp(1), fp(990), MarginType::Cross).unwrap();
+    for (is_long, n, price) in [(true, 1, 950), (false, 2, 990)] {
+        let o = Obligation { height: 1, market: 1, is_long, trader: addr(n), size: fp(5), price: fp(price) };
+        put_obligation(&db, &o).unwrap();
+    }
+    drop(c);
+    let c = step_marks(&db, 2, &[(1, 900)], ADL_WORK_PER_BLOCK);
+    assert!(c.fatal_error.as_deref().is_some_and(|e| e.contains("cross")), "{:?}", c.fatal_error);
+}
+
+/// Per block: the positions, balances and liquidation rows of a P2 run
+/// (blocks 1-5 at W; u3 cut before block 3).
+fn p2_run(w: u64) -> Vec<Vec<Vec<(Vec<u8>, Vec<u8>)>>> {
+    let (_d, db) = p2_fixture();
+    let mut out = Vec::new();
+    for (h, mark) in [(1, 1_000), (2, 900), (3, 900), (4, 900), (5, 900)] {
+        if h == 3 {
+            fund(&ctx_at(db.clone(), 3), &p2_bankrupt()[2], fp(100));
+        }
+        drop(step(&db, h, mark, w));
+        out.push([CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION].map(|cf| db.iterate_cf(cf, None).unwrap()).to_vec());
+    }
+    out
+}
+
+/// Two fresh runs give identical rows block by block (default W and W = A
+/// + 3, a multi-block drain).
+#[test]
+fn p2_drain_is_deterministic() {
+    for w in [ADL_WORK_PER_BLOCK, 10] {
+        assert!(p2_run(w) == p2_run(w), "W {w}");
+    }
+}
+
+/// W sizing (A6 #8): 200 traders hold positions in 100 listed markets; 3
+/// accounts long 1 in all 100 go bankrupt in one block (300 rows). With the
+/// default W the step closes everything in that block: no `0x07` row, both
+/// escrows flat at 0, every ADL'd account at 0, OI symmetric, Σ value
+/// within the dust bound (per market <= 3 rows of sizes 1..3 and <= 4 closes).
+#[test]
+fn an_hl_sized_event_closes_in_its_own_block() {
+    let markets: Vec<MarketId> = (1..=100).collect();
+    let (_d, db) = liq_db(&markets);
+    let t = |i: u32| {
+        let mut a = [0x50u8; 20];
+        a[16..].copy_from_slice(&i.to_be_bytes());
+        Address::new(a)
+    };
+    let bankrupt = [addr(0x10), addr(0x11), addr(0x12)];
+    let sink = addr(0xF0);
+    let c = ctx_at(db.clone(), 1);
+    fund(&c, &sink, fp(1_000_000_000));
+    for i in 0..200 {
+        fund(&c, &t(i), fp(10_000_000));
+    }
+    for b in &bankrupt {
+        fund(&c, b, fp(2_500)); // AV 2,500 >= MM 2,500 at 1,000; -7,500 at 900
+    }
+    for m in 1..=100u64 {
+        let i = m as u32 - 1;
+        for b in &bankrupt {
+            open_pair(&c, b, &t(i), m, 1, 1_000);
+        }
+        open_pair(&c, &sink, &t(i + 100), m, 3, 1_000);
+    }
+    drop(c);
+    let all = |p: i64| markets.iter().map(|&m| (m, p)).collect::<Vec<_>>();
+    assert!(step_marks(&db, 1, &all(1_000), ADL_WORK_PER_BLOCK).fatal_error.is_none());
+    let before = total_value(&ctx_at(db.clone(), 2), &marks(&all(900)));
+    let c = step_marks(&db, 2, &all(900), ADL_WORK_PER_BLOCK);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert_eq!(c.metrics.as_ref().unwrap().liquidations_adl.get(), 3);
+    assert!(obligations(&c).is_empty(), "the queue is empty after B");
+    for a in bankrupt.iter().chain(&[ADL_ESCROW_LONG, ADL_ESCROW_SHORT]) {
+        flat_at_zero(&c, a);
+    }
+    for &m in &markets {
+        let (l, s) = oi(&c, m);
+        assert_eq!(l, s, "OI symmetric in {m}");
+    }
+    let now = total_value(&c, &marks(&all(900)));
+    assert!((now - before).raw().abs() <= 100 * ((1 + 3) + (2 + 3) + (3 + 3) + 4), "{now:?} vs {before:?}");
+}
+
+/// A listed market without a usable mark (stale oracle): its rows wait, cost
+/// 1 unit per visit and keep the step due. Rows at B = 2 in markets 1..=4;
+/// blocks 70-71 mark 2..=4 only (block 2's market-1 aggregate is 68 s old).
+/// W = 1: the first row (market 1) is visited and the budget is spent:
+/// nothing closes. Default W: market 1's rows stay, the others drain. Block
+/// 72 (market 1 marked again): the rest drains.
+#[test]
+fn p2_rows_of_an_unmarked_market_wait_and_cost_a_unit() {
+    let (_d, db) = p2_fixture();
+    let [u1, u2, _] = p2_bankrupt();
+    step(&db, 1, 1_000, 0);
+    drop(step(&db, 2, 900, 0));
+    let some = [(2, 900), (3, 900), (4, 900)];
+    let c = step_marks(&db, 70, &some, 1);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert_eq!(obligations(&c).len(), 8, "W = 1: the market-1 row's visit spends the budget");
+    drop(c);
+    let c = step_marks(&db, 71, &some, ADL_WORK_PER_BLOCK);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert_eq!(keys(&c), vec![(2, 1, u2), (2, 1, u1)], "market 1 waits");
+    assert!(NativeExecutor::liquidation_due(&c.state).unwrap());
+    drop(c);
+    let c = step(&db, 72, 900, ADL_WORK_PER_BLOCK);
+    assert!(obligations(&c).is_empty());
+    assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty());
+}
+
+/// A delisted market (open question 1, owner s96: rank at the stored price):
+/// after B, market 2's `CF_NATIVE_MARKETS` row goes; the next drain ranks its
+/// rows with the stored price standing in for the mark and closes them at
+/// the stored price: the escrow goes flat; OI and value invariants hold.
+#[test]
+fn p2_rows_of_a_delisted_market_close_at_the_stored_price() {
+    let (_d, db) = p2_fixture();
+    let before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+    step(&db, 1, 1_000, 0);
+    drop(step(&db, 2, 900, 0));
+    db.delete_cf_raw(CF_NATIVE_MARKETS, &2u64.to_be_bytes()).unwrap();
+    let ev = Captured::default();
+    let c = ev.with(|| step_marks(&db, 3, &[(1, 900), (3, 900), (4, 900)], ADL_WORK_PER_BLOCK));
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert!(obligations(&c).is_empty());
+    assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty(), "the escrow is flat");
+    let m2: Vec<String> = ev.events("liquidation: ADL close").iter().filter(|e| e["market"] == "2").map(|e| e["price"].clone()).collect();
+    assert_eq!(m2, vec![fp(1_000).to_string(); 2], "market 2 closed at the stored prices");
+    invariants(&c, 900, before, P2_DUST_BOUND);
+}
+
+/// M2 for the vault after the drain: the vault is market 1's only short
+/// holder (short 5 @ 900, cash 10, long 1 in market 2 at its entry). A
+/// long-escrow row of 5 at stored price 1,000 closes against it: the vault
+/// pays 5 x 100, its AV < 0 after the drain, so its pending row exists and
+/// the step stays due (with the row set before the drain it would be
+/// missing). The next (empty) block (W = 0) moves the vault's market-2 long
+/// to the long escrow.
+#[test]
+fn p2_a_drain_that_sinks_the_vault_keeps_the_step_due() {
+    use torus_core::liquidation::put_obligation;
+    let (_d, db) = liq_db(&[1, 2]);
+    let (u, s) = (addr(0x30), addr(0x31));
+    let c = ctx_at(db.clone(), 1);
+    c.positions.apply_fill(&ADL_ESCROW_LONG, 1, true, fp(5), fp(1_000), MarginType::Cross).unwrap();
+    c.positions.apply_fill(&LIQUIDATOR_VAULT, 1, false, fp(5), fp(900), MarginType::Cross).unwrap();
+    put_obligation(&db, &Obligation { height: 1, market: 1, is_long: true, trader: u, size: fp(5), price: fp(1_000) }).unwrap();
+    fund(&c, &LIQUIDATOR_VAULT, fp(10));
+    fund(&c, &s, fp(1_000_000));
+    open_pair(&c, &LIQUIDATOR_VAULT, &s, 2, 1, 1_000);
+    drop(c);
+    let c = step_marks(&db, 2, &[(1, 900), (2, 1_000)], ADL_WORK_PER_BLOCK);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert!(obligations(&c).is_empty());
+    assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, -fp(490));
+    assert!(has_row(&c, 0x06, &LIQUIDATOR_VAULT), "the vault is pending after the drain");
+    assert!(NativeExecutor::liquidation_due(&c.state).unwrap());
+    drop(c);
+    let mut c = ctx_at(db.clone(), 3);
+    NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, 0);
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert_eq!(pos(&c, &LIQUIDATOR_VAULT, 2), FixedPoint::ZERO);
+    assert_eq!(pos(&c, &ADL_ESCROW_LONG, 2), fp(1));
+    assert_eq!(keys(&c), vec![(3, 2, LIQUIDATOR_VAULT)]);
 }
 
 // ---- T7e: budgets, carry-over, due, stops ----
@@ -864,13 +1521,13 @@ fn budgets_carry_over_through_the_cursor_round_robin() {
         accts.iter().map(|a| c.order_books[&1].orders_for_trader(a).is_empty()).collect()
     };
     let cursor = |c: &NativeExecContext| liq_rows(c, 0x04).first().map(|(_, v)| Address::from_slice(v));
-    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2);
+    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2, ADL_WORK_PER_BLOCK);
     assert_eq!(acted(&ctx), [true, true, false, false, false]);
     assert_eq!(cursor(&ctx), Some(accts[1]));
     assert!(NativeExecutor::liquidation_due(&db).unwrap(), "a cut pass is due");
-    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2);
+    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2, ADL_WORK_PER_BLOCK);
     assert_eq!(acted(&ctx), [true, true, true, true, false]);
-    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2);
+    NativeExecutor::run_liquidations_with(&mut ctx, 2, 2, ADL_WORK_PER_BLOCK);
     assert_eq!(acted(&ctx), [true; 5]);
     assert_eq!(cursor(&ctx), None, "a5 then s (healthy) reached the end: cursor deleted");
     // Review M2 (s517): the five are still under MM (empty book), so their
@@ -944,12 +1601,12 @@ fn the_vault_in_the_window_does_not_end_a_pass_early() {
     }
     set_mark(&ctx, 1, fp(990)); // b, c: AV 245 < MM 247.5 -> stage 1
     assert_eq!(traders(&ctx), vec![LIQUIDATOR_VAULT, b, c, s]);
-    NativeExecutor::run_liquidations_with(&mut ctx, 1, 1);
+    NativeExecutor::run_liquidations_with(&mut ctx, 1, 1, ADL_WORK_PER_BLOCK);
     assert!(ctx.order_books[&1].orders_for_trader(&b).is_empty(), "b acted");
     assert_eq!(ctx.order_books[&1].orders_for_trader(&c).len(), 1, "c not yet");
     let cursor = liq_rows(&ctx, 0x04).first().map(|(_, v)| Address::from_slice(v));
     assert_eq!(cursor, Some(b), "cut after b: the pass continues at c next block");
-    NativeExecutor::run_liquidations_with(&mut ctx, 1, 1);
+    NativeExecutor::run_liquidations_with(&mut ctx, 1, 1, ADL_WORK_PER_BLOCK);
     assert!(ctx.order_books[&1].orders_for_trader(&c).is_empty(), "c acted next");
 }
 
@@ -1036,7 +1693,7 @@ fn an_unmarked_step_reads_no_positions() {
     let mut cursors = Vec::new();
     state.arm();
     for _ in 0..4 {
-        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64);
+        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64, ADL_WORK_PER_BLOCK);
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         cursors.push(cursor_row(&state));
     }
@@ -1070,7 +1727,7 @@ fn unmarked_step_rows_equal_the_full_scan_rules() {
         let h = step as u64 + 2;
         let overlay = torus_state::NativeStateOverlay::new(db.clone());
         let mut ctx = NativeExecContext::new(overlay.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
-        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64);
+        NativeExecutor::run_liquidations_with(&mut ctx, 100, 64, ADL_WORK_PER_BLOCK);
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         drop(ctx);
         let frozen = overlay.freeze(h);
@@ -1296,7 +1953,7 @@ fn telemetry_deferred_stays_inside_the_scan_window() {
         let (_d, db) = seven_under_mm();
         let mut ctx = ctx_at(db, 1);
         let met = metered(&mut ctx);
-        NativeExecutor::run_liquidations_with(&mut ctx, 4, act);
+        NativeExecutor::run_liquidations_with(&mut ctx, 4, act, ADL_WORK_PER_BLOCK);
         assert!(ctx.fatal_error.is_none());
         let t = liq_tel(&met);
         assert_eq!((t.acted, t.deferred, t.pending), (act as u64, deferred, pending), "act {act}");

@@ -32,7 +32,7 @@ use torus_core::order_book::OrderBook;
 use torus_core::position::{MarginType, NativeBalance};
 use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
 use torus_state::cf::{
-    CF_CONSENSUS_META, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
+    CF_CONSENSUS_META, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
     META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::running_hash::{configure_activation, read_running_hash, HASHED_CFS};
@@ -150,6 +150,38 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
     data
 }
 
+/// adl-budget re-pin evidence (18c review): [`db_digest`] without what rule H
+/// and P2 change on purpose — `0x03` values cut to `last` (16 bytes), no
+/// `0x07` row, no ADL-escrow position / balance row — and without what
+/// covers those rows: the native state root, `CF_CONSENSUS_META` (the
+/// running hash and the native trie's nodes) and the running hash.
+fn reduced_digest(db: &StateDb) -> Vec<u8> {
+    let escrow = |k: &[u8]| [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT].iter().any(|e| k.starts_with(e.as_slice()));
+    let mut data = Vec::new();
+    for (id, cf) in HASHED_CFS {
+        if *cf == CF_CONSENSUS_META {
+            continue;
+        }
+        for (k, mut v) in db.iterate_cf(cf, None).unwrap() {
+            if *cf == CF_NATIVE_LIQUIDATION {
+                match k.first() {
+                    Some(&liq::ADL_OBLIGATION_TAG) => continue,
+                    Some(&liq::PREV_MARK_TAG) => v.truncate(16),
+                    _ => {}
+                }
+            } else if (*cf == CF_NATIVE_POSITIONS || *cf == CF_NATIVE_BALANCES) && escrow(&k) {
+                continue;
+            }
+            data.push(*id);
+            data.extend_from_slice(&(k.len() as u32).to_be_bytes());
+            data.extend_from_slice(&k);
+            data.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            data.extend_from_slice(&v);
+        }
+    }
+    data
+}
+
 /// How a run keeps the resident rows R.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum R {
@@ -168,6 +200,11 @@ const R_MODES: [R; 3] = [R::Inline, R::Worker, R::Off];
 /// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `r`: how
 /// the resident rows R are kept. Returns one hex digest per block.
 fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<String> {
+    run_both(db, blocks, threads, r).0
+}
+
+/// [`run`], also returning each block's [`reduced_digest`] (+ its outputs).
+fn run_both(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>) {
     let resident = r != R::Off;
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
@@ -176,13 +213,15 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut outputs: Vec<String> = Vec::new();
-    let mut digests: Vec<String> = Vec::new();
-    let flush = |p: Arc<FrozenPending>, outputs: &[String], digests: &mut Vec<String>| {
+    let mut digests: Vec<(String, String)> = Vec::new();
+    let flush = |p: Arc<FrozenPending>, outputs: &[String], digests: &mut Vec<(String, String)>| {
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
-        let mut data = db_digest(db);
-        data.extend_from_slice(outputs[h as usize - 1].as_bytes());
-        digests.push(keccak256(&data).to_string());
+        let out = outputs[h as usize - 1].as_bytes();
+        let (mut data, mut reduced) = (db_digest(db), reduced_digest(db));
+        data.extend_from_slice(out);
+        reduced.extend_from_slice(out);
+        digests.push((keccak256(&data).to_string(), keccak256(&reduced).to_string()));
     };
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
@@ -215,7 +254,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
         };
         let liq_res = match b.liq {
             None => NativeExecutor::run_liquidations(&mut ctx),
-            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act),
+            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act, liq::ADL_WORK_PER_BLOCK),
         };
         ctx.save_order_books();
         let (agg, liq_res) = (pinned(&agg), pinned(&liq_res));
@@ -240,8 +279,9 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
         if std::env::var("GOLDEN_PRINT").is_ok() {
             let rows = |tag: u8| ctx.state.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap().len();
             println!(
-                "  block {h}: liquidations={} vault_positions={} cooldown={} prev_mark={} cursor={} pending={} trades={}",
+                "  block {h}: liquidations={} adl={} vault_positions={} cooldown={} prev_mark={} cursor={} pending={} trades={}",
                 metrics.liquidations_triggered.get(),
+                metrics.liquidations_adl.get(),
                 ctx.positions.positions_for_trader(&liq::LIQUIDATOR_VAULT).unwrap().len(),
                 rows(liq::COOLDOWN_TAG),
                 rows(liq::PREV_MARK_TAG),
@@ -316,7 +356,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             metrics.sell_margin_cuts[1][1].iter().map(|c| c.get()).collect::<Vec<_>>(),
         );
     }
-    digests
+    digests.into_iter().unzip()
 }
 
 struct Lcg(u64);
@@ -549,6 +589,11 @@ const GOLDEN_A: [&str; A_BLOCKS as usize] = [
 /// (the first mark change) the `0x03` rows are `last ‖ prev`; every block's
 /// results and position / balance / liquidation rows (the `0x03` values cut
 /// to `last`) checked equal to the D10 digests' run before re-pinning.
+/// Re-pinned by adl-budget A5+A6 (P2, on purpose): from block 8 (the first
+/// ADL block) the ADL'd positions pass through the escrows (`0x07` rows
+/// written and deleted in the block: tombstones in the running hash, escrow
+/// balance rows); [`golden_repins_change_only_rule_h_and_p2_rows`] proves
+/// every other row and every block's outputs equal to 56318a9's (D10, no P2).
 const GOLDEN_B: [&str; 18] = [
     "0x01ad98e2504ea6d07d86d94eb488ea2f620b593effec4284b1cb37a3cf07cdbd",
     "0xd5ce9dd0a968a2016bb69dc20bc5e12ba6e9bf600539c7cc2989087b49e98562",
@@ -557,17 +602,52 @@ const GOLDEN_B: [&str; 18] = [
     "0xdad5dd048374e566c584bd587745d949e7aa053bd1b0e36e43d36e61c76010f2",
     "0x08d89c1339ddf8b3da9246c698dd2673ad0398da8d70bdfa0985c17ae9604636",
     "0xb86de24be5bbd879d94fbef2787cb3d24813d99e7d141e570b23d0917a83a4be",
-    "0xad7ac32e8676ccfd0c0cccb60958cc3f43fe0cb7ba11c9ade2ad593d2d771459",
-    "0x8a178f231b7f33b9c4905f24fa8812bd660c5e0a1cf68bdd42e17497e24c9f93",
-    "0x3c1bacdee3a90b7aaf75755438a875b907d4b774dc8e638eaaaf38d1e6bc1cca",
-    "0x8e31b7263a2494e1aec20d6518e04bcd11ff25ec4ddf20e374665d4d0c2d2e06",
-    "0xada97eb07d210bdce4b48d7a9e7117615ca32d39549ff35c3e59c3bc76c48761",
-    "0xf339e719e6c6722ce064e52d7287b62018d2e0ca78dc39d5b11266ba3b1e9e1a",
-    "0xe48d734ea1e8ec53227434f01f1610470e1f0dc5a24c604fa3c2ba65bdb967d9",
-    "0xb0101d1d8449da2845ca76b2031899fc016220a840caa232cca1471dcd5e9b3f",
-    "0x98665ba8d8c117f778ece4b88f9141e13ff1f4d4e80ea3b22ca72f5f8b89cbc1",
-    "0x962a22ffa52706025d38f7574de7407eff52726313ceb8ad5c63bef635592094",
-    "0xdb59e96e9759fd5ded1d021307f62616ad505bb8d3fbdd46c4e434ea27f204ed",
+    "0xe56b53c9c75fa016fbd55e849f7fd71f75d412b94a0a51cf339d4585c99dbc0f",
+    "0x005f8e8c234f1c1c52ff405e93f3d91c3678c31147a3846a54749556656afd73",
+    "0x529970a5d09713b43c2972318e79c5a300016f1d26e20bf19a47c70a627878b0",
+    "0x3332a37809b93f4bb770cf0879083e31a453b0cf19a62f7b6d249bad559ed42a",
+    "0x831a18eb3ce615493024f86bed6426c50408945b6fc64ce0b5333aa37e6e884b",
+    "0xdb7b953bade90906fee455b7a502e27f09c4e980f0f2f723f8a38e027c0f8984",
+    "0x932f47d6158e82abaf81b2eabdf3a7843fe5d78a8c9cde8111c76df67b3dc601",
+    "0x530fe2e8ee6823ecc00939450c914dc090538b683f584a50895222accbc1b01e",
+    "0x5abd2a1432860f381db233de5715719a617b11a159363689bdd7e9cca45c5fb2",
+    "0x194865aa6001ef32b7982be69f08e62e6f1e824ec0a0ab087f689219c87f408a",
+    "0xab7e76a736438367521abc81cdf93c13060e37669dd681824f0e26ba11b5dad0",
+];
+/// [`golden_repins_change_only_rule_h_and_p2_rows`]: pinned on 56318a9.
+const REDUCED_A: [&str; A_BLOCKS as usize] = [
+    "0x1e216ac310a4dc30f9d20b20dc0804ddcb92139f362779b4ef72777a5c256395",
+    "0xdcf49a1ce6009f620d6ff1266adfa6f23cfcaf30fef509a3aa59a83178b798c4",
+    "0x95b5b46d895d255e59a4d8db1140916820173420257c30f27dcf476089c7d9b1",
+    "0x3a1a0425da7327bf46cc94d9fcfc985ff0b729772caba374a466fa62455c4ebb",
+    "0xd25f195f0051ee647a33c4fe7dde50b2fa183080695599f08aae12b77db2d28f",
+    "0xb5bfbf3ed1d60b6d7fdf24653ad365947d8fe34e78cf0814f686c6336d8c51dc",
+    "0x5b42210a9ab79087a0215784812c3c23a520e07bf51af9b19662c6f3153e3022",
+    "0x389cd1a820427a59fb1a1edb458d08f2a1cc80ebaeb9270b473d1d08e60dc2df",
+    "0x1568b3e98c89657bffed3f3b32f9c2b2ee7467af6aa937ae3037a052abb7771e",
+    "0xcffe661162f742bfef8479065dcb5970bd12585817fd35ef8d4c1a97d37dde62",
+    "0xf1a5fcfa71a63b7ac1debc6f4824bb4fd0fdde6865525094c57aeba638482d52",
+    "0x2c386f2dfc1c57fef323e35abe851fdef467326897b07075749f0cd6e751bacd",
+];
+const REDUCED_B: [&str; 18] = [
+    "0x86b5bbc4e7b12940fcaddd409473acc127055700930c7e2c01982c3995c1d2a6",
+    "0x76d1fca7edae343d092286720cafee54839d4fb5cff2c00f140fabc02b04cca2",
+    "0xd4b9f654dd63fd9489fea94ccf57f3f723b9d4d9bbcd8ae0124d6d931caf63d3",
+    "0xf02634d7adc94e535b13832909c7b9c26ba2269b1a9c0a6519a84b20f10b67f7",
+    "0xfa8a5ab7f9a2747ac39b83e8288c2f77f7553c0d47c1a88994cb57d1d538b2d4",
+    "0x5cd4fcc1eef97ef3a242faeda00a7d014df0a3f67a5b7236314844f90d3fac96",
+    "0x108f3b38bcd0c60eab535eef5e306e38fd4a44c22d580e45a44336f647bcf085",
+    "0x2ce64fc511d84ecf8ec00999634e68940cd5d259938b38d418629cccb676facc",
+    "0x12aeb2450213a440321509e37a628f2f6dbc5e095230f59c29b1d7107b12b8fe",
+    "0xbdc5885774cfc04aafcfe239b123f78c035acd82b288dc128e9e8f16dc285298",
+    "0x1983d61d95707772e8e5816d5856d93aaa9f8dc888557ebb035c08bca7a28ac0",
+    "0x93b7296ab71602ae128a4bc76187c88cf3e981202d227a79f187b75d0c2777ba",
+    "0xfbe0deac489a3c9394627d3ca84c29b42fd8ced5c125418780f04e820ef6575b",
+    "0xf6fba44ba5aebcf7fa1abfe4e8b2bb7d58dabb289fd858711f27f612e885d55d",
+    "0xdff904f5b8d4d6861ef61f8c0ff267ecf0c0ed36743eea3ad99e6ef7d578d278",
+    "0x4958522c33a537ea933e990150a60c66b6fb444deca45f245e7f821489416ca0",
+    "0x70667a0748eaa57168bd62b47f3093867d61835ca7bcd455e7873fe17bb429c1",
+    "0x0c263752661d6caa0b40181ba74be4af244bd4faf5f94bd180b262d0b67908a4",
 ];
 
 fn check(name: &str, got: &[String], want: &[&str]) {
@@ -608,4 +688,19 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
         let blocks = scenario_b(&db);
         check("GOLDEN_B", &run(&db, &blocks, None, r), &GOLDEN_B);
     }
+}
+
+/// 18c review (adl-budget A3 nit c; A5/A6): the GOLDEN_A / GOLDEN_B re-pins
+/// change only rule H's `0x03` rows and P2's rows. The reduced digests
+/// ([`reduced_digest`] + the block's outputs) were pinned on 56318a9 (D10, no
+/// P2) with this same function and stay equal after rule H and P2.
+#[test]
+fn golden_repins_change_only_rule_h_and_p2_rows() {
+    let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
+    let (_d, db) = listed_db(&markets);
+    let blocks = scenario_a(&db);
+    check("REDUCED_A", &run_both(&db, &blocks, None, R::Off).1, &REDUCED_A);
+    let (_d, db) = listed_db(&[1, 2, 3]);
+    let blocks = scenario_b(&db);
+    check("REDUCED_B", &run_both(&db, &blocks, None, R::Off).1, &REDUCED_B);
 }

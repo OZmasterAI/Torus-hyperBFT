@@ -35,6 +35,13 @@ struct LiqStats {
     /// The scan window's candidates (ascending, vault excluded) the act
     /// budget left unclassified; empty when the budget held.
     deferred: Vec<Address>,
+    /// adl-budget P2: obligation rows the drain worked on (waiting rows not
+    /// counted), its work units, the escrow dust swept to the vault and the
+    /// vault's escrow-pairing amounts (signed raw units, this step).
+    adl_obligations: u64,
+    adl_work: u64,
+    adl_dust: i128,
+    adl_pairing: i128,
 }
 
 impl NativeExecutor {
@@ -44,18 +51,20 @@ impl NativeExecutor {
     pub fn run_liquidations<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
-        Self::run_liquidations_with(ctx, liq::LIQ_SCAN_PER_BLOCK, liq::LIQ_ACT_PER_BLOCK)
+        Self::run_liquidations_with(ctx, liq::LIQ_SCAN_PER_BLOCK, liq::LIQ_ACT_PER_BLOCK, liq::ADL_WORK_PER_BLOCK)
     }
 
-    /// [`Self::run_liquidations`] with explicit budgets (tests).
+    /// [`Self::run_liquidations`] with explicit budgets (tests): `work` is the
+    /// ADL drain's per-block work units (adl-budget Q3; 0 = no drain).
     pub fn run_liquidations_with<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         scan: usize,
         act: usize,
+        work: u64,
     ) -> Vec<NativeActionResult> {
         let started = std::time::Instant::now();
         let mut stats = LiqStats::default();
-        let out = match Self::liquidation_pass(ctx, scan, act, &mut stats) {
+        let out = match Self::liquidation_pass(ctx, scan, act, work, &mut stats) {
             Ok(r) => r,
             Err(e) => {
                 ctx.fatal_error = Some(format!("liquidation step: {e}"));
@@ -75,7 +84,7 @@ impl NativeExecutor {
         s: &LiqStats,
         took: std::time::Duration,
     ) {
-        let happened = s.acted > 0 || s.vault_adl;
+        let happened = s.acted > 0 || s.vault_adl || s.adl_obligations > 0;
         // Pending = pending rows ∪ deferred window candidates (metrics only).
         // The row count is re-read only when this step changed a row or the
         // Metrics instance has none yet (a start; a read error resets it); a
@@ -127,6 +136,10 @@ impl NativeExecutor {
                 vault_adl = s.vault_adl,
                 deferred = s.deferred.len(),
                 pending = ?pending,
+                adl_obligations = s.adl_obligations,
+                adl_work = s.adl_work,
+                adl_dust = %FixedPoint::from_raw(s.adl_dust),
+                adl_pairing = %FixedPoint::from_raw(s.adl_pairing),
                 ms,
                 "liquidation step"
             );
@@ -153,6 +166,7 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
         scan: usize,
         act: usize,
+        work: u64,
         stats: &mut LiqStats,
     ) -> Result<Vec<NativeActionResult>, CoreError> {
         let listed = ctx
@@ -166,21 +180,22 @@ impl NativeExecutor {
         let (prev, mark_rows) = liq::adl_bases(&ctx.state, &listed, &marks)?;
         let l1 = Self::l1_on(ctx, &listed);
         // C1 (decided, s517): no separate index — walk CF_NATIVE_POSITIONS
-        // (sorted by trader) from the round-robin cursor. SCAN + 2: the vault
-        // (skipped) is at most one of them, so a pass that consumes every
-        // fetched trader without hitting a budget has reached the end.
+        // (sorted by trader) from the round-robin cursor. SCAN + 4: the vault
+        // and the two ADL escrows (skipped: never classified, P2) are at most
+        // three of them, so a pass that consumes every fetched trader without
+        // hitting a budget has reached the end.
         let cursor = liq::cursor(&ctx.state)?;
-        let accounts = Self::liq_traders_after(ctx, cursor, scan.saturating_add(2))?;
+        let accounts = Self::liq_traders_after(ctx, cursor, scan.saturating_add(4))?;
         let mut results = Vec::new();
         let (mut scanned, mut acted, mut last, mut cut) = (0usize, 0usize, None, false);
-        let not_vault = |a: &&Address| **a != LIQUIDATOR_VAULT;
-        for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_vault(a)) {
+        let not_protocol = |a: &&Address| **a != LIQUIDATOR_VAULT && !liq::is_adl_escrow(a);
+        for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_protocol(a)) {
             if scanned == scan || acted == act {
                 cut = true;
                 if acted == act {
-                    // Only the window: the walk fetched scan + 2 candidates.
+                    // Only the window: the walk fetched scan + 4 candidates.
                     stats.deferred =
-                        accounts[i..].iter().filter(not_vault).take(scan - scanned).copied().collect();
+                        accounts[i..].iter().filter(not_protocol).take(scan - scanned).copied().collect();
                 }
                 break;
             }
@@ -221,7 +236,7 @@ impl NativeExecutor {
             let release = Self::cancel_orders_and_stops(ctx, &trader, None);
             Self::release_order_margin(ctx, &trader, release);
             match h {
-                Health::Adl => Self::adl_account(ctx, &marks, &prev, &trader)?,
+                Health::Adl => Self::adl_to_escrow(ctx, &marks, &prev, &trader)?,
                 Health::Backstop => liq::backstop(&ctx.positions, &trader, &LIQUIDATOR_VAULT, |m| {
                     marks.get(&m).copied()
                 })?,
@@ -243,10 +258,17 @@ impl NativeExecutor {
             if liq::classify(&v) == Some(Health::Adl) {
                 stats.adl += 1;
                 stats.vault_adl = true;
-                Self::adl_account(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
+                Self::adl_to_escrow(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
-        // M2 for the vault: pending while it stays ADL-able.
+        // adl-budget P2: the escrows close their obligations under `work`
+        // (an empty queue costs one seek).
+        if work > 0 && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG])?.is_some() {
+            Self::adl_drain(ctx, &listed, &marks, work, stats)?;
+        }
+        // M2 for the vault: pending while it stays ADL-able — after the drain
+        // (the vault is an ordinary ADL candidate: a close can sink it; the
+        // row keeps the step due and the next block's D8 check acts).
         let vault_adl = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)?
             .is_some_and(|v| liq::classify(&v) == Some(Health::Adl));
         stats.pending_changed |= liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
@@ -510,59 +532,74 @@ impl NativeExecutor {
             .map_err(|_| CoreError::Overflow("liquidation notional overflows i128".into()))
     }
 
-    /// Decision 5 + rule H + review H1: close every MARKED position of `u`
-    /// (ascending market) against ranked opposite-side counterparties at the
-    /// rule-H base (the last mark different from the current one; the current
-    /// mark without one) clamped to `u`'s
-    /// bankruptcy price ([`liq::adl_price`]). Afterwards a non-vault account
-    /// without marked positions hands its remaining collateral (rounding dust,
-    /// or the deficit when the previous mark was worse than bankruptcy) to
-    /// the vault: it ends at exactly 0.
-    fn adl_account<T: StateBackend>(
+    /// adl-budget P2 (owner s96): terms fixed at B. Every MARKED position of
+    /// `u` (ascending market) moves to the escrow of its side at its ADL price
+    /// — the rule-H base (the mark without one) clamped one-sided to `u`'s
+    /// bankruptcy price (review H1, unchanged) — and its obligation is queued.
+    /// `rest` (cash + the UPnL of u's OTHER positions: marked at the mark,
+    /// unmarked at entry = 0) is kept running: rows read once, one balance
+    /// point read per transfer — O(P) (was `adl_rest` per market: O(P^2)).
+    /// Then D9: a non-vault account without marked positions hands its
+    /// remaining collateral to the vault. Never positive under the clamp (an
+    /// error line if it is; the move still conserves value): flat, exactly 0.
+    fn adl_to_escrow<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
         prev: &Marks,
         u: &Address,
     ) -> Result<(), CoreError> {
-        for p in ctx.positions.positions_for_trader(u)? {
+        let ps = ctx.positions.positions_for_trader(u)?;
+        // `build`'s terms per position (adl_rest's `build`); None = overflow
+        // -> no bankruptcy price (adl_rest's None).
+        let upnl = |p: &Position| {
+            torus_core::margin::position_terms(p, marks.get(&p.market_id).copied(), None).ok().map(|t| t.upnl)
+        };
+        let mut total = ps.iter().try_fold(FixedPoint::ZERO, |a, p| a.checked_add(upnl(p)?).ok());
+        for p in &ps {
             let m = p.market_id;
             let Some(&mark) = marks.get(&m) else { continue };
-            let px = prev.get(&m).copied().unwrap_or(mark);
-            let bankruptcy = Self::adl_rest(ctx, marks, u, m)?
-                .and_then(|rest| liq::bankruptcy_price(rest, p.is_long, p.size, p.entry_price));
-            let px = liq::adl_price(px, bankruptcy, mark, p.is_long);
-            let (cands, _) = Self::adl_candidates_of(ctx, m, !p.is_long)?;
-            let closes = liq::adl_close(&ctx.positions, u, m, px, p.size, &liq::adl_rank(mark, cands))?;
-            // Telemetry: one info line per (account, market), each close at debug.
-            let mut size = FixedPoint::ZERO;
-            for (c, q) in &closes {
-                tracing::debug!(account = %u, counterparty = %c, market = m, size = %q, price = %px, "liquidation: ADL close");
-                size += *q;
-            }
+            let own = upnl(p);
+            let bal = ctx.positions.get_native_balance(u)?;
+            let rest = (|| {
+                let others = total?.checked_sub(own?).ok()?;
+                bal.available.checked_add(bal.order_margin).ok()?.checked_add(others).ok()
+            })();
+            #[cfg(test)]
+            assert_eq!(rest, Self::adl_rest(ctx, marks, u, m)?, "running rest == adl_rest ({u}, {m})");
+            let base = prev.get(&m).copied().unwrap_or(mark);
+            let bankruptcy = rest.and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.entry_price));
+            let px = liq::adl_price(base, bankruptcy, mark, p.is_long);
+            liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
+            total = (|| total?.checked_sub(own?).ok())();
+            let o = liq::Obligation { height: ctx.block_height, market: m, is_long: p.is_long, trader: *u, size: p.size, price: px };
+            liq::put_obligation(&ctx.state, &o)?;
             tracing::info!(
                 height = ctx.block_height,
                 account = %u,
                 market = m,
-                counterparties = closes.len(),
-                size = %size,
+                size = %p.size,
+                base = %base,
+                bankruptcy = ?bankruptcy,
                 price = %px,
-                "liquidation: ADL"
+                "liquidation: ADL to escrow"
             );
         }
         if *u != LIQUIDATOR_VAULT
-            && !ctx
-                .positions
-                .positions_for_trader(u)?
-                .iter()
-                .any(|p| marks.contains_key(&p.market_id))
+            && !ctx.positions.positions_for_trader(u)?.iter().any(|p| marks.contains_key(&p.market_id))
         {
-            liq::move_collateral(&ctx.positions, u, &LIQUIDATOR_VAULT)?;
+            let moved = liq::move_collateral(&ctx.positions, u, &LIQUIDATOR_VAULT)?;
+            if moved > FixedPoint::ZERO {
+                tracing::error!(account = %u, %moved, "liquidation: positive D9 remainder after ADL (clamp invariant broken)");
+            }
         }
         Ok(())
     }
 
     /// Review H1: `u`'s collateral + the UPnL of its positions OTHER than in
     /// `m` (marked at the mark, unmarked at entry = 0). `None` on overflow.
+    /// adl-budget P2: the shadow reference of `adl_to_escrow`'s running
+    /// `rest` (tests only).
+    #[cfg(test)]
     fn adl_rest<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
@@ -585,6 +622,109 @@ impl NativeExecutor {
             .checked_add(v.order_margin)
             .and_then(|x| x.checked_add(v.upnl))
             .ok())
+    }
+
+    /// adl-budget P2 / Q2 / Q3: drain the obligation rows in key order under
+    /// `work` units. One step = one row (atomic; starts only while used <
+    /// work, so a block overshoots by at most one step). Every visited row
+    /// costs 1, plus its (market, side) ranking (once per block: `ranked`
+    /// holds the list and the position of the first candidate not yet used
+    /// up, so later rows continue where the last one stopped), plus the
+    /// candidates `adl_close` read, plus edge rows. The escrow of the row's
+    /// side closes at the row's stored price; real holders exhausted ->
+    /// [`Self::adl_cross`]. A listed market without a usable mark waits; a
+    /// delisted one ranks at the stored price (owner s96). Then a flat
+    /// escrow's balance (dust) goes to the vault.
+    fn adl_drain<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        listed: &[MarketId],
+        marks: &Marks,
+        work: u64,
+        stats: &mut LiqStats,
+    ) -> Result<(), CoreError> {
+        let mut ranked: BTreeMap<(MarketId, bool), (Vec<liq::AdlCandidate>, usize)> = BTreeMap::new();
+        let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        while used < work {
+            let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
+            start = [o.key().as_slice(), &[0]].concat();
+            used += 1; // the visit: a waiting row is never free
+            let rank_px = match marks.get(&o.market) {
+                Some(&mark) => mark,
+                None if listed.binary_search(&o.market).is_err() => o.price, // delisted
+                None => continue,                                           // listed, stale: wait
+            };
+            let key = (o.market, o.is_long);
+            if !ranked.contains_key(&key) {
+                let (c, examined) = Self::adl_candidates_of(ctx, o.market, !o.is_long)?;
+                used += examined;
+                ranked.insert(key, (liq::adl_rank(rank_px, c), 0));
+            }
+            let escrow = liq::adl_escrow(o.is_long);
+            let (list, at) = ranked.get_mut(&key).expect("ranked above");
+            let (closes, next, read) = liq::adl_close(&ctx.positions, &escrow, o.market, o.price, o.size, &list[*at..])?;
+            *at += next;
+            used += read as u64;
+            let owed = o.size;
+            for (c, q) in &closes {
+                tracing::debug!(market = o.market, account = %o.trader, counterparty = %c, size = %q, price = %o.price, "liquidation: ADL close");
+                o.size -= *q;
+            }
+            if o.size > FixedPoint::ZERO {
+                used += Self::adl_cross(ctx, &mut o, stats)?;
+            }
+            if o.size != owed {
+                liq::update_obligation(&ctx.state, &o)?; // the remainder; deleted at 0
+            }
+            stats.adl_obligations += 1;
+            if o.size > FixedPoint::ZERO {
+                tracing::error!(?o, "liquidation: ADL obligation left open (OI asymmetry?), retried next block");
+            }
+        }
+        for e in [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
+            if ctx.positions.positions_for_trader(&e)?.is_empty() {
+                let dust = liq::move_collateral(&ctx.positions, &e, &LIQUIDATOR_VAULT)?;
+                if dust != FixedPoint::ZERO {
+                    stats.adl_dust += dust.raw();
+                    tracing::info!(escrow = %e, %dust, "liquidation: ADL escrow dust to the vault");
+                    // Coarse node-local alarm (the exact bound is a test assertion).
+                    if dust.raw().unsigned_abs() >= FixedPoint::SCALE as u128 {
+                        tracing::error!(escrow = %e, %dust, "liquidation: ADL escrow dust >= 1 token (invariant alarm)");
+                    }
+                }
+            }
+        }
+        stats.adl_work = used;
+        Ok(())
+    }
+
+    /// P2 edge: the real opposite holders of `o.market` are exhausted (both
+    /// escrows hold it). Pair `o` with the opposite side's rows of the same
+    /// market in key order; each escrow closes at its own row's price, the
+    /// vault pays the difference (`liq::cross_close`, which refuses to flip an
+    /// escrow). Returns the rows scanned (work units).
+    fn adl_cross<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        o: &mut liq::Obligation,
+        stats: &mut LiqStats,
+    ) -> Result<u64, CoreError> {
+        let (mut units, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        while o.size > FixedPoint::ZERO {
+            let Some(mut x) = liq::next_obligation(&ctx.state, &start)? else { break };
+            start = [x.key().as_slice(), &[0]].concat();
+            units += 1;
+            if x.market != o.market || x.is_long == o.is_long {
+                continue;
+            }
+            let q = o.size.min(x.size);
+            let (pl, ps) = if o.is_long { (o.price, x.price) } else { (x.price, o.price) };
+            let paid = liq::cross_close(&ctx.positions, o.market, q, pl, ps, &LIQUIDATOR_VAULT)?;
+            stats.adl_pairing += paid.raw();
+            tracing::info!(market = o.market, size = %q, p_long = %pl, p_short = %ps, vault = %paid, "liquidation: ADL escrow pairing");
+            o.size -= q;
+            x.size -= q;
+            liq::update_obligation(&ctx.state, &x)?;
+        }
+        Ok(units)
     }
 }
 

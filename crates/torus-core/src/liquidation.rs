@@ -58,6 +58,11 @@ pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
 /// D5 (decided, user s517): accounts acted on per block.
 pub const LIQ_ACT_PER_BLOCK: usize = 64;
+/// adl-budget Q3: the drain's work units per block — traders examined by a
+/// ranking + rows visited + candidates read (+ edge rows). Chosen (A8) so an
+/// HL-sized event (a few hundred account-markets) closes the escrows in its
+/// own block; one constant. Placeholder until A8 measures it.
+pub const ADL_WORK_PER_BLOCK: u64 = 1_000_000;
 /// Rows per seek of the bounded walks.
 const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
@@ -325,7 +330,10 @@ pub fn backstop<T: StateBackend>(
 /// Decision 5 (ADL): close at most `qty` of `u`'s position in `m` at `price`
 /// against `ranked` in order, `q = min(remaining, candidate size)` each (a
 /// candidate whose position vanished or changed side is skipped). Returns
-/// the closes in order, `(counterparty, size)` (the caller logs them).
+/// `(closes, next, read)`: the closes in order, `(counterparty, size)` (the
+/// caller logs them); `next` = how many leading candidates are used up
+/// (vanished, flipped or fully closed: adl-budget Q2, the drain's cache
+/// position); `read` = how many candidates were read (Q3 work units).
 pub fn adl_close<T: StateBackend>(
     pm: &PositionManager<T>,
     u: &Address,
@@ -333,35 +341,43 @@ pub fn adl_close<T: StateBackend>(
     price: FixedPoint,
     qty: FixedPoint,
     ranked: &[AdlCandidate],
-) -> Result<Vec<(Address, FixedPoint)>, CoreError> {
+) -> Result<(Vec<(Address, FixedPoint)>, usize, usize), CoreError> {
     let mut closes = Vec::new();
+    let (mut next, mut read) = (0usize, 0usize);
     let Some(up) = pm.get_position(u, m)? else {
-        return Ok(closes);
+        return Ok((closes, next, read));
     };
     let mut remaining = up.size.min(qty);
     for c in ranked {
         if remaining <= FixedPoint::ZERO {
             break;
         }
-        if c.trader == *u {
-            continue;
+        read += 1;
+        // Used up: no later row of the block needs this candidate again.
+        let used_up = c.trader == *u
+            || match pm.get_position(&c.trader, m)? {
+                Some(cp) if cp.is_long != up.is_long && cp.size > FixedPoint::ZERO => {
+                    let q = remaining.min(cp.size);
+                    transfer(pm, u, &c.trader, m, q, price)?;
+                    closes.push((c.trader, q));
+                    remaining -= q;
+                    q == cp.size
+                }
+                _ => true,
+            };
+        if used_up && next + 1 == read {
+            next += 1;
         }
-        let Some(cp) = pm.get_position(&c.trader, m)? else { continue };
-        if cp.is_long == up.is_long || cp.size <= FixedPoint::ZERO {
-            continue;
-        }
-        let q = remaining.min(cp.size);
-        transfer(pm, u, &c.trader, m, q, price)?;
-        closes.push((c.trader, q));
-        remaining -= q;
     }
-    Ok(closes)
+    Ok((closes, next, read))
 }
 
 /// P2 edge (real holders exhausted): escrow long sells `q` at `p_long`, escrow
 /// short buys `q` at `p_short`. Two prices realize (p_long - p_short) x q more
 /// than one shared price would; the vault pays it, so value is conserved.
-/// Returns the vault's change (+ = credited).
+/// Returns the vault's change (+ = credited). Never flips or opens an escrow
+/// position (18c review): q <= 0, or an escrow not holding at least q on its
+/// own side, is an error and nothing is written.
 pub fn cross_close<T: StateBackend>(
     pm: &PositionManager<T>,
     m: MarketId,
@@ -371,6 +387,12 @@ pub fn cross_close<T: StateBackend>(
     vault: &Address,
 ) -> Result<FixedPoint, CoreError> {
     let of = |_| CoreError::Overflow("adl cross close overflows i128".into());
+    for (e, is_long) in [(ADL_ESCROW_LONG, true), (ADL_ESCROW_SHORT, false)] {
+        let holds = pm.get_position(&e, m)?.is_some_and(|p| p.is_long == is_long && p.size >= q);
+        if q <= FixedPoint::ZERO || !holds {
+            return Err(CoreError::InvalidInput(format!("adl cross close: {e} cannot close {q:?} in {m}")));
+        }
+    }
     pm.apply_fill(&ADL_ESCROW_LONG, m, false, q, p_long, MarginType::Cross)?;
     pm.apply_fill(&ADL_ESCROW_SHORT, m, true, q, p_short, MarginType::Cross)?;
     let paid = p_short.checked_sub(p_long).map_err(of)?.checked_mul(q).map_err(of)?;
@@ -666,17 +688,41 @@ impl Obligation {
     }
 }
 
-/// Write `o` as a new row (size > 0) or delete its row (size <= 0). A new row
+/// Write `o` as a new row (size > 0) or delete its row (size 0). A new row
 /// over an existing key is an error (never an overwrite: see
-/// [`Obligation::key`]).
+/// [`Obligation::key`]); so are a negative size (it never vanishes
+/// silently) and a price <= 0 (18c review).
 pub fn put_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
     let k = o.key();
-    if o.size <= FixedPoint::ZERO {
+    if o.size < FixedPoint::ZERO || o.price <= FixedPoint::ZERO {
+        return Err(CoreError::InvalidInput(format!("adl obligation: negative size or price <= 0: {o:?}")));
+    }
+    if o.size == FixedPoint::ZERO {
         state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
         return Ok(());
     }
     if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
         return Err(CoreError::InvalidInput(format!("adl obligation row exists: {o:?}")));
+    }
+    let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+    Ok(())
+}
+
+/// adl-budget A6: overwrite the EXISTING row of `o`'s key with `o`'s size and
+/// price (the drain's remainder, the pairing partner), or delete it at size
+/// 0. A missing row, a negative size or a price <= 0 is an error.
+pub fn update_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
+    let k = o.key();
+    if o.size < FixedPoint::ZERO || o.price <= FixedPoint::ZERO {
+        return Err(CoreError::InvalidInput(format!("adl obligation: negative size or price <= 0: {o:?}")));
+    }
+    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_none() {
+        return Err(CoreError::InvalidInput(format!("adl obligation row missing: {o:?}")));
+    }
+    if o.size == FixedPoint::ZERO {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        return Ok(());
     }
     let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
     state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;

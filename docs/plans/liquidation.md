@@ -142,7 +142,8 @@ C5 recorded as known limitations.
 1. **Marks** for listed markets (`governance.listed_market_ids()`, ascending) into a `BTreeMap`;
    **mark rows** (rule H: the ADL bases) from the liquidation CF.
 2. **Candidates**: distinct traders of `CF_NATIVE_POSITIONS` (ascending; consecutive keys of
-   one trader deduplicated), strictly after the stored cursor, the vault excluded. Up to
+   one trader deduplicated), strictly after the stored cursor, the vault and the two ADL
+   escrows excluded (adl-budget P2: never classified). Up to
    `SCAN` = 2048 accounts valued, up to `ACT` = 64 acted on; when a budget stops the pass, the
    cursor row = last scanned (carry-over); at the end of the CF it is deleted (next block
    starts from the first trader).
@@ -155,7 +156,10 @@ C5 recorded as known limitations.
       deficit moves to the vault (`vault.available += c; acct.available -= c`) — value is
       conserved, nothing is written off.
 4. **Vault:** if the vault holds positions and its AV (same valuation) < 0 ⇒ ADL the vault.
-5. Write the previous-mark rows (only changed ones) and the cursor.
+5. **ADL drain** (adl-budget P2): the escrows close the queued obligation rows under the
+   per-block work budget `W` (see *ADL*).
+6. The vault's pending row (M2), evaluated after the drain (a close can sink the vault).
+7. Write the mark rows (rule H, only changed ones) and the cursor.
 
 ### Stage 1
 
@@ -193,26 +197,53 @@ The account ends flat with `available + order_margin == 0`.
 
 ### ADL
 
-For each position of the underwater account `U` (ascending market):
+adl-budget P2 (owner s96; `docs/plans/adl-budget.md` §8, `docs/plans/adl-budget-impl.md`):
+terms are fixed in the bankruptcy block B, closes run under a per-block budget.
 
-* price `p` = previous-mark row of `m`, else the current mark (first step ever).
-* counterparties = every opposite-side position in `m` (scan of `CF_NATIVE_POSITIONS`,
-  key order), `U` excluded; ranked by `k = (px_num × notional) / (px_den × AV)` descending
-  (`px_num/px_den` = mark/entry for a long counterparty, entry/mark for a short; notional at
-  the mark; AV by `AccountReader::view`, entry fallback allowed for RANKING only); exact
-  comparison by U512 cross-multiplication; counterparties with `AV <= 0` rank last; ties by
-  address ascending.
-* close `q = min(remaining, cp.size)` pairwise: `apply_fill(U, m, !U.is_long, q, p)`,
-  `apply_fill(cp, m, U.is_long, q, p)`. Σ opposite size ≥ `U.size` always (OI symmetry), so the
-  position is fully closed.
-* then the flat-deficit rule.
+**At B**, for each MARKED position of the underwater account `U` (ascending market):
+
+* price `p` = `adl_price(base, bankruptcy, mark)`: the rule-H base (the last mark different from
+  the current one; the current mark without one) clamped one-sided to `U`'s bankruptcy price
+  (review H1). `rest` (cash + the other positions' UPnL) is kept running: O(P) per account.
+* the position moves to the escrow of its side at `p` (`ADL_ESCROW_LONG` /
+  `ADL_ESCROW_SHORT`, protocol accounts with no key: never classified, never candidates, one
+  aggregated position per (market, side), the sides never net), and an obligation row
+  `0x07 ‖ B ‖ m ‖ side ‖ U` → `(size, p)` is queued. Escrow size = Σ its rows per (market, side).
+* then D9: a non-vault account without marked positions hands its remaining collateral to the
+  vault. Under the one-sided clamp it is never positive (an error line if it is): `U` ends flat
+  at exactly 0 in B.
+
+**Drain** (after the pass and the vault step, every block while rows exist): rows in key order
+(height, market, side short first, trader) under `W = ADL_WORK_PER_BLOCK` work units (1 per row
+visited + the traders a ranking examines + the candidates read + edge rows); a row starts only
+while `used < W` and runs to its end (overshoot ≤ one row).
+
+* counterparties = every opposite-side holder of `m` (all traders of `CF_NATIVE_POSITIONS`,
+  adl-budget Q1; the escrows excluded, the vault included), ranked ONCE per (block, market,
+  side) at the mark by `k = (px_num × notional) / (px_den × AV)` descending (`px_num/px_den` =
+  mark/entry for a long counterparty, entry/mark for a short; notional at the mark; AV by
+  `AccountReader::view`, entry fallback allowed for RANKING only); exact comparison by U1024
+  cross-multiplication; counterparties with `AV <= 0` rank last; ties by address ascending.
+  A later row of the same key continues at the first candidate not yet used up.
+* the escrow closes `q = min(remaining, cp.size)` pairwise at the row's STORED price `p`; the
+  row keeps the remainder (deleted at 0).
+* a listed market without a usable mark: its rows wait (1 unit per visit, the step stays due). A
+  delisted market: ranked with the stored price in place of the mark (owner s96; delisting is
+  text-only today, see adl-budget-impl.md).
+* real holders exhausted (both escrows hold `m`): the row pairs with the opposite side's rows of
+  `m`; each escrow closes at its own row's price and the vault pays `(p_short − p_long) × q`
+  (`cross_close`; it refuses to flip or open an escrow position: a node fault).
+* a flat escrow's balance (dust of its weighted-average entries) moves to the vault, logged
+  (error line at |dust| ≥ 1 token).
 
 ### Invariants (tested)
 
 * **OI symmetry:** for every market, Σ long size == Σ short size after every step.
 * **Value conservation:** Σ over all accounts (available + order_margin + UPnL at mark) is
   unchanged by the step (any fill at any price conserves it; collateral moves are
-  transfers). Tests use exactly representable prices / sizes.
+  transfers). Tests use exactly representable prices / sizes. P2: an escrow's weighted-average
+  entry truncates, so the sum moves by at most the dust bound (adl-budget-impl.md *Dust bound*)
+  until the dust is swept to the vault.
 * Liquidation never runs on an account with a stale / absent mark in any of its markets.
 
 ### State: new native-root CF `CF_NATIVE_LIQUIDATION` (tag 6)
@@ -225,6 +256,7 @@ For each position of the underwater account `U` (ascending market):
 | `0x04` | trader(20) | scan cursor (only while a pass was cut) |
 | `0x05 ‖ …` | — | reserved: vault deposits / shares (later branch) |
 | `0x06 ‖ trader(20)` | `[1]` | still under MM after its last action — keeps the step due (review M2) |
+| `0x07 ‖ height(8) ‖ market(8) ‖ side(1: 1 long) ‖ trader(20)` | `size` i128 BE raw ‖ `price` i128 BE raw | adl-budget P2: what the escrow of `side` still owes for `trader`'s position taken at block `height` at `price` (FIFO; keeps the step due) |
 
 Appended as tag 6 to `NATIVE_ROOT_CFS` (tags 0-5 frozen and unchanged) and to
 `compute_native_state_root`. An empty CF contributes nothing to either root; rows exist only
@@ -236,7 +268,11 @@ The insurance-fund key in `CF_NATIVE_BALANCES` is removed (F7).
 `LIQUIDATOR_VAULT: Address = Address::new(*b"torus-liquidator-vlt")` (20 ASCII bytes, no
 known key ⇒ no signed action can come from it). It is an ordinary account (balance row +
 position rows), so RPC / precompile readers see it unchanged. Exempt from stage 1
-and backstop; ADL when its AV < 0. Deposits later: share rows under `0x05` plus deposit /
+and backstop; ADL when its AV < 0 (its marked positions move to the escrows like any account's,
+but it keeps its balance: no D9). It is an ordinary ADL counterparty, so a drain can push its
+AV below 0; its pending row is set after the drain and the next block's check acts. The ADL
+escrows (`*b"torus-adl-escrow-lng"`, `*b"torus-adl-escrow-sht"`) are protocol accounts of the
+same kind. Deposits later: share rows under `0x05` plus deposit /
 withdraw actions; nothing in this design depends on the vault having no depositors.
 
 Monitoring (s17, `fix/liq-oracle-metrics`): a vault with negative cash and no positions is
@@ -256,8 +292,10 @@ accounts on every budget-cut block) and `torus_liquidation_deferred` (that secon
 The pending rows are re-counted only on a step that changed one (or the first step after a
 start); `adl` counts ADL runs (an ADL'd account, or the vault, also when nothing closes).
 Logs: one info line per step that acted (height, scanned, acted, per-class counts, deferred,
-pending, ms), debug otherwise; one info line per ADL'd (account, market) (`liquidation: ADL`:
-counterparty count, total size, price), each counterparty close at debug. Metric rows:
+pending, the drain's rows / work units / dust / pairing, ms), debug otherwise; one info line per
+ADL'd (account, market) (`liquidation: ADL to escrow`: size, base, bankruptcy, price), each
+escrow close at debug (`liquidation: ADL close`), the dust sweep and the escrow pairing at
+info. Metric rows:
 `docs/monitoring-setup.md`.
 
 ### Margin configs (F2, F8)

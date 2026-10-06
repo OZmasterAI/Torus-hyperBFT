@@ -339,7 +339,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             }
         }
         let liq = if h % 3 == 0 {
-            NativeExecutor::run_liquidations_with(&mut ctx, 3, 2)
+            NativeExecutor::run_liquidations_with(&mut ctx, 3, 2, liq::ADL_WORK_PER_BLOCK)
         } else {
             NativeExecutor::run_liquidations(&mut ctx)
         };
@@ -432,4 +432,66 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");
+}
+
+/// adl-budget Q2 (A6 #3): one ranking per (block, market, side). The P2
+/// fixture's shape over the node path (R and the slot attached): u1 and u2
+/// long 1 @ 1,000 in markets 1..=4 (collateral 100: AV -300 at 900) against
+/// a short; block 2 at 900 leaves 8 rows over 4 (market, long) keys, and
+/// the drain (default W) ranks each key once: 4 rankings, not 8.
+#[test]
+fn p2_ranks_each_market_side_once_per_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    for m in 1..=4u64 {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+    }
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, 1_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let fund = |t: &Address, v: i64| {
+            ctx.positions.put_native_balance(t, &NativeBalance { available: fp(v), order_margin: FixedPoint::ZERO }).unwrap();
+        };
+        let (u1, u2, s) = (trader(1), trader(2), trader(3));
+        fund(&u1, 100);
+        fund(&u2, 100);
+        fund(&s, 10_000_000);
+        for m in 1..=4 {
+            for (t, is_long) in [(u1, true), (u2, true), (s, false), (s, false)] {
+                ctx.positions.apply_fill(&t, m, is_long, fp(1), fp(MID), MarginType::Cross).unwrap();
+            }
+        }
+    }
+    let mut holder = ResidentBooks::default();
+    let mut parent: Option<Arc<FrozenPending>> = None;
+    let mut rankings = Vec::new();
+    for (h, price) in [(1u64, MID), (2, 900)] {
+        let now = 10_000 + h;
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut rb = begin_resident(Some(&mut holder), &mut overlay, h, None);
+        for m in 1..=4 {
+            overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(price), now - 1)).unwrap();
+        }
+        let mut ctx =
+            NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.attach_resident_block(&mut rb);
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        let c = &ctx.sums.as_ref().expect("slot sums attached").counters;
+        rankings.push(c.adl_rankings.load(std::sync::atomic::Ordering::Relaxed));
+        if h == 2 {
+            assert!(liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none(), "drained in B");
+        }
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = overlay.own_pending_delta();
+        let frozen = overlay.freeze(h);
+        end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        if let Some(p) = parent.take() {
+            p.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        }
+        parent = Some(frozen);
+    }
+    assert_eq!(rankings, vec![0, 4], "block 2: one ranking per (market, long)");
 }
