@@ -9839,6 +9839,18 @@ impl NativeExecutor {
                 continue;
             }
 
+            // HL-parity: a stop order type (a row queued before the precompile
+            // rejected them) fails instead of running as a plain Limit order.
+            if let QueuedActionKind::PlaceOrder { order_type, .. } = qa.kind {
+                if decode_order_type(order_type).is_none() {
+                    results.push(NativeActionResult::err(
+                        "core_writer",
+                        format!("unsupported CoreWriter order_type {order_type}"),
+                    ));
+                    continue;
+                }
+            }
+
             let result = match core_writer_to_native(qa) {
                 Some(action) => Self::execute(ctx, &qa.trader, &action),
                 None => Self::exec_settle_lockbox_deposit(ctx, qa),
@@ -10247,7 +10259,8 @@ fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
             is_buy: *side == 0,
             price: *price,
             quantity: *quantity,
-            order_type: decode_order_type(*order_type),
+            // `drain_core_writer` rejects any other code before converting.
+            order_type: decode_order_type(*order_type).unwrap_or(OrderType::Limit),
             time_in_force: decode_time_in_force(*time_in_force),
             reduce_only: false,
             client_order_id: None,
@@ -10280,11 +10293,13 @@ fn core_writer_to_native(qa: &QueuedAction) -> Option<NativeAction> {
     })
 }
 
-fn decode_order_type(code: u8) -> OrderType {
+/// CoreWriter order type: 0 = Limit, 1 = Market; `None` for anything else
+/// (stop types carry no trigger price over the CoreWriter ABI).
+fn decode_order_type(code: u8) -> Option<OrderType> {
     match code {
-        0 => OrderType::Limit,
-        1 => OrderType::Market,
-        _ => OrderType::Limit,
+        0 => Some(OrderType::Limit),
+        1 => Some(OrderType::Market),
+        _ => None,
     }
 }
 
