@@ -133,8 +133,26 @@ covers before step 0 closes.
 - P2-1b, CancelOrder / ModifyOrder by id (`exec_cancel_order` :8814,
   `exec_modify_order` :9045) still loop over all books to find an order id (the cancel
   probes every book twice). Not measured: the standard shape sends no single cancels.
-  Owner s96 chose option B (market in the order id) with one point to confirm; the options
-  and the consensus caveat are in 9.2. Step 0.2 adds a cancel-by-id cell.
+  Owner s96: option C now, B later as its own consensus item (9.2). Step 0.2 adds a
+  cancel-by-id cell.
+  - Change (C): a node-local map `OrderId -> MarketId` in the resident holder, next to
+    P2-1's trader index. An entry is added wherever an order rests (placement, the rest of
+    a matched order) and removed when the order leaves the book (fill, cancel, cancel-all,
+    liquidation cancel), rebuilt from the books at load. Not hashed, not persisted.
+    `exec_cancel_order` and `exec_modify_order` look up the market and touch only that
+    book. No entry, or the book no longer has the order: the same `order {id} not found`
+    result as today's full scan, and a stale entry is dropped.
+  - Expected saving (estimate): ~10-20 us per cancel or modify by id; adds one map
+    insert and one remove per resting order (~0.05-0.1 us each).
+  - Risk: a missing entry for a resting order would turn a valid cancel into
+    "not found": the one failure mode, so every insert and remove path is tested.
+  - Tests (first): differential vs a `#[cfg(test)]` full-scan reference (random places,
+    partial fills, cancels, modifies, cancel-alls, liquidation cancels; identical results,
+    CF dumps and `h_n`); invariant after every block: every resting order has an entry
+    naming its book; restart: the rebuilt map equals the carried one; ownership checks
+    (CONS-FIND-30, ModifyOrder s83 fix) unchanged.
+  - Gate P2-1b: the cancel-by-id cell's phase 1 ms per cancel down; standard shape not
+    worse.
 
 ### P2-2 Cache flush on the execution thread (15.9 ms; flush worker 74.4 ms is Phase 3)
 
@@ -307,7 +325,7 @@ each commit, one full `cargo test --workspace` before the merge.
 | step | commit | gate |
 |---|---|---|
 | 1 | P2-1 cancel-all index | P2-1 above |
-| 1b | P2-1b order id -> market (only if the owner confirms C in 9.2; B is a separate consensus item) | cancel-by-id cell |
+| 1b | P2-1b order id -> market map (option C, 9.2) | P2-1b above |
 | 2 | P2-3 exec pool | P2-3 above |
 | 3 | P2-2 batch flush | P2-2 above |
 | 4 | P2-4 design check (read-only); build only if it passes | P2-4 above |
@@ -316,7 +334,7 @@ each commit, one full `cargo test --workspace` before the merge.
 
 ## 5. Commit plan
 
-C0 counters + reference paths | C1 cancel-all index | (C1b order id lookup, per 9.2) |
+C0 counters + reference paths | C1 cancel-all index | C1b order id -> market map |
 C2 exec pool | C3 batch flush | (C4 liquidation skip, if step 4 passes) | C5 hasher. Every commit: full suite and goldens green,
 per-item ms in the commit message. One commit per item so a single item can be benched
 from an intermediate commit if its effect must be isolated.
@@ -345,8 +363,7 @@ Standard shape (results doc 21.4, as section 22):
   and optional O1 / O2 (Phase 1 plan section 5).
 - The flush worker (74.4 ms) and row 77: Phase 3 (coalesced state checkpoints).
 - Phases 3-5 in full (`item6-phases-2-5-plans.md`).
-- P2-1b option B (market in the order id) if the owner keeps it: a consensus change, its
-  own item (9.2).
+- P2-1b option B (market in the order id): later, as its own consensus item (9.2).
 - Backlog items in Phase 1 plan 9.13 (maker over-commit, governance errors, etc.).
 
 ## 8. Review log (filled during the build)
@@ -386,21 +403,22 @@ Whether oids are global or per market: not public.
 (hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint,
 .../api/info-endpoint)
 
-**Chosen: B, market in the order id** (`OrderId` is u128, `MarketId` u64: id =
-`market_id << 64 | sequence`). **To confirm (found while writing this, s96):** order ids
-come from the global counter `next_global_order_id` (`native_executor.rs:6760, 7131`) and
-are stored in book rows and results, so B changes consensus-visible values (the id format,
-book state, receipts). That breaks Phase 2's rule of no consensus or state format change
-(section 1). B therefore needs its own consensus item: every validator switches at one
-height (or a fresh genesis), a rule for ids issued before the switch (fall back to the
-scan, or a one-time map), and a check of clients that assume sequential ids (trading app,
-SDK). Owner: B as a separate consensus item after Phase 2, or C inside Phase 2?
+**Chosen: C now (inside Phase 2, spec in P2-1b), B later as its own consensus item**
+(owner s96). The owner first picked B; while writing this up (s96) it turned out that
+order ids come from the global counter `next_global_order_id`
+(`native_executor.rs:6760, 7131`) and are stored in book rows and results, so B changes
+consensus-visible values (the id format, book state, receipts) and breaks Phase 2's rule
+of no consensus or state format change (section 1). B (`OrderId` is u128, `MarketId` u64:
+id = `market_id << 64 | sequence`) needs: every validator switching at one height (or a
+fresh genesis), a rule for ids issued before the switch (fall back to the scan, or a
+one-time map), and a check of clients that assume sequential ids (trading app, SDK). With
+B, C's map becomes unnecessary and can be removed.
 
 | option | saving | HL parity | consensus | note |
 |---|---|---|---|---|
 | A. market in the action (`{market, oid}`) | full (no lookup) | **same as HL** | action format change | SDK and app change; modify still needs B or C. Relevant if the action format is aligned with HL anyway |
-| **B. market in the id (chosen)** | full; modify too | HL-like (cancel without naming the market) | **yes** (id format, state) | no action format change; separate consensus item, see above |
-| C. node-local id -> market map (superset, rebuilt at load, as P2-1) | full minus one map write per resting order (~0.05-0.1 us, est.) | HL-like | none | fits Phase 2's rule; more memory |
+| B. market in the id (later) | full; modify too | HL-like (cancel without naming the market) | **yes** (id format, state) | no action format change; separate consensus item, see above |
+| **C. node-local id -> market map (chosen now)** | full minus one map insert + remove per resting order (~0.05-0.1 us each, est.) | HL-like | none | fits Phase 2's rule; more memory |
 | D. nothing | 0 | gap | none | cost grows with cancel-by-id traffic |
 
 Step 0.2 adds a cancel-by-id cell so the saving is measured before building.
@@ -454,7 +472,7 @@ more than the hasher.
 
 ### 9.6 Base
 
-**Chosen (s96 recommendation, owner asked for one): main `35e69b3`** = the s94 batch
+**Chosen (owner s96, on 18c's recommendation): main `35e69b3`** = the s94 batch
 (`a0eda77`) + `feat/liq-telemetry` (`0ce261b`), both merged and pushed in s96. The +7% is
 measured against `35e69b3` too, not `59fa407`: the batch (bad-debt, auth replay, gas
 fixes) and the telemetry changed the code since Phase 1, and a `59fa407` reference would
