@@ -151,3 +151,56 @@ fn claim_unbonded_releases_every_matured_entry() {
     }
     assert!(mgr.claim_unbonded(delegator, 50).is_err(), "nothing left matured");
 }
+
+/// Row 74 review: an overflow in `claim_unbonded` is the same on every node,
+/// so it must NOT be a local fault (that would halt the whole chain). It used
+/// to be `State(InvalidData)`. The message text stays the same.
+fn assert_overflow_not_local(err: torus_economics::EconomicsError) {
+    assert!(
+        matches!(err, torus_economics::EconomicsError::Overflow(_)),
+        "want Overflow, got {err:?}"
+    );
+    assert!(!err.is_local_fault(), "an overflow is deterministic, not a local fault");
+    assert_eq!(
+        err.to_string(),
+        "state error: invalid data: claim_unbonded: released amount overflows"
+    );
+}
+
+#[test]
+fn claim_unbonded_sum_overflow_is_not_a_local_fault() {
+    let (_dir, db, delegator, v1, _v2) = setup();
+    put_delegation(
+        &db,
+        &Delegation {
+            delegator,
+            validator: v1,
+            amount: U256::ZERO,
+            unbonding: vec![UnbondingEntry {
+                amount: U256::MAX,
+                release_block: 10,
+            }],
+        },
+    );
+    let before = dump(&db);
+    let mgr = StakingManager::new(db.clone());
+    assert_overflow_not_local(mgr.claim_unbonded(delegator, 50).unwrap_err());
+    assert_eq!(dump(&db), before, "an overflow must change nothing");
+}
+
+#[test]
+fn claim_unbonded_balance_overflow_is_not_a_local_fault() {
+    let (_dir, db, delegator, _v1, _v2) = setup();
+    db.put_account(
+        &delegator,
+        &AccountInfo {
+            balance: U256::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = dump(&db);
+    let mgr = StakingManager::new(db.clone());
+    assert_overflow_not_local(mgr.claim_unbonded(delegator, 50).unwrap_err());
+    assert_eq!(dump(&db), before, "an overflow must change nothing");
+}

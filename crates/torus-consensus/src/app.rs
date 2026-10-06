@@ -1753,6 +1753,10 @@ impl ExecutionContext {
         let out_of_batch = torus_state::OutOfBatchRecorder::begin();
         let slash_overlay = NativeStateOverlay::new(self.state_db.clone());
         let slash_staking = StakingManager::new(slash_overlay.clone());
+        // Row 74: a local storage fault (`is_local_fault`) in any slash or
+        // tombstone fail-stops before `commit_tx`, so none of the slashes nor
+        // the block is written; other errors are only logged, as before.
+        let mut slash_fault = false;
         for slash in pending_slashes {
             match slash_staking.slash(slash.validator, slash.fraction_bps, slash.reason, 0) {
                 Ok(amount) => {
@@ -1764,6 +1768,7 @@ impl ExecutionContext {
                     );
                 }
                 Err(e) => {
+                    slash_fault |= e.is_local_fault();
                     tracing::error!(
                         %slash.validator,
                         %e,
@@ -1773,6 +1778,7 @@ impl ExecutionContext {
             }
             if slash.tombstone {
                 if let Err(e) = slash_staking.tombstone_validator(&slash.validator) {
+                    slash_fault |= e.is_local_fault();
                     tracing::error!(
                         %slash.validator,
                         %e,
@@ -1781,8 +1787,21 @@ impl ExecutionContext {
                 }
             }
         }
-        if let Err(e) = slash_overlay.commit_tx(&self.state_db) {
-            tracing::error!(%e, height, "CRITICAL: failed to write buffered slashes");
+        let slash_fault = slash_fault
+            || match slash_overlay.commit_tx(&self.state_db) {
+                Ok(()) => false,
+                Err(e) => {
+                    tracing::error!(%e, height, "CRITICAL: failed to write buffered slashes");
+                    true
+                }
+            };
+        if slash_fault {
+            tracing::error!(
+                height,
+                "FATAL: buffered slash storage fault — halting execution pipeline (fail-stop)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return;
         }
 
         tracing::info!(
@@ -2335,6 +2354,21 @@ impl ExecutionContext {
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
+            // Row 74: a local storage fault in governance, staking (the
+            // batches' handlers latch too, caught above), fees or the epoch
+            // boundary fail-stops exactly like the checks above.
+            if let Some(reason) = ctx.fatal_error.take() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native block tail (governance / fees / epoch) failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
             let tail_ns = tail_timer.elapsed().as_nanos();
             let engine_secs = engine_timer.elapsed().as_secs_f64();
 
@@ -17883,6 +17917,115 @@ mod crash_recovery_tests {
                 assert_eq!(hash_off, hash_rs, "{what}: running hash with restarts");
             }
         }
+    }
+
+    /// Row 74: a storage / decode fault in the governance step (it runs after
+    /// the liquidation check) fail-stops like the batches and the liquidation
+    /// step: no flush (the DB is byte-identical to before the block), the
+    /// applied height stays, and every later block refuses to execute.
+    #[test]
+    fn governance_storage_fault_fail_stops_and_flushes_nothing() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::cf::{CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS};
+        let blocks = book_fixture_blocks();
+        let (_c, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let ctx = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert!(!ctx.exec_failed.load(SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(2));
+
+        // Proposal counter > 0 and a proposal row that does not decode: the
+        // governance step's scan returns a Borsh error (a local fault).
+        db.put_cf_raw(CF_FEE_CONFIG, b"gov_next_id", &2u64.to_be_bytes())
+            .unwrap();
+        db.put_cf_raw(CF_GOVERNANCE_PROPOSALS, &1u64.to_be_bytes(), b"\xff")
+            .unwrap();
+
+        for b in &blocks[2..4] {
+            let height = b.header.height;
+            let durable = persist_committed_block_durably(&db, b);
+            let before = dump_all_cfs(&db);
+            ctx.execute_committed_block_with(b, vec![], durable);
+            assert!(
+                ctx.exec_failed.load(SeqCst),
+                "block {height}: must fail-stop"
+            );
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(2),
+                "block {height} not applied"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                "nothing of the failed block flushed",
+            );
+        }
+    }
+
+    /// Row 74 item 4: the buffered-slash loop. A slash whose validator has a
+    /// delegation row that does not decode (a local fault) fail-stops before
+    /// `commit_tx`: nothing of the slashes nor of the block reaches the DB. A
+    /// slash every node refuses alike (unknown validator) is only logged, as
+    /// before.
+    #[test]
+    fn slash_storage_fault_fail_stops_unknown_validator_does_not() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::cf::CF_STAKING_DELEGATIONS;
+        let slash = |validator: Address| PendingSlash {
+            validator,
+            fraction_bps: 500,
+            reason: SlashReason::DoubleSign,
+            tombstone: true,
+        };
+        let blocks = book_fixture_blocks();
+        let (_c, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let val = Address::repeat_byte(0x66);
+        register_proposer(&db, val);
+        let ctx = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+
+        // Unknown validator: deterministic, logged, the block applies.
+        let durable = persist_committed_block_durably(&db, &blocks[1]);
+        ctx.execute_committed_block_with(
+            &blocks[1],
+            vec![slash(Address::repeat_byte(0x55))],
+            durable,
+        );
+        assert!(
+            !ctx.exec_failed.load(SeqCst),
+            "an unknown validator must not halt"
+        );
+        assert_eq!(read_native_applied_height(&db), Some(2));
+
+        // A delegation row of `val` that does not decode (only the slash
+        // reads it): fail-stop, nothing written.
+        let mut del_key = [0x11u8; 40];
+        del_key[20..].copy_from_slice(val.as_slice());
+        db.put_cf_raw(CF_STAKING_DELEGATIONS, &del_key, b"\xff")
+            .unwrap();
+        let durable = persist_committed_block_durably(&db, &blocks[2]);
+        let before = dump_all_cfs(&db);
+        ctx.execute_committed_block_with(
+            &blocks[2],
+            vec![slash(Address::repeat_byte(0x55)), slash(val)],
+            durable,
+        );
+        assert!(
+            ctx.exec_failed.load(SeqCst),
+            "a slash storage fault must fail-stop"
+        );
+        assert_eq!(read_native_applied_height(&db), Some(2));
+        assert_dumps_equal(
+            &before,
+            &dump_all_cfs(&db),
+            "nothing of the failed block flushed",
+        );
     }
 
     /// Item 6 C1, guard P7 on the committed-block path: a fatal block (wrong

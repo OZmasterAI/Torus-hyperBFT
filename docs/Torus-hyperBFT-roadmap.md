@@ -21,6 +21,7 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 3. **No silent caps or truncation.** Any bound that drops work emits a metric.
 4. **Measurement is done on isolated hardware** before any code conclusion is drawn (see Tier 0).
 5. **One change per PR, each independently revertible**, behind a flag where the blast radius is the whole fleet.
+6. **A change to a stored borsh layout needs a migration or a fresh genesis.** Since row 74 (`item6-phase1-impl.md`), a stored row that does not decode is a local fault: the node fail-stops at the first read. Rows written before the change (example: `ValidatorState` has no fallback for rows without `oracle_signer`) would halt every node at once. Before row 74 the step only returned an error.
 
 ---
 

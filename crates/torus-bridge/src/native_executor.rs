@@ -5518,7 +5518,7 @@ impl NativeExecutor {
             NativeAction::TopUpSelfStake { amount } => {
                 match ctx.staking.top_up_self_stake(*sender, *amount) {
                     Ok(()) => NativeActionResult::ok("top_up_self_stake", 2000),
-                    Err(e) => NativeActionResult::err("top_up_self_stake", e.to_string()),
+                    Err(e) => Self::econ_err(ctx, "top_up_self_stake", e),
                 }
             }
 
@@ -9219,6 +9219,33 @@ impl NativeExecutor {
         NativeActionResult::ok("modify_order", 800)
     }
 
+    /// Row 74: latch the fail-stop (`fatal_error`) when `e` is a LOCAL fault
+    /// (`EconomicsError::is_local_fault`: storage failed or stored bytes do
+    /// not decode). Nothing rolls back inside a block, so the writes made
+    /// before the error sit in the block's overlay; the committer then skips
+    /// the flush and halts. Errors every validator hits alike never halt.
+    /// The first latched fault is kept.
+    fn latch_local_fault<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        step: &str,
+        e: &torus_economics::EconomicsError,
+    ) {
+        if e.is_local_fault() && ctx.fatal_error.is_none() {
+            ctx.fatal_error = Some(format!("{step}: {e}"));
+        }
+    }
+
+    /// An economics error as the action's error result (unchanged), after
+    /// [`Self::latch_local_fault`].
+    fn econ_err<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action_type: &'static str,
+        e: torus_economics::EconomicsError,
+    ) -> NativeActionResult {
+        Self::latch_local_fault(ctx, action_type, &e);
+        NativeActionResult::err(action_type, e.to_string())
+    }
+
     // ========================================================================
     // Staking handlers
     // ========================================================================
@@ -9231,7 +9258,7 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         match ctx.staking.delegate(*sender, *validator, amount) {
             Ok(()) => NativeActionResult::ok("delegate", 2000),
-            Err(e) => NativeActionResult::err("delegate", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "delegate", e),
         }
     }
 
@@ -9246,7 +9273,7 @@ impl NativeExecutor {
             .undelegate(*sender, *validator, amount, ctx.block_height)
         {
             Ok(()) => NativeActionResult::ok("undelegate", 2000),
-            Err(e) => NativeActionResult::err("undelegate", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "undelegate", e),
         }
     }
 
@@ -9260,7 +9287,7 @@ impl NativeExecutor {
             .permanent_stake(*sender, amount, ctx.block_height)
         {
             Ok(()) => NativeActionResult::ok("permanent_stake", 2000),
-            Err(e) => NativeActionResult::err("permanent_stake", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "permanent_stake", e),
         }
     }
 
@@ -9270,7 +9297,7 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         match ctx.staking.claim_rewards(*sender) {
             Ok(_) => NativeActionResult::ok("claim_rewards", 1500),
-            Err(e) => NativeActionResult::err("claim_rewards", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "claim_rewards", e),
         }
     }
 
@@ -9282,7 +9309,7 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         match ctx.staking.claim_unbonded(*sender, ctx.block_height) {
             Ok(_) => NativeActionResult::ok("claim_unbonded", 2000),
-            Err(e) => NativeActionResult::err("claim_unbonded", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "claim_unbonded", e),
         }
     }
 
@@ -9299,7 +9326,7 @@ impl NativeExecutor {
                 let gas = if jailed { 5000 } else { 2000 };
                 NativeActionResult::ok("jail_vote", gas)
             }
-            Err(e) => NativeActionResult::err("jail_vote", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "jail_vote", e),
         }
     }
 
@@ -9316,7 +9343,7 @@ impl NativeExecutor {
             .record_state_hash_attestation(*sender, height, hash.0, ctx.block_height)
         {
             Ok(_) => NativeActionResult::ok("attest_state_hash", 2000),
-            Err(e) => NativeActionResult::err("attest_state_hash", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "attest_state_hash", e),
         }
     }
 
@@ -9326,7 +9353,7 @@ impl NativeExecutor {
     ) -> NativeActionResult {
         match ctx.staking.unjail(sender, ctx.block_height) {
             Ok(()) => NativeActionResult::ok("unjail_self", 2000),
-            Err(e) => NativeActionResult::err("unjail_self", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "unjail_self", e),
         }
     }
 
@@ -9345,7 +9372,7 @@ impl NativeExecutor {
                     format!("validator registration not approved by governance for {sender}"),
                 );
             }
-            Err(e) => return NativeActionResult::err("register_validator", e.to_string()),
+            Err(e) => return Self::econ_err(ctx, "register_validator", e),
         }
 
         // Determine self-stake: sender's full balance is used as self-stake
@@ -9357,7 +9384,11 @@ impl NativeExecutor {
                     "sender account not found".to_string(),
                 );
             }
-            Err(e) => return NativeActionResult::err("register_validator", e.to_string()),
+            Err(e) => {
+                let msg = e.to_string();
+                Self::latch_local_fault(ctx, "register_validator", &e.into());
+                return NativeActionResult::err("register_validator", msg);
+            }
         };
 
         match ctx
@@ -9369,6 +9400,7 @@ impl NativeExecutor {
                 // to prevent a validator from registering without consuming their whitelist slot.
                 if let Err(e) = ctx.governance.consume_whitelist(sender) {
                     tracing::error!(%sender, %e, "whitelist consumption failed after registration");
+                    Self::latch_local_fault(ctx, "register_validator", &e);
                     return NativeActionResult::err(
                         "register_validator",
                         format!("registered but whitelist error: {e}"),
@@ -9376,7 +9408,7 @@ impl NativeExecutor {
                 }
                 NativeActionResult::ok("register_validator", 5000)
             }
-            Err(e) => NativeActionResult::err("register_validator", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "register_validator", e),
         }
     }
 
@@ -9390,7 +9422,7 @@ impl NativeExecutor {
             .update_commission(*sender, new_rate, ctx.block_height)
         {
             Ok(()) => NativeActionResult::ok("update_commission", 2000),
-            Err(e) => NativeActionResult::err("update_commission", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "update_commission", e),
         }
     }
 
@@ -9407,7 +9439,7 @@ impl NativeExecutor {
             ctx.block_height,
         ) {
             Ok(()) => NativeActionResult::ok("rotate_validator_key", 5000),
-            Err(e) => NativeActionResult::err("rotate_validator_key", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "rotate_validator_key", e),
         }
     }
 
@@ -9742,7 +9774,7 @@ impl NativeExecutor {
             ctx.block_height,
         ) {
             Ok(_id) => NativeActionResult::ok("submit_proposal", 5000),
-            Err(e) => NativeActionResult::err("submit_proposal", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "submit_proposal", e),
         }
     }
 
@@ -9761,7 +9793,7 @@ impl NativeExecutor {
                     .cast_vote_abstain(*sender, proposal_id, ctx.block_height)
                 {
                     Ok(()) => NativeActionResult::ok("vote", 2000),
-                    Err(e) => NativeActionResult::err("vote", e.to_string()),
+                    Err(e) => Self::econ_err(ctx, "vote", e),
                 }
             }
             _ => {
@@ -9771,7 +9803,7 @@ impl NativeExecutor {
                     .cast_vote(*sender, proposal_id, support, ctx.block_height)
                 {
                     Ok(()) => NativeActionResult::ok("vote", 2000),
-                    Err(e) => NativeActionResult::err("vote", e.to_string()),
+                    Err(e) => Self::econ_err(ctx, "vote", e),
                 }
             }
         }
@@ -10082,7 +10114,7 @@ impl NativeExecutor {
             ctx.dev_pool_address,
         ) {
             Ok(()) => NativeActionResult::ok("fee_distribution", 2000),
-            Err(e) => NativeActionResult::err("fee_distribution", e.to_string()),
+            Err(e) => Self::econ_err(ctx, "fee_distribution", e),
         }
     }
 
@@ -10090,7 +10122,8 @@ impl NativeExecutor {
     ///
     /// Phase A — Rewards: distributes permanent staking rewards and validator
     /// inflation to the CURRENT active set. Errors log-and-continue (reward
-    /// bugs should not block rotation).
+    /// bugs should not block rotation); a local fault (row 74) also latches
+    /// `fatal_error`, as does one in Phase B.
     ///
     /// Phase B — Rotation (consensus bug (b), torus_economics::epoch_plan):
     /// applies the plan the previous boundary stored (the set consensus installs
@@ -10109,12 +10142,14 @@ impl NativeExecutor {
             RewardDistributor::distribute_permanent_staking_rewards(&ctx.staking, ctx.epoch_length)
         {
             tracing::error!(%e, "permanent staking rewards failed");
+            Self::latch_local_fault(ctx, "permanent staking rewards", &e);
         }
 
         if let Err(e) =
             RewardDistributor::distribute_validator_inflation(&ctx.staking, ctx.epoch_length)
         {
             tracing::error!(%e, "validator inflation distribution failed");
+            Self::latch_local_fault(ctx, "validator inflation", &e);
         }
 
         // --- Phase B: Validator set rotation ---
@@ -10142,6 +10177,7 @@ impl NativeExecutor {
                 }
                 Err(e) => {
                     tracing::error!(%e, height = ctx.block_height, "planned epoch rotation failed");
+                    Self::latch_local_fault(ctx, "epoch_rotation", &e);
                     EpochBoundaryResult {
                         action: NativeActionResult::err("epoch_rotation", e.to_string()),
                         new_set: None,
@@ -10154,7 +10190,8 @@ impl NativeExecutor {
     /// Process pending governance proposals: one result per proposal outcome.
     /// s94: a proposal that failed at execution is an error result carrying
     /// its id and reason; the others still run. A storage error aborts the
-    /// step as one error result (as before).
+    /// step as one error result (as before) and, row 74, latches
+    /// `fatal_error` when it is a local fault: the node fail-stops.
     pub fn process_governance<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
@@ -10174,7 +10211,7 @@ impl NativeExecutor {
                     }
                 })
                 .collect(),
-            Err(e) => vec![NativeActionResult::err("governance_process", e.to_string())],
+            Err(e) => vec![Self::econ_err(ctx, "governance_process", e)],
         }
     }
 }
