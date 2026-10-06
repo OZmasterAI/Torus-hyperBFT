@@ -1,0 +1,201 @@
+# ADL per-block budget (P0 before testnet)
+
+**Status (s18, ozarchy):** design + options, **no production code yet**. Owner decisions needed
+on Q1-Q6 below before tests / code. Branch `perf/adl-budget` off main aae6b9b (profiling test
+b60bdff only). Liquidation design: `docs/plans/liquidation.md`.
+
+## 1. Problem (measured)
+
+Liquidation-stress cell S=750 (ozarchy, bench/liq-stress af8529e, N=4 b900, 300 markets, 100
+thin accounts with positions in ~270 markets each, `docs/perf/` section 23):
+
+* all 100 thin losers classify **ADL** (AV ≈ 1M − 0.075 × 20M ≈ −500k < 0) in heights 788-790;
+* 26,778 ADL steps (one per account-market), 27,410 counterparty closes (K ≈ 1 per step);
+* liquidation step **332 s / 123 s / 241 s** per block, median 23-27 ms per step, rising
+  ~1.4× within a block; consensus height frozen 787-789 for **~11.6 min** (liveness FAIL);
+  state AGREE, vault deficit 26,516,805.13 on every node.
+
+S=400 (same cell, AV/MM ≈ 0.40 after the shock): all 100 BACKSTOP (0 stage 1, 0 ADL), step
+98 / 46 / 115 ms, vault +19.98M, pass. 18c's hypothesis is confirmed: stage 1 is the
+`[2/3 MM, MM)` band; a 400 bp shock on ~20M notional against 1M collateral moves AV/MM from
+~2.0 to ~0.40, past the band (a shock of 251-333 bp would land in it). Per-account AV/MM is
+derived (the logs print counts only); the mean (199,850 AV) is measured from the vault.
+
+## 2. Root cause (profiled)
+
+`adl_account` (`liquidation_step.rs:488`) runs, per marked position of the ADL'd account,
+`liq::adl_candidates` (`liquidation.rs:344`): a paged walk of `CF_NATIVE_POSITIONS` **from the
+empty key** until `ADL_MAX_SCAN_ROWS` = 65,536 rows, then a filter on `key[20..28] == m`. The
+CF is keyed `trader ‖ market`, so every step copies, merges and drops the same first 65,536 rows
+whatever the market.
+
+Microbench `crates/torus-bridge/tests/ubench_adl.rs` (ignored; real `run_liquidations` through
+`NativeStateOverlay` with R attached; quiet machine):
+
+| traders N (×300 positions) | rows | window | bankrupt K | ms / step (median) |
+|---|---|---|---|---|
+| 100 | 30,540 | whole CF | 1 | 5.4 |
+| 250 | 75,540 | capped | 1 | 11.7 |
+| 1000 | 300,540 | capped | 1 | 13.8 |
+| 5000 | 1,500,540 | capped | 1 | 12.0 |
+| 5000 | 1,502,970 | capped | 10 | 16.4 (13.5 → 17.3 first → last account) |
+| 5000, no R | 1,500,540 | capped | 1 | 37.9 |
+
+perf (N=5000, K=10): `adl_candidates` = **97.7 %** of `run_liquidations`
+(`iterate_cf_from`/`merge_from` ~35 % self, `memcmp` ~28 % from pending/parent map lookups per
+row, malloc/free ~25 % from two `Vec`s per row, `memcpy` ~6 %). Ranking AV (`pos_sums`) 0.4 %,
+`adl_rest` 0.04 ms, `adl_close`/`apply_fill` ≤ 0.1 %. The within-block rise is the pending map
+growing with every ADL transfer (each row's merge lookup gets slower). The rig's ~26 ms/step
+(~0.40 µs/row) is the same mechanism on a host running 3 nodes.
+
+Two further defects in the same code:
+
+* **Fairness (correctness).** The window always starts at the lowest key, so with > 65,536 rows
+  the counterparties come only from the lowest-address traders (~200 at 300 positions each),
+  not "every opposite-side position in m" as `liquidation.md` *ADL* specifies (H3 accepted the
+  window as a limitation; at bench scale it is the common case, not the rare one).
+* **No bound on ADL work.** `LIQ_ACT_PER_BLOCK` = 64 counts **accounts**; one ADL'd account is
+  one step per marked position (~270 here) and nothing bounds work inside it. Even at 0.1 ms
+  per step, 64 accounts × 300 markets = 1.9 s in one block.
+
+So the fix has two independent parts: **(A) make a step cheap and correct** (candidate source)
+and **(B) bound ADL work per block** (budget + carry-over queue). Either alone is not enough:
+(A) alone still lets one block do unbounded work; (B) alone at ~15-26 ms per step allows only
+~1-2 steps per block (26,778 steps ⇒ hours of ADL).
+
+## 3. Part A — candidate source (Q1)
+
+Target semantics (restores `liquidation.md`): candidates of `m` = **every** opposite-side
+position in `m` (the ADL'd account excluded), ranked as today (`adl_rank`, exact, ties by
+address). `ADL_MAX_SCAN_ROWS` goes. OI symmetry then guarantees one step fully closes the
+position (Σ opposite size ≥ size), so there is no partial-close retry.
+
+| Option | How | Cost per ranking of m | Format / consensus | Notes |
+|---|---|---|---|---|
+| **C1 — point reads over the trader set (recommended now)** | for each trader of the E2 sorted set (`TraderPositions::traders_after(None, ∞)`, block-written traders merged), `get_position(t, m)` via the records (clean traders) / overlay (dirty) | O(A) lookups (~0.1 µs with records) + AV for holders | none | Smallest change; reuses item 6 E2/C7 with the existing shadow check. Fallback without records (tests / tools): the same loop over `liq::traders_after` + overlay reads (slow, correct). Scales with A, not with holders of m. |
+| C2 — node-local market → traders index | kept in `TraderPositions` next to `traders`, updated from each block's `ResidentDelta` at `end_resident`; merged with the block's dirty traders | O(holders of m) | none (node-local, derived) | Same as C1 when every trader holds every market (the bench); wins for thin markets at 100k accounts. More code (another maintained set + tests). |
+| C3 — consensus index rows `market ‖ trader` | written on every position open / close / flip | O(holders of m), also on cold nodes | new root-hashed rows (fresh genesis; fine pre-testnet), extra write on the order hot path | Reverses C1-decision (s517 "no separate index"); needs a throughput A/B. Only if node-local is ever not enough. |
+
+Estimate at bench scale (A = 5000, ~2,500 opposite holders per market): C1 ≈ 0.5 ms of lookups
++ ~2,500 AV evaluations (~0.5 µs each from the microbench's ranking share) + one sort ≈ **2 ms
+per ranking**, i.e. ~10× cheaper than today, and correct. 27k rankings would still be ~54 s
+of work in total, hence Q2 (rank once per block and market) and the budget (Part B).
+
+### Q2 — ranking per step or per (block, market)?
+
+* **Per step** (today's semantics): every ADL'd account-market re-ranks m. Exact "current
+  state" ranking; cost = rankings × holders.
+* **Per (block, market) (recommended):** the first ADL step in m in a block ranks m once; later
+  steps in m in the same block walk the same ranked list from where the previous one stopped,
+  re-reading each candidate's current position (`adl_close` already skips a vanished / flipped
+  candidate and caps at the current size). Deterministic; a counterparty's AV used for ranking
+  is the one at the block's first ADL in m. S=750 cost: ~270 rankings per block instead of
+  ~12,600 (≈ 0.5 s → bounded by the budget anyway).
+
+## 4. Part B — budget and carry-over queue
+
+### Budget (Q3)
+
+`ADL_WORK_PER_BLOCK` = W work units, deterministic counts only:
+
+* **(a) units = candidates examined + closes (recommended):** a ranking of m costs the traders
+  it looked at (C1: A; C2: holders of m), a cached step costs its closes. Tracks CPU; a step
+  starts only while `used < W` and is atomic, so a block overshoots by at most one step (one
+  ranking of one market).
+* (b) units = account-market steps (18c's first suggestion): simplest to explain; with Q2 a
+  step's cost differs ~1000× between a ranking step and a cached one, so W must be set for the
+  worst case.
+* (c) units = closes: does not see the ranking cost (the dominant term). Not recommended.
+
+W is set from the prototype's measured ns per unit so that ADL adds ≤ ~20 ms to a block on the
+rig (normal exec ~18 ms/block); the number goes into this doc with the measurement.
+
+### Queue (Q4) — in `CF_NATIVE_LIQUIDATION` (root tag 6, already hashed; no new CF)
+
+* `0x07 ‖ height(8, BE) ‖ trader(20)` → `[1]`: account under ADL, **FIFO by the height it was
+  classified ADL, then address**. `0x08 ‖ trader` → height (membership / delete).
+  (Alternative: `0x07 ‖ trader` only = address order; simpler, but a high address can wait
+  behind later bankruptcies.)
+* Per block, the liquidation step:
+  1. the regular pass as today (scan 2048 / act 64, cursor); an account classified ADL gets its
+     orders and stops cancelled (D4) and is **enqueued**, not processed in the pass;
+  2. drains the queue in key order under W: per queued account, **re-classify first** — if
+     AV ≥ 0 now (marks moved) it leaves the queue (the regular pass handles it next time as
+     backstop / stage 1 / healthy); else its marked positions are closed in ascending market
+     (closed positions vanish, so resuming needs no stored market) until W runs out;
+  3. an account with no marked position left: flat-deficit / remaining collateral to the vault
+     (D9, unchanged) and dequeue;
+  4. the vault (D8): enqueued like any account when its AV < 0 (today it is ADL'd at the end of
+     every pass without bound).
+* `liquidation_due` also checks the `0x07` prefix (the queue keeps the step due, like the M2
+  pending row).
+
+### What a queued account may do meanwhile (Q5)
+
+* **(a) frozen (recommended):** every signed action of a queued account is rejected
+  (orders incl. reduce-only, cancels, withdrawals, transfers, leverage changes) with a
+  `liquidating` result; deposits / incoming transfers are credited (they only reduce the
+  deficit). Cost: one membership read per action only in blocks whose queue is non-empty
+  (`prefix_exists(0x07)` once per block → flag), so zero cost normally.
+* (b) not frozen, rely on margin gates: AV < 0 should fail opening orders and withdrawals (to
+  verify per action before choosing this), but **reduce-only orders have no margin gate**
+  (`liquidation.md` stage 1), so the account could
+  close positions into the book at worse prices between ADL steps; harmless for conservation
+  (the loss still lands in the vault) but it races the queue and is harder to reason about.
+
+### Vault deficit in between (Q6)
+
+* Queued positions stay with the bankrupt account and are marked every block; its negative AV is
+  the **unrealized** deficit. The vault's balance (the realized deficit) changes only when the
+  account goes flat (D9), at the ADL prices of each step (previous mark clamped to the
+  bankruptcy price at that step, H1/D10 unchanged — no price snapshot at enqueue).
+* Counterparties keep their positions (and PnL) until their market is reached; who is closed
+  depends on the ranking at that block, not at the bankruptcy block.
+* Exposure grows with drain time = total work / W. New node-local gauges:
+  `torus_liquidation_adl_queue` (accounts) and `torus_liquidation_adl_queue_deficit`
+  (Σ −AV of queued accounts, computed only with metrics).
+* Alternative considered, **not recommended:** at ADL classification move every marked position
+  + collateral to the vault at the mark (backstop-style, cheap) and then ADL the vault under the
+  budget. Resolves the account at once (no freeze), but ADL then prices against the vault's
+  bankruptcy price and closes the vault's healthy backstop inventory too — a larger semantic
+  change from HL (HL ADLs the user's positions).
+
+## 5. Tests first (before code)
+
+Unit / integration (torus-core `liquidation_tests.rs`, bridge `liquidation_l1_tests.rs` style):
+
+1. Candidates = every opposite-side holder: with > 65,536 position rows, the top-ranked
+   counterparty at a **high** address is closed first (fails today).
+2. C1 shadow: records path == overlay walk for candidate lists (incl. traders the block wrote).
+3. Budget: K ADL'd accounts whose work > W → the step stops at W (± one step), the queue holds
+   the rest in FIFO order, the next block resumes exactly there; two runs → identical state root.
+4. Re-classification: a queued account whose AV recovers ≥ 0 leaves the queue and is not ADL'd.
+5. Freeze (if Q5 a): queued account's order / cancel / withdraw rejected with `liquidating`;
+   deposit credited; no check cost when the queue is empty.
+6. Invariants over a multi-block drain: OI symmetry per market after every block, value
+   conservation, vault ends with the summed deficit, ADL'd accounts end at exactly 0.
+7. Vault in the queue: vault AV < 0 → enqueued, drained under W.
+8. `liquidation_due` true while the queue is non-empty.
+9. Backstop / stage-1 paths byte-identical (regression: existing liquidation tests unchanged).
+10. `ubench_adl`: per-step and per-block ADL time below the W target at N = 5000.
+
+## 6. Proof
+
+* `ubench_adl` before / after (ms per step, ms per block at W).
+* Liquidation-stress cell **S=750**: liveness PASS (no commit gap above the normal cadence
+  bound), liquidation step ≤ the W target every block, queue drains to 0, AGREE, vault deficit
+  identical on all nodes, number of blocks to drain reported.
+* **S=400 unchanged:** 100 BACKSTOP, vault +19.98M (19,984,975.69), step times in the same range.
+* Harness fixes from s17 first (liq_stress.py `_count` KeyError, stale test genesis in the
+  worktree, reflink-seeded stale binaries).
+
+## 7. Decisions needed
+
+| # | Question | Recommendation |
+|---|---|---|
+| Q1 | Candidate source | C1 now (no format change); C2 if a 100k-account sweep shows ranking dominates; C3 only as a later consensus item |
+| Q2 | Ranking refresh | once per (block, market), candidates re-read at close |
+| Q3 | Budget unit | candidates examined + closes; W from the measurement (≤ ~20 ms ADL per block) |
+| Q4 | Queue order | FIFO `0x07 ‖ height ‖ trader` in `CF_NATIVE_LIQUIDATION` |
+| Q5 | Queued account actions | frozen, deposits allowed |
+| Q6 | Deficit in between | unrealized on the account, realized at flat (D9); add the two gauges; no move-to-vault |
