@@ -62,10 +62,12 @@ NO_PENDING = (
     "torus_liquidations_triggered_total rose, a LOWER BOUND."
 )
 ALWAYS_MISSING = [
-    "ADL counterparties: each node logs one info line per ADL close ('liquidation: "
-    "ADL close' with account, counterparty, market, size, price) in its own log "
+    "ADL counterparties: each node logs one info line per ADL'd (account, market) "
+    "('liquidation: ADL to escrow' with size, base, bankruptcy price, price), one per "
+    "escrow pairing ('liquidation: ADL escrow pairing') and each escrow close at "
+    "debug ('liquidation: ADL close', with the counterparty) in its own log "
     "(RUN_DIR/val<i>.log, not in the cell dir); this tool does not parse node logs. "
-    "torus_liquidations_adl_total counts ADL'd accounts only.",
+    "torus_liquidations_adl_total counts ADL runs (accounts and the vault), not closes.",
 ]
 NOTES = [
     "torus_liquidations_triggered_total counts accounts ACTED ON per block: an account "
