@@ -383,6 +383,10 @@ impl BlockValidator {
                         "native action {i}: signature verification failed: {e}"
                     ))
                 })?;
+            // Nonce window against the block time (exec skips such an action).
+            torus_types::eip712::check_nonce_window(signed.nonce, block_ms).map_err(|e| {
+                BridgeError::InvalidBlock(format!("native action {i}: nonce {}: {e}", signed.nonce))
+            })?;
             // Replay check: reject blocks containing replayed nonces.
             let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
             if state_db

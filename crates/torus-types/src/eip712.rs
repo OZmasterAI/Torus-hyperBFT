@@ -35,6 +35,19 @@ pub fn block_timestamp_ms(header_timestamp_secs: u64) -> u64 {
     header_timestamp_secs.saturating_mul(1000)
 }
 
+/// A nonce (signing time, ms) is valid within ±[`NONCE_WINDOW_MS`] of `now_ms`,
+/// inclusive. Intake passes its wall clock; block execution passes
+/// [`block_timestamp_ms`] of the header, so every node decides identically.
+pub fn check_nonce_window(nonce: u64, now_ms: u64) -> Result<(), Eip712Error> {
+    if nonce.saturating_add(NONCE_WINDOW_MS) < now_ms {
+        return Err(Eip712Error::NonceTooOld);
+    }
+    if nonce > now_ms.saturating_add(NONCE_WINDOW_MS) {
+        return Err(Eip712Error::NonceTooFuture);
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -949,14 +962,7 @@ impl SignedNativeAction {
             });
         }
 
-        // Nonce must be within +-60 s of current time.
-        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
-            return Err(Eip712Error::NonceTooOld);
-        }
-        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
-            return Err(Eip712Error::NonceTooFuture);
-        }
-
+        check_nonce_window(self.nonce, current_time_ms)?;
         self.recover_sender()
     }
 
@@ -977,13 +983,7 @@ impl SignedNativeAction {
             });
         }
 
-        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
-            return Err(Eip712Error::NonceTooOld);
-        }
-        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
-            return Err(Eip712Error::NonceTooFuture);
-        }
-
+        check_nonce_window(self.nonce, current_time_ms)?;
         self.resolve_sender(current_time_ms, session_lookup)
     }
 }
@@ -1701,6 +1701,21 @@ mod tests {
         // Boundary: exactly 60 s in the future.
         let s = sign_native_action(NativeAction::ClaimRewards, now + NONCE_WINDOW_MS, &key);
         assert!(s.validate(now, TORUS_CHAIN_ID).is_ok());
+    }
+
+    /// The window check shared by intake (`validate*`) and block execution:
+    /// inclusive on both sides, saturating at the u64 ends.
+    #[test]
+    fn check_nonce_window_is_inclusive_and_saturating() {
+        let now = 1_700_000_000_000u64;
+        let w = NONCE_WINDOW_MS;
+        assert_eq!(check_nonce_window(now - w, now), Ok(()));
+        assert_eq!(check_nonce_window(now + w, now), Ok(()));
+        assert_eq!(check_nonce_window(now - w - 1, now), Err(Eip712Error::NonceTooOld));
+        assert_eq!(check_nonce_window(now + w + 1, now), Err(Eip712Error::NonceTooFuture));
+        assert_eq!(check_nonce_window(0, w), Ok(()));
+        assert_eq!(check_nonce_window(u64::MAX, u64::MAX), Ok(()));
+        assert_eq!(check_nonce_window(u64::MAX, 0), Err(Eip712Error::NonceTooFuture));
     }
 
     // --- chain ID ---

@@ -452,6 +452,43 @@ fn block_validation_rejects_session_expired_at_header_time() {
     assert!(err.to_string().contains("session key expired"), "{err}");
 }
 
+/// Commit 2: block validation enforces the ±NONCE_WINDOW_MS nonce window
+/// against the block time (inclusive), like intake does against wall time.
+#[test]
+fn block_validation_rejects_nonce_outside_window_of_header_time() {
+    use torus_types::eip712::NONCE_WINDOW_MS as W;
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    let evm = torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID);
+    let validator =
+        torus_bridge::BlockValidator::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0));
+    let session_key = make_ed25519_key();
+    let session = SessionData {
+        owner: addr(1),
+        expiry: u64::MAX,
+        scope: SessionScope::Trading,
+        created_at: 0,
+    };
+    state_db
+        .put_session(&session_key.verifying_key().to_bytes(), &session)
+        .unwrap();
+    for (nonce, ok) in [
+        (block_ms - W, true),
+        (block_ms + W, true),
+        (block_ms - W - 1, false),
+        (block_ms + W + 1, false),
+    ] {
+        let signed = sign_with_session(NativeAction::CancelOrder { order_id: 1 }, nonce, &session_key);
+        let block = propose(&state_db, signed).expect("the proposer does not filter by window");
+        match (validator.validate_block_with_native(&block, &state_db, &evm), ok) {
+            (Ok(_), true) => {}
+            (Err(e), false) => assert!(e.to_string().contains("nonce"), "{e}"),
+            (Ok(_), false) => panic!("nonce {nonce} outside the window of block {block_ms} ms accepted"),
+            (Err(e), true) => panic!("nonce {nonce} inside the window rejected: {e}"),
+        }
+    }
+}
+
 #[test]
 fn session_scope_transfers_only_blocks_trading() {
     let (_dir, state_db) = open_test_db();
