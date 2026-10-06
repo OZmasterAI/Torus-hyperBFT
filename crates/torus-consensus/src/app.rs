@@ -17278,6 +17278,75 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
+    /// s94 bad-debt route (`crates/torus-bridge/tests/
+    /// offmark_bad_debt_tests.rs` has the executor-level cases), through
+    /// committed blocks on the live dispatch path. A (seed 75) and B (76),
+    /// one owner, each funded 100 = the IM of 10 at 200 (20x).
+    /// Probe (77a3b21): B's IOC sell filled A's bid @200 in block 2, A was
+    /// ADL'd at the block's end with -900 left in the vault, and B moved
+    /// 1,100 to the EVM side for 200 deposited.
+    /// Fixed: block 1 (no mark yet, never marked: no band): A's GTC bid 10
+    /// @200 rests (reserves 100). Block 2 (mark 100): B's IOC sell @200 is
+    /// rejected at placement by the price band (option 2: more than 50% from
+    /// the mark; had it matched, option 1 would margin-cancel A's bid: loss
+    /// 1,000 − tolerance 75 > A's free 0). B's TransferToSpot 100 takes back
+    /// its own deposit. Block 3: B's 1,000 is refused. The vault stays at 0.
+    #[test]
+    fn offmark_fill_e2e_is_refused_and_the_counterparty_gets_back_only_its_deposit() {
+        use torus_core::liquidation::LIQUIDATOR_VAULT;
+        use torus_core::position::{NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        let (a, b) = (oracle_addr(75), oracle_addr(76));
+        for t in [a, b] {
+            pm.put_native_balance(&t, &NativeBalance { available: px(100), order_margin: FixedPoint::ZERO }).unwrap();
+        }
+        let ioc_sell = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: false,
+                price: px(200),
+                quantity: px(10),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::IOC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            2_076,
+            &oracle_key(76),
+        );
+        let to_spot = |nonce: u64, amount: i64| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToSpot { amount: U256::from(px(amount).raw() as u128) },
+                nonce,
+                &oracle_key(76),
+            )
+        };
+        let mut r1: Vec<SignedNativeAction> = (61..=63).map(|s| oracle_sub(s, 1, 100)).collect();
+        r1.push(signed_bid(75, 1_075, 200, 10));
+        let blocks = liq_blocks(vec![r1, vec![ioc_sell, to_spot(2_176, 100)], vec![to_spot(3_076, 1_000)]]);
+        let ctx = make_exec_ctx(&config, &db);
+        let native = |t: &Address| {
+            let x = pm.get_native_balance(t).unwrap();
+            (x.available, x.order_margin)
+        };
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: no fill (B's sell refused by the band)");
+        assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO);
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "A's bid still rests");
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
+        dispatch_and_execute(&ctx, &db, &blocks[2]);
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "block 3: nothing more");
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(3));
+    }
+
     // ---- s517 oracle feeder S4: the hot oracle signer through whole blocks ----
 
     /// The hot signer key of validator `seed` (a separate address).

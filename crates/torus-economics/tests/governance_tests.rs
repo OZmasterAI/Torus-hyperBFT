@@ -378,6 +378,30 @@ fn execute_parameter_change() {
     assert_eq!(proposal.proposal_type, ProposalType::ParameterChange);
 }
 
+/// s94 option 2: the placement price band is a ParameterChange key
+/// (`price_band_bps`, 100..=9,000): a valid value executes into
+/// CF_FEE_CONFIG (the executor and RPC read it there); out of range or not a
+/// number is refused at submission.
+#[test]
+fn execute_price_band_parameter_change() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    for bad in ["99", "9001", "0", "abc"] {
+        let payload = ExecutionPayload::ParameterChange { param_key: "price_band_bps".into(), new_value: bad.into() };
+        let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+        assert!(matches!(r, Err(EconomicsError::InvalidParameterValue { .. })), "{bad}: {r:?}");
+    }
+    let payload = ExecutionPayload::ParameterChange { param_key: "price_band_bps".into(), new_value: "1000".into() };
+    let id = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0).unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    assert_eq!(gov.finalize_proposal(id, 101).unwrap(), ProposalOutcome::Passed(id));
+    assert_eq!(gov.execute_proposal(id, 120).unwrap(), ProposalOutcome::Executed(id));
+    let data = gov.state().get_cf_raw(CF_FEE_CONFIG, b"price_band_bps").unwrap().unwrap();
+    assert_eq!(&data, b"1000");
+    assert_eq!(torus_types::price_band_bps(Some(&data)), 1_000);
+}
+
 #[test]
 fn execute_treasury_spend() {
     let (_dir, gov, staking) = setup();

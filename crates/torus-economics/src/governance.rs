@@ -705,6 +705,22 @@ impl<T: StateBackend> GovernanceManager<T> {
                     });
                 }
             }
+            // s94 option 2: the placement price band (executor + RPC read
+            // it through `torus_types::price_band_bps`).
+            torus_types::PRICE_BAND_PARAM => {
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
+                if !torus_types::PRICE_BAND_BPS_RANGE.contains(&v) {
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be between 100 and 9000 (1% - 90%)".to_string(),
+                    });
+                }
+            }
             _ => return Err(EconomicsError::ParameterNotModifiable(key.to_string())),
         }
         Ok(())

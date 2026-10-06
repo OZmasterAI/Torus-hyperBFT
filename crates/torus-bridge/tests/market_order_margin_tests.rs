@@ -601,8 +601,14 @@ fn market_sell_filling_worse_than_mark_stops_when_margin_runs_out() {
 }
 
 /// Mark 100, asks 105 x 5 then 110 x 5, taker holds 52: a market buy of 10
-/// (cap 120) reserves 50 at the mark. 5 @105 cost 26.25; 4 more @110 bring
-/// it to 48.25 (<= 52), a 10th would need 53.75: 9 fill, 1 is cancelled.
+/// (cap 120) reserves 50 at the mark. Before s94 (IM only): 5 @105 cost
+/// 26.25, 4 more @110 brought it to 48.25 (<= 52): 9 filled — and the
+/// taker lost 65 against the mark with 52 (equity −13, bad debt). s94
+/// option 1 (the loss against the mark beyond the fill's IM − MM): 5 @105
+/// need 26.25 + loss 25 − tolerance 13.75 = 37.5 (charge 11.25); each unit
+/// @110 adds IM 5.5 + loss 10 − tolerance 3 = 12.5: 1 more fits (50 <= 52),
+/// a 2nd would need 62.5. 6 fill (equity 52 − 35 = 17 >= MM 15), 4 are
+/// cancelled.
 #[test]
 fn market_buy_filling_worse_than_mark_stops_when_margin_runs_out() {
     for path in PATHS {
@@ -621,9 +627,9 @@ fn market_buy_filling_worse_than_mark_stops_when_margin_runs_out() {
 
         let r = run(&mut ctx, path, &[place(taker, market(1, true, fp(120), 10))]);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
-        assert_eq!(pos(&ctx, &taker), fp(9), "{path:?}: stopped at the margin limit");
+        assert_eq!(pos(&ctx, &taker), fp(6), "{path:?}: stopped at the margin limit");
         assert!(resting(&ctx, &taker).is_empty(), "{path:?}: remainder cancelled");
-        assert_eq!(resting(&ctx, &m2), vec![fp(1)], "{path:?}: 110 ask remainder");
+        assert_eq!(resting(&ctx, &m2), vec![fp(4)], "{path:?}: 110 ask remainder");
         assert_bal(&ctx, &taker, fp(52), FixedPoint::ZERO, "taker released exactly");
     }
 }
@@ -812,17 +818,20 @@ fn batch_bid_through_best_ask_does_not_affect_market_sell() {
 /// deep bid far BELOW the asks (100 @1) consumes none of them. With asks
 /// 100 @101, `[buy 100 @1, buy 1 @1000]` made the 1000 bid "rest" (it fills
 /// at 101) and every later market sell reserved at 1000 and was rejected.
+/// s94 option 2: 1 and 1,000 are outside the ±50% price band around the mark
+/// 100 (refused at placement), so the same shape at the band's edges: `[buy
+/// 100 @50, buy 1 @150]`.
 #[test]
 fn batch_deep_low_bid_then_high_bid_does_not_affect_market_sell() {
     for path in PATHS {
         let setup = [place(addr(4), limit(1, false, 101, 100))];
         let ahead = (
             addr(3),
-            NativeAction::PlaceOrderBatch(vec![limit(1, true, 1, 100), limit(1, true, 1_000, 1)]),
+            NativeAction::PlaceOrderBatch(vec![limit(1, true, 50, 100), limit(1, true, 150, 1)]),
         );
         let (r, ctx, _d) = run_sell_after(path, &setup, ahead);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
-        assert_eq!(pos(&ctx, &addr(3)), fp(1), "{path:?}: the 1000 bid filled at 101");
+        assert_eq!(pos(&ctx, &addr(3)), fp(1), "{path:?}: the 150 bid filled at 101");
         assert_sell_filled_at_100(path, &r, &ctx);
     }
 }
