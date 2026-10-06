@@ -12,16 +12,47 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use torus_state::cf::{
-    CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_GOVERNANCE_VOTES, CF_NATIVE_MARKETS,
+    CF_ACCOUNTS, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_GOVERNANCE_VOTES, CF_NATIVE_MARKETS,
     CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
 };
-use torus_state::{StateBackend, StateDb};
+use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 use crate::error::EconomicsError;
 use crate::types::{Delegation, PermanentStakeInfo};
 
 type Result<T> = std::result::Result<T, EconomicsError>;
+
+/// Row 75: one row write computed but not yet applied, `(cf, key, value)`;
+/// a `None` value deletes the row. A payload's staged writes are applied
+/// together by [`apply_staged`].
+pub(crate) type StagedWrite = (&'static str, Vec<u8>, Option<Vec<u8>>);
+
+/// Row 75: apply `writes` in order as ONE `atomic_write` (a RocksDB
+/// `WriteBatch` on `StateDb`, one pending-map update on the overlay): either
+/// every row lands or none does. A key written twice ends with its last value.
+pub(crate) fn apply_staged<T: StateBackend>(state: &T, writes: &[StagedWrite]) -> Result<()> {
+    let ops: Vec<AtomicWriteOp<'_>> = writes
+        .iter()
+        .map(|(cf, key, value)| match value {
+            Some(value) => AtomicWriteOp::Put { cf, key, value },
+            None => AtomicWriteOp::Delete { cf, key },
+        })
+        .collect();
+    state.atomic_write(&ops)?;
+    Ok(())
+}
+
+/// Row 75: an account row as a staged write. `encoded` is
+/// `torus_state::db::encode_account_info(&info)`, the bytes `put_account`
+/// stores.
+pub(crate) fn account_write(address: &Address, encoded: [u8; 72]) -> StagedWrite {
+    (
+        CF_ACCOUNTS,
+        address.as_slice().to_vec(),
+        Some(encoded.to_vec()),
+    )
+}
 
 // ============================================================================
 // Constants
@@ -1013,9 +1044,13 @@ impl<T: StateBackend> GovernanceManager<T> {
 
     /// Execute a passed proposal after its timelock has expired (FIX 15).
     ///
-    /// On an execution failure (`is_execution_failure`) nothing is written and
-    /// the proposal stays Passed; the per-block `process_pending_proposals` is
-    /// what turns it into the terminal Failed status (s94).
+    /// Row 75: all-or-nothing. The payload's rows and the proposal's
+    /// Executed status are staged first and land in ONE atomic write, so a
+    /// storage error can never leave a half-applied payload, nor an applied
+    /// payload under a still-Passed proposal (which the next block would apply
+    /// again). On any error nothing is written and the proposal stays Passed;
+    /// the per-block `process_pending_proposals` turns an execution failure
+    /// (`is_execution_failure`) into the terminal Failed status (s94).
     pub fn execute_proposal(
         &self,
         proposal_id: u64,
@@ -1040,10 +1075,16 @@ impl<T: StateBackend> GovernanceManager<T> {
         let params = self.get_governance_params()?;
 
         if let Some(ref payload) = proposal.execution_payload {
-            self.execute_payload(payload, &params, current_block)?;
+            let mut writes = self.stage_payload(payload, &params, current_block)?;
             proposal.status = ProposalStatus::Executed;
-            self.put_proposal(&proposal)?;
-            tracing::info!(proposal_id, "proposal executed after timelock");
+            let row = borsh::to_vec(&proposal).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            writes.push((
+                CF_GOVERNANCE_PROPOSALS,
+                proposal.id.to_be_bytes().to_vec(),
+                Some(row),
+            ));
+            apply_staged(&self.state, &writes)?;
+            tracing::info!(proposal_id, ?payload, "proposal executed after timelock");
             return Ok(ProposalOutcome::Executed(proposal_id));
         }
 
@@ -1095,8 +1136,8 @@ impl<T: StateBackend> GovernanceManager<T> {
     }
 
     /// Set a Passed proposal whose execution failed to the terminal Failed
-    /// status. Only the status changes; `execute_payload` wrote nothing
-    /// (every execution-failure check runs before its first write).
+    /// status. Only the status changes; `execute_proposal` wrote nothing
+    /// (row 75: it writes only once the whole payload has staged).
     fn mark_failed(&self, proposal_id: u64, reason: String) -> Result<ProposalOutcome> {
         let mut proposal = self
             .get_proposal_raw(proposal_id)?
@@ -1111,37 +1152,35 @@ impl<T: StateBackend> GovernanceManager<T> {
     // Proposal execution helpers
     // ========================================================================
 
-    /// Apply a payload. Invariant (s94): every error that
-    /// `is_execution_failure` accepts is raised before this function's first
-    /// write, so a Failed proposal never leaves a half-applied payload. After
-    /// the first write only storage / decode errors (which abort) can occur.
-    fn execute_payload(
+    /// Stage a payload: run every check and read, and return the rows it
+    /// writes, in order, WITHOUT writing anything (row 75). The caller applies
+    /// them with the proposal's status change in one atomic write. Every
+    /// error, execution failure or storage fault, therefore leaves no state.
+    fn stage_payload(
         &self,
         payload: &ExecutionPayload,
         params: &GovernanceParams,
         current_block: u64,
-    ) -> Result<()> {
-        match payload {
+    ) -> Result<Vec<StagedWrite>> {
+        let writes = match payload {
             ExecutionPayload::ParameterChange {
                 param_key,
                 new_value,
             } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
                 Self::validate_param_change(param_key, new_value)?;
-                self.state
-                    .put_cf_raw(CF_FEE_CONFIG, param_key.as_bytes(), new_value.as_bytes())?;
-                tracing::info!(param_key, new_value, "governance parameter updated");
+                vec![(
+                    CF_FEE_CONFIG,
+                    param_key.as_bytes().to_vec(),
+                    Some(new_value.as_bytes().to_vec()),
+                )]
             }
             ExecutionPayload::TreasurySpend {
-                recipient,
-                amount,
-                reason,
+                recipient, amount, ..
             } => {
                 // Debit treasury account.
-                let mut treasury_acct = self
-                    .state
-                    .get_account(&params.treasury_address)?
-                    .unwrap_or_default();
+                let treasury = params.treasury_address;
+                let mut treasury_acct = self.state.get_account(&treasury)?.unwrap_or_default();
                 if treasury_acct.balance < *amount {
                     return Err(EconomicsError::InsufficientTreasury {
                         have: treasury_acct.balance,
@@ -1149,15 +1188,22 @@ impl<T: StateBackend> GovernanceManager<T> {
                     });
                 }
                 treasury_acct.balance -= *amount;
-                self.state
-                    .put_account(&params.treasury_address, &treasury_acct)?;
 
-                // Credit recipient.
-                let mut recipient_acct = self.state.get_account(recipient)?.unwrap_or_default();
+                // Credit recipient. A spend to the treasury itself credits the
+                // debited row (as the old write-then-read order did); its
+                // second write below wins, leaving the balance unchanged.
+                let mut recipient_acct = if *recipient == treasury {
+                    treasury_acct.clone()
+                } else {
+                    self.state.get_account(recipient)?.unwrap_or_default()
+                };
                 recipient_acct.balance += *amount;
-                self.state.put_account(recipient, &recipient_acct)?;
 
-                tracing::info!(%recipient, %amount, reason, "treasury spend executed");
+                use torus_state::db::encode_account_info;
+                vec![
+                    account_write(&treasury, encode_account_info(&treasury_acct)),
+                    account_write(recipient, encode_account_info(&recipient_acct)),
+                ]
             }
             ExecutionPayload::MarketListing {
                 market_id,
@@ -1192,40 +1238,28 @@ impl<T: StateBackend> GovernanceManager<T> {
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
                 BorshSerialize::serialize(&initial_margin.raw(), &mut data)
                     .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-                self.state.put_cf_raw(CF_NATIVE_MARKETS, &key, &data)?;
-
-                tracing::info!(
-                    market_id,
-                    base_asset,
-                    quote_asset,
-                    "market listed via governance"
-                );
+                tracing::debug!(market_id, base_asset, quote_asset, "market listing staged");
+                vec![(CF_NATIVE_MARKETS, key.to_vec(), Some(data))]
             }
             ExecutionPayload::ValidatorRegistration { candidate } => {
                 use crate::types::{ValidatorWhitelistEntry, WHITELIST_EXPIRY_BLOCKS};
+                use torus_state::cf::CF_CONSENSUS_META;
 
                 let entry = ValidatorWhitelistEntry {
                     candidate: *candidate,
                     approved_at_block: current_block,
                     expires_at_block: current_block + WHITELIST_EXPIRY_BLOCKS,
                 };
-                self.put_validator_whitelist(candidate, &entry)?;
-                tracing::info!(
-                    %candidate,
-                    expires = current_block + WHITELIST_EXPIRY_BLOCKS,
-                    "validator registration whitelisted via governance"
-                );
+                let data =
+                    borsh::to_vec(&entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+                vec![(CF_CONSENSUS_META, whitelist_key(candidate), Some(data))]
             }
             ExecutionPayload::PermanentUnlock { staker, amount } => {
                 let staking = crate::staking::StakingManager::new(self.state.clone());
-                staking.governance_unlock_permanent_stake(*staker, *amount)?;
-                tracing::info!(
-                    %staker, %amount,
-                    "permanent stake unlocked via governance"
-                );
+                staking.stage_governance_unlock_permanent_stake(*staker, *amount)?
             }
-        }
-        Ok(())
+        };
+        Ok(writes)
     }
 
     // ========================================================================
@@ -1328,20 +1362,6 @@ impl<T: StateBackend> GovernanceManager<T> {
             )),
             None => Ok(None),
         }
-    }
-
-    /// Store a validator whitelist entry.
-    fn put_validator_whitelist(
-        &self,
-        candidate: &Address,
-        entry: &crate::types::ValidatorWhitelistEntry,
-    ) -> Result<()> {
-        use torus_state::cf::CF_CONSENSUS_META;
-
-        let key = whitelist_key(candidate);
-        let data = borsh::to_vec(entry).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-        self.state.put_cf_raw(CF_CONSENSUS_META, &key, &data)?;
-        Ok(())
     }
 
     /// Consume (delete) a validator whitelist entry after registration.
@@ -1596,8 +1616,8 @@ impl<T: StateBackend> GovernanceManager<T> {
 /// applied" (the proposal becomes Failed, the block goes on) rather than a
 /// fault that must still abort the governance step.
 ///
-/// Execution failures (each raised by `execute_payload` before its first
-/// write, so a failed proposal leaves no partial state):
+/// Execution failures (each raised by `stage_payload`, which writes nothing,
+/// so a failed proposal leaves no partial state):
 /// - `InvalidParameterValue`, `ParameterNotModifiable`: parameter change
 ///   re-validation; also a permanent unlock of 0.
 /// - `InsufficientTreasury`: treasury spend above the treasury balance.
