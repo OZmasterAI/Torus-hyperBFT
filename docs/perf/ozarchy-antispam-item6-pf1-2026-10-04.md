@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -28,6 +28,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 16 | Does `5524646` (end_resident timers, sums reuse decoded positions) pass Gate 2 at 10 markets without perf on either arm? | **0.866x main** (pairs 0.877x / 0.855x; both trie off, interleaved): **Gate 2 not met**. Perf off did not help (crab 152.8k vs 156.2k profiled in 15). Gap unchanged: native blk/s 2.01 vs 2.24, views 395 vs 335 ms. end_resident ~5.8 ms/blk (rows 3.4, positions 1.8), ~6 of the ~18 ms/blk untimed excess. `run-cell.sh` `WIDE_COLS` lacks the timer columns |
 | 17 | Where does the 10-market gap outside the engine go (views, RPC / gossip / ingress CPU, untimed exec)? | Nowhere outside execution: in the load window crab's exec block is +51.5 ms (485.5 vs 434.0) at equal fills per block. Views are exec-paced (64-deep channel fills 25-30 s earlier; free-running views 314-330 vs 325-348 ms). RPC +3.5 ms/1k is 2.3x more refused requests (equal CPU per request); signature verify equal per action. Untimed +23 ms/blk is mostly C's `native_failures` (`canonical_bytes`, ~20 ms CPU) plus end_resident (~7). Cutting those two and two small items: ~0.92x main (est.) |
 | 18 | Does step 2 (`4acdc59`: end_resident on a worker, begin_resident before `new_env`) pass Gate 2 at 300 markets? | **0.832x main** (pairs 0.819x / 0.844x; interleaved, both trie off), up from 0.760x (section 14): **Gate 2 not met**. Step 2 hides ~92% of end_resident (exec wait 4.8-5.3 ms per block, p50 0.4, p90 16-22, vs ~15 estimated); `residual_untimed` -56 ms per block; no visible cost to verify. Per block crab is now level with or faster than main (chain 548 vs 601 ms); the gap is 0.77x fills per native block (matched / placed 0.70 vs 0.77, fewer placed per action), present since section 9 |
+| 19 | Does B-blind (`31cea69`: non-pool sell top-up replaces the same-batch bound, on top of cuts 1/2/5/6) pass Gate 2 at both shapes? Is option A needed? | **Yes at both: 1.097x main at 300 markets** (pairs 1.102x / 1.092x; was 0.832x) **and 0.997x at 10 markets** (1.017x / 0.978x; was 0.866x); interleaved, both trie off, no perf. Fills per native block 0.956x at 300 markets (was 0.77x): matched / placed 0.766 vs 0.767. Non-pool zero-fill sell cuts 0.063% of placed (threshold 0.5%): **option A not needed**. All top-ups full; margin cancels and reduce-only cuts 0. 10-market margin +0.067 ms/1k vs main |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -1792,6 +1793,129 @@ val0 profile, r2 pair (45 s window, cycles:u):
   1.10 ms/1k, down from 2.36.** The execution-thread total is 15.54, down
   from 16.33; margin buckets are unchanged.
 
+## 19. Gate 2 with B-blind (`31cea69`), 300 and 10 markets (2026-10-06)
+
+Crab `perf/item6-phase1` @ `31cea69` = `ab12c75` (cuts 1, 2, 5 and 6, RPC
+shed by action tag, `detach.sh`) + `5e39ae8` (margin-cut counters: sell cuts
+by pool / non-pool, zero / partial fill and ticks above the reservation
+price; sell top-ups full / partial / none; maker margin cancels; reduce-only
+cuts) + `31cea69` (B-blind: non-pool sell top-up to B0 + 10 bps, partial,
+replaces the s89 same-batch bound). Node md5 `3a3c8951`; trie off by
+default. Main `92a02ed` (node md5 `31a95c65`) with
+`TORUS_NATIVE_TRIE_MAINTENANCE=0`. Both arms use the `31cea69` load
+generator (md5 `91ef7ffa`) and the same build flags.
+
+Shape per block: crab warm (60 s), crab r1, main r1, crab r2, main r2,
+interleaved; 120 s cells, cap 400, rate 76,000, `RETRY_BUSY=1`, oracle feed
+on crab only. The 300-market block (section 14 / 18 shape) ran first, then
+the 10-market block (section 15 / 16 shape). **No perf on any cell.**
+
+All 10 cells: rc 0, AGREE, liveness PASS, accepted.
+- **Binary and trie checks:** crab 18/18 node pids exe `3a3c8951` with no
+  trie variable; main 12/12 exe `31a95c65` with maintenance 0. Oracle stale
+  0, fresh 300/300 and 10/10.
+- **Process deaths:** none. Every node, the load generator and the oracle
+  feed lived until the harness stopped them.
+- **SIGKILL trace:** the system-wide `signal_generate` (`sig == 9`) trace
+  (section 18) ran through the whole campaign.
+- **Launch:** each cell ran as its own systemd user unit through
+  `detach.sh`, 06:14-07:12; no cargo / rustc on the host.
+- **Driver and analysis:** `ozarchy-bblind-gate2-campaign.sh`,
+  `ozarchy-bblind-31cea69-gate2-analysis.md`,
+  `ozarchy-bblind-31cea69-gate2-counters.txt`.
+
+### 19.1 Gate 2 at 300 markets
+
+| cell | matched/s | best60 | incl drain | native blk/s | fills per native block | chain ms | engine ms/1k | margin ms/1k | match ms/1k | CPU-s per 1M fills | actions per block |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| crab warm | 124,722 | 146,466 | 128,454 | 1.387 | 65.2k | 434 | 5.36 | 1.50 | 0.68 | 44.0 | 373 |
+| crab r1 | 110,593 | 131,359 | 113,400 | 1.475 | 63.6k | 500 | 6.31 | 1.75 | 0.76 | 55.0 | 382 |
+| main r1 | 100,317 | 133,575 | 105,414 | 1.301 | 66.7k | 574 | 7.08 | 1.45 | 2.34 | 59.6 | 394 |
+| crab r2 | 110,112 | 133,905 | 114,405 | 1.520 | 63.6k | 494 | 6.20 | 1.72 | 0.77 | 54.5 | 388 |
+| main r2 | 100,869 | 134,726 | 107,282 | 1.328 | 66.4k | 569 | 7.04 | 1.45 | 2.28 | 59.6 | 396 |
+
+| crab / main | r1 pair | r2 pair | mean | section 18 (`4acdc59`) |
+|---|---|---|---|---|
+| matched/s | 1.102x | 1.092x | **1.097x** | 0.832x |
+| best60 | 0.983x | 0.994x | 0.989x | 0.793x |
+| matched/s incl drain | 1.076x | 1.066x | 1.071x | 0.829x |
+| fills per native block | 0.953x | 0.959x | 0.956x | 0.77x |
+| native blk/s | 1.13x | 1.14x | 1.14x | 1.04x |
+| chain ms | 0.87x | 0.87x | 0.87x | 0.91x |
+| engine ms/1k | 0.89x | 0.88x | 0.89x | 1.10x |
+| CPU-s per 1M fills | 0.92x | 0.91x | 0.92x | 1.21x |
+
+- **Gate 2 at 300 markets (>= 0.9x): 1.097x, met.** It was 0.832x in
+  section 18.
+  - Crab mean 110.4k vs 81.3k in section 18 (+36%).
+  - Main mean 100.6k, equal to section 14's reference (100.6k); section
+    18's 97.8k had perf on the r2 pair.
+- **The fills-per-block gap (section 18) is nearly closed: 0.956x, from
+  0.77x.** Crab's matched / placed is 0.766 vs main's 0.767; it was 0.698 in
+  every crab cell since section 9. Cancelled orders fell from 82 to 0.63 per
+  1k placed. The section 18 gap was the same-batch sell bound.
+- **Per fill, crab is now cheaper than main:** engine 6.26 vs 7.06 ms/1k,
+  match phase 0.77 vs 2.3 ms/1k. Margin is still 1.20x main (1.73 vs
+  1.45 ms/1k; 2.56 on `4acdc59` r1).
+- **best60 is 0.99x main;** crab's lead is sustained throughput (native
+  blk/s 1.14x, chain 0.87x).
+- **Not B-blind alone:** `4acdc59..31cea69` also carries cuts 1, 2, 5 and 6.
+  This run does not split the gain between them.
+
+### 19.2 Gate 2 at 10 markets
+
+| cell | matched/s | best60 | incl drain | native blk/s | fills per native block | chain ms | engine ms/1k | margin ms/1k | match ms/1k | CPU-s per 1M fills | actions per block |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| crab warm | 208,228 | 212,229 | 187,185 | 2.381 | 56.1k | 255 | 3.34 | 0.96 | 0.65 | 31.3 | 323 |
+| crab r1 | 175,816 | 206,930 | 170,471 | 2.268 | 63.7k | 337 | 3.87 | 1.015 | 0.69 | 38.0 | 370 |
+| main r1 | 172,831 | 205,425 | 170,877 | 2.195 | 69.4k | 371 | 3.81 | 0.961 | 0.78 | 38.8 | 396 |
+| crab r2 | 172,079 | 202,131 | 167,862 | 2.226 | 63.1k | 333 | 3.88 | 1.031 | 0.71 | 38.3 | 364 |
+| main r2 | 176,017 | 211,036 | 171,368 | 2.260 | 68.7k | 365 | 3.79 | 0.951 | 0.74 | 38.8 | 395 |
+
+| crab / main | r1 pair | r2 pair | mean | section 16 (`5524646`) | section 15 (`c58775f`) |
+|---|---|---|---|---|---|
+| matched/s | 1.017x | 0.978x | **0.997x** | 0.866x | 0.893x |
+| best60 | 1.007x | 0.958x | 0.983x | 0.871x | 0.895x |
+| matched/s incl drain | 0.998x | 0.980x | 0.989x | 0.889x | 0.91x |
+| fills per native block | 0.918x | 0.918x | 0.918x | 0.94x | 0.93x |
+| native blk/s | 1.03x | 0.98x | 1.01x | 0.90x | 0.89x |
+| chain ms | 0.91x | 0.91x | 0.91x | 1.06x | 1.04x |
+| engine ms/1k | 1.02x | 1.02x | 1.02x | 1.10x | 1.09x |
+
+- **Gate 2 at 10 markets (>= 0.9x): 0.997x, met.** It was 0.866x in section
+  16; crab mean 173.9k vs 152.8k.
+- **Margin: crab 1.023 vs main 0.956 ms/1k, +0.067 (r1 +0.054, r2
+  +0.080).** In line with 18c's +0.1 ms/1k for B-blind; ozarchy has no
+  `ab12c75`-only run to isolate it. The margin gap was +0.45 ms/1k in
+  section 17 (1.40 vs 0.95).
+- **What is left:** crab carries fewer actions per block (367 vs 396), so
+  fills per native block are 0.92x; chain time (0.91x) and native blk/s
+  (1.01x) offset it. matched / placed is 0.797 on both arms.
+
+### 19.3 B-blind counters
+
+Per 1k placed, mean of crab r1 / r2; all three nodes survived, so the
+process-lifetime counters cover the whole cell. Raw values are per node.
+
+| counter | 300 markets | raw | 10 markets | raw |
+|---|---|---|---|---|
+| non-pool zero-fill sell cuts, all buckets (option A metric) | **0.630 (0.063% of placed; r1 0.084%, r2 0.042%)** | 15.1k | **0.038 (0.0038%)** | 1,233 |
+| by ticks above reservation: t0 / t1_2 / t3_5 / t6_10 / t11_30 / t31p | 0 / 0.182 / 0.267 / 0.181 / 0 / 0 | 0 / 4,374 / 6,399 / 4,344 / 0 / 0 | 0 / 0.021 / 0.012 / 0.005 / 0 / 0 | 0 / 680 / 395 / 158 / 0 / 0 |
+| non-pool partial-fill cuts | 0 | 0 | 0 | 0 |
+| pool zero / partial cuts | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| sell top-ups full / partial / none | 492.4 / 0 / 0 | 11.86M / 0 / 0 | 396 / 0 / 0 | 12.77M / 0 / 0 |
+| maker margin cancels | 0 | 0 | 0 | 0 |
+| reduce-only cuts | 0 | 0 | 0 | 0 |
+
+- **Option A (threshold 0.5% of placed) is not needed:** the cut rate is
+  0.063% at 300 markets and 0.0038% at 10 markets.
+- **Every remaining cut is non-pool, zero-fill, 1-10 ticks above the
+  reservation price.** At 300 markets the cut total equals
+  `rejected_cancelled` (the section 18 proxy, 82 per 1k on `4acdc59`).
+- **Every top-up was full;** 49% of placed orders got one at 300 markets,
+  40% at 10 markets.
+- The counters are exported with a `_total` suffix.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -1815,17 +1939,18 @@ val0 profile, r2 pair (45 s window, cycles:u):
 - Step 2 (end_resident off the execution thread, `2333ba4`): hides ~92%
   at 300 markets (exec wait ~5 ms per block, p90 16-22); no visible cost
   to verify (section 18).
-- Gate 2 at 10 markets: 0.866x at `5524646` without perf (section 16;
-  0.893x with perf on crab in 15.2); remaining gap is outside the engine
-  (block rate, view length, RPC / gossip-verify / ingress CPU per fill).
-- Gate 2 at 300 markets: 0.832x at `4acdc59` (section 18; 0.760x in 14).
-  Per block crab is level with main; the gap is 0.77x fills per native
-  block (matched / placed 0.70 vs 0.77, fewer placed per action, more
-  open-limit rejects), present since section 9. Cause not shown.
+- Gate 2 met at `31cea69` (B-blind, section 19): 1.097x main at 300
+  markets, 0.997x at 10 markets. The 300-market fills-per-block gap
+  (section 18) was the same-batch sell bound. Option A not needed (cuts
+  0.063% of placed). Margin per fill is still 1.20x main at 300 markets
+  (1.73 vs 1.45 ms/1k) and +0.067 ms/1k at 10 markets. B-blind's own share
+  is not split from cuts 1, 2, 5 and 6 (no `ab12c75`-only run here).
 - Bench host: three 300-market runs (00:16-00:57, 2026-10-06) lost a
   process (val1, val2, load generator) to a SIGKILL that is not an OOM
   kill and did not come through `kill`/`tkill`/`tgkill`; cause unknown
-  (section 18). Run heavy cells under the `signal_generate` trace.
+  (section 18). Run heavy cells under the `signal_generate` trace. The
+  section 19 campaign (10 cells under the trace, each its own systemd unit
+  through `detach.sh`) lost no process.
 - 10-market gap is all on the exec thread (section 17): +51.5 ms per block
   in the load window; views are exec-paced. Cheapest cut: C's
   `native_failures` re-encodes actions with `canonical_bytes` (~20 ms per
