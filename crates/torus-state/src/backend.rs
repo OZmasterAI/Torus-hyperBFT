@@ -74,6 +74,8 @@ pub trait StateBackend: Clone + Send + Sync {
     /// (`start >= prefix`): at most `limit` rows, ending at the prefix end.
     /// `StateDb` and `NativeStateOverlay` give RocksDB an iterate upper bound
     /// at the prefix end, so nothing past it (rows or tombstones) is read.
+    /// Deletion markers INSIDE the prefix are still stepped over (they return
+    /// no row; how many there are is bounded only by compaction).
     #[allow(clippy::type_complexity)]
     fn iterate_cf_prefix_from(
         &self,
@@ -2474,6 +2476,34 @@ mod tests {
                 );
             }
         }
+
+        // Final review N2: the empty prefix (no upper bound: the whole CF from
+        // `start`) and an all-0xff prefix (no key above it: no upper bound
+        // either), with rows under it in the DB and the overlay.
+        db.put_cf_raw(cf, &[0xff, 0xff, 1], b"db").unwrap();
+        overlay.put_cf_raw(cf, &[0xff, 0xff, 2], b"ov").unwrap();
+        let all = overlay.iterate_cf(cf, None).unwrap();
+        let all_db = StateBackend::iterate_cf(&db, cf, None).unwrap();
+        for (p, start) in [
+            (Vec::new(), Vec::new()),
+            (Vec::new(), prefix(100)),
+            (vec![0xff, 0xff], vec![0xff, 0xff]),
+            (vec![0xff, 0xff], vec![0xff, 0xff, 2]),
+        ] {
+            for limit in [0usize, 1, 2, 17, usize::MAX] {
+                assert_eq!(
+                    overlay.iterate_cf_prefix_from(cf, &p, &start, limit).unwrap(),
+                    in_prefix(&all, &p, &start, limit),
+                    "overlay prefix {p:?} start {start:?} limit {limit}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_prefix_from(&db, cf, &p, &start, limit).unwrap(),
+                    in_prefix(&all_db, &p, &start, limit),
+                    "db prefix {p:?} start {start:?} limit {limit}"
+                );
+            }
+        }
+        assert_eq!(overlay.iterate_cf_prefix_from(cf, &[0xff, 0xff], &[0xff, 0xff], 10).unwrap().len(), 2);
     }
 
     /// Fix 3 (s87) RED: a prefix scan through the overlay visits only the

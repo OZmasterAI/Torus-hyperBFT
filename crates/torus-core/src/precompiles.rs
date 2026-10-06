@@ -121,12 +121,17 @@ impl ReadMeter {
 /// (the `__book_mode__` marker in `cf_native_markets`) is skipped, so the
 /// charge — a block result — is the same on every node.
 ///
+/// Only hashed CFs may be scanned: a CF the running state hash does not cover
+/// at all (node-local, e.g. `cf_book_order_rows`) is an error, never "charge
+/// everything" — its rows differ between nodes.
+///
 /// Metered: pages of at most 64 rows through `iterate_cf_prefix_from` (RocksDB
 /// bounded at the prefix end), each page no larger than the rows still
 /// allowed + 1; out of gas as soon as the charged rows exceed the budget. A
-/// scan therefore reads at most `remaining + 1` rows plus the node-local rows
-/// it skips. Unlimited: one `iterate_cf` (the pre-existing read). A missing CF
-/// reads as empty.
+/// scan therefore reads at most `remaining + 1` rows, plus the node-local rows
+/// it skips, plus the RocksDB deletion markers inside the prefix that the
+/// iterator steps over uncharged (bounded only by compaction). Unlimited: one
+/// `iterate_cf` (the pre-existing read). A missing CF reads as empty.
 fn scan_prefix_metered(
     state: &impl StateBackend,
     cf: &'static str,
@@ -138,8 +143,12 @@ fn scan_prefix_metered(
         torus_state::StateError::MissingColumnFamily(_) => Ok(Vec::new()),
         e => Err(CoreError::State(e)),
     };
-    let hashed_id = torus_state::running_hash::hashed_cf_id(cf);
-    let consensus = |k: &[u8]| hashed_id.is_none_or(|id| torus_state::running_hash::key_is_hashed(id, k));
+    let Some(hashed_id) = torus_state::running_hash::hashed_cf_id(cf) else {
+        return Err(CoreError::InvalidPrecompileInput(format!(
+            "reader scan of {cf}: not a hashed consensus CF (its charge would be node-dependent)"
+        )));
+    };
+    let consensus = |k: &[u8]| torus_state::running_hash::key_is_hashed(hashed_id, k);
     if meter.is_unlimited() {
         let p = (!prefix.is_empty()).then_some(prefix);
         let mut rows = state.iterate_cf(cf, p).or_else(missing_is_empty)?;
@@ -1835,4 +1844,29 @@ pub fn write_stored_order(
     let data = borsh::to_vec(order).map_err(|e| CoreError::Borsh(e.to_string()))?;
     state_db.put_cf_raw(CF_NATIVE_ORDERS, &key, &data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scan_prefix_metered_tests {
+    use super::*;
+
+    /// Final review S2: a metered scan of a CF the running state hash does not
+    /// cover (node-local, e.g. `cf_book_order_rows`) would make the charge — a
+    /// block result — node-dependent. It is refused, metered or not, and
+    /// charges nothing.
+    #[test]
+    fn scanning_an_unhashed_cf_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_cf_raw(CF_BOOK_ORDER_ROWS, b"row", b"v").unwrap();
+        assert!(torus_state::running_hash::hashed_cf_id(CF_BOOK_ORDER_ROWS).is_none());
+        for mut meter in [ReadMeter::with_max(1_000), ReadMeter::unlimited()] {
+            let r = scan_prefix_metered(&db, CF_BOOK_ORDER_ROWS, b"", &mut meter);
+            assert!(r.is_err(), "unhashed CF scanned: {r:?}");
+            assert_eq!(meter.used(), 0);
+        }
+        // A hashed CF still scans.
+        let mut meter = ReadMeter::with_max(1_000);
+        assert!(scan_prefix_metered(&db, CF_NATIVE_MARKETS, b"", &mut meter).is_ok());
+    }
 }

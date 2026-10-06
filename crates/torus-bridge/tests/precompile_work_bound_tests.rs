@@ -27,7 +27,7 @@ use torus_core::precompiles::{
     ADDR_BALANCE_READER, ADDR_ORDER_BOOK_READER,
 };
 use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
-use torus_state::{StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
@@ -80,7 +80,7 @@ fn oog(r: &Result<Vec<u8>, CoreError>) -> bool {
     matches!(r, Err(CoreError::PrecompileOutOfGas))
 }
 
-fn rows_read(cb: &CountingBackend<StateDb>) -> usize {
+fn rows_read<T: StateBackend>(cb: &CountingBackend<T>) -> usize {
     cb.counts.rows_read.load(Ordering::SeqCst)
 }
 
@@ -299,4 +299,93 @@ fn open_orders_scan_stops_at_the_prefix_end() {
     let r = call(&cb, ADDR_ORDER_BOOK_READER, sig, &[addr_word(&a), market_word(1)], &mut ReadMeter::with_max(2));
     assert!(oog(&r), "{r:?}");
     assert!(rows_read(&cb) <= 3);
+}
+
+/// Final review N1: a mode-2 market whose last order was cancelled keeps only
+/// its meta row (no level rows). Classified from its own rows it reads back
+/// exactly like mode 1 and like a market that never had a book: the empty
+/// 8-word answer, metered = unmetered.
+#[test]
+fn a_mode2_market_with_only_a_meta_row_reads_like_an_empty_book() {
+    let (_dir, db) = open_test_db();
+    seed_book(&db, BookMode::LevelAuthority, &[100]);
+    let maker = Address::new([1; 20]);
+    let mut ctx = NativeExecContext::new_with_mode(
+        db.clone(),
+        2,
+        1_002,
+        0,
+        100,
+        10,
+        Address::new([99; 20]),
+        Address::new([100; 20]),
+        Address::new([101; 20]),
+        BookMode::LevelAuthority,
+        None,
+    );
+    let ids: Vec<u128> = ctx.order_books.get(&1).expect("book loaded").orders_for_trader(&maker).iter().map(|o| o.id).collect();
+    assert_eq!(ids.len(), 1);
+    let cancel = vec![(maker, NativeAction::CancelOrder { order_id: ids[0] })];
+    assert!(NativeExecutor::execute_batch(&mut ctx, &cancel).results.iter().all(|x| x.success));
+    ctx.save_order_books();
+
+    let rows = db.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&1u64.to_be_bytes())).unwrap();
+    assert!(!rows.is_empty(), "the meta row stays");
+    assert!(rows.iter().all(|(k, _)| k.len() != 26), "no level rows left: {rows:?}");
+
+    let layout = torus_core::book_reader::layout_of_market_rows(1, &rows).unwrap();
+    let as_mode2 = torus_core::book_reader::depth_from_market_rows(
+        &db,
+        1,
+        torus_core::book_reader::BookLayout::LevelAuthority,
+        &rows,
+    )
+    .unwrap();
+    let as_layout = torus_core::book_reader::depth_from_market_rows(&db, 1, layout, &rows).unwrap();
+    assert!(as_mode2.bids.is_empty() && as_mode2.asks.is_empty());
+    assert!(as_layout.bids.is_empty() && as_layout.asks.is_empty());
+
+    let mut metered = ReadMeter::with_max(1_000);
+    let out = order_book(&db, &mut metered).unwrap();
+    assert_eq!(out, order_book(&db, &mut ReadMeter::unlimited()).unwrap());
+    let never = call(&db, ADDR_ORDER_BOOK_READER, "getOrderBook(bytes32)", &[market_word(2)], &mut ReadMeter::with_max(1_000)).unwrap();
+    assert_eq!(out, never, "same answer as a market that never had a book");
+    assert_eq!(out.len(), 8 * 32);
+}
+
+/// Final review N2: the bounds hold over the EVM's real backend, a
+/// `NativeStateOverlay` journal with its own pending writes / deletes, and the
+/// metered answer equals the unmetered one there.
+#[test]
+fn bounds_hold_over_the_evm_overlay_journal() {
+    let (_dir, db) = open_test_db();
+    seed_book(&db, BookMode::LevelAuthority, &levels(150));
+    for m in 1..=500u64 {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &[1u8]).unwrap();
+    }
+    let ov = NativeStateOverlay::new(db.clone());
+    ov.put_cf_raw(CF_NATIVE_MARKETS, &501u64.to_be_bytes(), &[1u8]).unwrap();
+    ov.delete_cf_raw(CF_NATIVE_MARKETS, &7u64.to_be_bytes()).unwrap();
+
+    let cb = CountingBackend::new(ov.clone());
+    assert!(oog(&call(&cb, ADDR_BALANCE_READER, "getMarkets()", &[], &mut ReadMeter::with_max(20))));
+    assert!(rows_read(&cb) <= 21, "read {} rows on a 20-unit budget", rows_read(&cb));
+
+    let cb = CountingBackend::new(ov.clone());
+    assert!(oog(&order_book(&cb, &mut ReadMeter::with_max(40))));
+    assert!(rows_read(&cb) <= 41, "read {} rows on a 40-unit budget", rows_read(&cb));
+
+    let mut big = ReadMeter::with_max(1_000_000);
+    let markets = call(&ov, ADDR_BALANCE_READER, "getMarkets()", &[], &mut big).unwrap();
+    assert_eq!(markets, call(&ov, ADDR_BALANCE_READER, "getMarkets()", &[], &mut ReadMeter::unlimited()).unwrap());
+    let hashed = ov
+        .iterate_cf(CF_NATIVE_MARKETS, None)
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k.as_slice() != BOOK_MODE_MARKER_KEY)
+        .count() as u64;
+    assert_eq!(big.used(), hashed + 4 + 2 * 500, "500 markets (+1 pending, -1 deleted)");
+
+    let mut big = ReadMeter::with_max(1_000_000);
+    assert_eq!(order_book(&ov, &mut big).unwrap(), order_book(&ov, &mut ReadMeter::unlimited()).unwrap());
 }
