@@ -734,6 +734,58 @@ mod tests {
         assert_eq!(mgr.get_pending_rewards(&d1).unwrap().unwrap().amount, wei(250));
     }
 
+    fn pending(mgr: &StakingManager, a: &Address) -> U256 {
+        mgr.get_pending_rewards(a).unwrap().map(|r| r.amount).unwrap_or_default()
+    }
+
+    /// Review nit: an uneven split floors every share and the LAST delegation
+    /// takes the remainder; nothing is lost. Self 10k, two 10k delegations,
+    /// 10% commission, 1,000 raw units: self 333, delegators 667, commission
+    /// floor(66.7) = 66 -> validator 399; pool 601 -> 300 and 301 (remainder).
+    #[test]
+    fn uneven_split_floors_and_the_last_delegation_takes_the_remainder() {
+        let (_dir, mgr) = setup();
+        let val = addr(1);
+        fund(&mgr, &val, wei(10_000));
+        mgr.register_validator(val, [1u8; 32], 1000, wei(10_000)).unwrap();
+        for d in [addr(2), addr(3)] {
+            fund(&mgr, &d, wei(10_000));
+            mgr.delegate(d, val, wei(10_000)).unwrap();
+        }
+        let last = mgr.delegations_for_validator(&val).unwrap().last().unwrap().delegator;
+        let first = if last == addr(2) { addr(3) } else { addr(2) };
+
+        FeeSplitter::distribute_validator_rewards(&mgr, &val, U256::from(1_000u64)).unwrap();
+
+        assert_eq!(pending(&mgr, &val), U256::from(399u64));
+        assert_eq!(pending(&mgr, &first), U256::from(300u64));
+        assert_eq!(pending(&mgr, &last), U256::from(301u64), "remainder to the last");
+    }
+
+    /// Review nit: a validator with no self-stake left (but delegations) earns
+    /// only its commission; the delegators share the rest pro rata. Delegations
+    /// 1k and 3k, 10% commission, 1,000 raw units: validator 100, 225 / 675.
+    #[test]
+    fn zero_self_stake_with_delegators_earns_commission_only() {
+        let (_dir, mgr) = setup();
+        let val = addr(1);
+        fund(&mgr, &val, wei(10_000));
+        mgr.register_validator(val, [1u8; 32], 1000, wei(10_000)).unwrap();
+        for (d, amount) in [(addr(2), 1_000u64), (addr(3), 3_000)] {
+            fund(&mgr, &d, wei(amount));
+            mgr.delegate(d, val, wei(amount)).unwrap();
+        }
+        let mut v = mgr.get_validator(&val).unwrap().unwrap();
+        v.self_stake = U256::ZERO;
+        mgr.put_validator(&val, &v).unwrap();
+
+        FeeSplitter::distribute_validator_rewards(&mgr, &val, U256::from(1_000u64)).unwrap();
+
+        assert_eq!(pending(&mgr, &val), U256::from(100u64), "commission only");
+        assert_eq!(pending(&mgr, &addr(2)), U256::from(225u64));
+        assert_eq!(pending(&mgr, &addr(3)), U256::from(675u64));
+    }
+
     #[test]
     fn validator_inflation_multiple_validators() {
         let (_dir, mgr) = setup();
