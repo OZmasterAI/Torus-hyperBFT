@@ -719,3 +719,51 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
   speed).
 - Not in item 6 (item 6 keeps parallel matching by design). s92: tracked as its own backlog item,
   decide with a risk view before mainnet.
+
+### 9.12 Phase 1 gate verdict (s94, owner)
+All gates with their targets. ms/1k = ms per 1,000 fills, marks on. Gates 3 / 4 are 18c
+`ubench_econ` sanity numbers (first: at C3 / C4; latest: step 1 `1242d80`); the rest as cited.
+
+| gate | target (fail line) | first measured | latest | verdict |
+|---|---|---|---|---|
+| 0 guardrails | base numbers + storage-read counter test | - | done (`8814fc7`) | met |
+| 1 (C1) | suite + golden green, settle not up, total down | - | pass (`81a9567`) | met |
+| 2a (C2) | golden green, marks read once | - | pass after the row 12 fix (`ccdb59b`) | met |
+| PF1 | top-ups < 0.5 ms/1k | 11.21 | 0.02 (`0ebfd71`; later deleted by B-blind) | met |
+| 3: margin | <= 1.5 ms/1k (3.0) | 5.18 (ozarchy 2.15) | 300 mk: 2.46 static / 2.43 moving; 10 mk: 1.33 | missed at 300 mk, met at 10 |
+| 3: match | <= 2.0 ms/1k (4.0) | 5.62 (ozarchy 1.32) | 300 mk: 2.27 static / 3.25 moving; 10 mk: 1.38 | missed at 300 mk, met at 10 |
+| 4: tail | <= 1.0 ms/1k (2.0) | 6.93 | 300 mk: 1.97 static / **2.98 moving (past fail)**; 10 mk: 0.38 | missed at 300 mk, met at 10 |
+| empty block | <= 20 ms | 548 ms (s89 probe) | ubench 7.1 ms (`ecf4aec`); full node: oracle-only block steady max 4.9-5.9 ms, one 20-49 ms block after the load (row 77) | met in steady state |
+| 5 (C5) | warm == cold: identical state + every `h_n` | - | green, 3 replicas x 210 blocks (`6571a76`) | met |
+| **2 (throughput)** | **>= 0.9x main, 300 and 10 mk** | 0.508x (`14236fa`) | **1.097x / 0.997x** (section 19); moving prices 1.088x (walk 10) | **met** |
+| step 6 idle check | node drains with the feed live | - | passed (section 20) | met |
+| pre-merge suite | full `cargo test --workspace` green | - | 2819 / 0 on `9ab36ee` (ozarchy) | met |
+
+Full node (section 19): margin per fill 1.73 vs main 1.45 ms/1k (1.2x); engine per fill 6.26 vs
+7.06 (cheaper than main).
+
+Owner decision (s94): **Gates 3 and 4 accepted as missed for Phase 1** (Gate 2 decides the merge)
+and carried as targets into Phases 2-5. The backlog items (9.13) do not close them; the rest of
+item 6 does: margin and tail by Phase 4 (sums in one record per trader) and Phase 5 (sums inline
+per fill), plus optional O1 / O2 (section 5) if a phase gate still misses; match at 300 markets
+with moving prices (re-value cost) is checked first in the Phase 2 step 0 profile, which sets the
+order.
+
+### 9.13 Backlog after the Phase 1 merge (s94)
+Not merge blockers; each is tracked where it is defined.
+
+| item | where | when | recommendation |
+|---|---|---|---|
+| maker over-commit across markets in one batch | 9.11 | before mainnet | counter + read-only design check of the 3 options, then owner choice |
+| TreasurySpend / PermanentUnlock retry can pay twice after a storage error | row 75 | before mainnet | make both all-or-nothing |
+| governance storage errors don't halt the node | row 74 | before mainnet | owner call (halt like liquidation?) |
+| RPC 1/1 for undecodable rows, book StopLimit tick guard, RPC price <= 0 | rows 44-46 | soon | yes to all three (small) |
+| native root dropped from blocks in `02aa50c` (intended?) | 9.3 | before mainnet | decide whether blocks carry a native state root |
+| oracle review M2: lower bound on block timestamps | bench doc Open, `4a12020` | before testnet | review with the oracle docs |
+| anti-spam D: no validator exemption for the per-IP limit | bench doc Open | before testnet | check whether validators hit it |
+| liquidation stress at full-node load | row 76 | before testnet | one ozarchy cell (larger walk or accounts near maintenance) |
+| slow first block after the load; 2.5 ms empty block with the feed live | rows 77-78 | Phase 2 | step 0 profile |
+| trading app `"Failed"` proposal status | row 79 | anytime | app repo |
+| bench load: open-limit rejects 39-43% of orders | section 20.3 | before Phase 2 profile | `bench/max-in-flight` (ozarchy sweep running) |
+| C5 cooldown coverage thin | row 72 | anytime | dedicated cooldown sequence |
+| operator runbook: price feeder + oracle signer per validator, >= 3 reporters and > 2/3 stake, NTP (5 s skew) | review summary section 5 | before testnet | testnet runbook |
