@@ -265,51 +265,30 @@ pub struct OracleSignerProof {
 pub struct PublicKey(pub [u8; 32]);
 
 /// Scope of actions a session key is authorized to perform.
+///
+/// Session keys only ever trade, like Hyperliquid agent wallets: every other
+/// action (transfers, withdraw, staking, governance, validator, oracle,
+/// session management) needs the owner's EIP-712 signature
+/// ([`crate::eip712::requires_eip712`]). The variants and their encoding are
+/// unchanged so stored sessions and old `CreateSession` actions still decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionScope {
-    /// PlaceOrder, PlaceOrderBatch, CancelOrder, ModifyOrder, CancelAllOrders only.
+    /// The trading actions ([`NativeAction::is_trading`]).
     Trading,
-    /// TransferToPerp, TransferToSpot only.
+    /// Nothing: transfers need the owner key. Kept for encoding compatibility.
     TransfersOnly,
-    /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded, SetOracleSigner.
+    /// Same as `Trading`. Kept for encoding compatibility.
     Full,
 }
 
 impl SessionScope {
     pub fn allows(&self, action: &NativeAction) -> bool {
+        // LOCKSTEP DEPLOY: scope is enforced on the CONSENSUS path too (exec
+        // batch verify). A node with different rules resolves different
+        // senders and diverges, so the whole fleet must run the same rules.
         match self {
-            // LOCKSTEP-DEPLOY WARNING (O2/G3): scope is enforced on the
-            // CONSENSUS path too (eip712.rs batch verify guard) — on an old
-            // validator a Trading-scoped PlaceOrderBatch resolves to None,
-            // which the exec pipeline treats as an invalid signature and
-            // SLASHES + TOMBSTONES the block's PROPOSER (app.rs invalid-
-            // attestation arm). The ENTIRE fleet must run this change before
-            // any client signs batches under a Trading-scoped session.
-            SessionScope::Trading => matches!(
-                action,
-                NativeAction::PlaceOrder(_)
-                    | NativeAction::PlaceOrderBatch(_)
-                    | NativeAction::CancelOrder { .. }
-                    | NativeAction::ModifyOrder { .. }
-                    | NativeAction::CancelAllOrders { .. }
-            ),
-            SessionScope::TransfersOnly => matches!(
-                action,
-                NativeAction::TransferToPerp { .. } | NativeAction::TransferToSpot { .. }
-            ),
-            SessionScope::Full => !matches!(
-                action,
-                NativeAction::CreateSession { .. }
-                    | NativeAction::RevokeSession { .. }
-                    | NativeAction::Withdraw { .. }
-                    | NativeAction::Delegate { .. }
-                    | NativeAction::Undelegate { .. }
-                    | NativeAction::PermanentStake { .. }
-                    | NativeAction::ClaimRewards
-                    | NativeAction::ClaimUnbonded
-                    | NativeAction::SetOracleSigner { .. }
-            ),
+            SessionScope::Trading | SessionScope::Full => action.is_trading(),
+            SessionScope::TransfersOnly => false,
         }
     }
 }
@@ -601,6 +580,29 @@ pub fn batch_len_within_cap(len: usize) -> bool {
     (1..=NATIVE_ORDERS_PER_BATCH_CAP).contains(&len)
 }
 
+/// s94 option 2 (HL "Order price too far from oracle"): the governance key
+/// (`CF_FEE_CONFIG`, a decimal string, `ParameterChange`) of the chain-wide
+/// placement price band, in basis points of the market's reference price.
+/// Lives here because governance (torus-economics) validates it and the
+/// executor / RPC read it (torus-core), and both depend on torus-types.
+pub const PRICE_BAND_PARAM: &str = "price_band_bps";
+/// The band when the key is absent or invalid: ±50% of the reference.
+pub const PRICE_BAND_DEFAULT_BPS: u64 = 5_000;
+/// Valid governance values: ±1% .. ±90%.
+pub const PRICE_BAND_BPS_RANGE: std::ops::RangeInclusive<u64> = 100..=9_000;
+/// The stale-mark fallback reference is clamped to ± this of the last mark.
+pub const PRICE_BAND_FALLBACK_CLAMP_BPS: u64 = 1_000;
+
+/// The band in force for a stored [`PRICE_BAND_PARAM`] value: the value
+/// when it is a decimal in [`PRICE_BAND_BPS_RANGE`], else the default.
+pub fn price_band_bps(stored: Option<&[u8]>) -> u64 {
+    stored
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| PRICE_BAND_BPS_RANGE.contains(v))
+        .unwrap_or(PRICE_BAND_DEFAULT_BPS)
+}
+
 /// All native (non-EVM) actions processed by torus-core.
 /// Analogous to Hyperliquid's ~70 HyperCore action types.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -734,6 +736,19 @@ pub enum NativeAction {
 }
 
 impl NativeAction {
+    /// Place, batch, cancel, cancel-all and modify: the only actions a session
+    /// key may sign.
+    pub fn is_trading(&self) -> bool {
+        matches!(
+            self,
+            NativeAction::PlaceOrder(_)
+                | NativeAction::PlaceOrderBatch(_)
+                | NativeAction::CancelOrder { .. }
+                | NativeAction::ModifyOrder { .. }
+                | NativeAction::CancelAllOrders { .. }
+        )
+    }
+
     /// Append a single order's canonical body (no variant tag) to `buf`.
     ///
     /// Shared by the `PlaceOrder` and `PlaceOrderBatch` encodings so a batched

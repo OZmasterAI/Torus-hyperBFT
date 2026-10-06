@@ -147,6 +147,9 @@ fn d_bps() -> u32 {
 fn d_listen() -> String {
     "127.0.0.1:9466".into()
 }
+fn d_chain_id() -> u64 {
+    torus_types::eip712::TORUS_CHAIN_ID
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +173,8 @@ struct RawConfig {
     quote_mode: QuoteMode,
     #[serde(default = "d_listen")]
     health_listen: String,
+    #[serde(default = "d_chain_id")]
+    chain_id: u64,
     #[serde(default)]
     exchanges: BTreeMap<String, ExchangeOverride>,
     #[serde(default)]
@@ -205,6 +210,9 @@ pub struct Config {
     pub min_weight_bps: u32,
     pub quote_mode: QuoteMode,
     pub health_listen: String,
+    /// The network's chain id (its genesis `chain_id`; default 7778, devnet):
+    /// submissions are EIP-712-signed for it.
+    pub chain_id: u64,
     pub exchanges: BTreeMap<Exchange, ExchangeOverride>,
     pub markets: Vec<MarketCfg>,
 }
@@ -250,6 +258,7 @@ impl Config {
             min_weight_bps: raw.min_weight_bps,
             quote_mode: raw.quote_mode,
             health_listen: raw.health_listen,
+            chain_id: raw.chain_id,
             exchanges,
             markets,
         };
@@ -393,6 +402,8 @@ symbols = {{ binance = "BTCUSDT", okx = "BTC-USDT", bybit = "BTCUSDT" }}
         );
         assert_eq!(c.quote_mode, QuoteMode::Par);
         assert_eq!(c.health_listen, "127.0.0.1:9466");
+        assert_eq!(c.chain_id, torus_types::eip712::TORUS_CHAIN_ID);
+        assert_eq!(Config::parse(&minimal("chain_id = 7779")).unwrap().chain_id, 7779);
         let w: Vec<u32> = Exchange::ALL.iter().map(|e| c.weight(*e)).collect();
         assert_eq!(w, vec![3, 2, 2, 1, 1, 1, 1]);
         assert!(Exchange::ALL.iter().all(|e| c.enabled(*e)));

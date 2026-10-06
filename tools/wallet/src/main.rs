@@ -36,7 +36,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) key: Option<String>,
 
-    /// Chain ID (default: from eth_chainId)
+    /// Chain ID of the network (its genesis `chain_id`). Native actions are
+    /// EIP-712-signed for it (default 7778, devnet); EVM transactions use it
+    /// too (default: the node's eth_chainId).
     #[arg(long, global = true)]
     pub(crate) chain_id: Option<u64>,
 
@@ -336,6 +338,11 @@ pub(crate) enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let chain_id = cli.chain_id.unwrap_or(torus_types::eip712::TORUS_CHAIN_ID);
+    if let Err(e) = torus_types::eip712::set_network_chain_id(chain_id) {
+        eprintln!("Error: chain id {chain_id}: {e}");
+        std::process::exit(1);
+    }
     let rpc = RpcClient::new(&cli.rpc_url);
 
     let result = match &cli.command {

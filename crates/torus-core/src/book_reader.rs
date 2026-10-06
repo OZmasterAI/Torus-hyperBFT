@@ -332,7 +332,54 @@ pub fn read_book_depth<S: StateBackend>(
     }
 
     let rows = market_rows(state, market_id)?;
-    let meta = read_meta(state, market_id, &rows)?;
+    depth_from_market_rows(state, market_id, layout, &rows)
+}
+
+/// The row layout of ONE market from its own `cf_native_order_books` rows
+/// (8-byte prefix, classic blob key absent): level rows = mode 2, order rows =
+/// mode 1, both = an error; meta / stop rows only (or none) read back the same
+/// under either, reported as mode 1. Hashed rows only — no node-local marker,
+/// no DB-wide sniff.
+pub fn layout_of_market_rows(
+    market_id: MarketId,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<BookLayout, CoreError> {
+    let (mut levels, mut orders) = (false, false);
+    for (key, _) in rows {
+        match key_shape(key) {
+            Some(KeyShape::LevelRow) => levels = true,
+            Some(KeyShape::OrderRow) => orders = true,
+            Some(KeyShape::ClassicBlob) => {
+                return Err(layout_err(format!(
+                    "market {market_id}: classic whole-book blob among row-layout rows"
+                )))
+            }
+            _ => {}
+        }
+    }
+    match (levels, orders) {
+        (true, true) => Err(layout_err(format!(
+            "market {market_id} mixes per-order rows (mode 1) with level rows (mode 2) \
+             — the book CF is corrupt"
+        ))),
+        (true, false) => Ok(BookLayout::LevelAuthority),
+        _ => Ok(BookLayout::OrderRows),
+    }
+}
+
+/// [`read_book_depth`] for a row layout over the market's rows already read
+/// (all `cf_native_order_books` rows under the 8-byte market prefix, key
+/// order) — the precompile reads them with a work-bounded scan.
+pub fn depth_from_market_rows<S: StateBackend>(
+    state: &S,
+    market_id: MarketId,
+    layout: BookLayout,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<BookDepth, CoreError> {
+    if layout == BookLayout::Classic {
+        return Err(layout_err("depth_from_market_rows: the classic layout has no rows"));
+    }
+    let meta = read_meta(state, market_id, rows)?;
     if meta.is_none() {
         return Ok(BookDepth::default());
     }
@@ -342,7 +389,7 @@ pub fn read_book_depth<S: StateBackend>(
             // Level rows: forward key order is best-first per side, bids
             // before asks (see `book_rows::price_enc`).
             let mut depth = BookDepth::default();
-            for (key, value) in &rows {
+            for (key, value) in rows {
                 if key_shape(key) != Some(KeyShape::LevelRow) {
                     continue;
                 }
@@ -379,7 +426,7 @@ pub fn read_book_depth<S: StateBackend>(
         BookLayout::OrderRows => {
             let mut bids: BTreeMap<i128, (i128, u32)> = BTreeMap::new();
             let mut asks: BTreeMap<i128, (i128, u32)> = BTreeMap::new();
-            for (key, value) in &rows {
+            for (key, value) in rows {
                 if key_shape(key) != Some(KeyShape::OrderRow) {
                     continue;
                 }

@@ -333,8 +333,27 @@ impl<T: StateBackend> StakingManager<T> {
         Ok(())
     }
 
+    /// Test convenience: stage a governance unlock and apply it on its own
+    /// (production applies it with the proposal's status change).
+    #[cfg(test)]
+    pub(crate) fn governance_unlock_permanent_stake(
+        &self,
+        staker: Address,
+        amount: U256,
+    ) -> Result<()> {
+        let writes = self.stage_governance_unlock_permanent_stake(staker, amount)?;
+        crate::governance::apply_staged(&self.state, &writes)
+    }
+
     /// Unlock permanently staked tokens via governance vote. Only callable from
     /// within the crate (governance execution), never from user transactions.
+    ///
+    /// Row 75: returns the rows the unlock writes, in order, with every check
+    /// and read done and NOTHING written: the stake row (deleted on a full
+    /// unlock, else reduced), the pending-rewards row (deleted when non-zero:
+    /// the rewards are claimed), and the staker's account credited with the
+    /// unlocked principal plus the claimed rewards. Governance applies them
+    /// in one atomic write together with the proposal's status change.
     ///
     /// Mid-epoch timing: the staker receives full rewards for the last completed
     /// epoch (already distributed). They will not appear in the next epoch's
@@ -343,11 +362,11 @@ impl<T: StateBackend> StakingManager<T> {
     /// Vote weight: the staker's 1.5x governance weight automatically decreases
     /// for future proposals since `compute_vote_weight()` reads live permanent stake.
     /// Past proposal votes are unaffected (ECON-FIND-16 snapshots).
-    pub(crate) fn governance_unlock_permanent_stake(
+    pub(crate) fn stage_governance_unlock_permanent_stake(
         &self,
         staker: Address,
         amount: U256,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::governance::StagedWrite>> {
         if amount.is_zero() {
             return Err(EconomicsError::InvalidParameterValue {
                 key: "amount".to_string(),
@@ -366,36 +385,39 @@ impl<T: StateBackend> StakingManager<T> {
             });
         }
 
+        let key = staker.as_slice().to_vec();
+        let mut writes = Vec::with_capacity(3);
+
         // Update or remove the permanent stake entry.
         if amount == info.amount {
-            self.delete_permanent_stake(&staker)?;
+            writes.push((CF_STAKING_PERMANENT, key.clone(), None));
         } else {
             let updated = PermanentStakeInfo {
                 staker,
                 amount: info.amount - amount,
                 locked_at_block: info.locked_at_block,
             };
-            self.put_permanent_stake(&staker, &updated)?;
+            let data = borsh::to_vec(&updated).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+            writes.push((CF_STAKING_PERMANENT, key.clone(), Some(data)));
         }
 
         // Claim any accrued pending rewards (from delegation etc.) if present.
         let claimed_rewards = match self.get_pending_rewards(&staker)? {
             Some(rewards) if !rewards.amount.is_zero() => {
-                let r = rewards.amount;
-                self.delete_pending_rewards(&staker)?;
-                r
+                writes.push((CF_STAKING_REWARDS, key, None));
+                rewards.amount
             }
             _ => U256::ZERO,
         };
 
         // Credit unlocked principal + any claimed rewards to liquid balance.
-        self.credit_balance(&staker, amount + claimed_rewards)?;
+        let mut account = self.state.get_account(&staker)?.unwrap_or_default();
+        account.balance += amount + claimed_rewards;
+        let encoded = torus_state::db::encode_account_info(&account);
+        writes.push(crate::governance::account_write(&staker, encoded));
 
-        tracing::info!(
-            %staker, %amount, %claimed_rewards,
-            "permanent stake unlocked via governance"
-        );
-        Ok(())
+        tracing::debug!(%staker, %amount, %claimed_rewards, "permanent unlock staged");
+        Ok(writes)
     }
 
     // ========================================================================
@@ -957,12 +979,6 @@ impl<T: StateBackend> StakingManager<T> {
         let data = borsh::to_vec(info).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
         self.state
             .put_cf_raw(CF_STAKING_PERMANENT, address.as_slice(), &data)?;
-        Ok(())
-    }
-
-    fn delete_permanent_stake(&self, address: &Address) -> Result<()> {
-        self.state
-            .delete_cf_raw(CF_STAKING_PERMANENT, address.as_slice())?;
         Ok(())
     }
 

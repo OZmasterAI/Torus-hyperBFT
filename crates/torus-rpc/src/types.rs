@@ -295,6 +295,22 @@ pub struct RpcBalances {
     pub permanent_stake: String,
 }
 
+/// `torus_getLiquidatorVault`: the liquidator vault's committed cash and
+/// open positions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcLiquidatorVault {
+    /// `LIQUIDATOR_VAULT`, hex.
+    pub address: String,
+    /// Native available balance, signed decimal string (as `torus_getBalances`).
+    pub available_balance: String,
+    /// `-availableBalance` when it is negative, else 0 (the
+    /// `torus_liquidator_vault_deficit` gauge).
+    pub deficit: String,
+    /// Positions with a non-zero size the vault holds.
+    pub open_positions: u64,
+}
+
 /// `torus_getUserLimits`: the per-user open-order limit and its inputs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -650,6 +666,7 @@ mod action_failure_tests {
             (FailureReason::Price, "price"),
             (FailureReason::BatchCap, "batch_cap"),
             (FailureReason::Fill, "fill"),
+            (FailureReason::PriceBand, "price_band"),
         ];
         let status = BlockActionStatus {
             evm_skipped: vec![],

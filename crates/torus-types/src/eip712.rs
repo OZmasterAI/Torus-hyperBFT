@@ -20,11 +20,55 @@ use crate::{
 // Constants
 // ============================================================================
 
-/// Torus chain ID embedded in the EIP-712 domain separator.
+/// The devnet chain id, and the EIP-712 chain id of a network whose genesis
+/// sets none. Each network's own id comes from its genesis `chain_id`
+/// ([`set_network_chain_id`]).
 pub const TORUS_CHAIN_ID: u64 = 7778;
+
+static NETWORK_CHAIN_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set this process's network chain id — the `chainId` of the EIP-712 domain
+/// every default sign/verify function here uses — once, at startup, before
+/// anything signs or verifies (node: genesis `chain_id`; clients:
+/// `--chain-id`). Fails if the process already uses a different id, so a
+/// late or conflicting setting can never mix two domains in one process.
+pub fn set_network_chain_id(chain_id: u64) -> Result<(), Eip712Error> {
+    match *NETWORK_CHAIN_ID.get_or_init(|| chain_id) {
+        got if got == chain_id => Ok(()),
+        got => Err(Eip712Error::ChainIdMismatch { expected: chain_id, got }),
+    }
+}
+
+/// This process's network chain id: the value set by
+/// [`set_network_chain_id`], else (and from then on) [`TORUS_CHAIN_ID`].
+pub fn network_chain_id() -> u64 {
+    *NETWORK_CHAIN_ID.get_or_init(|| TORUS_CHAIN_ID)
+}
 
 /// Maximum allowed nonce drift from current time (60 seconds).
 pub const NONCE_WINDOW_MS: u64 = 60_000;
+
+/// A block header's timestamp (UNIX **seconds**) in **milliseconds**, the unit
+/// of nonces, the nonce window and session expiry. Every block-context auth
+/// check (session expiry, nonce window) converts with this — A8: passing the
+/// header seconds where milliseconds are expected meant no session ever
+/// expired in a block.
+pub fn block_timestamp_ms(header_timestamp_secs: u64) -> u64 {
+    header_timestamp_secs.saturating_mul(1000)
+}
+
+/// A nonce (signing time, ms) is valid within ±[`NONCE_WINDOW_MS`] of `now_ms`,
+/// inclusive. Intake passes its wall clock; block execution passes
+/// [`block_timestamp_ms`] of the header, so every node decides identically.
+pub fn check_nonce_window(nonce: u64, now_ms: u64) -> Result<(), Eip712Error> {
+    if nonce.saturating_add(NONCE_WINDOW_MS) < now_ms {
+        return Err(Eip712Error::NonceTooOld);
+    }
+    if nonce > now_ms.saturating_add(NONCE_WINDOW_MS) {
+        return Err(Eip712Error::NonceTooFuture);
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Errors
@@ -149,18 +193,24 @@ fn encode_string(s: &str) -> [u8; 32] {
 // Domain Separator
 // ============================================================================
 
-/// Compute the EIP-712 domain separator for Torus.
+/// The EIP-712 domain separator of this process's network
+/// ([`network_chain_id`]; devnet 7778 unless set).
+pub fn eip712_domain_separator() -> B256 {
+    eip712_domain_separator_for_chain(network_chain_id())
+}
+
+/// Compute the EIP-712 domain separator for Torus on `chain_id`.
 ///
 /// ```text
 /// keccak256(
 ///   typeHash("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 ///   || keccak256("Torus")
 ///   || keccak256("1")
-///   || uint256(7778)
+///   || uint256(chain_id)        // 7778 on devnet
 ///   || address(0x0)
 /// )
 /// ```
-pub fn eip712_domain_separator() -> B256 {
+pub fn eip712_domain_separator_for_chain(chain_id: u64) -> B256 {
     let type_hash = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
     );
@@ -168,7 +218,7 @@ pub fn eip712_domain_separator() -> B256 {
     buf.extend_from_slice(&type_hash.0);
     buf.extend_from_slice(&encode_string("Torus"));
     buf.extend_from_slice(&encode_string("1"));
-    buf.extend_from_slice(&encode_u256(&U256::from(TORUS_CHAIN_ID)));
+    buf.extend_from_slice(&encode_u256(&U256::from(chain_id)));
     buf.extend_from_slice(&encode_address(&Address::ZERO));
     keccak256(&buf)
 }
@@ -470,14 +520,15 @@ fn hash_set_oracle_signer(signer: &Address, proof: Option<&crate::OracleSignerPr
 }
 
 /// EIP-712 signing hash of the oracle-signer proof of possession (review M3).
-fn oracle_signer_proof_hash(validator: &Address, nonce: u64) -> B256 {
+/// `chain_id` is bound twice: in the struct and in the domain.
+fn oracle_signer_proof_hash(chain_id: u64, validator: &Address, nonce: u64) -> B256 {
     let th = keccak256("OracleSignerProof(address validator,uint64 chainId,uint64 nonce)");
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(validator));
-    buf.extend_from_slice(&encode_u64(TORUS_CHAIN_ID));
+    buf.extend_from_slice(&encode_u64(chain_id));
     buf.extend_from_slice(&encode_u64(nonce));
-    eip712_signing_hash(eip712_domain_separator(), keccak256(&buf))
+    eip712_signing_hash(eip712_domain_separator_for_chain(chain_id), keccak256(&buf))
 }
 
 /// The signer key's proof of possession for registering it as `validator`'s
@@ -489,7 +540,10 @@ pub fn sign_oracle_signer_proof(
 ) -> crate::OracleSignerProof {
     crate::OracleSignerProof {
         nonce,
-        signature: sign_prehash(&oracle_signer_proof_hash(validator, nonce), signer_key),
+        signature: sign_prehash(
+            &oracle_signer_proof_hash(network_chain_id(), validator, nonce),
+            signer_key,
+        ),
     }
 }
 
@@ -499,7 +553,10 @@ pub fn recover_oracle_signer_proof(
     validator: &Address,
     proof: &crate::OracleSignerProof,
 ) -> Result<Address, Eip712Error> {
-    ecrecover(&oracle_signer_proof_hash(validator, proof.nonce), &proof.signature)
+    ecrecover(
+        &oracle_signer_proof_hash(network_chain_id(), validator, proof.nonce),
+        &proof.signature,
+    )
 }
 
 // ---------- governance ----------
@@ -756,13 +813,24 @@ fn ecrecover(hash: &B256, sig: &Signature) -> Result<Address, Eip712Error> {
 // ============================================================================
 
 /// Sign a [`NativeAction`] with a secp256k1 private key, producing a
-/// [`SignedNativeAction`] with an EIP-712 signature.
+/// [`SignedNativeAction`] with an EIP-712 signature for this process's
+/// network ([`network_chain_id`]).
 pub fn sign_native_action(
     action: NativeAction,
     nonce: u64,
     key: &SigningKey,
 ) -> SignedNativeAction {
-    let domain = eip712_domain_separator();
+    sign_native_action_for_chain(network_chain_id(), action, nonce, key)
+}
+
+/// [`sign_native_action`] for an explicit `chain_id`.
+pub fn sign_native_action_for_chain(
+    chain_id: u64,
+    action: NativeAction,
+    nonce: u64,
+    key: &SigningKey,
+) -> SignedNativeAction {
+    let domain = eip712_domain_separator_for_chain(chain_id);
     let struct_hash = eip712_struct_hash(&action, nonce);
     let signing_hash = eip712_signing_hash(domain, struct_hash);
     SignedNativeAction {
@@ -800,8 +868,18 @@ pub fn sign_native_action_with_session(
     nonce: u64,
     session_key: &ed25519_dalek::SigningKey,
 ) -> SignedNativeAction {
+    sign_native_action_with_session_for_chain(network_chain_id(), action, nonce, session_key)
+}
+
+/// [`sign_native_action_with_session`] for an explicit `chain_id`.
+pub fn sign_native_action_with_session_for_chain(
+    chain_id: u64,
+    action: NativeAction,
+    nonce: u64,
+    session_key: &ed25519_dalek::SigningKey,
+) -> SignedNativeAction {
     use ed25519_dalek::Signer;
-    let domain = eip712_domain_separator();
+    let domain = eip712_domain_separator_for_chain(chain_id);
     let struct_hash = eip712_struct_hash(&action, nonce);
     let signing_hash = eip712_signing_hash(domain, struct_hash);
     let sig = session_key.sign(signing_hash.as_slice());
@@ -821,29 +899,25 @@ pub const MAX_SESSION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Maximum active sessions per address.
 pub const MAX_SESSIONS_PER_ADDRESS: usize = 5;
 
-/// Actions that MUST use EIP-712 signature (cannot use session keys).
+/// Actions that MUST use EIP-712 signature (cannot use session keys): every
+/// action that is not trading. Session keys may only trade.
 pub fn requires_eip712(action: &NativeAction) -> bool {
-    matches!(
-        action,
-        NativeAction::CreateSession { .. }
-            | NativeAction::RevokeSession { .. }
-            | NativeAction::Withdraw { .. }
-            | NativeAction::Delegate { .. }
-            | NativeAction::Undelegate { .. }
-            | NativeAction::PermanentStake { .. }
-            | NativeAction::ClaimRewards
-            | NativeAction::ClaimUnbonded
-            | NativeAction::SetOracleSigner { .. }
-    )
+    !action.is_trading()
 }
 
 impl SignedNativeAction {
     /// Recover the sender's Ethereum address from the EIP-712 signature.
     /// Returns error if the signature is a session key (use `resolve_sender` with state instead).
     pub fn recover_sender(&self) -> Result<Address, Eip712Error> {
+        self.recover_sender_for_chain(network_chain_id())
+    }
+
+    /// [`Self::recover_sender`] on an explicit `chain_id`. A signature made
+    /// for another chain recovers to an unrelated address, never its signer.
+    pub fn recover_sender_for_chain(&self, chain_id: u64) -> Result<Address, Eip712Error> {
         match &self.signature {
             ActionSignature::Eip712(sig) => {
-                let domain = eip712_domain_separator();
+                let domain = eip712_domain_separator_for_chain(chain_id);
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 ecrecover(&signing_hash, sig)
@@ -877,17 +951,36 @@ impl SignedNativeAction {
     /// Resolve the sender address using state-based session lookup.
     /// For Eip712: recovers ECDSA sender directly.
     /// For Session: verifies ed25519, then looks up session owner via the provided closure.
+    ///
+    /// `current_time_ms` is MILLISECONDS (the unit of `SessionData::expiry`); a
+    /// session is valid while `current_time_ms <= expiry`. In a block context
+    /// pass [`block_timestamp_ms`] of the header timestamp, never the raw
+    /// header seconds.
     pub fn resolve_sender<F>(
         &self,
-        current_timestamp: u64,
+        current_time_ms: u64,
         session_lookup: F,
     ) -> Result<Address, Eip712Error>
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
+        self.resolve_sender_for_chain(network_chain_id(), current_time_ms, session_lookup)
+    }
+
+    /// [`Self::resolve_sender`] on an explicit `chain_id`: a session signature
+    /// made for another chain fails ed25519 verification.
+    pub fn resolve_sender_for_chain<F>(
+        &self,
+        chain_id: u64,
+        current_time_ms: u64,
+        session_lookup: F,
+    ) -> Result<Address, Eip712Error>
+    where
+        F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
+    {
+        let domain = eip712_domain_separator_for_chain(chain_id);
         match &self.signature {
             ActionSignature::Eip712(sig) => {
-                let domain = eip712_domain_separator();
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 ecrecover(&signing_hash, sig)
@@ -902,13 +995,12 @@ impl SignedNativeAction {
                 let vk = Ed25519VerifyingKey::from_bytes(session_pubkey)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
                 let ed_sig = ed25519_dalek::Signature::from_bytes(&sig.0);
-                let domain = eip712_domain_separator();
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
                 let signing_hash = eip712_signing_hash(domain, struct_hash);
                 vk.verify(signing_hash.as_slice(), &ed_sig)
                     .map_err(|_| Eip712Error::SessionSignatureInvalid)?;
                 let session = session_lookup(session_pubkey).ok_or(Eip712Error::SessionNotFound)?;
-                if current_timestamp > session.expiry {
+                if current_time_ms > session.expiry {
                     return Err(Eip712Error::SessionExpired);
                 }
                 if !session.scope.allows(&self.action) {
@@ -922,27 +1014,15 @@ impl SignedNativeAction {
     /// Full validation: chain ID guard, nonce freshness, and sender recovery.
     ///
     /// `current_time_ms` — current wall-clock time in milliseconds.
-    /// `expected_chain_id` — the chain ID this node is configured for.
+    /// `expected_chain_id` — the chain ID this component is configured for;
+    /// it must be this process's [`network_chain_id`] (the domain verified).
     pub fn validate(
         &self,
         current_time_ms: u64,
         expected_chain_id: u64,
     ) -> Result<Address, Eip712Error> {
-        if expected_chain_id != TORUS_CHAIN_ID {
-            return Err(Eip712Error::ChainIdMismatch {
-                expected: TORUS_CHAIN_ID,
-                got: expected_chain_id,
-            });
-        }
-
-        // Nonce must be within +-60 s of current time.
-        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
-            return Err(Eip712Error::NonceTooOld);
-        }
-        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
-            return Err(Eip712Error::NonceTooFuture);
-        }
-
+        check_network_chain_id(expected_chain_id)?;
+        check_nonce_window(self.nonce, current_time_ms)?;
         self.recover_sender()
     }
 
@@ -956,22 +1036,19 @@ impl SignedNativeAction {
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
-        if expected_chain_id != TORUS_CHAIN_ID {
-            return Err(Eip712Error::ChainIdMismatch {
-                expected: TORUS_CHAIN_ID,
-                got: expected_chain_id,
-            });
-        }
-
-        if self.nonce.saturating_add(NONCE_WINDOW_MS) < current_time_ms {
-            return Err(Eip712Error::NonceTooOld);
-        }
-        if self.nonce > current_time_ms.saturating_add(NONCE_WINDOW_MS) {
-            return Err(Eip712Error::NonceTooFuture);
-        }
-
+        check_network_chain_id(expected_chain_id)?;
+        check_nonce_window(self.nonce, current_time_ms)?;
         self.resolve_sender(current_time_ms, session_lookup)
     }
+}
+
+/// A component's configured chain id must be the process's network chain id.
+fn check_network_chain_id(configured: u64) -> Result<(), Eip712Error> {
+    let expected = network_chain_id();
+    if configured != expected {
+        return Err(Eip712Error::ChainIdMismatch { expected, got: configured });
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1099,6 +1176,9 @@ fn par_recover(
 /// The resolved sender is exactly what `SignedNativeAction::resolve_sender`
 /// would return, so callers reuse it directly instead of recovering a second
 /// time — secp256k1 ecrecover happens once per action, not twice.
+///
+/// `timestamp` is MILLISECONDS, like `resolve_sender`'s `current_time_ms`
+/// (a block caller passes [`block_timestamp_ms`] of the header timestamp).
 ///
 /// The EIP-712 ecrecovers (the dominant per-action cost) run under the
 /// [`VerifyMode`] from `TORUS_PARALLEL_VERIFY`; the result is order-preserving
@@ -1304,6 +1384,148 @@ mod tests {
             SessionScope::Full,
         ] {
             assert!(!scope.allows(&a), "{scope:?} must not allow SetOracleSigner");
+        }
+    }
+
+    /// Commit 3: a session key, whatever its scope, may only trade (place,
+    /// batch, cancel, cancel-all, modify; not under TransfersOnly). Every
+    /// other family needs the owner's EIP-712 signature, on the ingress
+    /// (`resolve_sender`) and the exec (`batch_verify`) path alike. RED
+    /// before: a Full-scope session could vote, stake, transfer, run a
+    /// validator and submit oracle prices.
+    #[test]
+    fn session_keys_may_only_trade_in_every_scope() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[46u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x46; 20]);
+        let amount = U256::from(1_000u64);
+        let order = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::ONE,
+            quantity: FixedPoint::ONE,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let trading = [
+            NativeAction::PlaceOrder(order.clone()),
+            NativeAction::PlaceOrderBatch(vec![order.clone(), order]),
+            NativeAction::CancelOrder { order_id: 1 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::ModifyOrder { order_id: 1, new_price: Some(FixedPoint::ONE), new_qty: None },
+        ];
+        let families: [(&str, Vec<NativeAction>); 6] = [
+            (
+                "transfer",
+                vec![
+                    NativeAction::TransferToPerp { amount },
+                    NativeAction::TransferToSpot { amount },
+                    NativeAction::Withdraw { amount, to: owner },
+                ],
+            ),
+            (
+                "staking",
+                vec![
+                    NativeAction::Delegate { validator: owner, amount },
+                    NativeAction::Undelegate { validator: owner, amount },
+                    NativeAction::PermanentStake { amount },
+                    NativeAction::ClaimRewards,
+                    NativeAction::ClaimUnbonded,
+                    NativeAction::TopUpSelfStake { amount },
+                ],
+            ),
+            (
+                "governance",
+                vec![
+                    NativeAction::SubmitProposal(Proposal {
+                        title: "t".into(),
+                        description: "d".into(),
+                        action: ProposalAction::DelistMarket { market_id: 1 },
+                    }),
+                    NativeAction::Vote { proposal_id: 1, option: VoteOption::Yes },
+                    NativeAction::UpdateMarketParams {
+                        market_id: 1,
+                        params: MarketParams {
+                            tick_size: FixedPoint::ONE,
+                            lot_size: FixedPoint::ONE,
+                            max_leverage: 20,
+                            maintenance_margin_bps: 500,
+                            max_funding_rate_bps: 100,
+                        },
+                    },
+                    NativeAction::ListMarket(MarketListing {
+                        base_asset: "BTC".into(),
+                        quote_asset: "USD".into(),
+                        tick_size: FixedPoint::ONE,
+                        lot_size: FixedPoint::ONE,
+                        max_leverage: 50,
+                        maintenance_margin_bps: 300,
+                    }),
+                    NativeAction::DelistMarket { market_id: 1 },
+                ],
+            ),
+            (
+                "validator",
+                vec![
+                    NativeAction::RegisterValidator { pubkey: PublicKey([1; 32]), commission: 500 },
+                    NativeAction::UpdateCommission { new_rate: 300 },
+                    NativeAction::JailVote { target: owner },
+                    NativeAction::UnjailSelf,
+                    NativeAction::RotateValidatorKey { new_pubkey: PublicKey([2; 32]) },
+                    NativeAction::AttestStateHash { height: 100, hash: B256::ZERO },
+                ],
+            ),
+            (
+                "oracle",
+                vec![
+                    NativeAction::SubmitOraclePrices(OracleSubmission {
+                        prices: vec![(1, FixedPoint::ONE)],
+                        timestamp: TEST_NONCE,
+                    }),
+                    NativeAction::SetOracleSigner { signer: owner, proof: None },
+                ],
+            ),
+            (
+                "session",
+                vec![
+                    NativeAction::CreateSession {
+                        session_pubkey: [3; 32],
+                        expiry: TEST_NONCE + 1,
+                        scope: SessionScope::Trading,
+                    },
+                    NativeAction::RevokeSession { session_pubkey: [3; 32] },
+                ],
+            ),
+        ];
+        for scope in [SessionScope::Trading, SessionScope::TransfersOnly, SessionScope::Full] {
+            let session = SessionData { owner, expiry: u64::MAX, scope, created_at: 0 };
+            let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+            let both_paths = |action: &NativeAction| {
+                let signed = sign_action_with_session(action.clone(), TEST_NONCE, &ed_key);
+                (
+                    signed.resolve_sender(TEST_NONCE, lookup),
+                    batch_verify_native_actions(std::slice::from_ref(&signed), TEST_NONCE, lookup)[0],
+                )
+            };
+            let trades = scope != SessionScope::TransfersOnly;
+            for action in &trading {
+                let want = if trades { Ok(owner) } else { Err(Eip712Error::SessionScopeViolation) };
+                assert_eq!(both_paths(action), (want.clone(), want.ok()), "{scope:?} {action:?}");
+                assert_eq!(scope.allows(action), trades, "{scope:?} allows {action:?}");
+            }
+            for (family, actions) in &families {
+                for action in actions {
+                    assert!(requires_eip712(action), "{family} {action:?} needs the owner key");
+                    assert_eq!(
+                        both_paths(action),
+                        (Err(Eip712Error::RequiresEip712), None),
+                        "{scope:?} session must not sign {family} {action:?}"
+                    );
+                    assert!(!scope.allows(action), "{scope:?} allows {family} {action:?}");
+                }
+            }
         }
     }
 
@@ -1686,6 +1908,21 @@ mod tests {
         assert!(s.validate(now, TORUS_CHAIN_ID).is_ok());
     }
 
+    /// The window check shared by intake (`validate*`) and block execution:
+    /// inclusive on both sides, saturating at the u64 ends.
+    #[test]
+    fn check_nonce_window_is_inclusive_and_saturating() {
+        let now = 1_700_000_000_000u64;
+        let w = NONCE_WINDOW_MS;
+        assert_eq!(check_nonce_window(now - w, now), Ok(()));
+        assert_eq!(check_nonce_window(now + w, now), Ok(()));
+        assert_eq!(check_nonce_window(now - w - 1, now), Err(Eip712Error::NonceTooOld));
+        assert_eq!(check_nonce_window(now + w + 1, now), Err(Eip712Error::NonceTooFuture));
+        assert_eq!(check_nonce_window(0, w), Ok(()));
+        assert_eq!(check_nonce_window(u64::MAX, u64::MAX), Ok(()));
+        assert_eq!(check_nonce_window(u64::MAX, 0), Err(Eip712Error::NonceTooFuture));
+    }
+
     // --- chain ID ---
 
     #[test]
@@ -1707,6 +1944,83 @@ mod tests {
         let signed = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
         let addr = signed.validate(TEST_NONCE, TORUS_CHAIN_ID).unwrap();
         assert_eq!(addr, signer_address(&key));
+    }
+
+    /// Commit 4: the devnet (7778) domain separator is byte-identical to the
+    /// one every existing signature, fixture and client was made with
+    /// (tests/fixtures/eip712_vectors.json, the trading app's DOMAIN).
+    #[test]
+    fn domain_separator_for_7778_is_pinned() {
+        let pinned = "c17bc08f8d2e5d76651f1d3a5c156a7cfc34b56bb732b24997bfc22da5f4a257";
+        assert_eq!(alloy_primitives::hex::encode(eip712_domain_separator_for_chain(7778)), pinned);
+        assert_eq!(TORUS_CHAIN_ID, 7778);
+        // This process never sets a network chain id: the default is devnet.
+        assert_eq!(network_chain_id(), TORUS_CHAIN_ID);
+        assert_eq!(alloy_primitives::hex::encode(eip712_domain_separator()), pinned);
+        assert_ne!(
+            eip712_domain_separator_for_chain(7779),
+            eip712_domain_separator_for_chain(7778)
+        );
+    }
+
+    /// Commit 4: an action signed for one network never verifies as its
+    /// signer on another — EIP-712 (recovers a different address) and session
+    /// (ed25519 rejects) — in both directions; on its own network it does.
+    #[test]
+    fn action_signed_for_one_chain_never_verifies_on_another() {
+        let key = test_key();
+        let signer = signer_address(&key);
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[47u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x47; 20]);
+        let session = SessionData {
+            owner,
+            expiry: u64::MAX,
+            scope: SessionScope::Trading,
+            created_at: 0,
+        };
+        let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+        let cancel = NativeAction::CancelOrder { order_id: 1 };
+        for (signed_on, verified_on) in [(TORUS_CHAIN_ID, 9_999), (9_999, TORUS_CHAIN_ID)] {
+            let ecdsa = sign_native_action_for_chain(signed_on, cancel.clone(), TEST_NONCE, &key);
+            assert_eq!(ecdsa.recover_sender_for_chain(signed_on), Ok(signer));
+            assert_ne!(
+                ecdsa.recover_sender_for_chain(verified_on).ok(),
+                Some(signer),
+                "signed on {signed_on}, replayed on {verified_on}"
+            );
+            let sess =
+                sign_native_action_with_session_for_chain(signed_on, cancel.clone(), TEST_NONCE, &ed_key);
+            assert_eq!(sess.resolve_sender_for_chain(signed_on, TEST_NONCE, lookup), Ok(owner));
+            assert_eq!(
+                sess.resolve_sender_for_chain(verified_on, TEST_NONCE, lookup),
+                Err(Eip712Error::SessionSignatureInvalid),
+                "session signed on {signed_on}, replayed on {verified_on}"
+            );
+            // The oracle-signer proof binds the chain id too.
+            assert_ne!(
+                oracle_signer_proof_hash(signed_on, &signer, 1),
+                oracle_signer_proof_hash(verified_on, &signer, 1)
+            );
+        }
+        // Devnet defaults are the explicit 7778 functions, byte for byte.
+        assert_eq!(
+            sign_native_action(cancel.clone(), TEST_NONCE, &key).signature,
+            sign_native_action_for_chain(TORUS_CHAIN_ID, cancel, TEST_NONCE, &key).signature
+        );
+    }
+
+    /// The network chain id is set once per process (node: genesis
+    /// `chain_id`; clients: `--chain-id`) and never changes after first use.
+    #[test]
+    fn network_chain_id_is_set_once() {
+        // Only the devnet value is set here: tests share the process.
+        assert_eq!(set_network_chain_id(TORUS_CHAIN_ID), Ok(()));
+        assert_eq!(
+            set_network_chain_id(9_999),
+            Err(Eip712Error::ChainIdMismatch { expected: 9_999, got: TORUS_CHAIN_ID })
+        );
+        assert_eq!(network_chain_id(), TORUS_CHAIN_ID);
     }
 
     // --- signature encoding ---
@@ -1767,6 +2081,43 @@ mod tests {
             .resolve_sender(0, |pk| (pk == &pubkey).then(|| session.clone()))
             .expect("session-signed action resolves to owner");
         assert_eq!(got, owner);
+    }
+
+    /// A8: session expiry is inclusive and in MILLISECONDS on both the ingress
+    /// (`resolve_sender`) and the exec (`batch_verify`) path: valid at exactly
+    /// `expiry`, expired 1 ms later.
+    #[test]
+    fn session_expiry_boundary_is_inclusive_ms_on_both_paths() {
+        let ed_key = ed25519_dalek::SigningKey::from_bytes(&[45u8; 32]);
+        let pubkey = ed_key.verifying_key().to_bytes();
+        let owner = Address::from([0x45; 20]);
+        let expiry = TEST_NONCE + 3_600_000;
+        let session = SessionData {
+            owner,
+            expiry,
+            scope: SessionScope::Trading,
+            created_at: TEST_NONCE,
+        };
+        let lookup = |pk: &[u8; 32]| (pk == &pubkey).then(|| session.clone());
+        let signed =
+            sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, TEST_NONCE, &ed_key);
+
+        assert_eq!(signed.resolve_sender(expiry, lookup), Ok(owner));
+        assert_eq!(
+            signed.resolve_sender(expiry + 1, lookup),
+            Err(Eip712Error::SessionExpired)
+        );
+        let at = |t| batch_verify_native_actions(std::slice::from_ref(&signed), t, lookup)[0];
+        assert_eq!(at(expiry), Some(owner));
+        assert_eq!(at(expiry + 1), None);
+    }
+
+    /// A8: header seconds -> milliseconds, saturating.
+    #[test]
+    fn block_timestamp_ms_converts_header_seconds() {
+        assert_eq!(block_timestamp_ms(1_700_000_000), 1_700_000_000_000);
+        assert_eq!(block_timestamp_ms(0), 0);
+        assert_eq!(block_timestamp_ms(u64::MAX), u64::MAX);
     }
 
     /// O2/G3: least-privilege market makers must be able to batch under

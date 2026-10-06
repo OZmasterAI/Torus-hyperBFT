@@ -140,6 +140,18 @@ impl NativeExecutor {
         liq::set_pending(&ctx.state, &LIQUIDATOR_VAULT, vault_adl)?;
         liq::put_prev_marks(&ctx.state, &listed, &marks, &prev)?;
         liq::put_cursor(&ctx.state, if cut { last } else { None })?;
+        // Metric: the vault's deficit (negative cash it absorbed, D9). A pure
+        // point read, only with metrics attached; a read error skips the update
+        // so observability never changes what the step does.
+        if let Some(ref m) = ctx.metrics {
+            if let Ok(b) = ctx.positions.get_native_balance(&LIQUIDATOR_VAULT) {
+                let deficit = match b.available.raw() {
+                    raw if raw < 0 => raw.unsigned_abs() as f64 / FixedPoint::SCALE as f64,
+                    _ => 0.0,
+                };
+                m.liquidator_vault_deficit.set(deficit);
+            }
+        }
         Ok(results)
     }
 
@@ -330,7 +342,7 @@ impl NativeExecutor {
             };
             // Exactly `exec_place_order` (D7: stops fired by its fills run).
             let mut queue = VecDeque::new();
-            let r = Self::place_order_inner(ctx, trader, &params, None, &mut queue);
+            let r = Self::place_order_inner(ctx, trader, &params, None, &mut queue, true);
             Self::run_triggered_stops(ctx, queue);
             if !r.success {
                 results.push(r);

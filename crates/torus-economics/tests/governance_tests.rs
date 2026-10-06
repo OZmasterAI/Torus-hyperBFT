@@ -6,8 +6,14 @@ use torus_economics::governance::{
     ExecutionPayload, GovernanceManager, GovernanceParams, ProposalOutcome, ProposalStatus,
     ProposalType,
 };
-use torus_economics::{EconomicsError, StakingManager, MIN_SELF_DELEGATION};
-use torus_state::cf::{ALL_CF_NAMES, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS};
+use torus_economics::{
+    EconomicsError, PermanentStakeInfo, StakingManager, ValidatorWhitelistEntry,
+    MIN_SELF_DELEGATION, WHITELIST_EXPIRY_BLOCKS,
+};
+use torus_state::cf::{
+    ALL_CF_NAMES, CF_ACCOUNTS, CF_CONSENSUS_META, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS,
+    CF_NATIVE_MARKETS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS,
+};
 use torus_state::error::StateError;
 use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 use torus_types::FixedPoint;
@@ -376,6 +382,30 @@ fn execute_parameter_change() {
     let proposal = gov.get_proposal(id).unwrap().unwrap();
     assert_eq!(proposal.status, ProposalStatus::Executed);
     assert_eq!(proposal.proposal_type, ProposalType::ParameterChange);
+}
+
+/// s94 option 2: the placement price band is a ParameterChange key
+/// (`price_band_bps`, 100..=9,000): a valid value executes into
+/// CF_FEE_CONFIG (the executor and RPC read it there); out of range or not a
+/// number is refused at submission.
+#[test]
+fn execute_price_band_parameter_change() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    for bad in ["99", "9001", "0", "abc"] {
+        let payload = ExecutionPayload::ParameterChange { param_key: "price_band_bps".into(), new_value: bad.into() };
+        let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+        assert!(matches!(r, Err(EconomicsError::InvalidParameterValue { .. })), "{bad}: {r:?}");
+    }
+    let payload = ExecutionPayload::ParameterChange { param_key: "price_band_bps".into(), new_value: "1000".into() };
+    let id = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0).unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    assert_eq!(gov.finalize_proposal(id, 101).unwrap(), ProposalOutcome::Passed(id));
+    assert_eq!(gov.execute_proposal(id, 120).unwrap(), ProposalOutcome::Executed(id));
+    let data = gov.state().get_cf_raw(CF_FEE_CONFIG, b"price_band_bps").unwrap().unwrap();
+    assert_eq!(&data, b"1000");
+    assert_eq!(torus_types::price_band_bps(Some(&data)), 1_000);
 }
 
 #[test]
@@ -1181,30 +1211,46 @@ fn failed_execution_leaves_no_partial_state_for_any_payload_kind() {
     }
 }
 
-/// `StateDb` whose `put` of one market row fails (an injected storage fault).
+/// `StateDb` whose writes to one `(cf, key)` fail (an injected storage
+/// fault): a plain put / delete of it, and any `atomic_write` containing it,
+/// which then applies nothing (as a RocksDB `WriteBatch` does).
 #[derive(Clone)]
-struct FailingMarketPut {
+struct PoisonedKey {
     inner: StateDb,
-    market_id: u64,
+    cf: &'static str,
+    key: Vec<u8>,
 }
 
-impl FailingMarketPut {
+impl PoisonedKey {
+    fn new(inner: StateDb, cf: &'static str, key: &[u8]) -> Self {
+        Self {
+            inner,
+            cf,
+            key: key.to_vec(),
+        }
+    }
     fn hit(&self, cf: &str, key: &[u8]) -> bool {
-        cf == CF_NATIVE_MARKETS && key == self.market_id.to_be_bytes()
+        cf == self.cf && key == self.key.as_slice()
+    }
+    fn fail() -> StateError {
+        StateError::InvalidData("injected write failure".into())
     }
 }
 
-impl StateBackend for FailingMarketPut {
+impl StateBackend for PoisonedKey {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         StateBackend::get_cf_raw(&self.inner, cf, key)
     }
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         if self.hit(cf, key) {
-            return Err(StateError::InvalidData("injected write failure".into()));
+            return Err(Self::fail());
         }
         StateBackend::put_cf_raw(&self.inner, cf, key, value)
     }
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        if self.hit(cf, key) {
+            return Err(Self::fail());
+        }
         StateBackend::delete_cf_raw(&self.inner, cf, key)
     }
     fn iterate_cf(
@@ -1215,6 +1261,14 @@ impl StateBackend for FailingMarketPut {
         StateBackend::iterate_cf(&self.inner, cf, prefix)
     }
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        let poisoned = ops.iter().any(|op| match op {
+            AtomicWriteOp::Put { cf, key, .. } | AtomicWriteOp::Delete { cf, key } => {
+                self.hit(cf, key)
+            }
+        });
+        if poisoned {
+            return Err(Self::fail());
+        }
         StateBackend::atomic_write(&self.inner, ops)
     }
 }
@@ -1231,10 +1285,11 @@ fn storage_error_during_execution_still_aborts_the_step() {
     let p2 = submit_and_pass(&gov, listing(8, "Y"));
     gov.process_pending_proposals(101).unwrap();
 
-    let faulty = GovernanceManager::new(FailingMarketPut {
-        inner: gov.state().clone(),
-        market_id: 7,
-    });
+    let faulty = GovernanceManager::new(PoisonedKey::new(
+        gov.state().clone(),
+        CF_NATIVE_MARKETS,
+        &7u64.to_be_bytes(),
+    ));
     match faulty.process_pending_proposals(120) {
         Err(EconomicsError::State(e)) => assert!(e.to_string().contains("injected")),
         other => panic!("expected the storage error, got {other:?}"),
@@ -1242,4 +1297,293 @@ fn storage_error_during_execution_still_aborts_the_step() {
     assert_eq!(gov.get_proposal(p1).unwrap().unwrap().status, ProposalStatus::Passed);
     assert_eq!(gov.get_proposal(p2).unwrap().unwrap().status, ProposalStatus::Passed);
     assert!(market_ids(gov.state()).is_empty());
+}
+
+// ============================================================================
+// Row 75 (s94): a payload and its proposal's status change are one atomic
+// write. A storage fault anywhere in it leaves every CF unchanged and the
+// proposal Passed; the next block applies it exactly once.
+// ============================================================================
+
+/// Every column family's rows, per CF name.
+type CfDump = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+/// Every column family, in a comparable form.
+fn dump_all(db: &StateDb) -> CfDump {
+    ALL_CF_NAMES
+        .iter()
+        .map(|cf| (*cf, db.iterate_cf(cf, None).unwrap()))
+        .collect()
+}
+
+fn balance(db: &StateDb, a: &Address) -> U256 {
+    db.get_account(a)
+        .unwrap()
+        .map(|i| i.balance)
+        .unwrap_or_default()
+}
+
+/// Run block `block` through a manager whose writes to `(cf, key)` fail: the
+/// step returns the injected error, no CF changes, proposal `id` stays Passed.
+fn assert_faulted_block_changes_nothing(
+    gov: &GovernanceManager,
+    cf: &'static str,
+    key: &[u8],
+    block: u64,
+    id: u64,
+) {
+    let before = dump_all(gov.state());
+    let faulty = GovernanceManager::new(PoisonedKey::new(gov.state().clone(), cf, key));
+    match faulty.process_pending_proposals(block) {
+        Err(EconomicsError::State(e)) => assert!(e.to_string().contains("injected"), "{e}"),
+        other => panic!("expected the injected storage error, got {other:?}"),
+    }
+    assert!(
+        dump_all(gov.state()) == before,
+        "a failed execution must leave no partial write (fault on {cf})"
+    );
+    assert_eq!(gov.get_proposal(id).unwrap().unwrap().status, ProposalStatus::Passed);
+}
+
+/// Governance + staking with a funded treasury (addr 99, 10k tokens),
+/// addr(50) holding 3 tokens, and addr(3) holding a permanent stake of 10
+/// tokens (locked at block 0) plus 1 token of accrued rewards.
+fn setup_row75() -> (tempfile::TempDir, GovernanceManager, StakingManager) {
+    let (dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 3, validator, U256::ZERO, wei(10));
+    staking.credit_rewards(addr(3), wei(1)).unwrap();
+    fund(gov.state(), &addr(99), wei(10_000));
+    fund(gov.state(), &addr(50), wei(3));
+    (dir, gov, staking)
+}
+
+fn treasury_spend(recipient: Address, tokens: u64) -> ExecutionPayload {
+    ExecutionPayload::TreasurySpend {
+        recipient,
+        amount: wei(tokens),
+        reason: "Grant".into(),
+    }
+}
+
+fn unlock(tokens: u64) -> ExecutionPayload {
+    ExecutionPayload::PermanentUnlock {
+        staker: addr(3),
+        amount: wei(tokens),
+    }
+}
+
+#[test]
+fn treasury_spend_storage_fault_after_first_write_changes_nothing_and_retry_pays_once() {
+    let (_dir, gov, _staking) = setup_row75();
+    let (treasury, recipient) = (addr(99), addr(50));
+    let id = submit_and_pass(&gov, treasury_spend(recipient, 1_000));
+    gov.finalize_proposal(id, 101).unwrap();
+
+    // The treasury debit is written before the recipient credit: fail the credit.
+    assert_faulted_block_changes_nothing(&gov, CF_ACCOUNTS, recipient.as_slice(), 120, id);
+    assert_eq!(balance(gov.state(), &treasury), wei(10_000));
+
+    assert_eq!(
+        gov.process_pending_proposals(121).unwrap(),
+        vec![ProposalOutcome::Executed(id)]
+    );
+    for block in [122, 500] {
+        assert!(gov.process_pending_proposals(block).unwrap().is_empty());
+        assert_eq!(balance(gov.state(), &treasury), wei(9_000), "debited once");
+        assert_eq!(balance(gov.state(), &recipient), wei(1_003), "paid once");
+    }
+    assert_eq!(gov.get_proposal(id).unwrap().unwrap().status, ProposalStatus::Executed);
+}
+
+#[test]
+fn permanent_unlock_storage_fault_after_first_write_changes_nothing_and_retry_unlocks_once() {
+    let (_dir, gov, staking) = setup_row75();
+    let staker = addr(3);
+    let id = submit_and_pass(&gov, unlock(4));
+    gov.finalize_proposal(id, 101).unwrap();
+
+    // Stake row and rewards row are written before the balance credit: fail the credit.
+    assert_faulted_block_changes_nothing(&gov, CF_ACCOUNTS, staker.as_slice(), 120, id);
+    assert_eq!(staking.get_permanent_stake(&staker).unwrap().unwrap().amount, wei(10));
+    assert_eq!(staking.get_pending_rewards(&staker).unwrap().unwrap().amount, wei(1));
+
+    assert_eq!(
+        gov.process_pending_proposals(121).unwrap(),
+        vec![ProposalOutcome::Executed(id)]
+    );
+    for block in [122, 500] {
+        assert!(gov.process_pending_proposals(block).unwrap().is_empty());
+        assert_eq!(staking.get_permanent_stake(&staker).unwrap().unwrap().amount, wei(6));
+        assert!(staking.get_pending_rewards(&staker).unwrap().is_none());
+        assert_eq!(balance(gov.state(), &staker), wei(5), "4 unlocked + 1 reward, once");
+    }
+    assert_eq!(gov.get_proposal(id).unwrap().unwrap().status, ProposalStatus::Executed);
+}
+
+/// Every executable payload kind.
+fn all_payload_kinds() -> Vec<(&'static str, ExecutionPayload)> {
+    vec![
+        (
+            "param change",
+            ExecutionPayload::ParameterChange {
+                param_key: "max_leverage".into(),
+                new_value: "50".into(),
+            },
+        ),
+        ("treasury spend", treasury_spend(addr(50), 1_000)),
+        ("treasury spend to the treasury", treasury_spend(addr(99), 1_000)),
+        ("listing, explicit id", listing(42, "ETH")),
+        ("listing, auto id", listing(0, "SOL")),
+        (
+            "validator registration",
+            ExecutionPayload::ValidatorRegistration {
+                candidate: addr(70),
+            },
+        ),
+        ("permanent unlock, partial", unlock(4)),
+        ("permanent unlock, full", unlock(10)),
+    ]
+}
+
+/// The status write fails (the payload's writes would succeed): nothing of
+/// the payload may land, else the still-Passed proposal re-applies it. The
+/// retry leaves exactly the state of a run without the fault.
+#[test]
+fn status_write_fault_rolls_back_the_payload_for_every_kind() {
+    for (name, payload) in all_payload_kinds() {
+        let (_ref_dir, reference, _) = setup_row75();
+        let ref_id = submit_and_pass(&reference, payload.clone());
+        reference.finalize_proposal(ref_id, 101).unwrap();
+        assert_eq!(
+            reference.process_pending_proposals(121).unwrap(),
+            vec![ProposalOutcome::Executed(ref_id)],
+            "{name}"
+        );
+
+        let (_dir, gov, _) = setup_row75();
+        let id = submit_and_pass(&gov, payload);
+        gov.finalize_proposal(id, 101).unwrap();
+        assert_faulted_block_changes_nothing(
+            &gov,
+            CF_GOVERNANCE_PROPOSALS,
+            &id.to_be_bytes(),
+            120,
+            id,
+        );
+        assert_eq!(
+            gov.process_pending_proposals(121).unwrap(),
+            vec![ProposalOutcome::Executed(id)],
+            "{name}"
+        );
+        assert!(gov.process_pending_proposals(122).unwrap().is_empty(), "{name}");
+        assert!(
+            dump_all(gov.state()) == dump_all(reference.state()),
+            "{name}: the retry must apply the payload exactly once"
+        );
+    }
+}
+
+/// Success path of every kind, row by row: exactly these rows change
+/// (unchanged by row 75; this test passes before and after it).
+#[test]
+fn every_payload_kind_writes_exactly_its_rows_on_success() {
+    use std::collections::{BTreeMap, BTreeSet};
+    type Row = (&'static str, Vec<u8>, Option<Vec<u8>>);
+
+    let account = |a: Address, bal: U256| -> Row {
+        let info = AccountInfo {
+            balance: bal,
+            ..Default::default()
+        };
+        let bytes = torus_state::db::encode_account_info(&info).to_vec();
+        (CF_ACCOUNTS, a.as_slice().to_vec(), Some(bytes))
+    };
+    let market = |id: u64, base: &str| -> Row {
+        let fields = (
+            base.to_string(),
+            "USDC".to_string(),
+            FixedPoint::from_raw(10_000_000).raw(),
+            FixedPoint::from_raw(1_000_000).raw(),
+            FixedPoint::from_raw(500_000_000).raw(),
+        );
+        let bytes = borsh::to_vec(&fields).unwrap();
+        (CF_NATIVE_MARKETS, id.to_be_bytes().to_vec(), Some(bytes))
+    };
+    let perm = |amount: Option<U256>| -> Row {
+        let bytes = amount.map(|amount| {
+            borsh::to_vec(&PermanentStakeInfo {
+                staker: addr(3),
+                amount,
+                locked_at_block: 0,
+            })
+            .unwrap()
+        });
+        (CF_STAKING_PERMANENT, addr(3).as_slice().to_vec(), bytes)
+    };
+    let rewards_gone: Row = (CF_STAKING_REWARDS, addr(3).as_slice().to_vec(), None);
+
+    for (name, payload) in all_payload_kinds() {
+        let (_dir, gov, _staking) = setup_row75();
+        seed_market(gov.state(), 5);
+        let id = submit_and_pass(&gov, payload);
+        gov.finalize_proposal(id, 101).unwrap();
+        let mut proposal = gov.get_proposal(id).unwrap().unwrap();
+        let before = dump_all(gov.state());
+        assert_eq!(
+            gov.process_pending_proposals(121).unwrap(),
+            vec![ProposalOutcome::Executed(id)],
+            "{name}"
+        );
+
+        let mut changed: Vec<Row> = Vec::new();
+        for ((cf, rows_before), (_, rows_after)) in before.iter().zip(dump_all(gov.state())) {
+            let b: BTreeMap<_, _> = rows_before.iter().cloned().collect();
+            let a: BTreeMap<_, _> = rows_after.into_iter().collect();
+            for k in b.keys().chain(a.keys()).collect::<BTreeSet<_>>() {
+                if b.get(k) != a.get(k) {
+                    changed.push((cf, k.clone(), a.get(k).cloned()));
+                }
+            }
+        }
+
+        let mut want: Vec<Row> = match name {
+            "param change" => vec![(CF_FEE_CONFIG, b"max_leverage".to_vec(), Some(b"50".to_vec()))],
+            "treasury spend" => vec![account(addr(50), wei(1_003)), account(addr(99), wei(9_000))],
+            // Debit, then credit of the same account: the balance is unchanged.
+            "treasury spend to the treasury" => vec![],
+            "listing, explicit id" => vec![market(42, "ETH")],
+            "listing, auto id" => vec![market(6, "SOL")],
+            "validator registration" => {
+                let mut key = b"validator_whitelist:".to_vec();
+                key.extend_from_slice(addr(70).as_slice());
+                let entry = ValidatorWhitelistEntry {
+                    candidate: addr(70),
+                    approved_at_block: 121,
+                    expires_at_block: 121 + WHITELIST_EXPIRY_BLOCKS,
+                };
+                vec![(CF_CONSENSUS_META, key, Some(borsh::to_vec(&entry).unwrap()))]
+            }
+            "permanent unlock, partial" => vec![
+                account(addr(3), wei(5)),
+                perm(Some(wei(6))),
+                rewards_gone.clone(),
+            ],
+            "permanent unlock, full" => {
+                vec![account(addr(3), wei(11)), perm(None), rewards_gone.clone()]
+            }
+            other => unreachable!("{other}"),
+        };
+        // The proposal row changes in its status only.
+        proposal.status = ProposalStatus::Executed;
+        want.push((
+            CF_GOVERNANCE_PROPOSALS,
+            id.to_be_bytes().to_vec(),
+            Some(borsh::to_vec(&proposal).unwrap()),
+        ));
+        let order = |cf: &str| ALL_CF_NAMES.iter().position(|c| *c == cf).unwrap();
+        want.sort_by(|a, b| (order(a.0), &a.1).cmp(&(order(b.0), &b.1)));
+        assert_eq!(changed, want, "{name}");
+    }
 }

@@ -298,13 +298,14 @@ fn test_commission_change_affects_rewards() {
     )
     .unwrap();
 
-    // Commission = 1000 * 600/10000 = 60
+    // Self-stake share 50k/100k of 1000 = 500, plus commission on the
+    // delegator's 500 at the new rate: 500 * 600/10000 = 30.
     let proposer_rewards = staking
         .get_pending_rewards(&proposer)
         .unwrap()
         .unwrap()
         .amount;
-    assert_eq!(proposer_rewards, wei(60));
+    assert_eq!(proposer_rewards, wei(530));
 }
 
 /// Commission change within cooldown → rejected.

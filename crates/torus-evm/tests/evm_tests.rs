@@ -609,6 +609,148 @@ fn precompile_charges_correct_gas() {
     );
 }
 
+/// HL-parity: a reader precompile's gas scales with its work, not a flat
+/// 2,600: one unit per row read plus one per 32-byte word returned.
+/// `getMarkets()` reads 1 row and returns 2 words per market: 200 markets cost
+/// exactly 600 x GAS_PRECOMPILE_READ_PER_UNIT more than none, and a gas limit
+/// that only covers the empty answer runs out of gas.
+#[test]
+fn reader_precompile_gas_scales_with_returned_words() {
+    use torus_core::precompiles::GAS_PRECOMPILE_READ_PER_UNIT;
+    let block_cfg = default_block_cfg();
+    let get_markets = |db: &StateDb, gas_limit: u64| {
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit,
+            gas_price: block_cfg.base_fee as u128,
+            // BalanceReader precompile at 0x0801.
+            kind: TxKind::Call(Address::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01,
+            ])),
+            data: Bytes::from(alloy_primitives::keccak256("getMarkets()".as_bytes())[..4].to_vec()),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(db, &block_cfg, tx).unwrap().0
+    };
+    let funded_db = |markets: u64| {
+        let (dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();
+        for m in 1..=markets {
+            db.put_cf_raw("cf_native_markets", &m.to_be_bytes(), &[1u8]).unwrap();
+        }
+        (dir, db)
+    };
+
+    let (_d0, empty) = funded_db(0);
+    let r0 = get_markets(&empty, 1_000_000);
+    assert!(r0.success);
+    assert_eq!(r0.output.len(), 4 * 32, "two empty arrays: 2 offsets + 2 lengths");
+
+    let (_d1, full) = funded_db(200);
+    let r1 = get_markets(&full, 1_000_000);
+    assert!(r1.success);
+    assert_eq!(r1.output.len(), (4 + 400) * 32);
+    assert_eq!(
+        r1.gas_used - r0.gas_used,
+        600 * GAS_PRECOMPILE_READ_PER_UNIT,
+        "gas grows by one unit per row read and per word returned"
+    );
+
+    let (_d2, full2) = funded_db(200);
+    let short = get_markets(&full2, r0.gas_used + 1_000);
+    assert!(!short.success, "gas for the empty answer does not pay for 200 markets");
+}
+
+/// Runtime code: `calls` times CALL(gas = `stipend`, 0x0801, getMarkets()),
+/// summing the success flags; returns the sum as one word.
+fn get_markets_loop_code(calls: usize, stipend: u32) -> Vec<u8> {
+    let sel = alloy_primitives::keccak256("getMarkets()".as_bytes());
+    // mem[0..4] = selector: PUSH4 sel PUSH1 224 SHL PUSH1 0 MSTORE
+    let mut c = vec![0x63, sel[0], sel[1], sel[2], sel[3], 0x60, 0xe0, 0x1b, 0x60, 0x00, 0x52];
+    c.extend_from_slice(&[0x60, 0x00]); // running sum
+    let s = stipend.to_be_bytes();
+    for _ in 0..calls {
+        // retSize, retOffset, argsSize 4, argsOffset 0, value 0, addr, gas
+        c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x00, 0x60, 0x00]);
+        c.extend_from_slice(&[0x61, 0x08, 0x01]);
+        c.extend_from_slice(&[0x63, s[0], s[1], s[2], s[3]]);
+        c.extend_from_slice(&[0xf1, 0x01]); // CALL, ADD to the sum
+    }
+    // mem[0..32] = sum; RETURN(0, 32)
+    c.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    c
+}
+
+/// Review (blocking): the attack is a contract looping CALLs into a reader
+/// with a tight stipend. Each call with a stipend below the work of a
+/// 200-market getMarkets (600 units) runs out of gas and costs the caller only
+/// its stipend; the node's work per call is bounded by that stipend
+/// (torus-bridge precompile_work_bound_tests). With enough gas every call
+/// succeeds.
+#[test]
+fn tight_stipend_reader_calls_run_out_of_gas() {
+    let block_cfg = default_block_cfg();
+    let contract = Address::with_last_byte(0x77);
+    let run = |stipend: u32| {
+        let (dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();
+        for m in 1..=200u64 {
+            db.put_cf_raw("cf_native_markets", &m.to_be_bytes(), &[1u8]).unwrap();
+        }
+        install_contract(&db, &contract, &get_markets_loop_code(20, stipend));
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit: 10_000_000,
+            gas_price: block_cfg.base_fee as u128,
+            kind: TxKind::Call(contract),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        let r = EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(&db, &block_cfg, tx).unwrap().0;
+        drop(dir);
+        assert!(r.success, "the outer call survives its inner out-of-gas calls");
+        (U256::from_be_slice(&r.output).to::<u64>(), r.gas_used)
+    };
+
+    let (ok, gas) = run(2_600 + 50 * 20);
+    assert_eq!(ok, 0, "every tight call ran out of gas");
+    assert!(gas < 21_000 + 20 * (3_600 + 1_000), "each call costs about its stipend, got {gas}");
+
+    let (ok, _) = run(2_600 + 50 * 700);
+    assert_eq!(ok, 20, "with enough gas every call succeeds");
+}
+
+/// Re-review: the exact boundary through the EVM. getMarkets over 200 markets
+/// is 200 rows + 404 words = 604 units: a stipend of exactly 2,600 + 604 x 50
+/// succeeds, one gas less runs out of gas.
+#[test]
+fn reader_stipend_exact_boundary() {
+    use torus_core::precompiles::{GAS_PRECOMPILE_READ, GAS_PRECOMPILE_READ_PER_UNIT};
+    let block_cfg = default_block_cfg();
+    let contract = Address::with_last_byte(0x78);
+    let exact = (GAS_PRECOMPILE_READ + 604 * GAS_PRECOMPILE_READ_PER_UNIT) as u32;
+    for (stipend, want) in [(exact, 1u64), (exact - 1, 0)] {
+        let (_dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();
+        for m in 1..=200u64 {
+            db.put_cf_raw("cf_native_markets", &m.to_be_bytes(), &[1u8]).unwrap();
+        }
+        install_contract(&db, &contract, &get_markets_loop_code(1, stipend));
+        let tx = TxEnv {
+            caller: ALICE,
+            gas_limit: 1_000_000,
+            gas_price: block_cfg.base_fee as u128,
+            kind: TxKind::Call(contract),
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        let r = EvmExecutor::new(TORUS_CHAIN_ID).execute_tx(&db, &block_cfg, tx).unwrap().0;
+        assert!(r.success);
+        assert_eq!(U256::from_be_slice(&r.output).to::<u64>(), want, "stipend {stipend}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 12. Standard Ethereum precompile (ecrecover) still works
 // ---------------------------------------------------------------------------

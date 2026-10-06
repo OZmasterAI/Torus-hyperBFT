@@ -165,7 +165,10 @@ impl BlockValidator {
                 )));
             }
 
-            let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+            let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
             if computed_fee_revenue != block.header.evm_fee_revenue {
                 return Err(BridgeError::InvalidBlock(format!(
                     "fee revenue mismatch: header={}, computed={}",
@@ -267,7 +270,10 @@ impl BlockValidator {
             )));
         }
 
-        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
         if computed_fee_revenue != block.header.evm_fee_revenue {
             return Err(BridgeError::InvalidBlock(format!(
                 "fee revenue mismatch: header={}, computed={}",
@@ -371,9 +377,11 @@ impl BlockValidator {
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
         let mut sender_actions = Vec::with_capacity(block.native_actions.len());
         let mut consumed_nonces: Vec<(Address, u64)> = Vec::new();
+        // A8: the header timestamp is SECONDS, session expiry MILLISECONDS.
+        let block_ms = torus_types::eip712::block_timestamp_ms(block.header.timestamp);
         for (i, signed) in block.native_actions.iter().enumerate() {
             let sender = signed
-                .resolve_sender(block.header.timestamp, |pubkey| {
+                .resolve_sender(block_ms, |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
                 .map_err(|e| {
@@ -381,6 +389,10 @@ impl BlockValidator {
                         "native action {i}: signature verification failed: {e}"
                     ))
                 })?;
+            // Nonce window against the block time (exec skips such an action).
+            torus_types::eip712::check_nonce_window(signed.nonce, block_ms).map_err(|e| {
+                BridgeError::InvalidBlock(format!("native action {i}: nonce {}: {e}", signed.nonce))
+            })?;
             // Replay check: reject blocks containing replayed nonces.
             let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
             if state_db
@@ -429,7 +441,10 @@ impl BlockValidator {
             )));
         }
 
-        let computed_fee_revenue = crate::proposer::compute_fee_revenue(&exec_result.receipts);
+        let computed_fee_revenue = crate::proposer::compute_fee_revenue(
+                &exec_result.receipts,
+                block.header.base_fee_per_gas,
+            );
         if computed_fee_revenue != block.header.evm_fee_revenue {
             return Err(BridgeError::InvalidBlock(format!(
                 "fee revenue mismatch: header={}, computed={}",

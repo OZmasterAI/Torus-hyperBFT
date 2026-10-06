@@ -15,6 +15,7 @@ min_sources = 3
 min_weight_bps = 5000
 quote_mode = "par"                   # or "kraken_usdt"
 health_listen = "127.0.0.1:9466"
+chain_id = 7778                      # the network's genesis chain_id (7778 = devnet)
 
 # Optional per-venue overrides (defaults: weights binance 3, okx 2, bybit 2,
 # kraken/kucoin/gate/mexc 1; all enabled; public base URLs).

@@ -114,6 +114,10 @@ pub trait TorusApi {
     #[method(name = "getUserLimits")]
     async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
+    /// The liquidator vault's committed cash, deficit and open positions.
+    #[method(name = "getLiquidatorVault")]
+    async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault>;
+
     // --- 2.9.2: Market info ---
     #[method(name = "getMarkets")]
     async fn get_markets(
@@ -395,6 +399,43 @@ pub(crate) fn validate_known_markets(
     }
 }
 
+/// s94 option 2 at intake (node-local, non-consensus): the executor's price
+/// band rule (`torus_core::order_book::price_band_violation`, same text), but
+/// only against a mark that is usable at `now_secs` (the node's clock) —
+/// a stale or missing mark is NOT rejected here: the executor decides with
+/// its block-state fallback reference. Width: the governance key
+/// (`torus_types::price_band_bps`). A batch is one signed action, so one
+/// order outside rejects all of it. Modify orders are left to the executor.
+fn check_price_band(
+    action: &torus_types::NativeAction,
+    state_db: &torus_state::StateDb,
+    now_secs: u64,
+) -> Result<(), String> {
+    let orders = match action {
+        torus_types::NativeAction::PlaceOrder(p) => std::slice::from_ref(p),
+        torus_types::NativeAction::PlaceOrderBatch(orders) => orders.as_slice(),
+        _ => return Ok(()),
+    };
+    let stored = state_db
+        .get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::PRICE_BAND_PARAM.as_bytes())
+        .ok()
+        .flatten();
+    let bps = torus_types::price_band_bps(stored.as_deref());
+    let oracle = OracleManager::new(state_db.clone(), OracleConfig::default());
+    let mut marks = std::collections::BTreeMap::new();
+    for p in orders {
+        let mark = *marks
+            .entry(p.market_id)
+            .or_insert_with(|| oracle.get_price(p.market_id, now_secs).ok().and_then(|op| op.usable()));
+        let Some(reference) = mark else { continue };
+        let band = torus_core::order_book::PriceBand { reference, bps };
+        if let Some(v) = torus_core::order_book::price_band_violation(p, band) {
+            return Err(v.placement_message());
+        }
+    }
+    Ok(())
+}
+
 /// The executor's pre-book placement shape check (item 6 M1:
 /// `torus_core::order_book::shape_violation`, the same rule and text): the
 /// lot applies to every order type (`qty < lot`, so lot 0 admits any qty >=
@@ -436,6 +477,7 @@ fn verify_one_action_with(
     let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
     validate_known_markets(&action.action, state_db)?;
+    check_price_band(&action.action, state_db, current_time_ms / 1_000)?;
     let sender = action
         .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
             state_db.get_session(pubkey).ok().flatten()
@@ -1140,6 +1182,35 @@ impl TorusApiServer for RpcState {
             total_margin_used: dec_fp(total_margin),
             available_balance: dec_fp(native_bal.available),
             permanent_stake,
+        })
+    }
+
+    async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault> {
+        let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+        let pm = PositionManager::new(self.state.clone());
+        let available = pm
+            .get_native_balance(&vault)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?
+            .available;
+        let open_positions = pm
+            .positions_for_trader(&vault)
+            .map_err(|e| RpcError::Internal(e.to_string()))
+            .map_err(ErrorObjectOwned::from)?
+            .iter()
+            .filter(|p| p.size != FixedPoint::ZERO)
+            .count() as u64;
+        // Same definition as the torus_liquidator_vault_deficit gauge.
+        let deficit = if available < FixedPoint::ZERO {
+            -available
+        } else {
+            FixedPoint::ZERO
+        };
+        Ok(RpcLiquidatorVault {
+            address: hex_address(vault),
+            available_balance: dec_fp(available),
+            deficit: dec_fp(deficit),
+            open_positions,
         })
     }
 
@@ -2479,6 +2550,37 @@ mod ack_scratch_tests {
         }
     }
 
+    /// A8: RPC intake checks session expiry in milliseconds, inclusive: a
+    /// session expiring exactly now is accepted, one that expired 1 ms ago
+    /// is rejected.
+    #[test]
+    fn rpc_rejects_an_expired_session_at_the_ms_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let session = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::CancelOrder { order_id: 42 },
+            NOW,
+            &([8u8; 32].into()),
+        );
+        let ActionSignature::Session { session_pubkey, .. } = &session.signature else {
+            panic!("expected session signature")
+        };
+        let payload = format!("0x{}", hex::encode(serde_json::to_vec(&session).unwrap()));
+        let verify_with_expiry = |expiry| {
+            let data = torus_types::SessionData {
+                owner: Address::from([9; 20]),
+                expiry,
+                scope: torus_types::SessionScope::Trading,
+                created_at: 0,
+            };
+            state.put_session(session_pubkey, &data).unwrap();
+            verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, NOW)
+        };
+        assert_eq!(verify_with_expiry(NOW).unwrap().0, Address::from([9; 20]));
+        let err = verify_with_expiry(NOW - 1).unwrap_err();
+        assert!(err.contains("session key expired"), "{err}");
+    }
+
     #[test]
     fn acknowledgement_scratch_parallel_results_preserve_index_order() {
         use rayon::prelude::*;
@@ -2824,6 +2926,43 @@ mod tick_lot_ingress_tests {
         place(&state, order(1, 100 * S + 7, 1, OrderType::Limit)).unwrap();
         let e = place(&state, order(9, 100 * S, S, OrderType::Limit)).unwrap_err();
         assert_eq!(e, "unknown market_id 9");
+    }
+
+    /// s94 option 2 at intake (was the probe's
+    /// `orders_at_2x_and_half_the_mark_pass_ingress`: no band, both passed).
+    /// With a usable mark of 100: a buy at 200 (2x) and a sell at 49 are
+    /// refused with the executor's text; 150 / 50 (the band's edges) pass. A
+    /// stale mark (the node clock 120 s past the aggregate) is not judged at
+    /// intake: 200 passes (the executor decides with its fallback).
+    #[test]
+    fn orders_outside_the_band_are_refused_at_ingress_with_a_usable_mark() {
+        use torus_bridge::native_executor::NativeExecContext;
+        let (_d, state) = db();
+        list(&state, 1, S, S);
+        let rb = alloy_primitives::Address::repeat_byte;
+        let ctx = NativeExecContext::new(state.clone(), 1, NOW / 1_000, 0, 100, 10, rb(99), rb(100), rb(101));
+        let mark = FixedPoint::from_raw(100 * S);
+        let reporters = [rb(150), rb(151), rb(152)];
+        for v in &reporters {
+            ctx.oracle.submit_price(v, 1, mark, ctx.block_height, ctx.timestamp).unwrap();
+        }
+        let stakes: Vec<_> = reporters.iter().map(|v| (*v, FixedPoint::from_raw(S))).collect();
+        assert_eq!(ctx.oracle.aggregate_price(1, ctx.block_height, ctx.timestamp, &stakes).unwrap(), mark);
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let cases = [
+            (true, 200, NOW, Some("order rejected: price 200.00000000 is more than 50.00% from the reference price 100.00000000")),
+            (false, 49, NOW, Some("order rejected: price 49.00000000 is more than 50.00% from the reference price 100.00000000")),
+            (true, 150, NOW, None),
+            (false, 50, NOW, None),
+            (true, 200, NOW + 120_000, None),
+        ];
+        for (i, (is_buy, px, now, want)) in cases.into_iter().enumerate() {
+            let p = PlaceOrderParams { is_buy, ..order(1, px * S, S, OrderType::Limit) };
+            let signed = torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(p), now + i as u64, &key);
+            let payload = format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()));
+            let r = verify_one_action(&payload, torus_types::eip712::TORUS_CHAIN_ID, &state, now);
+            assert_eq!(r.err().as_deref(), want, "is_buy={is_buy} price={px} now={now}");
+        }
     }
 }
 

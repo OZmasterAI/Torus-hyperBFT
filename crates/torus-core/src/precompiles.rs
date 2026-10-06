@@ -38,12 +38,154 @@ pub const ADDR_LOCKBOX: u16 = 0x0820;
 /// FIX EVM-PF-10: Gas costs for Torus precompiles.
 /// Read-only queries (cold SLOAD equivalent).
 pub const GAS_PRECOMPILE_READ: u64 = 2_600;
+/// HL-parity (read precompiles charged flat gas for unbounded output): a reader
+/// (0x0800-0x0803) also pays this per work unit — a row (or 32 bytes of a
+/// whole-book blob) it read, and a 32-byte word it returned — and its work is
+/// capped by the units its gas limit pays for ([`ReadMeter`]). Tunable before
+/// a network freezes its gas schedule.
+pub const GAS_PRECOMPILE_READ_PER_UNIT: u64 = 50;
 /// State-mutating writes (SSTORE equivalent range).
 pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
-/// Gas cost for a precompile by address ID.
+/// Gas of a reader call (0x0800-0x0803) that used `units` work units: the
+/// base [`GAS_PRECOMPILE_READ`] plus [`GAS_PRECOMPILE_READ_PER_UNIT`] each.
+/// Charged by the EVM provider after the call, on success and on revert.
+pub const fn reader_gas(units: u64) -> u64 {
+    GAS_PRECOMPILE_READ.saturating_add(GAS_PRECOMPILE_READ_PER_UNIT.saturating_mul(units))
+}
+
+/// The work units a reader call with `gas_limit` may use: what its gas pays
+/// for above the base (0 when it does not even cover the base).
+pub const fn reader_budget(gas_limit: u64) -> u64 {
+    gas_limit.saturating_sub(GAS_PRECOMPILE_READ) / GAS_PRECOMPILE_READ_PER_UNIT
+}
+
+/// Work meter of one reader call: rows read and words returned, capped at
+/// what the caller's gas pays for. A reader charges BEFORE it does the work
+/// it charges for where it can (scans stop at the budget, a classic blob is
+/// charged before it is decoded), so the node's work per call is bounded by
+/// the call's gas, not only its price.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadMeter {
+    max: u64,
+    used: u64,
+}
+
+impl ReadMeter {
+    /// No cap (non-EVM callers and tests): readers take their unbounded paths.
+    pub const fn unlimited() -> Self {
+        Self { max: u64::MAX, used: 0 }
+    }
+
+    /// At most `max` units.
+    pub const fn with_max(max: u64) -> Self {
+        Self { max, used: 0 }
+    }
+
+    /// Units used so far.
+    pub const fn used(&self) -> u64 {
+        self.used
+    }
+
+    fn is_unlimited(&self) -> bool {
+        self.max == u64::MAX
+    }
+
+    fn remaining(&self) -> u64 {
+        self.max.saturating_sub(self.used)
+    }
+
+    /// Use `units`; out of gas once the total exceeds the cap.
+    fn charge(&mut self, units: u64) -> Result<(), CoreError> {
+        self.used = self.used.saturating_add(units);
+        if self.used > self.max {
+            return Err(CoreError::PrecompileOutOfGas);
+        }
+        Ok(())
+    }
+
+    /// Out of gas unless `units` more would still fit (a check, no charge).
+    fn require(&self, units: u64) -> Result<(), CoreError> {
+        if units > self.remaining() {
+            return Err(CoreError::PrecompileOutOfGas);
+        }
+        Ok(())
+    }
+}
+
+/// Consensus rows of `cf` whose key starts with `prefix`, in key order, each
+/// charged one unit. Only keys the running state hash covers
+/// (`running_hash::key_is_hashed`) are charged and returned: a node-local row
+/// (the `__book_mode__` marker in `cf_native_markets`) is skipped, so the
+/// charge — a block result — is the same on every node.
+///
+/// Only hashed CFs may be scanned: a CF the running state hash does not cover
+/// at all (node-local, e.g. `cf_book_order_rows`) is an error, never "charge
+/// everything" — its rows differ between nodes.
+///
+/// Metered: pages of at most 64 rows through `iterate_cf_prefix_from` (RocksDB
+/// bounded at the prefix end), each page no larger than the rows still
+/// allowed + 1; out of gas as soon as the charged rows exceed the budget. A
+/// scan therefore reads at most `remaining + 1` rows, plus the node-local rows
+/// it skips, plus the RocksDB deletion markers inside the prefix that the
+/// iterator steps over uncharged (bounded only by compaction). Unlimited: one
+/// `iterate_cf` (the pre-existing read). A missing CF reads as empty.
+fn scan_prefix_metered(
+    state: &impl StateBackend,
+    cf: &'static str,
+    prefix: &[u8],
+    meter: &mut ReadMeter,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoreError> {
+    const PAGE: u64 = 64;
+    let missing_is_empty = |e: torus_state::StateError| match e {
+        torus_state::StateError::MissingColumnFamily(_) => Ok(Vec::new()),
+        e => Err(CoreError::State(e)),
+    };
+    let Some(hashed_id) = torus_state::running_hash::hashed_cf_id(cf) else {
+        return Err(CoreError::InvalidPrecompileInput(format!(
+            "reader scan of {cf}: not a hashed consensus CF (its charge would be node-dependent)"
+        )));
+    };
+    let consensus = |k: &[u8]| torus_state::running_hash::key_is_hashed(hashed_id, k);
+    if meter.is_unlimited() {
+        let p = (!prefix.is_empty()).then_some(prefix);
+        let mut rows = state.iterate_cf(cf, p).or_else(missing_is_empty)?;
+        rows.retain(|(k, _)| consensus(k));
+        meter.charge(rows.len() as u64)?;
+        return Ok(rows);
+    }
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut start = prefix.to_vec();
+    loop {
+        // Rows still allowed, plus one that proves the budget is exceeded.
+        let left = meter.remaining().saturating_sub(out.len() as u64).saturating_add(1);
+        let page = left.min(PAGE) as usize;
+        let rows = state
+            .iterate_cf_prefix_from(cf, prefix, &start, page)
+            .or_else(missing_is_empty)?;
+        let ended = rows.len() < page;
+        let last = rows.last().map(|(k, _)| k.clone());
+        out.extend(rows.into_iter().filter(|(k, _)| consensus(k)));
+        if out.len() as u64 > meter.remaining() {
+            return Err(CoreError::PrecompileOutOfGas);
+        }
+        match last {
+            Some(mut k) if !ended => {
+                // The smallest key after the last one read.
+                k.push(0);
+                start = k;
+            }
+            _ => break,
+        }
+    }
+    meter.charge(out.len() as u64)?;
+    Ok(out)
+}
+
+/// Base gas cost for a precompile by address ID (a reader's full cost is
+/// [`reader_gas`] of the units it used).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
         0x0800..=0x0803 => GAS_PRECOMPILE_READ,
@@ -283,6 +425,7 @@ pub fn execute_precompile(
         current_block,
         current_timestamp,
         false,
+        &mut ReadMeter::unlimited(),
     )
 }
 
@@ -312,6 +455,7 @@ pub fn execute_precompile_with_value(
         current_block,
         current_timestamp,
         false,
+        &mut ReadMeter::unlimited(),
     )
 }
 
@@ -340,6 +484,37 @@ pub fn execute_precompile_read_only(
         current_block,
         current_timestamp,
         true,
+        &mut ReadMeter::unlimited(),
+    )
+}
+
+/// The EVM provider's entry: [`execute_precompile_with_value`] (or, with
+/// `read_only`, [`execute_precompile_read_only`]) where a reader's work is
+/// metered by `meter` — rows read and words returned, `PrecompileOutOfGas`
+/// once over its cap. `meter.used()` is the work done, also after an error.
+/// Writers ignore the meter.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_precompile_metered(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    call_value: U256,
+    state_db: &impl StateBackend,
+    current_block: u64,
+    current_timestamp: u64,
+    read_only: bool,
+    meter: &mut ReadMeter,
+) -> Result<Vec<u8>, CoreError> {
+    execute_precompile_inner(
+        address,
+        input,
+        caller,
+        call_value,
+        state_db,
+        current_block,
+        current_timestamp,
+        read_only,
+        meter,
     )
 }
 
@@ -353,6 +528,7 @@ fn execute_precompile_inner(
     current_block: u64,
     current_timestamp: u64,
     read_only: bool,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let bytes = address.as_slice();
     if !bytes[..18].iter().all(|&b| b == 0) {
@@ -378,11 +554,17 @@ fn execute_precompile_inner(
         )));
     }
 
+    // Readers: the answer's words are work too, charged once it is built.
+    let read = |out: Result<Vec<u8>, CoreError>, meter: &mut ReadMeter| {
+        let out = out?;
+        meter.charge((out.len() as u64).div_ceil(32))?;
+        Ok(out)
+    };
     match id {
-        ADDR_ORDER_BOOK_READER => order_book_reader(input, state_db, current_timestamp),
-        ADDR_BALANCE_READER => balance_reader(input, state_db),
-        ADDR_ORACLE_READER => oracle_reader(input, state_db, current_timestamp),
-        ADDR_STAKING_READER => staking_reader(input, state_db),
+        ADDR_ORDER_BOOK_READER => read(order_book_reader(input, state_db, current_timestamp, meter), meter),
+        ADDR_BALANCE_READER => read(balance_reader(input, state_db, meter), meter),
+        ADDR_ORACLE_READER => read(oracle_reader(input, state_db, current_timestamp, meter), meter),
+        ADDR_STAKING_READER => read(staking_reader(input, state_db, meter), meter),
         ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
         ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
         ADDR_LOCKBOX => lockbox_precompile(input, caller, call_value, state_db, current_block),
@@ -400,12 +582,13 @@ fn order_book_reader(
     input: &[u8],
     state_db: &impl StateBackend,
     now: u64,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getOrderBook(bytes32)") {
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
-        read_order_book(state_db, market_id)
+        read_order_book(state_db, market_id, meter)
     } else if sel == selector_for("getPosition(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
@@ -413,7 +596,7 @@ fn order_book_reader(
     } else if sel == selector_for("getOpenOrders(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_open_orders(state_db, &trader, market_id)
+        read_open_orders(state_db, &trader, market_id, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -439,47 +622,27 @@ type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
 ///   `torus-bridge/tests/book_read_modes_tests.rs::
 ///   classic_precompile_behaviour_is_unchanged`.
 ///
-/// GAS: `precompile_gas(0x0800)` is FLAT (`GAS_PRECOMPILE_READ`) while the
-/// returned level count is unbounded — see the top-N + metered-gas work on
-/// `feat/precompile-0800-topn-gas`. That bound must land before mode 1/2
-/// chains expose this selector to untrusted EVM traffic.
+/// GAS / WORK: metered by `meter` ([`ReadMeter`]): one unit per book row read
+/// (per 32 bytes of a classic blob, sized and charged before it is read) and
+/// per word returned; the market's rows are scanned only up to the budget
+/// (at most `remaining + 1` rows), so a call's work is bounded by its gas, and
+/// the metered layout choice reads only this market's hashed rows (see
+/// [`metered_levels`]). A deep book needs a large gas limit; returning
+/// only the top N levels (`feat/precompile-0800-topn-gas`) stays the way to
+/// serve deep books cheaply.
 fn read_order_book(
     state_db: &impl StateBackend,
     market_id: MarketId,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
+    // The answer has at least its 8-word head: a budget below it reads nothing.
+    meter.require(8)?;
     // (price, quantity) per level, best-first — the shape both arms feed.
-    let (bids, asks): (PriceQtyLevels, PriceQtyLevels) =
-        match crate::book_reader::detect_layout(state_db)? {
-            layout if layout.is_rows() => {
-                let depth = crate::book_reader::read_book_depth(state_db, market_id, layout)?;
-                let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
-                    levels
-                        .into_iter()
-                        .map(|l| (l.price, l.quantity))
-                        .collect::<Vec<_>>()
-                };
-                (pairs(depth.bids), pairs(depth.asks))
-            }
-            _ => {
-                // Classic arm — the pre-existing behaviour, untouched.
-                let key = market_id.to_be_bytes();
-                let snapshot = match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)? {
-                    Some(data) => OrderBookSnapshot::try_from_slice(&data)
-                        .map_err(|e| CoreError::Borsh(e.to_string()))?,
-                    None => OrderBookSnapshot {
-                        bids: vec![],
-                        asks: vec![],
-                    },
-                };
-                let pairs = |levels: &[PriceLevel]| {
-                    levels
-                        .iter()
-                        .map(|l| (l.price, l.quantity))
-                        .collect::<Vec<_>>()
-                };
-                (pairs(&snapshot.bids), pairs(&snapshot.asks))
-            }
-        };
+    let (bids, asks) = if meter.is_unlimited() {
+        unmetered_levels(state_db, market_id)?
+    } else {
+        metered_levels(state_db, market_id, meter)?
+    };
 
     let bid_prices: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
     let bid_qtys: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
@@ -492,6 +655,64 @@ fn read_order_book(
         &ask_prices,
         &ask_qtys,
     ]))
+}
+
+/// Classic arm: decode only the legacy `OrderBookSnapshot` (a production
+/// whole-book blob reverts — pre-existing, pinned by
+/// `classic_precompile_behaviour_is_unchanged`).
+fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
+    let snapshot =
+        OrderBookSnapshot::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))?;
+    let pairs = |levels: &[PriceLevel]| levels.iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>();
+    Ok((pairs(&snapshot.bids), pairs(&snapshot.asks)))
+}
+
+fn depth_pairs(depth: crate::book_reader::BookDepth) -> (PriceQtyLevels, PriceQtyLevels) {
+    let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
+        levels.into_iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>()
+    };
+    (pairs(depth.bids), pairs(depth.asks))
+}
+
+/// Unmetered (non-EVM callers): the DB-wide layout (`detect_layout`: the
+/// node-local marker, else a sniff), then the pre-existing reads.
+fn unmetered_levels(
+    state_db: &impl StateBackend,
+    market_id: MarketId,
+) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
+    match crate::book_reader::detect_layout(state_db)? {
+        layout if layout.is_rows() => Ok(depth_pairs(crate::book_reader::read_book_depth(
+            state_db, market_id, layout,
+        )?)),
+        _ => match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes())? {
+            Some(data) => classic_levels(&data),
+            None => Ok((vec![], vec![])),
+        },
+    }
+}
+
+/// Metered (the EVM): everything read and charged is a hashed consensus row
+/// of THIS market, so the charge is the same on every node — never the
+/// node-local `__book_mode__` marker or a DB-wide sniff. Classic iff the
+/// market's 8-byte whole-book key exists: sized with a length probe and
+/// charged (32 bytes a unit) BEFORE it is read. Otherwise the market's own
+/// rows (bounded scan) give the row layout.
+fn metered_levels(
+    state_db: &impl StateBackend,
+    market_id: MarketId,
+    meter: &mut ReadMeter,
+) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
+    let key = market_id.to_be_bytes();
+    if let Some(len) = state_db.get_cf_len(CF_NATIVE_ORDER_BOOKS, &key)? {
+        meter.charge((len as u64).div_ceil(32))?;
+        let data = state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)?.unwrap_or_default();
+        return classic_levels(&data);
+    }
+    let rows = scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &key, meter)?;
+    let layout = crate::book_reader::layout_of_market_rows(market_id, &rows)?;
+    Ok(depth_pairs(crate::book_reader::depth_from_market_rows(
+        state_db, market_id, layout, &rows,
+    )?))
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
@@ -546,13 +767,14 @@ fn read_open_orders(
     state_db: &impl StateBackend,
     trader: &Address,
     market_id: MarketId,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     // Prefix: trader(20) + market_id(8)
     let mut prefix = [0u8; 28];
     prefix[..20].copy_from_slice(trader.as_slice());
     prefix[20..28].copy_from_slice(&market_id.to_be_bytes());
 
-    let entries = state_db.iterate_cf(CF_NATIVE_ORDERS, Some(&prefix))?;
+    let entries = scan_prefix_metered(state_db, CF_NATIVE_ORDERS, &prefix, meter)?;
     let mut order_ids = Vec::new();
     let mut prices = Vec::new();
     let mut quantities = Vec::new();
@@ -579,14 +801,18 @@ fn read_open_orders(
 // BalanceReader (0x0801) — tasks 2.4.1
 // ============================================================================
 
-fn balance_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+fn balance_reader(
+    input: &[u8],
+    state_db: &impl StateBackend,
+    meter: &mut ReadMeter,
+) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getBalances(address)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         read_balances(state_db, &trader)
     } else if sel == selector_for("getMarkets()") {
-        read_markets(state_db)
+        read_markets(state_db, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -624,8 +850,8 @@ fn read_balances(state_db: &impl StateBackend, trader: &Address) -> Result<Vec<u
 }
 
 /// getMarkets → (bytes32[] market_ids, bool[] active)
-fn read_markets(state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
-    let entries = state_db.iterate_cf(CF_NATIVE_MARKETS, None)?;
+fn read_markets(state_db: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
+    let entries = scan_prefix_metered(state_db, CF_NATIVE_MARKETS, &[], meter)?;
     let mut market_ids = Vec::new();
     let mut active_flags = Vec::new();
 
@@ -666,6 +892,7 @@ fn oracle_reader(
     input: &[u8],
     state_db: &impl StateBackend,
     now: u64,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
@@ -673,7 +900,7 @@ fn oracle_reader(
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
         read_oracle_price(state_db, market_id, now)
     } else if sel == selector_for("getAllPrices()") {
-        read_all_oracle_prices(state_db, now)
+        read_all_oracle_prices(state_db, now, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -705,9 +932,10 @@ fn read_oracle_price(
 fn read_all_oracle_prices(
     state_db: &impl StateBackend,
     now: u64,
+    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let prefix = b"agg";
-    let entries = state_db.iterate_cf(CF_NATIVE_ORACLE, Some(prefix))?;
+    let entries = scan_prefix_metered(state_db, CF_NATIVE_ORACLE, prefix, meter)?;
 
     let mut market_ids = Vec::new();
     let mut prices = Vec::new();
@@ -763,26 +991,34 @@ fn get_oracle_price_fp(
 // StakingReader (0x0803) — tasks 2.4.2
 // ============================================================================
 
-fn staking_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+fn staking_reader(
+    input: &[u8],
+    state_db: &impl StateBackend,
+    meter: &mut ReadMeter,
+) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
     if sel == selector_for("getStakingInfo(address)") {
         let staker = abi::decode_address(&abi::word(input, 0)?);
-        read_staking_info(state_db, &staker)
+        read_staking_info(state_db, &staker, meter)
     } else if sel == selector_for("getValidators()") {
-        read_validators(state_db)
+        read_validators(state_db, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
 }
 
 /// getStakingInfo → (uint128 delegated, uint128 permanent, uint128 rewards_pending, address validator)
-fn read_staking_info(state_db: &impl StateBackend, staker: &Address) -> Result<Vec<u8>, CoreError> {
+fn read_staking_info(
+    state_db: &impl StateBackend,
+    staker: &Address,
+    meter: &mut ReadMeter,
+) -> Result<Vec<u8>, CoreError> {
     // Read delegation info: scan CF_STAKING_DELEGATIONS with prefix = staker(20)
     let mut total_delegated = U256::ZERO;
     let mut first_validator = Address::ZERO;
 
-    let entries = state_db.iterate_cf(CF_STAKING_DELEGATIONS, Some(staker.as_slice()))?;
+    let entries = scan_prefix_metered(state_db, CF_STAKING_DELEGATIONS, staker.as_slice(), meter)?;
     for (key, value) in &entries {
         if key.len() != 40 {
             break;
@@ -829,8 +1065,8 @@ fn read_staking_info(state_db: &impl StateBackend, staker: &Address) -> Result<V
 }
 
 /// getValidators → (address[] validators, uint128[] stakes, uint128[] commissions)
-fn read_validators(state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
-    let entries = state_db.iterate_cf(CF_STAKING_VALIDATORS, None)?;
+fn read_validators(state_db: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
+    let entries = scan_prefix_metered(state_db, CF_STAKING_VALIDATORS, &[], meter)?;
     let mut validators = Vec::new();
     let mut stakes = Vec::new();
     let mut commissions = Vec::new();
@@ -892,10 +1128,12 @@ fn core_writer(
         if side > 1 {
             return Err(CoreError::InvalidInput(format!("invalid side: {side}")));
         }
-        // OrderType: 0=Limit, 1=Market, 2=StopMarket, 3=StopLimit
-        if order_type > 3 {
+        // OrderType: 0=Limit, 1=Market. HL-parity: StopMarket (2) / StopLimit (3)
+        // are rejected — this ABI carries no trigger price, and the drain used to
+        // run them as plain Limit orders.
+        if order_type > 1 {
             return Err(CoreError::InvalidInput(format!(
-                "invalid order_type: {order_type}"
+                "invalid order_type: {order_type} (0=Limit, 1=Market; stop orders are not supported)"
             )));
         }
         // TimeInForce: 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
@@ -927,10 +1165,12 @@ fn core_writer(
             block_queued: current_block,
         };
 
-        let seq = CoreWriterQueue::enqueue(state_db, &action)?;
-        // Return a deterministic order ID: block(8) + seq(8) packed into u128
-        let order_id: u128 = ((current_block + 1) as u128) << 64 | seq as u128;
-        Ok(abi::encode_order_id(order_id).to_vec())
+        CoreWriterQueue::enqueue(state_db, &action)?;
+        // HL-parity: no order id. The executor assigns the real one from the
+        // global counter when the queue drains next block, so it cannot be known
+        // here (the old `(block + 1) << 64 | seq` never matched it). Contracts
+        // read their orders back via getOpenOrders (0x0800).
+        Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
         let order_id = abi::decode_order_id(&abi::word(input, 0)?);
 
@@ -1608,4 +1848,29 @@ pub fn write_stored_order(
     let data = borsh::to_vec(order).map_err(|e| CoreError::Borsh(e.to_string()))?;
     state_db.put_cf_raw(CF_NATIVE_ORDERS, &key, &data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scan_prefix_metered_tests {
+    use super::*;
+
+    /// Final review S2: a metered scan of a CF the running state hash does not
+    /// cover (node-local, e.g. `cf_book_order_rows`) would make the charge — a
+    /// block result — node-dependent. It is refused, metered or not, and
+    /// charges nothing.
+    #[test]
+    fn scanning_an_unhashed_cf_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_cf_raw(CF_BOOK_ORDER_ROWS, b"row", b"v").unwrap();
+        assert!(torus_state::running_hash::hashed_cf_id(CF_BOOK_ORDER_ROWS).is_none());
+        for mut meter in [ReadMeter::with_max(1_000), ReadMeter::unlimited()] {
+            let r = scan_prefix_metered(&db, CF_BOOK_ORDER_ROWS, b"", &mut meter);
+            assert!(r.is_err(), "unhashed CF scanned: {r:?}");
+            assert_eq!(meter.used(), 0);
+        }
+        // A hashed CF still scans.
+        let mut meter = ReadMeter::with_max(1_000);
+        assert!(scan_prefix_metered(&db, CF_NATIVE_MARKETS, b"", &mut meter).is_ok());
+    }
 }

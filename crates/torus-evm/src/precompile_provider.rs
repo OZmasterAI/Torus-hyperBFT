@@ -13,8 +13,8 @@ use revm::primitives::{Address, Bytes, U256};
 
 use torus_core::error::CoreError;
 use torus_core::precompiles::{
-    execute_precompile_read_only, execute_precompile_with_value, is_precompile,
-    is_reader_precompile, precompile_gas, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
+    execute_precompile_metered, is_precompile, is_reader_precompile, precompile_gas, reader_budget,
+    reader_gas, ReadMeter, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::NativeStateOverlay;
 
@@ -99,6 +99,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
         }
 
+        // Review (blocking): a reader's WORK is bounded by this call's gas, not
+        // only its charge — it gets the units its limit pays for above the base.
+        let mut meter = if is_reader_precompile(id) {
+            ReadMeter::with_max(reader_budget(inputs.gas_limit))
+        } else {
+            ReadMeter::unlimited()
+        };
+
         // Wei revm already moved into this precompile for this frame: only a CALL's
         // transferred value counts (DELEGATECALL value is apparent, CALLCODE sends to the
         // caller itself).
@@ -124,13 +132,16 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             };
 
             if self.read_only {
-                execute_precompile_read_only(
+                execute_precompile_metered(
                     &address,
                     input_bytes,
                     &inputs.caller,
+                    U256::ZERO,
                     &self.journal,
                     self.current_block,
                     self.current_timestamp,
+                    true,
+                    &mut meter,
                 )
             } else if !is_reader_precompile(id) && (!inputs.scheme.is_call() || inputs.is_static)
             {
@@ -142,7 +153,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     "writer precompile requires a plain non-static CALL".into(),
                 ))
             } else {
-                execute_precompile_with_value(
+                execute_precompile_metered(
                     &address,
                     input_bytes,
                     &inputs.caller,
@@ -150,6 +161,8 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &self.journal,
                     self.current_block,
                     self.current_timestamp,
+                    false,
+                    &mut meter,
                 )
             }
         };
@@ -175,6 +188,18 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                 }
             }
             other => other,
+        };
+
+        // A reader over its budget runs out of gas (its stipend is spent).
+        if matches!(result, Err(CoreError::PrecompileOutOfGas)) {
+            return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
+        }
+        // HL-parity: a reader pays for the work it did (rows read, words
+        // returned), whether it answered or reverted.
+        let gas_required = if is_reader_precompile(id) {
+            reader_gas(meter.used())
+        } else {
+            gas_required
         };
 
         // Build InterpreterResult.

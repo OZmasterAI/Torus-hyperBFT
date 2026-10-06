@@ -4152,6 +4152,100 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    async fn get_liquidator_vault(
+        state: StateDb,
+        mempool: Arc<Mempool>,
+        executor: Arc<EvmExecutor>,
+    ) -> RpcLiquidatorVault {
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let v: RpcLiquidatorVault = client
+            .request("torus_getLiquidatorVault", jsonrpsee::rpc_params![])
+            .await
+            .unwrap();
+        handle.stop().unwrap();
+        v
+    }
+
+    fn vault_position(market_id: u64, size: FixedPoint) -> Position {
+        Position {
+            trader: torus_core::liquidation::LIQUIDATOR_VAULT,
+            market_id,
+            is_long: market_id % 2 == 0,
+            size,
+            entry_price: fp(100),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        }
+    }
+
+    #[tokio::test]
+    async fn torus_get_liquidator_vault_flat_positive_balance() {
+        let (_dir, state, mempool, executor) = setup();
+        let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+        PositionManager::new(state.clone())
+            .put_native_balance(
+                &vault,
+                &NativeBalance {
+                    available: fp(750),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        let v = get_liquidator_vault(state, mempool, executor).await;
+        assert_eq!(v.address, hex_address(vault));
+        assert_eq!(v.address, "0x746f7275732d6c697175696461746f722d766c74");
+        assert_eq!(v.available_balance, "750.00000000");
+        assert_eq!(v.deficit, dec_fp(FixedPoint::ZERO));
+        assert_eq!(v.open_positions, 0);
+    }
+
+    #[tokio::test]
+    async fn torus_get_liquidator_vault_negative_available_is_deficit() {
+        let (_dir, state, mempool, executor) = setup();
+        let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+        PositionManager::new(state.clone())
+            .put_native_balance(
+                &vault,
+                &NativeBalance {
+                    available: -fp(200),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        let v = get_liquidator_vault(state, mempool, executor).await;
+        // Signed like torus_getBalances' availableBalance.
+        assert_eq!(v.available_balance, "-200.00000000");
+        assert_eq!(v.deficit, "200.00000000");
+        assert_eq!(v.open_positions, 0);
+    }
+
+    #[tokio::test]
+    async fn torus_get_liquidator_vault_counts_open_positions() {
+        let (_dir, state, mempool, executor) = setup();
+        let pm = PositionManager::new(state.clone());
+        for mid in 1..=3 {
+            pm.put_position(&vault_position(mid, fp(mid as i64))).unwrap();
+        }
+        // A zero-size row is not an open position.
+        pm.put_position(&vault_position(4, FixedPoint::ZERO)).unwrap();
+        // Another trader's position is not the vault's.
+        pm.put_position(&Position {
+            trader: Address::from([0x55; 20]),
+            ..vault_position(5, fp(1))
+        })
+        .unwrap();
+        let v = get_liquidator_vault(state, mempool, executor).await;
+        assert_eq!(v.open_positions, 3);
+        // No balance row: zero cash, no deficit.
+        assert_eq!(v.available_balance, dec_fp(FixedPoint::ZERO));
+        assert_eq!(v.deficit, dec_fp(FixedPoint::ZERO));
+    }
+
     #[tokio::test]
     async fn torus_get_markets() {
         let (_dir, state, mempool, executor) = setup();

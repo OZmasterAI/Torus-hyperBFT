@@ -1828,7 +1828,10 @@ impl ExecutionContext {
                         }
                     }
                     computed_fee_revenue =
-                        torus_bridge::proposer::compute_fee_revenue(&validated.receipts);
+                        torus_bridge::proposer::compute_fee_revenue(
+                            &validated.receipts,
+                            torus_block.header.base_fee_per_gas,
+                        );
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
@@ -1976,10 +1979,12 @@ impl ExecutionContext {
             // never recover the same action twice.
             overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
             let verify_timer = std::time::Instant::now();
+            // A8: header SECONDS -> the MILLISECONDS of session expiry and nonces.
+            let block_ms = torus_types::eip712::block_timestamp_ms(torus_block.header.timestamp);
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
-                    torus_block.header.timestamp,
+                    block_ms,
                     |pubkey| overlay.get_session(pubkey).ok().flatten(),
                     // Exec trust-cache read (gated by --exec-trust-cache, default
                     // off): when enabled, a HIT reuses a locally-verified sender
@@ -2071,6 +2076,21 @@ impl ExecutionContext {
                     );
                     continue;
                 };
+                // Nonce window against the BLOCK time (deterministic on every node):
+                // intake checks it against wall time, but a leader could still
+                // include a stale or far-future action. Skip and record it like any
+                // other invalid action; its nonce is not consumed.
+                if let Err(e) = torus_types::eip712::check_nonce_window(signed.nonce, block_ms) {
+                    native_skipped[i] = true;
+                    tracing::warn!(
+                        %sender,
+                        nonce = signed.nonce,
+                        block_ms,
+                        height,
+                        "skipping native action outside the nonce window of the block time: {e}"
+                    );
+                    continue;
+                }
                 let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
                 let already_committed =
                     StateBackend::get_cf_raw(&overlay, torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
@@ -7286,6 +7306,16 @@ mod crash_recovery_tests {
         (config, state_db)
     }
 
+    /// Block 0's time in ms under `make_block`'s `1000 + height` seconds. Exec
+    /// skips actions outside ±NONCE_WINDOW_MS of the block time, so fixtures that
+    /// must execute sign `NONCE_BASE + n` (in window up to ~height 60).
+    const NONCE_BASE: u64 = 1_000_000;
+
+    /// `make_block(height)`'s time in ms: a nonce in the window at any height.
+    fn block_time_ms(height: u64) -> u64 {
+        torus_types::eip712::block_timestamp_ms(make_block(height, vec![]).header.timestamp)
+    }
+
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
         // Header-identity hardening: the commit-time ancestry check
         // (`detect_parent_link_violation`) compares a block's `parent_hash`
@@ -8747,7 +8777,7 @@ mod crash_recovery_tests {
         let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32]).verifying_key().to_bytes();
         let rotate = torus_types::eip712::sign_native_action(
             NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
-            1,
+            NONCE_BASE + 1,
             &accounts[0],
         );
         let mut blocks: Vec<TorusBlock> = (1..=8)
@@ -10945,6 +10975,95 @@ mod crash_recovery_tests {
         );
     }
 
+    /// A8: exec checks session expiry in MILLISECONDS against the header
+    /// timestamp (SECONDS): a session that expired 1 ms before the block time is
+    /// skipped, one expiring exactly at the block time executes — on the serial
+    /// and on the pipelined flush. RED before A8: the raw header seconds (~1e3)
+    /// never exceeded a ms expiry (~1e6), so the expired action executed.
+    #[test]
+    fn session_expired_at_block_time_is_skipped_serial_and_pipelined() {
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[36u8; 32]);
+        let owner = Address::new([0x36; 20]);
+        let block_ms =
+            torus_types::eip712::block_timestamp_ms(make_block(1, vec![]).header.timestamp);
+        let block = make_block(
+            1,
+            vec![torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                block_ms,
+                &session_key,
+            )],
+        );
+        for pipelined in [false, true] {
+            for (expiry, skipped) in [(block_ms, false), (block_ms - 1, true)] {
+                let (_c, state_db) = make_test_config_and_db();
+                state_db
+                    .put_session(
+                        &session_key.verifying_key().to_bytes(),
+                        &torus_types::SessionData {
+                            owner,
+                            expiry,
+                            scope: torus_types::SessionScope::Trading,
+                            created_at: 0,
+                        },
+                    )
+                    .unwrap();
+                let ctx = pipeline_ctx(&state_db, pipelined, None);
+                dispatch_and_execute(&ctx, &state_db, &block);
+                assert!(ctx.pipeline_barrier(), "flush worker drained");
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+                assert_eq!(
+                    action_status(&state_db, 1).expect("block 1 record").native_skipped,
+                    vec![skipped],
+                    "pipelined {pipelined}: expiry {expiry} vs block time {block_ms} ms"
+                );
+                drop(ctx);
+            }
+        }
+    }
+
+    /// Commit 2: exec enforces the ±NONCE_WINDOW_MS nonce window against the
+    /// BLOCK time (header seconds -> ms), inclusive. An out-of-window action is
+    /// skipped and recorded like any other invalid action (no block rejection,
+    /// no slash) and its nonce is not consumed; in-window actions execute. Serial
+    /// and pipelined flush agree byte for byte. RED before: exec never checked
+    /// the window, so a leader could include stale or far-future actions.
+    #[test]
+    fn nonce_outside_window_of_block_time_is_skipped_serial_and_pipelined() {
+        use torus_types::eip712::{block_timestamp_ms, sign_native_action, NONCE_WINDOW_MS as W};
+        let key = k256::ecdsa::SigningKey::from_slice(&[37u8; 32]).unwrap();
+        let block_ms = block_timestamp_ms(make_block(1, vec![]).header.timestamp);
+        // Oldest allowed, 1 ms too old, newest allowed, 1 ms too new.
+        let nonces = [block_ms - W, block_ms - W - 1, block_ms + W, block_ms + W + 1];
+        let block = make_block(
+            1,
+            nonces
+                .iter()
+                .map(|&n| sign_native_action(NativeAction::ClaimRewards, n, &key))
+                .collect(),
+        );
+        let sender = block.native_actions[0].recover_sender().unwrap();
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            let (_c, state_db) = make_test_config_and_db();
+            let ctx = pipeline_ctx(&state_db, pipelined, None);
+            dispatch_and_execute(&ctx, &state_db, &block);
+            assert!(ctx.pipeline_barrier(), "flush worker drained");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+            assert_eq!(
+                action_status(&state_db, 1).expect("block 1 record").native_skipped,
+                vec![false, true, false, true],
+                "pipelined {pipelined}: window around block time {block_ms} ms"
+            );
+            for (n, consumed) in nonces.iter().zip([true, false, true, false]) {
+                assert_eq!(nonce_consumed(&state_db, sender, *n), consumed, "nonce {n}");
+            }
+            drop(ctx);
+            dumps.push(dump_all_cfs(&state_db));
+        }
+        assert_dumps_equal(&dumps[0], &dumps[1], "serial vs pipelined");
+    }
+
     // ---- s84 decision 1: skip invalid actions, record executed/skipped ----
 
     /// The block's executed/skipped record, if execution wrote one.
@@ -10993,12 +11112,13 @@ mod crash_recovery_tests {
         let evm_key = k256::ecdsa::SigningKey::from_slice(&[34u8; 32]).unwrap();
         let session_key = ed25519_dalek::SigningKey::from_bytes(&[35u8; 32]);
 
-        let first = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 1, &key_a);
+        let first =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 1, &key_a);
         let block1 = make_block(1, vec![first.clone()]);
 
         let mut forged = torus_types::eip712::sign_native_action(
             NativeAction::ClaimRewards,
-            7,
+            NONCE_BASE + 7,
             &k256::ecdsa::SigningKey::from_slice(&[32u8; 32]).unwrap(),
         );
         if let ActionSignature::Eip712(ref mut sig) = forged.signature {
@@ -11007,10 +11127,11 @@ mod crash_recovery_tests {
         }
         let expired = torus_types::eip712::sign_native_action_with_session(
             NativeAction::CancelOrder { order_id: 1 },
-            8,
+            NONCE_BASE + 8,
             &session_key,
         );
-        let valid = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, 9, &key_c);
+        let valid =
+            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 9, &key_c);
         // Positions: 0 replay of block 1's action, 1 forged, 2 expired, 3 valid.
         let mut block2 = make_block(2, vec![first, forged, expired, valid]);
         block2.header.parent_hash =
@@ -11097,13 +11218,13 @@ mod crash_recovery_tests {
                 }),
                 "replica {replica}: replay, forged and expired skipped; valid executed (and failed)"
             );
-            assert!(nonce_consumed(&state_db, k256_address(&key_a), 1));
+            assert!(nonce_consumed(&state_db, k256_address(&key_a), NONCE_BASE + 1));
             assert!(
-                nonce_consumed(&state_db, k256_address(&key_c), 9),
+                nonce_consumed(&state_db, k256_address(&key_c), NONCE_BASE + 9),
                 "valid action executed"
             );
             assert!(
-                !nonce_consumed(&state_db, k256_address(&key_c), 8),
+                !nonce_consumed(&state_db, k256_address(&key_c), NONCE_BASE + 8),
                 "expired-session action consumed nothing"
             );
             let evm_account = state_db
@@ -11154,7 +11275,7 @@ mod crash_recovery_tests {
             client_order_id: None,
         };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
-            torus_types::eip712::sign_native_action(a, n, k)
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
         let place = |o: torus_types::PlaceOrderParams| NativeAction::PlaceOrder(o);
         let fund_a = sign(NativeAction::TransferToPerp { amount: deposit }, 1, &k_a);
@@ -11339,7 +11460,7 @@ mod crash_recovery_tests {
             client_order_id: None,
         };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
-            torus_types::eip712::sign_native_action(a, n, k)
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
         let place = |o: PlaceOrderParams| NativeAction::PlaceOrder(o);
         let fund = |k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k);
@@ -11484,7 +11605,7 @@ mod crash_recovery_tests {
             seed % n
         };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
-            torus_types::eip712::sign_native_action(a, n, k)
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
         let mut nonces = vec![1u64; keys.len()];
         let mut blocks = vec![make_block(
@@ -11805,7 +11926,7 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
         let signed = torus_types::eip712::sign_native_action(
             NativeAction::TransferToPerp { amount },
-            424_242,
+            NONCE_BASE + 424,
             &key,
         );
         let sender = signed.recover_sender().unwrap();
@@ -11858,7 +11979,7 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[31u8; 32]).unwrap();
         let signed = torus_types::eip712::sign_native_action(
             NativeAction::TransferToPerp { amount },
-            424_242,
+            NONCE_BASE + 424,
             &key,
         );
         let real_sender = signed.recover_sender().unwrap();
@@ -11946,7 +12067,7 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
         let signed = torus_types::eip712::sign_native_action(
             NativeAction::TransferToPerp { amount },
-            424_242,
+            NONCE_BASE + 424,
             &key,
         );
         let sender = signed.recover_sender().expect("recover sender");
@@ -12016,7 +12137,7 @@ mod crash_recovery_tests {
         for (i, key) in [&k_sell, &k_buy].into_iter().enumerate() {
             let signed = torus_types::eip712::sign_native_action(
                 NativeAction::TransferToPerp { amount: deposit },
-                9_000 + i as u64,
+                NONCE_BASE + 9_000 + i as u64,
                 key,
             );
             fund_evm_balance(&state_db, signed.recover_sender().unwrap(), deposit);
@@ -12038,12 +12159,12 @@ mod crash_recovery_tests {
         };
         let sell = torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(order(false)),
-            9_002,
+            NONCE_BASE + 9_002,
             &k_sell,
         );
         let buy = torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(order(true)),
-            9_003,
+            NONCE_BASE + 9_003,
             &k_buy,
         );
         // Link block 2 to the ACTUAL (non-empty) block 1 so the commit-time
@@ -12294,7 +12415,7 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let signed = torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrderBatch(vec![mk(1), mk(2), mk(3)]),
-            555_555,
+            NONCE_BASE + 555,
             &key,
         );
         let sender = signed.recover_sender().expect("recover sender");
@@ -12404,7 +12525,7 @@ mod crash_recovery_tests {
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         exec_ctx.metrics = Some(metrics.clone());
 
-        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(7)]), vec![]);
+        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(NONCE_BASE + 7)]), vec![]);
 
         let text = metrics.encode();
         for name in [
@@ -13731,7 +13852,7 @@ mod crash_recovery_tests {
             client_order_id: None,
         };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
-            torus_types::eip712::sign_native_action(a, n, k)
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
         let sell5 = sign(NativeAction::PlaceOrder(order(false, 101)), 9_004, &k_a);
         let session_expiry = (1000 + 9) * 1000 + 3_600_000;
@@ -13751,7 +13872,7 @@ mod crash_recovery_tests {
                     sign(NativeAction::PlaceOrder(order(true, 100)), 9_003, &k_b),
                 ],
             ),
-            make_block(4, vec![sign_claim_rewards(4)]),
+            make_block(4, vec![sign_claim_rewards(NONCE_BASE + 4)]),
             make_block(5, vec![sell5.clone()]),
             make_block(
                 6,
@@ -13778,7 +13899,7 @@ mod crash_recovery_tests {
                 10,
                 vec![torus_types::eip712::sign_native_action_with_session(
                     NativeAction::PlaceOrder(order(false, 102)),
-                    9_007,
+                    NONCE_BASE + 9_007,
                     &s_key,
                 )],
             ),
@@ -14781,7 +14902,7 @@ mod crash_recovery_tests {
             ..order(true, 100, 1)
         };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
-            torus_types::eip712::sign_native_action(a, n, k)
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
         let place = |o: torus_types::PlaceOrderParams| NativeAction::PlaceOrder(o);
         let mut blocks = vec![
@@ -15601,6 +15722,9 @@ mod crash_recovery_tests {
 
         // Include it (block 153); restart again: on-chain -> nothing submitted.
         let mut b153 = make_block(153, pooled);
+        // The vote is signed at wall-clock time: the block carries that time
+        // so the nonce is in the window exec checks against the block time.
+        b153.header.timestamp = b153.native_actions[0].nonce / 1000;
         b153.header.parent_hash =
             alloy_primitives::keccak256(make_block(152, vec![]).header.canonical_header_bytes());
         dispatch_and_execute(&ctx, &state_db, &b153);
@@ -15663,7 +15787,7 @@ mod crash_recovery_tests {
             .map(|(i, (v, hash))| {
                 torus_types::eip712::sign_native_action(
                     NativeAction::AttestStateHash { height: 100, hash: *hash },
-                    1_000 + i as u64,
+                    block_time_ms(101) + i as u64,
                     &keys[*v],
                 )
             })
@@ -15822,7 +15946,7 @@ mod crash_recovery_tests {
             .map(|v| {
                 torus_types::eip712::sign_native_action(
                     NativeAction::AttestStateHash { height: 100, hash: x },
-                    2_000 + v as u64,
+                    block_time_ms(106) + v as u64,
                     &keys[v],
                 )
             })
@@ -15882,12 +16006,12 @@ mod crash_recovery_tests {
         let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x3f; 32]).verifying_key().to_bytes();
         let rotate = torus_types::eip712::sign_native_action(
             NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
-            1,
+            NONCE_BASE + 1,
             &vals[0].0,
         );
         let commission = torus_types::eip712::sign_native_action(
             NativeAction::UpdateCommission { new_rate: 600 },
-            1,
+            NONCE_BASE + 1,
             &vals[1].0,
         );
         let mut blocks: Vec<TorusBlock> = (1..=8)
@@ -16075,7 +16199,10 @@ mod crash_recovery_tests {
         assert_ne!(second[0].nonce, first[0].nonce, "fresh nonce");
         // The resubmitted one lands, and the dropped one lands late: one vote.
         let local = torus_state::running_hash::read_checkpoint(&db, 100).unwrap();
-        let b102 = make_block(102, vec![second[0].clone(), first[0].clone()]);
+        let mut b102 = make_block(102, vec![second[0].clone(), first[0].clone()]);
+        // Votes are signed at wall-clock time: the block carries that time so
+        // both nonces are in the window exec checks against the block time.
+        b102.header.timestamp = second[0].nonce / 1000;
         ctx.mempool = Some(mempool_for(&db));
         dispatch_and_execute(&ctx, &db, &b102);
         assert_eq!(
@@ -16128,7 +16255,7 @@ mod crash_recovery_tests {
         let vote = |v: usize| {
             torus_types::eip712::sign_native_action(
                 NativeAction::AttestStateHash { height: 100, hash: x },
-                3_000 + v as u64,
+                block_time_ms(101) + v as u64,
                 &keys[v],
             )
         };
@@ -16684,7 +16811,7 @@ mod crash_recovery_tests {
                                 // review M1(b): sampled at the block's time (ms)
                                 timestamp: (1_000 + h) * 1_000,
                             }),
-                            h * 1_000 + seed as u64,
+                            NONCE_BASE + h * 1_000 + seed as u64,
                             &oracle_key(seed),
                         )
                     })
@@ -16714,7 +16841,7 @@ mod crash_recovery_tests {
                     prices: vec![(ORACLE_MARKET, px(100))],
                     timestamp: 777_777_000,
                 }),
-                1_061,
+                777_777_061, // at the block time below (exec nonce window)
                 &oracle_key(61),
             );
             let mut blocks = vec![make_block(1, vec![sub])];
@@ -16948,7 +17075,7 @@ mod crash_recovery_tests {
                 prices: vec![(ORACLE_MARKET, px(price))],
                 timestamp: (1_000 + h) * 1_000, // review M1(b): sampled at the block's time (ms)
             }),
-            h * 1_000 + seed as u64,
+            NONCE_BASE + h * 1_000 + seed as u64,
             &oracle_key(seed),
         )
     }
@@ -16965,7 +17092,7 @@ mod crash_recovery_tests {
                 reduce_only: false,
                 client_order_id: None,
             }),
-            nonce,
+            NONCE_BASE + nonce,
             &oracle_key(seed),
         )
     }
@@ -17140,7 +17267,7 @@ mod crash_recovery_tests {
                 client_order_id: None,
             })
             .collect();
-        torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &oracle_key(seed))
+        torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), NONCE_BASE + nonce, &oracle_key(seed))
     }
 
     /// Option B: T (71) funded 101.0505 (101 + B-blind's δ top-up of its
@@ -17241,7 +17368,7 @@ mod crash_recovery_tests {
                 reduce_only: false,
                 client_order_id: None,
             }),
-            nonce,
+            NONCE_BASE + nonce,
             &oracle_key(seed),
         )
     }
@@ -17278,6 +17405,88 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
+    /// s94 bad-debt route (`crates/torus-bridge/tests/
+    /// offmark_bad_debt_tests.rs` has the executor-level cases), through
+    /// committed blocks on the live dispatch path. A (seed 75) and B (76),
+    /// one owner, each funded 100 = the IM of 10 at 200 (20x).
+    /// Probe (77a3b21): B's IOC sell filled A's bid @200 in block 2, A was
+    /// ADL'd at the block's end with -900 left in the vault, and B moved
+    /// 1,100 to the EVM side for 200 deposited.
+    /// Fixed: block 1 (no mark yet, never marked: no band): A's GTC bid 10
+    /// @200 rests (reserves 100). Block 2 (mark 100): B's IOC sell @200 is
+    /// rejected at placement by the price band (option 2: more than 50% from
+    /// the mark; had it matched, option 1 would margin-cancel A's bid: loss
+    /// 1,000 − tolerance 75 > A's free 0). B's TransferToSpot 100 takes back
+    /// its own deposit. Block 3: B's 1,000 is refused. The vault stays at 0.
+    #[test]
+    fn offmark_fill_e2e_is_refused_and_the_counterparty_gets_back_only_its_deposit() {
+        use torus_core::liquidation::LIQUIDATOR_VAULT;
+        use torus_core::position::{NativeBalance, PositionManager};
+        use torus_state::action_status::FailureReason;
+        // Inside the nonce window (block h's time is (1_000 + h) s, window
+        // +-60 s): the same base as `NONCE_BASE` on the nonce-window branch.
+        const NB: u64 = 1_000_000;
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        let (a, b) = (oracle_addr(75), oracle_addr(76));
+        for t in [a, b] {
+            pm.put_native_balance(&t, &NativeBalance { available: px(100), order_margin: FixedPoint::ZERO }).unwrap();
+        }
+        let ioc_sell = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: ORACLE_MARKET,
+                is_buy: false,
+                price: px(200),
+                quantity: px(10),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::IOC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            NB + 2_076,
+            &oracle_key(76),
+        );
+        let to_spot = |nonce: u64, amount: i64| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToSpot { amount: U256::from(px(amount).raw() as u128) },
+                NB + nonce,
+                &oracle_key(76),
+            )
+        };
+        let mut r1: Vec<SignedNativeAction> = (61..=63).map(|s| oracle_sub(s, 1, 100)).collect();
+        r1.push(signed_bid(75, 1_075, 200, 10));
+        let blocks = liq_blocks(vec![r1, vec![ioc_sell, to_spot(2_176, 100)], vec![to_spot(3_076, 1_000)]]);
+        let ctx = make_exec_ctx(&config, &db);
+        let native = |t: &Address| {
+            let x = pm.get_native_balance(t).unwrap();
+            (x.available, x.order_margin)
+        };
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: no fill (B's sell refused by the band)");
+        assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO);
+        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "A's bid still rests");
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
+        // Refused for the right reason: executed (not skipped), failed with
+        // `price_band`; the transfer executed.
+        let s2 = action_status(&db, 2).expect("block 2 status");
+        assert!(s2.native_skipped.iter().all(|s| !s), "block 2: nothing skipped (nonces in window)");
+        assert_eq!(s2.native_failed.len(), 1, "block 2: only B's sell failed");
+        assert_eq!(s2.native_failed[0].reason, FailureReason::PriceBand, "block 2: refused by the band");
+        dispatch_and_execute(&ctx, &db, &blocks[2]);
+        let s3 = action_status(&db, 3).expect("block 3 status");
+        assert!(s3.native_skipped.iter().all(|s| !s), "block 3: the transfer was executed, not skipped");
+        assert_eq!(s3.native_failed.len(), 1, "block 3: B's 1,000 refused");
+        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
+        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "block 3: nothing more");
+        assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(3));
+    }
+
     // ---- s517 oracle feeder S4: the hot oracle signer through whole blocks ----
 
     /// The hot signer key of validator `seed` (a separate address).
@@ -17294,7 +17503,7 @@ mod crash_recovery_tests {
     /// `SetOracleSigner` from validator `seed`; `signer` = the new signer's key
     /// (its proof of possession, review M3) or `None` to clear.
     fn set_signer_action(h: u64, seed: u8, signer: Option<&k256::ecdsa::SigningKey>) -> SignedNativeAction {
-        let nonce = h * 1_000 + 500 + seed as u64;
+        let nonce = NONCE_BASE + h * 1_000 + 500 + seed as u64;
         let action = match signer {
             None => NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None },
             Some(k) => NativeAction::SetOracleSigner {
@@ -17315,7 +17524,7 @@ mod crash_recovery_tests {
                 prices: vec![(ORACLE_MARKET, px(price))],
                 timestamp: sample_ms,
             }),
-            h * 1_000 + tag as u64,
+            NONCE_BASE + h * 1_000 + tag as u64,
             key,
         )
     }
@@ -17717,8 +17926,8 @@ mod crash_recovery_tests {
         };
         let mut blocks = vec![
             make_block(1, vec![]),
-            make_block(2, vec![torus_types::eip712::sign_native_action(order(90), 1, &key)]),
-            make_block(3, vec![torus_types::eip712::sign_native_action(order(95), 2, &key)]),
+            make_block(2, vec![torus_types::eip712::sign_native_action(order(90), NONCE_BASE + 1, &key)]),
+            make_block(3, vec![torus_types::eip712::sign_native_action(order(95), NONCE_BASE + 2, &key)]),
         ];
         blocks[0].evm_transactions = vec![signed_eip1559_with_value(
             &key,
@@ -17953,10 +18162,13 @@ mod crash_recovery_tests {
         let mut fed = C5Fed::default();
         let mut mark = [100i64; 3];
         let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
+        // The height being built: nonces sit at its block time (exec's window).
+        let cur_h = std::cell::Cell::new(0u64);
         let mut sign = |seed: u8, action: NativeAction| {
             let n = nonces.entry(seed).or_insert(0);
             *n += 1;
-            torus_types::eip712::sign_native_action(action, *n, &oracle_key(seed))
+            let nonce = NONCE_BASE + cur_h.get() * 1_000 + *n;
+            torus_types::eip712::sign_native_action(action, nonce, &oracle_key(seed))
         };
         let order = |m: u64, is_buy: bool, price: i64, qty: i64| torus_types::PlaceOrderParams {
             market_id: m,
@@ -17971,6 +18183,7 @@ mod crash_recovery_tests {
         let units = |v: u128| U256::from(v * FixedPoint::ONE.raw() as u128);
         let mut blocks = Vec::new();
         for h in 1..=C5_BLOCKS {
+            cur_h.set(h);
             let mut actions = Vec::new();
             let shock = h == 60 || h == 120;
             let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
@@ -17993,7 +18206,7 @@ mod crash_recovery_tests {
                             prices,
                             timestamp: (1_000 + h) * 1_000,
                         }),
-                        h * 1_000 + seed as u64,
+                        NONCE_BASE + h * 1_000 + seed as u64,
                         &oracle_key(seed),
                     ));
                 }

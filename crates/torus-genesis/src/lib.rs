@@ -58,6 +58,10 @@ pub enum GenesisError {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Genesis {
+    /// The network's chain id: EVM, consensus, and the EIP-712 domain every
+    /// native action is signed for (so a signature never replays across
+    /// networks). Absent = devnet, 7778. Testnet and mainnet need their own.
+    #[serde(default = "default_chain_id")]
     pub chain_id: u64,
     pub chain_name: String,
     pub timestamp: u64,
@@ -111,6 +115,10 @@ pub struct ConsensusConfig {
     /// every node hashes). Absent = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+}
+
+fn default_chain_id() -> u64 {
+    torus_types::eip712::TORUS_CHAIN_ID
 }
 
 fn default_backoff_factor() -> u32 {
@@ -815,6 +823,19 @@ mod tests {
         // Pre-existing Task A defaults are untouched by S470.
         assert_eq!(genesis.chain_config().backoff_factor, 2);
         assert_eq!(genesis.chain_config().backoff_cap, 8);
+    }
+
+    /// Commit 4: the network chain id (EIP-712 domain, EVM, consensus) comes
+    /// from genesis `chain_id`; a genesis without it is devnet, 7778.
+    #[test]
+    fn genesis_chain_id_defaults_to_devnet_7778() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json.as_object_mut().unwrap().remove("chain_id");
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().chain_id, torus_types::eip712::TORUS_CHAIN_ID);
+        json["chain_id"] = 7779.into();
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().chain_id, 7779);
     }
 
     #[test]

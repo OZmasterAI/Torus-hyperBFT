@@ -58,6 +58,7 @@ pub const CHEAP_READS: &[&str] = &[
     "torus_getBalances",
     "torus_getPosition",
     "torus_getUserLimits",
+    "torus_getLiquidatorVault",
     "torus_getMarkPrice",
     "torus_getOpenInterest",
     "torus_getLeader",
@@ -291,6 +292,7 @@ mod tests {
         assert_eq!(method_weight("torus_submitNativeActions", None), 1);
         assert_eq!(method_weight("eth_blockNumber", None), 2);
         assert_eq!(method_weight("torus_getBalances", Some(r#"["0x1"]"#)), 2);
+        assert_eq!(method_weight("torus_getLiquidatorVault", None), 2);
         assert_eq!(method_weight("torus_getTradeHistory", None), 20);
         assert_eq!(method_weight("eth_getLogs", None), 20);
         assert_eq!(method_weight("torus_subscribe", None), 20);
