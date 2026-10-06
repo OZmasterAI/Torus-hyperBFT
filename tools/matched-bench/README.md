@@ -127,6 +127,21 @@ python3 tools/matched-bench/test_harness.py
    `drain.json .feed_live` its summary over the final quiet window. The feed
    is then paused and the default drain re-run (`feed-stop-settle/`, up to
    60 s), so this step can take `DRAIN_TIMEOUT` + ~60 s.
+   **Liquidation stress** (all off by default; default cells unchanged):
+   `LIQ_THIN=N` sets `available` to `LIQ_THIN_AVAIL` (default 1,000,000 TRS)
+   for genesis notes `bulk-test 60` .. `bulk-test 60+N-1` before the genesis
+   md5 (the cell fails unless exactly N rows match). `ORACLE_SHOCK_BP=S`
+   `ORACLE_SHOCK_ROUND=R` (need `ORACLE_FEED=1`) make the feed add +S bp to odd
+   market ids and -S bp to even ones from round R on: on the uniform shape the
+   even-index senders lose on every position (with `MPS` set, sides follow
+   owner rank instead; run-cell warns). With either set, the liquidator vault
+   joins the digest accounts, `vault-val<i>.json` holds each node's
+   `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter
+   and vault deficit. `liq_stress.py <cell>` writes `liq-stress.json`
+   (liquidations per node, vault, shock height, first / last liquidation, exec
+   lag around the shock). Not measurable without node instrumentation:
+   liquidation step ms per block, blocks until no liquidatable account
+   remains (only a lower bound), and ADL'd counterparties.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
