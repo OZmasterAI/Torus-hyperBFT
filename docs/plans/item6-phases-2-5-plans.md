@@ -17,6 +17,13 @@ Common to every phase:
 
 ## Phase 2: per-block work in proportion to fills (size M)
 
+**Full plan: `item6-phase2-impl.md`** (2026-10-06, from the step 0 profile, results doc
+section 22). It replaces the table below. Order: cancel-all scan (26.7 ms per native
+block), worker pool (>= 15.6k thread spawns per minute), cache flush (15.9 ms on the
+execution thread; the 74.4 ms flush worker goes to Phase 3), then a design check for the
+liquidation sums with moving marks. The stops dirty flag is dropped (~0.06 ms). The table
+keeps the s89 estimates for the record.
+
 | item | today (main, per native block, 300 mkts) | gate |
 |---|---|---|
 | cancel/modify scan of all books -> OrderId -> MarketId index | part of phase 1 105-140 ms | phase-1 actions ms down, error strings and result order unchanged |
