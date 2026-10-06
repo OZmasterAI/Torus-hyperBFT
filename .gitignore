@@ -8,7 +8,8 @@
 LIVE_STATE.json
 .git-backup/
 *.keystore
-.claude/
+.claude/*
+!.claude/agents/
 testnet/data/
 __pycache__/
 *.pyc
