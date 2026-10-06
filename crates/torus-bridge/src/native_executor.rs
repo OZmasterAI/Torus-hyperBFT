@@ -10060,14 +10060,28 @@ impl NativeExecutor {
         )
     }
 
-    /// Process pending governance proposals.
+    /// Process pending governance proposals: one result per proposal outcome.
+    /// s94: a proposal that failed at execution is an error result carrying
+    /// its id and reason; the others still run. A storage error aborts the
+    /// step as one error result (as before).
     pub fn process_governance<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
+        use torus_economics::governance::ProposalOutcome;
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => outcomes
                 .iter()
-                .map(|_| NativeActionResult::ok("governance_process", 1000))
+                .map(|outcome| match outcome {
+                    ProposalOutcome::Failed(id, reason) => NativeActionResult::err(
+                        "governance_process",
+                        format!("proposal {id} execution failed: {reason}"),
+                    ),
+                    ProposalOutcome::Passed(_)
+                    | ProposalOutcome::Rejected(_)
+                    | ProposalOutcome::Executed(_) => {
+                        NativeActionResult::ok("governance_process", 1000)
+                    }
+                })
                 .collect(),
             Err(e) => vec![NativeActionResult::err("governance_process", e.to_string())],
         }

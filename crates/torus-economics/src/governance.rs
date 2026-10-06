@@ -132,6 +132,10 @@ pub enum ProposalStatus {
     Rejected,
     Executed,
     Expired,
+    /// Terminal (s94): passed, but its payload could not be applied at
+    /// execution (e.g. the listing's market id was taken during the
+    /// timelock). Nothing of the payload was written; never retried.
+    Failed,
 }
 
 impl BorshSerialize for ProposalStatus {
@@ -143,6 +147,7 @@ impl BorshSerialize for ProposalStatus {
             Self::Rejected => 3,
             Self::Executed => 4,
             Self::Expired => 5,
+            Self::Failed => 6,
         };
         writer.write_all(&[disc])
     }
@@ -159,6 +164,7 @@ impl BorshDeserialize for ProposalStatus {
             3 => Ok(Self::Rejected),
             4 => Ok(Self::Executed),
             5 => Ok(Self::Expired),
+            6 => Ok(Self::Failed),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalStatus discriminant: {x}"),
@@ -517,12 +523,15 @@ impl BorshDeserialize for GovernanceParams {
 // ProposalOutcome
 // ============================================================================
 
-/// Result of finalizing a proposal.
+/// Result of finalizing or executing a proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalOutcome {
     Passed(u64),
     Rejected(u64),
     Executed(u64),
+    /// Execution failed: the proposal is now [`ProposalStatus::Failed`].
+    /// Carries the id and the reason (the execution error's message).
+    Failed(u64, String),
 }
 
 // ============================================================================
@@ -987,6 +996,10 @@ impl<T: StateBackend> GovernanceManager<T> {
     }
 
     /// Execute a passed proposal after its timelock has expired (FIX 15).
+    ///
+    /// On an execution failure (`is_execution_failure`) nothing is written and
+    /// the proposal stays Passed; the per-block `process_pending_proposals` is
+    /// what turns it into the terminal Failed status (s94).
     pub fn execute_proposal(
         &self,
         proposal_id: u64,
@@ -1046,22 +1059,46 @@ impl<T: StateBackend> GovernanceManager<T> {
             }
         }
 
-        // Execute passed proposals whose timelock has expired.
+        // Execute passed proposals whose timelock has expired. s94: a payload
+        // that cannot be applied marks its proposal Failed and the loop goes
+        // on; only storage / decode errors still abort the step.
         let passed = self.get_proposals_by_status(ProposalStatus::Passed)?;
         for proposal in passed {
             if current_block >= proposal.executable_after && proposal.execution_payload.is_some() {
-                let outcome = self.execute_proposal(proposal.id, current_block)?;
-                outcomes.push(outcome);
+                match self.execute_proposal(proposal.id, current_block) {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(e) if is_execution_failure(&e) => {
+                        outcomes.push(self.mark_failed(proposal.id, e.to_string())?);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
         Ok(outcomes)
     }
 
+    /// Set a Passed proposal whose execution failed to the terminal Failed
+    /// status. Only the status changes; `execute_payload` wrote nothing
+    /// (every execution-failure check runs before its first write).
+    fn mark_failed(&self, proposal_id: u64, reason: String) -> Result<ProposalOutcome> {
+        let mut proposal = self
+            .get_proposal_raw(proposal_id)?
+            .ok_or(EconomicsError::ProposalNotFound(proposal_id))?;
+        proposal.status = ProposalStatus::Failed;
+        self.put_proposal(&proposal)?;
+        tracing::warn!(proposal_id, %reason, "proposal execution failed");
+        Ok(ProposalOutcome::Failed(proposal_id, reason))
+    }
+
     // ========================================================================
     // Proposal execution helpers
     // ========================================================================
 
+    /// Apply a payload. Invariant (s94): every error that
+    /// `is_execution_failure` accepts is raised before this function's first
+    /// write, so a Failed proposal never leaves a half-applied payload. After
+    /// the first write only storage / decode errors (which abort) can occur.
     fn execute_payload(
         &self,
         payload: &ExecutionPayload,
@@ -1539,6 +1576,37 @@ impl<T: StateBackend> GovernanceManager<T> {
     }
 }
 
+/// s94: whether an `execute_proposal` error means "this payload cannot be
+/// applied" (the proposal becomes Failed, the block goes on) rather than a
+/// fault that must still abort the governance step.
+///
+/// Execution failures (each raised by `execute_payload` before its first
+/// write, so a failed proposal leaves no partial state):
+/// - `InvalidParameterValue`, `ParameterNotModifiable`: parameter change
+///   re-validation; also a permanent unlock of 0.
+/// - `InsufficientTreasury`: treasury spend above the treasury balance.
+/// - `MarketIdInUse`, `MarketListingNotPositive`: listing id taken (or no free
+///   auto id), tick/lot not > 0.
+/// - `PermanentStakeNotFound`, `PermanentUnlockExceedsStake`.
+///
+/// Everything else aborts, as before: `State` (storage I/O and row decoding),
+/// `Borsh` (corrupt rows), `GovernanceNotInitialized` (no params: not
+/// specific to one proposal), and the loop invariants `ProposalNotFound`,
+/// `ProposalNotPassed`, `TimelockNotExpired`. A new variant aborts until it
+/// is listed here.
+fn is_execution_failure(e: &EconomicsError) -> bool {
+    matches!(
+        e,
+        EconomicsError::InvalidParameterValue { .. }
+            | EconomicsError::ParameterNotModifiable(_)
+            | EconomicsError::InsufficientTreasury { .. }
+            | EconomicsError::MarketIdInUse(_)
+            | EconomicsError::MarketListingNotPositive { .. }
+            | EconomicsError::PermanentStakeNotFound(_)
+            | EconomicsError::PermanentUnlockExceedsStake { .. }
+    )
+}
+
 /// Build the 28-byte vote key: proposal_id(8 BE) ++ voter(20).
 pub fn vote_key(proposal_id: u64, voter: &Address) -> [u8; 28] {
     let mut key = [0u8; 28];
@@ -1667,6 +1735,45 @@ mod tests {
     // ====================================================================
     // PermanentUnlock governance tests
     // ====================================================================
+
+    /// Stored proposals carry the status byte: existing discriminants must not
+    /// move; `Failed` (s94) takes the next free one.
+    #[test]
+    fn proposal_status_borsh_discriminants_are_stable() {
+        use ProposalStatus::*;
+        for (status, disc) in [
+            (Pending, 0u8),
+            (Active, 1),
+            (Passed, 2),
+            (Rejected, 3),
+            (Executed, 4),
+            (Expired, 5),
+            (Failed, 6),
+        ] {
+            assert_eq!(borsh::to_vec(&status).unwrap(), vec![disc], "{status:?}");
+            assert_eq!(ProposalStatus::try_from_slice(&[disc]).unwrap(), status);
+        }
+        assert!(ProposalStatus::try_from_slice(&[7]).is_err());
+
+        let p = Proposal {
+            id: 9,
+            proposer: addr(1),
+            title: "t".into(),
+            description: "d".into(),
+            proposal_type: ProposalType::MarketListing,
+            status: Failed,
+            votes_for: U256::from(5u64),
+            votes_against: U256::ZERO,
+            start_block: 1,
+            end_block: 2,
+            executable_after: 3,
+            snapshot_block: 1,
+            execution_payload: None,
+        };
+        let back = Proposal::try_from_slice(&borsh::to_vec(&p).unwrap()).unwrap();
+        assert_eq!(back.status, Failed);
+        assert_eq!(back.id, 9);
+    }
 
     fn wei_gov(tokens: u64) -> U256 {
         U256::from(tokens) * U256::from(10u64).pow(U256::from(18u64))

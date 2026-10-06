@@ -2232,6 +2232,7 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalStatus::Rejected => "Rejected",
         ProposalStatus::Executed => "Executed",
         ProposalStatus::Expired => "Expired",
+        ProposalStatus::Failed => "Failed",
     };
 
     RpcProposal {
@@ -2291,9 +2292,40 @@ fn parse_proposal_status(s: &str) -> Result<ProposalStatus, RpcError> {
         "rejected" => Ok(ProposalStatus::Rejected),
         "executed" => Ok(ProposalStatus::Executed),
         "expired" => Ok(ProposalStatus::Expired),
+        "failed" => Ok(ProposalStatus::Failed),
         _ => Err(RpcError::InvalidParams(format!(
             "unknown proposal status: {s}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod proposal_status_tests {
+    use super::*;
+
+    /// s94: a proposal that failed at execution is `"Failed"` over RPC and
+    /// can be filtered with `"failed"` (any case, like the other statuses).
+    #[test]
+    fn failed_status_maps_and_parses() {
+        let p = torus_economics::governance::Proposal {
+            id: 3,
+            proposer: alloy_primitives::Address::ZERO,
+            title: "t".into(),
+            description: "d".into(),
+            proposal_type: ProposalType::MarketListing,
+            status: ProposalStatus::Failed,
+            votes_for: alloy_primitives::U256::ZERO,
+            votes_against: alloy_primitives::U256::ZERO,
+            start_block: 0,
+            end_block: 0,
+            executable_after: 0,
+            snapshot_block: 0,
+            execution_payload: None,
+        };
+        assert_eq!(map_proposal(p).status, "Failed");
+        for s in ["failed", "Failed", "FAILED"] {
+            assert_eq!(parse_proposal_status(s).unwrap(), ProposalStatus::Failed);
+        }
     }
 }
 
