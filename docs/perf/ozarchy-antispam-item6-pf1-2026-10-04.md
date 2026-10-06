@@ -1,4 +1,4 @@
-# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`)
+# ozarchy 2026-10-04: anti-spam, item 6 sync 2, C1 full node, 10-market profile, PF1, C3 + PF1, 14236fa baseline, trie and gap analyses, C6 + C7, margin phase breakdown, `239ff69`, per-action results (C), M1 (`90a752c`), step 2 window, Gate 2 at 10 markets (`c58775f`, `5524646`), 10-market gap outside the engine, step 2 at 300 markets (`4acdc59`), Gate 2 with B-blind (`31cea69`), live-feed idle check and reject share (`5584880`), moving prices and the bench in-flight cap (`5584880`, `59fa407`)
 
 Host ozarchy (Ryzen 9 5950X, 32 threads, 62 GB; 3 validators + bench on one
 host). Raw data in `~/bench-results-matched/` on ozarchy (paths per section).
@@ -30,6 +30,7 @@ arm only differences above ~5% are resolved (per-cell noise ~1-4%).
 | 18 | Does step 2 (`4acdc59`: end_resident on a worker, begin_resident before `new_env`) pass Gate 2 at 300 markets? | **0.832x main** (pairs 0.819x / 0.844x; interleaved, both trie off), up from 0.760x (section 14): **Gate 2 not met**. Step 2 hides ~92% of end_resident (exec wait 4.8-5.3 ms per block, p50 0.4, p90 16-22, vs ~15 estimated); `residual_untimed` -56 ms per block; no visible cost to verify. Per block crab is now level with or faster than main (chain 548 vs 601 ms); the gap is 0.77x fills per native block (matched / placed 0.70 vs 0.77, fewer placed per action), present since section 9 |
 | 19 | Does B-blind (`31cea69`: non-pool sell top-up replaces the same-batch bound, on top of cuts 1/2/5/6) pass Gate 2 at both shapes? Is option A needed? | **Yes at both: 1.097x main at 300 markets** (pairs 1.102x / 1.092x; was 0.832x) **and 0.997x at 10 markets** (1.017x / 0.978x; was 0.866x); interleaved, both trie off, no perf. Fills per native block 0.956x at 300 markets (was 0.77x): matched / placed 0.766 vs 0.767. Non-pool zero-fill sell cuts 0.063% of placed (threshold 0.5%): **option A not needed**. All top-ups full; margin cancels and reduce-only cuts 0. 10-market margin +0.067 ms/1k vs main |
 | 20 | With the oracle feed live through the drain (plan Step 6), does `5584880` drain, and what does an oracle-only block cost to execute? How large is the bench's open-limit reject share? Does the pre-merge `cargo test` pass? | **Drains in 38.2 s with the feed live; AGREE, liveness PASS. Oracle-only blocks 4.6 ms p50, 5.92 ms max (target <= 20 ms)**, exec lag 0-1 in the quiet window; walk 0 (prices static). Reject share unchanged: 52-54% of actions fail, 39-43% of orders are open-limit rejects (only reject reason), `OPEN_ORDER_BUDGET` unset. `cargo test --workspace`: 2806 passed, 0 failed |
+| 21 | Do moving prices (walk 10 bp) change the merge gate? Does a per-sender in-flight cap (`--max-in-flight`) with `OPEN_ORDER_BUDGET` remove the open-limit rejects without losing throughput? What is crab / main on that shape? | Walk 10: **1.088x main** (walk 0 1.132x; walk costs ~4% matched/s), 0 liquidations, drains with the feed live. Cap: the budget (counting in-flight places) takes open-limit rejects 40% -> **0%** at every N; main matched/s 96-101k -> ~173k; plateau from N=2 (chosen **N=2 + budget 900**). Crab (`59fa407`) / main at that shape: **1.054x** (section 19 uncapped 1.097x); margin per fill 1.32x main |
 
 The crab stack (account-level margin, oracle, liquidation) at 10 markets ran
 ~64k matched/s vs ~175k on main before PF1, 127.5k after. Section 5 put the
@@ -2033,6 +2034,161 @@ section 13.2.
 `cargo test --workspace -q` on `5584880` (TESTING.md "Before merging to
 main"): rc 0, **2806 passed, 0 failed**, no panics, 565 s.
 
+## 21. Moving prices, bench in-flight cap, crab / main on the new shape (2026-10-06)
+
+### 21.1 Moving prices (walk 10 bp) at 300 markets
+
+Crab `5584880` (node `721e48d7`) with oracle feed 30000 / 2000 ms and
+`ORACLE_FEED_DRAIN=1` (section 20), walk 10 bp (W10) or 0 (W0); main
+`92a02ed` (`31a95c65`, `TORUS_NATIVE_TRIE_MAINTENANCE=0`, no feed). Both arms
+run bench-throughput `cc12451c`. Section 19 shape, trie off, no perf. Order:
+crab warm (W0), W10 r1, W0 r1, main r1, W10 r2, W0 r2, main r2; 09:39-10:22.
+Driver `~/bench-results-matched/ozarchy-walk-5584880-campaign.sh`, analysis
+`ozarchy-walk-5584880-analysis.txt` and `-loadwin.txt`.
+
+All 7 cells: rc 0, AGREE, liveness PASS, drained (37-52 s; settle 10-11 s),
+no deaths, exe md5 as staged, oracle stale 0 / fresh 300.
+
+| cell | matched/s | best60 | native blk/s | fills per native block (load) | chain ms (load) | engine ms/1k | margin ms/1k | match ms/1k |
+|---|---|---|---|---|---|---|---|---|
+| W10 r1 | 107,806 | 123,932 | 1.434 | 75.2k | 667 | 6.62 | 1.69 | 0.81 |
+| W0 r1 | 110,139 | 132,076 | 1.463 | 75.3k | 647 | 6.27 | 1.74 | 0.75 |
+| main r1 | 99,799 | 133,513 | 1.293 | 77.2k | 753 | 7.03 | 1.43 | 2.35 |
+| W10 r2 | 106,297 | 125,707 | 1.455 | 73.0k | 650 | 6.65 | 1.72 | 0.81 |
+| W0 r2 | 112,586 | 132,006 | 1.488 | 75.7k | 636 | 6.21 | 1.71 | 0.77 |
+| main r2 | 97,025 | 135,705 | 1.268 | 76.5k | 770 | 7.14 | 1.46 | 2.36 |
+
+| mean of r1 / r2 | W10 / main | W0 / main | W10 / W0 |
+|---|---|---|---|
+| matched/s | **1.088x** | 1.132x | 0.961x |
+| best60 | 0.927x | 0.981x | 0.945x |
+| engine ms/1k | 0.937x | 0.881x | 1.063x |
+| margin ms/1k | 1.18x | 1.19x | 0.99x |
+| match ms/1k | 0.34x | 0.32x | 1.06x |
+
+- **The merge gate holds with moving prices:** W10 is 1.088x main. Walk
+  costs ~4% matched/s and ~6% engine ms per fill (match +6%); margin per
+  fill does not change.
+- **No liquidations:** `torus_liquidations_triggered_total` stayed 0 on every
+  node in every cell, sampled every 2 s through the drain (`liq-drain.tsv`).
+  The walk stays within +-80 bp, which never pushed an account below
+  maintenance. This pair tests moving marks, not liquidations firing.
+- **Fills per native block and chain ms are load-window values** from val0's
+  `sampler.csv`: in `ORACLE_FEED_DRAIN=1` mode `summary.json` counted bench +
+  drain, and the live feed adds 350-630 oracle-only blocks per node. Fixed on
+  `bench/max-in-flight` (`3a75fe7`, `0d6f2c3`): in that mode the whole
+  exec-chain ruler uses the load window.
+- **Oracle-only blocks in the drain** (node logs, `executing finalized block`
+  -> `block done`, pooled over 3 nodes): W10 p50 4.01, p95 24.35, max 48.62
+  ms; W0 3.29 / 4.95 / 33.57 ms. Steady state (from 2 s after the last load
+  block): W10 p50 4.07, max 4.92; W0 3.60 / 5.35. Exec lag 65-66 at drain
+  start, 0 after 25-30 s, 0-2 in the quiet window.
+- **One slow oracle-only block per node right after the load** (20-49 ms,
+  within ~1 s of the last load block): both W10 runs and W0 r1, not W0 r2 or
+  the warm cell. Every other oracle-only block was <= 6.9 ms.
+- **Empty blocks cost ~2.5-2.8 ms with the feed live after the load**, vs
+  ~0.03 ms before the load, on main, and ~0.06 ms with the feed paused
+  (section 19 cell). Likely M1's mark carry passing over positions on every
+  block while marks are fresh (inferred from timings only).
+
+### 21.2 Bench in-flight cap (`bench/max-in-flight` @ `0d6f2c3`)
+
+Section 13.2 / 20.3: ~40% of orders are refused at the 1000 open-order limit.
+Cause (s83): the bench offers more than the chain executes, actions wait
+~16 s in the mempool (~16.5k nonce-expired evictions per node), and the
+mempool puts a sender's cancel-all ahead of its earlier places, so places
+sent before a cancel-all commit after it.
+
+`--max-in-flight N` (opt-in; `MAX_IN_FLIGHT=N` in `run-cell.sh`): a sender
+fires only while it has < N signed native actions in flight. Slots are freed
+on commit (one shared tail fetches every block body with `torus_getBlockBody`
+from val2 and matches nonce + signature), on an RPC refusal (including
+per-item errors in a partly accepted batch), or after nonce + 70 s. BUSY
+retries keep the slot; transport errors do not free it. With the cap,
+`OPEN_ORDER_BUDGET`'s estimate is orders placed since the sender's last
+**committed** cancel-all plus its in-flight places (fills ignored: it
+overestimates, which costs extra cancel-alls, not refusals). When the cap is
+set, `run-cell.sh` exports `TORUS_RPC_MAX_RESPONSE_MB=64` (loaded bodies exceed
+the 10 MiB default). New `summary.json` fields: `cell.max_in_flight`,
+`cell.open_order_budget`, `cell.rpc_max_response_mb`,
+`ingest.bench_submit_rate`, `ingest.econ_mix`, `ingest.in_flight`.
+
+Sweep: main `92a02ed` only (node `31a95c65`), bench `9b32d897`, section 19
+shape, trie off, no perf. Drivers `ozarchy-mif-campaign.sh`,
+`ozarchy-mif2-campaign.sh`; tables `ozarchy-mif-analysis.py`,
+`ozarchy-mif2-blockA-analysis.txt`. All cells rc 0, AGREE, liveness PASS, no
+deaths; the tail had 0 errors and 0 missed blocks in every capped cell.
+
+| setting | matched/s (x base) | open-limit rejects / orders | actions per native block | native blk/s | place / cancel-all | nonce-expired evictions per node | order age at commit p95 |
+|---|---|---|---|---|---|---|---|
+| base (4 cells) | 97.4k mean (1.00) | 39-42% | 389-395 | 1.19-1.32 | 95 / 5% | ~16.5k | ~63 s |
+| budget 900, no cap | 100.3k (1.03) | 30% | 394 | 1.37 | 64 / 36% | ~47k | 68 s |
+| N=1 | 144.1k (1.48) | 5.95% | | 2.40 | 95 / 5% | 0 | 2.7 s |
+| N=2 | 157.2k (1.61) | 17.1% | | 2.11 | 95 / 5% | 0 | 6.1 s |
+| N=4 | 149.8k (1.54) | 30.7% | | 1.98 | 95 / 5% | 0 | 14.7 s |
+| N=1 + 900 | 150.4k (1.54) | **0%** | 222 | 3.32 | 66 / 34% | 0 | 2.4 s |
+| N=2 + 900 | 173.0k (1.78) | **0%** | 237 | 3.59 | 66 / 34% | 0 | 4.0 s |
+| N=4 + 900 (3 cells) | 174.3k (1.79) | **0%** | 261-296 | 3.17-3.52 | 61 / 39% | 0 | ~5 s |
+| N=8 + 900 | 176.3k (1.81) | **0%** | 281 | 3.35 | 62 / 38% | 0 | 5.0 s |
+| N=16 + 900 | 172.3k (1.77) | **0%** | 246 | 3.72 | 61 / 39% | 0 | 4.9 s |
+
+- **The budget, not N=1, removes the open-limit rejects:** 0% at every N with
+  budget 900; without it N=1 still has 5.95% and more in flight is worse.
+  The cap is what makes the budget's estimate accurate: the budget alone
+  reaches only 30%.
+- **Plateau from N=2:** N=2 is 98.1% of the best (N=8), N=4 98.9%, N=16
+  97.8%; N=1 is 85.3%. Chosen setting: **N=2 + budget 900** (smallest N within
+  3% of the best). Main at N=2 repeats at 170.4k / 174.1k in 21.3.
+- **Blocks are smaller without the backlog** (220-300 vs ~392 actions); full
+  blocks only came from the backlog. No idle gaps mid-run in any capped cell
+  (the only 1-3 s gaps are before the first native block).
+- **34-39% of actions are cancel-alls with the budget** (5% without). Phase
+  2's cancel scan over all books will look bigger partly because of this
+  shape.
+- **Tail cost not measurable:** cap 1,000,000 (never binds) gave 1.02x base,
+  inside base's 3.6% spread; val2 (the tailed node) used ~10% more CPU than
+  val0 / val1. The capped and tail-cost cells ran with
+  `TORUS_RPC_MAX_RESPONSE_MB=64` and the base cells did not, so tail cost vs
+  base measures both together.
+- **The baseline moves ~1.8x:** matched/s on this shape is not comparable
+  with earlier sections.
+
+### 21.3 Crab (`59fa407`) / main at N=2 + budget 900
+
+Crab = main `59fa407` (item 6 Phase 1 merged; node `1cf9f647`, built in a
+fresh worktree, fresh genesis per cell, trie off by default), oracle feed as
+in section 19 (30000 / 2000 ms / walk 0, paused for the drain). Main
+`92a02ed` as in 21.2. Both arms bench `9b32d897`, `MAX_IN_FLIGHT=2`,
+`OPEN_ORDER_BUDGET=900`. Order: crab warm, crab r1, main r1, crab r2, main r2.
+All cells rc 0, AGREE, liveness PASS, no deaths, oracle stale 0 / fresh 300.
+Table `ozarchy-mif2-blockB-analysis.txt`.
+
+| cell | matched/s | best60 | native blk/s | actions per native block | fills per native block | chain ms | engine ms/1k | margin ms/1k | match ms/1k | CPU-s per 1M fills |
+|---|---|---|---|---|---|---|---|---|---|---|
+| crab r1 | 179,861 | 188,964 | 7.418 | 96 | 20.6k | 110 | 4.16 | 0.94 | 0.49 | 29.9 |
+| main r1 | 170,414 | 185,527 | 3.648 | 230 | 46.3k | 252 | 4.48 | 0.72 | 1.41 | 31.5 |
+| crab r2 | 183,357 | 190,402 | 7.730 | 93 | 19.5k | 102 | 4.14 | 0.93 | 0.49 | 29.6 |
+| main r2 | 174,143 | 183,640 | 3.352 | 255 | 51.3k | 277 | 4.44 | 0.70 | 1.38 | 31.5 |
+
+| crab / main | r1 pair | r2 pair | mean | section 19 (uncapped) |
+|---|---|---|---|---|
+| matched/s | 1.055x | 1.053x | **1.054x** | 1.097x |
+| best60 | 1.019x | 1.037x | 1.028x | 0.989x |
+| engine ms/1k | 0.93x | 0.93x | 0.93x | 0.89x |
+| margin ms/1k | 1.30x | 1.34x | 1.32x | 1.20x |
+| match ms/1k | 0.35x | 0.35x | 0.35x | 0.33x |
+| CPU-s per 1M fills | 0.95x | 0.94x | 0.94x | 0.92x |
+
+- **Crab leads main by 1.054x on the new shape** (1.097x uncapped). Main
+  gains more from the cap (~98k -> ~172k) than crab (~110k -> ~182k): with
+  the cap both arms are paced by the load, so the ratio compresses.
+- **Per fill crab is cheaper** (engine 0.93x, match 0.35x, CPU 0.94x); margin
+  is 1.32x main (0.93 vs 0.71 ms/1k), the same direction as section 19.
+- **Per-block figures are not like for like:** crab commits ~2.2x the native
+  blocks at ~0.4x the size. Part of the difference is the oracle feed (crab
+  only), which adds small native blocks; matched/s and per-fill costs are
+  unaffected.
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -2096,3 +2252,14 @@ main"): rc 0, **2806 passed, 0 failed**, no panics, 565 s.
   profile.
 - Anti-spam D (per-IP RPC limit) has no validator exemption; no metric for
   oracle submissions evicted inside the pool.
+- Liquidation-stress cell before testnet: no full-node cell has fired a
+  liquidation (walk 10 bp stays within +-80 bp, section 21.1). Needs a
+  larger walk or accounts seeded near maintenance.
+- Slow first oracle-only block after the load (20-49 ms) and ~2.5 ms empty
+  blocks while the feed is live (section 21.1): look at both in the Phase 2
+  step 0 profile.
+- Phase 2 step 0 shape: `MAX_IN_FLIGHT=2`, `OPEN_ORDER_BUDGET=900` on both
+  arms (section 21.2); 34-39% of actions are cancel-alls on this shape.
+- Feed-drain mode reports exec ms per oracle-only block as a per-interval
+  mean that only sees empty blocks; exact numbers need per-block exec timing
+  in the node (section 20.2).
