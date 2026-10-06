@@ -270,10 +270,11 @@ fn test_validator_reward_with_delegator_redistribution() {
     staking.delegate(d2, proposer, wei(30_000)).unwrap();
     staking.delegate(d3, proposer, wei(50_000)).unwrap();
 
-    let validator_share = wei(10_000);
+    let validator_share = wei(11_000);
     FeeSplitter::distribute_validator_rewards(&staking, &proposer, validator_share).unwrap();
 
-    // Commission = 20% of 10,000 = 2,000 -> proposer.
+    // Self-stake share = 10k/110k of 11,000 = 1,000; commission = 20% of the
+    // delegators' 10,000 = 2,000 -> proposer 3,000.
     // Delegator pool = 8,000.
     // d1: 20k/100k * 8000 = 1,600.
     // d2: 30k/100k * 8000 = 2,400.
@@ -287,12 +288,12 @@ fn test_validator_reward_with_delegator_redistribution() {
     let r_d2 = staking.get_pending_rewards(&d2).unwrap().unwrap().amount;
     let r_d3 = staking.get_pending_rewards(&d3).unwrap().unwrap().amount;
 
-    assert_eq!(r_proposer, wei(2_000));
+    assert_eq!(r_proposer, wei(3_000));
     assert_eq!(r_d1, wei(1_600));
     assert_eq!(r_d2, wei(2_400));
     assert_eq!(r_d3, wei(4_000));
 
-    // Exact conservation: commission + all delegator shares = validator share.
+    // Exact conservation: self share + commission + delegator shares = validator share.
     assert_eq!(r_proposer + r_d1 + r_d2 + r_d3, validator_share);
 }
 
