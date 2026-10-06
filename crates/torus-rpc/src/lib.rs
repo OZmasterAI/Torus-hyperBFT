@@ -1809,6 +1809,114 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Cut 6: `submitNativeActionsBin` decides the shed from the bincode tag.
+    /// While backlogged: a well-formed refused action and (the one deliberate
+    /// exception) a refused tag with a broken body both get "busy" and count as
+    /// `backlog_preverify`; a cancel still verifies; an unreadable tag keeps
+    /// its decode error and `verify_failed`. Not backlogged: the broken body
+    /// gets its decode error as before.
+    #[tokio::test]
+    async fn bin_shed_peeks_tag_and_malformed_keeps_decode_error_outside_shedding() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let mk = |action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
+            format!("0x{}", hex::encode(bincode::serialize(&signed).unwrap()))
+        };
+        let full = mk(torus_types::NativeAction::ClaimRewards, now_ms + 9);
+        let broken = full[..full.len() - 2].to_string();
+
+        for backlogged in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let state = StateDb::open(dir.path()).unwrap();
+            let cfg = if backlogged {
+                MempoolConfig {
+                    native_admission_horizon_ms: 1,
+                    native_admission_floor: 0,
+                    ..Default::default()
+                }
+            } else {
+                MempoolConfig::default()
+            };
+            let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+            assert_eq!(mempool.native_admission_backlogged(), backlogged);
+            let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let mut server = RpcServer::new(
+                state,
+                mempool,
+                executor,
+                TORUS_CHAIN_ID,
+                100,
+                BlockNotifier::new(),
+            );
+            server.set_metrics(metrics.clone());
+            let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+
+            let batch = vec![
+                mk(torus_types::NativeAction::ClaimRewards, now_ms),
+                broken.clone(),
+                mk(
+                    torus_types::NativeAction::CancelOrder { order_id: 7 },
+                    now_ms + 1,
+                ),
+                "0xzz".to_string(),
+            ];
+            let results: Vec<RpcSubmitResult> = client
+                .request(
+                    "torus_submitNativeActionsBin",
+                    jsonrpsee::rpc_params![batch],
+                )
+                .await
+                .unwrap();
+            let err = |i: usize| results[i].error.clone().unwrap_or_default();
+            assert!(err(3).starts_with("invalid hex: "), "{:?}", results[3]);
+            assert!(
+                !err(2).contains("busy"),
+                "cancel must pass: {:?}",
+                results[2]
+            );
+            let text = metrics.encode();
+            if backlogged {
+                assert_eq!(err(0), crate::torus::ADMISSION_BUSY_MSG);
+                // The deliberate exception: shed by tag, body never decoded.
+                assert_eq!(err(1), crate::torus::ADMISSION_BUSY_MSG);
+                assert!(
+                    text.contains(
+                        r#"torus_rpc_submit_admit_rejects_total{reason="backlog_preverify"} 2"#
+                    ),
+                    "dump:\n{text}"
+                );
+                assert!(
+                    text.contains(
+                        r#"torus_rpc_submit_admit_rejects_total{reason="verify_failed"} 1"#
+                    ),
+                    "dump:\n{text}"
+                );
+            } else {
+                assert!(
+                    err(1).starts_with("invalid action encoding: "),
+                    "{:?}",
+                    results[1]
+                );
+                assert!(!err(0).contains("busy"), "{:?}", results[0]);
+                assert!(!text.contains("backlog_preverify"), "dump:\n{text}");
+            }
+            handle.stop().unwrap();
+        }
+    }
+
     // ---- s517 oracle feeder M3: priority screens let oracle submissions through ----
 
     /// Active validator V (key `ac09…ff80`) with hot signer S (key `[21; 32]`),

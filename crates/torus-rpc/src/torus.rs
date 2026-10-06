@@ -256,6 +256,74 @@ fn decode_action_bin(bytes: &[u8]) -> Result<torus_types::SignedNativeAction, St
     bincode::deserialize(bytes).map_err(|e| format!("invalid action encoding: {e}"))
 }
 
+/// Reads an ingress payload's action tag from its first bytes without
+/// decoding the rest; `None` when the tag cannot be read. Only the bincode
+/// format has one (JSON ingress passes no peek and always fully decodes).
+type PeekFn = fn(&str) -> Option<u32>;
+
+/// `NativeAction` variant count: bincode tags are `0..NATIVE_ACTION_TAGS`
+/// (declaration order; variants are only ever appended).
+const NATIVE_ACTION_TAGS: u32 = 29;
+/// bincode tags of the actions that pass the pre-verify shed
+/// (`torus_mempool::is_cancel` / `is_oracle_submission`).
+const TAG_CANCEL_ORDER: u32 = 2;
+const TAG_CANCEL_ALL_ORDERS: u32 = 3;
+const TAG_SUBMIT_ORACLE_PRICES: u32 = 15;
+
+/// bincode ingress tag peek. `SignedNativeAction.action` is the first field
+/// and bincode 1 (fixint) writes an enum variant as a little-endian u32, so
+/// the tag is the first 4 bytes = the first 8 hex characters (after an
+/// optional `0x`, as in `parse_bytes`).
+fn peek_bin_tag(signed_action: &str) -> Option<u32> {
+    let s = signed_action.strip_prefix("0x").unwrap_or(signed_action);
+    let mut tag = [0u8; 4];
+    hex::decode_to_slice(s.get(..8)?, &mut tag).ok()?;
+    Some(u32::from_le_bytes(tag))
+}
+
+/// Pre-verify screen for one payload while the pool sheds (full pool or
+/// admission backlog): `Ok` = proceed to full verification, `Err` = the
+/// per-item rejection. Oracle submissions always proceed, cancels only when
+/// `cancels_pass`; everything else gets `shed_msg`.
+fn screen_payload(
+    signed_action: &str,
+    decode: DecodeFn,
+    peek_tag: Option<PeekFn>,
+    shed_msg: &str,
+    cancels_pass: bool,
+) -> Result<(), String> {
+    // Cut 6: decide from the tag alone when it names a refused action, so a
+    // shed request is never hex- or bincode-decoded. A pass-through tag
+    // (oracle; cancels when `cancels_pass`), an unreadable tag or an unknown
+    // one falls through to the full decode below, unchanged.
+    //
+    // THE ONE DELIBERATE EXCEPTION (owner decision, s92): while shedding, a
+    // payload with a refused tag and a malformed body (bad hex past the tag,
+    // odd length, truncated or invalid bincode) gets `shed_msg` and is
+    // counted under the shed label (`backlog_preverify` /
+    // `pool_full_preverify`) instead of its decode error and `verify_failed`.
+    // Outside shedding this screen does not run and the same payload still
+    // gets its decode error. Pinned by
+    // `malformed_body_with_refused_tag_is_shed_while_shedding`.
+    if let Some(tag) = peek_tag.and_then(|peek| peek(signed_action)) {
+        let passes = tag == TAG_SUBMIT_ORACLE_PRICES
+            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS));
+        if tag < NATIVE_ACTION_TAGS && !passes {
+            return Err(shed_msg.to_string());
+        }
+    }
+    let action = parse_bytes(signed_action)
+        .map_err(|e| format!("invalid hex: {e}"))
+        .and_then(|bytes| decode(&bytes))?;
+    if torus_mempool::is_oracle_submission(&action.action)
+        || (cancels_pass && torus_mempool::is_cancel(&action.action))
+    {
+        Ok(())
+    } else {
+        Err(shed_msg.to_string())
+    }
+}
+
 /// RPC-only ingress guard (non-consensus; O2 design Open Question 2): reject
 /// PlaceOrder / PlaceOrderBatch actions referencing a market_id with no row
 /// in CF_NATIVE_MARKETS — closing the phantom-book trap where a typo'd id
@@ -489,12 +557,14 @@ impl RpcState {
     }
 
     /// Shared batch-submit pipeline: cap check → permit → pool-full prescreen
-    /// (decode-only shed) → blocking-pool verify → admit + leader-forward.
+    /// (decode-only shed; bincode sheds by tag peek, `screen_payload`) →
+    /// blocking-pool verify → admit + leader-forward.
     /// `decode` fixes the wire format; everything downstream is format-agnostic.
     async fn run_submit_pipeline(
         &self,
         signed_actions: Vec<String>,
         decode: DecodeFn,
+        peek_tag: Option<PeekFn>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
         if signed_actions.len() > crate::SUBMIT_BATCH_MAX {
             return Err(ErrorObjectOwned::from(RpcError::InvalidParams(format!(
@@ -540,18 +610,14 @@ impl RpcState {
                 signed_actions
                     .into_iter()
                     .map(|signed_action| {
-                        let decoded = parse_bytes(&signed_action)
-                            .map_err(|e| format!("invalid hex: {e}"))
-                            .and_then(|bytes| decode(&bytes));
-                        match decoded {
-                            Ok(action)
-                                if torus_mempool::is_oracle_submission(&action.action)
-                                    || (cancels_pass
-                                        && torus_mempool::is_cancel(&action.action)) =>
-                            {
-                                SubmitSlot::Proceed(signed_action)
-                            }
-                            Ok(_) => SubmitSlot::Rejected(shed_msg.to_string()),
+                        match screen_payload(
+                            &signed_action,
+                            decode,
+                            peek_tag,
+                            shed_msg,
+                            cancels_pass,
+                        ) {
+                            Ok(()) => SubmitSlot::Proceed(signed_action),
                             Err(e) => SubmitSlot::Rejected(e),
                         }
                     })
@@ -1427,7 +1493,7 @@ impl TorusApiServer for RpcState {
         &self,
         signed_actions: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
-        self.run_submit_pipeline(signed_actions, decode_action_json)
+        self.run_submit_pipeline(signed_actions, decode_action_json, None)
             .await
     }
 
@@ -1435,7 +1501,8 @@ impl TorusApiServer for RpcState {
         &self,
         payloads: Vec<String>,
     ) -> RpcResult<Vec<RpcSubmitResult>> {
-        self.run_submit_pipeline(payloads, decode_action_bin).await
+        self.run_submit_pipeline(payloads, decode_action_bin, Some(peek_bin_tag))
+            .await
     }
 
     // === 2.9.5: Governance ===
@@ -2809,5 +2876,507 @@ mod order_book_decode_tests {
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].quantity, dec_fp(FixedPoint::from_raw(42)));
         assert_eq!(asks.len(), 0);
+    }
+}
+
+/// Cut 6 (ozarchy section 17.4): the shed screen peeks the bincode tag
+/// instead of decoding the whole payload. Every test compares against the
+/// pre-change screen (`old_screen`, full decode first).
+#[cfg(test)]
+mod shed_peek_tests {
+    use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use torus_types::{
+        ActionSignature, Ed25519Sig, MarketListing, MarketParams, NativeAction, OracleSubmission,
+        OrderType, PlaceOrderParams, Proposal, ProposalAction, PublicKey, SessionScope, Signature,
+        SignedNativeAction, TimeInForce, VoteOption,
+    };
+
+    /// (shed message, cancels_pass) of the two shedding modes.
+    const MODES: [(&str, bool); 2] = [(POOL_FULL_PREVERIFY_MSG, false), (ADMISSION_BUSY_MSG, true)];
+
+    /// The pre-change screen, verbatim: full hex + action decode, then decide.
+    fn old_screen(
+        signed_action: &str,
+        decode: DecodeFn,
+        shed_msg: &str,
+        cancels_pass: bool,
+    ) -> Result<(), String> {
+        let decoded = parse_bytes(signed_action)
+            .map_err(|e| format!("invalid hex: {e}"))
+            .and_then(|bytes| decode(&bytes));
+        match decoded {
+            Ok(action)
+                if torus_mempool::is_oracle_submission(&action.action)
+                    || (cancels_pass && torus_mempool::is_cancel(&action.action)) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(shed_msg.to_string()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn new_screen(
+        payload: &str,
+        binary: bool,
+        shed_msg: &str,
+        cancels_pass: bool,
+    ) -> Result<(), String> {
+        if binary {
+            screen_payload(
+                payload,
+                decode_action_bin,
+                Some(peek_bin_tag),
+                shed_msg,
+                cancels_pass,
+            )
+        } else {
+            screen_payload(payload, decode_action_json, None, shed_msg, cancels_pass)
+        }
+    }
+
+    fn decode_for(binary: bool) -> DecodeFn {
+        if binary {
+            decode_action_bin
+        } else {
+            decode_action_json
+        }
+    }
+
+    /// Declaration index of every variant. Exhaustive on purpose: a new
+    /// variant fails to compile here until it is added to `samples()` too.
+    fn variant_index(a: &NativeAction) -> u32 {
+        match a {
+            NativeAction::PlaceOrder(_) => 0,
+            NativeAction::PlaceOrderBatch(_) => 1,
+            NativeAction::CancelOrder { .. } => 2,
+            NativeAction::CancelAllOrders { .. } => 3,
+            NativeAction::ModifyOrder { .. } => 4,
+            NativeAction::TransferToPerp { .. } => 5,
+            NativeAction::TransferToSpot { .. } => 6,
+            NativeAction::Withdraw { .. } => 7,
+            NativeAction::Delegate { .. } => 8,
+            NativeAction::Undelegate { .. } => 9,
+            NativeAction::PermanentStake { .. } => 10,
+            NativeAction::ClaimRewards => 11,
+            NativeAction::TopUpSelfStake { .. } => 12,
+            NativeAction::SubmitProposal(_) => 13,
+            NativeAction::Vote { .. } => 14,
+            NativeAction::SubmitOraclePrices(_) => 15,
+            NativeAction::RegisterValidator { .. } => 16,
+            NativeAction::UpdateCommission { .. } => 17,
+            NativeAction::JailVote { .. } => 18,
+            NativeAction::UnjailSelf => 19,
+            NativeAction::RotateValidatorKey { .. } => 20,
+            NativeAction::CreateSession { .. } => 21,
+            NativeAction::RevokeSession { .. } => 22,
+            NativeAction::UpdateMarketParams { .. } => 23,
+            NativeAction::ListMarket(_) => 24,
+            NativeAction::DelistMarket { .. } => 25,
+            NativeAction::AttestStateHash { .. } => 26,
+            NativeAction::ClaimUnbonded => 27,
+            NativeAction::SetOracleSigner { .. } => 28,
+        }
+    }
+
+    fn order(i: u64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: i,
+            is_buy: i.is_multiple_of(2),
+            price: FixedPoint::from_raw(1_000 + i as i128),
+            quantity: FixedPoint::from_raw(7),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: Some(i),
+        }
+    }
+
+    /// At least one sample of every `NativeAction` variant.
+    fn samples() -> Vec<NativeAction> {
+        let params = MarketParams {
+            tick_size: FixedPoint::from_raw(1),
+            lot_size: FixedPoint::from_raw(1),
+            max_leverage: 20,
+            maintenance_margin_bps: 50,
+            max_funding_rate_bps: 10,
+        };
+        let listing = MarketListing {
+            base_asset: "BTC".into(),
+            quote_asset: "USD".into(),
+            tick_size: FixedPoint::from_raw(1),
+            lot_size: FixedPoint::from_raw(1),
+            max_leverage: 20,
+            maintenance_margin_bps: 50,
+        };
+        vec![
+            NativeAction::PlaceOrder(order(1)),
+            NativeAction::PlaceOrderBatch(vec![]),
+            NativeAction::PlaceOrderBatch((0..50).map(order).collect()),
+            NativeAction::CancelOrder { order_id: 7 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::CancelAllOrders { market_id: Some(3) },
+            NativeAction::ModifyOrder {
+                order_id: 7,
+                new_price: Some(FixedPoint::from_raw(5)),
+                new_qty: None,
+            },
+            NativeAction::TransferToPerp {
+                amount: U256::from(5),
+            },
+            NativeAction::TransferToSpot { amount: U256::MAX },
+            NativeAction::Withdraw {
+                amount: U256::from(1),
+                to: Address::repeat_byte(3),
+            },
+            NativeAction::Delegate {
+                validator: Address::repeat_byte(4),
+                amount: U256::from(9),
+            },
+            NativeAction::Undelegate {
+                validator: Address::repeat_byte(5),
+                amount: U256::from(9),
+            },
+            NativeAction::PermanentStake {
+                amount: U256::from(2),
+            },
+            NativeAction::ClaimRewards,
+            NativeAction::TopUpSelfStake {
+                amount: U256::from(2),
+            },
+            NativeAction::SubmitProposal(Proposal {
+                title: "t".into(),
+                description: "d".into(),
+                action: ProposalAction::ParameterChange {
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+            }),
+            NativeAction::Vote {
+                proposal_id: 1,
+                option: VoteOption::Yes,
+            },
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![],
+                timestamp: 0,
+            }),
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![
+                    (1, FixedPoint::from_raw(100)),
+                    (2, FixedPoint::from_raw(200)),
+                ],
+                timestamp: 9,
+            }),
+            NativeAction::RegisterValidator {
+                pubkey: PublicKey([7; 32]),
+                commission: 100,
+            },
+            NativeAction::UpdateCommission { new_rate: 50 },
+            NativeAction::JailVote {
+                target: Address::repeat_byte(8),
+            },
+            NativeAction::UnjailSelf,
+            NativeAction::RotateValidatorKey {
+                new_pubkey: PublicKey([9; 32]),
+            },
+            NativeAction::CreateSession {
+                session_pubkey: [10; 32],
+                expiry: 99,
+                scope: SessionScope::Trading,
+            },
+            NativeAction::RevokeSession {
+                session_pubkey: [10; 32],
+            },
+            NativeAction::UpdateMarketParams {
+                market_id: 1,
+                params,
+            },
+            NativeAction::ListMarket(listing),
+            NativeAction::DelistMarket { market_id: 1 },
+            NativeAction::AttestStateHash {
+                height: 100,
+                hash: B256::repeat_byte(11),
+            },
+            NativeAction::ClaimUnbonded,
+            NativeAction::SetOracleSigner {
+                signer: Address::repeat_byte(11),
+                proof: None,
+            },
+        ]
+    }
+
+    fn signed(action: NativeAction, session: bool) -> SignedNativeAction {
+        SignedNativeAction {
+            action,
+            nonce: 1_000_000,
+            signature: if session {
+                ActionSignature::Session {
+                    session_pubkey: [17; 32],
+                    sig: Ed25519Sig([29; 64]),
+                }
+            } else {
+                ActionSignature::Eip712(Signature {
+                    v: 28,
+                    r: [31; 32],
+                    s: [43; 32],
+                })
+            },
+        }
+    }
+
+    /// Hex body (no prefix) of a signed sample in the given format.
+    fn body(action: &NativeAction, session: bool, binary: bool) -> String {
+        let s = signed(action.clone(), session);
+        hex::encode(if binary {
+            bincode::serialize(&s).unwrap()
+        } else {
+            serde_json::to_vec(&s).unwrap()
+        })
+    }
+
+    fn is_pass_tag(tag: u32, cancels_pass: bool) -> bool {
+        tag == TAG_SUBMIT_ORACLE_PRICES
+            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS))
+    }
+
+    /// Payloads broken after a readable tag (all fail the full decode).
+    fn malformed_after_tag(h: &str) -> Vec<String> {
+        vec![
+            h[..8].to_string(),                   // tag only: truncated
+            h[..h.len() - 2].to_string(),         // truncated body
+            h[..h.len() - 1].to_string(),         // odd length
+            format!("{}g", &h[..h.len() - 1]),    // bad hex at the end
+            format!("{}zz{}", &h[..8], &h[10..]), // bad hex right after the tag
+            format!("{}é{}", &h[..8], &h[10..]),  // non-ASCII after the tag
+        ]
+    }
+
+    #[test]
+    fn samples_cover_every_variant_and_bin_tags_are_variant_indices() {
+        let mut seen = std::collections::BTreeSet::new();
+        for a in samples() {
+            let idx = variant_index(&a);
+            seen.insert(idx);
+            for session in [false, true] {
+                let h = body(&a, session, true);
+                for p in [h.clone(), format!("0x{h}")] {
+                    assert_eq!(peek_bin_tag(&p), Some(idx), "{a:?}");
+                }
+            }
+            assert_eq!(
+                torus_mempool::is_cancel(&a),
+                idx == TAG_CANCEL_ORDER || idx == TAG_CANCEL_ALL_ORDERS
+            );
+            assert_eq!(
+                torus_mempool::is_oracle_submission(&a),
+                idx == TAG_SUBMIT_ORACLE_PRICES
+            );
+        }
+        assert_eq!(seen, (0..NATIVE_ACTION_TAGS).collect());
+        // The first tag past the last variant is not an action.
+        let mut bytes = bincode::serialize(&signed(NativeAction::ClaimUnbonded, false)).unwrap();
+        bytes[..4].copy_from_slice(&NATIVE_ACTION_TAGS.to_le_bytes());
+        assert!(decode_action_bin(&bytes).is_err());
+    }
+
+    /// Well-formed payloads of every variant, both formats, both signature
+    /// kinds, with and without `0x`, both shedding modes: same decision.
+    #[test]
+    fn well_formed_every_variant_same_decision_as_full_decode() {
+        let mut proceeds = 0;
+        for a in samples() {
+            for binary in [false, true] {
+                for session in [false, true] {
+                    let h = body(&a, session, binary);
+                    for p in [h.clone(), format!("0x{h}")] {
+                        for (msg, cancels_pass) in MODES {
+                            let old = old_screen(&p, decode_for(binary), msg, cancels_pass);
+                            assert_eq!(
+                                new_screen(&p, binary, msg, cancels_pass),
+                                old,
+                                "{a:?} binary={binary} cancels_pass={cancels_pass}"
+                            );
+                            assert_eq!(old.is_ok(), is_pass_tag(variant_index(&a), cancels_pass));
+                            proceeds += usize::from(old.is_ok());
+                        }
+                    }
+                }
+            }
+        }
+        // 2 oracle samples x both modes + 3 cancel samples x busy mode,
+        // each x 2 formats x 2 signatures x 2 prefixes.
+        assert_eq!(proceeds, (2 * 2 + 3) * 8);
+    }
+
+    /// Pass-through tags (2, 3, 15) are never decided by the peek: a broken
+    /// body gets the same decode error as before, and a well-formed one
+    /// proceeds to the unchanged full verify (which still rejects bad content).
+    #[test]
+    fn pass_through_tags_are_still_fully_decoded_and_validated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        let pass = [
+            NativeAction::CancelOrder { order_id: 7 },
+            NativeAction::CancelAllOrders { market_id: None },
+            NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: vec![],
+                timestamp: 0,
+            }),
+        ];
+        for a in &pass {
+            for (msg, cancels_pass) in MODES {
+                if !is_pass_tag(variant_index(a), cancels_pass) {
+                    continue;
+                }
+                let h = body(a, false, true);
+                for bad in malformed_after_tag(&h) {
+                    for p in [bad.clone(), format!("0x{bad}")] {
+                        let old = old_screen(&p, decode_action_bin, msg, cancels_pass);
+                        assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                        assert_eq!(new_screen(&p, true, msg, cancels_pass), old, "{p}");
+                    }
+                }
+                // Unregistered session key: decodes fine, must fail verify.
+                let p = format!("0x{}", body(a, true, true));
+                assert_eq!(new_screen(&p, true, msg, cancels_pass), Ok(()));
+                let verified = verify_one_action_with(
+                    decode_action_bin,
+                    &p,
+                    torus_types::eip712::TORUS_CHAIN_ID,
+                    &state,
+                    1_000_000,
+                    &mut Vec::new(),
+                );
+                let err = verified.expect_err("bogus content / signature must fail verify");
+                assert!(
+                    err.starts_with("oracle submission carries")
+                        || err.starts_with("signature verification failed"),
+                    "{a:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// An unreadable tag (short, empty, non-hex, wrong prefix) or an unknown
+    /// one falls back to the full decode: the same error as before, in both
+    /// formats and both modes.
+    #[test]
+    fn unreadable_or_unknown_tag_falls_back_to_full_decode() {
+        let claim = body(&NativeAction::ClaimRewards, false, true);
+        let mut cases: Vec<String> = [
+            "",
+            "0x",
+            "0",
+            "0x0",
+            "00",
+            "0x1234567",
+            "0X0b000000",
+            "zz000000",
+            "0x0g000000",
+            "0b00000",
+            "é",
+            "0x0b0000é0",
+            "0x0x0b000000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for tag in [NATIVE_ACTION_TAGS, NATIVE_ACTION_TAGS + 1, u32::MAX] {
+            let t = hex::encode(tag.to_le_bytes());
+            cases.push(format!("{t}{}", &claim[8..]));
+            cases.push(format!("0x{t}{}", &claim[8..]));
+            cases.push(format!("0x{t}"));
+        }
+        for p in &cases {
+            for binary in [false, true] {
+                for (msg, cancels_pass) in MODES {
+                    let old = old_screen(p, decode_for(binary), msg, cancels_pass);
+                    assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                    assert_eq!(
+                        new_screen(p, binary, msg, cancels_pass),
+                        old,
+                        "{p:?} binary={binary}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE ONE DELIBERATE EXCEPTION (cut 6): while shedding, a bincode
+    /// payload whose readable tag is a refused action but whose body is
+    /// malformed gets the shed reply (counted under the shed label) instead
+    /// of its decode error. Outside shedding the same payload still gets its
+    /// decode error (`malformed_input_outside_shedding_is_unchanged`).
+    #[test]
+    fn malformed_body_with_refused_tag_is_shed_while_shedding() {
+        let mut checked = 0;
+        for a in samples() {
+            for (msg, cancels_pass) in MODES {
+                if is_pass_tag(variant_index(&a), cancels_pass) {
+                    continue;
+                }
+                let h = body(&a, false, true);
+                for bad in malformed_after_tag(&h) {
+                    for p in [bad.clone(), format!("0x{bad}")] {
+                        let old = old_screen(&p, decode_action_bin, msg, cancels_pass);
+                        assert!(old.as_ref().is_err_and(|e| e != msg), "{p}: {old:?}");
+                        assert_eq!(
+                            new_screen(&p, true, msg, cancels_pass),
+                            Err(msg.to_string())
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+        // JSON ingress has no tag peek: unchanged there.
+        let h = body(&NativeAction::ClaimRewards, false, false);
+        let bad = &h[..h.len() - 2];
+        for (msg, cancels_pass) in MODES {
+            assert_eq!(
+                new_screen(bad, false, msg, cancels_pass),
+                old_screen(bad, decode_action_json, msg, cancels_pass)
+            );
+        }
+    }
+
+    /// Outside shedding the screen does not run; the verify path decodes as
+    /// before, so malformed input keeps its exact decode error.
+    #[test]
+    fn malformed_input_outside_shedding_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        for binary in [false, true] {
+            let decode = decode_for(binary);
+            let h = body(
+                &NativeAction::PlaceOrderBatch((0..3).map(order).collect()),
+                false,
+                binary,
+            );
+            let mut cases = malformed_after_tag(&h);
+            cases.extend(["".into(), "0x".into(), "0x0".into(), "zz".into()]);
+            for p in cases {
+                let expected = parse_bytes(&p)
+                    .map_err(|e| format!("invalid hex: {e}"))
+                    .and_then(|b| decode(&b))
+                    .expect_err("malformed");
+                let got = verify_one_action_with(
+                    decode,
+                    &p,
+                    torus_types::eip712::TORUS_CHAIN_ID,
+                    &state,
+                    1_000_000,
+                    &mut Vec::new(),
+                )
+                .expect_err("malformed");
+                assert_eq!(got, expected, "{p:?} binary={binary}");
+                assert!(
+                    got.starts_with("invalid hex: ")
+                        || got.starts_with("invalid action encoding: ")
+                );
+            }
+        }
     }
 }
