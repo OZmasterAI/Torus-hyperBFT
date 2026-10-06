@@ -146,7 +146,8 @@ python3 tools/matched-bench/test_harness.py
    (pending rows plus the scan-window candidates the act budget left
    unclassified; see `docs/monitoring-setup.md`). On a binary without the
    telemetry it falls back to the lower bound from the triggered counter.
-   ADL counterparties are in the node logs (`liquidation: ADL close`), not
+   ADL counterparties are in the node logs (info `liquidation: ADL` per
+   account and market; each close at debug, `liquidation: ADL close`), not
    parsed.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
