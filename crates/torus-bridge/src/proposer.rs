@@ -211,9 +211,11 @@ impl BlockProposer {
         // SignedNativeActions are kept intact in the block so validators can
         // independently verify signatures during consensus validation.
         // FIX ECON-FIND-03: Check persistent nonces to prevent replay.
+        // A8: `timestamp` (the header's) is SECONDS, session expiry MILLISECONDS.
+        let block_ms = torus_types::eip712::block_timestamp_ms(timestamp);
         for signed in &signed_native_actions {
             let sender = signed
-                .resolve_sender(timestamp, |pubkey| {
+                .resolve_sender(block_ms, |pubkey| {
                     state_db.get_session(pubkey).ok().flatten()
                 })
                 .map_err(|e| BridgeError::SignatureRecovery(format!("{e}")))?;

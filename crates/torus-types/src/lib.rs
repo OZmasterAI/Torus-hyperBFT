@@ -265,51 +265,30 @@ pub struct OracleSignerProof {
 pub struct PublicKey(pub [u8; 32]);
 
 /// Scope of actions a session key is authorized to perform.
+///
+/// Session keys only ever trade, like Hyperliquid agent wallets: every other
+/// action (transfers, withdraw, staking, governance, validator, oracle,
+/// session management) needs the owner's EIP-712 signature
+/// ([`crate::eip712::requires_eip712`]). The variants and their encoding are
+/// unchanged so stored sessions and old `CreateSession` actions still decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionScope {
-    /// PlaceOrder, PlaceOrderBatch, CancelOrder, ModifyOrder, CancelAllOrders only.
+    /// The trading actions ([`NativeAction::is_trading`]).
     Trading,
-    /// TransferToPerp, TransferToSpot only.
+    /// Nothing: transfers need the owner key. Kept for encoding compatibility.
     TransfersOnly,
-    /// Everything except CreateSession, RevokeSession, Withdraw, Delegate,
-    /// Undelegate, PermanentStake, ClaimRewards, ClaimUnbonded, SetOracleSigner.
+    /// Same as `Trading`. Kept for encoding compatibility.
     Full,
 }
 
 impl SessionScope {
     pub fn allows(&self, action: &NativeAction) -> bool {
+        // LOCKSTEP DEPLOY: scope is enforced on the CONSENSUS path too (exec
+        // batch verify). A node with different rules resolves different
+        // senders and diverges, so the whole fleet must run the same rules.
         match self {
-            // LOCKSTEP-DEPLOY WARNING (O2/G3): scope is enforced on the
-            // CONSENSUS path too (eip712.rs batch verify guard) — on an old
-            // validator a Trading-scoped PlaceOrderBatch resolves to None,
-            // which the exec pipeline treats as an invalid signature and
-            // SLASHES + TOMBSTONES the block's PROPOSER (app.rs invalid-
-            // attestation arm). The ENTIRE fleet must run this change before
-            // any client signs batches under a Trading-scoped session.
-            SessionScope::Trading => matches!(
-                action,
-                NativeAction::PlaceOrder(_)
-                    | NativeAction::PlaceOrderBatch(_)
-                    | NativeAction::CancelOrder { .. }
-                    | NativeAction::ModifyOrder { .. }
-                    | NativeAction::CancelAllOrders { .. }
-            ),
-            SessionScope::TransfersOnly => matches!(
-                action,
-                NativeAction::TransferToPerp { .. } | NativeAction::TransferToSpot { .. }
-            ),
-            SessionScope::Full => !matches!(
-                action,
-                NativeAction::CreateSession { .. }
-                    | NativeAction::RevokeSession { .. }
-                    | NativeAction::Withdraw { .. }
-                    | NativeAction::Delegate { .. }
-                    | NativeAction::Undelegate { .. }
-                    | NativeAction::PermanentStake { .. }
-                    | NativeAction::ClaimRewards
-                    | NativeAction::ClaimUnbonded
-                    | NativeAction::SetOracleSigner { .. }
-            ),
+            SessionScope::Trading | SessionScope::Full => action.is_trading(),
+            SessionScope::TransfersOnly => false,
         }
     }
 }
@@ -757,6 +736,19 @@ pub enum NativeAction {
 }
 
 impl NativeAction {
+    /// Place, batch, cancel, cancel-all and modify: the only actions a session
+    /// key may sign.
+    pub fn is_trading(&self) -> bool {
+        matches!(
+            self,
+            NativeAction::PlaceOrder(_)
+                | NativeAction::PlaceOrderBatch(_)
+                | NativeAction::CancelOrder { .. }
+                | NativeAction::ModifyOrder { .. }
+                | NativeAction::CancelAllOrders { .. }
+        )
+    }
+
     /// Append a single order's canonical body (no variant tag) to `buf`.
     ///
     /// Shared by the `PlaceOrder` and `PlaceOrderBatch` encodings so a batched

@@ -153,6 +153,13 @@ async fn run(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Sign every submission for the configured network's EIP-712 domain.
+fn with_chain_id(c: Config) -> Result<Config, String> {
+    torus_types::eip712::set_network_chain_id(c.chain_id)
+        .map_err(|e| format!("chain_id {}: {e}", c.chain_id))?;
+    Ok(c)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -178,11 +185,11 @@ async fn main() -> ExitCode {
         Command::Address { config } => Config::load(&config)
             .and_then(|c| load_signer(&c))
             .map(|k| println!("{:#x}", torus_wallet::keystore::address_from_key(&k))),
-        Command::Check { config } => match Config::load(&config) {
+        Command::Check { config } => match Config::load(&config).and_then(with_chain_id) {
             Ok(c) => check(c).await,
             Err(e) => Err(e),
         },
-        Command::Run { config } => match Config::load(&config) {
+        Command::Run { config } => match Config::load(&config).and_then(with_chain_id) {
             Ok(c) => run(c).await,
             Err(e) => Err(e),
         },

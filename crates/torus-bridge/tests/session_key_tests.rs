@@ -380,8 +380,119 @@ fn invalid_ed25519_signature_rejected() {
     );
 }
 
+// ---- A8: session expiry in blocks (the header timestamp is SECONDS) ----
+
+const BLOCK_TS_SECS: u64 = 1_700_000_000;
+
+/// Register the test session key for `addr(1)` with `expiry_ms` and return a
+/// session-signed cancel whose nonce is the block time.
+fn session_cancel(state_db: &StateDb, expiry_ms: u64) -> SignedNativeAction {
+    let session_key = make_ed25519_key();
+    let session = SessionData {
+        owner: addr(1),
+        expiry: expiry_ms,
+        scope: SessionScope::Trading,
+        created_at: 0,
+    };
+    state_db
+        .put_session(&session_key.verifying_key().to_bytes(), &session)
+        .unwrap();
+    sign_with_session(
+        NativeAction::CancelOrder { order_id: 1 },
+        BLOCK_TS_SECS * 1000,
+        &session_key,
+    )
+}
+
+fn propose(state_db: &StateDb, signed: SignedNativeAction) -> Result<torus_types::TorusBlock, String> {
+    torus_bridge::BlockProposer::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0))
+        .build_block_with_native(
+            state_db,
+            &torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID),
+            &torus_bridge::genesis_parent_header(),
+            vec![signed],
+            vec![],
+            BLOCK_TS_SECS,
+            addr(99),
+        )
+        .map(|p| p.block)
+        .map_err(|e| e.to_string())
+}
+
 #[test]
-fn session_scope_transfers_only_blocks_trading() {
+fn block_proposal_rejects_session_expired_at_header_time() {
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    // Boundary: a session expiring exactly at the block time is still valid.
+    propose(&state_db, session_cancel(&state_db, block_ms)).expect("valid at expiry");
+    let err = propose(&state_db, session_cancel(&state_db, block_ms - 1))
+        .expect_err("a session expired 1 ms before the block must not be proposed");
+    assert!(err.contains("session key expired"), "{err}");
+}
+
+#[test]
+fn block_validation_rejects_session_expired_at_header_time() {
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    let evm = torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID);
+    let validator =
+        torus_bridge::BlockValidator::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0));
+    let block = propose(&state_db, session_cancel(&state_db, block_ms)).unwrap();
+
+    let ok = validator
+        .validate_block_with_native(&block, &state_db, &evm)
+        .expect("a session expiring exactly at the block time is valid");
+    assert_eq!(ok.native_sender_actions[0].0, addr(1));
+
+    // Same block, the session now expired 1 ms before the block time.
+    session_cancel(&state_db, block_ms - 1);
+    let err = validator
+        .validate_block_with_native(&block, &state_db, &evm)
+        .expect_err("an expired session must fail block validation");
+    assert!(err.to_string().contains("session key expired"), "{err}");
+}
+
+/// Commit 2: block validation enforces the ±NONCE_WINDOW_MS nonce window
+/// against the block time (inclusive), like intake does against wall time.
+#[test]
+fn block_validation_rejects_nonce_outside_window_of_header_time() {
+    use torus_types::eip712::NONCE_WINDOW_MS as W;
+    let (_dir, state_db) = open_test_db();
+    let block_ms = BLOCK_TS_SECS * 1000;
+    let evm = torus_evm::EvmExecutor::new(torus_evm::TORUS_CHAIN_ID);
+    let validator =
+        torus_bridge::BlockValidator::new(torus_evm::TORUS_CHAIN_ID, 100, 4, addr(0), addr(0));
+    let session_key = make_ed25519_key();
+    let session = SessionData {
+        owner: addr(1),
+        expiry: u64::MAX,
+        scope: SessionScope::Trading,
+        created_at: 0,
+    };
+    state_db
+        .put_session(&session_key.verifying_key().to_bytes(), &session)
+        .unwrap();
+    for (nonce, ok) in [
+        (block_ms - W, true),
+        (block_ms + W, true),
+        (block_ms - W - 1, false),
+        (block_ms + W + 1, false),
+    ] {
+        let signed = sign_with_session(NativeAction::CancelOrder { order_id: 1 }, nonce, &session_key);
+        let block = propose(&state_db, signed).expect("the proposer does not filter by window");
+        match (validator.validate_block_with_native(&block, &state_db, &evm), ok) {
+            (Ok(_), true) => {}
+            (Err(e), false) => assert!(e.to_string().contains("nonce"), "{e}"),
+            (Ok(_), false) => panic!("nonce {nonce} outside the window of block {block_ms} ms accepted"),
+            (Err(e), true) => panic!("nonce {nonce} inside the window rejected: {e}"),
+        }
+    }
+}
+
+/// Commit 3: session keys may only trade, so a TransfersOnly session can sign
+/// nothing — transfers need the owner's EIP-712 key, trading is out of scope.
+#[test]
+fn session_scope_transfers_only_allows_nothing() {
     let (_dir, state_db) = open_test_db();
     let owner = addr(1);
     let session_key = make_ed25519_key();
@@ -396,13 +507,16 @@ fn session_scope_transfers_only_blocks_trading() {
     };
     state_db.put_session(&pubkey, &session_data).unwrap();
 
-    // TransferToPerp should work
+    // TransferToPerp needs the owner key.
     let transfer = NativeAction::TransferToPerp {
         amount: U256::from(100),
     };
     let signed = sign_with_session(transfer, timestamp, &session_key);
     let result = signed.resolve_sender(timestamp, |pk| state_db.get_session(pk).ok().flatten());
-    assert_eq!(result.unwrap(), owner);
+    assert_eq!(
+        result.unwrap_err(),
+        torus_types::eip712::Eip712Error::RequiresEip712
+    );
 
     // PlaceOrder should fail
     let order = place_order_action();
