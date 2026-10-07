@@ -17,8 +17,16 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # surfacing as "no matching package named reth-storage-errors".
 git-fetch-with-cli = true
 
+# Debug/test builds keep only what backtraces need: full DWARF for every
+# dependency made a workspace target dir 50-90 GB. The test profile inherits
+# dev. For a debugger session on workspace crates, override locally, e.g.
+#   CARGO_PROFILE_DEV_DEBUG=full cargo test -p <crate>
 [profile.dev]
 split-debuginfo = "unpacked"
+debug = "line-tables-only"   # workspace crates: file:line in backtraces/panics, no full DWARF
+
+[profile.dev.package."*"]
+debug = false                # dependencies: no debuginfo
 
 [env]
 # Cache only librocksdb-sys C++ compilation via sccache
