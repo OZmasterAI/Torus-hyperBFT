@@ -37,6 +37,7 @@ fn position(t: Address, m: MarketId, raw: u64, long: bool) -> Position {
         is_long: long,
         size: FixedPoint::from_raw(i128::from(raw) + 1),
         entry_price: FixedPoint::from_raw(i128::from(raw) * 7 + 3),
+        cost_basis: FixedPoint::from_raw(i128::from(raw) * 11 + 5),
         realized_pnl: FixedPoint::from_raw(-(i128::from(raw))),
         isolated_margin: FixedPoint::ZERO,
         margin_type: if raw.is_multiple_of(5) { MarginType::Isolated } else { MarginType::Cross },

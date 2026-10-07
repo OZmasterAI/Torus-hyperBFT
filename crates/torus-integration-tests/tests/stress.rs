@@ -88,10 +88,10 @@ fn verify_all_book_invariants(ctx: &torus_bridge::native_executor::NativeExecCon
     }
 }
 
-/// Check value conservation: sum(available) + sum(unrealized PnL) ≈ sum(initial funding).
-///
-/// Allows a small epsilon for FixedPoint rounding from repeated multiply/divide
-/// in volume-weighted average entry price calculations.
+/// Check value conservation: sum(available + order margin) + sum(unrealized PnL) ==
+/// sum(initial funding), exactly (s100 item 2: one rounding per fill, shared by both
+/// sides). The order margin of resting orders is collateral too (s100: it was left
+/// out, so these ignored tests failed by the reserved margin).
 fn verify_value_conservation(
     h: &TestHarness,
     traders: &[Address],
@@ -103,7 +103,7 @@ fn verify_value_conservation(
 
     for trader in traders {
         let bal = h.positions.get_native_balance(trader).unwrap();
-        total_available = total_available + bal.available;
+        total_available = total_available + bal.available + bal.order_margin;
 
         let positions = h.positions.positions_for_trader(trader).unwrap();
         for pos in &positions {
@@ -113,12 +113,9 @@ fn verify_value_conservation(
 
     let actual = total_available + total_unrealized;
     let diff_raw = (actual - total_initial).raw();
-    let abs_diff = diff_raw.unsigned_abs();
-    // Allow up to 0.00001 (1000 raw units) of rounding drift from
-    // repeated FixedPoint multiply/divide in entry price averaging.
-    assert!(
-        abs_diff < 1000,
-        "Value conservation violated beyond epsilon: available({total_available}) + unrealized({total_unrealized}) = {actual}, expected {total_initial}, diff_raw={diff_raw}"
+    assert_eq!(
+        diff_raw, 0,
+        "Value conservation violated: available({total_available}) + unrealized({total_unrealized}) = {actual}, expected {total_initial}"
     );
 }
 

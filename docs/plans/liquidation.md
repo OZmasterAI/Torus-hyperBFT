@@ -241,9 +241,9 @@ while `used < W` and runs to its end (overshoot ≤ one row).
 * **OI symmetry:** for every market, Σ long size == Σ short size after every step.
 * **Value conservation:** Σ over all accounts (available + order_margin + UPnL at mark) is
   unchanged by the step (any fill at any price conserves it; collateral moves are
-  transfers). Tests use exactly representable prices / sizes. P2: an escrow's weighted-average
-  entry truncates, so the sum moves by at most the dust bound (adl-budget-impl.md *Dust bound*)
-  until the dust is swept to the vault.
+  transfers). s100 (exact cost basis, one rounding per fill): the sum over all accounts at one
+  common price is exact. An escrow row closed in pieces leaves < 1 raw dust per piece, swept to
+  the vault (a transfer; adl-budget-impl.md *Dust bound*).
 * Liquidation never runs on an account with a stale / absent mark in any of its markets.
 
 ### State: new native-root CF `CF_NATIVE_LIQUIDATION` (tag 6)
