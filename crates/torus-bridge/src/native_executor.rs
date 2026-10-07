@@ -1151,6 +1151,9 @@ struct SumsCounters {
     /// adl-budget A8 perf (P1): trader sets the drain took (one per drain
     /// with a ranking; the rankings share it).
     adl_trader_sets: std::sync::atomic::AtomicUsize,
+    /// adl-budget C2: rankings over a market's holder list (records
+    /// attached), each shadow-checked against C1 when `shadow` is on.
+    adl_holder_lists: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]

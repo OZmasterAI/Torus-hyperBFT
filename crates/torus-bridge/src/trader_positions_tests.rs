@@ -113,6 +113,13 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
     // E2: the trader set = the traders of R's 28-byte keys (opaque or not).
     let with_key: BTreeSet<Address> = r.keys().filter(|k| k.len() == 28).map(|k| Address::from_slice(&k[..20])).collect();
     assert_eq!(rec.traders, with_key, "{tag}: trader set != traders of R's 28-byte keys");
+    // adl-budget C2: per market, the traders of R's 28-byte keys `t ‖ m`.
+    let mut by_market: HashMap<MarketId, BTreeSet<Address>> = HashMap::new();
+    for k in r.keys().filter(|k| k.len() == 28) {
+        let m = MarketId::from_be_bytes(k[20..].try_into().unwrap());
+        by_market.entry(m).or_default().insert(Address::from_slice(&k[..20]));
+    }
+    assert_eq!(rec.holders, by_market, "{tag}: holder lists != traders of R's keys per market");
     let mut prefixes: BTreeSet<Address> =
         r.keys().filter(|k| k.len() >= 20).map(|k| Address::from_slice(&k[..20])).collect();
     prefixes.extend((0..=TRADERS).map(trader));
@@ -329,4 +336,83 @@ fn traders_after_equals_the_walk_over_r_and_pending() {
     println!("TRADERS_AFTER compared={compared} appeared={appeared} vanished={vanished}");
     assert!(compared > 10_000, "non-vacuous: {compared}");
     assert!(appeared > 50 && vanished > 50, "traders appear / vanish in the block: {appeared} / {vanished}");
+}
+
+/// adl-budget C2 (owner s96 / s99): R's holder list of a market merged with
+/// the block's dirty traders of that market ([`dirty_by_market`]) is
+/// ascending, has no duplicate, and holds every trader the overlay (R + the
+/// block's own rows) has a key `t ‖ m` for — the traders the C1 ranking
+/// finds holding `m` when it reads every trader of the walk. Its extra
+/// entries are only dirty traders whose `t ‖ m` the block deleted (the
+/// ranking reads no position for them and skips them, as C1 skips a trader
+/// that does not hold `m`). Same random blocks as the E2 test (irregular
+/// rows, a trader's first position, a trader losing every row, a market at
+/// `MarketId::MAX`); without R there is no dirty map (the caller ranks over
+/// the whole trader set).
+#[test]
+fn holder_lists_with_the_dirty_traders_cover_the_walk() {
+    use torus_core::liquidation as liq;
+    let (mut compared, mut extra, mut new_holders) = (0usize, 0usize, 0usize);
+    for seed in 1..=8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0xC2C2_0517);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let mut rows = ResidentRows::build(&db).unwrap();
+        let mut rec = TraderPositions::build(&rows);
+        assert!(dirty_by_market(&db).is_none(), "no R: no dirty map");
+        for h in 1..=80 {
+            let mut o = NativeStateOverlay::new(db.clone());
+            o.attach_resident(std::sync::Arc::new(rows.clone()));
+            random_block(&o, &mut rng);
+            if rng.below(3) == 0 {
+                let t = trader(TRADERS + rng.below(3));
+                let m = if rng.below(2) == 0 { MarketId::MAX } else { 1 + rng.below(MARKETS) };
+                o.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m), &bytes(&position(t, m, 9, true))).unwrap();
+            }
+            if rng.below(3) == 0 {
+                let t = trader(rng.below(TRADERS + 3));
+                let keys: Vec<Vec<u8>> = o
+                    .iterate_cf(CF_NATIVE_POSITIONS, Some(t.as_slice()))
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .filter(|k| k.len() == 28)
+                    .collect();
+                for k in keys {
+                    o.delete_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap();
+                }
+            }
+            let dirty = dirty_by_market(&o).expect("R attached: a dirty map");
+            let walk = liq::traders_after(&o, None, usize::MAX).unwrap();
+            for m in (0..=MARKETS + 1).chain([MarketId::MAX]) {
+                let d = dirty.get(&m).map_or(&[][..], Vec::as_slice);
+                assert!(d.windows(2).all(|w| w[0] < w[1]), "seed {seed} block {h} m {m}: dirty ascending, once");
+                let got = rec.holders_with(m, d);
+                assert!(got.windows(2).all(|w| w[0] < w[1]), "seed {seed} block {h} m {m}: ascending, no duplicate");
+                let holds = |t: &Address| o.get_cf_raw(CF_NATIVE_POSITIONS, &position_key(t, m)).unwrap().is_some();
+                let want: Vec<Address> = walk.iter().copied().filter(|t| holds(t)).collect();
+                let kept: Vec<Address> = got.iter().copied().filter(|t| holds(t)).collect();
+                assert_eq!(kept, want, "seed {seed} block {h} m {m}: holders == the walk's traders holding m");
+                for t in got.iter().filter(|t| !holds(t)) {
+                    assert!(d.contains(t), "seed {seed} block {h} m {m}: {t} listed without a key and not dirty");
+                    extra += 1;
+                }
+                new_holders += want.iter().filter(|t| rec.holders.get(&m).is_none_or(|s| !s.contains(*t))).count();
+                compared += 1;
+            }
+            let delta = o.own_pending_delta();
+            o.detach_resident();
+            o.flush(&db).unwrap();
+            rows.apply(&delta);
+            rec.apply(&delta, &rows, None);
+        }
+    }
+    println!("HOLDERS compared={compared} extra={extra} new_holders={new_holders}");
+    assert!(compared > 5_000, "non-vacuous: {compared}");
+    assert!(extra > 50 && new_holders > 50, "deleted and new keys in the block: {extra} / {new_holders}");
 }

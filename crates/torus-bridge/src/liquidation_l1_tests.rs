@@ -144,6 +144,9 @@ struct Stats {
     adl_rankings: usize,
     /// A8 perf (P1): trader sets the drains took (shared by their rankings).
     adl_trader_sets: usize,
+    /// adl-budget C2: rankings over a market's holder list (shadow-checked
+    /// against C1, the whole trader set, inside the drain).
+    adl_holder_lists: usize,
     shadow: usize,
     persistent: usize,
     memo: usize,
@@ -373,6 +376,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.traders_slice += get(&c.traders_slice);
             stats.adl_rankings += get(&c.adl_rankings);
             stats.adl_trader_sets += get(&c.adl_trader_sets);
+            stats.adl_holder_lists += get(&c.adl_holder_lists);
             stats.shadow += get(&c.shadow);
             stats.persistent += get(&c.persistent);
             stats.memo += get(&c.memo);
@@ -442,6 +446,7 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
     assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_trader_sets, "E2: pass + one ADL set per drain from the slot: {s:?}");
     assert!(s.adl_rankings > 0 && s.adl_trader_sets > 0 && s.adl_trader_sets <= s.adl_rankings, "ADL rankings met: {s:?}");
+    assert_eq!(s.adl_holder_lists, s.adl_rankings, "C2: every ranking of the node path from a holder list: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");
@@ -546,7 +551,14 @@ fn adl_bankrupt(b: u64) -> Address {
 /// Block 1 at 1,000 (rule-H base), then 900 until the queue is empty and
 /// every bankrupt account was ADL'd (cap 40 blocks), plus one block.
 fn adl_run(shape: AdlShape, resident: bool, caches: bool) -> Vec<AdlBlock> {
+    adl_run_with(shape, resident, caches, true)
+}
+
+/// [`adl_run`]; `c2`: the drain ranks a market's holder list (C2, needs R),
+/// else every trader of the set (C1, the reference).
+fn adl_run_with(shape: AdlShape, resident: bool, caches: bool, c2: bool) -> Vec<AdlBlock> {
     ADL_CACHES_OFF.with(|c| c.set(!caches));
+    ADL_C2_OFF.with(|c| c.set(!c2));
     let AdlShape { k, pu, act, work, two_sided } = shape;
     let markets = pu + u64::from(two_sided);
     let dir = tempfile::tempdir().unwrap();
@@ -642,6 +654,7 @@ fn adl_run(shape: AdlShape, resident: bool, caches: bool) -> Vec<AdlBlock> {
                 assert_ne!(metrics.liquidation_adl_pairing.get(), 0.0, "the escrows paired");
             }
             ADL_CACHES_OFF.with(|c| c.set(false));
+            ADL_C2_OFF.with(|c| c.set(false));
             return out;
         }
     }
@@ -658,12 +671,21 @@ fn adl_run(shape: AdlShape, resident: bool, caches: bool) -> Vec<AdlBlock> {
 /// market: pairing), with and without R. Equal positions, balances and
 /// liquidation rows, drain units and results block by block; caches used
 /// (AV hits, traders dropped, sets taken) — and every hit equals a fresh
-/// valuation, every set the walk (shadow asserts inside the drain).
+/// valuation, every set the walk (shadow asserts inside the drain). 18c
+/// review (s96 fix list e): the R run (records: E2 set, C2 holder lists) and
+/// the run without R (the walk, C1) are equal too, block by block.
 #[test]
 fn adl_drain_caches_are_bit_identical() {
     let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
     let storm = AdlShape { k: 10, pu: 6, act: 3, work: 60, two_sided: true };
     for (name, shape) in [("hl", hl), ("storm", storm)] {
+        let with_r = adl_run(shape, true, true);
+        let without_r = adl_run(shape, false, true);
+        assert_eq!(with_r.len(), without_r.len(), "{name}: blocks, R vs no R");
+        for (h, (a, b)) in with_r.iter().zip(&without_r).enumerate() {
+            assert_eq!(a.adl_work, b.adl_work, "{name} block {}: drain units, R vs no R", h + 1);
+            assert!(a == b, "{name} block {}: rows / units / results, R vs no R", h + 1);
+        }
         for resident in [true, false] {
             ADL_CACHE_STATS.with(|s| s.set((0, 0, 0)));
             let cached = adl_run(shape, resident, true);
@@ -679,6 +701,40 @@ fn adl_drain_caches_are_bit_identical() {
             if name == "storm" {
                 assert!(drain_blocks >= 3, "{name}: a multi-block drain");
             }
+        }
+    }
+}
+
+/// adl-budget C2 (owner 18c s96 / s99): the drain ranks a market's holder
+/// list (R's holders of `m` merged with the block's dirty traders of `m`)
+/// instead of reading every trader of the set (C1) — the same candidates in
+/// the same order (shadow-checked at every ranking inside the drain), the
+/// same work units (the ranking still charges the whole set's size), so
+/// bit-identical rows, units and results block by block: the HL-like event
+/// and the S=750-like storm of [`adl_drain_caches_are_bit_identical`], with
+/// the caches on and off. Non-vacuous: the shapes have traders that hold
+/// only some markets (counterparty `i` skips `m` when `(i + m) % 4 == 0`,
+/// the solo traders hold market 1 only), so some holder lists are shorter
+/// than the set.
+#[test]
+fn adl_c2_holder_lists_are_bit_identical_to_c1() {
+    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
+    let storm = AdlShape { k: 10, pu: 6, act: 3, work: 60, two_sided: true };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        for caches in [true, false] {
+            ADL_C2_STATS.with(|s| s.set((0, 0)));
+            let c2 = adl_run_with(shape, true, caches, true);
+            let (lists, skipped) = ADL_C2_STATS.with(|s| s.get());
+            ADL_C2_STATS.with(|s| s.set((0, 0)));
+            let c1 = adl_run_with(shape, true, caches, false);
+            assert_eq!(ADL_C2_STATS.with(|s| s.get()), (0, 0), "{name} caches {caches}: C1 run used no holder list");
+            assert_eq!(c2.len(), c1.len(), "{name} caches {caches}: blocks");
+            for (h, (a, b)) in c2.iter().zip(&c1).enumerate() {
+                assert_eq!(a.adl_work, b.adl_work, "{name} caches {caches} block {}: drain units", h + 1);
+                assert!(a == b, "{name} caches {caches} block {}: rows / units / results", h + 1);
+            }
+            println!("ADL C2 {name} caches={caches}: holder lists={lists} traders skipped={skipped}");
+            assert!(lists > 0 && skipped > 0, "{name} caches {caches}: holder lists used and shorter than the set");
         }
     }
 }

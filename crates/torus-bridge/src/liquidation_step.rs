@@ -24,6 +24,12 @@ thread_local! {
     static ADL_CACHES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Tests: (AV cache hits, traders dropped from the set, sets taken).
     static ADL_CACHE_STATS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    /// Tests: C2 off = the drain ranks every trader of the set (C1, the
+    /// reference) even with the records attached.
+    static ADL_C2_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: (rankings over a holder list, Σ traders of the set the holder
+    /// lists left out).
+    static ADL_C2_STATS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// What one step did — telemetry only (metrics and logs), never read by
@@ -74,10 +80,17 @@ struct LiqStats {
 ///   positions and the block's fixed marks / configs — used only as a
 ///   lookup (never iterated); dropped for both parties of every close and
 ///   for the vault on a pairing, i.e. for every account the drain writes.
+/// * `dirty` (adl-budget C2): the block's dirty traders per market
+///   ([`trader_positions::dirty_by_market`]), taken at the drain's first
+///   ranking with R attached. A ranking of `m` reads R's holders of `m`
+///   merged with them. That list covers every holder of `m` for the whole
+///   drain for the reason `traders` stays exact: the drain gives no trader a
+///   new key. (A listed trader gone flat reads no position and is skipped.)
 #[derive(Default)]
 struct DrainCache {
     traders: Option<Vec<Address>>,
     av: HashMap<Address, FixedPoint>,
+    dirty: Option<HashMap<MarketId, Vec<Address>>>,
 }
 
 impl DrainCache {
@@ -471,6 +484,16 @@ impl NativeExecutor {
     /// candidates and the traders examined (the ranking's work units, Q3).
     /// A8 perf: the set and the ranking AV come from the drain's `cache`
     /// ([`DrainCache`]: the same values as a fresh read, see there).
+    ///
+    /// C2 (owner 18c s96 / s99): with the records attached the point reads go
+    /// only to the traders that may hold `m` — R's holders of `m` merged with
+    /// the block's dirty traders of `m` ([`TraderPositions::holders_with`]),
+    /// ascending — instead of every trader: the same candidates in the same
+    /// order (every holder is in the list, a listed non-holder is skipped as
+    /// C1 skips it), shadow-checked against C1 at every ranking in tests. The
+    /// units stay C1's (the whole set's size): the drain's progress, its
+    /// state and the goldens do not change; only the work behind a unit
+    /// drops to O(holders of `m`). Without records: C1.
     fn adl_candidates_of<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         m: MarketId,
@@ -481,8 +504,13 @@ impl NativeExecutor {
         let on = !ADL_CACHES_OFF.with(|c| c.get());
         #[cfg(not(test))]
         let on = true;
+        #[cfg(test)]
+        let c2 = !ADL_C2_OFF.with(|c| c.get());
+        #[cfg(not(test))]
+        let c2 = true;
         let fresh_set;
-        let DrainCache { traders, av } = cache;
+        let fresh_dirty;
+        let DrainCache { traders, av, dirty: dirty_cache } = cache;
         let traders: &[Address] = if on {
             if traders.is_none() {
                 *traders = Some(Self::liq_traders_after(ctx, None, usize::MAX)?);
@@ -501,6 +529,25 @@ impl NativeExecutor {
             fresh_set = Self::liq_traders_after(ctx, None, usize::MAX)?;
             &fresh_set
         };
+        // C2: the holder list of `m` when the records are attached (with R:
+        // the dirty map exists), else every trader (C1).
+        let records = ctx.sums.as_ref().and_then(|s| s.records.as_ref()).filter(|_| c2);
+        let dirty = match records {
+            None => None,
+            Some(_) if on => {
+                if dirty_cache.is_none() {
+                    *dirty_cache = trader_positions::dirty_by_market(&ctx.state);
+                }
+                dirty_cache.as_ref()
+            }
+            Some(_) => {
+                fresh_dirty = trader_positions::dirty_by_market(&ctx.state);
+                fresh_dirty.as_ref()
+            }
+        };
+        let holders: Option<Vec<Address>> =
+            records.zip(dirty).map(|(r, d)| r.holders_with(m, d.get(&m).map_or(&[][..], Vec::as_slice)));
+        let list: &[Address] = holders.as_deref().unwrap_or(traders);
         let reader = AccountReader::of(ctx);
         // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
         // storage error stays an error (fail-stop).
@@ -513,7 +560,7 @@ impl NativeExecutor {
             };
             Ok(v.available.checked_add(v.order_margin).and_then(|x| x.checked_add(v.upnl)).unwrap_or(FixedPoint::ZERO))
         };
-        let cands = liq::adl_candidates(traders, want_long, |t| reader.get_position(t, m), |t| {
+        let cands = liq::adl_candidates(list, want_long, |t| reader.get_position(t, m), |t| {
             if !on {
                 return value(t);
             }
@@ -532,6 +579,20 @@ impl NativeExecutor {
         #[cfg(test)]
         if let Some(s) = ctx.sums.as_ref() {
             bump(&s.counters.adl_rankings);
+            if let Some(h) = holders.as_ref() {
+                bump(&s.counters.adl_holder_lists);
+                ADL_C2_STATS.with(|x| x.set((x.get().0 + 1, x.get().1 + traders.len().saturating_sub(h.len()))));
+                if s.shadow {
+                    // C2 == C1: the whole set, the same reads and valuation.
+                    let want = liq::adl_candidates(traders, want_long, |t| reader.get_position(t, m), |t| value(t));
+                    if want.as_ref().ok() != Some(&cands) {
+                        s.shadow_mismatches
+                            .lock()
+                            .unwrap()
+                            .push(format!("adl_candidates {m} long={want_long}: holders {cands:?}, C1 {want:?}"));
+                    }
+                }
+            }
         }
         Ok((cands, traders.len() as u64))
     }
