@@ -1,6 +1,7 @@
 # Read precompile gas per unit (sizing the 50-gas placeholder)
 
-> Superseded by the s99 owner decisions: see the last section, "s99 owner decisions: implemented and measured".
+> Superseded by the s99 owner decisions (section "s99 owner decisions: implemented and measured")
+> and the s100 decisions (last section, "Decisions (owner s100)").
 
 ozarchy, 2026-10-07. Bench `crates/torus-bridge/tests/ubench_read_precompile_gas.rs`
 (branch `bench/read-precompile-gas`, base `98f035ee`). Release, `-C force-frame-pointers=yes`,
@@ -260,7 +261,10 @@ in `backend.rs` after the durable batch write):
 * One long-lived worker thread per DB, parked on a condvar (was: a new thread per request); one
   batch of ranges at a time; requests during a run join the next batch. The stop flag is checked
   between ranges; the last owner's drop calls `cancel_all_background_work(false)` if a run is in
-  progress, then joins the worker. The s89 oracle prune uses the same job (range `sub..`).
+  progress and nothing else holds the DB (s100: not while the consensus kv store shares it), then
+  joins the worker. A run fails (logged, counted) on a panic or when RocksDB's
+  `rocksdb.background-errors` count grows during it (s100; `compact_range` returns no status).
+  The s89 oracle prune uses the same job (range `sub..`).
 * Not added: `add_compact_on_deletion_collector_factory`. It only marks SST files for RocksDB's own
   compaction; the churned tombstones live in the 128 MiB memtable, and in the no-compaction
   baseline below RocksDB ran no compaction at all, so it would not have changed these numbers.
@@ -339,6 +343,8 @@ open-order limit 1,000, up to 5,000 with volume; many traders: the proposer-loca
   invariance and the compaction.
 
 ### Open for the owner
+
+Both decided in s100: see "Decisions (owner s100)" at the end.
 
 1. **Heavy multi-market churn costs one background core** (above): the per-market threshold cannot
    avoid rewriting the bottommost files that hold the tombstones. Options: accept until scan reads
@@ -481,3 +487,33 @@ not rewritten on the switch: the new target applies to files that compactions wr
 quiet CF moves over gradually and a churning one within its first passes. When only a few markets
 churn in a large CF, each of their runs rewrites ~4 MiB instead of ~64 MiB (16x less compaction I/O
 and CPU per run).
+
+## Decisions (owner s100, 2026-10-07)
+
+Built on `fix/read-gas-followup` (ozarchy).
+
+* **Tombstone bound re-accepted for testnet.** The previous block's deletes stay uncharged; they
+  are bounded per block only by block content (one trader: the open-order limit; many traders:
+  `NATIVE_ORDERS_PER_BLOCK_CAP` = 200,000, not validated), so a Sybil cancel wave can make the next
+  block's getOrderBook walk that many markers until the background compaction removes them.
+* **Before mainnet: getOrderBook answers from the in-memory book.** Requirements: byte-identical
+  to today's answer (and the same on every validator), the top 64 levels per side in modes 2 / 3,
+  including the block's own changes up to the call, rebuilt after a restart and after crash
+  replay, and no fallback to the row scan. That removes the deletion markers from the read path
+  entirely. Fallback if it slips: a per-market cap on level deletes per block, as a new block
+  validity rule.
+* **Book CF SST target 4 MiB by default** (`target_file_size_base` of `cf_native_order_books` only;
+  `db.rs` `book_cf_target_file_bytes`, test
+  `book_cf_target_file_size_is_4mib_by_default_and_book_cf_only`). `TORUS_BOOK_CF_TARGET_FILE_MB`
+  still overrides. 1-2 MiB only together with a raised `LimitNOFILE` or a bounded
+  `max_open_files` (the DB keeps every SST open, `max_open_files` = -1). Node-local, no format or
+  consensus impact.
+* **No integrity check in the EVM reader; the layout is enforced at write time.** Already the case,
+  no new check: each process runs one mode (`TORUS_BOOK_ROWS`, read once), the mode-1 saver
+  writes only order rows (its level journal is discarded), the mode-2 / 3 savers write level rows
+  to the root CF and order rows to the node-local `cf_book_order_rows`, every save writes the
+  meta row of each book it writes (when missing or moved) and no path deletes a meta row, and a
+  DB whose content or `__book_mode__` marker belongs to another mode fail-stops at load before
+  any block executes. Pinned by `book_read_modes_tests::row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market`
+  (modes 1-3, serial and deferred save, reload, a market emptied by a fill). The RPC readers
+  still reject both corruptions.
