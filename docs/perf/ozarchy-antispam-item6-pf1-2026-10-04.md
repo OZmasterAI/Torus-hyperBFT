@@ -2632,16 +2632,25 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   `CF_STAKING_DELEGATIONS` table on every call; with the self-stake reward
   split (`fix/inflation-self-stake`) that is per block once the validator fee
   share is above 0 bps, and once per active validator at epoch boundaries.
-- Read precompile gas: measured on `bench/read-precompile-gas` `0e9d918b`
-  (`docs/perf/read-precompile-gas.md`). At 50 gas per unit, the worst
-  30M-gas block of reads is 234 ms on ozarchy; `getOpenOrders` over RocksDB
-  deletion markers is ~820 ms at any unit price. Owner decisions (s99, item6
-  plan 9.16, revisit later): single reads at HL level (~16,500 gas per
-  position read; ozarchy computes the exact base); scan reads at 500 gas per
-  scanned row + 20 per word or blob, capped at 64 orders per call; the
-  deletion markers are node-local tombstones, so they are never charged.
-  **In progress on ozarchy** (a-c with before/after numbers). After item 7 the
-  owner leans to removing scan reads like HL (single reads + bbo).
+- Read precompile gas: **built and reviewed** (`bench/read-precompile-gas` `ae767806`, 18c s100: merge as is,
+  merge pending after 18c's suites; `docs/perf/read-precompile-gas.md`). Owner s99 final: base 16,400
+  (getPosition 16,500; cold 30M-gas block 170.7 -> 33.7 ms); scans 500 gas per scanned row + 20 per word or
+  32 B blob; `getOpenOrders` removed (never worked on a live chain: nothing writes `cf_native_orders`);
+  `getOrderBook` 64 best levels per side in modes 2/3 (worst block 18.7-24.5 ms), mode 1 reverts, classic
+  unchanged; RocksDB tombstones never charged; node-local per-market compaction (threshold 64,
+  `ForceOptimized`). Stall / SST campaign (`bench/read-gas-stall` `8e3326c6`): no write stalls; owner s100:
+  book CF SST target 4 MiB (1-2 MiB only with a raised `LimitNOFILE` or bounded `max_open_files`).
+  **Follow-up branch after the merge** (ozarchy): the 4 MiB default, the write-time book layout check (the
+  EVM reader skips it, owner s100), 18c's lows (compaction errors counted as success, shared-DB cancel on
+  drop) and 3 missing tests, nits, decisions in the doc.
+- **Before mainnet: `getOrderBook` from the in-memory book** (owner s100). The previous block's tombstones
+  (up to 200k cancels in one block, uncharged) are re-accepted for testnet only. The in-memory reader removes
+  them: byte-identical on every validator (the same top 64 per side in modes 2/3, the block's own changes
+  included, correct rebuild after restart and crash replay, no lazy row-scan fallback). Fallback if it slips:
+  a per-market cap on level deletes per block (a new validity rule).
+- Test hygiene: the torus-consensus crash-test fixture (`app.rs:7356`) creates a ~6 MB RocksDB dir per run
+  under `/tmp` (`torus-crash-test-<pid>-<n>`) and almost never removes it: thousands per suite run, several
+  GB of tmpfs (RAM) on ozarchy and 18c. Fix: a `tempfile::TempDir`, or remove on drop.
 - **Item 7 EVM lanes** (owner s99): every Torus block can carry 30M EVM gas
   next to trading, and any EVM tx sends its block down the serial path. HL
   rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about

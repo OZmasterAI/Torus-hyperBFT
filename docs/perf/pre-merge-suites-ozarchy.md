@@ -1,7 +1,8 @@
 # Pre-merge suites on ozarchy
 
-Owner rule (18c s99, 2026-10-07): from now on the pre-merge suites run on ozarchy. Each run is added
-here, newest first.
+Owner rule (18c s99, 2026-10-07): the pre-merge suites run on ozarchy. Updated the same day: **each
+machine runs the suites for what it builds or merges** (18c for 18c's branches, ozarchy for ozarchy's);
+big builds and all benches stay on ozarchy. Each ozarchy run is added here, newest first.
 
 The suites:
 1. `cargo nextest run --workspace --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar` (TESTING.md)
@@ -14,6 +15,53 @@ The suites:
 
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
+
+## `bench/read-precompile-gas` `ae767806` (2026-10-07, s26)
+
+`fc1fb25a` (s99 final read decisions + review fixes) merged with main `f1e41975`. Worktree `wt/read-gas-bench`,
+`CARGO_TARGET_DIR=~/.cargo-target-read-gas`; suite 4 baseline main `f1e41975`. 18c review: merge as is.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,028 passed, 0 failed**, 35 skipped, 0 flaky | 100 s (81.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 4 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,029 passed, 0 failed**, 42 ignored (159 result lines) | 409 s |
+| 4 | clippy (no `-D`) / fmt vs `f1e41975` | – | clippy 271 = 271, **0 new**; fmt **0 new**, 21 fewer hunks (3,361 vs 3,382); `run-local.sh check` fails only at the known `-D warnings` stop | 16 s / – / 27 s |
+| 5 | uniswap | – | 18c | – |
+| 6 | matched-bench | 0 | **164 passed**; 8 of 8 scripts OK | 30 s |
+
+Logs: `~/bench-results-matched/presuite-ae767806/`.
+
+## `fix/evm-vote-checks` `4164382d` (2026-10-07, s26; 18c's branch, run before the rule update)
+
+Item 7 step 0 (vote-time EVM header checks) on main `2174d3bf`. Merged as `7c15b5aa`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,017 passed, 0 failed**, 34 skipped, 0 flaky | 106 s (82 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 4 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,018 passed, 0 failed**, 41 ignored | 403 s |
+| 4 | clippy (no `-D`) / fmt vs `2174d3bf` | – | clippy 271 = 271, fmt 3,382 = 3,382: **0 new** | 130 s / – |
+| 5 | uniswap | – | 18c | – |
+| 6 | matched-bench | 0 | **164 passed**; 8 of 8 scripts OK | 59 s |
+
+The known flaky `fill_sink_not_wanted_records_nothing_with_history_off` did not fire. Logs:
+`~/bench-results-matched/presuite-4164382d/`.
+
+## `bench/read-precompile-gas` `76eb081c` (2026-10-07, s26)
+
+The first a-c build, before the review fixes. Baseline main `2174d3bf`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,022 passed, 0 failed**, 35 skipped, 0 flaky | 84 s |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 4 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,023 passed, 0 failed**, 42 ignored | 400 s |
+| 4 | clippy (no `-D`) / fmt vs `2174d3bf` | – | clippy 271 = 271, **0 new**; fmt **0 new**, 17 fewer hunks | 12 s / – |
+| 5 | uniswap | – | not run | – |
+| 6 | matched-bench | 0 | **164 passed** | 29 s |
+
+Logs: `~/bench-results-matched/presuite-76eb081c/`.
 
 ## main `b8bf3e8a` (2026-10-07, s26)
 
