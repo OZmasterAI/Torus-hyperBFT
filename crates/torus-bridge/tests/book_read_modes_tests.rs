@@ -408,13 +408,14 @@ fn a_corrupt_book_mode_marker_is_an_error() {
 
 /// Owner s100: the EVM getOrderBook does not check the book layout (it would
 /// cost a read per call); the writers guarantee it instead. Every row-mode
-/// save, serial or deferred (modes 2 / 3), across a reload and a market
-/// emptied by a fill, leaves each market in cf_native_order_books with (1)
+/// save, serial or deferred (modes 2 / 3), across a reload, a market emptied
+/// by a fill and a market first saved by the deferred path, leaves each market in cf_native_order_books with (1)
 /// order rows or level rows, never both, and only the kind of its mode, and
-/// (2) a meta row whenever it has any order, level or stop row.
+/// (2) a meta row whenever it has any order, level or stop row. Any other
+/// key fails the test.
 #[test]
 fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
-    use torus_core::book_rows::{ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER};
+    use torus_core::book_rows::{ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER, ROW_TAG_STOP};
     for mode in [
         BookMode::OrderRows,
         BookMode::LevelAuthority,
@@ -423,7 +424,8 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
         let (_dir, db) = open_test_db();
         seed(&db, mode);
         // Block 2 on a reloaded context: TAKER fills all of market 2 (its
-        // order and level rows are deleted), MAKER adds a bid on market 1.
+        // order and level rows are deleted), MAKER adds a bid on market 1 and
+        // opens market 3 (its first save is the deferred one in modes 2 / 3).
         let mut ctx = make_ctx(db.clone(), 2, mode);
         assert!(
             ctx.fatal_error.is_none(),
@@ -433,6 +435,7 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
         let block = vec![
             place(addr(TAKER), gtc(2, false, 50, 3)),
             place(addr(MAKER), gtc(1, true, 98, 1)),
+            place(addr(MAKER), gtc(3, false, 70, 2)),
         ];
         let r = NativeExecutor::execute_batch(&mut ctx, &block);
         assert!(
@@ -462,12 +465,13 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
                 Some(ROW_TAG_META) => m.0 = true,
                 Some(ROW_TAG_ORDER) => m.1 = true,
                 Some(ROW_TAG_LEVEL) => m.2 = true,
-                _ => m.3 = true,
+                Some(ROW_TAG_STOP) => m.3 = true,
+                _ => panic!("{mode:?}: unknown book key {key:02x?}"),
             }
         }
-        assert_eq!(markets.len(), 2, "{mode:?}: {markets:?}");
-        for (market, (meta, orders, levels, other)) in markets {
-            let rows = orders || levels || other;
+        assert_eq!(markets.len(), 3, "{mode:?}: {markets:?}");
+        for (market, (meta, orders, levels, stops)) in markets {
+            let rows = orders || levels || stops;
             assert!(
                 meta || !rows,
                 "{mode:?} market {market:?}: rows without a meta row"

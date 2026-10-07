@@ -156,6 +156,10 @@ impl RangeCompaction {
         // a RocksDB error shows only as a failed flush / compaction job in the
         // DB-wide background error count. Any such error during the run fails
         // it (one in another CF at the same time too: it cannot tell them apart).
+        // Not caught, so such runs still count as done: a DB already stopped by
+        // an earlier background error (CompactRange returns that error without
+        // counting a new one), and a failed property read (`unwrap_or(0)`: no
+        // change).
         let bg_errors = || {
             db.property_int_value("rocksdb.background-errors")
                 .ok()
@@ -282,6 +286,9 @@ impl RangeCompaction {
 /// a whole run, so without the join it could hold the last `Arc<DB>` and close
 /// RocksDB on its own thread during process exit, after RocksDB's static
 /// mutexes are destroyed (teardown SIGABRT "pthread lock: Invalid argument").
+/// In torus-node the DB is always shared (`RocksKVStore` and the metrics task
+/// hold `db_arc()`, `torus-node` `main.rs`), so the cancel never fires there:
+/// shutdown waits for the range being compacted and skips the remaining ones.
 #[derive(Default)]
 struct CompactionOwner(Arc<RangeCompaction>);
 
@@ -547,6 +554,8 @@ impl StateDb {
     }
 
     /// Open (or create) the database with explicit tuning (tests / tooling).
+    /// The book CF's SST target still comes from the environment
+    /// (`TORUS_BOOK_CF_TARGET_FILE_MB`, [`book_cf_target_file_bytes`]).
     pub fn open_with_tuning(path: &Path, tuning: &DbTuning) -> Result<Self, StateError> {
         Self::open_with(path, tuning, book_cf_target_file_bytes())
     }
@@ -901,9 +910,7 @@ impl StateDb {
             }
         }
         if !state.worker_started {
-            *job.db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&self.db);
+            *job.lock_db() = Arc::downgrade(&self.db);
             let worker = Arc::clone(job);
             match std::thread::Builder::new()
                 .name("torus-range-compact".into())
@@ -2022,18 +2029,22 @@ mod compaction_drop_tests {
         )
         .expect("put");
         db.inner().flush_cf(cf).expect("flush");
-        let chmod = |mode| {
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
-        };
-        chmod(0o555);
+        /// Makes the directory writable again on drop (a panic included), so
+        /// the TempDir can always be deleted.
+        struct Writable<'a>(&'a Path);
+        impl Drop for Writable<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _writable = Writable(dir.path());
         if std::fs::File::create(dir.path().join("probe")).is_ok() {
             // Root ignores the mode: no error to provoke.
-            chmod(0o755);
             return;
         }
         db.compact_pruned_submissions_in_background();
         let runs = db.wait_background_compaction();
-        chmod(0o755);
         assert_eq!(runs, (0, 1), "the failed compaction was counted as done");
     }
 

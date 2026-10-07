@@ -377,9 +377,10 @@ now; getOrderBook from memory later).
   block's own overlay flush (write) time; at the end the book CF's `rocksdb.cfstats` stall lines
   ("Write Stall (count)" per cause, "Cumulative stall") and the level table.
 * SST target: new node-local knob `TORUS_BOOK_CF_TARGET_FILE_MB` (`db.rs`
-  `book_cf_target_file_bytes`), read at open, applied to `cf_native_order_books` only. Unset (the
-  default) calls no setter: RocksDB's 64 MiB, the exact current options (test
-  `book_cf_target_file_size_is_unset_by_default_and_book_cf_only` reads the OPTIONS file).
+  `book_cf_target_file_bytes`), read at open, applied to `cf_native_order_books` only. Unset meant
+  RocksDB's 64 MiB at bench time; 4 MiB is the default since s100, so set
+  `TORUS_BOOK_CF_TARGET_FILE_MB=64` to reproduce the 64 MiB baseline rows below (tables A and B; test
+  `book_cf_target_file_size_is_4mib_by_default_and_book_cf_only` reads the OPTIONS file).
   `target_file_size_multiplier` stays 1 (all levels), `level_compaction_dynamic_level_bytes` on.
 * Variants: `nocompact` (the trigger `note_scanned_deletes` disabled in `backend.rs`, temporary patch,
   RocksDB's own compaction only), `compact` = current per-market compaction (T = 64,
@@ -472,9 +473,8 @@ Reading the table:
   and with `level_compaction_dynamic_level_bytes` the bottommost level holds the data either way;
   `target_file_size_multiplier` stays 1 (the same 4 MiB at every level). The memtable (128 MiB) is
   unchanged: the forced flushes already make it small and often while markets churn.
-* How to ship: on a follow-up branch after 18c merges ae767806, change the knob's default (or set
-  the CF option directly) to 4 MiB for `cf_native_order_books` only. Node-local, no format or
-  consensus impact, results unchanged.
+* How to ship: **done** (s100, `fix/read-gas-followup`): the knob's default is 4 MiB for
+  `cf_native_order_books` only. Node-local, no format or consensus impact, results unchanged.
 
 **A node with a large, quiet book CF** (many resting orders, little churn): no deletes, so the
 compaction worker never runs and costs nothing at either target. What changes is the file layout:
