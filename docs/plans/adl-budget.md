@@ -1,6 +1,7 @@
 # ADL per-block budget (P0 before testnet)
 
-**Status (s18, ozarchy):** design **decided** (owner 18c s96). Q1-Q4 are the recommendations in
+**Status (s18, ozarchy):** design **decided** (owner 18c s96). **s99 (owner):** W = 100,000,
+holder units, B charged into W, cheap `has_key`: §12 (as built, s26). Q1-Q4 are the recommendations in
 section 7. **Q5 (freeze) is dropped and Q6 = P2 (terms fixed at B, ADL escrow)**, plus the new
 previous-mark rule **H**; see section 8, which supersedes sections 4 and 5 where they differ.
 Implementation plan: `docs/plans/adl-budget-impl.md`. Branch
@@ -258,7 +259,7 @@ Sections 4-5 above describe the earlier account queue (Q4-Q6 before P2). Where t
 this section, this section holds: there is no account queue, no freeze and no re-classification,
 and the queue gauge counts rows.
 
-W is one constant (630,000, measured in §9), high enough that an HL-sized event (a few hundred
+W is one constant (630,000, measured in §9; **100,000 since owner s99, §12**), high enough that an HL-sized event (a few hundred
 account-markets) closes the escrows in its own block. Only S=750-type storms spill over several blocks. HL's Oct 10 2025 ADL
 (raw node_fills) closed every (account, coin) fully in one block.
 
@@ -357,7 +358,8 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
   drain. A listed trader without a position in `m` (a deleted key) is skipped by the position
   read, exactly as C1 skips a trader of the whole set that does not hold `m`.
 * `adl_candidates_of` ranks the holder list when the records are attached; without records
-  (no R: tests, tools) it is C1. **Units are unchanged:** a ranking still charges the whole
+  (no R: tests, tools) it is C1. (**Superseded by §12, owner s99:** a ranking now charges the
+  holders of its market.) **Units are unchanged:** a ranking still charges the whole
   trader set's size (C1's units), so the drain's per-block progress, its state and every golden
   are the same; only the work behind a unit drops to O(holders of `m`). (Charging holders
   instead would be a consensus change of the drain's progress; not done.)
@@ -558,3 +560,196 @@ Raw logs: `~/bench-results-matched/ubench-adl-c2/` (`<case>-w<W>.r<n>.log`, `cam
 with load and step ms per run, `campaign{,2,3}.sh`, `perf-c{1,2,4}.data`).
 Setup: case 1 1,500,400 rows (6.2 s), case 2 150,126 (0.6 s), case 3 3,003,738 (13 s), case 4
 1,527,270 (6.3 s). RAM was not a limit (62 GB host, ~53 GB available).
+
+## 12. s99 owner decisions: W = 100,000, holder units, B charged into W, cheap `has_key` (as built, s26 ozarchy)
+
+Commits: `6134998c` (decision 4, `has_key`) and `f7b191fd` (decisions 1-3, the units). Proof:
+`cargo nextest run --workspace` 3,001 / 3,001 passed (0 flaky), doc tests 1 / 0.
+
+Owner 18c s99, after the §11 numbers. There is no live chain and this merge needs a fresh devnet
+genesis, so consensus changes are allowed. The decisions:
+
+1. **W = 100,000** (option 2, §11.5).
+2. **A ranking charges the holders of the ranked market**, not the trader set. The count is derived
+   from consensus state, so every validator charges the same. A test checks it against a state
+   walk at every ranking, and the C1 shadow also compares the count.
+3. **Block B's own work is charged into W** (the escrow transfers and the valuations), with a
+   defined unit per operation. B stays atomic: when its work alone reaches W, the drain gets
+   nothing in that block and continues in the next. **The per-block act limit is not lowered**
+   (`LIQ_ACT_PER_BLOCK` = 64 for every class).
+4. **The `traders_after` → `has_key` seeks are made cheap** (node-local, the same trader set).
+
+This supersedes §10's "units are unchanged" (C2 still lists the same candidates; only the
+charge changed) and §8's / §9's W = 630,000.
+
+### 12.1 Units (consensus)
+
+A block's ADL units, in order (`liquidation_step.rs`):
+
+| work | units | code |
+|---|---|---|
+| B: each position the pass moves to an ADL escrow (an ADL'd account's, or the vault's under D8) | T = `ADL_TRANSFER_UNITS` = 6 | `liquidation_pass` (`b_work`) |
+| drain: each obligation row visited (a waiting row too) | 1 | `adl_drain` |
+| drain: the ranking of a (market, side) key, once per block at the key's first row | H(m) | `adl_candidates_of` |
+| drain: each candidate valued for the first time in the block's drain | 1 | `DrainCache.seen` |
+| drain: each candidate `adl_close` reads | 1 | `adl_close` |
+| drain: each row the escrow-pairing scan reads | 1 | `adl_cross` |
+
+**H(m), the holders of m:** the number of traders t, other than `ADL_ESCROW_LONG` /
+`ADL_ESCROW_SHORT`, with a live position row at key `t ‖ m` in the block's overlay at ranking time,
+on either side. "Ranking time" is after B's transfers and after the drain's earlier closes in the
+block. The details:
+* The two escrows are out, because `adl_candidates` never reads them (they are never candidates).
+* The vault (`LIQUIDATOR_VAULT`, which is also the liquidator) is in, because it is an ordinary
+  candidate.
+* An account ADL'd in this block is flat in m (its escrow took the position), so it is out.
+* An account waiting for B behind the act limit still holds m, so it is in.
+
+How H(m) is counted: the ranking reads `get_position(t, m)` for each listed trader, and H is the
+number of reads that return a row. Both lists hold every holder exactly once and read the same
+overlay:
+* C1 (no R: tests, tools; or C2 off in tests) lists every trader of the set.
+* C2 lists R's holders of m merged with the block's dirty traders of m. That is a superset of the
+  holders: a dirty key the block deleted reads no row and is not counted.
+
+So both give the exact live count, the same on every node, with or without R. The trader set no
+longer enters the units. With a holder list the drain does not take the set at all; only the test
+shadow does.
+
+**Valuations:** `seen` is the set of traders the block's drain valued for a ranking. It is never
+reduced within the block and is kept with the caches on and off, so the units do not depend on the
+caches. A re-valuation after a close (the AV cache drops the trader) costs no unit, because the
+close's read unit covers it.
+
+**Budget flow:**
+1. `used` starts at B's units.
+2. If `used >= W`, nothing drains this block. The rows wait, `liquidation_due` keeps the step due,
+   and `liquidation_adl_work_total` shows B's units.
+3. Else the drain runs rows while `used < W`. A row is atomic, so it overshoots by at most one row.
+4. B is never cut. A block's units are at most max(B, W − 1 + the cost of one row).
+
+**T = 6, calibrated from the measurements.** B costs 3.3-3.8 µs per transfer (§9 / §11: the HL
+block 1.0 ms for 300 transfers, the S=750-like B₁ ~66 ms for 17,280, classification included). A
+drain unit costs 0.55-0.8 µs (§11.1 drains, all-hold shapes). So a transfer is 4.1-6.9 units,
+rounded up to 6. A first-sight valuation (`pos_sums` of a clean trader, ~0.8 µs in §11.4 case 1)
+is 1 unit.
+
+### 12.2 Formulas
+
+**HL event:** 3 accounts × 100 markets, one side, 300 rows of size 1, each row closed by one
+candidate read. U = 300 T + Σ_{m = 1..100} H(m) + V + 300 × 2, where V is the number of distinct
+opposite-side candidates over the 100 markets (each valued once in B). The event closes in block B
+iff W ≥ U − 1: the last row starts at U − 2 and costs 2.
+
+| shape | H(m) | V | U |
+|---|---|---|---|
+| bridge test fixture (`an_hl_shaped_event_costs_exactly_the_sizing_formula`: N traders short in every market, a long sink) | N + 1 | N | 300 T + 100 (N + 1) + N + 600 (N = 20: 4,520) |
+| `ubench_adl` HL, all hold (traders alternate sides, a short sink) | N + 1 | N + 1 | 1,800 + 100 (N + 1) + (N + 1) + 600 (N = 5,000: 507,501) |
+| `ubench_adl` HL, holder fraction p | ≈ pN + 1 | the distinct shorts over the 100 markets, + 1 | computed exactly by the bench (it prints `U`) |
+
+With holders charged, a ranking costs ≈ pN + 1 instead of N + 3 (§11), so the units follow C2's
+work at any holder fraction (§11.5's "units track the trader set, not the work" is gone). The W
+floor test (`adl_work_per_block_is_option_2_and_covers_a_thin_hl_event`, core) pins W = 100,000 and
+W ≥ 300 T + 100 × (500 + 3) + (5,000 + 3) + 600 = 57,703. That is the HL event at N = 5,000 with
+10 % holders, which closes in B.
+
+### 12.3 Expected units for the re-measure (W = 100,000)
+
+Computed with a small model of these rules: each row closes against the top-ranked short sink,
+which holds k per market. The model reproduces U(20) of the ubench shape exactly (1,800 + 2,100 +
+21 + 600 = 4,521). The bench itself prints `adl_work` per block, and
+in HL mode it asserts "closes in block B" iff W ≥ U, with U computed from the setup.
+
+| case | blocks with ADL work | block B | later blocks | total units |
+|---|---|---|---|---|
+| HL, N = 5,000, all hold | 6 | 101,930 (1,800 transfers + 55 rows) | 100,128 × 4 (54 rows each), last 55,069 (29 rows) | 557,511 |
+| HL, N = 5,000, 10 % holders | 1 | 57,283 (all 300 rows) | — | 57,283 |
+| HL, N = 100,000, 10 % holders | 17 | 102,763 (19 rows) | 100,064-113,593 (18-21 rows), last 44,933 (8 rows) | 1,672,032 |
+| S=750-like (5,000 × 300, 100 × 270, act 64) | 32 | B₁ 103,680 (17,280 transfers: B alone > W, no drain); B₂ 104,227 (58,320 for 9,720 transfers + 449 rows) | 101,316-102,324 (648-1,152 rows), last 60,802 (395 rows) | 3,221,601 |
+
+Compared with §11.3 at W = 100,000 (trader-set units): HL at N = 100k, 10 % takes 17 blocks, not
+300. HL at N = 5k, 10 % closes in B, not 6 blocks. HL at N = 5k all-hold still takes 6 blocks (there
+every trader holds every market, so the units barely change). S=750-like takes 32 blocks, not 29.
+B₁ is now B's transfers only: no drain, no trader set (C2), and bounded `has_key` seeks.
+
+### 12.4 `has_key` (decision 4, node-local, bit-identical)
+
+`trader_positions::has_key` used to seek unbounded from `t ‖ 00×8` with limit 1. For a trader the
+block emptied (B's ADL'd accounts, every key a tombstone over R), the overlay merge stepped over
+its tombstones and then over every following emptied trader's, until it found another trader's
+live key. B₁ empties 64 adjacent accounts × 270 keys, so this was quadratic: ~96 ms of B₁ (§11.3).
+Each seek is now bounded to the trader's prefix (`iterate_cf_prefix_from`, which existed already)
+and reads only the trader's own keys and tombstones. The answer is the same, since a key past the
+prefix already meant `false`.
+
+Proof:
+* `trader_positions_tests::traders_after_equals_the_walk_over_r_and_pending`: random blocks,
+  traders appearing and vanishing in the block, every cursor and limit; unchanged and passing.
+* The E2 shadow in `liq_traders_after`, run in every lib test with shadow on.
+* The new `has_key_seeks_only_under_the_traders_prefix`: 8 adjacent emptied traders × 20
+  markets, a live trader after them, and traders with longer keys. Every seek is bounded to the
+  trader's prefix, never returns another trader's key, and the answers equal the walk's.
+  It was red before the change: the first seek was unbounded.
+
+The drain also skips the trader set with C2 (see 12.1), so in production the B₁ drain no longer
+calls `traders_after` at all.
+
+### 12.5 Tests (written first; red against 8f1150b9 + the constant stub, then green)
+
+New tests:
+* `block_b_work_is_charged_into_w_before_the_drain` (bridge): p2 fixture, B = 8 × 6 = 48.
+  * At W = 47 (B alone exceeds W) and W = 48: no drain in B; 8 rows; u1 and u2 flat at 0; the
+    escrow equals Σ rows; the step stays due; units 48. Block 3 drains all 8 rows for 44 units.
+  * At W = 49: one row drains (overshoot), 60 units.
+* `a_ranking_charges_the_holders_of_its_market_not_the_trader_set` (bridge): 33 traders, of which
+  1 holds the ranked market. The block costs T + 4: 1 visit, 1 holder, 1 valuation, 1 read. With
+  the old units it was 35.
+* `adl_charged_holders_equal_a_state_walk_in_every_r_mode` (bridge lib): the HL-like and storm
+  shapes, run in every combination of:
+  * R off, inline or worker (`end_resident_on_worker`, as the goldens);
+  * caches on or off;
+  * C2 on or off.
+
+  At every ranking, a `#[cfg(test)]` assert in `adl_candidates_of` checks that the charged H(m)
+  equals a full walk of `CF_NATIVE_POSITIONS` through the overlay. With C2 and the shadow, the C1
+  shadow compares candidates, order **and the holder count**. Every run checks the same number of
+  rankings and gives the same rows, units and results block by block.
+* `has_key_seeks_only_under_the_traders_prefix` (12.4).
+
+Existing tests re-derived for the new units. Each was red first, with its new expectation:
+
+| test | change |
+|---|---|
+| `adl_work_per_block_is_option_2_and_covers_a_thin_hl_event` (core; was `..._covers_an_hl_sized_event`) | the new floor and W = 100,000 |
+| `an_hl_shaped_event_costs_exactly_the_sizing_formula` | U(N) = 300 T + 100 (N + 1) + N + 600; W = U closes in B, W = U − 2 leaves the last row |
+| `p2_drain_stops_at_w_and_resumes_in_fifo_order` | W = 63; per-block units 70 / 64 / 11 |
+| `p2_drain_overshoots_by_at_most_one_step` | W = 60 / 61 |
+| `p2_escrow_pairing_units_are_linear_in_the_rows` | 3K − 1: the market's only holders are the escrows, so H = 0 |
+| `telemetry_reports_the_adl_queue_escrow_and_value_sum` | B at W = 0 shows 48 units; block 3 = 48 + 22 |
+| `liquidation_e2e_adl_obligations_drain_over_empty_blocks`, `liquidation_e2e_adl_drain_survives_a_restart` (app.rs) | at W = 2, B's 14 transfers spend the block, so the drain runs in blocks 3..=16 (one more empty block); the restart is at 8 rows left |
+
+The in-code walk assert also turned `adl_drain_caches_are_bit_identical`,
+`adl_c2_holder_lists_are_bit_identical_to_c1` and `p2_ranks_each_market_side_once_per_block` red
+until the units changed. The storm shape's W is now `STORM_W` = 160, so the drain still interleaves
+with B (B's 3 accounts × 6-7 positions = 108-114 units per B block). `ubench_adl.rs` was changed:
+* its HL assert uses U from 12.2 (one block iff W ≥ U; more than one iff W ≤ U − 2), and it prints
+  `U`;
+* its per-block bound is max(B's units, W + one row).
+
+### 12.6 Goldens: no re-pin
+
+Every pinned digest is unchanged in every R mode, serial and engine: `PRE_ROW50_A`,
+`ROW50_OUT_A`, `GOLDEN_A`, `GOLDEN_B`, `REDUCED_A` and `REDUCED_B`
+(`perf_equivalence_golden.rs`). Why:
+* **Scenario A has no ADL.** `GOLDEN_PRINT=1` shows `adl=0` (cumulative `liquidations_adl`) in all
+  12 blocks of every R mode. So the A pins cannot depend on the ADL units, and they did not move.
+* **Scenario B ADLs** in blocks 8-12 (cumulative 2 → 6 accounts, the vault included). Each event
+  is a few rows whose units are far below both the old and the new W, so the whole queue drains in
+  its own block under both. The per-block state and outputs are therefore identical, which the
+  unchanged per-block `GOLDEN_B` / `REDUCED_B` digests (full DB + outputs) prove directly.
+  `liquidation_adl_work_total` is not part of any digest.
+* No other test pins a digest over liquidation state (the other 64-hex constants are in genesis,
+  RPC and type encodings).
+
+The units are visible only in `liquidation_adl_work_total` and in drain progress, so every test
+that pins either is re-derived in 12.5.
