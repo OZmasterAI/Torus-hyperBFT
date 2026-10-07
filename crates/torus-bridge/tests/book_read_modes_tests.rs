@@ -406,6 +406,83 @@ fn a_corrupt_book_mode_marker_is_an_error() {
     assert!(book_reader::detect_layout(&db).is_err());
 }
 
+/// Owner s100: the EVM getOrderBook does not check the book layout (it would
+/// cost a read per call); the writers guarantee it instead. Every row-mode
+/// save, serial or deferred (modes 2 / 3), across a reload and a market
+/// emptied by a fill, leaves each market in cf_native_order_books with (1)
+/// order rows or level rows, never both, and only the kind of its mode, and
+/// (2) a meta row whenever it has any order, level or stop row.
+#[test]
+fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
+    use torus_core::book_rows::{ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER};
+    for mode in [
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ] {
+        let (_dir, db) = open_test_db();
+        seed(&db, mode);
+        // Block 2 on a reloaded context: TAKER fills all of market 2 (its
+        // order and level rows are deleted), MAKER adds a bid on market 1.
+        let mut ctx = make_ctx(db.clone(), 2, mode);
+        assert!(
+            ctx.fatal_error.is_none(),
+            "{mode:?} reload: {:?}",
+            ctx.fatal_error
+        );
+        let block = vec![
+            place(addr(TAKER), gtc(2, false, 50, 3)),
+            place(addr(MAKER), gtc(1, true, 98, 1)),
+        ];
+        let r = NativeExecutor::execute_batch(&mut ctx, &block);
+        assert!(
+            r.results.iter().all(|x| x.success),
+            "{mode:?}: block 2 failed"
+        );
+        match ctx.save_order_books_deferred() {
+            Some(save) => {
+                torus_bridge::native_executor::apply_deferred_book_save(&db, None, save);
+            }
+            None => {
+                ctx.save_order_books();
+            }
+        }
+        assert!(ctx
+            .order_books
+            .get(&2)
+            .expect("market 2")
+            .bid_depth()
+            .is_empty());
+
+        let mut markets: std::collections::BTreeMap<Vec<u8>, (bool, bool, bool, bool)> =
+            Default::default();
+        for (key, _) in db.iterate_cf(CF_NATIVE_ORDER_BOOKS, None).unwrap() {
+            let m = markets.entry(key[..8].to_vec()).or_default();
+            match key.get(8).copied() {
+                Some(ROW_TAG_META) => m.0 = true,
+                Some(ROW_TAG_ORDER) => m.1 = true,
+                Some(ROW_TAG_LEVEL) => m.2 = true,
+                _ => m.3 = true,
+            }
+        }
+        assert_eq!(markets.len(), 2, "{mode:?}: {markets:?}");
+        for (market, (meta, orders, levels, other)) in markets {
+            let rows = orders || levels || other;
+            assert!(
+                meta || !rows,
+                "{mode:?} market {market:?}: rows without a meta row"
+            );
+            assert!(
+                !(orders && levels),
+                "{mode:?} market {market:?}: order and level rows"
+            );
+            let order_mode = mode == BookMode::OrderRows;
+            assert!(!levels || !order_mode, "{mode:?}: level rows in mode 1");
+            assert!(!orders || order_mode, "{mode:?}: order rows in the root CF");
+        }
+    }
+}
+
 // ---- 6. Precompile 0x0800 --------------------------------------------------
 
 /// s99 owner decision (final): the 0x0800 reader serves the level-row
