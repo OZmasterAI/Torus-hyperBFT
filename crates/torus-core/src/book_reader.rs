@@ -335,41 +335,9 @@ pub fn read_book_depth<S: StateBackend>(
     depth_from_market_rows(state, market_id, layout, &rows)
 }
 
-/// The row layout of ONE market from its own `cf_native_order_books` rows
-/// (8-byte prefix, classic blob key absent): level rows = mode 2, order rows =
-/// mode 1, both = an error; meta / stop rows only (or none) read back the same
-/// under either, reported as mode 1. Hashed rows only — no node-local marker,
-/// no DB-wide sniff.
-pub fn layout_of_market_rows(
-    market_id: MarketId,
-    rows: &[(Vec<u8>, Vec<u8>)],
-) -> Result<BookLayout, CoreError> {
-    let (mut levels, mut orders) = (false, false);
-    for (key, _) in rows {
-        match key_shape(key) {
-            Some(KeyShape::LevelRow) => levels = true,
-            Some(KeyShape::OrderRow) => orders = true,
-            Some(KeyShape::ClassicBlob) => {
-                return Err(layout_err(format!(
-                    "market {market_id}: classic whole-book blob among row-layout rows"
-                )))
-            }
-            _ => {}
-        }
-    }
-    match (levels, orders) {
-        (true, true) => Err(layout_err(format!(
-            "market {market_id} mixes per-order rows (mode 1) with level rows (mode 2) \
-             — the book CF is corrupt"
-        ))),
-        (true, false) => Ok(BookLayout::LevelAuthority),
-        _ => Ok(BookLayout::OrderRows),
-    }
-}
-
 /// [`read_book_depth`] for a row layout over the market's rows already read
 /// (all `cf_native_order_books` rows under the 8-byte market prefix, key
-/// order) — the precompile reads them with a work-bounded scan.
+/// order): the meta-row check, then [`depth_from_rows`].
 pub fn depth_from_market_rows<S: StateBackend>(
     state: &S,
     market_id: MarketId,
@@ -389,8 +357,8 @@ pub fn depth_from_market_rows<S: StateBackend>(
 /// The depth of `rows` of one market under a row `layout`: its level rows
 /// (mode 2: forward key order = best-first per side, bids before asks) or its
 /// order rows aggregated per price (mode 1); other row kinds are ignored and
-/// no meta row is needed. The reader precompile passes the bounded scans of
-/// [`crate::precompiles`]'s 64-order cap.
+/// no meta row is needed. The reader precompile (0x0800 getOrderBook) passes
+/// its bounded level-row scans (64 best levels per side).
 pub fn depth_from_rows(
     market_id: MarketId,
     layout: BookLayout,

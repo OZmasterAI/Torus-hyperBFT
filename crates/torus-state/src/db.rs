@@ -64,26 +64,56 @@ pub fn prefix_iter<'a>(
 
 /// One key range a background compaction covers: `[start, end)` of a CF
 /// (`end` `None` = to the CF's end).
-type KeyRange = (&'static str, Vec<u8>, Option<Vec<u8>>);
+pub(crate) type KeyRange = (&'static str, Vec<u8>, Option<Vec<u8>>);
 
-/// s89 fix B (generalized for s99 (c)): state of the background compaction
-/// of key ranges whose rows a flush deleted — the pruned oracle submissions
-/// (`[ORACLE_SUBMISSION_PREFIX, successor)` of `CF_NATIVE_ORACLE`) and the
-/// order rows the reader precompiles scan (see
-/// [`StateDb::compact_range_in_background`]).
+/// Requested ranges per `(CF, group)`: `(start, end)`.
+type PendingRanges =
+    std::collections::BTreeMap<(&'static str, Vec<u8>), (Vec<u8>, Option<Vec<u8>>)>;
+/// Uncompacted deletes per `(CF, market prefix)`: `(count, first key, last key)`.
+type DeleteCounts = std::collections::HashMap<(&'static str, Vec<u8>), (u64, Vec<u8>, Vec<u8>)>;
+
+/// What the [`RangeCompaction`] job holds under its lock.
+#[derive(Default)]
+struct JobState {
+    /// The worker is compacting.
+    running: bool,
+    /// Ranges requested and not yet started, one per `(CF, group)` (the oracle
+    /// submission prefix, or one market's book rows); a request for a group
+    /// widens its range.
+    pending: PendingRanges,
+    /// s99 (c): deletes not yet compacted per `(CF, market prefix)` of the
+    /// rows the reader precompiles scan: `(count, first key, last key)`,
+    /// summed across flushes until the count reaches
+    /// [`crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD`]. In memory only
+    /// (node-local; a restart forgets it, RocksDB's own compactions remain).
+    uncompacted: DeleteCounts,
+    /// The worker thread exists (spawned on the first request, lives until
+    /// the last owner drops).
+    worker_started: bool,
+}
+
+/// s89 fix B (generalized for s99 (c)): the background compaction of key
+/// ranges whose rows flushes deleted — the pruned oracle submissions
+/// (`[ORACLE_SUBMISSION_PREFIX, successor)` of `CF_NATIVE_ORACLE`) and, per
+/// market, the book rows the reader precompiles scan (see
+/// [`StateDb::compact_range_in_background`], [`StateDb::note_scanned_deletes`]).
+/// One long-lived worker thread, parked on `work` between runs.
 #[derive(Default)]
 struct RangeCompaction {
-    /// `(running, ranges requested and not yet started)`; at most one range
-    /// per CF (requests widen it).
-    state: std::sync::Mutex<(bool, Vec<KeyRange>)>,
-    /// Signalled when `running` goes false.
+    state: std::sync::Mutex<JobState>,
+    /// Signalled on a new request and on shutdown.
+    work: std::sync::Condvar,
+    /// Signalled when the worker goes idle (nothing running or pending).
     idle: std::sync::Condvar,
     /// Finished runs: `(done, failed)`.
     runs: std::sync::Mutex<(u64, u64)>,
-    /// Set by [`CompactionOwner`]'s drop: start no run and no re-run.
+    /// Set by [`CompactionOwner`]'s drop: no new run, no further range.
     shutdown: std::sync::atomic::AtomicBool,
-    /// The last worker thread, joined by [`CompactionOwner`]'s drop.
+    /// The worker thread, joined by [`CompactionOwner`]'s drop.
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The DB the worker compacts (set with the first request); weak, so a
+    /// parked worker never keeps a closed DB (and its LOCK) alive.
+    db: std::sync::Mutex<std::sync::Weak<DB>>,
     /// Test hook: every run fails (logged, counted) instead of compacting.
     #[cfg(test)]
     fail: std::sync::atomic::AtomicBool,
@@ -93,53 +123,47 @@ struct RangeCompaction {
     /// Test hook: each run keeps its strong `Arc<DB>` this many ms before compacting.
     #[cfg(test)]
     hold_ms: std::sync::atomic::AtomicU64,
-}
-
-/// Add `range` to `pending`, widening the CF's range if it has one.
-fn add_range(pending: &mut Vec<KeyRange>, (cf, start, end): KeyRange) {
-    match pending.iter_mut().find(|r| r.0 == cf) {
-        Some(r) => {
-            if start < r.1 {
-                r.1 = start;
-            }
-            r.2 = match (r.2.take(), end) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                _ => None,
-            };
-        }
-        None => pending.push((cf, start, end)),
-    }
+    /// Test hook: every range a run compacted, in order.
+    #[cfg(test)]
+    ran: std::sync::Mutex<Vec<KeyRange>>,
 }
 
 impl RangeCompaction {
-    fn run(&self, db: &std::sync::Weak<DB>, ranges: &[KeyRange]) -> Result<(), String> {
+    fn run(&self, db: &DB, ranges: &[KeyRange]) -> Result<(), String> {
+        use std::sync::atomic::Ordering::Relaxed;
         #[cfg(test)]
-        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.fail.load(Relaxed) {
             return Err("injected failure (test)".into());
         }
-        // The DB closed since the request: nothing left to compact.
-        let Some(db) = db.upgrade() else {
-            return Ok(());
-        };
         #[cfg(test)]
         {
-            use std::sync::atomic::Ordering::Relaxed;
             self.started.fetch_add(1, Relaxed);
             std::thread::sleep(std::time::Duration::from_millis(self.hold_ms.load(Relaxed)));
         }
         let mut opts = rocksdb::CompactOptions::default();
         // Do not hold back the automatic compactions while this one runs.
         opts.set_exclusive_manual_compaction(false);
-        // Rewrite the bottommost files too: a file that reached the last level
-        // by a trivial move (no overlap, e.g. rows and their deletes flushed
-        // together) still carries its tombstones otherwise.
-        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        // Rewrite the bottommost files of the range too: a file that reached
+        // the last level by a trivial move (no overlap, e.g. rows and their
+        // deletes flushed together) still carries its tombstones otherwise.
+        // ForceOptimized skips only files this same compaction just wrote; a
+        // trivially moved file keeps its older file number and is rewritten.
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
         let mut result = Ok(());
         for (name, start, end) in ranges {
+            // The last owner is dropping: leave the rest.
+            if self.shutdown.load(Relaxed) {
+                break;
+            }
             let Some(cf) = db.cf_handle(name) else {
                 result = Err(format!("missing column family {name}"));
                 continue;
             };
+            #[cfg(test)]
+            self.ran
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((name, start.clone(), end.clone()));
             let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 db.compact_range_cf_opt(cf, Some(start.as_slice()), end.as_deref(), &opts)
             }));
@@ -150,7 +174,7 @@ impl RangeCompaction {
         result
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, (bool, Vec<KeyRange>)> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, JobState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
@@ -158,27 +182,102 @@ impl RangeCompaction {
         self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Mark the job idle and wake [`StateDb::wait_background_compaction`].
-    fn finish(&self, state: &mut (bool, Vec<KeyRange>)) {
-        *state = (false, Vec::new());
-        self.idle.notify_all();
+    /// The worker: wait for requests, compact them, until shutdown.
+    fn work_loop(&self) {
+        loop {
+            let ranges: Vec<KeyRange> = {
+                let mut state = self.lock_state();
+                loop {
+                    if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.running = false;
+                        state.pending.clear();
+                        self.idle.notify_all();
+                        return;
+                    }
+                    if !state.pending.is_empty() {
+                        break;
+                    }
+                    if state.running {
+                        state.running = false;
+                        self.idle.notify_all();
+                    }
+                    state = self
+                        .work
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                state.running = true;
+                std::mem::take(&mut state.pending)
+                    .into_iter()
+                    .map(|((cf, _), (start, end))| (cf, start, end))
+                    .collect()
+            };
+            let started = std::time::Instant::now();
+            // Strong only for this run: the DB closed since the request leaves
+            // nothing to compact.
+            let db = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .upgrade();
+            let result = db.as_deref().map_or(Ok(()), |db| self.run(db, &ranges));
+            drop(db);
+            match result {
+                Ok(()) => {
+                    self.lock_runs().0 += 1;
+                    tracing::debug!(
+                        ms = started.elapsed().as_secs_f64() * 1e3,
+                        ranges = ranges.len(),
+                        "compacted deleted key ranges"
+                    );
+                }
+                Err(e) => {
+                    self.lock_runs().1 += 1;
+                    tracing::warn!(error = %e, "deleted key range compaction failed (ignored)");
+                }
+            }
+        }
     }
 }
 
 /// The owners' side of the [`RangeCompaction`] job, shared by every clone
 /// of one `StateDb` (the worker holds only the job). Its drop runs once, with
-/// the last clone and before that clone's `Arc<DB>`: it cancels any re-run and
-/// joins the worker. The worker upgrades its `Weak<DB>` for a whole run, so
-/// without this it could hold the last `Arc<DB>` and close RocksDB on its own
-/// thread during process exit, after RocksDB's static mutexes are destroyed
-/// (teardown SIGABRT "pthread lock: Invalid argument").
+/// the last clone and before that clone's `Arc<DB>`: it stops the worker
+/// (no further range; a running RocksDB compaction is cancelled with
+/// `cancel_all_background_work`, so shutdown does not wait for it) and joins
+/// it. The worker upgrades its `Weak<DB>` for a whole run, so without the join
+/// it could hold the last `Arc<DB>` and close RocksDB on its own thread during
+/// process exit, after RocksDB's static mutexes are destroyed (teardown
+/// SIGABRT "pthread lock: Invalid argument").
 #[derive(Default)]
 struct CompactionOwner(Arc<RangeCompaction>);
 
 impl Drop for CompactionOwner {
     fn drop(&mut self) {
-        self.0.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        let worker = self.0.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let job = &self.0;
+        job.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            let state = job.lock_state();
+            if state.running {
+                // Only at the last owner's drop (node shutdown): it also stops
+                // RocksDB's automatic background work for this DB instance.
+                let db = job
+                    .db
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .upgrade();
+                if let Some(db) = db {
+                    db.cancel_all_background_work(false);
+                }
+            }
+            job.work.notify_all();
+        }
+        let worker = job
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(worker) = worker {
             let _ = worker.join();
         }
@@ -666,79 +765,121 @@ impl StateDb {
 
     /// Compact `[start, end)` of `cf` (`end` `None` = to the CF's end) on a
     /// background thread, bottommost level included, so the tombstones a flush
-    /// left there stop costing later scans of the range (s89 fix B; s99 (c):
-    /// the order rows getOrderBook / getOpenOrders scan).
+    /// left there stop costing later scans of the range (s89 fix B).
     ///
-    /// Never blocks the caller and never runs on it: at most one compaction
-    /// is in flight per DB; a request while one runs joins the next run (one
-    /// range per CF, widened to cover every request). A failure is logged and
-    /// counted, never returned. Node-local: a compaction changes no read
-    /// result, state, root or hash.
+    /// Never blocks the caller and never runs on it: one long-lived worker per
+    /// DB compacts one batch of requests at a time; a request while it runs
+    /// joins the next batch (requests with the same `start` widen one range).
+    /// A failure is logged and counted, never returned. Node-local: a
+    /// compaction changes no read result, state, root or hash.
     pub fn compact_range_in_background(&self, cf: &'static str, start: &[u8], end: Option<&[u8]>) {
-        let job = &self.range_compaction.0;
-        {
-            let mut state = job.lock_state();
-            add_range(&mut state.1, (cf, start.to_vec(), end.map(<[u8]>::to_vec)));
-            if state.0 {
-                return;
-            }
-            state.0 = true;
-        }
-        // Weak: a pending compaction never keeps a closed DB (and its LOCK) alive.
-        let db = Arc::downgrade(&self.db);
-        let worker = Arc::clone(job);
-        let spawned = std::thread::Builder::new()
-            .name("torus-range-compact".into())
-            .spawn(move || loop {
-                // The last owner is dropping (and joining): no run, no re-run.
-                if worker.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    worker.finish(&mut worker.lock_state());
-                    break;
-                }
-                let ranges = {
-                    let mut state = worker.lock_state();
-                    if state.1.is_empty() {
-                        worker.finish(&mut state);
-                        break;
-                    }
-                    std::mem::take(&mut state.1)
-                };
-                let started = std::time::Instant::now();
-                match worker.run(&db, &ranges) {
-                    Ok(()) => {
-                        worker.lock_runs().0 += 1;
-                        tracing::debug!(
-                            ms = started.elapsed().as_secs_f64() * 1e3,
-                            ranges = ranges.len(),
-                            "compacted deleted key ranges"
-                        );
-                    }
-                    Err(e) => {
-                        worker.lock_runs().1 += 1;
-                        tracing::warn!(error = %e, "deleted key range compaction failed (ignored)");
-                    }
-                }
-            });
-        match spawned {
-            // Replaces the handle of an earlier worker, which already finished.
-            Ok(handle) => {
-                *job.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not start the deleted key range compaction (ignored)");
-                job.lock_runs().1 += 1;
-                job.finish(&mut job.lock_state());
-            }
-        }
+        let mut state = self.range_compaction.0.lock_state();
+        self.request_locked(
+            &mut state,
+            cf,
+            start.to_vec(),
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+        );
     }
 
-    /// Wait until no background range compaction is in flight; returns the
-    /// finished runs `(done, failed)` so far. Tests and benches only — the
-    /// node never waits for it.
+    /// s99 (c): a flush deleted `n` rows in `[first, last]` under `prefix` of
+    /// `cf` (one market's book rows, which getOrderBook scans). The count is
+    /// summed per `(cf, prefix)` across flushes; once it reaches
+    /// [`crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD`] the market's span of
+    /// uncompacted deletes is compacted in the background
+    /// ([`Self::compact_range_in_background`]) and the count starts over. One
+    /// market per range, so a run rewrites only the files holding the churned
+    /// markets, never the whole CF.
+    pub fn note_scanned_deletes(
+        &self,
+        cf: &'static str,
+        prefix: &[u8],
+        n: u64,
+        first: &[u8],
+        last: &[u8],
+    ) {
+        let mut state = self.range_compaction.0.lock_state();
+        let key = (cf, prefix.to_vec());
+        let entry = state
+            .uncompacted
+            .entry(key.clone())
+            .or_insert_with(|| (0, first.to_vec(), last.to_vec()));
+        entry.0 += n;
+        if first < entry.1.as_slice() {
+            entry.1 = first.to_vec();
+        }
+        if last > entry.2.as_slice() {
+            entry.2 = last.to_vec();
+        }
+        if entry.0 < crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD {
+            return;
+        }
+        let (_, lo, mut hi) = state.uncompacted.remove(&key).expect("entry just updated");
+        // The smallest key after `hi`: the range covers `hi` itself.
+        hi.push(0);
+        self.request_locked(&mut state, cf, key.1, lo, Some(hi));
+    }
+
+    /// Queue `[start, end)` of `cf` under `group`, start the worker if needed
+    /// and wake it.
+    fn request_locked(
+        &self,
+        state: &mut JobState,
+        cf: &'static str,
+        group: Vec<u8>,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    ) {
+        let job = &self.range_compaction.0;
+        match state.pending.entry((cf, group)) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let r = e.get_mut();
+                if start < r.0 {
+                    r.0 = start;
+                }
+                r.1 = match (r.1.take(), end) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert((start, end));
+            }
+        }
+        if !state.worker_started {
+            *job.db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&self.db);
+            let worker = Arc::clone(job);
+            match std::thread::Builder::new()
+                .name("torus-range-compact".into())
+                .spawn(move || worker.work_loop())
+            {
+                Ok(handle) => {
+                    *job.worker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                    state.worker_started = true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not start the deleted key range compaction (ignored)");
+                    job.lock_runs().1 += 1;
+                    state.pending.clear();
+                    return;
+                }
+            }
+        }
+        job.work.notify_all();
+    }
+
+    /// Wait until no background range compaction is running or pending;
+    /// returns the finished runs `(done, failed)` so far. Tests and benches
+    /// only — the node never waits for it.
     pub fn wait_background_compaction(&self) -> (u64, u64) {
         let job = &self.range_compaction.0;
         let mut state = job.lock_state();
-        while state.0 {
+        while state.running || !state.pending.is_empty() {
             state = job.idle.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         drop(state);
@@ -758,6 +899,17 @@ impl StateDb {
     #[cfg(test)]
     fn compaction_job(&self) -> Arc<RangeCompaction> {
         Arc::clone(&self.range_compaction.0)
+    }
+
+    /// Test hook: every range the background compactions ran, in order.
+    #[cfg(test)]
+    pub(crate) fn compacted_ranges(&self) -> Vec<KeyRange> {
+        self.range_compaction
+            .0
+            .ran
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Get a shared handle to the underlying RocksDB instance.
@@ -1626,9 +1778,20 @@ mod compaction_drop_tests {
             weak.upgrade().is_none(),
             "the last StateDb drop must close RocksDB on its own thread, not leave the last Arc<DB> to the worker"
         );
-        assert_eq!(*job.lock_runs(), (1, 0), "drop returned before the run finished");
-        assert!(!job.lock_state().0, "job still marked running after drop");
-        assert_eq!(Arc::strong_count(&job), 1, "the worker thread is still alive");
+        assert_eq!(
+            *job.lock_runs(),
+            (1, 0),
+            "drop returned before the run finished"
+        );
+        assert!(
+            !job.lock_state().running,
+            "job still marked running after drop"
+        );
+        assert_eq!(
+            Arc::strong_count(&job),
+            1,
+            "the worker thread is still alive"
+        );
         StateDb::open(dir.path()).expect("reopen right after drop (LOCK released)");
     }
 
@@ -1639,7 +1802,7 @@ mod compaction_drop_tests {
         let job = start_held_compaction(&db, 200);
         db.compact_pruned_submissions_in_background();
         assert!(
-            !job.lock_state().1.is_empty(),
+            !job.lock_state().pending.is_empty(),
             "second request must be queued as a re-run"
         );
         let t = Instant::now();
@@ -1660,8 +1823,15 @@ mod compaction_drop_tests {
         let job = start_held_compaction(&db, 300);
         let t = Instant::now();
         drop(clone);
-        assert!(t.elapsed() < Duration::from_millis(150), "a clone drop waited {:?}", t.elapsed());
-        assert!(job.lock_state().0, "the compaction should still be running");
+        assert!(
+            t.elapsed() < Duration::from_millis(150),
+            "a clone drop waited {:?}",
+            t.elapsed()
+        );
+        assert!(
+            job.lock_state().running,
+            "the compaction should still be running"
+        );
         drop(db);
         assert!(weak.upgrade().is_none(), "the last drop must close RocksDB itself");
         assert_eq!(*job.lock_runs(), (1, 0));

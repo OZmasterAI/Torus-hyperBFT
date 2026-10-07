@@ -424,6 +424,10 @@ struct JournalEntry {
     prev_deleted: bool,
 }
 
+/// s99 (c): one market's deletes in a layer: `(prefix, count, first key,
+/// last key)`.
+type DeleteGroup<'a> = (&'a [u8], u64, &'a [u8], &'a [u8]);
+
 /// Per-CF pending mutations. Keys are plain `Vec<u8>` — no `(String, Vec<u8>)`
 /// composite allocation per get/put, and lookups borrow the caller's `&[u8]`
 /// directly (zero allocations on the read path).
@@ -517,10 +521,24 @@ impl PendingState {
         })
     }
 
-    /// s99 (c): the first and last key this layer deletes in `cf`, if any.
-    fn delete_span(&self, cf: &str) -> Option<(&[u8], &[u8])> {
-        let deletes = &self.cf(intern_cf(cf)?).deletes;
-        Some((deletes.first()?.as_slice(), deletes.last()?.as_slice()))
+    /// s99 (c): this layer's deletes in `cf` grouped by their first
+    /// `prefix_len` bytes (one market).
+    fn delete_groups(&self, cf: &str, prefix_len: usize) -> Vec<DeleteGroup<'_>> {
+        let mut out: Vec<DeleteGroup<'_>> = Vec::new();
+        let Some(id) = intern_cf(cf) else {
+            return out;
+        };
+        for key in &self.cf(id).deletes {
+            let prefix = &key[..prefix_len.min(key.len())];
+            match out.last_mut() {
+                Some(g) if g.0 == prefix => {
+                    g.1 += 1;
+                    g.3 = key;
+                }
+                _ => out.push((prefix, 1, key, key)),
+            }
+        }
+        out
     }
 
     /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
@@ -1811,20 +1829,13 @@ fn flush_pending_after_batch(
         {
             target.compact_pruned_submissions_in_background();
         }
-        // s99 (c): same for the order rows the reader precompiles scan
-        // (getOrderBook, getOpenOrders): compact the span of this batch's
-        // deletes, so their tombstones stop costing the scans.
-        for cf in crate::cf::READER_SCANNED_ORDER_CFS {
-            let spans = [
-                state.delete_span(cf),
-                sidecar.and_then(|s| s.delete_span(cf)),
-            ];
-            let mut spans = spans.into_iter().flatten();
-            if let Some(first) = spans.next() {
-                let (lo, hi) = spans.fold(first, |a, b| (a.0.min(b.0), a.1.max(b.1)));
-                // The smallest key after `hi`: the range covers `hi` itself.
-                let end = [hi, &[0u8][..]].concat();
-                target.compact_range_in_background(cf, lo, Some(&end));
+        // s99 (c): count the deleted book rows per market; a market that
+        // reaches the threshold gets its span compacted off this thread.
+        for (cf, prefix_len) in crate::cf::READER_SCANNED_CFS {
+            for layer in std::iter::once(&*state).chain(sidecar) {
+                for (prefix, n, first, last) in layer.delete_groups(cf, prefix_len) {
+                    target.note_scanned_deletes(cf, prefix, n, first, last);
+                }
             }
         }
         // L3 #2: record post-flush residency for the eviction-pressure gauge.
@@ -4764,5 +4775,111 @@ mod submission_compaction_tests {
         let (done, failed) = db.wait_background_compaction();
         assert_eq!(failed, 0);
         assert!((1..=20).contains(&done), "{done} runs for 20 requests");
+    }
+}
+
+#[cfg(test)]
+mod scanned_delete_compaction_tests {
+    //! s99 (c) review: the background compaction of getOrderBook's book rows
+    //! runs per market (never one span over every market a block touched),
+    //! and only once a market's uncompacted deletes, summed across flushes,
+    //! reach `SCANNED_DELETES_COMPACTION_THRESHOLD`.
+    use super::*;
+    use crate::cf::{CF_NATIVE_ORDER_BOOKS, SCANNED_DELETES_COMPACTION_THRESHOLD as T};
+
+    fn temp_db() -> (StateDb, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open db");
+        (db, dir)
+    }
+
+    /// A market's level row key: market(8) ‖ 0x03 ‖ bid ‖ price(16).
+    fn level_key(market: u64, price: u64) -> Vec<u8> {
+        [
+            &market.to_be_bytes()[..],
+            &[3u8, 0],
+            &(price as u128).to_be_bytes(),
+        ]
+        .concat()
+    }
+
+    /// One block flush writing, then one deleting, `prices` of each market.
+    fn put_then_delete(db: &StateDb, rows: &[(u64, std::ops::Range<u64>)]) {
+        let ov = NativeStateOverlay::new(db.clone());
+        for (m, prices) in rows {
+            for p in prices.clone() {
+                ov.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &level_key(*m, p), b"level")
+                    .unwrap();
+            }
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None)
+            .unwrap();
+        let ov = NativeStateOverlay::new(db.clone());
+        for (m, prices) in rows {
+            for p in prices.clone() {
+                ov.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &level_key(*m, p))
+                    .unwrap();
+            }
+        }
+        ov.flush_with_native_trie_stats(db, None, None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn one_range_per_market_never_a_span_over_markets() {
+        assert_eq!(T, 64);
+        let (db, _dir) = temp_db();
+        put_then_delete(&db, &[(1, 0..100), (5_000, 0..100), (9_000, 0..100)]);
+        assert_eq!(db.wait_background_compaction(), (1, 0), "one run");
+        let want: Vec<crate::db::KeyRange> = [1u64, 5_000, 9_000]
+            .iter()
+            .map(|&m| {
+                (
+                    CF_NATIVE_ORDER_BOOKS,
+                    level_key(m, 0),
+                    Some([level_key(m, 99), vec![0]].concat()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            db.compacted_ranges(),
+            want,
+            "one range per market, covering its deletes only"
+        );
+    }
+
+    #[test]
+    fn deletes_below_the_threshold_add_up_across_flushes() {
+        let (db, _dir) = temp_db();
+        put_then_delete(&db, &[(7, 0..40)]);
+        assert_eq!(
+            db.wait_background_compaction(),
+            (0, 0),
+            "40 < 64: nothing yet"
+        );
+        put_then_delete(&db, &[(7, 100..124)]);
+        assert_eq!(
+            db.wait_background_compaction(),
+            (1, 0),
+            "40 + 24 = 64: compacted"
+        );
+        assert_eq!(
+            db.compacted_ranges(),
+            vec![(
+                CF_NATIVE_ORDER_BOOKS,
+                level_key(7, 0),
+                Some([level_key(7, 123), vec![0]].concat())
+            )],
+            "the span of both flushes' deletes"
+        );
+        // The count starts over.
+        put_then_delete(&db, &[(7, 200..263)]);
+        assert_eq!(
+            db.wait_background_compaction(),
+            (1, 0),
+            "63 more: below again"
+        );
+        put_then_delete(&db, &[(7, 300..301)]);
+        assert_eq!(db.wait_background_compaction(), (2, 0));
     }
 }

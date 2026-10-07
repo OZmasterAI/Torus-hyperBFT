@@ -11,13 +11,14 @@
 //! the node-local rows it skips), and a classic blob is sized before it is
 //! read.
 //!
-//! s99 owner pricing (item6 plan 9.16, revisit later): a reader pays
-//! `GAS_PRECOMPILE_READ` (16,400: single reads at HL level, getPosition =
-//! 16,500) + 500 per scanned row + 20 per returned word or 32 B blob chunk;
-//! getOpenOrders / getOrderBook read at most 64 orders (book rows) per call.
-//! RocksDB deletion markers in a scanned range change neither gas nor answer
-//! (node-local), and a block flush that deletes rows in the scanned order
-//! ranges schedules a background compaction of them.
+//! s99 owner decisions (final): a reader pays `GAS_PRECOMPILE_READ` (16,400:
+//! single reads at HL level, getPosition = 16,500) + 500 per scanned row + 20
+//! per returned word or 32 B blob chunk. getOpenOrders is removed;
+//! getOrderBook answers the 64 best levels per side in modes 2/3, reverts on
+//! a mode-1 market (unsupported), classic unchanged. RocksDB deletion markers
+//! in a scanned range change neither gas nor answer (node-local), and block
+//! flushes that delete level rows of a market compact them in the background
+//! once enough accumulate.
 
 #[path = "common/counting_backend.rs"]
 mod counting_backend;
@@ -32,14 +33,13 @@ use torus_core::book_reader::BOOK_MODE_MARKER_KEY;
 use torus_core::error::CoreError;
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
 use torus_core::precompiles::{
-    execute_precompile_metered, precompile_address, reader_gas, write_stored_order, ReadMeter,
-    StoredOrder, ADDR_BALANCE_READER, ADDR_ORACLE_READER, ADDR_ORDER_BOOK_READER,
-    ADDR_STAKING_READER, GAS_PRECOMPILE_READ, GAS_PRECOMPILE_READ_PER_ROW,
-    GAS_PRECOMPILE_READ_PER_WORD, READER_MAX_ORDERS,
+    execute_precompile_metered, precompile_address, reader_gas, ReadMeter, ADDR_BALANCE_READER,
+    ADDR_ORACLE_READER, ADDR_ORDER_BOOK_READER, ADDR_STAKING_READER, GAS_PRECOMPILE_READ,
+    GAS_PRECOMPILE_READ_PER_ROW, GAS_PRECOMPILE_READ_PER_WORD, READER_MAX_LEVELS_PER_SIDE,
 };
 use torus_state::cf::{
-    CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS,
-    CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
+    CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_ORDER_BOOKS,
+    CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS,
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -115,20 +115,6 @@ fn rows(n: u64) -> ReadMeter {
 
 fn order_book(state: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
     call(state, ADDR_ORDER_BOOK_READER, "getOrderBook(bytes32)", &[market_word(1)], meter)
-}
-
-fn open_orders(
-    state: &impl StateBackend,
-    trader: &Address,
-    meter: &mut ReadMeter,
-) -> Result<Vec<u8>, CoreError> {
-    call(
-        state,
-        ADDR_ORDER_BOOK_READER,
-        "getOpenOrders(address,bytes32)",
-        &[addr_word(trader), market_word(1)],
-        meter,
-    )
 }
 
 /// The first `n` dynamic arrays of a reader answer, low 16 bytes per element.
@@ -236,19 +222,6 @@ fn levels(n: i64) -> Vec<i64> {
     (1..=n).collect()
 }
 
-fn stored(id: u128) -> StoredOrder {
-    StoredOrder {
-        order_id: id,
-        price: fp(100 + id as i64),
-        remaining_qty: fp(1),
-        side: 0,
-    }
-}
-
-fn orders_key(trader: &Address, id: u128) -> Vec<u8> {
-    [trader.as_slice(), &1u64.to_be_bytes(), &id.to_be_bytes()].concat()
-}
-
 /// MAKER's resting orders on market 1 below `price` (the churn the tests add).
 fn churn_ids<T: StateBackend + Clone>(ctx: &NativeExecContext<T>, below: i64) -> Vec<u128> {
     let book = ctx.order_books.get(&1).expect("book loaded");
@@ -301,7 +274,7 @@ fn get_markets_work_is_bounded_by_the_budget() {
 }
 
 /// getOrderBook on a 150-level (mode 2) book: a 20-row budget runs out of gas
-/// after at most 21 rows; a large budget returns the best 32 bid levels.
+/// after at most 21 rows; a large budget returns the best 64 bid levels.
 #[test]
 fn get_order_book_work_is_bounded_by_the_budget() {
     let (_dir, db) = open_test_db();
@@ -320,11 +293,11 @@ fn get_order_book_work_is_bounded_by_the_budget() {
     let out = order_book(&db, &mut big).unwrap();
     assert_eq!(
         out.len(),
-        (8 + 32 * 2) * 32,
-        "the best 32 bid levels, no asks"
+        (8 + 64 * 2) * 32,
+        "the best 64 bid levels, no asks"
     );
     assert_eq!(out, order_book(&db, &mut ReadMeter::unlimited()).unwrap());
-    assert_eq!(big.used(), 32 * ROW + (8 + 64) * WORD);
+    assert_eq!(big.used(), 64 * ROW + (8 + 128) * WORD);
 }
 
 /// A stipend below the answer's fixed head (8 words) reads nothing at all.
@@ -418,63 +391,6 @@ fn classic_blob_is_sized_and_charged_before_it_is_read() {
         chunks * WORD,
         "the revert pays for the blob it read"
     );
-}
-
-/// Mode 1 stores one row per ORDER: 30 orders on 3 price levels are charged
-/// 30 rows for a 3-level answer, and a tight budget stops the scan.
-#[test]
-fn mode1_charges_one_row_per_order() {
-    let (_dir, db) = open_test_db();
-    let prices: Vec<i64> = (0..30).map(|i| 10 + i % 3).collect();
-    seed_book(&db, BookMode::OrderRows, &prices);
-
-    let (out, gas) = gas_of(
-        &db,
-        ADDR_ORDER_BOOK_READER,
-        "getOrderBook(bytes32)",
-        &[market_word(1)],
-    );
-    assert_eq!(out.len(), (8 + 3 * 2) * 32, "3 bid levels");
-    assert_eq!(
-        gas,
-        GAS_PRECOMPILE_READ + 30 * ROW + (8 + 6) * WORD,
-        "every order row + the words returned"
-    );
-
-    let cb = CountingBackend::new(db.clone());
-    assert!(oog(&order_book(&cb, &mut rows(10))));
-    assert!(
-        rows_read(&cb) <= 11,
-        "read {} rows on a 10-row budget",
-        rows_read(&cb)
-    );
-}
-
-/// A scan ending mid-table: trader A's 3 orders are followed in key order by
-/// trader B's 1,000. getOpenOrders(A) reads A's rows (the scan stops at the
-/// prefix end) and charges 3 rows + 20 words; a 2-row budget stops early.
-#[test]
-fn open_orders_scan_stops_at_the_prefix_end() {
-    let (_dir, db) = open_test_db();
-    let (a, b) = (Address::new([0x0A; 20]), Address::new([0x0B; 20]));
-    for id in 1..=3u128 {
-        write_stored_order(&db, &a, 1, &stored(id)).unwrap();
-    }
-    for id in 10..1_010u128 {
-        write_stored_order(&db, &b, 1, &stored(id)).unwrap();
-    }
-    let cb = CountingBackend::new(db.clone());
-
-    let mut big = ReadMeter::with_max(30_000_000);
-    let out = open_orders(&cb, &a, &mut big).unwrap();
-    assert_eq!(out.len(), (8 + 4 * 3) * 32, "A's 3 orders");
-    assert_eq!(big.used(), 3 * ROW + 20 * WORD);
-    assert!(rows_read(&cb) <= 3, "read {} rows: past A's prefix", rows_read(&cb));
-
-    let cb = CountingBackend::new(db.clone());
-    let r = open_orders(&cb, &a, &mut rows(2));
-    assert!(oog(&r), "{r:?}");
-    assert!(rows_read(&cb) <= 3);
 }
 
 /// Final review N1: a mode-2 market whose last order was cancelled keeps only
@@ -696,28 +612,14 @@ fn single_readers_cost_the_base_plus_their_words() {
     assert!(oog(&r), "{r:?}");
 }
 
-/// (b) Scans: 500 per scanned row + 20 per returned word. getOpenOrders over 3
-/// orders = 3 rows + 20 words; getOrderBook (mode 2) over 3 bid + 2 ask
-/// levels = 5 rows + 18 words.
+/// (b) Scans: 500 per scanned row + 20 per returned word. getOrderBook (mode
+/// 2) over 3 bid + 2 ask levels = 5 rows + 18 words.
 #[test]
 fn scans_cost_500_per_row_and_20_per_word() {
     let (_dir, db) = open_test_db();
-    let a = Address::new([0x0A; 20]);
-    for id in 1..=3u128 {
-        write_stored_order(&db, &a, 1, &stored(id)).unwrap();
-    }
-    let (_, gas) = gas_of(
-        &db,
-        ADDR_ORDER_BOOK_READER,
-        "getOpenOrders(address,bytes32)",
-        &[addr_word(&a), market_word(1)],
-    );
-    assert_eq!(gas, 16_400 + 3 * 500 + 20 * 20);
-
-    let (_d2, db2) = open_test_db();
-    seed_sides(&db2, BookMode::LevelAuthority, &[10, 11, 12], &[20, 21]);
+    seed_sides(&db, BookMode::LevelAuthority, &[10, 11, 12], &[20, 21]);
     let (out, gas) = gas_of(
-        &db2,
+        &db,
         ADDR_ORDER_BOOK_READER,
         "getOrderBook(bytes32)",
         &[market_word(1)],
@@ -735,174 +637,155 @@ fn scans_cost_500_per_row_and_20_per_word() {
     assert_eq!(gas, 16_400 + 5 * 500 + 18 * 20);
 }
 
-/// (b) Cap: getOpenOrders over 100 orders answers the first 64 in key order
-/// (order ids 1..=64), no revert, the same with any meter; it reads and
-/// charges 64 rows + 264 words. A gas limit one short of that runs out of gas.
+/// (b) Cap, modes 2/3: the 64 best levels per side. 64 levels per side answer
+/// all of them; 65 per side answer the best 64 of each, at the same gas:
+/// 16,400 + 128 x 500 + (8 + 4 x 64) x 20 = 85,680. That exact gas limit
+/// answers; one gas less runs out of gas, never a shorter answer.
 #[test]
-fn open_orders_answer_the_first_64_orders() {
-    assert_eq!(READER_MAX_ORDERS, 64);
-    let (_dir, db) = open_test_db();
-    let a = Address::new([0x0A; 20]);
-    for id in 1..=100u128 {
-        write_stored_order(&db, &a, 1, &stored(id)).unwrap();
+fn order_book_answers_the_64_best_levels_per_side() {
+    assert_eq!(READER_MAX_LEVELS_PER_SIDE, 64);
+    let exact = 128 * ROW + (8 + 4 * 64) * WORD;
+    assert_eq!(GAS_PRECOMPILE_READ + exact, 85_680);
+    for n in [64i64, 65] {
+        let (_dir, db) = open_test_db();
+        let bids: Vec<i64> = (1..=n).collect();
+        let asks: Vec<i64> = (1_001..=1_000 + n).collect();
+        seed_sides(&db, BookMode::LevelAuthority, &bids, &asks);
+        let cb = CountingBackend::new(db.clone());
+        let mut m = ReadMeter::with_max(30_000_000);
+        let out = order_book(&cb, &mut m).unwrap();
+        let a = arrays(&out, 4);
+        assert_eq!(
+            a[0],
+            (n - 63..=n).rev().map(raw).collect::<Vec<_>>(),
+            "n={n}: best 64 bids, best first"
+        );
+        assert_eq!(
+            a[2],
+            (1_001..=1_064).map(raw).collect::<Vec<_>>(),
+            "n={n}: best 64 asks, best first"
+        );
+        assert_eq!(m.used(), exact, "n={n}");
+        assert!(rows_read(&cb) <= 128, "n={n}: read {} rows", rows_read(&cb));
+        assert_eq!(out, order_book(&db, &mut ReadMeter::unlimited()).unwrap());
+
+        assert_eq!(
+            order_book(&db, &mut ReadMeter::with_max(exact)).unwrap(),
+            out
+        );
+        assert!(
+            oog(&order_book(&db, &mut ReadMeter::with_max(exact - 1))),
+            "n={n}"
+        );
+        assert!(
+            oog(&order_book(&db, &mut rows(127))),
+            "n={n}: 127 rows of gas"
+        );
     }
-    let cb = CountingBackend::new(db.clone());
-    let mut m = ReadMeter::with_max(30_000_000);
-    let out = open_orders(&cb, &a, &mut m).unwrap();
-    assert_eq!(
-        arrays(&out, 1)[0],
-        (1..=64u128).collect::<Vec<_>>(),
-        "the first 64 order ids"
-    );
-    assert_eq!(m.used(), 64 * ROW + (8 + 4 * 64) * WORD);
-    assert!(
-        rows_read(&cb) <= 64,
-        "read {} rows for a 64-order answer",
-        rows_read(&cb)
-    );
-    assert_eq!(
-        out,
-        open_orders(&db, &a, &mut ReadMeter::unlimited()).unwrap(),
-        "unmetered: same cap"
-    );
-
-    let exact = 64 * ROW + 264 * WORD;
-    assert_eq!(
-        open_orders(&db, &a, &mut ReadMeter::with_max(exact)).unwrap(),
-        out
-    );
-    assert!(oog(&open_orders(
-        &db,
-        &a,
-        &mut ReadMeter::with_max(exact - 1)
-    )));
-    let r = open_orders(&db, &a, &mut rows(63));
-    assert!(
-        oog(&r),
-        "63 rows of gas: out of gas, never a shorter answer: {r:?}"
-    );
 }
 
-/// (b) Cap, mode 2: the best 32 levels per side (64 level rows at most).
+/// s99 owner decision (final): mode 1 (order rows by id, no price index) is
+/// not served. A mode-1 market with resting orders reverts, deterministically:
+/// the two empty level scans read nothing, one order row is probed and
+/// charged, so the revert costs 16,400 + 500 = 16,900 gas. A mode-1 market
+/// whose orders are all gone (meta row only) answers the empty book.
 #[test]
-fn order_book_mode2_answers_the_best_32_levels_per_side() {
+fn order_book_reverts_on_a_mode1_market() {
     let (_dir, db) = open_test_db();
-    let bids: Vec<i64> = (1..=50).collect();
-    let asks: Vec<i64> = (101..=150).collect();
-    seed_sides(&db, BookMode::LevelAuthority, &bids, &asks);
+    let prices: Vec<i64> = (0..30).map(|i| 10 + i % 3).collect();
+    seed_book(&db, BookMode::OrderRows, &prices);
+
     let cb = CountingBackend::new(db.clone());
     let mut m = ReadMeter::with_max(30_000_000);
-    let out = order_book(&cb, &mut m).unwrap();
-    let a = arrays(&out, 4);
-    assert_eq!(
-        a[0],
-        (19..=50).rev().map(raw).collect::<Vec<_>>(),
-        "best 32 bids, best first"
+    let r = order_book(&cb, &mut m);
+    assert!(
+        matches!(r, Err(CoreError::BookLayout(_))),
+        "mode 1 reverts: {r:?}"
     );
     assert_eq!(
-        a[2],
-        (101..=132).map(raw).collect::<Vec<_>>(),
-        "best 32 asks, best first"
+        reader_gas(m.used()),
+        16_900,
+        "the revert pays the one probed row"
     );
-    assert_eq!(m.used(), 64 * ROW + (8 + 4 * 32) * WORD);
-    assert!(rows_read(&cb) <= 64, "read {} rows", rows_read(&cb));
-    assert_eq!(out, order_book(&db, &mut ReadMeter::unlimited()).unwrap());
+    assert_eq!(rows_read(&cb), 1);
+    assert_eq!(m.used(), {
+        let mut again = ReadMeter::with_max(30_000_000);
+        let _ = order_book(&db, &mut again);
+        again.used()
+    });
+    // The head is checked, not charged: exactly one row of gas reaches the
+    // probe and the revert; one gas less runs out of gas.
+    let r = order_book(&db, &mut ReadMeter::with_max(ROW));
+    assert!(matches!(r, Err(CoreError::BookLayout(_))), "{r:?}");
+    assert!(oog(&order_book(&db, &mut ReadMeter::with_max(ROW - 1))));
+
+    let mut ctx = ctx_on(db.clone(), 2, BookMode::OrderRows);
+    let ids = churn_ids(&ctx, 1_000);
+    let cancels: Vec<_> = ids
+        .iter()
+        .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
+        .collect();
+    run_block(&mut ctx, &cancels);
+    let out = order_book(&db, &mut ReadMeter::with_max(30_000_000)).unwrap();
+    assert_eq!(out.len(), 8 * 32, "no order row left: the empty book");
 }
 
-/// (b) Cap, mode 1: the order rows are keyed by order id, so the answer
-/// aggregates the market's first 64 resting orders by id (the oldest), not
-/// the best prices: 100 bids at prices 1..=100 placed in that order answer
-/// the 64 levels 64..=1.
+/// A key of the wrong length under a market's level prefix (a corrupt row
+/// store) reverts instead of being skipped.
 #[test]
-fn order_book_mode1_aggregates_the_first_64_orders() {
+fn a_wrong_length_level_key_reverts() {
     let (_dir, db) = open_test_db();
-    seed_book(&db, BookMode::OrderRows, &levels(100));
-    let cb = CountingBackend::new(db.clone());
-    let mut m = ReadMeter::with_max(30_000_000);
-    let out = order_book(&cb, &mut m).unwrap();
-    assert_eq!(
-        arrays(&out, 4)[0],
-        (1..=64).rev().map(raw).collect::<Vec<_>>()
-    );
-    assert_eq!(m.used(), 64 * ROW + (8 + 2 * 64) * WORD);
-    assert!(rows_read(&cb) <= 64, "read {} rows", rows_read(&cb));
+    seed_sides(&db, BookMode::LevelAuthority, &[10, 11], &[20]);
+    let mut key =
+        torus_core::book_rows::level_row_key_tagged(1, torus_core::book_rows::SIDE_TAG_BID, 1)
+            .to_vec();
+    key.push(0);
+    db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, b"junk").unwrap();
+    let r = order_book(&db, &mut ReadMeter::with_max(30_000_000));
+    assert!(matches!(r, Err(CoreError::BookLayout(_))), "{r:?}");
 }
 
 // ---------------------------------------------------------------------------
 // (c) Deletion markers: node-local, never in a block result.
 // ---------------------------------------------------------------------------
 
-/// The same logical state with and without RocksDB tombstones in the scanned
-/// range (rows written and deleted, flushed to an SST, never compacted) gives
-/// the same answer and the same gas: getOpenOrders over cf_native_orders, and
-/// getOrderBook in mode 1 after real place + cancel churn.
+/// MAKER places one bid at each of `prices` in one block and cancels them all
+/// in the next (mode 2: level rows written, then deleted), on the DB directly.
+fn churn_levels(db: &StateDb, prices: &[i64]) {
+    let mut ctx = ctx_on(db.clone(), 2, BookMode::LevelAuthority);
+    let block: Vec<_> = prices.iter().map(|&p| place(true, p)).collect();
+    run_block(&mut ctx, &block);
+    db.inner()
+        .flush_cf(db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap())
+        .unwrap();
+    let mut ctx = ctx_on(db.clone(), 3, BookMode::LevelAuthority);
+    let ids: Vec<u128> = {
+        let book = ctx.order_books.get(&1).expect("book");
+        book.orders_for_trader(&MAKER)
+            .iter()
+            .filter(|o| o.price > fp(100))
+            .map(|o| o.id)
+            .collect()
+    };
+    assert_eq!(ids.len(), prices.len());
+    let cancels: Vec<_> = ids
+        .iter()
+        .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
+        .collect();
+    run_block(&mut ctx, &cancels);
+}
+
+/// The same logical book with and without RocksDB tombstones in the scanned
+/// range (200 better bid levels written and deleted by real place + cancel
+/// churn, flushed to an SST, never compacted) gives the same answer and gas.
 #[test]
 fn tombstones_change_neither_gas_nor_answer() {
-    // getOpenOrders: 3 live orders; DB A also had 500 more, deleted.
-    let a = Address::new([0x0A; 20]);
+    let prices: Vec<i64> = (101..=300).collect();
     let build = |churn: bool| {
         let (dir, db) = open_test_db();
-        for id in 1..=3u128 {
-            write_stored_order(&db, &a, 1, &stored(id)).unwrap();
-        }
+        seed_book(&db, BookMode::LevelAuthority, &[10, 11, 12]);
         if churn {
-            for id in 1_000..1_500u128 {
-                write_stored_order(&db, &a, 1, &stored(id)).unwrap();
-            }
-            db.inner()
-                .flush_cf(db.cf_handle(CF_NATIVE_ORDERS).unwrap())
-                .unwrap();
-            for id in 1_000..1_500u128 {
-                db.delete_cf_raw(CF_NATIVE_ORDERS, &orders_key(&a, id))
-                    .unwrap();
-            }
-            db.inner()
-                .flush_cf(db.cf_handle(CF_NATIVE_ORDERS).unwrap())
-                .unwrap();
-        }
-        let ((out, gas), skipped) = deletes_skipped(|| {
-            gas_of(
-                &db,
-                ADDR_ORDER_BOOK_READER,
-                "getOpenOrders(address,bytes32)",
-                &[addr_word(&a), market_word(1)],
-            )
-        });
-        (dir, out, gas, skipped)
-    };
-    let (_d1, out_a, gas_a, skipped_a) = build(true);
-    let (_d2, out_b, gas_b, skipped_b) = build(false);
-    assert!(
-        skipped_a >= 500,
-        "DB A's scan steps over the tombstones ({skipped_a})"
-    );
-    assert_eq!(skipped_b, 0);
-    assert_eq!(
-        (out_a, gas_a),
-        (out_b, gas_b),
-        "getOpenOrders: tombstones changed the answer or the gas"
-    );
-
-    // getOrderBook mode 1: 3 resting bids; DB A also placed 200 more in a later
-    // block and cancelled them in the next (real executor, rows on the DB).
-    let build = |churn: bool| {
-        let (dir, db) = open_test_db();
-        seed_book(&db, BookMode::OrderRows, &[10, 11, 12]);
-        if churn {
-            let mut ctx = ctx_on(db.clone(), 2, BookMode::OrderRows);
-            let block: Vec<_> = (0..200).map(|i| place(true, 1 + i % 5)).collect();
-            run_block(&mut ctx, &block);
-            db.inner()
-                .flush_cf(db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap())
-                .unwrap();
-            let mut ctx = ctx_on(db.clone(), 3, BookMode::OrderRows);
-            let ids = churn_ids(&ctx, 10);
-            assert_eq!(ids.len(), 200);
-            let cancels: Vec<_> = ids
-                .iter()
-                .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
-                .collect();
-            run_block(&mut ctx, &cancels);
+            churn_levels(&db, &prices);
             db.inner()
                 .flush_cf(db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap())
                 .unwrap();
@@ -921,62 +804,60 @@ fn tombstones_change_neither_gas_nor_answer() {
     let (_d2, out_b, gas_b, skipped_b) = build(false);
     assert!(
         skipped_a >= 200,
-        "mode-1 scan steps over the cancelled order rows ({skipped_a})"
+        "the scan steps over the deleted levels ({skipped_a})"
     );
     assert_eq!(skipped_b, 0);
     assert_eq!(arrays(&out_b, 4)[0], vec![raw(12), raw(11), raw(10)]);
     assert_eq!(
         (out_a, gas_a),
         (out_b, gas_b),
-        "getOrderBook: tombstones changed the answer or the gas"
+        "tombstones changed the answer or the gas"
     );
 }
 
-/// (c) Node-local mitigation (s89 fix B pattern): a block flush whose batch
-/// deletes rows in the order ranges the scan readers walk (cf_native_order_books,
-/// cf_native_orders) compacts that range in the background, so the next scans
-/// step over no tombstone; the answer and gas are the same before and after.
+/// (c) Node-local mitigation (s89 fix B pattern, per market, threshold): a
+/// block flush that deletes at least the threshold of level rows in a market
+/// compacts that market's span in the background, so the next scans step over
+/// no tombstone; answer and gas unchanged.
 #[test]
-fn a_block_flush_that_deletes_order_rows_compacts_them_away() {
+fn a_block_flush_that_deletes_level_rows_compacts_them_away() {
     let (_dir, db) = open_test_db();
-    seed_book(&db, BookMode::OrderRows, &[10, 11, 12]);
-    let a = Address::new([0x0A; 20]);
-    write_stored_order(&db, &a, 1, &stored(1)).unwrap();
+    seed_book(&db, BookMode::LevelAuthority, &[10, 11, 12]);
+    let prices: Vec<i64> = (101..=400).collect();
+    let runs_before = db.wait_background_compaction();
 
-    // Block 2: 300 more orders (book rows) and 300 cf_native_orders rows.
+    // Block 2: 300 better bid levels; block 3: cancel them; both flushed
+    // through the block overlay like the node.
     let ov = NativeStateOverlay::new(db.clone());
-    let mut ctx = ctx_on(ov.clone(), 2, BookMode::OrderRows);
-    let block: Vec<_> = (0..300).map(|i| place(true, 1 + i % 5)).collect();
-    run_block(&mut ctx, &block);
-    for id in 1_000..1_300u128 {
-        ov.put_cf_raw(CF_NATIVE_ORDERS, &orders_key(&a, id), b"x")
-            .unwrap();
-    }
+    let mut ctx = ctx_on(ov.clone(), 2, BookMode::LevelAuthority);
+    run_block(
+        &mut ctx,
+        &prices.iter().map(|&p| place(true, p)).collect::<Vec<_>>(),
+    );
     drop(ctx);
     ov.flush_with_native_trie_stats(&db, None, None, None)
         .unwrap();
     db.inner()
         .flush_cf(db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap())
         .unwrap();
-    db.inner()
-        .flush_cf(db.cf_handle(CF_NATIVE_ORDERS).unwrap())
-        .unwrap();
-    let runs_before = db.wait_background_compaction();
 
-    // Block 3: cancel them all, delete the rows.
     let ov = NativeStateOverlay::new(db.clone());
-    let mut ctx = ctx_on(ov.clone(), 3, BookMode::OrderRows);
-    let ids = churn_ids(&ctx, 10);
+    let mut ctx = ctx_on(ov.clone(), 3, BookMode::LevelAuthority);
+    let ids = {
+        let book = ctx.order_books.get(&1).expect("book");
+        book.orders_for_trader(&MAKER)
+            .iter()
+            .filter(|o| o.price > fp(100))
+            .map(|o| o.id)
+            .collect::<Vec<_>>()
+    };
     assert_eq!(ids.len(), 300);
-    let cancels: Vec<_> = ids
-        .iter()
-        .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
-        .collect();
-    run_block(&mut ctx, &cancels);
-    for id in 1_000..1_300u128 {
-        ov.delete_cf_raw(CF_NATIVE_ORDERS, &orders_key(&a, id))
-            .unwrap();
-    }
+    run_block(
+        &mut ctx,
+        &ids.iter()
+            .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
+            .collect::<Vec<_>>(),
+    );
     drop(ctx);
     let book_before = order_book(&ov, &mut ReadMeter::with_max(30_000_000)).unwrap();
     ov.flush_with_native_trie_stats(&db, None, None, None)
@@ -988,7 +869,7 @@ fn a_block_flush_that_deletes_order_rows_compacts_them_away() {
         "the delete flush scheduled a compaction ({runs_before:?} -> {done})"
     );
 
-    let ((book, book_gas), skipped) = deletes_skipped(|| {
+    let ((book, gas), skipped) = deletes_skipped(|| {
         gas_of(
             &db,
             ADDR_ORDER_BOOK_READER,
@@ -1002,11 +883,5 @@ fn a_block_flush_that_deletes_order_rows_compacts_them_away() {
     );
     assert_eq!(book, book_before);
     assert_eq!(arrays(&book, 4)[0], vec![raw(12), raw(11), raw(10)]);
-    assert_eq!(book_gas, 16_400 + 3 * ROW + (8 + 6) * WORD);
-    let (_, skipped) =
-        deletes_skipped(|| open_orders(&db, &a, &mut ReadMeter::with_max(30_000_000)).unwrap());
-    assert_eq!(
-        skipped, 0,
-        "getOpenOrders still walks {skipped} tombstones after the compaction"
-    );
+    assert_eq!(gas, 16_400 + 3 * ROW + (8 + 6) * WORD);
 }

@@ -248,37 +248,32 @@ fn order_book_reader_get_position() {
     assert_eq!(entry, fp(50_000).raw() as u128);
 }
 
+/// s99 owner decision: getOpenOrders is removed from 0x0800 (it read
+/// cf_native_orders, which no production code writes, so it always answered
+/// empty). Its selector now reverts exactly like any unknown selector.
 #[test]
-fn order_book_reader_get_open_orders() {
+fn order_book_reader_get_open_orders_is_an_unknown_selector() {
     let (_dir, db) = setup();
-    let trader = addr(1);
-
-    // Write stored orders
-    let order1 = StoredOrder {
-        order_id: 1001,
-        price: fp(49_000),
-        remaining_qty: fp(3),
-        side: 0, // Buy
-    };
-    let order2 = StoredOrder {
-        order_id: 1002,
-        price: fp(51_000),
-        remaining_qty: fp(7),
-        side: 1, // Sell
-    };
-    write_stored_order(&db, &trader, 1, &order1).unwrap();
-    write_stored_order(&db, &trader, 1, &order2).unwrap();
-
-    // Call precompile
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = build_input(
         "getOpenOrders(address,bytes32)",
-        &[encode_addr(&trader), encode_market_id(1)],
+        &[encode_addr(&addr(1)), encode_market_id(1)],
     );
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
-
-    // Should have 4 dynamic arrays with 2 elements each
-    assert!(output.len() > 128);
+    let sel = u32::from_be_bytes(input[..4].try_into().unwrap());
+    let result = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
+    assert!(
+        matches!(result, Err(CoreError::UnknownSelector(s)) if s == sel),
+        "{result:?}"
+    );
+    let bogus = build_input(
+        "noSuchReader(address,bytes32)",
+        &[encode_addr(&addr(1)), encode_market_id(1)],
+    );
+    let other = execute_precompile(&address, &bogus, &addr(0), &db, 100, 0);
+    assert!(
+        matches!(other, Err(CoreError::UnknownSelector(_))),
+        "{other:?}"
+    );
 }
 
 // ============================================================================
@@ -531,7 +526,7 @@ fn place_order_input(order_type: u8) -> Vec<u8> {
 /// queue drains next block (global counter), so it cannot be known here. The
 /// precompile used to return a synthetic `(block + 1) << 64 | seq` that never
 /// matched it (a later cancelOrder with it cancelled nothing). It now returns
-/// zero: no id; contracts read their orders back via getOpenOrders.
+/// zero: no id (the 0x0800 getOpenOrders reader was removed in s99).
 #[test]
 fn core_writer_place_order_returns_no_synthetic_order_id() {
     let (_dir, db) = setup();

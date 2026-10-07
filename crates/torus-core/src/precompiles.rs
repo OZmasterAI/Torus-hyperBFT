@@ -51,12 +51,10 @@ pub const GAS_PRECOMPILE_READ_PER_ROW: u64 = 500;
 /// Gas per 32-byte word a reader returned, and per 32 bytes of a classic
 /// whole-book blob it read (sized and charged before it is read).
 pub const GAS_PRECOMPILE_READ_PER_WORD: u64 = 20;
-/// Most orders (book rows) one getOpenOrders / getOrderBook call reads (s99
-/// cap, no revert): getOpenOrders answers the trader's first 64 orders in
-/// key (order id) order; getOrderBook answers the best 32 levels per side in
-/// mode 2 and aggregates the market's first 64 orders by id in mode 1 (see
-/// [`book_levels`]).
-pub const READER_MAX_ORDERS: u64 = 64;
+/// Most price levels per side one getOrderBook call answers (s99 owner
+/// decision, final): the 64 best bids and the 64 best asks of a mode 2 / 3
+/// market (level rows), no revert past the cap (see [`book_levels`]).
+pub const READER_MAX_LEVELS_PER_SIDE: u64 = 64;
 /// State-mutating writes (SSTORE equivalent range).
 pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
@@ -147,8 +145,9 @@ impl ReadMeter {
 }
 
 /// Consensus rows of `cf` whose key starts with `prefix`, in key order, at
-/// most `max_rows` (the first ones; `None` = all), each charged a row. Only keys the running state hash covers
-/// (`running_hash::key_is_hashed`) are charged and returned: a node-local row
+/// most `max_rows` (the first ones; `None` = all), each charged a row. Only
+/// keys the running state hash covers (`running_hash::key_is_hashed`) are
+/// charged and returned: a node-local row
 /// (the `__book_mode__` marker in `cf_native_markets`) is skipped, so the
 /// charge — a block result — is the same on every node.
 ///
@@ -225,7 +224,7 @@ fn scan_prefix_metered(
 }
 
 /// Base gas cost for a precompile by address ID (a reader's full cost is
-/// [`reader_gas`] of the units it used).
+/// [`reader_gas`] of the gas its [`ReadMeter`] used).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
         0x0800..=0x0803 => GAS_PRECOMPILE_READ,
@@ -633,10 +632,6 @@ fn order_book_reader(
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
         read_position(state_db, &trader, market_id, now)
-    } else if sel == selector_for("getOpenOrders(address,bytes32)") {
-        let trader = abi::decode_address(&abi::word(input, 0)?);
-        let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_open_orders(state_db, &trader, market_id, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -665,8 +660,8 @@ type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
 /// GAS / WORK: metered by `meter` ([`ReadMeter`]): 500 per book row read
 /// (20 per 32 bytes of a classic blob, sized and charged before it is read)
 /// and 20 per word returned; the market's rows are scanned only up to the
-/// budget and the 64-order cap ([`READER_MAX_ORDERS`]), and only this
-/// market's hashed rows are read (see [`book_levels`]).
+/// budget and the 64-levels-per-side cap ([`READER_MAX_LEVELS_PER_SIDE`]),
+/// and only this market's hashed rows are read (see [`book_levels`]).
 fn read_order_book(
     state_db: &impl StateBackend,
     market_id: MarketId,
@@ -708,16 +703,19 @@ fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreE
 /// * Classic iff the market's 8-byte whole-book key exists: sized with a
 ///   length probe and charged (20 gas per 32 bytes) BEFORE it is read, then
 ///   decoded whole (a blob cannot be read in part; no cap).
-/// * Mode 2 (level rows, `market ‖ 0x03 ‖ side ‖ price`): the best
-///   [`READER_MAX_ORDERS`] / 2 = 32 levels per side, best-first (two bounded
-///   scans, bids then asks).
-/// * Mode 1 (order rows, `market ‖ 0x01 ‖ order_id`, read when the market has
-///   no level row): the market's first 64 resting orders in order-id order
-///   (the oldest), aggregated per price — a partial book whenever the market
-///   rests more than 64 orders, since the root CF keeps no price index.
+/// * Modes 2 / 3 (level rows, `market ‖ 0x03 ‖ side ‖ price`, 26-byte keys):
+///   the [`READER_MAX_LEVELS_PER_SIDE`] (64) best levels per side, best-first
+///   (two bounded scans, bids then asks: at most 128 rows). A key of another
+///   length under those prefixes is a corrupt row store: revert.
+/// * Mode 1 (order rows `market ‖ 0x01 ‖ order_id`, no price index): not
+///   served (s99 owner decision, final). When the market has no level row, one
+///   order row is probed (charged, 500 gas); if there is one, the call reverts
+///   as an unsupported layout (16,400 + 500 = 16,900 gas through the EVM).
 ///
 /// Meta and stop rows are not read. A market with neither level nor order
-/// rows is an empty book.
+/// rows is an empty book. Not detected here (it would cost an extra read per
+/// call): a market holding both level and order rows, or rows without a meta
+/// row; the RPC readers (`book_reader::read_book_depth`) still reject those.
 fn book_levels(
     state_db: &impl StateBackend,
     market_id: MarketId,
@@ -733,34 +731,31 @@ fn book_levels(
         return classic_levels(&data);
     }
     let sub = |tags: &[u8]| [&key[..], tags].concat();
-    let per_side = Some(READER_MAX_ORDERS / 2);
-    let mut rows = scan_prefix_metered(
-        state_db,
-        CF_NATIVE_ORDER_BOOKS,
-        &sub(&[ROW_TAG_LEVEL, SIDE_TAG_BID]),
-        per_side,
-        meter,
-    )?;
-    rows.extend(scan_prefix_metered(
-        state_db,
-        CF_NATIVE_ORDER_BOOKS,
-        &sub(&[ROW_TAG_LEVEL, SIDE_TAG_ASK]),
-        per_side,
-        meter,
-    )?);
-    let layout = if rows.is_empty() {
-        rows = scan_prefix_metered(
-            state_db,
-            CF_NATIVE_ORDER_BOOKS,
-            &sub(&[ROW_TAG_ORDER]),
-            Some(READER_MAX_ORDERS),
-            meter,
-        )?;
-        BookLayout::OrderRows
-    } else {
-        BookLayout::LevelAuthority
+    let side = |tag: u8, meter: &mut ReadMeter| {
+        let prefix = sub(&[ROW_TAG_LEVEL, tag]);
+        let max = Some(READER_MAX_LEVELS_PER_SIDE);
+        scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &prefix, max, meter)
     };
-    let depth = depth_from_rows(market_id, layout, &rows)?;
+    let mut rows = side(SIDE_TAG_BID, meter)?;
+    rows.extend(side(SIDE_TAG_ASK, meter)?);
+    if let Some((k, _)) = rows.iter().find(|(k, _)| k.len() != 26) {
+        return Err(CoreError::BookLayout(format!(
+            "market {market_id}: level row key of {} bytes (corrupt row store)",
+            k.len()
+        )));
+    }
+    if rows.is_empty() {
+        let orders = sub(&[ROW_TAG_ORDER]);
+        if !scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &orders, Some(1), meter)?
+            .is_empty()
+        {
+            return Err(CoreError::BookLayout(format!(
+                "market {market_id}: getOrderBook does not serve the order-row layout \
+                 (TORUS_BOOK_ROWS=1)"
+            )));
+        }
+    }
+    let depth = depth_from_rows(market_id, BookLayout::LevelAuthority, &rows)?;
     let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
         levels
             .into_iter()
@@ -815,50 +810,6 @@ fn read_position(
     out.extend_from_slice(&abi::encode_fp_as_i128(pos.realized_pnl));
     out.extend_from_slice(&abi::encode_fp_as_u128(pos.isolated_margin));
     Ok(out)
-}
-
-/// getOpenOrders → (bytes32[] order_ids, uint128[] prices, uint128[] quantities, uint8[] sides)
-///
-/// The trader's first [`READER_MAX_ORDERS`] (64) rows of the market in key
-/// (order id) order; no revert past the cap.
-fn read_open_orders(
-    state_db: &impl StateBackend,
-    trader: &Address,
-    market_id: MarketId,
-    meter: &mut ReadMeter,
-) -> Result<Vec<u8>, CoreError> {
-    // Prefix: trader(20) + market_id(8)
-    let mut prefix = [0u8; 28];
-    prefix[..20].copy_from_slice(trader.as_slice());
-    prefix[20..28].copy_from_slice(&market_id.to_be_bytes());
-
-    let entries = scan_prefix_metered(
-        state_db,
-        CF_NATIVE_ORDERS,
-        &prefix,
-        Some(READER_MAX_ORDERS),
-        meter,
-    )?;
-    let mut order_ids = Vec::new();
-    let mut prices = Vec::new();
-    let mut quantities = Vec::new();
-    let mut sides = Vec::new();
-
-    for (_key, value) in &entries {
-        if let Ok(order) = StoredOrder::try_from_slice(value) {
-            order_ids.push(abi::encode_order_id(order.order_id));
-            prices.push(abi::encode_fp_as_u128(order.price));
-            quantities.push(abi::encode_fp_as_u128(order.remaining_qty));
-            sides.push(abi::encode_u8(order.side));
-        }
-    }
-
-    Ok(abi::encode_arrays_response(&[
-        &order_ids,
-        &prices,
-        &quantities,
-        &sides,
-    ]))
 }
 
 // ============================================================================
@@ -1238,8 +1189,7 @@ fn core_writer(
         CoreWriterQueue::enqueue(state_db, &action)?;
         // HL-parity: no order id. The executor assigns the real one from the
         // global counter when the queue drains next block, so it cannot be known
-        // here (the old `(block + 1) << 64 | seq` never matched it). Contracts
-        // read their orders back via getOpenOrders (0x0800).
+        // here (the old `(block + 1) << 64 | seq` never matched it).
         Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
         let order_id = abi::decode_order_id(&abi::word(input, 0)?);
@@ -1825,45 +1775,6 @@ impl BorshDeserialize for OrderBookSnapshot {
     }
 }
 
-/// An open order stored in CF_NATIVE_ORDERS.
-/// Key: trader(20) + market_id(8) + order_id(16) = 44 bytes.
-/// Value: borsh-serialized StoredOrder.
-#[derive(Clone, Debug)]
-pub struct StoredOrder {
-    pub order_id: OrderId,
-    pub price: FixedPoint,
-    pub remaining_qty: FixedPoint,
-    pub side: u8, // 0 = Buy, 1 = Sell
-}
-
-impl BorshSerialize for StoredOrder {
-    fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
-        w.write_all(&self.order_id.to_be_bytes())?;
-        borsh_write_fp(&self.price, w)?;
-        borsh_write_fp(&self.remaining_qty, w)?;
-        w.write_all(&[self.side])?;
-        Ok(())
-    }
-}
-
-impl BorshDeserialize for StoredOrder {
-    fn deserialize_reader<R: IoRead>(r: &mut R) -> io::Result<Self> {
-        let mut ob = [0u8; 16];
-        r.read_exact(&mut ob)?;
-        let order_id = u128::from_be_bytes(ob);
-        let price = borsh_read_fp(r)?;
-        let remaining_qty = borsh_read_fp(r)?;
-        let mut sb = [0u8; 1];
-        r.read_exact(&mut sb)?;
-        Ok(Self {
-            order_id,
-            price,
-            remaining_qty,
-            side: sb[0],
-        })
-    }
-}
-
 /// Write a legacy order-book snapshot to CF_NATIVE_ORDER_BOOKS under the
 /// CLASSIC 8-byte market key.
 ///
@@ -1900,23 +1811,6 @@ pub fn write_order_book_snapshot(
     let key = market_id.to_be_bytes();
     let data = borsh::to_vec(snapshot).map_err(|e| CoreError::Borsh(e.to_string()))?;
     state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)?;
-    Ok(())
-}
-
-/// Write a stored order to CF_NATIVE_ORDERS.
-/// Key: trader(20) + market_id(8) + order_id(16).
-pub fn write_stored_order(
-    state_db: &StateDb,
-    trader: &Address,
-    market_id: MarketId,
-    order: &StoredOrder,
-) -> Result<(), CoreError> {
-    let mut key = [0u8; 44];
-    key[..20].copy_from_slice(trader.as_slice());
-    key[20..28].copy_from_slice(&market_id.to_be_bytes());
-    key[28..44].copy_from_slice(&order.order_id.to_be_bytes());
-    let data = borsh::to_vec(order).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    state_db.put_cf_raw(CF_NATIVE_ORDERS, &key, &data)?;
     Ok(())
 }
 

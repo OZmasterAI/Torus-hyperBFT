@@ -83,13 +83,19 @@ pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
 /// that deletes rows under it (the submission prune) schedules a background
 /// compaction of the range (s89 fix B, [`crate::StateDb::compact_pruned_submissions_in_background`]).
 pub const ORACLE_SUBMISSION_PREFIX: &[u8] = b"sub";
-/// s99 (c): the CFs whose order rows the reader precompiles scan
-/// (getOrderBook: mode 1 order rows / mode 2 level rows of
-/// `CF_NATIVE_ORDER_BOOKS`; getOpenOrders: `CF_NATIVE_ORDERS`). A flush that
-/// deletes rows in one of them compacts the span of those deletes in the
-/// background ([`crate::StateDb::compact_range_in_background`]), so the
-/// tombstones do not slow every later scan until RocksDB's own compaction.
-pub const READER_SCANNED_ORDER_CFS: [&str; 2] = [CF_NATIVE_ORDER_BOOKS, CF_NATIVE_ORDERS];
+/// s99 (c): the rows the reader precompiles scan, as `(CF, market prefix
+/// length)`: getOrderBook's level rows in `CF_NATIVE_ORDER_BOOKS`, grouped by
+/// the 8-byte market id. A flush that deletes such rows counts them per market
+/// ([`crate::StateDb::note_scanned_deletes`]), and a market whose uncompacted
+/// deletes reach [`SCANNED_DELETES_COMPACTION_THRESHOLD`] has their span
+/// compacted in the background, so the tombstones do not slow every later scan
+/// until RocksDB's own compaction.
+pub const READER_SCANNED_CFS: [(&str, usize); 1] = [(CF_NATIVE_ORDER_BOOKS, 8)];
+/// Uncompacted deletes per market that trigger its background compaction.
+/// 64: at most 63 tombstones linger in a market below it, ~130 ns each, so an
+/// empty-answer getOrderBook (16,560 gas) pays at most ~8 us extra, a 30M-gas
+/// block of them ~15 ms more (`docs/perf/read-precompile-gas.md`, s99).
+pub const SCANNED_DELETES_COMPACTION_THRESHOLD: u64 = 64;
 /// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_NATIVE_USER_TRADES: &str = "cf_native_user_trades";
