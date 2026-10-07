@@ -47,8 +47,8 @@ type ListFailure = (usize, u32, u32, Outcome, FailureReason, String);
 
 /// Row 50: an order placement refused for a reason with an HL `*Rejected`
 /// status is `Rejected` (the book's refusals and zero-fill cancels, and the
-/// placement margin / reduce-only checks); anything else that did not
-/// execute `Failed`.
+/// placement margin / reduce-only / tick / price-band checks); anything else
+/// that did not execute `Failed`.
 fn outcome(action: &NativeAction, reason: FailureReason) -> Outcome {
     let placement = matches!(action, NativeAction::PlaceOrder(_) | NativeAction::PlaceOrderBatch(_));
     if placement && reason.hl_rejected_name().is_some() {
@@ -229,8 +229,14 @@ pub fn encode_status(
 ) -> Vec<u8> {
     let bytes = status.encode();
     if let Some(m) = metrics {
+        let rejected = status
+            .native_failed
+            .iter()
+            .filter(|f| f.outcome == Outcome::Rejected)
+            .count();
         m.exec_action_failures
-            .inc_by(status.native_failed.len() as u64);
+            .inc_by((status.native_failed.len() - rejected) as u64);
+        m.exec_action_rejections.inc_by(rejected as u64);
         m.exec_action_status_bytes.inc_by(bytes.len() as u64);
     }
     bytes
@@ -353,8 +359,10 @@ mod tests {
 
     /// Row 50: an order placement refused for an HL rejection reason is
     /// recorded `Rejected`; any other failure (and a modify refused for
-    /// margin) stays `Failed`. A batch records its first order that did not
-    /// execute, with that order's outcome, and counts every such order.
+    /// margin or tick) stays `Failed`. A batch records its first order that
+    /// did not execute, with that order's outcome, and counts every such
+    /// order. Row 50 review (S3): off-tick and price-band placements are
+    /// rejected too (`tickRejected`, `oracleRejected`).
     #[test]
     fn order_rejections_are_recorded_rejected() {
         use torus_state::action_status::Outcome;
@@ -365,6 +373,9 @@ mod tests {
             (a, NativeAction::ModifyOrder { order_id: 1, new_price: None, new_qty: None }),
             (a, NativeAction::PlaceOrder(order(2))),
             (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2)])),
+            (a, NativeAction::PlaceOrder(order(3))),
+            (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2)])),
+            (a, NativeAction::ModifyOrder { order_id: 2, new_price: None, new_qty: None }),
         ];
         let result = batch(vec![
             err(FailureReason::IocCancel, "ioc"),
@@ -374,11 +385,15 @@ mod tests {
             ok(),
             err(FailureReason::Margin, "modify margin"),
             err(FailureReason::Margin, "insufficient margin"),
-            err(FailureReason::Tick, "tick"),
+            err(FailureReason::Lot, "lot"),
             err(FailureReason::FokCancel, "fok"),
+            err(FailureReason::Tick, "tick"),
+            ok(),
+            err(FailureReason::PriceBand, "band"),
+            err(FailureReason::Tick, "modify tick"),
         ]);
         let failures =
-            native_failures(&[0, 1, 2, 3, 4], [(&list, &[0, 1, 2, 3, 4], &mut result.clone()), (&[], &[], &mut batch(vec![]))]);
+            native_failures(&[0, 1, 2, 3, 4, 5, 6, 7], [(&list, &[0, 1, 2, 3, 4, 5, 6, 7], &mut result.clone()), (&[], &[], &mut batch(vec![]))]);
         let got: Vec<_> = failures
             .iter()
             .map(|f| (f.index, f.order, f.failed_orders, f.outcome, f.reason, f.message.as_str()))
@@ -390,14 +405,50 @@ mod tests {
                 (1, 1, 2, Outcome::Rejected, FailureReason::BadAloPx, "alo"),
                 (2, 0, 1, Outcome::Failed, FailureReason::Margin, "modify margin"),
                 (3, 0, 1, Outcome::Rejected, FailureReason::Margin, "insufficient margin"),
-                (4, 0, 2, Outcome::Failed, FailureReason::Tick, "tick"),
+                (4, 0, 2, Outcome::Failed, FailureReason::Lot, "lot"),
+                (5, 0, 1, Outcome::Rejected, FailureReason::Tick, "tick"),
+                (6, 1, 1, Outcome::Rejected, FailureReason::PriceBand, "band"),
+                (7, 0, 1, Outcome::Failed, FailureReason::Tick, "modify tick"),
             ]
         );
         assert!(failures.iter().all(|f| f.orders.is_empty()), "per-order statuses not written yet");
         assert_eq!(
             failures,
-            native_failures_by_content(&list, &[0, 1, 2, 3, 4], [(&list, result), (&[], batch(vec![]))])
+            native_failures_by_content(&list, &[0, 1, 2, 3, 4, 5, 6, 7], [(&list, result), (&[], batch(vec![]))])
         );
+    }
+
+    /// Row 50 review (S1): `torus_exec_action_failures` counts only failed
+    /// entries and `torus_exec_action_rejections` only rejected ones; the
+    /// bytes counter counts the record.
+    #[test]
+    fn encode_status_counts_failures_and_rejections_apart() {
+        let m = torus_telemetry::Metrics::new();
+        let rejected = |index| NativeActionFailure {
+            outcome: Outcome::Rejected,
+            ..NativeActionFailure::new(index, 0, 1, FailureReason::IocCancel, "ioc".into())
+        };
+        let status = |native_failed| BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false; 4],
+            native_failed,
+        };
+        let failed = NativeActionFailure::new(0, 0, 1, FailureReason::OpenLimit, "limit".into());
+        let counts = |m: &torus_telemetry::Metrics| (m.exec_action_failures.get(), m.exec_action_rejections.get());
+
+        let one_failed = encode_status(&status(vec![failed.clone()]), Some(&m));
+        assert_eq!(counts(&m), (1, 0), "a failed action bumps failures only");
+        let one_rejected = encode_status(&status(vec![rejected(1)]), Some(&m));
+        assert_eq!(counts(&m), (1, 1), "a rejected action bumps rejections only");
+        let mixed = encode_status(&status(vec![failed, rejected(2), rejected(3)]), Some(&m));
+        assert_eq!(counts(&m), (2, 3));
+        assert_eq!(
+            m.exec_action_status_bytes.get(),
+            (one_failed.len() + one_rejected.len() + mixed.len()) as u64
+        );
+        let text = m.encode();
+        assert!(text.contains("torus_exec_action_failures_total 2\n"), "{text}");
+        assert!(text.contains("torus_exec_action_rejections_total 3\n"), "{text}");
     }
 
     #[test]

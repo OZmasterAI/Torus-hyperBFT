@@ -1338,11 +1338,24 @@ fn no_other_sender_changes_a_non_pool_sell_reservation(path: Path) {
         actions.push(place(t, limit(2, false, 999, 1)));
         let r = run(&mut ctx, path, &actions);
         let what = format!("{path:?} {shape}");
-        // Row 50: the m2 sell either fills or, cut before its first fill
-        // (some shapes), is rejected for margin at match (gas kept).
+        // Row 50: the m2 sell's best bid decides. At the maker's 1,000
+        // (control, ioc: X's IOC lifts the ask and leaves; unfunded: X's bid
+        // is refused) it fills 1 within its reservation + top-up. At X's
+        // resting 1,050 (gtc_rests, post_only) or 1,020 (many) the first fill
+        // needs more than that and the pool is m1's alone, so it is cut
+        // before its first fill: rejected for margin at match (HL
+        // `perpMarginRejected`, gas kept), nothing opened in m2.
         let last = r.last().unwrap();
-        let cut = !last.success && last.reason == torus_state::action_status::FailureReason::Margin && last.gas_used == 1000;
-        assert!(r[0].success && (last.success || cut), "{what}: {r:?}");
+        let cut = matches!(shape, "gtc_rests" | "post_only" | "many");
+        assert!(r[0].success, "{what}: {r:?}");
+        if cut {
+            assert!(!last.success && last.reason == torus_state::action_status::FailureReason::Margin, "{what}: {last:?}");
+            assert_eq!(last.gas_used, 1000, "{what}: rejected at match keeps the gas");
+            assert!(last.error.as_deref().is_some_and(|e| e.starts_with("insufficient margin")), "{what}: {last:?}");
+        } else {
+            assert!(last.success, "{what}: {last:?}");
+        }
+        assert_eq!(pos_in(&ctx, &t, 2), if cut { FixedPoint::ZERO } else { -fp(1) }, "{what}: m2 position");
         assert_eq!(pos_in(&ctx, &t, 1), -fp(10), "{what}: the pool kept its 5");
         assert_eq!(top_ups(&metrics), [1, 0, 0], "{what}: the same top-up in every shape");
         m1_outcomes.push((pos_in(&ctx, &t, 1), resting_in(&ctx, &t, 1)));

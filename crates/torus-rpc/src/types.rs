@@ -639,11 +639,12 @@ pub struct RpcBlockBody {
     /// or session, replayed nonce; no state change). `null` while the block
     /// has not executed on this node, or for a block executed before the
     /// record existed.
-    /// v2: `"failed"` too — executed, but the executor refused it (margin,
-    /// open-order limit, off-tick price, ...); see `native_action_failures`.
+    /// v2: `"failed"` too — executed, but the executor refused it (open-order
+    /// limit, lot size, a modify's margin, ...); see `native_action_failures`.
     /// Row 50: `"rejected"` — an order refused with an HL `*Rejected`
     /// status (IOC / market / FOK without a fill, crossing PostOnly,
-    /// reduce-only that cannot reduce, margin, bad stop trigger).
+    /// reduce-only that cannot reduce, margin, bad stop trigger, off-tick
+    /// price, outside the price band).
     #[serde(default)]
     pub native_action_status: Option<Vec<String>>,
     /// v2: every `"failed"` (row 50: and `"rejected"`) native action,
@@ -720,6 +721,9 @@ mod action_failure_tests {
             (FailureReason::Margin, "perpMarginRejected"),
             (FailureReason::FokCancel, "fokCancelRejected"),
             (FailureReason::BadTriggerPx, "badTriggerPxRejected"),
+            // Review S3 (owner): off-tick and price-band placements.
+            (FailureReason::Tick, "tickRejected"),
+            (FailureReason::PriceBand, "oracleRejected"),
         ];
         let mut native_failed: Vec<_> = rejected
             .iter()
@@ -729,8 +733,8 @@ mod action_failure_tests {
                 ..NativeActionFailure::new(i as u32, 0, 1, *r, "msg".into())
             })
             .collect();
-        native_failed.push(NativeActionFailure::new(7, 0, 1, FailureReason::Margin, "modify".into()));
-        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 9], native_failed };
+        native_failed.push(NativeActionFailure::new(9, 0, 1, FailureReason::Margin, "modify".into()));
+        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 11], native_failed };
         let stored = BlockActionStatus::decode(&status.encode()).unwrap();
         let rpc = native_action_failures(&stored);
         let got: Vec<(&str, &str)> = rpc.iter().map(|f| (f.status.as_str(), f.reason.as_str())).collect();
@@ -738,7 +742,7 @@ mod action_failure_tests {
         want.push(("failed", "margin"));
         assert_eq!(got, want);
         let labels = native_action_labels(&stored);
-        assert_eq!(labels[..7], ["rejected"; 7]);
-        assert_eq!(labels[7..], ["failed", "executed"]);
+        assert_eq!(labels[..9], ["rejected"; 9]);
+        assert_eq!(labels[9..], ["failed", "executed"]);
     }
 }

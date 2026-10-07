@@ -5,11 +5,11 @@
 //! runs every action and SKIPS (no state change) any that fails its validity
 //! check (unresolvable signature or session, replayed or duplicate nonce,
 //! undecodable EVM tx, a tx revm refuses). A native action that passes those
-//! checks executes, and the executor may still refuse it (margin, open-order
-//! limit, off-tick price, ...): it then FAILED. Row 50: an order refused with
-//! a Hyperliquid `*Rejected` status (the book refused it or cancelled it
-//! without a fill, or the placement margin / reduce-only check) was REJECTED.
-//! This record says which, so the RPC and the explorer show every action as
+//! checks executes, and the executor may still refuse it (open-order limit,
+//! lot size, a modify's margin, ...): it then FAILED. Row 50: an order
+//! refused with a Hyperliquid `*Rejected` status (the book refused it or
+//! cancelled it without a fill, or a placement margin / reduce-only / tick /
+//! price-band check) was REJECTED. This record says which, so the RPC and the explorer show every action as
 //! executed, skipped, failed or rejected.
 //!
 //! One row per executed block that carries at least one native action or EVM
@@ -67,7 +67,8 @@ pub enum FailureReason {
     Margin = 1,
     /// Open-order limit reached (plain, or the reduce-only / stop rule).
     OpenLimit = 2,
-    /// A limit (or stop-limit limit, or modify) price off the market tick.
+    /// A limit (or stop-limit limit, or modify) price off the market tick
+    /// (a placement: HL `tickRejected`).
     Tick = 3,
     /// Quantity below the market lot size (or a modify quantity <= 0).
     Lot = 4,
@@ -152,6 +153,8 @@ impl FailureReason {
     /// [`Outcome::Rejected`] (the rest stay [`Outcome::Failed`]).
     pub fn hl_rejected_name(self) -> Option<&'static str> {
         Some(match self {
+            Self::Tick => "tickRejected",
+            Self::PriceBand => "oracleRejected",
             Self::Margin => "perpMarginRejected",
             Self::ReduceOnly => "reduceOnlyRejected",
             Self::IocCancel => "iocCancelRejected",
@@ -176,8 +179,8 @@ pub enum Outcome {
     /// status).
     Failed = 1,
     /// An order refused with an HL `*Rejected` status (the book refused or
-    /// cancelled it without a fill, or a placement margin / reduce-only
-    /// check): see [`FailureReason::hl_rejected_name`].
+    /// cancelled it without a fill, or a placement margin / reduce-only /
+    /// tick / price-band check): see [`FailureReason::hl_rejected_name`].
     Rejected = 2,
 }
 
@@ -515,6 +518,86 @@ mod tests {
         assert_eq!(BlockActionStatus::decode(&bad), None);
     }
 
+    /// A v3 record of one entry for native action 0 with one per-order
+    /// status, and the offsets of its entry outcome byte, its order_count and
+    /// its per-order outcome byte.
+    fn v3_one_entry() -> (Vec<u8>, usize, usize, usize) {
+        let mut entry = failure(0, 0, 1, FailureReason::IocCancel, "ab");
+        entry.outcome = Outcome::Rejected;
+        entry.orders = vec![OrderOutcome {
+            outcome: Outcome::Rejected,
+            reason: FailureReason::IocCancel,
+            message: "c".into(),
+        }];
+        let bytes = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false],
+            native_failed: vec![entry],
+        }
+        .encode();
+        // version 1 + counts 8 + bitmaps 0+1 + entry count 4 + index, order,
+        // count 12 -> the entry outcome; + outcome, reason, msg_len 1+1+1 +
+        // msg 2 -> order_count; + 4 -> the order's outcome.
+        let (outcome_at, count_at) = (26, 31);
+        assert_eq!(bytes[outcome_at], Outcome::Rejected as u8);
+        assert_eq!(&bytes[count_at..count_at + 4], &1u32.to_be_bytes());
+        assert_eq!(bytes[count_at + 4], Outcome::Rejected as u8);
+        assert_eq!(bytes.len(), count_at + 4 + 1 + 1 + 1 + 1, "the record ends with the order's msg");
+        (bytes, outcome_at, count_at, count_at + 4)
+    }
+
+    /// Row 50 review: a v3 per-order list shorter than its order_count (cut
+    /// mid-order, or a count larger than the bytes, up to u32::MAX) is a
+    /// truncated record: `None`, like every other truncation, never a panic
+    /// or an allocation sized by the count.
+    #[test]
+    fn v3_truncated_per_order_list_does_not_decode() {
+        let (bytes, _, count_at, _) = v3_one_entry();
+        assert!(BlockActionStatus::decode(&bytes).is_some(), "the base record decodes");
+        for cut in count_at..bytes.len() {
+            assert_eq!(BlockActionStatus::decode(&bytes[..cut]), None, "cut at {cut}");
+        }
+        for count in [2u32, 3, u32::MAX] {
+            let mut more = bytes.clone();
+            more[count_at..count_at + 4].copy_from_slice(&count.to_be_bytes());
+            assert_eq!(BlockActionStatus::decode(&more), None, "order_count {count}");
+        }
+        // A count smaller than the list leaves bytes over: also rejected.
+        let mut fewer = bytes.clone();
+        fewer[count_at..count_at + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(BlockActionStatus::decode(&fewer), None, "order_count 0 with one order");
+    }
+
+    /// Row 50 review: an outcome code this reader does not know (a newer
+    /// writer) reads as `Failed`, in an entry and in a per-order status (as
+    /// an unknown reason code reads as `Other`); no panic. Only `Executed`
+    /// is refused, and only for an entry.
+    #[test]
+    fn v3_unknown_outcome_code_reads_as_failed() {
+        let (bytes, outcome_at, _, order_outcome_at) = v3_one_entry();
+        for code in 3..=255u8 {
+            let mut entry = bytes.clone();
+            entry[outcome_at] = code;
+            let status = BlockActionStatus::decode(&entry).expect("unknown entry outcome decodes");
+            assert_eq!(status.native_failed[0].outcome, Outcome::Failed, "code {code}");
+            assert_eq!(status.native_label(0), "failed", "code {code}");
+            assert_eq!(status.native_failed[0].orders[0].outcome, Outcome::Rejected);
+
+            let mut order = bytes.clone();
+            order[order_outcome_at] = code;
+            let status = BlockActionStatus::decode(&order).expect("unknown order outcome decodes");
+            assert_eq!(status.native_failed[0].orders[0].outcome, Outcome::Failed, "code {code}");
+            assert_eq!(status.native_failed[0].outcome, Outcome::Rejected);
+        }
+        let mut executed_order = bytes.clone();
+        executed_order[order_outcome_at] = Outcome::Executed as u8;
+        let status = BlockActionStatus::decode(&executed_order).expect("an executed order decodes");
+        assert_eq!(status.native_failed[0].orders[0].outcome, Outcome::Executed);
+        let mut executed_entry = bytes;
+        executed_entry[outcome_at] = Outcome::Executed as u8;
+        assert_eq!(BlockActionStatus::decode(&executed_entry), None);
+    }
+
     /// The exact bytes the v2 writer produced (s92 to row 50) still read:
     /// every entry is a failure, no per-order statuses.
     #[test]
@@ -539,9 +622,13 @@ mod tests {
     /// Row 50: the rejection reasons and their Hyperliquid status names
     /// (`orderStatus`; FOK has none in HL: `fokCancelRejected`, named like
     /// `iocCancelRejected`). Every other reason has no rejected name.
+    /// Row 50 review (S3, owner): off-tick -> `tickRejected`, outside the
+    /// price band -> `oracleRejected`.
     #[test]
     fn rejected_reasons_have_hyperliquid_names() {
         let named = [
+            (FailureReason::Tick, "tickRejected"),
+            (FailureReason::PriceBand, "oracleRejected"),
             (FailureReason::Margin, "perpMarginRejected"),
             (FailureReason::ReduceOnly, "reduceOnlyRejected"),
             (FailureReason::IocCancel, "iocCancelRejected"),

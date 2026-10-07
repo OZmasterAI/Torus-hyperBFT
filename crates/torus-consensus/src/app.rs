@@ -11285,12 +11285,12 @@ mod crash_recovery_tests {
     /// Blocks for the failure-record tests (market 1, tick = lot = 1):
     ///   1  fund A, B
     ///   2  0 A sell 100x1 GTC                       executes (rests)
-    ///      1 B buy 100x1000 GTC                     fails: margin
-    ///      2 A sell 100.5x1 GTC                     fails: off-tick
-    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   fails: order 1 off-tick, 2 failed
+    ///      1 B buy 100x1000 GTC                     rejected: margin
+    ///      2 A sell 100.5x1 GTC                     rejected: off-tick
+    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   rejected: order 1 off-tick, 2 failed
     ///      4 replay of block 1's A action           skipped
     ///      5 A cancel unknown order id              fails (pre-EVM list)
-    ///      6 B IOC buy 100.5x1                      fails: off-tick (pre-EVM list)
+    ///      6 B IOC buy 100.5x1                      rejected: off-tick (pre-EVM list)
     ///      7 A sell 100x1 GTC (same as 0, new nonce) executes
     ///   3  A sell 120x1 GTC                         executes (v1 record)
     fn failure_fixture_blocks() -> Vec<TorusBlock> {
@@ -11439,13 +11439,15 @@ mod crash_recovery_tests {
                     "{label}"
                 );
                 // Row 50: the margin-refused placement is rejected
-                // (perpMarginRejected); the rest stay failed.
+                // (perpMarginRejected); review S3: so are the off-tick
+                // placements (tickRejected: single, batch, IOC); the unknown
+                // cancel stays failed.
                 let labels: Vec<&str> = (0..8).map(|i| status.native_label(i)).collect();
                 assert_eq!(
                     labels,
                     vec![
-                        "executed", "rejected", "failed", "failed", "skipped", "failed", "failed",
-                        "executed"
+                        "executed", "rejected", "rejected", "rejected", "skipped", "failed",
+                        "rejected", "executed"
                     ],
                     "{label}"
                 );
@@ -11756,7 +11758,18 @@ mod crash_recovery_tests {
                 {
                     assert!(msgs[i].starts_with(want), "{label} #{i}: {:?}", msgs[i]);
                 }
-                assert_eq!(status.native_label(9), "executed", "{label}");
+                // Row 50 (+ review S3): placements refused for tick and
+                // margin are rejected; lot, price, open limit, batch cap and
+                // an unknown cancel stay failed.
+                let labels: Vec<&str> = (0..10).map(|i| status.native_label(i)).collect();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "rejected", "rejected", "failed", "failed", "failed", "rejected", "failed",
+                        "failed", "failed", "executed"
+                    ],
+                    "{label}"
+                );
                 dumps.push((label, dump_all_cfs(&db)));
             }
         }
@@ -17712,12 +17725,14 @@ mod crash_recovery_tests {
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
-        // Refused for the right reason: executed (not skipped), failed with
-        // `price_band`; the transfer executed.
+        // Refused for the right reason: executed (not skipped), rejected
+        // (review S3: HL `oracleRejected`) with `price_band`; the transfer
+        // executed.
         let s2 = action_status(&db, 2).expect("block 2 status");
         assert!(s2.native_skipped.iter().all(|s| !s), "block 2: nothing skipped (nonces in window)");
         assert_eq!(s2.native_failed.len(), 1, "block 2: only B's sell failed");
         assert_eq!(s2.native_failed[0].reason, FailureReason::PriceBand, "block 2: refused by the band");
+        assert_eq!(s2.native_failed[0].outcome, torus_state::action_status::Outcome::Rejected, "block 2: oracleRejected");
         dispatch_and_execute(&ctx, &db, &blocks[2]);
         let s3 = action_status(&db, 3).expect("block 3 status");
         assert!(s3.native_skipped.iter().all(|s| !s), "block 3: the transfer was executed, not skipped");
