@@ -3663,6 +3663,10 @@ mod tests {
     #[test]
     fn frozen_flush_identical_to_overlay_flush() {
         use crate::cf::{CF_CONSENSUS_META, CF_NATIVE_POSITIONS, META_NATIVE_APPLIED_HEIGHT};
+        // Both flushes resolve trie maintenance from the process-global flag; force it so a
+        // test forcing it on between them cannot make one write the stale marker and the other
+        // the maintained trie.
+        crate::native_trie::force_native_trie_maintenance_on_for_tests();
         let dump = |db: &StateDb| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
             crate::cf::ALL_CF_NAMES
                 .iter()
