@@ -180,11 +180,13 @@ impl NativeExecutor {
     /// included) of available + order margin + UPnL at ONE common price per
     /// market — a paged walk of every balance and position row. Fix list c
     /// (18c review; s750vs: -1,740.69 in the step the marks went stale): the
-    /// common price is 0 for every market (UPnL = -signed size x entry), not
-    /// the mark with unmarked positions at entry, which jumped whenever a
-    /// market gained or lost its mark. With OI symmetric, Σ UPnL of a market
-    /// is the same at any common price (at the mark too), so the sum stays
-    /// constant across a drain without transfers (within the escrow dust).
+    /// common price is 0 for every market (UPnL = -basis long, +basis short,
+    /// exactly), not the mark with unmarked positions at entry, which jumped
+    /// whenever a market gained or lost its mark. With OI symmetric, Σ UPnL
+    /// of a market is the same at any common price (at the mark too, up to
+    /// the mark x size truncation per position), so the sum stays exactly
+    /// constant across a drain without transfers (s100 item 2: one rounding
+    /// per fill; the escrow dust sweep is a transfer).
     /// Exact (`FixedPoint`, i128); the gauge is its f64. Sets the gauge and
     /// logs `liquidation: value sum`; a read error skips it.
     fn liquidation_value_sum<T: StateBackend>(ctx: &NativeExecContext<T>) {
@@ -1149,7 +1151,9 @@ impl NativeExecutor {
                 if dust != FixedPoint::ZERO {
                     stats.adl_dust += dust.raw();
                     tracing::info!(escrow = %e, %dust, "liquidation: ADL escrow dust to the vault");
-                    // Coarse node-local alarm (the exact bound is a test assertion).
+                    // Coarse node-local alarm. Dust comes only from a row closed in
+                    // pieces (< 1 raw per piece; s100 test
+                    // `a_row_closed_in_pieces_sweeps_its_dust_to_the_vault`).
                     if dust.raw().unsigned_abs() >= FixedPoint::SCALE as u128 {
                         tracing::error!(escrow = %e, %dust, "liquidation: ADL escrow dust >= 1 token (invariant alarm)");
                     }
