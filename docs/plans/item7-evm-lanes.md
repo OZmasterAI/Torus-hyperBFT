@@ -99,14 +99,18 @@ blocks, fee estimation per type.
 ## 4. Recommendation (18c)
 
 Do it in steps; each step stands on its own.
-1. **Step 0, consensus gaps (small, could go earlier than item 7):** validators check
+1. **Step 0, consensus gaps (built s99 on `fix/evm-vote-checks` `72ee965a` + review follow-ups
+   `4164382d`; also checks the header `evm_tx_count` against the body, which closed a crash-replay
+   divergence; merge after ozarchy's suites):** validators check
    `evm_gas_limit` and `base_fee_per_gas` against the rule (genesis value until governance can
    change it) and the EVM gas used against the limit at vote time; wire the EIP-1559 check or
    decide the base fee stays fixed on purpose.
 2. **Measure first (ozarchy):** the D1 mixed-load bench: matched/s and block time with EVM load
    at 0 / 5M / 15M gas per block, EVM in every block vs every Nth block. This sizes A and B.
 3. **Step 1 = A + B:** consensus budget per block plus EVM every Nth block (N and the budget
-   from step 2). Most of HL's benefit at a fraction of C's cost.
+   from step 2). Most of HL's benefit at a fraction of C's cost. Also a cap on EVM tx count or
+   bytes per block (step 0 review): undecodable or 0-gas txs count 0 toward the gas rule, so
+   today only the datum size limits how many a block carries.
 4. **Step 2 = C, only if needed:** if contracts need big deploys or step 1 limits real usage.
 
 ## 5. Open questions (owner)
