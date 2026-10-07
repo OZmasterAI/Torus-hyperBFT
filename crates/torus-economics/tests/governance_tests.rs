@@ -356,8 +356,8 @@ fn execute_parameter_change() {
     setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
 
     let payload = ExecutionPayload::ParameterChange {
-        param_key: "max_leverage".into(),
-        new_value: "50".into(),
+        param_key: "voting_period_blocks".into(),
+        new_value: "2000".into(),
     };
     let id = gov
         .submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0)
@@ -368,20 +368,276 @@ fn execute_parameter_change() {
     let outcome = gov.finalize_proposal(id, 101).unwrap();
     assert_eq!(outcome, ProposalOutcome::Passed(id));
 
-    let outcome = gov.execute_proposal(id, 120).unwrap(); // after timelock (101 + 5)
+    let outcome = gov.execute_proposal(id, 120).unwrap(); // after timelock (101 + 10)
     assert_eq!(outcome, ProposalOutcome::Executed(id));
 
-    // Verify parameter updated in CF_FEE_CONFIG.
-    let data = gov
-        .state()
-        .get_cf_raw(CF_FEE_CONFIG, b"max_leverage")
-        .unwrap()
-        .unwrap();
-    assert_eq!(&data, b"50");
+    // The vote lands in the GovernanceParams record (the one governance
+    // reads), not in a raw CF_FEE_CONFIG row of its own.
+    assert_eq!(
+        gov.get_governance_params().unwrap().voting_period_blocks,
+        2000
+    );
+    assert_eq!(
+        gov.state()
+            .get_cf_raw(CF_FEE_CONFIG, b"voting_period_blocks")
+            .unwrap(),
+        None
+    );
 
     let proposal = gov.get_proposal(id).unwrap().unwrap();
     assert_eq!(proposal.status, ProposalStatus::Executed);
     assert_eq!(proposal.proposal_type, ProposalType::ParameterChange);
+}
+
+/// s99: `maintenance_margin_bps`, `max_leverage` and `liquidation_penalty_bps`
+/// had nothing reading them (MM is half the IM, leverage is per market, no
+/// liquidation penalty by design): a vote "passed" and changed nothing. They
+/// are refused at submission, for any value.
+#[test]
+fn dead_parameter_keys_are_refused_at_submission() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    for (key, value) in [
+        ("maintenance_margin_bps", "500"),
+        ("max_leverage", "50"),
+        ("liquidation_penalty_bps", "100"),
+    ] {
+        let payload = ExecutionPayload::ParameterChange {
+            param_key: key.into(),
+            new_value: value.into(),
+        };
+        let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+        assert!(
+            matches!(&r, Err(EconomicsError::ParameterNotModifiable(k)) if k == key),
+            "{key}: {r:?}"
+        );
+    }
+}
+
+/// Submit a ParameterChange from addr(2) at `block`, vote yes with every
+/// voter in `yes`, finalize after the voting period and execute after the
+/// timelock (both read from the current params). Returns the proposal id.
+fn pass_param(gov: &GovernanceManager, key: &str, value: &str, yes: &[u8], block: u64) -> u64 {
+    let payload = ExecutionPayload::ParameterChange {
+        param_key: key.into(),
+        new_value: value.into(),
+    };
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), block)
+        .unwrap();
+    for v in yes {
+        gov.cast_vote(addr(*v), id, true, block + 1).unwrap();
+    }
+    let end = gov.get_proposal(id).unwrap().unwrap().end_block;
+    assert_eq!(
+        gov.finalize_proposal(id, end + 1).unwrap(),
+        ProposalOutcome::Passed(id)
+    );
+    let after = gov.get_proposal(id).unwrap().unwrap().executable_after;
+    assert_eq!(
+        gov.execute_proposal(id, after).unwrap(),
+        ProposalOutcome::Executed(id)
+    );
+    id
+}
+
+/// s99: a passed `voting_period_blocks` vote sets the voting period of the
+/// next proposal.
+#[test]
+fn voting_period_vote_sets_next_proposals_end_block() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    pass_param(&gov, "voting_period_blocks", "2000", &[2], 0);
+    let next = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 500)
+        .unwrap();
+    assert_eq!(gov.get_proposal(next).unwrap().unwrap().end_block, 2500);
+}
+
+/// s99: a passed `quorum_bps` vote moves the quorum. 25% participation
+/// fails the 33% quorum and passes the 10% one.
+#[test]
+fn quorum_vote_changes_the_outcome_at_the_boundary() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    // Total staked 2,000: addr(2) alone is 25%.
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(1_500), U256::ZERO);
+
+    // Under the 33% quorum, 25% participation is rejected.
+    let before = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    gov.cast_vote(addr(2), before, true, 1).unwrap();
+    assert_eq!(
+        gov.finalize_proposal(before, 101).unwrap(),
+        ProposalOutcome::Rejected(before)
+    );
+
+    pass_param(&gov, "quorum_bps", "1000", &[2, 3], 200);
+    assert_eq!(gov.get_governance_params().unwrap().quorum_bps, 1000);
+
+    let after = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 400)
+        .unwrap();
+    gov.cast_vote(addr(2), after, true, 401).unwrap();
+    assert_eq!(
+        gov.finalize_proposal(after, 501).unwrap(),
+        ProposalOutcome::Passed(after)
+    );
+}
+
+/// s99: a passed `timelock_blocks` vote sets when the next passed proposal
+/// can execute.
+#[test]
+fn timelock_vote_sets_when_a_passed_proposal_executes() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+
+    pass_param(&gov, "timelock_blocks", "50", &[2], 0);
+
+    let payload = ExecutionPayload::ParameterChange {
+        param_key: "price_band_bps".into(),
+        new_value: "1000".into(),
+    };
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 300)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 301).unwrap();
+    assert_eq!(
+        gov.finalize_proposal(id, 401).unwrap(),
+        ProposalOutcome::Passed(id)
+    );
+    assert_eq!(gov.get_proposal(id).unwrap().unwrap().executable_after, 451);
+    // The old 10-block timelock would allow it at 411.
+    assert!(matches!(
+        gov.execute_proposal(id, 411),
+        Err(EconomicsError::TimelockNotExpired {
+            executable_after: 451,
+            ..
+        })
+    ));
+    assert_eq!(
+        gov.execute_proposal(id, 451).unwrap(),
+        ProposalOutcome::Executed(id)
+    );
+}
+
+/// s99: a passed `permanent_unlock_threshold_bps` vote sets the
+/// supermajority a PermanentUnlock needs: 60% for fails 80%, passes 60%.
+#[test]
+fn unlock_threshold_vote_changes_the_permanent_unlock_outcome() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(600), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(400), U256::ZERO);
+    setup_voter(&staking, 5, validator, U256::ZERO, wei(10));
+    let unlock = || ExecutionPayload::PermanentUnlock {
+        staker: addr(5),
+        amount: wei(10),
+    };
+    // 600 for, 400 against: 60%.
+    let vote_60 = |id: u64, block: u64| {
+        gov.cast_vote(addr(2), id, true, block).unwrap();
+        gov.cast_vote(addr(3), id, false, block).unwrap();
+    };
+
+    let before = gov
+        .submit_proposal(addr(2), "U".into(), "D".into(), Some(unlock()), 0)
+        .unwrap();
+    vote_60(before, 1);
+    assert_eq!(
+        gov.finalize_proposal(before, 101).unwrap(),
+        ProposalOutcome::Rejected(before)
+    );
+
+    pass_param(&gov, "permanent_unlock_threshold_bps", "6000", &[2, 3], 200);
+    assert_eq!(
+        gov.get_governance_params()
+            .unwrap()
+            .permanent_unlock_threshold_bps,
+        6000
+    );
+
+    let after = gov
+        .submit_proposal(addr(2), "U".into(), "D".into(), Some(unlock()), 400)
+        .unwrap();
+    vote_60(after, 401);
+    assert_eq!(
+        gov.finalize_proposal(after, 501).unwrap(),
+        ProposalOutcome::Passed(after)
+    );
+}
+
+/// s99: a passed `permanent_weight_multiplier_num` vote changes the weight
+/// of permanent stake: 100 permanent weighs 150 at 3/2, 250 at 5/2.
+#[test]
+fn multiplier_vote_changes_permanent_stake_weight() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 4, validator, U256::ZERO, wei(100));
+
+    pass_param(&gov, "permanent_weight_multiplier_num", "5", &[2], 0);
+
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 300)
+        .unwrap();
+    gov.cast_vote(addr(4), id, true, 301).unwrap();
+    assert_eq!(
+        gov.get_vote(id, &addr(4)).unwrap().unwrap().weight,
+        wei(250)
+    );
+}
+
+/// s99: two passed parameter changes executing in the same block both land
+/// (each reloads the record the one before it wrote): num 5 and den 4 give
+/// 5/4, so 100 permanent weighs 125.
+#[test]
+fn two_parameter_changes_in_one_block_both_land() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 4, validator, U256::ZERO, wei(100));
+
+    for (key, value) in [
+        ("permanent_weight_multiplier_num", "5"),
+        ("permanent_weight_multiplier_den", "4"),
+    ] {
+        submit_and_pass(
+            &gov,
+            ExecutionPayload::ParameterChange {
+                param_key: key.into(),
+                new_value: value.into(),
+            },
+        );
+    }
+    gov.process_pending_proposals(101).unwrap();
+    assert_eq!(
+        gov.process_pending_proposals(111).unwrap(),
+        vec![ProposalOutcome::Executed(1), ProposalOutcome::Executed(2)]
+    );
+    let params = gov.get_governance_params().unwrap();
+    assert_eq!(
+        (
+            params.permanent_weight_multiplier_num,
+            params.permanent_weight_multiplier_den
+        ),
+        (5, 4)
+    );
+
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 300)
+        .unwrap();
+    gov.cast_vote(addr(4), id, true, 301).unwrap();
+    assert_eq!(
+        gov.get_vote(id, &addr(4)).unwrap().unwrap().weight,
+        wei(125)
+    );
 }
 
 /// s94 option 2: the placement price band is a ParameterChange key
@@ -1088,8 +1344,29 @@ fn failed_execution_leaves_no_partial_state_for_any_payload_kind() {
         (
             "param change, value out of range",
             ExecutionPayload::ParameterChange {
-                param_key: "max_leverage".into(),
-                new_value: "10".into(),
+                param_key: "voting_period_blocks".into(),
+                new_value: "2000".into(),
+            },
+            |gov, id| {
+                overwrite_payload(
+                    gov,
+                    id,
+                    ExecutionPayload::ParameterChange {
+                        param_key: "voting_period_blocks".into(),
+                        new_value: "0".into(),
+                    },
+                )
+            },
+            "invalid parameter value for voting_period_blocks: must be between 1000 and 1000000 blocks"
+                .into(),
+        ),
+        (
+            // s99: a dead key is refused at execution too (a proposal stored
+            // before the fix).
+            "param change, dead key",
+            ExecutionPayload::ParameterChange {
+                param_key: "price_band_bps".into(),
+                new_value: "1000".into(),
             },
             |gov, id| {
                 overwrite_payload(
@@ -1097,17 +1374,33 @@ fn failed_execution_leaves_no_partial_state_for_any_payload_kind() {
                     id,
                     ExecutionPayload::ParameterChange {
                         param_key: "max_leverage".into(),
-                        new_value: "0".into(),
+                        new_value: "50".into(),
                     },
                 )
             },
-            "invalid parameter value for max_leverage: must be between 1 and 200".into(),
+            "governance parameter not modifiable: max_leverage".into(),
+        ),
+        (
+            // s99: one side of the multiplier changes; the resulting pair is
+            // checked (here the stored den is 0, so num 5 / den 0 is refused).
+            "param change, multiplier pair invalid",
+            ExecutionPayload::ParameterChange {
+                param_key: "permanent_weight_multiplier_num".into(),
+                new_value: "5".into(),
+            },
+            |gov, _| {
+                let mut params = gov.get_governance_params().unwrap();
+                params.permanent_weight_multiplier_den = 0;
+                gov.set_governance_params(&params).unwrap();
+            },
+            "invalid parameter value for permanent_weight_multiplier_den: must be between 1 and 100 (zero disallowed)"
+                .into(),
         ),
         (
             "param change, key not modifiable",
             ExecutionPayload::ParameterChange {
-                param_key: "max_leverage".into(),
-                new_value: "10".into(),
+                param_key: "voting_period_blocks".into(),
+                new_value: "2000".into(),
             },
             |gov, id| {
                 overwrite_payload(
@@ -1426,10 +1719,17 @@ fn permanent_unlock_storage_fault_after_first_write_changes_nothing_and_retry_un
 fn all_payload_kinds() -> Vec<(&'static str, ExecutionPayload)> {
     vec![
         (
-            "param change",
+            "param change, price band",
             ExecutionPayload::ParameterChange {
-                param_key: "max_leverage".into(),
-                new_value: "50".into(),
+                param_key: "price_band_bps".into(),
+                new_value: "1000".into(),
+            },
+        ),
+        (
+            "param change, governance param",
+            ExecutionPayload::ParameterChange {
+                param_key: "quorum_bps".into(),
+                new_value: "5000".into(),
             },
         ),
         ("treasury spend", treasury_spend(addr(50), 1_000)),
@@ -1530,6 +1830,7 @@ fn every_payload_kind_writes_exactly_its_rows_on_success() {
         let id = submit_and_pass(&gov, payload);
         gov.finalize_proposal(id, 101).unwrap();
         let mut proposal = gov.get_proposal(id).unwrap().unwrap();
+        let params_before = gov.get_governance_params().unwrap();
         let before = dump_all(gov.state());
         assert_eq!(
             gov.process_pending_proposals(121).unwrap(),
@@ -1549,7 +1850,15 @@ fn every_payload_kind_writes_exactly_its_rows_on_success() {
         }
 
         let mut want: Vec<Row> = match name {
-            "param change" => vec![(CF_FEE_CONFIG, b"max_leverage".to_vec(), Some(b"50".to_vec()))],
+            "param change, price band" => {
+                vec![(CF_FEE_CONFIG, b"price_band_bps".to_vec(), Some(b"1000".to_vec()))]
+            }
+            // s99: the whole GovernanceParams record, one field changed.
+            "param change, governance param" => {
+                let mut params = params_before.clone();
+                params.quorum_bps = 5000;
+                vec![(CF_FEE_CONFIG, b"gov_params".to_vec(), Some(borsh::to_vec(&params).unwrap()))]
+            }
             "treasury spend" => vec![account(addr(50), wei(1_003)), account(addr(99), wei(9_000))],
             // Debit, then credit of the same account: the balance is unchanged.
             "treasury spend to the treasury" => vec![],
