@@ -108,7 +108,7 @@ struct LiqStats {
 ///   drain for the reason `traders` stays exact: the drain gives no trader a
 ///   new key. (A listed trader gone flat reads no position and is skipped.)
 /// * `dirty_traders` (adl-dirty-check, node-local): the traders the block
-///   wrote under ([`trader_positions::dirty_traders`]), taken with `dirty`
+///   wrote under ([`trader_positions::dirty_by_market_and_traders`]), taken with `dirty`
 ///   and grown by every drain write ([`Self::touched`]), so it equals
 ///   `layer_touches` at every ranking (asserted in tests). The ranking's
 ///   reader asks it instead of a `layer_touches` per read.
@@ -619,8 +619,9 @@ impl NativeExecutor {
             None => None,
             Some(_) if on => {
                 if dirty_cache.is_none() {
-                    *dirty_cache = trader_positions::dirty_by_market(&ctx.state);
-                    *dirty_traders = trader_positions::dirty_traders(&ctx.state);
+                    if let Some((m, t)) = trader_positions::dirty_by_market_and_traders(&ctx.state) {
+                        (*dirty_cache, *dirty_traders) = (Some(m), Some(t));
+                    }
                 }
                 dirty_cache.as_ref()
             }

@@ -30,7 +30,8 @@ asks `dirty(t)` again for the same trader. Block 2's layer is smaller, so the sa
 
 ### Option A: drain-local dirty-trader set (recommended)
 `DrainCache.dirty_traders: Option<HashSet<Address>>` holds the trader prefix of every pending
-position key. It is built with the dirty map at the drain's first ranking (R attached, caches on), and
+position key. It is built with the dirty map, from the same `layer_keys` call, at the drain's first
+ranking (R attached, C2 records on, caches on: the dirty map's condition), and
 `touched` inserts into it. The ranking's `AccountReader` gets `drain_dirty: Option<&HashSet<Address>>`,
 and `dirty()` consults it before `batch` / `layer_touches`. Inside a ranking there are no writes,
 so the set is exact for the whole ranking.
@@ -88,3 +89,43 @@ not re-pinned.
 
 * None blocking. If the re-measure stays over ~125-130 ms on ozarchy, the next candidate is the
   records binary search (hand the holder list's record slice to the ranking).
+
+## Result (A/B on ozarchy, s26, measured)
+
+A = main `a746c408` and B = `c60ee4fa`. Both were built with adl-budget §13.7's flags into separate target dirs and run
+interleaved A, B × 3 as `ubench_adl` case 3 (HL, N = 100,000, 10 % holders). Each run started at load < 1.5.
+
+| step ms (r1 / r2 / r3, median) | A | B | delta |
+|---|---|---|---|
+| block B (h = 50) | 149.6 / 148.4 / 150.0, **149.6** | 128.8 / 128.7 / 131.7, **128.8** | **−20.8 ms (−13.9 %)** |
+| block 2 (h = 51) | 126.6 / 125.9 / 124.0, **125.9** | 122.2 / 114.5 / 123.2, **122.2** | −3.7 ms |
+| blocks 2-16, all runs | median 118.5 | median 120.2 | no change |
+
+* **Units are identical:** every run has 17 blocks with ADL work and 1,672,032 units, the same as §12.3 / §13.
+  Per-block `adl_work`, rows, transfers and scanned are equal across all 6 runs.
+* **Block B's excess over block 2:** ~24 ms → ~7 ms (ratio 1.19 → 1.05).
+* **Profile of B** (one perf run; inclusive shares, s99 §13.5 → B):
+
+| frame | block B | block 2 |
+|---|---|---|
+| `layer_touches` | 15.5 → 0.6 % | 6 → 0.0 % |
+| `dirty` | 11 → 3.1 % | 4.6 → 2.7 % |
+| `get_position` | 43.4 → 38.8 % | 41.1 → 39.4 % |
+| `resident_positions` | 16.0 → 11.6 % | 11.2 → 9.7 % |
+| `adl_rank` (sort) | 28.3 (25.3) → 31.4 (27.7) % | 33.5 → 30.8 % |
+| `get_native_balance` | 9 → 12.8 % | 12 → 13.6 % |
+
+What remains of block B's excess is the cold `liq_view` scan (~5 ms) and the extra `pos_sums` (~3 ms).
+
+**Against 250 ms rig:** B's block B is 128.8 ms on ozarchy, so 245-258 rig: on the line. This session ran
+9-15 % slower than s99 for the same shape (A's block B 149.6 vs §13's 134.6-138.0 ms; later blocks ~118 vs
+~103). §13 measured `f6a54382`, not `a746c408`, and Firefox held ~70 % of a core, so it is not settled
+whether the host or the code caused that gap. If it is all host, B's block B is ~118 ms at s99 speed
+(224-236 rig).
+
+After the bench, the review nit was applied: `dirty_by_market_and_traders` builds the dirty map and the
+set from one `layer_keys` call (one clone + sort of block B's pending keys, not two). It is a
+once-per-drain cost, and units and state are unchanged.
+
+Raw files: `~/bench-results-matched/ubench-adl-dirty-check/` (`summary.txt`, `c3.{A,B}.r{1,2,3}.log`,
+`perf-c3.B.{data,log}`, `analysis/`).
