@@ -987,7 +987,8 @@ impl NativeExecutor {
             #[cfg(test)]
             assert_eq!(rest, Self::adl_rest(ctx, marks, u, m)?, "running rest == adl_rest ({u}, {m})");
             let base = prev.get(&m).copied().unwrap_or(mark);
-            let bankruptcy = rest.and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.entry_price));
+            let bankruptcy =
+                rest.and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.cost_basis));
             let px = liq::adl_price(base, bankruptcy, mark, p.is_long);
             liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
             total = (|| total?.checked_sub(own?).ok())();

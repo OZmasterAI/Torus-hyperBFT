@@ -390,6 +390,7 @@ fn queued_withdraw_respects_account_transfer_margin() {
                 is_long: true,
                 size: fp(10),
                 entry_price: fp(100),
+                cost_basis: fp(100) * fp(10),
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,

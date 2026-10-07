@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
+use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{StateBackend, StateDb};
@@ -54,7 +55,16 @@ pub struct Position {
     pub market_id: MarketId,
     pub is_long: bool,
     pub size: FixedPoint,
+    /// Average entry price (decisions and display). The fill price on an
+    /// open or a flip, `cost_basis / size` (truncated) after an increase,
+    /// unchanged by a partial close. Money is computed from `cost_basis`.
     pub entry_price: FixedPoint,
+    /// s100 item 2 (design A): the exact cost of the open size, Σ of the
+    /// fills' notionals (`price × qty`, one rounding per fill) less the
+    /// pro-rata cost of what was closed. UPnL = mark × size − cost_basis
+    /// (long), cost_basis − mark × size (short). Only `fill_transition`
+    /// writes it, together with `entry_price`.
+    pub cost_basis: FixedPoint,
     pub realized_pnl: FixedPoint,
     /// Margin allocated to this position (>0 for isolated, 0 for cross).
     pub isolated_margin: FixedPoint,
@@ -62,14 +72,16 @@ pub struct Position {
 }
 
 impl Position {
-    /// Unrealized PnL at a given mark price.
+    /// Unrealized PnL at a given mark price: `mark × size − cost_basis` for a
+    /// long, `cost_basis − mark × size` for a short (one rounding: the
+    /// product).
     pub fn unrealized_pnl(&self, mark_price: FixedPoint) -> FixedPoint {
-        let diff = if self.is_long {
-            mark_price - self.entry_price
+        let value = mark_price * self.size;
+        if self.is_long {
+            value - self.cost_basis
         } else {
-            self.entry_price - mark_price
-        };
-        diff * self.size
+            self.cost_basis - value
+        }
     }
 
     /// Notional value at mark price.
@@ -81,7 +93,12 @@ impl Position {
 /// AUDIT FIX ECON-FIND-31: Schema version byte prepended to Position serialization.
 /// BREAKING CHANGE (acceptable pre-launch): existing serialized Positions are
 /// incompatible and must be re-created.
-const POSITION_SCHEMA_VERSION: u8 = 1;
+/// s100 item 2: v2 adds `cost_basis` after `entry_price` (111 bytes). A v1
+/// row has no cost basis and is refused (fresh genesis), never guessed.
+const POSITION_SCHEMA_VERSION: u8 = 2;
+
+/// Serialized size of a v2 [`Position`].
+pub const POSITION_V2_LEN: usize = 111;
 
 impl BorshSerialize for Position {
     fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -91,6 +108,7 @@ impl BorshSerialize for Position {
         w.write_all(&[u8::from(self.is_long)])?;
         borsh_write_fp(&self.size, w)?;
         borsh_write_fp(&self.entry_price, w)?;
+        borsh_write_fp(&self.cost_basis, w)?;
         borsh_write_fp(&self.realized_pnl, w)?;
         borsh_write_fp(&self.isolated_margin, w)?;
         w.write_all(&[self.margin_type as u8])?;
@@ -120,6 +138,7 @@ impl BorshDeserialize for Position {
         let is_long = lb[0] != 0;
         let size = borsh_read_fp(r)?;
         let entry_price = borsh_read_fp(r)?;
+        let cost_basis = borsh_read_fp(r)?;
         let realized_pnl = borsh_read_fp(r)?;
         let isolated_margin = borsh_read_fp(r)?;
         let mut mt = [0u8; 1];
@@ -135,6 +154,7 @@ impl BorshDeserialize for Position {
             is_long,
             size,
             entry_price,
+            cost_basis,
             realized_pnl,
             isolated_margin,
             margin_type,
@@ -270,9 +290,9 @@ impl<T: StateBackend> PositionManager<T> {
 
     pub fn put_position(&self, pos: &Position) -> Result<(), CoreError> {
         let key = position_key(&pos.trader, pos.market_id);
-        // Capacity hint matches the fixed v1 layout; Vec can still grow if the
+        // Capacity hint matches the fixed v2 layout; Vec can still grow if the
         // codec changes. Avoid retaining borsh::to_vec's 1 KiB starter buffer.
-        let mut data = Vec::with_capacity(95);
+        let mut data = Vec::with_capacity(POSITION_V2_LEN);
         pos.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state.put_cf_raw_owned(CF_NATIVE_POSITIONS, &key, data)?;
         Ok(())
@@ -493,76 +513,77 @@ fn fill_transition(
     fill_price: FixedPoint,
     margin_type: MarginType,
 ) -> (Option<Position>, Option<FixedPoint>) {
+    // s100 item 2 (design A): ONE rounding per fill. Both sides of a fill
+    // call with the same price and qty, so they book the same product and
+    // the value sum (balances + Σ UPnL at one price) is conserved exactly.
+    let notional = fill_price * fill_qty;
+    let open = |size: FixedPoint, cost_basis: FixedPoint| Position {
+        trader: *trader,
+        market_id,
+        is_long: is_buy,
+        size,
+        entry_price: fill_price,
+        cost_basis,
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type,
+    };
     match existing {
-        None => (
-            // Open new position
-            Some(Position {
-                trader: *trader,
-                market_id,
-                is_long: is_buy,
-                size: fill_qty,
-                entry_price: fill_price,
-                realized_pnl: FixedPoint::ZERO,
-                isolated_margin: FixedPoint::ZERO,
-                margin_type,
-            }),
-            None,
-        ),
+        None => (Some(open(fill_qty, notional)), None),
         Some(mut pos) => {
             let same_dir = (is_buy && pos.is_long) || (!is_buy && !pos.is_long);
+            // PnL of closing cost `removed` for `value` (the close's notional).
+            let is_long = pos.is_long;
+            let close_pnl = |value: FixedPoint, removed: FixedPoint| {
+                if is_long {
+                    value - removed
+                } else {
+                    removed - value
+                }
+            };
 
             if same_dir {
-                // Increase: weighted average entry
-                let total_cost = pos.entry_price * pos.size + fill_price * fill_qty;
+                // Increase: the basis adds the notional; entry = basis / size.
                 let new_size = pos.size + fill_qty;
+                pos.cost_basis += notional;
                 if new_size > FixedPoint::ZERO {
-                    pos.entry_price = total_cost / new_size;
+                    pos.entry_price = pos.cost_basis / new_size;
                 }
                 pos.size = new_size;
                 (Some(pos), None)
             } else if fill_qty < pos.size {
-                // Partial close
-                let pnl_per = if pos.is_long {
-                    fill_price - pos.entry_price
-                } else {
-                    pos.entry_price - fill_price
-                };
-                pos.realized_pnl += pnl_per * fill_qty;
+                // Partial close: remove the closed part's pro-rata cost.
+                let removed = pro_rata(pos.cost_basis, fill_qty, pos.size);
+                let pnl = close_pnl(notional, removed);
+                pos.cost_basis -= removed;
+                pos.realized_pnl += pnl;
                 pos.size -= fill_qty;
-                (Some(pos), Some(pnl_per * fill_qty))
+                (Some(pos), Some(pnl))
             } else if fill_qty == pos.size {
-                // Full close
-                let pnl_per = if pos.is_long {
-                    fill_price - pos.entry_price
-                } else {
-                    pos.entry_price - fill_price
-                };
-                (None, Some(pnl_per * fill_qty))
+                // Full close: the whole basis.
+                (None, Some(close_pnl(notional, pos.cost_basis)))
             } else {
-                // Flip: close + open opposite
-                let pnl_per = if pos.is_long {
-                    fill_price - pos.entry_price
-                } else {
-                    pos.entry_price - fill_price
-                };
-                let close_pnl = pnl_per * pos.size;
+                // Flip: split the notional by subtraction, so the close and
+                // open parts add up to exactly the counterparty's notional.
                 let remainder = fill_qty - pos.size;
-                (
-                    Some(Position {
-                        trader: *trader,
-                        market_id,
-                        is_long: is_buy,
-                        size: remainder,
-                        entry_price: fill_price,
-                        realized_pnl: FixedPoint::ZERO,
-                        isolated_margin: FixedPoint::ZERO,
-                        margin_type,
-                    }),
-                    Some(close_pnl),
-                )
+                let open_part = fill_price * remainder;
+                let pnl = close_pnl(notional - open_part, pos.cost_basis);
+                (Some(open(remainder, open_part)), Some(pnl))
             }
         }
     }
+}
+
+/// `basis × q / size`, truncated toward zero, in one rounding. `q <= size`
+/// keeps `|result| <= |basis|`, so it fits.
+fn pro_rata(basis: FixedPoint, q: FixedPoint, size: FixedPoint) -> FixedPoint {
+    if let Some(p) = basis.raw().checked_mul(q.raw()) {
+        return FixedPoint::from_raw(p / size.raw());
+    }
+    let wide = |x: i128| U256::from(x.unsigned_abs());
+    let m = (wide(basis.raw()) * wide(q.raw()) / wide(size.raw())).to::<u128>() as i128;
+    let negative = (basis.raw() < 0) ^ (q.raw() < 0) ^ (size.raw() < 0);
+    FixedPoint::from_raw(if negative { -m } else { m })
 }
 
 /// C1: per-batch write-back cache for `Position` rows, mirroring the
@@ -666,5 +687,227 @@ impl PositionCache {
         }
         self.dirty.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: i128 = FixedPoint::SCALE;
+
+    fn raw(r: i128) -> FixedPoint {
+        FixedPoint::from_raw(r)
+    }
+
+    /// `p × q`, truncated: the one rounding of a fill.
+    fn n(p: i128, q: i128) -> i128 {
+        p * q / S
+    }
+
+    fn fill(
+        pos: Option<Position>,
+        is_buy: bool,
+        q: i128,
+        p: i128,
+    ) -> (Option<Position>, Option<FixedPoint>) {
+        fill_transition(
+            pos,
+            &Address::new([7; 20]),
+            3,
+            is_buy,
+            raw(q),
+            raw(p),
+            MarginType::Cross,
+        )
+    }
+
+    /// (is_long, size, entry, basis, realized) in raw units.
+    fn parts(p: &Position) -> (bool, i128, i128, i128, i128) {
+        (
+            p.is_long,
+            p.size.raw(),
+            p.entry_price.raw(),
+            p.cost_basis.raw(),
+            p.realized_pnl.raw(),
+        )
+    }
+
+    const P1: i128 = 1_000 * S + 7; // 1,000.00000007
+    const Q1: i128 = 33_333_333; // 0.33333333
+    const P2: i128 = 1_013 * S + 99_999_991;
+    const Q2: i128 = 77_777_777;
+
+    #[test]
+    fn open_books_the_notional_at_the_fill_price() {
+        let (pos, pnl) = fill(None, true, Q1, P1);
+        assert_eq!(parts(&pos.unwrap()), (true, Q1, P1, n(P1, Q1), 0));
+        assert_eq!(pnl, None);
+    }
+
+    #[test]
+    fn increase_adds_the_notional_and_reaverages_the_entry() {
+        let pos = fill(None, false, Q1, P1).0;
+        let (pos, pnl) = fill(pos, false, Q2, P2);
+        let basis = n(P1, Q1) + n(P2, Q2);
+        assert_eq!(
+            parts(&pos.unwrap()),
+            (false, Q1 + Q2, basis * S / (Q1 + Q2), basis, 0)
+        );
+        assert_eq!(pnl, None);
+    }
+
+    #[test]
+    fn partial_close_removes_the_pro_rata_basis() {
+        for is_long in [true, false] {
+            let pos = fill(fill(None, is_long, Q1, P1).0, is_long, Q2, P2)
+                .0
+                .unwrap();
+            let (size, entry, basis) =
+                (pos.size.raw(), pos.entry_price.raw(), pos.cost_basis.raw());
+            let (q, p) = (12_345_679, 990 * S + 31);
+            let removed = basis * q / size;
+            let pnl = if is_long {
+                n(p, q) - removed
+            } else {
+                removed - n(p, q)
+            };
+            let (pos, got) = fill(Some(pos), !is_long, q, p);
+            assert_eq!(
+                parts(&pos.unwrap()),
+                (is_long, size - q, entry, basis - removed, pnl),
+                "{is_long}"
+            );
+            assert_eq!(got, Some(raw(pnl)));
+        }
+    }
+
+    #[test]
+    fn full_close_realizes_notional_against_the_whole_basis() {
+        for is_long in [true, false] {
+            let pos = fill(fill(None, is_long, Q1, P1).0, is_long, Q2, P2).0;
+            let basis = n(P1, Q1) + n(P2, Q2);
+            let p = 1_001 * S + 3;
+            let (pos, pnl) = fill(pos, !is_long, Q1 + Q2, p);
+            assert!(pos.is_none(), "{is_long}: row deleted");
+            let want = if is_long {
+                n(p, Q1 + Q2) - basis
+            } else {
+                basis - n(p, Q1 + Q2)
+            };
+            assert_eq!(pnl, Some(raw(want)), "{is_long}");
+        }
+    }
+
+    /// The close and open parts add up to exactly the fill's one notional.
+    #[test]
+    fn flip_splits_the_notional_by_subtraction() {
+        for is_long in [true, false] {
+            let pos = fill(None, is_long, Q1, P1).0;
+            let (q, p) = (Q1 + Q2, 1_020 * S + 55_555_555);
+            let open_part = n(p, Q2);
+            let close_part = n(p, q) - open_part;
+            let want = if is_long {
+                close_part - n(P1, Q1)
+            } else {
+                n(P1, Q1) - close_part
+            };
+            let (pos, pnl) = fill(pos, !is_long, q, p);
+            assert_eq!(
+                parts(&pos.unwrap()),
+                (!is_long, Q2, p, open_part, 0),
+                "{is_long}"
+            );
+            assert_eq!(pnl, Some(raw(want)), "{is_long}");
+        }
+    }
+
+    /// Value moved by one fill: the buyer gives exactly the notional, the
+    /// seller gets it, whatever each side's branch (here: a flip vs an open).
+    #[test]
+    fn both_sides_of_a_fill_move_the_same_notional() {
+        // value at price 0 = cash + (−basis long, +basis short)
+        let v = |pos: &Option<Position>, cash: FixedPoint| match pos {
+            Some(p) if p.is_long => cash - p.cost_basis,
+            Some(p) => cash + p.cost_basis,
+            None => cash,
+        };
+        let (q, p) = (Q1 + Q2, 1_020 * S + 55_555_555);
+        let short = fill(None, false, Q1, P1).0;
+        let before = v(&short, FixedPoint::ZERO);
+        let (flipped, pnl) = fill(short, true, q, p);
+        let (opened, _) = fill(None, false, q, p);
+        assert_eq!(v(&flipped, pnl.unwrap()) - before, raw(-n(p, q)), "buyer");
+        assert_eq!(v(&opened, FixedPoint::ZERO), raw(n(p, q)), "seller");
+    }
+
+    #[test]
+    fn pro_rata_is_one_rounding_also_past_i128() {
+        assert_eq!(pro_rata(raw(10), raw(1), raw(3)), raw(3));
+        let big = 10i128.pow(30) + 1;
+        assert!(
+            big.checked_mul(10i128.pow(10)).is_none(),
+            "takes the wide path"
+        );
+        assert_eq!(
+            pro_rata(raw(big), raw(10i128.pow(10)), raw(3 * 10i128.pow(10))),
+            raw(big / 3)
+        );
+        assert_eq!(
+            pro_rata(raw(-big), raw(10i128.pow(10)), raw(3 * 10i128.pow(10))),
+            raw(-big / 3),
+            "toward zero"
+        );
+    }
+
+    #[test]
+    fn v2_layout_roundtrips_and_v1_is_refused() {
+        let pos = Position {
+            trader: Address::new([9; 20]),
+            market_id: 0x0102_0304_0506_0708,
+            is_long: false,
+            size: raw(11),
+            entry_price: raw(22),
+            cost_basis: raw(-33),
+            realized_pnl: raw(44),
+            isolated_margin: raw(55),
+            margin_type: MarginType::Isolated,
+        };
+        let bytes = borsh::to_vec(&pos).unwrap();
+        assert_eq!((bytes.len(), bytes[0]), (POSITION_V2_LEN, 2));
+        assert_eq!(
+            &bytes[62..78],
+            &(-33i128).to_be_bytes(),
+            "cost_basis right after entry_price"
+        );
+        let back = Position::try_from_slice(&bytes).unwrap();
+        assert_eq!(
+            (
+                back.trader,
+                back.market_id,
+                parts(&back),
+                back.isolated_margin,
+                back.margin_type
+            ),
+            (
+                pos.trader,
+                pos.market_id,
+                parts(&pos),
+                pos.isolated_margin,
+                pos.margin_type
+            )
+        );
+        // v1: no cost basis (95 bytes). Refused, never decoded with a guess.
+        let v1: Vec<u8> = [&[1u8][..], &bytes[1..62], &bytes[78..]].concat();
+        assert_eq!(v1.len(), 95);
+        let err = Position::try_from_slice(&v1).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported Position schema version: 1"),
+            "{err}"
+        );
+        assert!(
+            Position::try_from_slice(&bytes[..POSITION_V2_LEN - 1]).is_err(),
+            "truncated"
+        );
     }
 }

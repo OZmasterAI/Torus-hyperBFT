@@ -3822,6 +3822,8 @@ mod tests {
                 is_long: true,
                 size: torus_types::FixedPoint::from_raw(ONE_TRS),
                 entry_price: torus_types::FixedPoint::from_raw(ONE_TRS),
+                cost_basis: torus_types::FixedPoint::from_raw(ONE_TRS)
+                    * torus_types::FixedPoint::from_raw(ONE_TRS),
                 realized_pnl: torus_types::FixedPoint::ZERO,
                 isolated_margin: torus_types::FixedPoint::ZERO,
                 margin_type: torus_core::position::MarginType::Cross,
