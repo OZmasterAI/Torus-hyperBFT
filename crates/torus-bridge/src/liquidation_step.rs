@@ -30,6 +30,9 @@ thread_local! {
     /// Tests: (rankings over a holder list, Σ traders of the set the holder
     /// lists left out).
     static ADL_C2_STATS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// Tests (s99): rankings whose charged holder count was checked against
+    /// a state walk.
+    static ADL_UNIT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What one step did — telemetry only (metrics and logs), never read by
@@ -51,8 +54,9 @@ struct LiqStats {
     /// budget left unclassified; empty when the budget held.
     deferred: Vec<Address>,
     /// adl-budget P2: obligation rows the drain worked on (waiting rows not
-    /// counted), its work units, the escrow dust swept to the vault and the
-    /// vault's escrow-pairing amounts (signed raw units, this step).
+    /// counted), the block's ADL work units (s99: B's own transfers + the
+    /// drain's), the escrow dust swept to the vault and the vault's
+    /// escrow-pairing amounts (signed raw units, this step).
     adl_obligations: u64,
     adl_work: u64,
     adl_dust: i128,
@@ -75,16 +79,21 @@ struct LiqStats {
 /// one block, built from state at the drain (never carried over a block).
 ///
 /// * `traders`: `liq_traders_after(None, MAX)` taken once, at the drain's
-///   first ranking (after block B's transfers), then kept equal to a fresh
+///   first ranking that needs it (C1: no records; with C2 only the test
+///   shadow), after block B's transfers, then kept equal to a fresh
 ///   read: during the drain the only writes are closes that move size from
 ///   an escrow to an existing opposite holder (`adl_close`: q <= the
 ///   holder's size, never a flip), escrow pairings (`cross_close`: the two
 ///   escrows' positions, the vault's BALANCE) and obligation rows — so no
 ///   trader gains a first position key, and one that loses its last is
 ///   dropped ([`Self::touched`]). (A trader gone flat would be skipped by
-///   `get_position` anyway; the drop keeps `traders.len()`, the ranking's
-///   work units, equal to a fresh set.) The dust sweep runs after the last
-///   ranking.
+///   `get_position` anyway; the drop keeps the set equal to a fresh one,
+///   asserted in tests.) The dust sweep runs after the last ranking.
+/// * `seen` (s99 units, consensus): every trader the block's drain valued
+///   for a ranking. A valuation costs 1 unit the first time a trader is
+///   valued in the block (never removed: a re-valuation after a close is
+///   covered by the close's read unit). Kept with the caches on AND off, so
+///   the units do not depend on them.
 /// * `av`: the ranking AV per trader — a function of its balance, its
 ///   positions and the block's fixed marks / configs — used only as a
 ///   lookup (never iterated); dropped for both parties of every close and
@@ -100,6 +109,7 @@ struct DrainCache {
     traders: Option<Vec<Address>>,
     av: HashMap<Address, FixedPoint>,
     dirty: Option<HashMap<MarketId, Vec<Address>>>,
+    seen: std::collections::HashSet<Address>,
 }
 
 impl DrainCache {
@@ -399,6 +409,10 @@ impl NativeExecutor {
         let accounts = Self::liq_traders_after(ctx, cursor, scan.saturating_add(4))?;
         let mut results = Vec::new();
         let (mut scanned, mut acted, mut last, mut cut) = (0usize, 0usize, None, false);
+        // adl-budget s99 (owner decision 3): block B's own work, charged into
+        // W before the drain (`ADL_TRANSFER_UNITS` per position moved to an
+        // escrow). B itself is never cut by it.
+        let mut b_work = 0u64;
         let not_protocol = |a: &&Address| **a != LIQUIDATOR_VAULT && !liq::is_adl_escrow(a);
         for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_protocol(a)) {
             if scanned == scan || acted == act {
@@ -447,7 +461,11 @@ impl NativeExecutor {
             let release = Self::cancel_orders_and_stops(ctx, &trader, None);
             Self::release_order_margin(ctx, &trader, release);
             match h {
-                Health::Adl => stats.adl_rows_added += Self::adl_to_escrow(ctx, &marks, &prev, &trader)?,
+                Health::Adl => {
+                    let rows = Self::adl_to_escrow(ctx, &marks, &prev, &trader)?;
+                    stats.adl_rows_added += rows;
+                    b_work = b_work.saturating_add(rows.saturating_mul(liq::ADL_TRANSFER_UNITS));
+                }
                 Health::Backstop => liq::backstop(&ctx.positions, &trader, &LIQUIDATOR_VAULT, |m| {
                     marks.get(&m).copied()
                 })?,
@@ -469,13 +487,17 @@ impl NativeExecutor {
             if liq::classify(&v) == Some(Health::Adl) {
                 stats.adl += 1;
                 stats.vault_adl = true;
-                stats.adl_rows_added += Self::adl_to_escrow(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
+                let rows = Self::adl_to_escrow(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
+                stats.adl_rows_added += rows;
+                b_work = b_work.saturating_add(rows.saturating_mul(liq::ADL_TRANSFER_UNITS));
             }
         }
-        // adl-budget P2: the escrows close their obligations under `work`
-        // (an empty queue costs one seek).
-        if work > 0 && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG])?.is_some() {
-            Self::adl_drain(ctx, &listed, &marks, work, stats)?;
+        // adl-budget P2: the escrows close their obligations under what B
+        // left of `work` (s99: none when B's own work reached W; the rows
+        // wait for the next block). An empty queue costs one seek.
+        stats.adl_work = b_work;
+        if b_work < work && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG])?.is_some() {
+            Self::adl_drain(ctx, &listed, &marks, work, b_work, stats)?;
         }
         // M2 for the vault: pending while it stays ADL-able — after the drain
         // (the vault is an ordinary ADL candidate: a close can sink it; the
@@ -534,7 +556,7 @@ impl NativeExecutor {
     /// read of every trader of the positions CF (the slot's sorted set merged
     /// with the block's dirty traders, else the walk), through the records for a
     /// clean trader and the overlay for a dirty one; escrows skipped. Returns the
-    /// candidates and the traders examined (the ranking's work units, Q3).
+    /// candidates and the ranking's work units (Q3, s99 below).
     /// A8 perf: the set and the ranking AV come from the drain's `cache`
     /// ([`DrainCache`]: the same values as a fresh read, see there).
     ///
@@ -544,9 +566,19 @@ impl NativeExecutor {
     /// ascending — instead of every trader: the same candidates in the same
     /// order (every holder is in the list, a listed non-holder is skipped as
     /// C1 skips it), shadow-checked against C1 at every ranking in tests. The
-    /// units stay C1's (the whole set's size): the drain's progress, its
-    /// state and the goldens do not change; only the work behind a unit
-    /// drops to O(holders of `m`). Without records: C1.
+    /// trader set is then not taken at all (only the test shadow reads it).
+    /// Without records: C1.
+    ///
+    /// Units (owner 18c s99, decisions 2 and 3; consensus): the HOLDERS of
+    /// `m` — the traders `get_position` finds a position row for in `m` at
+    /// ranking time, the two escrows never counted (`adl_candidates` skips
+    /// them; the vault counts, it is a candidate) — plus 1 per candidate
+    /// valued for the first time in the block's drain (`cache.seen`). Both
+    /// lists hold every holder once and read the same overlay, so C1 and C2
+    /// count the same exact live number: C2's extra entries (dirty keys the
+    /// block deleted) read no row and are not counted. Asserted in tests at
+    /// every ranking against a walk of `CF_NATIVE_POSITIONS`, and C2's count
+    /// against the shadow's C1 count.
     fn adl_candidates_of<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         m: MarketId,
@@ -561,27 +593,13 @@ impl NativeExecutor {
         let c2 = !ADL_C2_OFF.with(|c| c.get());
         #[cfg(not(test))]
         let c2 = true;
+        #[cfg(test)]
+        let shadow = ctx.sums.as_ref().is_some_and(|s| s.shadow);
+        #[cfg(not(test))]
+        let shadow = false;
         let fresh_set;
         let fresh_dirty;
-        let DrainCache { traders, av, dirty: dirty_cache } = cache;
-        let traders: &[Address] = if on {
-            if traders.is_none() {
-                *traders = Some(Self::liq_traders_after(ctx, None, usize::MAX)?);
-                #[cfg(test)]
-                ADL_CACHE_STATS.with(|s| s.set((s.get().0, s.get().1, s.get().2 + 1)));
-                #[cfg(test)]
-                if let Some(s) = ctx.sums.as_ref() {
-                    bump(&s.counters.adl_trader_sets);
-                }
-            }
-            let kept = traders.as_deref().expect("taken above");
-            #[cfg(test)]
-            assert_eq!(kept, liq::traders_after(&ctx.state, None, usize::MAX)?.as_slice(), "kept trader set == the walk");
-            kept
-        } else {
-            fresh_set = Self::liq_traders_after(ctx, None, usize::MAX)?;
-            &fresh_set
-        };
+        let DrainCache { traders, av, dirty: dirty_cache, seen } = cache;
         // C2: the holder list of `m` when the records are attached (with R:
         // the dirty map exists), else every trader (C1).
         let records = ctx.sums.as_ref().and_then(|s| s.records.as_ref()).filter(|_| c2);
@@ -600,7 +618,32 @@ impl NativeExecutor {
         };
         let holders: Option<Vec<Address>> =
             records.zip(dirty).map(|(r, d)| r.holders_with(m, d.get(&m).map_or(&[][..], Vec::as_slice)));
-        let list: &[Address] = holders.as_deref().unwrap_or(traders);
+        // The trader set: C1's list; with a holder list only the shadow's.
+        let set: Option<&[Address]> = if holders.is_some() && !shadow {
+            None
+        } else if on {
+            if traders.is_none() {
+                *traders = Some(Self::liq_traders_after(ctx, None, usize::MAX)?);
+                #[cfg(test)]
+                ADL_CACHE_STATS.with(|s| s.set((s.get().0, s.get().1, s.get().2 + 1)));
+                #[cfg(test)]
+                if let Some(s) = ctx.sums.as_ref() {
+                    bump(&s.counters.adl_trader_sets);
+                }
+            }
+            let kept = traders.as_deref().expect("taken above");
+            #[cfg(test)]
+            assert_eq!(kept, liq::traders_after(&ctx.state, None, usize::MAX)?.as_slice(), "kept trader set == the walk");
+            Some(kept)
+        } else {
+            fresh_set = Self::liq_traders_after(ctx, None, usize::MAX)?;
+            Some(&fresh_set)
+        };
+        let list: &[Address] = match (holders.as_deref(), set) {
+            (Some(h), _) => h,
+            (None, Some(s)) => s,
+            (None, None) => unreachable!("without a holder list the set is taken"),
+        };
         let reader = AccountReader::of(ctx);
         // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
         // storage error stays an error (fail-stop).
@@ -613,7 +656,15 @@ impl NativeExecutor {
             };
             Ok(v.available.checked_add(v.order_margin).and_then(|x| x.checked_add(v.upnl)).unwrap_or(FixedPoint::ZERO))
         };
-        let cands = liq::adl_candidates(list, want_long, |t| reader.get_position(t, m), |t| {
+        // s99 units: the holders read, the first-sight valuations.
+        let (mut held, mut first_sight) = (0u64, 0u64);
+        let get = |t: &Address| {
+            let p = reader.get_position(t, m)?;
+            held += u64::from(p.is_some());
+            Ok(p)
+        };
+        let cands = liq::adl_candidates(list, want_long, get, |t| {
+            first_sight += u64::from(seen.insert(*t));
             if !on {
                 return value(t);
             }
@@ -634,20 +685,42 @@ impl NativeExecutor {
             bump(&s.counters.adl_rankings);
             if let Some(h) = holders.as_ref() {
                 bump(&s.counters.adl_holder_lists);
-                ADL_C2_STATS.with(|x| x.set((x.get().0 + 1, x.get().1 + traders.len().saturating_sub(h.len()))));
-                if s.shadow {
-                    // C2 == C1: the whole set, the same reads and valuation.
-                    let want = liq::adl_candidates(traders, want_long, |t| reader.get_position(t, m), |t| value(t));
-                    if want.as_ref().ok() != Some(&cands) {
-                        s.shadow_mismatches
-                            .lock()
-                            .unwrap()
-                            .push(format!("adl_candidates {m} long={want_long}: holders {cands:?}, C1 {want:?}"));
+                let skipped = set.map_or(0, |t| t.len().saturating_sub(h.len()));
+                ADL_C2_STATS.with(|x| x.set((x.get().0 + 1, x.get().1 + skipped)));
+                if let Some(all) = set.filter(|_| s.shadow) {
+                    // C2 == C1: the whole set, the same reads and valuation,
+                    // the same holder count (s99 units).
+                    let mut c1_held = 0u64;
+                    let c1_get = |t: &Address| {
+                        let p = reader.get_position(t, m)?;
+                        c1_held += u64::from(p.is_some());
+                        Ok(p)
+                    };
+                    let want = liq::adl_candidates(all, want_long, c1_get, |t| value(t));
+                    if want.as_ref().ok() != Some(&cands) || c1_held != held {
+                        s.shadow_mismatches.lock().unwrap().push(format!(
+                            "adl_candidates {m} long={want_long}: holders {cands:?} ({held} held), C1 {want:?} ({c1_held} held)"
+                        ));
                     }
                 }
             }
         }
-        Ok((cands, traders.len() as u64))
+        #[cfg(test)]
+        {
+            // s99 (owner decision 2b): the charged count == the holders of
+            // `m` from a full walk of the block's overlay (escrows out).
+            let walk = ctx
+                .state
+                .iterate_cf(CF_NATIVE_POSITIONS, None)?
+                .iter()
+                .filter(|(k, _)| {
+                    k.len() == 28 && k[20..] == m.to_be_bytes() && !liq::is_adl_escrow(&Address::from_slice(&k[..20]))
+                })
+                .count() as u64;
+            assert_eq!(held, walk, "the ranking of {m} charges its holders (a state walk)");
+            ADL_UNIT_CHECKS.with(|c| c.set(c.get() + 1));
+        }
+        Ok((cands, held + first_sight))
     }
 
     /// Item 6 C4 (plan 2.5, L1): whether [`Self::liq_view`] values from the
@@ -937,12 +1010,14 @@ impl NativeExecutor {
     }
 
     /// adl-budget P2 / Q2 / Q3: drain the obligation rows in key order under
-    /// `work` units. One step = one row (atomic; starts only while used <
+    /// `work` units, `spent` of them already used by block B's own work (s99).
+    /// One step = one row (atomic; starts only while used <
     /// work, so a block overshoots by at most one step). Every visited row
     /// costs 1, plus its (market, side) ranking (once per block: `ranked`
     /// holds the list and the position of the first candidate not yet used
-    /// up, so later rows continue where the last one stopped), plus the
-    /// candidates `adl_close` read, plus edge rows. The escrow of the row's
+    /// up, so later rows continue where the last one stopped; s99: the
+    /// market's holders + first-sight valuations, [`Self::adl_candidates_of`]),
+    /// plus the candidates `adl_close` read, plus edge rows. The escrow of the row's
     /// side closes at the row's stored price; real holders exhausted ->
     /// [`Self::adl_cross`] (one pairing position per market and block); a
     /// row still open after both breaks escrow size = Σ rows and is fatal
@@ -954,12 +1029,13 @@ impl NativeExecutor {
         listed: &[MarketId],
         marks: &Marks,
         work: u64,
+        spent: u64,
         stats: &mut LiqStats,
     ) -> Result<(), CoreError> {
         let mut ranked: BTreeMap<(MarketId, bool), (Vec<liq::AdlCandidate>, usize)> = BTreeMap::new();
         let mut paired: BTreeMap<MarketId, Vec<u8>> = BTreeMap::new();
         let mut cache = DrainCache::default();
-        let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        let (mut used, mut start) = (spent, vec![liq::ADL_OBLIGATION_TAG]);
         // Telemetry (s99 review LOW 1): the rows this drain left in place. A
         // visited row either waits or closes to 0 (else the step is fatal);
         // a row the pairing deleted ahead is never visited, one it reduced is
@@ -988,8 +1064,8 @@ impl NativeExecutor {
             };
             let key = (o.market, o.is_long);
             if !ranked.contains_key(&key) {
-                let (c, examined) = Self::adl_candidates_of(ctx, o.market, !o.is_long, &mut cache)?;
-                used += examined;
+                let (c, units) = Self::adl_candidates_of(ctx, o.market, !o.is_long, &mut cache)?;
+                used += units;
                 ranked.insert(key, (liq::adl_rank(rank_px, c), 0));
             }
             let escrow = liq::adl_escrow(o.is_long);

@@ -251,14 +251,22 @@ fn adl_close_reports_next_and_read() {
     assert_eq!(pm.get_position(&c2, 1).unwrap().unwrap().size, fp(1), "c2 keeps 1: the next row starts at it");
 }
 
-/// adl-budget W (A6): the default budget closes an HL-sized event in its own
-/// block — N = 5,000 traders, 100 (market, side) rankings of N + 3 traders
-/// each (the escrow and up to two protocol accounts), 300 rows x (1 visit +
-/// 1 read). The bridge test (200 traders) cannot catch a W too small at N.
+/// adl-budget W (owner 18c s99, option 2): W = 100,000, with the s99 units
+/// (adl-budget.md §12): B's transfers at `ADL_TRANSFER_UNITS` each, a
+/// ranking = the holders of its market, 1 per first-sight valuation, 1 per
+/// row visit and per candidate read. W still closes an HL-sized event in its
+/// own block at the realistic shape — N = 5,000 accounts, ~10 % of them
+/// holding a market (500 holders; + up to 3 protocol / sink accounts), 3
+/// accounts x 100 markets: U <= 300 x T + 100 x (500 + 3) + (5,000 + 3) +
+/// 300 x 2. (At every account holding every market it takes ~6 blocks, by
+/// design: §11.5 / §12.) The bridge test (20 traders) cannot catch a W too
+/// small at N.
 #[test]
-fn adl_work_per_block_covers_an_hl_sized_event() {
-    use torus_core::liquidation::ADL_WORK_PER_BLOCK;
-    assert!(ADL_WORK_PER_BLOCK >= 100 * (5_000 + 3) + 300 * 2, "{ADL_WORK_PER_BLOCK}");
+fn adl_work_per_block_is_option_2_and_covers_a_thin_hl_event() {
+    use torus_core::liquidation::{ADL_TRANSFER_UNITS, ADL_WORK_PER_BLOCK};
+    assert_eq!(ADL_WORK_PER_BLOCK, 100_000, "owner s99: option 2");
+    let u = 300 * ADL_TRANSFER_UNITS + 100 * (500 + 3) + (5_000 + 3) + 300 * 2;
+    assert!(ADL_WORK_PER_BLOCK >= u, "W {ADL_WORK_PER_BLOCK} covers U = {u}");
 }
 
 /// D9: a FLAT account's negative collateral moves to the vault (conserved);

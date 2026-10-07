@@ -58,13 +58,25 @@ pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
 /// D5 (decided, user s517): accounts acted on per block.
 pub const LIQ_ACT_PER_BLOCK: usize = 64;
-/// adl-budget Q3: the drain's work units per block — traders examined by a
-/// ranking + rows visited + candidates read (+ edge rows). Chosen (A8) so an
-/// HL-sized event (a few hundred account-markets) closes the escrows in its
-/// own block; one constant. A8 (measured, `ubench_adl` HL mode: N = 5,000
-/// traders, 3 accounts x 100 markets, one side): U_hl = 500,800 units;
-/// W = max(1.25 U_hl, 500,900) rounded up to 10,000 (adl-budget.md §9).
-pub const ADL_WORK_PER_BLOCK: u64 = 630_000;
+/// adl-budget Q3 / s99: the ADL work units per block. Block B's own
+/// transfers are charged first ([`ADL_TRANSFER_UNITS`] per position moved to
+/// an escrow; B is never cut), the drain gets what is left: per obligation
+/// row 1 (visit) + its (market, side) ranking once per block (the HOLDERS of
+/// the market: traders other than the two escrows with a position row in it)
+/// + 1 per candidate valued for the first time in the block + the
+/// candidates read (+ edge rows). Owner 18c s99, option 2 (adl-budget.md
+/// §11.5, §12): W = 100,000 keeps the worst measured HL-shaped block <= ~125
+/// ms on ozarchy (~250 ms on the rig); an HL event at N = 5,000 accounts with
+/// ~10 % holders per market still closes in its own block, at every account
+/// holding every market it takes ~6 blocks.
+pub const ADL_WORK_PER_BLOCK: u64 = 100_000;
+/// adl-budget s99 (owner decision 3): block B's own work in W units — per
+/// position the pass moves to an ADL escrow (`adl_to_escrow`: the transfer's
+/// two fills, the balance read, the obligation row, the log line). Measured
+/// (§9 / §11, ozarchy): B costs 3.3-3.8 µs per transfer (HL 1.0 ms / 300,
+/// S=750-like B₁ 66 ms / 17,280, classification included) against 0.55-0.8
+/// µs per drain unit: 4.1-6.9 units, rounded up to 6.
+pub const ADL_TRANSFER_UNITS: u64 = 6;
 /// Rows per seek of the bounded walks.
 const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
@@ -407,7 +419,9 @@ pub fn cross_close<T: StateBackend>(
 /// Q1 (s96): ADL counterparties = every position on side `want_long` of
 /// `traders` (ascending, each once; the escrows skipped), `get` reading a
 /// trader's position in the ADL market, `av` valuing a holder (ranking only,
-/// C7). The ranking's work units are `traders.len()` (Q3).
+/// C7). Work units (Q3, s99): the caller counts the traders `get` finds a
+/// position for (the market's holders: `traders` must hold every one of
+/// them; escrows are never read) and its first-sight valuations.
 pub fn adl_candidates(
     traders: &[Address],
     want_long: bool,

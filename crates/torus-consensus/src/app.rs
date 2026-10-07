@@ -17672,10 +17672,10 @@ mod crash_recovery_tests {
         std::iter::once(71).chain(80..=92)
     }
 
-    /// Block 1: the mark 970 (aggregated at block 2's start); 2..=15 empty.
+    /// Block 1: the mark 970 (aggregated at block 2's start); 2..=16 empty.
     fn adl_e2e_blocks() -> Vec<TorusBlock> {
         let mut rounds = vec![vec![oracle_sub(61, 1, 970), oracle_sub(62, 1, 970), oracle_sub(63, 1, 970)]];
-        rounds.extend(std::iter::repeat_n(Vec::new(), 14)); // 2..=15
+        rounds.extend(std::iter::repeat_n(Vec::new(), 15)); // 2..=16
         liq_blocks(rounds)
     }
 
@@ -17687,13 +17687,14 @@ mod crash_recovery_tests {
     /// adl-budget P2: obligation rows keep the step DUE. Mark 970: all 14
     /// longs are ADL'd at B = 2 (AV 50 - 300 < 0; price min(970, 995) =
     /// 970), flat, 14 rows, the long escrow long 140. `test_adl_work = 2`:
-    /// one row per block (a row costs >= 2: its visit + a ranking or a
-    /// read), blocks 2..=15. Oracle rows are pruned at 12, so blocks 13..=15
-    /// carry no action, oracle row, cursor, cooldown or pending row: only
-    /// the 0x07 rows run them. The last row drains in block 15, so block 2's
-    /// aggregate (ts 1,002) still gives a usable mark at ts 1,015 (rows of a
-    /// listed market without a mark wait). Two runs: equal native root and
-    /// dumps.
+    /// B's own 14 transfers cost 14 x `ADL_TRANSFER_UNITS` >= 2 (s99), so
+    /// block 2 drains nothing; then one row per block (a row costs >= 2: its
+    /// visit + a ranking or a read), blocks 3..=16. Oracle rows are pruned
+    /// at 12, so blocks 13..=16 carry no action, oracle row, cursor,
+    /// cooldown or pending row: only the 0x07 rows run them. The last row
+    /// drains in block 16, so block 2's aggregate (ts 1,002) still gives a
+    /// usable mark at ts 1,016 (rows of a listed market without a mark
+    /// wait). Two runs: equal native root and dumps.
     #[test]
     fn liquidation_e2e_adl_obligations_drain_over_empty_blocks() {
         use torus_core::liquidation::{ADL_ESCROW_LONG, COOLDOWN_TAG, CURSOR_KEY, PENDING_TAG};
@@ -17723,8 +17724,8 @@ mod crash_recovery_tests {
             (left, dump_all_cfs(&db), root, db)
         };
         let (left, dump_1, root_1, db) = run();
-        let want: Vec<usize> = std::iter::once(0).chain((2..=15).map(|h| 15 - h)).collect();
-        assert_eq!(left, want, "B = 2: 14 rows, one drained per block 2..=15");
+        let want: Vec<usize> = std::iter::once(0).chain((2..=16).map(|h| 16 - h)).collect();
+        assert_eq!(left, want, "B = 2: 14 rows, none drained in B (its transfers spend W), one per block 3..=16");
         for seed in adl_e2e_longs() {
             assert_eq!(signed_pos_of(&db, &oracle_addr(seed)), FixedPoint::ZERO, "seed {seed}: flat at B");
         }
@@ -17738,12 +17739,12 @@ mod crash_recovery_tests {
 
     /// The drain keeps no in-memory state across blocks (the ranking cache is
     /// per block, the dust bound test-only): the blocks above, run 2 stops
-    /// after block 8 (mid-drain: 7 rows left), drops the ExecutionContext AND
+    /// after block 8 (mid-drain: 8 rows left), drops the ExecutionContext AND
     /// the StateDb (RocksDB closed), opens the DB again from its directory
     /// (as a node restart does: running-hash activation configured again, a
     /// cold R slot, no resident state, a new Metrics instance) for 9..=15.
     /// Equal native root and dump after every block from 9 on, and the same
-    /// drain work units (`liquidation_adl_work_total`) in every block 1..=15
+    /// drain work units (`liquidation_adl_work_total`) in every block 1..=16
     /// (18c review, s96 fix list d: the units are what a restart could
     /// change without moving W = 2's one-row-per-block progress).
     #[test]
@@ -17763,13 +17764,13 @@ mod crash_recovery_tests {
             let (mut after, mut units) = (Vec::new(), Vec::new());
             for (i, b) in blocks.iter().enumerate() {
                 if Some(i) == restart_before {
-                    assert_eq!(adl_rows(&db), 7, "mid-drain");
+                    assert_eq!(adl_rows(&db), 8, "mid-drain");
                     drop(ctx);
                     drop(db);
                     db = StateDb::open(&dir).expect("reopen the state db");
                     torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height)
                         .expect("configure running hash activation");
-                    assert_eq!(adl_rows(&db), 7, "mid-drain after the reopen");
+                    assert_eq!(adl_rows(&db), 8, "mid-drain after the reopen");
                     ctx = open_ctx(&db);
                 }
                 let work = |ctx: &ExecutionContext| {
@@ -17788,7 +17789,7 @@ mod crash_recovery_tests {
         };
         let (straight, units_s) = run(None);
         let (restarted, units_r) = run(Some(8));
-        assert!(units_s.iter().filter(|&&u| u > 0).count() >= 14, "a drain in blocks 2..=15: {units_s:?}");
+        assert!(units_s.iter().filter(|&&u| u > 0).count() >= 15, "B's units in block 2, a drain in blocks 3..=16: {units_s:?}");
         assert_eq!(units_s, units_r, "drain work units per block, straight vs restarted");
         for (i, ((d1, r1), (d2, r2))) in straight.iter().zip(restarted.iter()).enumerate() {
             assert_dumps_equal(d1, d2, &format!("block {}", i + 9));

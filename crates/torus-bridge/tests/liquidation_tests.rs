@@ -8,8 +8,8 @@ use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
 use torus_core::liquidation::{
-    adl_escrow, next_obligation, Obligation, ADL_ESCROW_LONG, ADL_ESCROW_SHORT, ADL_OBLIGATION_TAG, ADL_WORK_PER_BLOCK,
-    LIQUIDATOR_VAULT,
+    adl_escrow, next_obligation, Obligation, ADL_ESCROW_LONG, ADL_ESCROW_SHORT, ADL_OBLIGATION_TAG, ADL_TRANSFER_UNITS,
+    ADL_WORK_PER_BLOCK, LIQUIDATOR_VAULT,
 };
 use torus_core::position::{MarginType, NativeBalance, Position};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS};
@@ -138,6 +138,12 @@ fn traders(ctx: &NativeExecContext) -> Vec<Address> {
     let mut v: Vec<Address> = all_positions(ctx).iter().map(|p| p.trader).collect();
     v.dedup();
     v
+}
+
+/// adl-budget s99 ranking units: the traders other than the two escrows
+/// with a position row in `m` (what a ranking of `m` charges).
+fn holders(ctx: &NativeExecContext, m: MarketId) -> u64 {
+    all_positions(ctx).iter().filter(|p| p.market_id == m && p.trader != ADL_ESCROW_LONG && p.trader != ADL_ESCROW_SHORT).count() as u64
 }
 
 fn liq_rows(ctx: &NativeExecContext, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1194,54 +1200,132 @@ fn p2_the_vault_moves_its_positions_to_the_escrow() {
     assert_eq!(bal(&c2, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
 }
 
-/// Q2 / Q3 (A6), W = 19. A row costs 1 (visit) + A_h if it is the first row
-/// of its (market, side) in block h (the ranking cache is per block) + 1
-/// read (each row is size 1; the top-ranked short always has >= 1 left).
-/// A_2 = 7 (c0..c3, sink, u3, the long escrow); A_3.. = 6 (u3 flat at B = 3).
-/// * Block 2: (2,1,u2) 9, (2,1,u1) 11, (2,2,u2) 20 >= 19: 3 rows.
-/// * Block 3 (u3's rows at height 3 sort after every height-2 row): (2,2,u1)
-///   8, (2,3,u2) 16, (2,3,u1) 18, (2,4,u2) 26: 4 rows.
-/// * Block 4: (2,4,u1) 8, (3,1,u3) 16, (3,2,u3) 24: 3 rows.
-/// * Block 5: (3,3,u3), (3,4,u3): the queue is empty.
+/// Q2 / Q3 (A6) with the s99 units (adl-budget.md §12), W = 63. Block B's
+/// transfers come first: T = `ADL_TRANSFER_UNITS` (6) each. A row costs 1
+/// (visit) + H_h if it is the first row of its (market, side) in block h
+/// (the ranking cache is per block; H = the holders of the market, escrows
+/// out) + 1 per candidate valued for the first time in the block (c0..c3, at
+/// the block's first ranking) + 1 read (each row is size 1; the top-ranked
+/// short always has >= 1 left). H_2 = 6 (c0..c3, sink, u3); H_3.. = 5 (u3
+/// flat at B = 3).
+/// * Block 2: B = 8 x 6 = 48; (2,1,u2) 60, (2,1,u1) 62, (2,2,u2) 70 >= 63:
+///   3 rows.
+/// * Block 3 (u3's rows at height 3 sort after every height-2 row): B = 4 x
+///   6 = 24; (2,2,u1) 35, (2,3,u2) 42, (2,3,u1) 44, (2,4,u2) 51, (2,4,u1)
+///   53, (3,1,u3) 60, then markets 2 and 3 are ranked already: (3,2,u3) 62,
+///   (3,3,u3) 64 >= 63: 8 rows.
+/// * Block 4: (3,4,u3) 1 + 5 + 4 + 1 = 11: the queue is empty.
 #[test]
 fn p2_drain_stops_at_w_and_resumes_in_fifo_order() {
+    const W: u64 = 63;
     let (_d, db) = p2_fixture();
     let [u1, u2, u3] = p2_bankrupt();
     let mut before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
-    step(&db, 1, 1_000, 19);
-    let c = step(&db, 2, 900, 19);
-    assert_eq!(traders(&c).len(), 7, "A_2");
+    let work = |c: &NativeExecContext| c.metrics.as_ref().unwrap().liquidation_adl_work_total.get();
+    step(&db, 1, 1_000, W);
+    let c = step(&db, 2, 900, W);
+    assert_eq!(holders(&c, 1), 6, "H_2");
     assert_eq!(keys(&c), vec![(2, 2, u1), (2, 3, u2), (2, 3, u1), (2, 4, u2), (2, 4, u1)]);
+    assert_eq!(work(&c), 70);
     invariants(&c, 900, before, P2_DUST_BOUND);
     drop(c);
     fund(&ctx_at(db.clone(), 3), &u3, fp(100));
     before -= fp(900);
-    let c = step(&db, 3, 900, 19);
-    assert_eq!(traders(&c).len(), 6, "A_3");
-    assert_eq!(keys(&c), vec![(2, 4, u1), (3, 1, u3), (3, 2, u3), (3, 3, u3), (3, 4, u3)]);
+    let c = step(&db, 3, 900, W);
+    assert_eq!(holders(&c, 1), 5, "H_3");
+    assert_eq!(keys(&c), vec![(3, 4, u3)]);
+    assert_eq!(work(&c), 64);
     invariants(&c, 900, before, P2_DUST_BOUND);
     drop(c);
-    let c = step(&db, 4, 900, 19);
-    assert_eq!(keys(&c), vec![(3, 3, u3), (3, 4, u3)]);
-    invariants(&c, 900, before, P2_DUST_BOUND);
-    drop(c);
-    let c = step(&db, 5, 900, 19);
+    let c = step(&db, 4, 900, W);
     assert_eq!(keys(&c), vec![]);
+    assert_eq!(work(&c), 11);
     invariants(&c, 900, before, P2_DUST_BOUND);
     assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty());
 }
 
-/// A step starts only while used < W and then runs to its end: block 2 (A =
-/// 7), W = A + 2 = 9 drains exactly one row (it costs 9; 9 is not < 9); W =
-/// A + 3 = 10 drains two (the second starts at 9 and ends at 11).
+/// A step starts only while used < W and then runs to its end: block 2
+/// (B = 48, the first row costs 1 + 6 + 4 + 1 = 12), W = 60 drains exactly
+/// one row (60 is not < 60); W = 61 drains two (the second starts at 60 and
+/// ends at 62).
 #[test]
 fn p2_drain_overshoots_by_at_most_one_step() {
-    for (w, drained) in [(9u64, 1usize), (10, 2)] {
+    for (w, drained) in [(60u64, 1usize), (61, 2)] {
         let (_d, db) = p2_fixture();
         step(&db, 1, 1_000, w);
         let c = step(&db, 2, 900, w);
         assert_eq!(obligations(&c).len(), 8 - drained, "W {w}");
     }
+}
+
+/// Owner s99 decision 3: block B's own work is charged into W first
+/// (`ADL_TRANSFER_UNITS` per position moved to an escrow) and B is never cut
+/// by it (atomic, as designed: every account the pass ADLs is flat at B).
+/// p2 fixture, block 2: u1 and u2 move 8 positions, B = 8 x 6 = 48.
+/// * W = 47 (B alone exceeds W) and W = 48 (B uses all of it): no drain in
+///   B — 8 rows, u1 / u2 flat at 0, the long escrow holds Σ rows, the step
+///   stays due, the block's units = 48. Block 3 (no B, same W) drains all 8
+///   rows for 12 + 2 + 3 x (8 + 2) = 44 units.
+/// * W = 49: the drain gets the 1 unit left and runs its first row
+///   (overshoot by one step): 7 rows left, 48 + 12 = 60 units.
+#[test]
+fn block_b_work_is_charged_into_w_before_the_drain() {
+    let [u1, u2, _] = p2_bankrupt();
+    for (w, left, units) in [(47u64, 8usize, 48u64), (48, 8, 48), (49, 7, 60)] {
+        let (_d, db) = p2_fixture();
+        let before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+        step(&db, 1, 1_000, w);
+        let c = step(&db, 2, 900, w);
+        let met = c.metrics.as_ref().unwrap();
+        assert_eq!(met.liquidations_adl.get(), 2, "W {w}");
+        assert_eq!(met.liquidation_adl_work_total.get(), units, "W {w}: B's units (+ the drain)");
+        assert_eq!(obligations(&c).len(), left, "W {w}");
+        for u in [u1, u2] {
+            flat_at_zero(&c, &u);
+        }
+        invariants(&c, 900, before, P2_DUST_BOUND);
+        assert!(NativeExecutor::liquidation_due(&c.state).unwrap(), "W {w}: rows keep the step due");
+        drop(c);
+        if left == 8 {
+            let c = step(&db, 3, 900, w);
+            assert!(obligations(&c).is_empty(), "W {w}: block 3 drains the rest");
+            assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_work_total.get(), 44, "W {w}");
+            invariants(&c, 900, before, P2_DUST_BOUND);
+        }
+    }
+}
+
+/// Owner s99 decision 2: a ranking charges the HOLDERS of its market (live
+/// position rows in it, the escrows never counted), not the trader set.
+/// Market 1: u long 1 against c short 1; market 2: 30 bystanders long 1
+/// against a sink short 30. u goes bankrupt (B = 1 transfer); the drain
+/// ranks market 1 once: 1 visit + 1 holder (c) + 1 first-sight valuation
+/// (c) + 1 read = 4, so the block costs T + 4 whatever the 32 traders of
+/// market 2.
+#[test]
+fn a_ranking_charges_the_holders_of_its_market_not_the_trader_set() {
+    let (_d, db) = liq_db(&[1, 2]);
+    let (u, c, sink) = (addr(0x0A), addr(0x0B), addr(0xF0));
+    let ctx = ctx_at(db.clone(), 1);
+    fund(&ctx, &u, fp(60)); // MM 50 at 1,000: healthy; AV 60 - 100 < 0 at 900
+    fund(&ctx, &c, fp(10_000_000));
+    fund(&ctx, &sink, fp(10_000_000));
+    open_pair(&ctx, &u, &c, 1, 1, 1_000);
+    for i in 0..30u8 {
+        let b = addr(0x80 + i);
+        fund(&ctx, &b, fp(10_000_000));
+        open_pair(&ctx, &b, &sink, 2, 1, 1_000);
+    }
+    assert_eq!(traders(&ctx).len(), 33, "u, c, the sink and 30 bystanders");
+    drop(ctx);
+    assert!(step_marks(&db, 1, &[(1, 1_000), (2, 1_000)], ADL_WORK_PER_BLOCK).fatal_error.is_none());
+    let ctx = step_marks(&db, 2, &[(1, 900), (2, 1_000)], ADL_WORK_PER_BLOCK);
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    let met = ctx.metrics.as_ref().unwrap();
+    assert_eq!(met.liquidations_adl.get(), 1);
+    assert!(obligations(&ctx).is_empty(), "drained in B");
+    flat_at_zero(&ctx, &u);
+    assert_eq!(met.liquidation_adl_work_total.get(), ADL_TRANSFER_UNITS + 4, "T + 1 + 1 holder + 1 valuation + 1 read");
 }
 
 /// Default W: the drain finishes in B; both escrows end with no position
@@ -1389,10 +1473,11 @@ fn p2_a_row_left_open_after_the_holders_and_the_pairing_is_fatal() {
 /// (a per-block position, never before the row itself), not at the queue
 /// head. K short rows (990) and K long rows (950) of size 1 in one market, no
 /// real holder, each escrow holding K. Units: K visits (the long rows go as
-/// partners before the drain reaches them) + one ranking of the 2 traders
-/// (the escrows) + the pairing reads: the first scan reads the K - 1 other
-/// short rows and l1, each later one only its partner: 3K + 1, linear (from
-/// the head it was K + 2 + K(K + 1)/2 + K).
+/// partners before the drain reaches them) + one ranking of 0 holders (only
+/// the escrows hold the market; s99: escrows never count) + the pairing
+/// reads: the first scan reads the K - 1 other short rows and l1, each later
+/// one only its partner: 3K - 1, linear (from the head it was K + 2 + K(K +
+/// 1)/2 + K with the A6 units).
 #[test]
 fn p2_escrow_pairing_units_are_linear_in_the_rows() {
     use torus_core::liquidation::put_obligation;
@@ -1413,7 +1498,7 @@ fn p2_escrow_pairing_units_are_linear_in_the_rows() {
     assert!(obligations(&c).is_empty());
     assert_eq!(oi(&c, 1), (FixedPoint::ZERO, FixedPoint::ZERO));
     let k = u64::from(K);
-    assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_work_total.get(), 3 * k + 1);
+    assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_work_total.get(), 3 * k - 1);
 }
 
 /// Per block: the positions, balances and liquidation rows of a P2 run
@@ -1431,8 +1516,8 @@ fn p2_run(w: u64) -> Vec<Vec<Vec<(Vec<u8>, Vec<u8>)>>> {
     out
 }
 
-/// Two fresh runs give identical rows block by block (default W and W = A
-/// + 3, a multi-block drain).
+/// Two fresh runs give identical rows block by block (default W and W = 10:
+/// no drain in B, then one row per block, a multi-block drain).
 #[test]
 fn p2_drain_is_deterministic() {
     for w in [ADL_WORK_PER_BLOCK, 10] {
@@ -2044,9 +2129,11 @@ fn telemetry_does_not_change_results_or_state() {
 /// `liq_value_sum` on, the value sum over ALL accounts (= the test's
 /// `total_value` after every block, constant across the drain within the
 /// dust bound). B = block 2 with W = 0: 8 rows, the long escrow long 2 in
-/// each market (8 x 900 notional); then W = 19: block 3 drains 3 rows for 20
-/// units (9 + 2 + 9, A = 7), and later blocks the rest. Every block: each
-/// market nets to 0 over every holder, escrows and vault included (18c s99).
+/// each market (8 x 900 notional), B's own 8 transfers counted (48 units,
+/// s99); then W = 19: block 3 drains 3 rows for 22 units (12 + 2 + 8: H = 6
+/// holders, 4 first-sight valuations), and later blocks the rest. Every
+/// block: each market nets to 0 over every holder, escrows and vault
+/// included (18c s99).
 #[test]
 fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
     let (_d, db) = p2_fixture();
@@ -2078,7 +2165,7 @@ fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
     assert_eq!(met.liquidation_adl_queue_deficit.get(), tokens(deficit));
     let owed = obligations(&c).iter().fold(FixedPoint::ZERO, |s, o| s + fp(900) - o.price);
     assert!((deficit - owed).raw().abs() <= 1, "≈ Σ (900 - price) over the rows: {deficit:?} vs {owed:?}");
-    assert_eq!(met.liquidation_adl_work_total.get(), 0, "W = 0: no drain");
+    assert_eq!(met.liquidation_adl_work_total.get(), 8 * ADL_TRANSFER_UNITS, "W = 0: no drain, B's transfers only");
     let before = total_value(&c, &p2_marks(900));
     assert_eq!(met.liquidation_value_sum.get(), tokens(before));
     drop(c);
@@ -2086,7 +2173,7 @@ fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
     loop {
         let c = step(h, 900, 19);
         if h == 3 {
-            assert_eq!((met.liquidation_adl_work_total.get(), met.liquidation_adl_queue.get()), (20, 5));
+            assert_eq!((met.liquidation_adl_work_total.get(), met.liquidation_adl_queue.get()), (8 * ADL_TRANSFER_UNITS + 22, 5));
         }
         assert_eq!(met.liquidation_adl_queue.get(), obligations(&c).len() as i64, "block {h}");
         let now = total_value(&c, &p2_marks(900));
@@ -2295,16 +2382,18 @@ fn value_sum_does_not_jump_when_a_market_loses_its_mark() {
 /// the HL shape of `ubench_adl`'s HL mode at small N, in the default suite.
 /// N = 20 traders each short 1 in every one of 100 listed markets (against a
 /// sink long N), 3 accounts long 1 in all 100 (against the traders) go
-/// bankrupt in one block: 300 rows, one side. The drain's units are exactly
-/// the formula W = 630,000 is sized from (§9, at N = 5,000): U(N) = 100
-/// rankings x (N + 2 traders in the set: the N shorts, the sink, the long
-/// escrow) + 300 rows x (1 visit + 1 read). W = U(N) closes every row in B;
-/// W = U(N) - 2 leaves the last row (cost 2: its ranking is done) for the
-/// next block.
+/// bankrupt in one block: 300 rows, one side. Block B's units are exactly
+/// the s99 formula (adl-budget.md §12): U(N) = 300 transfers x
+/// `ADL_TRANSFER_UNITS` (B's own work) + 100 rankings x (N + 1 holders of
+/// the market: the N shorts and the sink; the bankrupt accounts are flat,
+/// the escrows never count) + N first-sight valuations (the N shorts, the
+/// candidates; the sink is long) + 300 rows x (1 visit + 1 read). W = U(N)
+/// closes every row in B; W = U(N) - 2 leaves the last row (cost 2: its
+/// ranking is done) for the next block.
 #[test]
 fn an_hl_shaped_event_costs_exactly_the_sizing_formula() {
     const N: u64 = 20;
-    let units = 100 * (N + 2) + 300 * 2;
+    let units = 300 * ADL_TRANSFER_UNITS + 100 * (N + 1) + N + 300 * 2;
     let markets: Vec<MarketId> = (1..=100).collect();
     let t = |i: u64| {
         let mut a = [0x50u8; 20];
@@ -2341,7 +2430,8 @@ fn an_hl_shaped_event_costs_exactly_the_sizing_formula() {
         assert_eq!(met.liquidation_adl_work_total.get(), units - 2 * left as u64, "W {w}: units = U(N)");
         assert_eq!(obligations(&c).len(), left, "W {w}");
     }
-    assert!(ADL_WORK_PER_BLOCK >= 100 * (5_000 + 3) + 300 * 2, "W covers U(5,000) (+1 protocol account)");
+    let thin = 300 * ADL_TRANSFER_UNITS + 100 * (500 + 3) + (5_000 + 3) + 300 * 2;
+    assert!(ADL_WORK_PER_BLOCK >= thin, "W covers U at N = 5,000 with 10 % holders per market (+3 protocol / sink)");
 }
 
 /// Fix list h (18c s99; s750 h803 and s750vs h620 logged one 'ADL escrow dust

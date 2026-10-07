@@ -28,8 +28,13 @@
 //!
 //! `UB_ADL_HL=1` (the W sizing case, adl-budget-impl A8): 3 bankrupt accounts
 //! in markets 1..=100 (300 rows over 100 (market, long) keys); asserts the
-//! escrows are closed after block B when W covers the event's units
-//! U(N) = 100 × (N + 2) + 300 × 2 (the sizing formula, §9).
+//! escrows are closed after block B exactly when W covers the event's units
+//! (s99 units, adl-budget.md §12): U = 300 × `ADL_TRANSFER_UNITS` (B's
+//! transfers) + Σ over markets 1..=100 of its holders (the traders holding
+//! it + the sink) + the first-sight valuations (every trader short in some
+//! market of 1..=100, + the sink) + 300 × 2 (row visit + read). All hold:
+//! U(N) = 1,800 + 100 × (N + 1) + (N + 1) + 600. W >= U: one block; W <=
+//! U - 2: more than one (the last row starts at U - 2).
 //!
 //! `UB_ADL_HOLDERS_PCT` (default 100: every trader holds every market):
 //! thin markets for C2. Traders come in pairs (2p, 2p + 1); a pair holds
@@ -38,9 +43,10 @@
 //! pair is one long, one short by the `i + m` rule). Bankrupt accounts and
 //! the sink as above. Use an even `UB_ADL_TRADERS`.
 //!
-//! Asserts: per-block units <= W + the largest row cost (1 visit + a ranking
-//! of every trader + reads; no edge rows here); afterwards OI symmetric in
-//! every market, both escrows and every bankrupt account flat at exactly 0.
+//! Asserts: per-block units <= max(B's units, W + the largest row cost (1
+//! visit + a ranking of every holder + first-sight valuations + reads; no
+//! edge rows here)); afterwards OI symmetric in every market, both escrows
+//! and every bankrupt account flat at exactly 0.
 //!
 //!   UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
 //!   UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 cargo test ... (S=750-like)
@@ -211,6 +217,13 @@ fn ubench_adl_p2() {
         }
     }
     let rows = db.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap().len();
+    // s99 units of the HL event (see the module doc): holders per market and
+    // the distinct short candidates over markets 1..=pu, each + the sink.
+    let hl_units = {
+        let holders: u64 = (1..=pu).map(|m| (0..n).filter(|&i| holds(i, m, holders_pct)).count() as u64 + 1).sum();
+        let seen = (0..n).filter(|&i| (1..=pu).any(|m| holds(i, m, holders_pct) && (i + m) % 2 == 1)).count() as u64 + 1;
+        k * pu * liq::ADL_TRANSFER_UNITS + holders + seen + k * pu * 2
+    };
     println!(
         "ADL setup: hl={hl} traders={n} bankrupt={k} positions/bankrupt={pu} obligations={} W={w} R={resident} \
          position rows={rows} setup_ms={:.0}",
@@ -219,6 +232,9 @@ fn ubench_adl_p2() {
     );
     if holders_pct < 100 {
         println!("ADL setup: holders_pct={holders_pct}");
+    }
+    if hl {
+        println!("ADL setup: HL event units U={hl_units} (one block iff W >= U)");
     }
 
     let metrics = Arc::new(torus_telemetry::Metrics::new());
@@ -268,8 +284,10 @@ fn ubench_adl_p2() {
             }
             Some(s) => {
                 let b_ms = seen.escrow.last().map_or(0.0, |e| (*e - t0).as_secs_f64() * 1e3);
-                let row_cost = 1 + (n + k + 4) + 2 * (n + 4);
-                assert!(s.adl_work <= w + row_cost, "h={h}: {} units > W {w} + {row_cost}", s.adl_work);
+                let row_cost = 1 + 2 * (n + k + 4) + 2 * (n + 4);
+                let b_units = seen.escrow.len() as u64 * liq::ADL_TRANSFER_UNITS;
+                let cap = b_units.max(w + row_cost);
+                assert!(s.adl_work <= cap, "h={h}: {} units > max(B {b_units}, W {w} + {row_cost})", s.adl_work);
                 println!(
                     "h={h} transfers={} B_ms={b_ms:.1} step_ms={:.1} adl={} scanned={} rows={} adl_work={}",
                     seen.escrow.len(),
@@ -284,8 +302,11 @@ fn ubench_adl_p2() {
         }
         let queue_empty = liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none();
         if !drained && h >= 2 && queue_empty && metrics.liquidations_adl.get() >= k {
-            if hl && w >= 100 * (n + 2) + 600 {
-                assert_eq!(blocks.len(), 1, "an HL-sized event closes the escrows in block B");
+            if hl && w >= hl_units {
+                assert_eq!(blocks.len(), 1, "W {w} >= U {hl_units}: the HL event closes the escrows in block B");
+            }
+            if hl && w + 2 <= hl_units {
+                assert!(blocks.len() > 1, "W {w} <= U {hl_units} - 2: the HL event does not close in block B");
             }
             for a in (0..k).map(bankrupt).chain([liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT]) {
                 assert!(ctx.positions.positions_for_trader(&a).unwrap().is_empty(), "{a}: positions");
