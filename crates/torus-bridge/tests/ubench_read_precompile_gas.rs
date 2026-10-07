@@ -53,17 +53,22 @@
 //! cancels them all (CancelAllOrders) and places as many new ones at worse
 //! prices, through the real executor; blocks are flushed like the node does
 //! (`flush_with_native_trie_stats`) every `UB_RG_CHURN_BLOCK_MS` (default
-//! 100); after each flush one getOrderBook on that market is measured.
+//! 100); after each flush one getOrderBook on that market is measured, with
+//! the stall / flush / L0 counters of part 5.
 //!
 //! Part 5 (`MCHURN`): `UB_RG_MCHURN_MARKETS` (default 50) markets each delete
 //! and re-write `UB_RG_MCHURN_ORDERS` (default 100, then 10) bid level rows per
 //! block (through the block overlay and its flush), in a book CF with
 //! `UB_RG_BOOK_MB` (default 400) MB of incompressible filler rows of 4,000
-//! other markets: the compaction work per block (RocksDB tickers) and the
-//! tombstones one getOrderBook walks.
+//! other markets (each churn market also holds 64 static ask levels, so the
+//! read answers 64 + 64 levels): the compaction work per block (RocksDB
+//! tickers), write stalls, flushes and the book CF's L0 / SST file counts
+//! (needs `TORUS_ROCKSDB_STATS=2`), and the tombstones one getOrderBook walks
+//! (first call after the flush and the median of 5). The book CF's SST target
+//! follows `TORUS_BOOK_CF_TARGET_FILE_MB` (default: RocksDB's 64 MiB).
 //!
 //! Output lines (whitespace key=value): `ROW`, `FIT`, `E2E`, `TOMB`, `COMPACT`,
-//! `CHURN`, `CHURNSUM`, `MCHURN`, `MCHURNSUM`.
+//! `CHURN`, `CHURNSUM`, `CHURNSTALL`, `MCHURN`, `MCHURNSUM`, `MCHURNSTALL`, `MCHURNCFSTATS`.
 //!
 //!   cargo test -p torus-bridge --release --test ubench_read_precompile_gas -- --ignored --nocapture
 //!
@@ -86,7 +91,7 @@ use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor};
-use torus_core::book_rows::{book_order_key, level_row_key_tagged, SIDE_TAG_BID};
+use torus_core::book_rows::{book_order_key, level_row_key_tagged, SIDE_TAG_ASK, SIDE_TAG_BID};
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
 use torus_core::precompiles::{
     execute_precompile_metered, precompile_address, reader_budget, reader_gas, ReadMeter,
@@ -1290,6 +1295,8 @@ fn scenario_churn(blocks: u64, orders: u64, block_ms: u64, filler: u64) {
         let db = tomb_db(&dir, filler);
         let maker = addr(16, 0);
         let (mut peak, mut peak_block, mut skipped_sum, mut last) = (0u64, 0u64, 0u64, Vec::new());
+        let lsm0 = lsm(&db);
+        let (mut prev_lsm, mut max_l0, mut flush_ms_all) = (lsm0, 0u64, Vec::new());
         let t0 = Instant::now();
         for b in 0..blocks {
             let started = Instant::now();
@@ -1320,12 +1327,23 @@ fn scenario_churn(blocks: u64, orders: u64, block_ms: u64, filler: u64) {
             drop(ov);
             let (ns, gas, bytes, skipped) =
                 tomb_call(&NativeStateOverlay::new(db.clone()), &inp, 5);
+            let l = lsm(&db);
+            max_l0 = max_l0.max(l.l0);
+            flush_ms_all.push(flush_ms);
             println!(
                 "CHURN case={case} block={b} orders={orders} flush_ms={flush_ms:.1} gas={gas} answer_bytes={bytes} \
-                 skipped={skipped} ns={ns:.0} ms_at_30M={:.1} t_ms={}",
+                 skipped={skipped} ns={ns:.0} ms_at_30M={:.1} stall_us={} flushes={} write_stopped={} delayed_rate={} \
+                 l0={} files={} t_ms={}",
                 ns / gas as f64 * 30.0,
+                l.stall_us - prev_lsm.stall_us,
+                l.flushes - prev_lsm.flushes,
+                l.write_stopped,
+                l.delayed_rate,
+                l.l0,
+                l.files,
                 t0.elapsed().as_millis()
             );
+            prev_lsm = l;
             if skipped > peak {
                 (peak, peak_block) = (skipped, b);
             }
@@ -1343,6 +1361,17 @@ fn scenario_churn(blocks: u64, orders: u64, block_ms: u64, filler: u64) {
             skipped_sum as f64 / blocks as f64,
             median_f(&last),
             db.wait_background_compaction()
+        );
+        flush_ms_all.sort_by(f64::total_cmp);
+        println!(
+            "CHURNSTALL case={case} blocks={blocks} stall_us={} stalls={} flushes={} max_l0={max_l0} end_files={} \
+             flush_ms_median={:.1} flush_ms_max={:.1}",
+            prev_lsm.stall_us - lsm0.stall_us,
+            prev_lsm.stalls - lsm0.stalls,
+            prev_lsm.flushes - lsm0.flushes,
+            prev_lsm.files,
+            median_f(&flush_ms_all),
+            flush_ms_all.last().copied().unwrap_or(0.0)
         );
     }
 }
@@ -1377,6 +1406,46 @@ fn compaction_tickers(db: &StateDb) -> (u64, u64, u64) {
         t.compact_write_bytes,
         t.compaction_cpu_micros,
     )
+}
+
+/// Write-stall / LSM snapshot for part 5: RocksDB stall micros, write-stall
+/// events, flushes and compaction jobs (counters; level-2 histograms, so
+/// `TORUS_ROCKSDB_STATS=2`), plus the write-controller state and the book
+/// CF's L0 / total SST file counts right now.
+#[derive(Clone, Copy, Default)]
+struct Lsm {
+    stall_us: u64,
+    stalls: u64,
+    flushes: u64,
+    compactions: u64,
+    write_stopped: u64,
+    delayed_rate: u64,
+    l0: u64,
+    files: u64,
+}
+
+fn lsm(db: &StateDb) -> Lsm {
+    let s = db.runtime_stats();
+    let h = s
+        .histograms
+        .expect("RocksDB histograms (TORUS_ROCKSDB_STATS=2)");
+    let cf = db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap();
+    let files_at = |l: usize| {
+        db.inner()
+            .property_int_value_cf(cf, &format!("rocksdb.num-files-at-level{l}"))
+            .unwrap()
+            .unwrap_or(0)
+    };
+    Lsm {
+        stall_us: s.tickers.expect("tickers").stall_micros,
+        stalls: h.write_stall.count,
+        flushes: h.flush.count,
+        compactions: h.compaction.count,
+        write_stopped: s.write_stopped,
+        delayed_rate: s.delayed_write_rate,
+        l0: files_at(0),
+        files: (0..7).map(files_at).sum(),
+    }
 }
 
 /// Part 5 (`MCHURN`): `markets` markets each cancel and re-place `orders`
@@ -1428,9 +1497,15 @@ fn scenario_multi_churn(blocks: u64, markets: u64, per_block: &[u64], book_mb: u
                 fp(1_000_000 - (b * orders + i) as i64).raw(),
             )
         };
+        // 64 static ask levels per churn market: getOrderBook answers the
+        // s99 cap on both sides (64 + 64 levels).
         for &m in &churn {
             for i in 0..orders {
                 batch.put_cf(cf, level(m, 0, i), &template);
+            }
+            for i in 0..COLD_LEVELS_PER_SIDE {
+                let ask = level_row_key_tagged(m, SIDE_TAG_ASK, fp(2_000_000 + i).raw());
+                batch.put_cf(cf, ask, &template);
             }
         }
         db.inner().write(batch).unwrap();
@@ -1452,6 +1527,10 @@ fn scenario_multi_churn(blocks: u64, markets: u64, per_block: &[u64], book_mb: u
         let inp = input("getOrderBook(bytes32)", &[u64_word(churn[0])]);
         let (mut sum_r, mut sum_w, mut sum_cpu, mut peak, mut times) =
             (0u64, 0u64, 0u64, 0u64, Vec::new());
+        let (mut firsts, mut flushes_ms, mut steady) = (Vec::new(), Vec::new(), Vec::new());
+        let lsm0 = lsm(&db);
+        let (mut prev_lsm, mut max_l0, mut max_files) = (lsm0, 0u64, 0u64);
+        let (mut stopped_blocks, mut delayed_blocks) = (0u64, 0u64);
         let mut prev = compaction_tickers(&db);
         let t0 = Instant::now();
         for b in 1..=blocks {
@@ -1470,9 +1549,33 @@ fn scenario_multi_churn(blocks: u64, markets: u64, per_block: &[u64], book_mb: u
                 .unwrap();
             let flush_ms = tf.elapsed().as_secs_f64() * 1e3;
             drop(ov);
-            let (ns, gas, _, skipped) = tomb_call(&NativeStateOverlay::new(db.clone()), &inp, 5);
+            // The first call after the flush (new SST files not yet in the
+            // block cache; the OS page cache stays warm), then the median of 5.
+            let reader = NativeStateOverlay::new(db.clone());
+            let (first_ns, _, ok) = call_once(&reader, ADDR_ORDER_BOOK_READER, &inp);
+            assert!(ok);
+            let first_ns = first_ns as f64;
+            let (ns, gas, bytes, skipped) = tomb_call(&reader, &inp, 5);
+            drop(reader);
             if let Some(rest) = pace.checked_sub(started.elapsed()) {
                 std::thread::sleep(rest);
+            }
+            // Stalls, flushes and the book CF's files during this block interval.
+            let l = lsm(&db);
+            let (stall_us, stalls, flushes, compactions) = (
+                l.stall_us - prev_lsm.stall_us,
+                l.stalls - prev_lsm.stalls,
+                l.flushes - prev_lsm.flushes,
+                l.compactions - prev_lsm.compactions,
+            );
+            prev_lsm = l;
+            (max_l0, max_files) = (max_l0.max(l.l0), max_files.max(l.files));
+            stopped_blocks += u64::from(l.write_stopped > 0);
+            delayed_blocks += u64::from(l.delayed_rate > 0);
+            firsts.push(first_ns / gas as f64 * 30.0);
+            flushes_ms.push(flush_ms);
+            if 2 * b > blocks {
+                steady.push(skipped as f64);
             }
             // Compaction work during this block interval.
             let now = compaction_tickers(&db);
@@ -1484,16 +1587,62 @@ fn scenario_multi_churn(blocks: u64, markets: u64, per_block: &[u64], book_mb: u
             times.push(ms30);
             println!(
                 "MCHURN markets={markets} orders={orders} block={b} flush_ms={flush_ms:.1} compact_read_mb={:.1} \
-                 compact_write_mb={:.1} compact_cpu_ms={:.1} gas={gas} skipped={skipped} ns={ns:.0} ms_at_30M={ms30:.1} t_ms={}",
+                 compact_write_mb={:.1} compact_cpu_ms={:.1} gas={gas} answer_bytes={bytes} skipped={skipped} ns={ns:.0} \
+                 ms_at_30M={ms30:.1} first_ms_at_30M={:.1} stall_us={stall_us} stalls={stalls} write_stopped={} \
+                 delayed_rate={} flushes={flushes} compactions={compactions} l0={} files={} t_ms={}",
                 r as f64 / 1e6,
                 w as f64 / 1e6,
                 cpu as f64 / 1e3,
+                first_ns / gas as f64 * 30.0,
+                l.write_stopped,
+                l.delayed_rate,
+                l.l0,
+                l.files,
                 t0.elapsed().as_millis()
             );
         }
         let tw = Instant::now();
         let runs = db.wait_background_compaction();
         let tail = compaction_tickers(&db);
+        let end = lsm(&db);
+        let mut sorted = flushes_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        println!(
+            "MCHURNSTALL markets={markets} orders={orders} blocks={blocks} stall_us={} stalls={} stopped_blocks={stopped_blocks} \
+             delayed_blocks={delayed_blocks} flushes={} compactions={} max_l0={max_l0} max_files={max_files} end_l0={} \
+             end_files={} flush_ms_median={:.1} flush_ms_p99={:.1} flush_ms_max={:.1} steady_skipped_median={:.0} \
+             first_median_ms_at_30M={:.1} first_max_ms_at_30M={:.1}",
+            prev_lsm.stall_us - lsm0.stall_us,
+            prev_lsm.stalls - lsm0.stalls,
+            prev_lsm.flushes - lsm0.flushes,
+            prev_lsm.compactions - lsm0.compactions,
+            end.l0,
+            end.files,
+            median_f(&flushes_ms),
+            sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)],
+            sorted.last().copied().unwrap_or(0.0),
+            median_f(&steady),
+            median_f(&firsts),
+            firsts.iter().cloned().fold(0.0, f64::max)
+        );
+        let book = db.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap();
+        for line in db
+            .inner()
+            .property_value_cf(book, "rocksdb.cfstats")
+            .unwrap()
+            .unwrap_or_default()
+            .lines()
+            .chain(
+                db.inner()
+                    .property_value("rocksdb.dbstats")
+                    .unwrap()
+                    .unwrap_or_default()
+                    .lines(),
+            )
+            .filter(|l| l.contains("tall") || l.starts_with("  L") || l.starts_with(" Sum"))
+        {
+            println!("MCHURNCFSTATS {line}");
+        }
         println!(
             "MCHURNSUM markets={markets} orders={orders} blocks={blocks} book_cf_mb={:.0} per_block_compact_read_mb={:.2} \
              per_block_compact_write_mb={:.2} per_block_compact_cpu_ms={:.1} tail_wait_ms={:.0} tail_write_mb={:.1} \
