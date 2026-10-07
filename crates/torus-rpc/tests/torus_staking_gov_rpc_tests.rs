@@ -563,3 +563,67 @@ async fn torus_get_governance_params() {
 
     handle.stop().unwrap();
 }
+
+/// s99: passed ParameterChange votes on governance params show up in
+/// `torus_getGovernanceParams` (they used to write a row nothing read).
+#[tokio::test]
+async fn torus_get_governance_params_reflects_passed_votes() {
+    use torus_economics::governance::{ExecutionPayload, GovernanceParams, ProposalOutcome};
+
+    let (_dir, state, mempool, executor) = setup();
+    let gov = GovernanceManager::new(state.clone());
+    let mut params = GovernanceParams::defaults(Address::ZERO);
+    params.voting_period_blocks = 100;
+    params.timelock_blocks = 10;
+    params.min_proposal_stake = wei(100);
+    gov.set_governance_params(&params).unwrap();
+
+    let staking = StakingManager::new(state.clone());
+    let (validator, voter) = (addr(1), addr(2));
+    fund(&state, &validator, wei(100_000));
+    fund(&state, &voter, wei(100_000));
+    staking
+        .register_validator(validator, [1u8; 32], 500, wei(10_000))
+        .unwrap();
+    staking.delegate(voter, validator, wei(5_000)).unwrap();
+
+    for (key, value) in [
+        ("voting_period_blocks", "2000"),
+        ("quorum_bps", "5000"),
+        ("permanent_weight_multiplier_num", "7"),
+    ] {
+        gov.submit_proposal(
+            voter,
+            "P".into(),
+            "D".into(),
+            Some(ExecutionPayload::ParameterChange {
+                param_key: key.into(),
+                new_value: value.into(),
+            }),
+            0,
+        )
+        .unwrap();
+    }
+    for id in 1..=3 {
+        gov.cast_vote(voter, id, true, 1).unwrap();
+    }
+    gov.process_pending_proposals(101).unwrap();
+    assert_eq!(
+        gov.process_pending_proposals(111).unwrap(),
+        (1..=3).map(ProposalOutcome::Executed).collect::<Vec<_>>()
+    );
+
+    let (handle, saddr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{saddr}"))
+        .unwrap();
+    let result: RpcGovernanceParams = client
+        .request("torus_getGovernanceParams", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(result.voting_period_blocks, hex_u64(2000));
+    assert_eq!(result.quorum_bps, hex_u64(5000));
+    assert_eq!(result.permanent_weight_multiplier, "7/2");
+
+    handle.stop().unwrap();
+}
