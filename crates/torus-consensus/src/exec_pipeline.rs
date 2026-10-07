@@ -580,6 +580,21 @@ mod tests {
             })
             .unwrap();
         });
+        // Wait (bounded) until the sender is inside submit(2): `outstanding` is
+        // bumped right before the rendezvous send. A fixed sleep here flaked
+        // under load (the thread had not run yet, outstanding still 1).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while worker.outstanding() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sender thread never reached submit(2) within 10 s (outstanding = {})",
+                worker.outstanding()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The sender is now at (or about to enter) the rendezvous send; give it
+        // time to complete if it wrongly could. A slow scheduler can only make
+        // this check pass, never fail it spuriously.
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(!sender.is_finished(), "submit(2) must block while W holds job 1");
         assert_eq!(gate.received(), vec![1], "W must not have received 2 yet");
