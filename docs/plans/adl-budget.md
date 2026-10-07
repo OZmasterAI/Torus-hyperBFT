@@ -753,3 +753,218 @@ Every pinned digest is unchanged in every R mode, serial and engine: `PRE_ROW50_
 
 The units are visible only in `liquidation_adl_work_total` and in drain progress, so every test
 that pins either is re-derived in 12.5.
+
+## 13. Re-measure at W = 100,000 with holder units (s99)
+
+`crates/torus-bridge/tests/ubench_adl.rs` on perf/adl-budget @ **f6a54382** (local, not pushed). This is §12 as built:
+* W = `ADL_WORK_PER_BLOCK` = 100,000 (`UB_ADL_WORK` not set);
+* a ranking charges H(m);
+* block B is charged into W (T = `ADL_TRANSFER_UNITS` = 6 per escrow transfer, 1 per first-sight valuation);
+* `has_key` is prefix-bounded.
+
+No code or bench knob was changed. The method is as in §9 / §11:
+* release build, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`, `RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`;
+* binary `ubench_adl-5626de9bfbcc1f30`, sha256 `9b04a13c…`;
+* 3 runs per case, run as the systemd unit `bench-adl-s99`, plus one perf unit `bench-adl-s99-perfc3`;
+* every case started at 1-min load < 1.5. The 5/15-min averages were still 7-9 / 7, decaying after a nextest.
+
+B ms, step ms and ns/unit are as in §9. "Gross ns/unit" = step ms / `adl_work`. "Rig" = ozarchy ms × 1.9-2 (§9 factor).
+
+### 13.1 Units: measured = §12.3 model, exactly
+
+| case | load at start (1/5/15 min) | blocks | block B units (rows) | later blocks units (rows) | last block | total | vs §12.3 |
+|---|---|---|---|---|---|---|---|
+| 1 HL N = 5,000, all hold | 1.10 / 9.12 / 7.62 | 6 | 101,930 (55) | 100,128 × 4 (54 each) | 55,069 (29) | 557,511 | identical |
+| 2 HL N = 5,000, 10 % | 1.06 / 8.47 / 7.44 | 1 | 57,283 (300) | — | — | 57,283 | identical |
+| 3 HL N = 100,000, 10 % | 1.06 / 8.34 / 7.41 | 17 | 102,763 (19) | 100,064-113,593 (18-21; 21 rows = 113,593 in block 5) | 44,933 (8) | 1,672,032 | identical |
+| 4 S=750-like (5,000 × 300; 100 × 270) | 1.05 / 7.02 / 7.01 | 32 | B₁ 103,680 (0 rows: 17,280 transfers × 6, no drain); B₂ 104,227 (449 rows; 58,320 for 9,720 transfers) | 102,324 × 14 (1,152), 101,932 (956), 101,316 × 14 (648) | 60,802 (395) | 3,221,601 | identical |
+
+Units, rows and transfers are bit-identical across the 3 runs of every case, and no block differs from the model. The bench's single-block U (`U=` line) is 507,501 for case 1 and 1,101,695 for case 3. The multi-block totals are higher (557,511 / 1,672,032) because a market whose rows span a block boundary is ranked again (§11.3).
+
+### 13.2 Time per block (ozarchy ms, 3 runs; rig = × 1.9-2)
+
+| case | block | transfers | rows | units | B ms | step ms (r1 / r2 / r3) | rig ms | gross ns/unit |
+|---|---|---|---|---|---|---|---|---|
+| 1 HL 5k all-hold | B (h=4) | 300 | 55 | 101,930 | 1.0 | 113.4 / 110.7 / 109.1 | 207-227 | 1,070-1,113 |
+| | 2-5 | 0 | 54 | 100,128 | — | 54.6-59.8 | 104-120 | 545-597 |
+| | 6 | 0 | 29 | 55,069 | — | 28.4 / 28.5 / 28.1 | 53-57 | 510-518 |
+| 2 HL 5k 10 % | B (only) | 300 | 300 | 57,283 | 0.9 | 57.2 / 57.0 / 61.1 | 108-122 | 995-1,067 |
+| 3 HL 100k 10 % | B (h=50) | 300 | 19 | 102,763 | 1.0 | 138.0 / 137.0 / 134.6 | **256-276** | 1,310-1,343 |
+| | 2-16 | 0 | 18-21 | 100,064-113,593 | — | 101.8-123.3 | 193-247 | 1,008-1,112 |
+| | worst later: 5 | 0 | 21 | 113,593 | — | 123.3 / 118.1 / 118.1 | 224-247 | 1,040-1,086 |
+| | 17 | 0 | 8 | 44,933 | — | 45.6 / 44.2 / 44.4 | 84-91 | 984-1,015 |
+| 4 S=750-like | B₁ (h=4) | 17,280 | 0 | 103,680 | 65.7-65.9 | 66.0 / 66.2 / 66.1 | 125-132 | 637-639 |
+| | B₂ (h=5) | 9,720 | 449 | 104,227 | 35.1-35.5 | 107.1 / 106.6 / 107.3 | 203-215 | 1,023-1,030 |
+| | 3 | 0 | 1,152 | 102,324 | — | 62.3 / 63.0 / 62.7 | 118-126 | 609-616 |
+| | 4-31 | 0 | 648-1,152 | 101,316-102,324 | — | 54.8-59.9 | 104-120 | 537-590 |
+| | 32 | 0 | 395 | 60,802 | — | 33.8 / 33.4 / 33.2 | 63-68 | 546-556 |
+
+Sum of step ms per event: case 1 366-367, case 2 57-61, case 3 1,738-1,791, case 4 1,844-1,847.
+
+**ns/unit by kind of work:**
+
+| work | ns/unit | per transfer |
+|---|---|---|
+| B's transfers (B ms / 6 T) | 500-556 (HL), 602-609 (B₂), 634-636 (B₁) | 3.0-3.8 µs, so T = 6 holds |
+| plain drain blocks, N = 5k all-hold and S=750-like | 535-605 | — |
+| HL 10 % holders (N = 5k and 100k) | ~1,000-1,090 | — |
+| drain inside block B | 1,070-1,110 (case 1), 1,310-1,345 (case 3), 1,536-1,547 (case 4 B₂, 45,907 drain units) | — |
+
+The spread is now ~2-3×. In §11 it was 114-1,144 (10×) under trader-set units.
+
+### 13.3 Against §11 at W = 100,000 (trader-set units, `UB_ADL_WORK=100000`)
+
+| shape | §11: blocks / worst (later) ms | §13: blocks / worst (later) ms | change |
+|---|---|---|---|
+| HL 5k all-hold | 6 / 115-117 (57-61) | 6 / 109-113 (55-60) | same blocks; units barely change (H = N + 1 ≈ N + 3) |
+| HL 5k 10 % | 6 / 18-19 (9-11) | **1** / 57-61 | closes in B, as at W = 630k (§11.1: 59-61 ms) |
+| HL 100k 10 % | 300 / 28-30 (14-30) | **17** / 135-138 (102-123) | 18× fewer blocks; the block is ~4.6× heavier; event step time 1.74-1.79 s |
+| S=750-like | 29 / B₁ 290-293 (B₂ 152-156; drains 24-61) | 32 / B₁ **66** (B₂ 107; drains 55-63) | B₁ −77 %; B₂ −31 %; 3 more blocks |
+
+### 13.4 Answers to 18c / owner
+
+**(a) Is every HL block ≤ ~250 ms rig-equivalent?**
+
+Every block but one is. The exception is case 3's block B.
+
+| HL shape | worst block | ozarchy ms | rig ms | ≤ 250 rig? |
+|---|---|---|---|---|
+| 5k all-hold | B | 109-113 | 207-227 | yes |
+| 5k all-hold | later | ≤ 59.8 | ≤ 120 | yes |
+| 5k 10 % | B (only block) | 57-61 | 108-122 | yes |
+| 100k 10 % | B | 134.6-138.0 (142 under perf) | **256-276** | **no**, 2-10 % over |
+| 100k 10 % | block 5 (21 rows, 113,593 units) | 118-123 | 224-247 | yes, at the edge |
+| 100k 10 % | other later blocks | 102-112 | 193-224 | yes |
+
+Read as ozarchy ms, every HL block is ≤ 138 ms. The §11.5 ozarchy line was ≤ ~125-130 ms, and case 3's B is over it by 5-8 ms.
+
+**(b) S=750-like B₁ and B₂.**
+* **B₁ is now transfers only: 66.0-66.2 ms on ozarchy, 125-132 rig.**
+  * At W = 100k it was 290-293 ms, and 245-254 ms even at W = 50k.
+  * B ms = step ms, so there is no drain work: 103,680 units = 17,280 × 6, and `adl_drain` has 0 samples.
+  * `traders_after` / `has_key` do not appear in the profile at all (§13.5).
+* **B₂ (9,720 transfers + 449 drain rows + 1 ranking path): 106.6-107.3 ms, 203-215 rig.** It is case 4's worst block.
+  * Split: B 35.1-35.5 ms (3.6 µs per transfer); `liq_view` ~30 ms (the cold healthy scan, §13.5); the drain ~42 ms.
+
+**(c) Blocks per event:**
+
+| case | blocks |
+|---|---|
+| HL 5k all-hold | 6 |
+| HL 5k 10 % | 1 |
+| HL 100k 10 % | 17 |
+| S=750-like | 32: B₁ has no drain, B₂ starts it, 30 drain-only blocks follow |
+
+### 13.5 Profiles (perf 4,999 Hz, `--call-graph fp`, one perf run per case)
+
+Each block was isolated as a burst of samples under `run_liquidations_with`, with a gap of more than 3 ms between bursts. Burst k = block h=k, and the span matches the block's step ms. Percentages are inclusive (partly nested) shares of the block's samples.
+
+**Case 4 B₂ (h=5, worst block of case 4; 547 samples ≈ 109 ms; this run's step 110.7 ms).** The callees of `liquidation_pass`:
+
+| callee | share | ms |
+|---|---|---|
+| `adl_drain` | 38.8 % | ~42 |
+| `liq_view` | 27.8 % | ~30 |
+| `adl_to_escrow` | 27.6 % | ~30 |
+| `mark_pending` | 2.9 % | |
+| `settle_flat_deficit` | 1.1 % | |
+
+* `adl_drain`: `get_position` ← `adl_candidates_of` 25 %, `adl_rank` 4.8 % (sort 2.9 %).
+* `liq_view`: all of it is `pos_sums` → `cached_sums` → `build_sums` (26 %), the healthy scan's classification of 2,048 traders × 270-300 positions running on a cold sums cache.
+* `adl_to_escrow`: `transfer` 17.9 %, of which `apply_fill` 13.3 %, and `get_position` 8.2 %.
+* `traders_after` / `has_key`: 0 samples (§12.4: the drain skips the trader set under C2).
+* Leaf (self) frames: `find_key_index` 13 % (B-tree search), `select_unpredictable` 9 % (binary search in the records), `__divti3` 7 %, `build_with` 7 %.
+
+**Case 4 B₁ (h=4; 349 samples ≈ 70 ms).** The callees of `liquidation_pass`:
+
+| callee | share |
+|---|---|
+| `adl_to_escrow` | 81.7 % |
+| `mark_pending` | 9.5 % |
+| `settle_flat_deficit` | 3.2 % |
+| `positions_for_trader` | 2.9 % |
+| `liq_view` | 1.4 % (only 64 traders scanned) |
+
+* Inside `adl_to_escrow`: `transfer` 49.9 %, of which `apply_fill` 39.3 %; `get_position` 24.6 % (B-tree `search_tree`/`find_key_index` 24 %); `put_obligation` 12 %; `delete_position` 8.3 %; `put_position` 6.3 %.
+* `adl_drain`, `traders_after`, `has_key`: 0 samples.
+* So B₁ is pure escrow-transfer work: 3.8 µs per transfer, linear in the 17,280 transfers.
+
+**Case 1 block B (h=4; 574 samples ≈ 115 ms; this run's step 117.8 ms).**
+
+| frame | share | ms |
+|---|---|---|
+| `adl_drain` | 71.8 % | ~82 |
+| `liq_view` | 27.4 % | ~31 |
+| `adl_to_escrow` | 0.5 % | |
+
+* `liq_view` is all cold `pos_sums` → `build_sums` (26 %), as in B₂.
+* `adl_drain`: `get_position` ← `adl_candidates_of` 50.9 % (`resident_positions` binary search 24.7 %, overlay `layer_touches` 19.7 %, `dirty` 19.5 %), `adl_rank` 11.8 % (sort 5.9 %), `holders_with` 1 %.
+
+Block 2 for comparison (h=5; 282 samples ≈ 56 ms):
+* `adl_drain` 97.9 %, `liq_view` 0.7 %;
+* `get_position` 59.9 % (`layer_touches` 15.2 %);
+* `adl_rank` 21.3 % (sort 12.1 %).
+
+So block B's ~2× over a later block at the same units is:
+1. ~30 ms of cold healthy-scan classification;
+2. ~25 ms more in the drain's `get_position`, because each read's overlay dirty check (`layer_touches` → B-tree `find_leaf_edges_spanning_range` 10 %) runs over a current layer that holds B's writes.
+
+**Case 3 block B (h=50; 689 samples ≈ 138 ms; this run's step 142.2 ms; extra perf unit).**
+* `adl_drain` 95.5 %, `liq_view` only 3.5 % (holders hold ~30 markets, so the cold scan is cheap).
+* `get_position` ← `adl_candidates_of` 43.4 % (`layer_touches` 15.5 %, `dirty` 11 %).
+* `adl_rank` 28.3 % (sort 25.3 %).
+* `pos_sums` ← `adl_candidates_of` 7 %.
+* `get_native_balance` 9 %.
+
+Block 2 (h=51; 565 samples ≈ 113 ms):
+
+| frame | block B | block 2 |
+|---|---|---|
+| `adl_drain` | 95.5 % | 98.9 % |
+| `get_position` | 43.4 % | 41.1 % |
+| `adl_rank` | 28.3 % | 33.5 % (sort 29.7 %) |
+| `get_native_balance` | 9 % | 12 % |
+| `layer_touches` | 15.5 % | **6 %** |
+| `dirty` | 11 % | **4.6 %** |
+
+Case 3's block B excess (~25 ms over a later block) is the same overlay dirty check as case 1's, not the scan. Why case 3 costs ~1,000-1,100 ns/unit against case 1's ~540:
+* the sort over ~10,000 holders per ranking (n log n, ~30 % of the block);
+* `get_native_balance` for the candidates;
+* a 3M-row R.
+
+### 13.6 Reading
+
+* The units are exact: every block of every case equals the §12.3 model. B's charge works: B₁ alone exceeds W, so it does not drain. Holder units give 1 block for 5k 10 % and 17 blocks for 100k 10 % (§11: 6 and 300).
+* T = 6 is confirmed: B costs 3.0-3.8 µs per transfer = 500-636 ns per B-unit, the same band as a plain drain unit (535-605 ns).
+* The only block over ~250 ms rig is **HL 100k 10 % block B (135-138 ms ozarchy, 256-276 rig)**. It is over because block B's drain pays ~25 ms more per unit than later blocks (the overlay dirty check against B's writes). The 10 % shape also costs ~2× per unit vs all-hold (sort over 10k holders, balances). Units do not see either.
+* In block B of the bench, ~30 ms is the healthy scan running against a cold sums cache. This happens when the scanned traders hold ~300 positions: case 1 and case 4 B₂, not case 3. The bench's scan cursor revisits traders 0-2,047 for the first time since the mark moved at h=2, so this part is a bench-shape effect and not ADL work. How it compares with production depends on how often production's mark-table version changes; that was not measured here.
+* S=750-like B₁ is fixed: 66 ms (−77 %), pure transfer work, and `has_key` / `traders_after` are absent. The worst S=750-like block is now B₂ at 107 ms (203-215 rig).
+
+### 13.7 Commands and files
+
+Build (worktree root `/home/oz/projects/wt/adl-budget`):
+
+    CARGO_TARGET_DIR=~/.cargo-target-adl-budget RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes" \
+      CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo test -p torus-bridge --release --test ubench_adl --no-run
+
+Runs (the same env; the campaign called the binary
+`~/.cargo-target-adl-budget/release/deps/ubench_adl-5626de9bfbcc1f30 --ignored --nocapture` directly):
+
+    UB_ADL_HL=1 UB_ADL_TRADERS=5000 <bin> --ignored --nocapture                                  # case 1
+    UB_ADL_HL=1 UB_ADL_TRADERS=5000 UB_ADL_HOLDERS_PCT=10 <bin> --ignored --nocapture            # case 2
+    UB_ADL_HL=1 UB_ADL_TRADERS=100000 UB_ADL_HOLDERS_PCT=10 <bin> --ignored --nocapture          # case 3
+    UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 <bin> --ignored --nocapture     # case 4
+    perf record -F 4999 --call-graph fp -o perf-<case>.data -- <bin> --ignored --nocapture       # same env per case
+    perf script -i perf-<case>.data -F tid,time,ip,sym > <case>.txt
+    python3 -I analysis/prof.py <burst,...> < <case>.txt                                         # burst k = block h=k
+
+Launch: `tools/matched-bench/campaign/detach.sh adl-s99 ~/bench-results-matched/ubench-adl-s99/campaign.log bash -c '…/campaign.sh; echo "exit=$?" > …/campaign.done'`.
+The case 3 perf run used `adl-s99-perfc3` with `perf-c3.sh` in the same way.
+
+Raw files in `~/bench-results-matched/ubench-adl-s99/`:
+* per-run logs `c{1,2,3,4}.r{1,2,3}.log` and the smoke run `smoke-c2.log`;
+* the campaign `campaign.{sh,log,done}`;
+* the perf data and logs `perf-c{1,3,4}.{data,log}`, `perf-c3.{sh,campaign.log,done}`;
+* `analysis/`: `per-block.txt`, `ns-per-unit.txt`, `prof-c4-B1-B2-blk3.txt`, `prof-c1-B-blk2.txt`, `prof-c3-B-blk2.txt`, and the scripts `split.py`, `prof.py`, `ns.py`, `tab.py`.
+
+Setup times: case 1 1,500,400 rows (6.0 s), case 2 150,126 (0.6 s), case 3 3,003,738 (12.8 s), case 4 1,527,270 (6.3 s).
