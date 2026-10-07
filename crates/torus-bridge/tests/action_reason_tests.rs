@@ -186,9 +186,73 @@ fn open_order_limit_carries_its_reason_on_every_path() {
             &[
                 Some((FailureReason::OpenLimit, "open order limit reached: 1000 open orders, limit 1000")),
                 Some((FailureReason::OpenLimit, "open order limit: reduce-only and stop orders need fewer than")),
-                None, // IOC never rests: no slot needed (rests nothing, no fill).
+                // IOC never rests: no slot needed. Row 50: nothing to fill
+                // against, so it is rejected (HL `iocCancelRejected`).
+                Some((FailureReason::IocCancel, "order rejected: IOC order could not immediately match")),
             ],
         );
+    }
+}
+
+/// Row 50: an order the book refuses, or cancels without a fill, is
+/// rejected with its HL reason on the single-action path, the sequential
+/// settle (engine 0) and the parallel settle's pass B (engine 2, 4), with
+/// the executed order's gas (1000) kept; an IOC that partly fills stays
+/// executed. Market 3 (tick / lot 1): bid 100 x 2, ask 110 x 2, last trade
+/// 105; addr(1) is flat there.
+#[test]
+fn book_rejections_carry_their_hl_reason_on_every_path() {
+    let a = addr(1);
+    let with = |tif, p: PlaceOrderParams| PlaceOrderParams { time_in_force: tif, ..p };
+    let block = vec![
+        place(a, with(TimeInForce::IOC, gtc(3, true, 105, 1))), // 0
+        place(a, with(TimeInForce::PostOnly, gtc(3, true, 110, 1))), // 1
+        place(
+            a,
+            PlaceOrderParams { order_type: OrderType::Market, ..with(TimeInForce::IOC, gtc(3, true, 106, 1)) },
+        ), // 2: cap under the ask
+        place(a, PlaceOrderParams { reduce_only: true, ..gtc(3, false, 100, 1) }), // 3
+        place(a, with(TimeInForce::FOK, gtc(3, true, 110, 5))), // 4
+        place(
+            a,
+            PlaceOrderParams { order_type: OrderType::StopMarket { trigger: fp(104) }, ..gtc(3, true, 200, 1) },
+        ), // 5: trigger under the last trade
+        place(a, with(TimeInForce::IOC, gtc(3, true, 110, 3))), // 6: fills 2
+    ];
+    let want = [
+        Some((FailureReason::IocCancel, "order rejected: IOC order could not immediately match")),
+        Some((FailureReason::BadAloPx, "order rejected: post-only order would have immediately matched")),
+        Some((FailureReason::MarketNoLiquidity, "order rejected: no liquidity for the market order")),
+        Some((FailureReason::ReduceOnly, "reduce-only order rejected")),
+        Some((FailureReason::FokCancel, "order rejected: FOK order could not be filled completely")),
+        Some((FailureReason::BadTriggerPx, "order rejected: stop trigger")),
+        None,
+    ];
+    for mode in MODES {
+        let (_d, mut ctx) = fresh();
+        for t in [3, 4, 5] {
+            fund_native(&ctx, &addr(t), fp(1_000_000));
+        }
+        let setup = [
+            place(addr(4), gtc(3, false, 105, 1)),
+            place(addr(5), gtc(3, true, 105, 1)),
+            place(addr(3), gtc(3, true, 100, 2)),
+            place(addr(3), gtc(3, false, 110, 2)),
+        ];
+        for action in &setup {
+            assert!(exec(&mut ctx, mode, std::slice::from_ref(action))[0].success, "{mode:?}");
+        }
+        let r = exec(&mut ctx, mode, &block);
+        check(mode, &r, &want);
+        for (i, r) in r.iter().enumerate() {
+            // The single path refuses a reduce-only order before the book
+            // (`reduce_only_violation`, no gas, as before row 50).
+            let gas = if mode.is_none() && i == 3 { 0 } else { 1000 };
+            assert_eq!(r.gas_used, gas, "{mode:?} #{i}: a book outcome keeps the executed order's gas");
+        }
+        let book = &ctx.order_books[&3];
+        assert_eq!(book.best_ask(), None, "{mode:?}: the partial IOC took the ask");
+        assert_eq!(book.best_bid(), Some(fp(100)), "{mode:?}: nothing rejected rests");
     }
 }
 

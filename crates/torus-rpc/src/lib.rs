@@ -3221,7 +3221,7 @@ mod tests {
     async fn torus_get_block_body_reports_executed_and_skipped_status() {
         let (_dir, state, mempool, executor) = setup();
         let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let actions: Vec<_> = (1..=3)
+        let actions: Vec<_> = (1..=4)
             .map(|nonce| {
                 torus_types::eip712::sign_native_action(
                     torus_types::NativeAction::ClaimRewards,
@@ -3250,17 +3250,30 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
-        // v2: action 2 executed and failed (margin).
+        // v2: action 2 executed and failed (margin). Row 50: action 3 was
+        // rejected (an IOC that found nothing to fill).
         let record = torus_state::action_status::BlockActionStatus {
             evm_skipped: vec![true],
-            native_skipped: vec![false, true, false],
-            native_failed: vec![torus_state::action_status::NativeActionFailure::new(
-                2,
-                0,
-                1,
-                torus_state::action_status::FailureReason::Margin,
-                "insufficient margin: need 5, have 1 (account)".to_string(),
-            )],
+            native_skipped: vec![false, true, false, false],
+            native_failed: vec![
+                torus_state::action_status::NativeActionFailure::new(
+                    2,
+                    0,
+                    1,
+                    torus_state::action_status::FailureReason::Margin,
+                    "insufficient margin: need 5, have 1 (account)".to_string(),
+                ),
+                torus_state::action_status::NativeActionFailure {
+                    outcome: torus_state::action_status::Outcome::Rejected,
+                    ..torus_state::action_status::NativeActionFailure::new(
+                        3,
+                        0,
+                        1,
+                        torus_state::action_status::FailureReason::IocCancel,
+                        "order rejected: IOC order could not immediately match".to_string(),
+                    )
+                },
+            ],
         };
         state
             .put_cf_raw(
@@ -3291,23 +3304,34 @@ mod tests {
         let executed = get(1).await;
         assert_eq!(
             executed["nativeActionStatus"],
-            serde_json::json!(["executed", "skipped", "failed"])
+            serde_json::json!(["executed", "skipped", "failed", "rejected"])
         );
         assert_eq!(
             executed["nativeActionFailures"],
-            serde_json::json!([{
-                "index": 2,
-                "reason": "margin",
-                "message": "insufficient margin: need 5, have 1 (account)",
-                "order": 0,
-                "failedOrders": 1
-            }])
+            serde_json::json!([
+                {
+                    "index": 2,
+                    "status": "failed",
+                    "reason": "margin",
+                    "message": "insufficient margin: need 5, have 1 (account)",
+                    "order": 0,
+                    "failedOrders": 1
+                },
+                {
+                    "index": 3,
+                    "status": "rejected",
+                    "reason": "iocCancelRejected",
+                    "message": "order rejected: IOC order could not immediately match",
+                    "order": 0,
+                    "failedOrders": 1
+                }
+            ])
         );
         assert_eq!(
             executed["evmTransactionStatus"],
             serde_json::json!(["skipped"])
         );
-        assert_eq!(executed["nativeActions"].as_array().unwrap().len(), 3);
+        assert_eq!(executed["nativeActions"].as_array().unwrap().len(), 4);
         let pending = get(2).await;
         assert!(pending["nativeActionStatus"].is_null());
         assert!(pending["nativeActionFailures"].is_null());

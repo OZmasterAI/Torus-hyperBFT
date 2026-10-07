@@ -18,6 +18,7 @@ use torus_types::{
 };
 
 use crate::error::CoreError;
+use torus_state::action_status::FailureReason;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
@@ -147,10 +148,15 @@ pub struct PlaceResult {
     /// match-time margin ([`TakerMarginLimit`]) ran out — it was cancelled
     /// there, after the fills that fitted (`Cancelled`); `None` otherwise.
     pub margin_cut_price: Option<FixedPoint>,
+    /// Row 50: why the book refused this order (`Rejected`) or cancelled it
+    /// without a single fill (`Cancelled`, zero fills) — the HL `*Rejected`
+    /// reason the executor reports; `None` for anything that filled (even
+    /// partly), rests or waits for its trigger.
+    pub reject: Option<FailureReason>,
 }
 
 impl PlaceResult {
-    fn rejected(order_id: OrderId) -> Self {
+    fn rejected(order_id: OrderId, why: FailureReason) -> Self {
         PlaceResult {
             order_id,
             status: OrderStatus::Rejected,
@@ -161,6 +167,7 @@ impl PlaceResult {
             triggered_stops: vec![],
             margin_cancels: vec![],
             margin_cut_price: None,
+            reject: Some(why),
         }
     }
 }
@@ -1297,7 +1304,7 @@ impl OrderBook {
 
         // Dust order rejection (2.1b.2): qty must be >= lot_size
         if params.quantity < self.lot_size {
-            return PlaceResult::rejected(order_id);
+            return PlaceResult::rejected(order_id, FailureReason::Lot);
         }
 
         // FIX 7 (ECON-FIND-10): Limit orders must have positive price.
@@ -1310,7 +1317,7 @@ impl OrderBook {
             OrderType::StopLimit { limit, .. } => limit <= FixedPoint::ZERO,
         };
         if price_invalid {
-            return PlaceResult::rejected(order_id);
+            return PlaceResult::rejected(order_id, FailureReason::Price);
         }
 
         // FIX 8 (ECON-FIND-11): Enforce tick size for limit orders.
@@ -1322,7 +1329,7 @@ impl OrderBook {
             OrderType::Market | OrderType::StopMarket { .. } => None,
         };
         if tick_price.is_some_and(|p| self.tick_size > FixedPoint::ZERO && p.raw() % self.tick_size.raw() != 0) {
-            return PlaceResult::rejected(order_id);
+            return PlaceResult::rejected(order_id, FailureReason::Tick);
         }
 
         // FIX 10 (ECON-FIND-17): open orders are limited per user across all
@@ -1345,7 +1352,7 @@ impl OrderBook {
                     Side::Sell => trigger >= current_price,
                 };
                 if invalid_trigger {
-                    return PlaceResult::rejected(order_id);
+                    return PlaceResult::rejected(order_id, FailureReason::BadTriggerPx);
                 }
             }
             // F4 (s515 review): a policed reduce-only stop must be able to reduce
@@ -1355,7 +1362,7 @@ impl OrderBook {
             if params.reduce_only {
                 if let Some(pos) = self.reduce_only_positions.get(&trader) {
                     if reduce_only_allowance(pos, params.is_buy) <= FixedPoint::ZERO {
-                        return PlaceResult::rejected(order_id);
+                        return PlaceResult::rejected(order_id, FailureReason::ReduceOnly);
                     }
                 }
             }
@@ -1376,13 +1383,14 @@ impl OrderBook {
             return PlaceResult {
                 status: OrderStatus::PendingTrigger,
                 rested_qty: params.quantity,
-                ..PlaceResult::rejected(order_id)
+                reject: None,
+                ..PlaceResult::rejected(order_id, FailureReason::Other)
             };
         }
 
         // PostOnly: reject if would cross the spread
         if params.time_in_force == TimeInForce::PostOnly && self.would_cross(side, params.price) {
-            return PlaceResult::rejected(order_id);
+            return PlaceResult::rejected(order_id, FailureReason::BadAloPx);
         }
 
         let is_market = matches!(params.order_type, OrderType::Market);
@@ -1394,7 +1402,7 @@ impl OrderBook {
                 Side::Sell => !self.bids.is_empty(),
             };
             if !has_liquidity {
-                return PlaceResult::rejected(order_id);
+                return PlaceResult::rejected(order_id, FailureReason::MarketNoLiquidity);
             }
         }
 
@@ -1410,7 +1418,7 @@ impl OrderBook {
             if let Some(pos) = self.reduce_only_positions.get(&trader) {
                 let allowed = reduce_only_allowance(pos, params.is_buy);
                 if allowed <= FixedPoint::ZERO {
-                    return PlaceResult::rejected(order_id);
+                    return PlaceResult::rejected(order_id, FailureReason::ReduceOnly);
                 }
                 quantity = quantity.min(allowed);
             }
@@ -1536,7 +1544,7 @@ impl OrderBook {
                 }),
             };
             if !fits {
-                return PlaceResult::rejected(order_id);
+                return PlaceResult::rejected(order_id, FailureReason::FokCancel);
             }
         }
 
@@ -1594,6 +1602,7 @@ impl OrderBook {
 
         // Determine outcome
         let mut rested_qty = FixedPoint::ZERO;
+        let mut reject = None;
         let status = if order.remaining_qty == FixedPoint::ZERO {
             OrderStatus::Filled
         } else if is_market
@@ -1603,6 +1612,19 @@ impl OrderBook {
         {
             // s515 review 4: a taker that ran out of margin mid-match is
             // cancelled like an IOC remainder — it never rests.
+            // Row 50: without a fill it was rejected, for the first of these
+            // that applies (margin, market, FOK, IOC).
+            if fills.is_empty() {
+                reject = Some(if margin_exhausted {
+                    FailureReason::Margin
+                } else if is_market {
+                    FailureReason::MarketNoLiquidity
+                } else if params.time_in_force == TimeInForce::FOK {
+                    FailureReason::FokCancel
+                } else {
+                    FailureReason::IocCancel
+                });
+            }
             OrderStatus::Cancelled
         } else {
             // s515: a resting reduce-only remainder ranks behind the
@@ -1613,6 +1635,7 @@ impl OrderBook {
             }
             if order.remaining_qty == FixedPoint::ZERO {
                 if fills.is_empty() {
+                    reject = Some(FailureReason::ReduceOnly);
                     OrderStatus::Rejected
                 } else {
                     OrderStatus::Cancelled
@@ -1681,6 +1704,7 @@ impl OrderBook {
             triggered_stops,
             margin_cancels,
             margin_cut_price,
+            reject,
         }
     }
 
@@ -6654,6 +6678,79 @@ mod taker_margin_limit_tests {
         let r = b.place_order_with_margin(market_sell(fp(1_000_000)), addr(2), 2, Some(&lim));
         assert!(filled(&r) > FixedPoint::ZERO && filled(&r) < fp(1_000_000));
         assert_eq!(r.status, OrderStatus::Cancelled);
+    }
+
+    /// Row 50: every order the book refuses, or cancels without a fill, says
+    /// why (`PlaceResult::reject`, the HL `*Rejected` reason); an order that
+    /// filled (even partly), rests or waits for its trigger has none. Book:
+    /// bid 100 x 2 (addr 1), ask 110 x 2 (addr 3), last trade 105.
+    #[test]
+    fn zero_fill_outcomes_carry_their_reason() {
+        use torus_state::action_status::FailureReason as R;
+        let with = |tif, p: PlaceOrderParams| PlaceOrderParams { time_in_force: tif, ..p };
+        let fresh = || {
+            let mut b = OrderBook::new(1, fp(1), fp(1));
+            b.place_order(order(false, fp(105), fp(1)), addr(4), 1);
+            b.place_order(order(true, fp(105), fp(1)), addr(5), 1);
+            b.place_order(order(true, fp(100), fp(2)), addr(1), 1);
+            b.place_order(order(false, fp(110), fp(2)), addr(3), 1);
+            assert_eq!(b.last_trade_price, Some(fp(105)));
+            b
+        };
+        let market_buy = |cap: i64, qty: i64| PlaceOrderParams {
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::IOC,
+            ..order(true, fp(cap), fp(qty))
+        };
+        let stop_buy = |trigger: i64| PlaceOrderParams {
+            order_type: OrderType::StopMarket { trigger: fp(trigger) },
+            ..order(true, fp(200), fp(1))
+        };
+        let ro_sell = |price: i64, qty: i64| PlaceOrderParams { reduce_only: true, ..order(false, fp(price), fp(qty)) };
+        let half = FixedPoint::from_raw(FixedPoint::SCALE / 2);
+        // (what, order, budget, taker position, want reject, want status)
+        let cases: Vec<(&str, PlaceOrderParams, Option<i64>, Option<i64>, Option<R>, OrderStatus)> = vec![
+            ("ioc no fill", with(TimeInForce::IOC, order(true, fp(105), fp(1))), None, None, Some(R::IocCancel), OrderStatus::Cancelled),
+            ("ioc partial", with(TimeInForce::IOC, order(true, fp(110), fp(3))), None, None, None, OrderStatus::Cancelled),
+            ("alo crosses", with(TimeInForce::PostOnly, order(true, fp(110), fp(1))), None, None, Some(R::BadAloPx), OrderStatus::Rejected),
+            ("alo rests", with(TimeInForce::PostOnly, order(true, fp(101), fp(1))), None, None, None, OrderStatus::Resting),
+            ("market under its cap", market_buy(106, 1), None, None, Some(R::MarketNoLiquidity), OrderStatus::Cancelled),
+            ("market fills", market_buy(110, 1), None, None, None, OrderStatus::Filled),
+            ("fok short", with(TimeInForce::FOK, order(true, fp(110), fp(5))), None, None, Some(R::FokCancel), OrderStatus::Rejected),
+            ("reduce-only flat", ro_sell(100, 1), None, Some(0), Some(R::ReduceOnly), OrderStatus::Rejected),
+            ("reduce-only stop flat", PlaceOrderParams { reduce_only: true, ..stop_buy(120) }, None, Some(0), Some(R::ReduceOnly), OrderStatus::Rejected),
+            ("margin cut at the first level", PlaceOrderParams { order_type: OrderType::Market, ..with(TimeInForce::IOC, order(false, fp(1), fp(1))) }, Some(1), None, Some(R::Margin), OrderStatus::Cancelled),
+            ("stop trigger below the last trade", stop_buy(104), None, None, Some(R::BadTriggerPx), OrderStatus::Rejected),
+            ("stop pending", stop_buy(120), None, None, None, OrderStatus::PendingTrigger),
+            ("dust", order(true, fp(100), half), None, None, Some(R::Lot), OrderStatus::Rejected),
+            ("price", order(true, FixedPoint::ZERO, fp(1)), None, None, Some(R::Price), OrderStatus::Rejected),
+            ("tick", order(true, fp(100) + half, fp(1)), None, None, Some(R::Tick), OrderStatus::Rejected),
+            ("gtc rests", order(true, fp(101), fp(1)), None, None, None, OrderStatus::Resting),
+        ];
+        for (what, p, budget, pos, want, status) in cases {
+            let mut b = fresh();
+            if let Some(pos) = pos {
+                let mut m = ReduceOnlyPositions::new();
+                m.insert(addr(2), fp(pos));
+                b.set_reduce_only_positions(m);
+            }
+            let lim = budget.map(|x| limit(fp(x), None));
+            let r = b.place_order_with_margin(p, addr(2), 2, lim.as_ref());
+            assert_eq!(r.status, status, "{what}");
+            assert_eq!(r.reject, want, "{what}");
+            assert!(r.reject.is_none() || r.fills.is_empty(), "{what}: a rejection never has fills");
+        }
+
+        // A resting GTC reduce-only order that its older reduce-only orders
+        // leave no position to reduce: rejected (no fill).
+        let mut b = fresh();
+        let mut m = ReduceOnlyPositions::new();
+        m.insert(addr(2), fp(2));
+        b.set_reduce_only_positions(m);
+        let older = b.place_order(ro_sell(120, 2), addr(2), 2);
+        assert_eq!((older.status, older.reject), (OrderStatus::Resting, None));
+        let r = b.place_order(ro_sell(115, 1), addr(2), 3);
+        assert_eq!((r.status, r.reject), (OrderStatus::Rejected, Some(R::ReduceOnly)));
     }
 
     /// Book with bid 100 x 30 (addr 1) and the taker (addr 2) at signed

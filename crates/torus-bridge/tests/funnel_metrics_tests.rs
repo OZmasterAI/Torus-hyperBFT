@@ -231,9 +231,10 @@ fn batch_book_rejected_counts_rejected_book_not_accepted() {
         NativeAction::PlaceOrder(market_order(1, true, 5)),
     )];
     let res = NativeExecutor::execute_batch(&mut ctx, &actions);
-    // Documents the funnel gap under investigation: the action still reports
-    // success even though the book rejected the order.
-    assert!(res.results[0].success);
+    // Row 50: the book's reject is the action's result (it used to report
+    // success).
+    assert!(!res.results[0].success);
+    assert_eq!(res.results[0].reason, torus_state::action_status::FailureReason::MarketNoLiquidity);
 
     assert_eq!(m.orders_matched.get(), 0);
     assert_funnel(&m, 0, 0, 0, 1, 0, 0, 0, 0);
@@ -257,7 +258,9 @@ fn batch_ioc_no_fill_counts_rejected_cancelled() {
         NativeAction::PlaceOrder(ioc_limit(1, true, 100, 5)),
     )];
     let res = NativeExecutor::execute_batch(&mut ctx, &actions);
-    assert!(res.results[0].success);
+    // Row 50: rejected (HL iocCancelRejected).
+    assert!(!res.results[0].success);
+    assert_eq!(res.results[0].reason, torus_state::action_status::FailureReason::IocCancel);
 
     assert_funnel(&m, 0, 0, 0, 0, 1, 0, 0, 0);
 }
@@ -326,7 +329,8 @@ fn sequential_path_counts_resting_margin_and_book_rejects() {
         &funded,
         &NativeAction::PlaceOrder(market_order(1, true, 5)),
     );
-    assert!(r.success, "book reject still reports action success today");
+    // Row 50: the book's reject is the action's result.
+    assert!(!r.success && r.reason == torus_state::action_status::FailureReason::MarketNoLiquidity, "{r:?}");
     assert_funnel(&m, 1, 1, 1, 1, 0, 0, 0, 0);
 }
 

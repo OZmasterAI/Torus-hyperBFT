@@ -153,7 +153,9 @@ fn world(ctx: &mut NativeExecContext) -> World {
 /// @151, FOK sell @49, PostOnly buy @151, a StopLimit whose LIMIT is out
 /// (151, trigger 120), one whose TRIGGER is out (limit 120, trigger 151), a
 /// StopMarket with its trigger out (49). Accepted: the exact boundaries
-/// @150 / @50 and a Market order whose cap (1,000) is out (out of scope).
+/// @150 / @50 and a Market order whose cap (1,000) is out (out of scope;
+/// row 50: its only ask is its sender's own, so the book rejects it,
+/// `marketOrderNoLiquidityRejected` — not a band reject).
 /// The rejects take no slot / margin / order id: the world equals the block
 /// without them, on every path; batch modes agree byte for byte.
 #[test]
@@ -178,7 +180,7 @@ fn orders_outside_the_band_are_rejected_before_the_book_on_every_path() {
         place(a, stop_market),                                                    // 7 out (trigger)
         place(a, gtc(true, fp(50))),                                              // 8 boundary: rests
         place(b, gtc(false, fp(150))),                                            // 9 boundary: rests
-        place(b, order(true, fp(1_000), OrderType::Market, TimeInForce::IOC)),    // 10 cap out: fills @150
+        place(b, order(true, fp(1_000), OrderType::Market, TimeInForce::IOC)),    // 10 cap out: no fill (own ask)
     ];
     let want = [
         ("151.00000000", "50.00"),
@@ -200,13 +202,14 @@ fn orders_outside_the_band_are_rejected_before_the_book_on_every_path() {
         for (i, (price, pct)) in want.iter().enumerate() {
             assert!(is_band_reject(&r[i], price, pct, "100.00000000"), "{mode:?} #{i}: {:?}", r[i]);
         }
-        for i in 8..block.len() {
+        for i in 8..10 {
             assert!(r[i].0, "{mode:?} #{i}: {:?}", r[i]);
         }
+        assert!(!r[10].0 && r[10].2 == FailureReason::MarketNoLiquidity, "{mode:?}: {:?}", r[10]);
         assert_eq!(metrics.orders_rejected_other.get(), 8, "{mode:?}: pre-book rejects");
         let got = world(&mut ctx);
         let (_d2, mut reference) = setup(Some(100));
-        assert!(exec(&mut reference, mode, &valid).iter().all(|r| r.0), "{mode:?}");
+        assert!(exec(&mut reference, mode, &valid).iter().take(2).all(|r| r.0), "{mode:?}");
         assert_eq!(got, world(&mut reference), "{mode:?}: the rejected orders changed state");
         if mode.is_some() {
             batch_worlds.push((r, got));

@@ -1279,8 +1279,9 @@ fn open_limit_book_rejected_orders_keep_their_slot_but_off_tick_and_dust_take_no
         NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
         let results: Vec<_> = r.results.iter().map(|r| (r.success, r.error.clone())).collect();
-        assert!(results[0].0, "a book reject (PostOnly cross) reports ok: {results:?}");
         let err = |i: usize, s: &str| !results[i].0 && results[i].1.as_deref().is_some_and(|e| e.contains(s));
+        // Row 50: a book reject (PostOnly cross) is reported rejected.
+        assert!(err(0, "post-only order would have immediately matched"), "{results:?}");
         assert!(err(1, "below the lot size"), "{results:?}");
         assert!(err(2, "is not a multiple of the tick"), "{results:?}");
         assert!(results[3].0 && results[4].0, "slots 999 and 1000: {results:?}");

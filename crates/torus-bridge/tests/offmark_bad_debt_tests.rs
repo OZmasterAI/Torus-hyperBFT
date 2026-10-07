@@ -222,7 +222,9 @@ fn view(ctx: &NativeExecContext, t: &Address) -> AccountView {
 /// Mark 100 in market 1. A and B each funded exactly the IM of `Q` at
 /// `price`. A trades `Q` at `price` (`a_buys`: A buys, B sells), as the
 /// maker (A rests first) or the taker (B rests first). Both placements
-/// must be accepted (asserted here).
+/// must be accepted (asserted here). Row 50: a taker refused at match
+/// before its first fill is reported rejected for margin, with the gas of
+/// an accepted order (a placement refusal has none).
 fn off_mark_fill(path: Path, a_buys: bool, price: i64, a_maker: bool) -> (tempfile::TempDir, NativeExecContext) {
     let (d, db) = liq_db(&[M]);
     let mut ctx = ctx_at(db, 1);
@@ -235,7 +237,8 @@ fn off_mark_fill(path: Path, a_buys: bool, price: i64, a_maker: bool) -> (tempfi
     let (first, second) = if a_maker { (ao, bo) } else { (bo, ao) };
     for (t, p) in [first, second] {
         let r = run(&mut ctx, path, t, p);
-        assert!(r.success, "{path:?} a_buys={a_buys} price={price} a_maker={a_maker}: {t}: {:?}", r.error);
+        let accepted = r.success || (r.reason == torus_state::action_status::FailureReason::Margin && r.gas_used == 1000);
+        assert!(accepted, "{path:?} a_buys={a_buys} price={price} a_maker={a_maker}: {t}: {r:?}");
     }
     (d, ctx)
 }

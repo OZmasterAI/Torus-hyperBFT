@@ -4,6 +4,9 @@
 //! returns, so these digests must stay identical after every fix commit.
 //! Option B (s87) changes outcomes on purpose: it re-pinned scenario A only
 //! (scenario B — GTC bids and liquidation orders — is unchanged).
+//! Row 50 (s96) re-pinned scenario A for the results' success / error only
+//! (book rejections reported rejected); the digests over the pre-row-50 view
+//! of the results (`pre_row50`) must still equal the previous pins.
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
@@ -61,6 +64,28 @@ fn pinned(results: &[torus_bridge::native_executor::NativeActionResult]) -> Vec<
             success: r.success,
             error: r.error.clone(),
             gas_used: r.gas_used,
+        })
+        .collect()
+}
+
+/// Row 50: the results as they read before row 50, when an order the book
+/// refused or cancelled without a fill was reported ok. Such a result is the
+/// only failure that keeps its gas (a book outcome: `gas_used > 0`); it
+/// reads back as ok, and in the liquidation step's list (which keeps only
+/// failures) it is dropped. Digesting this view against the pre-row-50 pins
+/// proves the label is ALL row 50 changed: state, gas, metrics, trade index.
+fn pre_row50(results: &[torus_bridge::native_executor::NativeActionResult], failures_only: bool) -> Vec<NativeActionResult> {
+    let book_outcome = |r: &torus_bridge::native_executor::NativeActionResult| !r.success && r.gas_used > 0;
+    pinned(results)
+        .into_iter()
+        .zip(results)
+        .filter(|(_, r)| !(failures_only && book_outcome(r)))
+        .map(|(mut p, r)| {
+            if book_outcome(r) {
+                p.success = true;
+                p.error = None;
+            }
+            p
         })
         .collect()
 }
@@ -166,8 +191,10 @@ const R_MODES: [R; 3] = [R::Inline, R::Worker, R::Off];
 
 /// Runs `blocks` on the pipelined overlay path; `threads` = `None` runs
 /// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `r`: how
-/// the resident rows R are kept. Returns one hex digest per block.
-fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<String> {
+/// the resident rows R are kept. Returns one hex digest per block, twice:
+/// over the results as they are, and over their pre-row-50 view
+/// ([`pre_row50`]).
+fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>) {
     let resident = r != R::Off;
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
@@ -175,14 +202,17 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
     let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
-    let mut outputs: Vec<String> = Vec::new();
-    let mut digests: Vec<String> = Vec::new();
-    let flush = |p: Arc<FrozenPending>, outputs: &[String], digests: &mut Vec<String>| {
+    let mut outputs: Vec<[String; 2]> = Vec::new();
+    let mut digests: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let flush = |p: Arc<FrozenPending>, outputs: &[[String; 2]], digests: &mut [Vec<String>; 2]| {
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
-        let mut data = db_digest(db);
-        data.extend_from_slice(outputs[h as usize - 1].as_bytes());
-        digests.push(keccak256(&data).to_string());
+        let state = db_digest(db);
+        for (k, out) in outputs[h as usize - 1].iter().enumerate() {
+            let mut data = state.clone();
+            data.extend_from_slice(out.as_bytes());
+            digests[k].push(keccak256(&data).to_string());
+        }
     };
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
@@ -218,10 +248,9 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act),
         };
         ctx.save_order_books();
-        let (agg, liq_res) = (pinned(&agg), pinned(&liq_res));
-        outputs.push(format!(
-            "agg={agg:?}|res={:?}|gas={}|liq={liq_res:?}|trades={}|next_id={}|fatal={:?}|acc={} rc={} rm={} ol={} rb={} cpf={} stp={} oth={} liqs={}",
-            pinned(&res.results),
+        let agg = pinned(&agg);
+        let output = |res_view: Vec<NativeActionResult>, liq_view: Vec<NativeActionResult>| format!(
+            "agg={agg:?}|res={res_view:?}|gas={}|liq={liq_view:?}|trades={}|next_id={}|fatal={:?}|acc={} rc={} rm={} ol={} rb={} cpf={} stp={} oth={} liqs={}",
             res.total_gas,
             ctx.trade_index,
             ctx.next_global_order_id,
@@ -235,7 +264,11 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             metrics.orders_self_trade_cancels.get(),
             metrics.orders_rejected_other.get(),
             metrics.liquidations_triggered.get(),
-        ));
+        );
+        outputs.push([
+            output(pinned(&res.results), pinned(&liq_res)),
+            output(pre_row50(&res.results, false), pre_row50(&liq_res, true)),
+        ]);
         assert!(ctx.fatal_error.is_none(), "block {h}: {:?}", ctx.fatal_error);
         if std::env::var("GOLDEN_PRINT").is_ok() {
             let rows = |tag: u8| ctx.state.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap().len();
@@ -286,6 +319,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
     } else {
         assert_eq!(holder.rows_builds(), 0);
     }
+    let [digests, pre_row50_digests] = digests;
     if std::env::var("GOLDEN_PRINT").is_ok() {
         println!(
             "summary threads={threads:?}: accepted={} rejected_cancelled={} rejected_margin={} liquidations={} positions={} liq_rows={}",
@@ -316,7 +350,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> Vec<Stri
             metrics.sell_margin_cuts[1][1].iter().map(|c| c.get()).collect::<Vec<_>>(),
         );
     }
-    digests
+    (digests, pre_row50_digests)
 }
 
 struct Lcg(u64);
@@ -528,7 +562,12 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// here walk up to ±900 per block (3% of the mid), so same-batch bids sit
 /// far above the start bid B0: the s89 bound followed them, B-blind covers
 /// B0 + 30 ticks only.
-const GOLDEN_A: [&str; A_BLOCKS as usize] = [
+///
+/// Row 50 keeps these as the pre-row-50 pins: the digests over the
+/// [`pre_row50`] view of the results must stay exactly these (state, gas,
+/// metrics and trade index unchanged); [`GOLDEN_A`] re-pins the results'
+/// success / error only.
+const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
     "0x2284087928a8c8753efa5355fb90d3993a781ccd6dc93642fea91528732cbdad",
     "0xbd5bd04f2e1e9b445ec102b461fbf506a92a2054b1301013d42f11af2adff0f8",
@@ -542,7 +581,25 @@ const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0x1151116c5cc5f7a22af8f0299d36f89864d0ba505a3676ada8696c5c116a0599",
     "0x1456c3b4d0de478bcefd4bed519c5288d9946861e7c37914e99e327e9187f923",
 ];
-/// Scenario B on c93c579.
+/// Scenario A at row 50 (s96, owner decision): an order the book refuses or
+/// cancels without a fill is rejected with its HL reason (success false, an
+/// error), not executed; gas and everything else as [`PRE_ROW50_A`].
+const GOLDEN_A: [&str; A_BLOCKS as usize] = [
+    "0x8e809cbd45abcc0545c71fa1e509b7ab261510773ea274bcfa4c429ff1104dac",
+    "0x9fce81bd56ac0fe851bd363547599bdf8d8e345f6f0a41b668a711e855e2539b",
+    "0xa5c2913771cabf06653dc40068a32f05ad644c08d597b1023e6938310f868c7b",
+    "0xc3369ad3810c8cace12fd2f462bb0e1d8c1e3b81171d2019cd15bac04b228e06",
+    "0x3f78722d7737d12048b66021062f7503ffaf1c2c61cee31e9887540a1c6b2f15",
+    "0x8efdc745286e9202b6fc5d52d1f2349dd7135e896248baf3ed994c782cb431c3",
+    "0xd53420062afa2f890c26b53df03f4cfb66a05699a28dbae5e3fd6090a304e833",
+    "0x3c6e4857a5f542c7ec73890ecde1034a4fa315ef019c84c8c2565fe4914cf7fb",
+    "0x2398b3bd6fda7614e49238a10d4dc6f931c584cbda437df57a5e36cece40bda3",
+    "0x8733aa91e2759daed4a9beb7cf7a3803fc9a36e49ce9d5b33bce055f27a5be76",
+    "0x90fab3384498cb2db3ab07d0b2ccb5c1082f7e6f22be338347f707aac4f79fc7",
+    "0xf1f68bbd98bdae97a8de1daa1ddb877d2e5746f4f17aeac5d8b57c0451d2b7bc",
+];
+/// Scenario B on c93c579 (no book rejection: the same with and without the
+/// pre-row-50 view).
 const GOLDEN_B: [&str; 18] = [
     "0x01ad98e2504ea6d07d86d94eb488ea2f620b593effec4284b1cb37a3cf07cdbd",
     "0xd5ce9dd0a968a2016bb69dc20bc5e12ba6e9bf600539c7cc2989087b49e98562",
@@ -581,7 +638,9 @@ fn scenario_a_serial_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        check("GOLDEN_A", &run(&db, &blocks, None, r), &GOLDEN_A);
+        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
 
@@ -591,7 +650,9 @@ fn scenario_a_engine_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        check("GOLDEN_A", &run(&db, &blocks, Some(4), r), &GOLDEN_A);
+        let (digests, pre_row50) = run(&db, &blocks, Some(4), r);
+        check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
 
@@ -600,6 +661,8 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
     for r in R_MODES {
         let (_d, db) = listed_db(&[1, 2, 3]);
         let blocks = scenario_b(&db);
-        check("GOLDEN_B", &run(&db, &blocks, None, r), &GOLDEN_B);
+        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        check("GOLDEN_B", &digests, &GOLDEN_B);
+        check("GOLDEN_B", &pre_row50, &GOLDEN_B);
     }
 }

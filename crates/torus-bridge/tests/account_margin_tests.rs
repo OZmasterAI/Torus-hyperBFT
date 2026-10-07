@@ -575,7 +575,9 @@ per_path!(unchecked_order_gets_no_projected_release_credit);
 /// IM(2,000) = 5 > budget 5 + pool (85 − 100 = −15) = −10 → nothing fills,
 /// the reservation comes back. Single path: the sell rests first, the buy
 /// sees the real long (need 5 > free −10) and is rejected at placement.
-/// Either way: still long 20, maker's ask untouched, 90 / 110.
+/// Either way: still long 20, maker's ask untouched, 90 / 110. Row 50:
+/// either way the buy is rejected for margin (batch paths: at match, with
+/// the executed order's gas; single path: at placement, no gas).
 fn checked_order_credit_is_bounded_at_match(path: Path) {
     let (t, mk) = (addr(2), addr(4));
     let (_d, mut ctx) = fresh(path, &[mk]);
@@ -584,7 +586,8 @@ fn checked_order_credit_is_bounded_at_match(path: Path) {
     let r = run(&mut ctx, path, &[place(t, limit(1, false, 110, 20)), place(t, market(1, true, fp(100), 1))]);
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     let accepted = !matches!(path, Path::Single);
-    assert_eq!(r[1].success, accepted, "{path:?}: {:?}", r[1].error);
+    assert!(!r[1].success && r[1].reason == torus_state::action_status::FailureReason::Margin, "{path:?}: {:?}", r[1]);
+    assert_eq!(r[1].gas_used, if accepted { 1000 } else { 0 }, "{path:?}: accepted at placement?");
     assert_eq!(pos_in(&ctx, &t, 1), fp(20), "{path:?}: nothing released, nothing opened");
     assert_eq!(resting_in(&ctx, &mk, 1), vec![fp(5)], "{path:?}: maker's ask untouched");
     assert_eq!(resting_in(&ctx, &t, 1), vec![fp(20)], "{path:?}: the sell rests");
@@ -1233,7 +1236,9 @@ fn non_pool_sell_at_a_same_batch_bid_beyond_delta_is_cut(path: Path) {
         let metrics = metered(&mut ctx);
         let r = run(&mut ctx, path, &[place(t, pool_order()), place(b, limit(2, true, bid, 1)), place(t, limit(2, false, 999, 1))]);
         let what = format!("{path:?} bid {bid}");
-        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert!(r[0].success && r[1].success, "{what}: {r:?}");
+        // Row 50: cut before its first fill = rejected (perpMarginRejected).
+        assert!(!r[2].success && r[2].reason == torus_state::action_status::FailureReason::Margin, "{what}: {r:?}");
         assert_eq!(pos_in(&ctx, &t, 2), FixedPoint::ZERO, "{what}: cut with no fill");
         assert_eq!(resting_in(&ctx, &b, 2), vec![fp(1)], "{what}: B's bid untouched");
         assert_bal(&ctx, &t, fp(990), fp(10), &what);
@@ -1268,7 +1273,9 @@ fn partial_top_up_goes_in_flat_order(path: Path) {
             ],
         );
         let what = format!("{path:?} first m{first}");
-        assert!(r.iter().all(|x| x.success), "{what}: {r:?}");
+        assert!(r[..4].iter().all(|x| x.success), "{what}: {r:?}");
+        // Row 50: the second sell, cut with no fill, is rejected for margin.
+        assert!(!r[4].success && r[4].reason == torus_state::action_status::FailureReason::Margin, "{what}: {r:?}");
         assert_eq!((pos_in(&ctx, &t, first), pos_in(&ctx, &t, second)), (-fp(1), FixedPoint::ZERO), "{what}");
         assert_bal(&ctx, &t, fp_cents(10_008), fp(10), &what);
         assert_eq!(top_ups(&metrics), [1, 1, 0], "{what}");
@@ -1331,7 +1338,24 @@ fn no_other_sender_changes_a_non_pool_sell_reservation(path: Path) {
         actions.push(place(t, limit(2, false, 999, 1)));
         let r = run(&mut ctx, path, &actions);
         let what = format!("{path:?} {shape}");
-        assert!(r[0].success && r.last().unwrap().success, "{what}: {r:?}");
+        // Row 50: the m2 sell's best bid decides. At the maker's 1,000
+        // (control, ioc: X's IOC lifts the ask and leaves; unfunded: X's bid
+        // is refused) it fills 1 within its reservation + top-up. At X's
+        // resting 1,050 (gtc_rests, post_only) or 1,020 (many) the first fill
+        // needs more than that and the pool is m1's alone, so it is cut
+        // before its first fill: rejected for margin at match (HL
+        // `perpMarginRejected`, gas kept), nothing opened in m2.
+        let last = r.last().unwrap();
+        let cut = matches!(shape, "gtc_rests" | "post_only" | "many");
+        assert!(r[0].success, "{what}: {r:?}");
+        if cut {
+            assert!(!last.success && last.reason == torus_state::action_status::FailureReason::Margin, "{what}: {last:?}");
+            assert_eq!(last.gas_used, 1000, "{what}: rejected at match keeps the gas");
+            assert!(last.error.as_deref().is_some_and(|e| e.starts_with("insufficient margin")), "{what}: {last:?}");
+        } else {
+            assert!(last.success, "{what}: {last:?}");
+        }
+        assert_eq!(pos_in(&ctx, &t, 2), if cut { FixedPoint::ZERO } else { -fp(1) }, "{what}: m2 position");
         assert_eq!(pos_in(&ctx, &t, 1), -fp(10), "{what}: the pool kept its 5");
         assert_eq!(top_ups(&metrics), [1, 0, 0], "{what}: the same top-up in every shape");
         m1_outcomes.push((pos_in(&ctx, &t, 1), resting_in(&ctx, &t, 1)));
@@ -1547,12 +1571,19 @@ per_path!(sell_cut_counter_pool_partial);
 /// reservation at 1,000 (50); the fill @1005 needs 50.25 → cancelled with no
 /// fill, 5 ticks above its reservation price → `[non-pool][zero][3-5]`.
 /// Batch paths only: the single path's budget is the account.
+/// Row 50: the sell is rejected (`Margin`, HL `perpMarginRejected`) with the
+/// executed order's gas, on the sequential settle (Batch) and pass B
+/// (Parallel).
 fn sell_cut_counter_non_pool_zero_fill(path: Path) {
     let (t, x) = (addr(2), addr(5));
     let (_d, mut ctx) = fresh(path, &[t, x]);
     let metrics = metered(&mut ctx);
     let r = run(&mut ctx, path, &[place(t, pool_order()), place(x, limit(2, true, 1_005, 1)), place(t, limit(2, false, 1_000, 1))]);
-    assert!(r.iter().all(|x| x.success), "{path:?}: {r:?}");
+    assert!(r[0].success && r[1].success, "{path:?}: {r:?}");
+    assert!(!r[2].success, "{path:?}: {:?}", r[2]);
+    assert_eq!(r[2].reason, torus_state::action_status::FailureReason::Margin, "{path:?}");
+    assert!(r[2].error.as_deref().is_some_and(|e| e.starts_with("insufficient margin")), "{path:?}: {:?}", r[2]);
+    assert_eq!(r[2].gas_used, 1000, "{path:?}");
     assert_eq!(pos_in(&ctx, &t, 2), FixedPoint::ZERO, "{path:?}");
     assert_eq!(resting_in(&ctx, &x, 2), vec![fp(1)], "{path:?}: X's bid untouched");
     assert_eq!(sell_cuts(&metrics), vec![(1, 0, 2, 1)], "{path:?}");
