@@ -341,7 +341,7 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
     UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
     UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
 
-## 10. C2 and the s96 fix list (as built, s25 ozarchy, after 18c s96 / s99)
+## 10. C2 and the s96 fix list (as built, s24 ozarchy, after 18c s96 / s99)
 
 **C2: node-local per-market holder list (decided s96, replaces C1's walk per ranking).**
 * `TraderPositions` (item 6 C7 records, `trader_positions.rs`) keeps `holders`: per market `m`,
@@ -406,6 +406,11 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
   1-token alarm). No behaviour change; pinned by `p2_a_two_sided_storm_sweeps_both_escrows_to_zero`
   (B over two blocks interleaved with the drain, both escrows dusty: each swept once, 0
   positions and (0, 0) at the end, the vault = the dust, the dust gauge = the vault).
+* Value-sum checks (18c s99): judge by the exact i128 sum in the `liquidation: value sum` log
+  line, not the f64 gauge. The sum drifts ~−0.2 units of 1e-8 per trade fill (s750vs; likely the
+  truncating `total_cost / new_size` in `position.rs` `fill_transition`): on 18c's backlog (a test
+  showing it, then exact conservation). Until then a check across fills allows ~fills × 1 unit;
+  checks with no fills in between (ADL, escrows, stale marks) stay exact.
 
 **Mainnet risk (g): a historical OI imbalance halts every node.** The drain treats a row still
 open after the ranked holders and the escrow pairing as a broken invariant (escrow size = Σ rows,
