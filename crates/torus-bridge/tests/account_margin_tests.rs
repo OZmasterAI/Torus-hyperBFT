@@ -1622,10 +1622,10 @@ per_path!(reduce_only_cut_counter);
 /// reservation, but every release is computed at the limit, so none is
 /// stranded or over-released. Non-vacuous for B-blind (s92: top-ups
 /// happen on both paths), and value is conserved: Σ
-/// (available + order_margin) + Σ signed size × (mid − entry) stays the
-/// funding total (no fees, no mark: no liquidation; every fill has two
-/// sides, so the reference price cancels) up to the entry-averaging
-/// rounding (measured <= 6 raw; any top-up is >= IM(1 × tick) = 0.05).
+/// (available + order_margin) + Σ (signed size × mid ∓ cost basis) stays
+/// the funding total EXACTLY (no fees, no mark: no liquidation; every fill
+/// has two sides, so the reference price cancels; s100 item 2: one
+/// rounding per fill, shared by both sides).
 #[test]
 fn order_margin_matches_resting_reservations_under_option_b() {
     struct Lcg(u64);
@@ -1707,17 +1707,18 @@ fn order_margin_matches_resting_reservations_under_option_b() {
                 let b = bal(&ctx, s);
                 (1..=12u64).fold(acc + b.available + b.order_margin, |acc, m| {
                     acc + pos_in(&ctx, s, m) * fp(30_000) - ctx.positions.get_position(s, m).unwrap().map_or(FixedPoint::ZERO, |p| {
-                        let notional = p.size * p.entry_price;
                         if p.is_long {
-                            notional
+                            p.cost_basis
                         } else {
-                            -notional
+                            -p.cost_basis
                         }
                     })
                 })
             });
-            let drift = abs(value - funded);
-            assert!(drift <= FixedPoint::from_raw(100), "threads={threads} block={block}: value drift {drift}");
+            assert_eq!(
+                value, funded,
+                "threads={threads} block={block}: value drift"
+            );
         }
         assert!(fills > 0 && checked == 8 * senders.len(), "threads={threads}: non-vacuous");
         assert!(ctx.phase_accum.sell_top_ups > 0, "threads={threads}: B-blind top-ups happened");
