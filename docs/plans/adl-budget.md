@@ -573,8 +573,8 @@ genesis, so consensus changes are allowed. The decisions:
 2. **A ranking charges the holders of the ranked market**, not the trader set. The count is derived
    from consensus state, so every validator charges the same. A test checks it against a state
    walk at every ranking, and the C1 shadow also compares the count.
-3. **Block B's own work is charged into W** (the escrow transfers and the valuations), with a
-   defined unit per operation. B stays atomic: when its work alone reaches W, the drain gets
+3. **Block B's own work is charged into W**: its escrow transfers, T units per position moved.
+   The first-sight valuations are drain units (12.1), not B's. B stays atomic: when its work alone reaches W, the drain gets
    nothing in that block and continues in the next. **The per-block act limit is not lowered**
    (`LIQ_ACT_PER_BLOCK` = 64 for every class).
 4. **The `traders_after` → `has_key` seeks are made cheap** (node-local, the same trader set).
@@ -615,6 +615,26 @@ overlay:
 So both give the exact live count, the same on every node, with or without R. The trader set no
 longer enters the units. With a holder list the drain does not take the set at all; only the test
 shadow does.
+
+**What is checked only in tests (18c s99 review):** C1 == C2 (same candidates, same count) and
+"count == a state walk" are `#[cfg(test)]` assertions. A release node runs C2 alone and does not
+re-check it, so it relies on R being correct (R's own equality with the state is also shadow-checked
+in tests only). A wrong R gives a wrong candidate list and a wrong count on that node.
+
+**The C1 path charges H(m) but reads every trader.** Without R the ranking reads `get_position`
+for all N traders of the set and charges only the H(m) that return a row. At N = 100,000 with 10 %
+holders that is ~10× the charged work. This is kept on purpose: the units are consensus, so a node
+without R must charge what a node with R charges; charging N there would split the units by node.
+Production always has R attached; C1 runs only in tests and tools.
+
+**Outside W (not charged):**
+* The cold `build_sums` (R's build when the records are first attached or rebuilt).
+* `dirty_by_market`, taken once at the drain's first ranking (one pass over the block's pending
+  position keys).
+* Stale-listed reads: C2's dirty entries that read no row (keys the block deleted), and on the C1
+  path every non-holder read.
+* `liq_view`: B's classification of each scanned trader and the vault's view (bounded by the
+  scan / act limits; T's calibration includes it only for accounts moved to an escrow).
 
 **Valuations:** `seen` is the set of traders the block's drain valued for a ranking. It is never
 reduced within the block and is kept with the caches on and off, so the units do not depend on the
