@@ -630,6 +630,13 @@ pub struct AccountMargins {
     /// reservation is still in its snapshot free; `false`: read after it
     /// (the single path).
     pre_batch: bool,
+    /// Plan 9.11 (s99, node-local telemetry; nothing in execution reads
+    /// it): maker fills committed with a mark charge > 0 since this was
+    /// installed. Each draws the maker's free margin, and every book of a
+    /// batch checks its own copy of the snapshot, so these are an upper
+    /// bound on cross-market maker over-commit. The executor adds it to
+    /// `torus_maker_offmark_charged_fills` before clearing the margins.
+    charged_maker_fills: u64,
 }
 
 /// Item 6 P1: one trader's part of [`AccountMargins`] — the three former
@@ -669,7 +676,14 @@ impl AccountMargins {
             traders: HashMap::new(),
             mark: None,
             pre_batch: false,
+            charged_maker_fills: 0,
         }
+    }
+
+    /// Plan 9.11 (telemetry): maker fills committed with a mark charge
+    /// (see the field).
+    pub fn charged_maker_fills(&self) -> u64 {
+        self.charged_maker_fills
     }
 
     /// s94 option 1: the snapshots are pre-batch (see the field).
@@ -816,7 +830,7 @@ fn account_fill(
 ) -> bool {
     // Item 6 P1 / P3: split borrow — the slot, and the tiers without an
     // Arc clone per fill.
-    let AccountMargins { tiers, traders, mark, pre_batch } = accounts;
+    let AccountMargins { tiers, traders, mark, pre_batch, charged_maker_fills } = accounts;
     let t = tiers.as_deref();
     let loss_of = |closing: FixedPoint| match *mark {
         Some(m) => crate::margin::mark_loss(t, m, is_buy, price, q, closing),
@@ -899,6 +913,10 @@ fn account_fill(
                 // The entry `maker_slot` read: its shared account, else its
                 // snapshot (always present after the load).
                 slot.free = a.free - c;
+                // Plan 9.11 (telemetry): a maker fill that pays a charge.
+                if taker.is_none() && l.charge > FixedPoint::ZERO {
+                    *charged_maker_fills += 1;
+                }
             }
             true
         }
