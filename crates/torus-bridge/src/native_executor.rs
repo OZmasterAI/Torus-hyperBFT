@@ -6338,6 +6338,10 @@ impl NativeExecutor {
         let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
         for mbr in market_results.iter_mut() {
             mbr.book.clear_reduce_only_positions();
+            // Plan 9.11 (telemetry): this book's charged maker fills.
+            if let Some(m) = ctx.metrics.as_deref() {
+                m.maker_offmark_charged_fills.inc_by(mbr.book.account_margins().charged_maker_fills());
+            }
             mbr.book.clear_account_margins();
             for r in &mbr.results {
                 triggered.extend(r.result.triggered_stops.iter().cloned());
@@ -8719,6 +8723,10 @@ impl NativeExecutor {
             Some(&reader),
         );
         book.clear_reduce_only_positions();
+        // Plan 9.11 (telemetry): this placement's charged maker fills.
+        if let Some(m) = ctx.metrics.as_deref() {
+            m.maker_offmark_charged_fills.inc_by(book.account_margins().charged_maker_fills());
+        }
         book.clear_account_margins();
         if forced_id.is_some() {
             book.set_next_order_id(ctx.next_global_order_id);

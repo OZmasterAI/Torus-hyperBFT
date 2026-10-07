@@ -160,6 +160,13 @@ pub struct Metrics {
     /// s92: resting makers cancelled whole at match time because their
     /// account could not afford the fill (HL `marginCanceled`).
     pub maker_margin_cancels: Counter,
+    /// Plan 9.11 (s99): maker fills that committed a mark charge (s94
+    /// option 1: the fill's loss against the mark beyond its tolerance) —
+    /// each draws the maker's free margin, which every book of a batch
+    /// checks against its own copy of the snapshot. An upper bound on
+    /// cross-market maker over-commit (a fill in one market only is
+    /// counted too). Observability only: nothing reads it back.
+    pub maker_offmark_charged_fills: Counter,
     /// s92: reduce-only cuts (a resting reduce-only order cut at match time
     /// or shrunk / cancelled by the post-fill sweep), one per cut.
     pub reduce_only_cuts: Counter,
@@ -1187,6 +1194,12 @@ impl Metrics {
             "torus_maker_margin_cancels",
             "Resting makers cancelled whole at match time for margin (HL marginCanceled)",
             maker_margin_cancels.clone(),
+        );
+        let maker_offmark_charged_fills = Counter::default();
+        registry.register(
+            "torus_maker_offmark_charged_fills",
+            "Maker fills charged their loss against the mark; upper bound on cross-market maker over-commit in one batch (plan 9.11)",
+            maker_offmark_charged_fills.clone(),
         );
         let reduce_only_cuts = Counter::default();
         registry.register(
@@ -2440,6 +2453,7 @@ impl Metrics {
             orders_rejected_other,
             sell_margin_cuts,
             maker_margin_cancels,
+            maker_offmark_charged_fills,
             reduce_only_cuts,
             sell_top_ups_full,
             sell_top_ups_partial,
@@ -2808,6 +2822,7 @@ mod tests {
         let m = Metrics::new();
         m.sell_margin_cuts[1][0][2].inc();
         m.maker_margin_cancels.inc_by(2);
+        m.maker_offmark_charged_fills.inc_by(4);
         m.reduce_only_cuts.inc_by(3);
         let text = m.encode();
         let names = sell_cut_metric_names();
@@ -2817,6 +2832,7 @@ mod tests {
             assert!(text.contains(&format!("{name}_total {want}\n")), "{name}:\n{text}");
         }
         assert!(text.contains("torus_maker_margin_cancels_total 2\n"), "{text}");
+        assert!(text.contains("torus_maker_offmark_charged_fills_total 4\n"), "{text}");
         assert!(text.contains("torus_reduce_only_cuts_total 3\n"), "{text}");
         m.sell_top_ups_partial.inc();
         let text = m.encode();

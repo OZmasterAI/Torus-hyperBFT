@@ -2643,10 +2643,19 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   designed in s18 (`docs/plans/adl-budget.md`, owner decisions Q1-Q6 pending).
   **Budget built** (`perf/adl-budget` @ `6a25e20`, section 24): S=750 passes
   (rc 0, AGREE, 22 s drain, vault -0.00084). Still open: the heaviest
-  liquidation block is ~1.1-1.2 s vs ~250 ms. C2 (per-market holder lists,
-  shadow == C1) + the s96 fix list built on `perf/adl-budget` (s24, not pushed;
-  nextest 2996/0; `docs/plans/adl-budget.md` section 10). Next: review, HL
-  block at N=5,000 with ~10% holders, W re-size, cells on C2.
+  liquidation block is ~1.1-1.2 s vs ~250 ms. **Merged** to main as
+  `a746c408` (18c s99): C2 holder lists, W = 100,000, ranking charged by the
+  market's holders, block B charged into W (`docs/plans/adl-budget.md`
+  sections 10-13); main needs a fresh devnet genesis. Re-measure (section
+  13): the only block over ~250 ms rig was HL 100k 10 % block B (135-138 ms
+  ozarchy). **Fixed by `perf/adl-dirty-check` @ `f859907f`** (node-local,
+  units identical; 18c accepted at 128.8 ms, s99, merge pending): A/B block B
+  149.6 -> 128.8 ms (`docs/plans/adl-dirty-check.md`).
+- Optional ADL speedups (18c s99: not now). The largest remaining shares of HL
+  100k 10 % block B after the dirty check: the `adl_rank` sort (~28 %),
+  `get_native_balance` for the candidates (~13 %), and the records binary
+  search in `resident_positions` (~12 %; the holder list could hand the
+  ranking R's record slice). All node-local.
 - ADL proof cells (section 24.2), 18c s99: vault -0.00074 / -0.00084 accepted
   as dust; the escrow dust lines are the sweep itself (both escrows end at 0
   positions and 0 balance, the vault gets exactly the dust; pinned by a test on
