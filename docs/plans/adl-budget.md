@@ -340,3 +340,79 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
 
     UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
     UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
+
+## 10. C2 and the s96 fix list (as built, s25 ozarchy, after 18c s96 / s99)
+
+**C2: node-local per-market holder list (decided s96, replaces C1's walk per ranking).**
+* `TraderPositions` (item 6 C7 records, `trader_positions.rs`) keeps `holders`: per market `m`,
+  every trader with the 28-byte key `t ‖ m` in R (regular or opaque), ascending. It has the
+  records' lifecycle: built with R at load (`build`), followed per key from each block's
+  `ResidentDelta` at `end_resident` (`apply`: a write adds, a tombstone removes; O(log n) per
+  changed key). Never consensus-visible, no format change.
+* Block-dirty merge: `dirty_by_market(state)` groups the block's own pending 28-byte keys
+  (`layer_keys`, writes and tombstones) by market; `holders_with(m, dirty[m])` merges them with
+  R's holders of `m`. The drain takes the dirty map once, at its first ranking (with the trader
+  set, `DrainCache.dirty`): the drain gives no trader a new key (the same argument that keeps
+  the cached trader set exact), so the list stays a superset of `m`'s holders for the whole
+  drain. A listed trader without a position in `m` (a deleted key) is skipped by the position
+  read, exactly as C1 skips a trader of the whole set that does not hold `m`.
+* `adl_candidates_of` ranks the holder list when the records are attached; without records
+  (no R: tests, tools) it is C1. **Units are unchanged:** a ranking still charges the whole
+  trader set's size (C1's units), so the drain's per-block progress, its state and every golden
+  are the same; only the work behind a unit drops to O(holders of `m`). (Charging holders
+  instead would be a consensus change of the drain's progress; not done.)
+* Shadow (as E2): in tests with `shadow` on, every C2 ranking also runs C1 over the whole set
+  with the same reads and valuation and records any difference (candidates, order). Proof:
+  `trader_positions_tests::holder_lists_with_the_dirty_traders_cover_the_walk` (random blocks,
+  irregular rows, new / vanishing traders: the merged list is ascending, unique, and holds
+  exactly the walk's traders holding `m` plus only deleted dirty keys; the warm `holders` equal
+  a cold build after every block), `liquidation_l1_tests::adl_c2_holder_lists_are_bit_identical_to_c1`
+  (HL-like and S=750-like shapes, caches on and off: rows, units, results block by block; holder
+  lists used and shorter than the set), the seeded L1 test (every node-path ranking from a
+  holder list, shadow-clean), the goldens unchanged (R modes Inline / Worker use C2, Off uses C1).
+* Where it pays: markets held by a fraction of the accounts (thin markets at 100k accounts).
+  In `ubench_adl`'s HL shape every trader holds every market, so the ranking reads the same
+  5,002 positions as C1 there; memory ~1 BTreeSet entry per position row (~30-50 bytes).
+
+**Fix list (18c review of 6a25e20, s96; s99 additions).**
+* (b) `adl_queue_telemetry` no longer counts the whole queue every metrics block: a running
+  count on the Metrics instance (`liquidation_adl_queue_rows_cache`) = last count + rows the
+  step wrote (B) − rows it deleted (drain, pairing); an empty queue is one seek and resets it to
+  0; a count is taken only on a start, after a read error / failed step, or when the running
+  count says 0 while rows exist. Test `telemetry_counts_the_adl_queue_without_rescanning_it`.
+* (c) The proof-only value sum values every position at one common price per market (0:
+  UPnL = −signed size × entry); while OI is symmetric that equals Σ UPnL at the marks. It no
+  longer jumps when a market loses or regains its mark (s750vs: −1,740.69 in the step the feed's
+  marks went stale). Test `value_sum_does_not_jump_when_a_market_loses_its_mark`.
+* (d) `liquidation_e2e_adl_drain_survives_a_restart` closes RocksDB (drops the context and the
+  StateDb), opens the directory again, configures the running-hash activation as boot does, and
+  compares `liquidation_adl_work_total` per block (plus dumps and roots from block 9).
+* (e) `adl_drain_caches_are_bit_identical` also compares the run with R (E2 set, C2 holder
+  lists) against the run without R (walk, C1), block by block.
+* (f) `an_hl_shaped_event_costs_exactly_the_sizing_formula` (default suite): the HL shape at
+  N = 20 (every trader short in all 100 markets, 3 bankrupt longs, 300 rows) costs exactly
+  U(N) = 100 × (N + 2) + 300 × 2 units; W = U(N) closes in B, W = U(N) − 2 leaves the last row.
+* (g) Delisted markets rank at the stored price of the first row of their (market, side) the
+  block visits (once per block and key; each row still closes at its own price): documented at
+  the drain. Mainnet risk below.
+* (h) The two "escrow dust" lines of s750 (h803: long +0.00132290, short −0.00216415) and
+  s750vs (h620: +0.00147665 / −0.00221684) are the sweep itself, not dust left behind:
+  `adl_drain` logs `liquidation: ADL escrow dust to the vault` after `move_collateral` has moved
+  the flat escrow's whole balance to the vault. End state on all nodes: `adl_queue` 0, escrow
+  notional 0, `adl_queue_deficit` 0.0 (both escrows' balance + UPnL), vault deficit = −(sum of
+  the two lines) exactly (0.00084125 / 0.00074019), i.e. the vault holds exactly the dust and
+  D9 summed to 0. The dust itself is `apply_fill`'s truncated weighted-average entry on the
+  aggregated escrow positions (exact arithmetic gives 0; within the *Dust bound*, far below the
+  1-token alarm). No behaviour change; pinned by `p2_a_two_sided_storm_sweeps_both_escrows_to_zero`
+  (B over two blocks interleaved with the drain, both escrows dusty: each swept once, 0
+  positions and (0, 0) at the end, the vault = the dust, the dust gauge = the vault).
+
+**Mainnet risk (g): a historical OI imbalance halts every node.** The drain treats a row still
+open after the ranked holders and the escrow pairing as a broken invariant (escrow size = Σ rows,
+OI symmetric) and sets `fatal_error` (review M1, "ADL obligation left open ..."). That is
+deterministic, so every node stops at the same block: a chain halt, not a fork. Any state whose
+open interest is not symmetric in some market — a past bug, a migration, a manual state edit,
+a genesis with one-sided positions — turns the first ADL storm in that market into a halt.
+Before mainnet: an OI-symmetry check per market at genesis / upgrade (and ideally a node-local
+invariant gauge), and a decision whether an unpairable remainder should go to the vault with an
+error line instead of halting.
