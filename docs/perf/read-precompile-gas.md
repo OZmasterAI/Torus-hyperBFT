@@ -347,3 +347,137 @@ open-order limit 1,000, up to 5,000 with volume; many traders: the proposer-loca
    getOrderBook from the executor's in-memory book (no markers at all).
 2. **Corrupt books not detected by the EVM reader** (mixed level + order rows, rows without a meta
    row): detecting them costs one extra read per call. The RPC readers still reject them.
+
+## Write stalls and the book CF's SST target (ozarchy, 2026-10-07, `bench/read-gas-stall`)
+
+Questions: does the per-market tombstone compaction cause write stalls (18c review finding 2: each
+per-market `compact_range` forces a memtable flush of the book CF), and which `target_file_size_base`
+should `cf_native_order_books` get (owner s100: accept one background core plus a smaller SST target
+now; getOrderBook from memory later).
+
+### Method
+
+* Bench: parts 4-5 of `ubench_read_precompile_gas` (`UB_RG_ONLY=churn`). Part 5 = 50 churn markets
+  spread among 4,000 filler markets, book CF 383 MB on disk (incompressible filler, bottommost level),
+  each churn market deletes and re-writes 100 bid levels per block through the block overlay and its
+  flush, **200 blocks** of 100 ms. New in part 5: every churn market also holds 64 static ask levels,
+  so the measured getOrderBook answers the s99 cap on both sides (64 + 64 levels, 85,680 gas); the
+  first call after each flush ("first": new SST files not in the block cache, OS page cache warm;
+  a page-cache-cold read was not feasible without root) and the median of the next 5 ("warm").
+  Part 4 = single-market churn (1,000 cancels + 1,000 places per block, real executor, 150 blocks).
+* New per-block counters (parts 4 and 5; `TORUS_ROCKSDB_STATS=2`): `STALL_MICROS` ticker delta,
+  write-stall histogram count, `rocksdb.is-write-stopped`, `rocksdb.actual-delayed-write-rate`,
+  flushes (flush histogram count), the book CF's `num-files-at-level0` and total SST files, the
+  block's own overlay flush (write) time; at the end the book CF's `rocksdb.cfstats` stall lines
+  ("Write Stall (count)" per cause, "Cumulative stall") and the level table.
+* SST target: new node-local knob `TORUS_BOOK_CF_TARGET_FILE_MB` (`db.rs`
+  `book_cf_target_file_bytes`), read at open, applied to `cf_native_order_books` only. Unset (the
+  default) calls no setter: RocksDB's 64 MiB, the exact current options (test
+  `book_cf_target_file_size_is_unset_by_default_and_book_cf_only` reads the OPTIONS file).
+  `target_file_size_multiplier` stays 1 (all levels), `level_compaction_dynamic_level_bytes` on.
+* Variants: `nocompact` (the trigger `note_scanned_deletes` disabled in `backend.rs`, temporary patch,
+  RocksDB's own compaction only), `compact` = current per-market compaction (T = 64,
+  ForceOptimized, one worker) with SST target 64 (current) / 16 / 8 / 4 / 2 / 1 MiB.
+  3 reps each, variants interleaved per rep, each run started at 1-min load < 1.5.
+  v1 (64/16/8/4 MiB + nocompact) and v2 (64/4/2/1 MiB + nocompact, part-4 counters added): the
+  64 and 4 MiB cells agree between v1 and v2 within 3 %. Medians of 3 reps below; rep spread was
+  under 5 % except the max columns.
+* Results: `~/bench-results-matched/read-gas-stall/` (v2 at the top, v1 in `v1/`, `summary-v2.txt`,
+  `v1/summary-v1.txt`; binaries and the nocompact patch in `compact/`, `nocompact/`, `bin-v1/`).
+
+### A. Write stalls: none
+
+| cell | variant | stall time | write-stall events | blocks with write stopped / delayed | flushes (max per block) | book CF L0 files (max) | block flush (write) median / max |
+|---|---|---|---|---|---|---|---|
+| 50 markets x 100, 200 blocks | nocompact | 0 us | 0 | 0 / 0 | 1 (1) | 1 | 5.0 / 6.0 ms |
+| 50 markets x 100, 200 blocks | compact, 64 MiB (current) | 0 us | 0 | 0 / 0 | 9 (1) | 0 | 4.6 / 6.0 ms |
+| 50 markets x 100, 200 blocks | compact, 4 MiB | 0 us | 0 | 0 / 0 | 13 (1) | 1 | 4.5 / 7.9 ms |
+| 50 markets x 100, 200 blocks | compact, 1 MiB | 0 us | 0 | 0 / 0 | 35 (1) | 1 | 4.4 / 7.6 ms |
+| 1 market x 1,000, 150 blocks | nocompact | 0 us | 0 | 0 / 0 | 0 | 0 | 1.9 / 2.3 ms |
+| 1 market x 1,000, 150 blocks | compact, 64 / 4 / 1 MiB | 0 us | 0 | 0 / 0 | 148 (1) | 0 | 1.6 / 2.0-2.1 ms |
+
+The book CF's `rocksdb.cfstats` agrees in every run: "Write Stall (count)" 0 for every cause
+(L0 file count, memtable limit, pending compaction bytes, write buffer manager), "Cumulative stall:
+00:00:0.000".
+
+Why: the forced flushes are real (part 4: 148 flushes in 150 blocks, 18c's "149 L0 files") but they
+do not pile up. Each forced flush writes one small L0 file, and the `compact_range` that forced it
+compacts that market's span out of L0 into the bottommost level, so the book CF never held more
+than 1 L0 file when sampled after a block (RocksDB slows writes at 20, stops at 36). At most one
+flush per block, and no stall cause (L0 count, memtable count, pending compaction bytes, write
+buffer manager) ever fired. The block's own write (overlay flush) time does not move: 4.4-5.0 ms
+median in part 5 and 1.6-1.9 ms in part 4, with or without the compaction. Stalls are **not a
+problem** at this load; what the compaction costs is the background CPU below.
+
+Not measured: the same churn on a node also writing full blocks (the 128 MiB memtables and L0
+triggers shared with heavy EVM / native writes); a forced flush there flushes whatever the book CF
+memtable holds at that moment, which is still one CF and one file.
+
+### B. SST target for `cf_native_order_books`
+
+50-market churn cell (100 levels per market per block, 200 blocks of 100 ms, 383 MB book CF).
+Compaction = all RocksDB compaction in the interval (automatic + background), per block; one core =
+100 ms CPU per 100 ms block. Markers = deletes one getOrderBook on a churn market walks (peak, and
+the median over blocks 101-200 = steady). getOrderBook = one 30M-gas block of that call (64 + 64
+levels).
+
+| SST target | files (end) | compaction per block read / write / CPU | background runs (cfstats Comp(cnt), whole run) | markers peak / steady | getOrderBook block, warm median / max | first call after the flush, median / max | tail after the last block |
+|---|---|---|---|---|---|---|---|
+| no compaction (64 MiB) | 7 | 0 / 0 / 0 | 0 (7) | 20,000 / 15,050 (growing) | 449 / 776 ms | 457 / 827 ms | 0 |
+| 64 MiB (current) | 6 | 15.5 / 15.4 MB / 97 ms | 10 (26) | 5,000 / 3,750 | 131 / 234 ms | 146 / 300 ms | 4.7 s, 725 MB |
+| 16 MiB (v1) | 23 | 15.1 / 15.1 MB / 97 ms | 9 (24) | 5,100 / 3,800 | 142 / 211 ms | 159 / 293 ms | 2.9 s, 435 MB |
+| 8 MiB (v1) | 46 | 14.7 / 14.7 MB / 96 ms | 9 (44) | 4,100 / 2,800 | 117 / 220 ms | 134 / 281 ms | 3.2 s, 480 MB |
+| **4 MiB** | 92 | 13.1 / 13.1 MB / 88 ms | 14 (612) | 1,800 / 1,000 | **62 / 115 ms** | 78 / 171 ms | 2.5 s, 343 MB |
+| 2 MiB | 183 | 11.3 / 11.3 MB / 80 ms | 23 (1,158-1,210) | 1,100 / 600 | 47 / 111 ms | 63 / 135 ms | 1.2 s, 143 MB |
+| 1 MiB | 364 | 9.2 / 9.2 MB / 69 ms | 36 (1,894) | 700 / 400 | 40 / 86 ms | 54 / 149 ms | 0.8 s, 75 MB |
+
+Single-market churn (part 4, 1,000 cancels + places per block) at every target: flat 1,000 markers
+(exactly the previous block's deletes), last-20-block median 89-92 ms per 30M-gas block (64 MiB:
+92.0, 4 MiB: 89.2, 2 MiB: 89.5, 1 MiB: 91.0; no compaction: 149,000 markers, 6.3 s). No regression.
+
+Reading the table:
+
+* The worker is CPU-bound (one core, ~97 % at 64 MiB): the bytes it rewrites per block barely
+  change with the target, because it always runs back to back. What a smaller target changes is how
+  much each market's run must rewrite (the bottommost file(s) holding that market's 100-level span:
+  one 64 MiB file vs one 4 MiB file), so a full pass over the 50 markets finishes sooner and the
+  markers it leaves behind drop: steady 3,750 -> 1,000 (4 MiB) -> 400 (1 MiB).
+* 16 MiB does nothing here (markers and CPU as 64 MiB); 8 MiB little. The step is at 4 MiB:
+  read time per 30M-gas block halves (131 -> 62 ms median, 234 -> 115 ms max), CPU -9 %.
+  2 and 1 MiB add less per halving (62 -> 47 -> 40 ms) and start to free CPU (80 / 69 ms of 100),
+  for 2x and 4x the files of 4 MiB.
+* Stalls: none at any target (table A).
+
+### Recommendation: `target_file_size_base` = 4 MiB for `cf_native_order_books`
+
+* 4 MiB takes most of the measured gain: steady markers -73 % (3,750 -> 1,000), the 30M-gas
+  getOrderBook block 131 -> 62 ms median and 234 -> 115 ms worst, compaction CPU 97 -> 88 ms per
+  100 ms block, single-market churn unchanged, no stalls. What remains in this cell is ~1,000
+  markers per churn market (about 10 blocks of its deletes).
+* Why not 1-2 MiB, although they measure better: the file count. The DB opens with
+  `max_open_files = -1` (every SST file stays open; the s470 status list has fd exhaustion as a
+  known validator-death mode, finding 14, and the code sets no fd limit). At 4 MiB the book CF
+  needs ~250 open files per GB of book data (92 for the 383 MB CF), at 1 MiB ~950 per GB (364):
+  a 1 GB book plus the other CFs then passes a 1,024 `nofile` soft limit (systemd's default for
+  services). Move to 2 MiB only together with a raised `LimitNOFILE` (or a bounded
+  `max_open_files`); 2 MiB then gives 47 ms / 600 markers / 80 ms CPU.
+* Companion options: none needed. L0 never exceeded 1 file in the book CF, so the L0 slowdown / stop
+  triggers (RocksDB 20 / 36) are not involved; `max_bytes_for_level_base` sizes levels, not files,
+  and with `level_compaction_dynamic_level_bytes` the bottommost level holds the data either way;
+  `target_file_size_multiplier` stays 1 (the same 4 MiB at every level). The memtable (128 MiB) is
+  unchanged: the forced flushes already make it small and often while markets churn.
+* How to ship: on a follow-up branch after 18c merges ae767806, change the knob's default (or set
+  the CF option directly) to 4 MiB for `cf_native_order_books` only. Node-local, no format or
+  consensus impact, results unchanged.
+
+**A node with a large, quiet book CF** (many resting orders, little churn): no deletes, so the
+compaction worker never runs and costs nothing at either target. What changes is the file layout:
+16x as many, 16x smaller files in the book CF (~250 per GB instead of ~16), each kept open
+(`max_open_files = -1`) with its index and filter blocks in the shared 256 MiB block cache (about
+the same total bytes, split across more files) plus per-file table-reader metadata (not measured).
+A read binary-searches more files of the level (a few more steps, log2 of the file count), not
+more I/O; not measured on a quiet CF here. Existing 64 MiB files are
+not rewritten on the switch: the new target applies to files that compactions write after it, so a
+quiet CF moves over gradually and a churning one within its first passes. When only a few markets
+churn in a large CF, each of their runs rewrites ~4 MiB instead of ~64 MiB (16x less compaction I/O
+and CPU per run).
