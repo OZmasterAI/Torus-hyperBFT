@@ -406,9 +406,31 @@ pub(super) fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, S
 /// (writes and tombstones) as market -> traders, each list ascending and
 /// without duplicates; `None`: R not attached (the caller ranks over the
 /// whole trader set).
-pub(crate) fn dirty_by_market<B: StateBackend>(state: &B) -> Option<HashMap<MarketId, Vec<Address>>> {
+pub(crate) fn dirty_by_market<B: StateBackend>(state: &B) -> Option<ByMarket> {
+    Some(by_market(&state.layer_keys(CF_NATIVE_POSITIONS)?))
+}
+
+/// adl-dirty-check: [`dirty_by_market`] and the traders under whose
+/// positions prefix `state`'s own pending set writes or deletes
+/// (`layer_touches(CF_NATIVE_POSITIONS, t)` iff `t` is in it), from one
+/// `layer_keys`; `None`: R not attached.
+pub(crate) fn dirty_by_market_and_traders<B: StateBackend>(
+    state: &B,
+) -> Option<(ByMarket, HashSet<Address>)> {
     let pending = state.layer_keys(CF_NATIVE_POSITIONS)?;
-    let mut out: HashMap<MarketId, Vec<Address>> = HashMap::new();
+    let traders = pending
+        .iter()
+        .filter(|k| k.len() >= TRADER)
+        .map(|k| Address::from_slice(&k[..TRADER]))
+        .collect();
+    Some((by_market(&pending), traders))
+}
+
+/// Market -> the traders of its keys (ascending, deduplicated).
+type ByMarket = HashMap<MarketId, Vec<Address>>;
+
+fn by_market(pending: &[Vec<u8>]) -> ByMarket {
+    let mut out = ByMarket::new();
     // Key-sorted (`t ‖ m`): per market the traders come ascending.
     for k in pending.iter().filter(|k| k.len() == KEY) {
         out.entry(market_of(k)).or_default().push(Address::from_slice(&k[..TRADER]));
@@ -416,7 +438,7 @@ pub(crate) fn dirty_by_market<B: StateBackend>(state: &B) -> Option<HashMap<Mark
     for list in out.values_mut() {
         list.dedup();
     }
-    Some(out)
+    out
 }
 
 /// The position in `market_id` of a trader's record.

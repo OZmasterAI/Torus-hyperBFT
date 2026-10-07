@@ -33,6 +33,9 @@ thread_local! {
     /// Tests (s99): rankings whose charged holder count was checked against
     /// a state walk.
     static ADL_UNIT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tests (adl-dirty-check): the rankings' dirty checks answered by the
+    /// drain's set, by `layer_touches`.
+    static ADL_DIRTY_STATS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// What one step did — telemetry only (metrics and logs), never read by
@@ -99,16 +102,22 @@ struct LiqStats {
 ///   lookup (never iterated); dropped for both parties of every close and
 ///   for the vault on a pairing, i.e. for every account the drain writes.
 /// * `dirty` (adl-budget C2): the block's dirty traders per market
-///   ([`trader_positions::dirty_by_market`]), taken at the drain's first
+///   ([`trader_positions::dirty_by_market_and_traders`]), taken at the drain's first
 ///   ranking with R attached. A ranking of `m` reads R's holders of `m`
 ///   merged with them. That list covers every holder of `m` for the whole
 ///   drain for the reason `traders` stays exact: the drain gives no trader a
 ///   new key. (A listed trader gone flat reads no position and is skipped.)
+/// * `dirty_traders` (adl-dirty-check, node-local): the traders the block
+///   wrote under ([`trader_positions::dirty_by_market_and_traders`]), taken with `dirty`
+///   and grown by every drain write ([`Self::touched`]), so it equals
+///   `layer_touches` at every ranking (`debug_assert`). The ranking's
+///   reader asks it instead of a `layer_touches` per read.
 #[derive(Default)]
 struct DrainCache {
     traders: Option<Vec<Address>>,
     av: HashMap<Address, FixedPoint>,
     dirty: Option<HashMap<MarketId, Vec<Address>>>,
+    dirty_traders: Option<std::collections::HashSet<Address>>,
     seen: std::collections::HashSet<Address>,
 }
 
@@ -118,6 +127,9 @@ impl DrainCache {
     /// when its row in `m` is gone).
     fn touched<T: StateBackend>(&mut self, ctx: &NativeExecContext<T>, t: &Address, m: MarketId) -> Result<(), CoreError> {
         self.av.remove(t);
+        if let Some(set) = self.dirty_traders.as_mut() {
+            set.insert(*t);
+        }
         let Some(list) = self.traders.as_mut() else { return Ok(()) };
         let Ok(i) = list.binary_search(t) else { return Ok(()) };
         if ctx.positions.get_position(t, m)?.is_none() && !trader_positions::has_key(&ctx.state, t)? {
@@ -599,7 +611,13 @@ impl NativeExecutor {
         let shadow = false;
         let fresh_set;
         let fresh_dirty;
-        let DrainCache { traders, av, dirty: dirty_cache, seen } = cache;
+        let DrainCache {
+            traders,
+            av,
+            dirty: dirty_cache,
+            dirty_traders,
+            seen,
+        } = cache;
         // C2: the holder list of `m` when the records are attached (with R:
         // the dirty map exists), else every trader (C1).
         let records = ctx.sums.as_ref().and_then(|s| s.records.as_ref()).filter(|_| c2);
@@ -607,7 +625,10 @@ impl NativeExecutor {
             None => None,
             Some(_) if on => {
                 if dirty_cache.is_none() {
-                    *dirty_cache = trader_positions::dirty_by_market(&ctx.state);
+                    if let Some((m, t)) = trader_positions::dirty_by_market_and_traders(&ctx.state)
+                    {
+                        (*dirty_cache, *dirty_traders) = (Some(m), Some(t));
+                    }
                 }
                 dirty_cache.as_ref()
             }
@@ -644,7 +665,12 @@ impl NativeExecutor {
             (None, Some(s)) => s,
             (None, None) => unreachable!("without a holder list the set is taken"),
         };
-        let reader = AccountReader::of(ctx);
+        let reader = AccountReader {
+            drain_dirty: dirty_traders.as_ref(),
+            ..AccountReader::of(ctx)
+        };
+        #[cfg(test)]
+        let checks_before = DIRTY_CHECKS.with(|c| c.get());
         // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
         // storage error stays an error (fail-stop).
         let value = |t: &Address| -> Result<FixedPoint, CoreError> {
@@ -680,6 +706,16 @@ impl NativeExecutor {
             av.insert(*t, v);
             Ok(v)
         })?;
+        #[cfg(test)]
+        {
+            let (set, layer) = DIRTY_CHECKS.with(|c| c.get());
+            ADL_DIRTY_STATS.with(|x| {
+                x.set((
+                    x.get().0 + set - checks_before.0,
+                    x.get().1 + layer - checks_before.1,
+                ))
+            });
+        }
         #[cfg(test)]
         if let Some(s) = ctx.sums.as_ref() {
             bump(&s.counters.adl_rankings);

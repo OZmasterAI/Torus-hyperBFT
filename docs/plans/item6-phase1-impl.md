@@ -838,15 +838,17 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 |---|---|
 | bad-debt fix (fills far from the mark) | merged (`fix/offmark-bad-debt`); ozarchy's fresh-genesis cost cell (`35e69b3` vs `92a02ed`, N=4 + b900, x2) running |
 | row 75 TreasurySpend / PermanentUnlock all-or-nothing | merged (`720805e`) |
-| row 74 governance / staking storage errors halt | built (`f0fc022`, `a86112b`; branch `fix/row74-storage-halt`); not merged yet |
-| row 80 genesis `fee_split` ignored | new (s96); owner choice before testnet |
+| row 74 governance / staking storage errors halt | merged (`f0fc022`, `a86112b`; s96) |
+| row 80 genesis `fee_split` ignored | s99: the split is the built-in constants (`torus-economics` `types.rs` 362-374: 10/0/45/45 -> 25 each over 1825 epochs); genesis is read once, so the field could never change a running chain. Owner leaning to option D (keep the field, genesis loader refuses a value that differs from the built-in split until it is wired in or made a governance setting); not built |
 | liquidation stress at full-node load (row 76) | telemetry merged; liq-stress cells S=400 / S=750 on `35e69b3` + `bench/liq-stress` next on ozarchy |
 | bench load: open-limit rejects (section 20.3) | `bench/max-in-flight` merged; standard shape `MAX_IN_FLIGHT=4` + `OPEN_ORDER_BUDGET=900` |
 | rows 77-78 slow first block, empty block with the feed live | profiled (results doc section 22): flush-worker wait (77, Phase 3) and `run_liquidations_with` sums (78, Phase 2 P2-4 design check) |
 | 9.14 D row 48 (faster hasher) | `hash_one` / SipHash showed (~13% of execution self time): Phase 2 P2-5 (`item6-phase2-impl.md` 9.5) |
-| 9.14 B batch (rows 44, 45, 46, 52, 69) | built on `fix/s94-b-batch` (`9ab2837`, `d9e3c19`, `457fd70`, `860da7d`, `553aa51`); not merged yet |
-| row 50 "rejected" (HL names; s96 owner chose "rejected", not "canceled") | built on `feat/row50-rejected-status` (`d8f79878`, review fixes `640cad35`); not merged yet |
-| 9.11 counter, anti-spam eviction metric | s99: 9.11 counter + pins built (`b1adeee9`, branch `feat/9.11-overcommit-counter`; over-commit IS possible under flat tiers, see 9.11); anti-spam metric unchanged |
+| 9.14 B batch (rows 44, 45, 46, 52, 69) | merged (`2e1e4b44`, s96) |
+| row 50 "rejected" (HL names; s96 owner chose "rejected", not "canceled") | merged (`171fa6ec`, s99; review fixes `640cad35`). Follow-ups: S2 (~98 B status entry per IOC no-fill), RPC `hlStatus` field, 2 review nits |
+| 9.11 counter, anti-spam eviction metric | s99: 9.11 counter + pins merged (`98f035ee`; over-commit IS possible under flat tiers, see 9.11; real fix = owner decision before mainnet); anti-spam metric: next on 18c |
+| governance ParameterChange votes that changed nothing (s99 audit, hl-parity `findings.md` ~4132) | s99: fixed and merged (`b8bf3e8a`). The 6 `GovernanceParams` keys (`voting_period_blocks`, `quorum_bps`, `permanent_weight_multiplier_num` / `_den`, `timelock_blocks`, `permanent_unlock_threshold_bps`) now rewrite the `gov_params` record governance reads (one staged write, atomic with the Executed status; a multiplier change re-checks the num / den pair); they no longer write a raw `CF_FEE_CONFIG` row nobody read. `maintenance_margin_bps`, `max_leverage`, `liquidation_penalty_bps` (no reader) are refused as not modifiable at submission and execution. `price_band_bps` unchanged. Changes governance execution output: needs a fresh devnet genesis (already needed after `a746c408`) |
+| per-market leverage / margin by governance | open: `ProposalAction::UpdateMarketParams` is text-only today (`native_executor.rs` ~9826, no payload); per-market `max_leverage` / MM changes need a real payload writing the market row |
 | `/tmp` test-folder leak (`app.rs`) | unchanged; after the merge (now unblocked) |
 | compiler warnings (ozarchy s17): `swarm.rs` 3047 `enqueue_body_fetch_traced` and 3210 `handle_consensus_direct` unused; `bench-throughput` `main.rs` 1592 needless `mut`, `in_flight.rs` 152 unused | new; small cleanup, anytime |
 | other 9.13 rows (native root 9.3, oracle M2, anti-spam D, runbook, C5 cooldown, trading app `"Failed"`) | unchanged |
@@ -854,6 +856,22 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 Item 6 Phase 2: full plan with owner decisions in `item6-phase2-impl.md` (`docs/item6-phase2-plan`);
 base and gate reference main `35e69b3`.
 
-Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> row 50 done -> 9.11 counter + pin
-tests done (s99, `b1adeee9`) -> next: governance params fix -> anti-spam eviction metric; Phase 2 step 0 after
-ozarchy's reference cells on `35e69b3`.
+Build queue on 18c (s99): row 74, B batch, row 50, 9.11 counter + pins, governance params fix: all merged
+(main `b8bf3e8a`) -> next: anti-spam eviction metric; per-fill value-sum rounding drift (`position.rs`
+`fill_transition` average-entry truncation); Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.
+Item 7 design doc on 18c (section 9.16). Rule (owner s99): pre-merge full suites run on ozarchy; 18c reviews
+read-only and merges.
+
+### 9.16 Owner decisions and open questions (s99)
+
+| topic | status |
+|---|---|
+| ADL under a work budget | merged (`a746c408`): W = 100,000, ranking charged by market holders, block B charged into W; dirty-check speedup merged (`87a05374`); HL 100k 10% block B 128.8 ms ozarchy accepted. Vault dust (-0.00074) accepted as rounding |
+| liquidator vault capital | decided: seed the vault through genesis on devnet and testnet; HL-style user deposits (HLP: deposit, withdraw, pro-rata PnL) built before mainnet; one vault, no separate insurance fund (HL's liquidator vault plays that role) |
+| margin currency | OPEN (owner decision list): margin is TRS counted as $1 (`lockbox.rs:62`, `margin.rs` 403-438) while markets are quoted in USD; no conversion, no stablecoin collateral (roadmap P5 line 317). Options: USDC margin like HL (18c recommendation) / TRS with a TRS-USD price and a haircut / markets quoted in TRS |
+| 9.11 real fix | OPEN, before mainnet: split each maker's free margin per book / tighten the 50% band / serialise makers resting in several markets; counter `torus_maker_offmark_charged_fills` gives the data |
+| read-precompile gas (ozarchy `bench/read-precompile-gas`, `docs/perf/read-precompile-gas.md`) | decided, revisit later: single reads at HL level (~16,500 gas per position read; base ~16,000, ozarchy computes the exact base); scan reads (`getOrderBook`, `getOpenOrders`) kept for now at 500 gas per scanned row + 20 per word or blob, capped at 64 orders per call; owner leaning to remove scan reads like HL after item 7. Open question to ozarchy: are the `getOpenOrders` deletion markers node-local RocksDB tombstones (then cap skipped keys, never charge them) |
+| item 7 EVM lanes | decided: own item; design now (`docs/plans/item7-evm-lanes.md`, 18c), build after item 6 Phase 2, before Phase 3 and before testnet. Why: every block can carry 30M EVM gas next to trading and any EVM tx sends its block down the serial path; HL rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about once a minute) |
+| per-fill value-sum drift | 18c backlog: ~-0.2 units of 1e-8 per fill from the average-entry division in `fill_transition`; also the source of the ADL escrow dust. Until fixed, value-sum checks use a tolerance of about fills x 1 unit |
+| test flakes | fixed and merged: row-50 test vs the process-global native-trie maintenance flag (`9301f417`), exec_pipeline rendezvous sleep (`f1b84717`) |
+| build size | merged (`11183d2a`): dev profile `line-tables-only`, no debuginfo for dependencies; a full test build writes 10.8 GB instead of 27.8 GB |

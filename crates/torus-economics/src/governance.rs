@@ -606,36 +606,16 @@ impl<T: StateBackend> GovernanceManager<T> {
     // ========================================================================
 
     /// Validate a parameter change against the allowlist of modifiable parameters.
+    ///
+    /// s99: every allowed key has a reader. The six [`GovernanceParams`] keys
+    /// change that record ([`Self::with_governance_param`]); `price_band_bps`
+    /// is its own `CF_FEE_CONFIG` row. `maintenance_margin_bps`,
+    /// `max_leverage` and `liquidation_penalty_bps` were allowed but never
+    /// read (MM is half the IM, leverage is per market, no liquidation
+    /// penalty by design), so a vote changed nothing; they are now refused
+    /// as not modifiable.
     fn validate_param_change(key: &str, value: &str) -> Result<()> {
         match key {
-            "maintenance_margin_bps" => {
-                let v: u64 = value
-                    .parse()
-                    .map_err(|_| EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be a valid u64".to_string(),
-                    })?;
-                if !(25..=5000).contains(&v) {
-                    return Err(EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be between 25 and 5000 (0.25% - 50%)".to_string(),
-                    });
-                }
-            }
-            "max_leverage" => {
-                let v: u32 = value
-                    .parse()
-                    .map_err(|_| EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be a valid u32".to_string(),
-                    })?;
-                if v == 0 || v > 200 {
-                    return Err(EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be between 1 and 200".to_string(),
-                    });
-                }
-            }
             "voting_period_blocks" => {
                 let v: u64 = value
                     .parse()
@@ -689,20 +669,6 @@ impl<T: StateBackend> GovernanceManager<T> {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 1 and 100 (zero disallowed)".to_string(),
-                    });
-                }
-            }
-            "liquidation_penalty_bps" => {
-                let v: u64 = value
-                    .parse()
-                    .map_err(|_| EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be a valid u64".to_string(),
-                    })?;
-                if v > 1000 {
-                    return Err(EconomicsError::InvalidParameterValue {
-                        key: key.to_string(),
-                        reason: "must be between 0 and 1000 (0% - 10%)".to_string(),
                     });
                 }
             }
@@ -1169,11 +1135,20 @@ impl<T: StateBackend> GovernanceManager<T> {
             } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
                 Self::validate_param_change(param_key, new_value)?;
-                vec![(
-                    CF_FEE_CONFIG,
-                    param_key.as_bytes().to_vec(),
-                    Some(new_value.as_bytes().to_vec()),
-                )]
+                match Self::with_governance_param(params, param_key, new_value)? {
+                    // s99: one write of the whole record governance reads.
+                    Some(updated) => {
+                        let data = borsh::to_vec(&updated)
+                            .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+                        vec![(CF_FEE_CONFIG, GOVERNANCE_PARAMS_KEY.to_vec(), Some(data))]
+                    }
+                    // `price_band_bps`: its own row (executor and RPC read it).
+                    None => vec![(
+                        CF_FEE_CONFIG,
+                        param_key.as_bytes().to_vec(),
+                        Some(new_value.as_bytes().to_vec()),
+                    )],
+                }
             }
             ExecutionPayload::TreasurySpend {
                 recipient, amount, ..
@@ -1260,6 +1235,45 @@ impl<T: StateBackend> GovernanceManager<T> {
             }
         };
         Ok(writes)
+    }
+
+    /// s99: `params` with the [`GovernanceParams`] field named `key` set to
+    /// `value` (already checked by `validate_param_change`), or `None` when
+    /// `key` is not a field of the record. A multiplier vote changes one side
+    /// of the ratio: the resulting num / den pair is checked with the same
+    /// rules (each 1..=100, so den is never 0).
+    fn with_governance_param(
+        params: &GovernanceParams,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<GovernanceParams>> {
+        let mut updated = params.clone();
+        let field = match key {
+            "voting_period_blocks" => &mut updated.voting_period_blocks,
+            "quorum_bps" => &mut updated.quorum_bps,
+            "permanent_weight_multiplier_num" => &mut updated.permanent_weight_multiplier_num,
+            "permanent_weight_multiplier_den" => &mut updated.permanent_weight_multiplier_den,
+            "timelock_blocks" => &mut updated.timelock_blocks,
+            "permanent_unlock_threshold_bps" => &mut updated.permanent_unlock_threshold_bps,
+            _ => return Ok(None),
+        };
+        *field = value
+            .parse()
+            .map_err(|_| EconomicsError::InvalidParameterValue {
+                key: key.to_string(),
+                reason: "must be a valid u64".to_string(),
+            })?;
+        if key.starts_with("permanent_weight_multiplier_") {
+            Self::validate_param_change(
+                "permanent_weight_multiplier_num",
+                &updated.permanent_weight_multiplier_num.to_string(),
+            )?;
+            Self::validate_param_change(
+                "permanent_weight_multiplier_den",
+                &updated.permanent_weight_multiplier_den.to_string(),
+            )?;
+        }
+        Ok(Some(updated))
     }
 
     // ========================================================================
@@ -1703,23 +1717,37 @@ mod tests {
     #[test]
     fn reject_out_of_range_parameter() {
         let (_dir, _gm) = setup();
-        let result =
-            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "0");
+        let result = GovernanceManager::<StateDb>::validate_param_change("quorum_bps", "0");
         assert!(matches!(
             result,
             Err(EconomicsError::InvalidParameterValue { .. })
         ));
 
-        let result =
-            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "10000");
+        let result = GovernanceManager::<StateDb>::validate_param_change("quorum_bps", "10000");
         assert!(matches!(
             result,
             Err(EconomicsError::InvalidParameterValue { .. })
         ));
 
-        let result =
-            GovernanceManager::<StateDb>::validate_param_change("maintenance_margin_bps", "500");
+        let result = GovernanceManager::<StateDb>::validate_param_change("quorum_bps", "5000");
         assert!(result.is_ok());
+    }
+
+    /// s99: keys with no reader (MM is half the IM, leverage is per market,
+    /// no liquidation penalty by design) are not modifiable, for any value.
+    #[test]
+    fn dead_parameter_keys_are_not_modifiable() {
+        for (key, value) in [
+            ("maintenance_margin_bps", "500"),
+            ("max_leverage", "50"),
+            ("liquidation_penalty_bps", "100"),
+        ] {
+            let result = GovernanceManager::<StateDb>::validate_param_change(key, value);
+            assert!(
+                matches!(&result, Err(EconomicsError::ParameterNotModifiable(k)) if k == key),
+                "{key}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1957,8 +1985,8 @@ mod tests {
                 "Change param".into(),
                 "desc".into(),
                 Some(ExecutionPayload::ParameterChange {
-                    param_key: "maintenance_margin_bps".into(),
-                    new_value: "500".into(),
+                    param_key: "quorum_bps".into(),
+                    new_value: "5000".into(),
                 }),
                 0,
             )

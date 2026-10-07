@@ -9,7 +9,6 @@ use alloy_primitives::{Address, U256};
 use torus_economics::governance::{ExecutionPayload, ProposalOutcome, ProposalStatus};
 use torus_economics::types::*;
 use torus_economics::{GovernanceManager, GovernanceParams, RewardDistributor, StakingManager};
-use torus_state::cf::CF_FEE_CONFIG;
 
 use crate::common::TestHarness;
 
@@ -165,15 +164,15 @@ fn test_governance_permanent_weight_decides_outcome() {
 
     // Submit ParameterChange proposal (delegator has 5,000 > min 1,000).
     // FIX 13 whitelists param keys at submission — use a whitelisted key
-    // (same fixture as governance_tests.rs execute_parameter_change).
+    // (s99: one that takes effect; max_leverage is refused).
     let prop_id = gov
         .submit_proposal(
             delegator,
-            "Change leverage param".to_string(),
-            "Set max_leverage to 50".to_string(),
+            "Change quorum param".to_string(),
+            "Set quorum_bps to 5000".to_string(),
             Some(ExecutionPayload::ParameterChange {
-                param_key: "max_leverage".to_string(),
-                new_value: "50".to_string(),
+                param_key: "quorum_bps".to_string(),
+                new_value: "5000".to_string(),
             }),
             100,
         )
@@ -202,12 +201,8 @@ fn test_governance_permanent_weight_decides_outcome() {
     let outcome = gov.execute_proposal(prop_id, 116).unwrap();
     assert_eq!(outcome, ProposalOutcome::Executed(prop_id));
 
-    // Verify parameter was actually updated in CF_FEE_CONFIG.
-    let stored = h
-        .state_db
-        .get_cf_raw(CF_FEE_CONFIG, b"max_leverage")
-        .unwrap();
-    assert_eq!(stored.unwrap(), b"50");
+    // Verify the parameter took effect: governance reads the new quorum.
+    assert_eq!(gov.get_governance_params().unwrap().quorum_bps, 5000);
 
     let prop = gov.get_proposal(prop_id).unwrap().unwrap();
     assert_eq!(prop.status, ProposalStatus::Executed);

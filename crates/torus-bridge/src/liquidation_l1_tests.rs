@@ -763,6 +763,61 @@ fn adl_c2_holder_lists_are_bit_identical_to_c1() {
     }
 }
 
+/// adl-dirty-check (node-local, after adl-budget §13.6): with R attached and
+/// the caches on, a ranking's dirty checks (`AccountReader::dirty`, asked by
+/// every `get_position` and valuation of the ranking) are answered by the
+/// drain's dirty-trader set (`DrainCache::dirty_traders`: the block's pending
+/// position keys at the first ranking, grown by every drain write through
+/// `touched`), not by a `layer_touches` per read. Every set answer equals
+/// `layer_touches` (asserted inside `dirty`). Rows, units and results are
+/// bit-identical to the caches-off run (the `layer_touches` reference), block
+/// by block: the HL-like event and the S=750-like storm, R inline and worker.
+#[test]
+fn adl_ranking_dirty_checks_use_the_drain_set() {
+    let hl = AdlShape {
+        k: 3,
+        pu: 6,
+        act: 64,
+        work: liq::ADL_WORK_PER_BLOCK,
+        two_sided: false,
+    };
+    let storm = AdlShape {
+        k: 10,
+        pu: 6,
+        act: 3,
+        work: STORM_W,
+        two_sided: true,
+    };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        for r in [Rm::Inline, Rm::Worker] {
+            ADL_DIRTY_STATS.with(|s| s.set((0, 0)));
+            let fast = adl_run_with(shape, r, true, true);
+            let (set, layer) = ADL_DIRTY_STATS.with(|s| s.get());
+            let reference = adl_run_with(shape, r, false, true);
+            println!("ADL dirty checks {name} {r:?}: drain set {set}, layer_touches {layer}");
+            assert!(
+                set > 0,
+                "{name} {r:?}: the rankings asked the drain set ({set})"
+            );
+            assert_eq!(layer, 0, "{name} {r:?}: no ranking asked layer_touches");
+            assert_eq!(fast.len(), reference.len(), "{name} {r:?}: blocks");
+            for (h, (a, b)) in fast.iter().zip(&reference).enumerate() {
+                assert_eq!(
+                    a.adl_work,
+                    b.adl_work,
+                    "{name} {r:?} block {}: units",
+                    h + 1
+                );
+                assert!(
+                    a == b,
+                    "{name} {r:?} block {}: rows / units / results",
+                    h + 1
+                );
+            }
+        }
+    }
+}
+
 /// adl-budget s99 (owner decision 2): a ranking charges the holders of its
 /// market — the traders other than the two escrows with a live position row
 /// in it at ranking time — derived from consensus state: at EVERY ranking
