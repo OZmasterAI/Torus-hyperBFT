@@ -2632,10 +2632,32 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   `CF_STAKING_DELEGATIONS` table on every call; with the self-stake reward
   split (`fix/inflation-self-stake`) that is per block once the validator fee
   share is above 0 bps, and once per active validator at epoch boundaries.
-- Read precompile gas (`fix/read-precompile-gas`, 50 gas per unit is a
-  placeholder): before testnet, microbench ns per unit (row read / 32 B blob /
-  32 B returned) and size it so a 30M-gas block of reads fits the block exec
-  budget.
+- Read precompile gas: measured on `bench/read-precompile-gas` `0e9d918b`
+  (`docs/perf/read-precompile-gas.md`). At 50 gas per unit, the worst
+  30M-gas block of reads is 234 ms on ozarchy; `getOpenOrders` over RocksDB
+  deletion markers is ~820 ms at any unit price. Owner decisions (s99, item6
+  plan 9.16, revisit later): single reads at HL level (~16,500 gas per
+  position read; ozarchy computes the exact base); scan reads at 500 gas per
+  scanned row + 20 per word or blob, capped at 64 orders per call; the
+  deletion markers are node-local tombstones, so they are never charged.
+  **In progress on ozarchy** (a-c with before/after numbers). After item 7 the
+  owner leans to removing scan reads like HL (single reads + bbo).
+- **Item 7 EVM lanes** (owner s99): every Torus block can carry 30M EVM gas
+  next to trading, and any EVM tx sends its block down the serial path. HL
+  rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about
+  once a minute). Design by 18c (`docs/plans/item7-evm-lanes.md`); build after
+  item 6 Phase 2, before Phase 3 and before testnet.
+- Liquidator vault capital (owner s99): seed it through genesis on devnet and
+  testnet; HL-style user deposits (deposit, withdraw, pro-rata PnL) before
+  mainnet; one vault, no separate insurance fund.
+- **Margin currency: OPEN owner decision.** Margin is TRS counted as $1 while
+  markets are quoted in USD (no conversion, no stablecoin collateral). Options:
+  USDC margin like HL (18c recommendation), TRS with a TRS-USD price and a
+  haircut, or markets quoted in TRS (item6 plan 9.16).
+- **9.11 real fix: OPEN, before mainnet.** Maker over-commit is possible under
+  flat tiers: split each maker's free margin per book, tighten the 50 % band,
+  or serialise makers resting in several markets. The
+  `torus_maker_offmark_charged_fills` counter gives the data.
 - **P0 before testnet: ADL has no per-block work budget** (section 23.2): at
   S=750, 100 accounts x ~270 markets of ADL took 332 / 123 / 241 s on three
   blocks and froze consensus ~11.6 min. Needs a budget (account-markets or

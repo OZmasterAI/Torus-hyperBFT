@@ -8,7 +8,8 @@ The suites:
 2. `cargo test --workspace --doc -q`
 3. `cargo test --workspace --no-fail-fast -q`
 4. `ci/run-local.sh check`. Clippy and fmt carry old debt, so only findings that are new against the previous main are reported.
-5. `ci/run-local.sh uniswap` (devnet end to end, fresh genesis)
+5. `ci/run-local.sh uniswap` (devnet end to end, fresh genesis). It runs on 18c, which has Foundry;
+   Foundry on ozarchy is optional (owner s99).
 6. `tools/matched-bench` Python tests (`python3 -I -m pytest tools/matched-bench`, plus each `test_*.py` as a script as the README runs them)
 
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
@@ -29,7 +30,7 @@ Worktree `wt/main-b8bf3e8a`, `CARGO_TARGET_DIR=~/.cargo-target-main`. The baseli
 | 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 4 s |
 | 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,014 passed, 0 failed**, 41 ignored (157 result lines) | 401 s |
 | 4 | `ci/run-local.sh check` | 1 | the same failures as `98f035ee` (old debt), plus the new findings below | 121 s (base 114 s) |
-| 5 | `ci/run-local.sh uniswap` | 1 | **not run**: `missing: forge` (Foundry is not installed on ozarchy) | 0 s |
+| 5 | `ci/run-local.sh uniswap` | 0 (on 18c) | **PASS on 18c** at `7547f2b1` (= `b8bf3e8a` + docs): 3 pairs deployed, D6 swap check passed, Multicall3 live. On ozarchy: not run (`missing: forge`) | 132 s (18c) |
 | 6 | matched-bench Python tests | 0 | **164 passed**, 18 subtests; each script exits 0 | ~40 s |
 
 ### Suite 4: check / clippy / fmt / test
@@ -44,12 +45,15 @@ Worktree `wt/main-b8bf3e8a`, `CARGO_TARGET_DIR=~/.cargo-target-main`. The baseli
   merges touched: 8 from adl-dirty-check (`liquidation_l1_tests.rs` +3, `liquidation_step.rs` +4,
   `trader_positions.rs` +1) and 1 from governance-params (`economics/tests/governance_tests.rs` +1).
   Those files already had fmt debt, so a whole-file `cargo fmt` would also reformat old code.
+* **Fixed** on `fix/adl-dirty-check-lint`: the `ByMarket` alias clears `type_complexity`, and rustfmt
+  was applied only to the lines the dirty-check and governance commits introduced (`55da48a8`, merged
+  as `6af5e28c`; the governance hunks are in `474bb1ac`). The old fmt debt is unchanged.
 
 ### Suite 5: uniswap
 
-`forge` / `cast` are missing, so the script exits before building or starting a node. Ports 18545 and
-30933 were free, and the empty temp dir it left was removed. Running it on ozarchy needs Foundry
-installed.
+On ozarchy `forge` / `cast` are missing, so the script exits before building or starting a node. Ports
+18545 and 30933 were free, and the empty temp dir it left was removed. 18c ran it at `7547f2b1`: PASS
+in 132 s (3 pairs deployed, D6 swap check passed, Multicall3 live).
 
 ### Failures
 
