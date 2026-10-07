@@ -416,3 +416,101 @@ fn holder_lists_with_the_dirty_traders_cover_the_walk() {
     assert!(compared > 5_000, "non-vacuous: {compared}");
     assert!(extra > 50 && new_holders > 50, "deleted and new keys in the block: {extra} / {new_holders}");
 }
+
+/// One seek of [`Spy`]: its start, its prefix bound (`None`: unbounded) and
+/// the keys it returned.
+type Seek = (Vec<u8>, Option<Vec<u8>>, Vec<Vec<u8>>);
+
+/// [`has_key`]'s reads through the overlay, recorded.
+#[derive(Clone)]
+struct Spy {
+    inner: NativeStateOverlay,
+    seeks: std::sync::Arc<std::sync::Mutex<Vec<Seek>>>,
+}
+
+impl StateBackend for Spy {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let rows = self.inner.iterate_cf_from(cf, start, limit)?;
+        self.seeks.lock().unwrap().push((start.to_vec(), None, rows.iter().map(|(k, _)| k.clone()).collect()));
+        Ok(rows)
+    }
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        let rows = self.inner.iterate_cf_prefix_from(cf, prefix, start, limit)?;
+        self.seeks.lock().unwrap().push((start.to_vec(), Some(prefix.to_vec()), rows.iter().map(|(k, _)| k.clone()).collect()));
+        Ok(rows)
+    }
+    fn atomic_write(&self, ops: &[torus_state::AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// adl-budget s99 (owner decision 4; §11.3: ~96 ms of the S=750-like B₁):
+/// [`has_key`] reads only under the trader's own prefix. Before, it was an
+/// unbounded overlay seek from `t ‖ 00×8`: for a trader the block emptied
+/// (B's ADL'd accounts: every key a tombstone over R) the merge stepped over
+/// its tombstones AND every following emptied trader's, then returned the
+/// next live key of another trader — quadratic in a block that empties many
+/// adjacent accounts. Shape: 8 adjacent traders x 20 markets in R, all
+/// deleted in the block, a live trader after them, one trader with a
+/// longer-than-28-byte key and a 28-byte key, one with only a longer key.
+/// Every seek must be bounded to the trader's prefix and never return
+/// another trader's key; the answers equal the walk's (`liq::traders_after`
+/// holds `t` iff `has_key`).
+#[test]
+fn has_key_seeks_only_under_the_traders_prefix() {
+    use torus_core::liquidation as liq;
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let live = trader(20);
+    let (mixed, long_only) = (trader(21), trader(22));
+    for i in 0..8 {
+        for m in 1..=20 {
+            let t = trader(i);
+            db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m), &bytes(&position(t, m, 3, true))).unwrap();
+        }
+    }
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&live, 1), &bytes(&position(live, 1, 3, false))).unwrap();
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &[&position_key(&mixed, 1)[..], &[1]].concat(), &[1]).unwrap();
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&mixed, 2), &bytes(&position(mixed, 2, 3, true))).unwrap();
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &[&position_key(&long_only, 1)[..], &[1]].concat(), &[1]).unwrap();
+    let rows = ResidentRows::build(&db).unwrap();
+    let mut o = NativeStateOverlay::new(db.clone());
+    o.attach_resident(std::sync::Arc::new(rows));
+    for i in 0..8 {
+        for m in 1..=20 {
+            o.delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&trader(i), m)).unwrap();
+        }
+    }
+    let spy = Spy { inner: o.clone(), seeks: Default::default() };
+    let walk = liq::traders_after(&o, None, usize::MAX).unwrap();
+    assert_eq!(walk, vec![live, mixed], "the walk: the emptied traders and the long-key-only one are out");
+    for t in (0..8).map(trader).chain([live, mixed, long_only]) {
+        spy.seeks.lock().unwrap().clear();
+        assert_eq!(has_key(&spy, &t).unwrap(), walk.contains(&t), "{t}");
+        let seeks = spy.seeks.lock().unwrap().clone();
+        assert!(!seeks.is_empty(), "{t}: read through the backend");
+        for (start, bound, got) in &seeks {
+            assert_eq!(bound.as_deref(), Some(t.as_slice()), "{t}: seek from {start:?} bounded to the trader's prefix");
+            assert!(got.iter().all(|k| k.starts_with(t.as_slice())), "{t}: no other trader's key read: {got:?}");
+        }
+    }
+    o.detach_resident();
+}

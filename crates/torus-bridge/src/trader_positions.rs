@@ -381,15 +381,20 @@ impl TraderPositions {
 /// Item 6 E2: whether `state` holds a 28-byte position key of `t`. They all
 /// lie in `[t ‖ 00×8, t ‖ ff×8]`; longer keys under `t` in between are
 /// stepped over. (adl-budget A8 perf: also the ADL drain's flat check.)
+///
+/// adl-budget s99 (owner decision 4): each seek is bounded to `t`'s prefix
+/// (`iterate_cf_prefix_from`), so it reads only `t`'s own keys and
+/// tombstones. The unbounded seek it replaces gave the same answer (a key
+/// past the prefix meant `false`) but, for a trader the block emptied, the
+/// overlay merge stepped over its tombstones AND every following emptied
+/// trader's before reaching a live key: quadratic in a block B that ADLs
+/// many adjacent accounts (~96 ms of the S=750-like B₁, §11.3).
 pub(super) fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, StateError> {
     let mut start = [t.as_slice(), &[0u8; KEY - TRADER]].concat();
     loop {
-        let Some((k, _)) = state.iterate_cf_from(CF_NATIVE_POSITIONS, &start, 1)?.pop() else {
+        let Some((k, _)) = state.iterate_cf_prefix_from(CF_NATIVE_POSITIONS, t.as_slice(), &start, 1)?.pop() else {
             return Ok(false);
         };
-        if !k.starts_with(t.as_slice()) {
-            return Ok(false);
-        }
         if k.len() == KEY {
             return Ok(true);
         }
