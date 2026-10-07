@@ -11322,12 +11322,12 @@ mod crash_recovery_tests {
     /// Blocks for the failure-record tests (market 1, tick = lot = 1):
     ///   1  fund A, B
     ///   2  0 A sell 100x1 GTC                       executes (rests)
-    ///      1 B buy 100x1000 GTC                     fails: margin
-    ///      2 A sell 100.5x1 GTC                     fails: off-tick
-    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   fails: order 1 off-tick, 2 failed
+    ///      1 B buy 100x1000 GTC                     rejected: margin
+    ///      2 A sell 100.5x1 GTC                     rejected: off-tick
+    ///      3 B batch [90x1, 90.5x1, 91x1, 91.5x1]   rejected: order 1 off-tick, 2 failed
     ///      4 replay of block 1's A action           skipped
     ///      5 A cancel unknown order id              fails (pre-EVM list)
-    ///      6 B IOC buy 100.5x1                      fails: off-tick (pre-EVM list)
+    ///      6 B IOC buy 100.5x1                      rejected: off-tick (pre-EVM list)
     ///      7 A sell 100x1 GTC (same as 0, new nonce) executes
     ///   3  A sell 120x1 GTC                         executes (v1 record)
     fn failure_fixture_blocks() -> Vec<TorusBlock> {
@@ -11475,12 +11475,16 @@ mod crash_recovery_tests {
                         .starts_with("insufficient margin"),
                     "{label}"
                 );
+                // Row 50: the margin-refused placement is rejected
+                // (perpMarginRejected); review S3: so are the off-tick
+                // placements (tickRejected: single, batch, IOC); the unknown
+                // cancel stays failed.
                 let labels: Vec<&str> = (0..8).map(|i| status.native_label(i)).collect();
                 assert_eq!(
                     labels,
                     vec![
-                        "executed", "failed", "failed", "failed", "skipped", "failed", "failed",
-                        "executed"
+                        "executed", "rejected", "rejected", "rejected", "skipped", "failed",
+                        "rejected", "executed"
                     ],
                     "{label}"
                 );
@@ -11579,6 +11583,164 @@ mod crash_recovery_tests {
         blocks
     }
 
+    /// Row 50 blocks (market 1, tick = lot = 1):
+    ///   1  fund A, B, C, D
+    ///   2  B sell 105x1, bid 100x2, ask 110x2      rest
+    ///   3  C buy 105x1                              trades: last trade 105
+    ///   4  0 A IOC buy 105x1                        iocCancelRejected
+    ///      1 A PostOnly buy 110x1                   badAloPxRejected
+    ///      2 A market buy, cap 106                  marketOrderNoLiquidityRejected
+    ///      3 A reduce-only sell 100x1 (flat)        reduceOnlyRejected
+    ///      4 A FOK buy 110x5                        fokCancelRejected
+    ///      5 A stop buy, trigger 104                badTriggerPxRejected
+    ///      6 C batch [GTC 90x1, IOC 105x1, GTC 91x1, PostOnly 110x1]
+    ///                                               order 1 iocCancelRejected, 2 not executed
+    ///      7 A buy 100x100000 GTC                   perpMarginRejected (placement check)
+    ///   5  D IOC sell 100x3                         fills 2 of 3: executed (v1 record)
+    fn rejection_fixture_blocks() -> Vec<TorusBlock> {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let keys: Vec<_> = (91u8..=94)
+            .map(|b| k256::ecdsa::SigningKey::from_slice(&[b; 32]).unwrap())
+            .collect();
+        let (k_a, k_b, k_c, k_d) = (&keys[0], &keys[1], &keys[2], &keys[3]);
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let fp = |units: i128| FixedPoint::from_raw(units * FixedPoint::SCALE);
+        let order = |is_buy: bool, price: i128, qty: i128| PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let tif = |t, o: PlaceOrderParams| PlaceOrderParams { time_in_force: t, ..o };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
+        };
+        let place = |o: PlaceOrderParams| NativeAction::PlaceOrder(o);
+        let fund = |k| sign(NativeAction::TransferToPerp { amount: deposit }, 1, k);
+        let mut blocks = vec![
+            make_block(1, vec![fund(k_a), fund(k_b), fund(k_c), fund(k_d)]),
+            make_block(
+                2,
+                vec![
+                    sign(place(order(false, 105, 1)), 2, k_b),
+                    sign(place(order(true, 100, 2)), 3, k_b),
+                    sign(place(order(false, 110, 2)), 4, k_b),
+                ],
+            ),
+            make_block(3, vec![sign(place(order(true, 105, 1)), 2, k_c)]),
+            make_block(
+                4,
+                vec![
+                    sign(place(tif(TimeInForce::IOC, order(true, 105, 1))), 2, k_a),
+                    sign(place(tif(TimeInForce::PostOnly, order(true, 110, 1))), 3, k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::Market,
+                            ..tif(TimeInForce::IOC, order(true, 106, 1))
+                        }),
+                        4,
+                        k_a,
+                    ),
+                    sign(place(PlaceOrderParams { reduce_only: true, ..order(false, 100, 1) }), 5, k_a),
+                    sign(place(tif(TimeInForce::FOK, order(true, 110, 5))), 6, k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            order_type: OrderType::StopMarket { trigger: fp(104) },
+                            ..order(true, 200, 1)
+                        }),
+                        7,
+                        k_a,
+                    ),
+                    sign(
+                        NativeAction::PlaceOrderBatch(vec![
+                            order(true, 90, 1),
+                            tif(TimeInForce::IOC, order(true, 105, 1)),
+                            order(true, 91, 1),
+                            tif(TimeInForce::PostOnly, order(true, 110, 1)),
+                        ]),
+                        3,
+                        k_c,
+                    ),
+                    sign(place(order(true, 100, 100_000)), 8, k_a),
+                ],
+            ),
+            make_block(5, vec![sign(place(tif(TimeInForce::IOC, order(false, 100, 3))), 2, k_d)]),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// Row 50: orders the book refuses or cancels without a fill (and a
+    /// placement refused for margin) are stored `rejected` with their HL
+    /// reason at their body position, a batch as its first rejected order +
+    /// the count, in every exec mode — sequential settle (production auto,
+    /// engine 0) and the parallel settle's pass B (engine 2, 4) — on both
+    /// flushes, with identical bytes in every CF. An IOC that partly fills
+    /// stays executed.
+    ///
+    /// RED before row 50: block 4 recorded only the margin failure (as
+    /// `failed`); every book outcome read `executed`.
+    #[test]
+    fn book_rejections_are_recorded_rejected_in_every_exec_mode() {
+        use torus_state::action_status::{FailureReason as R, Outcome};
+        let mut dumps = Vec::new();
+        for pipelined in [false, true] {
+            for threads in [None, Some(0), Some(2), Some(4)] {
+                let label = format!("threads {threads:?} pipelined {pipelined}");
+                let db = run_fixture_blocks(rejection_fixture_blocks(), threads, pipelined);
+                let status = action_status(&db, 4).expect("block 4 record");
+                assert_eq!(status.native_skipped, vec![false; 8], "{label}");
+                let got: Vec<(u32, u32, u32, Outcome, R)> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| (f.index, f.order, f.failed_orders, f.outcome, f.reason))
+                    .collect();
+                let rejected = Outcome::Rejected;
+                assert_eq!(
+                    got,
+                    vec![
+                        (0, 0, 1, rejected, R::IocCancel),
+                        (1, 0, 1, rejected, R::BadAloPx),
+                        (2, 0, 1, rejected, R::MarketNoLiquidity),
+                        (3, 0, 1, rejected, R::ReduceOnly),
+                        (4, 0, 1, rejected, R::FokCancel),
+                        (5, 0, 1, rejected, R::BadTriggerPx),
+                        (6, 1, 2, rejected, R::IocCancel),
+                        (7, 0, 1, rejected, R::Margin),
+                    ],
+                    "{label}: {:?}",
+                    status.native_failed
+                );
+                assert!(
+                    (0..8).all(|i| status.native_label(i) == "rejected"),
+                    "{label}"
+                );
+                assert!(status.native_failed[0].message.starts_with("order rejected: IOC"), "{label}");
+                assert!(status.native_failed[7].message.starts_with("insufficient margin"), "{label}");
+                let raw = db
+                    .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &4u64.to_be_bytes())
+                    .unwrap()
+                    .expect("record");
+                assert_eq!(raw[0], 0x03, "{label}: v3");
+                // Block 5: the partly filled IOC executed (compact v1).
+                let raw = db
+                    .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &5u64.to_be_bytes())
+                    .unwrap()
+                    .expect("record");
+                assert_eq!(raw[0], 0x01, "{label}: block 5 keeps v1");
+                assert_eq!(action_status(&db, 5).unwrap().native_label(0), "executed", "{label}");
+                dumps.push((label, dump_all_cfs(&db)));
+            }
+        }
+        for (label, dump) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, dump, &format!("{} vs {label}", dumps[0].0));
+        }
+    }
+
     /// Typed reasons: every reason code the executor can produce from a
     /// block is stored as the executor's own reason (M1's tick / lot texts
     /// included), at its body position, in every exec mode and on both
@@ -11633,7 +11795,18 @@ mod crash_recovery_tests {
                 {
                     assert!(msgs[i].starts_with(want), "{label} #{i}: {:?}", msgs[i]);
                 }
-                assert_eq!(status.native_label(9), "executed", "{label}");
+                // Row 50 (+ review S3): placements refused for tick and
+                // margin are rejected; lot, price, open limit, batch cap and
+                // an unknown cancel stay failed.
+                let labels: Vec<&str> = (0..10).map(|i| status.native_label(i)).collect();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "rejected", "rejected", "failed", "failed", "failed", "rejected", "failed",
+                        "failed", "failed", "executed"
+                    ],
+                    "{label}"
+                );
                 dumps.push((label, dump_all_cfs(&db)));
             }
         }
@@ -17714,12 +17887,14 @@ mod crash_recovery_tests {
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
-        // Refused for the right reason: executed (not skipped), failed with
-        // `price_band`; the transfer executed.
+        // Refused for the right reason: executed (not skipped), rejected
+        // (review S3: HL `oracleRejected`) with `price_band`; the transfer
+        // executed.
         let s2 = action_status(&db, 2).expect("block 2 status");
         assert!(s2.native_skipped.iter().all(|s| !s), "block 2: nothing skipped (nonces in window)");
         assert_eq!(s2.native_failed.len(), 1, "block 2: only B's sell failed");
         assert_eq!(s2.native_failed[0].reason, FailureReason::PriceBand, "block 2: refused by the band");
+        assert_eq!(s2.native_failed[0].outcome, torus_state::action_status::Outcome::Rejected, "block 2: oracleRejected");
         dispatch_and_execute(&ctx, &db, &blocks[2]);
         let s3 = action_status(&db, 3).expect("block 3 status");
         assert!(s3.native_skipped.iter().all(|s| !s), "block 3: the transfer was executed, not skipped");

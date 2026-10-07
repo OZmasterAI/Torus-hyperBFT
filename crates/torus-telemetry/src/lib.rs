@@ -34,8 +34,12 @@ pub struct Metrics {
     // Transaction metrics
     pub evm_txs_processed: Counter,
     pub native_actions_processed: Counter,
-    /// v2 action status: native actions recorded as failed at execution.
+    /// v2 action status: native actions recorded as failed at execution
+    /// (outcome `Failed`; rejected ones count in `exec_action_rejections`).
     pub exec_action_failures: Counter,
+    /// Row 50: native actions recorded as rejected (an order refused with an
+    /// HL `*Rejected` status).
+    pub exec_action_rejections: Counter,
     /// v2 action status: bytes written to `cf_block_action_status`.
     pub exec_action_status_bytes: Counter,
 
@@ -915,8 +919,15 @@ impl Metrics {
         let exec_action_failures = Counter::default();
         registry.register(
             "torus_exec_action_failures",
-            "Native actions recorded as failed at execution (v2 action status)",
+            "Native actions recorded as failed at execution (action status record)",
             exec_action_failures.clone(),
+        );
+
+        let exec_action_rejections = Counter::default();
+        registry.register(
+            "torus_exec_action_rejections",
+            "Native actions recorded as rejected at execution (action status record)",
+            exec_action_rejections.clone(),
         );
 
         let exec_action_status_bytes = Counter::default();
@@ -2381,6 +2392,7 @@ impl Metrics {
             evm_txs_processed,
             native_actions_processed,
             exec_action_failures,
+            exec_action_rejections,
             exec_action_status_bytes,
             consensus_rounds,
             consensus_view,

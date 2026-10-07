@@ -229,7 +229,8 @@ pub struct NativeActionRow {
     pub payload: String,
     /// s84: `"executed"` or `"skipped"` (`torus_getBlockBody`
     /// `nativeActionStatus`); v2: `"failed (<reason>...): <message>"`;
-    /// `None` until the block executed on the node.
+    /// row 50: `"rejected (<HL reason>...): <message>"`; `None` until the
+    /// block executed on the node.
     pub status: Option<String>,
 }
 

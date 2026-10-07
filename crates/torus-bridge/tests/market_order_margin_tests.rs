@@ -287,7 +287,8 @@ fn market_buy_cap_below_best_ask_does_not_fill() {
         run(&mut ctx, path, &[place(maker, limit(1, false, 100, 4))]);
 
         let r = run(&mut ctx, path, &[place(taker, market(1, true, fp(99), 4))]);
-        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        // Row 50: nothing within the cap = marketOrderNoLiquidityRejected.
+        assert!(!r[0].success && r[0].reason == torus_state::action_status::FailureReason::MarketNoLiquidity, "{path:?}: {:?}", r[0]);
         assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: nothing within cap");
         assert_eq!(resting(&ctx, &maker), vec![fp(4)], "{path:?}: ask untouched");
         assert!(resting(&ctx, &taker).is_empty(), "{path:?}: market never rests");
@@ -305,7 +306,8 @@ fn market_sell_cap_above_best_bid_does_not_fill() {
         run(&mut ctx, path, &[place(maker, limit(1, true, 100, 4))]);
 
         let r = run(&mut ctx, path, &[place(taker, market(1, false, fp(101), 4))]);
-        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        // Row 50: nothing within the cap = marketOrderNoLiquidityRejected.
+        assert!(!r[0].success && r[0].reason == torus_state::action_status::FailureReason::MarketNoLiquidity, "{path:?}: {:?}", r[0]);
         assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: nothing within cap");
         assert_eq!(resting(&ctx, &maker), vec![fp(4)], "{path:?}: bid untouched");
         assert_bal(&ctx, &taker, fp(FUNDING), FixedPoint::ZERO, "taker released");
@@ -705,7 +707,8 @@ fn fok_limit_sell_that_cannot_afford_its_fills_is_rejected_whole() {
         let mut p = limit(1, false, 50, 4);
         p.time_in_force = TimeInForce::FOK;
         let r = run(&mut ctx, path, &[place(taker, p)]);
-        assert!(r[0].success, "{path:?}: book-level reject {:?}", r[0].error);
+        // Row 50: the book-level reject is the result (fokCancelRejected).
+        assert!(!r[0].success && r[0].reason == torus_state::action_status::FailureReason::FokCancel, "{path:?}: {:?}", r[0]);
         assert_eq!(pos(&ctx, &taker), FixedPoint::ZERO, "{path:?}: nothing filled");
         assert_eq!(resting(&ctx, &maker), vec![fp(4)], "{path:?}: bid untouched");
         assert_bal(&ctx, &taker, fp(16), FixedPoint::ZERO, "taker released");
@@ -769,7 +772,8 @@ fn batch_funded_ioc_bid_does_not_affect_market_sell() {
     for path in PATHS {
         let bid = ioc(limit(1, true, 150, 1));
         let (r, ctx, _d) = run_sell_after(path, &[], place(addr(3), bid));
-        assert!(r[0].success, "{path:?}: IOC bid (cancelled) {:?}", r[0].error);
+        // Row 50: cancelled without a fill = rejected (iocCancelRejected).
+        assert!(!r[0].success && r[0].reason == torus_state::action_status::FailureReason::IocCancel, "{path:?}: IOC bid {:?}", r[0]);
         assert!(resting(&ctx, &addr(3)).is_empty(), "{path:?}: IOC never rests");
         assert_sell_filled_at_100(path, &r, &ctx);
     }

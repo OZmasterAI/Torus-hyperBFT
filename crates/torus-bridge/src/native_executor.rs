@@ -87,6 +87,53 @@ impl NativeActionResult {
 /// A refused action: its typed reason and its message.
 type Rejection = (FailureReason, String);
 
+/// Gas of a placed order, whatever the book did with it.
+const PLACE_ORDER_GAS: u64 = 1000;
+
+impl NativeActionResult {
+    /// Row 50: the result of an order the book answered, THE helper of the
+    /// sequential settle, the parallel settle's pass B and the single path
+    /// (`place_order_inner`). Rejected with the book's HL reason when the
+    /// book refused it or cancelled it without a fill
+    /// ([`PlaceResult::reject`]: IOC / market / FOK without a fill, crossing
+    /// PostOnly, reduce-only that cannot reduce, margin cut before the first
+    /// fill, bad stop trigger); executed otherwise — resting, filled, partly
+    /// filled with the rest cancelled (HL: filled), pending trigger. Either
+    /// way it costs the executed order's gas: the label changes no total.
+    fn placed(result: &PlaceResult) -> Self {
+        match result.reject {
+            None => Self::ok("place_order", PLACE_ORDER_GAS),
+            Some(reason) => Self {
+                gas_used: PLACE_ORDER_GAS,
+                ..Self::rejected("place_order", (reason, book_reject_message(reason).to_string()))
+            },
+        }
+    }
+}
+
+/// Row 50: the message of a book rejection (the reason is the record's).
+fn book_reject_message(reason: FailureReason) -> &'static str {
+    match reason {
+        FailureReason::IocCancel => {
+            "order rejected: IOC order could not immediately match against any resting order"
+        }
+        FailureReason::BadAloPx => "order rejected: post-only order would have immediately matched",
+        FailureReason::MarketNoLiquidity => {
+            "order rejected: no liquidity for the market order within its price cap"
+        }
+        FailureReason::FokCancel => "order rejected: FOK order could not be filled completely",
+        FailureReason::ReduceOnly => "reduce-only order rejected: would not reduce the position",
+        FailureReason::Margin => "insufficient margin: none left for the first fill (match time)",
+        FailureReason::BadTriggerPx => {
+            "order rejected: stop trigger price is on the wrong side of the last trade"
+        }
+        FailureReason::Lot => "order rejected: quantity below the lot size",
+        FailureReason::Price => "order rejected: price must be positive",
+        FailureReason::Tick => "order rejected: price is not a multiple of the tick",
+        _ => "order rejected by the book",
+    }
+}
+
 /// Result of executing a batch of native actions.
 #[derive(Clone, Debug)]
 pub struct NativeBatchResult {
@@ -6897,8 +6944,8 @@ impl NativeExecutor {
                     Self::record_order_status_funnel(m, &result.status, result.fills.len());
                 }
 
-                *total_gas += 1000;
-                results[prep.index] = NativeActionResult::ok("place_order", 1000);
+                *total_gas += PLACE_ORDER_GAS;
+                results[prep.index] = NativeActionResult::placed(result);
             }
 
             // A5 (maker-fill margin leak): release maker-side order margin for
@@ -7245,8 +7292,8 @@ impl NativeExecutor {
                     Self::record_order_status_funnel(m, &result.status, result.fills.len());
                 }
 
-                *total_gas += 1000;
-                results[prep.index] = NativeActionResult::ok("place_order", 1000);
+                *total_gas += PLACE_ORDER_GAS;
+                results[prep.index] = NativeActionResult::placed(result);
             }
 
             // cum_volume: the worker's per-trader sums when every order ran
@@ -8765,7 +8812,7 @@ impl NativeExecutor {
             Self::record_order_status_funnel(m, &result.status, result.fills.len());
         }
 
-        NativeActionResult::ok("place_order", 1000)
+        NativeActionResult::placed(&result)
     }
 
     /// Record one fill for this block's trade-history rows (written after the

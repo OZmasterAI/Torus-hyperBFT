@@ -2440,6 +2440,53 @@ position). The vault and 50 thin senders are in the digest. Driver
   `torus_exec_post_engine_tail_seconds_count` (`sampler.csv` has only
   `_sum`). Results above use a patched copy (`ozarchy-liq-tools/`).
 
+## 24. ADL budget proof cells (`perf/adl-budget` @ `6a25e20`, 2026-10-07)
+
+Node `18bf0759` (= `6a25e20`: A1-A8, review fixes, bit-identical drain
+caches), bench `ec4e14a9` (`bench/liq-stress` @ `b49e40b`). Same shape and
+shock as section 23.2 (N=4 + budget 900, 300 markets, walk 10 bp,
+`ORACLE_FEED_DRAIN=1`, `LIQ_THIN=200`, parity-signed shock at round 45).
+Cells: warm, s400, s750 with `TORUS_LIQ_VALUE_SUM` off (timed), s400vs and
+s750vs with it on (conservation). Driver
+`~/bench-results-matched/ozarchy-adlcells-campaign.sh` (unit
+`bench-adlcells`), notes `ozarchy-adlcells-FINDINGS-partial.md`.
+
+| | warm | S=400 | S=750 |
+|---|---|---|---|
+| verdict | rc 0, ACCEPT | rc 0, ACCEPT, liveness PASS | **rc 0, ACCEPT, liveness PASS** |
+| AGREE (incl. vault + thin) | - | AGREE | AGREE |
+| matched/s | - | 161,875 | 150,855 |
+| backstop / ADL | - | 100 / 0 | 0 / **100** ("ADL to escrow" 26,790, escrow dust 2) |
+| `adl_queue` | - | never used | max 15,462 at h799, empty after 27 blocks (h796-h823); 73 blocks shock to zero |
+| liquidation step per block | - | - | window max 1,232 / 1,111 / 1,158 ms (val0-2), window avg ~50-54, baseline ~17 |
+| feed-live drain | - | - | **22 s** (section 23.2: 749 s of 780) |
+| vault (identical on all nodes) | - | +19,998,661.35, deficit 0, 300 positions | **-0.00084125**, 0 positions (section 23.2: deficit 26,516,805.13) |
+
+- **The S=750 stall is fixed:** the ADL work is spread over 27 blocks with
+  the queue carrying the rest, the chain keeps committing, and the vault ends
+  at ~0 instead of -26.5M. S=400 vault differs from section 23.2
+  (+19,984,975.69): runs are not block-identical (wall-clock load + feed).
+- **Still above the HL target:** the heaviest liquidation block is ~1.1-1.2 s
+  against ~250 ms. That is what C2 (node-local per-market holder list) and the
+  W re-size are for (18c s96 decision).
+- **Log noise only:** WARN "skipping duplicate/replayed native action on live
+  commit path" (s400 4, s750 1); no liquidation errors.
+
+### 24.1 Conservation with the value sum on
+
+- **s400vs:** `value_sum` 69,980,200,000,000.00 at h100 to
+  69,980,199,999,999.98 at ~h2780 on all 3 validators. Only 3 changes, each
+  -0.0078125 (2^-7, 1 f64 ULP at 7e13), at h376 / h465 / h596, the same on
+  every validator; no jump at the 100 backstops (~h820). Conserved up to f64
+  rounding. Not rerun: it never touches ADL or escrows.
+- **The sum-on cells cannot drain:** with the value sum on, exec takes ~0.34 s
+  per block, keeping `exec_queue_depth` at 58 while the feed runs, so the
+  drain criterion (exec lag <= 2) is never met. Not a liveness failure (the
+  chain went from h574 at bench end to ~h2780). Stopped by the owner during
+  the drain at 02:34; logs saved in
+  `ozarchy-adlcells-300m-s400vs/partial-at-stop/`. No rc / verdict file.
+- **s750vs not run.** It is the cell that matters (ADL + escrows).
+
 ## Open
 
 - Native trie maintenance is off by default since `db6c9de` (owner
@@ -2536,6 +2583,14 @@ position). The vault and 50 thin senders are in the digest. Driver
   blocks and froze consensus ~11.6 min. Needs a budget (account-markets or
   closes per block) with carry-over, and cheaper per-close work. Profiled and
   designed in s18 (`docs/plans/adl-budget.md`, owner decisions Q1-Q6 pending).
+  **Budget built** (`perf/adl-budget` @ `6a25e20`, section 24): S=750 passes
+  (rc 0, AGREE, 22 s drain, vault -0.00084). Still open: the heaviest
+  liquidation block is ~1.1-1.2 s vs ~250 ms (C2 + W re-size next).
+- ADL proof cells, open points (section 24): rerun s750vs alone after a drain
+  fix for sum-on cells (pause the feed or exempt them from the exec-lag
+  check); is the s750 vault -0.00084 rounding dust or a leak (2 escrow dust
+  lines); escrows still open at the end of s750 (not read yet); is the value
+  sum f64 (check before calling conservation exact).
 - Liquidation stress at S=400: all backstop is explained (section 23.2, AV/MM
   ~0.40 after the shock). A stage-1 cell needs a shock of ~290 bp on this
   shape.
