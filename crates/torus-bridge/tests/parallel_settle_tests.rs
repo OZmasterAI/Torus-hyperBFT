@@ -185,7 +185,7 @@ fn run_batches_opts(
         results.push(
             r.results
                 .iter()
-                .map(|a| (a.success, a.error.clone()))
+                .map(|a| (a.success, a.error.clone().map(String::from)))
                 .collect(),
         );
         total_gas.push(r.total_gas);
@@ -714,7 +714,7 @@ fn default_mode_multi_market_settles() {
         results.push(
             r.results
                 .iter()
-                .map(|a| (a.success, a.error.clone()))
+                .map(|a| (a.success, a.error.clone().map(String::from)))
                 .collect::<Vec<_>>(),
         );
         total_gas.push(r.total_gas);

@@ -6,6 +6,7 @@
 //!
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -49,7 +50,10 @@ use crate::market_workers::{MarketWorkerPool, MatchRequest};
 pub struct NativeActionResult {
     pub action_type: &'static str,
     pub success: bool,
-    pub error: Option<String>,
+    /// Why it failed. Borrowed for a book rejection (its reason's
+    /// [`FailureReason::book_reject_message`]: no allocation per rejected
+    /// order), owned for a message built at the check.
+    pub error: Option<Cow<'static, str>>,
     pub gas_used: u64,
     /// Why it failed, set where the check failed (v2 action status stores
     /// it; never derived from `error`). `Other` for a success and for any
@@ -77,7 +81,7 @@ impl NativeActionResult {
         Self {
             action_type,
             success: false,
-            error: Some(error),
+            error: Some(Cow::Owned(error)),
             gas_used: 0,
             reason,
         }
@@ -103,34 +107,16 @@ impl NativeActionResult {
     fn placed(result: &PlaceResult) -> Self {
         match result.reject {
             None => Self::ok("place_order", PLACE_ORDER_GAS),
+            // The message is the reason's canonical one (torus-state, one
+            // table for the executor and the action status record).
             Some(reason) => Self {
+                action_type: "place_order",
+                success: false,
+                error: Some(Cow::Borrowed(reason.book_reject_message())),
                 gas_used: PLACE_ORDER_GAS,
-                ..Self::rejected("place_order", (reason, book_reject_message(reason).to_string()))
+                reason,
             },
         }
-    }
-}
-
-/// Row 50: the message of a book rejection (the reason is the record's).
-fn book_reject_message(reason: FailureReason) -> &'static str {
-    match reason {
-        FailureReason::IocCancel => {
-            "order rejected: IOC order could not immediately match against any resting order"
-        }
-        FailureReason::BadAloPx => "order rejected: post-only order would have immediately matched",
-        FailureReason::MarketNoLiquidity => {
-            "order rejected: no liquidity for the market order within its price cap"
-        }
-        FailureReason::FokCancel => "order rejected: FOK order could not be filled completely",
-        FailureReason::ReduceOnly => "reduce-only order rejected: would not reduce the position",
-        FailureReason::Margin => "insufficient margin: none left for the first fill (match time)",
-        FailureReason::BadTriggerPx => {
-            "order rejected: stop trigger price is on the wrong side of the last trade"
-        }
-        FailureReason::Lot => "order rejected: quantity below the lot size",
-        FailureReason::Price => "order rejected: price must be positive",
-        FailureReason::Tick => "order rejected: price is not a multiple of the tick",
-        _ => "order rejected by the book",
     }
 }
 
@@ -5566,7 +5552,7 @@ impl NativeExecutor {
                 NativeActionResult {
                     action_type: "place_order_batch",
                     success: ok == total,
-                    error: (ok != total).then(|| format!("{ok}/{total} orders placed")),
+                    error: (ok != total).then(|| format!("{ok}/{total} orders placed").into()),
                     gas_used: batch.total_gas,
                     // The first failing order's reason.
                     reason: batch

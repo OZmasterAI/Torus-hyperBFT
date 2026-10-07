@@ -583,10 +583,11 @@ pub struct RpcLeaderInfo {
 /// its orders failed; a batch skipped whole (empty / over the cap) has
 /// `failedOrders` 0. Any other action: `order` 0, `failedOrders` 1.
 /// Row 50: or one that was rejected — `status` `"failed"` or `"rejected"`
-/// (the action's `nativeActionStatus`); a rejected entry's `reason` is the
-/// Hyperliquid `orderStatus` name (`iocCancelRejected`, ...), a failed one's
-/// the stable lowercase name (`margin`, `tick`, ...). `failedOrders` counts
-/// a batch's orders that did not execute, failed or rejected.
+/// (the action's `nativeActionStatus`). s100: `reason` is always the stable
+/// lowercase name (`margin`, `tick`, `ioc_cancel`, ...); a rejected entry
+/// also has `rejectStatus`, the Hyperliquid `*Rejected` order status name
+/// (`iocCancelRejected`, ...). `failedOrders` counts a batch's orders that
+/// did not execute, failed or rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcActionFailure {
@@ -594,7 +595,14 @@ pub struct RpcActionFailure {
     /// Row 50: `"failed"` or `"rejected"`; absent from a pre-row-50 node.
     #[serde(default)]
     pub status: String,
+    /// The stable lowercase reason name (`FailureReason::as_str`). A row 50
+    /// node before s100 sent the HL name here for a rejected entry.
     pub reason: String,
+    /// s100: the HL `*Rejected` name of a rejected entry
+    /// (`FailureReason::hl_rejected_name`); absent for a failed one and
+    /// from an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_status: Option<String>,
     pub message: String,
     pub order: u32,
     pub failed_orders: u32,
@@ -616,11 +624,16 @@ pub fn native_action_failures(
         .map(|f| RpcActionFailure {
             index: f.index,
             status: f.outcome.as_str().to_string(),
-            reason: match f.outcome {
-                Outcome::Rejected => f.reason.hl_rejected_name().unwrap_or(f.reason.as_str()),
-                _ => f.reason.as_str(),
-            }
-            .to_string(),
+            reason: f.reason.as_str().to_string(),
+            reject_status: match f.outcome {
+                Outcome::Rejected => Some(
+                    f.reason
+                        .hl_rejected_name()
+                        .unwrap_or(f.reason.as_str())
+                        .to_string(),
+                ),
+                _ => None,
+            },
             message: f.message.clone(),
             order: f.order,
             failed_orders: f.failed_orders,
@@ -707,9 +720,9 @@ mod action_failure_tests {
     }
 
     /// Row 50: a rejected entry reaches the RPC as status `"rejected"` with
-    /// its Hyperliquid `orderStatus` name as the reason; a failed one keeps
-    /// the stable lowercase name (a margin failure of a modify stays
-    /// `"margin"`).
+    /// its Hyperliquid `orderStatus` name in `rejectStatus` (s100: `reason`
+    /// is always the stable lowercase name); a failed one has no
+    /// `rejectStatus` (a margin failure of a modify stays `"margin"`).
     #[test]
     fn rejected_entries_carry_hyperliquid_names() {
         use torus_state::action_status::Outcome;
@@ -737,12 +750,80 @@ mod action_failure_tests {
         let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 11], native_failed };
         let stored = BlockActionStatus::decode(&status.encode()).unwrap();
         let rpc = native_action_failures(&stored);
-        let got: Vec<(&str, &str)> = rpc.iter().map(|f| (f.status.as_str(), f.reason.as_str())).collect();
-        let mut want: Vec<(&str, &str)> = rejected.iter().map(|(_, n)| ("rejected", *n)).collect();
-        want.push(("failed", "margin"));
+        let got: Vec<_> = rpc
+            .iter()
+            .map(|f| {
+                (
+                    f.status.as_str(),
+                    f.reason.as_str(),
+                    f.reject_status.as_deref(),
+                )
+            })
+            .collect();
+        let mut want: Vec<_> = rejected
+            .iter()
+            .map(|(r, n)| ("rejected", r.as_str(), Some(*n)))
+            .collect();
+        want.push(("failed", "margin", None));
         assert_eq!(got, want);
         let labels = native_action_labels(&stored);
         assert_eq!(labels[..9], ["rejected"; 9]);
         assert_eq!(labels[9..], ["failed", "executed"]);
+    }
+
+    /// s100: the JSON of a rejected and a failed entry. `reason` is the
+    /// stable lowercase name for both; `rejectStatus` (the HL name) only on
+    /// the rejected one, absent from the failed one. An older node's JSON
+    /// (no `rejectStatus`) still reads.
+    #[test]
+    fn reject_status_json() {
+        use torus_state::action_status::Outcome;
+        let ioc = FailureReason::IocCancel.book_reject_message();
+        let status = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false; 2],
+            native_failed: vec![
+                NativeActionFailure {
+                    outcome: Outcome::Rejected,
+                    ..NativeActionFailure::new(0, 0, 1, FailureReason::IocCancel, ioc.into())
+                },
+                NativeActionFailure::new(1, 0, 1, FailureReason::Margin, "modify margin".into()),
+            ],
+        };
+        let stored = BlockActionStatus::decode(&status.encode()).unwrap();
+        let json = serde_json::to_value(native_action_failures(&stored)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "index": 0,
+                    "status": "rejected",
+                    "reason": "ioc_cancel",
+                    "rejectStatus": "iocCancelRejected",
+                    "message": ioc,
+                    "order": 0,
+                    "failedOrders": 1
+                },
+                {
+                    "index": 1,
+                    "status": "failed",
+                    "reason": "margin",
+                    "message": "modify margin",
+                    "order": 0,
+                    "failedOrders": 1
+                }
+            ])
+        );
+        let old: RpcActionFailure = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "status": "rejected",
+            "reason": "iocCancelRejected",
+            "message": "m",
+            "order": 0,
+            "failedOrders": 1
+        }))
+        .unwrap();
+        assert_eq!(old.reject_status, None);
+        assert_eq!(old.reason, "iocCancelRejected");
     }
 }

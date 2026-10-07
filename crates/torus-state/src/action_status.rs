@@ -43,6 +43,11 @@
 //! [`Outcome::Failed`] or [`Outcome::Rejected`] for an entry. The per-order
 //! list is the room for HL-style per-order statuses (one per order of a
 //! PlaceOrderBatch): written empty today; a reader already decodes it.
+//! s100 (S2): a [`Outcome::Rejected`] entry or order whose message is its
+//! reason's [`FailureReason::book_reject_message`] is written with an empty
+//! `msg` (an IOC no-fill entry: 19 B instead of 98), and a reader restores
+//! that text for a rejected one with an empty `msg`. Same version byte:
+//! records written before still hold the text in full and read the same.
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
@@ -80,7 +85,8 @@ pub enum FailureReason {
     /// A fill could not be applied at settlement.
     Fill = 7,
     /// s94: an order price outside the price band around the market's
-    /// reference price (placement, modify; HL `oracleRejected`).
+    /// reference price, at placement or modify. A placement is rejected (HL
+    /// `oracleRejected`); a modify stays failed.
     PriceBand = 8,
     /// Row 52 (s94 B): a reduce-only order that cannot reduce the position
     /// (no position, or the increasing side), at placement or modify
@@ -165,6 +171,36 @@ impl FailureReason {
             _ => return None,
         })
     }
+
+    /// Row 50: the message of a book rejection for this reason (the book
+    /// refused the order or cancelled it without a fill; the executor
+    /// records this text). s100 S2: a v3 writer stores an EMPTY message for
+    /// a [`Outcome::Rejected`] entry or order whose message is exactly this
+    /// text, and the reader restores it. Never change a text, and never
+    /// give a reason that falls to the `_` arm (e.g. `PriceBand`) an arm of
+    /// its own: records already written read back the current text. Pinned
+    /// by `book_reject_messages_never_change`.
+    pub fn book_reject_message(self) -> &'static str {
+        match self {
+            Self::IocCancel => {
+                "order rejected: IOC order could not immediately match against any resting order"
+            }
+            Self::BadAloPx => "order rejected: post-only order would have immediately matched",
+            Self::MarketNoLiquidity => {
+                "order rejected: no liquidity for the market order within its price cap"
+            }
+            Self::FokCancel => "order rejected: FOK order could not be filled completely",
+            Self::ReduceOnly => "reduce-only order rejected: would not reduce the position",
+            Self::Margin => "insufficient margin: none left for the first fill (match time)",
+            Self::BadTriggerPx => {
+                "order rejected: stop trigger price is on the wrong side of the last trade"
+            }
+            Self::Lot => "order rejected: quantity below the lot size",
+            Self::Price => "order rejected: price must be positive",
+            Self::Tick => "order rejected: price is not a multiple of the tick",
+            _ => "order rejected by the book",
+        }
+    }
 }
 
 /// Row 50: what an executed native action (or one order of a batch) came
@@ -229,6 +265,10 @@ pub struct NativeActionFailure {
     pub order: u32,
     pub failed_orders: u32,
     pub reason: FailureReason,
+    /// s100 S2: empty for a `Rejected` entry stands for its reason's
+    /// [`FailureReason::book_reject_message`] (the record's own form: the
+    /// executor's path leaves it empty, [`BlockActionStatus::decode`] gives
+    /// the text).
     pub message: String,
     /// Row 50 (v3): `Failed` or `Rejected` (v1 / v2 entries: `Failed`).
     pub outcome: Outcome,
@@ -308,16 +348,32 @@ fn take_u8(bytes: &mut &[u8]) -> Option<u8> {
     take(bytes, 1).map(|b| b[0])
 }
 
-/// `msg_len u8 ‖ msg`, cut to [`MAX_MESSAGE_BYTES`].
-fn push_message(out: &mut Vec<u8>, message: &str) {
-    let msg = truncate_utf8(message, MAX_MESSAGE_BYTES);
+/// `msg_len u8 ‖ msg`, cut to [`MAX_MESSAGE_BYTES`]; empty for a rejection
+/// with its reason's canonical message (s100 S2,
+/// [`FailureReason::book_reject_message`]).
+fn push_message(out: &mut Vec<u8>, outcome: Outcome, reason: FailureReason, message: &str) {
+    let msg = if outcome == Outcome::Rejected && message == reason.book_reject_message() {
+        ""
+    } else {
+        truncate_utf8(message, MAX_MESSAGE_BYTES)
+    };
     out.push(msg.len() as u8);
     out.extend_from_slice(msg.as_bytes());
 }
 
-fn take_message(bytes: &mut &[u8]) -> Option<String> {
+/// The message [`push_message`] stored: a rejection's empty message is its
+/// reason's canonical one.
+fn take_message(bytes: &mut &[u8], outcome: Outcome, reason: FailureReason) -> Option<String> {
     let len = take_u8(bytes)? as usize;
-    Some(std::str::from_utf8(take(bytes, len)?).ok()?.to_string())
+    let msg = std::str::from_utf8(take(bytes, len)?).ok()?;
+    Some(
+        if msg.is_empty() && outcome == Outcome::Rejected {
+            reason.book_reject_message()
+        } else {
+            msg
+        }
+        .to_string(),
+    )
 }
 
 impl BlockActionStatus {
@@ -345,12 +401,12 @@ impl BlockActionStatus {
                 out.extend_from_slice(&f.failed_orders.to_be_bytes());
                 out.push(f.outcome as u8);
                 out.push(f.reason as u8);
-                push_message(&mut out, &f.message);
+                push_message(&mut out, f.outcome, f.reason, &f.message);
                 out.extend_from_slice(&(f.orders.len() as u32).to_be_bytes());
                 for o in &f.orders {
                     out.push(o.outcome as u8);
                     out.push(o.reason as u8);
-                    push_message(&mut out, &o.message);
+                    push_message(&mut out, o.outcome, o.reason, &o.message);
                 }
             }
         }
@@ -381,14 +437,17 @@ impl BlockActionStatus {
                     Outcome::Failed
                 };
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
-                let message = take_message(&mut rest)?;
+                let message = take_message(&mut rest, outcome, reason)?;
                 let mut orders = Vec::new();
                 if v3 {
                     for _ in 0..take_u32(&mut rest)? {
+                        let outcome = Outcome::from_u8(take_u8(&mut rest)?);
+                        let reason = FailureReason::from_u8(take_u8(&mut rest)?);
+                        let message = take_message(&mut rest, outcome, reason)?;
                         orders.push(OrderOutcome {
-                            outcome: Outcome::from_u8(take_u8(&mut rest)?),
-                            reason: FailureReason::from_u8(take_u8(&mut rest)?),
-                            message: take_message(&mut rest)?,
+                            outcome,
+                            reason,
+                            message,
                         });
                     }
                 }
@@ -438,6 +497,38 @@ impl BlockActionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s100 S2: rejected entries with the canonical text are stored empty,
+    /// so the text read back for every code (unknown codes too) is frozen.
+    #[test]
+    fn book_reject_messages_never_change() {
+        let fallback = "order rejected by the book";
+        let want = [
+            fallback,
+            "insufficient margin: none left for the first fill (match time)",
+            fallback,
+            "order rejected: price is not a multiple of the tick",
+            "order rejected: quantity below the lot size",
+            "order rejected: price must be positive",
+            fallback,
+            fallback,
+            fallback,
+            "reduce-only order rejected: would not reduce the position",
+            "order rejected: IOC order could not immediately match against any resting order",
+            "order rejected: post-only order would have immediately matched",
+            "order rejected: no liquidity for the market order within its price cap",
+            "order rejected: FOK order could not be filled completely",
+            "order rejected: stop trigger price is on the wrong side of the last trade",
+            fallback,
+        ];
+        for (code, text) in want.iter().enumerate() {
+            assert_eq!(
+                FailureReason::from_u8(code as u8).book_reject_message(),
+                *text,
+                "code {code}"
+            );
+        }
+    }
 
     fn failure(
         index: u32,
@@ -645,6 +736,124 @@ mod tests {
             if !named.iter().any(|(r, _)| *r == reason) {
                 assert_eq!(reason.hl_rejected_name(), None, "{reason:?}");
             }
+        }
+    }
+
+    /// A one-action record holding `entry`, and the bytes of that entry
+    /// (after version 1 + counts 8 + bitmaps 0+1 + entry count 4).
+    fn one_entry_record(entry: NativeActionFailure) -> (BlockActionStatus, Vec<u8>) {
+        let status = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false],
+            native_failed: vec![entry],
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V3);
+        let entry_bytes = bytes[14..].to_vec();
+        (status, entry_bytes)
+    }
+
+    fn rejected_entry(reason: FailureReason, msg: &str) -> NativeActionFailure {
+        NativeActionFailure {
+            outcome: Outcome::Rejected,
+            ..failure(0, 0, 1, reason, msg)
+        }
+    }
+
+    /// s100 S2 (option 1): a rejected entry whose message is its reason's
+    /// canonical book message stores an empty message (an IOC no-fill entry:
+    /// 98 B -> 19 B, still v3); the reader restores the text.
+    #[test]
+    fn v3_canonical_rejection_message_is_not_stored() {
+        let ioc = FailureReason::IocCancel.book_reject_message();
+        assert_eq!(ioc.len(), 79, "the message an IOC no-fill used to store");
+        let (status, entry) = one_entry_record(rejected_entry(FailureReason::IocCancel, ioc));
+        // index 4 + order 4 + failed_orders 4 + outcome 1 + reason 1 +
+        // msg_len 1 (0, no msg) + order_count 4.
+        assert_eq!(entry.len(), 19, "was 19 + 79 = 98 B");
+        assert_eq!(entry[14], 0, "msg_len 0");
+        let back = BlockActionStatus::decode(&status.encode()).expect("v3 decodes");
+        assert_eq!(back, status, "the full message comes back");
+        assert_eq!(back.native_failed[0].message, ioc);
+
+        // Every book rejection, and a per-order status, the same way.
+        for code in 0..=14u8 {
+            let reason = FailureReason::from_u8(code);
+            let mut entry = rejected_entry(reason, reason.book_reject_message());
+            entry.orders = vec![OrderOutcome {
+                outcome: Outcome::Rejected,
+                reason,
+                message: reason.book_reject_message().to_string(),
+            }];
+            let (status, bytes) = one_entry_record(entry);
+            assert_eq!(
+                bytes.len(),
+                19 + 3,
+                "{reason:?}: entry + one order, no message bytes"
+            );
+            assert_eq!(
+                BlockActionStatus::decode(&status.encode()),
+                Some(status),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// s100 S2: v3 records written before option 1 hold the canonical
+    /// message in full; they decode exactly as before (and re-encode
+    /// shorter, to the same status).
+    #[test]
+    fn v3_old_rejected_entry_with_full_message_decodes_unchanged() {
+        let ioc = FailureReason::IocCancel.book_reject_message();
+        let mut old = vec![0x03, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+        old.extend_from_slice(&[0; 12]); // index 0, order 0 ...
+        old[25] = 1; // ... failed_orders 1
+        old.extend_from_slice(&[Outcome::Rejected as u8, FailureReason::IocCancel as u8, 79]);
+        old.extend_from_slice(ioc.as_bytes());
+        old.extend_from_slice(&[0; 4]); // no per-order statuses
+        assert_eq!(old.len(), 14 + 98);
+        let status = BlockActionStatus::decode(&old).expect("an old v3 record decodes");
+        assert_eq!(
+            status.native_failed,
+            vec![rejected_entry(FailureReason::IocCancel, ioc)]
+        );
+        assert_eq!(status.native_label(0), "rejected");
+        let new = status.encode();
+        assert_eq!(new.len(), 14 + 19);
+        assert_eq!(BlockActionStatus::decode(&new), Some(status));
+    }
+
+    /// s100 S2: only the exact canonical text of a REJECTED entry is left
+    /// out. A rejected entry with its own message (a placement-time check),
+    /// another reason's text, or a failed entry with a canonical text are
+    /// stored verbatim.
+    #[test]
+    fn v3_non_canonical_messages_are_stored_verbatim() {
+        let placement_margin = "insufficient margin: need 5, have 1 (account)";
+        let cases = [
+            rejected_entry(FailureReason::Margin, placement_margin),
+            rejected_entry(
+                FailureReason::Tick,
+                "price 100.25 is not a multiple of the tick 0.5",
+            ),
+            rejected_entry(
+                FailureReason::BadAloPx,
+                FailureReason::IocCancel.book_reject_message(),
+            ),
+            failure(
+                0,
+                0,
+                1,
+                FailureReason::IocCancel,
+                FailureReason::IocCancel.book_reject_message(),
+            ),
+        ];
+        for entry in cases {
+            let message = entry.message.clone();
+            let (status, bytes) = one_entry_record(entry);
+            assert_eq!(bytes.len(), 19 + message.len(), "{message} is stored");
+            assert_eq!(&bytes[15..15 + message.len()], message.as_bytes());
+            assert_eq!(BlockActionStatus::decode(&status.encode()), Some(status));
         }
     }
 

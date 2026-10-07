@@ -356,7 +356,8 @@ fn parse_log_row(log: &Value, block_height: i64) -> LogRow {
 /// order and the failed-order count for a PlaceOrderBatch.
 /// Row 50: a `"rejected"` entry likewise: `rejected (<HL reason>): <message>`
 /// (a batch: `, order N, M not executed`); an entry without `status` (a
-/// pre-row-50 node) is a failure.
+/// pre-row-50 node) is a failure. s100: the HL reason is `rejectStatus`
+/// (`reason` is the lowercase name); a node before s100 sent it as `reason`.
 fn native_action_status(body: &Value) -> Option<Vec<String>> {
     let mut statuses: Vec<String> = body
         .get("nativeActionStatus")?
@@ -373,7 +374,7 @@ fn native_action_status(body: &Value) -> Option<Vec<String>> {
         else {
             continue;
         };
-        let reason = val_str(f, "reason");
+        let reason = val_str_opt(f, "rejectStatus").unwrap_or_else(|| val_str(f, "reason"));
         let rejected = f.get("status").and_then(Value::as_str) == Some("rejected");
         let (label, count) = if rejected {
             ("rejected", "not executed")
@@ -674,8 +675,31 @@ mod tests {
             native_action_status(&v1).unwrap(),
             vec!["executed".to_string(), "skipped".to_string()]
         );
-        // Row 50: a rejected action shows its status and HL reason.
+        // Row 50: a rejected action shows its status and HL reason. s100:
+        // read from `rejectStatus` (`reason` is the lowercase name, kept for
+        // a failed entry); a failed entry without one shows its `reason`.
         let rejected = json!({
+            "nativeActionStatus": ["rejected", "rejected", "failed"],
+            "nativeActionFailures": [
+                {"index": 0, "status": "rejected", "reason": "ioc_cancel",
+                    "rejectStatus": "iocCancelRejected",
+                    "message": "order rejected: IOC", "order": 0, "failedOrders": 1},
+                {"index": 1, "status": "rejected", "reason": "bad_alo_px",
+                    "rejectStatus": "badAloPxRejected",
+                    "message": "order rejected: ALO", "order": 2, "failedOrders": 3},
+                {"index": 2, "status": "failed", "reason": "tick",
+                    "message": "off tick", "order": 0, "failedOrders": 1}
+            ]
+        });
+        let want = vec![
+            "rejected (iocCancelRejected): order rejected: IOC".to_string(),
+            "rejected (badAloPxRejected, order 2, 3 not executed): order rejected: ALO".to_string(),
+            "failed (tick): off tick".to_string(),
+        ];
+        assert_eq!(native_action_status(&rejected).unwrap(), want);
+        // A row 50 node before s100 sent the HL name as `reason` and no
+        // `rejectStatus`: the same rendering.
+        let old_rejected = json!({
             "nativeActionStatus": ["rejected", "rejected", "failed"],
             "nativeActionFailures": [
                 {"index": 0, "status": "rejected", "reason": "iocCancelRejected",
@@ -686,14 +710,7 @@ mod tests {
                     "message": "off tick", "order": 0, "failedOrders": 1}
             ]
         });
-        assert_eq!(
-            native_action_status(&rejected).unwrap(),
-            vec![
-                "rejected (iocCancelRejected): order rejected: IOC".to_string(),
-                "rejected (badAloPxRejected, order 2, 3 not executed): order rejected: ALO".to_string(),
-                "failed (tick): off tick".to_string(),
-            ]
-        );
+        assert_eq!(native_action_status(&old_rejected).unwrap(), want);
     }
 
     #[test]

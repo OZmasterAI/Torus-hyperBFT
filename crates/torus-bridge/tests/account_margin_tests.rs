@@ -1355,7 +1355,18 @@ fn no_other_sender_changes_a_non_pool_sell_reservation(path: Path) {
         } else {
             assert!(last.success, "{what}: {last:?}");
         }
-        assert_eq!(pos_in(&ctx, &t, 2), if cut { FixedPoint::ZERO } else { -fp(1) }, "{what}: m2 position");
+        assert_eq!(
+            pos_in(&ctx, &t, 2),
+            if cut { FixedPoint::ZERO } else { -fp(1) },
+            "{what}: m2 position"
+        );
+        // Cut before its first fill, the sell does not rest either (filled
+        // whole otherwise): no order of T is left in m2.
+        assert_eq!(
+            resting_in(&ctx, &t, 2),
+            Vec::<FixedPoint>::new(),
+            "{what}: T resting in m2"
+        );
         assert_eq!(pos_in(&ctx, &t, 1), -fp(10), "{what}: the pool kept its 5");
         assert_eq!(top_ups(&metrics), [1, 0, 0], "{what}: the same top-up in every shape");
         m1_outcomes.push((pos_in(&ctx, &t, 1), resting_in(&ctx, &t, 1)));

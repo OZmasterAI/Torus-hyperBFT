@@ -16,6 +16,7 @@
 //! Deterministic: a pure function of the block, the replay-guard decisions and
 //! the executor's results, which are themselves identical in every exec mode.
 
+use std::borrow::Cow;
 #[cfg(test)]
 use std::collections::HashMap;
 
@@ -97,11 +98,21 @@ fn list_failures(
             let failed_orders = 1 + failed.count() as u32;
             // The executor's typed reason; the message is only stored.
             let reason = entries[first].reason;
-            let message = entries[first]
-                .error
-                .take()
-                .unwrap_or_else(|| "failed".to_string());
-            out.push((pos, first as u32, failed_orders, outcome(action, reason), reason, message));
+            let outcome = outcome(action, reason);
+            let message = match entries[first].error.take() {
+                Some(Cow::Owned(message)) => message,
+                // s100 S2: a rejection with its reason's canonical message is
+                // recorded with an empty one (the record's own form; a reader
+                // restores the text), so the static text is never copied.
+                Some(Cow::Borrowed(message))
+                    if outcome == Outcome::Rejected && message == reason.book_reject_message() =>
+                {
+                    String::new()
+                }
+                Some(Cow::Borrowed(message)) => message.to_string(),
+                None => "failed".to_string(),
+            };
+            out.push((pos, first as u32, failed_orders, outcome, reason, message));
         }
     }
     Some(out)
@@ -275,7 +286,7 @@ mod tests {
         NativeActionResult {
             action_type: "x",
             success: false,
-            error: Some(msg.to_string()),
+            error: Some(msg.to_string().into()),
             gas_used: 0,
             reason,
         }
@@ -416,6 +427,76 @@ mod tests {
             failures,
             native_failures_by_content(&list, &[0, 1, 2, 3, 4, 5, 6, 7], [(&list, result), (&[], batch(vec![]))])
         );
+    }
+
+    /// s100 S2: a book rejection's canonical message (borrowed from the
+    /// executor) is recorded empty, without a copy, and the stored record
+    /// reads it back in full; a borrowed text that is not the canonical one
+    /// for a rejection is copied as is.
+    #[test]
+    fn canonical_book_rejection_message_is_recorded_empty() {
+        let a = Address::repeat_byte(1);
+        let canonical = |reason: FailureReason| NativeActionResult {
+            error: Some(Cow::Borrowed(reason.book_reject_message())),
+            ..err(reason, "")
+        };
+        let list = vec![
+            (a, NativeAction::PlaceOrder(order(1))),
+            (a, NativeAction::PlaceOrder(order(2))),
+            (
+                a,
+                NativeAction::ModifyOrder {
+                    order_id: 1,
+                    new_price: None,
+                    new_qty: None,
+                },
+            ),
+        ];
+        let mut result = batch(vec![
+            canonical(FailureReason::IocCancel),
+            NativeActionResult {
+                // Another reason's text: not canonical for this one.
+                error: Some(Cow::Borrowed(
+                    FailureReason::IocCancel.book_reject_message(),
+                )),
+                ..err(FailureReason::BadAloPx, "")
+            },
+            // Not a placement: failed, the text kept.
+            canonical(FailureReason::Margin),
+        ]);
+        let failures = native_failures(
+            &[0, 1, 2],
+            [
+                (&list, &[0, 1, 2], &mut result),
+                (&[], &[], &mut batch(vec![])),
+            ],
+        );
+        let got: Vec<_> = failures
+            .iter()
+            .map(|f| (f.outcome, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Outcome::Rejected, ""),
+                (
+                    Outcome::Rejected,
+                    FailureReason::IocCancel.book_reject_message()
+                ),
+                (Outcome::Failed, FailureReason::Margin.book_reject_message()),
+            ]
+        );
+        let status = BlockActionStatus {
+            native_skipped: vec![false; 3],
+            native_failed: failures,
+            ..Default::default()
+        };
+        let back = BlockActionStatus::decode(&encode_status(&status, None)).expect("decodes");
+        assert_eq!(
+            back.native_failed[0].message,
+            FailureReason::IocCancel.book_reject_message()
+        );
+        assert_eq!(back.native_failed[1..], status.native_failed[1..]);
     }
 
     /// Row 50 review (S1): `torus_exec_action_failures` counts only failed
