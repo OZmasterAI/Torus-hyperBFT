@@ -574,14 +574,16 @@ fn fill_transition(
     }
 }
 
-/// `basis × q / size`, truncated toward zero, in one rounding. `q <= size`
-/// keeps `|result| <= |basis|`, so it fits.
+/// `basis × q / size`, truncated toward zero, in one rounding. `q < size`
+/// (a partial close) keeps `|result| < |basis|`, so it fits.
 fn pro_rata(basis: FixedPoint, q: FixedPoint, size: FixedPoint) -> FixedPoint {
     if let Some(p) = basis.raw().checked_mul(q.raw()) {
         return FixedPoint::from_raw(p / size.raw());
     }
     let wide = |x: i128| U256::from(x.unsigned_abs());
-    let m = (wide(basis.raw()) * wide(q.raw()) / wide(size.raw())).to::<u128>() as i128;
+    let m = (wide(basis.raw()) * wide(q.raw()) / wide(size.raw())).to::<u128>();
+    // The caller's q < size keeps m < |basis| <= 2^127: it fits.
+    let m = i128::try_from(m).expect("pro_rata: q < size keeps the share below |basis|");
     let negative = (basis.raw() < 0) ^ (q.raw() < 0) ^ (size.raw() < 0);
     FixedPoint::from_raw(if negative { -m } else { m })
 }
