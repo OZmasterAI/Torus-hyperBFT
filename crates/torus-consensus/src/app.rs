@@ -643,6 +643,23 @@ struct ExecutionContext {
     /// `execute_batch_engine_mode(n)`; `None` = production `execute_batch`.
     #[cfg(test)]
     test_engine_threads: Option<usize>,
+    /// Test-only: `Some(w)` runs the liquidation step with the ADL drain's
+    /// per-block work budget `w` (adl-budget A7: a multi-block drain over
+    /// empty blocks); `None` = `liq::ADL_WORK_PER_BLOCK`.
+    #[cfg(test)]
+    test_adl_work: Option<u64>,
+    /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
+    /// once at construction): copied into every block's context; with
+    /// metrics attached the liquidation step logs the value sum over all
+    /// accounts. Never changes what a block writes.
+    liq_value_sum: bool,
+}
+
+/// adl-budget A7: `TORUS_LIQ_VALUE_SUM=1` turns on the liquidation step's
+/// node-local value-sum walk (proof runs only; it reads every balance and
+/// position row once per native block).
+fn liq_value_sum_enabled() -> bool {
+    std::env::var("TORUS_LIQ_VALUE_SUM").is_ok_and(|v| v == "1")
 }
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
@@ -1965,8 +1982,10 @@ impl ExecutionContext {
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
-        // Item 3: so is the liquidation step while a cooldown or cursor row
-        // exists (a pending chunk / a cut pass must not wait for activity).
+        // Item 3: so is the liquidation step while a cooldown, cursor, pending
+        // or (adl-budget P2) ADL obligation row exists (a pending chunk, a cut
+        // pass, an account still under MM or an escrow still to drain must
+        // not wait for activity).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
         let run_native = if has_native
@@ -2336,6 +2355,18 @@ impl ExecutionContext {
             // Item 3: the liquidation step — end of the block, on the block-start
             // mark (`begin_block_oracle` above). The EVM ran before this phase:
             // precompile readers see a block's liquidations from the next block.
+            ctx.liq_value_sum = self.liq_value_sum;
+            #[cfg(test)]
+            let _ = match self.test_adl_work {
+                Some(w) => NativeExecutor::run_liquidations_with(
+                    &mut ctx,
+                    torus_core::liquidation::LIQ_SCAN_PER_BLOCK,
+                    torus_core::liquidation::LIQ_ACT_PER_BLOCK,
+                    w,
+                ),
+                None => NativeExecutor::run_liquidations(&mut ctx),
+            };
+            #[cfg(not(test))]
             let _ = NativeExecutor::run_liquidations(&mut ctx);
             // F11: a storage fault in the step (or in CoreWriter) fail-stops
             // exactly like the batches' check above.
@@ -3982,6 +4013,9 @@ impl TorusApp {
             test_crash_after_evm_section: false,
             #[cfg(test)]
             test_engine_threads: None,
+            #[cfg(test)]
+            test_adl_work: None,
+            liq_value_sum: liq_value_sum_enabled(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -10825,6 +10859,9 @@ mod crash_recovery_tests {
             test_crash_after_evm_section: false,
             #[cfg(test)]
             test_engine_threads: None,
+            #[cfg(test)]
+            test_adl_work: None,
+            liq_value_sum: liq_value_sum_enabled(),
         }
     }
 
@@ -17622,6 +17659,154 @@ mod crash_recovery_tests {
         assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "flat: nothing pending");
         ctx.execute_committed_block(&blocks[14], vec![]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    /// adl-budget P2: T (71) and 13 accounts (seeds 80..=92) long 10 @ 1,000,
+    /// collateral 50 each, against S (72, short 140, rich).
+    fn adl_e2e_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = oracle_fixture_db();
+        let pm = PositionManager::new(db.clone());
+        let fund = |seed: u8, amt: i64| {
+            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        };
+        for seed in adl_e2e_longs() {
+            fund(seed, 50);
+            pm.apply_fill(&oracle_addr(seed), ORACLE_MARKET, true, px(10), px(1_000), MarginType::Cross).unwrap();
+        }
+        fund(72, 10_000_000);
+        pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(140), px(1_000), MarginType::Cross).unwrap();
+        (config, db)
+    }
+
+    fn adl_e2e_longs() -> impl Iterator<Item = u8> {
+        std::iter::once(71).chain(80..=92)
+    }
+
+    /// Block 1: the mark 970 (aggregated at block 2's start); 2..=16 empty.
+    fn adl_e2e_blocks() -> Vec<TorusBlock> {
+        let mut rounds = vec![vec![oracle_sub(61, 1, 970), oracle_sub(62, 1, 970), oracle_sub(63, 1, 970)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 15)); // 2..=16
+        liq_blocks(rounds)
+    }
+
+    fn adl_rows(db: &StateDb) -> usize {
+        let tag = torus_core::liquidation::ADL_OBLIGATION_TAG;
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap().len()
+    }
+
+    /// adl-budget P2: obligation rows keep the step DUE. Mark 970: all 14
+    /// longs are ADL'd at B = 2 (AV 50 - 300 < 0; price min(970, 995) =
+    /// 970), flat, 14 rows, the long escrow long 140. `test_adl_work = 2`:
+    /// B's own 14 transfers cost 14 x `ADL_TRANSFER_UNITS` >= 2 (s99), so
+    /// block 2 drains nothing; then one row per block (a row costs >= 2: its
+    /// visit + a ranking or a read), blocks 3..=16. Oracle rows are pruned
+    /// at 12, so blocks 13..=16 carry no action, oracle row, cursor,
+    /// cooldown or pending row: only the 0x07 rows run them. The last row
+    /// drains in block 16, so block 2's aggregate (ts 1,002) still gives a
+    /// usable mark at ts 1,016 (rows of a listed market without a mark
+    /// wait). Two runs: equal native root and dumps.
+    #[test]
+    fn liquidation_e2e_adl_obligations_drain_over_empty_blocks() {
+        use torus_core::liquidation::{ADL_ESCROW_LONG, COOLDOWN_TAG, CURSOR_KEY, PENDING_TAG};
+        use torus_state::cf::CF_NATIVE_LIQUIDATION;
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let blocks = adl_e2e_blocks();
+        let run = || {
+            let (config, db) = adl_e2e_fixture();
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.test_adl_work = Some(2);
+            let mut left = Vec::new();
+            for (i, b) in blocks.iter().enumerate() {
+                let h = i as u64 + 1;
+                if h >= 13 {
+                    assert!(oracle_sub_rows(&db).is_empty(), "block {h}: oracle rows pruned");
+                    for tag in [COOLDOWN_TAG, CURSOR_KEY[0], PENDING_TAG] {
+                        let rows = StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap();
+                        assert!(rows.is_empty(), "block {h}: no 0x{tag:02x} row");
+                    }
+                }
+                ctx.execute_committed_block(b, vec![]);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "block {h}");
+                left.push(adl_rows(&db));
+            }
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+            (left, dump_all_cfs(&db), root, db)
+        };
+        let (left, dump_1, root_1, db) = run();
+        let want: Vec<usize> = std::iter::once(0).chain((2..=16).map(|h| 16 - h)).collect();
+        assert_eq!(left, want, "B = 2: 14 rows, none drained in B (its transfers spend W), one per block 3..=16");
+        for seed in adl_e2e_longs() {
+            assert_eq!(signed_pos_of(&db, &oracle_addr(seed)), FixedPoint::ZERO, "seed {seed}: flat at B");
+        }
+        assert_eq!(signed_pos_of(&db, &ADL_ESCROW_LONG), FixedPoint::ZERO, "the escrow drained");
+        assert_eq!(signed_pos_of(&db, &oracle_addr(72)), FixedPoint::ZERO, "S closed 140 against the escrow");
+        assert!(!NativeExecutor::liquidation_due(&db).unwrap());
+        let (_, dump_2, root_2, _) = run();
+        assert_dumps_equal(&dump_1, &dump_2, "adl drain: two runs");
+        assert_eq!(root_1, root_2);
+    }
+
+    /// The drain keeps no in-memory state across blocks (the ranking cache is
+    /// per block, the dust bound test-only): the blocks above, run 2 stops
+    /// after block 8 (mid-drain: 8 rows left), drops the ExecutionContext AND
+    /// the StateDb (RocksDB closed), opens the DB again from its directory
+    /// (as a node restart does: running-hash activation configured again, a
+    /// cold R slot, no resident state, a new Metrics instance) for 9..=15.
+    /// Equal native root and dump after every block from 9 on, and the same
+    /// drain work units (`liquidation_adl_work_total`) in every block 1..=16
+    /// (18c review, s96 fix list d: the units are what a restart could
+    /// change without moving W = 2's one-row-per-block progress).
+    #[test]
+    fn liquidation_e2e_adl_drain_survives_a_restart() {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let blocks = adl_e2e_blocks();
+        let run = |restart_before: Option<usize>| {
+            let (config, mut db) = adl_e2e_fixture();
+            let dir = db.inner().path().to_path_buf();
+            let open_ctx = |db: &StateDb| {
+                let mut ctx = make_exec_ctx(&config, db);
+                ctx.test_adl_work = Some(2);
+                ctx.metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
+                ctx
+            };
+            let mut ctx = open_ctx(&db);
+            let (mut after, mut units) = (Vec::new(), Vec::new());
+            for (i, b) in blocks.iter().enumerate() {
+                if Some(i) == restart_before {
+                    assert_eq!(adl_rows(&db), 8, "mid-drain");
+                    drop(ctx);
+                    drop(db);
+                    db = StateDb::open(&dir).expect("reopen the state db");
+                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height)
+                        .expect("configure running hash activation");
+                    assert_eq!(adl_rows(&db), 8, "mid-drain after the reopen");
+                    ctx = open_ctx(&db);
+                }
+                let work = |ctx: &ExecutionContext| {
+                    ctx.metrics.as_ref().expect("metrics attached").liquidation_adl_work_total.get()
+                };
+                let before = work(&ctx);
+                ctx.execute_committed_block(b, vec![]);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "block {}", i + 1);
+                units.push(work(&ctx) - before);
+                if i >= 8 {
+                    after.push((dump_all_cfs(&db), torus_state::native_trie::persisted_native_root(&db).unwrap()));
+                }
+            }
+            assert_eq!(adl_rows(&db), 0);
+            (after, units)
+        };
+        let (straight, units_s) = run(None);
+        let (restarted, units_r) = run(Some(8));
+        assert!(units_s.iter().filter(|&&u| u > 0).count() >= 15, "B's units in block 2, a drain in blocks 3..=16: {units_s:?}");
+        assert_eq!(units_s, units_r, "drain work units per block, straight vs restarted");
+        for (i, ((d1, r1), (d2, r2))) in straight.iter().zip(restarted.iter()).enumerate() {
+            assert_dumps_equal(d1, d2, &format!("block {}", i + 9));
+            assert_eq!(r1, r2, "block {}: native root", i + 9);
+        }
     }
 
     /// Liquidation telemetry is node-local: the M2 sequence above (stage 1

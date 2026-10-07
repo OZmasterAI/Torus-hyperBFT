@@ -199,7 +199,7 @@ fn adl_close_pairs_against_ranked_counterparties_at_the_price() {
         ],
     );
     // The closes, in rank order: (counterparty, size) — the bridge logs them.
-    let closes = adl_close(&pm, &u, 1, fp(990), &ranked).unwrap();
+    let (closes, _, _) = adl_close(&pm, &u, 1, fp(990), fp(4), &ranked).unwrap();
     assert_eq!(closes, vec![(s2, fp(3)), (s1, fp(1))]);
     assert!(pm.get_position(&u, 1).unwrap().is_none());
     assert!(pm.get_position(&s2, 1).unwrap().is_none());
@@ -208,6 +208,65 @@ fn adl_close_pairs_against_ranked_counterparties_at_the_price() {
     assert_eq!(pm.get_native_balance(&s2).unwrap().available, fp(330), "3 x (1,100 - 990)");
     assert_eq!(pm.get_native_balance(&s1).unwrap().available, fp(10));
     assert_eq!(oi(&pm, 1), (fp(3), fp(3)));
+}
+
+/// adl-budget P2: `adl_close` closes at most `qty` (an obligation row's
+/// remainder): limit 2 -> S2 (ranked first) takes 2, U keeps long 2.
+#[test]
+fn adl_close_stops_at_the_qty_limit() {
+    let (_d, pm) = setup();
+    let (u, s1, s2, l) = (addr(1), addr(2), addr(3), addr(4));
+    open_pair(&pm, &u, &s1, 1, 4, 1_000);
+    open_pair(&pm, &l, &s2, 1, 3, 1_100);
+    let ranked = adl_rank(
+        fp(900),
+        vec![
+            AdlCandidate { trader: s1, is_long: false, size: fp(4), entry_price: fp(1_000), account_value: fp(10_400) },
+            AdlCandidate { trader: s2, is_long: false, size: fp(3), entry_price: fp(1_100), account_value: fp(1_600) },
+        ],
+    );
+    assert_eq!(adl_close(&pm, &u, 1, fp(990), fp(2), &ranked).unwrap().0, vec![(s2, fp(2))]);
+    assert_eq!(pm.get_position(&u, 1).unwrap().unwrap().size, fp(2), "U keeps 2");
+    assert_eq!(pm.get_position(&s2, 1).unwrap().unwrap().size, fp(1));
+    assert_eq!(pm.get_position(&s1, 1).unwrap().unwrap().size, fp(4), "untouched");
+    assert_eq!(oi(&pm, 1), (fp(5), fp(5)));
+}
+
+/// adl-budget Q2 (A6): `adl_close` also reports `next` = how many leading
+/// candidates are used up (vanished, flipped or fully closed) and `read` =
+/// how many it read. U long 5; candidates [gone, c1 (2), c2 (3)], qty 4:
+/// closes c1 2 and c2 2; `next` = 2 (gone and c1; c2 keeps 1), `read` = 3.
+#[test]
+fn adl_close_reports_next_and_read() {
+    let (_d, pm) = setup();
+    let (u, gone, c1, c2) = (addr(1), addr(2), addr(3), addr(4));
+    open_pair(&pm, &u, &c1, 1, 2, 1_000);
+    open_pair(&pm, &u, &c2, 1, 3, 1_000);
+    let cand = |trader, size| AdlCandidate { trader, is_long: false, size: fp(size), entry_price: fp(1_000), account_value: fp(1) };
+    let ranked = [cand(gone, 5), cand(c1, 2), cand(c2, 3)];
+    let (closes, next, read) = adl_close(&pm, &u, 1, fp(990), fp(4), &ranked).unwrap();
+    assert_eq!(closes, vec![(c1, fp(2)), (c2, fp(2))]);
+    assert_eq!((next, read), (2, 3));
+    assert_eq!(pm.get_position(&u, 1).unwrap().unwrap().size, fp(1), "U keeps 1 (qty 4)");
+    assert_eq!(pm.get_position(&c2, 1).unwrap().unwrap().size, fp(1), "c2 keeps 1: the next row starts at it");
+}
+
+/// adl-budget W (owner 18c s99, option 2): W = 100,000, with the s99 units
+/// (adl-budget.md §12): B's transfers at `ADL_TRANSFER_UNITS` each, a
+/// ranking = the holders of its market, 1 per first-sight valuation, 1 per
+/// row visit and per candidate read. W still closes an HL-sized event in its
+/// own block at the realistic shape — N = 5,000 accounts, ~10 % of them
+/// holding a market (500 holders; + up to 3 protocol / sink accounts), 3
+/// accounts x 100 markets: U <= 300 x T + 100 x (500 + 3) + (5,000 + 3) +
+/// 300 x 2. (At every account holding every market it takes ~6 blocks, by
+/// design: §11.5 / §12.) The bridge test (20 traders) cannot catch a W too
+/// small at N.
+#[test]
+fn adl_work_per_block_is_option_2_and_covers_a_thin_hl_event() {
+    use torus_core::liquidation::{ADL_TRANSFER_UNITS, ADL_WORK_PER_BLOCK};
+    assert_eq!(ADL_WORK_PER_BLOCK, 100_000, "owner s99: option 2");
+    let u = 300 * ADL_TRANSFER_UNITS + 100 * (500 + 3) + (5_000 + 3) + 300 * 2;
+    assert!(ADL_WORK_PER_BLOCK >= u, "W {ADL_WORK_PER_BLOCK} covers U = {u}");
 }
 
 /// D9: a FLAT account's negative collateral moves to the vault (conserved);
@@ -271,31 +330,215 @@ fn bankruptcy_price_rounds_against_the_trader() {
     assert_eq!(bankruptcy_price(fp(1), true, FixedPoint::ZERO, fp(1)), None);
 }
 
-/// Review H3 (s517): ADL candidates come from a BOUNDED walk of the positions
-/// CF (`max_rows` rows in key order, paged) — never a full-CF load. Rows:
-/// addr(1) long, addr(2) short, addr(3) short (market 1), addr(4) market 2.
+/// Q1 (s96): ADL counterparties = every holder on side `want_long` among
+/// `traders`, read through `get`, in `traders` order. The vault is an
+/// ordinary holder; the two ADL escrows are never candidates (P2). One read
+/// per non-escrow trader.
 #[test]
-fn adl_candidates_scan_at_most_max_rows() {
+fn adl_candidates_are_every_opposite_holder_except_the_escrows() {
+    use torus_core::liquidation::{ADL_ESCROW_LONG, ADL_ESCROW_SHORT};
     let (_d, pm) = setup();
     open_pair(&pm, &addr(1), &addr(2), 1, 3, 100);
     open_pair(&pm, &addr(5), &addr(3), 1, 1, 100);
-    open_pair(&pm, &addr(4), &addr(6), 2, 1, 100);
-    let shorts = |rows: usize| -> Vec<Address> {
-        adl_candidates(&pm, 1, &addr(1), false, rows, |_| Ok(fp(1))).unwrap().iter().map(|c| c.trader).collect()
-    };
-    assert_eq!(shorts(usize::MAX), vec![addr(2), addr(3)]);
-    assert_eq!(shorts(2), vec![addr(2)], "rows addr(1), addr(2) only");
-    assert_eq!(shorts(1), Vec::<Address>::new());
-    assert_eq!(shorts(0), Vec::<Address>::new());
+    open_pair(&pm, &addr(4), &LIQUIDATOR_VAULT, 1, 2, 100);
+    open_pair(&pm, &ADL_ESCROW_LONG, &ADL_ESCROW_SHORT, 1, 7, 100);
+    open_pair(&pm, &addr(7), &addr(6), 2, 1, 100); // market 2 only
+    let traders = traders_after(pm.state(), None, usize::MAX).unwrap();
+    let reads = std::cell::Cell::new(0);
+    let shorts = adl_candidates(&traders, false, |t| { reads.set(reads.get() + 1); pm.get_position(t, 1) }, |_| Ok(fp(1)))
+        .unwrap();
+    assert_eq!(
+        shorts.iter().map(|c| (c.trader, c.size)).collect::<Vec<_>>(),
+        vec![(addr(2), fp(3)), (addr(3), fp(1)), (LIQUIDATOR_VAULT, fp(2))]
+    );
+    assert_eq!(reads.get(), traders.len() - 2, "escrows are not read");
+    let longs = adl_candidates(&traders, true, |t| pm.get_position(t, 1), |_| Ok(fp(1))).unwrap();
+    assert_eq!(longs.iter().map(|c| c.trader).collect::<Vec<_>>(), vec![addr(1), addr(4), addr(5)]);
 }
 
-/// Telemetry: `pending_count` counts exactly the pending rows across seek
+/// H (owner s96): row `0x03 ‖ m` = last ‖ [prev]; the pre-clamp ADL base is the
+/// last mark DIFFERENT from the current one; a step with the same mark writes
+/// nothing; without a usable mark the row goes (and the next mark has no base).
+#[test]
+fn adl_base_is_the_last_different_mark() {
+    use std::collections::BTreeMap;
+    use torus_core::liquidation::{adl_bases, put_mark_rows};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let (mut bases_seen, mut writes_seen) = (Vec::new(), Vec::new());
+    for mark in [Some(990), Some(990), Some(900), Some(900), Some(880), None, Some(870)] {
+        let marks: BTreeMap<u64, FixedPoint> = mark.map(|p| (1u64, fp(p))).into_iter().collect();
+        let (bases, rows) = adl_bases(&db, &[1], &marks).unwrap();
+        bases_seen.push(bases.get(&1).copied());
+        writes_seen.push(put_mark_rows(&db, &[1], &marks, &rows).unwrap());
+    }
+    assert_eq!(bases_seen, vec![None, None, Some(fp(990)), Some(fp(990)), Some(fp(900)), None, None]);
+    assert_eq!(writes_seen, vec![1, 0, 1, 0, 1, 1, 1], "a write only when the mark changes or goes");
+}
+
+/// P2 (s96): obligation rows `0x07 ‖ height ‖ market ‖ side ‖ trader` ->
+/// size ‖ price, read in key order (height, market, side short-before-long,
+/// trader); size 0 deletes the row.
+#[test]
+fn adl_obligations_are_fifo_rows() {
+    use torus_core::liquidation::{next_obligation, put_obligation, Obligation, ADL_OBLIGATION_TAG};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let o = |h, market, is_long, n, size, price| Obligation { height: h, market, is_long, trader: addr(n), size: fp(size), price: fp(price) };
+    for x in [o(6, 1, true, 1, 2, 950), o(5, 2, true, 9, 1, 990), o(5, 2, false, 9, 3, 1_010), o(5, 1, true, 8, 4, 940)] {
+        put_obligation(&db, &x).unwrap();
+    }
+    let mut got = Vec::new();
+    let mut start = vec![ADL_OBLIGATION_TAG];
+    while let Some(x) = next_obligation(&db, &start).unwrap() {
+        start = [x.key().as_slice(), &[0]].concat();
+        got.push(x);
+    }
+    assert_eq!(got, vec![o(5, 1, true, 8, 4, 940), o(5, 2, false, 9, 3, 1_010), o(5, 2, true, 9, 1, 990), o(6, 1, true, 1, 2, 950)]);
+    put_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..got[0] }).unwrap();
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(got[1]));
+}
+
+/// P2: a new obligation never overwrites a row (a re-bankruptcy of the same
+/// trader comes at a later height: a new key). Writing a size > 0 row over an
+/// existing key is an error and leaves the row; size 0 still deletes it.
+#[test]
+fn adl_obligation_rows_are_never_overwritten() {
+    use torus_core::liquidation::{next_obligation, put_obligation, Obligation, ADL_OBLIGATION_TAG};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let o = Obligation { height: 5, market: 1, is_long: true, trader: addr(8), size: fp(4), price: fp(940) };
+    put_obligation(&db, &o).unwrap();
+    assert!(put_obligation(&db, &Obligation { size: fp(1), price: fp(900), ..o }).is_err(), "key exists");
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(o), "row unchanged");
+    put_obligation(&db, &Obligation { height: 6, ..o }).unwrap();
+    put_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..o }).unwrap();
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(Obligation { height: 6, ..o }));
+}
+
+/// P2 (A6): the drain's remainder goes through `update_obligation` — it
+/// overwrites an EXISTING row's size (price and key kept), deletes it at 0,
+/// and errors on a missing row, a negative size or a price <= 0 (never a
+/// silent insert; `put_obligation`'s rules).
+#[test]
+fn update_obligation_overwrites_and_deletes() {
+    use torus_core::liquidation::{next_obligation, put_obligation, update_obligation, Obligation, ADL_OBLIGATION_TAG};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let o = Obligation { height: 5, market: 1, is_long: true, trader: addr(8), size: fp(4), price: fp(940) };
+    put_obligation(&db, &o).unwrap();
+    update_obligation(&db, &Obligation { size: fp(1), ..o }).unwrap();
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(Obligation { size: fp(1), ..o }));
+    assert!(update_obligation(&db, &Obligation { size: -fp(1), ..o }).is_err(), "negative remainder");
+    assert!(update_obligation(&db, &Obligation { size: fp(1), price: FixedPoint::ZERO, ..o }).is_err(), "price 0");
+    update_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..o }).unwrap();
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), None, "deleted at 0");
+    assert!(update_obligation(&db, &Obligation { size: fp(1), ..o }).is_err(), "missing row");
+    assert!(update_obligation(&db, &Obligation { size: FixedPoint::ZERO, ..o }).is_err(), "missing row, size 0");
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), None);
+}
+
+/// Review L1: a stored `0x07` value with size <= 0 or price <= 0 is malformed
+/// (the writers never store one: `put_obligation` / `update_obligation`
+/// reject it), so reading it is an error (fatal in the step), never a row
+/// the drain would act on.
+#[test]
+fn next_obligation_rejects_a_stored_size_or_price_at_or_below_zero() {
+    use torus_core::liquidation::{next_obligation, Obligation, ADL_OBLIGATION_TAG};
+    use torus_state::cf::CF_NATIVE_LIQUIDATION;
+    let o = Obligation { height: 5, market: 1, is_long: true, trader: addr(8), size: fp(4), price: fp(940) };
+    for (size, price) in [(0, 940), (-1, 940), (4, 0), (4, -1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let v = [fp(size).raw().to_be_bytes(), fp(price).raw().to_be_bytes()].concat();
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &o.key(), &v).unwrap();
+        let got = next_obligation(&db, &[ADL_OBLIGATION_TAG]);
+        assert!(got.as_ref().is_err_and(|e| e.to_string().contains("malformed")), "({size}, {price}): {got:?}");
+    }
+}
+
+/// P2 edge: escrow long sells q at p_long, escrow short buys q at p_short;
+/// the vault pays (p_short - p_long) x q. Entries differ from the close
+/// prices (realized PnL != 0) and q is fractional (a partial close): EL long
+/// 10 @ 940, ES short 10 @ 1,010, q = 2.5 at (950, 990): EL +25, ES +50,
+/// vault +100; 7.5 left on each side. Value at the mark conserved (escrows
+/// + vault); then the rest (7.5) closes both flat.
+#[test]
+fn cross_close_conserves_value_through_the_vault() {
+    use torus_core::liquidation::{cross_close, ADL_ESCROW_LONG as EL, ADL_ESCROW_SHORT as ES};
+    let (_d, pm) = setup();
+    let half = |v: i64| FixedPoint::from_raw(v as i128 * FixedPoint::SCALE / 2);
+    pm.apply_fill(&EL, 1, true, fp(10), fp(940), MarginType::Cross).unwrap();
+    pm.apply_fill(&ES, 1, false, fp(10), fp(1_010), MarginType::Cross).unwrap();
+    let who = [EL, ES, LIQUIDATOR_VAULT];
+    let before = value(&pm, &who, 1, fp(900));
+    assert_eq!(cross_close(&pm, 1, half(5), fp(950), fp(990), &LIQUIDATOR_VAULT).unwrap(), fp(100));
+    let avail = |t: &Address| pm.get_native_balance(t).unwrap().available;
+    assert_eq!((avail(&EL), avail(&ES), avail(&LIQUIDATOR_VAULT)), (fp(25), fp(50), fp(100)));
+    let (l, s) = (pm.get_position(&EL, 1).unwrap().unwrap(), pm.get_position(&ES, 1).unwrap().unwrap());
+    assert_eq!((l.is_long, l.size, l.entry_price), (true, half(15), fp(940)));
+    assert_eq!((s.is_long, s.size, s.entry_price), (false, half(15), fp(1_010)));
+    assert_eq!(oi(&pm, 1), (half(15), half(15)));
+    assert_eq!(value(&pm, &who, 1, fp(900)), before);
+    assert_eq!(cross_close(&pm, 1, half(15), fp(950), fp(990), &LIQUIDATOR_VAULT).unwrap(), fp(300));
+    assert!(pm.get_position(&EL, 1).unwrap().is_none() && pm.get_position(&ES, 1).unwrap().is_none());
+    assert_eq!(value(&pm, &who, 1, fp(900)), before);
+}
+
+/// 18c review: `cross_close` never flips or opens an escrow position — q <= 0,
+/// q above either escrow's size, or an escrow on the wrong side (or without
+/// a position) is an error, and nothing is written.
+#[test]
+fn cross_close_rejects_a_mismatched_pairing() {
+    use torus_core::liquidation::{cross_close, ADL_ESCROW_LONG as EL, ADL_ESCROW_SHORT as ES};
+    let snapshot = |pm: &PositionManager| {
+        let s = pm.state();
+        (s.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap(), s.iterate_cf(torus_state::cf::CF_NATIVE_BALANCES, None).unwrap())
+    };
+    let cases: [(i64, i64, i64, &str); 5] = [
+        (3, -3, 0, "q 0"),
+        (3, -3, -1, "q < 0"),
+        (2, -3, 3, "q above the long escrow's size"),
+        (3, -2, 3, "q above the short escrow's size"),
+        (-3, 3, 1, "both escrows on the wrong side"),
+    ];
+    for (el, es, q, what) in cases {
+        let (_d, pm) = setup();
+        for (e, size) in [(EL, el), (ES, es)] {
+            pm.apply_fill(&e, 1, size > 0, fp(size.abs()), fp(1_000), MarginType::Cross).unwrap();
+        }
+        let before = snapshot(&pm);
+        assert!(cross_close(&pm, 1, fp(q), fp(950), fp(990), &LIQUIDATOR_VAULT).is_err(), "{what}");
+        assert!(snapshot(&pm) == before, "{what}: nothing written");
+    }
+    let (_d, pm) = setup();
+    pm.apply_fill(&ES, 1, false, fp(1), fp(1_000), MarginType::Cross).unwrap();
+    assert!(cross_close(&pm, 1, fp(1), fp(950), fp(990), &LIQUIDATOR_VAULT).is_err(), "no long escrow position");
+}
+
+/// 18c review: an obligation is deleted only at size 0; a negative size or a
+/// price <= 0 is an error (a negative remainder never vanishes silently).
+#[test]
+fn put_obligation_rejects_a_negative_size_or_a_non_positive_price() {
+    use torus_core::liquidation::{next_obligation, put_obligation, Obligation, ADL_OBLIGATION_TAG};
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let o = Obligation { height: 5, market: 1, is_long: true, trader: addr(8), size: fp(4), price: fp(940) };
+    assert!(put_obligation(&db, &Obligation { price: FixedPoint::ZERO, ..o }).is_err(), "price 0");
+    assert!(put_obligation(&db, &Obligation { price: -fp(1), ..o }).is_err(), "price < 0");
+    put_obligation(&db, &o).unwrap();
+    assert!(put_obligation(&db, &Obligation { size: -fp(1), ..o }).is_err(), "size < 0");
+    assert_eq!(next_obligation(&db, &[ADL_OBLIGATION_TAG]).unwrap(), Some(o), "row kept");
+}
+
+/// Telemetry: `tag_count` counts exactly the pending rows across seek
 /// pages (1,030 rows > one 1,024-row page), ignoring the other tags (a
 /// cooldown row, the cursor); `pending_among` counts the rows of a sorted
 /// trader list only. `set_pending` reports whether it changed the row.
 #[test]
 fn pending_rows_are_counted_across_pages() {
-    use torus_core::liquidation::{pending_among, pending_count, put_cursor, set_cooldown, set_pending};
+    use torus_core::liquidation::{pending_among, put_cursor, set_cooldown, set_pending, tag_count, PENDING_TAG};
+    let pending_count = |db: &StateDb| tag_count(db, PENDING_TAG);
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     assert_eq!(pending_count(&db).unwrap(), 0);

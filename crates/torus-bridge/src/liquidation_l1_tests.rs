@@ -112,6 +112,10 @@ struct BlockOut {
     markets: String,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     triggered: u64,
+    /// adl-budget A7: `liquidation_adl_work_total` after the block (drain
+    /// work units: a ranking examines `liq_traders_after(None, MAX)`, the
+    /// slot list on the L1 path, the walk on the reference path).
+    adl_work: u64,
 }
 
 /// Counters of the L1 run (non-vacuous checks).
@@ -135,6 +139,14 @@ struct Stats {
     /// E2: candidate lists from the slot's trader set (shadow-checked
     /// against the walk inside the step).
     traders_slice: usize,
+    /// adl-budget Q1: ADL counterparty rankings (each from the slot's
+    /// trader set, shadow-checked like the pass's list).
+    adl_rankings: usize,
+    /// A8 perf (P1): trader sets the drains took (shared by their rankings).
+    adl_trader_sets: usize,
+    /// adl-budget C2: rankings over a market's holder list (shadow-checked
+    /// against C1, the whole trader set, inside the drain).
+    adl_holder_lists: usize,
     shadow: usize,
     persistent: usize,
     memo: usize,
@@ -336,7 +348,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             }
         }
         let liq = if h % 3 == 0 {
-            NativeExecutor::run_liquidations_with(&mut ctx, 3, 2)
+            NativeExecutor::run_liquidations_with(&mut ctx, 3, 2, liq::ADL_WORK_PER_BLOCK)
         } else {
             NativeExecutor::run_liquidations(&mut ctx)
         };
@@ -362,6 +374,9 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.l1 += get(&c.l1);
             stats.l1_off += get(&c.l1_off);
             stats.traders_slice += get(&c.traders_slice);
+            stats.adl_rankings += get(&c.adl_rankings);
+            stats.adl_trader_sets += get(&c.adl_trader_sets);
+            stats.adl_holder_lists += get(&c.adl_holder_lists);
             stats.shadow += get(&c.shadow);
             stats.persistent += get(&c.persistent);
             stats.memo += get(&c.memo);
@@ -380,7 +395,8 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
         let mut rows = liq_rows;
         rows.extend(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap());
         rows.extend(overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
-        out.push(BlockOut { results, markets, rows, triggered: metrics.liquidations_triggered.get() });
+        let adl_work = metrics.liquidation_adl_work_total.get();
+        out.push(BlockOut { results, markets, rows, triggered: metrics.liquidations_triggered.get(), adl_work });
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
@@ -403,6 +419,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
 #[test]
 fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     let mut stats = Stats::default();
+    let mut drain_blocks = 0;
     for seed in 1..=6u64 {
         let with_l1 = run(seed * 0x517C_C1B7, true, &mut stats);
         let reference = run(seed * 0x517C_C1B7, false, &mut Stats::default());
@@ -411,9 +428,13 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
             assert_eq!(a.markets, b.markets, "seed {seed} block {}: margin configs / listed markets", h + 1);
             assert!(a.rows == b.rows, "seed {seed} block {}: liquidation / position / balance rows", h + 1);
             assert_eq!(a.triggered, b.triggered, "seed {seed} block {}: liquidations_triggered", h + 1);
+            assert_eq!(a.adl_work, b.adl_work, "seed {seed} block {}: ADL drain work units", h + 1);
+            let prev = if h == 0 { 0 } else { with_l1[h - 1].adl_work };
+            drain_blocks += usize::from(a.adl_work > prev);
         }
     }
-    println!("LIQ_L1 P3 {stats:?}");
+    println!("LIQ_L1 P3 {stats:?} drain_blocks={drain_blocks}");
+    assert!(drain_blocks >= 6, "blocks with ADL drain work: {drain_blocks}");
     let s = &stats;
     assert!(s.stage1 > 20 && s.backstop > 20 && s.adl > 5 && s.vault_adl > 0, "every class met: {s:?}");
     assert!(s.skipped > 100 && s.cuts > 10 && s.cooldowns > 5, "skips, cursor cuts, chunks: {s:?}");
@@ -423,8 +444,360 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
         "rule B: two chunks of one account in one block, every MULTI account: {s:?}"
     );
     assert!(s.l1 > 1_000 && s.shadow > 1_000, "L1 valuations checked: {s:?}");
-    assert_eq!(s.traders_slice, 6 * BLOCKS as usize, "E2: every L1 block's candidates from the slot: {s:?}");
+    assert_eq!(s.traders_slice, 6 * BLOCKS as usize + s.adl_trader_sets, "E2: pass + one ADL set per drain from the slot: {s:?}");
+    assert!(s.adl_rankings > 0 && s.adl_trader_sets > 0 && s.adl_trader_sets <= s.adl_rankings, "ADL rankings met: {s:?}");
+    assert_eq!(s.adl_holder_lists, s.adl_rankings, "C2: every ranking of the node path from a holder list: {s:?}");
     assert!(s.l1_off > 50 && s.delisted_marked_blocks >= 6 * 5, "delisted market with a fresh mark: L1 off: {s:?}");
     assert!(s.marks_off_blocks >= 6 * 4, "marks off: {s:?}");
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");
+}
+
+/// adl-budget Q2 (A6 #3): one ranking per (block, market, side). The P2
+/// fixture's shape over the node path (R and the slot attached): u1 and u2
+/// long 1 @ 1,000 in markets 1..=4 (collateral 100: AV -300 at 900) against
+/// a short; block 2 at 900 leaves 8 rows over 4 (market, long) keys, and
+/// the drain (default W) ranks each key once: 4 rankings, not 8.
+#[test]
+fn p2_ranks_each_market_side_once_per_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    for m in 1..=4u64 {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+    }
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, 1_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let fund = |t: &Address, v: i64| {
+            ctx.positions.put_native_balance(t, &NativeBalance { available: fp(v), order_margin: FixedPoint::ZERO }).unwrap();
+        };
+        let (u1, u2, s) = (trader(1), trader(2), trader(3));
+        fund(&u1, 100);
+        fund(&u2, 100);
+        fund(&s, 10_000_000);
+        for m in 1..=4 {
+            for (t, is_long) in [(u1, true), (u2, true), (s, false), (s, false)] {
+                ctx.positions.apply_fill(&t, m, is_long, fp(1), fp(MID), MarginType::Cross).unwrap();
+            }
+        }
+    }
+    let mut holder = ResidentBooks::default();
+    let mut parent: Option<Arc<FrozenPending>> = None;
+    let mut rankings = Vec::new();
+    for (h, price) in [(1u64, MID), (2, 900)] {
+        let now = 10_000 + h;
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut rb = begin_resident(Some(&mut holder), &mut overlay, h, None);
+        for m in 1..=4 {
+            overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(price), now - 1)).unwrap();
+        }
+        let mut ctx =
+            NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.attach_resident_block(&mut rb);
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        let c = &ctx.sums.as_ref().expect("slot sums attached").counters;
+        rankings.push(c.adl_rankings.load(std::sync::atomic::Ordering::Relaxed));
+        if h == 2 {
+            assert!(liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none(), "drained in B");
+        }
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = overlay.own_pending_delta();
+        let frozen = overlay.freeze(h);
+        end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        if let Some(p) = parent.take() {
+            p.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        }
+        parent = Some(frozen);
+    }
+    assert_eq!(rankings, vec![0, 4], "block 2: one ranking per (market, long)");
+}
+
+/// An ADL fixture for [`adl_run`]: `k` bankrupt accounts long 1 in markets
+/// `1..=pu`; scan / act / W budgets of the step.
+#[derive(Clone, Copy)]
+struct AdlShape {
+    k: u64,
+    pu: u64,
+    act: usize,
+    work: u64,
+    /// Market `pu + 1`: bankrupt 0 long 2 against bankrupt 1 short 2, no
+    /// other holder: both escrows hold it -> escrow pairing (vault pays).
+    two_sided: bool,
+}
+
+/// What one block of [`adl_run`] left: positions / balances / liquidation
+/// rows, the drain's units, the step's results.
+#[derive(PartialEq, Eq, Debug)]
+struct AdlBlock {
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    adl_work: u64,
+    results: String,
+}
+
+/// The storm shape's W: B's transfers (3 accounts x 6-7 positions x
+/// `ADL_TRANSFER_UNITS` = 108-114 units, s99) leave the drain a remainder in
+/// each B block (the drain interleaves with B), then several drain blocks.
+const STORM_W: u64 = 160;
+
+fn adl_bankrupt(b: u64) -> Address {
+    let mut a = [0x11u8; 20];
+    a[12..].copy_from_slice(&(b + 1).to_be_bytes());
+    Address::new(a)
+}
+
+/// adl-budget A8 perf (P1 + P3): the node lifecycle (R attached when
+/// `resident`, the sums shadow on) over `shape`. Counterparties: 24 traders
+/// short 1-3 in most ADL markets (funded 100,000), 4 "solo" traders short 1
+/// in market 1 only, funded 30 (high leverage: ranked first, closed out,
+/// gone from the trader set), the vault short 2 in markets 2 and 3 (an
+/// ordinary candidate; the pairing pays it), a sink long on the other side.
+/// Block 1 at 1,000 (rule-H base), then 900 until the queue is empty and
+/// every bankrupt account was ADL'd (cap 40 blocks), plus one block.
+fn adl_run(shape: AdlShape, resident: bool, caches: bool) -> Vec<AdlBlock> {
+    adl_run_with(shape, if resident { Rm::Inline } else { Rm::Off }, caches, true)
+}
+
+/// How [`adl_run_with`] keeps the resident rows R (as the goldens' R modes).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Rm {
+    /// No R (`begin_resident(None, ..)`): the walk, C1.
+    Off,
+    /// R attached, `end_resident` inline.
+    Inline,
+    /// R attached, `end_resident_on_worker` (the frozen set's delta), joined
+    /// by the next block's `begin_resident` (app.rs, pipelined).
+    Worker,
+}
+
+/// [`adl_run`]; `r`: R off / inline / worker; `c2`: the drain ranks a
+/// market's holder list (C2, needs R), else every trader of the set (C1,
+/// the reference).
+fn adl_run_with(shape: AdlShape, r: Rm, caches: bool, c2: bool) -> Vec<AdlBlock> {
+    let resident = r != Rm::Off;
+    ADL_CACHES_OFF.with(|c| c.set(!caches));
+    ADL_C2_OFF.with(|c| c.set(!c2));
+    let AdlShape { k, pu, act, work, two_sided } = shape;
+    let markets = pu + u64::from(two_sided);
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    for m in 1..=markets {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
+    }
+    let sink = trader(500);
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, 1_000, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let fund = |t: &Address, v: i64| {
+            ctx.positions.put_native_balance(t, &NativeBalance { available: fp(v), order_margin: FixedPoint::ZERO }).unwrap();
+        };
+        let pair = |long: &Address, short: &Address, m: MarketId, q: u64| {
+            ctx.positions.apply_fill(long, m, true, fp(q as i64), fp(MID), MarginType::Cross).unwrap();
+            ctx.positions.apply_fill(short, m, false, fp(q as i64), fp(MID), MarginType::Cross).unwrap();
+        };
+        fund(&sink, 100_000_000);
+        for i in 0..24 {
+            fund(&trader(i), 100_000);
+            for m in 1..=pu {
+                if (i + m) % 4 != 0 {
+                    pair(&sink, &trader(i), m, 1 + (i * m) % 3);
+                }
+            }
+        }
+        for j in 0..4 {
+            fund(&trader(100 + j), 30); // MM 25 at 1,000
+            pair(&sink, &trader(100 + j), 1, 1);
+        }
+        for m in [2, 3] {
+            pair(&sink, &LIQUIDATOR_VAULT, m, 2);
+        }
+        for b in 0..k {
+            // MM 25 per position at 1,000: AV 50 pu >= 25 pu (+ 50 for the
+            // two-sided pair); at 900: 50 pu - 100 pu (-/+ 200) < 0.
+            fund(&adl_bankrupt(b), 50 * pu as i64);
+            for m in 1..=pu {
+                pair(&adl_bankrupt(b), &sink, m, 1);
+            }
+        }
+        if two_sided {
+            pair(&adl_bankrupt(0), &adl_bankrupt(1), markets, 2);
+        }
+    }
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    let mut holder = ResidentBooks::default();
+    let mut parent: Option<Arc<FrozenPending>> = None;
+    let (mut out, mut tail) = (Vec::new(), 0);
+    for h in 1..=40u64 {
+        let now = 10_000 + h;
+        let price = if h == 1 { MID } else { 900 };
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+        let mut rb = begin_resident(resident.then_some(&mut holder), &mut overlay, h, None);
+        for m in 1..=markets {
+            overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(m), &agg_row(fp(price), now - 1)).unwrap();
+        }
+        let mut ctx =
+            NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.metrics = Some(metrics.clone());
+        ctx.attach_resident_block(&mut rb);
+        if resident {
+            ctx.sums.as_mut().expect("slot sums attached").shadow = true;
+        }
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        let liq = NativeExecutor::run_liquidations_with(&mut ctx, 2_048, act, work);
+        assert!(ctx.fatal_error.is_none(), "h {h}: {:?}", ctx.fatal_error);
+        if let Some(s) = ctx.sums.as_ref() {
+            let bad = s.shadow_mismatches.lock().unwrap().clone();
+            assert!(bad.is_empty(), "h {h}: {bad:?}");
+        }
+        let done = h > 1
+            && metrics.liquidations_adl.get() >= k
+            && liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none();
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        let mut rows = overlay.iterate_cf(CF_NATIVE_LIQUIDATION, None).unwrap();
+        rows.extend(overlay.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap());
+        rows.extend(overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
+        let results = format!("{:?}", liq.iter().map(|x| (&x.error, x.success, x.gas_used)).collect::<Vec<_>>());
+        out.push(AdlBlock { rows, adl_work: metrics.liquidation_adl_work_total.get(), results });
+        overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+        let delta = if rb.attached() && r != Rm::Worker { overlay.own_pending_delta() } else { Default::default() };
+        let frozen = overlay.freeze(h);
+        if r == Rm::Worker {
+            end_resident_on_worker(&mut holder, rb, &mut overlay, BlockDelta::Frozen(frozen.clone()), true, None);
+        } else {
+            end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+        }
+        if let Some(p) = parent.take() {
+            p.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        }
+        parent = Some(frozen);
+        tail += usize::from(done);
+        if tail == 2 {
+            if two_sided {
+                assert_ne!(metrics.liquidation_adl_pairing.get(), 0.0, "the escrows paired");
+            }
+            ADL_CACHES_OFF.with(|c| c.set(false));
+            ADL_C2_OFF.with(|c| c.set(false));
+            return out;
+        }
+    }
+    panic!("not drained in 40 blocks");
+}
+
+/// adl-budget A8 perf (P1 + P3): the drain with its caches (one trader set
+/// per drain, kept by dropping traders gone flat; the ranking AV memoized
+/// per trader, dropped for both parties of every close and for the vault on
+/// a pairing) is bit-identical to the reference (a fresh set and AV per
+/// ranking): an HL-like event (3 accounts x 6 markets, default W, drained
+/// in B) and an S=750-like storm (10 accounts x 6 markets, act 3: B over 4
+/// blocks mixed with the drain, W `STORM_W`: several drain blocks; a two-sided
+/// market: pairing), with and without R. Equal positions, balances and
+/// liquidation rows, drain units and results block by block; caches used
+/// (AV hits, traders dropped, sets taken) — and every hit equals a fresh
+/// valuation, every set the walk (shadow asserts inside the drain). 18c
+/// review (s96 fix list e): the R run (records: E2 set, C2 holder lists) and
+/// the run without R (the walk, C1) are equal too, block by block.
+#[test]
+fn adl_drain_caches_are_bit_identical() {
+    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
+    let storm = AdlShape { k: 10, pu: 6, act: 3, work: STORM_W, two_sided: true };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        let with_r = adl_run(shape, true, true);
+        let without_r = adl_run(shape, false, true);
+        assert_eq!(with_r.len(), without_r.len(), "{name}: blocks, R vs no R");
+        for (h, (a, b)) in with_r.iter().zip(&without_r).enumerate() {
+            assert_eq!(a.adl_work, b.adl_work, "{name} block {}: drain units, R vs no R", h + 1);
+            assert!(a == b, "{name} block {}: rows / units / results, R vs no R", h + 1);
+        }
+        for resident in [true, false] {
+            ADL_CACHE_STATS.with(|s| s.set((0, 0, 0)));
+            let cached = adl_run(shape, resident, true);
+            let (hits, dropped, sets) = ADL_CACHE_STATS.with(|s| s.get());
+            let reference = adl_run(shape, resident, false);
+            assert_eq!(cached.len(), reference.len(), "{name} R={resident}: blocks");
+            for (h, (a, b)) in cached.iter().zip(&reference).enumerate() {
+                assert!(a == b, "{name} R={resident} block {}: rows / units / results differ", h + 1);
+            }
+            let drain_blocks = cached.windows(2).filter(|w| w[1].adl_work > w[0].adl_work).count();
+            println!("ADL caches {name} R={resident}: blocks={} drain_blocks={drain_blocks} hits={hits} dropped={dropped} sets={sets}", cached.len());
+            assert!(hits > 0 && dropped > 0 && sets > 0, "{name} R={resident}: caches used");
+            if name == "storm" {
+                assert!(drain_blocks >= 3, "{name}: a multi-block drain");
+            }
+        }
+    }
+}
+
+/// adl-budget C2 (owner 18c s96 / s99): the drain ranks a market's holder
+/// list (R's holders of `m` merged with the block's dirty traders of `m`)
+/// instead of reading every trader of the set (C1) — the same candidates in
+/// the same order (shadow-checked at every ranking inside the drain), the
+/// same work units (s99: the holders of the market, counted from the same
+/// reads; also shadow-checked), so
+/// bit-identical rows, units and results block by block: the HL-like event
+/// and the S=750-like storm of [`adl_drain_caches_are_bit_identical`], with
+/// the caches on and off. Non-vacuous: the shapes have traders that hold
+/// only some markets (counterparty `i` skips `m` when `(i + m) % 4 == 0`,
+/// the solo traders hold market 1 only), so some holder lists are shorter
+/// than the set.
+#[test]
+fn adl_c2_holder_lists_are_bit_identical_to_c1() {
+    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
+    let storm = AdlShape { k: 10, pu: 6, act: 3, work: STORM_W, two_sided: true };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        for caches in [true, false] {
+            ADL_C2_STATS.with(|s| s.set((0, 0)));
+            let c2 = adl_run_with(shape, Rm::Inline, caches, true);
+            let (lists, skipped) = ADL_C2_STATS.with(|s| s.get());
+            ADL_C2_STATS.with(|s| s.set((0, 0)));
+            let c1 = adl_run_with(shape, Rm::Inline, caches, false);
+            assert_eq!(ADL_C2_STATS.with(|s| s.get()), (0, 0), "{name} caches {caches}: C1 run used no holder list");
+            assert_eq!(c2.len(), c1.len(), "{name} caches {caches}: blocks");
+            for (h, (a, b)) in c2.iter().zip(&c1).enumerate() {
+                assert_eq!(a.adl_work, b.adl_work, "{name} caches {caches} block {}: drain units", h + 1);
+                assert!(a == b, "{name} caches {caches} block {}: rows / units / results", h + 1);
+            }
+            println!("ADL C2 {name} caches={caches}: holder lists={lists} traders skipped={skipped}");
+            assert!(lists > 0 && skipped > 0, "{name} caches {caches}: holder lists used and shorter than the set");
+        }
+    }
+}
+
+/// adl-budget s99 (owner decision 2): a ranking charges the holders of its
+/// market — the traders other than the two escrows with a live position row
+/// in it at ranking time — derived from consensus state: at EVERY ranking
+/// the drain asserts (`#[cfg(test)]`, inside `adl_candidates_of`) that the
+/// charged count equals a full walk of `CF_NATIVE_POSITIONS` through the
+/// block's overlay, and with C2 the shadow's C1 count over the whole trader
+/// set equals it too. This drives that check through every R mode (off:
+/// the walk / C1; inline and worker: C2 over the holder lists, and C1 with
+/// C2 off), caches on and off, the HL-like and the storm shapes, and
+/// requires every run to give the same rows, units and results block by
+/// block.
+#[test]
+fn adl_charged_holders_equal_a_state_walk_in_every_r_mode() {
+    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
+    let storm = AdlShape { k: 10, pu: 6, act: 3, work: STORM_W, two_sided: true };
+    for (name, shape) in [("hl", hl), ("storm", storm)] {
+        ADL_UNIT_CHECKS.with(|c| c.set(0));
+        let reference = adl_run_with(shape, Rm::Off, true, true);
+        let off_checks = ADL_UNIT_CHECKS.with(|c| c.get());
+        assert!(off_checks > 0, "{name}: R off: every ranking checked ({off_checks})");
+        for r in [Rm::Off, Rm::Inline, Rm::Worker] {
+            for caches in [true, false] {
+                for c2 in [true, false] {
+                    ADL_UNIT_CHECKS.with(|c| c.set(0));
+                    let run = adl_run_with(shape, r, caches, c2);
+                    let checks = ADL_UNIT_CHECKS.with(|c| c.get());
+                    assert_eq!(checks, off_checks, "{name} {r:?} caches {caches} c2 {c2}: rankings checked");
+                    assert_eq!(run.len(), reference.len(), "{name} {r:?} caches {caches} c2 {c2}: blocks");
+                    for (h, (a, b)) in run.iter().zip(&reference).enumerate() {
+                        assert_eq!(a.adl_work, b.adl_work, "{name} {r:?} caches {caches} c2 {c2} block {}: units", h + 1);
+                        assert!(a == b, "{name} {r:?} caches {caches} c2 {c2} block {}: rows / units / results", h + 1);
+                    }
+                }
+            }
+        }
+        println!("ADL unit checks {name}: {off_checks} rankings per run");
+    }
 }

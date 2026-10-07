@@ -19,6 +19,11 @@
 //! (same lifecycle), so the liquidation step's candidate list
 //! (`liq::traders_after`) is a slice of them instead of one seek over R per
 //! trader ([`TraderPositions::traders_after`]).
+//!
+//! adl-budget C2 (owner 18c s96 / s99): per market, the traders of R's keys
+//! `t ‖ m` (same lifecycle), so an ADL ranking of `m` reads the holders of
+//! `m` (merged with the block's dirty traders of `m`) instead of every
+//! trader ([`TraderPositions::holders_with`], [`dirty_by_market`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
@@ -51,6 +56,16 @@ pub(crate) struct TraderPositions {
     /// Item 6 E2: every trader with a 28-byte key in R (regular or opaque),
     /// ascending: the candidates of the liquidation walk.
     traders: BTreeSet<Address>,
+    /// adl-budget C2: per market `m`, every trader with the 28-byte key
+    /// `t ‖ m` in R (regular or opaque), ascending. A market without one has
+    /// no entry. Followed per key from the delta (a write adds, a tombstone
+    /// removes): O(log n) per changed key.
+    holders: HashMap<MarketId, BTreeSet<Address>>,
+}
+
+/// The market of a 28-byte positions key `t ‖ m`.
+fn market_of(key: &[u8]) -> MarketId {
+    MarketId::from_be_bytes(key[TRADER..KEY].try_into().expect("28-byte key"))
 }
 
 /// The position of a regular row, `None` for an irregular one.
@@ -88,13 +103,11 @@ impl TraderPositions {
         if let Some((t, ps)) = cur {
             out.set(t, ps);
         }
-        out.traders = rows
-            .rows(CF_NATIVE_POSITIONS)
-            .into_iter()
-            .flatten()
-            .filter(|(k, _)| k.len() == KEY)
-            .map(|(k, _)| Address::from_slice(&k[..TRADER]))
-            .collect();
+        for (k, _) in rows.rows(CF_NATIVE_POSITIONS).into_iter().flatten().filter(|(k, _)| k.len() == KEY) {
+            let t = Address::from_slice(&k[..TRADER]);
+            out.traders.insert(t);
+            out.holders.entry(market_of(k)).or_default().insert(t);
+        }
         out
     }
 
@@ -148,6 +161,10 @@ impl TraderPositions {
             let t = Address::from_slice(&first.0[..TRADER]);
             if group.iter().any(|(k, _)| k.len() == KEY) {
                 keyed.push(t);
+            }
+            // C2: R after the block holds `t ‖ m` iff the delta wrote it.
+            for &(k, v) in group.iter().filter(|(k, _)| k.len() == KEY) {
+                self.set_holder(t, market_of(k), v.is_some());
             }
             changes.clear();
             if !self.follow(t, &group, &mut changes, seen.as_deref_mut()) {
@@ -241,6 +258,56 @@ impl TraderPositions {
         true
     }
 
+    /// C2: whether R holds `t ‖ m` now.
+    fn set_holder(&mut self, t: Address, m: MarketId, holds: bool) {
+        if holds {
+            self.holders.entry(m).or_default().insert(t);
+        } else if let Some(set) = self.holders.get_mut(&m) {
+            set.remove(&t);
+            if set.is_empty() {
+                self.holders.remove(&m);
+            }
+        }
+    }
+
+    /// adl-budget C2: every trader that may hold a position in `m` in the
+    /// block's overlay over these records' R, ascending, each once: R's
+    /// holders of `m` merged with `dirty` (ascending: the traders whose key
+    /// `t ‖ m` the block wrote or deleted, from [`dirty_by_market`]). A
+    /// superset of the holders — a dirty trader may have deleted its row —
+    /// so the caller reads each one's position and skips those without,
+    /// exactly as C1 skips a trader of the whole set that does not hold `m`.
+    pub(crate) fn holders_with(&self, m: MarketId, dirty: &[Address]) -> Vec<Address> {
+        let base = self.holders.get(&m);
+        let mut out = Vec::with_capacity(base.map_or(0, BTreeSet::len) + dirty.len());
+        let mut a = base.into_iter().flatten().peekable();
+        let mut b = dirty.iter().peekable();
+        loop {
+            let t = match (a.peek(), b.peek()) {
+                (None, None) => break,
+                (Some(&&x), Some(&&y)) if x == y => {
+                    a.next();
+                    b.next();
+                    x
+                }
+                (Some(&&x), Some(&&y)) if x < y => {
+                    a.next();
+                    x
+                }
+                (Some(&&x), None) => {
+                    a.next();
+                    x
+                }
+                (_, Some(&&y)) => {
+                    b.next();
+                    y
+                }
+            };
+            out.push(t);
+        }
+        out
+    }
+
     /// `trader`'s positions in key order (empty: no rows), `None` if opaque.
     #[inline]
     pub(crate) fn get(&self, trader: &Address) -> Option<&[Position]> {
@@ -304,6 +371,7 @@ impl TraderPositions {
     pub(crate) fn same_as(&self, other: &Self) -> bool {
         let enc = |ps: &Vec<Position>| ps.iter().map(|p| borsh::to_vec(p).ok()).collect::<Vec<_>>();
         self.traders == other.traders
+            && self.holders == other.holders
             && self.opaque == other.opaque
             && self.map.len() == other.map.len()
             && self.map.iter().all(|(t, ps)| other.map.get(t).is_some_and(|o| enc(o) == enc(ps)))
@@ -312,21 +380,43 @@ impl TraderPositions {
 
 /// Item 6 E2: whether `state` holds a 28-byte position key of `t`. They all
 /// lie in `[t ‖ 00×8, t ‖ ff×8]`; longer keys under `t` in between are
-/// stepped over.
-fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, StateError> {
+/// stepped over. (adl-budget A8 perf: also the ADL drain's flat check.)
+///
+/// adl-budget s99 (owner decision 4): each seek is bounded to `t`'s prefix
+/// (`iterate_cf_prefix_from`), so it reads only `t`'s own keys and
+/// tombstones. The unbounded seek it replaces gave the same answer (a key
+/// past the prefix meant `false`) but, for a trader the block emptied, the
+/// overlay merge stepped over its tombstones AND every following emptied
+/// trader's before reaching a live key: quadratic in a block B that ADLs
+/// many adjacent accounts (~96 ms of the S=750-like B₁, §11.3).
+pub(super) fn has_key<B: StateBackend>(state: &B, t: &Address) -> Result<bool, StateError> {
     let mut start = [t.as_slice(), &[0u8; KEY - TRADER]].concat();
     loop {
-        let Some((k, _)) = state.iterate_cf_from(CF_NATIVE_POSITIONS, &start, 1)?.pop() else {
+        let Some((k, _)) = state.iterate_cf_prefix_from(CF_NATIVE_POSITIONS, t.as_slice(), &start, 1)?.pop() else {
             return Ok(false);
         };
-        if !k.starts_with(t.as_slice()) {
-            return Ok(false);
-        }
         if k.len() == KEY {
             return Ok(true);
         }
         start = [k.as_slice(), &[0]].concat();
     }
+}
+
+/// adl-budget C2: the block's own pending 28-byte position keys of `state`
+/// (writes and tombstones) as market -> traders, each list ascending and
+/// without duplicates; `None`: R not attached (the caller ranks over the
+/// whole trader set).
+pub(crate) fn dirty_by_market<B: StateBackend>(state: &B) -> Option<HashMap<MarketId, Vec<Address>>> {
+    let pending = state.layer_keys(CF_NATIVE_POSITIONS)?;
+    let mut out: HashMap<MarketId, Vec<Address>> = HashMap::new();
+    // Key-sorted (`t ‖ m`): per market the traders come ascending.
+    for k in pending.iter().filter(|k| k.len() == KEY) {
+        out.entry(market_of(k)).or_default().push(Address::from_slice(&k[..TRADER]));
+    }
+    for list in out.values_mut() {
+        list.dedup();
+    }
+    Some(out)
 }
 
 /// The position in `market_id` of a trader's record.

@@ -6,7 +6,8 @@
 //! (scenario B — GTC bids and liquidation orders — is unchanged).
 //! Row 50 (s96) re-pinned scenario A for the results' success / error only
 //! (book rejections reported rejected); the digests over the pre-row-50 view
-//! of the results (`pre_row50`) must still equal the previous pins.
+//! of the results (`pre_row50`) must still equal the previous pins, and the
+//! row-50 outputs alone (`ROW50_OUT_A`) must equal main's.
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
@@ -35,7 +36,7 @@ use torus_core::order_book::OrderBook;
 use torus_core::position::{MarginType, NativeBalance};
 use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
 use torus_state::cf::{
-    CF_CONSENSUS_META, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
+    CF_CONSENSUS_META, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS,
     META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::running_hash::{configure_activation, read_running_hash, HASHED_CFS};
@@ -175,6 +176,38 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
     data
 }
 
+/// adl-budget re-pin evidence (18c review): [`db_digest`] without what rule H
+/// and P2 change on purpose — `0x03` values cut to `last` (16 bytes), no
+/// `0x07` row, no ADL-escrow position / balance row — and without what
+/// covers those rows: the native state root, `CF_CONSENSUS_META` (the
+/// running hash and the native trie's nodes) and the running hash.
+fn reduced_digest(db: &StateDb) -> Vec<u8> {
+    let escrow = |k: &[u8]| [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT].iter().any(|e| k.starts_with(e.as_slice()));
+    let mut data = Vec::new();
+    for (id, cf) in HASHED_CFS {
+        if *cf == CF_CONSENSUS_META {
+            continue;
+        }
+        for (k, mut v) in db.iterate_cf(cf, None).unwrap() {
+            if *cf == CF_NATIVE_LIQUIDATION {
+                match k.first() {
+                    Some(&liq::ADL_OBLIGATION_TAG) => continue,
+                    Some(&liq::PREV_MARK_TAG) => v.truncate(16),
+                    _ => {}
+                }
+            } else if (*cf == CF_NATIVE_POSITIONS || *cf == CF_NATIVE_BALANCES) && escrow(&k) {
+                continue;
+            }
+            data.push(*id);
+            data.extend_from_slice(&(k.len() as u32).to_be_bytes());
+            data.extend_from_slice(&k);
+            data.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            data.extend_from_slice(&v);
+        }
+    }
+    data
+}
+
 /// How a run keeps the resident rows R.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum R {
@@ -191,10 +224,18 @@ const R_MODES: [R; 3] = [R::Inline, R::Worker, R::Off];
 
 /// Runs `blocks` on the pipelined overlay path; `threads` = `None` runs
 /// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `r`: how
-/// the resident rows R are kept. Returns one hex digest per block, twice:
-/// over the results as they are, and over their pre-row-50 view
-/// ([`pre_row50`]).
-fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>) {
+/// the resident rows R are kept. Returns one hex digest per block, three
+/// times: over the results as they are, over their pre-row-50 view
+/// ([`pre_row50`]), and over the block's outputs alone as they are (no DB:
+/// the row-50 outputs, [`ROW50_OUT_A`]).
+fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let [digests, pre_row50, _, row50_out] = run_all(db, blocks, threads, r);
+    (digests, pre_row50, row50_out)
+}
+
+/// [`run`], also returning each block's [`reduced_digest`] + its outputs in
+/// the pre-row-50 view (the reduced pins predate row 50), third of four.
+fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec<String>; 4] {
     let resident = r != R::Off;
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
@@ -203,16 +244,18 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<Str
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut outputs: Vec<[String; 2]> = Vec::new();
-    let mut digests: [Vec<String>; 2] = [Vec::new(), Vec::new()];
-    let flush = |p: Arc<FrozenPending>, outputs: &[[String; 2]], digests: &mut [Vec<String>; 2]| {
+    let mut digests: [Vec<String>; 4] = Default::default();
+    let flush = |p: Arc<FrozenPending>, outputs: &[[String; 2]], digests: &mut [Vec<String>; 4]| {
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
-        let state = db_digest(db);
-        for (k, out) in outputs[h as usize - 1].iter().enumerate() {
-            let mut data = state.clone();
+        let out = &outputs[h as usize - 1];
+        let (state, reduced) = (db_digest(db), reduced_digest(db));
+        for (k, (base, out)) in [(&state, &out[0]), (&state, &out[1]), (&reduced, &out[1])].into_iter().enumerate() {
+            let mut data = base.clone();
             data.extend_from_slice(out.as_bytes());
             digests[k].push(keccak256(&data).to_string());
         }
+        digests[3].push(keccak256(out[0].as_bytes()).to_string());
     };
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
@@ -245,7 +288,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<Str
         };
         let liq_res = match b.liq {
             None => NativeExecutor::run_liquidations(&mut ctx),
-            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act),
+            Some((scan, act)) => NativeExecutor::run_liquidations_with(&mut ctx, scan, act, liq::ADL_WORK_PER_BLOCK),
         };
         ctx.save_order_books();
         let agg = pinned(&agg);
@@ -273,8 +316,9 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<Str
         if std::env::var("GOLDEN_PRINT").is_ok() {
             let rows = |tag: u8| ctx.state.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap().len();
             println!(
-                "  block {h}: liquidations={} vault_positions={} cooldown={} prev_mark={} cursor={} pending={} trades={}",
+                "  block {h}: liquidations={} adl={} vault_positions={} cooldown={} prev_mark={} cursor={} pending={} trades={}",
                 metrics.liquidations_triggered.get(),
+                metrics.liquidations_adl.get(),
                 ctx.positions.positions_for_trader(&liq::LIQUIDATOR_VAULT).unwrap().len(),
                 rows(liq::COOLDOWN_TAG),
                 rows(liq::PREV_MARK_TAG),
@@ -319,7 +363,6 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<Str
     } else {
         assert_eq!(holder.rows_builds(), 0);
     }
-    let [digests, pre_row50_digests] = digests;
     if std::env::var("GOLDEN_PRINT").is_ok() {
         println!(
             "summary threads={threads:?}: accepted={} rejected_cancelled={} rejected_margin={} liquidations={} positions={} liq_rows={}",
@@ -350,7 +393,7 @@ fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<Str
             metrics.sell_margin_cuts[1][1].iter().map(|c| c.get()).collect::<Vec<_>>(),
         );
     }
-    (digests, pre_row50_digests)
+    digests
 }
 
 struct Lcg(u64);
@@ -561,7 +604,10 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// (8, 0) unchanged; top-ups (full, partial, none) = (393, 0, 2). The marks
 /// here walk up to ±900 per block (3% of the mid), so same-batch bids sit
 /// far above the start bid B0: the s89 bound followed them, B-blind covers
-/// B0 + 30 ticks only.
+/// B0 + 30 ticks only. Re-pinned by adl-budget A3 (rule H): from block 2 (the
+/// first mark change) the `0x03` rows are `last ‖ prev`; every block's
+/// results and position / balance / liquidation rows (the `0x03` values cut
+/// to `last`) checked equal to the D10 digests' run before re-pinning.
 ///
 /// Row 50 keeps these as the pre-row-50 pins: the digests over the
 /// [`pre_row50`] view of the results must stay exactly these (state, gas,
@@ -569,56 +615,127 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// success / error only.
 const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
     "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0x2284087928a8c8753efa5355fb90d3993a781ccd6dc93642fea91528732cbdad",
-    "0xbd5bd04f2e1e9b445ec102b461fbf506a92a2054b1301013d42f11af2adff0f8",
-    "0x26775ae3d5baec11446832b8dbcecdf1f2ca3286ab23c6a12d824c029c28b6c9",
-    "0x366884dbde98bcf0308d6248644d0ac91ebf211e42a99c15c4c5c673f932744f",
-    "0x04b7be2cb2d2c80957563a8fc0855b4f3212a6ea96f5088537988324a8f9a11a",
-    "0x5ba4d2fdaa7c9f95e1182c11fdc08391ee44e0b9e0dc485b72ca5b0cc54d9bed",
-    "0xba8206944edc83ec4f0d4aa8d6d906905bcd462df719282dfd497fd8145c4b5e",
-    "0x079961f4d69af475d3724614f78c3c05d3002c2d5a76dbad6deb91a519f50086",
-    "0x580ac36cac8cf8295e1f711152502335c55b0d59187ecf7b951f5dd5806027e6",
-    "0x1151116c5cc5f7a22af8f0299d36f89864d0ba505a3676ada8696c5c116a0599",
-    "0x1456c3b4d0de478bcefd4bed519c5288d9946861e7c37914e99e327e9187f923",
+    "0x7960e867a35c8fdce5f56e5d3d6661162f8a96b14a350628d83604b434cf3e59",
+    "0x0deec3de2ab24b612cca75d3c47e0011738c35dabe404af3a65a43577c261fc0",
+    "0x129722e4f2903ebe050545391ae83abcad213281ec8c23be16d8b3bc9d8bf433",
+    "0xcdbdfe174f649470f76be10c682bbe8303cea0d95d185cf47687df2fc90b6756",
+    "0x721844dce07776e4592fff8226d4a4b43276ca41dcf09b499de02ad48356713c",
+    "0x5604445b0b78069641ee2b8c7672c1618a1453099204819edca910f679920db9",
+    "0x964a678de1c4ea0e0b9e41105df3869f1f8b485933624e205f9db2329d776285",
+    "0x19463cac6e154c0a1ffba1373e36fe9075a51d42e9681baf0442fc63cab47fc1",
+    "0xbf6055429f8f1a82473be75c259f142c1332e4cf11396afe861f1cf8c58f96c2",
+    "0x92fe19c4cec83034d4ea3837faf04d350798c12eb8d2cdcba6f85240452a0970",
+    "0x214002d6bcf9c104b7361973e1b70e9712d334c55ca4829d32483374496b4047",
 ];
 /// Scenario A at row 50 (s96, owner decision): an order the book refuses or
 /// cancels without a fill is rejected with its HL reason (success false, an
 /// error), not executed; gas and everything else as [`PRE_ROW50_A`].
+/// Re-pinned at the merge of row 50 into adl-budget (s25, blocks 2-12;
+/// block 1 is main's: rule H changes nothing before the first mark change):
+/// the rule-H state with row 50's labels. Proof, in two parts: the state is
+/// adl-budget's ([`PRE_ROW50_A`], adl-budget's pins, and
+/// `golden_repins_change_only_rule_h_and_p2_rows` pass unchanged), and the
+/// row-50 outputs are main's ([`ROW50_OUT_A`], checked in every run); every
+/// R mode and the engine give the same digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0x8e809cbd45abcc0545c71fa1e509b7ab261510773ea274bcfa4c429ff1104dac",
-    "0x9fce81bd56ac0fe851bd363547599bdf8d8e345f6f0a41b668a711e855e2539b",
-    "0xa5c2913771cabf06653dc40068a32f05ad644c08d597b1023e6938310f868c7b",
-    "0xc3369ad3810c8cace12fd2f462bb0e1d8c1e3b81171d2019cd15bac04b228e06",
-    "0x3f78722d7737d12048b66021062f7503ffaf1c2c61cee31e9887540a1c6b2f15",
-    "0x8efdc745286e9202b6fc5d52d1f2349dd7135e896248baf3ed994c782cb431c3",
-    "0xd53420062afa2f890c26b53df03f4cfb66a05699a28dbae5e3fd6090a304e833",
-    "0x3c6e4857a5f542c7ec73890ecde1034a4fa315ef019c84c8c2565fe4914cf7fb",
-    "0x2398b3bd6fda7614e49238a10d4dc6f931c584cbda437df57a5e36cece40bda3",
-    "0x8733aa91e2759daed4a9beb7cf7a3803fc9a36e49ce9d5b33bce055f27a5be76",
-    "0x90fab3384498cb2db3ab07d0b2ccb5c1082f7e6f22be338347f707aac4f79fc7",
-    "0xf1f68bbd98bdae97a8de1daa1ddb877d2e5746f4f17aeac5d8b57c0451d2b7bc",
+    "0x3292c34d45b5ef098ba276ae158ee0c201cf0419a5f5f0673bf0ab4abceac828",
+    "0xd0aa3bd3bab354190bc64a7e66e7ff0172578305f9b46f2ccf693f5923a5f521",
+    "0x5c7bf9ba72de8918b8f3d3efda137b1d0bd8cd38bfed38c8aa6bb0a14dabf9c3",
+    "0x6270f1e4d41dbc104e198639cbe6118affe3af8d7a1e13b52894652b4f14023f",
+    "0x352308f4f49f066a7f479cad088011b562f718ee0600617b364322fc059293bd",
+    "0x6847c337ecb796dc46d57afc36d4b29adb697e3d482e7c159175af196f9d5963",
+    "0x9a1a741c170f8c7c84024f6500cfad6524647f501eb52e462225be0c25ae5c12",
+    "0xd47a8ee40cfac970b559b63ccd469abfdd0cb7a2afaff38680d9560d725a853d",
+    "0xb3520cea6e8b5ecd151edbe88ff813edf03d892129fd5de2357cc9ac91f2b239",
+    "0x83f6c8bfe6fd92475fd069d063d91501f82134ae7dc5aff70945eb27dfa62df9",
+    "0x4e7880623e2f1aa95a6b3d3be8465c25a43d3628a6c6d02efb43e4ee1b5c19f7",
+];
+/// Scenario A's outputs alone in the row-50 view (s99 review LOW 2):
+/// keccak256 over each block's output string (results, gas, liquidation
+/// results, trade index, next order id, fatal error, funnel metrics; no DB
+/// row). Equal to main's (7348576a, the row-50 merge; checked against its
+/// output dump, serial and engine, R Inline / Worker / Off: byte-identical
+/// to this branch's), so with [`PRE_ROW50_A`] the merge's [`GOLDEN_A`]
+/// re-pin is adl-budget's state plus main's row-50 outputs.
+const ROW50_OUT_A: [&str; A_BLOCKS as usize] = [
+    "0x23f04f7f1940fd0ea9e7199467856ff19e94fd5e9feb6a731e4ab6d7fa354ff5",
+    "0xb019cecb20537d9f70418bdce16c7e98e6c79cc4f879359429c1c98b2ef1b079",
+    "0x11c88743a5704bfe253573b06e178e5dff795e242a75acbb2cead0e0fa2518c5",
+    "0xbd812ad25dc5302aa2c0363d00da462ecfa26cf1552e1bd0f7fde1eefd8e920c",
+    "0x732d7cca926d2b612cc98d3a938217de3e67622f78e56b9e14ac7cf3ed0ca176",
+    "0x3fdf84c3576003162295b79c1f4f869f8c28a159ffc7126dccf43263eaaa4371",
+    "0x2858ee5256d4a24a81ecf30ae5bcc67354598e8843af6af62d479f524e60ba20",
+    "0x50e06807e87e5bc0a495b9bff420068ba2b320676853d24a1d7673b6b4bbde91",
+    "0xc52ccf15aac9f4863f5cac31b2461b6e01a7a3d9b416c1b8a16a5c0f7b38cd0f",
+    "0xa28a95f4abd15db763bf6c603af847a936fee06eebe37dfab01ca19c9f13e6e1",
+    "0x9f74082b27774f46fd22f09f287a5a27944b105e035bfec7b9ace7a530bee740",
+    "0xa73989938536f8cf022cc16d297beaa0e3e5e8bb67cfef2b455969f8cd5a2f68",
 ];
 /// Scenario B on c93c579 (no book rejection: the same with and without the
-/// pre-row-50 view).
+/// pre-row-50 view); re-pinned by adl-budget A3 (rule H): from block 6
+/// (the first mark change) the `0x03` rows are `last ‖ prev`; every block's
+/// results and position / balance / liquidation rows (the `0x03` values cut
+/// to `last`) checked equal to the D10 digests' run before re-pinning.
+/// Re-pinned by adl-budget A5+A6 (P2, on purpose): from block 8 (the first
+/// ADL block) the ADL'd positions pass through the escrows (`0x07` rows
+/// written and deleted in the block: tombstones in the running hash, escrow
+/// balance rows); [`golden_repins_change_only_rule_h_and_p2_rows`] proves
+/// every other row and every block's outputs equal to 56318a9's (D10, no P2).
 const GOLDEN_B: [&str; 18] = [
     "0x01ad98e2504ea6d07d86d94eb488ea2f620b593effec4284b1cb37a3cf07cdbd",
     "0xd5ce9dd0a968a2016bb69dc20bc5e12ba6e9bf600539c7cc2989087b49e98562",
     "0xd8abb0cf2659f07e75b8727065ad904f5216d93f0ea257066e0c0b35336e9268",
     "0x4993dfb40e8b399bd26259a06dcf3b3cc8863a3234b2a4470cdbfefd3156f85e",
     "0xdad5dd048374e566c584bd587745d949e7aa053bd1b0e36e43d36e61c76010f2",
-    "0xc0d047fa5ae5b4641924063d9d67f203c2788a0a91e2301e6e9e3634b5ddc7dc",
-    "0x82219ea69717ef004a6b291d775c328fc12af6c33ff6eec3f703e8ee5ae87b6f",
-    "0x7f639e61703da2cce928adbad2b036b139c94e620fee028f7850e821982a51ca",
-    "0xd4399be1f08f404e26c96ae4cebdd280bf211e0c81f809ab0179c23b06dd0f20",
-    "0xda0330908ca7cf9b53873f0e5b0786c2dfb49d1b260c1c705ff320d6d6157179",
-    "0xe199aa106ea73caf7a394cf3a3a139f159083e336835dc5d713604cc8c74e91f",
-    "0x977df580684dafa431097fd40494ef5e9c13b619e16cc64e51c2787ceb96170b",
-    "0x931b70afb6c0dda49742a5cfd88efd5e838f59656f0f46ea9cceeef8d1d25050",
-    "0xaf52e01b7f6e0024dba69213f932e4925b7af4e0b4b235402f5c3e16b314f1f6",
-    "0x0d8de3f9c2113cb5fbd1cba0e6f284d96b585bed9948671fde57f1db0369477d",
-    "0x9f21b7d6fab6f78ae5b753fa3751fcd8ff462332e777063692ef0974024a0fa8",
-    "0x1661b87681327eea7728c912ef4a63965082b2e15fb24ca6b4f071ff5eb974b7",
-    "0xddb569290db77e72f597a706895d10fca15687cefd1b1f053d2aa878fa819545",
+    "0x08d89c1339ddf8b3da9246c698dd2673ad0398da8d70bdfa0985c17ae9604636",
+    "0xb86de24be5bbd879d94fbef2787cb3d24813d99e7d141e570b23d0917a83a4be",
+    "0xe56b53c9c75fa016fbd55e849f7fd71f75d412b94a0a51cf339d4585c99dbc0f",
+    "0x005f8e8c234f1c1c52ff405e93f3d91c3678c31147a3846a54749556656afd73",
+    "0x529970a5d09713b43c2972318e79c5a300016f1d26e20bf19a47c70a627878b0",
+    "0x3332a37809b93f4bb770cf0879083e31a453b0cf19a62f7b6d249bad559ed42a",
+    "0x831a18eb3ce615493024f86bed6426c50408945b6fc64ce0b5333aa37e6e884b",
+    "0xdb7b953bade90906fee455b7a502e27f09c4e980f0f2f723f8a38e027c0f8984",
+    "0x932f47d6158e82abaf81b2eabdf3a7843fe5d78a8c9cde8111c76df67b3dc601",
+    "0x530fe2e8ee6823ecc00939450c914dc090538b683f584a50895222accbc1b01e",
+    "0x5abd2a1432860f381db233de5715719a617b11a159363689bdd7e9cca45c5fb2",
+    "0x194865aa6001ef32b7982be69f08e62e6f1e824ec0a0ab087f689219c87f408a",
+    "0xab7e76a736438367521abc81cdf93c13060e37669dd681824f0e26ba11b5dad0",
+];
+/// [`golden_repins_change_only_rule_h_and_p2_rows`]: pinned on 56318a9.
+const REDUCED_A: [&str; A_BLOCKS as usize] = [
+    "0x1e216ac310a4dc30f9d20b20dc0804ddcb92139f362779b4ef72777a5c256395",
+    "0xdcf49a1ce6009f620d6ff1266adfa6f23cfcaf30fef509a3aa59a83178b798c4",
+    "0x95b5b46d895d255e59a4d8db1140916820173420257c30f27dcf476089c7d9b1",
+    "0x3a1a0425da7327bf46cc94d9fcfc985ff0b729772caba374a466fa62455c4ebb",
+    "0xd25f195f0051ee647a33c4fe7dde50b2fa183080695599f08aae12b77db2d28f",
+    "0xb5bfbf3ed1d60b6d7fdf24653ad365947d8fe34e78cf0814f686c6336d8c51dc",
+    "0x5b42210a9ab79087a0215784812c3c23a520e07bf51af9b19662c6f3153e3022",
+    "0x389cd1a820427a59fb1a1edb458d08f2a1cc80ebaeb9270b473d1d08e60dc2df",
+    "0x1568b3e98c89657bffed3f3b32f9c2b2ee7467af6aa937ae3037a052abb7771e",
+    "0xcffe661162f742bfef8479065dcb5970bd12585817fd35ef8d4c1a97d37dde62",
+    "0xf1a5fcfa71a63b7ac1debc6f4824bb4fd0fdde6865525094c57aeba638482d52",
+    "0x2c386f2dfc1c57fef323e35abe851fdef467326897b07075749f0cd6e751bacd",
+];
+const REDUCED_B: [&str; 18] = [
+    "0x86b5bbc4e7b12940fcaddd409473acc127055700930c7e2c01982c3995c1d2a6",
+    "0x76d1fca7edae343d092286720cafee54839d4fb5cff2c00f140fabc02b04cca2",
+    "0xd4b9f654dd63fd9489fea94ccf57f3f723b9d4d9bbcd8ae0124d6d931caf63d3",
+    "0xf02634d7adc94e535b13832909c7b9c26ba2269b1a9c0a6519a84b20f10b67f7",
+    "0xfa8a5ab7f9a2747ac39b83e8288c2f77f7553c0d47c1a88994cb57d1d538b2d4",
+    "0x5cd4fcc1eef97ef3a242faeda00a7d014df0a3f67a5b7236314844f90d3fac96",
+    "0x108f3b38bcd0c60eab535eef5e306e38fd4a44c22d580e45a44336f647bcf085",
+    "0x2ce64fc511d84ecf8ec00999634e68940cd5d259938b38d418629cccb676facc",
+    "0x12aeb2450213a440321509e37a628f2f6dbc5e095230f59c29b1d7107b12b8fe",
+    "0xbdc5885774cfc04aafcfe239b123f78c035acd82b288dc128e9e8f16dc285298",
+    "0x1983d61d95707772e8e5816d5856d93aaa9f8dc888557ebb035c08bca7a28ac0",
+    "0x93b7296ab71602ae128a4bc76187c88cf3e981202d227a79f187b75d0c2777ba",
+    "0xfbe0deac489a3c9394627d3ca84c29b42fd8ced5c125418780f04e820ef6575b",
+    "0xf6fba44ba5aebcf7fa1abfe4e8b2bb7d58dabb289fd858711f27f612e885d55d",
+    "0xdff904f5b8d4d6861ef61f8c0ff267ecf0c0ed36743eea3ad99e6ef7d578d278",
+    "0x4958522c33a537ea933e990150a60c66b6fb444deca45f245e7f821489416ca0",
+    "0x70667a0748eaa57168bd62b47f3093867d61835ca7bcd455e7873fe17bb429c1",
+    "0x0c263752661d6caa0b40181ba74be4af244bd4faf5f94bd180b262d0b67908a4",
 ];
 
 fn check(name: &str, got: &[String], want: &[&str]) {
@@ -638,8 +755,9 @@ fn scenario_a_serial_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        let (digests, pre_row50, row50_out) = run(&db, &blocks, None, r);
         check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
@@ -650,8 +768,9 @@ fn scenario_a_engine_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        let (digests, pre_row50) = run(&db, &blocks, Some(4), r);
+        let (digests, pre_row50, row50_out) = run(&db, &blocks, Some(4), r);
         check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
@@ -661,8 +780,24 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
     for r in R_MODES {
         let (_d, db) = listed_db(&[1, 2, 3]);
         let blocks = scenario_b(&db);
-        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        let (digests, pre_row50, _) = run(&db, &blocks, None, r);
         check("GOLDEN_B", &digests, &GOLDEN_B);
         check("GOLDEN_B", &pre_row50, &GOLDEN_B);
     }
+}
+
+/// 18c review (adl-budget A3 nit c; A5/A6): the GOLDEN_A / GOLDEN_B re-pins
+/// change only rule H's `0x03` rows and P2's rows. The reduced digests
+/// ([`reduced_digest`] + the block's outputs) were pinned on 56318a9 (D10, no
+/// P2) with this same function and stay equal after rule H and P2. They
+/// predate row 50, so they take the outputs' pre-row-50 view ([`run_all`]).
+#[test]
+fn golden_repins_change_only_rule_h_and_p2_rows() {
+    let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
+    let (_d, db) = listed_db(&markets);
+    let blocks = scenario_a(&db);
+    check("REDUCED_A", &run_all(&db, &blocks, None, R::Off)[2], &REDUCED_A);
+    let (_d, db) = listed_db(&[1, 2, 3]);
+    let blocks = scenario_b(&db);
+    check("REDUCED_B", &run_all(&db, &blocks, None, R::Off)[2], &REDUCED_B);
 }

@@ -1,0 +1,148 @@
+{
+  "prp": "adl-budget",
+  "created": "2026-10-06T23:00:00",
+  "notes": "Plan: docs/plans/adl-budget-impl.md (final owner decisions 18c s96: C1, rank per block+market+side, W units, FIFO obligation rows, P2 two escrows, H1 clamp kept, rule H last-different-mark, Q5 freeze dropped, funding doc-only, node-local conservation sum, W sized so an HL event closes in one block). Plan fixed after 18c review of 7c2c784. Commit A1+A2 together and A5+A6 together. Env: CARGO_TARGET_DIR=/home/oz/.cargo-target-adl-budget; F='--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar'.",
+  "tasks": [
+    {
+      "id": "A1",
+      "name": "core adl_candidates over a trader set, escrow constants, escrows excluded; remove ADL_MAX_SCAN_ROWS (Q1)",
+      "status": "done",
+      "files": [
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-core/tests/liquidation_tests.rs",
+        "docs/plans/liquidation.md"
+      ],
+      "validate": "cargo nextest run -p torus-core liquidation $F && cargo check --workspace --tests -q",
+      "depends_on": [],
+      "commit": "56318a9"
+    },
+    {
+      "id": "A2",
+      "name": "bridge C1 wiring (records/E2 + fallback walk), >65,536-row fairness test, L1 adl_rankings counter, ubench parts",
+      "status": "done",
+      "files": [
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/src/liquidation_l1_tests.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs",
+        "crates/torus-bridge/tests/ubench_adl.rs"
+      ],
+      "validate": "cargo nextest run -p torus-bridge liquidation $F && cargo nextest run -p torus-bridge scenario_b_liquidation_digests $F",
+      "depends_on": [
+        "A1"
+      ],
+      "commit": "56318a9"
+    },
+    {
+      "id": "A3",
+      "name": "rule H: 0x03 row last||[prev], base = last different mark (D10 change); same-mark-interval same pre-clamp price test",
+      "status": "done",
+      "files": [
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-core/tests/liquidation_tests.rs",
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs",
+        "docs/plans/liquidation.md"
+      ],
+      "validate": "cargo nextest run -p torus-core adl_base $F && cargo nextest run -p torus-bridge liquidation $F",
+      "depends_on": [],
+      "commit": "07c0deb"
+    },
+    {
+      "id": "A4",
+      "name": "core obligation rows 0x07 (height|market|side|trader -> size|price), put_obligation = insert (errors on an existing key) or delete at <= 0, adl_close qty limit, cross_close, liquidation_due checks 0x07",
+      "status": "done",
+      "files": [
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-core/tests/liquidation_tests.rs",
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs"
+      ],
+      "validate": "cargo nextest run -p torus-core liquidation $F && cargo nextest run -p torus-bridge liquidation_due $F",
+      "depends_on": [
+        "A1"
+      ],
+      "commit": "c782dc0"
+    },
+    {
+      "id": "A5",
+      "name": "at B: positions to the side escrow at the clamped rule-H price with a RUNNING rest (O(P), adl_rest becomes cfg(test) shadow), obligation rows, D9 never positive (error log if > 0; test p2_d9_remainder_is_never_positive); escrows skipped by the pass; run_liquidations_with(work)",
+      "status": "done",
+      "files": [
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-bridge/src/liquidation_l1_tests.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs",
+        "crates/torus-bridge/tests/perf_equivalence_golden.rs",
+        "docs/plans/liquidation.md"
+      ],
+      "validate": "cargo nextest run -p torus-bridge p2_ $F && cargo nextest run -p torus-bridge same_mark_interval $F",
+      "depends_on": [
+        "A2",
+        "A3",
+        "A4"
+      ]
+    },
+    {
+      "id": "A6",
+      "name": "drain under W: update_obligation (overwrite existing / delete at 0); 1 unit per row visited, per-block ranking cache per (market, side) with a per-key position (adl_close returns closes/next/read), close at stored price, listed-unmarked rows wait / delisted rows rank at the stored price (OQ1), escrow pairing via vault, dust sweep (test-only bound, >=1 token error log), vault pending row set AFTER the drain; HL-sized event in one block; non-ignored W floor test; GOLDEN_B re-pin",
+      "status": "done",
+      "files": [
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-bridge/src/liquidation_l1_tests.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs",
+        "crates/torus-bridge/tests/perf_equivalence_golden.rs",
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-core/tests/liquidation_tests.rs"
+      ],
+      "validate": "cargo nextest run -p torus-core adl_ $F && cargo nextest run -p torus-bridge p2_ $F && cargo nextest run -p torus-bridge an_hl_sized $F && cargo nextest run -p torus-bridge liquidation $F && cargo nextest run -p torus-bridge offmark_bad_debt $F && cargo nextest run -p torus-bridge perf_equivalence $F",
+      "depends_on": [
+        "A5"
+      ]
+    },
+    {
+      "id": "A7",
+      "name": "e2e (0x07 rows keep empty blocks due with a usable mark through block 15, equal roots; restart mid-drain = uninterrupted; test_adl_work hook) + records-vs-walk work units equal (L1) + gauges (queue rows, queue_deficit, adl_work_total, escrow notional, dust, pairing) + gated node-local value sum (TORUS_LIQ_VALUE_SUM)",
+      "status": "done",
+      "files": [
+        "crates/torus-consensus/src/app.rs",
+        "crates/torus-bridge/src/native_executor.rs",
+        "crates/torus-bridge/src/liquidation_step.rs",
+        "crates/torus-core/src/liquidation.rs",
+        "crates/torus-telemetry/src/lib.rs",
+        "crates/torus-bridge/tests/liquidation_tests.rs",
+        "docs/monitoring-setup.md",
+        "crates/torus-bridge/src/liquidation_l1_tests.rs"
+      ],
+      "validate": "cargo nextest run -p torus-consensus liquidation_e2e $F && cargo nextest run -p torus-bridge telemetry_ $F",
+      "depends_on": [
+        "A6"
+      ]
+    },
+    {
+      "id": "A8",
+      "name": "ubench_adl multi-block + HL mode (N=5000, one side, 100 keys, 300 rows); measure units/ms incl. block-B ms; per-block bound incl. adl_cross rows; set ADL_WORK_PER_BLOCK = max(1.25 x U_hl, 500,900); document in adl-budget.md (bench-runner)",
+      "status": "done",
+      "files": [
+        "crates/torus-bridge/tests/ubench_adl.rs",
+        "crates/torus-core/src/liquidation.rs",
+        "docs/plans/adl-budget.md"
+      ],
+      "validate": "cargo nextest run -p torus-bridge an_hl_sized $F && UB_ADL_HL=1 UB_ADL_TRADERS=5000 cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture",
+      "depends_on": [
+        "A6"
+      ]
+    },
+    {
+      "id": "C",
+      "name": "Proof (final list): ADL'd accounts end at 0; S=750 vault ~0 from ADL under H (bases checked via logs + 0x03 rows at 787/788/790); escrows 0/0 (dust separate); S=400 unchanged; HL-sized event in one block; conservation sum every drain block; S=750 liveness + drain blocks (bench-runner)",
+      "status": "pending",
+      "files": [],
+      "validate": "cargo nextest run --workspace $F",
+      "depends_on": [
+        "A7",
+        "A8"
+      ]
+    }
+  ]
+}

@@ -26,6 +26,26 @@ use crate::position::{MarginType, Position, PositionManager};
 /// Item 3 (decision 7): the liquidator vault — a fixed protocol account (no
 /// known key: no signed action can come from it). Deposits: later branch.
 pub const LIQUIDATOR_VAULT: Address = Address::new(*b"torus-liquidator-vlt");
+/// adl-budget P2 (owner s96): the ADL escrows — protocol accounts (no known
+/// key) that take a bankrupt account's positions at their ADL price in the
+/// bankruptcy block, one per side so opposite obligations never net. Never
+/// classified, never ADL candidates, excluded from funding (adl-budget §8).
+pub const ADL_ESCROW_LONG: Address = Address::new(*b"torus-adl-escrow-lng");
+pub const ADL_ESCROW_SHORT: Address = Address::new(*b"torus-adl-escrow-sht");
+
+/// The escrow that takes a bankrupt position of side `is_long`.
+pub fn adl_escrow(is_long: bool) -> Address {
+    if is_long {
+        ADL_ESCROW_LONG
+    } else {
+        ADL_ESCROW_SHORT
+    }
+}
+
+pub fn is_adl_escrow(a: &Address) -> bool {
+    *a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT
+}
+
 /// HL: positions above this notional (at the mark) are liquidated in chunks.
 /// Raw units (`FixedPoint::from_raw` is not `const`).
 pub const CHUNK_NOTIONAL_THRESHOLD_RAW: i128 = 100_000 * FixedPoint::SCALE;
@@ -38,11 +58,25 @@ pub const CHUNK_COOLDOWN_SECS: u64 = 30;
 pub const LIQ_SCAN_PER_BLOCK: usize = 2_048;
 /// D5 (decided, user s517): accounts acted on per block.
 pub const LIQ_ACT_PER_BLOCK: usize = 64;
-/// Review H3 (s517): ADL counterparties are searched in at most this many
-/// `CF_NATIVE_POSITIONS` rows (key order, paged) per ADL'd position. Beyond
-/// it the ranking covers that window only; a partial close is retried by a
-/// later step. Deterministic; bounds the rare ADL path's cost.
-pub const ADL_MAX_SCAN_ROWS: usize = 65_536;
+/// adl-budget Q3 / s99: the ADL work units per block. Block B's own
+/// transfers are charged first ([`ADL_TRANSFER_UNITS`] per position moved to
+/// an escrow; B is never cut), the drain gets what is left: per obligation
+/// row 1 (visit) + its (market, side) ranking once per block (the HOLDERS of
+/// the market: traders other than the two escrows with a position row in it)
+/// + 1 per candidate valued for the first time in the block + the
+/// candidates read (+ edge rows). Owner 18c s99, option 2 (adl-budget.md
+/// §11.5, §12): W = 100,000 keeps the worst measured HL-shaped block <= ~125
+/// ms on ozarchy (~250 ms on the rig); an HL event at N = 5,000 accounts with
+/// ~10 % holders per market still closes in its own block, at every account
+/// holding every market it takes ~6 blocks.
+pub const ADL_WORK_PER_BLOCK: u64 = 100_000;
+/// adl-budget s99 (owner decision 3): block B's own work in W units — per
+/// position the pass moves to an ADL escrow (`adl_to_escrow`: the transfer's
+/// two fills, the balance read, the obligation row, the log line). Measured
+/// (§9 / §11, ozarchy): B costs 3.3-3.8 µs per transfer (HL 1.0 ms / 300,
+/// S=750-like B₁ 66 ms / 17,280, classification included) against 0.55-0.8
+/// µs per drain unit: 4.1-6.9 units, rounded up to 6.
+pub const ADL_TRANSFER_UNITS: u64 = 6;
 /// Rows per seek of the bounded walks.
 const SCAN_PAGE: usize = 1_024;
 /// `CF_NATIVE_LIQUIDATION` tags (0x01 unused / reserved: no account index, C1).
@@ -52,6 +86,11 @@ pub const CURSOR_KEY: [u8; 1] = [0x04];
 /// Review M2 (s517): `0x06 ‖ trader` — the account was still under MM after
 /// its last liquidation action (keeps the step due; 0x05 is reserved).
 pub const PENDING_TAG: u8 = 0x06;
+/// P2 (s96): `0x07 ‖ height(8) ‖ market(8) ‖ side(1: 1 long) ‖ trader(20)` ->
+/// `size raw (16, BE) ‖ price raw (16, BE)`: what the escrow of `is_long`
+/// still owes for `trader`'s position taken at block `height` at `price`
+/// (per account: H1's clamp).
+pub const ADL_OBLIGATION_TAG: u8 = 0x07;
 
 // ============================================================================
 // Pure parts
@@ -302,82 +341,105 @@ pub fn backstop<T: StateBackend>(
     Ok(())
 }
 
-/// Decision 5 (ADL): close `u`'s position in `m` at `price` against `ranked`
-/// in order, `q = min(remaining, candidate size)` each (a candidate whose
-/// position vanished or changed side is skipped). Returns the closes in
-/// order, `(counterparty, size)` (the caller logs them).
+/// Decision 5 (ADL): close at most `qty` of `u`'s position in `m` at `price`
+/// against `ranked` in order, `q = min(remaining, candidate size)` each (a
+/// candidate whose position vanished or changed side is skipped). Returns
+/// `(closes, next, read)`: the closes in order, `(counterparty, size)` (the
+/// caller logs them); `next` = how many leading candidates are used up
+/// (vanished, flipped or fully closed: adl-budget Q2, the drain's cache
+/// position); `read` = how many candidates were read (Q3 work units).
 pub fn adl_close<T: StateBackend>(
     pm: &PositionManager<T>,
     u: &Address,
     m: MarketId,
     price: FixedPoint,
+    qty: FixedPoint,
     ranked: &[AdlCandidate],
-) -> Result<Vec<(Address, FixedPoint)>, CoreError> {
+) -> Result<(Vec<(Address, FixedPoint)>, usize, usize), CoreError> {
     let mut closes = Vec::new();
+    let (mut next, mut read) = (0usize, 0usize);
     let Some(up) = pm.get_position(u, m)? else {
-        return Ok(closes);
+        return Ok((closes, next, read));
     };
-    let mut remaining = up.size;
+    let mut remaining = up.size.min(qty);
     for c in ranked {
         if remaining <= FixedPoint::ZERO {
             break;
         }
-        if c.trader == *u {
-            continue;
+        read += 1;
+        // Used up: no later row of the block needs this candidate again.
+        let used_up = c.trader == *u
+            || match pm.get_position(&c.trader, m)? {
+                Some(cp) if cp.is_long != up.is_long && cp.size > FixedPoint::ZERO => {
+                    let q = remaining.min(cp.size);
+                    transfer(pm, u, &c.trader, m, q, price)?;
+                    closes.push((c.trader, q));
+                    remaining -= q;
+                    q == cp.size
+                }
+                _ => true,
+            };
+        if used_up && next + 1 == read {
+            next += 1;
         }
-        let Some(cp) = pm.get_position(&c.trader, m)? else { continue };
-        if cp.is_long == up.is_long || cp.size <= FixedPoint::ZERO {
-            continue;
-        }
-        let q = remaining.min(cp.size);
-        transfer(pm, u, &c.trader, m, q, price)?;
-        closes.push((c.trader, q));
-        remaining -= q;
     }
-    Ok(closes)
+    Ok((closes, next, read))
 }
 
-/// ADL counterparties in `m`: every position on side `want_long`, `exclude`
-/// skipped, in `CF_NATIVE_POSITIONS` key order; `av` values each. Review H3:
-/// a paged walk of at most `max_rows` rows (the caller passes
-/// [`ADL_MAX_SCAN_ROWS`]) — never a whole-CF load.
-pub fn adl_candidates<T: StateBackend>(
+/// P2 edge (real holders exhausted): escrow long sells `q` at `p_long`, escrow
+/// short buys `q` at `p_short`. Two prices realize (p_long - p_short) x q more
+/// than one shared price would; the vault pays it, so value is conserved.
+/// Returns the vault's change (+ = credited). Never flips or opens an escrow
+/// position (18c review): q <= 0, or an escrow not holding at least q on its
+/// own side, is an error and nothing is written.
+pub fn cross_close<T: StateBackend>(
     pm: &PositionManager<T>,
     m: MarketId,
-    exclude: &Address,
-    want_long: bool,
-    max_rows: usize,
-    av: impl Fn(&Address) -> Result<FixedPoint, CoreError>,
-) -> Result<Vec<AdlCandidate>, CoreError> {
-    let mut rows = Vec::new();
-    let mut start: Vec<u8> = Vec::new();
-    while rows.len() < max_rows {
-        let want = SCAN_PAGE.min(max_rows - rows.len());
-        let page = pm.state().iterate_cf_from(CF_NATIVE_POSITIONS, &start, want)?;
-        let done = page.len() < want;
-        if let Some((k, _)) = page.last() {
-            start = [k.as_slice(), &[0u8]].concat(); // the next key after k
-        }
-        rows.extend(page);
-        if done {
-            break;
+    q: FixedPoint,
+    p_long: FixedPoint,
+    p_short: FixedPoint,
+    vault: &Address,
+) -> Result<FixedPoint, CoreError> {
+    let of = |_| CoreError::Overflow("adl cross close overflows i128".into());
+    for (e, is_long) in [(ADL_ESCROW_LONG, true), (ADL_ESCROW_SHORT, false)] {
+        let holds = pm.get_position(&e, m)?.is_some_and(|p| p.is_long == is_long && p.size >= q);
+        if q <= FixedPoint::ZERO || !holds {
+            return Err(CoreError::InvalidInput(format!("adl cross close: {e} cannot close {q:?} in {m}")));
         }
     }
+    pm.apply_fill(&ADL_ESCROW_LONG, m, false, q, p_long, MarginType::Cross)?;
+    pm.apply_fill(&ADL_ESCROW_SHORT, m, true, q, p_short, MarginType::Cross)?;
+    let paid = p_short.checked_sub(p_long).map_err(of)?.checked_mul(q).map_err(of)?;
+    let mut vb = pm.get_native_balance(vault)?;
+    vb.available = vb.available.checked_add(paid).map_err(of)?;
+    pm.put_native_balance(vault, &vb)?;
+    Ok(paid)
+}
+
+/// Q1 (s96): ADL counterparties = every position on side `want_long` of
+/// `traders` (ascending, each once; the escrows skipped), `get` reading a
+/// trader's position in the ADL market, `av` valuing a holder (ranking only,
+/// C7). Work units (Q3, s99): the caller counts the traders `get` finds a
+/// position for (the market's holders: `traders` must hold every one of
+/// them; escrows are never read) and its first-sight valuations.
+pub fn adl_candidates(
+    traders: &[Address],
+    want_long: bool,
+    mut get: impl FnMut(&Address) -> Result<Option<Position>, CoreError>,
+    mut av: impl FnMut(&Address) -> Result<FixedPoint, CoreError>,
+) -> Result<Vec<AdlCandidate>, CoreError> {
     let mut out = Vec::new();
-    for (k, v) in rows {
-        if k.len() != 28 || k[20..28] != m.to_be_bytes() {
-            continue;
-        }
-        let p: Position = borsh::from_slice(&v).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        if p.is_long != want_long || p.trader == *exclude || p.size <= FixedPoint::ZERO {
+    for t in traders.iter().filter(|t| !is_adl_escrow(t)) {
+        let Some(p) = get(t)? else { continue };
+        if p.is_long != want_long || p.size <= FixedPoint::ZERO {
             continue;
         }
         out.push(AdlCandidate {
-            trader: p.trader,
+            trader: *t,
             is_long: p.is_long,
             size: p.size,
             entry_price: p.entry_price,
-            account_value: av(&p.trader)?,
+            account_value: av(t)?,
         });
     }
     Ok(out)
@@ -480,12 +542,13 @@ pub fn set_pending<T: StateBackend>(state: &T, t: &Address, on: bool) -> Result<
     Ok(true)
 }
 
-/// Telemetry (node-local, read-only): the number of pending rows — paged
-/// prefix seeks over the `0x06` tag, nothing collected.
-pub fn pending_count<T: StateBackend>(state: &T) -> Result<u64, CoreError> {
-    let (mut n, mut start) = (0u64, vec![PENDING_TAG]);
+/// Telemetry (node-local, read-only): the number of rows of `tag` (the
+/// pending rows `0x06`, the ADL obligation rows `0x07`) — paged prefix seeks,
+/// nothing collected.
+pub fn tag_count<T: StateBackend>(state: &T, tag: u8) -> Result<u64, CoreError> {
+    let (mut n, mut start) = (0u64, vec![tag]);
     loop {
-        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[PENDING_TAG], &start, SCAN_PAGE)?;
+        let page = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[tag], &start, SCAN_PAGE)?;
         n += page.len() as u64;
         match page.last() {
             Some((k, _)) if page.len() == SCAN_PAGE => start = [k.as_slice(), &[0u8]].concat(),
@@ -546,46 +609,167 @@ pub fn clear_cooldown<T: StateBackend>(state: &T, t: &Address) -> Result<(), Cor
     Ok(())
 }
 
-/// D10: the previous mark rows of `markets` (absent rows omitted).
-pub fn prev_marks<T: StateBackend>(
-    state: &T,
-    markets: impl IntoIterator<Item = MarketId>,
-) -> Result<BTreeMap<MarketId, FixedPoint>, CoreError> {
-    let mut out = BTreeMap::new();
-    for m in markets {
-        if let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? {
-            let raw = i128::from_be_bytes(v.as_slice().try_into().map_err(|_| malformed("prev mark"))?);
-            out.insert(m, FixedPoint::from_raw(raw));
-        }
-    }
-    Ok(out)
+/// Rule H (owner s96, changes D10): `0x03 ‖ m` -> last(16) ‖ [prev(16)]: the
+/// market's last usable mark and the mark before it that DIFFERED from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkRow {
+    pub last: FixedPoint,
+    pub prev: Option<FixedPoint>,
 }
 
-/// D10 + review H1: store this step's marks as the next step's previous
-/// marks (only rows whose value changed); a listed market WITHOUT a usable
-/// mark loses its row, so a previous mark is always the immediately
-/// preceding usable mark — never one from before an oracle outage.
-pub fn put_prev_marks<T: StateBackend>(
+/// The rows of `markets` and each marked market's pre-clamp ADL base this
+/// step: the old `last` when the mark changed, else `prev` (absent: the
+/// caller uses the mark, D10's fallback).
+pub fn adl_bases<T: StateBackend>(
+    state: &T,
+    markets: &[MarketId],
+    marks: &BTreeMap<MarketId, FixedPoint>,
+) -> Result<(BTreeMap<MarketId, FixedPoint>, BTreeMap<MarketId, MarkRow>), CoreError> {
+    let raw = |b: &[u8]| -> Result<FixedPoint, CoreError> {
+        Ok(FixedPoint::from_raw(i128::from_be_bytes(b.try_into().map_err(|_| malformed("prev mark"))?)))
+    };
+    let (mut bases, mut rows) = (BTreeMap::new(), BTreeMap::new());
+    for &m in markets {
+        let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &prev_mark_key(m))? else { continue };
+        let row = match v.len() {
+            16 => MarkRow { last: raw(&v)?, prev: None },
+            32 => MarkRow { last: raw(&v[..16])?, prev: Some(raw(&v[16..])?) },
+            _ => return Err(malformed("prev mark")),
+        };
+        if let Some(mark) = marks.get(&m) {
+            if let Some(b) = if *mark != row.last { Some(row.last) } else { row.prev } {
+                bases.insert(m, b);
+            }
+        }
+        rows.insert(m, row);
+    }
+    Ok((bases, rows))
+}
+
+/// Rule H: a listed market with a usable mark that differs from its row's
+/// `last` (or has no row) gets (last = mark, prev = old last); an unchanged
+/// mark writes nothing; a listed market without a usable mark loses its row
+/// (review H1: never a base from before an oracle outage). Returns the writes.
+pub fn put_mark_rows<T: StateBackend>(
     state: &T,
     listed: &[MarketId],
     marks: &BTreeMap<MarketId, FixedPoint>,
-    prev: &BTreeMap<MarketId, FixedPoint>,
-) -> Result<(), CoreError> {
+    rows: &BTreeMap<MarketId, MarkRow>,
+) -> Result<usize, CoreError> {
+    let mut writes = 0;
     for m in listed {
         let k = prev_mark_key(*m);
-        match marks.get(m) {
-            Some(p) if prev.get(m) != Some(p) => {
-                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &p.raw().to_be_bytes())?
-            }
-            Some(_) => {}
-            None => {
-                if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
-                    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        match (marks.get(m), rows.get(m)) {
+            (Some(p), Some(r)) if r.last == *p => {}
+            (Some(p), r) => {
+                let mut v = p.raw().to_be_bytes().to_vec();
+                if let Some(r) = r {
+                    v.extend_from_slice(&r.last.raw().to_be_bytes());
                 }
+                state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+                writes += 1;
             }
+            (None, Some(_)) => {
+                state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+                writes += 1;
+            }
+            (None, None) => {}
         }
     }
+    Ok(writes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Obligation {
+    pub height: u64,
+    pub market: MarketId,
+    pub is_long: bool,
+    pub trader: Address,
+    pub size: FixedPoint,
+    pub price: FixedPoint,
+}
+
+impl Obligation {
+    /// The row key (see [`ADL_OBLIGATION_TAG`]). Unique per obligation: an
+    /// account leaves liquidation flat in its bankruptcy block, so a
+    /// re-bankruptcy of the same trader gets a new (later) height — never a
+    /// key collision ([`put_obligation`] rejects one).
+    pub fn key(&self) -> [u8; 38] {
+        let mut k = [0u8; 38];
+        k[0] = ADL_OBLIGATION_TAG;
+        k[1..9].copy_from_slice(&self.height.to_be_bytes());
+        k[9..17].copy_from_slice(&self.market.to_be_bytes());
+        k[17] = u8::from(self.is_long);
+        k[18..].copy_from_slice(self.trader.as_slice());
+        k
+    }
+}
+
+/// Write `o` as a new row (size > 0) or delete its row (size 0). A new row
+/// over an existing key is an error (never an overwrite: see
+/// [`Obligation::key`]); so are a negative size (it never vanishes
+/// silently) and a price <= 0 (18c review).
+pub fn put_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
+    let k = o.key();
+    if o.size < FixedPoint::ZERO || o.price <= FixedPoint::ZERO {
+        return Err(CoreError::InvalidInput(format!("adl obligation: negative size or price <= 0: {o:?}")));
+    }
+    if o.size == FixedPoint::ZERO {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        return Ok(());
+    }
+    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_some() {
+        return Err(CoreError::InvalidInput(format!("adl obligation row exists: {o:?}")));
+    }
+    let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
     Ok(())
+}
+
+/// adl-budget A6: overwrite the EXISTING row of `o`'s key with `o`'s size and
+/// price (the drain's remainder, the pairing partner), or delete it at size
+/// 0. A missing row, a negative size or a price <= 0 is an error.
+pub fn update_obligation<T: StateBackend>(state: &T, o: &Obligation) -> Result<(), CoreError> {
+    let k = o.key();
+    if o.size < FixedPoint::ZERO || o.price <= FixedPoint::ZERO {
+        return Err(CoreError::InvalidInput(format!("adl obligation: negative size or price <= 0: {o:?}")));
+    }
+    if state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.is_none() {
+        return Err(CoreError::InvalidInput(format!("adl obligation row missing: {o:?}")));
+    }
+    if o.size == FixedPoint::ZERO {
+        state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &k)?;
+        return Ok(());
+    }
+    let v = [o.size.raw().to_be_bytes(), o.price.raw().to_be_bytes()].concat();
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &k, &v)?;
+    Ok(())
+}
+
+/// The first obligation at or after `start` (the bare tag, or a key + 0x00).
+/// A malformed row (lengths, side byte, size or price <= 0) is an error.
+pub fn next_obligation<T: StateBackend>(state: &T, start: &[u8]) -> Result<Option<Obligation>, CoreError> {
+    let Some((k, v)) = state.iterate_cf_prefix_from(CF_NATIVE_LIQUIDATION, &[ADL_OBLIGATION_TAG], start, 1)?.pop()
+    else {
+        return Ok(None);
+    };
+    if k.len() != 38 || v.len() != 32 || k[17] > 1 {
+        return Err(malformed("adl obligation"));
+    }
+    let raw = |b: &[u8]| i128::from_be_bytes(b.try_into().expect("16 bytes"));
+    let (size, price) = (FixedPoint::from_raw(raw(&v[..16])), FixedPoint::from_raw(raw(&v[16..])));
+    // Review L1: the writers never store size <= 0 or price <= 0.
+    if size <= FixedPoint::ZERO || price <= FixedPoint::ZERO {
+        return Err(malformed("adl obligation (size or price <= 0)"));
+    }
+    Ok(Some(Obligation {
+        height: u64::from_be_bytes(k[1..9].try_into().expect("8 bytes")),
+        market: MarketId::from_be_bytes(k[9..17].try_into().expect("8 bytes")),
+        is_long: k[17] == 1,
+        trader: Address::from_slice(&k[18..]),
+        size,
+        price,
+    }))
 }
 
 /// D5: the round-robin scan cursor (the last trader scanned by a cut pass).
