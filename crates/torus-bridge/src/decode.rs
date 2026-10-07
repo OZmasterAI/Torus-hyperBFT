@@ -38,6 +38,20 @@ pub fn decode_rlp_tx(rlp_bytes: &[u8]) -> Result<DecodedTx, BridgeError> {
     })
 }
 
+/// The gas limit `rlp_bytes` declares, or `None` for a tx execution skips
+/// before running it: not an envelope, or a type Torus does not execute (the
+/// same types [`decode_rlp_tx`] refuses). No signature recovery: this runs
+/// before every vote (item 7 step 0), so a supported tx with a bad signature
+/// still counts its gas (the mempool never admits one).
+pub fn declared_gas_limit(rlp_bytes: &[u8]) -> Option<u64> {
+    match TxEnvelope::decode(&mut &rlp_bytes[..]).ok()? {
+        TxEnvelope::Legacy(s) => Some(s.tx().gas_limit),
+        TxEnvelope::Eip2930(s) => Some(s.tx().gas_limit),
+        TxEnvelope::Eip1559(s) => Some(s.tx().gas_limit),
+        _ => None,
+    }
+}
+
 /// Decode a batch of RLP-encoded signed EVM transactions.
 pub fn decode_all_txs(rlp_txs: &[Vec<u8>]) -> Result<Vec<DecodedTx>, BridgeError> {
     rlp_txs.iter().map(|b| decode_rlp_tx(b)).collect()

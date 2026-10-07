@@ -1498,6 +1498,26 @@ fn check_parent_link(
         );
         return BlockDataCheck::Invalid;
     }
+    // Item 7 step 0: the EVM gas limit and the base fee are the parent's (a
+    // pure header comparison, like the timestamp rule). Both start at the
+    // genesis parent header's values. Gas limit: when governance can change
+    // it, this becomes "equals the rule value". Base fee: fixed on purpose
+    // until the owner decides EIP-1559 vs a fixed fee
+    // (docs/plans/item7-evm-lanes.md, open question 4); the EIP-1559 check in
+    // `torus_bridge::validator` is not wired into consensus.
+    if header.evm_gas_limit != parent.evm_gas_limit
+        || header.base_fee_per_gas != parent.base_fee_per_gas
+    {
+        tracing::warn!(
+            height = header.height,
+            evm_gas_limit = header.evm_gas_limit,
+            parent_evm_gas_limit = parent.evm_gas_limit,
+            base_fee_per_gas = header.base_fee_per_gas,
+            parent_base_fee_per_gas = parent.base_fee_per_gas,
+            "REJECTED -- block EVM gas limit or base fee differs from its parent's"
+        );
+        return BlockDataCheck::Invalid;
+    }
     if header.height == parent.height + 1 && header.parent_hash == expected {
         return BlockDataCheck::Held;
     }
@@ -1509,6 +1529,41 @@ fn check_parent_link(
         "REJECTED -- header does not link to its parent block's header (ancestry violation)"
     );
     BlockDataCheck::Invalid
+}
+
+/// Item 7 step 0, pre-vote only (like the native action count): the EVM body
+/// fits its header. `evm_tx_count` equals the body's tx count (crash replay
+/// loads a body only when the header counts are non-zero), and the txs'
+/// declared gas limits sum to at most `evm_gas_limit`: gas used is unknown
+/// before execution, and execution fails the whole EVM section once the
+/// cumulative gas exceeds the limit. An honest proposer passes: `drain_evm`
+/// sums declared limits up to min(header limit, local budget). A tx that does
+/// not decode counts no gas: execution skips it (D3 S392, s84 decision 1), it
+/// is never a reason to reject the block.
+fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool {
+    if evm_txs.len() != header.evm_tx_count as usize {
+        tracing::warn!(
+            height = header.height,
+            header_count = header.evm_tx_count,
+            body_count = evm_txs.len(),
+            "not voting -- header evm_tx_count != body"
+        );
+        return false;
+    }
+    let declared = evm_txs
+        .iter()
+        .filter_map(|tx| torus_bridge::declared_gas_limit(tx))
+        .fold(0u64, u64::saturating_add);
+    if declared > header.evm_gas_limit {
+        tracing::warn!(
+            height = header.height,
+            declared,
+            evm_gas_limit = header.evm_gas_limit,
+            "not voting -- EVM txs declare more gas than the block's limit"
+        );
+        return false;
+    }
+    true
 }
 
 /// T0b: max seconds a proposal's header timestamp may run ahead of this
@@ -5246,7 +5301,8 @@ impl TorusApp {
     /// s84 (vote after body): a QC implies a quorum holds the block AND its
     /// out-of-band native-action bodies (compact proposals carry only hashes).
     /// Cheap: fail-stop, the one datum, its hash, decode, the header's action
-    /// count against the body, the header's link to its parent (s84 decision
+    /// count and EVM tx count and gas against the body (item 7 step 0,
+    /// [`evm_body_fits_header`]), the header's link to its parent (s84 decision
     /// 2, [`check_parent_link`], `parent` looks the parent up), then a
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
@@ -5269,10 +5325,13 @@ impl TorusApp {
         let bytes = datums[0].bytes();
         // Same decode order as `decode_proposal_and_ensure_durable_core`.
         // Execution fail-stops on an action-count mismatch (T1.2), so such a
-        // block must never be certified.
+        // block must never be certified. Item 7 step 0: the EVM body must fit
+        // the header ([`evm_body_fits_header`]).
         let (header, compact) = match bincode::deserialize::<TorusBlock>(bytes) {
             Ok(full) => {
-                if full.native_actions.len() != full.header.native_action_count as usize {
+                if full.native_actions.len() != full.header.native_action_count as usize
+                    || !evm_body_fits_header(&full.header, &full.evm_transactions)
+                {
                     return BlockDataCheck::Invalid;
                 }
                 (full.header, None)
@@ -5282,6 +5341,7 @@ impl TorusApp {
                     return BlockDataCheck::Invalid;
                 };
                 if compact.native_action_hashes.len() != compact.header.native_action_count as usize
+                    || !evm_body_fits_header(&compact.header, &compact.evm_transactions)
                 {
                     return BlockDataCheck::Invalid;
                 }
@@ -15626,6 +15686,18 @@ mod crash_recovery_tests {
         input: Vec<u8>,
         value: U256,
     ) -> Vec<u8> {
+        signed_eip1559_gas(key, nonce, to, input, value, 300_000)
+    }
+
+    /// [`signed_eip1559_with_value`] declaring `gas_limit`.
+    fn signed_eip1559_gas(
+        key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+        value: U256,
+        gas_limit: u64,
+    ) -> Vec<u8> {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
         use alloy_rlp::Encodable;
         let tx = TxEip1559 {
@@ -15633,7 +15705,7 @@ mod crash_recovery_tests {
             nonce,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 0,
-            gas_limit: 300_000,
+            gas_limit,
             to,
             value,
             input: alloy_primitives::Bytes::from(input),
@@ -16997,6 +17069,226 @@ mod crash_recovery_tests {
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
             assert_eq!(read_native_applied_height(&db), Some(2), "replay={replay}");
         }
+    }
+
+    // ---- item 7 step 0: EVM header rules before the vote ----
+
+    /// A signed EVM tx declaring `gas_limit` (a plain call, zero value).
+    fn evm_tx_gas(nonce: u64, gas_limit: u64) -> Vec<u8> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        signed_eip1559_gas(&key, nonce, to, vec![], U256::ZERO, gas_limit)
+    }
+
+    /// `child_of(parent)` carrying `evm` (header `evm_tx_count` matching).
+    fn evm_child_of(parent: &TorusBlock, evm: Vec<Vec<u8>>) -> TorusBlock {
+        let mut b = child_of(parent, parent.header.timestamp);
+        b.header.evm_tx_count = evm.len() as u32;
+        b.evm_transactions = evm;
+        b
+    }
+
+    /// [`pre_vote`] of `block` sent as a FULL or a COMPACT datum.
+    fn pre_vote_as(
+        app: &mut TorusApp,
+        parent: &TorusBlock,
+        block: &TorusBlock,
+        compact: bool,
+    ) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let datum = encode_proposal_datum(block, compact);
+        let hs = Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(block.header.height),
+            justify_for(&hs_parent),
+            CryptoHash::new(TorusApp::hash_datum(&datum)),
+            Data::new(vec![Datum::new(datum)]),
+        );
+        let header = parent.header.clone();
+        app.check_proposal_data(&hs, move |_| ParentHeader::Header(Box::new(header)))
+    }
+
+    /// `evm_gas_limit` and `base_fee_per_gas` must equal the parent's, before
+    /// the vote and in `check_parent_link` (so also on insertion: a pure
+    /// header check, the same verdict on every replica). Higher and lower are
+    /// both refused; the first block is held to the genesis parent's values.
+    /// RED before step 0: every variant was `Held`.
+    #[test]
+    fn evm_gas_limit_and_base_fee_must_equal_the_parents() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        let honest = child_of(&parent, 2_000);
+        assert_eq!(pre_vote(&mut app, &parent, &honest), BlockDataCheck::Held);
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        type Change = fn(&mut TorusBlockHeader);
+        let variants: [(&str, Change); 4] = [
+            ("gas limit raised", |h| h.evm_gas_limit += 1),
+            ("gas limit lowered", |h| h.evm_gas_limit -= 1),
+            ("base fee raised", |h| h.base_fee_per_gas += 1),
+            ("base fee lowered", |h| h.base_fee_per_gas -= 1),
+        ];
+        for (what, change) in variants {
+            let mut b = honest.clone();
+            change(&mut b.header);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                BlockDataCheck::Invalid,
+                "{what}"
+            );
+            let header = parent.header.clone();
+            assert_eq!(
+                check_parent_link(&b.header, &justify_for(&hs_parent), move |_| {
+                    ParentHeader::Header(Box::new(header))
+                }),
+                BlockDataCheck::Invalid,
+                "{what}: parent link"
+            );
+        }
+
+        // First block: the parent is genesis_parent_header (30M, 1 gwei).
+        let mut app = ts_app(1_700_000_000);
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let mut b1 = make_block(1, vec![]);
+        b1.header.timestamp = 1_700_000_000;
+        let genesis = torus_bridge::genesis_parent_header();
+        assert_eq!(b1.header.evm_gas_limit, genesis.evm_gas_limit);
+        assert_eq!(b1.header.base_fee_per_gas, genesis.base_fee_per_gas);
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Held
+        );
+        b1.header.evm_gas_limit = 60_000_000;
+        assert_eq!(
+            app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// Before the vote the EVM body must fit the header: `evm_tx_count`
+    /// equals the body's tx count (crash replay trusts the header counts) and
+    /// the txs' declared gas limits sum to at most `evm_gas_limit` (execution
+    /// fails the whole EVM section over the limit). An undecodable tx counts
+    /// no gas: execution skips it (s84 decision 1). Full and compact datums.
+    /// RED before step 0: the count and gas variants were `Held`.
+    #[test]
+    fn evm_body_must_fit_the_header_before_the_vote() {
+        let parent = tip_2000();
+        let limit = parent.header.evm_gas_limit;
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let at_limit = evm_child_of(
+                &parent,
+                vec![evm_tx_gas(0, limit / 2), evm_tx_gas(1, limit / 2)],
+            );
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &at_limit, compact),
+                BlockDataCheck::Held,
+                "declared gas == limit (compact={compact})"
+            );
+            let over = evm_child_of(
+                &parent,
+                vec![
+                    evm_tx_gas(0, limit / 2),
+                    evm_tx_gas(1, limit / 2),
+                    evm_tx_gas(2, 21_000),
+                ],
+            );
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &over, compact),
+                BlockDataCheck::Invalid,
+                "declared gas > limit (compact={compact})"
+            );
+            let one_too_big = evm_child_of(&parent, vec![evm_tx_gas(0, limit + 1)]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &one_too_big, compact),
+                BlockDataCheck::Invalid,
+                "one tx over the limit (compact={compact})"
+            );
+            let with_garbage = evm_child_of(&parent, vec![evm_tx_gas(0, limit), vec![0xff; 8]]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &with_garbage, compact),
+                BlockDataCheck::Held,
+                "an undecodable tx is skipped at execution, counts no gas (compact={compact})"
+            );
+            for count in [0, 1, 3] {
+                let mut miscounted = at_limit.clone();
+                miscounted.header.evm_tx_count = count;
+                assert_eq!(
+                    pre_vote_as(&mut app, &parent, &miscounted, compact),
+                    BlockDataCheck::Invalid,
+                    "header evm_tx_count {count} != body 2 (compact={compact})"
+                );
+            }
+        }
+    }
+
+    /// An honest proposal with EVM txs passes the pre-vote check, even with the
+    /// proposer-local budget set far above the header limit: `drain_evm`
+    /// caps the declared gas at min(header limit, budget).
+    #[test]
+    fn honest_proposal_with_evm_txs_passes_the_pre_vote_check() {
+        let (config, db) = make_test_config_and_db();
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        db.put_account(
+            &sender,
+            &revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                evm_block_gas_budget: u64::MAX,
+                evm_sender_share_pct: 0,
+                ..torus_mempool::MempoolConfig::default()
+            },
+        ));
+        for nonce in 0..4 {
+            mempool.add_evm_tx(evm_tx_gas(nonce, 10_000_000)).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool), None);
+        let parent = TorusBlock {
+            header: app.last_header.clone(),
+            native_actions: vec![],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        let resp = app.build_proposal(parent.header.clone());
+        let produced = app.pending_proposals[&(parent.header.height + 1)]
+            .block
+            .clone();
+        assert_eq!(
+            produced.evm_transactions.len(),
+            3,
+            "30M header limit fits three 10M txs"
+        );
+        assert_eq!(produced.header.evm_tx_count, 3);
+        assert_eq!(produced.header.evm_gas_limit, parent.header.evm_gas_limit);
+        assert_eq!(
+            produced.header.base_fee_per_gas,
+            parent.header.base_fee_per_gas
+        );
+
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let hs = Block::new(
+            hotstuff_rs::types::data_types::BlockHeight::new(produced.header.height),
+            justify_for(&hs_parent),
+            resp.data_hash,
+            resp.data,
+        );
+        let header = parent.header.clone();
+        assert_eq!(
+            app.check_proposal_data(&hs, move |_| ParentHeader::Header(Box::new(header))),
+            BlockDataCheck::Held
+        );
     }
 
     // ---- item 2: oracle helpers ----
