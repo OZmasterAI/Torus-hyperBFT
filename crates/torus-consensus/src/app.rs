@@ -17738,36 +17738,58 @@ mod crash_recovery_tests {
 
     /// The drain keeps no in-memory state across blocks (the ranking cache is
     /// per block, the dust bound test-only): the blocks above, run 2 stops
-    /// after block 8 (mid-drain: 7 rows left), drops the ExecutionContext and
-    /// reopens it on the same DB (cold R slot, no resident state) for 9..=15.
-    /// Equal native root and dump after every block from 9 on.
+    /// after block 8 (mid-drain: 7 rows left), drops the ExecutionContext AND
+    /// the StateDb (RocksDB closed), opens the DB again from its directory
+    /// (as a node restart does: running-hash activation configured again, a
+    /// cold R slot, no resident state, a new Metrics instance) for 9..=15.
+    /// Equal native root and dump after every block from 9 on, and the same
+    /// drain work units (`liquidation_adl_work_total`) in every block 1..=15
+    /// (18c review, s96 fix list d: the units are what a restart could
+    /// change without moving W = 2's one-row-per-block progress).
     #[test]
     fn liquidation_e2e_adl_drain_survives_a_restart() {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let blocks = adl_e2e_blocks();
         let run = |restart_before: Option<usize>| {
-            let (config, db) = adl_e2e_fixture();
-            let mut ctx = make_exec_ctx(&config, &db);
-            ctx.test_adl_work = Some(2);
-            let mut after = Vec::new();
+            let (config, mut db) = adl_e2e_fixture();
+            let dir = db.inner().path().to_path_buf();
+            let open_ctx = |db: &StateDb| {
+                let mut ctx = make_exec_ctx(&config, db);
+                ctx.test_adl_work = Some(2);
+                ctx.metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
+                ctx
+            };
+            let mut ctx = open_ctx(&db);
+            let (mut after, mut units) = (Vec::new(), Vec::new());
             for (i, b) in blocks.iter().enumerate() {
                 if Some(i) == restart_before {
                     assert_eq!(adl_rows(&db), 7, "mid-drain");
                     drop(ctx);
-                    ctx = make_exec_ctx(&config, &db);
-                    ctx.test_adl_work = Some(2);
+                    drop(db);
+                    db = StateDb::open(&dir).expect("reopen the state db");
+                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height)
+                        .expect("configure running hash activation");
+                    assert_eq!(adl_rows(&db), 7, "mid-drain after the reopen");
+                    ctx = open_ctx(&db);
                 }
+                let work = |ctx: &ExecutionContext| {
+                    ctx.metrics.as_ref().expect("metrics attached").liquidation_adl_work_total.get()
+                };
+                let before = work(&ctx);
                 ctx.execute_committed_block(b, vec![]);
                 assert!(!ctx.exec_failed.load(Ordering::SeqCst), "block {}", i + 1);
+                units.push(work(&ctx) - before);
                 if i >= 8 {
                     after.push((dump_all_cfs(&db), torus_state::native_trie::persisted_native_root(&db).unwrap()));
                 }
             }
             assert_eq!(adl_rows(&db), 0);
-            after
+            (after, units)
         };
-        let straight = run(None);
-        let restarted = run(Some(8));
+        let (straight, units_s) = run(None);
+        let (restarted, units_r) = run(Some(8));
+        assert!(units_s.iter().filter(|&&u| u > 0).count() >= 14, "a drain in blocks 2..=15: {units_s:?}");
+        assert_eq!(units_s, units_r, "drain work units per block, straight vs restarted");
         for (i, ((d1, r1), (d2, r2))) in straight.iter().zip(restarted.iter()).enumerate() {
             assert_dumps_equal(d1, d2, &format!("block {}", i + 9));
             assert_eq!(r1, r2, "block {}: native root", i + 9);
