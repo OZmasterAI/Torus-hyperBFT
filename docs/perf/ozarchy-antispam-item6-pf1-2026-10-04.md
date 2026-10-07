@@ -2474,18 +2474,76 @@ s750vs with it on (conservation). Driver
 
 ### 24.1 Conservation with the value sum on
 
-- **s400vs:** `value_sum` 69,980,200,000,000.00 at h100 to
-  69,980,199,999,999.98 at ~h2780 on all 3 validators. Only 3 changes, each
-  -0.0078125 (2^-7, 1 f64 ULP at 7e13), at h376 / h465 / h596, the same on
-  every validator; no jump at the 100 backstops (~h820). Conserved up to f64
-  rounding. Not rerun: it never touches ADL or escrows.
-- **The sum-on cells cannot drain:** with the value sum on, exec takes ~0.34 s
-  per block, keeping `exec_queue_depth` at 58 while the feed runs, so the
-  drain criterion (exec lag <= 2) is never met. Not a liveness failure (the
-  chain went from h574 at bench end to ~h2780). Stopped by the owner during
-  the drain at 02:34; logs saved in
-  `ozarchy-adlcells-300m-s400vs/partial-at-stop/`. No rc / verdict file.
-- **s750vs not run.** It is the cell that matters (ADL + escrows).
+`value_sum` is `FixedPoint` (i128, scale 1e8) and its log line prints it
+exactly; only the Prometheus gauge `liquidation_value_sum` is f64
+(`liquidation_step.rs:144-181` at `6a25e20`). Compare the log values as
+decimals, never as floats.
+
+- **Correction (s24):** the first version of this section said s400vs changed
+  only 3 times by 1 f64 ULP. That came from comparing the values as floats.
+  Exact recount (`partial-at-stop/vs-val*.txt`): unchanged h100-h350, then
+  557-568 changes from h351, net -0.0208 by ~h2780 (69,980,199,999,999.97924),
+  the same on all 3 validators (the files differ only in where they stop).
+- **s400vs drain:** exec lag sat at 65-66 for the whole 772 s feed-live drain
+  (`drain-samples.jsonl`; exec ~0.34 s per block with the value sum on), so
+  the criterion (exec lag <= 2) was never met. Not a liveness failure (h574
+  at bench end to ~h2780). Stopped by the owner at 02:34; no rc / verdict
+  file. Not rerun: S=400 has no ADL or escrows.
+- **Drain fix:** `bench/liq-stress` @ `95f50cdb` adds
+  `ORACLE_FEED_DRAIN_MAX_LAG` (default 2, needs `ORACLE_FEED_DRAIN=1`), passed
+  as `--max-lag` to the feed-live drain only. Timed cells are unchanged. Value-sum
+  cells use 1000. Harness tests 171 passed.
+
+### 24.2 s750vs (value sum on, S=750)
+
+Driver `ozarchy-adlcells-s750vs-campaign.sh` (s750vs only), same node and
+bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
+
+- **Verdict:** rc 0, AGREE, ACCEPT, liveness PASS; feed-live drain 57 s
+  (max exec lag 66). The drain after the feed pause did not go quiet within
+  its 60 s (exec queue 0 at 58 s); the digest was still quiescent.
+- **Liquidations:** 100 ADL, 0 backstop, 0 stage 1 on all 3 validators;
+  "ADL to escrow" 26,666 (h613 8,777, h614 12,563, h615 5,326). `adl_queue`
+  max 14,731 at h614, 0 at h619 (7 drain blocks, 74 blocks from the shock at
+  h545). Heaviest liquidation block 1,400 / 1,293 / 1,264 ms.
+- **Vault:** -0.00074019 on all 3 validators, 0 open positions.
+- **Value sum** (`value-sum-val{0,1,2}.txt`, identical on all 3, 201
+  changes): h100 69,980,200,000,000.00000000 unchanged to h404, then:
+
+| heights | change | fills | per fill (1e-8 units) |
+|---|---|---|---|
+| h404-437 | -0.00502494 | 2.98M | -0.17 |
+| h482-524 | -0.00803519 | 2.90M | -0.28 |
+| h547-611 | -0.00451432 | 1.87M | -0.24 |
+| h611-616 (ADL) | -0.00135589 | 264k | -0.51 |
+| h437-482, h524-547 | +0.00011 each | ~20k each | ~0 |
+| h700-810 | -0.00000374 | 0 | - |
+| h810-1402 | 0 | 0 | - |
+| h1402-1500 | **-1,740.68816344** | 0 | - |
+| h1500-1702 | 0 | 0 | - |
+
+- **Dust verdict (18c's rule: conserved = dust, drifts with the ADL count =
+  trace):** the drift follows trade fills (~-0.2 units of 1e-8 per fill, net
+  -0.0209 by h1402), not ADL. ADL adds ~2-3 units per op above the fill
+  rate, the same order as the vault's -0.00074 (s750: -0.00084). So the vault
+  figure is dust. The per-fill drift is a separate rounding bias in trade
+  settlement (not traced).
+- **The -1,740.69 step** (09:58:20-26Z) follows the feed pause at 09:57:12Z.
+  Marks expire after 60 s; the sum drops markets without a usable mark
+  (`liquidation_step.rs:321-324`) and unmarked positions count at entry, and
+  the feed's last mark check shows markPrice 0. Most likely a measuring
+  artifact (inferred, not proved per market). Compare the sum only while marks
+  are fresh. Fix (c) of the C2 round (one common price per market) targets it.
+- **Escrow dust lines** (2 per validator, identical): s750 step h803 long
+  +0.00132290, short -0.00216415 (sum -0.00084125 = h803 `adl_dust` = vault
+  deficit); s750vs step h620 long +0.00147665, short -0.00221684 (sum
+  -0.00074019 = vault deficit). At the end escrow notional, `adl_queue` and
+  `adl_queue_deficit` are 0 on all validators. The sweep (~:899) moves an
+  escrow's whole collateral to the vault once it holds no positions; the
+  escrows are not digest accounts, so their 0 balance has no digest-level
+  proof. 18c (s99): explain and fix as part of C2.
+- Harness nit: `funnel-val*.csv` has a 14-name header and 15 values per row
+  (columns after `rej_margin` shifted by one).
 
 ## Open
 
@@ -2586,11 +2644,12 @@ s750vs with it on (conservation). Driver
   **Budget built** (`perf/adl-budget` @ `6a25e20`, section 24): S=750 passes
   (rc 0, AGREE, 22 s drain, vault -0.00084). Still open: the heaviest
   liquidation block is ~1.1-1.2 s vs ~250 ms (C2 + W re-size next).
-- ADL proof cells, open points (section 24): rerun s750vs alone after a drain
-  fix for sum-on cells (pause the feed or exempt them from the exec-lag
-  check); is the s750 vault -0.00084 rounding dust or a leak (2 escrow dust
-  lines); escrows still open at the end of s750 (not read yet); is the value
-  sum f64 (check before calling conservation exact).
+- ADL proof cells (section 24.2): vault -0.00074 / -0.00084 is dust; the
+  escrow dust lines get a test or fix in C2; the value sum drifts ~-0.2 units
+  of 1e-8 per trade fill (rounding bias in trade settlement, not traced); the
+  sum is only valid while marks are fresh (-1,740.69 step after the feed
+  pause). Harness: the post-pause drain (60 s) is too short for value-sum
+  cells; `funnel-val*.csv` header is one column short.
 - Liquidation stress at S=400: all backstop is explained (section 23.2, AV/MM
   ~0.40 after the shock). A stage-1 cell needs a shock of ~290 bp on this
   shape.
