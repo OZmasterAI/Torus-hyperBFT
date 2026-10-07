@@ -408,9 +408,19 @@ fn a_corrupt_book_mode_marker_is_an_error() {
 
 // ---- 6. Precompile 0x0800 --------------------------------------------------
 
+/// s99 owner decision (final): the 0x0800 reader serves the level-row
+/// layouts (modes 2 / 3); a mode-1 (order-row) market reverts as unsupported.
+#[test]
+fn precompile_get_order_book_reverts_on_mode1() {
+    let (_dir, db) = open_test_db();
+    seed(&db, BookMode::OrderRows);
+    let err = call_get_order_book(&db, 1).expect_err("mode 1 is not served");
+    assert!(err.contains("order-row layout"), "{err}");
+}
+
 #[test]
 fn precompile_get_order_book_serves_row_modes() {
-    for mode in [BookMode::OrderRows, BookMode::LevelAuthority] {
+    for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
         let (_dir, db) = open_test_db();
         let exp = seed(&db, mode);
         let arrays = call_get_order_book(&db, 1).expect("precompile must decode row modes");
