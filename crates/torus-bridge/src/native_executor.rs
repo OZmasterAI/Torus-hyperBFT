@@ -857,6 +857,10 @@ struct AccountReader<'a, T: StateBackend> {
     batch: Option<&'a BatchSums>,
     /// Item 6 M1: `margin_configs`' tiers by market id (batch reader only).
     dense_tiers: Option<&'a DenseTiers<'a>>,
+    /// adl-dirty-check (node-local): the ADL drain's dirty traders
+    /// (`DrainCache::dirty_traders`, ranking reader only), in place of a
+    /// `layer_touches` per read. `None` elsewhere.
+    drain_dirty: Option<&'a std::collections::HashSet<Address>>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -1297,6 +1301,13 @@ impl BatchSums {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// adl-dirty-check (tests): [`AccountReader::dirty`] answers from the ADL
+    /// drain's set, from `layer_touches`.
+    static DIRTY_CHECKS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 thread_local! {
     /// C6c (D): each Phase 3 worker's maker cache, in front of the shared
     /// memo locks: [`AccountReader::maker_free`] per maker for the batch
@@ -1434,6 +1445,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             sums: ctx.sums.as_ref(),
             batch: None,
             dense_tiers: None,
+            drain_dirty: None,
         }
     }
 
@@ -1519,12 +1531,27 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     }
 
     /// Whether the block wrote under `trader`'s positions prefix (own pending
-    /// writes or tombstones): C6c's frozen set on a batch reader, else
-    /// `layer_touches` ("dirty" when R is not attached).
+    /// writes or tombstones): the ADL drain's set on its ranking reader,
+    /// C6c's frozen set on a batch reader, else `layer_touches` ("dirty" when
+    /// R is not attached).
     fn dirty(&self, trader: &Address) -> bool {
+        let touches = || self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice());
+        if let Some(set) = self.drain_dirty {
+            let d = set.contains(trader);
+            #[cfg(test)]
+            {
+                assert_eq!(d, touches(), "drain dirty set == layer_touches ({trader})");
+                DIRTY_CHECKS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+            }
+            return d;
+        }
         match self.batch.and_then(|b| b.dirty.as_ref()) {
             Some(set) => set.contains(trader),
-            None => self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice()),
+            None => {
+                #[cfg(test)]
+                DIRTY_CHECKS.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                touches()
+            }
         }
     }
 
@@ -6017,6 +6044,7 @@ impl NativeExecutor {
             sums: ctx.sums.as_ref(),
             batch: batch_sums.as_ref(),
             dense_tiers: Some(&dense_tiers),
+            drain_dirty: None,
         };
         // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
         // configs and marks: each batch market's, once (item 6 M1).
@@ -8568,6 +8596,7 @@ impl NativeExecutor {
             sums: ctx.sums.as_ref(),
             batch: None,
             dense_tiers: None,
+            drain_dirty: None,
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
