@@ -627,24 +627,25 @@ const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
 /// Scenario A at row 50 (s96, owner decision): an order the book refuses or
 /// cancels without a fill is rejected with its HL reason (success false, an
 /// error), not executed; gas and everything else as [`PRE_ROW50_A`].
-/// Merge of row 50 into adl-budget (s24): block 1 is the same on both sides
-/// (rule H changes nothing before the first mark change); blocks 2-12 are
-/// main's row-50 pins over D10 state and must be RE-PINNED at the first
-/// build (`GOLDEN_PRINT=1`) once [`PRE_ROW50_A`] (adl-budget's pins) and
-/// `golden_repins_change_only_rule_h_and_p2_rows` pass.
+/// Re-pinned at the merge of row 50 into adl-budget (s25, blocks 2-12;
+/// block 1 is main's: rule H changes nothing before the first mark change):
+/// the rule-H state with row 50's labels. Proof: [`PRE_ROW50_A`] (adl-budget's
+/// pins) and `golden_repins_change_only_rule_h_and_p2_rows` pass unchanged,
+/// so the label is all that differs; every R mode and the engine give the
+/// same digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0x8e809cbd45abcc0545c71fa1e509b7ab261510773ea274bcfa4c429ff1104dac",
-    "0x9fce81bd56ac0fe851bd363547599bdf8d8e345f6f0a41b668a711e855e2539b",
-    "0xa5c2913771cabf06653dc40068a32f05ad644c08d597b1023e6938310f868c7b",
-    "0xc3369ad3810c8cace12fd2f462bb0e1d8c1e3b81171d2019cd15bac04b228e06",
-    "0x3f78722d7737d12048b66021062f7503ffaf1c2c61cee31e9887540a1c6b2f15",
-    "0x8efdc745286e9202b6fc5d52d1f2349dd7135e896248baf3ed994c782cb431c3",
-    "0xd53420062afa2f890c26b53df03f4cfb66a05699a28dbae5e3fd6090a304e833",
-    "0x3c6e4857a5f542c7ec73890ecde1034a4fa315ef019c84c8c2565fe4914cf7fb",
-    "0x2398b3bd6fda7614e49238a10d4dc6f931c584cbda437df57a5e36cece40bda3",
-    "0x8733aa91e2759daed4a9beb7cf7a3803fc9a36e49ce9d5b33bce055f27a5be76",
-    "0x90fab3384498cb2db3ab07d0b2ccb5c1082f7e6f22be338347f707aac4f79fc7",
-    "0xf1f68bbd98bdae97a8de1daa1ddb877d2e5746f4f17aeac5d8b57c0451d2b7bc",
+    "0x3292c34d45b5ef098ba276ae158ee0c201cf0419a5f5f0673bf0ab4abceac828",
+    "0xd0aa3bd3bab354190bc64a7e66e7ff0172578305f9b46f2ccf693f5923a5f521",
+    "0x5c7bf9ba72de8918b8f3d3efda137b1d0bd8cd38bfed38c8aa6bb0a14dabf9c3",
+    "0x6270f1e4d41dbc104e198639cbe6118affe3af8d7a1e13b52894652b4f14023f",
+    "0x352308f4f49f066a7f479cad088011b562f718ee0600617b364322fc059293bd",
+    "0x6847c337ecb796dc46d57afc36d4b29adb697e3d482e7c159175af196f9d5963",
+    "0x9a1a741c170f8c7c84024f6500cfad6524647f501eb52e462225be0c25ae5c12",
+    "0xd47a8ee40cfac970b559b63ccd469abfdd0cb7a2afaff38680d9560d725a853d",
+    "0xb3520cea6e8b5ecd151edbe88ff813edf03d892129fd5de2357cc9ac91f2b239",
+    "0x83f6c8bfe6fd92475fd069d063d91501f82134ae7dc5aff70945eb27dfa62df9",
+    "0x4e7880623e2f1aa95a6b3d3be8465c25a43d3628a6c6d02efb43e4ee1b5c19f7",
 ];
 /// Scenario B on c93c579 (no book rejection: the same with and without the
 /// pre-row-50 view); re-pinned by adl-budget A3 (rule H): from block 6

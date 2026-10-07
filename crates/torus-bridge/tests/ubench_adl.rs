@@ -155,7 +155,7 @@ fn ubench_adl_p2() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
-    feed_setup(&db, MARKETS);
+    feed_setup(&db, MARKETS, false); // placeholder rows, as measured (§9)
     let t = Instant::now();
     {
         let ctx = NativeExecContext::new(
