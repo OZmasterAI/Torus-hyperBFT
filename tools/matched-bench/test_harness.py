@@ -1974,8 +1974,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
         doc = self.src.index("#   ORACLE_FEED_DRAIN=1")
         self.assertLess(self.src.index("#   ORACLE_FEED=1"), doc)
         self.assertLess(doc, self.src.index("set -uo pipefail"))
+        self.assertIn("ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}", self.src)
+        self.assertLess(doc, self.src.index("#   ORACLE_FEED_DRAIN_MAX_LAG=N"))
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
-            self.assertIn('"ORACLE_FEED_DRAIN",', f.read())
+            allow = f.read()
+        self.assertIn('"ORACLE_FEED_DRAIN",', allow)
+        self.assertIn('"ORACLE_FEED_DRAIN_MAX_LAG",', allow)
         tmp = tempfile.mkdtemp(prefix="oracle-drain-pre-")
         try:
             tgt = os.path.join(tmp, "release")
@@ -1991,6 +1995,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="yes"), "ORACLE_FEED_DRAIN must be 0 or 1"),
                 (dict(ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
                 (dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+                (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="1", ORACLE_FEED_DRAIN_MAX_LAG="x"),
+                 "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer"),
+                (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="1", ORACLE_FEED_DRAIN_MAX_LAG="-1"),
+                 "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer"),
+                (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN_MAX_LAG="100"),
+                 "ORACLE_FEED_DRAIN_MAX_LAG=100 needs ORACLE_FEED_DRAIN=1"),
             ):
                 r = subprocess.run(
                     [script, wt, "oracle-drain-pre-x"],
@@ -2011,7 +2021,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def _run_drain_flow(self, mode):
+    def _run_drain_flow(self, mode, max_lag="2"):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
         (T = SIGSTOPped) and its argv."""
@@ -2037,7 +2047,8 @@ class OracleFeedHarnessTest(unittest.TestCase):
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
-              "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s T_BENCH1=$(date +%%s)\n" % (tmp, mode)
+              "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s T_BENCH1=$(date +%%s)\n"
+              % (tmp, mode, max_lag)
             + "METS=(9161 9162 9163)\n"
             + pause + "\n" + drain
             + '\ncat "$OUT/py.log"; echo "END $(ps -o stat= -p "$FEED" | cut -c1)"\n'
@@ -2062,6 +2073,17 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertNotIn("FEED_STILL_ALIVE", out)
         self.assertIn("STOPPED rc=143", out)
 
+    def test_feed_drain_max_lag_reaches_the_feed_live_drain_only(self):
+        """ORACLE_FEED_DRAIN_MAX_LAG (value-sum proof cells: exec ~0.34 s per
+        block keeps the lag at ~60 while the feed runs) widens only the
+        feed-live exec-lag bound; the paused settle keeps the idle criterion."""
+        out_dir, out = self._run_drain_flow("1", "100")
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        self.assertEqual(len(py), 2, out)
+        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 100"), py[0])
+        self.assertNotIn("--max-lag", py[1])
+        self.assertIn("exec lag <= 100", out)
+
     def test_feed_drain_keeps_the_feed_live_then_pauses_and_settles(self):
         out_dir, out = self._run_drain_flow("1")
         py = [l for l in out.splitlines() if l.startswith("PY ")]
@@ -2069,7 +2091,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
         # live through the drain, judged by the feed-live criterion; the
         # mempool bound = 2 rounds x 3 validators x ceil(300/256) chunks
         self.assertTrue(py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0])
-        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12"), py[0])
+        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0])
         # paused right after it, then a legacy quiet settle before the digest
         self.assertTrue(
             py[1].startswith("PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "

@@ -180,6 +180,13 @@
 #                drain.json .feed_live and run.log. Then the feed is SIGSTOPped
 #                and the default quiet drain re-run (feed-stop-settle/, 60 s)
 #                before the after-snapshots and the state digest.
+#   ORACLE_FEED_DRAIN_MAX_LAG=N  with ORACLE_FEED_DRAIN=1 (else FATAL unless 2):
+#                the feed-live drain's exec-lag bound (health.py --max-lag),
+#                default 2. Only for cells whose timings are not read: a
+#                TORUS_LIQ_VALUE_SUM=1 node walks every balance and position
+#                each native block (~0.34 s at 300 markets), so the lag stays
+#                ~60 while the feed runs and the default bound never holds.
+#                The paused settle (feed-stop-settle/) keeps the idle bound.
 #   LIQ_THIN=N   liquidation stress (row 76): after the genesis is generated, set
 #                native `available` = LIQ_THIN_AVAIL (default 1000000.0 TRS, the
 #                genesis' decimal-string units; at most 8 decimals) on the
@@ -291,6 +298,7 @@ ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
 ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
 ORACLE_FEED_DRAIN=${ORACLE_FEED_DRAIN:-0}
+ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}
 LIQ_THIN=${LIQ_THIN:-0}
 LIQ_THIN_AVAIL=${LIQ_THIN_AVAIL:-1000000.0}
 ORACLE_SHOCK_BP=${ORACLE_SHOCK_BP:-0}
@@ -492,6 +500,10 @@ case "$ORACLE_FEED_DRAIN" in
     1) [ "$ORACLE_FEED" = 1 ] || { echo "FATAL: ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1" >&2; exit 2; } ;;
     *) echo "FATAL: ORACLE_FEED_DRAIN must be 0 or 1 (got '$ORACLE_FEED_DRAIN')" >&2; exit 2 ;;
 esac
+[[ "$ORACLE_FEED_DRAIN_MAX_LAG" =~ ^[0-9]{1,6}$ ]] || { echo "FATAL: ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer (got '$ORACLE_FEED_DRAIN_MAX_LAG')" >&2; exit 2; }
+ORACLE_FEED_DRAIN_MAX_LAG=$((10#$ORACLE_FEED_DRAIN_MAX_LAG))
+[ "$ORACLE_FEED_DRAIN_MAX_LAG" = 2 ] || [ "$ORACLE_FEED_DRAIN" = 1 ] \
+    || { echo "FATAL: ORACLE_FEED_DRAIN_MAX_LAG=$ORACLE_FEED_DRAIN_MAX_LAG needs ORACLE_FEED_DRAIN=1" >&2; exit 2; }
 case "$ORACLE_FEED" in
     0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; }
        [ "$ORACLE_SHOCK_BP" = 0 ] || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
@@ -1027,8 +1039,8 @@ DRAINED=0
 DRAIN_URLS=("http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics")
 FEED_DRAIN_ARGS=()
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
-    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )))
-    log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= 2; the feed's actions may move)"
+    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )) --max-lag "$ORACLE_FEED_DRAIN_MAX_LAG")
+    log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= $ORACLE_FEED_DRAIN_MAX_LAG; the feed's actions may move)"
 fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
     --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" \
