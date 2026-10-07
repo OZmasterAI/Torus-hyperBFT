@@ -44,6 +44,7 @@ All metrics are prefixed with `torus_`:
 | `torus_mempool_evm_size` | Gauge | Pending EVM transactions in mempool |
 | `torus_mempool_native_size` | Gauge | Pending native actions in mempool |
 | `torus_mempool_oracle_evicted_total` | Counter | Pooled oracle submissions evicted by a newer one from the same validator at the per-validator cap (4); node-local |
+| `torus_mempool_oracle_dropped_total{reason}` | Counter | Oracle submissions evicted from or refused by the native pool (plan 9.14 C). `replaced_by_newer`: same events as `torus_mempool_oracle_evicted_total`; `cap_rejected`: refused at the per-validator cap, older than every pooled one; `pool_full`: refused by a pool holding only oracle submissions; `expired`: aged out of the nonce window while pooled. Committed submissions and normal entries an oracle submission evicts are not counted; node-local |
 | `torus_liquidator_vault_deficit` | Gauge | Liquidator vault's negative cash in tokens (0 when not negative); set after each liquidation pass, reads 0 after a restart until the next pass |
 | `torus_liquidation_step_seconds` | Histogram | Wall time of the liquidation step (`run_liquidations`) per native block; `_sum`/`_count` deltas give ms per block |
 | `torus_liquidations_stage1_total` | Counter | Accounts acted on by stage 1 (reduce-only IOC orders into the book); an account under maintenance over several blocks counts once per block |
