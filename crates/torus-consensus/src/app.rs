@@ -5397,11 +5397,10 @@ impl TorusApp {
         // T0b: never below the parent (validators reject a regressing timestamp).
         let timestamp = unix_now_secs().max(parent_header.timestamp);
 
-        let gas_limit = if parent_header.evm_gas_limit == 0 {
-            torus_evm::DEFAULT_BLOCK_GAS_LIMIT
-        } else {
-            parent_header.evm_gas_limit
-        };
+        // Item 7 step 0: validators require the header limit to equal the parent's and
+        // the declared EVM gas to fit it, so select against exactly that limit (a 0
+        // limit selects no EVM txs instead of filling a default the header can't carry).
+        let gas_limit = parent_header.evm_gas_limit;
         let (native_with_senders, evm_txs) = {
             let _select_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
