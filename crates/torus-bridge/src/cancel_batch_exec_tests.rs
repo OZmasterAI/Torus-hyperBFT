@@ -208,7 +208,14 @@ fn run(blocks: &[Vec<(Address, NativeAction)>], mode: BookMode, batch: bool) -> 
         results.push(
             r.results
                 .iter()
-                .map(|a| (a.action_type, a.success, a.error.clone(), a.gas_used))
+                .map(|a| {
+                    (
+                        a.action_type,
+                        a.success,
+                        a.error.as_deref().map(str::to_string),
+                        a.gas_used,
+                    )
+                })
                 .collect(),
         );
         total_gas.push(r.total_gas);
