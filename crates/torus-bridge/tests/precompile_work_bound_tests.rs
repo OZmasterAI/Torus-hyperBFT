@@ -816,6 +816,67 @@ fn tombstones_change_neither_gas_nor_answer() {
     );
 }
 
+/// 18c review (missing test): the same deletes held by the current block's
+/// overlay or by the frozen parent block's set (the pipelined path's layer,
+/// read between the overlay and the DB) give the clean book's answer and gas:
+/// 200 better bid levels, durable in the DB, cancelled in block 3.
+#[test]
+fn parent_and_current_block_deletes_change_neither_gas_nor_answer() {
+    let book = |state: &dyn Fn(&mut ReadMeter) -> Result<Vec<u8>, CoreError>| {
+        let mut m = ReadMeter::with_max(30_000_000);
+        (state(&mut m).expect("reader answers"), reader_gas(m.used()))
+    };
+    let (_d0, clean) = open_test_db();
+    seed_book(&clean, BookMode::LevelAuthority, &[10, 11, 12]);
+    let want = book(&|m| order_book(&clean, m));
+    assert_eq!(arrays(&want.0, 4)[0], vec![raw(12), raw(11), raw(10)]);
+
+    let (_dir, db) = open_test_db();
+    seed_book(&db, BookMode::LevelAuthority, &[10, 11, 12]);
+    let mut ctx = ctx_on(db.clone(), 2, BookMode::LevelAuthority);
+    run_block(
+        &mut ctx,
+        &(101..=300).map(|p| place(true, p)).collect::<Vec<_>>(),
+    );
+    drop(ctx);
+    let ov = NativeStateOverlay::new(db.clone());
+    let mut ctx = ctx_on(ov.clone(), 3, BookMode::LevelAuthority);
+    let ids: Vec<u128> = {
+        let book = ctx.order_books.get(&1).expect("book");
+        book.orders_for_trader(&MAKER)
+            .iter()
+            .filter(|o| o.price > fp(100))
+            .map(|o| o.id)
+            .collect()
+    };
+    assert_eq!(ids.len(), 200);
+    run_block(
+        &mut ctx,
+        &ids.iter()
+            .map(|&order_id| (MAKER, NativeAction::CancelOrder { order_id }))
+            .collect::<Vec<_>>(),
+    );
+    drop(ctx);
+    assert_ne!(
+        book(&|m| order_book(&db, m)),
+        want,
+        "the DB alone still holds the 200 levels"
+    );
+
+    assert_eq!(
+        book(&|m| order_book(&ov, m)),
+        want,
+        "deletes in the current block"
+    );
+    let child = NativeStateOverlay::with_parent(db.clone(), Some(ov.freeze(3)));
+    assert_eq!(child.parent_height(), Some(3));
+    assert_eq!(
+        book(&|m| order_book(&child, m)),
+        want,
+        "deletes in the frozen parent"
+    );
+}
+
 /// (c) Node-local mitigation (s89 fix B pattern, per market, threshold): a
 /// block flush that deletes at least the threshold of level rows in a market
 /// compacts that market's span in the background, so the next scans step over
