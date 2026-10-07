@@ -200,6 +200,15 @@ pub struct Metrics {
     /// Pooled oracle submissions evicted by a NEWER submission of the same
     /// validator at the per-validator cap (review M1(a)). Node-local.
     pub mempool_oracle_evicted: Counter,
+    /// Oracle submissions evicted from or refused by the native pool, by
+    /// `reason` (plan 9.14 C, anti-spam D: measure before deciding on a
+    /// validator exemption). `replaced_by_newer`: the per-validator cap
+    /// evicted a pooled one for a newer one (same events as
+    /// `mempool_oracle_evicted`); `cap_rejected`: refused at the cap, older
+    /// than every pooled one; `pool_full`: refused by a pool holding only
+    /// oracle submissions; `expired`: aged out of the nonce window while
+    /// pooled. Committed submissions are not counted. Node-local.
+    pub mempool_oracle_dropped: Family<Vec<(String, String)>, Counter>,
     /// Outbound native actions dropped from pre-spread because a single action
     /// exceeds the receivers' gossip cap (`max_tx_message_size`) — it could never
     /// be delivered and would get the forwarder penalized (s339 validator ban).
@@ -1299,6 +1308,14 @@ impl Metrics {
             "torus_mempool_oracle_evicted",
             "Pooled oracle submissions evicted by a newer one of the same validator (per-validator cap)",
             mempool_oracle_evicted.clone(),
+        );
+
+        let mempool_oracle_dropped = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_mempool_oracle_dropped",
+            "Oracle submissions evicted from or refused by the native pool, by reason \
+             (replaced_by_newer / cap_rejected / pool_full / expired)",
+            mempool_oracle_dropped.clone(),
         );
 
         let native_gossip_dropped_oversized = Counter::default();
@@ -2467,6 +2484,7 @@ impl Metrics {
             native_gossip_received_actions,
             native_gossip_dropped_full,
             mempool_oracle_evicted,
+            mempool_oracle_dropped,
             native_gossip_dropped_oversized,
             verified_sender_cache_hits,
             verified_sender_cache_misses,

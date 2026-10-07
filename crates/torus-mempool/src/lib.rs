@@ -383,6 +383,32 @@ impl Mempool {
         self.publish_native_pool_size(&pool);
     }
 
+    /// Plan 9.14 C (anti-spam D, measure first): count `n` oracle
+    /// submissions evicted from or refused by the native pool, by `reason`.
+    fn record_oracle_dropped(&self, reason: &str, n: u64) {
+        if let Some(m) = self.metrics.get() {
+            m.mempool_oracle_dropped
+                .get_or_create(&vec![("reason".into(), reason.into())])
+                .inc_by(n);
+        }
+    }
+
+    /// Lazy nonce-window expiry run by every selection / drain entry point
+    /// (under the caller's write lock); counts the expired oracle
+    /// submissions. The caller publishes the pool size.
+    fn evict_expired_native(&self, pool: &mut native_pool::NativePool) {
+        let evicted = pool.evict_expired(now_ms());
+        if evicted.all > 0 {
+            tracing::info!(
+                evicted = evicted.all,
+                "evicted nonce-expired native actions from pool"
+            );
+        }
+        if evicted.oracle > 0 {
+            self.record_oracle_dropped("expired", evicted.oracle as u64);
+        }
+    }
+
     /// Publish while the native lock is held. Setting a size captured after
     /// unlocking could overwrite a newer mutation's gauge with a stale value.
     fn publish_native_pool_size(&self, pool: &native_pool::NativePool) {
@@ -765,6 +791,7 @@ impl Mempool {
                     && !pool.contains(&sender, &action)
                 {
                     if !pool.evict_oldest_oracle_older_than(accounts, action.nonce) {
+                        self.record_oracle_dropped("cap_rejected", 1);
                         return Err(MempoolError::NativeValidationFailed(format!(
                             "oracle pending cap {} reached for validator {} (all pooled submissions are newer)",
                             crate::rate_limit::ORACLE_PENDING_PER_VALIDATOR,
@@ -774,10 +801,17 @@ impl Mempool {
                     if let Some(m) = self.metrics.get() {
                         m.mempool_oracle_evicted.inc();
                     }
+                    self.record_oracle_dropped("replaced_by_newer", 1);
                 }
             }
             let result = pool.insert_with_restash_key(sender, action, cache_key);
             self.publish_native_pool_size(&pool);
+            // A full pool refuses an oracle submission only when no normal
+            // entry or cancel is left to evict (oracle submissions never
+            // evict each other).
+            if oracle_accounts.is_some() && matches!(result, Err(MempoolError::NativePoolFull)) {
+                self.record_oracle_dropped("pool_full", 1);
+            }
             result?;
         }
         // Anti-spam item B: count every action that entered the pool, from
@@ -870,10 +904,7 @@ impl Mempool {
         // Durable-before-selectable (T2.2): land buffered ingress mirrors first.
         self.flush_da_mirrors();
         let mut pool = self.native.write().unwrap();
-        let evicted = pool.evict_expired(now_ms());
-        if evicted > 0 {
-            tracing::info!(evicted, "evicted nonce-expired native actions from pool");
-        }
+        self.evict_expired_native(&mut pool);
         let actions = pool.drain(limit);
         self.publish_native_pool_size(&pool);
         actions
@@ -1231,11 +1262,8 @@ impl Mempool {
         self.flush_da_mirrors();
         {
             let mut pool = self.native.write().unwrap();
-            let evicted = pool.evict_expired(now_ms());
+            self.evict_expired_native(&mut pool);
             self.publish_native_pool_size(&pool);
-            if evicted > 0 {
-                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
-            }
         }
         // T2.3: selection is read-only over the incrementally-sorted pool —
         // no re-sort, no hash_index rebuild, and ingress inserts only contend
@@ -1264,11 +1292,8 @@ impl Mempool {
         self.flush_da_mirrors();
         {
             let mut pool = self.native.write().unwrap();
-            let evicted = pool.evict_expired(now_ms());
+            self.evict_expired_native(&mut pool);
             self.publish_native_pool_size(&pool);
-            if evicted > 0 {
-                tracing::info!(evicted, "evicted nonce-expired native actions from pool");
-            }
         }
         self.native
             .read()
@@ -3625,6 +3650,176 @@ mod tests {
             .collect();
         vs.sort_unstable();
         assert_eq!(vs, vec![now + 1, now + 2, now + 3, now + 10], "the oldest (now) was evicted");
+    }
+
+    // ---- plan 9.14 C (s100): torus_mempool_oracle_dropped{reason} ----
+
+    fn metered(pool: &Mempool) -> std::sync::Arc<torus_telemetry::Metrics> {
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        metrics
+    }
+
+    /// `[replaced_by_newer, cap_rejected, pool_full, expired]`.
+    fn oracle_drops(m: &torus_telemetry::Metrics) -> [u64; 4] {
+        ["replaced_by_newer", "cap_rejected", "pool_full", "expired"].map(|r| {
+            m.mempool_oracle_dropped
+                .get_or_create(&vec![("reason".into(), r.into())])
+                .get()
+        })
+    }
+
+    /// The per-validator cap (4): a newer submission evicting the oldest
+    /// pooled one counts `replaced_by_newer` (and still the old unlabelled
+    /// counter); one older than every pooled one counts `cap_rejected`; a
+    /// duplicate (gossip echo) counts nothing.
+    #[test]
+    fn oracle_dropped_counts_the_per_validator_cap_paths() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let metrics = metered(&pool);
+        let kv = key(61);
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        let now = now_ms();
+        for i in 0..4 {
+            pool.add_native_action(oracle_from(&kv, now + i)).unwrap();
+        }
+        assert!(matches!(
+            pool.add_native_action_from_gossip_trusted(v, oracle_from(&kv, now + 3)),
+            Err(MempoolError::DuplicateNativeAction)
+        ));
+        assert_eq!(oracle_drops(&metrics), [0; 4], "a duplicate is not a drop");
+        assert!(pool.add_native_action(oracle_from(&kv, now - 5)).is_err());
+        assert_eq!(
+            oracle_drops(&metrics),
+            [0, 1, 0, 0],
+            "older than all pooled: cap_rejected"
+        );
+        pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
+        assert_eq!(
+            oracle_drops(&metrics),
+            [1, 1, 0, 0],
+            "newer: replaced_by_newer"
+        );
+        assert_eq!(
+            metrics.mempool_oracle_evicted.get(),
+            1,
+            "the old counter is kept"
+        );
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_mempool_oracle_dropped_total{reason=\"cap_rejected\"} 1\n"),
+            "{text}"
+        );
+    }
+
+    /// A full pool: an oracle submission evicting a NORMAL entry (or a
+    /// cancel) is not an oracle drop; an oracle submission refused because
+    /// only oracle submissions are pooled counts `pool_full`.
+    #[test]
+    fn oracle_dropped_counts_pool_full_refusals_only() {
+        use torus_economics::ValidatorStatus::Active;
+        let (_dir, state) = setup();
+        let config = MempoolConfig {
+            native_pool_max_size: 1,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(state.clone(), config);
+        let metrics = metered(&pool);
+        let (kv, kw, kn) = (key(62), key(63), key(64));
+        let (v, w) = (address_from_key(&kv), address_from_key(&kw));
+        put_oracle_validator(&state, v, Active, None);
+        put_oracle_validator(&state, w, Active, None);
+        let now = now_ms();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &kn,
+        ))
+        .unwrap();
+        pool.add_native_action(oracle_from(&kv, now)).unwrap();
+        assert_eq!(pool.native_pool_size(), 1);
+        assert_eq!(
+            oracle_drops(&metrics),
+            [0; 4],
+            "evicting a normal entry is not an oracle drop"
+        );
+        assert!(matches!(
+            pool.add_native_action(oracle_from(&kw, now)),
+            Err(MempoolError::NativePoolFull)
+        ));
+        assert_eq!(
+            oracle_drops(&metrics),
+            [0, 0, 1, 0],
+            "refused at a pool full of oracle submissions"
+        );
+    }
+
+    /// Lazy nonce-window expiry (every selection / drain entry point) counts
+    /// the expired oracle submissions only; committed ones are not drops.
+    #[test]
+    fn oracle_dropped_counts_expired_not_committed() {
+        use torus_economics::ValidatorStatus::Active;
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let metrics = metered(&pool);
+        let (kv, kn) = (key(65), key(66));
+        let v = address_from_key(&kv);
+        put_oracle_validator(&state, v, Active, None);
+        let now = now_ms();
+        let stale = now - 2 * NONCE_WINDOW_MS;
+        // `submit_native_action` has no nonce-window check: pool stale bodies.
+        pool.submit_native_action(v, oracle_from(&kv, stale))
+            .unwrap();
+        pool.submit_native_action(v, oracle_from(&kv, stale + 1))
+            .unwrap();
+        let n = address_from_key(&kn);
+        pool.submit_native_action(
+            n,
+            torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                stale,
+                &kn,
+            ),
+        )
+        .unwrap();
+        let fresh = oracle_from(&kv, now);
+        pool.add_native_action(fresh.clone()).unwrap();
+        let sel = pool.select_native_for_block_with_senders_excluding(
+            100,
+            &Default::default(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(sel.len(), 1, "3 expired, the fresh one selected");
+        assert_eq!(
+            oracle_drops(&metrics),
+            [0, 0, 0, 2],
+            "2 expired oracle submissions, the normal one not counted"
+        );
+        pool.remove_committed_native(&[torus_types::compute_action_hash(&fresh)]);
+        assert_eq!(pool.native_pool_size(), 0);
+        // The other two lazy-expiry entry points count too.
+        pool.submit_native_action(v, oracle_from(&kv, stale + 2))
+            .unwrap();
+        pool.select_native_cancels_for_block_with_senders_excluding(
+            100,
+            &Default::default(),
+            usize::MAX,
+            usize::MAX,
+        );
+        pool.submit_native_action(v, oracle_from(&kv, stale + 3))
+            .unwrap();
+        pool.drain_native(100);
+        assert_eq!(
+            oracle_drops(&metrics),
+            [0, 0, 0, 4],
+            "committed: not counted; each expiry path: counted"
+        );
+        assert_eq!(metrics.mempool_oracle_evicted.get(), 0);
     }
 
     /// M4: the deepest pacing tier selects cancels, then oracle submissions;

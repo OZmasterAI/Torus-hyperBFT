@@ -119,6 +119,15 @@ fn expiry_key(&(priority, sender, nonce, seq): &SortKey) -> ExpiryKey {
     (nonce, priority, sender, seq)
 }
 
+/// What [`NativePool::evict_expired`] removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Expired {
+    /// Every expired entry.
+    pub all: usize,
+    /// The expired oracle submissions ([`PRIO_ORACLE`]) among them.
+    pub oracle: usize,
+}
+
 /// Entry in the native action pool with pre-recovered sender and dedup hash.
 pub(crate) struct NativePoolEntry {
     pub sender: Address,
@@ -579,22 +588,24 @@ impl NativePool {
     /// admission/validation again, so keeping it selectable only lets leaders
     /// propose blocks that cannot validate — the s334 bs1000 wedge had no
     /// self-heal precisely because nothing ever removed these. Called lazily
-    /// from the selection/drain wrappers. Returns the number evicted.
-    pub fn evict_expired(&mut self, now_ms: u64) -> usize {
+    /// from the selection/drain wrappers. Returns the number evicted, and how
+    /// many of them are oracle submissions (plan 9.14 C telemetry).
+    pub fn evict_expired(&mut self, now_ms: u64) -> Expired {
         use torus_types::eip712::NONCE_WINDOW_MS;
         // nonce.saturating_add(window) < now is equivalent to nonce <
         // now-window when subtraction succeeds; otherwise nothing is expired.
         // In particular, nonce+window==now and saturated u64::MAX stay live.
         let Some(cutoff) = now_ms.checked_sub(NONCE_WINDOW_MS) else {
-            return 0;
+            return Expired::default();
         };
-        let mut removed = 0;
+        let mut removed = Expired::default();
         while let Some(&(nonce, priority, sender, seq)) = self.expiry_index.first() {
             if nonce >= cutoff {
                 break;
             }
             self.remove_entry_by_key(&(priority, sender, nonce, seq));
-            removed += 1;
+            removed.all += 1;
+            removed.oracle += usize::from(priority == PRIO_ORACLE);
         }
         removed
     }
@@ -934,11 +945,11 @@ mod tests {
                 }
             }
             assert_eq!(
-                candidate.evict_expired(now),
+                candidate.evict_expired(now).all,
                 evict_expired_reference(&mut reference, now)
             );
             assert_same_pool(&candidate, &reference);
-            assert_eq!(candidate.evict_expired(now), 0);
+            assert_eq!(candidate.evict_expired(now).all, 0);
         }
     }
 
@@ -968,7 +979,7 @@ mod tests {
                 0 => {
                     let now = (rng >> 5) % 170_000;
                     assert_eq!(
-                        candidate.evict_expired(now),
+                        candidate.evict_expired(now).all,
                         evict_expired_reference(&mut reference, now)
                     );
                 }
@@ -1007,7 +1018,7 @@ mod tests {
         pool.insert(sender, fresh).unwrap();
         assert_eq!(pool.size(), 2);
 
-        let evicted = pool.evict_expired(now);
+        let evicted = pool.evict_expired(now).all;
         assert_eq!(evicted, 1);
         assert_eq!(pool.size(), 1);
         assert!(pool.get_by_hash(&stale_hash).is_none());
@@ -1669,7 +1680,7 @@ mod tests {
         pool.insert(Address::repeat_byte(1), stale.clone()).unwrap();
         pool.insert(Address::repeat_byte(2), stale.clone()).unwrap();
 
-        assert_eq!(pool.evict_expired(now), 2);
+        assert_eq!(pool.evict_expired(now).all, 2);
         assert_eq!(pool.size(), 0);
         assert!(pool.get_by_hash(&hash).is_none());
         pool.assert_index_consistent();
@@ -1690,6 +1701,34 @@ mod tests {
                 timestamp: nonce,
             }),
         )
+    }
+
+    /// Plan 9.14 C (s100): `evict_expired` reports how many of the expired
+    /// entries are oracle submissions (the `expired` oracle-drop metric).
+    #[test]
+    fn evict_expired_counts_oracle_submissions() {
+        use torus_types::eip712::NONCE_WINDOW_MS;
+        let mut pool = NativePool::new(100, 64, 16);
+        let now = 10 * NONCE_WINDOW_MS;
+        let stale = now - 2 * NONCE_WINDOW_MS;
+        pool.insert(Address::repeat_byte(1), oracle(stale)).unwrap();
+        pool.insert(Address::repeat_byte(2), oracle(stale + 1))
+            .unwrap();
+        pool.insert(
+            Address::repeat_byte(3),
+            make_action(stale, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        pool.insert(
+            Address::repeat_byte(4),
+            make_action(stale, NativeAction::CancelOrder { order_id: 1 }),
+        )
+        .unwrap();
+        pool.insert(Address::repeat_byte(5), oracle(now)).unwrap();
+        assert_eq!(pool.evict_expired(now), Expired { all: 4, oracle: 2 });
+        assert_eq!(pool.size(), 1);
+        assert_eq!(pool.evict_expired(now), Expired::default());
+        pool.assert_index_consistent();
     }
 
     #[test]
