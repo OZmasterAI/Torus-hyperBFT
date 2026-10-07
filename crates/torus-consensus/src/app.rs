@@ -7305,6 +7305,18 @@ mod crash_recovery_tests {
 
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
         use std::sync::atomic::{AtomicU64, Ordering};
+        // Native trie maintenance is a process-global flag that only ever
+        // goes off -> on (resolved off from the env on first use, forced on
+        // by tests that read the maintained root). Tests in this module that
+        // run a fixture several times and compare full CF dumps (exec modes,
+        // serial vs pipelined, crash replay, with/without R) would otherwise
+        // see a different mode per run whenever another test in the same
+        // process forces it on in between: the off run writes
+        // `native_trie_stale` and leaves CF_NATIVE_TRIE/CF_NATIVE_HASHED
+        // unmaintained, the on run does not. Force it on before every
+        // fixture DB, so every run in every test sees the same mode in
+        // `cargo test` and in nextest.
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         static COUNTER: AtomicU64 = AtomicU64::new(1000);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
