@@ -50,6 +50,8 @@ pub enum GenesisError {
     InvalidAmount(String),
     #[error("invalid market: {0}")]
     InvalidMarket(String),
+    #[error("invalid fee_split: {0}")]
+    InvalidFeeSplit(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ pub struct EconomicsConfig {
     pub treasury_address: Option<String>,
     #[serde(default)]
     pub dev_pool_address: Option<String>,
+    /// Must equal the built-in split; the loader refuses another value (row 80 option D).
     pub fee_split: FeeSplitConfig,
     pub permanent_staking: PermanentStakingConfig,
     pub validator: ValidatorConstraints,
@@ -321,13 +324,58 @@ fn stake_to_power(stake: U256) -> u64 {
 impl Genesis {
     /// Parse a genesis configuration from a JSON file.
     pub fn from_file(path: &Path) -> Result<Self, GenesisError> {
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(GenesisError::Json)
+        Self::from_json(&std::fs::read_to_string(path)?)
     }
 
     /// Parse a genesis configuration from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, GenesisError> {
-        serde_json::from_str(json).map_err(GenesisError::Json)
+        let genesis: Self = serde_json::from_str(json)?;
+        genesis.check_fee_split()?;
+        Ok(genesis)
+    }
+
+    /// Row 80 option D: fees are split by the built-in constants
+    /// (`torus_economics::types` FEE_* and TRANSITION_EPOCHS), not by this
+    /// field, so a genesis that asks for another split is refused until the
+    /// field is wired in or made a governance setting.
+    fn check_fee_split(&self) -> Result<(), GenesisError> {
+        use torus_economics::types as t;
+        let fs = &self.economics.fee_split;
+        let start = [
+            fs.start.burn,
+            fs.start.validator,
+            fs.start.treasury,
+            fs.start.dev_pool,
+        ];
+        let end = [
+            fs.end.burn,
+            fs.end.validator,
+            fs.end.treasury,
+            fs.end.dev_pool,
+        ];
+        let want_start = [
+            t::FEE_START_BURN_BPS,
+            t::FEE_START_VALIDATOR_BPS,
+            t::FEE_START_TREASURY_BPS,
+            t::FEE_START_DEV_POOL_BPS,
+        ]
+        .map(u32::from);
+        let want_end = [
+            t::FEE_END_BURN_BPS,
+            t::FEE_END_VALIDATOR_BPS,
+            t::FEE_END_TREASURY_BPS,
+            t::FEE_END_DEV_POOL_BPS,
+        ]
+        .map(u32::from);
+        if start != want_start || end != want_end || fs.transition_epochs != t::TRANSITION_EPOCHS {
+            return Err(GenesisError::InvalidFeeSplit(format!(
+                "start {start:?} end {end:?} over {} epochs; the chain splits fees by the built-in \
+                 start {want_start:?} end {want_end:?} over {} epochs (burn, validator, treasury, dev_pool bps)",
+                fs.transition_epochs,
+                t::TRANSITION_EPOCHS
+            )));
+        }
+        Ok(())
     }
 
     /// Initialize the state database with genesis data. Returns the state root.
@@ -836,6 +884,47 @@ mod tests {
         json["chain_id"] = 7779.into();
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
         assert_eq!(genesis.chain_config().chain_id, 7779);
+    }
+
+    /// Row 80 option D (s100): fees are split by the built-in constants
+    /// (`torus_economics::types` FEE_*); the genesis `fee_split` is not wired
+    /// in, so the loader refuses any value that differs from them.
+    #[test]
+    fn genesis_fee_split_must_match_the_built_in_split() {
+        assert!(Genesis::from_json(&sample_genesis_json()).is_ok());
+        for (path, value) in [
+            ("/economics/fee_split/start/burn", 2000),
+            ("/economics/fee_split/start/validator", 1),
+            ("/economics/fee_split/start/treasury", 4000),
+            ("/economics/fee_split/start/dev_pool", 5000),
+            ("/economics/fee_split/end/burn", 0),
+            ("/economics/fee_split/end/validator", 5000),
+            ("/economics/fee_split/end/treasury", 2400),
+            ("/economics/fee_split/end/dev_pool", 2600),
+            ("/economics/fee_split/transition_epochs", 365),
+        ] {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            *json.pointer_mut(path).unwrap() = value.into();
+            let err = Genesis::from_json(&json.to_string()).unwrap_err();
+            assert!(
+                matches!(err, GenesisError::InvalidFeeSplit(_)),
+                "{path}: {err}"
+            );
+        }
+    }
+
+    /// The file loader (the node's path) applies the same check.
+    #[test]
+    fn genesis_file_with_another_fee_split_is_refused() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"]["fee_split"]["start"]["burn"] = 2500.into();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("genesis.json");
+        std::fs::write(&path, json.to_string()).unwrap();
+        assert!(matches!(
+            Genesis::from_file(&path),
+            Err(GenesisError::InvalidFeeSplit(_))
+        ));
     }
 
     #[test]
