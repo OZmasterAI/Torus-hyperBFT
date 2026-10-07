@@ -100,7 +100,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
         }
 
         // Review (blocking): a reader's WORK is bounded by this call's gas, not
-        // only its charge — it gets the units its limit pays for above the base.
+        // only its charge — its meter holds the gas its limit has above the base.
         let mut meter = if is_reader_precompile(id) {
             ReadMeter::with_max(reader_budget(inputs.gas_limit))
         } else {
@@ -194,8 +194,8 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
         if matches!(result, Err(CoreError::PrecompileOutOfGas)) {
             return Ok(Some(InterpreterResult::new_oog(inputs.gas_limit)));
         }
-        // HL-parity: a reader pays for the work it did (rows read, words
-        // returned), whether it answered or reverted.
+        // HL-parity: a reader pays the base + the work it did (500 per row read,
+        // 20 per word returned / blob chunk read), whether it answered or reverted.
         let gas_required = if is_reader_precompile(id) {
             reader_gas(meter.used())
         } else {
