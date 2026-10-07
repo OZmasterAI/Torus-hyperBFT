@@ -1538,11 +1538,9 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         let touches = || self.positions.state().layer_touches(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice());
         if let Some(set) = self.drain_dirty {
             let d = set.contains(trader);
+            debug_assert_eq!(d, touches(), "drain dirty set == layer_touches ({trader})");
             #[cfg(test)]
-            {
-                assert_eq!(d, touches(), "drain dirty set == layer_touches ({trader})");
-                DIRTY_CHECKS.with(|c| c.set((c.get().0 + 1, c.get().1)));
-            }
+            DIRTY_CHECKS.with(|c| c.set((c.get().0 + 1, c.get().1)));
             return d;
         }
         match self.batch.and_then(|b| b.dirty.as_ref()) {

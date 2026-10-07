@@ -102,7 +102,7 @@ struct LiqStats {
 ///   lookup (never iterated); dropped for both parties of every close and
 ///   for the vault on a pairing, i.e. for every account the drain writes.
 /// * `dirty` (adl-budget C2): the block's dirty traders per market
-///   ([`trader_positions::dirty_by_market`]), taken at the drain's first
+///   ([`trader_positions::dirty_by_market_and_traders`]), taken at the drain's first
 ///   ranking with R attached. A ranking of `m` reads R's holders of `m`
 ///   merged with them. That list covers every holder of `m` for the whole
 ///   drain for the reason `traders` stays exact: the drain gives no trader a
@@ -110,7 +110,7 @@ struct LiqStats {
 /// * `dirty_traders` (adl-dirty-check, node-local): the traders the block
 ///   wrote under ([`trader_positions::dirty_by_market_and_traders`]), taken with `dirty`
 ///   and grown by every drain write ([`Self::touched`]), so it equals
-///   `layer_touches` at every ranking (asserted in tests). The ranking's
+///   `layer_touches` at every ranking (`debug_assert`). The ranking's
 ///   reader asks it instead of a `layer_touches` per read.
 #[derive(Default)]
 struct DrainCache {
