@@ -1055,3 +1055,61 @@ fn gas_accounting_unused_gas_refunded_to_sender() {
         "bob should receive the transferred value"
     );
 }
+
+// Item 7 step 0: the gas a tx declares, as validators count it before the vote.
+#[test]
+fn declared_gas_limit_counts_executed_types_only() {
+    use alloy_consensus::{SignableTransaction, TxEip2930, TxEip7702, TxEnvelope, TxLegacy};
+    use torus_bridge::declared_gas_limit;
+    // Any signature: the count does not recover the sender, so a bad one still counts.
+    let sig = AlloySig::new(U256::from(1u64), U256::from(2u64), false);
+    let enc = |e: TxEnvelope| {
+        let mut buf = Vec::new();
+        e.encode(&mut buf);
+        buf
+    };
+    let legacy = TxLegacy {
+        chain_id: Some(TORUS_CHAIN_ID),
+        gas_limit: 21_000,
+        ..Default::default()
+    };
+    let eip2930 = TxEip2930 {
+        chain_id: TORUS_CHAIN_ID,
+        gas_limit: 50_000,
+        ..Default::default()
+    };
+    let eip1559 = TxEip1559 {
+        chain_id: TORUS_CHAIN_ID,
+        gas_limit: 7_000_000,
+        ..Default::default()
+    };
+    let eip7702 = TxEip7702 {
+        chain_id: TORUS_CHAIN_ID,
+        gas_limit: 90_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        declared_gas_limit(&enc(TxEnvelope::Legacy(legacy.into_signed(sig)))),
+        Some(21_000)
+    );
+    assert_eq!(
+        declared_gas_limit(&enc(TxEnvelope::Eip2930(eip2930.into_signed(sig)))),
+        Some(50_000)
+    );
+    assert_eq!(
+        declared_gas_limit(&enc(TxEnvelope::Eip1559(eip1559.into_signed(sig)))),
+        Some(7_000_000)
+    );
+    // A type Torus does not execute counts nothing (execution skips it).
+    assert_eq!(
+        declared_gas_limit(&enc(TxEnvelope::Eip7702(eip7702.into_signed(sig)))),
+        None
+    );
+    // Not an envelope at all.
+    assert_eq!(declared_gas_limit(&[]), None);
+    assert_eq!(declared_gas_limit(&[0xde, 0xad, 0xbe, 0xef]), None);
+    // A properly signed tx counts the same as a badly signed one.
+    let sk = test_signing_key(1);
+    let rlp = build_signed_tx(&sk, Address::new([0xBB; 20]), U256::ZERO, 0, 2, 1, 123_456);
+    assert_eq!(declared_gas_limit(&rlp), Some(123_456));
+}
