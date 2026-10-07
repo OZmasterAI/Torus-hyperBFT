@@ -114,6 +114,9 @@ struct RangeCompaction {
     /// The DB the worker compacts (set with the first request); weak, so a
     /// parked worker never keeps a closed DB (and its LOCK) alive.
     db: std::sync::Mutex<std::sync::Weak<DB>>,
+    /// The worker holds a strong `Arc<DB>` for its run (set and cleared under
+    /// the `db` lock, with the upgrade and the drop).
+    holds_db: std::sync::atomic::AtomicBool,
     /// Test hook: every run fails (logged, counted) instead of compacting.
     #[cfg(test)]
     fail: std::sync::atomic::AtomicBool,
@@ -149,6 +152,17 @@ impl RangeCompaction {
         // ForceOptimized skips only files this same compaction just wrote; a
         // trivially moved file keeps its older file number and is rewritten.
         opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
+        // `compact_range_cf_opt` returns `()` (the C API drops the status), so
+        // a RocksDB error shows only as a failed flush / compaction job in the
+        // DB-wide background error count. Any such error during the run fails
+        // it (one in another CF at the same time too: it cannot tell them apart).
+        let bg_errors = || {
+            db.property_int_value("rocksdb.background-errors")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+        };
+        let errors_before = bg_errors();
         let mut result = Ok(());
         for (name, start, end) in ranges {
             // The last owner is dropping: leave the rest.
@@ -171,6 +185,12 @@ impl RangeCompaction {
                 result = Err(format!("compact_range_cf of {name} panicked"));
             }
         }
+        let errors = bg_errors().saturating_sub(errors_before);
+        if errors > 0 && result.is_ok() {
+            result = Err(format!(
+                "RocksDB reported {errors} background error(s) during the run"
+            ));
+        }
         result
     }
 
@@ -180,6 +200,12 @@ impl RangeCompaction {
 
     fn lock_runs(&self) -> std::sync::MutexGuard<'_, (u64, u64)> {
         self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_db(&self) -> std::sync::MutexGuard<'_, std::sync::Weak<DB>> {
+        self.db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The worker: wait for requests, compact them, until shutdown.
@@ -215,13 +241,20 @@ impl RangeCompaction {
             let started = std::time::Instant::now();
             // Strong only for this run: the DB closed since the request leaves
             // nothing to compact.
-            let db = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .upgrade();
+            let db = {
+                let slot = self.lock_db();
+                let db = slot.upgrade();
+                self.holds_db
+                    .store(db.is_some(), std::sync::atomic::Ordering::Relaxed);
+                db
+            };
             let result = db.as_deref().map_or(Ok(()), |db| self.run(db, &ranges));
-            drop(db);
+            {
+                let _slot = self.lock_db();
+                drop(db);
+                self.holds_db
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             match result {
                 Ok(()) => {
                     self.lock_runs().0 += 1;
@@ -244,11 +277,11 @@ impl RangeCompaction {
 /// of one `StateDb` (the worker holds only the job). Its drop runs once, with
 /// the last clone and before that clone's `Arc<DB>`: it stops the worker
 /// (no further range; a running RocksDB compaction is cancelled with
-/// `cancel_all_background_work`, so shutdown does not wait for it) and joins
-/// it. The worker upgrades its `Weak<DB>` for a whole run, so without the join
-/// it could hold the last `Arc<DB>` and close RocksDB on its own thread during
-/// process exit, after RocksDB's static mutexes are destroyed (teardown
-/// SIGABRT "pthread lock: Invalid argument").
+/// `cancel_all_background_work` when nothing else holds the DB, so shutdown
+/// does not wait for it) and joins it. The worker upgrades its `Weak<DB>` for
+/// a whole run, so without the join it could hold the last `Arc<DB>` and close
+/// RocksDB on its own thread during process exit, after RocksDB's static
+/// mutexes are destroyed (teardown SIGABRT "pthread lock: Invalid argument").
 #[derive(Default)]
 struct CompactionOwner(Arc<RangeCompaction>);
 
@@ -260,15 +293,19 @@ impl Drop for CompactionOwner {
         {
             let state = job.lock_state();
             if state.running {
-                // Only at the last owner's drop (node shutdown): it also stops
-                // RocksDB's automatic background work for this DB instance.
-                let db = job
-                    .db
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .upgrade();
-                if let Some(db) = db {
-                    db.cancel_all_background_work(false);
+                // Only at the last owner's drop (node shutdown), and only when
+                // nothing else holds the DB: the cancel also stops RocksDB's
+                // automatic background work (flushes included) for good, so a
+                // DB still shared (`db_arc`, the consensus kv store) is left
+                // alone and the join below waits for the run instead.
+                let slot = job.lock_db();
+                if let Some(db) = slot.upgrade() {
+                    // This upgrade, the last `StateDb`'s own `Arc`, the run's.
+                    let ours =
+                        2 + usize::from(job.holds_db.load(std::sync::atomic::Ordering::Relaxed));
+                    if Arc::strong_count(&db) == ours {
+                        db.cancel_all_background_work(false);
+                    }
                 }
             }
             job.work.notify_all();
@@ -782,8 +819,11 @@ impl StateDb {
     ///
     /// Never blocks the caller and never runs on it: one long-lived worker per
     /// DB compacts one batch of requests at a time; a request while it runs
-    /// joins the next batch (requests with the same `start` widen one range).
-    /// A failure is logged and counted, never returned. Node-local: a
+    /// joins the next batch. Requests group by `(cf, group)` and one group
+    /// widens one range: `group` is `start` here, and the market prefix for
+    /// [`Self::note_scanned_deletes`] (one range per `(cf, market)`).
+    /// A failure (a panic, or a RocksDB background error during the run) is
+    /// logged and counted, never returned. Node-local: a
     /// compaction changes no read result, state, root or hash.
     pub fn compact_range_in_background(&self, cf: &'static str, start: &[u8], end: Option<&[u8]>) {
         let mut state = self.range_compaction.0.lock_state();
@@ -1893,6 +1933,108 @@ mod compaction_drop_tests {
         assert_eq!(job.started.load(Relaxed), 1);
         assert_eq!(Arc::strong_count(&job), 1, "the worker thread is still alive");
         assert!(took < Duration::from_secs(5), "drop took {took:?}");
+    }
+
+    /// 18c review (low): the last `StateDb` drop must not cancel RocksDB's
+    /// background work while another owner (the consensus kv store's
+    /// `db_arc`) still uses the DB: its flushes would fail from then on.
+    #[test]
+    fn the_last_drop_leaves_a_db_still_shared_with_another_owner_working() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let kv = db.db_arc();
+        let job = start_held_compaction(&db, 300);
+        drop(db);
+        assert_eq!(*job.lock_runs(), (1, 0));
+        kv.put(b"k", b"v").expect("put");
+        kv.flush()
+            .expect("the shared DB must still flush after the StateDb drop");
+    }
+
+    /// 18c review (missing test): dropping the last `StateDb` while RocksDB is
+    /// running the worker's compaction neither hangs nor panics, and the DB
+    /// reopens with every row.
+    #[test]
+    fn shutdown_during_a_running_compaction_neither_hangs_nor_panics() {
+        const ROWS: u32 = 400_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let key = |i: u32| [ORACLE_SUBMISSION_PREFIX, &i.to_be_bytes()].concat();
+        // Two overlapping L0 files: the compaction must merge them.
+        for pass in 0..2u8 {
+            let cf = db.cf_handle(CF_NATIVE_ORACLE).unwrap();
+            let mut batch = WriteBatch::default();
+            for i in 0..ROWS {
+                batch.put_cf(cf, key(i), [pass; 64]);
+            }
+            db.write(batch).expect("write");
+            db.inner().flush_cf(cf).expect("flush");
+        }
+        let job = db.compaction_job();
+        db.compact_pruned_submissions_in_background();
+        let running = || {
+            db.inner()
+                .property_int_value("rocksdb.num-running-compactions")
+                .unwrap()
+                .unwrap_or(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while running() == 0 {
+            assert!(
+                *job.lock_runs() == (0, 0) && Instant::now() < deadline,
+                "the compaction ended before the drop: make the fixture bigger"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(db);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the last StateDb drop hung on the running compaction");
+        dropper.join().expect("the drop panicked");
+        assert_eq!(
+            Arc::strong_count(&job),
+            1,
+            "the worker thread is still alive"
+        );
+        let db = StateDb::open(dir.path()).expect("reopen after the drop");
+        let rows =
+            crate::StateBackend::iterate_cf(&db, CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX));
+        assert_eq!(rows.expect("scan").len(), ROWS as usize);
+    }
+
+    /// 18c review (low): rust-rocksdb's `compact_range_cf_opt` returns `()`, so
+    /// a RocksDB error inside the run (here the compaction cannot create its
+    /// output file in a read-only directory) must still count as a failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_rocksdb_error_during_the_run_counts_as_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = StateDb::open(dir.path()).expect("open");
+        let cf = db.cf_handle(CF_NATIVE_ORACLE).unwrap();
+        db.put_cf_raw(
+            CF_NATIVE_ORACLE,
+            &[ORACLE_SUBMISSION_PREFIX, b"k"].concat(),
+            b"v",
+        )
+        .expect("put");
+        db.inner().flush_cf(cf).expect("flush");
+        let chmod = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        chmod(0o555);
+        if std::fs::File::create(dir.path().join("probe")).is_ok() {
+            // Root ignores the mode: no error to provoke.
+            chmod(0o755);
+            return;
+        }
+        db.compact_pruned_submissions_in_background();
+        let runs = db.wait_background_compaction();
+        chmod(0o755);
+        assert_eq!(runs, (0, 1), "the failed compaction was counted as done");
     }
 
     #[test]
