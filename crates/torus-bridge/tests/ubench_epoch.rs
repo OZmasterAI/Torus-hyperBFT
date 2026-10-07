@@ -303,12 +303,16 @@ fn run() {
             .unwrap();
             for k in 0..seed_pos {
                 let m = 1 + (i * 7 + k) % markets;
+                let is_long = rng.chance(500);
+                let size = FixedPoint::from_raw((1 + rng.below(5) as i128) * FixedPoint::SCALE);
+                let entry_price = FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE);
                 pm.put_position(&Position {
                     trader: t,
                     market_id: m,
-                    is_long: rng.chance(500),
-                    size: FixedPoint::from_raw((1 + rng.below(5) as i128) * FixedPoint::SCALE),
-                    entry_price: FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE),
+                    is_long,
+                    size,
+                    entry_price,
+                    cost_basis: entry_price * size,
                     realized_pnl: FixedPoint::ZERO,
                     isolated_margin: FixedPoint::ZERO,
                     margin_type: MarginType::Cross,

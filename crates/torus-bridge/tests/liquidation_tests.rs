@@ -875,7 +875,12 @@ fn same_mark_interval_gives_the_same_pre_clamp_price() {
     assert_eq!((pos(&c2, &u1, 1), pos(&c2, &u2, 1)), (FixedPoint::ZERO, fp(10)), "only u1 reached");
     let c3 = step(3, 900, Some(&u2), 2_048, 64);
     assert_eq!(pos(&c3, &u2, 1), FixedPoint::ZERO);
-    let want = adl_price(fp(1_000), bankruptcy_price(fp(600), true, fp(10), fp(1_000)), fp(900), true);
+    let want = adl_price(
+        fp(1_000),
+        bankruptcy_price(fp(600), true, fp(10), fp(10_000)),
+        fp(900),
+        true,
+    );
     assert_eq!(want, fp(940));
     let o = |height, trader| Obligation { height, market: 1, is_long: true, trader, size: fp(10), price: want };
     assert_eq!(obligations(&c3), vec![o(2, u1), o(3, u2)]);
@@ -972,15 +977,11 @@ fn keys(ctx: &NativeExecContext) -> Vec<(u64, MarketId, Address)> {
     obligations(ctx).iter().map(|o| (o.height, o.market, o.trader)).collect()
 }
 
-/// The dust bound (plan *Dust bound*) for [`p2_fixture`], in raw units: per
-/// market the long escrow receives at most 3 rows (sizes after receiving
-/// 1, 2, 3: (1 + 3) + (2 + 3) + (3 + 3)) and closes at most 3 times.
-const P2_DUST_BOUND: i128 = 4 * ((1 + 3) + (2 + 3) + (3 + 3) + 3);
-
 /// OI symmetric (escrows included), escrow size = Σ rows per (market, side),
-/// Σ value over ALL accounts within `tol` raw of `before` (mark-independent
-/// under OI symmetry, so comparable across blocks).
-fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint, tol: i128) {
+/// Σ value over ALL accounts EXACTLY `before` (mark-independent under OI
+/// symmetry, so comparable across blocks; s100 item 2: the escrows' exact
+/// cost basis leaves no dust: the plan's *Dust bound* is now 0).
+fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint) {
     let rows = obligations(ctx);
     for m in 1..=4 {
         let (l, s) = oi(ctx, m);
@@ -992,7 +993,7 @@ fn invariants(ctx: &NativeExecContext, mark: i64, before: FixedPoint, tol: i128)
         }
     }
     let now = total_value(ctx, &p2_marks(mark));
-    assert!((now - before).raw().abs() <= tol, "Σ over ALL accounts (vault, escrows): {now:?} vs {before:?}");
+    assert_eq!(now, before, "Σ over ALL accounts (vault, escrows)");
 }
 
 /// No position and (available, order margin) == (0, 0).
@@ -1010,8 +1011,8 @@ fn has_row(ctx: &NativeExecContext, tag: u8, t: &Address) -> bool {
 /// test computes sequentially (`rest` = cash + the other positions at 900):
 /// u1 1,000, 1,000, 1,000, 900 (the clamp binds at m4); u2 1,000, 1,000,
 /// 962.99999999, 900. D9 = 0 for both (under H the deficit is ~0). Σ value
-/// within 1 raw: the escrow's market-3 average (962.99999999 + 1,000) / 2
-/// truncates by half a raw unit x size 2 (plan: 0; the dust starts at B).
+/// exact (s100 item 2: was within 1 raw, the escrow's market-3 average
+/// (962.99999999 + 1,000) / 2 truncated; its cost basis is exact).
 #[test]
 fn p2_a_bankrupt_account_is_flat_with_zero_collateral_at_b() {
     use torus_core::liquidation::{adl_price, bankruptcy_price};
@@ -1046,7 +1047,7 @@ fn p2_a_bankrupt_account_is_flat_with_zero_collateral_at_b() {
         (1..=4).flat_map(|m| [row(m, u2, p2[m as usize - 1]), row(m, u1, p1[m as usize - 1])]).collect();
     assert_eq!(obligations(&c), want);
     assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO, "D9: 0 for both");
-    invariants(&c, 900, before, 1);
+    invariants(&c, 900, before);
     assert!(NativeExecutor::liquidation_due(&c.state).unwrap(), "rows keep the step due");
     assert_eq!(c.metrics.as_ref().unwrap().liquidations_adl.get(), 2);
 }
@@ -1227,7 +1228,7 @@ fn p2_drain_stops_at_w_and_resumes_in_fifo_order() {
     assert_eq!(holders(&c, 1), 6, "H_2");
     assert_eq!(keys(&c), vec![(2, 2, u1), (2, 3, u2), (2, 3, u1), (2, 4, u2), (2, 4, u1)]);
     assert_eq!(work(&c), 70);
-    invariants(&c, 900, before, P2_DUST_BOUND);
+    invariants(&c, 900, before);
     drop(c);
     fund(&ctx_at(db.clone(), 3), &u3, fp(100));
     before -= fp(900);
@@ -1235,12 +1236,12 @@ fn p2_drain_stops_at_w_and_resumes_in_fifo_order() {
     assert_eq!(holders(&c, 1), 5, "H_3");
     assert_eq!(keys(&c), vec![(3, 4, u3)]);
     assert_eq!(work(&c), 64);
-    invariants(&c, 900, before, P2_DUST_BOUND);
+    invariants(&c, 900, before);
     drop(c);
     let c = step(&db, 4, 900, W);
     assert_eq!(keys(&c), vec![]);
     assert_eq!(work(&c), 11);
-    invariants(&c, 900, before, P2_DUST_BOUND);
+    invariants(&c, 900, before);
     assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty());
 }
 
@@ -1283,14 +1284,14 @@ fn block_b_work_is_charged_into_w_before_the_drain() {
         for u in [u1, u2] {
             flat_at_zero(&c, &u);
         }
-        invariants(&c, 900, before, P2_DUST_BOUND);
+        invariants(&c, 900, before);
         assert!(NativeExecutor::liquidation_due(&c.state).unwrap(), "W {w}: rows keep the step due");
         drop(c);
         if left == 8 {
             let c = step(&db, 3, 900, w);
             assert!(obligations(&c).is_empty(), "W {w}: block 3 drains the rest");
             assert_eq!(c.metrics.as_ref().unwrap().liquidation_adl_work_total.get(), 44, "W {w}");
-            invariants(&c, 900, before, P2_DUST_BOUND);
+            invariants(&c, 900, before);
         }
     }
 }
@@ -1330,8 +1331,9 @@ fn a_ranking_charges_the_holders_of_its_market_not_the_trader_set() {
 
 /// Default W: the drain finishes in B; both escrows end with no position
 /// and (0, 0); the vault holds D9 at B (0, see the B test) + the swept dust,
-/// within the dust bound and not 0 (u2's 962.99999999 makes market 3's
-/// average inexact); Σ value within |dust|.
+/// which is 0 (s100 item 2: was 1 raw, u2's 962.99999999 made market 3's
+/// average inexact; the exact cost basis closes each row at its own
+/// notional): no sweep line; Σ value exact.
 #[test]
 fn p2_escrows_end_flat_with_zero_balance_and_the_vault_holds_the_deficit() {
     let (_d, db) = p2_fixture();
@@ -1343,10 +1345,15 @@ fn p2_escrows_end_flat_with_zero_balance_and_the_vault_holds_the_deficit() {
     for e in [ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
         flat_at_zero(&c, &e);
     }
-    let dust = bal(&c, &LIQUIDATOR_VAULT).available;
-    assert!(dust != FixedPoint::ZERO && dust.raw().abs() <= P2_DUST_BOUND, "dust {dust:?}");
-    assert_eq!(ev.events("liquidation: ADL escrow dust to the vault").len(), 1);
-    invariants(&c, 900, before, dust.raw().abs());
+    assert_eq!(
+        bal(&c, &LIQUIDATOR_VAULT).available,
+        FixedPoint::ZERO,
+        "no dust"
+    );
+    assert!(ev
+        .events("liquidation: ADL escrow dust to the vault")
+        .is_empty());
+    invariants(&c, 900, before);
 }
 
 /// Terms fixed at B: rows written at B (W = 0, mark 900); the next block has
@@ -1529,7 +1536,7 @@ fn p2_drain_is_deterministic() {
 /// accounts long 1 in all 100 go bankrupt in one block (300 rows). With the
 /// default W the step closes everything in that block: no `0x07` row, both
 /// escrows flat at 0, every ADL'd account at 0, OI symmetric, Σ value
-/// within the dust bound (per market <= 3 rows of sizes 1..3 and <= 4 closes).
+/// exact (s100 item 2: was within the dust bound).
 #[test]
 fn an_hl_sized_event_closes_in_its_own_block() {
     let markets: Vec<MarketId> = (1..=100).collect();
@@ -1571,8 +1578,7 @@ fn an_hl_sized_event_closes_in_its_own_block() {
         let (l, s) = oi(&c, m);
         assert_eq!(l, s, "OI symmetric in {m}");
     }
-    let now = total_value(&c, &marks(&all(900)));
-    assert!((now - before).raw().abs() <= 100 * ((1 + 3) + (2 + 3) + (3 + 3) + 4), "{now:?} vs {before:?}");
+    assert_eq!(total_value(&c, &marks(&all(900))), before);
 }
 
 /// A listed market without a usable mark (stale oracle): its rows wait, cost
@@ -1620,7 +1626,7 @@ fn p2_rows_of_a_delisted_market_close_at_the_stored_price() {
     assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty(), "the escrow is flat");
     let m2: Vec<String> = ev.events("liquidation: ADL close").iter().filter(|e| e["market"] == "2").map(|e| e["price"].clone()).collect();
     assert_eq!(m2, vec![fp(1_000).to_string(); 2], "market 2 closed at the stored prices");
-    invariants(&c, 900, before, P2_DUST_BOUND);
+    invariants(&c, 900, before);
 }
 
 /// M2 for the vault after the drain: the vault is market 1's only short
@@ -2127,8 +2133,8 @@ fn telemetry_does_not_change_results_or_state() {
 /// deficit (Σ over both escrows of available + UPnL at the marks), the
 /// drain's work units and the swept dust (cumulative, signed); with
 /// `liq_value_sum` on, the value sum over ALL accounts (= the test's
-/// `total_value` after every block, constant across the drain within the
-/// dust bound). B = block 2 with W = 0: 8 rows, the long escrow long 2 in
+/// `total_value` after every block, constant across the drain: exactly,
+/// s100 item 2, so the swept dust is 0). B = block 2 with W = 0: 8 rows, the long escrow long 2 in
 /// each market (8 x 900 notional), B's own 8 transfers counted (48 units,
 /// s99); then W = 19: block 3 drains 3 rows for 22 units (12 + 2 + 8: H = 6
 /// holders, 4 first-sight valuations), and later blocks the rest. Every
@@ -2164,7 +2170,7 @@ fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
     let deficit = escrows(&c);
     assert_eq!(met.liquidation_adl_queue_deficit.get(), tokens(deficit));
     let owed = obligations(&c).iter().fold(FixedPoint::ZERO, |s, o| s + fp(900) - o.price);
-    assert!((deficit - owed).raw().abs() <= 1, "≈ Σ (900 - price) over the rows: {deficit:?} vs {owed:?}");
+    assert_eq!(deficit, owed, "Σ (900 - price) over the rows (s100: exact, was within 1 raw)");
     assert_eq!(met.liquidation_adl_work_total.get(), 8 * ADL_TRANSFER_UNITS, "W = 0: no drain, B's transfers only");
     let before = total_value(&c, &p2_marks(900));
     assert_eq!(met.liquidation_value_sum.get(), tokens(before));
@@ -2178,13 +2184,13 @@ fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
         assert_eq!(met.liquidation_adl_queue.get(), obligations(&c).len() as i64, "block {h}");
         let now = total_value(&c, &p2_marks(900));
         assert_eq!(met.liquidation_value_sum.get(), tokens(now), "block {h}");
-        assert!((now - before).raw().abs() <= P2_DUST_BOUND, "block {h}: constant within the dust bound");
+        assert_eq!(now, before, "block {h}: constant");
         if obligations(&c).is_empty() {
             assert_eq!(met.liquidation_adl_escrow_notional.get(), 0.0);
             assert_eq!(met.liquidation_adl_queue_deficit.get(), 0.0);
-            let dust = bal(&c, &LIQUIDATOR_VAULT).available; // D9 at B = 0 (the B test)
-            assert!(dust != FixedPoint::ZERO);
-            assert_eq!(met.liquidation_adl_dust.get(), tokens(dust));
+            // D9 at B = 0 (the B test), and no dust.
+            assert_eq!(bal(&c, &LIQUIDATOR_VAULT).available, FixedPoint::ZERO);
+            assert_eq!(met.liquidation_adl_dust.get(), 0.0);
             break;
         }
         h += 1;
@@ -2442,14 +2448,13 @@ fn an_hl_shaped_event_costs_exactly_the_sizing_formula() {
 /// row per block from block 3). L1 / L2 / L3 long 1 in markets 1 and 3, S1 /
 /// S2 short 1 in markets 2 and 4 (collateral 100.00000001 for L1 and S1, 100
 /// for the others; marks 1,000, then 900 for 1 / 3 and 1,100 for 2 / 4: AV
-/// -100, ADL). L1's market-1 price 999.99999999 truncates the long escrow's
-/// average to 999.99999999 (with L2's 1,000, later L3's), so L2's and L3's
-/// rows each realize +1 raw: long dust +2 raw; S1's market-2 price
-/// 1,000.00000001 truncates the short escrow's average (with S2's 1,000) to
-/// 1,000: S1's row realizes -1 raw. At the end: no row, both escrows with no
-/// position and (0, 0), each swept exactly once (+0.00000002, -0.00000001),
-/// the vault holding exactly their sum (+1 raw: D9 = 0 for all five), the
-/// dust gauge = the vault.
+/// -100, ADL). L1's market-1 price 999.99999999 and S1's market-2 price
+/// 1,000.00000001 made the escrows' averaged entries inexact (main: long
+/// dust +2 raw, short -1 raw, the vault +1 raw). s100 item 2: the escrows'
+/// cost basis is exact, so every escrow ends flat with exactly 0 and the
+/// sweep moves nothing: no sweep line, the vault at 0 (D9 = 0 for all
+/// five), the dust gauge 0. At the end: no row, both escrows with no
+/// position and (0, 0).
 #[test]
 fn p2_a_two_sided_storm_sweeps_both_escrows_to_zero() {
     let (_d, db) = liq_db(&[1, 2, 3, 4]);
@@ -2500,20 +2505,17 @@ fn p2_a_two_sided_storm_sweeps_both_escrows_to_zero() {
             for t in [l1, s1, l2, s2, l3, ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
                 flat_at_zero(&c, &t);
             }
-            let vault = bal(&c, &LIQUIDATOR_VAULT).available;
-            let swept = ev.events("liquidation: ADL escrow dust to the vault");
-            let mut got: Vec<(String, String)> =
-                swept.iter().map(|e| (e["escrow"].clone(), e["dust"].clone())).collect();
-            got.sort();
-            let mut want = vec![
-                (ADL_ESCROW_LONG.to_string(), FixedPoint::from_raw(2).to_string()),
-                (ADL_ESCROW_SHORT.to_string(), FixedPoint::from_raw(-1).to_string()),
-            ];
-            want.sort();
-            assert_eq!(got, want, "one sweep per escrow, with its dust");
-            assert_eq!(vault, FixedPoint::from_raw(1), "the vault holds exactly the dust sum (+2 - 1 raw)");
-            let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;
-            assert_eq!(met.liquidation_adl_dust.get(), tokens(vault), "dust gauge = the vault (D9 = 0)");
+            assert!(
+                ev.events("liquidation: ADL escrow dust to the vault")
+                    .is_empty(),
+                "no dust to sweep"
+            );
+            assert_eq!(
+                bal(&c, &LIQUIDATOR_VAULT).available,
+                FixedPoint::ZERO,
+                "the vault: D9 = 0, no dust"
+            );
+            assert_eq!(met.liquidation_adl_dust.get(), 0.0, "dust gauge");
             assert_eq!(met.liquidation_adl_queue.get(), 0);
             assert_eq!(met.liquidation_adl_escrow_notional.get(), 0.0);
             assert_eq!(met.liquidation_adl_queue_deficit.get(), 0.0);
@@ -2522,4 +2524,86 @@ fn p2_a_two_sided_storm_sweeps_both_escrows_to_zero() {
         h += 1;
         assert!(h < 20, "drained");
     }
+}
+
+/// s100 review follow-up 1: escrow dust is still reachable when a row is
+/// closed in PIECES at a price where price × piece truncates. L long 1 in
+/// markets 1 and 3 at 1,000 (collateral 100.00000001); market 1's shorts are
+/// two holders of 0.5 each, market 3's one holder of 1. Marks 1,000, then
+/// 900: L is ADL'd at B; its market-1 row clamps to the bankruptcy price
+/// 999.99999999 (rest = 0.00000001), market 3's to 900 (L ends at exactly 0,
+/// D9 = 0). The drain (same block) closes the market-1 row against the two
+/// holders at 0.5 each: each piece's notional 499.999999995 truncates, so
+/// the long escrow realizes 2 × 499.99999999 − 999.99999999 = −1 raw. At the
+/// end: both escrows flat, the long escrow's −0.00000001 swept to the vault
+/// exactly once (the sweep line and the `adl_dust` gauge carry it), the
+/// vault at −1 raw, and the value sum over ALL accounts exact (the sweep is
+/// a transfer).
+#[test]
+fn a_row_closed_in_pieces_sweeps_its_dust_to_the_vault() {
+    let (_d, db) = liq_db(&[1, 3]);
+    let (l, c1, c2, c3) = (addr(0x31), addr(0x41), addr(0x42), addr(0x43));
+    let half = FixedPoint::from_raw(FixedPoint::SCALE / 2);
+    let c = ctx_at(db.clone(), 1);
+    fund(&c, &l, FixedPoint::from_raw(fp(100).raw() + 1));
+    for t in [c1, c2, c3] {
+        fund(&c, &t, fp(10_000_000));
+    }
+    for s in [c1, c2] {
+        c.positions
+            .apply_fill(&l, 1, true, half, fp(1_000), MarginType::Cross)
+            .unwrap();
+        c.positions
+            .apply_fill(&s, 1, false, half, fp(1_000), MarginType::Cross)
+            .unwrap();
+    }
+    open_pair(&c, &l, &c3, 3, 1, 1_000);
+    drop(c);
+    let marks2 = |p: i64| marks(&[(1, p), (3, p)]);
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let ev = Captured::default();
+    let block = |h: u64, p: i64| {
+        let mut c = ctx_at(db.clone(), h);
+        for m in [1, 3] {
+            set_mark(&c, m, fp(p));
+        }
+        c.metrics = Some(met.clone());
+        ev.with(|| NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, ADL_WORK_PER_BLOCK));
+        assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        c
+    };
+    drop(block(1, 1_000));
+    let before = total_value(&ctx_at(db.clone(), 2), &marks2(900));
+    let c = block(2, 900);
+    assert_eq!(met.liquidations_adl.get(), 1);
+    assert!(obligations(&c).is_empty(), "drained in B");
+    for t in [l, ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
+        flat_at_zero(&c, &t);
+    }
+    let dust = FixedPoint::from_raw(-1);
+    let swept: Vec<(String, String)> = ev
+        .events("liquidation: ADL escrow dust to the vault")
+        .iter()
+        .map(|e| (e["escrow"].clone(), e["dust"].clone()))
+        .collect();
+    assert_eq!(
+        swept,
+        vec![(ADL_ESCROW_LONG.to_string(), dust.to_string())],
+        "one sweep, the long escrow's"
+    );
+    assert_eq!(
+        bal(&c, &LIQUIDATOR_VAULT).available,
+        dust,
+        "the vault holds exactly the dust (D9 = 0)"
+    );
+    assert_eq!(
+        met.liquidation_adl_dust.get(),
+        dust.raw() as f64 / FixedPoint::SCALE as f64,
+        "dust gauge"
+    );
+    assert_eq!(
+        total_value(&c, &marks2(900)),
+        before,
+        "Σ over ALL accounts exact"
+    );
 }

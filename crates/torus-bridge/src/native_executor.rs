@@ -10794,13 +10794,17 @@ mod maker_accounts_tests {
                     } else {
                         FixedPoint::from_raw(1 + rng.below(500 * FixedPoint::SCALE as u64) as i128)
                     };
+                    let is_long = rng.below(2) == 0;
+                    let entry_price = fp(1 + rng.below(50_000) as i64);
                     ctx.positions
                         .put_position(&Position {
                             trader: *t,
                             market_id: m,
-                            is_long: rng.below(2) == 0,
+                            is_long,
                             size,
-                            entry_price: fp(1 + rng.below(50_000) as i64),
+                            entry_price,
+                            // The huge size overflows the notional anyway.
+                            cost_basis: entry_price.checked_mul(size).unwrap_or(FixedPoint::MAX),
                             realized_pnl: FixedPoint::ZERO,
                             isolated_margin: FixedPoint::ZERO,
                             margin_type: if rng.below(40) == 0 { MarginType::Isolated } else { MarginType::Cross },

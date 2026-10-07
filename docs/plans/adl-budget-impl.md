@@ -124,9 +124,9 @@ opposite side's rows of the same market, in key order. The two escrows close aga
 **each at its own stored price**, and the vault pays `(p_long − p_short) × q`: `liq::cross_close`.
 The amount is tested and reported (log + gauge).
 
-**Dust sweep.** At the end of a drain, a flat escrow's balance (dust from weighted-average
-entries, any sign) moves to the vault. It is reported separately (log + gauge) and must stay
-within the *Dust bound*.
+**Dust sweep.** At the end of a drain, a flat escrow's balance (dust, any sign) moves to the
+vault. It is reported separately (log + gauge) and must stay within the *Dust bound*. s100 (exact
+cost basis): the dust is 0 unless a row is closed in pieces; see *Dust bound*.
 
 **Where the Q2 cache lives.** A local
 `BTreeMap<(MarketId, bool), (Vec<AdlCandidate>, usize)>` in `adl_drain`, dropped when the drain
@@ -174,10 +174,17 @@ available + order margin + UPnL at the mark (unmarked: at entry).
 * It sets a gauge and logs one info line `liquidation: value sum` that the harness can parse
   from cell logs.
 * With OI symmetric and every market marked, the sum does not depend on the mark
-  (Σ UPnL = −Σ signed size × entry), so it must stay constant across a drain without deposits,
-  withdrawals or fee debits.
+  (Σ UPnL = −Σ signed size × entry; s100: −Σ signed cost basis, exact), so it must stay constant
+  across a drain without deposits, withdrawals or fee debits.
 
 ### Dust bound
+
+**s100 (item 2, exact cost basis): superseded.** Positions store an exact `cost_basis` and each
+fill rounds once (price × qty, shared by both sides), so the value sum is exact and an escrow ends
+with 0 dust when each row closes whole. Dust remains only when a row closes in pieces: each piece's
+price × qty truncates, < 1 raw per piece (test
+`a_row_closed_in_pieces_sweeps_its_dust_to_the_vault`: −1 raw). The bound below is the old
+(averaged-entry) analysis.
 
 `apply_fill` (`position.rs:515-519`) averages the entry with
 `(entry × size + price × qty) / new_size`, truncating. Each average is off by < 1 raw price unit,
@@ -896,7 +903,7 @@ The existing ADL tests stay RED until A6 (same commit).
 **As built (dfa170c, one commit with A6), deviations:**
 * #1 asserts Σ value within **1 raw**, not 0: the escrow's market-3 average
   `(962.99999999 + 1,000) / 2` truncates, so its UPnL at 900 is off by 1 raw at B already
-  (checked: with 0 the test fails by exactly 1 raw).
+  (checked: with 0 the test fails by exactly 1 raw). s100: exact (0) with the cost basis.
 * #2: the running-`rest` shadow is `#[cfg(test)]` inside the bridge library, so it cannot run
   in the `tests/liquidation_tests.rs` binary. It runs in the lib's seeded L1 test
   (`liquidation_l1_equals_reference_walk_on_seeded_sequences`: 78 ADL classifications over
@@ -937,6 +944,7 @@ time: escrows are in the list, and the flat accounts are not):
    * `dust = vault − D9_at_B`, and `|dust| ≤` the *Dust bound* (u2's 962.99999999 makes market
      3's average inexact, so the dust is not 0 by construction);
    * `invariants` within `|dust|`.
+   * s100 (exact cost basis): the dust is 0 and `invariants` exact; the rows close whole.
 5. `p2_counterparties_are_paid_at_the_stored_price`: rows written at B with W = 0. The next block
    has mark 800 and the default W, and the closes still use the stored prices (terms fixed at
    B). Each counterparty's realized PnL = `(entry − price) × q`.
