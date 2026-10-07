@@ -28,7 +28,15 @@
 //!
 //! `UB_ADL_HL=1` (the W sizing case, adl-budget-impl A8): 3 bankrupt accounts
 //! in markets 1..=100 (300 rows over 100 (market, long) keys); asserts the
-//! escrows are closed after block B.
+//! escrows are closed after block B when W covers the event's units
+//! U(N) = 100 × (N + 2) + 300 × 2 (the sizing formula, §9).
+//!
+//! `UB_ADL_HOLDERS_PCT` (default 100: every trader holds every market):
+//! thin markets for C2. Traders come in pairs (2p, 2p + 1); a pair holds
+//! market `m` iff a fixed hash of (p, m) mod 100 < the percentage, so each
+//! market's holders are a deterministic ~pct % subset with net size 0 (the
+//! pair is one long, one short by the `i + m` rule). Bankrupt accounts and
+//! the sink as above. Use an even `UB_ADL_TRADERS`.
 //!
 //! Asserts: per-block units <= W + the largest row cost (1 visit + a ranking
 //! of every trader + reads; no edge rows here); afterwards OI symmetric in
@@ -123,6 +131,18 @@ fn bankrupt(k: u64) -> Address {
     Address::new(b)
 }
 
+/// Whether trader `i` holds market `m` (`UB_ADL_HOLDERS_PCT`): per pair
+/// `i / 2`, splitmix64 of (pair, market) mod 100 < `pct`.
+fn holds(i: u64, m: u64, pct: u64) -> bool {
+    if pct >= 100 {
+        return true;
+    }
+    let mut z = ((i / 2) << 16 | m).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) % 100 < pct
+}
+
 fn fp(v: i128) -> FixedPoint {
     FixedPoint::from_raw(v * FixedPoint::SCALE)
 }
@@ -149,6 +169,7 @@ fn ubench_adl_p2() {
     let pu = if hl { 100 } else { env("UB_ADL_POSITIONS", 270) };
     let w = env("UB_ADL_WORK", liq::ADL_WORK_PER_BLOCK);
     let resident = env("UB_NO_R", 0) != 1;
+    let holders_pct = env("UB_ADL_HOLDERS_PCT", 100);
     let (scan, act) = (liq::LIQ_SCAN_PER_BLOCK, liq::LIQ_ACT_PER_BLOCK);
     let mid = base_mark();
     let low = mid - fp(1_000);
@@ -172,7 +193,9 @@ fn ubench_adl_p2() {
         for i in 0..n {
             fund(&sender(i), fp(100_000_000));
             for m in 1..=MARKETS {
-                fill(&sender(i), m, (i + m) % 2 == 0);
+                if holds(i, m, holders_pct) {
+                    fill(&sender(i), m, (i + m) % 2 == 0);
+                }
             }
         }
         let sink = special(0xF0);
@@ -194,6 +217,9 @@ fn ubench_adl_p2() {
         k * pu,
         ms(t)
     );
+    if holders_pct < 100 {
+        println!("ADL setup: holders_pct={holders_pct}");
+    }
 
     let metrics = Arc::new(torus_telemetry::Metrics::new());
     let mut holder = ResidentBooks::default();
@@ -258,7 +284,7 @@ fn ubench_adl_p2() {
         }
         let queue_empty = liq::next_obligation(&ctx.state, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none();
         if !drained && h >= 2 && queue_empty && metrics.liquidations_adl.get() >= k {
-            if hl {
+            if hl && w >= 100 * (n + 2) + 600 {
                 assert_eq!(blocks.len(), 1, "an HL-sized event closes the escrows in block B");
             }
             for a in (0..k).map(bankrupt).chain([liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT]) {
