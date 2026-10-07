@@ -774,8 +774,20 @@ fn adl_c2_holder_lists_are_bit_identical_to_c1() {
 /// by block: the HL-like event and the S=750-like storm, R inline and worker.
 #[test]
 fn adl_ranking_dirty_checks_use_the_drain_set() {
-    let hl = AdlShape { k: 3, pu: 6, act: 64, work: liq::ADL_WORK_PER_BLOCK, two_sided: false };
-    let storm = AdlShape { k: 10, pu: 6, act: 3, work: STORM_W, two_sided: true };
+    let hl = AdlShape {
+        k: 3,
+        pu: 6,
+        act: 64,
+        work: liq::ADL_WORK_PER_BLOCK,
+        two_sided: false,
+    };
+    let storm = AdlShape {
+        k: 10,
+        pu: 6,
+        act: 3,
+        work: STORM_W,
+        two_sided: true,
+    };
     for (name, shape) in [("hl", hl), ("storm", storm)] {
         for r in [Rm::Inline, Rm::Worker] {
             ADL_DIRTY_STATS.with(|s| s.set((0, 0)));
@@ -783,12 +795,24 @@ fn adl_ranking_dirty_checks_use_the_drain_set() {
             let (set, layer) = ADL_DIRTY_STATS.with(|s| s.get());
             let reference = adl_run_with(shape, r, false, true);
             println!("ADL dirty checks {name} {r:?}: drain set {set}, layer_touches {layer}");
-            assert!(set > 0, "{name} {r:?}: the rankings asked the drain set ({set})");
+            assert!(
+                set > 0,
+                "{name} {r:?}: the rankings asked the drain set ({set})"
+            );
             assert_eq!(layer, 0, "{name} {r:?}: no ranking asked layer_touches");
             assert_eq!(fast.len(), reference.len(), "{name} {r:?}: blocks");
             for (h, (a, b)) in fast.iter().zip(&reference).enumerate() {
-                assert_eq!(a.adl_work, b.adl_work, "{name} {r:?} block {}: units", h + 1);
-                assert!(a == b, "{name} {r:?} block {}: rows / units / results", h + 1);
+                assert_eq!(
+                    a.adl_work,
+                    b.adl_work,
+                    "{name} {r:?} block {}: units",
+                    h + 1
+                );
+                assert!(
+                    a == b,
+                    "{name} {r:?} block {}: rows / units / results",
+                    h + 1
+                );
             }
         }
     }

@@ -611,7 +611,13 @@ impl NativeExecutor {
         let shadow = false;
         let fresh_set;
         let fresh_dirty;
-        let DrainCache { traders, av, dirty: dirty_cache, dirty_traders, seen } = cache;
+        let DrainCache {
+            traders,
+            av,
+            dirty: dirty_cache,
+            dirty_traders,
+            seen,
+        } = cache;
         // C2: the holder list of `m` when the records are attached (with R:
         // the dirty map exists), else every trader (C1).
         let records = ctx.sums.as_ref().and_then(|s| s.records.as_ref()).filter(|_| c2);
@@ -619,7 +625,8 @@ impl NativeExecutor {
             None => None,
             Some(_) if on => {
                 if dirty_cache.is_none() {
-                    if let Some((m, t)) = trader_positions::dirty_by_market_and_traders(&ctx.state) {
+                    if let Some((m, t)) = trader_positions::dirty_by_market_and_traders(&ctx.state)
+                    {
                         (*dirty_cache, *dirty_traders) = (Some(m), Some(t));
                     }
                 }
@@ -658,7 +665,10 @@ impl NativeExecutor {
             (None, Some(s)) => s,
             (None, None) => unreachable!("without a holder list the set is taken"),
         };
-        let reader = AccountReader { drain_dirty: dirty_traders.as_ref(), ..AccountReader::of(ctx) };
+        let reader = AccountReader {
+            drain_dirty: dirty_traders.as_ref(),
+            ..AccountReader::of(ctx)
+        };
         #[cfg(test)]
         let checks_before = DIRTY_CHECKS.with(|c| c.get());
         // C7: ranking AV with entry fallback; overflow ranks last (AV 0); a
@@ -699,7 +709,12 @@ impl NativeExecutor {
         #[cfg(test)]
         {
             let (set, layer) = DIRTY_CHECKS.with(|c| c.get());
-            ADL_DIRTY_STATS.with(|x| x.set((x.get().0 + set - checks_before.0, x.get().1 + layer - checks_before.1)));
+            ADL_DIRTY_STATS.with(|x| {
+                x.set((
+                    x.get().0 + set - checks_before.0,
+                    x.get().1 + layer - checks_before.1,
+                ))
+            });
         }
         #[cfg(test)]
         if let Some(s) = ctx.sums.as_ref() {
