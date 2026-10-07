@@ -48,6 +48,10 @@ pub struct Counts {
     /// Always on: scans of `CF_NATIVE_LIQUIDATION` starting in the pending
     /// tag (`0x06`) — the liquidation telemetry's pending-row reads.
     pub pending_scans: AtomicUsize,
+    /// Always on: page scans (limit > 1) of `CF_NATIVE_LIQUIDATION`'s ADL
+    /// obligation rows (prefix `0x07`) — the queue gauge's re-counts (the
+    /// drain reads one row at a time).
+    pub queue_page_scans: AtomicUsize,
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
     /// count, answered by a layer or not.
     layer_calls: Mutex<HashMap<(&'static str, &'static str), usize>>,
@@ -122,6 +126,11 @@ impl<T: StateBackend> CountingBackend<T> {
         if cf == CF_NATIVE_LIQUIDATION && start.first() == Some(&0x06) {
             self.counts.pending_scans.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Page scans of the ADL obligation rows so far (never reset).
+    pub fn queue_page_scans(&self) -> usize {
+        self.counts.queue_page_scans.load(Ordering::SeqCst)
     }
 
     /// Scans of the pending rows so far (never reset).
@@ -283,6 +292,9 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         self.count_pending_scan(cf, start);
+        if cf == CF_NATIVE_LIQUIDATION && prefix == [0x07u8].as_slice() && limit > 1 {
+            self.counts.queue_page_scans.fetch_add(1, Ordering::SeqCst);
+        }
         let out = self.inner.iterate_cf_prefix_from(cf, prefix, start, limit);
         self.count_rows(&out);
         out

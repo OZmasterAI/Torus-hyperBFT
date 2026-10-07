@@ -100,6 +100,11 @@ pub struct Metrics {
     /// adl-budget P2 (A7), after each step: ADL obligation ROWS queued (not
     /// accounts).
     pub liquidation_adl_queue: Gauge,
+    /// Not exported: the obligation-row count of the last liquidation step,
+    /// -1 before the first (or after a read error / failed step). The step
+    /// keeps it running (+ rows written, - rows deleted) instead of counting
+    /// the queue every block (adl-budget fix list b).
+    pub liquidation_adl_queue_rows_cache: std::sync::atomic::AtomicI64,
     /// Σ over both ADL escrows of available + UPnL at the step's marks
     /// (signed tokens): what the queue still costs at the mark.
     pub liquidation_adl_queue_deficit: Gauge<f64, std::sync::atomic::AtomicU64>,
@@ -115,7 +120,8 @@ pub struct Metrics {
     /// tokens, + = the vault was credited).
     pub liquidation_adl_pairing: Gauge<f64, std::sync::atomic::AtomicU64>,
     /// Proof-only (`TORUS_LIQ_VALUE_SUM=1`): Σ over ALL accounts of available
-    /// + order margin + UPnL at the step's marks (unmarked: entry), tokens.
+    /// + order margin + UPnL at one common price per market (0; = at the marks
+    /// while OI is symmetric), tokens.
     pub liquidation_value_sum: Gauge<f64, std::sync::atomic::AtomicU64>,
 
     // Order-funnel metrics (perf A1) — where PlaceOrder actions die inside
@@ -1122,7 +1128,7 @@ impl Metrics {
         let liquidation_value_sum = Gauge::<f64, std::sync::atomic::AtomicU64>::default();
         registry.register(
             "torus_liquidation_value_sum",
-            "Proof-only (TORUS_LIQ_VALUE_SUM=1): sum over all accounts of available + order margin + UPnL at the step's marks (tokens)",
+            "Proof-only (TORUS_LIQ_VALUE_SUM=1): sum over all accounts of available + order margin + UPnL at one common price per market (0; equal to the marks' while OI is symmetric) (tokens)",
             liquidation_value_sum.clone(),
         );
 
@@ -2415,6 +2421,7 @@ impl Metrics {
             liquidation_pending,
             liquidation_deferred,
             liquidation_pending_rows_cache: std::sync::atomic::AtomicI64::new(-1),
+            liquidation_adl_queue_rows_cache: std::sync::atomic::AtomicI64::new(-1),
             liquidation_adl_queue,
             liquidation_adl_queue_deficit,
             liquidation_adl_work_total,

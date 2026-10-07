@@ -57,6 +57,10 @@ struct LiqStats {
     adl_work: u64,
     adl_dust: i128,
     adl_pairing: i128,
+    /// Fix list b (18c review): obligation rows this step wrote (B) and
+    /// deleted (drained or paired to 0): the queue gauge's running count.
+    adl_rows_added: u64,
+    adl_rows_removed: u64,
     /// The step's marks (A7: the escrow gauges and the value sum value at
     /// them).
     marks: Marks,
@@ -139,20 +143,24 @@ impl NativeExecutor {
         };
         Self::liquidation_telemetry(ctx, &stats, started.elapsed());
         if ctx.liq_value_sum && ctx.metrics.is_some() && ctx.fatal_error.is_none() {
-            Self::liquidation_value_sum(ctx, &stats.marks);
+            Self::liquidation_value_sum(ctx);
         }
         out
     }
 
     /// adl-budget A7, proof-only (`ctx.liq_value_sum`, metrics attached;
     /// after the step's timer): Σ over ALL accounts (vault and escrows
-    /// included) of available + order margin + UPnL at the step's marks
-    /// (unmarked: entry) — a paged walk of every balance and position row.
-    /// With OI symmetric it does not depend on the marks, so it stays
+    /// included) of available + order margin + UPnL at ONE common price per
+    /// market — a paged walk of every balance and position row. Fix list c
+    /// (18c review; s750vs: -1,740.69 in the step the marks went stale): the
+    /// common price is 0 for every market (UPnL = -signed size x entry), not
+    /// the mark with unmarked positions at entry, which jumped whenever a
+    /// market gained or lost its mark. With OI symmetric, Σ UPnL of a market
+    /// is the same at any common price (at the mark too), so the sum stays
     /// constant across a drain without transfers (within the escrow dust).
-    /// Sets the gauge and logs `liquidation: value sum`; a read error skips
-    /// it.
-    fn liquidation_value_sum<T: StateBackend>(ctx: &NativeExecContext<T>, marks: &Marks) {
+    /// Exact (`FixedPoint`, i128); the gauge is its f64. Sets the gauge and
+    /// logs `liquidation: value sum`; a read error skips it.
+    fn liquidation_value_sum<T: StateBackend>(ctx: &NativeExecContext<T>) {
         const PAGE: usize = 1_024;
         let of = |_| CoreError::Overflow("liquidation value sum overflows i128".into());
         let borsh = |e: std::io::Error| CoreError::Borsh(e.to_string());
@@ -174,7 +182,7 @@ impl NativeExecutor {
                                 continue;
                             }
                             let p = <Position as borsh::BorshDeserialize>::try_from_slice(v).map_err(borsh)?;
-                            torus_core::margin::position_terms(&p, marks.get(&p.market_id).copied(), None)?.upnl
+                            torus_core::margin::position_terms(&p, Some(FixedPoint::ZERO), None)?.upnl
                         };
                         sum = sum.checked_add(x).map_err(of)?;
                     }
@@ -202,10 +210,12 @@ impl NativeExecutor {
     /// at the step's marks (the queue's deficit; unmarked: entry).
     fn adl_queue_telemetry<T: StateBackend>(
         ctx: &NativeExecContext<T>,
-        marks: &Marks,
+        s: &LiqStats,
+        m: &torus_telemetry::Metrics,
     ) -> Result<(u64, FixedPoint, FixedPoint), CoreError> {
         let of = |_| CoreError::Overflow("adl escrow telemetry overflows i128".into());
-        let rows = liq::tag_count(&ctx.state, liq::ADL_OBLIGATION_TAG)?;
+        let marks = &s.marks;
+        let rows = Self::adl_queue_rows(ctx, s, m)?;
         let (mut notional, mut deficit) = (FixedPoint::ZERO, FixedPoint::ZERO);
         for e in [liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
             let b = ctx.positions.get_native_balance(&e)?;
@@ -217,6 +227,34 @@ impl NativeExecutor {
             }
         }
         Ok((rows, notional, deficit))
+    }
+
+    /// Fix list b (18c review: `tag_count` read the whole queue every block
+    /// with metrics, O(queue) per block during an S=750 drain): the
+    /// obligation rows as a running count kept on the Metrics instance —
+    /// the last count + the rows this step wrote - the rows it deleted. An
+    /// empty queue is one seek (and resets the count to 0); the rows are
+    /// counted only without a count (a start, or after a read error /
+    /// fatal step: -1) or when the running count says 0 while rows exist.
+    fn adl_queue_rows<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        s: &LiqStats,
+        m: &torus_telemetry::Metrics,
+    ) -> Result<u64, CoreError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let rows = if !ctx.state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_OBLIGATION_TAG])? {
+            0
+        } else {
+            let running = u64::try_from(m.liquidation_adl_queue_rows_cache.load(Relaxed))
+                .ok()
+                .and_then(|c| c.checked_add(s.adl_rows_added)?.checked_sub(s.adl_rows_removed));
+            match running {
+                Some(n) if n > 0 => n,
+                _ => liq::tag_count(&ctx.state, liq::ADL_OBLIGATION_TAG)?,
+            }
+        };
+        m.liquidation_adl_queue_rows_cache.store(rows as i64, Relaxed);
+        Ok(rows)
     }
 
     /// Node-local telemetry of one step (after its timer stopped): the
@@ -272,14 +310,20 @@ impl NativeExecutor {
             m.liquidation_adl_dust.inc_by(tokens(s.adl_dust));
             m.liquidation_adl_pairing.inc_by(tokens(s.adl_pairing));
             if ctx.fatal_error.is_none() {
-                match Self::adl_queue_telemetry(ctx, &s.marks) {
+                match Self::adl_queue_telemetry(ctx, s, m) {
                     Ok((rows, notional, deficit)) => {
                         m.liquidation_adl_queue.set(rows as i64);
                         m.liquidation_adl_escrow_notional.set(tokens(notional.raw()));
                         m.liquidation_adl_queue_deficit.set(tokens(deficit.raw()));
                     }
-                    Err(e) => tracing::debug!(%e, "liquidation telemetry: ADL queue unreadable"),
+                    Err(e) => {
+                        m.liquidation_adl_queue_rows_cache.store(-1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(%e, "liquidation telemetry: ADL queue unreadable");
+                    }
                 }
+            } else {
+                // A failed step's writes are not the block's: count again.
+                m.liquidation_adl_queue_rows_cache.store(-1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let ms = took.as_secs_f64() * 1e3;
@@ -394,7 +438,7 @@ impl NativeExecutor {
             let release = Self::cancel_orders_and_stops(ctx, &trader, None);
             Self::release_order_margin(ctx, &trader, release);
             match h {
-                Health::Adl => Self::adl_to_escrow(ctx, &marks, &prev, &trader)?,
+                Health::Adl => stats.adl_rows_added += Self::adl_to_escrow(ctx, &marks, &prev, &trader)?,
                 Health::Backstop => liq::backstop(&ctx.positions, &trader, &LIQUIDATOR_VAULT, |m| {
                     marks.get(&m).copied()
                 })?,
@@ -416,7 +460,7 @@ impl NativeExecutor {
             if liq::classify(&v) == Some(Health::Adl) {
                 stats.adl += 1;
                 stats.vault_adl = true;
-                Self::adl_to_escrow(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
+                stats.adl_rows_added += Self::adl_to_escrow(ctx, &marks, &prev, &LIQUIDATOR_VAULT)?;
             }
         }
         // adl-budget P2: the escrows close their obligations under `work`
@@ -791,12 +835,13 @@ impl NativeExecutor {
     /// Then D9: a non-vault account without marked positions hands its
     /// remaining collateral to the vault. Never positive under the clamp (an
     /// error line if it is; the move still conserves value): flat, exactly 0.
+    /// Returns the obligation rows written (telemetry: the queue count).
     fn adl_to_escrow<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         marks: &Marks,
         prev: &Marks,
         u: &Address,
-    ) -> Result<(), CoreError> {
+    ) -> Result<u64, CoreError> {
         let ps = ctx.positions.positions_for_trader(u)?;
         // `build`'s terms per position (adl_rest's `build`); None = overflow
         // -> no bankruptcy price (adl_rest's None).
@@ -811,6 +856,7 @@ impl NativeExecutor {
             torus_core::margin::position_terms(p, marks.get(&p.market_id).copied(), None).ok().map(|t| t.upnl)
         };
         let mut total = ps.iter().try_fold(FixedPoint::ZERO, |a, p| a.checked_add(upnl(p)?).ok());
+        let mut rows = 0u64;
         for p in &ps {
             let m = p.market_id;
             let Some(&mark) = marks.get(&m) else { continue };
@@ -828,7 +874,8 @@ impl NativeExecutor {
             liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
             total = (|| total?.checked_sub(own?).ok())();
             let o = liq::Obligation { height: ctx.block_height, market: m, is_long: p.is_long, trader: *u, size: p.size, price: px };
-            liq::put_obligation(&ctx.state, &o)?;
+            liq::put_obligation(&ctx.state, &o)?; // size > 0: a new row (insert-only)
+            rows += 1;
             tracing::info!(
                 height = ctx.block_height,
                 account = %u,
@@ -848,7 +895,7 @@ impl NativeExecutor {
                 tracing::error!(account = %u, %moved, "liquidation: positive D9 remainder after ADL (clamp invariant broken)");
             }
         }
-        Ok(())
+        Ok(rows)
     }
 
     /// Review H1: `u`'s collateral + the UPnL of its positions OTHER than in
@@ -908,6 +955,12 @@ impl NativeExecutor {
             let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
             start = [o.key().as_slice(), &[0]].concat();
             used += 1; // the visit: a waiting row is never free
+            // A delisted market ranks at a stored price (owner s96). The
+            // ranking is once per (block, market, side), so it is the stored
+            // price of the FIRST row of that (market, side) the block visits;
+            // the later rows of the key reuse that ranking, whatever their own
+            // stored price (each still closes at its own price). 18c review
+            // nit g: documented, not changed.
             let rank_px = match marks.get(&o.market) {
                 Some(&mark) => mark,
                 None if listed.binary_search(&o.market).is_err() => o.price, // delisted
@@ -953,6 +1006,7 @@ impl NativeExecutor {
             }
             if o.size != owed {
                 liq::update_obligation(&ctx.state, &o)?; // deleted at 0
+                stats.adl_rows_removed += u64::from(o.size == FixedPoint::ZERO);
             }
             stats.adl_obligations += 1;
         }
@@ -1010,6 +1064,7 @@ impl NativeExecutor {
             o.size -= q;
             x.size -= q;
             liq::update_obligation(&ctx.state, &x)?;
+            stats.adl_rows_removed += u64::from(x.size == FixedPoint::ZERO);
             start = if x.size > FixedPoint::ZERO { x.key().to_vec() } else { after };
         }
         *from = start;

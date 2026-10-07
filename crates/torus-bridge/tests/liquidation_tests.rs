@@ -2144,3 +2144,235 @@ fn telemetry_rescans_pending_rows_only_after_a_change() {
     let fresh = std::sync::Arc::new(torus_telemetry::Metrics::new());
     assert_eq!(step(4, &fresh), (1, 7, 7), "block 4, new Metrics: forced scan");
 }
+
+// ---- adl-budget s96 fix list (18c) ----
+
+/// Fix list b (18c review): the ADL queue gauge is a running count — the
+/// rows the step wrote (B's transfers) minus the rows it deleted (the drain,
+/// the pairing) — re-counted only for a Metrics instance without a count (a
+/// start) or when the running count is not consistent with the queue; an
+/// empty queue is one seek. P2 over a counting backend: block 1 (empty
+/// queue), block 2 = B + a drain at W = 19, block 3 with a FRESH Metrics and
+/// W = 9 (one row), then W = 19 until the queue is empty. Only block 3 page-
+/// scans the `0x07` rows (once); the gauge equals the rows after every block.
+#[test]
+fn telemetry_counts_the_adl_queue_without_rescanning_it() {
+    let (_d, db) = p2_fixture();
+    let state = CountingBackend::new(db.clone());
+    let rows = || db.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[ADL_OBLIGATION_TAG])).unwrap().len() as i64;
+    let step = |h: u64, mark: i64, w: u64, met: &std::sync::Arc<torus_telemetry::Metrics>| -> (usize, i64) {
+        let mut c = NativeExecContext::new(state.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+        for m in 1..=4 {
+            set_mark(&c, m, fp(mark));
+        }
+        c.metrics = Some(met.clone());
+        let before = state.queue_page_scans();
+        NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
+        assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        (state.queue_page_scans() - before, met.liquidation_adl_queue.get())
+    };
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    assert_eq!(step(1, 1_000, 19, &met), (0, 0), "block 1: empty queue, one seek, no scan");
+    let (scans, gauge) = step(2, 900, 19, &met);
+    assert!(gauge > 0, "block 2: rows left after B + the drain");
+    assert_eq!((scans, gauge), (0, rows()), "block 2: running count (+8 at B, - the drained rows)");
+    let fresh = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let (scans, gauge) = step(3, 900, 9, &fresh);
+    assert!(gauge > 0, "block 3: rows left");
+    assert_eq!((scans, gauge), (1, rows()), "block 3, new Metrics: one count");
+    let mut h = 4;
+    loop {
+        let (scans, gauge) = step(h, 900, 19, &fresh);
+        assert_eq!((scans, gauge), (0, rows()), "block {h}: running count");
+        if gauge == 0 {
+            break;
+        }
+        h += 1;
+        assert!(h < 12, "drained");
+    }
+}
+
+/// Fix list c (18c review; s750vs: the sum dropped 1,740.69 in the step where
+/// the marks went stale): the value sum values every position at ONE common
+/// price per market (0: while OI is symmetric Σ UPnL is the same at any
+/// common price), not at the mark with unmarked positions at entry, so it
+/// does not move when a market loses its mark. Market 1: A long 10 @ 1,000,
+/// B short 10 @ 800 (X sold to A and bought from B: flat); at the mark 900
+/// their UPnL is -1,000 each, at entry 0. Block 2 marks 900; block 70 has no
+/// usable mark (69 s old) and nothing else changes: the same sum, = Σ cash +
+/// Σ UPnL at 900.
+#[test]
+fn value_sum_does_not_jump_when_a_market_loses_its_mark() {
+    let (_d, db) = liq_db(&[1]);
+    let (a, b, x) = (addr(0x0A), addr(0x0B), addr(0x0C));
+    let c = ctx_at(db.clone(), 1);
+    for t in [a, b, x] {
+        fund(&c, &t, fp(10_000));
+    }
+    open_pair(&c, &a, &x, 1, 10, 1_000);
+    open_pair(&c, &x, &b, 1, 10, 800);
+    assert!(c.positions.get_position(&x, 1).unwrap().is_none(), "X flat");
+    drop(c);
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let step = |h: u64, mark: Option<i64>| {
+        let mut c = ctx_at(db.clone(), h);
+        if let Some(p) = mark {
+            set_mark(&c, 1, fp(p));
+        }
+        c.metrics = Some(met.clone());
+        c.liq_value_sum = true;
+        NativeExecutor::run_liquidations(&mut c);
+        assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        met.liquidation_value_sum.get()
+    };
+    let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;
+    let marked = step(2, Some(900));
+    let want = total_value(&ctx_at(db.clone(), 2), &marks(&[(1, 900)]));
+    assert_eq!(marked, tokens(want), "block 2: = Σ cash + Σ UPnL at the mark");
+    let stale = step(70, None);
+    assert_eq!(pos(&ctx_at(db.clone(), 70), &a, 1), fp(10), "nothing acted on");
+    assert_eq!(stale, marked, "block 70: the mark went stale, the sum stays");
+}
+
+/// Fix list f (18c review: W sizing was only arithmetic + an ignored bench):
+/// the HL shape of `ubench_adl`'s HL mode at small N, in the default suite.
+/// N = 20 traders each short 1 in every one of 100 listed markets (against a
+/// sink long N), 3 accounts long 1 in all 100 (against the traders) go
+/// bankrupt in one block: 300 rows, one side. The drain's units are exactly
+/// the formula W = 630,000 is sized from (§9, at N = 5,000): U(N) = 100
+/// rankings x (N + 2 traders in the set: the N shorts, the sink, the long
+/// escrow) + 300 rows x (1 visit + 1 read). W = U(N) closes every row in B;
+/// W = U(N) - 2 leaves the last row (cost 2: its ranking is done) for the
+/// next block.
+#[test]
+fn an_hl_shaped_event_costs_exactly_the_sizing_formula() {
+    const N: u64 = 20;
+    let units = 100 * (N + 2) + 300 * 2;
+    let markets: Vec<MarketId> = (1..=100).collect();
+    let t = |i: u64| {
+        let mut a = [0x50u8; 20];
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::new(a)
+    };
+    for (w, left) in [(units, 0usize), (units - 2, 1)] {
+        let (_d, db) = liq_db(&markets);
+        let bankrupt = [addr(0x10), addr(0x11), addr(0x12)];
+        let sink = addr(0xF0);
+        let c = ctx_at(db.clone(), 1);
+        fund(&c, &sink, fp(1_000_000_000));
+        for i in 0..N {
+            fund(&c, &t(i), fp(10_000_000));
+        }
+        for b in &bankrupt {
+            fund(&c, b, fp(2_500)); // AV 2,500 >= MM 2,500 at 1,000; -7,500 at 900
+        }
+        for &m in &markets {
+            for i in 0..N {
+                open_pair(&c, &sink, &t(i), m, 1, 1_000);
+            }
+            for (k, b) in bankrupt.iter().enumerate() {
+                open_pair(&c, b, &t((m + k as u64) % N), m, 1, 1_000);
+            }
+        }
+        drop(c);
+        let all = |p: i64| markets.iter().map(|&m| (m, p)).collect::<Vec<_>>();
+        assert!(step_marks(&db, 1, &all(1_000), w).fatal_error.is_none());
+        let c = step_marks(&db, 2, &all(900), w);
+        assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        let met = c.metrics.as_ref().unwrap();
+        assert_eq!(met.liquidations_adl.get(), 3, "W {w}");
+        assert_eq!(met.liquidation_adl_work_total.get(), units - 2 * left as u64, "W {w}: units = U(N)");
+        assert_eq!(obligations(&c).len(), left, "W {w}");
+    }
+    assert!(ADL_WORK_PER_BLOCK >= 100 * (5_000 + 3) + 300 * 2, "W covers U(5,000) (+1 protocol account)");
+}
+
+/// Fix list h (18c s99; s750 h803 and s750vs h620 logged one 'ADL escrow dust
+/// to the vault' line per escrow): those lines ARE the sweep — the drain
+/// moves a flat escrow's whole balance to the vault and logs the amount.
+/// This pins the s96 end state on a two-sided storm shaped like S=750: B
+/// over three blocks (act 2) and the drain interleaved with it (W = 1: one
+/// row per block from block 3). L1 / L2 / L3 long 1 in markets 1 and 3, S1 /
+/// S2 short 1 in markets 2 and 4 (collateral 100.00000001 for L1 and S1, 100
+/// for the others; marks 1,000, then 900 for 1 / 3 and 1,100 for 2 / 4: AV
+/// -100, ADL). L1's market-1 price 999.99999999 truncates the long escrow's
+/// average to 999.99999999 (with L2's 1,000, later L3's), so L2's and L3's
+/// rows each realize +1 raw: long dust +2 raw; S1's market-2 price
+/// 1,000.00000001 truncates the short escrow's average (with S2's 1,000) to
+/// 1,000: S1's row realizes -1 raw. At the end: no row, both escrows with no
+/// position and (0, 0), each swept exactly once (+0.00000002, -0.00000001),
+/// the vault holding exactly their sum (+1 raw: D9 = 0 for all five), the
+/// dust gauge = the vault.
+#[test]
+fn p2_a_two_sided_storm_sweeps_both_escrows_to_zero() {
+    let (_d, db) = liq_db(&[1, 2, 3, 4]);
+    let (l1, s1, l2, s2, l3) = (addr(0x31), addr(0x32), addr(0x33), addr(0x34), addr(0x35));
+    let (c_short, d_long) = (addr(0x40), addr(0x41));
+    let c = ctx_at(db.clone(), 1);
+    let odd = FixedPoint::from_raw(fp(100).raw() + 1);
+    for (t, cash) in [(l1, odd), (s1, odd), (l2, fp(100)), (s2, fp(100)), (l3, fp(100)), (c_short, fp(10_000_000)), (d_long, fp(10_000_000))] {
+        fund(&c, &t, cash);
+    }
+    for l in [l1, l2, l3] {
+        for m in [1, 3] {
+            open_pair(&c, &l, &c_short, m, 1, 1_000);
+        }
+    }
+    for s in [s1, s2] {
+        for m in [2, 4] {
+            open_pair(&c, &d_long, &s, m, 1, 1_000);
+        }
+    }
+    drop(c);
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    let ev = Captured::default();
+    let block = |h: u64, shocked: bool, act: usize, w: u64| {
+        let mut c = ctx_at(db.clone(), h);
+        for m in 1..=4u64 {
+            let p = match (shocked, m % 2) {
+                (false, _) => 1_000,
+                (true, 1) => 900,
+                (true, _) => 1_100,
+            };
+            set_mark(&c, m, fp(p));
+        }
+        c.metrics = Some(met.clone());
+        ev.with(|| NativeExecutor::run_liquidations_with(&mut c, 2_048, act, w));
+        assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        c
+    };
+    drop(block(1, false, 64, 1));
+    let c = block(2, true, 2, 0);
+    assert_eq!(obligations(&c).len(), 4, "block 2: L1 and S1 at B (W = 0)");
+    drop(c);
+    let mut h = 3;
+    loop {
+        let c = block(h, true, 2, 1);
+        if obligations(&c).is_empty() {
+            assert_eq!(met.liquidations_adl.get(), 5);
+            for t in [l1, s1, l2, s2, l3, ADL_ESCROW_LONG, ADL_ESCROW_SHORT] {
+                flat_at_zero(&c, &t);
+            }
+            let vault = bal(&c, &LIQUIDATOR_VAULT).available;
+            let swept = ev.events("liquidation: ADL escrow dust to the vault");
+            let mut got: Vec<(String, String)> =
+                swept.iter().map(|e| (e["escrow"].clone(), e["dust"].clone())).collect();
+            got.sort();
+            let mut want = vec![
+                (ADL_ESCROW_LONG.to_string(), FixedPoint::from_raw(2).to_string()),
+                (ADL_ESCROW_SHORT.to_string(), FixedPoint::from_raw(-1).to_string()),
+            ];
+            want.sort();
+            assert_eq!(got, want, "one sweep per escrow, with its dust");
+            assert_eq!(vault, FixedPoint::from_raw(1), "the vault holds exactly the dust sum (+2 - 1 raw)");
+            let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;
+            assert_eq!(met.liquidation_adl_dust.get(), tokens(vault), "dust gauge = the vault (D9 = 0)");
+            assert_eq!(met.liquidation_adl_queue.get(), 0);
+            assert_eq!(met.liquidation_adl_escrow_notional.get(), 0.0);
+            assert_eq!(met.liquidation_adl_queue_deficit.get(), 0.0);
+            break;
+        }
+        h += 1;
+        assert!(h < 20, "drained");
+    }
+}
