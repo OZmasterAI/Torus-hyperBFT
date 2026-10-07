@@ -610,6 +610,48 @@ fn precompile_charges_correct_gas() {
     );
 }
 
+/// s99: getOpenOrders was removed from 0x0800. Its selector reverts like any
+/// unknown selector and the tx pays exactly the reader base (16,400) on top of
+/// its intrinsic gas (Cancun: 21,000 + 16 per nonzero / 4 per zero calldata
+/// byte).
+#[test]
+fn removed_get_open_orders_reverts_for_exactly_the_base() {
+    use torus_core::precompiles::GAS_PRECOMPILE_READ;
+    let (_dir, db) = open_test_db();
+    db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+        .unwrap();
+    let mut data =
+        alloy_primitives::keccak256("getOpenOrders(address,bytes32)".as_bytes())[..4].to_vec();
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(BOB.as_slice());
+    data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+    let intrinsic: u64 = 21_000
+        + data
+            .iter()
+            .map(|&b| if b == 0 { 4 } else { 16 })
+            .sum::<u64>();
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        // OrderBookReader precompile at 0x0800.
+        kind: TxKind::Call(Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00,
+        ])),
+        data: Bytes::from(data),
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_tx(&db, &block_cfg, tx)
+        .unwrap()
+        .0;
+    assert!(!r.success, "the removed selector reverts");
+    assert_eq!(GAS_PRECOMPILE_READ, 16_400);
+    assert_eq!(r.gas_used, intrinsic + GAS_PRECOMPILE_READ);
+}
+
 /// HL-parity: a reader precompile's gas scales with its work, not a flat
 /// base: 500 per row read plus 20 per 32-byte word returned (s99).
 /// `getMarkets()` reads 1 row and returns 2 words per market: 200 markets cost

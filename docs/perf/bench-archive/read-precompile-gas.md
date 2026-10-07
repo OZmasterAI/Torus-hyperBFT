@@ -1,7 +1,7 @@
 # Read precompile gas microbench (ozarchy, 2026-10-07)
 
-Dir: `read-precompile-gas`. Recorded in the docs: **on a branch only**. The write-up is `docs/perf/read-precompile-gas.md` on `origin/bench/read-precompile-gas` (`0e9d918b`, "recommend 125 gas per unit (was 50)"),
-which is not merged to main; main's `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` (Open list) and `docs/plans/item6-phase1-impl.md` refer to it. That doc names `rep{1,2,3}.log` and `summary.txt` in this dir.
+Dir: `read-precompile-gas`. Recorded in the docs: yes. The write-up is `docs/perf/read-precompile-gas.md` from `bench/read-precompile-gas` (`0e9d918b`, "recommend 125 gas per unit (was 50)"),
+merged to main as `00bf7346` (s100); main's `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` (Open list) and `docs/plans/item6-phase1-impl.md` refer to it. That doc names `rep{1,2,3}.log` and `summary.txt` in this dir.
 The dir `read-precompile-gas-ac` was in use when this archive was made and is not covered.
 
 ## Purpose and setup

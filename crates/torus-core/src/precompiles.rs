@@ -713,9 +713,12 @@ fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreE
 ///   as an unsupported layout (16,400 + 500 = 16,900 gas through the EVM).
 ///
 /// Meta and stop rows are not read. A market with neither level nor order
-/// rows is an empty book. Not detected here (it would cost an extra read per
-/// call): a market holding both level and order rows, or rows without a meta
-/// row; the RPC readers (`book_reader::read_book_depth`) still reject those.
+/// rows is an empty book. Not checked here (owner s100: it would cost an
+/// extra read per call): a market holding both level and order rows, or rows
+/// without a meta row. The writers never produce either (one mode per
+/// process, the meta row saved with every book; a DB of another mode
+/// fail-stops at load; test `row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market`),
+/// and the RPC readers (`book_reader::read_book_depth`) still reject both.
 fn book_levels(
     state_db: &impl StateBackend,
     market_id: MarketId,

@@ -16,6 +16,51 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `fix/read-gas-followup` `105a6e28` (2026-10-08, s101)
+
+`b26bd3b3` plus the review fixes (docs, comments, `lock_db` in `request_locked`, a chmod drop guard in
+the error test, a deferred-first market and strict key tags in the layout test). Same worktree and
+target dir; suite 4 baseline main `1914609f` in a detached worktree created after the candidate's
+clippy, with the 6 differing `.rs` files touched (base clippy checked 21 crates, candidate 14).
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,057 passed, 0 failed**, 35 skipped, 0 flaky | 110 s (83.2 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 6 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 101, rerun 0 | first run 3,057 passed, **1 failed** (flaky, below); rerun **3,058 passed, 0 failed**, 42 ignored (159 result lines) | 409 s / ~400 s |
+| 4 | clippy (no `-D`) / fmt vs `1914609f` | – | clippy 270 = 270, **0 new**; fmt 3,349 = 3,349, **0 new** | 19 s / 18 s |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **164 passed**; 8 of 8 scripts OK | 29 s |
+
+Suite 3 flake: `torus-bridge` `liquidation_tests::p2_counterparties_are_paid_at_the_stored_price`
+("one close per row", 6 vs 8). Neither the test nor the liquidation code changed on this branch; it
+passed in nextest, in 8 of 8 runs of its binary alone and in the full rerun. Likely cause: its
+`Captured` subscriber is thread-local (`with_default`, no `register_callsite`), and tracing caches
+callsite interest process-wide, so parallel tests in one binary can make it miss events. Not fixed
+here. Logs: `~/bench-results-matched/presuite-105a6e28/` (`3-fulltest.log`, `3-fulltest-rerun.log`).
+
+## `fix/read-gas-followup` `b26bd3b3` (2026-10-08, s101)
+
+Read-precompile gas follow-up on main `1914609f` with `bench/read-gas-stall` (`8e3326c6`) merged: book CF
+SST target 4 MiB by default, range-compaction error accounting, last-drop cancel only on the last DB
+reference, layout pin test, review tests, s100 decisions. Worktree `wt/read-gas-followup`,
+`CARGO_TARGET_DIR=~/.cargo-target-read-gas`; suite 4 baseline main `1914609f` (detached worktree, same
+target dir).
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,057 passed, 0 failed**, 35 skipped, 0 flaky | 131 s (83.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 5 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,058 passed, 0 failed**, 42 ignored (159 result lines) | 400 s |
+| 4 | clippy (no `-D`) / fmt vs `1914609f` | – | clippy 270 = 270, **0 new**; fmt 3,349 = 3,349, **0 new** | 18 s / – |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **164 passed**; 8 of 8 scripts OK | 29 s |
+
+Suite 4 note: the two worktrees share one target dir, and cargo keys workspace units by path relative
+to the workspace, so the first base clippy replayed the candidate's cached results (1 s, nothing
+checked). Touching the 6 differing `.rs` files in the base worktree forced a real check (14 crates,
+17 s). Logs: `~/bench-results-matched/presuite-b26bd3b3/`.
+
 ## `bench/read-precompile-gas` `ae767806` (2026-10-07, s26)
 
 `fc1fb25a` (s99 final read decisions + review fixes) merged with main `f1e41975`. Worktree `wt/read-gas-bench`,
