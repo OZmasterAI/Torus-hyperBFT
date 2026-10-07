@@ -65,7 +65,8 @@
 //! tickers), write stalls, flushes and the book CF's L0 / SST file counts
 //! (needs `TORUS_ROCKSDB_STATS=2`), and the tombstones one getOrderBook walks
 //! (first call after the flush and the median of 5). The book CF's SST target
-//! follows `TORUS_BOOK_CF_TARGET_FILE_MB` (default: RocksDB's 64 MiB).
+//! follows `TORUS_BOOK_CF_TARGET_FILE_MB` (default 4 MiB since s100; the
+//! results doc's 64 MiB runs predate it).
 //!
 //! Output lines (whitespace key=value): `ROW`, `FIT`, `E2E`, `TOMB`, `COMPACT`,
 //! `CHURN`, `CHURNSUM`, `CHURNSTALL`, `MCHURN`, `MCHURNSUM`, `MCHURNSTALL`, `MCHURNCFSTATS`.

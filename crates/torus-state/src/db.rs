@@ -519,7 +519,7 @@ impl StateDb {
     fn open_with(
         path: &Path,
         tuning: &DbTuning,
-        book_cf_target_file: Option<u64>,
+        book_cf_target_file: u64,
     ) -> Result<Self, StateError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -637,21 +637,16 @@ impl StateDb {
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
             .iter()
             .map(|name| {
-                let opts = if *name == CF_CONSENSUS_META {
+                let mut opts = if *name == CF_CONSENSUS_META {
                     meta_opts.clone()
                 } else if let (true, Some(o)) = (is_churny_cf(name), churny_opts.as_ref()) {
                     o.clone()
                 } else {
                     cf_opts.clone()
                 };
-                let opts = match book_cf_target_file {
-                    Some(bytes) if *name == CF_NATIVE_ORDER_BOOKS => {
-                        let mut o = opts;
-                        o.set_target_file_size_base(bytes);
-                        o
-                    }
-                    _ => opts,
-                };
+                if *name == CF_NATIVE_ORDER_BOOKS {
+                    opts.set_target_file_size_base(book_cf_target_file);
+                }
                 ColumnFamilyDescriptor::new(*name, opts)
             })
             .collect();
@@ -1348,18 +1343,21 @@ pub fn churny_cf_write_buffer_bytes() -> Option<usize> {
     parse_opt_usize_min1_mb(std::env::var("TORUS_CHURNY_CF_WRITE_BUFFER_MB").ok())
 }
 
-/// Bench / ops knob: `target_file_size_base` of `cf_native_order_books` only,
-/// in bytes. `None` (default) = not set = RocksDB's 64 MiB = exact-today.
-/// `TORUS_BOOK_CF_TARGET_FILE_MB` (>=1, whole MiB) sets it: smaller SST files
-/// make the per-market tombstone compaction (`note_scanned_deletes`) rewrite
-/// less of the bottommost level per run. Node-local, no format or consensus
-/// impact. Read once at DB open.
-pub fn book_cf_target_file_bytes() -> Option<u64> {
+/// `target_file_size_base` of `cf_native_order_books` only, in bytes (every
+/// other CF keeps RocksDB's 64 MiB). Default 4 MiB (owner s100): smaller SST
+/// files make the per-market tombstone compaction (`note_scanned_deletes`)
+/// rewrite less of the bottommost level per run (bench: 30M-gas getOrderBook
+/// block 131 -> 62 ms median, no write stalls). 1-2 MiB measured better but
+/// need ~2-4x the open files, and the DB keeps every SST open
+/// (`max_open_files` -1): only with a raised `LimitNOFILE` or a bounded
+/// `max_open_files`. `TORUS_BOOK_CF_TARGET_FILE_MB` (>=1, whole MiB)
+/// overrides. Node-local, no format or consensus impact. Read once at DB open.
+pub fn book_cf_target_file_bytes() -> u64 {
     book_cf_target_file_bytes_from(std::env::var("TORUS_BOOK_CF_TARGET_FILE_MB").ok())
 }
 
-fn book_cf_target_file_bytes_from(raw: Option<String>) -> Option<u64> {
-    parse_opt_usize_min1_mb(raw).map(|bytes| bytes as u64)
+fn book_cf_target_file_bytes_from(raw: Option<String>) -> u64 {
+    parse_opt_usize_min1_mb(raw).map_or(4 << 20, |bytes| bytes as u64)
 }
 
 /// STABILITY: DB-wide memtable budget, in bytes — the global cap on the SUM of
@@ -1578,35 +1576,32 @@ mod sync_wal_tests {
     }
 
     #[test]
-    fn book_cf_target_file_size_is_unset_by_default_and_book_cf_only() {
-        // Unset (the default) leaves RocksDB's 64 MiB on every CF: no setter is
-        // called, the options are exactly today's.
-        assert_eq!(book_cf_target_file_bytes_from(None), None);
-        assert_eq!(book_cf_target_file_bytes_from(Some("0".into())), None);
-        assert_eq!(
-            book_cf_target_file_bytes_from(Some("4".into())),
-            Some(4 << 20)
-        );
-        let dir = tempfile::tempdir().unwrap();
-        drop(StateDb::open_with(dir.path(), &DbTuning::default(), None).unwrap());
-        let sizes = target_file_sizes(dir.path());
-        assert_eq!(
-            sizes.len(),
-            ALL_CF_NAMES.len() + 1,
-            "every CF incl. default"
-        );
-        assert!(sizes.iter().all(|(_, v)| *v == 64 << 20), "{sizes:?}");
-
-        // Set: only cf_native_order_books gets it.
-        let dir = tempfile::tempdir().unwrap();
-        drop(StateDb::open_with(dir.path(), &DbTuning::default(), Some(4 << 20)).unwrap());
-        for (cf, v) in target_file_sizes(dir.path()) {
-            let want = if cf == CF_NATIVE_ORDER_BOOKS {
-                4 << 20
-            } else {
-                64 << 20
-            };
-            assert_eq!(v, want, "{cf}");
+    fn book_cf_target_file_size_is_4mib_by_default_and_book_cf_only() {
+        // Unset (or 0 / garbage) = the 4 MiB default; the knob overrides it.
+        assert_eq!(book_cf_target_file_bytes_from(None), 4 << 20);
+        assert_eq!(book_cf_target_file_bytes_from(Some("0".into())), 4 << 20);
+        assert_eq!(book_cf_target_file_bytes_from(Some("x".into())), 4 << 20);
+        assert_eq!(book_cf_target_file_bytes_from(Some("16".into())), 16 << 20);
+        // The default and an override reach cf_native_order_books only; every
+        // other CF (incl. default) keeps RocksDB's 64 MiB.
+        for (book, raw) in [(4 << 20, None), (16 << 20, Some("16".into()))] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = book_cf_target_file_bytes_from(raw);
+            drop(StateDb::open_with(dir.path(), &DbTuning::default(), target).unwrap());
+            let sizes = target_file_sizes(dir.path());
+            assert_eq!(
+                sizes.len(),
+                ALL_CF_NAMES.len() + 1,
+                "every CF incl. default"
+            );
+            for (cf, v) in sizes {
+                let want = if cf == CF_NATIVE_ORDER_BOOKS {
+                    book
+                } else {
+                    64 << 20
+                };
+                assert_eq!(v, want, "{cf}");
+            }
         }
     }
 
