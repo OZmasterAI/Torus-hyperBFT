@@ -720,6 +720,26 @@ each block is rejected work; revisit the load generator before Gate 2's final ce
   speed).
 - Not in item 6 (item 6 keeps parallel matching by design). s92: tracked as its own backlog item,
   decide with a risk view before mainnet.
+- **s99 status: over-commit IS possible under one flat tier** (corrects the s94 design check below,
+  which was made on `59fa407`, before option 1). A maker fill's IM delta minus its share of the
+  order's reservation, `d`, is still `<= 0` under one flat tier (resting orders prepay their IM), but
+  since s94 option 1 (`f6b0f4c5`) the fill commits `d + charge`, the charge being its loss against
+  the mark beyond its tolerance (`order_book.rs` `account_fill`). Each book of a batch checks its own
+  copy of the maker's pre-batch free margin, so k books can charge up to k x that free margin. Bounded
+  by the price band (default 50%, which caps what one fill can charge), not prevented by it: resting
+  orders stay put while the mark moves.
+  - Pin: `offmark_bad_debt_tests.rs` `one_batch_charges_a_makers_snapshot_free_once_per_book` (flat
+    20x default, 3 markets: the maker ends at free -82, stage 1).
+  - Pin (a): `every_production_market_config_is_one_flat_tier` (same file): every market config the
+    node loads (`load_margin_configs` -> `market_margin_config`, and the 20x no-config default) is one
+    flat tier. A second tier would open a second route (the tier gap): build option 4 (reserve at
+    the position tier) first.
+  - Counter built (`b1adeee9`, node-local, no consensus change): `torus_maker_offmark_charged_fills`
+    counts maker fills committed with a charge > 0, an upper bound on cross-market over-commit (a
+    charged fill in one market only counts too). Cost: one branch per committed fill, plus one
+    counter add per book per batch / per single placement.
+  - Real fix: owner decision before mainnet, among: split each maker's free margin per book, tighten
+    the band, or serialise makers resting in several markets.
 
 ### 9.12 Phase 1 gate verdict (s94, owner)
 All gates with their targets. ms/1k = ms per 1,000 fills, marks on. Gates 3 / 4 are 18c
@@ -797,6 +817,12 @@ already (16, 17, 26, 28, 36, 40-43, 71, 73, 9.10, 9.12) or asked no question.
     flat tier (resting orders prepay their IM). Build a non-consensus counter + tests that pin
     `d <= 0` under flat tiers; multi-tier configs trigger option 4 (reserve at the position tier).
     The real bad-debt route it found (fills far from the mark) is fixed on `fix/offmark-bad-debt`.
+    **s99 correction:** "cannot happen" no longer holds since that fix (`f6b0f4c5`): a maker fill
+    commits `d + charge`, and each book charges its own copy of the snapshot, so over-commit across
+    markets IS possible under one flat tier for fills far from the mark (bounded by the 50% band).
+    Pinned by `one_batch_charges_a_makers_snapshot_free_once_per_book`; counter
+    `torus_maker_offmark_charged_fills` built (`b1adeee9`); the real fix is an owner decision before
+    mainnet (9.11 s99 status).
 - **D. Moot:** rows 2, 6, 18, 23, 24, 31, 47, 62 (settled by ratios, step 2, E2-E4 and 9.12);
   48 (faster hasher): no, revisit only if `hash_one` shows in the Phase 2 profile.
 
@@ -820,7 +846,7 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 | 9.14 D row 48 (faster hasher) | `hash_one` / SipHash showed (~13% of execution self time): Phase 2 P2-5 (`item6-phase2-impl.md` 9.5) |
 | 9.14 B batch (rows 44, 45, 46, 52, 69) | built on `fix/s94-b-batch` (`9ab2837`, `d9e3c19`, `457fd70`, `860da7d`, `553aa51`); not merged yet |
 | row 50 "rejected" (HL names; s96 owner chose "rejected", not "canceled") | built on `feat/row50-rejected-status` (`d8f79878`, review fixes `640cad35`); not merged yet |
-| 9.11 counter, anti-spam eviction metric | unchanged; next: 9.11 counter |
+| 9.11 counter, anti-spam eviction metric | s99: 9.11 counter + pins built (`b1adeee9`, branch `feat/9.11-overcommit-counter`; over-commit IS possible under flat tiers, see 9.11); anti-spam metric unchanged |
 | `/tmp` test-folder leak (`app.rs`) | unchanged; after the merge (now unblocked) |
 | compiler warnings (ozarchy s17): `swarm.rs` 3047 `enqueue_body_fetch_traced` and 3210 `handle_consensus_direct` unused; `bench-throughput` `main.rs` 1592 needless `mut`, `in_flight.rs` 152 unused | new; small cleanup, anytime |
 | other 9.13 rows (native root 9.3, oracle M2, anti-spam D, runbook, C5 cooldown, trading app `"Failed"`) | unchanged |
@@ -828,5 +854,6 @@ merged as `a3bfab2`; ozarchy s17: nextest 2912/2912, cargo test 2913/0) + `feat/
 Item 6 Phase 2: full plan with owner decisions in `item6-phase2-impl.md` (`docs/item6-phase2-plan`);
 base and gate reference main `35e69b3`.
 
-Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> row 50 done -> next: 9.11 counter + pin
-tests -> anti-spam eviction metric; Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.
+Build queue on 18c (s96): row 74 done -> B batch (44, 45, 46, 52, 69) done -> row 50 done -> 9.11 counter + pin
+tests done (s99, `b1adeee9`) -> next: governance params fix -> anti-spam eviction metric; Phase 2 step 0 after
+ozarchy's reference cells on `35e69b3`.

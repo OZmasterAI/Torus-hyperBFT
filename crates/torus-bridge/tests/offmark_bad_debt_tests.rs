@@ -471,6 +471,19 @@ fn deviation_sweep_fills_stop_where_the_account_would_turn_unhealthy() {
 // 9.11 interaction: one batch, several books, one maker snapshot each
 // ============================================================================
 
+/// `ctx` with metrics on (the 9.11 counter `maker_offmark_charged_fills`).
+fn metered(ctx: &mut NativeExecContext) -> std::sync::Arc<torus_telemetry::Metrics> {
+    let m = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    ctx.metrics = Some(m.clone());
+    m
+}
+
+/// THE plan 9.11 over-commit pin (s99): maker over-commit across markets in
+/// one batch IS possible under one flat tier since option 1 (`f6b0f4c5`) —
+/// the fill commits `d + charge`, `d <= 0` but `charge > 0` off the mark.
+/// The node-local counter `torus_maker_offmark_charged_fills` counts the 3
+/// charged fills (0 when every book cancels the maker).
+///
 /// Option 1 lets a maker's fill draw its free margin (the mark charge), and
 /// each book of a batch checks makers against their OWN copy of the
 /// snapshot (plan 9.11): across k books one batch can charge up to k x the
@@ -506,8 +519,10 @@ fn one_batch_charges_a_makers_snapshot_free_once_per_book() {
                     (s, NativeAction::PlaceOrder(limit(m, false, 103, Q)))
                 })
                 .collect();
+            let metrics = metered(&mut ctx);
             let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &sells, threads);
             assert!(r.results.iter().all(|r| r.success), "{what}: {:?}", r.results);
+            assert_eq!(metrics.maker_offmark_charged_fills.get(), if fills { 3 } else { 0 }, "{what}: 9.11 counter");
             for m in markets {
                 assert_eq!(pos(&ctx, &mk, m), if fills { fp(Q) } else { FixedPoint::ZERO }, "{what}: market {m}");
             }
@@ -524,5 +539,110 @@ fn one_batch_charges_a_makers_snapshot_free_once_per_book() {
                 assert_eq!(v.equity(), fp_cents(3 * 5_150) + free, "{what}: all three cancelled, nothing lost");
             }
         }
+    }
+}
+
+/// Plan 9.11 counter (s99): `torus_maker_offmark_charged_fills` counts a
+/// maker fill only when it commits a mark charge, on every PlaceOrder path.
+/// Market 1, mark 100, A rests a bid of 10, B sells into it at the same
+/// price; A funded the IM at the price plus `extra`. Charge of a buy @103:
+/// loss 30 − tolerance (IM 51.5 − MM 25) = 3.5.
+/// - @100 (at the mark) and @102 (near: loss 20 <= tolerance 26) fill
+///   uncharged: 0.
+/// - @103 with extra 10: fills charged: 1.
+/// - @103 with extra 0: A is margin-cancelled (nothing committed): 0.
+/// - @103 with A as the TAKER (GTC buy, unchecked taker charged by option
+///   1; the maker B sells above the mark, no loss): 0 — takers are not
+///   counted.
+#[test]
+fn the_offmark_counter_counts_charged_maker_fills_only() {
+    // (price, extra free, A is the maker, A fills, counter)
+    let cases: [(i64, i64, bool, bool, u64); 5] = [
+        (100, 0, true, true, 0),
+        (102, 0, true, true, 0),
+        (103, 10, true, true, 1),
+        (103, 0, true, false, 0),
+        (103, 10, false, true, 0),
+    ];
+    for path in PATHS {
+        for (price, extra, a_maker, fills, want) in cases {
+            let what = format!("{path:?} price={price} extra={extra} a_maker={a_maker}");
+            let (_d, db) = liq_db(&[M]);
+            let mut ctx = ctx_at(db, 1);
+            set_mark(&ctx, M, fp(MARK));
+            fund(&ctx, &a(), im_at(price) + fp(extra));
+            fund(&ctx, &b(), fp(1_000));
+            fund(&ctx, &filler(), fp(1_000));
+            let metrics = metered(&mut ctx);
+            let ao = (a(), limit(M, true, price, Q));
+            let bo = (b(), limit(M, false, price, Q));
+            let (first, second) = if a_maker { (ao, bo) } else { (bo, ao) };
+            for (t, p) in [first, second] {
+                assert!(run(&mut ctx, path, t, p).success, "{what}: {t}");
+            }
+            assert_eq!(pos(&ctx, &a(), M), if fills { fp(Q) } else { FixedPoint::ZERO }, "{what}: A's fill");
+            assert_eq!(metrics.maker_offmark_charged_fills.get(), want, "{what}: 9.11 counter");
+        }
+    }
+}
+
+// ============================================================================
+// 9.11 pin (a): every production market config is ONE flat tier
+// ============================================================================
+
+/// Plan 9.11 (s94 / s99): `d` (a maker fill's IM delta minus its share of
+/// the order's reservation) is <= 0 only while every market has ONE flat
+/// tier: a resting order prepays its IM at placement, and a flat tier
+/// charges the position the same rate. Production market configs come from
+/// `CF_NATIVE_MARKETS` rows (genesis, RPC, governance listing: borsh
+/// `(base, quote, lot, tick, initial_margin)`) through
+/// `load_margin_configs` -> `market_margin_config`; a market without a
+/// config uses the flat `DEFAULT_ORDER_MAX_LEVERAGE` (20x). If this test
+/// fails, a second tier has reached production: makers can then over-commit
+/// through the tier gap too — plan 9.11 option 4 (reserve at the position
+/// tier) must be built first.
+#[test]
+fn every_production_market_config_is_one_flat_tier() {
+    use torus_core::margin::{order_initial_margin, DEFAULT_ORDER_MAX_LEVERAGE};
+    let row = |im: i128| {
+        borsh::to_vec(&("BTC".to_string(), "USDC".to_string(), FixedPoint::SCALE, FixedPoint::SCALE / 100, im)).unwrap()
+    };
+    let s = FixedPoint::SCALE;
+    // (market, row with its initial margin in percent, expected leverage;
+    // None = no config, the 20x default)
+    let rows: Vec<(MarketId, Vec<u8>, Option<u32>)> = vec![
+        (1, row(s), Some(100)),
+        (2, row(5 * s), Some(20)),
+        (3, row(10 * s), Some(10)),
+        (4, row(3 * s / 7), Some(233)),
+        (5, row(100 * s), Some(1)),
+        (6, row(200 * s), Some(1)),
+        (7, row(1), Some(u32::MAX)),
+        (8, row(0), None),
+        (9, row(-s), None),
+        (10, b"listed".to_vec(), None),
+    ];
+    let (_d, db) = open_test_db();
+    for (m, r, _) in &rows {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), r).unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_MARKETS, b"__metadata_row__", &row(s / 3)).unwrap();
+    let ctx = ctx_at(db, 1);
+    let fail = "plan 9.11: a production market config has more than one flat tier; build option 4 (reserve at the position tier) first";
+    assert_eq!(ctx.margin_configs.len(), 7, "configs loaded: {:?}", ctx.margin_configs.keys());
+    for (m, _, lev) in &rows {
+        let c = ctx.margin_configs.get(m);
+        assert_eq!(c.map(|c| c.max_leverage), *lev, "market {m}");
+        if let Some(c) = c {
+            assert_eq!(c.tiers.len(), 1, "{fail}: market {m}: {:?}", c.tiers);
+            assert_eq!(c.tiers[0].max_notional, FixedPoint::MAX, "{fail}: market {m}: {:?}", c.tiers);
+            assert_eq!(c.tiers[0].max_leverage, c.max_leverage, "{fail}: market {m}");
+        }
+    }
+    // The no-config default: one rate at every notional.
+    assert_eq!(DEFAULT_ORDER_MAX_LEVERAGE, 20);
+    for n in [1i128, s, 1_000_000 * s, 1_000_000_000_000 * s, i128::MAX] {
+        let im = order_initial_margin(None, FixedPoint::from_raw(n));
+        assert_eq!(im, FixedPoint::from_raw(n / 20), "{fail}: no-config default at notional raw {n}");
     }
 }
