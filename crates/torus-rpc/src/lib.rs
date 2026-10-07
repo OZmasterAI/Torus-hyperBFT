@@ -3270,7 +3270,9 @@ mod tests {
                         0,
                         1,
                         torus_state::action_status::FailureReason::IocCancel,
-                        "order rejected: IOC order could not immediately match".to_string(),
+                        torus_state::action_status::FailureReason::IocCancel
+                            .book_reject_message()
+                            .to_string(),
                     )
                 },
             ],
@@ -3320,8 +3322,9 @@ mod tests {
                 {
                     "index": 3,
                     "status": "rejected",
-                    "reason": "iocCancelRejected",
-                    "message": "order rejected: IOC order could not immediately match",
+                    "reason": "ioc_cancel",
+                    "rejectStatus": "iocCancelRejected",
+                    "message": "order rejected: IOC order could not immediately match against any resting order",
                     "order": 0,
                     "failedOrders": 1
                 }

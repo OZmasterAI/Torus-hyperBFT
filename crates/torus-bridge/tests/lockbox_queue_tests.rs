@@ -175,7 +175,7 @@ fn drain(db: &StateDb, height: u64) -> Vec<(bool, Option<String>)> {
     NativeExecutor::drain_core_writer(&mut ctx)
         .unwrap()
         .into_iter()
-        .map(|r| (r.success, r.error))
+        .map(|r| (r.success, r.error.map(String::from)))
         .collect()
 }
 
