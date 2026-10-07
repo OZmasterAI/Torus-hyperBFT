@@ -22,6 +22,15 @@
 //! (<= 5 raw; blocks 3-12 of `ROW50_OUT_A`) differ. Scenario B's outputs
 //! are unchanged.
 //!
+//! Re-run that comparison: in a worktree of the base and one of the change
+//! (each with its OWN `CARGO_TARGET_DIR`: a shared one can run the other
+//! tree's stale build), run
+//!   GOLDEN_PRINT=1 REPIN_DUMP=/tmp/<name>.txt cargo nextest run -p torus-bridge
+//!     --test perf_equivalence_golden -E 'test(golden_repins_change_only)'
+//! (scenarios A and B, serial, R off; the dump appends, so start from no
+//! file), then `python3 tools/golden-repin-diff.py /tmp/base.txt /tmp/new.txt`.
+//! The dump needs the same `repin_dump` (field names) in both trees.
+//!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
 //! `freeze` + `flush` with the running state hash on. Item 6 Phase 1 (C1):
@@ -189,6 +198,49 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
     data
 }
 
+/// s100 re-pin evidence (`REPIN_DUMP=<file>`): appends block `h`'s output
+/// line and every hashed row but `CF_CONSENSUS_META` to `path`, position and
+/// balance rows decoded field by field (so two layouts compare), the rest
+/// hex. `tools/golden-repin-diff.py` compares two dumps.
+fn repin_dump(db: &StateDb, h: u64, out: &str, path: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(f, "{h} OUT {out}").unwrap();
+    for (id, cf) in HASHED_CFS {
+        if *cf == CF_CONSENSUS_META {
+            continue;
+        }
+        for (k, v) in db.iterate_cf(cf, None).unwrap() {
+            let val = if *cf == CF_NATIVE_POSITIONS {
+                let p: torus_core::position::Position = borsh::from_slice(&v).unwrap();
+                format!(
+                    "POS long={} size={} entry={} margin={:?}/{} real={}",
+                    p.is_long,
+                    p.size.raw(),
+                    p.entry_price.raw(),
+                    p.margin_type,
+                    p.isolated_margin.raw(),
+                    p.realized_pnl.raw()
+                )
+            } else if *cf == CF_NATIVE_BALANCES && k.len() == 20 {
+                let b: NativeBalance = borsh::from_slice(&v).unwrap();
+                format!(
+                    "BAL avail={} om={}",
+                    b.available.raw(),
+                    b.order_margin.raw()
+                )
+            } else {
+                alloy_primitives::hex::encode(&v)
+            };
+            writeln!(f, "{h} {id} {} {val}", alloy_primitives::hex::encode(&k)).unwrap();
+        }
+    }
+}
+
 /// adl-budget re-pin evidence (18c review): [`db_digest`] without what rule H
 /// and P2 change on purpose — `0x03` values cut to `last` (16 bytes), no
 /// `0x07` row, no ADL-escrow position / balance row — and without what
@@ -262,6 +314,9 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
         let out = &outputs[h as usize - 1];
+        if let Ok(path) = std::env::var("REPIN_DUMP") {
+            repin_dump(db, h, &out[0], &path);
+        }
         let (state, reduced) = (db_digest(db), reduced_digest(db));
         for (k, (base, out)) in [(&state, &out[0]), (&state, &out[1]), (&reduced, &out[1])].into_iter().enumerate() {
             let mut data = base.clone();
