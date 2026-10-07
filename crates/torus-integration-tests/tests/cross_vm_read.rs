@@ -86,6 +86,7 @@ fn test_order_book_reader_position() {
         is_long: true,
         size: TestHarness::fp(10),
         entry_price: TestHarness::fp(50000),
+        cost_basis: TestHarness::fp(50000) * TestHarness::fp(10),
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: TestHarness::fp(5000),
         margin_type: torus_core::position::MarginType::Isolated,

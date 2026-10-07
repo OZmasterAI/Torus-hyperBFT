@@ -304,19 +304,29 @@ fn traders_after_walks_the_positions_cf_from_the_cursor() {
 /// which the account (collateral + other UPnL = `rest`) ends at 0. Rounded
 /// AGAINST the bankrupt trader (a long's price down, a short's up), so the
 /// close never leaves it positive: `rest + pnl` is in (-1 unit, 0].
+/// s100 item 2: the last argument is the cost basis (entry × size here).
 #[test]
 fn bankruptcy_price_rounds_against_the_trader() {
     // long 4 @ 1,000, rest 200: exactly 950
-    assert_eq!(bankruptcy_price(fp(200), true, fp(4), fp(1_000)), Some(fp(950)));
+    assert_eq!(
+        bankruptcy_price(fp(200), true, fp(4), fp(4_000)),
+        Some(fp(950))
+    );
     // short 4 @ 1,000, rest 200: exactly 1,050
-    assert_eq!(bankruptcy_price(fp(200), false, fp(4), fp(1_000)), Some(fp(1_050)));
+    assert_eq!(
+        bankruptcy_price(fp(200), false, fp(4), fp(4_000)),
+        Some(fp(1_050))
+    );
     // inexact: long / short 3 @ 1,000, rest 100 -> 33.333.. per unit, rounded against the trader
     let pnl = |is_long: bool, p: FixedPoint| {
-        let per = if is_long { p - fp(1_000) } else { fp(1_000) - p };
-        per * fp(3)
+        if is_long {
+            p * fp(3) - fp(3_000)
+        } else {
+            fp(3_000) - p * fp(3)
+        }
     };
-    let l = bankruptcy_price(fp(100), true, fp(3), fp(1_000)).unwrap();
-    let s = bankruptcy_price(fp(100), false, fp(3), fp(1_000)).unwrap();
+    let l = bankruptcy_price(fp(100), true, fp(3), fp(3_000)).unwrap();
+    let s = bankruptcy_price(fp(100), false, fp(3), fp(3_000)).unwrap();
     assert_eq!(l, FixedPoint::from_raw(fp(1_000).raw() - 3_333_333_334));
     assert_eq!(s, FixedPoint::from_raw(fp(1_000).raw() + 3_333_333_334));
     for (is_long, p) in [(true, l), (false, s)] {
@@ -324,7 +334,17 @@ fn bankruptcy_price_rounds_against_the_trader() {
         assert!(end <= FixedPoint::ZERO && end > -FixedPoint::ONE, "{is_long}: {end:?}");
     }
     // negative rest (other positions losing): the price moves past entry
-    assert_eq!(bankruptcy_price(-fp(40), true, fp(4), fp(1_000)), Some(fp(1_010)));
+    assert_eq!(
+        bankruptcy_price(-fp(40), true, fp(4), fp(4_000)),
+        Some(fp(1_010))
+    );
+    // a basis that is not entry × size (an averaged entry): exact on the basis
+    let odd = FixedPoint::from_raw(fp(3_000).raw() + 2);
+    let s = bankruptcy_price(fp(100), false, fp(3), odd).unwrap();
+    assert!(
+        fp(100) + (odd - s * fp(3)) <= FixedPoint::ZERO,
+        "short at basis + 2 raw"
+    );
     // overflow / zero size -> None (caller falls back to the mark)
     assert_eq!(bankruptcy_price(FixedPoint::MAX, true, FixedPoint::from_raw(1), fp(1)), None);
     assert_eq!(bankruptcy_price(fp(1), true, FixedPoint::ZERO, fp(1)), None);
@@ -560,4 +580,152 @@ fn pending_rows_are_counted_across_pages() {
     let among = [t(4), t(5), t(6), t(1_029), t(2_000)];
     assert_eq!(pending_among(&db, &among).unwrap(), 3);
     assert_eq!(pending_among(&db, &[]).unwrap(), 0);
+}
+
+/// s100 item 2 (design A, exact cost basis): the value sum — Σ (available +
+/// order margin) + Σ position UPnL at one common price, the
+/// `liquidation_value_sum` formula — is EXACTLY conserved by 400 fills at
+/// uneven prices and sizes (opens, increases, partial and full closes,
+/// flips, both sides) and by an ADL cycle: transfers into both escrows (3
+/// rows each, re-averaged), a partial `adl_close`, `cross_close`, then a
+/// drain and the dust sweep to the vault. Price 0 and a whole-number mark:
+/// exact. A fractional mark: within 1 raw per open position (mark × size
+/// truncates once per position, from the current state: no drift).
+#[test]
+fn value_sum_is_exact_across_fills_and_an_adl_cycle() {
+    use torus_core::liquidation::{
+        cross_close, move_collateral, transfer, ADL_ESCROW_LONG as EL, ADL_ESCROW_SHORT as ES,
+    };
+    use torus_core::margin::position_terms;
+    let (_d, pm) = setup();
+    let ts: Vec<Address> = (0x31..=0x38).map(addr).collect();
+    let all: Vec<Address> = ts
+        .iter()
+        .copied()
+        .chain([EL, ES, LIQUIDATOR_VAULT])
+        .collect();
+    for t in &ts {
+        set_balance(&pm, t, fp(1_000_000));
+    }
+    // (value sum at `px`, open positions)
+    let sum = |px: FixedPoint| -> (FixedPoint, i128) {
+        let (mut v, mut n) = (FixedPoint::ZERO, 0);
+        for t in &all {
+            let b = pm.get_native_balance(t).unwrap();
+            v += b.available + b.order_margin;
+            for p in pm.positions_for_trader(t).unwrap() {
+                v += position_terms(&p, Some(px), None).unwrap().upnl;
+                n += 1;
+            }
+        }
+        (v, n)
+    };
+    let (whole, frac) = (
+        fp(1_000),
+        FixedPoint::from_raw(fp(1_000).raw() + 37_777_777),
+    );
+    let (zero0, whole0, frac0) = (sum(FixedPoint::ZERO).0, sum(whole).0, sum(frac).0);
+    // |max| drift at price 0, at the whole mark; max excess over the
+    // fractional mark's bound (1 raw per open position).
+    let mut worst = (0i128, 0i128, 0i128);
+    let mut check = || {
+        let (d0, dw) = (
+            (sum(FixedPoint::ZERO).0 - zero0).raw(),
+            (sum(whole).0 - whole0).raw(),
+        );
+        let (f, n) = sum(frac);
+        let excess = ((f - frac0).raw().abs() - n).max(0);
+        worst = (
+            worst.0.max(d0.abs()),
+            worst.1.max(dw.abs()),
+            worst.2.max(excess),
+        );
+        (d0, dw)
+    };
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let px_at = |r: u64| FixedPoint::from_raw(fp(900).raw() + r as i128);
+    for _ in 0..400 {
+        let b = rnd(ts.len() as u64) as usize;
+        let s = (b + 1 + rnd(ts.len() as u64 - 1) as usize) % ts.len();
+        let q = FixedPoint::from_raw(1_000_000 + rnd(300_000_000) as i128);
+        let px = px_at(rnd(20_000_000_000));
+        pm.apply_fill(&ts[b], 1, true, q, px, MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(&ts[s], 1, false, q, px, MarginType::Cross)
+            .unwrap();
+        check();
+    }
+    let after_fills = check();
+    // ADL cycle: 3 rows into each escrow, each at its own uneven price.
+    let holders = |long: bool| -> Vec<(Address, FixedPoint)> {
+        ts.iter()
+            .filter_map(|t| {
+                pm.get_position(t, 1)
+                    .unwrap()
+                    .filter(|p| p.is_long == long)
+                    .map(|p| (*t, p.size))
+            })
+            .collect()
+    };
+    for long in [true, false] {
+        let e = if long { EL } else { ES };
+        for (t, size) in holders(long).into_iter().take(3) {
+            let part = FixedPoint::from_raw(size.raw() * 2 / 3 + 1);
+            transfer(&pm, &t, &e, 1, part, px_at(rnd(20_000_000_000))).unwrap();
+            check();
+        }
+    }
+    let esize = |e: &Address| pm.get_position(e, 1).unwrap().unwrap().size;
+    let ranked = |long: bool| {
+        let get = |t: &Address| pm.get_position(t, 1);
+        adl_rank(
+            fp(1_000),
+            adl_candidates(&ts, long, get, |_| Ok(fp(1))).unwrap(),
+        )
+    };
+    let half = FixedPoint::from_raw(esize(&EL).raw() / 2 + 3);
+    adl_close(
+        &pm,
+        &EL,
+        1,
+        px_at(rnd(20_000_000_000)),
+        half,
+        &ranked(false),
+    )
+    .unwrap();
+    check();
+    let q = FixedPoint::from_raw(esize(&EL).raw().min(esize(&ES).raw()) / 3 + 7);
+    cross_close(
+        &pm,
+        1,
+        q,
+        px_at(rnd(20_000_000_000)),
+        px_at(rnd(20_000_000_000)),
+        &LIQUIDATOR_VAULT,
+    )
+    .unwrap();
+    check();
+    for (e, long) in [(EL, true), (ES, false)] {
+        let size = esize(&e);
+        adl_close(&pm, &e, 1, px_at(rnd(20_000_000_000)), size, &ranked(!long)).unwrap();
+        assert!(
+            pm.get_position(&e, 1).unwrap().is_none(),
+            "escrow {long} drained"
+        );
+        move_collateral(&pm, &e, &LIQUIDATOR_VAULT).unwrap();
+        check();
+    }
+    let end = check();
+    assert_eq!(
+        worst,
+        (0, 0, 0),
+        "value-sum drift, raw units (|max| at price 0, at mark 1,000, excess at a fractional mark); \
+         after the fills (price 0, mark 1,000): {after_fills:?}, at the end: {end:?}"
+    );
 }

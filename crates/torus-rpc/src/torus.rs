@@ -1110,11 +1110,11 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Compute unrealized PnL at the usable oracle price; fall back to entry price.
-                let mark_price = self
+                // Unrealized PnL at the usable oracle price; 0 without one
+                // (valued at entry, as the margin math does).
+                let unrealized = self
                     .usable_oracle_price(mid)
-                    .map_or(p.entry_price, |op| op.price);
-                let unrealized = p.unrealized_pnl(mark_price);
+                    .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
 
                 // Simplified liquidation price estimate.
                 let liquidation_price =

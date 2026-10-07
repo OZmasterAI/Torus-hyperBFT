@@ -8,6 +8,28 @@
 //! (book rejections reported rejected); the digests over the pre-row-50 view
 //! of the results (`pre_row50`) must still equal the previous pins, and the
 //! row-50 outputs alone (`ROW50_OUT_A`) must equal main's.
+//! s100 item 2 (exact cost basis, Position layout v2) re-pinned EVERY
+//! const here, on purpose: each position row gains `cost_basis` (and the
+//! native state root covers them), so every DB digest changes, the reduced
+//! ones too (they keep the non-escrow position and balance rows). Checked
+//! against main f1e41975 (per-block dump of every hashed row but
+//! `CF_CONSENSUS_META`, scenarios A and B, serial, R off): the same keys in
+//! every block and the same outcomes (success, gas, trades, metrics,
+//! liquidation results, obligation and other rows byte-equal); only
+//! position entry (1,056 row versions, <= 10 raw) and realized PnL (129,
+//! <= 15 raw), balance `available` (62, <= 14 raw) and the free-margin
+//! amounts in 375 "insufficient margin" error texts of scenario A
+//! (<= 5 raw; blocks 3-12 of `ROW50_OUT_A`) differ. Scenario B's outputs
+//! are unchanged.
+//!
+//! Re-run that comparison: in a worktree of the base and one of the change
+//! (each with its OWN `CARGO_TARGET_DIR`: a shared one can run the other
+//! tree's stale build), run
+//!   GOLDEN_PRINT=1 REPIN_DUMP=/tmp/<name>.txt cargo nextest run -p torus-bridge
+//!     --test perf_equivalence_golden -E 'test(golden_repins_change_only)'
+//! (scenarios A and B, serial, R off; the dump appends, so start from no
+//! file), then `python3 tools/golden-repin-diff.py /tmp/base.txt /tmp/new.txt`.
+//! The dump needs the same `repin_dump` (field names) in both trees.
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
@@ -176,6 +198,49 @@ fn db_digest(db: &StateDb) -> Vec<u8> {
     data
 }
 
+/// s100 re-pin evidence (`REPIN_DUMP=<file>`): appends block `h`'s output
+/// line and every hashed row but `CF_CONSENSUS_META` to `path`, position and
+/// balance rows decoded field by field (so two layouts compare), the rest
+/// hex. `tools/golden-repin-diff.py` compares two dumps.
+fn repin_dump(db: &StateDb, h: u64, out: &str, path: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(f, "{h} OUT {out}").unwrap();
+    for (id, cf) in HASHED_CFS {
+        if *cf == CF_CONSENSUS_META {
+            continue;
+        }
+        for (k, v) in db.iterate_cf(cf, None).unwrap() {
+            let val = if *cf == CF_NATIVE_POSITIONS {
+                let p: torus_core::position::Position = borsh::from_slice(&v).unwrap();
+                format!(
+                    "POS long={} size={} entry={} margin={:?}/{} real={}",
+                    p.is_long,
+                    p.size.raw(),
+                    p.entry_price.raw(),
+                    p.margin_type,
+                    p.isolated_margin.raw(),
+                    p.realized_pnl.raw()
+                )
+            } else if *cf == CF_NATIVE_BALANCES && k.len() == 20 {
+                let b: NativeBalance = borsh::from_slice(&v).unwrap();
+                format!(
+                    "BAL avail={} om={}",
+                    b.available.raw(),
+                    b.order_margin.raw()
+                )
+            } else {
+                alloy_primitives::hex::encode(&v)
+            };
+            writeln!(f, "{h} {id} {} {val}", alloy_primitives::hex::encode(&k)).unwrap();
+        }
+    }
+}
+
 /// adl-budget re-pin evidence (18c review): [`db_digest`] without what rule H
 /// and P2 change on purpose — `0x03` values cut to `last` (16 bytes), no
 /// `0x07` row, no ADL-escrow position / balance row — and without what
@@ -249,6 +314,9 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
         let out = &outputs[h as usize - 1];
+        if let Ok(path) = std::env::var("REPIN_DUMP") {
+            repin_dump(db, h, &out[0], &path);
+        }
         let (state, reduced) = (db_digest(db), reduced_digest(db));
         for (k, (base, out)) in [(&state, &out[0]), (&state, &out[1]), (&reduced, &out[1])].into_iter().enumerate() {
             let mut data = base.clone();
@@ -614,18 +682,18 @@ fn scenario_b(db: &StateDb) -> Vec<Block> {
 /// metrics and trade index unchanged); [`GOLDEN_A`] re-pins the results'
 /// success / error only.
 const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
-    "0xc89a22e0fea0bc6f60a62e6f94b1599a68c07b33b5f17431538843383b80a0b5",
-    "0x7960e867a35c8fdce5f56e5d3d6661162f8a96b14a350628d83604b434cf3e59",
-    "0x0deec3de2ab24b612cca75d3c47e0011738c35dabe404af3a65a43577c261fc0",
-    "0x129722e4f2903ebe050545391ae83abcad213281ec8c23be16d8b3bc9d8bf433",
-    "0xcdbdfe174f649470f76be10c682bbe8303cea0d95d185cf47687df2fc90b6756",
-    "0x721844dce07776e4592fff8226d4a4b43276ca41dcf09b499de02ad48356713c",
-    "0x5604445b0b78069641ee2b8c7672c1618a1453099204819edca910f679920db9",
-    "0x964a678de1c4ea0e0b9e41105df3869f1f8b485933624e205f9db2329d776285",
-    "0x19463cac6e154c0a1ffba1373e36fe9075a51d42e9681baf0442fc63cab47fc1",
-    "0xbf6055429f8f1a82473be75c259f142c1332e4cf11396afe861f1cf8c58f96c2",
-    "0x92fe19c4cec83034d4ea3837faf04d350798c12eb8d2cdcba6f85240452a0970",
-    "0x214002d6bcf9c104b7361973e1b70e9712d334c55ca4829d32483374496b4047",
+    "0x4386433aed4609e3fe307eb69e039cb84ab03da0eb4c8d916f962d792b9c3270",
+    "0x75d7ec4447e7104b9b2c6a72599483737fe1c876ef33b135fd58dc17a3b4c68d",
+    "0x41ddb8b10e16eda61dca97de78cb4589b2946da5682f6a58820faa8ec3d5b0a3",
+    "0x00b3694b6ecd4a4f16c23ee5f3c57c81fdc04a4b3f7c515b1e5c6170123a11b4",
+    "0x853a1549f5512b58258dc29d5dfdd98b523875db083a3a11f4c9724bcb2eb9d4",
+    "0x599aef9d919b064f557abca7b950adaa95e4bd5ee001d88051081eb85f713b18",
+    "0xf95e0f89341f38697b4869466ed7b136a08b6b49b88e9ab75d8a4ceef9492c07",
+    "0xc6a1ba12d0b21941f364c2ca65965aaba3a565b1d264048fbfda00b027591a5a",
+    "0x7f318bddaa40c2989137acbf46e5e7addf75157862a7e1d7c34b39773cf73ff5",
+    "0x864712b5dee3b98655541aa7d59172f2a4527cfcb57a80cb52cf3a248eb75b7a",
+    "0xf8bc82248cbec9b960b3a294ea2e69ed225e60f4ab185f57ee24484ab3a3d96a",
+    "0xea39d111774af97ee560e25de1ab18623846e522e45c0a827bf0d4448c58cb35",
 ];
 /// Scenario A at row 50 (s96, owner decision): an order the book refuses or
 /// cancels without a fill is rejected with its HL reason (success false, an
@@ -638,18 +706,18 @@ const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
 /// row-50 outputs are main's ([`ROW50_OUT_A`], checked in every run); every
 /// R mode and the engine give the same digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
-    "0x8e809cbd45abcc0545c71fa1e509b7ab261510773ea274bcfa4c429ff1104dac",
-    "0x3292c34d45b5ef098ba276ae158ee0c201cf0419a5f5f0673bf0ab4abceac828",
-    "0xd0aa3bd3bab354190bc64a7e66e7ff0172578305f9b46f2ccf693f5923a5f521",
-    "0x5c7bf9ba72de8918b8f3d3efda137b1d0bd8cd38bfed38c8aa6bb0a14dabf9c3",
-    "0x6270f1e4d41dbc104e198639cbe6118affe3af8d7a1e13b52894652b4f14023f",
-    "0x352308f4f49f066a7f479cad088011b562f718ee0600617b364322fc059293bd",
-    "0x6847c337ecb796dc46d57afc36d4b29adb697e3d482e7c159175af196f9d5963",
-    "0x9a1a741c170f8c7c84024f6500cfad6524647f501eb52e462225be0c25ae5c12",
-    "0xd47a8ee40cfac970b559b63ccd469abfdd0cb7a2afaff38680d9560d725a853d",
-    "0xb3520cea6e8b5ecd151edbe88ff813edf03d892129fd5de2357cc9ac91f2b239",
-    "0x83f6c8bfe6fd92475fd069d063d91501f82134ae7dc5aff70945eb27dfa62df9",
-    "0x4e7880623e2f1aa95a6b3d3be8465c25a43d3628a6c6d02efb43e4ee1b5c19f7",
+    "0xee9cfcb29cfcaaa92cf39ea0ec182858f7723d40d8ae468bfb52a5242c02a43d",
+    "0x7b6cd8c5abdd43a95389085c1896babbc9e15b2dd50780aee9f9cc6e282c7610",
+    "0xdfe38147efd86f0fc62c775ee2759ceb814fde9028380225d7c1228706508639",
+    "0x455735df88d0eefe8c3697e56ed7604fc4bf991e9c7018c7431d10ca7c23c22b",
+    "0xd441f993c882b7e79a25dc1d4e3908006c2291c5467d4cbc037623e7f17acb29",
+    "0xf92c2dc331b3ef1fa0d9fc990636d301c1ae770eb173950b352a3eb6817b4b5f",
+    "0xfbbea8f662b113c8f8dd505a1f8c3eac814c5595a2194d3fcc4f263710abe925",
+    "0x3c7dcbfb9dc3d90b6dc3a67122d2337b709591ee189c1abc8b97368b7bc03123",
+    "0x4bc981065cabb03c4371df90cf5174774ccd7ca66744ed1d8eaebf733d759d70",
+    "0xa74714efbb7d518a2983ae5c58724df1190c644bad5a33e2f8e4cb7d01ad1b0d",
+    "0x0c0904814ddb5cda09ac323bb2e8a7f0d6a09c111f99ae0a252507c51b3dd092",
+    "0xa1c4082152acb17fbfc42dbc3f9c8b5ce0c2210c090e0f5b07ffcfc5d5770191",
 ];
 /// Scenario A's outputs alone in the row-50 view (s99 review LOW 2):
 /// keccak256 over each block's output string (results, gas, liquidation
@@ -661,16 +729,16 @@ const GOLDEN_A: [&str; A_BLOCKS as usize] = [
 const ROW50_OUT_A: [&str; A_BLOCKS as usize] = [
     "0x23f04f7f1940fd0ea9e7199467856ff19e94fd5e9feb6a731e4ab6d7fa354ff5",
     "0xb019cecb20537d9f70418bdce16c7e98e6c79cc4f879359429c1c98b2ef1b079",
-    "0x11c88743a5704bfe253573b06e178e5dff795e242a75acbb2cead0e0fa2518c5",
-    "0xbd812ad25dc5302aa2c0363d00da462ecfa26cf1552e1bd0f7fde1eefd8e920c",
-    "0x732d7cca926d2b612cc98d3a938217de3e67622f78e56b9e14ac7cf3ed0ca176",
-    "0x3fdf84c3576003162295b79c1f4f869f8c28a159ffc7126dccf43263eaaa4371",
-    "0x2858ee5256d4a24a81ecf30ae5bcc67354598e8843af6af62d479f524e60ba20",
-    "0x50e06807e87e5bc0a495b9bff420068ba2b320676853d24a1d7673b6b4bbde91",
-    "0xc52ccf15aac9f4863f5cac31b2461b6e01a7a3d9b416c1b8a16a5c0f7b38cd0f",
-    "0xa28a95f4abd15db763bf6c603af847a936fee06eebe37dfab01ca19c9f13e6e1",
-    "0x9f74082b27774f46fd22f09f287a5a27944b105e035bfec7b9ace7a530bee740",
-    "0xa73989938536f8cf022cc16d297beaa0e3e5e8bb67cfef2b455969f8cd5a2f68",
+    "0x849c1549d75348fa088e085f712130dce7860666025fdc230276b6b22215efad",
+    "0xad589fcc58bcea9d7fb6cad81117f557cfbfc8b564d907898e35fd6045c527d9",
+    "0x1035bf9c67a19a2d5fb714e4730519eece3501d8951fe489d25cdc1e7af1f051",
+    "0x2aec3b9af6fb9c706f8afc1b4f0e5d43cd7f1aa688ca4708f812a88dc49952d6",
+    "0x175c4f59d4c1beda5c480e706ed10d63d2bbf9639e0d04832ab9f904049fb0a9",
+    "0x4ab9e55569131cb51562b268ab635d91bd4ee0a3e581b4d11d6743481697c55c",
+    "0x01c837df8b7235a67e724b4157d7aafc39b40341113e2fcb49cb12c288f7e57b",
+    "0xcb909c73fcc8beee3578a22633469517f4066e263933257bd118bfc0c8ffc6c2",
+    "0xce3e5a7be3957a045123c50fe2b0df1a754ce5d9fafa80a975eead569b11042f",
+    "0xe491e39bc519aea7f0eb6c202055baa07af816058309b3f8080f21e093d2abbb",
 ];
 /// Scenario B on c93c579 (no book rejection: the same with and without the
 /// pre-row-50 view); re-pinned by adl-budget A3 (rule H): from block 6
@@ -683,59 +751,59 @@ const ROW50_OUT_A: [&str; A_BLOCKS as usize] = [
 /// balance rows); [`golden_repins_change_only_rule_h_and_p2_rows`] proves
 /// every other row and every block's outputs equal to 56318a9's (D10, no P2).
 const GOLDEN_B: [&str; 18] = [
-    "0x01ad98e2504ea6d07d86d94eb488ea2f620b593effec4284b1cb37a3cf07cdbd",
-    "0xd5ce9dd0a968a2016bb69dc20bc5e12ba6e9bf600539c7cc2989087b49e98562",
-    "0xd8abb0cf2659f07e75b8727065ad904f5216d93f0ea257066e0c0b35336e9268",
-    "0x4993dfb40e8b399bd26259a06dcf3b3cc8863a3234b2a4470cdbfefd3156f85e",
-    "0xdad5dd048374e566c584bd587745d949e7aa053bd1b0e36e43d36e61c76010f2",
-    "0x08d89c1339ddf8b3da9246c698dd2673ad0398da8d70bdfa0985c17ae9604636",
-    "0xb86de24be5bbd879d94fbef2787cb3d24813d99e7d141e570b23d0917a83a4be",
-    "0xe56b53c9c75fa016fbd55e849f7fd71f75d412b94a0a51cf339d4585c99dbc0f",
-    "0x005f8e8c234f1c1c52ff405e93f3d91c3678c31147a3846a54749556656afd73",
-    "0x529970a5d09713b43c2972318e79c5a300016f1d26e20bf19a47c70a627878b0",
-    "0x3332a37809b93f4bb770cf0879083e31a453b0cf19a62f7b6d249bad559ed42a",
-    "0x831a18eb3ce615493024f86bed6426c50408945b6fc64ce0b5333aa37e6e884b",
-    "0xdb7b953bade90906fee455b7a502e27f09c4e980f0f2f723f8a38e027c0f8984",
-    "0x932f47d6158e82abaf81b2eabdf3a7843fe5d78a8c9cde8111c76df67b3dc601",
-    "0x530fe2e8ee6823ecc00939450c914dc090538b683f584a50895222accbc1b01e",
-    "0x5abd2a1432860f381db233de5715719a617b11a159363689bdd7e9cca45c5fb2",
-    "0x194865aa6001ef32b7982be69f08e62e6f1e824ec0a0ab087f689219c87f408a",
-    "0xab7e76a736438367521abc81cdf93c13060e37669dd681824f0e26ba11b5dad0",
+    "0x6508c280d9bc733731f1c36b1b7dc836defa7eb79e5ad88ed15546c359a758d4",
+    "0x67fa8d76b4341eed802a05cbb1eff9666292220e12f0445cf96a112735e01570",
+    "0x938ecff6e39bf510a6b672a8215aec72cd1cc1ec4707c114de2ba697022e52ee",
+    "0xdb34aa85e3d6c856b7dafb516a4f0d17e709f1fe0cbc5352f9a82d8556b6bd31",
+    "0x1160786fcac855581da8ec6c7b24cf9684a0b84b2eba8f7a5441c188be564689",
+    "0x5a9a4f8495e76a113d4b7485bdc16c3e8f9932bf5cd0469b3d9c6ea846c44c0f",
+    "0xc35d9f3776241ce5c84f35cd9267059cc760c3f1902a6db659f051cb2f2cbcb6",
+    "0x7d52a77e23bc8e38b6234c15731d9107041551f3ecdb5d485c7327f41d3a34af",
+    "0x4480e1caa330a4e9f27ee2ece66945528452b5972072e794ab0955a61dde8503",
+    "0xaa88b9e1ba36c62d8320263879e1026b4ef58b481fb50c575f217740d1e0fdec",
+    "0x823d8df0b1f557ffd3430a5b00781106aa3b54e52704483c51124953f4c4696a",
+    "0x0919f1b17feec14537329f70d6f5d11c17ab1c0d0335a5a64008498c1ff45990",
+    "0xb83b82d4bedcbe859dca44ce122aba1258645c50e1c357801f228ec6fb56d62b",
+    "0xfa2e4e077d7f185b6607a81a434b54d4ce640adf4120157e0077d963176f5be3",
+    "0xdfbdb8b0bace7eb864bf8fd5acf9b2fbc4921fcdec1811046a94bab45261e25d",
+    "0x861bd1c802dca594080202e91a1a2ce69ba00937ecaa0d8edb278075f6ccfeef",
+    "0x9878d278ea9aba25370833278793b13665c9b8802ec56febedfe0d955e392775",
+    "0xa36fcb45f6d2e86744ea9b27e317dcb1f3692ab14107e2bc6ed3bd0465021afe",
 ];
 /// [`golden_repins_change_only_rule_h_and_p2_rows`]: pinned on 56318a9.
 const REDUCED_A: [&str; A_BLOCKS as usize] = [
-    "0x1e216ac310a4dc30f9d20b20dc0804ddcb92139f362779b4ef72777a5c256395",
-    "0xdcf49a1ce6009f620d6ff1266adfa6f23cfcaf30fef509a3aa59a83178b798c4",
-    "0x95b5b46d895d255e59a4d8db1140916820173420257c30f27dcf476089c7d9b1",
-    "0x3a1a0425da7327bf46cc94d9fcfc985ff0b729772caba374a466fa62455c4ebb",
-    "0xd25f195f0051ee647a33c4fe7dde50b2fa183080695599f08aae12b77db2d28f",
-    "0xb5bfbf3ed1d60b6d7fdf24653ad365947d8fe34e78cf0814f686c6336d8c51dc",
-    "0x5b42210a9ab79087a0215784812c3c23a520e07bf51af9b19662c6f3153e3022",
-    "0x389cd1a820427a59fb1a1edb458d08f2a1cc80ebaeb9270b473d1d08e60dc2df",
-    "0x1568b3e98c89657bffed3f3b32f9c2b2ee7467af6aa937ae3037a052abb7771e",
-    "0xcffe661162f742bfef8479065dcb5970bd12585817fd35ef8d4c1a97d37dde62",
-    "0xf1a5fcfa71a63b7ac1debc6f4824bb4fd0fdde6865525094c57aeba638482d52",
-    "0x2c386f2dfc1c57fef323e35abe851fdef467326897b07075749f0cd6e751bacd",
+    "0xc616add92af77cf85acf74b1b1b17bf03beff5273130d13db7154bf757fcc171",
+    "0x2b139a63be87782da59c007ea47f2bcff6b96fe66ca1dd259a929b23a7100459",
+    "0x250198987e3694f39aac06fff8567d0d405de0f54dc89c4e2c83ee615fcbe8d3",
+    "0x5a0be2fc72ea792e0fb8c593b45707d5ca768285e8dafb10a2df808e68a418da",
+    "0xe3f16ed16893c04e47a0088dd4b8dc5ad9ad58624639d7bbbed1945447efdfc5",
+    "0xda149b6927bede1b00dd98ace06f8d28ad2b6d831c087be90d857baf99b1ece1",
+    "0x403184602d242e647dda5d8f0cbe49402e3d542d47295f3428b581d2f47802db",
+    "0x576110b823d1e23e802ad7782d58eec16baa8f417bcc3b153041ff7249948f5a",
+    "0x2044c4b481d38d9fc5dde77a69a7ad3085b3216e59e70b51cf6a08f7ca958362",
+    "0x842eea796cac7d9babed48d67489251cfacdc1ac3ede14bf302f195b909eac0c",
+    "0xe1e5adf61b910e1bd39ce92bb44647f06926230e37f3a7ab2010be035301486f",
+    "0xc6c24ea8cf285570eb4438d7682a0b349f460bf65931b378e09eacf1b4caf764",
 ];
 const REDUCED_B: [&str; 18] = [
-    "0x86b5bbc4e7b12940fcaddd409473acc127055700930c7e2c01982c3995c1d2a6",
-    "0x76d1fca7edae343d092286720cafee54839d4fb5cff2c00f140fabc02b04cca2",
-    "0xd4b9f654dd63fd9489fea94ccf57f3f723b9d4d9bbcd8ae0124d6d931caf63d3",
-    "0xf02634d7adc94e535b13832909c7b9c26ba2269b1a9c0a6519a84b20f10b67f7",
-    "0xfa8a5ab7f9a2747ac39b83e8288c2f77f7553c0d47c1a88994cb57d1d538b2d4",
-    "0x5cd4fcc1eef97ef3a242faeda00a7d014df0a3f67a5b7236314844f90d3fac96",
-    "0x108f3b38bcd0c60eab535eef5e306e38fd4a44c22d580e45a44336f647bcf085",
-    "0x2ce64fc511d84ecf8ec00999634e68940cd5d259938b38d418629cccb676facc",
-    "0x12aeb2450213a440321509e37a628f2f6dbc5e095230f59c29b1d7107b12b8fe",
-    "0xbdc5885774cfc04aafcfe239b123f78c035acd82b288dc128e9e8f16dc285298",
-    "0x1983d61d95707772e8e5816d5856d93aaa9f8dc888557ebb035c08bca7a28ac0",
-    "0x93b7296ab71602ae128a4bc76187c88cf3e981202d227a79f187b75d0c2777ba",
-    "0xfbe0deac489a3c9394627d3ca84c29b42fd8ced5c125418780f04e820ef6575b",
-    "0xf6fba44ba5aebcf7fa1abfe4e8b2bb7d58dabb289fd858711f27f612e885d55d",
-    "0xdff904f5b8d4d6861ef61f8c0ff267ecf0c0ed36743eea3ad99e6ef7d578d278",
-    "0x4958522c33a537ea933e990150a60c66b6fb444deca45f245e7f821489416ca0",
-    "0x70667a0748eaa57168bd62b47f3093867d61835ca7bcd455e7873fe17bb429c1",
-    "0x0c263752661d6caa0b40181ba74be4af244bd4faf5f94bd180b262d0b67908a4",
+    "0xada71eb46de7a1c7b4aca6d19d4fce204c5c9aa9ae9bf9c306245f0a0d77a11c",
+    "0x6397c7753b9ef43698486776073f7e28276af3b8dfc5b352fb84ac45c2fbd7d8",
+    "0xd77b2f80d7bb9fe21176a8c7876bf30b74dd1ebba8895fdf5dcb876c4b42c47a",
+    "0xf2063736bbb7de86b8f9b6868d6c17ab53f8db3b056cb6884ba5b95f90c71955",
+    "0xfece76fc902d4ffaea0f9929dff27df0f93d82fbdba5ed843972488b6cea8cf8",
+    "0xadff9c80e0884640c70a0127a59fe0330b3a50966251f4cee0963e7cfb364ee5",
+    "0x60a732514d1bc194e36bb2a899fbe05739e67d6cce2165c171b14c0ec5471da4",
+    "0x8ff6e1858ff7a56c6466fd6e7067be196e3d9f79332ccc8e9f9387230995383a",
+    "0x99d596c82b7f051d51fa0e2b52a6063aad2df09c5c077ec8b03299db0ffbdd6c",
+    "0x7255c0b32493b43245ce2e680aa95738d16dfb0245ca5acf5ecd6cb76a82c18c",
+    "0xeb6541be145314db76fc1bc5a590040449dfe9cd5333f06c01835fe98243200b",
+    "0xa303836221614bdf5b9d44fc3b659fd906a636a2c065a75ec15ad2f40461f12b",
+    "0xd7b056ce6823a787bb03b7dede59b9bf5a743144439292c3e689abcc06f83dbc",
+    "0x80ac10b0abc5ba7c136f498760ddac578a01d6252da82a0cdc405dd5edbd07df",
+    "0x5bab6832f800e3b737489c5d6e2ea071e916cb8f642f7862cfe9af9a173900a5",
+    "0xfdae772ac064299c08ed1c079bc1a7e50b69f7caebf5643f359e4afa4d3939d4",
+    "0xb1a32e289d3ef396a8b6517cd5ab764295d658f16fe53bba7b6441271b1cc154",
+    "0x11947a7ad2fa6f14ab404890c39c03bf20cab72ac911852fd60b7723d0cabc16",
 ];
 
 fn check(name: &str, got: &[String], want: &[&str]) {

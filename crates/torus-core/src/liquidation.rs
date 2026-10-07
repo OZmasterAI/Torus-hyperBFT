@@ -182,26 +182,36 @@ fn ceil_div(a: i128, b: i128) -> i128 {
 /// Review H1 (user decision s517): the BANKRUPTCY price of a position — the
 /// close price at which its account ends at exactly 0, given `rest` =
 /// collateral (available + order margin) + the UPnL of the account's OTHER
-/// positions. Long: `entry − rest / size`; short: `entry + rest / size`.
-/// Exact integer math, rounded AGAINST the bankrupt trader (a long's price
-/// down, a short's up: `ceil(rest × SCALE / size)` off the entry), so a close
-/// at this price never leaves the account positive (realized PnL truncates
-/// toward zero, i.e. up for a loss, and still stays `<= −rest`). `None` on
-/// overflow or a non-positive size.
+/// positions. Long: `(basis − rest) / size`; short: `(basis + rest) / size`
+/// (`basis` = the position's `cost_basis`, s100 item 2). Exact integer math,
+/// rounded AGAINST the bankrupt trader (a long's price down, a short's up),
+/// so a full close at a positive price here never leaves the account
+/// positive: the close notional `price × size` truncates down, and realized
+/// PnL is `notional − basis` (long) or `basis − notional` (short), `<= −rest`.
+/// `None` on overflow or a non-positive size.
 pub fn bankruptcy_price(
     rest: FixedPoint,
     is_long: bool,
     size: FixedPoint,
-    entry: FixedPoint,
+    basis: FixedPoint,
 ) -> Option<FixedPoint> {
     if size.raw() <= 0 {
         return None;
     }
-    let per = ceil_div(rest.raw().checked_mul(FixedPoint::SCALE)?, size.raw());
     let p = if is_long {
-        entry.raw().checked_sub(per)?
+        basis
+            .raw()
+            .checked_sub(rest.raw())?
+            .checked_mul(FixedPoint::SCALE)?
+            .div_euclid(size.raw())
     } else {
-        entry.raw().checked_add(per)?
+        ceil_div(
+            basis
+                .raw()
+                .checked_add(rest.raw())?
+                .checked_mul(FixedPoint::SCALE)?,
+            size.raw(),
+        )
     };
     Some(FixedPoint::from_raw(p))
 }
@@ -389,6 +399,8 @@ pub fn adl_close<T: StateBackend>(
 /// P2 edge (real holders exhausted): escrow long sells `q` at `p_long`, escrow
 /// short buys `q` at `p_short`. Two prices realize (p_long - p_short) x q more
 /// than one shared price would; the vault pays it, so value is conserved.
+/// s100 item 2: the vault pays `p_short × q − p_long × q`, the same two
+/// products the escrow closes book, so the three legs net to 0 exactly.
 /// Returns the vault's change (+ = credited). Never flips or opens an escrow
 /// position (18c review): q <= 0, or an escrow not holding at least q on its
 /// own side, is an error and nothing is written.
@@ -409,7 +421,11 @@ pub fn cross_close<T: StateBackend>(
     }
     pm.apply_fill(&ADL_ESCROW_LONG, m, false, q, p_long, MarginType::Cross)?;
     pm.apply_fill(&ADL_ESCROW_SHORT, m, true, q, p_short, MarginType::Cross)?;
-    let paid = p_short.checked_sub(p_long).map_err(of)?.checked_mul(q).map_err(of)?;
+    let paid = p_short
+        .checked_mul(q)
+        .map_err(of)?
+        .checked_sub(p_long.checked_mul(q).map_err(of)?)
+        .map_err(of)?;
     let mut vb = pm.get_native_balance(vault)?;
     vb.available = vb.available.checked_add(paid).map_err(of)?;
     pm.put_native_balance(vault, &vb)?;
