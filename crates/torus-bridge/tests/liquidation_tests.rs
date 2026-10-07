@@ -101,6 +101,23 @@ fn oi(ctx: &NativeExecContext, m: MarketId) -> (FixedPoint, FixedPoint) {
     (l, s)
 }
 
+/// Net signed size (long +, short -) per market over EVERY position row
+/// (traders, both ADL escrows, the vault, the liquidator): markets with a
+/// position only. 18c s99: the price-0 value sum equals the sum at the marks
+/// only while each market nets to 0, so its tests assert this map is all 0.
+fn net_size_per_market(ctx: &NativeExecContext) -> BTreeMap<MarketId, FixedPoint> {
+    let mut net = BTreeMap::new();
+    for p in all_positions(ctx) {
+        *net.entry(p.market_id).or_insert(FixedPoint::ZERO) += if p.is_long { p.size } else { -p.size };
+    }
+    net
+}
+
+/// `markets`, each with net size 0 ([`net_size_per_market`]'s expected map).
+fn net_zero(markets: &[MarketId]) -> BTreeMap<MarketId, FixedPoint> {
+    markets.iter().map(|&m| (m, FixedPoint::ZERO)).collect()
+}
+
 /// Σ over every balance row (available + order margin) + Σ UPnL at `marks`.
 fn total_value(ctx: &NativeExecContext, marks: &BTreeMap<MarketId, FixedPoint>) -> FixedPoint {
     let mut v = FixedPoint::ZERO;
@@ -2028,7 +2045,8 @@ fn telemetry_does_not_change_results_or_state() {
 /// `total_value` after every block, constant across the drain within the
 /// dust bound). B = block 2 with W = 0: 8 rows, the long escrow long 2 in
 /// each market (8 x 900 notional); then W = 19: block 3 drains 3 rows for 20
-/// units (9 + 2 + 9, A = 7), and later blocks the rest.
+/// units (9 + 2 + 9, A = 7), and later blocks the rest. Every block: each
+/// market nets to 0 over every holder, escrows and vault included (18c s99).
 #[test]
 fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
     let (_d, db) = p2_fixture();
@@ -2042,6 +2060,7 @@ fn telemetry_reports_the_adl_queue_escrow_and_value_sum() {
         c.liq_value_sum = true;
         NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
         assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+        assert_eq!(net_size_per_market(&c), net_zero(&[1, 2, 3, 4]), "block {h}: every market nets to 0");
         c
     };
     let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;
@@ -2192,6 +2211,42 @@ fn telemetry_counts_the_adl_queue_without_rescanning_it() {
     }
 }
 
+/// s99 review LOW 1: the running ADL queue count corrects an overcount (a
+/// row write / delete that skipped the step's counters) for free: a drain
+/// that ends at the queue's end has seen every remaining row and stores
+/// their exact number. The p2 queue (8 rows at B = 2, W = 0), then a Metrics
+/// whose count says 1,000 (8 + 992 phantom rows). Block 70 with market 1
+/// unmarked (it waits) and W = 1: the budget ends the drain before the
+/// queue's end, so the count stays the running one (1,000). Block 71, same
+/// marks, the default W: markets 2..=4 drain, market 1's 2 rows wait, the
+/// drain reaches the end: the gauge is 2 with no page scan of the queue.
+#[test]
+fn telemetry_adl_queue_count_self_corrects_at_the_queues_end() {
+    let (_d, db) = p2_fixture();
+    step(&db, 1, 1_000, 0);
+    drop(step(&db, 2, 900, 0));
+    let state = CountingBackend::new(db.clone());
+    let rows = || db.iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[ADL_OBLIGATION_TAG])).unwrap().len() as i64;
+    assert_eq!(rows(), 8, "B = 2 wrote 8 rows");
+    let met = std::sync::Arc::new(torus_telemetry::Metrics::new());
+    met.liquidation_adl_queue_rows_cache.store(1_000, std::sync::atomic::Ordering::Relaxed);
+    let step = |h: u64, w: u64| -> (usize, i64) {
+        let mut c = NativeExecContext::new(state.clone(), h, 1_000 + h, 0, 1_000, 10, addr(99), addr(100), addr(101));
+        for m in 2..=4 {
+            set_mark(&c, m, fp(900));
+        }
+        c.metrics = Some(met.clone());
+        let before = state.queue_page_scans();
+        NativeExecutor::run_liquidations_with(&mut c, 2_048, 64, w);
+        assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        (state.queue_page_scans() - before, met.liquidation_adl_queue.get())
+    };
+    assert_eq!(step(70, 1), (0, 1_000), "block 70: the budget ends the drain, the running count stays");
+    assert_eq!(rows(), 8);
+    assert_eq!(step(71, ADL_WORK_PER_BLOCK), (0, 2), "block 71: the drain saw every row, exact count, no scan");
+    assert_eq!(rows(), 2, "market 1's rows wait");
+}
+
 /// Fix list c (18c review; s750vs: the sum dropped 1,740.69 in the step where
 /// the marks went stale): the value sum values every position at ONE common
 /// price per market (0: while OI is symmetric Σ UPnL is the same at any
@@ -2200,7 +2255,8 @@ fn telemetry_counts_the_adl_queue_without_rescanning_it() {
 /// B short 10 @ 800 (X sold to A and bought from B: flat); at the mark 900
 /// their UPnL is -1,000 each, at entry 0. Block 2 marks 900; block 70 has no
 /// usable mark (69 s old) and nothing else changes: the same sum, = Σ cash +
-/// Σ UPnL at 900.
+/// Σ UPnL at 900. Both blocks: market 1 nets to 0 over every holder (18c s99:
+/// else the price-0 sum could hide an unbalanced market).
 #[test]
 fn value_sum_does_not_jump_when_a_market_loses_its_mark() {
     let (_d, db) = liq_db(&[1]);
@@ -2223,6 +2279,7 @@ fn value_sum_does_not_jump_when_a_market_loses_its_mark() {
         c.liq_value_sum = true;
         NativeExecutor::run_liquidations(&mut c);
         assert!(c.fatal_error.is_none(), "block {h}: {:?}", c.fatal_error);
+        assert_eq!(net_size_per_market(&c), net_zero(&[1]), "block {h}: market 1 nets to 0");
         met.liquidation_value_sum.get()
     };
     let tokens = |v: FixedPoint| v.raw() as f64 / FixedPoint::SCALE as f64;

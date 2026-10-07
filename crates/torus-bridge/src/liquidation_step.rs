@@ -61,6 +61,11 @@ struct LiqStats {
     /// deleted (drained or paired to 0): the queue gauge's running count.
     adl_rows_added: u64,
     adl_rows_removed: u64,
+    /// s99 review LOW 1: the obligation rows left, exact, when the drain
+    /// ended at the queue's end (it saw every remaining row; nothing writes
+    /// a row after it): replaces the running count, so an overcount from a
+    /// write or delete that skipped the counters corrects itself.
+    adl_rows_left: Option<u64>,
     /// The step's marks (A7: the escrow gauges and the value sum value at
     /// them).
     marks: Marks,
@@ -232,17 +237,21 @@ impl NativeExecutor {
     /// Fix list b (18c review: `tag_count` read the whole queue every block
     /// with metrics, O(queue) per block during an S=750 drain): the
     /// obligation rows as a running count kept on the Metrics instance —
-    /// the last count + the rows this step wrote - the rows it deleted. An
-    /// empty queue is one seek (and resets the count to 0); the rows are
-    /// counted only without a count (a start, or after a read error /
-    /// fatal step: -1) or when the running count says 0 while rows exist.
+    /// the last count + the rows this step wrote - the rows it deleted. A
+    /// drain that reached the queue's end gives the exact rows left (no read;
+    /// this corrects an overcount, s99 review LOW 1). An empty queue is one
+    /// seek (and resets the count to 0); the rows are counted only without a
+    /// count (a start, or after a read error / fatal step: -1) or when the
+    /// running count says 0 while rows exist.
     fn adl_queue_rows<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         s: &LiqStats,
         m: &torus_telemetry::Metrics,
     ) -> Result<u64, CoreError> {
         use std::sync::atomic::Ordering::Relaxed;
-        let rows = if !ctx.state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_OBLIGATION_TAG])? {
+        let rows = if let Some(left) = s.adl_rows_left {
+            left
+        } else if !ctx.state.prefix_exists(CF_NATIVE_LIQUIDATION, &[liq::ADL_OBLIGATION_TAG])? {
             0
         } else {
             let running = u64::try_from(m.liquidation_adl_queue_rows_cache.load(Relaxed))
@@ -951,8 +960,16 @@ impl NativeExecutor {
         let mut paired: BTreeMap<MarketId, Vec<u8>> = BTreeMap::new();
         let mut cache = DrainCache::default();
         let (mut used, mut start) = (0u64, vec![liq::ADL_OBLIGATION_TAG]);
+        // Telemetry (s99 review LOW 1): the rows this drain left in place. A
+        // visited row either waits or closes to 0 (else the step is fatal);
+        // a row the pairing deleted ahead is never visited, one it reduced is
+        // visited later (its key is after the current row's).
+        let (mut waiting, mut at_end) = (0u64, false);
         while used < work {
-            let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else { break };
+            let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else {
+                at_end = true;
+                break;
+            };
             start = [o.key().as_slice(), &[0]].concat();
             used += 1; // the visit: a waiting row is never free
             // A delisted market ranks at a stored price (owner s96). The
@@ -964,7 +981,10 @@ impl NativeExecutor {
             let rank_px = match marks.get(&o.market) {
                 Some(&mark) => mark,
                 None if listed.binary_search(&o.market).is_err() => o.price, // delisted
-                None => continue,                                           // listed, stale: wait
+                None => {
+                    waiting += 1; // listed, stale: wait
+                    continue;
+                }
             };
             let key = (o.market, o.is_long);
             if !ranked.contains_key(&key) {
@@ -1024,6 +1044,7 @@ impl NativeExecutor {
             }
         }
         stats.adl_work = used;
+        stats.adl_rows_left = at_end.then_some(waiting);
         Ok(())
     }
 

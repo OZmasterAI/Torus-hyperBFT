@@ -380,10 +380,17 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
   step wrote (B) − rows it deleted (drain, pairing); an empty queue is one seek and resets it to
   0; a count is taken only on a start, after a read error / failed step, or when the running
   count says 0 while rows exist. Test `telemetry_counts_the_adl_queue_without_rescanning_it`.
+  Project review LOW 1: a drain that ends at the queue's end has seen every remaining row and
+  stores their exact number (the rows that waited for a mark), so an overcount corrects itself
+  with no extra read. Test `telemetry_adl_queue_count_self_corrects_at_the_queues_end`.
 * (c) The proof-only value sum values every position at one common price per market (0:
   UPnL = −signed size × entry); while OI is symmetric that equals Σ UPnL at the marks. It no
   longer jumps when a market loses or regains its mark (s750vs: −1,740.69 in the step the feed's
-  marks went stale). Test `value_sum_does_not_jump_when_a_market_loses_its_mark`.
+  marks went stale). Test `value_sum_does_not_jump_when_a_market_loses_its_mark`. 18c s99: the
+  value-sum tests (that one and `telemetry_reports_the_adl_queue_escrow_and_value_sum`) also
+  assert net signed size 0 per market over every holder (traders, both escrows, the vault) at
+  each checked block (`net_size_per_market`), so the price-0 sum cannot hide an unbalanced
+  market.
 * (d) `liquidation_e2e_adl_drain_survives_a_restart` closes RocksDB (drops the context and the
   StateDb), opens the directory again, configures the running-hash activation as boot does, and
   compares `liquidation_adl_work_total` per block (plus dumps and roots from block 9).
@@ -404,7 +411,8 @@ Commands (worktree root, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`,
   D9 summed to 0. The dust itself is `apply_fill`'s truncated weighted-average entry on the
   aggregated escrow positions (exact arithmetic gives 0; within the *Dust bound*, far below the
   1-token alarm). No behaviour change; pinned by `p2_a_two_sided_storm_sweeps_both_escrows_to_zero`
-  (B over two blocks interleaved with the drain, both escrows dusty: each swept once, 0
+  (B over three blocks with act 2, L1 + S1 at block 2, L2 + S2 at 3, L3 at 4, interleaved with
+  the drain at W = 1 from block 3, both escrows dusty: each swept once, 0
   positions and (0, 0) at the end, the vault = the dust, the dust gauge = the vault).
 * Value-sum checks (18c s99): judge by the exact i128 sum in the `liquidation: value sum` log
   line, not the f64 gauge. The sum drifts ~−0.2 units of 1e-8 per trade fill (s750vs; likely the

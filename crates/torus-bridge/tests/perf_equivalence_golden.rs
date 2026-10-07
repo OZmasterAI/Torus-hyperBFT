@@ -6,7 +6,8 @@
 //! (scenario B — GTC bids and liquidation orders — is unchanged).
 //! Row 50 (s96) re-pinned scenario A for the results' success / error only
 //! (book rejections reported rejected); the digests over the pre-row-50 view
-//! of the results (`pre_row50`) must still equal the previous pins.
+//! of the results (`pre_row50`) must still equal the previous pins, and the
+//! row-50 outputs alone (`ROW50_OUT_A`) must equal main's.
 //!
 //! Each block runs like the node's pipelined exec path (and `ubench_econ`):
 //! a `NativeStateOverlay` over the previous block's frozen set, then
@@ -223,17 +224,18 @@ const R_MODES: [R; 3] = [R::Inline, R::Worker, R::Off];
 
 /// Runs `blocks` on the pipelined overlay path; `threads` = `None` runs
 /// `execute_batch`, `Some(t)` `execute_batch_engine_mode(.., t)`; `r`: how
-/// the resident rows R are kept. Returns one hex digest per block, twice:
-/// over the results as they are, and over their pre-row-50 view
-/// ([`pre_row50`]).
-fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>) {
-    let [digests, pre_row50, _] = run_all(db, blocks, threads, r);
-    (digests, pre_row50)
+/// the resident rows R are kept. Returns one hex digest per block, three
+/// times: over the results as they are, over their pre-row-50 view
+/// ([`pre_row50`]), and over the block's outputs alone as they are (no DB:
+/// the row-50 outputs, [`ROW50_OUT_A`]).
+fn run(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let [digests, pre_row50, _, row50_out] = run_all(db, blocks, threads, r);
+    (digests, pre_row50, row50_out)
 }
 
 /// [`run`], also returning each block's [`reduced_digest`] + its outputs in
-/// the pre-row-50 view (the reduced pins predate row 50).
-fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec<String>; 3] {
+/// the pre-row-50 view (the reduced pins predate row 50), third of four.
+fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec<String>; 4] {
     let resident = r != R::Off;
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
@@ -242,8 +244,8 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut outputs: Vec<[String; 2]> = Vec::new();
-    let mut digests: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let flush = |p: Arc<FrozenPending>, outputs: &[[String; 2]], digests: &mut [Vec<String>; 3]| {
+    let mut digests: [Vec<String>; 4] = Default::default();
+    let flush = |p: Arc<FrozenPending>, outputs: &[[String; 2]], digests: &mut [Vec<String>; 4]| {
         let h = p.height();
         p.flush_with_native_trie_stats(db, Some(h), None, None).expect("flush");
         let out = &outputs[h as usize - 1];
@@ -253,6 +255,7 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
             data.extend_from_slice(out.as_bytes());
             digests[k].push(keccak256(&data).to_string());
         }
+        digests[3].push(keccak256(out[0].as_bytes()).to_string());
     };
     for (i, b) in blocks.iter().enumerate() {
         let h = i as u64 + 1;
@@ -629,10 +632,11 @@ const PRE_ROW50_A: [&str; A_BLOCKS as usize] = [
 /// error), not executed; gas and everything else as [`PRE_ROW50_A`].
 /// Re-pinned at the merge of row 50 into adl-budget (s25, blocks 2-12;
 /// block 1 is main's: rule H changes nothing before the first mark change):
-/// the rule-H state with row 50's labels. Proof: [`PRE_ROW50_A`] (adl-budget's
-/// pins) and `golden_repins_change_only_rule_h_and_p2_rows` pass unchanged,
-/// so the label is all that differs; every R mode and the engine give the
-/// same digests.
+/// the rule-H state with row 50's labels. Proof, in two parts: the state is
+/// adl-budget's ([`PRE_ROW50_A`], adl-budget's pins, and
+/// `golden_repins_change_only_rule_h_and_p2_rows` pass unchanged), and the
+/// row-50 outputs are main's ([`ROW50_OUT_A`], checked in every run); every
+/// R mode and the engine give the same digests.
 const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0x8e809cbd45abcc0545c71fa1e509b7ab261510773ea274bcfa4c429ff1104dac",
     "0x3292c34d45b5ef098ba276ae158ee0c201cf0419a5f5f0673bf0ab4abceac828",
@@ -646,6 +650,27 @@ const GOLDEN_A: [&str; A_BLOCKS as usize] = [
     "0xb3520cea6e8b5ecd151edbe88ff813edf03d892129fd5de2357cc9ac91f2b239",
     "0x83f6c8bfe6fd92475fd069d063d91501f82134ae7dc5aff70945eb27dfa62df9",
     "0x4e7880623e2f1aa95a6b3d3be8465c25a43d3628a6c6d02efb43e4ee1b5c19f7",
+];
+/// Scenario A's outputs alone in the row-50 view (s99 review LOW 2):
+/// keccak256 over each block's output string (results, gas, liquidation
+/// results, trade index, next order id, fatal error, funnel metrics; no DB
+/// row). Equal to main's (7348576a, the row-50 merge; checked against its
+/// output dump, serial and engine, R Inline / Worker / Off: byte-identical
+/// to this branch's), so with [`PRE_ROW50_A`] the merge's [`GOLDEN_A`]
+/// re-pin is adl-budget's state plus main's row-50 outputs.
+const ROW50_OUT_A: [&str; A_BLOCKS as usize] = [
+    "0x23f04f7f1940fd0ea9e7199467856ff19e94fd5e9feb6a731e4ab6d7fa354ff5",
+    "0xb019cecb20537d9f70418bdce16c7e98e6c79cc4f879359429c1c98b2ef1b079",
+    "0x11c88743a5704bfe253573b06e178e5dff795e242a75acbb2cead0e0fa2518c5",
+    "0xbd812ad25dc5302aa2c0363d00da462ecfa26cf1552e1bd0f7fde1eefd8e920c",
+    "0x732d7cca926d2b612cc98d3a938217de3e67622f78e56b9e14ac7cf3ed0ca176",
+    "0x3fdf84c3576003162295b79c1f4f869f8c28a159ffc7126dccf43263eaaa4371",
+    "0x2858ee5256d4a24a81ecf30ae5bcc67354598e8843af6af62d479f524e60ba20",
+    "0x50e06807e87e5bc0a495b9bff420068ba2b320676853d24a1d7673b6b4bbde91",
+    "0xc52ccf15aac9f4863f5cac31b2461b6e01a7a3d9b416c1b8a16a5c0f7b38cd0f",
+    "0xa28a95f4abd15db763bf6c603af847a936fee06eebe37dfab01ca19c9f13e6e1",
+    "0x9f74082b27774f46fd22f09f287a5a27944b105e035bfec7b9ace7a530bee740",
+    "0xa73989938536f8cf022cc16d297beaa0e3e5e8bb67cfef2b455969f8cd5a2f68",
 ];
 /// Scenario B on c93c579 (no book rejection: the same with and without the
 /// pre-row-50 view); re-pinned by adl-budget A3 (rule H): from block 6
@@ -730,8 +755,9 @@ fn scenario_a_serial_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        let (digests, pre_row50, row50_out) = run(&db, &blocks, None, r);
         check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
@@ -742,8 +768,9 @@ fn scenario_a_engine_digests_golden() {
         let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
         let (_d, db) = listed_db(&markets);
         let blocks = scenario_a(&db);
-        let (digests, pre_row50) = run(&db, &blocks, Some(4), r);
+        let (digests, pre_row50, row50_out) = run(&db, &blocks, Some(4), r);
         check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+        check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
 }
@@ -753,7 +780,7 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
     for r in R_MODES {
         let (_d, db) = listed_db(&[1, 2, 3]);
         let blocks = scenario_b(&db);
-        let (digests, pre_row50) = run(&db, &blocks, None, r);
+        let (digests, pre_row50, _) = run(&db, &blocks, None, r);
         check("GOLDEN_B", &digests, &GOLDEN_B);
         check("GOLDEN_B", &pre_row50, &GOLDEN_B);
     }
