@@ -517,6 +517,12 @@ impl PendingState {
         })
     }
 
+    /// s99 (c): the first and last key this layer deletes in `cf`, if any.
+    fn delete_span(&self, cf: &str) -> Option<(&[u8], &[u8])> {
+        let deletes = &self.cf(intern_cf(cf)?).deletes;
+        Some((deletes.first()?.as_slice(), deletes.last()?.as_slice()))
+    }
+
     /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
     fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
         writes_under(&self.cf(id).writes, prefix).next().is_some()
@@ -1804,6 +1810,22 @@ fn flush_pending_after_batch(
             || sidecar.is_some_and(PendingState::deletes_oracle_submissions)
         {
             target.compact_pruned_submissions_in_background();
+        }
+        // s99 (c): same for the order rows the reader precompiles scan
+        // (getOrderBook, getOpenOrders): compact the span of this batch's
+        // deletes, so their tombstones stop costing the scans.
+        for cf in crate::cf::READER_SCANNED_ORDER_CFS {
+            let spans = [
+                state.delete_span(cf),
+                sidecar.and_then(|s| s.delete_span(cf)),
+            ];
+            let mut spans = spans.into_iter().flatten();
+            if let Some(first) = spans.next() {
+                let (lo, hi) = spans.fold(first, |a, b| (a.0.min(b.0), a.1.max(b.1)));
+                // The smallest key after `hi`: the range covers `hi` itself.
+                let end = [hi, &[0u8][..]].concat();
+                target.compact_range_in_background(cf, lo, Some(&end));
+            }
         }
         // L3 #2: record post-flush residency for the eviction-pressure gauge.
         if let Some(c) = member_cache.as_deref() {

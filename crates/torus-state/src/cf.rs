@@ -83,6 +83,13 @@ pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
 /// that deletes rows under it (the submission prune) schedules a background
 /// compaction of the range (s89 fix B, [`crate::StateDb::compact_pruned_submissions_in_background`]).
 pub const ORACLE_SUBMISSION_PREFIX: &[u8] = b"sub";
+/// s99 (c): the CFs whose order rows the reader precompiles scan
+/// (getOrderBook: mode 1 order rows / mode 2 level rows of
+/// `CF_NATIVE_ORDER_BOOKS`; getOpenOrders: `CF_NATIVE_ORDERS`). A flush that
+/// deletes rows in one of them compacts the span of those deletes in the
+/// background ([`crate::StateDb::compact_range_in_background`]), so the
+/// tombstones do not slow every later scan until RocksDB's own compaction.
+pub const READER_SCANNED_ORDER_CFS: [&str; 2] = [CF_NATIVE_ORDER_BOOKS, CF_NATIVE_ORDERS];
 /// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
 pub const CF_NATIVE_USER_TRADES: &str = "cf_native_user_trades";

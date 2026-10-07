@@ -383,7 +383,19 @@ pub fn depth_from_market_rows<S: StateBackend>(
     if meta.is_none() {
         return Ok(BookDepth::default());
     }
+    depth_from_rows(market_id, layout, rows)
+}
 
+/// The depth of `rows` of one market under a row `layout`: its level rows
+/// (mode 2: forward key order = best-first per side, bids before asks) or its
+/// order rows aggregated per price (mode 1); other row kinds are ignored and
+/// no meta row is needed. The reader precompile passes the bounded scans of
+/// [`crate::precompiles`]'s 64-order cap.
+pub fn depth_from_rows(
+    market_id: MarketId,
+    layout: BookLayout,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<BookDepth, CoreError> {
     match layout {
         BookLayout::LevelAuthority => {
             // Level rows: forward key order is best-first per side, bids
@@ -455,7 +467,9 @@ pub fn depth_from_market_rows<S: StateBackend>(
                 asks: to_levels(asks),
             })
         }
-        BookLayout::Classic => unreachable!("handled above"),
+        BookLayout::Classic => Err(layout_err(
+            "depth_from_rows: the classic layout has no rows",
+        )),
     }
 }
 
