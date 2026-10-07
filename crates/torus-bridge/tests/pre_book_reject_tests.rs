@@ -118,7 +118,9 @@ fn exec(ctx: &mut NativeExecContext, mode: Mode, block: &[(Address, NativeAction
         Some(t) => NativeExecutor::execute_batch_engine_mode(ctx, block, t).results,
     };
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    r.into_iter().map(|a| (a.success, a.error)).collect()
+    r.into_iter()
+        .map(|a| (a.success, a.error.map(String::from)))
+        .collect()
 }
 
 /// Book m1 (tick 2, lot 2) with maker addr(2)'s ask 5 @60; then `block`

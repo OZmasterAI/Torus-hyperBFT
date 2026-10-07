@@ -63,7 +63,7 @@ fn pinned(results: &[torus_bridge::native_executor::NativeActionResult]) -> Vec<
         .map(|r| NativeActionResult {
             action_type: r.action_type,
             success: r.success,
-            error: r.error.clone(),
+            error: r.error.clone().map(String::from),
             gas_used: r.gas_used,
         })
         .collect()

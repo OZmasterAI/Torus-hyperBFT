@@ -162,7 +162,7 @@ fn run_with_volumes(
         results.push(
             r.results
                 .iter()
-                .map(|a| (a.success, a.error.clone()))
+                .map(|a| (a.success, a.error.clone().map(String::from)))
                 .collect(),
         );
         total_gas.push(r.total_gas);
@@ -440,7 +440,7 @@ fn cross_market_margin_exhaustion_mid_batch_identical() {
             results.push(
                 r.results
                     .iter()
-                    .map(|a| (a.success, a.error.clone()))
+                    .map(|a| (a.success, a.error.clone().map(String::from)))
                     .collect(),
             );
             total_gas.push(r.total_gas);
@@ -565,7 +565,7 @@ fn default_mode_matches_serial() {
         results.push(
             r.results
                 .iter()
-                .map(|a| (a.success, a.error.clone()))
+                .map(|a| (a.success, a.error.clone().map(String::from)))
                 .collect::<Vec<_>>(),
         );
         total_gas.push(r.total_gas);
@@ -844,7 +844,7 @@ fn fired_stop_case(
         assert!(r2.results[0].success, "{:?}", r2.results[0]);
         r2.results
             .iter()
-            .map(|r| (r.success, r.error.clone()))
+            .map(|r| (r.success, r.error.clone().map(String::from)))
             .collect()
     };
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
@@ -928,7 +928,12 @@ fn run_volumes_counted(
         }
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, block, threads);
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-        results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+        results.push(
+            r.results
+                .iter()
+                .map(|a| (a.success, a.error.clone().map(String::from)))
+                .collect(),
+        );
     }
     ctx.save_order_books();
     let volumes = (1..=5u8)
@@ -1115,7 +1120,10 @@ fn open_limit_and_cum_volume_on_the_single_action_path() {
 
     let gtc_6 = NativeAction::PlaceOrder(gtc(6, true, 50, 1));
     let r = NativeExecutor::execute(&mut ctx, &a, &gtc_6);
-    assert!(is_open_limit(&(r.success, r.error.clone())), "{r:?}");
+    assert!(
+        is_open_limit(&(r.success, r.error.clone().map(String::from))),
+        "{r:?}"
+    );
     let buy = NativeAction::PlaceOrder(market_buy(1, 2));
     let r = NativeExecutor::execute(&mut ctx, &a, &buy);
     assert!(r.success, "{r:?}");
@@ -1207,7 +1215,11 @@ fn open_limit_same_after_reload_or_resident_in_every_book_mode() {
             assert!(ctx.fatal_error.is_none(), "{mode:?}: {:?}", ctx.fatal_error);
             assert_eq!(ctx.resident_reused(), resident, "{mode:?}");
             let r2 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, 0);
-            let results: Vec<_> = r2.results.iter().map(|r| (r.success, r.error.clone())).collect();
+            let results: Vec<_> = r2
+                .results
+                .iter()
+                .map(|r| (r.success, r.error.clone().map(String::from)))
+                .collect();
             assert!(is_open_limit(&results[0]), "{mode:?} resident={resident}: {results:?}");
             assert!(results[1].0, "{mode:?} resident={resident}");
             ctx.save_order_books();
@@ -1278,7 +1290,11 @@ fn open_limit_book_rejected_orders_keep_their_slot_but_off_tick_and_dust_take_no
         fund_native(&ctx, &maker, fp(1_000_000));
         NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block2, threads);
-        let results: Vec<_> = r.results.iter().map(|r| (r.success, r.error.clone())).collect();
+        let results: Vec<_> = r
+            .results
+            .iter()
+            .map(|r| (r.success, r.error.clone().map(String::from)))
+            .collect();
         let err = |i: usize, s: &str| !results[i].0 && results[i].1.as_deref().is_some_and(|e| e.contains(s));
         // Row 50: a book reject (PostOnly cross) is reported rejected.
         assert!(err(0, "post-only order would have immediately matched"), "{results:?}");
@@ -1374,7 +1390,12 @@ fn f1_account_margin_shapes_identical() {
             }
             let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, batch, threads);
             assert!(ctx.fatal_error.is_none());
-            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            results.push(
+                r.results
+                    .iter()
+                    .map(|a| (a.success, a.error.clone().map(String::from)))
+                    .collect(),
+            );
             total_gas.push(r.total_gas);
         }
         // Sanity: the shape really exercises the maker cancel — mk's m4 bid
@@ -1448,7 +1469,12 @@ fn option_b_shapes_identical() {
         for batch in [b1.clone(), b2.clone()] {
             let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
             assert!(ctx.fatal_error.is_none());
-            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            results.push(
+                r.results
+                    .iter()
+                    .map(|a| (a.success, a.error.clone().map(String::from)))
+                    .collect(),
+            );
             total_gas.push(r.total_gas);
         }
         let pos = |t: &Address, m: MarketId| match ctx.positions.get_position(t, m).unwrap() {
@@ -1564,7 +1590,12 @@ fn b_blind_shapes_identical() {
         for batch in [b1.clone(), b2.clone()] {
             let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, threads);
             assert!(ctx.fatal_error.is_none());
-            results.push(r.results.iter().map(|a| (a.success, a.error.clone())).collect());
+            results.push(
+                r.results
+                    .iter()
+                    .map(|a| (a.success, a.error.clone().map(String::from)))
+                    .collect(),
+            );
             total_gas.push(r.total_gas);
         }
         let pos = |t: &Address, m: MarketId| match ctx.positions.get_position(t, m).unwrap() {

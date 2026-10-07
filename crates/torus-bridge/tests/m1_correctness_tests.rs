@@ -128,7 +128,9 @@ fn exec(ctx: &mut NativeExecContext, mode: Mode, block: &[(Address, NativeAction
         Some(t) => NativeExecutor::execute_batch_engine_mode(ctx, block, t).results,
     };
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    r.into_iter().map(|a| (a.success, a.error)).collect()
+    r.into_iter()
+        .map(|a| (a.success, a.error.map(String::from)))
+        .collect()
 }
 
 fn world(ctx: &mut NativeExecContext) -> World {
