@@ -429,3 +429,132 @@ a genesis with one-sided positions — turns the first ADL storm in that market 
 Before mainnet: an OI-symmetry check per market at genesis / upgrade (and ideally a node-local
 invariant gauge), and a decision whether an unpairable remainder should go to the vault with an
 error line instead of halting.
+
+## 11. Budget measurement on C2 (ozarchy s24, measured; W unchanged until the owner picks option 1 or 2)
+
+`crates/torus-bridge/tests/ubench_adl.rs` on perf/adl-budget @ **3139c36f** (= 497121e5 C2 + the bench
+knob `UB_ADL_HOLDERS_PCT`; tests-only change, no consensus-visible change, W unchanged). Method as
+§9: release, `CARGO_TARGET_DIR=~/.cargo-target-adl-budget`, `RUSTFLAGS="-C link-arg=-fuse-ld=mold
+-C force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`. Every case started
+at 1-min load < 1.5 (the 5/15-min averages were still 2-6, decaying after a nextest run and the
+build). 3 runs each, run as systemd units `bench-adl-c2{,b,c}`. B ms, step ms and ns/unit are as in §9.
+The 250 ms target is applied to **rig-equivalent ms = ozarchy ms × 1.9-2** (§9 factor). The
+ozarchy-ms reading is given beside it.
+
+**Thin markets (`UB_ADL_HOLDERS_PCT=p`, default 100 = unchanged).** Traders come in pairs (2i, 2i+1).
+A pair holds market m iff splitmix64(i, m) mod 100 < p, so each market has ~p % of the traders as
+holders, with net size 0 (one long, one short). Bankrupt accounts and the sink are as in HL mode. At
+p = 10 every trader still holds ~30 markets, so the **trader set (and the units) are the same as at
+p = 100**. Only C2's work per ranking drops, to ~10 % of the set.
+
+### 11.1 At W = 630,000 (today)
+
+| case | block | transfers | rows closed | units | B ms | step ms (3 runs) | ns/unit | §9 "after" step ms |
+|---|---|---|---|---|---|---|---|---|
+| 1 HL, N = 5,000, all hold all (1.5M rows) | B | 300 | 300 | 500,800 | 1.0 | 408.5 / 407.2 / 410.8 | 809-816 | 396 / 399 / 405 |
+| 2 HL, N = 5,000, 10 % holders (150k rows) | B | 300 | 300 | 500,800 | 0.9-1.0 | 58.8 / 60.9 / 59.3 | 113-118 | — |
+| 3 HL, N = 100,000, 10 % holders (3.0M rows) | B | 300 | 19 | 700,052 | 1.0 | 143.5 / 139.6 / 144.3 | 196-203 | — |
+| | drains 2-16 | 0 | 18 each | 700,050 | — | 107.9-122.1 | 152-170 | — |
+| | drain 17 | 0 | 11 | 400,030 | — | 64.0 / 69.0 / 64.7 | 156-169 | — |
+| 4 S=750-like: 100 × 270 | B₁ (64 accounts) | 17,280 | 7,745 | 630,126 | 65.6-67.4 | 739.2 / 738.2 / 786.4 | 1,065-1,144 | 715 / 722 / 727 |
+| | B₂ (36 accounts) | 9,720 | 7,808 | 630,862 | 35.8-36.7 | 583.1 / 592.9 / 588.3 | 865-880 | 571 / 571 / 575 |
+| | drain 3 | 0 | 5,184 | 630,616 | — | 412.3 / 412.5 / 411.4 | 650-652 | 399 / 400 / 402 |
+| | drain 4 | 0 | 4,464 | 634,178 | — | 398.0 / 399.7 / 393.4 | 619-629 | 386 / 387 / 390 |
+| | drain 5 | 0 | 1,799 | 253,698 | — | 144.3 / 143.9 / 144.8 | 562-566 | 138 / 139 / 141 |
+
+* Case 3: 17 blocks, 11,600,832 units in total (U = 10,000,800). At N = 100k one ranking charges
+  100,002 units, so a block overshoots W by up to one ranking (7 rankings = 700,050). A market whose
+  3 rows span a block boundary is ranked again in the next block.
+* **C2 on the all-hold shapes (cases 1, 4): no saving.** It is +1-3 % against §9 "after" (the
+  `holders_with` merge, ~2 % in the profile, or day-to-day noise). Units and rows per block are
+  identical to §9 (630,126 / 630,862 / 630,616 / 634,178 / 253,698).
+* **C2 at 10 % holders: ~7× less time per unit** (114 vs 811 ns/unit at N = 5,000), because a ranking
+  now reads ~500 holders, not 5,002. At N = 100k a ranking reads ~10,000 holders: 150-200 ns/unit.
+
+### 11.2 Option (1): full, HL-sized W (W = max(1.25 × U_hl, 100 × (N + 3) + 600), rounded up to 10,000)
+
+| shape | U_hl (units) | HL-sized W | blocks | HL block, ozarchy ms (3 runs) | rig-equivalent | ≤ 250 ms? |
+|---|---|---|---|---|---|---|
+| N = 5,000, all hold all | 500,800 | 630,000 | 1 | 408.5 / 407.2 / 410.8 | ~775-820 | no |
+| N = 5,000, 10 % holders | 500,800 | 630,000 | 1 | 58.8 / 60.9 / 59.3 | ~112-122 | **yes** |
+| N = 100,000, 10 % holders | 10,000,800 | 12,510,000 | 1 | 1,540.7 / 1,545.6 / 1,549.3 | ~2.9-3.1 s | no |
+| same, W = U exactly | 10,000,800 | 10,000,800 | 1 | 1,530.5 / 1,510.1 / 1,572.6 | ~2.9-3.1 s | no |
+
+U_hl = 100 rankings × trader-set size + 300 rows × 2. C2 does not change units, so the HL-sized W
+grows with the account count N. C2's work grows only with the holders per market, which is still
+10,000 at 100k accounts and 10 %, twice the 5,002 of case 1.
+
+### 11.3 Option (2): lower W (all measured with `UB_ADL_WORK`, 3 runs each)
+
+Worst block / (later full-W blocks; the S=750-like column also gives B₂ and the drain range), ozarchy ms. The worst block is block B (the block with B's own writes) except at N = 100k, W = 100k, where a later block reached 29.8 ms against B's 28.4.
+
+| W | HL all-hold N = 5k: blocks / worst (later) | HL 10 % N = 5k | HL 10 % N = 100k | S=750-like: blocks / worst B₁ (B₂; drains) |
+|---|---|---|---|---|
+| 630,000 | 1 / 407-411 | 1 / 59-61 | 17 / 140-144 (108-122) | 5 / 738-786 (583-593; 144-412) |
+| 400,000 | 2 / 336-340 (61-62) | 2 / 49-51 (11) | — | — |
+| 300,000 | 2 / 259-264 (123-124) | 2 / 38-42 (18-20) | 50 / 66-68 (32-54) | 10 / 456-469 (304-319; 40-194) |
+| 200,000 | 3 / 190-195 (121-124) | 3 / 27-28 (18) | 100 / 47-48 (17-43) | 14 / 373-385 (230-236; 108-127) |
+| 150,000 | 4 / 152-154 (89-92) | — | — | — |
+| 100,000 | 6 / 115-117 (57-61) | 6 / 18-19 (9-11) | 300 / 28-30 (14-30) | 29 / 290-293 (152-156; 24-61) |
+| 50,000 | — | — | — | 60 / 245-254 (112-118; 27-34) |
+
+* Units of the whole HL event grow as W falls, because rankings repeat across blocks: N = 5k
+  500,800 → 525,810 at W = 100k. N = 100k: 10.0M → 11.6M (630k), 14.9M (300k), 19.9M (200k),
+  30.0M (100k). At N = 100k and W ≤ ~200k, one ranking (100,002 units) is a whole block's budget:
+  W = 100k closes **one row per block** (300 blocks); W = 200k closes one market per block (100 blocks).
+* Block B costs ~2× a later block at the same W, even with only 300 transfers (all-hold, W = 100k:
+  116 vs 58 ms; N = 100k: 28 vs 19 ms).
+* **S=750-like B₁ is not bounded by W**: it is 245-254 ms even at W = 50,000. From the profile
+  (B₁ at W = 200,000, 367 ms of samples) roughly: B's transfers `adl_to_escrow` ~15 % (~55 ms; B ms
+  66), the drain's trader set `liq_traders_after` → `TraderPositions::traders_after` 26 % (~96 ms;
+  almost all `has_key`, an overlay `iterate_cf_from` seek per dirty trader, here the 64 accounts whose
+  270 keys the block just deleted; < 0.1 % in a plain drain block), and the first-sight AV `pos_sums`
+  10 % (~38 ms). This is §9's open item (charge B's work into W, or a lower act limit for ADL
+  accounts). The `has_key` seek cost is node-local and could be cut without a consensus change.
+
+### 11.4 Profiles (perf, 4,999 Hz, `--call-graph fp`, samples under `adl_drain`, inclusive, partly nested)
+
+* **Case 1, HL all-hold** (1,884 samples ≈ 377 ms): `adl_candidates_of` 81 %; `get_position` 73 %
+  (`resident_positions` 39 %: the records' `binary_search_by_key` 31 %; the overlay dirty-range check
+  `layer_touches` 32 %); `adl_rank` 19 % (its sort 10 %); `holders_with` 2.1 %; `pos_sums` 1.1 %.
+  This is §9's profile: C2 reads the same 5,002 positions per ranking.
+* **Case 2, HL 10 %** (263 samples ≈ 53 ms): `adl_candidates_of` 59 %; `get_position` 43 %
+  (`resident_positions` 26 %, `layer_touches` 24 %, binary search 12 %); `adl_rank` 37 % (sort 33 %);
+  `pos_sums` 8.7 % (`dirty_sums` 4.2 %); `holders_with` 1.9 %. The sort is now a third of the block.
+* **Case 4, B₁ at W = 200k** (1,835 samples ≈ 367 ms): `adl_drain` 82 %; `adl_candidates_of` 72 %
+  (`get_position` 38 %, `traders_after` 26 %, `pos_sums` 10 %); `adl_to_escrow` 15 %; `adl_rank` 7 %.
+  A plain drain block (h = 6, 116 ms) looks like case 1: `get_position` 62 %, `adl_rank` 20 %.
+
+### 11.5 Reading (for the owner; 18c s96 rule)
+
+* **Rule: is the HL-sized block ≤ ~250 ms on C2 at the realistic ~10 % holders shape?**
+  * **N = 5,000: yes.** 59-61 ms on ozarchy, ~112-122 ms rig-equivalent. W = 630,000 stays.
+  * **N = 100,000: no.** The HL-sized W is 12,510,000 and its block takes 1.51-1.57 s on ozarchy
+    (~3 s on the rig). C2's 7× gain per unit is eaten by the 20× unit count, because units still
+    charge the whole trader set.
+  * The all-hold shape (case 1) and the S=750-like B₁ fail at any N (408 / 738-786 ms on ozarchy).
+* **Option (2), the W that keeps the worst measured block ≤ ~250 ms rig-equivalent (≤ ~125-130 ms
+  on ozarchy): W = 100,000.** Worst blocks: all-hold 115-117 ms (~220-235 rig), 10 % N = 5k 18-19 ms,
+  10 % N = 100k 28-30 ms. The HL event then takes 6 blocks at N = 5,000 (either shape) and 300 blocks at
+  N = 100,000, one row per block. If the 250 ms is read as ozarchy ms, W = 200,000 suffices for every
+  HL shape (worst 190-195 ms; 3 blocks at N = 5k, 100 blocks at N = 100k).
+* **No W keeps the S=750-like B₁ ≤ 250 ms** (245-254 ms on ozarchy even at W = 50,000, ~470-510 rig).
+  That needs B's work counted or capped, or the `traders_after` `has_key` seeks made cheap.
+* Measured C2 ns/unit by shape: 114 (10 %, 5k), ~155-200 (10 %, 100k), ~570-810 (all hold, 5k),
+  ~550-650 (S=750-like drains), 1,065-1,144 (S=750-like B₁). Units track the trader set, not the
+  work, so a single W fits one shape at a time.
+
+Commands (worktree root; the cargo form, the runs used the built binary
+`~/.cargo-target-adl-budget/release/deps/ubench_adl-5626de9bfbcc1f30 --ignored --nocapture` with the
+same env):
+
+    UB_ADL_HL=1 UB_ADL_TRADERS=5000 [UB_ADL_WORK=W] cargo test -p torus-bridge --release --test ubench_adl -- --ignored --nocapture
+    UB_ADL_HL=1 UB_ADL_TRADERS=5000 UB_ADL_HOLDERS_PCT=10 [UB_ADL_WORK=W] cargo test ... (case 2)
+    UB_ADL_HL=1 UB_ADL_TRADERS=100000 UB_ADL_HOLDERS_PCT=10 UB_ADL_WORK=W cargo test ... (case 3)
+    UB_ADL_TRADERS=5000 UB_ADL_BANKRUPT=100 UB_ADL_POSITIONS=270 [UB_ADL_WORK=W] cargo test ... (case 4)
+    perf record -F 4999 --call-graph fp -o perf-<case>.data -- <binary> --ignored --nocapture
+
+Raw logs: `~/bench-results-matched/ubench-adl-c2/` (`<case>-w<W>.r<n>.log`, `campaign{,2,3}.log`
+with load and step ms per run, `campaign{,2,3}.sh`, `perf-c{1,2,4}.data`).
+Setup: case 1 1,500,400 rows (6.2 s), case 2 150,126 (0.6 s), case 3 3,003,738 (13 s), case 4
+1,527,270 (6.3 s). RAM was not a limit (62 GB host, ~53 GB available).
