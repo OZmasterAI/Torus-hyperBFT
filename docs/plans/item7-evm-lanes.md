@@ -4,7 +4,10 @@ Status: design only. Owner decision s99: item 7 is its own item; design now, bui
 Phase 2 (before Phase 3 and before testnet; a block-format change needs a fresh genesis, which is
 free before testnet). Context: `item6-phase1-impl.md` 9.16.
 
-**Owner decisions (s99):** the target is **option C** (HL-style small and big EVM blocks).
+**Owner decisions (s99):** the target is **option C** (HL-style small and big EVM blocks), built in
+two steps: step 1 = A + B (consensus EVM budget per block, EVM only every Nth block), then step 2 =
+C right after (block types with their own limits and cadence, two EVM pools, big-block opt-in,
+RPC / fees); A + B are the base C needs anyway.
 Start with HL's EVM throughput: small blocks 3M gas every second, big blocks 30M gas once a
 minute (about 3.5M gas/s in total). Step 0 (vote-side EVM header checks) is approved and being
 built now on `fix/evm-vote-checks`, ahead of the rest of item 7.
