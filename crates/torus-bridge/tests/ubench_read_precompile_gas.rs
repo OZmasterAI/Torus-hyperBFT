@@ -1,23 +1,21 @@
-//! Read precompile gas µbench (sizing `GAS_PRECOMPILE_READ_PER_UNIT`, the
-//! 50-gas placeholder of fix/read-precompile-gas): ns per call of every
-//! reader (0x0800-0x0803) over a sweep of response sizes, the work units the
-//! call was charged (`ReadMeter::used`), and a linear fit ns = fixed + slope
-//! x N per case, so ns per unit = slope / (units per N).
+//! Read precompile gas µbench: ns per call of every reader (0x0800-0x0803)
+//! over a sweep of response sizes, the gas the call was charged
+//! (`reader_gas(ReadMeter::used)`), a linear fit ns = fixed + slope x N per
+//! case, and 30M-gas blocks of one reader end to end.
 //!
-//! Units (crates/torus-core/src/precompiles.rs): a reader pays
-//! `GAS_PRECOMPILE_READ` (2,600) + `GAS_PRECOMPILE_READ_PER_UNIT` (50) per
-//! unit; one unit = one hashed row a prefix scan returned
-//! (`scan_prefix_metered`), 32 bytes of a classic whole-book blob (sized
-//! before it is read), or one 32-byte word of the answer. Point reads
-//! (`get_cf_raw`) are not charged beyond the base.
+//! Written against the reader gas API only (`reader_gas`, `reader_budget`,
+//! `ReadMeter`), so the same source measures any pricing: the s26 sizing
+//! (2,600 base + 50 per unit) and the s99 owner pricing (single reads at a
+//! ~16,400 base, scans 500 gas per row + 20 per word / 32 B blob chunk, at
+//! most 64 orders per getOrderBook / getOpenOrders call). `CONFIG` prints
+//! `reader_gas(0)`.
 //!
-//! Part 1 (units): `execute_precompile_metered` over a `NativeStateOverlay`
-//! of a RocksDB `StateDb` (the backend and meter the EVM provider passes;
-//! budget `reader_budget(30M)`). Three cache states per scenario:
-//! `mem` (rows still in the memtable), then every CF flushed + compacted and
-//! the DB reopened: `cold` (first call of each target after the reopen:
-//! block cache cold, OS page cache warm) and `warm` (repeated calls).
-//! Scenarios:
+//! Part 1: `execute_precompile_metered` over a `NativeStateOverlay` of a
+//! RocksDB `StateDb` (the backend and meter the EVM provider passes; budget
+//! `reader_budget(30M)`). Three cache states per scenario: `mem` (rows still
+//! in the memtable), then every CF flushed + compacted and the DB reopened:
+//! `cold` (first call of each target after the reopen: block cache cold, OS
+//! page cache warm) and `warm` (repeated calls). Scenarios:
 //! * `P` (one DB): getOpenOrders (N order rows of one trader + market),
 //!   getStakingInfo (N delegation rows, a fixed 4-word answer), and the point
 //!   readers getPosition / getBalances / getPrice; `UB_RG_FILLER` random rows
@@ -28,50 +26,73 @@
 //!   and a 1-level answer; rows2: N price levels, one level row each).
 //! * `G-N` (one DB per N): the whole-CF scans getMarkets / getAllPrices /
 //!   getValidators over N rows (one target, so `cold` is one sample).
-//! * `getOpenOrders-tombstones` (in `P`): a trader whose N orders were
-//!   written and deleted: an empty answer over N RocksDB deletion markers,
-//!   which the scan steps over uncharged (they survive the flush +
-//!   `compact_range` before `cold` / `warm` here, likely a trivial move).
 //!
 //! Part 2 (end to end, `UB_RG_E2E=1`): a contract that STATICCALLs one
-//! reader in a loop with a fixed stipend until its gas is spent, run as one
-//! 30M-gas tx through `EvmExecutor::execute_tx` (the real
-//! `TorusPrecompiles` provider), plus SLOAD loops (cold: a new slot each
-//! time, 2,100 gas; warm: one slot, 100 gas) as the EVM's own price point.
-//! `vary` adds 1 to the first argument word each call (a new trader / market
-//! / staker: mostly empty prefixes, a cold seek per call).
+//! reader in a loop with a fixed stipend until its gas is spent (or a call
+//! count is reached), run as one 30M-gas tx through `EvmExecutor::execute_tx`
+//! (the real `TorusPrecompiles` provider), plus SLOAD loops (cold: a new slot
+//! each time, 2,100 gas; warm: one slot, 100 gas). `vary=stride` adds a
+//! constant to the first argument word each call: a NEW existing target per
+//! call (traders spread over the key space, consecutive markets); `cold`
+//! lines are the first tx after a flush + compact + reopen (block cache cold),
+//! `warm` the median of the next ones. `ms_at_30M` scales ns/gas to 30M gas
+//! when the call count, not the gas, ended the loop.
 //!
-//! Output lines (whitespace key=value, one per measurement): `ROW` (case,
-//! state, N, units, gas, median ns, ns/gas), `FIT` (per case + state) and
-//! `E2E`.
+//! Part 3 (`T`, deletion markers): getOpenOrders over a trader + market and
+//! getOrderBook (mode 1) over a market with one live order, whose N other rows
+//! were written and deleted, in four states: `overlay` (deletes pending in the
+//! reader's overlay over live DB rows: the current / parent block),
+//! `flushed` (the deletes written by a block flush,
+//! `NativeStateOverlay::flush_with_native_trie_stats`, then
+//! `wait_background_compaction`: a node-local compaction of the range, if the
+//! build schedules one), `memtable` (RocksDB tombstones written directly, not
+//! flushed) and `sst` (that memtable flushed to an L0 file, no compaction). `skipped` = RocksDB `internal_delete_skipped_count` of one call.
+//!
+//! Part 4 (`CHURN`): one trader keeps `UB_RG_CHURN_ORDERS` (default 1,000 =
+//! `OPEN_ORDER_BASE_LIMIT`) orders open and every block cancels them all and
+//! places as many new ones; blocks are flushed like the node does
+//! (`flush_with_native_trie_stats`) every `UB_RG_CHURN_BLOCK_MS` (default 100);
+//! after each flush one reader call on the trader + market is measured.
+//! Two variants: `getOpenOrders` (rows written / deleted straight in
+//! cf_native_orders, which no production code writes) and `getOrderBook-rows1`
+//! (the real executor in mode 1: CancelAllOrders + PlaceOrder, order rows in
+//! cf_native_order_books).
+//!
+//! Output lines (whitespace key=value): `ROW`, `FIT`, `E2E`, `TOMB`, `COMPACT`,
+//! `CHURN`, `CHURNSUM`.
 //!
 //!   cargo test -p torus-bridge --release --test ubench_read_precompile_gas -- --ignored --nocapture
 //!
 //! Knobs: `UB_RG_SIZES` (default 0,1,4,16,64,256,1024), `UB_RG_TARGETS`
 //! (K distinct targets per size, default 16), `UB_RG_WORK` (warm calls per
 //! size ~ WORK / (N + 8), default 200000), `UB_RG_FILLER` (default 300000),
-//! `UB_RG_E2E` (default 1), `UB_RG_E2E_REPS` (default 3).
+//! `UB_RG_E2E` (default 1), `UB_RG_E2E_REPS` (default 3), `UB_RG_POINTS`
+//! (cold e2e targets per point reader, default 2000), `UB_RG_SCANS` (cold e2e
+//! targets per scan reader, default 700), `UB_RG_TOMBS` (default 1024,16384),
+//! `UB_RG_CHURN_BLOCKS` (default 150), `UB_RG_CHURN_ORDERS`,
+//! `UB_RG_CHURN_BLOCK_MS`, `UB_RG_ONLY` (`churn`: part 4 only).
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{keccak256, Address, Bytes, U256};
 use revm::context::TxEnv;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
+use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor};
+use torus_core::book_rows::book_order_key;
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
 use torus_core::precompiles::{
     execute_precompile_metered, precompile_address, reader_budget, reader_gas, write_stored_order, ReadMeter,
     StoredOrder, ADDR_BALANCE_READER, ADDR_ORACLE_READER, ADDR_ORDER_BOOK_READER, ADDR_STAKING_READER,
-    GAS_PRECOMPILE_READ_PER_UNIT,
 };
 use torus_economics::types::{ValidatorState, ValidatorStatus};
 use torus_state::cf::{
-    ALL_CF_NAMES, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS, CF_NATIVE_POSITIONS,
-    CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
+    ALL_CF_NAMES, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS, CF_NATIVE_ORDER_BOOKS,
+    CF_NATIVE_POSITIONS, CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS, CF_STAKING_VALIDATORS,
 };
-use torus_state::{NativeStateOverlay, StateDb};
+use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_evm::{BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
 use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
@@ -81,16 +102,20 @@ const NOW: u64 = 1_000_000;
 const CALL_GAS: u64 = 30_000_000;
 const BOOK_MARKET_BASE: u64 = 1;
 const OPEN_ORDERS_MARKET: u64 = 7;
+/// First market of the cold e2e book targets (one market per call).
+const COLD_BOOK_MARKET: u64 = 100_000;
+/// Orders per cold e2e scan target: the s99 cap.
+const COLD_SCAN_ROWS: u64 = 64;
 
 fn env(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
-fn sizes() -> Vec<u64> {
-    std::env::var("UB_RG_SIZES")
-        .unwrap_or_else(|_| "0,1,4,16,64,256,1024".into())
+fn list(k: &str, d: &str) -> Vec<u64> {
+    std::env::var(k)
+        .unwrap_or_else(|_| d.into())
         .split(',')
-        .map(|s| s.trim().parse().expect("UB_RG_SIZES: comma-separated integers"))
+        .map(|s| s.trim().parse().expect("comma-separated integers"))
         .collect()
 }
 
@@ -126,6 +151,24 @@ fn u64_word(v: u64) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[24..].copy_from_slice(&v.to_be_bytes());
     w
+}
+
+/// Added to argument word 0 per e2e call (`vary=stride`): the low 20 bytes
+/// (an address) jump across the key space; the low 8 bytes (a market id) too.
+fn addr_stride() -> U256 {
+    U256::from_be_slice(&[
+        0x9E, 0x37, 0x79, 0xB9, 0x7F, 0x4A, 0x7C, 0x15, 0xF3, 0x9C, 0xC0, 0x60, 0x5C, 0xED, 0xC8, 0x34, 0x10, 0x82,
+        0x27, 0x6B,
+    ])
+}
+
+/// Word 0 of call `i` of a strided loop.
+fn strided(w0: [u8; 32], stride: U256, i: u64) -> [u8; 32] {
+    (U256::from_be_bytes(w0).wrapping_add(stride.wrapping_mul(U256::from(i)))).to_be_bytes()
+}
+
+fn word_addr(w: &[u8; 32]) -> Address {
+    Address::from_slice(&w[12..])
 }
 
 fn input(sig: &str, words: &[[u8; 32]]) -> Vec<u8> {
@@ -166,6 +209,14 @@ fn put_delegation(db: &StateDb, staker: &Address, validator: &Address) {
     db.put_cf_raw(CF_STAKING_DELEGATIONS, &key, &delegation_row(staker, validator, 1_000)).unwrap();
 }
 
+fn put_staker_rows(db: &StateDb, sk: &Address) {
+    let mut perm = sk.as_slice().to_vec();
+    perm.extend_from_slice(&U256::from(7u64).to_be_bytes::<32>());
+    perm.extend_from_slice(&5u64.to_le_bytes());
+    db.put_cf_raw(CF_STAKING_PERMANENT, sk.as_slice(), &perm).unwrap();
+    db.put_cf_raw(CF_STAKING_REWARDS, sk.as_slice(), &perm[..52]).unwrap();
+}
+
 fn put_position(db: &StateDb, trader: &Address, m: u64) {
     let pos = Position {
         trader: *trader,
@@ -201,6 +252,24 @@ fn put_evm_account(db: &StateDb, a: &Address, code: Option<&[u8]>) {
     .unwrap();
 }
 
+fn stored_order(id: u128) -> StoredOrder {
+    StoredOrder { order_id: id, price: fp(100 + (id % 1_000) as i64), remaining_qty: fp(1), side: 0 }
+}
+
+fn put_orders(db: &StateDb, trader: &Address, market: u64, n: u64) {
+    for j in 0..n {
+        write_stored_order(db, trader, market, &stored_order(j as u128 + 1)).unwrap();
+    }
+}
+
+/// cf_native_orders key: trader(20) ‖ market(8) ‖ order_id(16).
+fn order_key(trader: &Address, market: u64, id: u128) -> Vec<u8> {
+    let mut key = trader.as_slice().to_vec();
+    key.extend_from_slice(&market.to_be_bytes());
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
 /// One case at one size: K calldata targets (distinct keys).
 struct Group {
     case: &'static str,
@@ -213,7 +282,7 @@ struct Row {
     case: &'static str,
     state: &'static str,
     n: u64,
-    units: u64,
+    gas: u64,
     ns: f64,
 }
 
@@ -230,8 +299,9 @@ fn median(v: &mut [u64]) -> f64 {
     }
 }
 
-/// One call through the EVM provider's entry (metered, journaled overlay).
-fn call_once(ov: &NativeStateOverlay, id: u16, inp: &[u8]) -> (u64, u64, bool) {
+/// One call through the EVM provider's entry (metered, journaled overlay):
+/// (ns, gas charged, ok).
+fn call_once(ov: &impl StateBackend, id: u16, inp: &[u8]) -> (u64, u64, bool) {
     let mut meter = ReadMeter::with_max(reader_budget(CALL_GAS));
     let t = Instant::now();
     let r = execute_precompile_metered(
@@ -248,7 +318,7 @@ fn call_once(ov: &NativeStateOverlay, id: u16, inp: &[u8]) -> (u64, u64, bool) {
     let ns = t.elapsed().as_nanos() as u64;
     let ok = r.is_ok();
     let _ = std::hint::black_box(r);
-    (ns, meter.used(), ok)
+    (ns, reader_gas(meter.used()), ok)
 }
 
 fn measure(
@@ -262,11 +332,11 @@ fn measure(
     let ov = NativeStateOverlay::new(db.clone());
     for g in groups {
         let mut ns = Vec::new();
-        let mut units = None;
+        let mut gas = None;
         let mut ok_all = true;
         let mut record = |(t, u, ok): (u64, u64, bool), ns: &mut Vec<u64>| {
-            assert!(units.is_none() || units == Some(u), "{}: targets of N={} differ in units", g.case, g.n);
-            units = Some(u);
+            assert!(gas.is_none() || gas == Some(u), "{}: targets of N={} differ in gas", g.case, g.n);
+            gas = Some(u);
             ok_all &= ok;
             ns.push(t);
         };
@@ -285,17 +355,18 @@ fn measure(
                 }
             }
         }
-        let units = units.unwrap_or(0);
+        let gas = gas.unwrap_or(0);
         let med = median(&mut ns);
-        let gas = reader_gas(units);
         println!(
-            "ROW scen={scen} case={} state={state} N={} units={units} gas={gas} ok={ok_all} samples={} ns={med:.0} ns_per_gas={:.3}",
+            "ROW scen={scen} case={} state={state} N={} gas={gas} ok={ok_all} samples={} ns={med:.0} ns_per_gas={:.3} \
+             ms_at_30M={:.1}",
             g.case,
             g.n,
             ns.len(),
-            med / gas as f64
+            med / gas as f64,
+            med / gas as f64 * 30.0
         );
-        rows.push(Row { case: g.case, state, n: g.n, units, ns: med });
+        rows.push(Row { case: g.case, state, n: g.n, gas, ns: med });
     }
 }
 
@@ -321,25 +392,23 @@ fn print_fits(rows: &[Row]) {
         let rs: Vec<&Row> = rows.iter().filter(|r| r.case == case && r.state == state).collect();
         let worst = rs
             .iter()
-            .map(|r| (r.ns / reader_gas(r.units) as f64, r.n))
+            .map(|r| (r.ns / r.gas as f64, r.n))
             .fold((0.0, 0), |a, b| if b.0 > a.0 { b } else { a });
         if rs.len() < 2 {
             println!(
-                "FIT case={case} state={state} fixed_ns={:.0} units={} worst_ns_per_gas={:.3}@N={}",
-                rs[0].ns, rs[0].units, worst.0, worst.1
+                "FIT case={case} state={state} fixed_ns={:.0} gas={} worst_ns_per_gas={:.3}@N={}",
+                rs[0].ns, rs[0].gas, worst.0, worst.1
             );
             continue;
         }
         let xs: Vec<f64> = rs.iter().map(|r| r.n as f64).collect();
         let (a, b) = fit(&xs, &rs.iter().map(|r| r.ns).collect::<Vec<_>>());
-        let (ua, ub) = fit(&xs, &rs.iter().map(|r| r.units as f64).collect::<Vec<_>>());
-        let per_unit = if ub > 0.0 { b / ub } else { 0.0 };
+        let (ga, gb) = fit(&xs, &rs.iter().map(|r| r.gas as f64).collect::<Vec<_>>());
+        let asym = if gb > 0.0 { b / gb } else { 0.0 };
         println!(
-            "FIT case={case} state={state} fixed_ns={a:.0} ns_per_N={b:.1} units_fixed={ua:.1} units_per_N={ub:.2} \
-             ns_per_unit={per_unit:.1} asym_ns_per_gas={:.3} worst_ns_per_gas={:.3}@N={}",
-            per_unit / GAS_PRECOMPILE_READ_PER_UNIT as f64,
-            worst.0,
-            worst.1
+            "FIT case={case} state={state} fixed_ns={a:.0} ns_per_N={b:.1} gas_fixed={ga:.0} gas_per_N={gb:.1} \
+             asym_ns_per_gas={asym:.3} worst_ns_per_gas={:.3}@N={}",
+            worst.0, worst.1
         );
     }
 }
@@ -354,6 +423,7 @@ fn reopen(path: &Path, db: StateDb) -> StateDb {
             raw.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
         }
     }
+    db.wait_background_compaction();
     drop(db);
     StateDb::open(path).expect("reopen db")
 }
@@ -378,11 +448,17 @@ const LOOP_CALLER: Address = Address::new([0xCA; 20]);
 const E2E_GAS: u64 = 30_000_000;
 
 /// CALLDATACOPY the tx data (the reader's calldata) to memory 0, then
-/// STATICCALL `target` with `stipend` gas until less than ~stipend is left;
-/// a failed inner call reverts the tx. `vary`: +1 on argument word 0 per call.
-fn loop_code(target: u16, stipend: u32, vary: bool) -> Vec<u8> {
+/// STATICCALL `target` with `stipend` gas, at most `max_calls` times and
+/// while more than ~stipend is left; a failed inner call reverts the tx.
+/// `stride`: added to argument word 0 after each call.
+fn loop_code(target: u16, stipend: u32, stride: Option<U256>, max_calls: u32) -> Vec<u8> {
     let thr = stipend as u64 * 65 / 63 + 10_000;
-    let mut c = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37, 0x5b]; // CALLDATACOPY(0,0,size); JUMPDEST @6
+    let mut c = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37]; // CALLDATACOPY(0,0,size)
+    c.push(0x63); // counter at mem[0x400]
+    c.extend_from_slice(&max_calls.to_be_bytes());
+    c.extend_from_slice(&[0x61, 0x04, 0x00, 0x52]);
+    let top = c.len() as u8;
+    c.push(0x5b); // JUMPDEST
     c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00]); // retSize retOff argsSize argsOff
     c.push(0x61);
     c.extend_from_slice(&target.to_be_bytes());
@@ -391,12 +467,21 @@ fn loop_code(target: u16, stipend: u32, vary: bool) -> Vec<u8> {
     c.extend_from_slice(&[0xfa, 0x15, 0x60]); // STATICCALL ISZERO PUSH1 <fail>
     let fail_at = c.len();
     c.extend_from_slice(&[0x00, 0x57]); // JUMPI
-    if vary {
-        c.extend_from_slice(&[0x60, 0x04, 0x51, 0x60, 0x01, 0x01, 0x60, 0x04, 0x52]);
+    if let Some(s) = stride {
+        c.extend_from_slice(&[0x60, 0x04, 0x51, 0x7f]); // PUSH1 4 MLOAD PUSH32 stride
+        c.extend_from_slice(&s.to_be_bytes::<32>());
+        c.extend_from_slice(&[0x01, 0x60, 0x04, 0x52]); // ADD PUSH1 4 MSTORE
     }
+    // counter = mem[0x400] - 1 (stored back); jump to end at 0.
+    c.extend_from_slice(&[0x61, 0x04, 0x00, 0x51, 0x60, 0x01, 0x90, 0x03, 0x80, 0x61, 0x04, 0x00, 0x52, 0x15, 0x60]);
+    let end_at = c.len();
+    c.extend_from_slice(&[0x00, 0x57]); // JUMPI end
     c.extend_from_slice(&[0x5a, 0x63]);
     c.extend_from_slice(&(thr as u32).to_be_bytes());
-    c.extend_from_slice(&[0x10, 0x60, 0x06, 0x57, 0x00]); // LT PUSH1 6 JUMPI STOP
+    c.extend_from_slice(&[0x10, 0x60, top, 0x57]); // GAS > thr: loop
+    c.push(0x00); // STOP
+    c[end_at] = c.len() as u8;
+    c.extend_from_slice(&[0x5b, 0x00]); // end: STOP
     c[fail_at] = c.len() as u8;
     c.extend_from_slice(&[0x5b, 0x60, 0x00, 0x60, 0x00, 0xfd]); // fail: REVERT(0,0)
     assert!(c.len() < 256);
@@ -415,7 +500,8 @@ fn sload_code(cold: bool) -> Vec<u8> {
     c
 }
 
-fn run_tx(db: &StateDb, code: &[u8], data: &[u8], reps: u64) -> (u64, f64, bool) {
+/// Runs the tx `reps` times: (gas used, ms of each rep, all succeeded).
+fn run_tx(db: &StateDb, code: &[u8], data: &[u8], reps: u64) -> (u64, Vec<f64>, bool) {
     put_evm_account(db, &LOOP_CONTRACT, Some(code));
     let ex = EvmExecutor::new(TORUS_CHAIN_ID);
     let cfg = BlockEnvCfg {
@@ -442,23 +528,61 @@ fn run_tx(db: &StateDb, code: &[u8], data: &[u8], reps: u64) -> (u64, f64, bool)
         };
         let t = Instant::now();
         let (r, _) = ex.execute_tx(db, &cfg, tx).expect("e2e tx");
-        ms.push(t.elapsed().as_micros() as u64);
+        ms.push(t.elapsed().as_micros() as f64 / 1_000.0);
         gas = r.gas_used;
         ok &= r.success;
     }
-    (gas, median(&mut ms) / 1_000.0, ok)
+    (gas, ms, ok)
+}
+
+fn median_f(v: &[f64]) -> f64 {
+    let mut us: Vec<u64> = v.iter().map(|m| (m * 1_000.0) as u64).collect();
+    median(&mut us) / 1_000.0
 }
 
 #[allow(clippy::too_many_arguments)]
-fn e2e(db: &StateDb, scen: &str, case: &str, n: u64, id: u16, data: &[u8], units: u64, vary: bool, reps: u64) {
-    let stipend = (reader_gas(units) + 5_000) as u32;
-    let (gas, ms, ok) = run_tx(db, &loop_code(id, stipend, vary), data, reps);
+fn print_e2e(scen: &str, case: &str, n: u64, state: &str, vary: &str, call_gas: u64, ok: bool, gas: u64, ms: f64) {
     let ns_gas = ms * 1e6 / gas as f64;
     println!(
-        "E2E scen={scen} case={case} N={n} vary={vary} units={units} stipend={stipend} ok={ok} gas_used={gas} \
+        "E2E scen={scen} case={case} N={n} state={state} vary={vary} call_gas={call_gas} ok={ok} gas_used={gas} \
          ms={ms:.2} ns_per_gas={ns_gas:.3} ms_at_30M={:.1}",
         ns_gas * 30.0
     );
+}
+
+/// A warm e2e loop over one target (`stride` None) or many.
+#[allow(clippy::too_many_arguments)]
+fn e2e(db: &StateDb, scen: &str, case: &str, n: u64, id: u16, data: &[u8], call_gas: u64, stride: Option<U256>, reps: u64) {
+    let stipend = (call_gas + 5_000) as u32;
+    let (gas, ms, ok) = run_tx(db, &loop_code(id, stipend, stride, u32::MAX), data, reps);
+    let vary = if stride.is_some() { "stride" } else { "none" };
+    print_e2e(scen, case, n, "warm", vary, call_gas, ok, gas, median_f(&ms));
+}
+
+/// The cold e2e block: flush + compact + reopen, then `reps` txs of at most
+/// `calls` calls over strided targets; the first tx is `cold`, the median of
+/// the rest `warm`. Returns the reopened DB.
+#[allow(clippy::too_many_arguments)]
+fn e2e_cold(
+    path: &Path,
+    db: StateDb,
+    scen: &str,
+    case: &str,
+    n: u64,
+    id: u16,
+    data: &[u8],
+    stride: U256,
+    calls: u64,
+    reps: u64,
+) -> StateDb {
+    let (_, call_gas, ok) = call_once(&NativeStateOverlay::new(db.clone()), id, data);
+    assert!(ok, "{case}: first target fails");
+    let db = reopen(path, db);
+    let stipend = (call_gas + 5_000) as u32;
+    let (gas, ms, ok) = run_tx(&db, &loop_code(id, stipend, Some(stride), calls as u32), data, reps.max(2));
+    print_e2e(scen, case, n, "cold", "stride", call_gas, ok, gas, ms[0]);
+    print_e2e(scen, case, n, "warm", "stride", call_gas, ok, gas, median_f(&ms[1..]));
+    db
 }
 
 // ---------------------------------------------------------------------------
@@ -469,14 +593,14 @@ fn open(dir: &tempfile::TempDir) -> StateDb {
     StateDb::open(dir.path()).expect("open db")
 }
 
-fn scenario_p(sizes: &[u64], k: u64, filler: u64, work: u64, e2e_on: bool, reps: u64) {
+#[allow(clippy::too_many_arguments)]
+fn scenario_p(sizes: &[u64], k: u64, filler: u64, work: u64, e2e_on: bool, reps: u64, points: u64, scans: u64) {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
     let t = Instant::now();
     for i in 0..filler {
         let tr = addr(9, i);
-        let o = StoredOrder { order_id: i as u128, price: fp(100), remaining_qty: fp(1), side: 0 };
-        write_stored_order(&db, &tr, 1 + i % 50, &o).unwrap();
+        write_stored_order(&db, &tr, 1 + i % 50, &stored_order(i as u128)).unwrap();
         put_delegation(&db, &addr(10, i), &addr(11, i % 64));
         put_position(&db, &addr(12, i), 1 + i % 50);
         put_balance(&db, &addr(13, i));
@@ -484,45 +608,25 @@ fn scenario_p(sizes: &[u64], k: u64, filler: u64, work: u64, e2e_on: bool, reps:
     db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(OPEN_ORDERS_MARKET), &agg_row(105)).unwrap();
     let mut groups = Vec::new();
     for (si, &n) in sizes.iter().enumerate() {
-        let (mut oo, mut st, mut tomb) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut oo, mut st) = (Vec::new(), Vec::new());
         for kk in 0..k {
             let idx = si as u64 * k + kk;
             let tr = addr(1, idx);
-            for j in 0..n {
-                let o = StoredOrder { order_id: j as u128 + 1, price: fp(100 + j as i64), remaining_qty: fp(1), side: 0 };
-                write_stored_order(&db, &tr, OPEN_ORDERS_MARKET, &o).unwrap();
-            }
+            put_orders(&db, &tr, OPEN_ORDERS_MARKET, n);
             oo.push(input("getOpenOrders(address,bytes32)", &[addr_word(&tr), u64_word(OPEN_ORDERS_MARKET)]));
-            // N orders placed and cancelled: N deletion markers under the
-            // prefix, stepped over uncharged until a compaction drops them.
-            let tt = addr(14, idx);
-            for j in 0..n {
-                let mut key = [0u8; 44];
-                key[..20].copy_from_slice(tt.as_slice());
-                key[20..28].copy_from_slice(&OPEN_ORDERS_MARKET.to_be_bytes());
-                key[28..44].copy_from_slice(&(j as u128 + 1).to_be_bytes());
-                db.put_cf_raw(CF_NATIVE_ORDERS, &key, &[0u8; 49]).unwrap();
-                db.delete_cf_raw(CF_NATIVE_ORDERS, &key).unwrap();
-            }
-            tomb.push(input("getOpenOrders(address,bytes32)", &[addr_word(&tt), u64_word(OPEN_ORDERS_MARKET)]));
             let sk = addr(2, idx);
             for j in 0..n {
                 put_delegation(&db, &sk, &addr(3, j));
             }
-            let mut perm = sk.as_slice().to_vec();
-            perm.extend_from_slice(&U256::from(7u64).to_be_bytes::<32>());
-            perm.extend_from_slice(&5u64.to_le_bytes());
-            db.put_cf_raw(CF_STAKING_PERMANENT, sk.as_slice(), &perm).unwrap();
-            db.put_cf_raw(CF_STAKING_REWARDS, sk.as_slice(), &perm[..52]).unwrap();
+            put_staker_rows(&db, &sk);
             st.push(input("getStakingInfo(address)", &[addr_word(&sk)]));
         }
         groups.push(Group { case: "getOpenOrders", id: ADDR_ORDER_BOOK_READER, n, inputs: oo });
         groups.push(Group { case: "getStakingInfo", id: ADDR_STAKING_READER, n, inputs: st });
-        groups.push(Group { case: "getOpenOrders-tombstones", id: ADDR_ORDER_BOOK_READER, n, inputs: tomb });
     }
-    let points = k * 4;
+    let pk = k * 4;
     let (mut gp, mut gb, mut gpr) = (Vec::new(), Vec::new(), Vec::new());
-    for i in 0..points {
+    for i in 0..pk {
         let tr = addr(4, i);
         put_position(&db, &tr, OPEN_ORDERS_MARKET);
         gp.push(input("getPosition(address,bytes32)", &[addr_word(&tr), u64_word(OPEN_ORDERS_MARKET)]));
@@ -536,53 +640,86 @@ fn scenario_p(sizes: &[u64], k: u64, filler: u64, work: u64, e2e_on: bool, reps:
     groups.push(Group { case: "getPosition", id: ADDR_ORDER_BOOK_READER, n: 1, inputs: gp });
     groups.push(Group { case: "getBalances", id: ADDR_BALANCE_READER, n: 1, inputs: gb });
     groups.push(Group { case: "getPrice", id: ADDR_ORACLE_READER, n: 1, inputs: gpr });
-    println!("SETUP scen=P filler={filler} K={k} ms={}", t.elapsed().as_millis());
 
-    let db = run_states(dir.path(), db, &groups, "P", work);
-    if e2e_on {
-        let big = *sizes.iter().max().unwrap();
-        let ov = NativeStateOverlay::new(db.clone());
-        for g in &groups {
-            if g.n == big || g.n == 1 || g.n == 0 {
-                let (_, units, _) = call_once(&ov, g.id, &g.inputs[0]);
-                e2e(&db, "P", g.case, g.n, g.id, &g.inputs[0], units, false, reps);
-            }
-        }
-        // vary: a new (mostly empty) trader / staker each call.
-        for (case, id, inp) in [
-            ("getOpenOrders", ADDR_ORDER_BOOK_READER, &groups[0].inputs[0]),
-            ("getStakingInfo", ADDR_STAKING_READER, &groups[1].inputs[0]),
-        ] {
-            e2e(&db, "P", case, 0, id, inp, 100, true, reps);
-        }
-        let gp = groups.iter().find(|g| g.case == "getPosition").unwrap();
-        e2e(&db, "P", "getPosition", 0, gp.id, &gp.inputs[0], 100, true, reps);
+    // Cold e2e targets: one existing target per call, strided from word 0.
+    let s = addr_stride();
+    let w_pos = addr_word(&addr(20, 0));
+    let w_bal = addr_word(&addr(21, 0));
+    let w_stk = addr_word(&addr(22, 0));
+    let w_oo = addr_word(&addr(23, 0));
+    let w_px = u64_word(5_000_000);
+    for i in 0..points {
+        put_position(&db, &word_addr(&strided(w_pos, s, i)), OPEN_ORDERS_MARKET);
+        let b = word_addr(&strided(w_bal, s, i));
+        put_balance(&db, &b);
+        put_evm_account(&db, &b, None);
+        let sk = word_addr(&strided(w_stk, s, i));
+        put_delegation(&db, &sk, &addr(3, i % 64));
+        put_staker_rows(&db, &sk);
+        let m = strided(w_px, s, i);
+        db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(u64::from_be_bytes(m[24..].try_into().unwrap())), &agg_row(100))
+            .unwrap();
+    }
+    for i in 0..scans {
+        put_orders(&db, &word_addr(&strided(w_oo, s, i)), OPEN_ORDERS_MARKET, COLD_SCAN_ROWS);
+    }
+    println!("SETUP scen=P filler={filler} K={k} points={points} scans={scans} ms={}", t.elapsed().as_millis());
 
-        // SLOAD price point: slots 0..40k exist (cold loop reads ~14k of them).
-        for s in 0..40_000u64 {
-            db.put_storage(&LOOP_CONTRACT, &U256::from(s), &U256::from(s + 1)).unwrap();
+    let mut db = run_states(dir.path(), db, &groups, "P", work);
+    if !e2e_on {
+        return;
+    }
+    let big = *sizes.iter().max().unwrap();
+    let ov = NativeStateOverlay::new(db.clone());
+    for g in &groups {
+        if g.n == big || g.n == 1 || g.n == 0 {
+            let (_, gas, _) = call_once(&ov, g.id, &g.inputs[0]);
+            e2e(&db, "P", g.case, g.n, g.id, &g.inputs[0], gas, None, reps);
         }
-        for cold in [true, false] {
-            let (gas, ms, ok) = run_tx(&db, &sload_code(cold), &[], reps);
-            let ns_gas = ms * 1e6 / gas as f64;
-            println!(
-                "E2E scen=P case=SLOAD-{} N=0 vary={cold} units=0 stipend=0 ok={ok} gas_used={gas} ms={ms:.2} \
-                 ns_per_gas={ns_gas:.3} ms_at_30M={:.1}",
-                if cold { "cold" } else { "warm" },
-                ns_gas * 30.0
-            );
-        }
+    }
+    drop(ov);
+    let mkt = u64_word(OPEN_ORDERS_MARKET);
+    for (case, id, data, n, calls) in [
+        ("getPosition", ADDR_ORDER_BOOK_READER, input("getPosition(address,bytes32)", &[w_pos, mkt]), 1, points),
+        ("getBalances", ADDR_BALANCE_READER, input("getBalances(address)", &[w_bal]), 1, points),
+        ("getPrice", ADDR_ORACLE_READER, input("getPrice(bytes32)", &[w_px]), 1, points),
+        ("getStakingInfo", ADDR_STAKING_READER, input("getStakingInfo(address)", &[w_stk]), 1, points),
+        ("getOpenOrders", ADDR_ORDER_BOOK_READER, input("getOpenOrders(address,bytes32)", &[w_oo, mkt]), COLD_SCAN_ROWS, scans),
+    ] {
+        db = e2e_cold(dir.path(), db, "P", case, n, id, &data, s, calls, reps);
+    }
+
+    // SLOAD price point: slots 0..40k exist (cold loop reads ~14k of them).
+    for s in 0..40_000u64 {
+        db.put_storage(&LOOP_CONTRACT, &U256::from(s), &U256::from(s + 1)).unwrap();
+    }
+    for cold in [true, false] {
+        let (gas, ms, ok) = run_tx(&db, &sload_code(cold), &[], reps);
+        print_e2e("P", if cold { "SLOAD-cold" } else { "SLOAD-warm" }, 0, "warm", "none", 0, ok, gas, median_f(&ms));
     }
 }
 
-fn scenario_book(mode: BookMode, scen: &str, sizes: &[u64], k: u64, work: u64, e2e_on: bool, reps: u64) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(&dir);
-    let t = Instant::now();
-    let mut ctx = NativeExecContext::new_with_mode(
-        db.clone(),
-        1,
-        1_001,
+fn place(maker: Address, m: u64, is_buy: bool, price: i64) -> (Address, NativeAction) {
+    (
+        maker,
+        NativeAction::PlaceOrder(PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: fp(price),
+            quantity: fp(1),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }),
+    )
+}
+
+fn exec_ctx<T: StateBackend + Clone>(state: T, height: u64, mode: BookMode) -> NativeExecContext<T> {
+    NativeExecContext::new_with_mode(
+        state,
+        height,
+        1_000 + height,
         0,
         100,
         10,
@@ -591,7 +728,30 @@ fn scenario_book(mode: BookMode, scen: &str, sizes: &[u64], k: u64, work: u64, e
         Address::new([101; 20]),
         mode,
         None,
-    );
+    )
+}
+
+fn fund<T: StateBackend + Clone>(ctx: &NativeExecContext<T>, maker: &Address) {
+    ctx.positions
+        .put_native_balance(maker, &NativeBalance { available: fp(1_000_000_000), order_margin: FixedPoint::ZERO })
+        .unwrap();
+}
+
+fn execute_all<T: StateBackend + Clone>(ctx: &mut NativeExecContext<T>, block: &[(Address, NativeAction)], what: &str) {
+    for chunk in block.chunks(50_000) {
+        let r = NativeExecutor::execute_batch(ctx, chunk);
+        let failed: Vec<_> = r.results.iter().enumerate().filter(|(_, x)| !x.success).take(3).collect();
+        assert!(failed.is_empty(), "{what}: block failed ({} of {}): {:?}", failed.len(), chunk.len(),
+            failed.iter().map(|(i, x)| (i, x.error.clone())).collect::<Vec<_>>());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scenario_book(mode: BookMode, scen: &str, sizes: &[u64], k: u64, work: u64, e2e_on: bool, reps: u64, scans: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let t = Instant::now();
+    let mut ctx = exec_ctx(db.clone(), 1, mode);
     let mut block = Vec::new();
     let mut groups = Vec::new();
     for (si, &n) in sizes.iter().enumerate() {
@@ -602,60 +762,62 @@ fn scenario_book(mode: BookMode, scen: &str, sizes: &[u64], k: u64, work: u64, e
                 // One maker per 512 orders (an account may hold 1,000 open orders).
                 let maker = addr(6, m * 1_000 + j / 512);
                 if j % 512 == 0 {
-                    ctx.positions
-                        .put_native_balance(&maker, &NativeBalance { available: fp(1_000_000_000), order_margin: FixedPoint::ZERO })
-                        .unwrap();
+                    fund(&ctx, &maker);
                 }
                 let price = if mode == BookMode::OrderRows { 1_000 } else { 1_000 + j as i64 };
-                block.push((
-                    maker,
-                    NativeAction::PlaceOrder(PlaceOrderParams {
-                        market_id: m,
-                        is_buy: true,
-                        price: fp(price),
-                        quantity: fp(1),
-                        order_type: OrderType::Limit,
-                        time_in_force: TimeInForce::GTC,
-                        reduce_only: false,
-                        client_order_id: None,
-                    }),
-                ));
+                block.push(place(maker, m, true, price));
             }
             inputs.push(input("getOrderBook(bytes32)", &[u64_word(m)]));
         }
         groups.push(Group { case: "getOrderBook", id: ADDR_ORDER_BOOK_READER, n, inputs });
     }
-    let r = NativeExecutor::execute_batch(&mut ctx, &block);
-    let failed: Vec<_> = r.results.iter().enumerate().filter(|(_, x)| !x.success).take(3).collect();
-    assert!(failed.is_empty(), "{scen}: seed block failed ({} of {}): {:?}", failed.len(), block.len(),
-        failed.iter().map(|(i, x)| (i, x.error.clone())).collect::<Vec<_>>());
+    // Cold e2e targets: `scans` consecutive markets of 64 resting orders each
+    // (rows1: all at one price, a 1-level answer = row-heavy; rows2: 32 bid +
+    // 32 ask levels).
+    if mode != BookMode::Classic {
+        for i in 0..scans {
+            let m = COLD_BOOK_MARKET + i;
+            let maker = addr(15, m);
+            fund(&ctx, &maker);
+            for j in 0..COLD_SCAN_ROWS as i64 {
+                block.push(if mode == BookMode::OrderRows {
+                    place(maker, m, true, 1_000)
+                } else if j < 32 {
+                    place(maker, m, true, 1_000 + j)
+                } else {
+                    place(maker, m, false, 2_000 + j)
+                });
+            }
+        }
+    }
+    execute_all(&mut ctx, &block, scen);
     ctx.save_order_books();
     drop(ctx);
     println!("SETUP scen={scen} K={k} orders={} ms={}", block.len(), t.elapsed().as_millis());
 
-    let db = run_states(dir.path(), db, &groups, scen, work);
-    if e2e_on {
-        let big = *sizes.iter().max().unwrap();
-        let ov = NativeStateOverlay::new(db.clone());
-        for g in &groups {
-            if g.n == big || g.n == 1 {
-                let (_, units, _) = call_once(&ov, g.id, &g.inputs[0]);
-                // Classic reverts (the blob is not an OrderBookSnapshot): the
-                // loop needs successful calls, so classic runs part 1 only.
-                if mode != BookMode::Classic {
-                    e2e(&db, scen, g.case, g.n, g.id, &g.inputs[0], units, false, reps);
-                }
+    let mut db = run_states(dir.path(), db, &groups, scen, work);
+    if !e2e_on {
+        return;
+    }
+    let big = *sizes.iter().max().unwrap();
+    let ov = NativeStateOverlay::new(db.clone());
+    for g in &groups {
+        if g.n == big || g.n == 1 {
+            let (_, gas, _) = call_once(&ov, g.id, &g.inputs[0]);
+            // Classic reverts (the blob is not an OrderBookSnapshot): the
+            // loop needs successful calls, so classic runs part 1 only.
+            if mode != BookMode::Classic {
+                e2e(&db, scen, g.case, g.n, g.id, &g.inputs[0], gas, None, reps);
             }
         }
-        if mode != BookMode::Classic {
-            // vary walks markets 1, 2, ... (the seeded ones first): a stipend
-            // for the deepest book keeps every call in budget.
-            let g = &groups[0];
-            let deepest = groups.last().unwrap();
-            let (_, max_units, _) = call_once(&ov, deepest.id, &deepest.inputs[0]);
-            e2e(&db, scen, "getOrderBook", 0, g.id, &g.inputs[0], max_units, true, reps);
-        }
     }
+    drop(ov);
+    if mode != BookMode::Classic {
+        let data = input("getOrderBook(bytes32)", &[u64_word(COLD_BOOK_MARKET)]);
+        let n = COLD_SCAN_ROWS;
+        db = e2e_cold(dir.path(), db, scen, "getOrderBook", n, ADDR_ORDER_BOOK_READER, &data, U256::from(1), scans, reps);
+    }
+    drop(db);
 }
 
 fn scenario_global(n: u64, work: u64) {
@@ -692,28 +854,270 @@ fn scenario_global(n: u64, work: u64) {
     drop(db);
 }
 
+// ---------------------------------------------------------------------------
+// Parts 3 and 4: deletion markers.
+// ---------------------------------------------------------------------------
+
+/// RocksDB tombstones the current thread's iterators skipped during `f`.
+fn deletes_skipped(f: impl FnOnce()) -> u64 {
+    set_perf_stats(PerfStatsLevel::EnableCount);
+    let mut ctx = PerfContext::default();
+    ctx.reset();
+    f();
+    let n = ctx.metric(PerfMetric::InternalDeleteSkippedCount);
+    set_perf_stats(PerfStatsLevel::Disable);
+    n
+}
+
+const TOMB_TRADER_TAG: u8 = 30;
+
+/// The rows a target's N markers are made from: getOpenOrders (cf_native_orders
+/// under trader + market) and getOrderBook mode 1 (order rows of the market,
+/// ids above the live order's).
+fn marker_keys(case: &str, n: u64) -> Vec<(&'static str, Vec<u8>)> {
+    (0..n)
+        .map(|j| match case {
+            "getOpenOrders" => (CF_NATIVE_ORDERS, order_key(&addr(TOMB_TRADER_TAG, 0), OPEN_ORDERS_MARKET, j as u128 + 1_000)),
+            _ => (CF_NATIVE_ORDER_BOOKS, book_order_key(COLD_BOOK_MARKET, 1_000_000 + j as u128).to_vec()),
+        })
+        .collect()
+}
+
+/// A DB with each target's one live row, and filler around it.
+fn tomb_db(dir: &tempfile::TempDir, filler: u64) -> StateDb {
+    let db = open(dir);
+    for i in 0..filler {
+        write_stored_order(&db, &addr(9, i), 1 + i % 50, &stored_order(i as u128)).unwrap();
+    }
+    put_orders(&db, &addr(TOMB_TRADER_TAG, 0), OPEN_ORDERS_MARKET, 1);
+    let mut ctx = exec_ctx(db.clone(), 1, BookMode::OrderRows);
+    let maker = addr(15, 0);
+    fund(&ctx, &maker);
+    let mut block = vec![place(maker, COLD_BOOK_MARKET, true, 1_000)];
+    for i in 0..filler / 64 {
+        block.push(place(maker, COLD_BOOK_MARKET + 1 + i % 50, true, 1_000));
+    }
+    execute_all(&mut ctx, &block, "tomb seed");
+    ctx.save_order_books();
+    drop(ctx);
+    db
+}
+
+fn flush_cfs(db: &StateDb) {
+    for name in [CF_NATIVE_ORDERS, CF_NATIVE_ORDER_BOOKS] {
+        db.inner().flush_cf(db.cf_handle(name).unwrap()).unwrap();
+    }
+}
+
+/// ns (median of `work` calls), gas, answer bytes and skipped tombstones of
+/// one target.
+fn tomb_call(state: &impl StateBackend, inp: &[u8], work: u64) -> (f64, u64, usize, u64) {
+    let out = execute_precompile_metered(
+        &precompile_address(ADDR_ORDER_BOOK_READER),
+        inp,
+        &Address::ZERO,
+        U256::ZERO,
+        state,
+        100,
+        NOW,
+        false,
+        &mut ReadMeter::with_max(reader_budget(CALL_GAS)),
+    )
+    .expect("tombstone target answers");
+    let skipped = deletes_skipped(|| {
+        std::hint::black_box(call_once(state, ADDR_ORDER_BOOK_READER, inp));
+    });
+    let mut ns = Vec::new();
+    let mut gas = 0;
+    for _ in 0..work.max(1) {
+        let (t, g, ok) = call_once(state, ADDR_ORDER_BOOK_READER, inp);
+        assert!(ok);
+        gas = g;
+        ns.push(t);
+    }
+    (median(&mut ns), gas, out.len(), skipped)
+}
+
+fn print_tomb(case: &str, n: u64, state: &str, (ns, gas, bytes, skipped): (f64, u64, usize, u64)) {
+    println!(
+        "TOMB case={case} N={n} state={state} gas={gas} answer_bytes={bytes} skipped={skipped} ns={ns:.0} \
+         ns_per_marker={:.1} ns_per_gas={:.3} ms_at_30M={:.1}",
+        ns / n.max(1) as f64,
+        ns / gas as f64,
+        ns / gas as f64 * 30.0
+    );
+}
+
+fn tomb_inputs() -> [(&'static str, Vec<u8>); 2] {
+    [
+        (
+            "getOpenOrders",
+            input("getOpenOrders(address,bytes32)", &[addr_word(&addr(TOMB_TRADER_TAG, 0)), u64_word(OPEN_ORDERS_MARKET)]),
+        ),
+        ("getOrderBook", input("getOrderBook(bytes32)", &[u64_word(COLD_BOOK_MARKET)])),
+    ]
+}
+
+fn scenario_tombstones(ns_list: &[u64], filler: u64, reps: u64) {
+    for &n in ns_list {
+        for (case, inp) in &tomb_inputs() {
+            let work = (2_000_000 / (n + 64)).clamp(5, 2_000);
+            let keys = marker_keys(case, n);
+
+            // overlay: rows in an SST, deleted in the reader's overlay.
+            let dir = tempfile::tempdir().unwrap();
+            let db = tomb_db(&dir, filler);
+            for (cf, k) in &keys {
+                db.put_cf_raw(cf, k, &[0u8; 64]).unwrap();
+            }
+            flush_cfs(&db);
+            let ov = NativeStateOverlay::new(db.clone());
+            for (cf, k) in &keys {
+                ov.delete_cf_raw(cf, k).unwrap();
+            }
+            print_tomb(case, n, "overlay", tomb_call(&ov, inp, work));
+
+            // flushed: the deletes written by a block flush (+ the background
+            // compaction the build schedules for them, if any).
+            let t = Instant::now();
+            ov.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+            let flush_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            let (done, failed) = db.wait_background_compaction();
+            println!(
+                "COMPACT case={case} N={n} flush_ms={flush_ms:.1} wait_ms={:.1} runs_done={done} runs_failed={failed}",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            print_tomb(case, n, "flushed", tomb_call(&NativeStateOverlay::new(db.clone()), inp, work));
+            drop(ov);
+            drop(db);
+
+            // memtable / sst: tombstones written straight to RocksDB.
+            let dir = tempfile::tempdir().unwrap();
+            let db = tomb_db(&dir, filler);
+            for (cf, k) in &keys {
+                db.put_cf_raw(cf, k, &[0u8; 64]).unwrap();
+            }
+            flush_cfs(&db);
+            for (cf, k) in &keys {
+                db.delete_cf_raw(cf, k).unwrap();
+            }
+            print_tomb(case, n, "memtable", tomb_call(&NativeStateOverlay::new(db.clone()), inp, work));
+            // sst: the memtable flushed to an L0 file above the rows' file; no
+            // compaction (a full manual compaction would merge them away).
+            flush_cfs(&db);
+            print_tomb(case, n, "sst", tomb_call(&NativeStateOverlay::new(db.clone()), inp, work));
+            if n == ns_list[0] {
+                let (_, gas, _) = call_once(&NativeStateOverlay::new(db.clone()), ADDR_ORDER_BOOK_READER, inp);
+                let stipend = (gas + 5_000) as u32;
+                let (g, ms, ok) = run_tx(&db, &loop_code(ADDR_ORDER_BOOK_READER, stipend, None, u32::MAX), inp, reps);
+                print_e2e("T", &format!("{case}-tombstones-sst"), n, "warm", "none", gas, ok, g, median_f(&ms));
+            }
+        }
+    }
+}
+
+/// Part 4: per block, cancel the trader's `orders` open orders and place as
+/// many new ones (ids keep rising, so every older deleted id sits before the
+/// live rows in key order), flush the block like the node, then measure one
+/// reader call on the trader + market.
+fn scenario_churn(blocks: u64, orders: u64, block_ms: u64, filler: u64) {
+    let pace = Duration::from_millis(block_ms);
+    for (case, inp) in tomb_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tomb_db(&dir, filler);
+        let trader = addr(TOMB_TRADER_TAG, 0);
+        let maker = addr(16, 0);
+        let mut ctx_mode1 = None;
+        let (mut peak, mut peak_block, mut skipped_sum, mut last) = (0u64, 0u64, 0u64, Vec::new());
+        let t0 = Instant::now();
+        for b in 0..blocks {
+            let started = Instant::now();
+            let ov = NativeStateOverlay::new(db.clone());
+            if case == "getOpenOrders" {
+                let id = |i: u64| (10_000 + b * orders + i) as u128;
+                for i in 0..orders {
+                    if b > 0 {
+                        ov.delete_cf_raw(CF_NATIVE_ORDERS, &order_key(&trader, OPEN_ORDERS_MARKET, id(i) - orders as u128))
+                            .unwrap();
+                    }
+                    ov.put_cf_raw(CF_NATIVE_ORDERS, &order_key(&trader, OPEN_ORDERS_MARKET, id(i)), &borsh::to_vec(&stored_order(id(i))).unwrap())
+                        .unwrap();
+                }
+            } else {
+                let mut ctx = exec_ctx(ov.clone(), 2 + b, BookMode::OrderRows);
+                if ctx_mode1.is_none() {
+                    fund(&ctx, &maker);
+                    ctx_mode1 = Some(());
+                }
+                let mut block = vec![(maker, NativeAction::CancelAllOrders { market_id: Some(COLD_BOOK_MARKET) })];
+                block.extend((0..orders).map(|i| place(maker, COLD_BOOK_MARKET, true, 900 + (i % 50) as i64)));
+                execute_all(&mut ctx, &block, "churn block");
+                ctx.save_order_books();
+            }
+            let tf = Instant::now();
+            ov.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+            let flush_ms = tf.elapsed().as_secs_f64() * 1e3;
+            drop(ov);
+            let (ns, gas, bytes, skipped) = tomb_call(&NativeStateOverlay::new(db.clone()), &inp, 5);
+            println!(
+                "CHURN case={case} block={b} orders={orders} flush_ms={flush_ms:.1} gas={gas} answer_bytes={bytes} \
+                 skipped={skipped} ns={ns:.0} ms_at_30M={:.1} t_ms={}",
+                ns / gas as f64 * 30.0,
+                t0.elapsed().as_millis()
+            );
+            if skipped > peak {
+                (peak, peak_block) = (skipped, b);
+            }
+            skipped_sum += skipped;
+            if b + 20 >= blocks {
+                last.push(ns / gas as f64 * 30.0);
+            }
+            if let Some(rest) = pace.checked_sub(started.elapsed()) {
+                std::thread::sleep(rest);
+            }
+        }
+        println!(
+            "CHURNSUM case={case} blocks={blocks} orders={orders} block_ms={block_ms} peak_skipped={peak}@block={peak_block} \
+             mean_skipped={:.0} last20_ms_at_30M_median={:.1} runs={:?}",
+            skipped_sum as f64 / blocks as f64,
+            median_f(&last),
+            db.wait_background_compaction()
+        );
+    }
+}
+
 #[test]
 #[ignore = "µbench (sizing the read precompile gas) — run with --ignored --nocapture on a quiet box"]
 fn ubench_read_precompile_gas() {
-    let sizes = sizes();
+    let sizes = list("UB_RG_SIZES", "0,1,4,16,64,256,1024");
     let k = env("UB_RG_TARGETS", 16);
     let work = env("UB_RG_WORK", 200_000);
     let filler = env("UB_RG_FILLER", 300_000);
     let e2e_on = env("UB_RG_E2E", 1) == 1;
     let reps = env("UB_RG_E2E_REPS", 3);
+    let points = env("UB_RG_POINTS", 2_000);
+    let scans = env("UB_RG_SCANS", 700);
+    let tombs = list("UB_RG_TOMBS", "1024,16384");
+    let churn = (env("UB_RG_CHURN_BLOCKS", 150), env("UB_RG_CHURN_ORDERS", 1_000), env("UB_RG_CHURN_BLOCK_MS", 100));
+    let only_churn = std::env::var("UB_RG_ONLY").is_ok_and(|v| v == "churn");
     println!(
-        "CONFIG sizes={sizes:?} K={k} work={work} filler={filler} e2e={e2e_on} e2e_reps={reps} \
-         base_gas={} gas_per_unit={GAS_PRECOMPILE_READ_PER_UNIT}",
+        "CONFIG sizes={sizes:?} K={k} work={work} filler={filler} e2e={e2e_on} e2e_reps={reps} points={points} \
+         scans={scans} tombs={tombs:?} churn={churn:?} base_gas={}",
         reader_gas(0)
     );
     let t = Instant::now();
-    scenario_p(&sizes, k, filler, work, e2e_on, reps);
-    scenario_book(BookMode::Classic, "B-classic", &sizes, k, work, e2e_on, reps);
-    scenario_book(BookMode::OrderRows, "B-rows1", &sizes, k, work, e2e_on, reps);
-    scenario_book(BookMode::LevelAuthority, "B-rows2", &sizes, k, work, e2e_on, reps);
-    // Whole-CF scans: one DB per N; FIT over the G rows of all N.
-    for &n in &sizes {
-        scenario_global(n, work);
+    if !only_churn {
+        scenario_p(&sizes, k, filler, work, e2e_on, reps, points, scans);
+        scenario_book(BookMode::Classic, "B-classic", &sizes, k, work, e2e_on, reps, scans);
+        scenario_book(BookMode::OrderRows, "B-rows1", &sizes, k, work, e2e_on, reps, scans);
+        scenario_book(BookMode::LevelAuthority, "B-rows2", &sizes, k, work, e2e_on, reps, scans);
+        // Whole-CF scans: one DB per N; FIT over the G rows of all N.
+        for &n in &sizes {
+            scenario_global(n, work);
+        }
+        scenario_tombstones(&tombs, filler / 10, reps);
     }
+    scenario_churn(churn.0, churn.1, churn.2, filler / 10);
     println!("DONE total_s={:.1}", t.elapsed().as_secs_f64());
 }
