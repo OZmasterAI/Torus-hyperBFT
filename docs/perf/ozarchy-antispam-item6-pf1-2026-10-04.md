@@ -2643,12 +2643,17 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   designed in s18 (`docs/plans/adl-budget.md`, owner decisions Q1-Q6 pending).
   **Budget built** (`perf/adl-budget` @ `6a25e20`, section 24): S=750 passes
   (rc 0, AGREE, 22 s drain, vault -0.00084). Still open: the heaviest
-  liquidation block is ~1.1-1.2 s vs ~250 ms (C2 + W re-size next).
-- ADL proof cells (section 24.2): vault -0.00074 / -0.00084 is dust; the
-  escrow dust lines get a test or fix in C2; the value sum drifts ~-0.2 units
-  of 1e-8 per trade fill (rounding bias in trade settlement, not traced); the
-  sum is only valid while marks are fresh (-1,740.69 step after the feed
-  pause). Harness: the post-pause drain (60 s) is too short for value-sum
+  liquidation block is ~1.1-1.2 s vs ~250 ms. C2 (per-market holder lists,
+  shadow == C1) + the s96 fix list built on `perf/adl-budget` (s24, not pushed;
+  nextest 2996/0; `docs/plans/adl-budget.md` section 10). Next: review, HL
+  block at N=5,000 with ~10% holders, W re-size, cells on C2.
+- ADL proof cells (section 24.2), 18c s99: vault -0.00074 / -0.00084 accepted
+  as dust; the escrow dust lines are the sweep itself (both escrows end at 0
+  positions and 0 balance, the vault gets exactly the dust; pinned by a test on
+  `perf/adl-budget`). The value sum drifts ~-0.2 units of 1e-8 per trade fill
+  (likely `fill_transition`'s truncating average entry): 18c backlog; until
+  then value-sum checks across fills allow ~fills x 1 unit. Stale marks moved
+  the old sum (-1,740.69 after the feed pause); C2's fix (c) prices at 0. Harness: the post-pause drain (60 s) is too short for value-sum
   cells; `funnel-val*.csv` header is one column short.
 - Liquidation stress at S=400: all backstop is explained (section 23.2, AV/MM
   ~0.40 after the shock). A stage-1 cell needs a shock of ~290 bp on this
