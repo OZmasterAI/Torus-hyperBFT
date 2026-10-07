@@ -859,8 +859,10 @@ base and gate reference main `35e69b3`.
 Build queue on 18c (s99): row 74, B batch, row 50, 9.11 counter + pins, governance params fix: all merged
 (main `b8bf3e8a`) -> next: anti-spam eviction metric; per-fill value-sum rounding drift (`position.rs`
 `fill_transition` average-entry truncation); Phase 2 step 0 after ozarchy's reference cells on `35e69b3`.
-Item 7 design doc on 18c (section 9.16). Rule (owner s99): pre-merge full suites run on ozarchy; 18c reviews
-read-only and merges.
+Item 7: design `item7-evm-lanes.md`, step 0 merged (`7c15b5aa`). Rule (owner s99, final): each machine runs
+its own test suites (18c tests what it builds or merges); big feature builds and all benches stay on ozarchy.
+Next session on 18c: anti-spam eviction metric, then the per-fill rounding fix, row 80 option D, row 50
+follow-ups.
 
 ### 9.16 Owner decisions and open questions (s99)
 
@@ -870,8 +872,8 @@ read-only and merges.
 | liquidator vault capital | decided: seed the vault through genesis on devnet and testnet; HL-style user deposits (HLP: deposit, withdraw, pro-rata PnL) built before mainnet; one vault, no separate insurance fund (HL's liquidator vault plays that role) |
 | margin currency | OPEN (owner decision list): margin is TRS counted as $1 (`lockbox.rs:62`, `margin.rs` 403-438) while markets are quoted in USD; no conversion, no stablecoin collateral (roadmap P5 line 317). Options: USDC margin like HL (18c recommendation) / TRS with a TRS-USD price and a haircut / markets quoted in TRS |
 | 9.11 real fix | OPEN, before mainnet: split each maker's free margin per book / tighten the 50% band / serialise makers resting in several markets; counter `torus_maker_offmark_charged_fills` gives the data |
-| read-precompile gas (ozarchy `bench/read-precompile-gas`, `docs/perf/read-precompile-gas.md`) | decided, revisit later: single reads at HL level (~16,500 gas per position read; base ~16,000, ozarchy computes the exact base); scan reads (`getOrderBook`, `getOpenOrders`) kept for now at 500 gas per scanned row + 20 per word or blob, capped at 64 orders per call; owner leaning to remove scan reads like HL after item 7. Open question to ozarchy: are the `getOpenOrders` deletion markers node-local RocksDB tombstones (then cap skipped keys, never charge them) |
-| item 7 EVM lanes | decided: own item; design now (`docs/plans/item7-evm-lanes.md`, 18c), build after item 6 Phase 2, before Phase 3 and before testnet. Why: every block can carry 30M EVM gas next to trading and any EVM tx sends its block down the serial path; HL rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about once a minute) |
+| read-precompile gas (ozarchy `bench/read-precompile-gas`, `docs/perf/read-precompile-gas.md`) | decided (s99), revisit after item 7; being built on ozarchy: single reads base 16,400 (~16,500 gas per position read; cold block 170.7 -> 33.7 ms ozarchy); scans 500 gas per scanned row + 20 per word or blob; `getOrderBook` modes 2/3 return the 64 best price levels per side (~85,500 gas per call), mode 1 (single orders) removed (best prices would need an on-chain price index), classic unchanged; `getOpenOrders` removed (nothing in production writes `cf_native_orders`, so it always returned empty); deletion markers are node-local RocksDB tombstones: never charged or capped, a forced background compaction of the order range keeps them bounded (churn of 1,000 cancels per block flat at ~90-100 ms), and the previous block's uncharged deletes are accepted. Owner leaning to remove scan reads like HL after item 7 |
+| item 7 EVM lanes | decided: own item; design in `docs/plans/item7-evm-lanes.md`; target option C (HL small and big EVM blocks, HL throughput: 3M gas every second + 30M once a minute) in steps: step 0 vote-side EVM header checks (merged `7c15b5aa`), step 1 = A + B, step 2 = C, built after item 6 Phase 2, before Phase 3 and before testnet. Why: every block can carry 30M EVM gas next to trading and any EVM tx sends its block down the serial path; HL rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about once a minute) |
 | per-fill value-sum drift | 18c backlog: ~-0.2 units of 1e-8 per fill from the average-entry division in `fill_transition`; also the source of the ADL escrow dust. Until fixed, value-sum checks use a tolerance of about fills x 1 unit |
 | test flakes | fixed and merged: row-50 test vs the process-global native-trie maintenance flag (`9301f417`), exec_pipeline rendezvous sleep (`f1b84717`) |
 | build size | merged (`11183d2a`): dev profile `line-tables-only`, no debuginfo for dependencies; a full test build writes 10.8 GB instead of 27.8 GB |
