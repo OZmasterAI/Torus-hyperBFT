@@ -176,8 +176,10 @@ impl FailureReason {
     /// refused the order or cancelled it without a fill; the executor
     /// records this text). s100 S2: a v3 writer stores an EMPTY message for
     /// a [`Outcome::Rejected`] entry or order whose message is exactly this
-    /// text, and the reader restores it. Never change a text: records
-    /// already written read back the current one.
+    /// text, and the reader restores it. Never change a text, and never
+    /// give a reason that falls to the `_` arm (e.g. `PriceBand`) an arm of
+    /// its own: records already written read back the current text. Pinned
+    /// by `book_reject_messages_never_change`.
     pub fn book_reject_message(self) -> &'static str {
         match self {
             Self::IocCancel => {
@@ -495,6 +497,38 @@ impl BlockActionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s100 S2: rejected entries with the canonical text are stored empty,
+    /// so the text read back for every code (unknown codes too) is frozen.
+    #[test]
+    fn book_reject_messages_never_change() {
+        let fallback = "order rejected by the book";
+        let want = [
+            fallback,
+            "insufficient margin: none left for the first fill (match time)",
+            fallback,
+            "order rejected: price is not a multiple of the tick",
+            "order rejected: quantity below the lot size",
+            "order rejected: price must be positive",
+            fallback,
+            fallback,
+            fallback,
+            "reduce-only order rejected: would not reduce the position",
+            "order rejected: IOC order could not immediately match against any resting order",
+            "order rejected: post-only order would have immediately matched",
+            "order rejected: no liquidity for the market order within its price cap",
+            "order rejected: FOK order could not be filled completely",
+            "order rejected: stop trigger price is on the wrong side of the last trade",
+            fallback,
+        ];
+        for (code, text) in want.iter().enumerate() {
+            assert_eq!(
+                FailureReason::from_u8(code as u8).book_reject_message(),
+                *text,
+                "code {code}"
+            );
+        }
+    }
 
     fn failure(
         index: u32,
