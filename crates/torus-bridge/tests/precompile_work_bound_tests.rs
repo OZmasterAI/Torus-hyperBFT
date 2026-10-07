@@ -502,6 +502,7 @@ fn single_readers_cost_the_base_plus_their_words() {
         is_long: true,
         size: fp(3),
         entry_price: fp(100),
+        cost_basis: fp(300),
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,

@@ -240,6 +240,7 @@ fn put_position(db: &StateDb, trader: &Address, m: u64) {
         is_long: true,
         size: fp(3),
         entry_price: fp(100),
+        cost_basis: fp(300),
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
