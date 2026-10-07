@@ -1851,13 +1851,21 @@ fn every_payload_kind_writes_exactly_its_rows_on_success() {
 
         let mut want: Vec<Row> = match name {
             "param change, price band" => {
-                vec![(CF_FEE_CONFIG, b"price_band_bps".to_vec(), Some(b"1000".to_vec()))]
+                vec![(
+                    CF_FEE_CONFIG,
+                    b"price_band_bps".to_vec(),
+                    Some(b"1000".to_vec()),
+                )]
             }
             // s99: the whole GovernanceParams record, one field changed.
             "param change, governance param" => {
                 let mut params = params_before.clone();
                 params.quorum_bps = 5000;
-                vec![(CF_FEE_CONFIG, b"gov_params".to_vec(), Some(borsh::to_vec(&params).unwrap()))]
+                vec![(
+                    CF_FEE_CONFIG,
+                    b"gov_params".to_vec(),
+                    Some(borsh::to_vec(&params).unwrap()),
+                )]
             }
             "treasury spend" => vec![account(addr(50), wei(1_003)), account(addr(99), wei(9_000))],
             // Debit, then credit of the same account: the balance is unchanged.
