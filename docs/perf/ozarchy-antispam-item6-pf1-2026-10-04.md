@@ -3042,6 +3042,85 @@ column cannot resolve a 3% change (cache-misses per 1k instructions 3.64 vs
   another CCX's cache, not an L3 hit (the section 9 sidecar's comment calls
   it "L3 fill"; section 9.2's tables do not use it).
 
+## 29. C2 holder-index fix and Position v2 savings A/B (campaign `ozarchy-c2h`, 2026-10-08)
+
+The two fixes for section 27's regression, A/B'd against `d3ba3c0a` as 18c
+asked (s104), outside Phase 2's +7% gate. Node-only builds as section 27
+(`--release`, line-tables-only, mold, frame pointers), each from its own
+worktree into its own fresh, unseeded target dir (`ozarchy-c2h-build.sh`,
+`ozarchy-c2h2-build.sh`); same bench `fff899ca`, harness and standard shape
+as section 27, no perf.
+
+| arm | commit | node | what |
+|---|---|---|---|
+| b | `d3ba3c0a` | `193ae781` | the Phase 2 reference (section 26's B) |
+| base | `bf2edda6` | `29860dc0` | main, parent of both fixes (over `d3ba3c0a`: the open-file limit raise, a test flake fix, stress tests in every suite) |
+| fix | `perf/c2-set-holder` `d7bd1c36` (built from `c051872b`, docs only on top) | `b843f522` | C2 holder index moved only when a position key appears or disappears; foldhash `holders` map (ozarchy; 18c s104 review: merge as is) |
+| sav | `perf/position-v2-savings` `37b28dd6` | `4fcbf7cb` | 18c: `5d197a3b` reserves the batch `PositionCache` before pass B's merges; `37b28dd6` updates the cached position in place on the fill path |
+| both | `f1ab2166` (local merge of `37b28dd6` + `d7bd1c36`, not pushed) | `17ac7525` | both fixes |
+
+Order: b warm (60 s), then b base fix sav both both sav fix base b (120 s
+each), 17:46-18:52, unit `bench-c2h.service`; then base warm (60 s), sav r3,
+base r3, 18:57-19:13, unit `bench-c2hx.service` (`ozarchy-c2h-campaign-x.sh`),
+because sav r1 failed. All other cells rc 0, AGREE, liveness PASS, accepted,
+exe md5 3/3 as staged, trie off, 4 MiB book CF on every arm. Analysis
+`ozarchy-c2h-tools/c2h.py`, table `ozarchy-c2h-table.txt`.
+
+**sav r1 failed (rc 2, liveness unverified, excluded):** AGREE and no node
+died, but all three nodes' RPC stalled for 6-10 s twice (about 38 s and 55 s
+into the cell); `state_write_db` 68 ms per block (~23 elsewhere), flush 93
+ms, 3.37 native blk/s, node CPU 299% vs ~385% (waiting, not busy). sav r2 and
+r3 are normal: a host-wide stall, not the arm.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | pass B | pass B / 1k fills | match | end_resident | `apply` | `apply` / 1k fills | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| b r1 | 173,407 | 5.163 | 25,718 | 4.39 | 142.3 | 41.5 | 24.4 | 0.947 | 13.6 | 21.9 | 9.34 | 0.363 | 8.61 |
+| base r1 | 177,394 | 5.303 | 28,590 | 4.28 | 154.8 | 44.1 | 25.9 | 0.906 | 14.3 | 22.3 | 9.99 | 0.349 | 9.18 |
+| fix r1 | 173,912 | 5.220 | 27,624 | 4.40 | 151.0 | 43.3 | 25.2 | 0.912 | 14.5 | 19.7 | 6.30 | 0.228 | 6.31 |
+| ~~sav r1~~ | 135,694 | 3.369 | 26,522 | 3.98 | 169.4 | 35.5 | 19.7 | 0.741 | 13.2 | 20.6 | 9.03 | 0.340 | 6.70 |
+| both r1 | 180,619 | 5.301 | 28,149 | 4.23 | 148.9 | 40.3 | 22.4 | 0.796 | 15.4 | 19.7 | 6.32 | 0.225 | 6.38 |
+| both r2 | 177,660 | 5.148 | 27,880 | 4.30 | 150.4 | 39.6 | 21.8 | 0.780 | 15.2 | 21.3 | 6.92 | 0.248 | 6.93 |
+| sav r2 | 178,037 | 5.138 | 28,381 | 4.17 | 150.4 | 40.3 | 22.6 | 0.798 | 14.6 | 22.8 | 10.17 | 0.358 | 9.32 |
+| fix r2 | 177,892 | 5.320 | 27,586 | 4.38 | 149.3 | 43.2 | 25.1 | 0.911 | 14.4 | 19.1 | 6.35 | 0.230 | 6.37 |
+| base r2 | 173,528 | 5.146 | 27,615 | 4.33 | 151.5 | 42.1 | 24.5 | 0.886 | 14.9 | 23.6 | 10.29 | 0.373 | 9.80 |
+| b r2 | 174,680 | 5.131 | 28,069 | 4.34 | 154.8 | 44.5 | 26.2 | 0.932 | 14.4 | 23.5 | 10.66 | 0.380 | 10.00 |
+| sav r3 | 176,912 | 5.114 | 28,843 | 4.23 | 154.8 | 41.1 | 23.1 | 0.802 | 15.1 | 24.4 | 10.83 | 0.375 | 9.69 |
+| base r3 | 176,774 | 5.270 | 27,589 | 4.27 | 150.2 | 42.5 | 25.1 | 0.911 | 14.6 | 22.1 | 9.62 | 0.349 | 9.13 |
+
+ms per native block (val0) unless per 1k fills; `apply` is the
+`TraderPositions::apply` timer (section 27).
+
+| mean (valid cells) | n | matched/s | spread | vs base | vs b | pass B / 1k fills | vs base | `apply` / 1k fills | vs base | end_resident wait | settle |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b | 2 | 174,044 | 0.7% | 0.989 | 1.000 | 0.940 | 1.043 | 0.371 | 1.041 | 9.30 | 43.0 |
+| base | 3 | 175,899 | 2.2% | 1.000 | 1.011 | 0.901 | 1.000 | 0.357 | 1.000 | 9.37 | 42.9 |
+| fix | 2 | 175,902 | 2.3% | 1.000 | 1.011 | 0.911 | 1.011 | **0.229** | **0.642** | 6.34 | 43.3 |
+| sav | 2 | 177,475 | 0.6% | 1.009 | 1.020 | **0.800** | **0.888** | 0.367 | 1.028 | 9.50 | 40.7 |
+| both | 2 | 179,140 | 1.7% | **1.018** | **1.029** | **0.788** | **0.875** | **0.236** | **0.662** | 6.65 | 40.0 |
+
+- **fix: `apply` per fill -36%** (0.357 -> 0.229 ms per 1k fills, both cells
+  within 0.9%), end_resident wait 9.37 -> 6.34 ms per block. Most of the
+  a746c408 step, not all: the p0 cells of section 27 were 0.201 / 0.213, so
+  ~8-14% is left. Throughput alone: 1.000x base.
+- **sav: pass B per fill -11%** (0.901 -> 0.800 ms per 1k fills, cells 0.798
+  / 0.802), below p2's level in section 27 (0.839 / 0.863; today's b also
+  reads ~2% below section 27's b). Reserve plus the in-place update recover
+  the whole +7% of section 28 and more; no leftover from the 144 B entries
+  moved by `extend` is visible at this resolution, so 18c's next steps
+  (boxing Position, per-market caches) are not needed for this regression.
+  Settle 0.949x base; `apply` unchanged, as expected. Throughput 1.009x base.
+- **both: the gains add up.** `apply` per fill as fix (0.236), pass B per
+  fill as sav (0.788), end_resident wait 6.65; the best arm at 1.018x base,
+  1.029x b.
+- **base vs b: neutral** (matched/s 1.011x, pass B 0.959x, `apply` 0.961x per
+  fill).
+- **Throughput is within noise.** Both fixes together take ~3 ms per block
+  off the end_resident wait plus ~3 ms of pass B, ~4% of a ~150 ms chain,
+  and matched/s moves +1.8% vs base, about base's 2.2% cell spread. The
+  per-fill timers are unambiguous; a firmer matched/s number needs ~4 cells
+  per arm. 18c s104: both branches go to main as separate `--no-ff` merges
+  if each recovers its share.
+
 ## Open
 
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
@@ -3051,10 +3130,12 @@ column cannot resolve a 3% change (cache-misses per 1k instructions 3.64 vs
   `set_holder`, ~38% of the gap) and `9e695364` (exact cost basis; settle
   pass B +10% and engine +4% per fill, ~44%). Profiled (section 28): pass B's
   extra time is all `PositionCache::merge_disjoint` (more DRAM fills, same
-  instructions); match does not regress. Fixes: `perf/c2-set-holder`
-  `d7bd1c36` (ozarchy, suites green, not pushed) and 18c's
-  `perf/position-v2-savings` `37b28dd6`; 5-arm A/B against `d3ba3c0a`
-  (campaign `ozarchy-c2h`) running.
+  instructions); match does not regress. Fixes A/B'd (section 29):
+  `perf/c2-set-holder` `d7bd1c36` (`apply` per fill -36%, ~8-14% above the
+  pre-a746c408 level; 18c review: merge as is) and 18c's
+  `perf/position-v2-savings` `37b28dd6` (pass B per fill -11%, below p2's
+  level); together 1.018x matched/s vs base, within noise. Merge both to
+  main as separate `--no-ff` merges (18c).
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).

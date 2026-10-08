@@ -1,6 +1,6 @@
 # Per-cell results (every cell dir with a `summary.json`)
 
-Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`).
+Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`). After the c2h campaign finished: added `c2h` (14 cells).
 
 
 ## 14236fa: Baseline `14236fa` (C3 + C4 + PF1 + cooldown fix) at 300 markets, with perf on r1/r2
@@ -372,6 +372,25 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p2s0y-300m-p3-rec1` | OK | 2026-10-08 15:57 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 110,853.3 | 108,984.6 | 160,763.6 | 145,679.9 | 2.4 | 149.8 | 321.82 | 5.68 | AGREE | PASS | ACCEPT |
 | `ozarchy-p2s0y-300m-p3-xstat1` | OK | 2026-10-08 16:41 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 169,545.4 | 168,473.1 | 179,766.7 | 224,968.8 | 4.9 | 129.9 | 154.62 | 4.44 | AGREE | PASS | ACCEPT |
 | `ozarchy-p2s0y-300m-p3-xstat2` | OK | 2026-10-08 16:46 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 173,464.7 | 173,072.6 | 180,380.9 | 230,372.4 | 5.0 | 129.1 | 154.41 | 4.32 | AGREE | PASS | ACCEPT |
+
+## c2h: C2 holder-index fix and Position v2 savings A/B vs `d3ba3c0a`: b `d3ba3c0a`, base `bf2edda6`, fix `d7bd1c36` (built from `c051872b`), sav `37b28dd6`, both `f1ab2166`; b base fix sav both both sav fix base b, plus c2h-x pair sav-r3 base-r3; `sav-r1` failed (rc=2, host-wide RPC stall), excluded from the arm means
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-c2h-300m-b-r1` | OK | 2026-10-08 17:57 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 173,407.1 | 172,204.7 | 184,308.5 | 229,829.5 | 5.2 | 119.4 | 142.31 | 4.39 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-b-r2` | OK | 2026-10-08 18:52 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 174,680.5 | 174,554.7 | 186,820.3 | 231,920.0 | 5.1 | 126.2 | 154.79 | 4.34 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-b-warm` | OK | 2026-10-08 17:51 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 60 | 400 | - | 173,007.6 | 173,007.6 | 187,010.4 | 229,321.2 | 4.7 | 101.8 | 133.68 | 4.24 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-base-r1` | OK | 2026-10-08 18:03 | c2-set-holder-base @ bf2edda6 | 29860dc0 | 300 | 120 | 400 | - | 177,394.3 | 176,203.4 | 186,606.4 | 235,641.9 | 5.3 | 134.5 | 154.84 | 4.28 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-base-r2` | OK | 2026-10-08 18:45 | c2-set-holder-base @ bf2edda6 | 29860dc0 | 300 | 120 | 400 | - | 173,527.9 | 172,727.2 | 186,905.1 | 230,250.1 | 5.1 | 126.3 | 151.45 | 4.33 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-base-r3` | OK | 2026-10-08 19:12 | c2-set-holder-base @ bf2edda6 | 29860dc0 | 300 | 120 | 400 | - | 176,773.9 | 175,904.1 | 185,885.3 | 235,050.9 | 5.3 | 135.4 | 150.21 | 4.27 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-base-warm2` | OK | 2026-10-08 19:00 | c2-set-holder-base @ bf2edda6 | 29860dc0 | 300 | 60 | 400 | - | 173,138.1 | 173,138.1 | 184,856.4 | 229,103.3 | 4.6 | 98.5 | 135.51 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-both-r1` | OK | 2026-10-08 18:21 | c2-v2-both @ f1ab2166 | 17ac7525 | 300 | 120 | 400 | - | 180,618.7 | 179,826.4 | 191,706.9 | 240,305.8 | 5.3 | 136.8 | 148.87 | 4.23 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-both-r2` | OK | 2026-10-08 18:27 | c2-v2-both @ f1ab2166 | 17ac7525 | 300 | 120 | 400 | - | 177,660.3 | 177,354.6 | 190,390.0 | 235,624.8 | 5.1 | 124.8 | 150.43 | 4.30 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-fix-r1` | OK | 2026-10-08 18:09 | c2-set-holder @ c051872b | b843f522 | 300 | 120 | 400 | - | 173,911.6 | 173,507.6 | 186,159.6 | 231,733.2 | 5.2 | 131.8 | 150.97 | 4.40 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-fix-r2` | OK | 2026-10-08 18:40 | c2-set-holder @ c051872b | b843f522 | 300 | 120 | 400 | - | 177,891.7 | 176,949.1 | 189,261.7 | 235,688.6 | 5.3 | 134.2 | 149.31 | 4.38 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-sav-r1` | UNVERIFIED | 2026-10-08 18:16 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 135,694.4 | 133,782.9 | 171,276.0 | 178,545.7 | 3.4 | 126.0 | 169.37 | 3.98 | AGREE | UNKNOWN | UNVERIFIED |
+| `ozarchy-c2h-300m-sav-r2` | OK | 2026-10-08 18:33 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 178,036.6 | 177,179.0 | 189,469.0 | 236,627.5 | 5.1 | 131.6 | 150.37 | 4.17 | AGREE | PASS | ACCEPT |
+| `ozarchy-c2h-300m-sav-r3` | OK | 2026-10-08 19:06 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 176,912.5 | 176,991.8 | 188,521.7 | 234,400.6 | 5.1 | 130.9 | 154.80 | 4.23 | AGREE | PASS | ACCEPT |
 
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 

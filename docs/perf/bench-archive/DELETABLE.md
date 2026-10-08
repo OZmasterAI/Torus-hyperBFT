@@ -3,7 +3,7 @@
 Nothing was deleted when this list was made. Sizes are file sizes (apparent), taken at archive time on ozarchy (btrfs: the space actually freed can differ if files
 are reflinked). **Run the commands on ozarchy, after this directory is committed.**
 
-**Updated 2026-10-08 (s29).** By this update every file in the original lists below (88 Tier A + 1,008 Tier B files) had already been deleted on ozarchy. Added for the 64 dirs inventoried in s29 (see `INDEX.md`): 6 campaigns (`p2s0b`, `p2s0r`, `p2s0x`, `p2s0y`, `read-gas-stall`, `rpg-ac`) in the per-campaign table and as the last 6 command blocks, sizes taken 2026-10-08 ~17:45. Tier A now also covers staged node / bench binaries (`*-stage/<arm>/release/torus-node`, `release/bench-throughput`), `ubench_hasher` and `ubench.bin`. **Held:** `ozarchy-p2s0r-stage/b/` is in use by the c2h campaign running at update time (its own block, delete after c2h). Not listed: the `*c2h*` dirs; the `presuite-*` dirs (logs only, nothing deletable, as for `presuite-b8bf3e8a`).
+**Updated 2026-10-08 (s29).** By this update every file in the original lists below (88 Tier A + 1,008 Tier B files) had already been deleted on ozarchy. Added for the 64 dirs inventoried in s29 (see `INDEX.md`): 6 campaigns (`p2s0b`, `p2s0r`, `p2s0x`, `p2s0y`, `read-gas-stall`, `rpg-ac`) in the per-campaign table and as the last 6 command blocks, sizes taken 2026-10-08 ~17:45. Tier A now also covers staged node / bench binaries (`*-stage/<arm>/release/torus-node`, `release/bench-throughput`), `ubench_hasher` and `ubench.bin`. `ozarchy-p2s0r-stage/b/` was held while the c2h campaign ran; c2h has finished, so it is deletable now (its block below). After c2h finished (2026-10-08 ~19:15) campaign `c2h` was added (18 dirs, section 29 of the ozarchy doc; the last command block), including the c2h stage binaries as Tier A. Not listed: the `presuite-*` dirs (logs only, nothing deletable, as for `presuite-b8bf3e8a`).
 
 * **Tier A (recommended)**: profiler output (`perf.data`, `perf-*.data`, `perf.folded`, perf script dumps `*script.gz`), staged binaries (`ubench.bin`, `ubench_adl`, `ubench_read_precompile_gas.bin`,
   `bin/` dirs) and generated `genesis-*val.json` (the harness regenerates it; the md5 of each is in the cell's `summary.json`). The numbers read from them are in the docs listed in `INDEX.md`.
@@ -20,7 +20,9 @@ are reflinked). **Run the commands on ozarchy, after this directory is committed
 **Grand total freed: Tier A 3.88 GiB (4,169,742,007 bytes); Tier B 4.42 GiB (4,741,801,673 bytes); A + B 8.30 GiB (8,911,543,680 bytes)**,
 out of 8.69 GiB in the 211 inventoried dirs.
 
-**Added s29: Tier A 12.51 GiB (13,430,049,752 bytes, 70 files, of which 999.5 MiB held for c2h); Tier B 1.15 GiB (1,238,410,434 bytes, 291 files); A + B 13.66 GiB (14,668,460,186 bytes)**, out of 13.82 GiB in the 64 dirs added.
+**Added s29: Tier A 12.51 GiB (13,430,049,752 bytes, 70 files); Tier B 1.15 GiB (1,238,410,434 bytes, 291 files); A + B 13.66 GiB (14,668,460,186 bytes)**, out of 13.82 GiB in the 64 dirs added.
+
+**Added `c2h` (after the campaign finished): Tier A 3.90 GiB (4,192,376,800 bytes, 8 files); Tier B 0.35 GiB (373,635,377 bytes, 84 files); A + B 4.25 GiB (4,566,012,177 bytes)**, out of 4.28 GiB in its 18 dirs. **All s29 additions incl. c2h: Tier A 16.41 GiB (17,622,426,552 bytes); Tier B 1.50 GiB (1,612,045,811 bytes); A + B 17.91 GiB (19,234,472,363 bytes)**.
 
 ## Per campaign
 
@@ -77,8 +79,9 @@ A campaign here is a group of dirs from the same run (for example all `ozarchy-m
 | `p2s0y` | Perf A/B p2 `2ebe1a14` vs p3 `9e695364` (prof / xstat cells; first-launch rec1 cells superseded) | 12 | 521.6 MiB | 340.8 MiB | 862.4 MiB |
 | `read-gas-stall` | Write stalls and the book CF SST target (`bench/read-gas-stall`), staged `ubench.bin` | 1 | 77.1 MiB | - | 77.1 MiB |
 | `rpg-ac` | Read precompile gas after the s99 decisions (before / after / review-* runs), staged `ubench.bin` | 1 | 2144.9 MiB | - | 2144.9 MiB |
+| `c2h` | C2 holder-index fix and Position v2 savings A/B vs `d3ba3c0a` (b, base, fix, sav, both; `sav-r1` failed), staged binaries | 15 | 3998.2 MiB | 356.3 MiB | 4354.5 MiB |
 | **total (2026-10-07)** | | 183 | **3.88 GiB** | **4.42 GiB** | **8.30 GiB** |
-| **total added s29** | | 51 | **12.51 GiB** | **1.15 GiB** | **13.66 GiB** |
+| **total added s29** (incl. `c2h`) | | 66 | **16.41 GiB** | **1.50 GiB** | **17.91 GiB** |
 
 ## Largest Tier A files
 
@@ -1731,9 +1734,9 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p2s0r-stage/d/release/torus-node'
 ```
 
-**Held: in use by the c2h campaign running at archive time** (`ozarchy-c2h-campaign.sh` arm `b` = `ozarchy-p2s0r-stage/b`, and `ozarchy-c2h-build.sh` / `ozarchy-c2h2-build.sh` copy its `bench-throughput`). Delete only after the c2h campaign is finished and written up.
+**Was held while the c2h campaign ran** (`ozarchy-c2h-campaign.sh` arm `b` = `ozarchy-p2s0r-stage/b`, and `ozarchy-c2h-build.sh` / `ozarchy-c2h2-build.sh` copy its `bench-throughput`). The c2h campaign has finished: deletable now.
 
-Tier A, held, 999.5 MiB, 2 files:
+Tier A (formerly held), 999.5 MiB, 2 files:
 
 ```
 rm -- \
@@ -2088,14 +2091,124 @@ rm -- \
   '/home/oz/bench-results-matched/read-precompile-gas-ac/review-nocompact/ubench.bin'
 ```
 
+### `c2h` (A 3998.2 MiB, B 356.3 MiB; dirs: `ozarchy-c2h-300m-b-r1`, `ozarchy-c2h-300m-b-r2`, `ozarchy-c2h-300m-b-warm` ...)
+
+`ozarchy-c2h-300m-sav-r1` failed (rc=2, host-wide RPC stall) and is excluded from the arm means; its Tier B files are listed like the others.
+
+Tier A, 3998.2 MiB, 8 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/base/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/base/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/both/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/both/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/fix/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/fix/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/sav/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-stage/sav/release/torus-node'
+```
+
+Tier B, 356.3 MiB, 84 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-b-warm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-r3/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-base-warm2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-both-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-fix-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/val2.log.gz'
+```
+
 ## Grand total freed
 
 * Tier A: **3.88 GiB** (4,169,742,007 bytes), 88 files
 * Tier B: **4.42 GiB** (4,741,801,673 bytes), 1008 files
 * Tier A + B: **8.30 GiB** (8,911,543,680 bytes), out of 8.69 GiB in the 211 inventoried dirs
-* Added s29: Tier A **12.51 GiB** (13,430,049,752 bytes), 70 files, of which 999.5 MiB (`ozarchy-p2s0r-stage/b/`, 2 files) held until the c2h campaign is done
+* Added s29: Tier A **12.51 GiB** (13,430,049,752 bytes), 70 files (incl. `ozarchy-p2s0r-stage/b/`, 999.5 MiB, no longer held)
 * Added s29: Tier B **1.15 GiB** (1,238,410,434 bytes), 291 files
 * Added s29: Tier A + B **13.66 GiB** (14,668,460,186 bytes), out of 13.82 GiB in the 64 dirs added
+* Added `c2h`: Tier A **3.90 GiB** (4,192,376,800 bytes), 8 files; Tier B **0.35 GiB** (373,635,377 bytes), 84 files; A + B **4.25 GiB**
+* All s29 additions incl. `c2h`: Tier A **16.41 GiB** (17,622,426,552 bytes), 78 files; Tier B **1.50 GiB** (1,612,045,811 bytes), 375 files; A + B **17.91 GiB** (19,234,472,363 bytes)
 
 ## After the deletes
 
