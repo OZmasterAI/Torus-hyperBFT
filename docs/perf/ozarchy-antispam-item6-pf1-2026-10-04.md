@@ -2842,7 +2842,7 @@ fds; load before each cell 1.6-2.1. Driver
 `~/bench-results-matched/ozarchy-p2s0x-campaign.sh` (copy of the section 26
 driver), log `ozarchy-p2s0x.log`, cells `ozarchy-p2s0x-300m-<tag>/`.
 
-| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | settle pass B | match | end_resident | end_resident positions | positions / 1k fills | end_resident wait |
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | settle pass B | match | end_resident | `apply` | `apply` ms / 1k fills | end_resident wait |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | b warm | 175,335 | 4.68 | 24,920 | 4.29 | 133.7 | 38.7 | 22.3 | 12.7 | 21.4 | 9.13 | 0.366 | 7.7 |
 | a r1 | 185,496 | 5.44 | 26,698 | 4.20 | 139.1 | 40.1 | 23.1 | 13.8 | 16.9 | 5.28 | 0.198 | 4.6 |
@@ -2858,10 +2858,12 @@ driver), log `ozarchy-p2s0x.log`, cells `ozarchy-p2s0x-300m-<tag>/`.
 | p0 r2 | 180,164 | 5.37 | 27,340 | 4.28 | 145.3 | 40.3 | 22.9 | 15.1 | 18.8 | 5.83 | 0.213 | 5.5 |
 | a r2 | 182,789 | 5.34 | 27,740 | 4.24 | 145.3 | 40.4 | 22.7 | 14.5 | 17.9 | 5.49 | 0.198 | 4.8 |
 
-ms per native block (val0) unless per 1k fills; end_resident positions in
-thousands per block.
+ms per native block (val0) unless per 1k fills. `apply` is the
+`exec_end_resident_positions_seconds` timer (the `TraderPositions::apply`
+call in `native_executor.rs`), not a count of positions (18c s104;
+`summarize.py` labels it `end_resident_positions`).
 
-| mean of r1, r2 | matched/s | r1/r2 spread | vs a | vs b | engine ms/1k | chain ms / 1k fills | settle pass B ms / 1k fills | positions / 1k fills |
+| mean of r1, r2 | matched/s | r1/r2 spread | vs a | vs b | engine ms/1k | chain ms / 1k fills | settle pass B ms / 1k fills | `apply` ms / 1k fills |
 |---|---|---|---|---|---|---|---|---|
 | a | 184,142 | 1.5% | 1.000 | 1.080 | 4.22 | 5.22 | 0.840 | 0.198 |
 | p0 | 181,708 | 1.7% | 0.987 | 1.066 | 4.25 | 5.28 | 0.848 | 0.207 |
@@ -2873,7 +2875,7 @@ thousands per block.
 | step | matched/s | share of the a -> b gap | what moves |
 |---|---|---|---|
 | a -> p0 | -1.3% | 18% | nothing clear; within noise |
-| **p0 -> p1 (`a746c408`)** | **-2.9%** | **38%** | end_resident positions per 1k fills 0.207 -> 0.377 (1.8x), end_resident wait +3.9 ms per block; engine per fill unchanged |
+| **p0 -> p1 (`a746c408`)** | **-2.9%** | **38%** | `TraderPositions::apply` ms per 1k fills 0.207 -> 0.377 (1.8x), end_resident wait +3.9 ms per block; engine per fill unchanged |
 | p1 -> p2 | -0.7% | 9% | within noise (the p1 and p2 cells overlap) |
 | **p2 -> p3 (`9e695364`)** | **-3.5%** | **44%** | engine ms/1k 4.28 -> 4.46 (+4%), settle pass B per 1k fills 0.851 -> 0.933 (+10%) |
 | p3 -> b | +0.8% | -9% | within noise |
@@ -2884,30 +2886,40 @@ thousands per block.
 - **Confidence:** matched/s alone does not settle it. The anchors' r1/r2
   spread is 1.5-1.8% (a, b) and up to 4.2% (p1, p2), and the two culprit steps
   are only ~2x that. The per-fill metrics split cleanly at the same two steps
-  in every cell: end_resident positions per 1k fills 0.198-0.213 in all a and
-  p0 cells, 0.372-0.400 in every cell from p1 on; engine ms/1k 4.32 / 4.24 in
+  in every cell: `TraderPositions::apply` ms per 1k fills 0.198-0.213 in all a
+  and p0 cells, 0.372-0.400 in every cell from p1 on; engine ms/1k 4.32 / 4.24 in
   the p2 cells, 4.45 / 4.46 in p3; settle pass B per 1k fills 0.839 / 0.863 in
   p2, 0.932 / 0.934 in p3. Chain ms per 1k fills rises at the same two steps
   (+3.4%, +3.8%) and is flat elsewhere. High confidence that both merges cost
   throughput, moderate on the exact split.
-- **Section 26's 1.9x end_resident positions per 1k fills** (0.203 -> 0.386
-  there) is all `a746c408`.
+- **`TraderPositions::apply` time per fill** rises 1.8x at `a746c408` (a -> b
+  0.198 -> 0.374 ms per 1k fills; 0.203 -> 0.386 in the section 26 cells). 18c
+  s104 (code reading): C2's `set_holder` runs in `apply` on every written
+  position key (~2 per fill), a SipHash map lookup plus a `BTreeSet` insert,
+  even when nothing changes and no ADL is queued; holder lists are read only
+  in `adl_candidates_of`.
 - **Against section 26:** a is 2.3% higher (184,142 vs 179,993), b 1.1%
   higher (170,485 vs 168,630). Settle pass B per 1k fills a -> b is +14% here
   vs +6.9% in `ozarchy-p2s0r-phasecmp-ab.txt`; match per 1k fills +2% here vs
   +6% there.
-- **Next (owner decision):** why `a746c408` keeps ~1.8x the positions resident
-  per fill and why Position v2 makes settle pass B ~10% dearer per fill (code
-  reading first, no new bench).
+- **Next (18c s104):** ozarchy fixes C2 (`set_holder` only when a key appears
+  or disappears, non-SipHash hasher for the market map; node-local,
+  bit-identical) and A/Bs it against `d3ba3c0a` as its own row, outside Phase
+  2's +7%. Position v2 (96 -> 112 B) is not explained by the code (pass B
+  touches Position only through `pos_cache.merge_disjoint`, and match, which
+  never touches Position, rose too): ozarchy runs a perf A/B p2 vs p3 (perf
+  diff of pass B and match, perf stat cache misses); 18c builds bit-identical
+  savings meanwhile. The Phase 2 gate stays measured against `d3ba3c0a`.
 
 ## Open
 
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
   build style (D/B 1.014x), not the load generator. **Bisected** (section
-  27): `a746c408` (ADL budget; ~1.8x end_resident positions per fill, ~38% of
-  the gap) and `9e695364` (exact cost basis; settle pass B +10% and engine +4%
-  per fill, ~44%). Next: why, from the code (owner decision).
+  27): `a746c408` (ADL budget; `TraderPositions::apply` 1.8x per fill from C2's
+  `set_holder`, ~38% of the gap; ozarchy fixes it) and `9e695364` (exact cost
+  basis; settle pass B +10% and engine +4% per fill, ~44%; perf A/B p2 vs p3
+  on ozarchy, 18c builds savings).
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
