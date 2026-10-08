@@ -16,6 +16,34 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## main `b8e3b606` (2026-10-08, s104 merges)
+
+The s104 merges on top of the owner's local commits, never tested together before this run: `91f51ca0`
+(bench-launcher agent) and `4a641d15` (`detach.sh` secrets, `test_harness.py`), the merge of main
+`bf2edda6` (`93af4402`), then `perf/c2-set-holder` (`c8d25db8`) and `perf/position-v2-savings`
+(`b8e3b606`). Both branches: 18c review "merge as is". Run in the main checkout,
+`CARGO_TARGET_DIR=~/.cargo-target-c2-set-holder`; suite 4 baseline `bf2edda6` in a detached worktree
+(the differing `.rs` files touched; removed afterwards).
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,071 passed, 0 failed**, 33 skipped, 0 flaky | 124 s (82.5 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 3 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,072 passed, 0 failed**, 40 ignored (160 result lines) | 403 s |
+| 4 | clippy (no `-D`) / fmt vs `bf2edda6` | – | clippy 268 = 268, **0 new**; fmt 3,366 vs 3,354, **12 new** (below) | 12 s / 11 s |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **165 passed**, 18 subtests; 8 of 8 scripts OK (`test_harness.py` 107 tests) | 30 s |
+
+Suite 4 fmt: all 12 new hunks are in lines `perf/position-v2-savings` added:
+`torus-core/tests/position_cache_tests.rs` +10 (the new tests at lines 405-549),
+`torus-core/src/position.rs` +1 (the new `PositionCache` code at 668/682), and
+`torus-core/tests/ubench_position_cache.rs` +1 (new file, line 70). Not fixed here. The base fmt log
+shows 3,355 because `touch` created an empty `ubench_position_cache.rs` in the base worktree (1 hunk);
+the clean `bf2edda6` count is 3,354 (as in the `d7bd1c36` run below). The `test_harness.py`
+`ResourceWarning` (unclosed socket) lines are the same as in earlier runs; the script exits 0.
+
+Logs: `~/bench-results-matched/presuite-b8e3b606/`.
+
 ## `perf/c2-set-holder` `d7bd1c36` (2026-10-08)
 
 C2 holder index moved only when a position key appears or disappears, foldhash market map (18c s104
