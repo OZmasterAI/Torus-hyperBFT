@@ -438,7 +438,8 @@ Risks
   (section 5 rule 8; tests P1, P5).
 - Crash safety: unchanged; R and the summary are caches of DB post-state,
   rebuilt cold. A failed serial flush (logged, not latched) trips the marker
-  guard next block, exactly like books.
+  guard next block, exactly like books. (Since audit R01 a failed serial
+  flush latches the fail-stop; no next block runs, restart rebuilds cold.)
 - Running hash: unchanged (the flush still digests the pending set).
 - Memory: section 4; rebuild scan at the first block after boot (~1 s per 1M
   rows, estimate).

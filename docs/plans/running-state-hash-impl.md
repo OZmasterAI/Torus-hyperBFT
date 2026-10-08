@@ -405,6 +405,9 @@ deletes the row at restart and fails unless the key is excluded.
     flush is logged, not latched; the pipelined worker already latches
     `exec_failed`). The chain never continues over a gap: the next flush finds no
     `h_{n-1}` and the node goes hash-unverified (Deviation 9).
+    Superseded by audit R01 (main-chain deep review 2026-10-08): every failed
+    serial flush of a block's state or applied marker now latches `exec_failed`
+    as well, so the gap no longer arises; the hash-unverified arm stays as a guard.
 13. **Review finding 6 — attest key file.** Refused unless owner-only (no group /
     other bits: 0600 or stricter); file text and decoded bytes are zeroized
     (`zeroize::Zeroizing`; `SigningKey` zeroizes on drop); `decode_hex_key` rejects

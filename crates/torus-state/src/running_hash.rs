@@ -327,6 +327,12 @@ pub(crate) enum ChainStep {
     /// No valid `h_{height-1}` (DB above the activation height without a
     /// chain, or a skipped height): hash-unverified, nothing hashed.
     /// `first`: the marker is not recorded yet (this batch records it).
+    ///
+    /// A failed flush no longer produces a skipped height in consensus
+    /// (R01): every failed write of a block's state or applied marker, on
+    /// the serial path and on the flush worker, latches the node's fail-stop
+    /// before any later height runs, and the restart replays from the
+    /// durable marker. The skipped-height case stays as a guard.
     Unverified { first: bool },
 }
 
