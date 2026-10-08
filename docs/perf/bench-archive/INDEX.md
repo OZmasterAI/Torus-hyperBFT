@@ -35,7 +35,7 @@ New summary files in this directory (campaigns the docs do not fully cover):
 * `ozarchy-main-300m-hostcheck.md`
 * `read-precompile-gas.md`
 
-Other files here: `cells.md` (every cell's numbers), `DELETABLE.md` (what can be removed from ozarchy).
+Other files here: `cells.md` (every cell's numbers), `DELETABLE.md` (what can be removed from ozarchy), `tools/` (copies of the drivers, analysis scripts and patches that were not in git, same paths as on ozarchy; s29).
 
 | dir | size | date | commit(s) / branch | what it measured | recorded in | st | del A | del B |
 |---|---|---|---|---|---|---|---|---|
