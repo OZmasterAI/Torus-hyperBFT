@@ -28,8 +28,13 @@ if systemctl --user is-active --quiet "$UNIT.service"; then
 fi
 LOG=$(realpath -m "$LOG")
 mkdir -p "$(dirname "$LOG")"
+# Secrets stay out of the unit: `systemctl --user show` prints a unit's env, and on
+# 2026-10-08 that put the launching Claude session's messaging token into a transcript.
+SECRET_RE='TOKEN|SECRET|PASSWORD|PASSWD|_KEY$|^ANTHROPIC_|^CLAUDE_CODE_MESSAGING_'
 ENV_ARGS=()
-while IFS= read -r v; do ENV_ARGS+=(-E "$v"); done < <(compgen -e)
+while IFS= read -r v; do
+    [[ $v =~ $SECRET_RE ]] || ENV_ARGS+=(-E "$v")
+done < <(compgen -e)
 echo "detach.sh: starting $UNIT.service (log $LOG; stop: systemctl --user stop $UNIT.service)"
 exec systemd-run --user --quiet --collect --same-dir --unit="$UNIT" \
     -p StandardInput=null -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
