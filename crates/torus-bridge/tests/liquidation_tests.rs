@@ -801,7 +801,15 @@ fn adl_reaches_a_top_ranked_counterparty_past_65536_rows() {
 struct Captured(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, BTreeMap<&'static str, String>)>>>);
 
 impl Captured {
+    /// Installs [`Sometimes`] as the global default first (once): tracing
+    /// caches each callsite's interest for the whole process, and while a
+    /// capture is the only live subscriber it computes that interest from
+    /// the default of whichever thread hits the callsite first, so a
+    /// callsite first hit by another test (no subscriber) was cached as
+    /// never and this capture lost its events (cargo test, one process).
     fn with<R>(&self, f: impl FnOnce() -> R) -> R {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| tracing::subscriber::set_global_default(Sometimes).expect("no other global subscriber"));
         tracing::subscriber::with_default(self.clone(), f)
     }
 
@@ -839,6 +847,43 @@ impl tracing::Subscriber for Captured {
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The global default for threads without a capture: records nothing, but
+/// its interest in every callsite is "sometimes", so no callsite is ever
+/// cached as never and each event asks the current thread's subscriber.
+struct Sometimes;
+
+impl tracing::Subscriber for Sometimes {
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A callsite first hit on a thread without a capture (another test) while
+/// a capture is live still reaches the capture afterwards.
+#[test]
+fn capture_sees_a_callsite_first_hit_on_another_thread() {
+    fn probe() {
+        tracing::debug!("capture probe");
+    }
+    let ev = Captured::default();
+    ev.with(|| {
+        std::thread::spawn(probe).join().unwrap();
+        probe();
+    });
+    assert_eq!(ev.events("capture probe").len(), 1);
 }
 
 /// Rule H (owner s96), the S=750-like case: u1 and u2 long 10 @ 1,000
