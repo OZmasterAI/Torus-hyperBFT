@@ -37,7 +37,10 @@ The s104 merges on top of the owner's local commits, never tested together befor
 Suite 4 fmt: all 12 new hunks are in lines `perf/position-v2-savings` added:
 `torus-core/tests/position_cache_tests.rs` +10 (the new tests at lines 405-549),
 `torus-core/src/position.rs` +1 (the new `PositionCache` code at 668/682), and
-`torus-core/tests/ubench_position_cache.rs` +1 (new file, line 70). Not fixed here. The base fmt log
+`torus-core/tests/ubench_position_cache.rs` +1 (new file, line 70). Fixed in `67a93a93` (rustfmt of
+only the lines that branch added, no logic change): afterwards no fmt hunk falls in a branch-added line,
+the workspace fmt count is 3,352 (the 2 below the base are old hunks inside code the branch rewrote),
+and `cargo nextest -p torus-core -p torus-bridge` passes 1,076 / 0 (20 skipped). The base fmt log
 shows 3,355 because `touch` created an empty `ubench_position_cache.rs` in the base worktree (1 hunk);
 the clean `bf2edda6` count is 3,354 (as in the `d7bd1c36` run below). The `test_harness.py`
 `ResourceWarning` (unclosed socket) lines are the same as in earlier runs; the script exits 0.

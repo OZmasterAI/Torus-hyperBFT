@@ -2545,8 +2545,602 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
 - Harness nit: `funnel-val*.csv` has a 14-name header and 15 values per row
   (columns after `rej_margin` shifted by one).
 
+## 25. Phase 2 step 0 (Gate 0) (`perf/item6-phase2` @ `707f132f`, 2026-10-08)
+
+Step 0 node = `707f132f` (= `1a6573dc` + docs: counters, harness columns,
+cancel-by-id cell), node `0a742915`; base = main `d3ba3c0a` (plan 9.7), node
+`193ae781`. Both arms: bench `fff899ca` (from `707f132f`, byte-identical; the
+cancel-by-id flags off unless set), the step 0.2 `run-cell.sh` /
+`summarize.py` (detached copy `wt/p2s0b-707f132f`), oracle feed 30000 / 2000 ms,
+walk 0, trie off by default. Builds: `--release`, line-tables-only, mold,
+frame pointers; the base in an unseeded target dir (a reflink-seeded first
+attempt kept step 0 crates as fresh and gave a mixed binary; discarded).
+Standard shape (section 21.4): N=4 + budget 900, 300 markets uniform, cap 400,
+rate 76,000, `RETRY_BUSY=1`, 120 s. Order: s-warm (60 s), overhead check
+ABBA s-r1, b-r1, b-r2, s-r2 (no perf), s-prof (perf on val0, `cycles:u` 499 Hz,
+45 s from 35 s into the load), s-byid (`CANCEL_BY_ID_FRACTION=0.1
+MODIFY_FRACTION=0.05`), s-w10 (`ORACLE_WALK_BP=10` + `ORACLE_FEED_DRAIN=1`, no
+perf); 03:10-04:03. All 8 cells rc 0, AGREE, liveness PASS, accepted, no
+deaths, exe md5 3/3 as staged, oracle stale 0 / fresh 300, block tail 0 errors
+/ 0 missed, no tail WARNING; cancel-alls 37.4-39.7% of actions. Each cell ran
+as its own unit through `detach.sh`; the root-only `signal_generate` trace was
+not running (no sudo on the agent side; the death watcher saw no death). Open
+files: max 657 per validator (soft limit in the `detach.sh` units 65,536, hard
+524,288), so `LimitNOFILE` was not changed. Driver
+`~/bench-results-matched/ozarchy-p2s0b-campaign.sh`, tables
+`ozarchy-p2s0b-cells.txt`, `ozarchy-p2s0b-pernode.txt`, tools
+`ozarchy-p2s0b-tools/`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/blk \| ms/1k | phase 1 | margin | match | settle | cache flush | flush worker | chain |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| s-warm (60 s) | 166,464 | 4.887 | 26,424 | 115.2 \| 4.36 | 21.3 | 26.6 | 13.6 | 40.8 | 11.3 | 52.5 | 146.0 |
+| s-r1 | 165,622 | 4.869 | 26,878 | 122.6 \| 4.56 | 21.7 | 28.0 | 15.2 | 43.8 | 12.1 | 51.1 | 155.7 |
+| b-r1 | 169,295 | 5.131 | 26,861 | 121.1 \| 4.51 | 21.5 | 28.4 | 14.8 | 43.7 | 11.6 | 50.1 | 152.2 |
+| b-r2 | 159,922 | 4.902 | 27,358 | 129.6 \| 4.74 | 22.8 | 28.7 | 16.2 | 46.6 | 12.5 | 54.1 | 164.2 |
+| s-r2 | 163,861 | 4.762 | 27,230 | 125.7 \| 4.61 | 21.8 | 29.3 | 15.5 | 46.4 | 12.6 | 51.2 | 159.9 |
+| s-prof (perf) | 155,194 | 3.637 | 36,586 | 170.8 \| 4.67 | 29.9 | 38.8 | 23.4 | 62.4 | 16.1 | 71.5 | 217.6 |
+| s-byid | 160,460 | 4.762 | 26,505 | 125.6 \| 4.74 | 25.1 | 27.9 | 14.7 | 43.7 | 11.9 | 51.8 | 158.6 |
+| s-w10 (walk 10, drain) | 164,322 | 4.813 | 34,141 | 160.6 \| 4.70 | 26.6 | 34.1 | 18.6 | 55.8 | 14.7 | 63.0 | 199.6 |
+
+ms per native block, val0, from the node's timers over bench + drain (harness
+`phase_by_node`). New columns (step 0.2):
+
+| cell | cancel-alls / blk | books visited / hit per cancel-all | spawns / blk (match, settle, save books, end_resident) | spawns / min | user \| sys CPU ms / blk | user \| sys CPU ms / 1k | oracle-only blocks: n, avg, p50, p95 ms |
+|---|---|---|---|---|---|---|---|
+| s-warm | 52.2 | 298.8 / 93.1 | 42.7 (13.8, 13.0, 15.0, 1.0) | 14,793 | 1,031 \| 84.9 | 30.3 \| 2.49 | 2, 3.6, 3.4, 4.9 |
+| s-r1 | 58.7 | 299.5 / 86.8 | 52.4 (17.1, 15.9, 18.4, 1.0) | 17,977 | 1,014 \| 76.7 | 29.8 \| 2.26 | 8, 39.9, 7.6, 112 |
+| b-r1 | - | - | - | - | 968 \| 75.5 | 29.3 \| 2.29 | - |
+| b-r2 | - | - | - | - | 983 \| 74.2 | 30.1 \| 2.28 | - |
+| s-r2 | 56.8 | 299.3 / 88.6 | 47.5 (15.2, 14.5, 16.9, 1.0) | 15,816 | 1,020 \| 77.2 | 29.6 \| 2.24 | 5, 40.4, 4.6, 124 |
+| s-prof | 72.2 | 299.3 / 92.3 | 54.9 (17.4, 16.9, 19.6, 1.0) | 13,423 | 1,286 \| 398 | 30.1 \| 9.33 | 12, 18.7, 6.6, 77.9 |
+| s-byid | 57.0 | 299.3 / 88.8 | 48.2 (15.6, 14.5, 17.1, 1.0) | 16,260 | 1,012 \| 78.0 | 30.0 \| 2.32 | 4, 48.7, 7.6, 121 |
+| s-w10 | 72.1 | 299.7 / 88.8 | 58.2 (18.8, 17.5, 21.0, 1.0) | 16,820 | 1,020 \| 72.9 | 29.9 \| 2.14 | 41, 19.3, 4.0, 100 |
+
+Process CPU is the whole node (all ~190 threads), load window. The base has no
+counters (-). Spawn sites `margin_prepare`, `open_orders`, `flush_digest`,
+`root_buckets` and `load_books` read 0 per native block on this shape.
+
+- **Overhead check: the counters cost nothing measurable.** Step 0 / base
+  (ABBA, 2 cells per arm): matched/s 164,741 / 164,608 = **1.001x**; engine
+  ms/1k 0.991x, phase 1 0.982x, chain 0.998x, user CPU / 1k 0.999x, sys CPU /
+  1k 0.986x. The two base cells alone differ by 5.6% (169,295 / 159,922), so
+  the resolution is the usual ~5%.
+- **Gate 0 met:** counters in the harness, standard-shape cells on the step 0
+  node with the new columns (s-r1, s-r2), estimates in the plan.
+- **Cancel-all:** 57-59 per native block (72-79 in the perf and walk-10 cells,
+  whose blocks are larger). Every call visits all ~300 books; the sender has
+  orders or stops in **87-93 of them (29-31%)**.
+- **Thread spawns: 47.5-52.4 per native block, 15.8-18.0k per minute** (exact
+  node counters; section 22's perf lower bound was 15.6k per minute; in s-prof
+  perf saw 11.5k distinct exec tids per minute vs the counter's 13.4k). Three
+  sites spawn ~15-19 threads each per block (match, settle, save books) plus
+  one end-resident thread. A C microbench on this host (pthread create + join,
+  2 MiB stacks, idle host, `ozarchy-p2s0b-spawn/`): 16.7 us per thread in a
+  scope of 16 (0.27 ms per scope), 30 us for a single thread. So ~0.8 ms per
+  native block of exec-thread wall at idle-host cost (estimate; more under
+  load). Its CPU (~50 x 17 us) is ~1% of the process sys time (77 ms per
+  native block), so sys CPU per 1k fills cannot show the pool's effect.
+- **Sys CPU:** 2.14-2.32 ms per 1k fills on both arms without perf; 9.33 with
+  perf on (section 22: 2 -> 9).
+- **Oracle-only blocks (node timer):** few in the standard cells (2-8, the feed
+  is paused for the drain), mean 40 ms, p95 112-124 ms: the first blocks after
+  the load, which wait on the flush backlog (row 77). With walk 10 and the feed
+  live through the drain: 41 blocks, mean 19.3, p50 4.0, p95 100 ms (section
+  22.3 from perf / logs: 15 blocks, mean 14.4, p50 4.7, p90 48). p50 / p95 are
+  bucket interpolations.
+- **Walk 10 vs walk 0** (s-w10 vs mean s-r1 / s-r2): matched/s 0.997x, engine
+  ms/1k 1.025x (section 22.2: 0.975x, 1.07x).
+
+### 25.1 0.3: what the cancel-all time is spent on (s-prof, load window)
+
+perf on val0 in the load window: 175 native blocks, 37,633 fills and 79.4
+cancel-alls per native block, 300.0 books visited / 94.7 hit per cancel-all.
+Inline-expanded (`llvm-addr2line -i`) exec-thread samples under
+`exec_cancel_all_run` / `exec_cancel_all` / `cancel_orders_and_stops`, split
+by line (`ozarchy-p2s0b-tools/split.py`, lines at `707f132f`). "Scan" = paid
+per (book x run member) or per (action x market) whether or not the sender has
+anything there; "work" = per cancelled order, stop or hit.
+
+| part | ms per native block | kind |
+|---|---|---|
+| cancel-all inclusive | **30.0** (0.80 ms/1k) | |
+| `apply_cancel_all_many`: removal from the levels, journals, index | 10.3 | work |
+| plan: locate targets (`order_index` / `order_seq` get + `partition_point`, cancel_batch.rs:352-361) | 9.7 | work |
+| plan: `trader_orders.get(sender)` probe (:338) | 3.5 | scan |
+| run: store / drop per book (`per_action`, the `cancel_all_many` result; native_executor.rs:9131-9137, 9159-9160) | 2.0 | scan |
+| plan: sort + levels; per-target push | 1.2 | work |
+| margin of cancelled orders, hit bookkeeping, release | 1.5 | work |
+| run: results loop over all markets per action (:9141-9149) | 0.9 | scan |
+| plan: first-occurrence sort + allocs, probe loop (:323-346) | 0.5 | scan |
+| run: `get_mut` / `margin_configs.get`, allocs, members filter per book (:9108-9122) | 0.3 | scan |
+| `take_pending_stops` (`any` over the book's stops + take) | 0.05 | scan / work |
+| sequential fallback (`owners < 2`) | 0.01 | |
+| **scan / work** | **7.3 / 22.7** | |
+
+- **Section 22's "book scan 18.2 ms" was mostly work.** It was the self time
+  of `cancel_all_many` with the plan and apply code inlined into it; per line,
+  three quarters of cancel-all is removing orders that are really cancelled
+  (locate, `partition_point`, removal), which scales with orders cancelled.
+  The members filter (0.05) and `take_pending_stops` (0.05) cost almost
+  nothing; the probes cost 3.5.
+- **P2-1 estimate: ~5.0 ms per native block in this window** (7.3 ms of scan
+  x (1 - 94.7 / 300) visited-but-empty books), **~3.7 ms on the standard
+  no-perf cells** (58 instead of 79 cancel-alls per block). The index's own
+  upkeep (one insert per resting order or per (trader, market) per block) is
+  not in that number. The plan's 5-18 ms range assumed most of the 18.2 ms was
+  scan.
+- **Cache flush (for P2-2, same window, `flush_all` inclusive 17.6 ms per
+  native block):** `put_position` 9.7 (overlay `BTreeMap` insert of the owned
+  key, backend.rs:2056: 7.2; `intern_cf` 0.8; serialise + buffer 1.2), the
+  second lookup `map.get` (position.rs:684) 3.5, the key sort (:682) 3.05,
+  balance cache 0.5 (`ozarchy-p2s0b-tools/flushsplit.py`). The batch API
+  removes the second lookup, `intern_cf` and the per-row lock: ~4.6 ms here,
+  ~3.2 ms on the standard cells (cache flush 12.1-12.6 ms there) (estimate).
+  The per-row `BTreeMap` insert (7.2) stays unless the CF map is built in bulk
+  from the sorted rows (not in the plan).
+
+### 25.2 Cancel / modify by id (P2-1b, s-byid)
+
+- **Delivered share is small:** the bench sent 658 cancels and 300 modifies,
+  all accepted (1.22 by-id actions per native block), not the 10% / 5% of
+  fires asked: 16,445 of 17,361 `torus_getOpenOrders` lookups (one market per
+  lookup) found no own order in that market. Lookup errors 0.
+- **Books probed per by-id action: 457** (val0; 456-459 on all validators),
+  i.e. 1.5 passes over the 300 books (cancel probes twice, modify once, both
+  stop at the order).
+- **Phase 1: 25.1-25.8 ms per native block on the three validators vs
+  21.7-23.4 in s-r1 / s-r2: +3.1 ms per block, ~2.5 ms per by-id action.** The
+  probes themselves are ~457 SipHash lookups (~10-20 us). The rest is not
+  split (no perf in this cell); likely cause (inferred, not measured): a single
+  cancel or modify between cancel-alls splits a cancel-all run, and each run
+  pays its per-book work over all 300 books again (25.1). P2-1's index cuts
+  that too; P2-1b's map cuts only the probes. A perf cell with a larger by-id
+  share is needed before P2-1b's gate is read.
+
+### 25.3 Hasher microbench (P2-5)
+
+`ubench_hasher` from `707f132f` (release, same flags), 10 processes x best of
+30 reps of 2M ops, pinned to CPU 8; median [min-max] over the processes,
+`ozarchy-p2s0b-hasher/summary.txt`:
+
+| case | SipHash ns | foldhash ns | ratio |
+|---|---|---|---|
+| `hash_one` Address | 16.57 [16.56-16.58] | 10.06 [10.05-10.06] | 0.607 [0.607-0.607] |
+| `hash_one` order id | 14.32 [14.31-14.35] | 1.87 [1.87-1.87] | 0.131 [0.130-0.131] |
+| Address map get | 23.88 [23.73-24.45] | 12.86 [12.76-13.34] | 0.540 [0.536-0.551] |
+| (Address, market) map get | 49.46 [47.16-50.76] | 28.11 [27.88-28.27] | 0.566 [0.551-0.597] |
+| order-id map get | 21.84 [21.23-22.34] | 6.28 [5.98-6.46] | 0.287 [0.282-0.291] |
+| order-id churn | 33.70 [33.33-34.13] | 13.74 [9.86-16.04] | 0.408 [0.296-0.470] |
+| Address set insert | 22.46 [22.31-22.83] | 21.70 [21.50-21.84] | 0.964 [0.946-0.974] |
+
+- `hash_one` mean ratio 0.369 (spread < 0.1%); the test's estimate is **15.8
+  ms per native block** at section 22's 190 ms engine and 13.2% hash share;
+  at the standard cells' engine (124 ms per native block) the same share gives
+  **~10.3 ms** (estimate). Map-level ratios (0.29-0.57) are the better guide
+  per map; order-id churn is the noisiest case (foldhash 9.9-16.0 ns).
+
+### 25.4 Verdict
+
+- Counters: no measurable cost (1.001x); later Phase 2 arms can carry them.
+- **Step 0 checkpoint: P2-1 + P2-2 come out below 13 ms per native block:**
+  ~5.0 + ~4.6 = ~9.6 ms in the perf window (37.6k fills per block, close to
+  section 22's 39.2k), ~3.7 + ~3.2 = ~6.9 ms on the standard no-perf cells
+  (27k fills, engine 124 ms). As a share of engine time that is 4.7-5.6%,
+  against the ~6.8% that 13 ms of 190 stood for. Owner decision (plan 9.1):
+  pull P2-5 (~10 ms on the standard cells, estimate) into the gate set, or
+  accept a lower gate.
+- P2-3: ~50 spawns per native block, ~0.8 ms of exec-thread wall at idle-host
+  spawn cost (estimate); its gate should read the spawn counter and matched/s,
+  not sys CPU (the spawns are ~1% of it).
+- **Unexplained: both arms are ~9% below section 23.1's `35e69b3` cells on the
+  same shape** (164.7k vs 181.5k matched/s; engine 4.51-4.74 vs 4.29 ms/1k;
+  native blocks 4.76-5.13 vs 5.45 per s). Not interleaved: bench binary,
+  base and day differ. The step 0 / base comparison is not affected.
+  **Checked in section 26:** interleaved, `d3ba3c0a` is 6.3% below `35e69b3`
+  (not the 4 MiB SSTs, not the build style); the rest was the day or window.
+
+## 26. Regression check: main `d3ba3c0a` vs `35e69b3` (2026-10-08)
+
+The ~9% gap of section 25.4 (not interleaved), checked with interleaved arms
+(owner s101). Arms, all with bench `fff899ca` (from `707f132f`), the step 0.2
+harness (`wt/p2s0b-707f132f`), oracle feed 30000 / 2000 ms walk 0, trie off by
+default, standard shape (N=4 + budget 900, 300 markets, cap 400, rate 76,000,
+`RETRY_BUSY=1`, 120 s), no perf:
+
+- **A** = main `35e69b3` (the section 23.1 node), node `9f5c53bb`. The 23.1
+  binary (`c2ea1ff8`) was pruned; rebuilt as 23.1 did (same worktree path and
+  target-dir path, same flags, `-p torus-node -p bench-throughput`, unseeded,
+  every workspace crate compiled from the 35e69b3 tree). Not bit-identical to
+  `c2ea1ff8` (cause not found); A reproduces 23.1's matched/s (below).
+- **B** = main `d3ba3c0a`, node-only build `193ae781` (the section 25 base).
+- **C** = B's binary + `TORUS_BOOK_CF_TARGET_FILE_MB=64` (the book CF SST size
+  before `d3ba3c0a`). The harness passes it through `EXTRA_ENV` unfiltered; the
+  driver checked the variable on all 3 nodes and `target_file_size_base=67108864`
+  for `cf_native_order_books` in each validator's RocksDB OPTIONS (B: 4194304;
+  A: 67108864, the old default).
+- **D** = `d3ba3c0a` built like A (`-p torus-node -p bench-throughput`), node
+  `d76b4427`. Added because the combined build gives a different node binary
+  than B's node-only build (bench-side `reqwest` / `hyper-rustls` / `tower`
+  features unify into the node). It isolates build style.
+
+Order: B warm (60 s), then A B C D D C B A; 04:59-05:51. All 9 cells rc 0,
+AGREE, liveness PASS, accepted, no deaths, exe md5 3/3 as staged, oracle stale
+0, no tail WARNING, max 675 open fds. Driver
+`~/bench-results-matched/ozarchy-p2s0r-campaign.sh`, table
+`ozarchy-p2s0r-table.txt`. (A first launch at 04:38 never started a cell: five
+looping `gh api graphql` processes from another app held the load at ~7, and
+the driver's quiet-host check gave up after 900 s; they were stopped by the
+owner and the campaign relaunched.)
+
+| cell | matched/s | submit/s | placed/s | native blk/s | fills/blk | engine ms/blk \| ms/1k | phase 1 | margin | match | settle | flush worker | chain | exec busy |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B warm | 166,867 | 1,046 | 221,292 | 5.000 | 23,699 | 104.5 \| 4.41 | 17.4 | 24.1 | 13.0 | 37.9 | 43.0 | 131.1 | 0.942 |
+| A r1 | 181,933 | 1,044 | 241,887 | 5.361 | 26,822 | 115.0 \| 4.29 | 21.3 | 26.9 | 13.6 | 40.6 | 49.1 | 142.4 | 0.967 |
+| B r1 | 167,115 | 983 | 222,106 | 4.992 | 27,953 | 125.8 \| 4.50 | 22.5 | 29.4 | 15.6 | 44.4 | 56.6 | 159.7 | 0.965 |
+| C r1 | 168,040 | 994 | 223,104 | 5.049 | 27,564 | 124.4 \| 4.51 | 23.1 | 28.9 | 14.7 | 44.9 | 51.5 | 156.2 | 0.961 |
+| D r1 | 172,577 | 989 | 228,932 | 5.106 | 27,579 | 121.4 \| 4.40 | 22.3 | 28.4 | 14.5 | 43.4 | 52.3 | 153.6 | 0.967 |
+| D r2 | 169,287 | 989 | 224,794 | 5.164 | 26,695 | 117.6 \| 4.40 | 20.6 | 26.6 | 14.1 | 42.5 | 50.2 | 150.8 | 0.965 |
+| C r2 | 170,337 | 1,000 | 226,048 | 5.163 | 28,180 | 125.2 \| 4.44 | 22.0 | 29.0 | 14.8 | 45.2 | 51.5 | 157.9 | 0.966 |
+| B r2 | 170,145 | 991 | 225,919 | 4.869 | 28,839 | 127.5 \| 4.42 | 21.9 | 30.3 | 15.9 | 45.8 | 52.8 | 161.0 | 0.959 |
+| A r2 | 178,052 | 1,032 | 236,876 | 5.244 | 27,410 | 119.0 \| 4.34 | 21.1 | 27.6 | 14.3 | 42.4 | 52.6 | 148.5 | 0.968 |
+
+ms per native block (val0, bench + drain window); submit/s = load-generator
+accepted actions per s; exec busy = execution-thread busy fraction (load
+window).
+
+| mean of r1, r2 | A | B | C | D | B/A | C/A | D/A | C/B | D/B |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | 179,993 | 168,630 | 169,188 | 170,932 | **0.937** | 0.940 | 0.950 | **1.003** | 1.014 |
+| submit/s | 1,038 | 987 | 997 | 989 | 0.951 | 0.961 | 0.953 | 1.010 | 1.002 |
+| placed/s | 239,382 | 224,013 | 224,576 | 226,863 | 0.936 | 0.938 | 0.948 | 1.003 | 1.013 |
+| native blk/s | 5.30 | 4.93 | 5.11 | 5.13 | 0.930 | 0.963 | 0.968 | 1.036 | 1.041 |
+| engine ms/1k | 4.31 | 4.46 | 4.47 | 4.40 | 1.034 | 1.037 | 1.020 | 1.003 | 0.987 |
+| chain ms/blk | 145.4 | 160.4 | 157.1 | 152.2 | 1.103 | 1.080 | 1.047 | 0.979 | 0.949 |
+
+- **Verdict (owner rules): B < A and C ≈ B.** `d3ba3c0a` is 6.3% below
+  `35e69b3` on matched/s (both B cells below both A cells), and the 64 MiB
+  book SSTs do not bring it back (C/B 1.003x). The 4 MiB SSTs are not the
+  cause. Next: the owner's bisect of the merges in between (ADL budget / dirty
+  check, exact cost basis, row 50 follow-ups), as a separate job.
+- **Not the build style:** D/B 1.014x, within the ~5% cell resolution (D sits
+  between B and A on engine ms/blk: 119.5 vs 126.7 / 117.0, a hint worth one
+  more pair if the bisect lands on nothing).
+- **Not the load generator:** with `MAX_IN_FLIGHT=4` the generator is closed
+  loop (a slot frees when its action commits), so submit/s follows the chain.
+  The execution thread is 96-97% busy on every arm and placed per submitted
+  action is the same (A 231, B 227), so the chain, not the generator, sets the
+  rate. The cost is on the node: engine +3.4% per 1k fills, chain +10% per
+  native block.
+- **Size of the gap:** A matches section 23.1's `35e69b3` cells (179,993 vs
+  181,500 / 180,501), and B is 2.4% above section 25's base cells (168,630 vs
+  164,608): of the ~9% in section 25.4, ~6% is the code and ~2-3% was the day
+  or window.
+- **For Phase 2:** the +7% gate is measured against `d3ba3c0a` (plan 9.7), so
+  the gate's reference does not move; the regression is for 18c / the owner.
+
+## 27. Bisect of the section 26 regression (campaign `ozarchy-p2s0x`, 2026-10-08)
+
+Five more node-only builds on the first-parent path from `35e69b3` to
+`d3ba3c0a`, each from its own detached worktree into its own fresh, unseeded
+target dir, flags as section 26 (`--release`, line-tables-only, mold, frame
+pointers; `ozarchy-p2s0x-build.sh`). B is section 26's `193ae781`. Same bench
+`fff899ca`, harness, oracle feed and standard shape as section 26.
+
+| arm | commit | node | merges since the previous arm (first parent) |
+|---|---|---|---|
+| a | `35e69b3` | `7a66c678` | - |
+| p0 | `8582e827` (`a746c408^1`) | `58ebd01a` | B batch, row 74 storage halt, row 50 rejected status, StateDb compaction join, test flakes, dev debuginfo, docs |
+| p1 | `a746c408` | `41b606d3` | `perf/adl-budget` (ADL work budget, C2 holder lists) |
+| p2 | `2ebe1a14` (`9e695364^1`) | `b7798354` | ADL dirty check, 9.11 counter, governance params, item 7 step 0, read-precompile gas, antispam eviction metric, row 80, row 50 follow-ups |
+| p3 | `9e695364` | `2549ecdf` | `fix/exact-cost-basis` (Position v2, cost basis) |
+| b | `d3ba3c0a` | `193ae781` | `fix/test-dir-leak`, `fix/read-gas-followup` (4 MiB book SSTs) |
+
+Order: b warm (60 s), then a p0 p1 p2 p3 b b p3 p2 p1 p0 a (120 s each);
+13:23-14:39. All 13 cells rc 0, AGREE, liveness PASS, accepted, no deaths, exe
+md5 3/3 as staged, trie off, oracle stale 0, no tail WARNING, max 439 open
+fds; load before each cell 1.6-2.1. Driver
+`~/bench-results-matched/ozarchy-p2s0x-campaign.sh` (copy of the section 26
+driver), log `ozarchy-p2s0x.log`, cells `ozarchy-p2s0x-300m-<tag>/`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | settle pass B | match | end_resident | `apply` | `apply` ms / 1k fills | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| b warm | 175,335 | 4.68 | 24,920 | 4.29 | 133.7 | 38.7 | 22.3 | 12.7 | 21.4 | 9.13 | 0.366 | 7.7 |
+| a r1 | 185,496 | 5.44 | 26,698 | 4.20 | 139.1 | 40.1 | 23.1 | 13.8 | 16.9 | 5.28 | 0.198 | 4.6 |
+| p0 r1 | 183,252 | 5.46 | 27,880 | 4.22 | 146.2 | 41.8 | 24.0 | 13.9 | 18.0 | 5.60 | 0.201 | 5.3 |
+| p1 r1 | 179,509 | 5.46 | 25,650 | 4.20 | 137.4 | 38.7 | 22.4 | 12.6 | 21.0 | 9.57 | 0.373 | 8.8 |
+| p2 r1 | 171,552 | 5.17 | 28,280 | 4.32 | 156.3 | 42.0 | 23.7 | 14.8 | 25.2 | 11.24 | 0.397 | 10.7 |
+| p3 r1 | 167,547 | 5.05 | 26,730 | 4.45 | 152.9 | 42.7 | 24.9 | 14.9 | 23.9 | 10.68 | 0.400 | 10.7 |
+| b r1 | 171,985 | 4.83 | 27,920 | 4.44 | 155.5 | 45.1 | 26.8 | 15.3 | 23.7 | 10.47 | 0.375 | 9.6 |
+| b r2 | 168,985 | 5.03 | 27,870 | 4.42 | 157.1 | 44.7 | 26.8 | 14.4 | 23.8 | 10.41 | 0.374 | 10.0 |
+| p3 r2 | 170,863 | 5.13 | 28,040 | 4.46 | 157.4 | 44.6 | 26.2 | 15.1 | 23.5 | 10.47 | 0.374 | 9.8 |
+| p2 r2 | 178,989 | 5.36 | 28,320 | 4.24 | 152.6 | 42.8 | 24.5 | 14.3 | 23.1 | 10.52 | 0.372 | 9.5 |
+| p1 r2 | 173,415 | 5.04 | 27,380 | 4.37 | 151.9 | 42.6 | 24.5 | 14.4 | 23.1 | 10.43 | 0.381 | 9.8 |
+| p0 r2 | 180,164 | 5.37 | 27,340 | 4.28 | 145.3 | 40.3 | 22.9 | 15.1 | 18.8 | 5.83 | 0.213 | 5.5 |
+| a r2 | 182,789 | 5.34 | 27,740 | 4.24 | 145.3 | 40.4 | 22.7 | 14.5 | 17.9 | 5.49 | 0.198 | 4.8 |
+
+ms per native block (val0) unless per 1k fills. `apply` is the
+`exec_end_resident_positions_seconds` timer (the `TraderPositions::apply`
+call in `native_executor.rs`), not a count of positions (18c s104;
+`summarize.py` labels it `end_resident_positions`).
+
+| mean of r1, r2 | matched/s | r1/r2 spread | vs a | vs b | engine ms/1k | chain ms / 1k fills | settle pass B ms / 1k fills | `apply` ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|
+| a | 184,142 | 1.5% | 1.000 | 1.080 | 4.22 | 5.22 | 0.840 | 0.198 |
+| p0 | 181,708 | 1.7% | 0.987 | 1.066 | 4.25 | 5.28 | 0.848 | 0.207 |
+| p1 | 176,462 | 3.5% | 0.958 | 1.035 | 4.29 | 5.46 | 0.884 | 0.377 |
+| p2 | 175,270 | 4.2% | 0.952 | 1.028 | 4.28 | 5.46 | 0.851 | 0.384 |
+| p3 | 169,205 | 2.0% | 0.919 | 0.992 | 4.46 | 5.66 | 0.933 | 0.387 |
+| b | 170,485 | 1.8% | **0.926** | 1.000 | 4.43 | 5.60 | 0.959 | 0.374 |
+
+| step | matched/s | share of the a -> b gap | what moves |
+|---|---|---|---|
+| a -> p0 | -1.3% | 18% | nothing clear; within noise |
+| **p0 -> p1 (`a746c408`)** | **-2.9%** | **38%** | `TraderPositions::apply` ms per 1k fills 0.207 -> 0.377 (1.8x), end_resident wait +3.9 ms per block; engine per fill unchanged |
+| p1 -> p2 | -0.7% | 9% | within noise (the p1 and p2 cells overlap) |
+| **p2 -> p3 (`9e695364`)** | **-3.5%** | **44%** | engine ms/1k 4.28 -> 4.46 (+4%), settle pass B per 1k fills 0.851 -> 0.933 (+10%) |
+| p3 -> b | +0.8% | -9% | within noise |
+
+- **Verdict: two merges, `a746c408` (ADL budget) and `9e695364` (exact cost
+  basis), together ~80% of the gap.** The rest is spread over steps within
+  noise. B/A 0.926 repeats section 26 (0.937).
+- **Confidence:** matched/s alone does not settle it. The anchors' r1/r2
+  spread is 1.5-1.8% (a, b) and up to 4.2% (p1, p2), and the two culprit steps
+  are only ~2x that. The per-fill metrics split cleanly at the same two steps
+  in every cell: `TraderPositions::apply` ms per 1k fills 0.198-0.213 in all a
+  and p0 cells, 0.372-0.400 in every cell from p1 on; engine ms/1k 4.32 / 4.24 in
+  the p2 cells, 4.45 / 4.46 in p3; settle pass B per 1k fills 0.839 / 0.863 in
+  p2, 0.932 / 0.934 in p3. Chain ms per 1k fills rises at the same two steps
+  (+3.4%, +3.8%) and is flat elsewhere. High confidence that both merges cost
+  throughput, moderate on the exact split.
+- **`TraderPositions::apply` time per fill** rises 1.8x at `a746c408` (a -> b
+  0.198 -> 0.374 ms per 1k fills; 0.203 -> 0.386 in the section 26 cells). 18c
+  s104 (code reading): C2's `set_holder` runs in `apply` on every written
+  position key (~2 per fill), a SipHash map lookup plus a `BTreeSet` insert,
+  even when nothing changes and no ADL is queued; holder lists are read only
+  in `adl_candidates_of`.
+- **Against section 26:** a is 2.3% higher (184,142 vs 179,993), b 1.1%
+  higher (170,485 vs 168,630). Settle pass B per 1k fills a -> b is +14% here
+  vs +6.9% in `ozarchy-p2s0r-phasecmp-ab.txt`; match per 1k fills +2% here vs
+  +6% there.
+- **Next (18c s104):** ozarchy fixes C2 (`set_holder` only when a key appears
+  or disappears, non-SipHash hasher for the market map; node-local,
+  bit-identical) and A/Bs it against `d3ba3c0a` as its own row, outside Phase
+  2's +7%. Position v2 (96 -> 112 B) is not explained by the code (pass B
+  touches Position only through `pos_cache.merge_disjoint`, and match, which
+  never touches Position, rose too): ozarchy runs a perf A/B p2 vs p3 (perf
+  diff of pass B and match, perf stat cache misses); 18c builds bit-identical
+  savings meanwhile. The Phase 2 gate stays measured against `d3ba3c0a`.
+
+## 28. Perf A/B of the exact cost basis merge: p2 `2ebe1a14` vs p3 `9e695364` (campaign `ozarchy-p2s0y`, 2026-10-08)
+
+Asked by 18c (s104) after reading the code could not explain section 27's
+p2 -> p3 step. The section 27 binaries (p2 `b7798354`, p3 `2549ecdf`), bench
+`fff899ca`, harness and standard shape as section 27. Driver
+`~/bench-results-matched/ozarchy-p2s0y-campaign.sh`, sidecar
+`ozarchy-p2s0y-tools/perf2-sidecar.sh`, analysis `ozarchy-p2s0y-tools/p2s0y.py`
+(`cells`, `rec`, `cmp`, `stat`); reports `ozarchy-p2s0y-{cells,xstat-cmp,prof-cmp,stat}.txt`
+and `ozarchy-p2s0y-perfdiff-prof{1,2}.txt`. All cells rc 0, exe md5 3/3 as
+staged, trie off, oracle stale 0, no deaths; load 1.7-1.98 before each cell;
+`perf_event_paranoid=2`, all events `:u`, no sysctl change.
+
+Cells, each mirrored p2 p3 p3 p2 after a 60 s p2 warm-up (15:58-16:52, unit
+`bench-ozarchy-p2s0y-2.service`):
+
+- **prof:** W1 whole-process `cycles:u` at 499 Hz with frame-pointer call
+  graphs (35-80 s, the section 22 / 25 setting); W2 `perf stat` on the
+  execution thread only (`-t <exec tid> --no-inherit`, 82-102 s). Costs ~3-6%
+  of matched/s.
+- **xstat:** W1 a 5-event `perf record` on the execution thread only, no
+  inherit (cycles, instructions, L1d load misses, DRAM demand fills
+  `ls_dmnd_fills_from_sys.mem_io_local`, one more); W2 whole-process `perf
+  stat`. Costs ~0-2%: the closest to clean cells.
+- The execution thread is the `torus-execution` task with the most CPU
+  (~2,700 ticks vs 3 for the next).
+
+| cell | node | matched/s | fills/blk | engine ms/1k | settle | pass B | match | pass B / 1k fills | match / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|
+| p2 warm2 | b7798354 | 170,799 | 29,722 | 4.19 | 43.6 | 25.2 | 14.1 | 0.848 | 0.475 |
+| p2 prof1 | b7798354 | 165,524 | 37,455 | 4.45 | 58.9 | 32.2 | 22.0 | 0.861 | 0.587 |
+| p3 prof1 | 2549ecdf | 166,816 | 38,353 | 4.41 | 59.9 | 32.9 | 22.6 | 0.858 | 0.589 |
+| p3 prof2 | 2549ecdf | 162,123 | 38,042 | 4.47 | 61.9 | 33.9 | 23.6 | 0.892 | 0.620 |
+| p2 prof2 | b7798354 | 165,228 | 37,990 | 4.37 | 59.0 | 31.8 | 22.8 | 0.836 | 0.601 |
+| p2 xstat1 | b7798354 | 172,823 | 27,274 | 4.34 | 41.0 | 23.5 | 14.5 | 0.861 | 0.531 |
+| p3 xstat1 | 2549ecdf | 169,545 | 27,562 | 4.44 | 44.4 | 25.9 | 14.7 | 0.939 | 0.534 |
+| p3 xstat2 | 2549ecdf | 173,465 | 28,161 | 4.32 | 43.7 | 25.7 | 14.5 | 0.912 | 0.516 |
+| p2 xstat2 | b7798354 | 177,606 | 28,020 | 4.25 | 42.2 | 24.3 | 14.6 | 0.867 | 0.520 |
+
+ms per native block (val0) unless per 1k fills. xstat means: matched/s p2
+175,215 vs p3 171,505 (**-2.1%**, r1/r2 spread 2.7% / 2.3%), pass B per 1k
+fills 0.864 vs 0.926 (**+7.1%**), match per 1k fills 0.526 vs 0.525 (flat),
+engine ms/1k 4.30 vs 4.38.
+
+### 28.1 Pass B: all in `PositionCache::merge_disjoint`
+
+Execution thread, xstat W1, inline-expanded, mean of 2 cells per arm, per 1k
+fills:
+
+| | Mcycles p2 -> p3 | Minstr | IPC | DRAM fills (k) |
+|---|---|---|---|---|
+| pass B total | 2.465 -> 2.622 (**+6.4%**) | 2.645 -> 2.656 (+0.4%) | 1.07 -> 1.01 | 8.23 -> 9.33 (+13%) |
+| `PositionCache::merge_disjoint` (`self.map.extend`) | **0.815 -> 0.979 (+20%)** | 1.08 -> 1.16 | 1.33 -> 1.19 | **2.33 -> 3.49 (+50%)** |
+| of which `reserve_rehash_inner` | 0.265 -> 0.334 | 0.57 -> 0.56 | 2.17 -> 1.69 | 0.51 -> 1.11 (2.2x) |
+| `persist_trade` | 0.361 -> 0.363 | flat | 0.81 / 0.80 | flat |
+| `bal_cache` / hashing | 0.75 -> 0.71 | | | |
+
+- **Verdict: memory traffic in one function, not more work.** Pass B
+  instructions per fill are unchanged; `merge_disjoint` alone is +0.164
+  Mcycles per 1k fills, the whole pass B delta (+0.157). Per cell it splits
+  cleanly: 0.817 / 0.812 Mcycles in the p2 cells, 0.987 / 0.971 in p3 (DRAM
+  fills 2.35 / 2.30 vs 3.77 / 3.20). The rest of the execution thread is
+  +2.4% cycles (margin +0.09, cache flush +0.02), instructions flat (+-1%)
+  in every class, DRAM fills +7%.
+- The whole-process cycles profile (prof) agrees: pass B 2.128 -> 2.338
+  Mcycles per 1k fills (+9.9%), `merge_disjoint` 0.718 -> 0.830,
+  `find_or_find_insert_index` and `RawTable` +25-33%.
+- **Likely mechanism (inferred from the layout, not measured):** the map
+  entry `((Address, u64), Option<Position>)` with 16-byte-aligned `i128`
+  FixedPoint is 32 + 96 = 128 B in p2 (two cache lines) and 32 + 112 = 144 B
+  in p3: +12.5% bytes per insert and rehash, and entries no longer line up
+  with cache lines. The 2.2x rehash DRAM fills are more than the bytes alone;
+  a table crossing a cache or allocator threshold may add to it (not tested).
+- **Fix (18c, `perf/position-v2-savings` `37b28dd6`, off `bf2edda6`):**
+  `5d197a3b` reserves the batch `PositionCache` (map and dirty set) for the
+  summed entry count before pass B's merges, so `extend` no longer rehashes
+  (18c microbench 1,179-1,359 -> 665-1,018 ns per entry); `37b28dd6` updates
+  the cached position in place on the fill path instead of cloning the 144 B
+  entry (pass A). A u64 fast path for FixedPoint multiply was dropped (the
+  bench's products are all above 2^64). If reserve leaves most of pass B's
+  +7%, 18c's next steps are boxing Position in the cache map, or keeping the
+  per-market caches separate and sorting their dirty keys once at flush.
+
+### 28.2 Match: no regression
+
+- Whole-process `cycles:u`: match workers do slightly less work per fill in
+  p3 (7.145 -> 6.759 Mcycles per 1k fills, 0.95x); the match share on the
+  execution thread (spawn and join) is 0.636 -> 0.681. Self-time movers
+  (`match_at_level`, `match_market`, `place_order_with_accounts`,
+  `__divti3`) all sit at 0.91-1.0x, none consistent across pairs.
+- Timers in the xstat cells: 0.550 vs 0.551 ms per 1k fills. Section 27's
+  match rise does not reproduce: noise.
+- Stock `perf diff` (`--comms torus-execution`, relative) is not usable
+  here: the two pairs disagree in direction for every symbol above +-0.15%,
+  and the `HashMap<(Address,u64),Option<Position>>` frames move only because
+  inlining changed (`extend` is its own frame only in p3). The inline-aware
+  tables above are the reliable view.
+
+### 28.3 perf stat (per 1k fills, mean of 2 cells, p3 / p2)
+
+| event | execution thread (prof W2) | spread p2 / p3 | whole process (xstat W2) |
+|---|---|---|---|
+| cycles | 1.017 | 4.5% / 1.5% | 1.027 |
+| instructions | 1.003 | 2.4% / 0.9% | 1.035 |
+| IPC | 1.537 -> 1.516 | | 1.699 -> 1.712 |
+| L1d load misses | 1.012 | 2.8% / 0.5% | 1.067 |
+| DRAM fills | 1.025 | 3.8% / 0.5% | - |
+| fills from another CCX | 1.008 | 10.5% / 5.6% | - |
+| cache-references / cache-misses | - | | 1.040 / 1.049 |
+
+The whole-process r1/r2 spread is 7-10%, larger than the effect, so that
+column cannot resolve a 3% change (cache-misses per 1k instructions 3.64 vs
+3.69). The execution-thread table's header in `ozarchy-p2s0y-stat.txt` says
+"val0 whole process"; it is the execution thread only.
+
+### 28.4 Profiling notes for this shape
+
+- **Do not reuse the 5-event inherited `perf record`** (section 9.2's
+  `ozarchy-ipc-tools/ipc-sidecar.sh`) on the standard shape: every
+  short-lived worker thread (~15k spawns per minute) inherits all 5
+  sampling events. The first p2s0y layout (cells `p2-rec1`, `p3-rec1`,
+  unit `bench-ozarchy-p2s0y.service`) ran at 109-111k matched/s (~-37%),
+  821 s of system CPU in a 50 s window, match and pass A timers ~10x. Kept
+  for reference only; profile the execution thread with `-t <tid>
+  --no-inherit` instead, or use plain `cycles:u` whole-process.
+- **Zen 3 events:** `LLC-loads` / `LLC-load-misses` are not supported on this
+  host; use `ls_dmnd_fills_from_sys.mem_io_local` (DRAM demand fills). With
+  the NMI watchdog on only 5 counters are free: 5 events per window keeps
+  them unmultiplexed. `ls_dmnd_fills_from_sys.ext_cache_local` is a fill from
+  another CCX's cache, not an L3 hit (the section 9 sidecar's comment calls
+  it "L3 fill"; section 9.2's tables do not use it).
+
+## 29. C2 holder-index fix and Position v2 savings A/B (campaign `ozarchy-c2h`, 2026-10-08)
+
+The two fixes for section 27's regression, A/B'd against `d3ba3c0a` as 18c
+asked (s104), outside Phase 2's +7% gate. Node-only builds as section 27
+(`--release`, line-tables-only, mold, frame pointers), each from its own
+worktree into its own fresh, unseeded target dir (`ozarchy-c2h-build.sh`,
+`ozarchy-c2h2-build.sh`); same bench `fff899ca`, harness and standard shape
+as section 27, no perf.
+
+| arm | commit | node | what |
+|---|---|---|---|
+| b | `d3ba3c0a` | `193ae781` | the Phase 2 reference (section 26's B) |
+| base | `bf2edda6` | `29860dc0` | main, parent of both fixes (over `d3ba3c0a`: the open-file limit raise, a test flake fix, stress tests in every suite) |
+| fix | `perf/c2-set-holder` `d7bd1c36` (built from `c051872b`, docs only on top) | `b843f522` | C2 holder index moved only when a position key appears or disappears; foldhash `holders` map (ozarchy; 18c s104 review: merge as is) |
+| sav | `perf/position-v2-savings` `37b28dd6` | `4fcbf7cb` | 18c: `5d197a3b` reserves the batch `PositionCache` before pass B's merges; `37b28dd6` updates the cached position in place on the fill path |
+| both | `f1ab2166` (local merge of `37b28dd6` + `d7bd1c36`, not pushed) | `17ac7525` | both fixes |
+
+Order: b warm (60 s), then b base fix sav both both sav fix base b (120 s
+each), 17:46-18:52, unit `bench-c2h.service`; then base warm (60 s), sav r3,
+base r3, 18:57-19:13, unit `bench-c2hx.service` (`ozarchy-c2h-campaign-x.sh`),
+because sav r1 failed. All other cells rc 0, AGREE, liveness PASS, accepted,
+exe md5 3/3 as staged, trie off, 4 MiB book CF on every arm. Analysis
+`ozarchy-c2h-tools/c2h.py`, table `ozarchy-c2h-table.txt`.
+
+**sav r1 failed (rc 2, liveness unverified, excluded):** AGREE and no node
+died, but all three nodes' RPC stalled for 6-10 s twice (about 38 s and 55 s
+into the cell); `state_write_db` 68 ms per block (~23 elsewhere), flush 93
+ms, 3.37 native blk/s, node CPU 299% vs ~385% (waiting, not busy). sav r2 and
+r3 are normal: a host-wide stall, not the arm.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | pass B | pass B / 1k fills | match | end_resident | `apply` | `apply` / 1k fills | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| b r1 | 173,407 | 5.163 | 25,718 | 4.39 | 142.3 | 41.5 | 24.4 | 0.947 | 13.6 | 21.9 | 9.34 | 0.363 | 8.61 |
+| base r1 | 177,394 | 5.303 | 28,590 | 4.28 | 154.8 | 44.1 | 25.9 | 0.906 | 14.3 | 22.3 | 9.99 | 0.349 | 9.18 |
+| fix r1 | 173,912 | 5.220 | 27,624 | 4.40 | 151.0 | 43.3 | 25.2 | 0.912 | 14.5 | 19.7 | 6.30 | 0.228 | 6.31 |
+| ~~sav r1~~ | 135,694 | 3.369 | 26,522 | 3.98 | 169.4 | 35.5 | 19.7 | 0.741 | 13.2 | 20.6 | 9.03 | 0.340 | 6.70 |
+| both r1 | 180,619 | 5.301 | 28,149 | 4.23 | 148.9 | 40.3 | 22.4 | 0.796 | 15.4 | 19.7 | 6.32 | 0.225 | 6.38 |
+| both r2 | 177,660 | 5.148 | 27,880 | 4.30 | 150.4 | 39.6 | 21.8 | 0.780 | 15.2 | 21.3 | 6.92 | 0.248 | 6.93 |
+| sav r2 | 178,037 | 5.138 | 28,381 | 4.17 | 150.4 | 40.3 | 22.6 | 0.798 | 14.6 | 22.8 | 10.17 | 0.358 | 9.32 |
+| fix r2 | 177,892 | 5.320 | 27,586 | 4.38 | 149.3 | 43.2 | 25.1 | 0.911 | 14.4 | 19.1 | 6.35 | 0.230 | 6.37 |
+| base r2 | 173,528 | 5.146 | 27,615 | 4.33 | 151.5 | 42.1 | 24.5 | 0.886 | 14.9 | 23.6 | 10.29 | 0.373 | 9.80 |
+| b r2 | 174,680 | 5.131 | 28,069 | 4.34 | 154.8 | 44.5 | 26.2 | 0.932 | 14.4 | 23.5 | 10.66 | 0.380 | 10.00 |
+| sav r3 | 176,912 | 5.114 | 28,843 | 4.23 | 154.8 | 41.1 | 23.1 | 0.802 | 15.1 | 24.4 | 10.83 | 0.375 | 9.69 |
+| base r3 | 176,774 | 5.270 | 27,589 | 4.27 | 150.2 | 42.5 | 25.1 | 0.911 | 14.6 | 22.1 | 9.62 | 0.349 | 9.13 |
+
+ms per native block (val0) unless per 1k fills; `apply` is the
+`TraderPositions::apply` timer (section 27).
+
+| mean (valid cells) | n | matched/s | spread | vs base | vs b | pass B / 1k fills | vs base | `apply` / 1k fills | vs base | end_resident wait | settle |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b | 2 | 174,044 | 0.7% | 0.989 | 1.000 | 0.940 | 1.043 | 0.371 | 1.041 | 9.30 | 43.0 |
+| base | 3 | 175,899 | 2.2% | 1.000 | 1.011 | 0.901 | 1.000 | 0.357 | 1.000 | 9.37 | 42.9 |
+| fix | 2 | 175,902 | 2.3% | 1.000 | 1.011 | 0.911 | 1.011 | **0.229** | **0.642** | 6.34 | 43.3 |
+| sav | 2 | 177,475 | 0.6% | 1.009 | 1.020 | **0.800** | **0.888** | 0.367 | 1.028 | 9.50 | 40.7 |
+| both | 2 | 179,140 | 1.7% | **1.018** | **1.029** | **0.788** | **0.875** | **0.236** | **0.662** | 6.65 | 40.0 |
+
+- **fix: `apply` per fill -36%** (0.357 -> 0.229 ms per 1k fills, both cells
+  within 0.9%), end_resident wait 9.37 -> 6.34 ms per block. Most of the
+  a746c408 step, not all: the p0 cells of section 27 were 0.201 / 0.213, so
+  ~8-14% is left. Throughput alone: 1.000x base.
+- **sav: pass B per fill -11%** (0.901 -> 0.800 ms per 1k fills, cells 0.798
+  / 0.802), below p2's level in section 27 (0.839 / 0.863; today's b also
+  reads ~2% below section 27's b). Reserve plus the in-place update recover
+  the whole +7% of section 28 and more; no leftover from the 144 B entries
+  moved by `extend` is visible at this resolution, so 18c's next steps
+  (boxing Position, per-market caches) are not needed for this regression.
+  Settle 0.949x base; `apply` unchanged, as expected. Throughput 1.009x base.
+- **both: the gains add up.** `apply` per fill as fix (0.236), pass B per
+  fill as sav (0.788), end_resident wait 6.65; the best arm at 1.018x base,
+  1.029x b.
+- **base vs b: neutral** (matched/s 1.011x, pass B 0.959x, `apply` 0.961x per
+  fill).
+- **Throughput is within noise.** Both fixes together take ~3 ms per block
+  off the end_resident wait plus ~3 ms of pass B, ~4% of a ~150 ms chain,
+  and matched/s moves +1.8% vs base, about base's 2.2% cell spread. The
+  per-fill timers are unambiguous; a firmer matched/s number needs ~4 cells
+  per arm. 18c s104: both branches go to main as separate `--no-ff` merges
+  if each recovers its share.
+
 ## Open
 
+- **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
+  interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
+  build style (D/B 1.014x), not the load generator. **Bisected** (section
+  27): `a746c408` (ADL budget; `TraderPositions::apply` 1.8x per fill from C2's
+  `set_holder`, ~38% of the gap) and `9e695364` (exact cost basis; settle
+  pass B +10% and engine +4% per fill, ~44%). Profiled (section 28): pass B's
+  extra time is all `PositionCache::merge_disjoint` (more DRAM fills, same
+  instructions); match does not regress. Fixes A/B'd (section 29):
+  `perf/c2-set-holder` `d7bd1c36` (`apply` per fill -36%, ~8-14% above the
+  pre-a746c408 level; 18c review: merge as is) and 18c's
+  `perf/position-v2-savings` `37b28dd6` (pass B per fill -11%, below p2's
+  level); together 1.018x matched/s vs base, within noise. **Merged** to
+  main (18c s104: merge as is) as `c8d25db8` (c2-set-holder) and
+  `b8e3b606` (position-v2-savings), ozarchy s29.
+- **Low priority, after Phase 2 (18c s104):** `TraderPositions::apply` per
+  1k fills is still 0.229 after the C2 fix vs 0.201 / 0.213 before
+  `a746c408` (section 29): find what is left of that step when convenient.
+  The Phase 2 +7% gate stays measured against `d3ba3c0a`.
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
@@ -2648,9 +3242,10 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   them: byte-identical on every validator (the same top 64 per side in modes 2/3, the block's own changes
   included, correct rebuild after restart and crash replay, no lazy row-scan fallback). Fallback if it slips:
   a per-market cap on level deletes per block (a new validity rule).
-- Test hygiene: the torus-consensus crash-test fixture (`app.rs:7356`) creates a ~6 MB RocksDB dir per run
-  under `/tmp` (`torus-crash-test-<pid>-<n>`) and almost never removes it: thousands per suite run, several
-  GB of tmpfs (RAM) on ozarchy and 18c. Fix: a `tempfile::TempDir`, or remove on drop.
+- **Done** (`f7fe17f3` on main): test hygiene, the torus-consensus crash-test fixture (`app.rs:7356`)
+  created a ~6 MB RocksDB dir per run under `/tmp` (`torus-crash-test-<pid>-<n>`) and almost never removed
+  it. Test scratch DBs now live under `/tmp/torus-consensus-test-dbs/<pid>/`, and the dirs of exited
+  processes are swept once per process.
 - **Item 7 EVM lanes** (owner s99): every Torus block can carry 30M EVM gas
   next to trading, and any EVM tx sends its block down the serial path. HL
   rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about
@@ -2701,3 +3296,16 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
 - Harness: fix `liq_stress.py` (`_count` column), keep harness tests from
   writing `testnet/genesis-weighted-full.json` into the worktree, and avoid
   stale binaries from reflink-seeded target dirs (section 23.2).
+- Shared-DB shutdown path untested (18c s101, not blocking): in production the DB is shared, so when
+  RocksDB is mid-compaction the drop waits for it, and a slow range at shutdown could run past
+  systemd's `TimeoutStopSec`.
+- Nit (`crates/torus-state/src/db.rs:164-192`): if the background-errors read before a range run fails
+  (`unwrap_or(0)`) and older errors are seen after it, the run counts as a false failure.
+- Nits (`crates/torus-bridge/tests/book_read_modes_tests.rs`): the assert message at :485 says "root
+  CF" but the check is level mode; `key[..8]` at :463 panics on a key shorter than 8 bytes.
+- Flaky test `liquidation_tests::p2_counterparties_are_paid_at_the_stored_price` ("one close per row",
+  6 vs 8): once in a full `cargo test` run; passes alone and under nextest. Likely cause: the
+  `Captured` event capture listens only on its own thread, and tracing caches per-callsite interest for
+  the whole process. Possible fix: `register_callsite` -> `Interest::sometimes()`.
+- **Done** (merged to main as `35953ff8`, 18c s101): `fix/raise-nofile-limit`. 4 MiB book SSTs are
+  ~256 files per GB; torus-node raises its soft `RLIMIT_NOFILE` to the hard limit at start-up.

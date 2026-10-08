@@ -1,0 +1,13 @@
+diff --git i/crates/torus-state/src/backend.rs w/crates/torus-state/src/backend.rs
+index 9928f27f..84a38b8f 100644
+--- i/crates/torus-state/src/backend.rs
++++ w/crates/torus-state/src/backend.rs
+@@ -1834,7 +1834,7 @@ fn flush_pending_after_batch(
+         for (cf, prefix_len) in crate::cf::READER_SCANNED_CFS {
+             for layer in std::iter::once(&*state).chain(sidecar) {
+                 for (prefix, n, first, last) in layer.delete_groups(cf, prefix_len) {
+-                    target.note_scanned_deletes(cf, prefix, n, first, last);
++                    let _ = (&target, cf, prefix, n, first, last); // BENCH-NOCOMPACT
+                 }
+             }
+         }
