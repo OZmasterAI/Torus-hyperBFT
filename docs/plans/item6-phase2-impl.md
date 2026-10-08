@@ -1,7 +1,7 @@
 # Implementation Plan: item 6 Phase 2 (per-block work in proportion to fills)
 
-Status: PLAN, nothing built; owner decisions recorded s96 (section 9, with the options not
-chosen). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
+Status: step 0 building on `perf/item6-phase2` (ozarchy, s27 / s101) from main `d3ba3c0a`
+(9.7); owner decisions recorded s96 (section 9, with the options not chosen). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
 `integrate/s94-batch`; "section 22" below). Short form and the phases after this one:
 `item6-phases-2-5-plans.md`. Design: `market-scaling-in-memory-design.md` section 3, Phase 2.
@@ -11,9 +11,10 @@ Code references are `file:function` with line numbers at `origin/integrate/s94-b
 (`a0eda77`). The step 0 profile ran crab = main `59fa407`; the hot files named here
 (`cancel_batch.rs`, `market_workers.rs`, `position.rs`) are the same on both, and
 `native_executor.rs` differs only in places this plan does not touch. The Phase 2 base is
-now main `35e69b3` (9.6): `a0eda77` plus `feat/liq-telemetry`, which changed
-`liquidation_step.rs`, `app.rs` and `torus-core/src/liquidation.rs`, so P2-4's line numbers
-there may have moved.
+now main `d3ba3c0a` (9.7; was `35e69b3`, 9.6). Main has moved since `a0eda77` (liquidation
+telemetry, the ADL budget, exact cost basis, item 7 step 0, read-precompile gas), so line
+numbers in `liquidation_step.rs`, `app.rs`, `position.rs` and `native_executor.rs` may have
+moved.
 
 Every number below is from section 22 or from the code, unless it is marked
 **(estimate)**.
@@ -26,7 +27,7 @@ No consensus rule, no state format and no state hash changes (same as Phase 1).
 
 | gate | target (fail line) | measured by | source |
 |---|---|---|---|
-| Phase gate, 300 markets | matched/s >= +7% vs the Phase 2 base (main `35e69b3`, 9.6) | interleaved cells, section 6 | short plan, Phase 2; owner s96 (9.1) |
+| Phase gate, 300 markets | matched/s >= +7% vs the Phase 2 base (main `d3ba3c0a`, 9.7) | interleaved cells, section 6 | short plan, Phase 2; owner s96 (9.1) |
 | Phase gate, 10 markets | no regression vs the base beyond the ~5% cell resolution | interleaved cells | short plan; Phase 1 plan 1.1 |
 | Gate 2 holds | >= 0.9x main `92a02ed`, 300 and 10 markets (today 1.097x / 0.997x) | one reference pair per campaign | Phase 1 plan 9.12 |
 | Gate 3 (carried) | margin <= 1.5 ms/1k (3.0), match <= 2.0 ms/1k (4.0) | `ubench_econ`, walk 0 and walk 10, reported | Phase 1 plan 9.12 |
@@ -305,7 +306,7 @@ each commit, one full `cargo test --workspace` before the merge.
 
 ### Step 0: guardrails (no engine change)
 
-- 0.1 Branch `perf/item6-phase2` from main `35e69b3` (9.6). Record the suite counts.
+- 0.1 Branch `perf/item6-phase2` from main `d3ba3c0a` (9.7). Record the suite counts.
 - 0.2 Node-local counters and harness columns (not hashed): per cancel-all, books
   visited and books where the sender had orders or stops; thread spawns per site per
   block; process sys CPU per 1k fills and per native block (from `/proc/<pid>/stat`);
@@ -348,7 +349,7 @@ Standard shape (results doc 21.4, as section 22):
 - oracle feed 30000 / 2000 ms on both arms (both are crab now), walk 0; plus walk 10
   (`ORACLE_WALK_BP=10`) cells, and `ORACLE_FEED_DRAIN=1` drain cells for rows 77-78;
 - 10-market cells with the same settings;
-- arms: Phase 2 branch vs the base, main `35e69b3` (9.6), interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
+- arms: Phase 2 branch vs the base, main `d3ba3c0a` (9.7), interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
   Gate 2; perf only in separate cells (perf costs ~4.4% on both arms);
 - every heavy cell under the `signal_generate` trace, each its own systemd unit through
   `detach.sh` (results doc Open, section 19);
@@ -370,6 +371,7 @@ Standard shape (results doc 21.4, as section 22):
 
 | # | step | finding | decision |
 |---|---|---|---|
+| 1 | 0.1 | Base suites on `d3ba3c0a` (ozarchy, 2026-10-08, own target dir): nextest `--workspace` 3059 passed / 0 failed (35 skipped), doc tests 1 / 0 | branch `perf/item6-phase2` cut from `d3ba3c0a` (9.7) |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -472,6 +474,8 @@ more than the hasher.
 
 ### 9.6 Base
 
+Superseded by 9.7 (base `d3ba3c0a`); kept as the s96 record.
+
 **Chosen (owner s96, on 18c's recommendation): main `35e69b3`** = the s94 batch
 (`a0eda77`) + `feat/liq-telemetry` (`0ce261b`), both merged and pushed in s96. The +7% is
 measured against `35e69b3` too, not `59fa407`: the batch (bad-debt, auth replay, gas
@@ -484,3 +488,14 @@ N=4 + b900, x2) gives the new base's Gate 2 reading. `59fa407` stays the Phase 1
 | **main `35e69b3` (chosen)** | has every merged fix; no merge conflicts later |
 | main `59fa407` | lacks the batch fixes; conflicts in `native_executor.rs` / `app.rs` at merge |
 | main `a3bfab2` (batch without telemetry) | relevant only if the telemetry shows a cost on the execution thread (ozarchy: native root identical; ms cost not measured yet) |
+
+### 9.7 Base moved to main `d3ba3c0a` (18c + owner, s101 / ozarchy s27, 2026-10-08)
+
+**Chosen: main `d3ba3c0a`** for the branch and for the +7% comparison (replaces `35e69b3`,
+9.6). Main has merged since s96: the ADL budget (`a746c408`) and its dirty check, exact
+cost basis, governance params, item 7 step 0 vote checks (`7c15b5aa`), read-precompile gas
+and its follow-up (`d3ba3c0a`, book CF SST 4 MiB), the test-dir leak fix (`f7fe17f3`). A
+`35e69b3` base would mix their effect into Phase 2's. Main `92a02ed` stays the Gate 2
+reference. ozarchy builds step 0; who builds steps 1-4 is decided after Gate 0. Main moved on
+to `35953ff8` (`fix/raise-nofile-limit`, `crates/torus-node` only) after the branch was cut;
+it is merged into the branch later with a plain merge, not a rebase.

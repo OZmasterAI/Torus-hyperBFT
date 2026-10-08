@@ -2648,9 +2648,10 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
   them: byte-identical on every validator (the same top 64 per side in modes 2/3, the block's own changes
   included, correct rebuild after restart and crash replay, no lazy row-scan fallback). Fallback if it slips:
   a per-market cap on level deletes per block (a new validity rule).
-- Test hygiene: the torus-consensus crash-test fixture (`app.rs:7356`) creates a ~6 MB RocksDB dir per run
-  under `/tmp` (`torus-crash-test-<pid>-<n>`) and almost never removes it: thousands per suite run, several
-  GB of tmpfs (RAM) on ozarchy and 18c. Fix: a `tempfile::TempDir`, or remove on drop.
+- **Done** (`f7fe17f3` on main): test hygiene, the torus-consensus crash-test fixture (`app.rs:7356`)
+  created a ~6 MB RocksDB dir per run under `/tmp` (`torus-crash-test-<pid>-<n>`) and almost never removed
+  it. Test scratch DBs now live under `/tmp/torus-consensus-test-dbs/<pid>/`, and the dirs of exited
+  processes are swept once per process.
 - **Item 7 EVM lanes** (owner s99): every Torus block can carry 30M EVM gas
   next to trading, and any EVM tx sends its block down the serial path. HL
   rations EVM (2M-gas small blocks every few seconds, 30M-gas big blocks about
@@ -2701,3 +2702,16 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
 - Harness: fix `liq_stress.py` (`_count` column), keep harness tests from
   writing `testnet/genesis-weighted-full.json` into the worktree, and avoid
   stale binaries from reflink-seeded target dirs (section 23.2).
+- Shared-DB shutdown path untested (18c s101, not blocking): in production the DB is shared, so when
+  RocksDB is mid-compaction the drop waits for it, and a slow range at shutdown could run past
+  systemd's `TimeoutStopSec`.
+- Nit (`crates/torus-state/src/db.rs:164-192`): if the background-errors read before a range run fails
+  (`unwrap_or(0)`) and older errors are seen after it, the run counts as a false failure.
+- Nits (`crates/torus-bridge/tests/book_read_modes_tests.rs`): the assert message at :485 says "root
+  CF" but the check is level mode; `key[..8]` at :463 panics on a key shorter than 8 bytes.
+- Flaky test `liquidation_tests::p2_counterparties_are_paid_at_the_stored_price` ("one close per row",
+  6 vs 8): once in a full `cargo test` run; passes alone and under nextest. Likely cause: the
+  `Captured` event capture listens only on its own thread, and tracing caches per-callsite interest for
+  the whole process. Possible fix: `register_callsite` -> `Interest::sometimes()`.
+- **Done** (merged to main as `35953ff8`, 18c s101): `fix/raise-nofile-limit`. 4 MiB book SSTs are
+  ~256 files per GB; torus-node raises its soft `RLIMIT_NOFILE` to the hard limit at start-up.
