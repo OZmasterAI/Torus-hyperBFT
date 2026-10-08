@@ -34,3 +34,6 @@ tracing-subscriber = { workspace = true }
 # s517 oracle feeder review M1(b): decode oracle submission rows in tests.
 torus-core = { workspace = true }
 borsh = { workspace = true }
+# Item 6 Phase 2 (plan 9.8): the app-level differentials flip torus-bridge's
+# reference paths (full-scan cancel-all, per-row flush). Test builds only.
+torus-bridge = { workspace = true, features = ["test-reference-paths"] }

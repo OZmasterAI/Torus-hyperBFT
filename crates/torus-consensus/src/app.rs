@@ -634,6 +634,12 @@ struct ExecutionContext {
     /// runtime flag for R (D16).
     #[cfg(test)]
     test_no_resident_rows: bool,
+    /// Item 6 Phase 2 (plan 9.8): test-only reference switch — `true` runs
+    /// every native block on torus-bridge's frozen reference paths (the
+    /// full-scan cancel-all, the per-row position flush), reached through its
+    /// test-only `test-reference-paths` feature (this crate's dev-dependency).
+    #[cfg(test)]
+    test_reference_paths: bool,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
@@ -2339,6 +2345,13 @@ impl ExecutionContext {
                 }
             }
             ctx.metrics = self.metrics.clone();
+            // Plan 9.8: the test-only reference paths (bridge feature
+            // `test-reference-paths`, enabled by this crate's dev-dependency).
+            #[cfg(test)]
+            {
+                ctx.test_cancel_all_full_scan = self.test_reference_paths;
+                ctx.test_flush_per_row = self.test_reference_paths;
+            }
             // Item 6 C2: the slot's previous mark table / configs decide the
             // version of this block's table (filled by begin_block_oracle).
             ctx.attach_resident_block(&mut resident_rows);
@@ -4095,6 +4108,8 @@ impl TorusApp {
             test_book_mode: None,
             #[cfg(test)]
             test_no_resident_rows: false,
+            #[cfg(test)]
+            test_reference_paths: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -11006,6 +11021,8 @@ mod crash_recovery_tests {
             test_book_mode: None,
             #[cfg(test)]
             test_no_resident_rows: false,
+            #[cfg(test)]
+            test_reference_paths: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -19499,5 +19516,497 @@ mod crash_recovery_tests {
     #[test]
     fn warm_equals_cold_every_block_pipelined_level_authority_chunked() {
         c5_warm_equals_cold(true, Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked));
+    }
+
+    // ======================================================================
+    // Item 6 Phase 2 (plan 9.8): app-level differential of torus-bridge's
+    // reference paths (full-scan cancel-all, per-row position flush) against
+    // the production paths, through the test-only `test-reference-paths`
+    // feature. P2-1 (cancel-all index) and P2-2 (batch flush) keep it green.
+    // ======================================================================
+
+    const P2_BLOCKS: u64 = 130;
+    /// Seeded long 30 @100 in market 1 (collateral 300): rests bids far
+    /// below the mark and a buy stop far above it in markets 2 / 3, never
+    /// cancels, and is liquidated later (the walk or the market-1 shock at
+    /// 60), so the liquidation step's cancel takes its orders and stops.
+    const P2_V4: u8 = 95;
+
+    /// `c5_fixture` plus V4 (above).
+    fn p2_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::position::{MarginType, NativeBalance, PositionManager};
+        let (config, db) = c5_fixture();
+        let pm = PositionManager::new(db.clone());
+        pm.put_native_balance(
+            &oracle_addr(P2_V4),
+            &NativeBalance {
+                available: px(300),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.apply_fill(
+            &oracle_addr(P2_V4),
+            1,
+            true,
+            px(30),
+            px(100),
+            MarginType::Cross,
+        )
+        .unwrap();
+        pm.apply_fill(
+            &oracle_addr(C5_S),
+            1,
+            false,
+            px(30),
+            px(100),
+            MarginType::Cross,
+        )
+        .unwrap();
+        (config, db)
+    }
+
+    /// What the generator fed (non-vacuity of the input side).
+    #[derive(Debug, Default)]
+    struct P2Fed {
+        cancel_all_none: u64,
+        cancel_all_some: u64,
+        /// A sender's second cancel-all in the same block (same run).
+        repeated: u64,
+        stops: u64,
+        crossing: u64,
+        v4_actions: u64,
+        cancel_only_blocks: u64,
+    }
+
+    /// The P2 sequence: heights 1..=P2_BLOCKS (ts 1000 + h), linked. C5's
+    /// mark walk (oracle rounds every 5th block plus at random, shocks at 60
+    /// and 120); every non-empty block a maker requotes every market (its
+    /// cancel-all, `None` or `Some(m)`, every 4th block); 2-5 trader actions:
+    /// resting and crossing limits (partial fills), stop-markets and
+    /// stop-limits near the last trade (some trigger into resting orders),
+    /// cancel-alls `None` / `Some(m)` (a block's cancel-alls form one run;
+    /// some senders send two), two-market batches; V4 rests early and is
+    /// liquidated later; ~1/6 of the other blocks empty, ~1/5 of the rest
+    /// cancel-alls only.
+    fn p2_blocks() -> (Vec<TorusBlock>, P2Fed) {
+        let mut rng = C5Rng(0x9e21_0008);
+        let mut fed = P2Fed::default();
+        let mut mark = [100i64; 3];
+        let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
+        let cur_h = std::cell::Cell::new(0u64);
+        let mut sign = |seed: u8, action: NativeAction| {
+            let n = nonces.entry(seed).or_insert(0);
+            *n += 1;
+            let nonce = NONCE_BASE + cur_h.get() * 1_000 + *n;
+            torus_types::eip712::sign_native_action(action, nonce, &oracle_key(seed))
+        };
+        let order =
+            |m: u64, is_buy: bool, price: i64, qty: i64, order_type: torus_types::OrderType| {
+                torus_types::PlaceOrderParams {
+                    market_id: m,
+                    is_buy,
+                    price: px(price),
+                    quantity: px(qty),
+                    order_type,
+                    time_in_force: torus_types::TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: None,
+                }
+            };
+        let limit = |m: u64, is_buy: bool, price: i64, qty: i64| {
+            order(m, is_buy, price, qty, torus_types::OrderType::Limit)
+        };
+        let mut blocks = Vec::new();
+        for h in 1..=P2_BLOCKS {
+            cur_h.set(h);
+            let mut actions = Vec::new();
+            let shock = h == 60 || h == 120;
+            let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
+            if mark_round {
+                match h {
+                    1 => {}
+                    60 => mark[0] = mark[0] * 85 / 100,
+                    120 => mark[1] = mark[1] * 118 / 100,
+                    _ => {
+                        for p in &mut mark {
+                            *p = (*p + rng.below(5) as i64 - 2).max(50);
+                        }
+                    }
+                }
+                for (seed, _) in ORACLE_VALIDATORS {
+                    let prices = C5_MARKETS
+                        .iter()
+                        .zip(mark)
+                        .map(|(m, p)| (*m, px(p)))
+                        .collect();
+                    actions.push(torus_types::eip712::sign_native_action(
+                        NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                            prices,
+                            timestamp: (1_000 + h) * 1_000,
+                        }),
+                        NONCE_BASE + h * 1_000 + seed as u64,
+                        &oracle_key(seed),
+                    ));
+                }
+            }
+            if !mark_round && rng.below(6) == 0 {
+                blocks.push(make_block(h, actions));
+                continue;
+            }
+            if rng.below(5) == 0 {
+                // Cancel-only block: the books these cancel-alls touch are
+                // dirty only through them (a missed cancel or dirty mark
+                // shows in the CF dump).
+                fed.cancel_only_blocks += 1;
+                for _ in 0..1 + rng.below(3) {
+                    let t = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                    let target = (rng.below(3) == 0).then(|| C5_MARKETS[rng.below(3) as usize]);
+                    if target.is_some() {
+                        fed.cancel_all_some += 1;
+                    } else {
+                        fed.cancel_all_none += 1;
+                    }
+                    actions.push(sign(t, NativeAction::CancelAllOrders { market_id: target }));
+                }
+                blocks.push(make_block(h, actions));
+                continue;
+            }
+            let maker = C5_MAKERS[(h % 2) as usize];
+            match h % 4 {
+                0 => {
+                    actions.push(sign(
+                        maker,
+                        NativeAction::CancelAllOrders { market_id: None },
+                    ));
+                    fed.cancel_all_none += 1;
+                }
+                2 => {
+                    let m = C5_MARKETS[(h / 4 % 3) as usize];
+                    actions.push(sign(
+                        maker,
+                        NativeAction::CancelAllOrders { market_id: Some(m) },
+                    ));
+                    fed.cancel_all_some += 1;
+                }
+                _ => {}
+            }
+            let mut quotes = Vec::new();
+            for (i, m) in C5_MARKETS.into_iter().enumerate() {
+                let q = 2 + rng.below(4) as i64;
+                quotes.push(limit(m, true, mark[i] - 1 - rng.below(2) as i64, q));
+                quotes.push(limit(m, false, mark[i] + 1 + rng.below(2) as i64, q));
+            }
+            actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
+            if (2..=40).contains(&h) && h % 4 == 3 {
+                // V4: a bid far below the mark and a buy stop far above it.
+                fed.v4_actions += 2;
+                actions.push(sign(
+                    P2_V4,
+                    NativeAction::PlaceOrder(limit(2, true, mark[1] - 30, 1)),
+                ));
+                let trigger = mark[2] + 40;
+                actions.push(sign(
+                    P2_V4,
+                    NativeAction::PlaceOrder(order(
+                        3,
+                        true,
+                        trigger + 10,
+                        1,
+                        torus_types::OrderType::StopMarket {
+                            trigger: px(trigger),
+                        },
+                    )),
+                ));
+            }
+            for _ in 0..2 + rng.below(4) {
+                let t = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                let mi = rng.below(3) as usize;
+                let (m, p) = (C5_MARKETS[mi], mark[mi]);
+                let qty = 1 + rng.below(4) as i64;
+                let is_buy = rng.below(2) == 0;
+                let action = match rng.below(13) {
+                    0..=2 => {
+                        let off = 1 + rng.below(3) as i64;
+                        NativeAction::PlaceOrder(limit(
+                            m,
+                            is_buy,
+                            if is_buy { p - off } else { p + off },
+                            qty,
+                        ))
+                    }
+                    3..=5 => {
+                        // Crossing, larger than one quote: partial fills, the rest rests.
+                        fed.crossing += 1;
+                        NativeAction::PlaceOrder(limit(
+                            m,
+                            is_buy,
+                            if is_buy { p + 2 } else { p - 2 },
+                            qty + 4,
+                        ))
+                    }
+                    6 => {
+                        // Stop-limit near the touch: crossing trades fire it, its limit
+                        // then rests or fills.
+                        fed.stops += 1;
+                        let (trigger, lim) = if is_buy {
+                            (p + 2, p + 1)
+                        } else {
+                            (p - 2, p - 1)
+                        };
+                        NativeAction::PlaceOrder(order(
+                            m,
+                            is_buy,
+                            lim,
+                            qty,
+                            torus_types::OrderType::StopLimit {
+                                trigger: px(trigger),
+                                limit: px(lim),
+                            },
+                        ))
+                    }
+                    7 => {
+                        fed.stops += 1;
+                        let trigger = if is_buy { p + 3 } else { p - 3 };
+                        let cap = if is_buy { trigger + 10 } else { trigger - 10 };
+                        NativeAction::PlaceOrder(order(
+                            m,
+                            is_buy,
+                            cap,
+                            qty,
+                            torus_types::OrderType::StopMarket {
+                                trigger: px(trigger),
+                            },
+                        ))
+                    }
+                    8 | 9 => {
+                        fed.cancel_all_none += 1;
+                        if rng.below(3) == 0 {
+                            // The same sender again in the same run.
+                            fed.repeated += 1;
+                            let again = if rng.below(2) == 0 { None } else { Some(m) };
+                            actions
+                                .push(sign(t, NativeAction::CancelAllOrders { market_id: again }));
+                        }
+                        NativeAction::CancelAllOrders { market_id: None }
+                    }
+                    10 => {
+                        fed.cancel_all_some += 1;
+                        NativeAction::CancelAllOrders { market_id: Some(m) }
+                    }
+                    _ => {
+                        let mj = (mi + 1) % 3;
+                        NativeAction::PlaceOrderBatch(vec![
+                            limit(m, true, p - 1 - rng.below(3) as i64, qty),
+                            limit(
+                                C5_MARKETS[mj],
+                                false,
+                                mark[mj] + 1 + rng.below(3) as i64,
+                                qty,
+                            ),
+                        ])
+                    }
+                };
+                actions.push(sign(t, action));
+            }
+            blocks.push(make_block(h, actions));
+        }
+        link_blocks(&mut blocks);
+        (blocks, fed)
+    }
+
+    struct P2Run {
+        db: StateDb,
+        dump: Vec<CfDump>,
+        captured: CapturedWrites,
+        hash: Option<(u64, [u8; 32])>,
+        metrics: Arc<torus_telemetry::Metrics>,
+        /// Classic layout only (else 0): V4's resting orders + pending stops
+        /// in markets 2 / 3, the most seen after any block and after the last.
+        v4_max: usize,
+        v4_last: usize,
+    }
+
+    /// V4's resting orders + pending stops in the classic book blobs of
+    /// markets 2 / 3 (0 in other layouts).
+    fn p2_v4_resting(db: &StateDb) -> usize {
+        use borsh::BorshDeserialize;
+        let v4 = oracle_addr(P2_V4);
+        [2u64, 3]
+            .iter()
+            .filter_map(|m| {
+                db.get_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &m.to_be_bytes())
+                    .unwrap()
+            })
+            .filter_map(|bytes| torus_core::order_book::OrderBook::try_from_slice(&bytes).ok())
+            .map(|mut book| book.open_order_count(&v4) + book.take_pending_stops(&v4).len())
+            .sum()
+    }
+
+    /// Feed `blocks` through the committed-block path on a fresh
+    /// `p2_fixture` DB. `reference`: every block on the bridge's reference
+    /// paths (`test_reference_paths`).
+    fn p2_run(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        reference: bool,
+    ) -> P2Run {
+        let (config, db) = p2_fixture();
+        torus_state::running_hash::capture_begin(&db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let what = format!("pipelined={pipelined} {mode:?} reference={reference}");
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_book_mode = mode;
+        ctx.test_reference_paths = reference;
+        ctx.metrics = Some(metrics.clone());
+        if pipelined {
+            ctx.attach_flush_worker(None);
+        }
+        let (mut v4_max, mut v4_last) = (0, 0);
+        for b in blocks {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "{what}: fail-stop at {}",
+                b.header.height
+            );
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle(), "{what}: W failed");
+            }
+            v4_last = p2_v4_resting(&db);
+            v4_max = v4_max.max(v4_last);
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        let hash = torus_state::running_hash::read_running_hash(&db);
+        let dump = dump_all_cfs(&db);
+        P2Run {
+            db,
+            dump,
+            captured,
+            hash,
+            metrics,
+            v4_max,
+            v4_last,
+        }
+    }
+
+    /// Plan 9.8: the reference paths and the production paths give
+    /// identical per-block consensus write sets (every `h_n`), running hash
+    /// and full CF dump (state, books, trades, action status), serial and
+    /// pipelined, in `mode` (`None`: the env default, classic without the
+    /// resident holder). The switch reaches the context (the reference
+    /// cancel-all keeps no counters) and the sequence is non-vacuous.
+    fn p2_reference_differential(mode: Option<torus_bridge::native_executor::BookMode>) {
+        let (blocks, fed) = p2_blocks();
+        assert_eq!(blocks.len() as u64, P2_BLOCKS);
+        assert!(
+            fed.cancel_all_none >= 40
+                && fed.cancel_all_some >= 20
+                && fed.repeated >= 5
+                && fed.stops >= 20
+                && fed.cancel_only_blocks >= 10,
+            "{fed:?}"
+        );
+        for pipelined in [false, true] {
+            let what = format!("pipelined={pipelined} {mode:?}");
+            let reference = p2_run(&blocks, pipelined, mode, true);
+            let current = p2_run(&blocks, pipelined, mode, false);
+            assert_write_sets_equal(
+                &reference.captured,
+                &current.captured,
+                &format!("{what}: reference vs current"),
+            );
+            assert_eq!(
+                reference
+                    .captured
+                    .iter()
+                    .map(|(h, _)| *h)
+                    .collect::<Vec<_>>(),
+                (1..=P2_BLOCKS).collect::<Vec<_>>(),
+                "{what}: every height through the hashed flush"
+            );
+            assert!(current.hash.is_some());
+            assert_eq!(reference.hash, current.hash, "{what}: running hash");
+            assert_dumps_equal(
+                &reference.dump,
+                &current.dump,
+                &format!("{what}: reference vs current"),
+            );
+            // The switch took: only the production cancel-all counts.
+            assert_eq!(reference.metrics.exec_cancel_all.get(), 0, "{what}");
+            assert!(
+                current.metrics.exec_cancel_all.get() >= 60,
+                "{what}: {}",
+                current.metrics.exec_cancel_all.get()
+            );
+
+            // Non-vacuous (the runs are equal, so one side is enough).
+            let fills =
+                StateBackend::iterate_cf(&current.db, torus_state::cf::CF_NATIVE_TRADES, None)
+                    .unwrap()
+                    .len();
+            let liquidations = current.metrics.liquidations_triggered.get();
+            println!(
+                "P2 {what}: fed {fed:?}; fills {fills}, liquidations {liquidations}, cancel-alls {} (books hit {}), \
+                 V4 resting max {} last {}",
+                current.metrics.exec_cancel_all.get(),
+                current.metrics.exec_cancel_all_books_hit.get(),
+                current.v4_max,
+                current.v4_last,
+            );
+            assert!(fills >= 80, "{what}: fills {fills}");
+            assert!(liquidations >= 3, "{what}: liquidations {liquidations}");
+            assert!(
+                current.metrics.exec_cancel_all_books_hit.get() >= 40,
+                "{what}"
+            );
+            if mode.is_none_or(|m| m == torus_bridge::native_executor::BookMode::Classic) {
+                // V4 never cancels: the liquidation step's cancel took what it rested.
+                assert!(current.v4_max >= 4, "{what}: V4 rested {}", current.v4_max);
+                assert_eq!(
+                    current.v4_last, 0,
+                    "{what}: V4's orders and stops left after its liquidation"
+                );
+                assert_eq!(
+                    torus_core::position::PositionManager::new(current.db.clone())
+                        .get_position(&oracle_addr(P2_V4), 1)
+                        .unwrap()
+                        .map(|p| p.size),
+                    None,
+                    "{what}: V4 liquidated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_paths_match_production_classic_reload() {
+        p2_reference_differential(None);
+    }
+
+    #[test]
+    fn reference_paths_match_production_classic_resident() {
+        p2_reference_differential(Some(torus_bridge::native_executor::BookMode::Classic));
+    }
+
+    #[test]
+    fn reference_paths_match_production_order_rows() {
+        p2_reference_differential(Some(torus_bridge::native_executor::BookMode::OrderRows));
+    }
+
+    #[test]
+    fn reference_paths_match_production_level_authority() {
+        p2_reference_differential(Some(
+            torus_bridge::native_executor::BookMode::LevelAuthority,
+        ));
+    }
+
+    #[test]
+    fn reference_paths_match_production_level_authority_chunked() {
+        p2_reference_differential(Some(
+            torus_bridge::native_executor::BookMode::LevelAuthorityChunked,
+        ));
     }
 }

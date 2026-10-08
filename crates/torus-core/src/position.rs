@@ -774,9 +774,10 @@ impl PositionCache {
     /// Item 6 Phase 2 step 0.4: the per-row flush, frozen as the reference
     /// for P2-2's batch overlay writes: one `put_position` /
     /// `delete_position` per dirty key in key order (`flush_all` as of
-    /// `d3ba3c0a`). Test-only, no runtime flag (D16).
-    #[cfg(test)]
-    fn flush_all_per_row<T: StateBackend>(
+    /// `d3ba3c0a`). Test-only, no runtime flag (D16); other crates' tests
+    /// reach it through the `test-reference-paths` feature (plan 9.8).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn flush_all_per_row<T: StateBackend>(
         &mut self,
         positions: &PositionManager<T>,
     ) -> Result<(), CoreError> {

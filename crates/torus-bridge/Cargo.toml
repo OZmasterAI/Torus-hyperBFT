@@ -29,6 +29,13 @@ tracing = { workspace = true }
 # builds compile the instrumentation out entirely. Enabled by the
 # l3_savebooks_ubench test target below.
 save-timings = []
+# Item 6 Phase 2 (plan 9.8): TEST-ONLY. Compiles the reference-path switches
+# of `NativeExecContext` (`test_cancel_all_full_scan`, `test_flush_per_row`)
+# into non-test builds, so torus-consensus's app-level differentials can flip
+# them (enabled from its dev-dependencies only). The switches default to off:
+# turning the feature on changes no behaviour by itself. No node build reaches
+# it (`cargo tree -e features,no-dev -p torus-node -i torus-bridge`).
+test-reference-paths = ["torus-core/test-reference-paths"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -39,6 +46,9 @@ criterion = { workspace = true }
 # Item 6 Phase 2 step 0.2: tests/ubench_hasher.rs (SipHash vs foldhash, P2-5).
 # Already in Cargo.lock through hashbrown.
 foldhash = "0.2"
+# Item 6 Phase 2 (plan 9.8): this crate's own tests reach the core reference
+# paths (`PositionCache::flush_all_per_row`) the feature build does.
+torus-core = { workspace = true, features = ["test-reference-paths"] }
 
 [[test]]
 name = "l3_savebooks_ubench"

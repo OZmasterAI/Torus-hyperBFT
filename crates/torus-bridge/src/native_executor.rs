@@ -3504,6 +3504,10 @@ mod cancel_batch_toggle_tests {
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
 
+#[cfg(any(test, feature = "test-reference-paths"))]
+#[path = "reference_paths.rs"]
+mod reference_paths;
+
 #[cfg(test)]
 #[path = "block_marks_tests.rs"]
 mod block_marks_tests;
@@ -3732,11 +3736,18 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Item 6 Phase 2 step 0.4: test-only reference switch (no runtime flag,
     /// D16). `true` runs every cancel-all (user runs and single actions, the
     /// liquidation step's cancels) one action at a time through the frozen
-    /// full scan of every book (`cancel_batch_exec_tests.rs`
+    /// full scan of every book (`reference_paths.rs`
     /// `cancel_orders_and_stops_full_scan`), the reference P2-1's book index
-    /// is compared against.
-    #[cfg(test)]
-    pub(crate) test_cancel_all_full_scan: bool,
+    /// is compared against. Other crates' tests reach it through the
+    /// test-only `test-reference-paths` feature (plan 9.8). Default off.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_cancel_all_full_scan: bool,
+    /// Item 6 Phase 2 (plan 9.8): test-only reference switch. `true` flushes
+    /// the batch position cache through the frozen per-row reference
+    /// (`PositionCache::flush_all_per_row`), the reference P2-2's batch
+    /// overlay writes are compared against. Default off.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_flush_per_row: bool,
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
@@ -4172,8 +4183,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-reference-paths"))]
             test_cancel_all_full_scan: false,
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_flush_per_row: false,
         }
     }
 
@@ -6438,7 +6451,16 @@ impl NativeExecutor {
         // r6: the two sorted flush_all walks are the tail of Phase 4 and were
         // only ever visible lumped into `exec_phase_settle_seconds`.
         let cache_flush_timer = std::time::Instant::now();
-        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+        // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        let pos_flushed = if ctx.test_flush_per_row {
+            pos_cache.flush_all_per_row(&ctx.positions)
+        } else {
+            pos_cache.flush_all(&ctx.positions)
+        };
+        #[cfg(not(any(test, feature = "test-reference-paths")))]
+        let pos_flushed = pos_cache.flush_all(&ctx.positions);
+        if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
@@ -9002,9 +9024,9 @@ impl NativeExecutor {
         trader: &Address,
         market: Option<MarketId>,
     ) -> FixedPoint {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-reference-paths"))]
         if ctx.test_cancel_all_full_scan {
-            return cancel_batch_exec_tests::cancel_orders_and_stops_full_scan(ctx, trader, market);
+            return reference_paths::cancel_orders_and_stops_full_scan(ctx, trader, market);
         }
         let market_ids: Vec<MarketId> = match market {
             Some(m) => vec![m],
@@ -9080,7 +9102,7 @@ impl NativeExecutor {
             return vec![Self::exec_cancel_all(ctx, sender, *market_id)];
         }
         // Step 0.4 reference: one action at a time, each a full scan.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-reference-paths"))]
         if ctx.test_cancel_all_full_scan {
             return run
                 .iter()
