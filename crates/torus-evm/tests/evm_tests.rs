@@ -1703,6 +1703,149 @@ fn writer_precompiles_reject_delegatecall_and_callcode() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Review #5 (s104): persisted contract code must be the ORIGINAL runtime bytes.
+// revm's analyzed legacy Bytecode carries a trailing STOP pad; storing
+// `Bytecode::bytes()` made every later block (and a restarted node) see a
+// longer code: EXTCODESIZE / EXTCODECOPY / eth_getCode diverged from the
+// deploy block and from Ethereum.
+// ---------------------------------------------------------------------------
+
+/// Runtime that does not end in STOP, so revm pads it: PUSH0 PUSH0 RETURN.
+const UNPADDED_RUNTIME: [u8; 3] = [0x5f, 0x5f, 0xf3];
+
+/// Probe: for the address in calldata[0..32] returns 96 bytes
+/// (EXTCODESIZE, EXTCODEHASH, keccak256(EXTCODECOPY(addr, 0, size))).
+#[rustfmt::skip]
+const CODE_PROBE: [u8; 27] = [
+    0x5f, 0x35,       // PUSH0 CALLDATALOAD          [addr]
+    0x80, 0x3b,       // DUP1 EXTCODESIZE            [size, addr]
+    0x80, 0x5f, 0x52, // DUP1 PUSH0 MSTORE           mem[0x00] = size
+    0x80,             // DUP1                        [size, size, addr]
+    0x5f,             // PUSH0                       offset 0
+    0x60, 0x60,       // PUSH1 0x60                  destOffset
+    0x84,             // DUP5                        addr
+    0x3c,             // EXTCODECOPY                 mem[0x60..] = code
+    0x60, 0x60, 0x20, // PUSH1 0x60 SHA3             [keccak(code), addr]
+    0x60, 0x40, 0x52, // PUSH1 0x40 MSTORE           mem[0x40] = keccak(code)
+    0x3f,             // EXTCODEHASH                 [codehash]
+    0x60, 0x20, 0x52, // PUSH1 0x20 MSTORE           mem[0x20] = codehash
+    0x60, 0x60, 0x5f, 0xf3, // PUSH1 0x60 PUSH0 RETURN
+];
+
+fn probe_code(db: &StateDb, number: u64, nonce: u64, probe: Address, target: Address) -> Vec<u8> {
+    let mut calldata = [0u8; 32];
+    calldata[12..].copy_from_slice(target.as_slice());
+    let mut cfg = default_block_cfg();
+    cfg.number = number;
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 200_000,
+        gas_price: 1_000_000_000,
+        kind: TxKind::Call(probe),
+        data: Bytes::copy_from_slice(&calldata),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let (r, _) = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_tx(db, &cfg, tx)
+        .unwrap();
+    assert!(r.success, "probe call must succeed");
+    r.output
+}
+
+#[test]
+fn persisted_code_is_original_runtime_across_commit_and_restart() {
+    use revm::DatabaseRef;
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Address::with_last_byte(0x70);
+    let runtime_hash = alloy_primitives::keccak256(UNPADDED_RUNTIME);
+    let mut want = vec![0u8; 96];
+    want[31] = UNPADDED_RUNTIME.len() as u8;
+    want[32..64].copy_from_slice(runtime_hash.as_slice());
+    want[64..].copy_from_slice(runtime_hash.as_slice());
+
+    let target = {
+        let db = StateDb::open(dir.path()).unwrap();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+            .unwrap();
+        install_contract(&db, &probe, &CODE_PROBE);
+
+        // Init: CODECOPY the 3 trailing runtime bytes to mem[0], RETURN them.
+        let mut init = vec![0x60, 0x03, 0x60, 0x0a, 0x5f, 0x39, 0x60, 0x03, 0x5f, 0xf3];
+        init.extend_from_slice(&UNPADDED_RUNTIME);
+        let deploy = TxEnv {
+            caller: ALICE,
+            gas_limit: 200_000,
+            gas_price: 1_000_000_000,
+            kind: TxKind::Create,
+            data: Bytes::from(init),
+            nonce: 0,
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        };
+        let result = EvmExecutor::new(TORUS_CHAIN_ID)
+            .execute_block(&db, &default_block_cfg(), vec![deploy], false)
+            .unwrap();
+        assert!(result.receipts[0].status, "deploy must succeed");
+        let target = ALICE.create(0);
+        assert_eq!(
+            result.bundle.state[&target]
+                .info
+                .as_ref()
+                .unwrap()
+                .code_hash,
+            runtime_hash
+        );
+
+        // Pending-parent path (StateOverlay) before the block is durable.
+        let overlay = torus_state::StateOverlay::from_bundle(db.clone(), &result.bundle);
+        let pending = overlay.code_by_hash_ref(runtime_hash).unwrap();
+        assert_eq!(
+            pending.original_byte_slice(),
+            UNPADDED_RUNTIME,
+            "overlay code"
+        );
+        assert_eq!(pending.len(), UNPADDED_RUNTIME.len(), "overlay code length");
+
+        // The consensus commit path.
+        let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(
+            &db,
+            &result.bundle,
+            None,
+            Some(&result.native_writes),
+        )
+        .unwrap();
+        db.write(batch).unwrap();
+
+        let stored = db.get_code(&runtime_hash).unwrap().expect("code stored");
+        assert_eq!(
+            stored, UNPADDED_RUNTIME,
+            "CF_CODE must hold the original runtime"
+        );
+        assert_eq!(alloy_primitives::keccak256(&stored), runtime_hash);
+        // A never-restarted node in the next block.
+        assert_eq!(
+            probe_code(&db, 2, 1, probe, target),
+            want,
+            "next block, same process"
+        );
+        target
+    };
+
+    // Restart: reopen the DB and rebuild the code from storage.
+    let db = StateDb::open(dir.path()).unwrap();
+    let reloaded = db.code_by_hash_ref(runtime_hash).unwrap();
+    assert_eq!(reloaded.original_byte_slice(), UNPADDED_RUNTIME);
+    assert_eq!(
+        reloaded.hash_slow(),
+        runtime_hash,
+        "reloaded code hashes to its key"
+    );
+    assert_eq!(probe_code(&db, 2, 1, probe, target), want, "after restart");
+}
+
 /// Convenience module for hex decoding in tests.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {
