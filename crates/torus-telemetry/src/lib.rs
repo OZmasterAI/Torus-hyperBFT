@@ -197,14 +197,12 @@ pub struct Metrics {
     /// Outbound native actions dropped because the gossip channel was full.
     /// Must stay 0 under load — drops mean pre-spread is silently failing.
     pub native_gossip_dropped_full: Counter,
-    /// Pooled oracle submissions evicted by a NEWER submission of the same
-    /// validator at the per-validator cap (review M1(a)). Node-local.
-    pub mempool_oracle_evicted: Counter,
     /// Oracle submissions evicted from or refused by the native pool, by
     /// `reason` (plan 9.14 C, anti-spam D: measure before deciding on a
     /// validator exemption). `replaced_by_newer`: the per-validator cap
-    /// evicted a pooled one for a newer one (same events as
-    /// `mempool_oracle_evicted`); `cap_rejected`: refused at the cap, older
+    /// evicted a pooled one for a newer one (review M1(a); replaces the
+    /// unlabelled `torus_mempool_oracle_evicted`, dropped s104);
+    /// `cap_rejected`: refused at the cap, older
     /// than every pooled one; `pool_full`: refused by a pool holding only
     /// oracle submissions; `expired`: aged out of the nonce window while
     /// pooled. Committed submissions are not counted. Node-local.
@@ -247,7 +245,10 @@ pub struct Metrics {
     /// anti-spam rule, by reason (`unfunded`).
     pub native_gossip_admit_rejects: Family<Vec<(String, String)>, Counter>,
     /// RPC calls refused by the per-IP weight limit (anti-spam item D), by
-    /// `kind` (`call` / `batch`).
+    /// `kind` (`call` / `batch`) and `action` (`oracle`: the call, or any
+    /// call of the batch, carries a `SubmitOraclePrices`; else `other`).
+    /// Each refusal counts once: summing over `action` gives the per-`kind`
+    /// total.
     pub rpc_ip_rejects: Family<Vec<(String, String)>, Counter>,
 
     // Link-storm visibility (Sprint 3.5) — the s338 sweep produced 155+ pull
@@ -1303,13 +1304,6 @@ impl Metrics {
             native_gossip_dropped_full.clone(),
         );
 
-        let mempool_oracle_evicted = Counter::default();
-        registry.register(
-            "torus_mempool_oracle_evicted",
-            "Pooled oracle submissions evicted by a newer one of the same validator (per-validator cap)",
-            mempool_oracle_evicted.clone(),
-        );
-
         let mempool_oracle_dropped = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "torus_mempool_oracle_dropped",
@@ -1405,7 +1399,7 @@ impl Metrics {
         let rpc_ip_rejects = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "torus_rpc_ip_rejects",
-            "RPC calls refused by the per-IP weight limit, by kind (call / batch)",
+            "RPC calls refused by the per-IP weight limit, by kind (call / batch) and action (oracle / other)",
             rpc_ip_rejects.clone(),
         );
 
@@ -2483,7 +2477,6 @@ impl Metrics {
             native_gossip_published_actions,
             native_gossip_received_actions,
             native_gossip_dropped_full,
-            mempool_oracle_evicted,
             mempool_oracle_dropped,
             native_gossip_dropped_oversized,
             verified_sender_cache_hits,

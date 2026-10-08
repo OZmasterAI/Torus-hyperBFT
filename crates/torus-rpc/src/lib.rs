@@ -634,17 +634,28 @@ struct IpLimitMiddleware<S> {
 }
 
 impl<S> IpLimitMiddleware<S> {
-    /// True when the call must be refused (and counts it).
-    fn refuse(&self, ext: &jsonrpsee::Extensions, weight: u32, kind: &str) -> bool {
-        let (Some(limiter), Some(peer)) = (&self.limiter, ext.get::<ip_limit::PeerIp>()) else {
+    /// True when the call must be refused (and counts it). `is_oracle` runs
+    /// only on a refusal, to label it ([`ip_limit::is_oracle_call`]).
+    fn refuse(
+        &self,
+        peer: Option<ip_limit::PeerIp>,
+        weight: u32,
+        kind: &str,
+        is_oracle: impl FnOnce() -> bool,
+    ) -> bool {
+        let (Some(limiter), Some(peer)) = (&self.limiter, peer) else {
             return false;
         };
         if limiter.check(peer.0, weight, Instant::now()) {
             return false;
         }
         if let Some(ref m) = self.metrics {
+            let action = if is_oracle() { "oracle" } else { "other" };
             m.rpc_ip_rejects
-                .get_or_create(&vec![("kind".into(), kind.into())])
+                .get_or_create(&vec![
+                    ("kind".into(), kind.into()),
+                    ("action".into(), action.into()),
+                ])
                 .inc();
         }
         true
@@ -681,7 +692,9 @@ where
     ) -> impl std::future::Future<Output = Self::MethodResponse> + Send + 'a {
         let weight = ip_limit::method_weight(request.method_name(), request.params().as_str());
         let refused = self
-            .refuse(request.extensions(), weight, "call")
+            .refuse(request.extensions().get().copied(), weight, "call", || {
+                ip_limit::is_oracle_call(request.method_name(), request.params().as_str())
+            })
             .then(|| self.refusal());
         let inner = self.inner.clone();
         async move {
@@ -703,8 +716,14 @@ where
             .flatten()
             .map(|e| ip_limit::method_weight(e.method_name(), e.params().map(|p| p.get())))
             .sum();
+        let peer = batch.extensions().get::<ip_limit::PeerIp>().copied();
         let refused = self
-            .refuse(batch.extensions(), weight, "batch")
+            .refuse(peer, weight, "batch", || {
+                batch
+                    .iter()
+                    .flatten()
+                    .any(|e| ip_limit::is_oracle_call(e.method_name(), e.params().map(|p| p.get())))
+            })
             .then(|| self.refusal());
         let inner = self.inner.clone();
         async move {
@@ -2457,13 +2476,81 @@ mod tests {
 
         let text = metrics.encode();
         assert!(
-            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
+            text.contains(concat!(r#"torus_rpc_ip_rejects_total{kind="call",action="other"} 1"#, "\n")),
             "{text}"
         );
         assert!(
-            text.contains(r#"torus_rpc_ip_rejects_total{kind="batch"} 1"#),
+            text.contains(concat!(r#"torus_rpc_ip_rejects_total{kind="batch",action="other"} 1"#, "\n")),
             "{text}"
         );
+        handle.stop().unwrap();
+    }
+
+    /// s104: per-IP refusals of oracle submissions are counted under
+    /// `action="oracle"`, everything else under `action="other"`; a batch is
+    /// `oracle` when any call in it carries one. Each refusal counts once, so
+    /// the sum over `action` is the old per-`kind` total.
+    #[tokio::test]
+    async fn ip_rejects_split_oracle_submissions() {
+        let (_dir, state, mempool, executor) = setup();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(metrics.clone());
+        server.set_ip_limiter(Arc::new(ip_limit::IpLimiter::new(10, Vec::new(), 100)));
+        let (handle, addr) = start_with(server).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        for i in 0..5 {
+            let r: Result<String, _> = client
+                .request("eth_chainId", jsonrpsee::rpc_params![])
+                .await;
+            assert!(r.is_ok(), "call {i}: {r:?}");
+        }
+        let key = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let oracle = oracle_payload(&key, 1);
+        // Refused before verification: the payload need not be admissible.
+        let err = client
+            .request::<String, _>(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![oracle.clone()],
+            )
+            .await
+            .expect_err("budget exhausted");
+        assert!(err.to_string().contains("-32005"), "{err}");
+        let _ = client
+            .request::<String, _>("eth_chainId", jsonrpsee::rpc_params![])
+            .await
+            .expect_err("budget exhausted");
+        let mut batch = jsonrpsee::core::params::BatchRequestBuilder::new();
+        batch
+            .insert("eth_chainId", jsonrpsee::rpc_params![])
+            .unwrap();
+        batch
+            .insert(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![oracle]],
+            )
+            .unwrap();
+        let _ = client.batch_request::<serde_json::Value>(batch).await;
+
+        let text = metrics.encode();
+        for line in [
+            r#"torus_rpc_ip_rejects_total{kind="call",action="oracle"} 1"#,
+            r#"torus_rpc_ip_rejects_total{kind="call",action="other"} 1"#,
+            r#"torus_rpc_ip_rejects_total{kind="batch",action="oracle"} 1"#,
+        ] {
+            assert!(text.contains(&format!("{line}\n")), "missing {line}: {text}");
+        }
+        assert!(!text.contains(r#"kind="batch",action="other""#), "{text}");
         handle.stop().unwrap();
     }
 
@@ -2505,7 +2592,7 @@ mod tests {
         );
         let text = metrics.encode();
         assert!(
-            text.contains(r#"torus_rpc_ip_rejects_total{kind="call"} 1"#),
+            text.contains(concat!(r#"torus_rpc_ip_rejects_total{kind="call",action="other"} 1"#, "\n")),
             "{text}"
         );
         handle.stop().unwrap();

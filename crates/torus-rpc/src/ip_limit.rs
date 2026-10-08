@@ -90,6 +90,39 @@ pub fn method_weight(method: &str, params: Option<&str>) -> u32 {
     }
 }
 
+/// Start of every canonical-JSON oracle submission: `SignedNativeAction`
+/// serializes `action` first and `NativeAction` is externally tagged.
+const ORACLE_JSON_HEAD: &[u8] = br#"{"action":{"SubmitOraclePrices""#;
+
+/// True when a submit call carries at least one oracle submission
+/// (`SubmitOraclePrices`). Only labels a per-IP refusal
+/// (`torus_rpc_ip_rejects_total{action}`), so it reads each payload's head
+/// (bincode tag, or the canonical-JSON prefix [`ORACLE_JSON_HEAD`]) and
+/// never decodes an action: a JSON payload with other key order or
+/// whitespace counts as `other`.
+pub fn is_oracle_call(method: &str, params: Option<&str>) -> bool {
+    let bin = match method {
+        "torus_submitNativeAction" | "torus_submitNativeActions" => false,
+        "torus_submitNativeActionsBin" => true,
+        _ => return false,
+    };
+    // Payloads are hex strings (no inner quotes): every second `"` piece.
+    params.is_some_and(|p| {
+        p.split('"').skip(1).step_by(2).any(|s| {
+            if bin {
+                crate::torus::peek_bin_tag(s) == Some(crate::torus::TAG_SUBMIT_ORACLE_PRICES)
+            } else {
+                let hex_head = s.strip_prefix("0x").unwrap_or(s);
+                let mut head = [0u8; ORACLE_JSON_HEAD.len()];
+                hex_head
+                    .get(..2 * head.len())
+                    .is_some_and(|h| hex::decode_to_slice(h, &mut head).is_ok())
+                    && head == ORACLE_JSON_HEAD
+            }
+        })
+    })
+}
+
 /// One CIDR block (`addr/prefix`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
@@ -298,6 +331,61 @@ mod tests {
         assert_eq!(method_weight("torus_subscribe", None), 20);
         assert_eq!(method_weight("torus_unsubscribe", None), 1);
         assert_eq!(method_weight("eth_unsubscribe", None), 1);
+    }
+
+    /// s104: a refused call is labelled `action="oracle"` when any of its
+    /// payloads is a `SubmitOraclePrices`, read from the payload head only
+    /// (canonical-JSON prefix or bincode tag), in all three submit formats.
+    #[test]
+    fn oracle_calls_are_recognised() {
+        use torus_types::{NativeAction, OracleSubmission};
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sign = |a| torus_types::eip712::sign_native_action(a, 1, &key);
+        let oracle = sign(NativeAction::SubmitOraclePrices(OracleSubmission {
+            prices: vec![],
+            timestamp: 0,
+        }));
+        let other = sign(NativeAction::ClaimRewards);
+        let json = |s: &torus_types::SignedNativeAction| {
+            format!("0x{}", hex::encode(serde_json::to_vec(s).unwrap()))
+        };
+        let bin = |s: &torus_types::SignedNativeAction| {
+            format!("0x{}", hex::encode(bincode::serialize(s).unwrap()))
+        };
+        let one = |p: String| serde_json::to_string(&vec![p]).unwrap();
+        let many = |v: Vec<String>| serde_json::to_string(&vec![v]).unwrap();
+
+        let single = "torus_submitNativeAction";
+        assert!(is_oracle_call(single, Some(&one(json(&oracle)))));
+        assert!(!is_oracle_call(single, Some(&one(json(&other)))));
+        // No `0x` prefix is accepted too (as `parse_bytes` does).
+        let bare = json(&oracle).trim_start_matches("0x").to_string();
+        assert!(is_oracle_call(single, Some(&one(bare))));
+
+        let batch = "torus_submitNativeActions";
+        assert!(is_oracle_call(
+            batch,
+            Some(&many(vec![json(&other), json(&oracle)]))
+        ));
+        assert!(!is_oracle_call(
+            batch,
+            Some(&many(vec![json(&other), json(&other)]))
+        ));
+        // A bincode payload sent to the JSON endpoint is not read as JSON.
+        assert!(!is_oracle_call(batch, Some(&many(vec![bin(&oracle)]))));
+
+        let bin_batch = "torus_submitNativeActionsBin";
+        assert!(is_oracle_call(
+            bin_batch,
+            Some(&many(vec![bin(&other), bin(&oracle)]))
+        ));
+        assert!(!is_oracle_call(bin_batch, Some(&many(vec![bin(&other)]))));
+
+        // Not a submit, no params, or junk: never oracle.
+        assert!(!is_oracle_call("eth_chainId", Some(&one(json(&oracle)))));
+        assert!(!is_oracle_call(single, None));
+        assert!(!is_oracle_call(single, Some(r#"["0x7b","zz",""]"#)));
+        assert!(!is_oracle_call(bin_batch, Some(r#"[["0x0f"]]"#)));
     }
 
     #[test]

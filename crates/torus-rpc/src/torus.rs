@@ -272,13 +272,13 @@ const NATIVE_ACTION_TAGS: u32 = 29;
 /// (`torus_mempool::is_cancel` / `is_oracle_submission`).
 const TAG_CANCEL_ORDER: u32 = 2;
 const TAG_CANCEL_ALL_ORDERS: u32 = 3;
-const TAG_SUBMIT_ORACLE_PRICES: u32 = 15;
+pub(crate) const TAG_SUBMIT_ORACLE_PRICES: u32 = 15;
 
 /// bincode ingress tag peek. `SignedNativeAction.action` is the first field
 /// and bincode 1 (fixint) writes an enum variant as a little-endian u32, so
 /// the tag is the first 4 bytes = the first 8 hex characters (after an
 /// optional `0x`, as in `parse_bytes`).
-fn peek_bin_tag(signed_action: &str) -> Option<u32> {
+pub(crate) fn peek_bin_tag(signed_action: &str) -> Option<u32> {
     let s = signed_action.strip_prefix("0x").unwrap_or(signed_action);
     let mut tag = [0u8; 4];
     hex::decode_to_slice(s.get(..8)?, &mut tag).ok()?;
