@@ -26,8 +26,14 @@ pub enum MempoolError {
     DuplicateTx(B256),
     /// Pool is full and the transaction doesn't outbid the cheapest.
     PoolFull,
-    /// Replacement transaction doesn't meet the minimum gas price bump.
-    ReplacementUnderpriced { need_min: u128, got: u128 },
+    /// Replacement transaction doesn't raise both the max fee and the max
+    /// priority fee by the minimum bump (geth rule).
+    ReplacementUnderpriced {
+        need_max_fee: u128,
+        got_max_fee: u128,
+        need_priority_fee: u128,
+        got_priority_fee: u128,
+    },
     /// Transaction gas limit exceeds block gas limit.
     GasLimitExceeded { tx_gas: u64, block_gas: u64 },
     /// State read error during validation.
@@ -57,6 +63,12 @@ pub enum MempoolError {
     /// Review #2 (s104): EIP-1559 max priority fee above the max fee (revm
     /// rejects it at execution).
     PriorityFeeAboveMaxFee { priority_fee: u128, max_fee: u128 },
+    /// Gas limit below the tx's intrinsic gas (revm skips such a tx at
+    /// execution, which would strand the sender's nonce).
+    IntrinsicGasTooLow { need: u64, got: u64 },
+    /// EIP-3860: contract-creation initcode above the size limit (revm
+    /// rejects it at execution).
+    InitCodeTooLarge { size: usize, max: usize },
 }
 
 impl fmt::Display for MempoolError {
@@ -83,9 +95,16 @@ impl fmt::Display for MempoolError {
             }
             Self::DuplicateTx(hash) => write!(f, "duplicate tx: {hash}"),
             Self::PoolFull => write!(f, "mempool full"),
-            Self::ReplacementUnderpriced { need_min, got } => {
-                write!(f, "replacement underpriced: need >= {need_min}, got {got}")
-            }
+            Self::ReplacementUnderpriced {
+                need_max_fee,
+                got_max_fee,
+                need_priority_fee,
+                got_priority_fee,
+            } => write!(
+                f,
+                "replacement transaction underpriced: need max fee >= {need_max_fee} \
+                 and priority fee >= {need_priority_fee}, got {got_max_fee} and {got_priority_fee}"
+            ),
             Self::GasLimitExceeded { tx_gas, block_gas } => {
                 write!(f, "tx gas {tx_gas} exceeds block gas {block_gas}")
             }
@@ -125,6 +144,15 @@ impl fmt::Display for MempoolError {
                 f,
                 "max priority fee per gas ({priority_fee}) above max fee per gas ({max_fee})"
             ),
+            Self::IntrinsicGasTooLow { need, got } => {
+                write!(f, "intrinsic gas too low: have {got}, want {need}")
+            }
+            Self::InitCodeTooLarge { size, max } => {
+                write!(
+                    f,
+                    "max initcode size exceeded: code size {size}, limit {max}"
+                )
+            }
         }
     }
 }
