@@ -2,8 +2,10 @@
 
 Status: step 0 done on `perf/item6-phase2` (ozarchy, s27 / s101) from main `d3ba3c0a` (9.7;
 review log rows 1-16): 0.1, 0.2 and 0.4 built, 0.3 and Gate 0 measured (results doc section 25).
-Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block, owner decision pending (section 1).
-Owner decisions recorded s96 (section 9, with the options not chosen) and s27 (9.8). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
+Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block; owner (s27 / s101): P2-5 joins the
+gate set, the +7% stays (9.9), P2-3 goes to the backlog (9.10). Next: step 1 (P2-1, 1b), then P2-5,
+P2-2, the P2-4 design check (section 4). Owner decisions recorded s96 (section 9, with the options
+not chosen) and s27 / s101 (9.8-9.10). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
 `integrate/s94-batch`; "section 22" below). Short form and the phases after this one:
 `item6-phases-2-5-plans.md`. Design: `market-scaling-in-memory-design.md` section 3, Phase 2.
@@ -24,7 +26,8 @@ Every number below is from section 22 or from the code, unless it is marked
 ## 1. Goal and gates
 
 Goal: cut the per-block work on the execution thread that does not scale with fills: the
-cancel-all scan of every book, a new thread set per block, and the per-row cache flush.
+cancel-all scan of every book, the per-row cache flush and SipHash on the exec-path maps (a new
+thread set per block was in the goal until 9.10 moved P2-3 to the backlog).
 No consensus rule, no state format and no state hash changes (same as Phase 1).
 
 | gate | target (fail line) | measured by | source |
@@ -55,11 +58,14 @@ accepting a lower gate (as Gates 3 / 4 were accepted missed in 9.12).
 ~9.6 ms per native block in the perf window (37.6k fills per block, close to section 22's 39.2k);
 ~3.7 + ~3.2 = ~6.9 ms on the standard no-perf cells (27k fills, engine 124 ms per native block).
 Both are estimates from the 0.3 split; as a share of engine time 4.7-5.6%, against the ~6.8% that
-13 ms of 190 stood for. With P2-5 (~10 ms on the standard cells, microbench estimate, 25.3) and
-P2-3 (~0.8 ms) the set would reach ~18 ms (~14% of engine) on those cells. **Owner: pull P2-5
-into the gate set, or accept a lower gate.** Note: on the standard cells the base runs ~9% below
-section 23.1's `35e69b3` cells (not interleaved; results doc Open); the +7% is still measured
-against `d3ba3c0a`, so this does not change the gate's reference.
+13 ms of 190 stood for. **Owner (9.9): P2-5 joins the gate set, the +7% stays.** The set is then
+P2-1 + P2-2 + P2-5: ~3.7 + ~3.2 + ~10.3 = **~17 ms per native block (~14% of engine) on the
+standard cells** (~5.0 + ~4.6 + ~15.8 = ~25 ms in the perf window, at section 22's engine for
+P2-5). P2-3 (~0.8 ms) is no longer in the set (9.10). P2-5's ~10 ms is a microbench estimate and
+counts only once a cell confirms it (9.9). Note: on the standard cells the base runs ~9% below
+section 23.1's `35e69b3` cells (not interleaved; results doc Open, regression check
+`ozarchy-p2s0r`); the +7% is still measured against `d3ba3c0a`, so this does not change the
+gate's reference.
 
 ## 2. What the step 0 profile measured (section 22.1, crab r2, load window)
 
@@ -224,6 +230,9 @@ covers before step 0 closes.
 
 ### P2-3 Persistent worker pool (>= 15.6k thread spawns per minute, ~62 per native block)
 
+**Dropped from Phase 2 to the backlog (owner, 9.10).** Kept below as the record.
+
+
 - Where (spawn sites per native block in the code; section 22 names the first three):
   - `market_workers.rs:MarketWorkerPool::match_parallel_capped_with` (:104, scope :158);
   - `native_executor.rs:settle_market_results_parallel` (:6966, scope :7055);
@@ -306,6 +315,10 @@ covers before step 0 closes.
 
 ### P2-5 Keyed fast hasher for exec-path maps (fallback item, owner s96: option C, 9.5)
 
+**In the gate set since step 0 (owner, 9.9); built right after P2-1.** A cell must confirm the
+microbench estimate before it counts (s82 caveat, 9.9).
+
+
 - Where: `Address`- and `OrderId`-keyed `HashMap`s / `HashSet`s on the execution path
   (section 22: SipHash `write` 6.6%, `hash_one<Address>` 3.5%, `hash_one<u128>` 3.1% of
   execution self time, ~13% together; Keccak 5.5% is the state hash and is not touched).
@@ -337,9 +350,10 @@ covers before step 0 closes.
 
 ## 4. Steps and order
 
-Order: step 0, then P2-1, P2-3, P2-2, P2-4 (design check). This is section 22's order
-(22.4). P2-1 is the largest measured item. P2-3 is ranked by spawn count, not ms, so its
-step 0.2 measurement may move it after P2-2. P2-2 is small, touches different code and can
+Order (owner s27 / s101, 9.9 and 9.10): step 0, then P2-1 (+ 1b), P2-5, P2-2, the P2-4
+design check. P2-1 is the largest measured item; P2-5 joins the gate set at the step 0
+checkpoint and goes right after it; P2-3 is in the backlog (9.10). Was (s96, section 22.4):
+P2-1, P2-3, P2-2, P2-4, with P2-5 as the fallback. P2-2 is small, touches different code and can
 be built in parallel by a second builder. Each step: tests first, then the change,
 then the gate. A failing correctness test stops the work. A missed cost gate is written
 into the review log (section 8) and the next step starts (Phase 1 rule).
@@ -370,18 +384,20 @@ each commit, one full `cargo test --workspace` before the merge.
 
 | step | commit | gate |
 |---|---|---|
-| 1 | P2-1 cancel-all index | P2-1 above |
+| 1 | P2-1 cancel-all index (starts with the test-only feature, 9.8) | P2-1 above |
 | 1b | P2-1b order id -> market map (option C, 9.2) | P2-1b above |
-| 2 | P2-3 exec pool | P2-3 above |
+| 2 | P2-5 hasher (9.9) | P2-5 above; the cell must confirm the microbench |
 | 3 | P2-2 batch flush | P2-2 above |
 | 4 | P2-4 design check (read-only); build only if it passes | P2-4 above |
-| 4b | P2-5 hasher (earlier if the step 0 checkpoint pulls it in) | P2-5 above |
 | 5 | phase campaign (section 6) | section 1 |
+
+P2-3 (exec pool) is not a step: backlog (9.10).
 
 ## 5. Commit plan
 
 C0 counters + reference paths | C1 cancel-all index | C1b order id -> market map |
-C2 exec pool | C3 batch flush | (C4 liquidation skip, if step 4 passes) | C5 hasher. Every commit: full suite and goldens green,
+C2 hasher | C3 batch flush | (C4 liquidation skip, if step 4 passes). The exec pool commit (was
+C2) is dropped (9.10); the hasher was C5. Every commit: full suite and goldens green,
 per-item ms in the commit message. One commit per item so a single item can be benched
 from an intermediate commit if its effect must be isolated.
 
@@ -432,6 +448,7 @@ Standard shape (results doc 21.4, as section 22):
 | 14 | 0.2 / 0.3 | Cache flush split: second lookup 3.5, `intern_cf` 0.8, sort 3.05, `BTreeMap` insert 7.2 of 17.6 ms; spawns 47.5-52.4 per block from 3 sites, ~17 us each (C microbench); sys CPU 2.2 ms / 1k, spawns ~1% of it | P2-2 ~4.6 / ~3.2 ms; P2-3 ~0.8 ms, gate on the spawn counter + matched/s (not sys CPU). Checkpoint: P2-1 + P2-2 < 13 ms, owner decides P2-5 vs lower gate (section 1) |
 | 15 | 0.2 | Cancel-by-id cell: 1.22 by-id actions per native block (16,445 of 17,361 id lookups found no own order in the market), 457 books probed per action, phase 1 +3.1 ms per block (~2.5 ms per action) on all 3 validators; the probes are ~10-20 us of it | P2-1b's map alone cuts only the probes; the rest is likely run splitting (inferred), which P2-1 cuts. Read P2-1b's gate with a perf cell and a larger by-id share |
 | 16 | 0.2 | Hasher microbench, 10 x 30 reps: `hash_one` 0.369x mean, map gets 0.29-0.57x; estimate 15.8 ms (190 ms engine) / ~10.3 ms (124 ms) per native block | P2-5 input for the checkpoint |
+| 17 | checkpoint | Owner (s27 / s101) on the step 0 checkpoint: P2-5 into the gate set, +7% kept, P2-5 right after P2-1, confirmed by a cell before it counts (s82 caveat); P2-3 to the backlog | 9.9, 9.10; order P2-1 (+1b), P2-5, P2-2, P2-4 design check (section 4); commits C2 hasher, C3 batch flush (section 5) |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -575,3 +592,37 @@ at the start of step 1, before the cancel-all index.
 |---|---|
 | **A. test-only cargo feature on torus-bridge (chosen)** | keeps the app-level differential, serial and pipelined |
 | B. bridge-level differentials only | loses the pipelined app-level check |
+
+### 9.9 Step 0 checkpoint: P2-5 into the gate set (2026-10-08, s27 / s101)
+
+Step 0 put P2-1 + P2-2 below 13 ms per native block (section 1; results doc 25.4).
+
+**Chosen: option 1.** Pull P2-5 (hasher) into the gate set, keep the +7% gate, and build P2-5
+right after P2-1. Caveat: s82's ahash A/B on the exec maps (`perf/s82-exec-hasher`,
+`docs/perf/s82-exec-hasher-2026-09-30.md`) cut hash-map CPU from 3.06 to 1.88 CPU-s per 1M but
+gave no matched/s gain, because the exec thread was not the bottleneck then. So the P2-5
+microbench sets the ms estimate (~10.3 ms per native block on the standard cells, results doc
+25.3), and a cell must confirm it before it counts toward the ~17 ms set (section 1). If the cell
+does not show it, the miss goes into the review log (Phase 1 rule) and the work continues.
+
+| option | note |
+|---|---|
+| **1. P2-5 into the gate set, keep +7% (chosen)** | set ~17 ms on the standard cells (estimate); P2-5 must be confirmed by a cell |
+| 2. accept a lower gate | P2-1 + P2-2 alone ~7-10 ms, ~+3-5% (estimate); not chosen |
+
+### 9.10 P2-3 (exec pool) to the backlog (2026-10-08, s27 / s101)
+
+Step 0 numbers (results doc section 25): ~50 spawns per native block from three sites, 16.7 us
+per spawn + join on ozarchy (C microbench, idle host), ~0.8 ms per native block of exec-thread
+wall; the spawns are ~1% of the process sys CPU. At ~0.5% of engine time that is below cell
+resolution, so its gate could not be measured, and a persistent pool adds lifetime, panic and
+shutdown complexity (the per-site panic rules in section 3).
+
+**Chosen: drop P2-3 from Phase 2 to the backlog.** Revisit when blocks get small (low load, or
+after Phase 3), where a fixed per-block cost weighs more. The spawn counter
+(`torus_exec_thread_spawns_<site>`) stays as the evidence.
+
+| option | note |
+|---|---|
+| **backlog (chosen)** | no lifetime / panic / shutdown risk in Phase 2; counter kept |
+| keep P2-3 in Phase 2 | ~0.8 ms (estimate), gate not measurable at ~5% cell resolution |
