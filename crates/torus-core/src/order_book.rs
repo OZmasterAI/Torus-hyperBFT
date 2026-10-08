@@ -3020,6 +3020,9 @@ impl OrderBook {
             .filter(|(_, ids)| !ids.is_empty())
             .map(|(trader, _)| trader)
             .chain(self.pending_stops.iter().map(|s| &s.trader))
+            // Unreachable today (18c s104): every path that removes a resting
+            // order also drops its reduce-only entry, so each entry's trader is
+            // already listed through `trader_orders`. Kept as a safeguard.
             .chain(self.reduce_only_index.iter().map(|(trader, _)| trader))
     }
 
