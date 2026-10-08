@@ -7,10 +7,13 @@
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
+// Item 6 Phase 2 P2-5: std's HashMap with foldhash, seeded per process
+// (alloy's default `map-foldhash`), instead of SipHash.
+use alloy_primitives::map::{HashMap, HashSet};
 use torus_core::error::CoreError;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
@@ -249,9 +252,9 @@ mod volume_cache_probe {
                 .iter()
                 .map(|f| {
                     let mut v = if sized {
-                        VolumeCache::with_capacity(2 * f.len())
+                        VolumeCache::with_capacity_and_hasher(2 * f.len(), Default::default())
                     } else {
-                        VolumeCache::new()
+                        VolumeCache::default()
                     };
                     add_fill_volumes(&mut v, f, 2 * f.len());
                     v
@@ -264,7 +267,7 @@ mod volume_cache_probe {
         }
         let built = plans(true);
         let distinct = {
-            let mut all = VolumeCache::new();
+            let mut all = VolumeCache::default();
             for p in &built {
                 all.extend(p.iter().map(|(t, v)| (*t, *v)));
             }
@@ -273,7 +276,7 @@ mod volume_cache_probe {
         let max_plan = built.iter().map(VolumeCache::len).max().unwrap_or(0);
         for (name, cap) in [("new", 0), ("max plan len", max_plan), ("distinct", distinct)] {
             let (min, med) = median_ms(|| {
-                let mut merged = VolumeCache::with_capacity(cap);
+                let mut merged = VolumeCache::with_capacity_and_hasher(cap, Default::default());
                 for p in &built {
                     for (t, add) in p {
                         *merged.entry(*t).or_insert(FixedPoint::ZERO) += *add;
@@ -297,7 +300,7 @@ struct CachedBalance {
 impl BalanceCache {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: HashMap::default(),
             dirty: Vec::new(),
         }
     }
@@ -671,7 +674,6 @@ const OPEN_COUNT_WORK_PER_THREAD: usize = 100_000;
 #[cfg(test)]
 mod open_order_count_tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn trader(n: u64) -> Address {
         let mut b = [0u8; 20];
@@ -718,7 +720,7 @@ mod open_order_count_tests {
             let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ seed);
             let big = seed == 8;
             let (n_books, universe) = if big { (40, 1600) } else { (1 + rng.below(30), 400) };
-            let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
+            let mut books: HashMap<MarketId, OrderBook> = HashMap::default();
             for m in 1..=n_books {
                 let mut book = OrderBook::new(m, fp(1), fp(1));
                 let traders = match (big, rng.below(4)) {
@@ -747,7 +749,7 @@ mod open_order_count_tests {
             };
             let got = NativeExecutor::open_order_counts(&books, senders.iter());
 
-            let mut idx: HashMap<Address, usize> = HashMap::new();
+            let mut idx: HashMap<Address, usize> = HashMap::default();
             for s in &senders {
                 let next = idx.len();
                 idx.entry(*s).or_insert(next);
@@ -846,7 +848,7 @@ struct AccountReader<'a, T: StateBackend> {
     /// adl-dirty-check (node-local): the ADL drain's dirty traders
     /// (`DrainCache::dirty_traders`, ranking reader only), in place of a
     /// `layer_touches` per read. `None` elsewhere.
-    drain_dirty: Option<&'a std::collections::HashSet<Address>>,
+    drain_dirty: Option<&'a HashSet<Address>>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -1264,7 +1266,7 @@ impl BlockSums {
 /// * `id`: keys each Phase 3 worker's maker cache ([`MAKER_FREE`]).
 pub(crate) struct BatchSums {
     id: u64,
-    dirty: Option<std::collections::HashSet<Address>>,
+    dirty: Option<HashSet<Address>>,
     memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
 }
 
@@ -1300,7 +1302,7 @@ thread_local! {
     /// `.0` ([`BatchSums::id`]; another batch clears it). A maker's free
     /// margin is the same in every market of a batch (frozen backend).
     static MAKER_FREE: std::cell::RefCell<(u64, HashMap<Address, FixedPoint>)> =
-        std::cell::RefCell::new((0, HashMap::new()));
+        std::cell::RefCell::new((0, HashMap::default()));
 }
 
 /// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
@@ -1757,7 +1759,7 @@ impl<T: StateBackend> AccountReader<'_, T> {
         MAKER_FREE.with(|c| {
             let mut c = c.borrow_mut();
             if c.0 != b.id {
-                *c = (b.id, HashMap::new());
+                *c = (b.id, HashMap::default());
             }
             c.1.insert(*maker, free);
         });
@@ -1977,8 +1979,8 @@ mod projections_tests {
         for round in 0..200 {
             let markets = [3u64, 12, 40][round % 3];
             let mut fold = SenderFold::with_capacity(0);
-            let mut want: HashMap<(Address, MarketId), Projection> = HashMap::new();
-            let mut want_released: HashMap<Address, FixedPoint> = HashMap::new();
+            let mut want: HashMap<(Address, MarketId), Projection> = HashMap::default();
+            let mut want_released: HashMap<Address, FixedPoint> = HashMap::default();
             for step in 0..600 {
                 // Runs of one sender, as in a batch, and switches.
                 let sender = Address::repeat_byte(1 + next(4) as u8);
@@ -2024,7 +2026,10 @@ mod projections_tests {
 impl SenderFold {
     /// Pre-sized: `senders` expected.
     fn with_capacity(senders: usize) -> Self {
-        Self { senders: HashMap::with_capacity(senders), cur: None }
+        Self {
+            senders: HashMap::with_capacity_and_hasher(senders, Default::default()),
+            cur: None,
+        }
     }
 
     /// `sender`'s state (default when new), held out of the map until the
@@ -2048,7 +2053,10 @@ impl SenderFold {
             self.senders.insert(a, st);
         }
         let mut out = FoldOut {
-            cache: BalanceCache { map: HashMap::with_capacity(self.senders.len()), dirty: Vec::new() },
+            cache: BalanceCache {
+                map: HashMap::with_capacity_and_hasher(self.senders.len(), Default::default()),
+                dirty: Vec::new(),
+            },
             ..FoldOut::default()
         };
         for (sender, st) in self.senders {
@@ -3721,7 +3729,7 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// byte-identical in final state (state-root-safe even in mixed
     /// deployments) and turns the old O(all resting orders) rewrite into
     /// O(touched) (S395).
-    pub dirty_books: std::collections::HashSet<MarketId>,
+    pub dirty_books: HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
     /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
@@ -4275,7 +4283,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 if load_error.is_none() {
                     load_error = Some(format!("margin configs: {e}"));
                 }
-                HashMap::new()
+                HashMap::default()
             }
         };
         load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
@@ -4287,7 +4295,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             governance,
             state,
             order_books,
-            dirty_books: std::collections::HashSet::new(),
+            dirty_books: HashSet::default(),
             margin_configs,
             block_marks: None,
             prev_marks: None,
@@ -4529,14 +4537,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
                 if Self::is_book_row_key(&key) {
                     return (
-                        HashMap::new(),
+                        HashMap::default(),
                         1,
                         Some(
                             "C4: cf_native_order_books holds per-order/level rows but \
@@ -4621,7 +4629,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (HashMap::default(), 1, Some(msg));
 
         // Per-market accumulators.
         #[derive(Default)]
@@ -4633,7 +4641,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         fn acc(m: &mut HashMap<MarketId, Acc>, id: MarketId) -> &mut Acc {
             m.entry(id).or_default()
         }
-        let mut accs: HashMap<MarketId, Acc> = HashMap::new();
+        let mut accs: HashMap<MarketId, Acc> = HashMap::default();
 
         let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             Ok(e) => e,
@@ -4681,7 +4689,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
 
         // Deterministic rebuild order (market id ascending).
@@ -4727,7 +4735,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (HashMap::default(), 1, Some(msg));
 
         let load_start = std::time::Instant::now();
         let t0 = load_start;
@@ -4739,7 +4747,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             /// level key (26 B) -> stored 52 B value
             levels: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
         }
-        let mut roots: HashMap<MarketId, RootAcc> = HashMap::new();
+        let mut roots: HashMap<MarketId, RootAcc> = HashMap::default();
 
         let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             Ok(e) => e,
@@ -4799,7 +4807,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         let t0 = std::time::Instant::now();
         // ---- Node-local order-row store scan ----
         let mut store_orders: HashMap<MarketId, Vec<(u64, torus_core::order_book::Order)>> =
-            HashMap::new();
+            HashMap::default();
         let store_entries = match state.iterate_cf(CF_BOOK_ORDER_ROWS, None) {
             Ok(e) => e,
             Err(e) => return fail(format!("3c: order-row store scan failed: {e}")),
@@ -4997,7 +5005,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         };
         timings.books_wall_ns = t_books.elapsed().as_nanos();
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
         for (market_id, loaded) in results {
             let (book, rebuild_ns, verify_ns) = match loaded {
@@ -5533,7 +5541,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut prefix = [0u8; 9];
         prefix[..8].copy_from_slice(&market_id.to_be_bytes());
         prefix[8] = ROW_TAG_STOP;
-        let persisted: std::collections::HashSet<u128> = state
+        let persisted: HashSet<u128> = state
             .iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix))
             .map(|rows| {
                 rows.iter()
@@ -5544,7 +5552,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             .unwrap_or_default();
 
         let mut written = 0usize;
-        let mut live = std::collections::HashSet::with_capacity(stops.len());
+        let mut live = HashSet::with_capacity_and_hasher(stops.len(), Default::default());
         for (id, bytes) in stops {
             live.insert(id);
             if !persisted.contains(&id) {
@@ -5621,10 +5629,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         let stops = book.stop_rows();
 
         // Fresh key set per CF.
-        let mut keep_root: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
-        let mut keep_store: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        let mut keep_root: HashSet<Vec<u8>> =
+            HashSet::default();
+        let mut keep_store: HashSet<Vec<u8>> =
+            HashSet::default();
         keep_root.insert(book_meta_key(market_id).to_vec());
         for (id, _) in &stops {
             keep_root.insert(book_stop_key(market_id, *id).to_vec());
@@ -6199,7 +6207,7 @@ impl NativeExecutor {
         // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
         // — the prepared order carries an 8-byte reference through Phases 2-4
         // instead of a per-order deep clone of `PlaceOrderParams`.
-        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
 
         // Open orders after Phase 1 of every sender with an order that takes
         // an open-order slot (read by the serial loop and the sharded workers).
@@ -6221,7 +6229,7 @@ impl NativeExecutor {
         // read-modify-writes per fill; they hit this map and flush once
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
-        let mut vol_cache = VolumeCache::new();
+        let mut vol_cache = VolumeCache::default();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
         let engine_threads = match engine_mode {
@@ -6283,7 +6291,7 @@ impl NativeExecutor {
             // groups is irrelevant — shards are disjoint — but keep it
             // deterministic anyway).
             let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
-            let mut group_of: HashMap<Address, usize> = HashMap::new();
+            let mut group_of: HashMap<Address, usize> = HashMap::default();
             for &i in &place_order_indices {
                 let (sender, entry) = &flat[i];
                 let params: &PlaceOrderParams = match entry {
@@ -6391,7 +6399,8 @@ impl NativeExecutor {
             m.sell_top_ups_partial.inc_by(partial);
             m.sell_top_ups_none.inc_by(none);
         }
-        let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::with_capacity(pool_takers.len());
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
+            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
         for (&sender, &(market_id, pos_net)) in &pool_takers {
             let available = bal_cache
                 .load(&ctx.positions, &sender)
@@ -6410,7 +6419,7 @@ impl NativeExecutor {
         // ---- Phase 3: Parallel matching ----
         let match_timer = std::time::Instant::now();
         let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
-            HashMap::new();
+            HashMap::default();
 
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
@@ -7627,7 +7636,7 @@ impl NativeExecutor {
         // At most two traders per fill: sized up front, the map never
         // regrows (s84: regrowth was a third of the cum_volume time).
         let fill_sides: usize = mbr.results.iter().map(|m| 2 * m.result.fills.len()).sum();
-        let mut volumes = VolumeCache::with_capacity(fill_sides);
+        let mut volumes = VolumeCache::with_capacity_and_hasher(fill_sides, Default::default());
 
         for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
             let result = &match_result.result;
@@ -8028,7 +8037,7 @@ impl NativeExecutor {
         books: &HashMap<MarketId, OrderBook>,
         senders: impl Iterator<Item = &'a Address>,
     ) -> HashMap<Address, u32> {
-        let mut idx: HashMap<Address, usize> = HashMap::new();
+        let mut idx: HashMap<Address, usize> = HashMap::default();
         for sender in senders {
             let next = idx.len();
             idx.entry(*sender).or_insert(next);
@@ -8245,11 +8254,14 @@ impl NativeExecutor {
         // never rest; without one in the batch they are not tracked (the
         // map is otherwise only written). Pre-sized: one key per order at most.
         let track_closing = orders.iter().any(|(_, _, p)| Self::never_rests(p));
-        let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
-        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
+        let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::default();
+        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::default();
         let mut closing: HashMap<(Address, MarketId, bool), (Option<FixedPoint>, FixedPoint)> =
-            HashMap::with_capacity(if track_closing { orders.len() } else { 0 });
-        let mut out = HashMap::new();
+            HashMap::with_capacity_and_hasher(
+                if track_closing { orders.len() } else { 0 },
+                Default::default(),
+            );
+        let mut out = HashMap::default();
         for &(i, sender, params) in orders {
             let mark = if matches!(params.order_type, OrderType::Market) {
                 *marks
@@ -8326,7 +8338,7 @@ impl NativeExecutor {
         reader: &AccountReader<'a, T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
     ) -> HashMap<MarketId, Phase2Market<'a>> {
-        let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::new();
+        let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::default();
         for &(_, _, p) in orders {
             out.entry(p.market_id)
                 .or_insert_with(|| Phase2Market {
@@ -11367,17 +11379,17 @@ mod option_b_fold_pool_tests {
             let place_orders: Vec<(usize, Address, &PlaceOrderParams)> =
                 orders.iter().enumerate().map(|(i, (s, p))| (i, *s, p)).collect();
             let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
-            let open_at_start = HashMap::new();
+            let open_at_start = HashMap::default();
             let reader = AccountReader::of(&ctx);
             let markets = NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
 
             let mut fold = SenderFold::default();
-            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
             let mut results: Vec<NativeActionResult> =
                 (0..orders.len()).map(|_| NativeActionResult::ok("pending", 0)).collect();
             let mut next_id = 1u128;
-            let mut first_seen: HashMap<Address, bool> = HashMap::new();
-            let mut want_excess: HashMap<Address, FixedPoint> = HashMap::new();
+            let mut first_seen: HashMap<Address, bool> = HashMap::default();
+            let mut want_excess: HashMap<Address, FixedPoint> = HashMap::default();
             for (i, (s, p)) in orders.iter().enumerate() {
                 let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, s, p);
                 if let PrepOutcome::Pass(pass) = &outcome {
@@ -11432,7 +11444,7 @@ mod option_b_fold_pool_tests {
             let (mut outcomes, sharded_out) =
                 NativeExecutor::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, 2, orders.len())
                     .expect("no worker panic");
-            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
             let mut next_id = 1u128;
             for (i, (s, p)) in orders.iter().enumerate() {
                 let o = outcomes[i].take().unwrap();

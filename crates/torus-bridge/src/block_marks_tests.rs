@@ -272,8 +272,8 @@ fn dense_indexes_equal_the_maps() {
     let mut dense_used = 0;
     for round in 0..300 {
         let span = if round % 10 == 0 { DENSE_MARKETS + 50 } else { 1 + below(400) };
-        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
-        let mut configs: HashMap<MarketId, MarketMarginConfig> = HashMap::new();
+        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::default();
+        let mut configs: HashMap<MarketId, MarketMarginConfig> = HashMap::default();
         for _ in 0..below(60) {
             let m = below(span);
             marks.insert(m, (below(3) > 0).then(|| fp(1 + below(1000) as i64)));

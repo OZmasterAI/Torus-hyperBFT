@@ -265,7 +265,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
     let mut rng = Lcg(seed);
     let mut holder = ResidentBooks::default();
     let mut parent: Option<Arc<FrozenPending>> = None;
-    let mut books = HashMap::new();
+    let mut books = HashMap::default();
     let mut next_id: u128 = 1;
     let mut prices: Vec<FixedPoint> = vec![fp(MID); MARKETS as usize + 1];
     let mut out = Vec::new();

@@ -40,7 +40,8 @@ mod counting_backend;
 #[path = "common/econ_load.rs"]
 mod econ_load;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use alloy_primitives::map::HashMap;
 use std::sync::Arc;
 
 use std::backtrace::Backtrace;
@@ -151,13 +152,20 @@ fn run_fed_sequence(walk_bp: u64) -> FedRun {
     let db = StateDb::open(dir.path()).unwrap();
     setup(&db);
     let counts = Arc::new(Counts::default());
-    let mut gen = Gen { rng: Lcg(0x5EED_0006), senders: SENDERS, markets: MARKETS, batch: 30, budget: 90, open: HashMap::new() };
+    let mut gen = Gen {
+        rng: Lcg(0x5EED_0006),
+        senders: SENDERS,
+        markets: MARKETS,
+        batch: 30,
+        budget: 90,
+        open: HashMap::default(),
+    };
     let mut walk = MarkWalk::new(MARKETS, walk_bp);
-    let mut books = HashMap::new();
+    let mut books = HashMap::default();
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut per_path: BTreeMap<ReadKey, usize> = BTreeMap::new();
-    let mut calls: HashMap<(&'static str, &'static str), usize> = HashMap::new();
+    let mut calls: HashMap<(&'static str, &'static str), usize> = HashMap::default();
     let mut fills = 0u64;
     let mut holder = ResidentBooks::default();
     let mut oracle_reads = Vec::new();
@@ -370,7 +378,7 @@ fn fed_fixed_marks_rescan_only_dirtied_traders() {
     assert!(run.fills > 0, "the sequence must trade");
     let per_block = margin_match_scans(&run);
     // trader -> block of its last margin / match valuation
-    let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut last: HashMap<Vec<u8>, usize> = HashMap::default();
     let (mut rescans, mut cached) = (0usize, 0usize);
     for (k, block) in per_block.iter().enumerate() {
         for (trader, n) in block {
@@ -447,7 +455,7 @@ fn fed_fixed_marks_liquidation_walk_rescans_only_dirtied_traders() {
     let run = run_fed_sequence(0);
     assert!(run.fills > 0, "the sequence must trade");
     let (per_block, liq, dirty) = valuation_scans(&run);
-    let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut last: HashMap<Vec<u8>, usize> = HashMap::default();
     let mut cached = 0usize;
     for (k, block) in per_block.iter().enumerate() {
         for (trader, n) in block {

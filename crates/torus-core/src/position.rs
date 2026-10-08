@@ -3,9 +3,9 @@
 //! Stores positions in CF_NATIVE_POSITIONS and native balances in CF_NATIVE_BALANCES.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
+use alloy_primitives::map::{HashMap, HashSet};
 use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
@@ -1118,5 +1118,23 @@ mod tests {
             }
         }
         assert!(!overlays[0].own_pending_delta().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod exec_hasher_tests {
+    use super::*;
+    use std::hash::BuildHasher;
+
+    /// Item 6 Phase 2 P2-5: the execution maps' hasher (alloy's default
+    /// `map-foldhash`) is seeded per map, so keys a trader chooses cannot be
+    /// aimed at one bucket. Fails if feature unification ever gives alloy's
+    /// map an unseeded hasher (e.g. `map-fxhash` without `map-foldhash`).
+    #[test]
+    fn exec_map_hasher_is_seeded_per_map() {
+        let a = HashMap::<(Address, MarketId), ()>::default();
+        let b = HashMap::<(Address, MarketId), ()>::default();
+        let key = (Address::ZERO, 1);
+        assert_ne!(a.hasher().hash_one(key), b.hasher().hash_one(key));
     }
 }

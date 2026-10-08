@@ -42,9 +42,9 @@
 #[path = "common/econ_load.rs"]
 mod econ_load;
 
+use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, U256};
 use econ_load::{market_row, real_markets, MarkWalk};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use torus_bridge::native_executor::{
@@ -284,7 +284,7 @@ fn run() {
     let mut chain = Chain {
         db: db.clone(),
         parent: None,
-        books: HashMap::new(),
+        books: HashMap::default(),
         next_id: 1,
         holder: ResidentBooks::default(),
         resident,
@@ -342,7 +342,7 @@ fn run() {
             }
         }
         let mut rng = Lcg(0x5EED_0089);
-        let mut open: HashMap<u64, u64> = HashMap::new();
+        let mut open: HashMap<u64, u64> = HashMap::default();
         // round-robin senders so every sender trades (cell: 5000 senders all active)
         let mut next_s = 0u64;
         for h in 1..=load {

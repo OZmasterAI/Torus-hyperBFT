@@ -55,14 +55,14 @@ impl StateBackend for RecordingBackend {
 // and allocating/sorting the entire retry set before every flush.
 struct OldBalanceCache {
     map: HashMap<Address, NativeBalance>,
-    dirty: std::collections::HashSet<Address>,
+    dirty: HashSet<Address>,
 }
 
 impl OldBalanceCache {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
-            dirty: std::collections::HashSet::new(),
+            map: HashMap::default(),
+            dirty: HashSet::default(),
         }
     }
 

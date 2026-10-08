@@ -38,7 +38,7 @@
 mod econ_load;
 
 use econ_load::{base_mark, env, feed_setup, real_markets, sender, special, Gen, Lcg, MarkWalk, REPORTERS};
-use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
 use std::sync::Arc;
 use torus_bridge::native_executor::{
     begin_resident, end_resident, end_resident_on_worker, NativeExecContext, NativeExecutor, ResidentBooks,
@@ -121,9 +121,9 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         markets,
         batch: env("UB_BATCH", 400),
         budget: env("UB_BUDGET", 900),
-        open: HashMap::new(),
+        open: HashMap::default(),
     };
-    let mut books = HashMap::new();
+    let mut books = HashMap::default();
     let mut next_id: u128 = 1;
     let mut parent = None;
     let mut samples = Vec::new();

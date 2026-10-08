@@ -3,8 +3,7 @@
 //! Dispatches PlaceOrder batches to scoped threads for concurrent matching.
 //! Each thread temporarily owns its market's OrderBook for cache-local access.
 
-use std::collections::HashMap;
-
+use alloy_primitives::map::HashMap;
 use alloy_primitives::Address;
 use torus_core::order_book::{MakerAccountSource, OrderBook, PlaceResult, TakerMarginLimit};
 use torus_types::{MarketId, OrderId, PlaceOrderParams};
@@ -388,7 +387,7 @@ mod worker_panic_containment_tests {
     /// Healthy input keeps working through the new `Result` surface.
     #[test]
     fn empty_batches_return_ok_empty() {
-        let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::new();
+        let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::default();
         let results =
             MarketWorkerPool::match_parallel(batches, 1000).expect("no worker, no panic");
         assert!(results.is_empty());

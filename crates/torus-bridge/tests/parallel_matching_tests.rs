@@ -11,7 +11,7 @@ use torus_types::{
     FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, TimeInForce,
 };
 
-use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
 
 // ---- Helpers ----
 
@@ -318,7 +318,7 @@ fn same_trader_insufficient_margin_second_order_fails() {
 
 #[test]
 fn worker_pool_empty_batch_noop() {
-    let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::new();
+    let batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::default();
     let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
     assert!(results.is_empty());
 }
@@ -334,7 +334,7 @@ fn worker_pool_single_market_no_thread_overhead() {
         margin: None,
     }];
 
-    let mut batches = HashMap::new();
+    let mut batches = HashMap::default();
     batches.insert(1u64, (book, requests));
 
     let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no worker panicked");
@@ -345,7 +345,7 @@ fn worker_pool_single_market_no_thread_overhead() {
 
 #[test]
 fn worker_pool_multiple_markets_parallel() {
-    let mut batches = HashMap::new();
+    let mut batches = HashMap::default();
 
     // Market 1: buy + sell → should fill
     let mut book1 = OrderBook::new(1, fp(1), fp(1));
@@ -951,7 +951,7 @@ fn capped_batches<'a>(
     n_markets: u64,
     req_params: &'a [Vec<PlaceOrderParams>],
 ) -> HashMap<MarketId, (OrderBook, Vec<MatchRequest<'a>>)> {
-    let mut batches = HashMap::new();
+    let mut batches = HashMap::default();
     for m in 1..=n_markets {
         let mut book = OrderBook::new(m, fp(1), fp(1));
         book.place_order(limit_sell(m, 100, 10), addr(200), 999);

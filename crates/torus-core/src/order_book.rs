@@ -9,7 +9,10 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+// Item 6 Phase 2 P2-5: std's HashMap with foldhash, seeded per process
+// (alloy's default `map-foldhash`).
+use alloy_primitives::map::{HashMap, HashSet};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -699,7 +702,7 @@ impl AccountMargins {
     pub fn new(tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>) -> Self {
         Self {
             tiers,
-            traders: HashMap::new(),
+            traders: HashMap::default(),
             mark: None,
             pre_batch: false,
             charged_maker_fills: 0,
@@ -1274,8 +1277,8 @@ impl OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: HashMap::default(),
+            trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
@@ -1284,16 +1287,16 @@ impl OrderBook {
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
             account_margins: AccountMargins::default(),
-            order_seq: HashMap::new(),
+            order_seq: HashMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: HashSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: HashSet::default(),
+            level_epoch: HashMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
         }
@@ -3495,7 +3498,7 @@ impl OrderBook {
             Some(c) => c.max_entries = max_entries,
             None => {
                 self.level_hash_cache = Some(Box::new(LevelHashCache {
-                    entries: HashMap::new(),
+                    entries: HashMap::default(),
                     max_entries,
                     tick: 0,
                     hits: 0,
@@ -4225,8 +4228,8 @@ impl BorshDeserialize for OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: HashMap::default(),
+            trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
@@ -4235,16 +4238,16 @@ impl BorshDeserialize for OrderBook {
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
             account_margins: AccountMargins::default(),
-            order_seq: HashMap::new(),
+            order_seq: HashMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: HashSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: HashSet::default(),
+            level_epoch: HashMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
         };
@@ -5079,7 +5082,7 @@ mod tests {
         assert_eq!(counts, want);
         assert_eq!(counts, [14, 11, 12, 11, 10]);
         // Fewer senders than traders in the book (the other walk).
-        let one: HashMap<Address, usize> = [(addr(1), 0)].into();
+        let one: HashMap<Address, usize> = [(addr(1), 0)].into_iter().collect();
         let mut counts = vec![0];
         ob.add_open_order_counts(&one, &mut counts);
         assert_eq!(counts, [4]);

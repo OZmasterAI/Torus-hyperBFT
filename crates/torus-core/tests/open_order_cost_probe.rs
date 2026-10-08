@@ -4,7 +4,7 @@
 //!
 //!   cargo test --release -p torus-core --test open_order_cost_probe -- --ignored --nocapture
 
-use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
 use std::time::Instant;
 
 use torus_core::order_book::{open_order_counts, OrderBook};

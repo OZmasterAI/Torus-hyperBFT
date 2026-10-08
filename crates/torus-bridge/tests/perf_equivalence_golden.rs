@@ -45,7 +45,7 @@
 //! Re-capture (only when behaviour changes ON PURPOSE, e.g. Fix 4):
 //!   GOLDEN_PRINT=1 cargo test -p torus-bridge --test perf_equivalence_golden -- --nocapture
 
-use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{keccak256, Address, U256};
@@ -305,7 +305,7 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     let mut holder = ResidentBooks::default();
     let metrics = Arc::new(Metrics::new());
-    let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
+    let mut books: HashMap<MarketId, OrderBook> = HashMap::default();
     let mut next_id: u128 = 1;
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut outputs: Vec<[String; 2]> = Vec::new();
