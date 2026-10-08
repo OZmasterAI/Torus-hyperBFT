@@ -1,7 +1,7 @@
 # Implementation Plan: item 6 Phase 2 (per-block work in proportion to fills)
 
 Status: step 0 done on `perf/item6-phase2` (ozarchy, s27 / s101) from main `d3ba3c0a` (9.7;
-review log rows 1-16): 0.1, 0.2 and 0.4 built, 0.3 and Gate 0 measured (results doc section 25).
+review log rows 1-16); base moved to main `e934fa0e` before step 1 (9.11): 0.1, 0.2 and 0.4 built, 0.3 and Gate 0 measured (results doc section 25).
 Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block; owner (s27 / s101): P2-5 joins the
 gate set, the +7% stays (9.9), P2-3 goes to the backlog (9.10). Next: step 1 (P2-1, 1b), then P2-5,
 P2-2, the P2-4 design check (section 4). Owner decisions recorded s96 (section 9, with the options
@@ -15,8 +15,9 @@ Code references are `file:function` with line numbers at `origin/integrate/s94-b
 (`a0eda77`). The step 0 profile ran crab = main `59fa407`; the hot files named here
 (`cancel_batch.rs`, `market_workers.rs`, `position.rs`) are the same on both, and
 `native_executor.rs` differs only in places this plan does not touch. The Phase 2 base is
-now main `d3ba3c0a` (9.7; was `35e69b3`, 9.6). Main has moved since `a0eda77` (liquidation
-telemetry, the ADL budget, exact cost basis, item 7 step 0, read-precompile gas), so line
+now main `e934fa0e` (9.11; was `d3ba3c0a`, 9.7, and `35e69b3`, 9.6). Main has moved since `a0eda77` (liquidation
+telemetry, the ADL budget, exact cost basis, item 7 step 0, read-precompile gas, the C2
+holder-index fix and the Position v2 savings), so line
 numbers in `liquidation_step.rs`, `app.rs`, `position.rs` and `native_executor.rs` may have
 moved.
 
@@ -32,7 +33,7 @@ No consensus rule, no state format and no state hash changes (same as Phase 1).
 
 | gate | target (fail line) | measured by | source |
 |---|---|---|---|
-| Phase gate, 300 markets | matched/s >= +7% vs the Phase 2 base (main `d3ba3c0a`, 9.7) | interleaved cells, section 6 | short plan, Phase 2; owner s96 (9.1) |
+| Phase gate, 300 markets | matched/s >= +7% vs the Phase 2 base (main `e934fa0e`, 9.11) | interleaved cells, section 6 | short plan, Phase 2; owner s96 (9.1) |
 | Phase gate, 10 markets | no regression vs the base beyond the ~5% cell resolution | interleaved cells | short plan; Phase 1 plan 1.1 |
 | Gate 2 holds | >= 0.9x main `92a02ed`, 300 and 10 markets (today 1.097x / 0.997x) | one reference pair per campaign | Phase 1 plan 9.12 |
 | Gate 3 (carried) | margin <= 1.5 ms/1k (3.0), match <= 2.0 ms/1k (4.0) | `ubench_econ`, walk 0 and walk 10, reported | Phase 1 plan 9.12 |
@@ -64,8 +65,10 @@ standard cells** (~5.0 + ~4.6 + ~15.8 = ~25 ms in the perf window, at section 22
 P2-5). P2-3 (~0.8 ms) is no longer in the set (9.10). P2-5's ~10 ms is a microbench estimate and
 counts only once a cell confirms it (9.9). Note: the base `d3ba3c0a` is 6.3% below `35e69b3` on
 the standard shape (results doc section 26, interleaved; not the 4 MiB book SSTs, not the build
-style; bisect of the merges in between is a separate owner job). The +7% is still measured
-against `d3ba3c0a`, so this does not change the gate's reference.
+style; bisect of the merges in between is a separate owner job). Bisected (results doc
+section 27) to `a746c408` and `9e695364`; both fixed on main (section 29: C2 holder index,
+Position v2 savings, together 1.018x matched/s vs `bf2edda6`). Since 9.11 the +7% is measured
+against `e934fa0e`, which includes those fixes, so they do not count toward Phase 2.
 
 ## 2. What the step 0 profile measured (section 22.1, crab r2, load window)
 
@@ -410,7 +413,7 @@ Standard shape (results doc 21.4, as section 22):
 - oracle feed 30000 / 2000 ms on both arms (both are crab now), walk 0; plus walk 10
   (`ORACLE_WALK_BP=10`) cells, and `ORACLE_FEED_DRAIN=1` drain cells for rows 77-78;
 - 10-market cells with the same settings;
-- arms: Phase 2 branch vs the base, main `d3ba3c0a` (9.7), interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
+- arms: Phase 2 branch vs the base, main `e934fa0e` (9.11), interleaved, a 60 s warm cell first, >= 4 cells per arm; one main `92a02ed` pair for
   Gate 2; perf only in separate cells (perf costs ~4.4% on both arms);
 - every heavy cell under the `signal_generate` trace, each its own systemd unit through
   `detach.sh` (results doc Open, section 19);
@@ -626,3 +629,19 @@ after Phase 3), where a fixed per-block cost weighs more. The spawn counter
 |---|---|
 | **backlog (chosen)** | no lifetime / panic / shutdown risk in Phase 2; counter kept |
 | keep P2-3 in Phase 2 | ~0.8 ms (estimate), gate not measurable at ~5% cell resolution |
+
+### 9.11 Base moved to main `e934fa0e` before step 1 (18c s104 / ozarchy s29, 2026-10-08)
+
+**Chosen: merge main `e934fa0e` into `perf/item6-phase2` now, and measure the +7% gate against
+`e934fa0e`** (replaces `d3ba3c0a`, 9.7). The branch had only step 0 since `d3ba3c0a` (counters,
+bench columns, docs). Main has since merged the open-file limit raise (`35953ff8`), the C2
+holder-index fix (`c8d25db8`) and the Position v2 savings (`b8e3b606`); main changed
+`native_executor.rs` and `position.rs`, so Phase 2 is built and measured on the code it will ship
+on instead of being merged at the end. `e934fa0e` already includes the two regression fixes
+(results doc sections 27-29), so they do not count toward Phase 2. The gate campaign uses
+`e934fa0e` as the reference arm, interleaved as usual. Plain merge, not a rebase (as 9.7).
+
+| option | note |
+|---|---|
+| A. keep `d3ba3c0a`, merge main at the end | gate measures Phase 2 alone, but on code it will not ship on; late conflicts in `native_executor.rs` / `position.rs` |
+| **B. merge `e934fa0e` now, reference `e934fa0e` (chosen)** | built and measured on the shipping code; the C2 / v2 fixes are in the reference, not in Phase 2's share |
