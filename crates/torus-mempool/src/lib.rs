@@ -3438,6 +3438,44 @@ mod tests {
         assert_eq!(pool.pending_nonce(&addr), 1);
     }
 
+    /// Review #2 (s104): a typed EIP-1559 TxEnv makes revm reject
+    /// max_priority_fee_per_gas > max_fee_per_gas, so admission rejects it too
+    /// instead of stranding the sender's nonce on a tx execution always skips.
+    #[test]
+    fn admission_rejects_priority_fee_above_max_fee() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(99);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        let err = pool
+            .add_evm_tx(create_eip1559_tx(
+                &k,
+                0,
+                2_000_000_000,
+                2_000_000_001,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::PriorityFeeAboveMaxFee { .. }),
+            "expected PriorityFeeAboveMaxFee, got: {err}"
+        );
+        // priority == max_fee is valid.
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            2_000_000_000,
+            2_000_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 1);
+    }
+
     #[test]
     fn drain_recheck_drops_below_floor_txs() {
         let (_dir, state) = setup();

@@ -560,19 +560,21 @@ fn commit_block_hash_is_canonical() {
 // Key invariant (verified against revm Cancun behavior):
 //   - Block base_fee = calc_next_block_base_fee(parent.gas_used, parent.gas_limit, parent.base_fee)
 //   - Genesis parent: gas_used=0, gas_limit=30M, base_fee=1G → block1 base_fee = 875M
-//   - Sender is debited:       gas_used * max_fee_per_gas  (+value)
+//   - effective_gas_price:     base_fee + min(priority_fee, max_fee - base_fee)
+//   - Sender is debited:       gas_used * effective_gas_price  (+value)
 //   - Burned (not credited):   gas_used * base_fee
-//   - Proposer (beneficiary):  gas_used * (max_fee_per_gas - base_fee)
-//   - receipt.effective_gas_price = base_fee + min(priority_fee, max_fee - base_fee)
-//   - Unused gas refund:       (gas_limit - gas_used) * max_fee_per_gas → credited to sender
+//   - Proposer (beneficiary):  gas_used * (effective_gas_price - base_fee)
+//   - receipt.effective_gas_price = the price the sender paid
+//   - Unused gas:              never charged (the up-front gas_limit * max_fee is refunded)
+// (Review #2, s104: before the TxEnv carried tx_type 2, revm charged EIP-1559
+// senders max_fee_per_gas and these tests pinned that.)
 // ============================================================================
 
-// 11. Sender balance deducted by gas_used * max_fee_per_gas + value
+// 11. Sender balance deducted by gas_used * effective_gas_price + value
 //
 // Uses max_fee = parent base_fee (1G), no tip.  The proposer recalculates block
-// base_fee = 875M from the empty genesis parent, so the actual deduction is
-// gas_used * max_fee(1G) — all of which is split between burn (875M/gas) and
-// proposer (125M/gas).  The sender is always debited max_fee_per_gas * gas_used.
+// base_fee = 875M from the empty genesis parent, so the effective price is
+// 875M (base + 0 tip): the sender pays gas_used * 875M, all of it burned.
 #[test]
 fn gas_accounting_sender_balance_deducted() {
     let h = TestHarness::new();
@@ -603,20 +605,23 @@ fn gas_accounting_sender_balance_deducted() {
     .unwrap();
 
     let alice_after = h.db.get_account(&alice).unwrap().unwrap();
-    // Sender pays: gas_used * max_fee_per_gas + value
-    let gas_cost = U256::from(21_000u128) * U256::from(max_fee);
+    // Sender pays: gas_used * effective_gas_price (= block base fee, no tip) + value
+    let block_base_fee = proposed.block.header.base_fee_per_gas;
+    assert!((block_base_fee as u128) < max_fee);
+    let gas_cost = U256::from(21_000u128) * U256::from(block_base_fee);
     let expected = ten_eth - value - gas_cost;
     assert_eq!(
         alice_after.balance, expected,
-        "sender should be debited value + gas_used * max_fee_per_gas"
+        "sender should be debited value + gas_used * effective_gas_price"
     );
+    assert_eq!(validated.receipts[0].effective_gas_price, block_base_fee);
 }
 
-// 12. Priority fee (tip) to proposer = gas_used * (max_fee - actual_block_base_fee)
+// 12. Priority fee (tip) to proposer = gas_used * min(tip, max_fee - block_base_fee)
 //
-// revm credits the beneficiary with (max_fee_per_gas - base_fee) per gas used.
-// Base fee is burned.  So proposer receives: gas_used * (max_fee - base_fee),
-// where base_fee is the block's base_fee (875M for block 1 from genesis).
+// revm credits the beneficiary with (effective_gas_price - base_fee) per gas
+// used. Base fee is burned. Here the tip fits under max_fee, so the proposer
+// receives exactly gas_used * tip.
 #[test]
 fn gas_accounting_tip_to_proposer() {
     let h = TestHarness::new();
@@ -649,12 +654,12 @@ fn gas_accounting_tip_to_proposer() {
     .unwrap();
 
     let proposer_acct = h.db.get_account(&proposer).unwrap().unwrap();
-    // Proposer receives: gas_used * (max_fee - block_base_fee)
-    let proposer_per_gas = max_fee - block_base_fee as u128;
-    let expected_proposer = U256::from(21_000u128) * U256::from(proposer_per_gas);
+    // Proposer receives: gas_used * tip (tip < max_fee - block_base_fee)
+    assert!(tip < max_fee - block_base_fee as u128);
+    let expected_proposer = U256::from(21_000u128) * U256::from(tip);
     assert_eq!(
         proposer_acct.balance, expected_proposer,
-        "proposer should receive gas_used * (max_fee - block_base_fee); \
+        "proposer should receive gas_used * tip; \
          block_base_fee={block_base_fee}, max_fee={max_fee}"
     );
 }
@@ -777,7 +782,7 @@ fn gas_is_credited_once_across_revm_and_fee_distribution() {
     );
     assert_eq!(
         bal(&proposer),
-        U256::from(21_000u128) * U256::from(max_fee - block_base_fee as u128),
+        U256::from(21_000u128) * U256::from(tip),
         "the proposer is paid the tip once (by revm)"
     );
 }
@@ -889,8 +894,9 @@ fn gas_accounting_effective_gas_price_in_receipt() {
 
 // 16. Tip capped when max_fee barely covers base_fee
 //
-// max_fee = 1.5G, requested tip = 3G.  Block base_fee = 875M.
-// Headroom = 1.5G - 875M = 625M < 3G → tip capped at 625M.
+// max_fee = 1.5G, requested tip = 1G.  Block base_fee = 875M.
+// Headroom = 1.5G - 875M = 625M < 1G → tip capped at 625M.
+// (A tip above max_fee itself is invalid: revm rejects it for a type-2 tx.)
 // Proposer receives: gas_used * (max_fee - block_base_fee) = 21000 * 625M.
 // effective_gas_price = max_fee = 1.5G (since base_fee + capped_tip = 875M + 625M = 1.5G).
 #[test]
@@ -904,9 +910,9 @@ fn gas_accounting_tip_capped_by_max_fee() {
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     h.db.put_account(&alice, &test_account(ten_eth)).unwrap();
 
-    // max_fee = 1.5 gwei, tip = 3 gwei (will be capped to max_fee - block_base_fee)
+    // max_fee = 1.5 gwei, tip = 1 gwei (will be capped to max_fee - block_base_fee)
     let max_fee: u128 = 1_500_000_000;
-    let requested_tip: u128 = 3_000_000_000;
+    let requested_tip: u128 = 1_000_000_000;
     let rlp = build_signed_transfer_with_tip(&sk, bob, U256::from(1u64), 0, max_fee, requested_tip);
 
     let proposed = h.propose(vec![rlp], proposer);
@@ -984,10 +990,11 @@ fn gas_accounting_tx_rejected_when_max_fee_below_base_fee() {
     assert_eq!(proposed.block.evm_transactions.len(), 0);
 }
 
-// 18. Unused gas is refunded to sender at max_fee_per_gas per gas unit
+// 18. Unused gas is never charged
 //
-// When a transaction specifies gas_limit > gas_used, the unspent gas is
-// refunded: refund = (gas_limit - gas_used) * max_fee_per_gas.
+// When a transaction specifies gas_limit > gas_used, only gas_used is charged
+// (at the effective price); the rest of the gas_limit * max_fee reservation
+// is refunded.
 // For a plain ETH transfer: gas_used = 21_000 always.
 // Setting gas_limit = 50_000 means 29_000 gas are refunded.
 #[test]
@@ -1031,10 +1038,10 @@ fn gas_accounting_unused_gas_refunded_to_sender() {
     let gas_used: u64 = 21_000;
     let gas_unused = gas_limit - gas_used;
 
-    // Alice pays for gas_used * max_fee (not gas_limit * max_fee) plus value.
-    // The unused gas (gas_unused * max_fee) is refunded back to Alice.
+    // Alice pays for gas_used * effective price (no tip: the block base fee),
+    // not gas_limit; the up-front gas_limit * max_fee reservation is refunded.
     let alice_after = h.db.get_account(&alice).unwrap().unwrap();
-    let gas_cost = U256::from(gas_used as u128) * U256::from(max_fee);
+    let gas_cost = U256::from(gas_used as u128) * U256::from(block_base_fee);
     let expected_alice = ten_eth - value - gas_cost;
     assert_eq!(
         alice_after.balance, expected_alice,
@@ -1112,4 +1119,168 @@ fn declared_gas_limit_counts_executed_types_only() {
     let sk = test_signing_key(1);
     let rlp = build_signed_tx(&sk, Address::new([0xBB; 20]), U256::ZERO, 0, 2, 1, 123_456);
     assert_eq!(declared_gas_limit(&rlp), Some(123_456));
+}
+
+// ============================================================================
+// Review #2 (s104): the decoded TxEnv carries the envelope's tx type, so revm
+// charges an EIP-1559 sender the effective price (base_fee + capped tip), the
+// price its receipt reports, not max_fee_per_gas.
+// ============================================================================
+
+fn sign_prehash(sk: &SigningKey, hash: B256) -> AlloySig {
+    let (sig, rec_id) = sk.sign_prehash_recoverable(hash.as_ref()).expect("sign");
+    let sig_bytes: [u8; 64] = sig.to_bytes().into();
+    AlloySig::new(
+        U256::from_be_slice(&sig_bytes[..32]),
+        U256::from_be_slice(&sig_bytes[32..]),
+        rec_id.is_y_odd(),
+    )
+}
+
+fn encode_envelope(envelope: alloy_consensus::TxEnvelope) -> Vec<u8> {
+    let mut buf = Vec::new();
+    envelope.encode(&mut buf);
+    buf
+}
+
+/// Propose, validate and commit one tx from a sender funded with 10 ETH.
+/// Returns (sender debit, proposer credit, receipt, block base fee).
+fn run_single_tx(sk: &SigningKey, rlp: Vec<u8>) -> (U256, U256, torus_types::Receipt, u64) {
+    let h = TestHarness::new();
+    let sender = signing_key_address(sk);
+    let proposer = Address::new([0xFF; 20]);
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    h.db.put_account(&sender, &test_account(ten_eth)).unwrap();
+
+    let proposed = h.propose(vec![rlp], proposer);
+    let base_fee = proposed.block.header.base_fee_per_gas;
+    let validated = h
+        .validator
+        .validate_block(&proposed.block, &h.db, &h.executor)
+        .unwrap();
+    assert_eq!(validated.receipts.len(), 1, "the tx must be included");
+    assert!(validated.receipts[0].status, "the tx must succeed");
+    BlockCommitter::commit_block(
+        &h.db,
+        &proposed.block,
+        &validated.bundle,
+        &validated.receipts,
+    )
+    .unwrap();
+    let debit = ten_eth - h.db.get_account(&sender).unwrap().unwrap().balance;
+    let proposer_acct = h.db.get_account(&proposer).unwrap();
+    let credit = proposer_acct.map_or(U256::ZERO, |a| a.balance);
+    (debit, credit, validated.receipts[0].clone(), base_fee)
+}
+
+#[test]
+fn eip1559_sender_pays_effective_price_not_max_fee() {
+    let sk = test_signing_key(1);
+    let bob = Address::new([0xBB; 20]);
+    let value = U256::from(1u64);
+    let tip: u128 = 1_000_000_000;
+    let max_fee: u128 = 20_000_000_000; // far above base_fee + tip
+    let rlp = build_signed_transfer_with_tip(&sk, bob, value, 0, max_fee, tip);
+    let tx_type = torus_bridge::decode_rlp_tx(&rlp).unwrap().tx_env.tx_type;
+
+    let (debit, credit, receipt, base_fee) = run_single_tx(&sk, rlp);
+    let gas = U256::from(receipt.gas_used);
+    assert!(max_fee > base_fee as u128 + tip);
+    assert_eq!(receipt.effective_gas_price as u128, base_fee as u128 + tip);
+    assert_eq!(
+        debit,
+        gas * U256::from(base_fee as u128 + tip) + value,
+        "sender pays gas_used * (base_fee + tip), not max_fee ({max_fee})"
+    );
+    assert_eq!(
+        debit,
+        gas * U256::from(receipt.effective_gas_price) + value,
+        "sender debit matches the receipt's effective_gas_price"
+    );
+    assert_eq!(
+        credit,
+        gas * U256::from(tip),
+        "proposer gets exactly the tip"
+    );
+    assert_eq!(tx_type, 2, "EIP-1559 envelope must decode to tx_type 2");
+}
+
+#[test]
+fn eip2930_tx_is_typed_and_keeps_its_access_list() {
+    use alloy_consensus::{SignableTransaction, TxEip2930};
+    use alloy_eips::eip2930::{AccessList, AccessListItem};
+    let sk = test_signing_key(2);
+    let gas_price: u128 = 2_000_000_000;
+    let access_list = AccessList(vec![AccessListItem {
+        address: Address::new([0xCC; 20]),
+        storage_keys: vec![B256::with_last_byte(1)],
+    }]);
+    let tx = TxEip2930 {
+        chain_id: TORUS_CHAIN_ID,
+        nonce: 0,
+        gas_price,
+        gas_limit: 50_000,
+        to: TxKind::Call(Address::new([0xBB; 20])),
+        value: U256::from(1u64),
+        access_list: access_list.clone(),
+        input: Bytes::new(),
+    };
+    let sig = sign_prehash(&sk, tx.signature_hash());
+    let rlp = encode_envelope(alloy_consensus::TxEnvelope::Eip2930(tx.into_signed(sig)));
+    let decoded = torus_bridge::decode_rlp_tx(&rlp).unwrap();
+    assert_eq!(
+        decoded.tx_env.tx_type, 1,
+        "EIP-2930 envelope must decode to tx_type 1"
+    );
+    assert_eq!(decoded.tx_env.access_list, access_list);
+
+    let (debit, _, receipt, _) = run_single_tx(&sk, rlp);
+    // 21000 + 2400 per address + 1900 per storage key.
+    assert_eq!(
+        receipt.gas_used,
+        21_000 + 2_400 + 1_900,
+        "access list is charged"
+    );
+    assert_eq!(receipt.effective_gas_price as u128, gas_price);
+    assert_eq!(
+        debit,
+        U256::from(receipt.gas_used) * U256::from(gas_price) + U256::from(1u64)
+    );
+
+    // An EIP-2930 tx with an EMPTY access list is still type 1.
+    let empty = TxEip2930 {
+        chain_id: TORUS_CHAIN_ID,
+        gas_price,
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::new([0xBB; 20])),
+        ..Default::default()
+    };
+    let sig = sign_prehash(&sk, empty.signature_hash());
+    let rlp = encode_envelope(alloy_consensus::TxEnvelope::Eip2930(empty.into_signed(sig)));
+    assert_eq!(torus_bridge::decode_rlp_tx(&rlp).unwrap().tx_env.tx_type, 1);
+}
+
+#[test]
+fn legacy_tx_stays_type_0_and_pays_gas_price() {
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    let sk = test_signing_key(3);
+    let gas_price: u128 = 2_000_000_000;
+    let tx = TxLegacy {
+        chain_id: Some(TORUS_CHAIN_ID),
+        nonce: 0,
+        gas_price,
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::new([0xBB; 20])),
+        value: U256::from(1u64),
+        input: Bytes::new(),
+    };
+    let sig = sign_prehash(&sk, tx.signature_hash());
+    let rlp = encode_envelope(alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig)));
+    assert_eq!(torus_bridge::decode_rlp_tx(&rlp).unwrap().tx_env.tx_type, 0);
+
+    let (debit, credit, receipt, base_fee) = run_single_tx(&sk, rlp);
+    let gas = U256::from(receipt.gas_used);
+    assert_eq!(receipt.effective_gas_price as u128, gas_price);
+    assert_eq!(debit, gas * U256::from(gas_price) + U256::from(1u64));
+    assert_eq!(credit, gas * U256::from(gas_price - base_fee as u128));
 }

@@ -4,7 +4,7 @@ use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Decodable;
-use revm::context::TxEnv;
+use revm::context::{TransactionType, TxEnv};
 
 use crate::error::BridgeError;
 
@@ -81,6 +81,7 @@ fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, B
         TxEnvelope::Legacy(signed) => {
             let tx = signed.tx();
             TxEnv {
+                tx_type: TransactionType::Legacy as u8,
                 caller: sender,
                 gas_limit: tx.gas_limit,
                 gas_price: tx.gas_price,
@@ -95,6 +96,7 @@ fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, B
         TxEnvelope::Eip2930(signed) => {
             let tx = signed.tx();
             TxEnv {
+                tx_type: TransactionType::Eip2930 as u8,
                 caller: sender,
                 gas_limit: tx.gas_limit,
                 gas_price: tx.gas_price,
@@ -109,7 +111,11 @@ fn envelope_to_tx_env(envelope: &TxEnvelope, sender: Address) -> Result<TxEnv, B
         }
         TxEnvelope::Eip1559(signed) => {
             let tx = signed.tx();
+            // tx_type 2 makes revm charge the effective price
+            // min(max_fee, base_fee + tip), the price the receipt reports.
+            // Left at the default (legacy) revm charged max_fee_per_gas.
             TxEnv {
+                tx_type: TransactionType::Eip1559 as u8,
                 caller: sender,
                 gas_limit: tx.gas_limit,
                 gas_price: tx.max_fee_per_gas,
