@@ -208,6 +208,18 @@ fn run_with(
     batch: bool,
     full_scan: bool,
 ) -> RunFingerprint {
+    run_observed(blocks, mode, batch, full_scan, &mut |_| {})
+}
+
+/// [`run_with`], calling `observe` with the context after every block
+/// (before its books are saved).
+fn run_observed(
+    blocks: &[Vec<(Address, NativeAction)>],
+    mode: BookMode,
+    batch: bool,
+    full_scan: bool,
+    observe: &mut dyn FnMut(&NativeExecContext),
+) -> RunFingerprint {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut ctx = new_ctx(&dir, mode);
     ctx.test_cancel_all_full_scan = full_scan;
@@ -219,6 +231,7 @@ fn run_with(
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         // P2-1: the index (once built) covers the books after every block.
         assert_index_covers_books(&ctx, &format!("{mode:?} batch={batch} block {b}"));
+        observe(&ctx);
         results.push(
             r.results
                 .iter()
@@ -645,6 +658,61 @@ fn stop_limit(market_id: MarketId, is_buy: bool, trigger: i64, limit: i64) -> Na
 /// are sparse (only this generator's places rest there).
 const INDEX_MARKETS: u64 = 12;
 
+/// Review gap 2: sender `n`'s home book (a deep setup book).
+fn ro_home(n: u8) -> MarketId {
+    MARKETS[n as usize % 4]
+}
+
+/// Review gap 2 prefix (after the setup): every sender opens a position of
+/// 3 in its home book (long for even `n`, short for odd; the setup's resting
+/// makers take the other side), then rests two reduce-only orders of 2 on
+/// the reducing side (the sweep cuts the second to 1).
+fn ro_prefix_blocks() -> Vec<Vec<(Address, NativeAction)>> {
+    let open = (1..=SENDERS + 4)
+        .map(|n| {
+            let long = n.is_multiple_of(2);
+            let price = if long { 111 } else { 99 };
+            (addr(n), limit_at(ro_home(n), long, price, 3))
+        })
+        .collect();
+    let reduce_only = (1..=SENDERS + 4)
+        .flat_map(|n| {
+            let long = n.is_multiple_of(2);
+            [0, 1].map(|k| {
+                let price = if long { 112 + k } else { 98 - k };
+                let NativeAction::PlaceOrder(mut p) = limit_at(ro_home(n), !long, price, 2) else {
+                    unreachable!()
+                };
+                p.reduce_only = true;
+                (addr(n), NativeAction::PlaceOrder(p))
+            })
+        })
+        .collect();
+    vec![open, reduce_only]
+}
+
+/// `(owner, id)` of every reduce-only order resting after the setup and
+/// [`ro_prefix_blocks`].
+fn ro_resting_after_prefix() -> Vec<(Address, u128)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut ctx = new_ctx(&dir, BookMode::Classic);
+    let mut blocks = setup_blocks();
+    blocks.extend(ro_prefix_blocks());
+    for block in &blocks {
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, block, true);
+    }
+    let mut out = Vec::new();
+    for id in 0..ctx.next_global_order_id {
+        for m in MARKETS {
+            if let Some(o) = ctx.order_books[&m].get_order(id).filter(|o| o.reduce_only) {
+                out.push((o.trader, id));
+            }
+        }
+    }
+    assert!(out.len() >= SENDERS as usize, "{}", out.len());
+    out
+}
+
 /// P2-1 blocks over the setup: places resting across 12 books, crossing
 /// places in the deep books (partial fills, rests), stop-limits near the
 /// touch (crossing trades fire them into resting orders: buy limits below
@@ -652,18 +720,57 @@ const INDEX_MARKETS: u64 = 12;
 /// price: re-inserted at the back), cancels by id, cancel-alls `None` /
 /// `Some(m)` / unknown market, a sender's second cancel-all right after the
 /// first, a transfer breaking runs.
-fn index_blocks(seed: u64, resting: &[(Address, u128)]) -> Vec<Vec<(Address, NativeAction)>> {
+///
+/// `ro` (review gap 2, reduce-only): `Some(the reduce-only orders resting
+/// after the prefix)` ([`ro_resting_after_prefix`]). The blocks start with
+/// [`ro_prefix_blocks`] and a block of modifies that leave every sender a
+/// reduce-only leftover (below); then a third of the places and stops become
+/// home-book actions: reduce-only orders resting on the reducing side,
+/// crossing to close, on the increasing side (rejected while the position
+/// has not flipped), reduce-only stop-limits, modifies of the prefix's
+/// reduce-only orders up to 3 (each is clamped to the position alone, so
+/// the pair can exceed it: leftovers no sweep has cut), plus plain crossing
+/// places of 1-6 that reduce, close, flip or grow the position the resting
+/// reduce-only orders depend on. The extra draws happen only with `ro`, so
+/// `ro: None` keeps the existing seeds' sequences.
+fn index_blocks(
+    seed: u64,
+    resting: &[(Address, u128)],
+    ro: Option<&[(Address, u128)]>,
+) -> Vec<Vec<(Address, NativeAction)>> {
     let mut rng = Lcg(seed);
     let mut blocks = Vec::new();
+    if let Some(ro_ids) = ro {
+        blocks.extend(ro_prefix_blocks());
+        // Each sender's first reduce-only order modified up to 3: with the
+        // second (1) the pair exceeds the position (3), a leftover no sweep
+        // cuts until the sender places or fills in its home book again.
+        let mut seen = std::collections::BTreeSet::new();
+        blocks.push(
+            ro_ids
+                .iter()
+                .filter(|(owner, _)| seen.insert(*owner))
+                .map(|&(owner, id)| {
+                    let modify = NativeAction::ModifyOrder {
+                        order_id: id,
+                        new_price: None,
+                        new_qty: Some(fp(3)),
+                    };
+                    (owner, modify)
+                })
+                .collect(),
+        );
+    }
     for _ in 0..4 {
         let mut block = Vec::new();
         for _ in 0..150 {
-            let mut s = addr(1 + rng.below(SENDERS as u64 + 4) as u8);
+            let n = 1 + rng.below(SENDERS as u64 + 4) as u8;
+            let mut s = addr(n);
             let m = 1 + rng.below(INDEX_MARKETS);
             let deep = MARKETS[rng.below(4) as usize];
             let (owner, id) = resting[rng.below(resting.len() as u64) as usize];
             let is_buy = rng.below(2) == 0;
-            let action = match rng.below(24) {
+            let mut action = match rng.below(24) {
                 0..=3 => cancel_all(None),
                 4 | 5 => cancel_all(Some(m)),
                 6 => cancel_all(Some(77)),
@@ -710,6 +817,58 @@ fn index_blocks(seed: u64, resting: &[(Address, u128)]) -> Vec<Vec<(Address, Nat
                     limit_at(m, is_buy, price as i64, 1 + rng.below(3) as i64)
                 }
             };
+            let ro_ids = ro.filter(|_| matches!(action, NativeAction::PlaceOrder(_)));
+            if let Some(ro_ids) = ro_ids.filter(|_| rng.below(3) == 0) {
+                // `long`: the side the position was opened on (it may have
+                // flipped since: then the sides below swap roles).
+                let (hm, long) = (ro_home(n), n.is_multiple_of(2));
+                let qty = 1 + rng.below(4) as i64;
+                let reduce_only = |mut a: NativeAction| {
+                    if let NativeAction::PlaceOrder(p) = &mut a {
+                        p.reduce_only = true;
+                    }
+                    a
+                };
+                action = match rng.below(8) {
+                    // Rests on the reducing side.
+                    0 | 1 => {
+                        let off = rng.below(5) as i64;
+                        reduce_only(if long {
+                            limit_at(hm, false, 110 + off, qty)
+                        } else {
+                            limit_at(hm, true, 100 - off, qty)
+                        })
+                    }
+                    // Crosses to close (part of) the position.
+                    2 => reduce_only(limit_at(hm, !long, if long { 99 } else { 111 }, qty)),
+                    // The increasing side.
+                    3 => reduce_only(limit_at(hm, long, if long { 97 } else { 113 }, qty)),
+                    // A reduce-only stop-limit on the reducing side.
+                    4 => {
+                        let t = 102 + rng.below(7) as i64;
+                        reduce_only(if long {
+                            stop_limit(hm, false, t, t - 1)
+                        } else {
+                            stop_limit(hm, true, t, t + 1)
+                        })
+                    }
+                    // A prefix reduce-only order modified up to 3 (re-inserted).
+                    5 | 6 => {
+                        let (owner, id) = ro_ids[rng.below(ro_ids.len() as u64) as usize];
+                        s = owner;
+                        NativeAction::ModifyOrder {
+                            order_id: id,
+                            new_price: None,
+                            new_qty: Some(fp(3)),
+                        }
+                    }
+                    // A plain crossing place: reduces, closes, flips or grows it.
+                    _ => {
+                        let buy = rng.below(2) == 0;
+                        limit_at(hm, buy, if buy { 111 } else { 99 }, 1 + rng.below(6) as i64)
+                    }
+                };
+            }
             block.push((s, action));
             if rng.below(12) == 0 {
                 block.push((s, cancel_all(None)));
@@ -738,7 +897,7 @@ fn cancel_all_index_matches_the_full_scan_reference_random() {
         (14, BookMode::LevelAuthorityChunked),
     ] {
         let mut blocks = setup_blocks();
-        blocks.extend(index_blocks(seed, &resting));
+        blocks.extend(index_blocks(seed, &resting, None));
         for batch in [true, false] {
             let reference = run_with(&blocks, mode, batch, true);
             let current = run_with(&blocks, mode, batch, false);
@@ -756,6 +915,156 @@ fn cancel_all_index_matches_the_full_scan_reference_random() {
             assert_eq!(
                 reference, current,
                 "{mode:?} batch={batch}: index diverged from the full scan"
+            );
+        }
+    }
+}
+
+/// `trader`'s signed position in `market` (+long / -short, zero when flat).
+fn signed_position(ctx: &NativeExecContext, trader: &Address, market: MarketId) -> FixedPoint {
+    match ctx.positions.get_position(trader, market).unwrap() {
+        Some(p) if p.is_long => p.size,
+        Some(p) => -p.size,
+        None => FixedPoint::ZERO,
+    }
+}
+
+/// Reduce-only coverage of a run (review gap 2), from the context after
+/// every block: what happened by the next block to the positions that
+/// resting reduce-only orders depend on.
+#[derive(Default, Debug)]
+struct RoStats {
+    /// (trader, market) -> (signed position, resting reduce-only orders)
+    /// after the previous block.
+    last: std::collections::BTreeMap<(Address, MarketId), (FixedPoint, usize)>,
+    resting_max: usize,
+    reduced: u64,
+    closed: u64,
+    flipped: u64,
+    /// Resting reduce-only orders a sweep would cut (position flat, on
+    /// their side, or already covered by the trader's other reduce-only
+    /// orders) after a block: left for a sweep or a cancel-all.
+    leftovers: u64,
+    /// Resting reduce-only orders gone by the next block (filled, cut,
+    /// cancelled).
+    removed: usize,
+}
+
+impl RoStats {
+    fn observe(&mut self, ctx: &NativeExecContext) {
+        use torus_core::order_book::reduce_only_allowance;
+        let mut now = std::collections::BTreeMap::new();
+        for (&m, book) in &ctx.order_books {
+            for t in book.reduce_only_traders() {
+                let orders: Vec<_> = book
+                    .orders_for_trader(&t)
+                    .into_iter()
+                    .filter(|o| o.reduce_only)
+                    .collect();
+                if orders.is_empty() {
+                    continue;
+                }
+                let pos = signed_position(ctx, &t, m);
+                // What a sweep would cut: orders on the increasing side, or
+                // beyond the position (the sweep's budget).
+                let mut budget = [true, false].map(|is_buy| reduce_only_allowance(pos, is_buy));
+                for o in &orders {
+                    let left = &mut budget[usize::from(o.side != torus_types::Side::Buy)];
+                    if o.remaining_qty > *left {
+                        self.leftovers += 1;
+                    }
+                    *left = (*left - o.remaining_qty).max(FixedPoint::ZERO);
+                }
+                now.insert((t, m), (pos, orders.len()));
+            }
+        }
+        for (&(t, m), &(pos, n)) in &self.last {
+            let (new_pos, new_n) = now
+                .get(&(t, m))
+                .copied()
+                .unwrap_or_else(|| (signed_position(ctx, &t, m), 0));
+            self.removed += n.saturating_sub(new_n);
+            let abs = |p: FixedPoint| if p < FixedPoint::ZERO { -p } else { p };
+            let flipped = pos != FixedPoint::ZERO
+                && new_pos != FixedPoint::ZERO
+                && (new_pos > FixedPoint::ZERO) != (pos > FixedPoint::ZERO);
+            if new_pos == FixedPoint::ZERO && pos != FixedPoint::ZERO {
+                self.closed += 1;
+            } else if flipped {
+                self.flipped += 1;
+            } else if abs(new_pos) < abs(pos) {
+                self.reduced += 1;
+            }
+        }
+        self.resting_max = self.resting_max.max(now.values().map(|v| v.1).sum());
+        self.last = now;
+    }
+}
+
+/// Review gap 2 (GPT-6.1-sol on C1): the P2-1 differential with reduce-only
+/// orders. `index_blocks` with `ro` (a third of the places and stops
+/// reduce-only) vs the frozen full scan, in all four book modes, batched and
+/// per-action: identical results, gas, dirty marks, books, stops, CF dumps,
+/// state roots, and the index covers the books (reduce-only entries
+/// included) after every block. Non-vacuous: reduce-only orders rest, get
+/// rejected (flat / increasing side), and positions they depend on are
+/// reduced, closed and flipped while they rest; leftovers that can no
+/// longer reduce stay until a sweep or a cancel-all takes them.
+#[test]
+fn cancel_all_index_matches_the_full_scan_reference_reduce_only() {
+    let resting = resting_after_setup();
+    let ro_resting = ro_resting_after_prefix();
+    for (seed, mode) in [
+        (31u64, BookMode::Classic),
+        (32, BookMode::OrderRows),
+        (33, BookMode::LevelAuthority),
+        (34, BookMode::LevelAuthorityChunked),
+    ] {
+        let mut blocks = setup_blocks();
+        blocks.extend(index_blocks(seed, &resting, Some(&ro_resting)));
+        for batch in [true, false] {
+            let what = format!("{mode:?} batch={batch}");
+            let reference = run_with(&blocks, mode, batch, true);
+            let mut stats = RoStats::default();
+            let current = run_observed(&blocks, mode, batch, false, &mut |ctx| stats.observe(ctx));
+            let (mut ro_ok, mut ro_failed) = (0, 0);
+            for (block, results) in blocks.iter().zip(&current.results) {
+                assert_eq!(block.len(), results.len(), "{what}");
+                for ((_, action), r) in block.iter().zip(results) {
+                    if matches!(action, NativeAction::PlaceOrder(p) if p.reduce_only) {
+                        if r.1 {
+                            ro_ok += 1;
+                        } else {
+                            ro_failed += 1;
+                        }
+                    }
+                }
+            }
+            let flat: Vec<_> = current.results.iter().flatten().collect();
+            let cancel_alls = flat.iter().filter(|r| r.0 == "cancel_all" && r.1).count();
+            println!(
+                "{what}: reduce-only placed {ro_ok}, rejected {ro_failed}, cancel-alls {cancel_alls}, \
+                 fills {}, {stats:?}",
+                current.trade_index
+            );
+            assert!(
+                ro_ok >= 20 && ro_failed >= 20,
+                "{what}: {ro_ok} / {ro_failed}"
+            );
+            assert!(cancel_alls > 150, "{what}: {cancel_alls}");
+            assert!(current.trade_index > 100, "{what}");
+            assert!(stats.resting_max >= 5, "{what}: {stats:?}");
+            assert!(
+                stats.reduced >= 1 && stats.closed >= 1 && stats.flipped >= 1,
+                "{what}: {stats:?}"
+            );
+            assert!(
+                stats.leftovers >= 20 && stats.removed >= 20,
+                "{what}: {stats:?}"
+            );
+            assert_eq!(
+                reference, current,
+                "{what}: index diverged from the full scan (reduce-only)"
             );
         }
     }
@@ -920,7 +1229,7 @@ fn cancel_all_index_rebuilt_at_load_equals_the_carried_one() {
     ] {
         let what = format!("{mode:?}");
         let mut blocks = setup_blocks();
-        blocks.extend(index_blocks(21, &resting));
+        blocks.extend(index_blocks(21, &resting, None));
         let run_blocks = |dir: &tempfile::TempDir| {
             let mut ctx = new_ctx(dir, mode);
             for block in &blocks {

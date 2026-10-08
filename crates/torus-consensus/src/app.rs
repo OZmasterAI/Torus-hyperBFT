@@ -19577,6 +19577,8 @@ mod crash_recovery_tests {
         crossing: u64,
         v4_actions: u64,
         cancel_only_blocks: u64,
+        /// Reduce-only places (single or in a batch), `p2_blocks(true)` only.
+        reduce_only: u64,
     }
 
     /// The P2 sequence: heights 1..=P2_BLOCKS (ts 1000 + h), linked. C5's
@@ -19588,8 +19590,12 @@ mod crash_recovery_tests {
     /// cancel-alls `None` / `Some(m)` (a block's cancel-alls form one run;
     /// some senders send two), two-market batches; V4 rests early and is
     /// liquidated later; ~1/6 of the other blocks empty, ~1/5 of the rest
-    /// cancel-alls only.
-    fn p2_blocks() -> (Vec<TorusBlock>, P2Fed) {
+    /// cancel-alls only. `ro` (review gap 2): a third of the trader places
+    /// (resting, crossing, stops, batch legs) are reduce-only; the crossing
+    /// places reduce, close and flip the positions they depend on, the
+    /// liquidations close some. The extra draws happen only with `ro`, so
+    /// `ro: false` is the original sequence.
+    fn p2_blocks(ro: bool) -> (Vec<TorusBlock>, P2Fed) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
         let mut mark = [100i64; 3];
@@ -19725,7 +19731,7 @@ mod crash_recovery_tests {
                 let (m, p) = (C5_MARKETS[mi], mark[mi]);
                 let qty = 1 + rng.below(4) as i64;
                 let is_buy = rng.below(2) == 0;
-                let action = match rng.below(13) {
+                let mut action = match rng.below(13) {
                     0..=2 => {
                         let off = 1 + rng.below(3) as i64;
                         NativeAction::PlaceOrder(limit(
@@ -19807,6 +19813,19 @@ mod crash_recovery_tests {
                         ])
                     }
                 };
+                if ro {
+                    let legs = match &mut action {
+                        NativeAction::PlaceOrder(p) => std::slice::from_mut(p),
+                        NativeAction::PlaceOrderBatch(ps) => ps.as_mut_slice(),
+                        _ => &mut [],
+                    };
+                    for p in legs {
+                        if rng.below(3) == 0 {
+                            p.reduce_only = true;
+                            fed.reduce_only += 1;
+                        }
+                    }
+                }
                 actions.push(sign(t, action));
             }
             blocks.push(make_block(h, actions));
@@ -19829,6 +19848,37 @@ mod crash_recovery_tests {
         /// cancel-all index (checked to cover the books), and restarts.
         index_checked: u64,
         restarts: u64,
+        /// Review gap 1: crashes replayed / stale holders put back (`P2Fault`).
+        faults: u64,
+        /// Review gap 2, classic layout only (else 0): the most resting
+        /// reduce-only orders after any block, and how often a position
+        /// under resting reduce-only orders was reduced, closed or flipped
+        /// by the next block.
+        ro_resting_max: usize,
+        ro_moved: u64,
+    }
+
+    /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
+    /// besides feeding the blocks.
+    #[derive(Clone, Debug)]
+    enum P2Fault {
+        None,
+        /// Drop and recreate the context after every n-th block (books, R
+        /// and the cancel-all index rebuilt from the DB).
+        RestartEvery(u64),
+        /// Pipelined only. For each k: W's write of k + 1 fails after E ran
+        /// k + 2 on top of it (fail-stop; nothing of k + 1 / k + 2 durable,
+        /// E's holder already carries their books and a warm cancel-all
+        /// index). A new context that KEEPS that holder replays k + 1 and
+        /// k + 2 from the DB (`replay_committed`): the staleness guard must
+        /// drop the books and the index (holder ahead of the DB) and rebuild.
+        CrashAfter(Vec<u64>),
+        /// For each (a, b): after block a the holder (warm index) is taken
+        /// out, blocks a + 1 ..= b run without it (the first rebuilds from
+        /// the DB), then it is put back: block b + 1 meets a holder stamped a
+        /// over the DB at b (holder behind the DB), the staleness guard trips
+        /// (height and marker) and rebuilds.
+        StaleHolder(Vec<(u64, u64)>),
     }
 
     /// V4's resting orders + pending stops in the classic book blobs of
@@ -19847,67 +19897,211 @@ mod crash_recovery_tests {
             .sum()
     }
 
+    /// Review gap 2: (trader, market) -> (signed position, resting
+    /// reduce-only orders) from the classic book blobs (empty in other
+    /// layouts).
+    fn p2_ro_resting(
+        db: &StateDb,
+    ) -> std::collections::BTreeMap<(Address, u64), (FixedPoint, usize)> {
+        use borsh::BorshDeserialize;
+        let pm = torus_core::position::PositionManager::new(db.clone());
+        let mut out = std::collections::BTreeMap::new();
+        for m in C5_MARKETS {
+            let Some(bytes) = db
+                .get_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &m.to_be_bytes())
+                .unwrap()
+            else {
+                continue;
+            };
+            let book = torus_core::order_book::OrderBook::try_from_slice(&bytes).unwrap();
+            for t in book.reduce_only_traders() {
+                let n = book
+                    .orders_for_trader(&t)
+                    .iter()
+                    .filter(|o| o.reduce_only)
+                    .count();
+                if n > 0 {
+                    out.insert((t, m), (p2_signed_position(&pm, &t, m), n));
+                }
+            }
+        }
+        out
+    }
+
+    fn p2_signed_position(
+        pm: &torus_core::position::PositionManager<StateDb>,
+        trader: &Address,
+        market: u64,
+    ) -> FixedPoint {
+        match pm.get_position(trader, market).unwrap() {
+            Some(p) if p.is_long => p.size,
+            Some(p) => -p.size,
+            None => FixedPoint::ZERO,
+        }
+    }
+
+    /// P2-1: the carried cancel-all index (once built) covers the books;
+    /// returns whether `ctx`'s holder carried a built index.
+    fn p2_index_covers_books(ctx: &ExecutionContext, what: &str) -> bool {
+        let index = ctx.resident_books.lock().unwrap().trader_index();
+        let Some((Some(carried), rebuilt)) = index else {
+            return false;
+        };
+        for (trader, markets) in &rebuilt {
+            let listed = carried.get(trader).map_or(&[][..], Vec::as_slice);
+            for m in markets {
+                assert!(
+                    listed.binary_search(m).is_ok(),
+                    "{what}: {trader} has orders or stops in market {m}, the index lists {listed:?}"
+                );
+            }
+        }
+        true
+    }
+
     /// Feed `blocks` through the committed-block path on a fresh
     /// `p2_fixture` DB. `reference`: every block on the bridge's reference
-    /// paths (`test_reference_paths`). `restart_every`: drop and recreate the
-    /// context after every n-th block (books, R and the cancel-all index
-    /// rebuilt from the DB). After every block with resident books, the
-    /// carried cancel-all index (once built) covers the books (P2-1).
+    /// paths (`test_reference_paths`). `fault`: see [`P2Fault`]. After every
+    /// block with resident books, the carried cancel-all index (once built)
+    /// covers the books (P2-1).
     fn p2_run(
         blocks: &[TorusBlock],
         pipelined: bool,
         mode: Option<torus_bridge::native_executor::BookMode>,
         reference: bool,
-        restart_every: Option<u64>,
+        fault: &P2Fault,
     ) -> P2Run {
         let (config, db) = p2_fixture();
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
-        let what = format!(
-            "pipelined={pipelined} {mode:?} reference={reference} restart_every={restart_every:?}"
-        );
-        let new_ctx = || {
+        let what = format!("pipelined={pipelined} {mode:?} reference={reference} {fault:?}");
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let new_ctx = |attach: bool| {
             let mut ctx = make_exec_ctx(&config, &db);
             ctx.test_book_mode = mode;
             ctx.test_reference_paths = reference;
             ctx.metrics = Some(metrics.clone());
-            if pipelined {
-                ctx.attach_flush_worker(None);
+            if pipelined && attach {
+                ctx.attach_flush_worker(Some(gate.clone()));
             }
             ctx
         };
-        let mut ctx = new_ctx();
-        let (mut v4_max, mut v4_last, mut index_checked, mut restarts) = (0, 0, 0, 0);
+        let mut ctx = new_ctx(true);
+        let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
+            (0, 0, 0, 0, 0);
+        let (mut ro_resting_max, mut ro_moved) = (0, 0);
+        let mut ro_last = std::collections::BTreeMap::new();
+        let mut withheld: Option<torus_bridge::native_executor::ResidentBooks> = None;
+        let mut skip_to = 0;
         for b in blocks {
             let h = b.header.height;
-            dispatch_and_execute(&ctx, &db, b);
-            assert!(
-                !ctx.exec_failed.load(Ordering::SeqCst),
-                "{what}: fail-stop at {h}"
-            );
-            if let Some(w) = ctx.flush_worker.as_ref() {
-                assert!(w.wait_idle(), "{what}: W failed");
+            if h <= skip_to {
+                continue;
             }
+            let crash = match fault {
+                P2Fault::CrashAfter(ks) => ks.contains(&(h - 1)),
+                _ => false,
+            };
+            if crash {
+                // Blocks k + 1 = h and k + 2 = h + 1: W parks on k + 1, E runs
+                // k + 2 on top of it, then W's write fails.
+                assert!(pipelined, "{what}: a crash needs the flush worker");
+                let k = h - 1;
+                let next = blocks[h as usize].clone();
+                assert_eq!(next.header.height, k + 2);
+                gate.hold();
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(gate.wait_received(k + 1), "{what}: W took {}", k + 1);
+                let db_t = db.clone();
+                let t = std::thread::spawn(move || {
+                    dispatch_and_execute(&ctx, &db_t, &next);
+                    ctx
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                gate.fail_next();
+                gate.release();
+                let failed = t.join().unwrap();
+                assert!(
+                    failed.exec_failed.load(Ordering::SeqCst),
+                    "{what}: crash after {k} latched"
+                );
+                let holder = std::mem::take(&mut *failed.resident_books.lock().unwrap());
+                drop(failed);
+                assert!(
+                    holder.height().is_some_and(|hh| hh > k),
+                    "{what}: the holder is past the DB ({:?} > {k})",
+                    holder.height()
+                );
+                assert!(
+                    matches!(holder.trader_index(), Some((Some(_), _))),
+                    "{what}: crash after {k}: the holder carries a warm index"
+                );
+                assert_eq!(read_native_applied_height(&db), Some(k), "{what}");
+                let mut replay = new_ctx(false);
+                *replay.resident_books.lock().unwrap() = holder;
+                let (_last, parked) = TorusApp::replay_committed(&db, &replay);
+                assert_eq!(parked, None, "{what}");
+                assert!(
+                    !replay.exec_failed.load(Ordering::SeqCst),
+                    "{what}: replay after {k}"
+                );
+                assert_eq!(read_native_applied_height(&db), Some(k + 2), "{what}");
+                if pipelined {
+                    replay.attach_flush_worker(Some(gate.clone()));
+                }
+                ctx = replay;
+                faults += 1;
+                skip_to = k + 2;
+            } else {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "{what}: fail-stop at {h}"
+                );
+                if let Some(w) = ctx.flush_worker.as_ref() {
+                    assert!(w.wait_idle(), "{what}: W failed");
+                }
+            }
+            let h = h.max(skip_to);
             v4_last = p2_v4_resting(&db);
             v4_max = v4_max.max(v4_last);
-            let index = ctx.resident_books.lock().unwrap().trader_index();
-            if let Some((Some(carried), rebuilt)) = index {
-                for (trader, markets) in &rebuilt {
-                    let listed = carried.get(trader).map_or(&[][..], Vec::as_slice);
-                    for m in markets {
-                        assert!(
-                            listed.binary_search(m).is_ok(),
-                            "{what}: after {h}: {trader} has orders or stops in market {m}, \
-                             the index lists {listed:?}"
-                        );
-                    }
+            let ro_now = p2_ro_resting(&db);
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            for (&(t, m), &(pos, _)) in &ro_last {
+                let new = p2_signed_position(&pm, &t, m);
+                let flipped = new != FixedPoint::ZERO
+                    && pos != FixedPoint::ZERO
+                    && (new > FixedPoint::ZERO) != (pos > FixedPoint::ZERO);
+                let abs = |p: FixedPoint| if p < FixedPoint::ZERO { -p } else { p };
+                if flipped || abs(new) < abs(pos) {
+                    ro_moved += 1;
                 }
+            }
+            ro_resting_max = ro_resting_max.max(ro_now.values().map(|v| v.1).sum());
+            ro_last = ro_now;
+            if p2_index_covers_books(&ctx, &format!("{what}: after {h}")) {
                 index_checked += 1;
             }
-            if restart_every.is_some_and(|n| h % n == 0) && h < P2_BLOCKS {
+            if let P2Fault::StaleHolder(windows) = fault {
+                if windows.iter().any(|w| w.0 == h) {
+                    let holder = std::mem::take(&mut *ctx.resident_books.lock().unwrap());
+                    assert!(
+                        matches!(holder.trader_index(), Some((Some(_), _))),
+                        "{what}: after {h}: the withheld holder carries a warm index"
+                    );
+                    assert_eq!(holder.height(), Some(h), "{what}");
+                    withheld = Some(holder);
+                }
+                if windows.iter().any(|w| w.1 == h) {
+                    let stale = withheld.take().expect("withheld earlier");
+                    *ctx.resident_books.lock().unwrap() = stale;
+                    faults += 1;
+                }
+            }
+            if matches!(fault, P2Fault::RestartEvery(n) if h % n == 0) && h < P2_BLOCKS {
                 restarts += 1;
                 drop(ctx);
-                ctx = new_ctx();
+                ctx = new_ctx(true);
             }
         }
         drop(ctx);
@@ -19924,6 +20118,9 @@ mod crash_recovery_tests {
             v4_last,
             index_checked,
             restarts,
+            faults,
+            ro_resting_max,
+            ro_moved,
         }
     }
 
@@ -19936,22 +20133,24 @@ mod crash_recovery_tests {
     /// production uses the cancel-all index, whose carried copy covers the
     /// books after every block (resident modes, `p2_run`); a replica
     /// restarted every 7 blocks (index rebuilt from the loaded books) gives
-    /// the same write sets, hash and dump.
-    fn p2_reference_differential(mode: Option<torus_bridge::native_executor::BookMode>) {
-        let (blocks, fed) = p2_blocks();
+    /// the same write sets, hash and dump. `ro` (review gap 2): on
+    /// `p2_blocks(true)` (reduce-only places).
+    fn p2_reference_differential(mode: Option<torus_bridge::native_executor::BookMode>, ro: bool) {
+        let (blocks, fed) = p2_blocks(ro);
         assert_eq!(blocks.len() as u64, P2_BLOCKS);
         assert!(
             fed.cancel_all_none >= 40
                 && fed.cancel_all_some >= 20
                 && fed.repeated >= 5
                 && fed.stops >= 20
-                && fed.cancel_only_blocks >= 10,
+                && fed.cancel_only_blocks >= 10
+                && (!ro || fed.reduce_only >= 40),
             "{fed:?}"
         );
         for pipelined in [false, true] {
-            let what = format!("pipelined={pipelined} {mode:?}");
-            let reference = p2_run(&blocks, pipelined, mode, true, None);
-            let current = p2_run(&blocks, pipelined, mode, false, None);
+            let what = format!("pipelined={pipelined} {mode:?} ro={ro}");
+            let reference = p2_run(&blocks, pipelined, mode, true, &P2Fault::None);
+            let current = p2_run(&blocks, pipelined, mode, false, &P2Fault::None);
             assert_write_sets_equal(
                 &reference.captured,
                 &current.captured,
@@ -19975,7 +20174,7 @@ mod crash_recovery_tests {
             );
             // P2-1 restart: the cancel-all index rebuilt from the loaded books
             // every 7 blocks gives the same blocks as the carried one.
-            let restarted = p2_run(&blocks, pipelined, mode, false, Some(7));
+            let restarted = p2_run(&blocks, pipelined, mode, false, &P2Fault::RestartEvery(7));
             assert_eq!(restarted.restarts, (P2_BLOCKS - 1) / 7, "{what}");
             assert_write_sets_equal(
                 &reference.captured,
@@ -20032,6 +20231,19 @@ mod crash_recovery_tests {
                 current.metrics.exec_cancel_all_books_hit.get() >= 40,
                 "{what}"
             );
+            if ro && mode.is_none_or(|m| m == torus_bridge::native_executor::BookMode::Classic) {
+                // Reduce-only orders rested, and positions under them moved.
+                println!(
+                    "P2 {what}: reduce-only resting max {}, positions moved under them {}",
+                    current.ro_resting_max, current.ro_moved
+                );
+                assert!(
+                    current.ro_resting_max >= 3,
+                    "{what}: {}",
+                    current.ro_resting_max
+                );
+                assert!(current.ro_moved >= 3, "{what}: {}", current.ro_moved);
+            }
             if mode.is_none_or(|m| m == torus_bridge::native_executor::BookMode::Classic) {
                 // V4 never cancels: the liquidation step's cancel took what it rested.
                 assert!(current.v4_max >= 4, "{what}: V4 rested {}", current.v4_max);
@@ -20053,30 +20265,214 @@ mod crash_recovery_tests {
 
     #[test]
     fn reference_paths_match_production_classic_reload() {
-        p2_reference_differential(None);
+        p2_reference_differential(None, false);
     }
 
     #[test]
     fn reference_paths_match_production_classic_resident() {
-        p2_reference_differential(Some(torus_bridge::native_executor::BookMode::Classic));
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::Classic),
+            false,
+        );
     }
 
     #[test]
     fn reference_paths_match_production_order_rows() {
-        p2_reference_differential(Some(torus_bridge::native_executor::BookMode::OrderRows));
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::OrderRows),
+            false,
+        );
     }
 
     #[test]
     fn reference_paths_match_production_level_authority() {
-        p2_reference_differential(Some(
-            torus_bridge::native_executor::BookMode::LevelAuthority,
-        ));
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::LevelAuthority),
+            false,
+        );
     }
 
     #[test]
     fn reference_paths_match_production_level_authority_chunked() {
-        p2_reference_differential(Some(
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked),
+            false,
+        );
+    }
+
+    // Review gap 2 (GPT-6.1-sol on C1): the 9.8 differential with
+    // reduce-only places (`p2_blocks(true)`).
+
+    #[test]
+    fn reference_paths_match_production_reduce_only_classic_reload() {
+        p2_reference_differential(None, true);
+    }
+
+    #[test]
+    fn reference_paths_match_production_reduce_only_classic_resident() {
+        p2_reference_differential(Some(torus_bridge::native_executor::BookMode::Classic), true);
+    }
+
+    #[test]
+    fn reference_paths_match_production_reduce_only_order_rows() {
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::OrderRows),
+            true,
+        );
+    }
+
+    #[test]
+    fn reference_paths_match_production_reduce_only_level_authority() {
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::LevelAuthority),
+            true,
+        );
+    }
+
+    #[test]
+    fn reference_paths_match_production_reduce_only_level_authority_chunked() {
+        p2_reference_differential(
+            Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked),
+            true,
+        );
+    }
+
+    // Review gap 1 (GPT-6.1-sol on C1): crash replay and staleness-guard
+    // rebuild with a WARM cancel-all index in the resident holder.
+
+    /// Crash points (`P2Fault::CrashAfter`): k + 1 / k + 2 lost, no epoch
+    /// boundary (50 / 100) inside.
+    const P2_CRASHES: [u64; 3] = [30, 63, 87];
+    /// Stale-holder windows (`P2Fault::StaleHolder`).
+    const P2_STALE: [(u64, u64); 3] = [(20, 26), (71, 77), (104, 109)];
+
+    /// `fault` on production vs the uninterrupted reference paths: identical
+    /// per-block write sets (every `h_n`, each height once), running hash and
+    /// full CF dump; the index covers the books after every block; every
+    /// fault met a warm index and the guard rebuilt exactly once per fault
+    /// (plus the cold start, and the cold block after a withheld holder).
+    fn p2_warm_index_fault(
+        mode: torus_bridge::native_executor::BookMode,
+        pipelined: bool,
+        fault: P2Fault,
+    ) {
+        let (blocks, _) = p2_blocks(false);
+        let what = format!("pipelined={pipelined} {mode:?} {fault:?}");
+        let reference = p2_run(&blocks, pipelined, Some(mode), true, &P2Fault::None);
+        let run = p2_run(&blocks, pipelined, Some(mode), false, &fault);
+        assert_eq!(
+            run.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=P2_BLOCKS).collect::<Vec<_>>(),
+            "{what}: every height through the hashed flush once"
+        );
+        assert_write_sets_equal(&reference.captured, &run.captured, &what);
+        assert!(run.hash.is_some());
+        assert_eq!(reference.hash, run.hash, "{what}: running hash");
+        assert_dumps_equal(&reference.dump, &run.dump, &what);
+        let (faults, rebuilds) = match &fault {
+            P2Fault::CrashAfter(ks) => (ks.len() as u64, 1 + ks.len() as u64),
+            P2Fault::StaleHolder(ws) => (ws.len() as u64, 1 + 2 * ws.len() as u64),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(run.faults, faults, "{what}");
+        assert_eq!(
+            run.metrics.exec_resident_rebuilds.get(),
+            rebuilds,
+            "{what}: one guard rebuild per fault"
+        );
+        assert!(
+            run.index_checked >= P2_BLOCKS - 15,
+            "{what}: {}",
+            run.index_checked
+        );
+        assert!(run.metrics.exec_cancel_all_books_hit.get() >= 40, "{what}");
+    }
+
+    #[test]
+    fn warm_index_crash_replay_matches_reference_classic() {
+        let crashes = P2Fault::CrashAfter(P2_CRASHES.to_vec());
+        p2_warm_index_fault(
+            torus_bridge::native_executor::BookMode::Classic,
+            true,
+            crashes,
+        );
+    }
+
+    #[test]
+    fn warm_index_crash_replay_matches_reference_order_rows() {
+        let crashes = P2Fault::CrashAfter(P2_CRASHES.to_vec());
+        p2_warm_index_fault(
+            torus_bridge::native_executor::BookMode::OrderRows,
+            true,
+            crashes,
+        );
+    }
+
+    #[test]
+    fn warm_index_crash_replay_matches_reference_level_authority() {
+        let crashes = P2Fault::CrashAfter(P2_CRASHES.to_vec());
+        p2_warm_index_fault(
+            torus_bridge::native_executor::BookMode::LevelAuthority,
+            true,
+            crashes,
+        );
+    }
+
+    #[test]
+    fn warm_index_crash_replay_matches_reference_level_authority_chunked() {
+        let crashes = P2Fault::CrashAfter(P2_CRASHES.to_vec());
+        p2_warm_index_fault(
             torus_bridge::native_executor::BookMode::LevelAuthorityChunked,
-        ));
+            true,
+            crashes,
+        );
+    }
+
+    #[test]
+    fn warm_index_stale_guard_rebuild_matches_reference_classic() {
+        for pipelined in [false, true] {
+            let stale = P2Fault::StaleHolder(P2_STALE.to_vec());
+            p2_warm_index_fault(
+                torus_bridge::native_executor::BookMode::Classic,
+                pipelined,
+                stale,
+            );
+        }
+    }
+
+    #[test]
+    fn warm_index_stale_guard_rebuild_matches_reference_order_rows() {
+        for pipelined in [false, true] {
+            let stale = P2Fault::StaleHolder(P2_STALE.to_vec());
+            p2_warm_index_fault(
+                torus_bridge::native_executor::BookMode::OrderRows,
+                pipelined,
+                stale,
+            );
+        }
+    }
+
+    #[test]
+    fn warm_index_stale_guard_rebuild_matches_reference_level_authority() {
+        for pipelined in [false, true] {
+            let stale = P2Fault::StaleHolder(P2_STALE.to_vec());
+            p2_warm_index_fault(
+                torus_bridge::native_executor::BookMode::LevelAuthority,
+                pipelined,
+                stale,
+            );
+        }
+    }
+
+    #[test]
+    fn warm_index_stale_guard_rebuild_matches_reference_level_authority_chunked() {
+        for pipelined in [false, true] {
+            let stale = P2Fault::StaleHolder(P2_STALE.to_vec());
+            p2_warm_index_fault(
+                torus_bridge::native_executor::BookMode::LevelAuthorityChunked,
+                pipelined,
+                stale,
+            );
+        }
     }
 }
