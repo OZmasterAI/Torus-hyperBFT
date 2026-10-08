@@ -3134,8 +3134,13 @@ ms per native block (val0) unless per 1k fills; `apply` is the
   `perf/c2-set-holder` `d7bd1c36` (`apply` per fill -36%, ~8-14% above the
   pre-a746c408 level; 18c review: merge as is) and 18c's
   `perf/position-v2-savings` `37b28dd6` (pass B per fill -11%, below p2's
-  level); together 1.018x matched/s vs base, within noise. Merge both to
-  main as separate `--no-ff` merges (18c).
+  level); together 1.018x matched/s vs base, within noise. **Merged** to
+  main (18c s104: merge as is) as `c8d25db8` (c2-set-holder) and
+  `b8e3b606` (position-v2-savings), ozarchy s29.
+- **Low priority, after Phase 2 (18c s104):** `TraderPositions::apply` per
+  1k fills is still 0.229 after the C2 fix vs 0.201 / 0.213 before
+  `a746c408` (section 29): find what is left of that step when convenient.
+  The Phase 2 +7% gate stays measured against `d3ba3c0a`.
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
