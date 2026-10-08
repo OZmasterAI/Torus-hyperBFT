@@ -16,6 +16,40 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `perf/item6-phase2` `744e55ee` (2026-10-08, s29, after merging main e934fa0e)
+
+Step 0 (`1a6573dc`) with main `e934fa0e` merged in (`c1a3bdb8`; the code merged without conflicts, git
+auto-merged `native_executor.rs`, `position.rs` and `test_harness.py`), plus the plan update `744e55ee`.
+Run before pushing and before step 1. Worktree `wt/item6-phase2`, new target dir
+`CARGO_TARGET_DIR=~/.cargo-target-item6-phase2`. The suite 4 baseline `e934fa0e` ran in a temporary
+detached worktree with its own target dir (`~/.cargo-target-item6-phase2-base`, so no `touch` was needed),
+and the worktree was removed afterwards. Both clippy runs checked the same 20 workspace crates. Suite 3
+was not requested for this run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,085 passed, 0 failed**, 34 skipped, 0 flaky (= main `b8e3b606` 3,071 / 33 + step 0's 14 tests and 1 ignored µbench) | 205 s (82.2 s of tests; cold target dir) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 3 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `e934fa0e` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**; fmt 3,352 = 3,352, **0 new** | 22 s / 4 s (base 87 s cold / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK (`test_harness.py` 109 tests) | 29 s |
+
+Neither step 0 nor the merge adds a finding. Step 0 alone had 0 new findings vs `d3ba3c0a` (the
+`1a6573dc` entry below), and the merged branch matches `e934fa0e` exactly. The step 0 tests are part
+of suite 1:
+* reference paths: `cancel_all_matches_the_full_scan_reference` (`torus-bridge`
+  `cancel_batch_exec_tests.rs`) and `flush_all_matches_the_per_row_reference` (`torus-core`
+  `position.rs`)
+* counters: `cancel_all_counters_count_visited_and_hit_books`, `by_id_counters_count_books_probed`,
+  `parallel_engine_counts_spawns_per_site`, `add_counts_at_its_site` (`torus-state` `spawn_count.rs`),
+  `phase2_step0_block_metrics` (`torus-consensus` `app.rs`) and `phase2_step0_metrics_are_exported`
+  (`torus-telemetry`)
+* bench client: the `by_id.rs` tests
+
+Logs: `~/bench-results-matched/presuite-item6-p2-e934/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`).
+
 ## main `b8e3b606` (2026-10-08, s104 merges)
 
 The s104 merges on top of the owner's local commits, never tested together before this run: `91f51ca0`
