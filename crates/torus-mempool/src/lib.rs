@@ -205,7 +205,7 @@ impl Mempool {
         let verified_cap = config.verified_sender_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
-            evm: RwLock::new(evm_pool::EvmPool::new()),
+            evm: RwLock::new(evm_pool::EvmPool::new(initial_base_fee)),
             native: RwLock::new(native_pool),
             state,
             da_store,
@@ -513,10 +513,15 @@ impl Mempool {
         drained
     }
 
-    /// Update the D4 fee floor from a committed block header's base fee.
+    /// Update the D4 fee floor from a committed block header's base fee, and
+    /// re-key the EVM pool's eviction index at it (fix (a), s104: eviction
+    /// ranks by effective tip, which depends on the base fee). Stored under
+    /// the EVM lock so the floor and the pool's index never disagree.
     pub fn set_base_fee(&self, base_fee: u64) {
+        let mut pool = self.evm.write().unwrap();
         self.current_base_fee
             .store(base_fee, std::sync::atomic::Ordering::Relaxed);
+        pool.set_base_fee(base_fee);
     }
 
     /// Current D4 fee floor in wei.
@@ -2739,8 +2744,8 @@ mod tests {
 
         let k5 = key(15);
         fund(&state, &address_from_key(&k5), U256::from(10u64.pow(18)), 0);
-        // At the D4 floor (1 gwei) but not outbidding the cheapest pooled tx
-        // (same max fee, lower priority fee) — still PoolFull, not FeeTooLow.
+        // At the D4 floor (1 gwei), so its effective tip is 0: it does not
+        // outbid the cheapest pooled tip (0.2 gwei) — PoolFull, not FeeTooLow.
         let err = pool
             .add_evm_tx(create_eip1559_tx(
                 &k5,
@@ -3532,6 +3537,222 @@ mod tests {
         pool.add_evm_tx(raw)
             .expect("pre-155 legacy tx must be admitted");
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    // ---- fix (b): intrinsic gas and EIP-3860 initcode size at admission ----
+
+    /// Fresh funded sender per case so admission depends on gas alone.
+    fn intrinsic_case(state: &StateDb, seed: u8) -> SigningKey {
+        let k = key(seed);
+        fund(state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+        k
+    }
+
+    /// revm's own figure for the chain's spec (executor.rs runs CANCUN).
+    fn revm_intrinsic(input: &[u8], is_create: bool, accounts: u64, slots: u64) -> u64 {
+        revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+            revm::primitives::hardfork::SpecId::CANCUN,
+            input,
+            is_create,
+            accounts,
+            slots,
+            0,
+        )
+        .initial_gas
+    }
+
+    /// `need - 1` is rejected with IntrinsicGasTooLow { need, .. }, `need` is admitted.
+    fn assert_intrinsic_boundary(pool: &Mempool, need: u64, make: impl Fn(u64) -> Vec<u8>) {
+        let err = pool.add_evm_tx(make(need - 1)).unwrap_err();
+        match err {
+            MempoolError::IntrinsicGasTooLow { need: n, got } => {
+                assert_eq!((n, got), (need, need - 1));
+            }
+            other => panic!("expected IntrinsicGasTooLow at {}, got: {other}", need - 1),
+        }
+        pool.add_evm_tx(make(need))
+            .unwrap_or_else(|e| panic!("gas limit {need} must be admitted: {e}"));
+    }
+
+    fn eip1559_with(
+        k: &SigningKey,
+        gas_limit: u64,
+        to: TxKind,
+        input: Vec<u8>,
+        access_list: alloy_eips::eip2930::AccessList,
+    ) -> Vec<u8> {
+        sign_envelope(
+            k,
+            TxEip1559 {
+                chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                nonce: 0,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                gas_limit,
+                to,
+                value: U256::ZERO,
+                input: input.into(),
+                access_list,
+            },
+        )
+    }
+
+    #[test]
+    fn intrinsic_gas_plain_transfer() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        assert_eq!(revm_intrinsic(&[], false, 0, 0), 21_000);
+
+        let k = intrinsic_case(&state, 200);
+        assert_intrinsic_boundary(&pool, 21_000, |gas| {
+            create_eip1559_tx(&k, 0, 2_000_000_000, 1, gas, U256::ZERO)
+        });
+
+        // Legacy envelope, same rule.
+        let k = intrinsic_case(&state, 201);
+        assert_intrinsic_boundary(&pool, 21_000, |gas_limit| {
+            sign_envelope(
+                &k,
+                alloy_consensus::TxLegacy {
+                    chain_id: Some(torus_types::eip712::TORUS_CHAIN_ID),
+                    nonce: 0,
+                    gas_price: 2_000_000_000,
+                    gas_limit,
+                    to: TxKind::Call(Address::ZERO),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                },
+            )
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_calldata() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 3 zero bytes x 4 + 5 non-zero bytes x 16 = 92.
+        let input = vec![0, 1, 0, 2, 3, 0, 4, 5];
+        let need = 21_000 + 3 * 4 + 5 * 16;
+        assert_eq!(revm_intrinsic(&input, false, 0, 0), need);
+
+        let k = intrinsic_case(&state, 202);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(
+                &k,
+                gas,
+                TxKind::Call(Address::ZERO),
+                input.clone(),
+                Default::default(),
+            )
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_contract_creation_and_initcode_words() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 33 non-zero bytes = 2 initcode words (EIP-3860, 2 gas each) + 32k create.
+        let input = vec![0x60; 33];
+        let need = 21_000 + 32_000 + 33 * 16 + 2 * 2;
+        assert_eq!(revm_intrinsic(&input, true, 0, 0), need);
+
+        let k = intrinsic_case(&state, 203);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(&k, gas, TxKind::Create, input.clone(), Default::default())
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_access_list() {
+        use alloy_eips::eip2930::{AccessList, AccessListItem};
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 2 addresses x 2400 + 3 storage keys x 1900.
+        let list = AccessList(vec![
+            AccessListItem {
+                address: Address::repeat_byte(1),
+                storage_keys: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+            },
+            AccessListItem {
+                address: Address::repeat_byte(2),
+                storage_keys: vec![B256::repeat_byte(3)],
+            },
+        ]);
+        let need = 21_000 + 2 * 2_400 + 3 * 1_900;
+        assert_eq!(revm_intrinsic(&[], false, 2, 3), need);
+
+        let k = intrinsic_case(&state, 204);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(&k, gas, TxKind::Call(Address::ZERO), vec![], list.clone())
+        });
+
+        // EIP-2930 envelope, same rule.
+        let k = intrinsic_case(&state, 205);
+        assert_intrinsic_boundary(&pool, need, |gas_limit| {
+            sign_envelope(
+                &k,
+                alloy_consensus::TxEip2930 {
+                    chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                    nonce: 0,
+                    gas_price: 2_000_000_000,
+                    gas_limit,
+                    to: TxKind::Call(Address::ZERO),
+                    value: U256::ZERO,
+                    access_list: list.clone(),
+                    input: Bytes::new(),
+                },
+            )
+        });
+    }
+
+    /// EIP-3860: revm (Shanghai+) rejects create txs whose initcode exceeds
+    /// 49,152 bytes, so admission must too.
+    #[test]
+    fn initcode_size_limit_at_admission() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let max = revm::primitives::eip3860::MAX_INITCODE_SIZE;
+        assert_eq!(max, 49_152);
+
+        let k = intrinsic_case(&state, 206);
+        let too_big = vec![0u8; max + 1];
+        let err = pool
+            .add_evm_tx(eip1559_with(
+                &k,
+                1_000_000,
+                TxKind::Create,
+                too_big,
+                Default::default(),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::InitCodeTooLarge { size, max: m } if size == max + 1 && m == max),
+            "expected InitCodeTooLarge, got: {err}"
+        );
+
+        let at_limit = vec![0u8; max];
+        let need = revm_intrinsic(&at_limit, true, 0, 0);
+        pool.add_evm_tx(eip1559_with(
+            &k,
+            need,
+            TxKind::Create,
+            at_limit,
+            Default::default(),
+        ))
+        .expect("initcode at the limit is admitted");
+
+        // A call (not a create) with the same calldata size has no initcode limit.
+        let k = intrinsic_case(&state, 207);
+        let data = vec![0u8; max + 1];
+        let need = revm_intrinsic(&data, false, 0, 0);
+        pool.add_evm_tx(eip1559_with(
+            &k,
+            need,
+            TxKind::Call(Address::ZERO),
+            data,
+            Default::default(),
+        ))
+        .expect("large calldata on a call is not initcode");
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

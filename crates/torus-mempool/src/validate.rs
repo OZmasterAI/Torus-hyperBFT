@@ -2,6 +2,9 @@ use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_primitives::{Address, U256};
 use alloy_rlp::Decodable;
+use revm::context_interface::cfg::gas::calculate_initial_tx_gas;
+use revm::primitives::eip3860::MAX_INITCODE_SIZE;
+use revm::primitives::hardfork::SpecId;
 
 use torus_state::StateDb;
 
@@ -28,8 +31,8 @@ fn extract_gas_price(tx: &TxEnvelope) -> (u128, u128) {
 
 /// Decode, validate, and extract metadata from a raw EVM transaction.
 ///
-/// Checks: RLP decode, tx type, chain ID, gas limit, fee floor, signature
-/// recovery, nonce, balance.
+/// Checks: RLP decode, tx type, chain ID, gas limit, initcode size, intrinsic
+/// gas, fee floor, signature recovery, nonce, balance.
 pub fn validate_evm_tx(
     raw_rlp: &[u8],
     state: &StateDb,
@@ -75,6 +78,42 @@ pub fn validate_evm_tx(
         return Err(MempoolError::GasLimitExceeded {
             tx_gas: gas_limit,
             block_gas: block_gas_limit,
+        });
+    }
+
+    // Fix (b, s104): gas limit must cover the intrinsic gas, else revm skips
+    // the tx at execution (CallGasCostMoreThanGasLimit) and the sender's
+    // nonce is stranded. revm computes it, for the spec the executor runs
+    // (CANCUN, torus-evm executor.rs), so the two can never drift apart.
+    let is_create = tx.kind().is_create();
+    let input = tx.input();
+    // EIP-3860 (Shanghai+): revm rejects a create whose initcode is over the
+    // limit (CreateInitCodeSizeLimit; the executor sets no custom code size).
+    if is_create && input.len() > MAX_INITCODE_SIZE {
+        return Err(MempoolError::InitCodeTooLarge {
+            size: input.len(),
+            max: MAX_INITCODE_SIZE,
+        });
+    }
+    let (al_accounts, al_storage_keys) = tx.access_list().map_or((0, 0), |al| {
+        (
+            al.len() as u64,
+            al.iter().map(|item| item.storage_keys.len() as u64).sum(),
+        )
+    });
+    let intrinsic = calculate_initial_tx_gas(
+        SpecId::CANCUN,
+        input,
+        is_create,
+        al_accounts,
+        al_storage_keys,
+        0,
+    )
+    .initial_gas;
+    if gas_limit < intrinsic {
+        return Err(MempoolError::IntrinsicGasTooLow {
+            need: intrinsic,
+            got: gas_limit,
         });
     }
 
