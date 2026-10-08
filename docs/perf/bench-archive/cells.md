@@ -1,6 +1,6 @@
 # Per-cell results (every cell dir with a `summary.json`)
 
-Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`). After the c2h campaign finished: added `c2h` (14 cells).
+Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`). After the c2h campaign finished: added `c2h` (14 cells). 2026-10-09: added `p2byid` (7 cells).
 
 
 ## 14236fa: Baseline `14236fa` (C3 + C4 + PF1 + cooldown fix) at 300 markets, with perf on r1/r2
@@ -391,6 +391,18 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-c2h-300m-sav-r1` | UNVERIFIED | 2026-10-08 18:16 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 135,694.4 | 133,782.9 | 171,276.0 | 178,545.7 | 3.4 | 126.0 | 169.37 | 3.98 | AGREE | UNKNOWN | UNVERIFIED |
 | `ozarchy-c2h-300m-sav-r2` | OK | 2026-10-08 18:33 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 178,036.6 | 177,179.0 | 189,469.0 | 236,627.5 | 5.1 | 131.6 | 150.37 | 4.17 | AGREE | PASS | ACCEPT |
 | `ozarchy-c2h-300m-sav-r3` | OK | 2026-10-08 19:06 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 176,912.5 | 176,991.8 | 188,521.7 | 234,400.6 | 5.1 | 130.9 | 154.80 | 4.23 | AGREE | PASS | ACCEPT |
+
+## p2byid: Cancel-by-id cost with P2-1 in: p2 `bdd5b470` vs ref main `e934fa0e`, by-id cells (bench flags `--cancel-by-id-fraction 0.1 --modify-fraction 0.05`, not in extra env) and std cells; `ref-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2byid-300m-p2-byid-r1` | OK | 2026-10-09 00:54 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 176,114.0 | 175,254.7 | 185,940.9 | 232,517.3 | 5.1 | 139.4 | 150.19 | 4.40 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-p2-byid-r2` | OK | 2026-10-09 01:11 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 177,730.6 | 177,967.5 | 187,942.1 | 235,498.8 | 5.3 | 127.5 | 149.06 | 4.37 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-p2-std-r1` | OK | 2026-10-09 01:00 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 179,851.2 | 177,949.1 | 187,550.4 | 238,403.1 | 5.5 | 129.9 | 146.09 | 4.27 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-byid-r1` | OK | 2026-10-09 00:48 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 179,228.2 | 178,558.5 | 190,142.6 | 238,251.5 | 5.4 | 127.8 | 143.40 | 4.33 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-byid-r2` | OK | 2026-10-09 01:18 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 173,816.0 | 172,096.1 | 186,523.8 | 230,660.5 | 5.5 | 127.9 | 140.64 | 4.38 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-std-r1` | OK | 2026-10-09 01:05 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 179,192.3 | 177,854.4 | 189,745.5 | 238,030.9 | 5.5 | 122.1 | 140.57 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-warm` | OK | 2026-10-09 00:42 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 60 | 400 | - | 182,389.8 | 182,389.8 | 193,182.4 | 241,955.8 | 5.0 | 100.2 | 126.34 | 4.17 | AGREE | PASS | ACCEPT |
 
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 

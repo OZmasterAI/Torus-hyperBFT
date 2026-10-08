@@ -3177,6 +3177,85 @@ the index visits (step 0 cells: ~300 = every book), so do not compare it with ol
   trader's last order or stop in that book leaves it, then one more gate cell; (C) bring the
   9.12 background prune forward.
 
+## 31. Cancel-by-id cost with P2-1 in: bdd5b470 vs e934fa0e (campaign ozarchy-p2byid, 2026-10-09)
+
+Plan review log row 27 (d), phase2 plan 9.15: what does one CancelOrder / ModifyOrder by id cost
+in phase 1 now that the P2-1 cancel-all index is in (used with resident books)? Step 0 (section
+25.2, s-byid on `707f132f`): +3.1 ms per native block, ~2.5 ms per by-id action, 457 books probed
+per action. Input to the priority of consensus item B (market in the order id); not a gate. Arms:
+ref = main `e934fa0e` (node `8d7d596c`; rebuilt, the p21g `28479dd1` binary was gone), p2 =
+`perf/item6-phase2` `bdd5b470` (node `e28bb121`). Node-only builds from new detached worktrees
+(`wt/p2byid-e934fa0e`, `wt/p2byid-bdd5b470`) into fresh target dirs (p21g method,
+`ozarchy-p2byid-build.sh`); both arms run the same bench `6c7ad1a7` (built from `bdd5b470`) and
+the `bdd5b470` harness. Standard shape as section 30, no perf; by-id cells add
+`CANCEL_BY_ID_FRACTION=0.1 MODIFY_FRACTION=0.05`. Order: ref warm (60 s, excluded), then
+ref-byid-r1 p2-byid-r1 p2-std-r1 ref-std-r1 p2-byid-r2 ref-byid-r2, 00:37-01:18, units
+`bench-ozarchy-p2byid-300m-<tag>.service`. All cells rc 0, AGREE, liveness PASS, accepted, node md5 =
+staged md5 of the arm, 4 MiB book CF, oracle stale 0, 0 panic / fail-stop lines, no deaths. Driver
+`/home/oz/bench-results-matched/ozarchy-p2byid-campaign.sh`, analysis
+`ozarchy-p2byid-tools/p2byid.py` (from `p21g.py`), table `ozarchy-p2byid-tools/p2byid-table.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **phase 1** | phase 1 val0-2 | phase 1 / 1k fills | by-id / blk | books probed / by-id | cancel-alls / blk | visited / hit per cancel-all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ref byid r1 | 179,228 | 5.352 | 26,647 | **22.71** | 22.82 | 0.852 | 0.903 | - | - | - |
+| p2 byid r1 | 176,114 | 5.057 | 27,719 | **24.25** | 24.62 | 0.875 | 1.058 | 454.1 | 58.6 | 184.3 / 89.7 |
+| p2 std r1 | 179,851 | 5.455 | 27,264 | **21.15** | 21.49 | 0.776 | - | - | 57.9 | 186.4 / 90.5 |
+| ref std r1 | 179,192 | 5.528 | 26,417 | **20.73** | 21.20 | 0.785 | - | - | - | - |
+| p2 byid r2 | 177,731 | 5.333 | 27,670 | **24.28** | 24.33 | 0.878 | 1.031 | 439.6 | 57.6 | 186.9 / 91.0 |
+| ref byid r2 | 173,816 | 5.455 | 25,742 | **22.91** | 22.88 | 0.890 | 1.163 | - | - | - |
+
+ms per native block (val0) unless noted; "phase 1 val0-2" = mean of the three validators.
+By-id / blk = bench-side accepted cancels + modifies (bench.log `Cancel-by-id (load-gen)` line,
+same bench binary both arms) / val0 phase-window native blocks; used for both arms because main has
+no by-id or cancel-all node counters. On p2 the node count equals the bench count (881, 863).
+Every by-id action sent was accepted; ~18.9-19.0k lookups per cell, ~18.0-18.2k found no own order,
+0 errors (delivered 0.90-1.16 per block vs step 0's 1.22). ref warm (182,390 matched/s) excluded.
+
+| mean | n | matched/s | native blk/s | fills/blk | phase 1 (r1/r2 spread) | phase 1 val0-2 (spread) | phase 1 / 1k fills | by-id / blk |
+|---|---|---|---|---|---|---|---|---|
+| ref byid | 2 | 176,522 | 5.404 | 26,195 | 22.81 (0.20) | 22.85 (0.06) | 0.871 | 1.033 |
+| ref std | 1 | 179,192 | 5.528 | 26,417 | 20.73 | 21.20 | 0.785 | - |
+| p2 byid | 2 | 176,922 | 5.195 | 27,694 | 24.27 (0.03) | 24.48 (0.30) | 0.876 | 1.044 |
+| p2 std | 1 | 179,851 | 5.455 | 27,264 | 21.15 | 21.49 | 0.776 | - |
+| p2 / ref byid | | 1.002x | 0.961x | 1.057x | +1.46 ms | +1.63 ms | 1.006x | |
+| p2 / ref std | | 1.004x | 0.987x | 1.032x | +0.42 ms | +0.30 ms | 0.989x | |
+
+| ms per by-id action = (phase 1 byid - phase 1 std) / by-id per blk | ref | p2 | p2 - ref |
+|---|---|---|---|
+| val0: step per native block | +2.08 | +3.12 | |
+| val0: per action (r1, r2 against the one std cell) | **2.01** (2.19, 1.88) | **2.98** (2.93, 3.04) | +0.97 |
+| mean val0-2: per action | 1.60 (1.79, 1.45) | 2.86 (2.96, 2.75) | +1.26 |
+| per 1k fills step x byid fills: per action | 2.19 | 2.66 | +0.47 |
+
+- **Verdict on (d): P2-1 did not cut the by-id cost.** One by-id action costs ~2.0 ms of phase 1
+  on main and ~3.0 ms on `bdd5b470` (val0), on either side of step 0's ~2.5 ms. p2 is not
+  lower; the +0.97 ms (p2 - ref) is not resolved. The input to item B's priority stays at
+  step 0's level: ~2-3 ms of phase 1 per by-id action, ~1 action per native block in this shape.
+- **Noise:** the by-id cells repeat closely (phase 1 r1/r2 0.20 ms ref, 0.03 ms p2; per action
+  0.31 / 0.11 ms), but both lean on one std cell per arm. On this shape section 30's std pairs
+  differ by 0.38 ms (ref) and 1.42 ms (p21), pooled sd ~0.74 ms per cell, so ~0.7 ms per action
+  per arm and ~1.0 ms on p2 - ref: the +0.97 is ~1 sd. A P2-1 cut to below ~1 ms per action
+  (~2 ms under p2's 2.98, ~2-3 sd) would have shown. Against section 30's std means (other
+  binaries, reference only) the figures are ref 0.95, p2 2.75 ms per action: p2 is still not lower.
+  The fills-normalised variant narrows p2 - ref to +0.47 ms (p2 by-id cells ran 5.7% more fills
+  per block).
+- **Why it did not move (sized, not profiled):** the probes are 454 / 440 books per action (all
+  validators within 440-458, step 0 457), ~10-20 us (section 25.2), <1% of the cost. P2-1 cut the
+  cancel-all walk to ~185 visited books (vs ~300 in step 0), but at ~0.07 us per visit (section 30)
+  even one extra full cancel-all pass per by-id action is ~13-21 us, also <1%. So the "a by-id
+  action splits a cancel-all run" mechanism (25.2, inferred), if it is the cause, does not cost
+  through book visits; the 2-3 ms is elsewhere and these cells do not split it (no perf).
+- **Harness limit:** it exposes cancel-alls per native block (by-id cells 58.6 / 57.6 vs 57.9 std
+  on p2) and visited / hit per cancel-all (184-187 / 90-91, unchanged by by-id), not the number of
+  cancel-all runs or how many runs the by-id actions split.
+- **Throughput:** matched/s p2 / ref 1.002x (by-id), 1.004x (std), inside the ref by-id r1/r2
+  spread (5,412, 3.1%). By-id lowers native blk/s on both arms (ref -0.12, p2 -0.26), within or
+  near the r1/r2 spread (0.10, 0.28).
+- **Caveats:** std cells n = 1 per arm; the delivered by-id share is ~1 per block (most lookups
+  find no own order), so the per-action figure rests on a ~2-3 ms step; consensus timeouts 5-8 per
+  cell in every cell, both arms. Next if 18c wants p2 - ref resolved: one more std cell per arm
+  (~6 min each); to find where the 2-3 ms goes: a perf cell on p2 with a larger by-id share.
+
 ## Open
 
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
