@@ -3121,8 +3121,67 @@ ms per native block (val0) unless per 1k fills; `apply` is the
   per arm. 18c s104: both branches go to main as separate `--no-ff` merges
   if each recovers its share.
 
+## 30. P2-1 gate cell: cancel-all index `2ecc2bdf` vs main `e934fa0e` (campaign `ozarchy-p21g`, 2026-10-08)
+
+Phase 2 step 1 (C1, the trader -> markets cancel-all index; plan P2-1, review log rows 17-23)
+against the Phase 2 reference main `e934fa0e` (phase2 plan 9.11). Gate (18c s104): phase 1 down
+by >= ~1.9 ms per native block (half of the ~3.7 ms no-perf estimate, section 25.1), 2 cells per
+arm mirrored, 2 more if the drop lands within ~1.4-2.4 ms. Node-only builds from new detached
+worktrees into fresh target dirs (c2h method; ref `28479dd1`, p21 `6f42e5c4`); both arms run the
+same bench `84e73617` (rebuilt from `2ecc2bdf`; `tools/bench-throughput` has no diff since
+`707f132f`, the `fff899ca` copy was pruned) and the `2ecc2bdf` harness (it samples the new index
+gauges). Standard shape as sections 26-29, no perf. Order: ref warm (60 s), then ref p21 p21 ref,
+23:01-23:30, unit `bench-p21g.service`. All cells rc 0, AGREE, liveness PASS, accepted, exe md5
+3/3, 4 MiB book CF, trie off, oracle stale 0, no deaths. Driver `ozarchy-p21g-campaign.sh`,
+analysis `ozarchy-p21g-tools/p21g.py`, table `ozarchy-p21g-table.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | **phase 1** | phase 1 / 1k fills | match / 1k | settle / 1k | pass B / 1k | `apply` / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ref r1 | 177,160 | 5.179 | 26,943 | 4.28 | 146.1 | **21.64** | 0.803 | 0.539 | 1.460 | 0.807 | 0.221 | 6.91 |
+| p21 r1 | 177,372 | 5.230 | 28,303 | 4.29 | 151.8 | **22.10** | 0.781 | 0.534 | 1.452 | 0.808 | 0.224 | 5.91 |
+| p21 r2 | 178,050 | 5.423 | 27,027 | 4.31 | 144.3 | **20.68** | 0.765 | 0.531 | 1.473 | 0.835 | 0.218 | 5.63 |
+| ref r2 | 174,826 | 5.333 | 27,746 | 4.31 | 151.7 | **22.02** | 0.794 | 0.514 | 1.510 | 0.846 | 0.233 | 7.11 |
+
+ms per native block (val0) unless per 1k fills; ref warm (180,752 matched/s) excluded.
+
+| mean | matched/s | native blk/s | chain | phase 1 | phase 1 / 1k fills | match / 1k | settle / 1k |
+|---|---|---|---|---|---|---|---|
+| ref | 175,993 | 5.256 | 148.9 | 21.83 | 0.798 | 0.526 | 1.485 |
+| p21 | 177,711 | 5.327 | 148.0 | 21.39 | 0.773 | 0.533 | 1.463 |
+| p21 / ref | 1.010x | 1.013x | 0.994x | **-0.44 ms** | 0.968x | 1.012x | 0.985x |
+
+| p21 cell | cancel-alls / blk | books visited / hit per cancel-all | index entries / traders at end |
+|---|---|---|---|
+| r1 | 59.2 | 189.1 / 92.4 | 252,457 / 1,317 |
+| r2 | 56.4 | 188.6 / 92.4 | 347,123 / 1,701 |
+
+Identical on all three validators. ref (main) has no cancel-all counters.
+**`torus_exec_cancel_all_books_visited` changed meaning at P2-1:** it now counts only the books
+the index visits (step 0 cells: ~300 = every book), so do not compare it with older cells.
+
+- **Verdict: gate missed.** Phase 1 -0.44 ms per native block (val0) vs >= 1.9 ms; all three
+  validators -0.30 ms; per 1k fills -3.2% (~0.7 ms per block at equal fills). Pairwise drops
+  -0.46 to +1.34 ms, below the 1.4-2.4 ms band, so no extra cells. Spread: ref 0.38 ms, p21
+  1.42 ms. Plan rule (section 4): the miss goes into the review log (row 24) and the work
+  continues.
+- **Why (from the counters, not profiled):** each cancel-all visits 189 books, not the ~87-95
+  where the sender has something (books hit 92.4, as in step 0). About half the visits are stale
+  index entries: "never removed eagerly" (phase2 plan 9.12) keeps a market listed after the
+  trader's orders there have filled. The index swings between ~135k and ~634k entries during a
+  cell (~690-2,700 traders, ~200 markets per trader) rather than growing. Scaling the ~3.7 ms
+  estimate by the empty visits actually avoided (111 of ~208) gives ~2.0 ms, still above the
+  0.44 ms measured, so the per-book saving also looks smaller than section 25.1's split implied.
+- **Upkeep:** none visible (match per fill +1.2%, settle -1.5%, within noise). end_resident wait
+  7.01 -> 5.77 ms, not established at n = 2.
+- Options for 18c: (A) accept, continue; (B) remove a market from the trader's set when the
+  trader's last order or stop in that book leaves it, then one more gate cell; (C) bring the
+  9.12 background prune forward.
+
 ## Open
 
+- **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
+  still visit 189 books, the sender has something in 92 (stale index entries, "never removed
+  eagerly"). Options A / B / C to 18c.
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
   build style (D/B 1.014x), not the load generator. **Bisected** (section
