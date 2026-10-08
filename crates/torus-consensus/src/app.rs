@@ -19825,6 +19825,10 @@ mod crash_recovery_tests {
         /// in markets 2 / 3, the most seen after any block and after the last.
         v4_max: usize,
         v4_last: usize,
+        /// P2-1: blocks after which the resident holder carried a built
+        /// cancel-all index (checked to cover the books), and restarts.
+        index_checked: u64,
+        restarts: u64,
     }
 
     /// V4's resting orders + pending stops in the classic book blobs of
@@ -19845,37 +19849,66 @@ mod crash_recovery_tests {
 
     /// Feed `blocks` through the committed-block path on a fresh
     /// `p2_fixture` DB. `reference`: every block on the bridge's reference
-    /// paths (`test_reference_paths`).
+    /// paths (`test_reference_paths`). `restart_every`: drop and recreate the
+    /// context after every n-th block (books, R and the cancel-all index
+    /// rebuilt from the DB). After every block with resident books, the
+    /// carried cancel-all index (once built) covers the books (P2-1).
     fn p2_run(
         blocks: &[TorusBlock],
         pipelined: bool,
         mode: Option<torus_bridge::native_executor::BookMode>,
         reference: bool,
+        restart_every: Option<u64>,
     ) -> P2Run {
         let (config, db) = p2_fixture();
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
-        let what = format!("pipelined={pipelined} {mode:?} reference={reference}");
-        let mut ctx = make_exec_ctx(&config, &db);
-        ctx.test_book_mode = mode;
-        ctx.test_reference_paths = reference;
-        ctx.metrics = Some(metrics.clone());
-        if pipelined {
-            ctx.attach_flush_worker(None);
-        }
-        let (mut v4_max, mut v4_last) = (0, 0);
+        let what = format!(
+            "pipelined={pipelined} {mode:?} reference={reference} restart_every={restart_every:?}"
+        );
+        let new_ctx = || {
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.test_book_mode = mode;
+            ctx.test_reference_paths = reference;
+            ctx.metrics = Some(metrics.clone());
+            if pipelined {
+                ctx.attach_flush_worker(None);
+            }
+            ctx
+        };
+        let mut ctx = new_ctx();
+        let (mut v4_max, mut v4_last, mut index_checked, mut restarts) = (0, 0, 0, 0);
         for b in blocks {
+            let h = b.header.height;
             dispatch_and_execute(&ctx, &db, b);
             assert!(
                 !ctx.exec_failed.load(Ordering::SeqCst),
-                "{what}: fail-stop at {}",
-                b.header.height
+                "{what}: fail-stop at {h}"
             );
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle(), "{what}: W failed");
             }
             v4_last = p2_v4_resting(&db);
             v4_max = v4_max.max(v4_last);
+            let index = ctx.resident_books.lock().unwrap().trader_index();
+            if let Some((Some(carried), rebuilt)) = index {
+                for (trader, markets) in &rebuilt {
+                    let listed = carried.get(trader).map_or(&[][..], Vec::as_slice);
+                    for m in markets {
+                        assert!(
+                            listed.binary_search(m).is_ok(),
+                            "{what}: after {h}: {trader} has orders or stops in market {m}, \
+                             the index lists {listed:?}"
+                        );
+                    }
+                }
+                index_checked += 1;
+            }
+            if restart_every.is_some_and(|n| h % n == 0) && h < P2_BLOCKS {
+                restarts += 1;
+                drop(ctx);
+                ctx = new_ctx();
+            }
         }
         drop(ctx);
         let captured = torus_state::running_hash::capture_take(&db);
@@ -19889,6 +19922,8 @@ mod crash_recovery_tests {
             metrics,
             v4_max,
             v4_last,
+            index_checked,
+            restarts,
         }
     }
 
@@ -19897,7 +19932,11 @@ mod crash_recovery_tests {
     /// and full CF dump (state, books, trades, action status), serial and
     /// pipelined, in `mode` (`None`: the env default, classic without the
     /// resident holder). The switch reaches the context (the reference
-    /// cancel-all keeps no counters) and the sequence is non-vacuous.
+    /// cancel-all keeps no counters) and the sequence is non-vacuous. P2-1:
+    /// production uses the cancel-all index, whose carried copy covers the
+    /// books after every block (resident modes, `p2_run`); a replica
+    /// restarted every 7 blocks (index rebuilt from the loaded books) gives
+    /// the same write sets, hash and dump.
     fn p2_reference_differential(mode: Option<torus_bridge::native_executor::BookMode>) {
         let (blocks, fed) = p2_blocks();
         assert_eq!(blocks.len() as u64, P2_BLOCKS);
@@ -19911,8 +19950,8 @@ mod crash_recovery_tests {
         );
         for pipelined in [false, true] {
             let what = format!("pipelined={pipelined} {mode:?}");
-            let reference = p2_run(&blocks, pipelined, mode, true);
-            let current = p2_run(&blocks, pipelined, mode, false);
+            let reference = p2_run(&blocks, pipelined, mode, true, None);
+            let current = p2_run(&blocks, pipelined, mode, false, None);
             assert_write_sets_equal(
                 &reference.captured,
                 &current.captured,
@@ -19934,6 +19973,37 @@ mod crash_recovery_tests {
                 &current.dump,
                 &format!("{what}: reference vs current"),
             );
+            // P2-1 restart: the cancel-all index rebuilt from the loaded books
+            // every 7 blocks gives the same blocks as the carried one.
+            let restarted = p2_run(&blocks, pipelined, mode, false, Some(7));
+            assert_eq!(restarted.restarts, (P2_BLOCKS - 1) / 7, "{what}");
+            assert_write_sets_equal(
+                &reference.captured,
+                &restarted.captured,
+                &format!("{what}: reference vs restarted"),
+            );
+            assert_eq!(
+                reference.hash, restarted.hash,
+                "{what}: running hash, restarted"
+            );
+            assert_dumps_equal(
+                &reference.dump,
+                &restarted.dump,
+                &format!("{what}: reference vs restarted"),
+            );
+            if mode.is_some() {
+                // Resident books: the carried index was built and checked.
+                assert!(
+                    current.index_checked >= P2_BLOCKS - 10,
+                    "{what}: {}",
+                    current.index_checked
+                );
+                assert!(
+                    restarted.index_checked >= P2_BLOCKS / 2,
+                    "{what}: {}",
+                    restarted.index_checked
+                );
+            }
             // The switch took: only the production cancel-all counts.
             assert_eq!(reference.metrics.exec_cancel_all.get(), 0, "{what}");
             assert!(

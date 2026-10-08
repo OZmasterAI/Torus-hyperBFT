@@ -1246,6 +1246,15 @@ pub struct OrderBook {
     /// same sites that journal the level). Drained per level by
     /// `take_level_ops`; a mark whose level is not journaled stays until it is.
     dirty_chunks: BTreeSet<(u8, i128, u64)>,
+
+    // ---- Item 6 Phase 2 P2-1: cancel-all index feed (in-RAM only) ----
+    /// Traders that came into this book since the executor last drained it
+    /// ([`Self::drain_new_traders`]): pushed when a trader's first resting
+    /// order goes in (its `trader_orders` entry was absent or empty) and for
+    /// every stored stop. The executor's trader -> markets index (a superset
+    /// of [`Self::traders_present`] over all books) is kept from it. Never
+    /// serialized, never read by matching, saving or hashing.
+    new_traders: Vec<Address>,
 }
 
 /// One chunk's aggregate for the chunked level digest: the keccak of its
@@ -1286,6 +1295,7 @@ impl OrderBook {
             level_hash_chunked: false,
             level_chunks: HashMap::new(),
             dirty_chunks: BTreeSet::new(),
+            new_traders: Vec::new(),
         }
     }
 
@@ -1410,6 +1420,8 @@ impl OrderBook {
                     }
                 }
             }
+            // P2-1: a stored stop feeds the cancel-all index.
+            self.new_traders.push(trader);
             self.pending_stops.push(StopOrder {
                 id: order_id,
                 trader,
@@ -2713,7 +2725,7 @@ impl OrderBook {
         book.entry(price).or_default().push_back(order);
 
         self.order_index.insert(id, OrderLocation { side, price });
-        self.trader_orders.entry(trader).or_default().push(id);
+        self.push_trader_order(trader, id);
 
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -2976,6 +2988,41 @@ impl OrderBook {
         }
     }
 
+    /// Append `id` to `trader`'s resting ids (every insert path goes through
+    /// here). P2-1: a trader with no resting order in this book until now
+    /// feeds the cancel-all index.
+    fn push_trader_order(&mut self, trader: Address, id: OrderId) {
+        let ids = self.trader_orders.entry(trader).or_default();
+        if ids.is_empty() {
+            self.new_traders.push(trader);
+        }
+        ids.push(id);
+    }
+
+    /// Item 6 Phase 2 P2-1: the traders logged since the last call (see the
+    /// `new_traders` field), in log order, possibly repeated; the log is
+    /// empty afterwards (also when the iterator is dropped unread).
+    pub fn drain_new_traders(&mut self) -> std::vec::Drain<'_, Address> {
+        self.new_traders.drain(..)
+    }
+
+    /// P2-1: entries in the log [`Self::drain_new_traders`] empties.
+    pub fn new_traders_logged(&self) -> usize {
+        self.new_traders.len()
+    }
+
+    /// P2-1: every trader a cancel-all of theirs would change this book for:
+    /// resting orders, pending stops, or reduce-only index entries (which
+    /// `cancel_all` also drops). May repeat a trader.
+    pub fn traders_present(&self) -> impl Iterator<Item = &Address> {
+        self.trader_orders
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(trader, _)| trader)
+            .chain(self.pending_stops.iter().map(|s| &s.trader))
+            .chain(self.reduce_only_index.iter().map(|(trader, _)| trader))
+    }
+
     /// Rebuild one pending stop from its row bytes (see [`Self::stop_rows`]).
     /// Callers MUST append in ascending id order. Returns the stop's id.
     pub fn restore_stop_row(&mut self, bytes: &[u8]) -> io::Result<OrderId> {
@@ -2990,6 +3037,7 @@ impl OrderBook {
             }
         }
         let id = stop.id;
+        self.new_traders.push(stop.trader);
         self.pending_stops.push(stop);
         Ok(id)
     }
@@ -3100,7 +3148,7 @@ impl OrderBook {
         }
         queue.push_back(order);
         self.order_index.insert(id, OrderLocation { side, price });
-        self.trader_orders.entry(trader).or_default().push(id);
+        self.push_trader_order(trader, id);
         self.order_seq.insert(id, seq);
         self.row_exists.insert(id);
         // A loaded order implies its level's persisted row exists (save-path
@@ -4195,6 +4243,7 @@ impl BorshDeserialize for OrderBook {
             level_hash_chunked: false,
             level_chunks: HashMap::new(),
             dirty_chunks: BTreeSet::new(),
+            new_traders: Vec::new(),
         };
 
         for _ in 0..order_count {
@@ -4209,6 +4258,7 @@ impl BorshDeserialize for OrderBook {
 
         for _ in 0..stop_count {
             let stop = StopOrder::deserialize_reader(r)?;
+            book.new_traders.push(stop.trader);
             book.pending_stops.push(stop);
         }
 
