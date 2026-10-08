@@ -68,6 +68,10 @@ pub fn open_order_counts(
             .chunks(books.len().div_ceil(threads))
             .map(|chunk| s.spawn(move || count(chunk)))
             .collect();
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::OpenOrders,
+            workers.len(),
+        );
         let mut total = vec![0usize; senders.len()];
         for worker in workers {
             let counts = worker.join().expect("open-order count worker panicked");
@@ -5035,6 +5039,12 @@ mod tests {
             assert_eq!(open_order_counts(&refs, &senders, threads, 0), want, "threads={threads}");
             assert_eq!(open_order_counts(&refs, &senders, threads, 1 << 20), want);
         }
+        // Item 6 Phase 2 step 0.2: the workers are counted (process-wide
+        // counter: a lower bound under concurrent tests).
+        use torus_state::spawn_count::{totals, SpawnSite};
+        let before = totals()[SpawnSite::OpenOrders as usize];
+        open_order_counts(&refs, &senders, 3, 0);
+        assert!(totals()[SpawnSite::OpenOrders as usize] >= before + 3);
     }
 
     #[test]

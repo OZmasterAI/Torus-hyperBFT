@@ -2495,6 +2495,14 @@ impl ExecutionContext {
                     .observe(secs(accum.cache_flush_ns));
                 m.exec_post_engine_tail_seconds.observe(tail_secs);
                 m.exec_engine_untimed_seconds.observe(untimed_secs);
+                // Item 6 Phase 2 step 0.2: node-local counts, once per block.
+                m.exec_cancel_all.inc_by(accum.cancel_alls);
+                m.exec_cancel_all_books_visited
+                    .inc_by(accum.cancel_all_books_visited);
+                m.exec_cancel_all_books_hit
+                    .inc_by(accum.cancel_all_books_hit);
+                m.exec_by_id_actions.inc_by(accum.by_id_actions);
+                m.exec_by_id_books_probed.inc_by(accum.by_id_books_probed);
             }
 
             // v2 action status: the executed/skipped record plus the native
@@ -3052,6 +3060,29 @@ impl ExecutionContext {
             m.block_transactions_count.observe(tx_count as f64);
             let block_secs = block_timer.elapsed().as_secs_f64();
             m.exec_block_seconds.observe(block_secs);
+            // Item 6 Phase 2 step 0.2: oracle-only blocks timed apart (the
+            // harness's per-interval means cannot isolate them), and the
+            // process's thread spawns per exec-path site.
+            if has_native
+                && !has_evm
+                && torus_block
+                    .native_actions
+                    .iter()
+                    .all(|a| matches!(a.action, torus_types::NativeAction::SubmitOraclePrices(_)))
+            {
+                m.exec_oracle_only_block_seconds.observe(block_secs);
+            }
+            const _: () = assert!(
+                torus_state::spawn_count::SpawnSite::COUNT
+                    == torus_telemetry::EXEC_SPAWN_SITES.len()
+            );
+            for (g, n) in m
+                .exec_thread_spawns
+                .iter()
+                .zip(torus_state::spawn_count::totals())
+            {
+                g.set(n as i64);
+            }
             // bl1 exec-chain-sub-100-attribution: the exec CRITICAL CHAIN per
             // NATIVE block — `exec_block_seconds` diluted by empty blocks is
             // not the number the campaign is driving to 100 ms.
@@ -17686,6 +17717,68 @@ mod crash_recovery_tests {
             NONCE_BASE + h * 1_000 + seed as u64,
             &oracle_key(seed),
         )
+    }
+
+    /// Item 6 Phase 2 step 0.2: only the oracle-only block is timed into
+    /// `exec_oracle_only_block_seconds`; the cancel-all and by-id counts of
+    /// the exec context reach the counters; the spawn gauges carry the
+    /// process totals, named in `SpawnSite` order.
+    #[test]
+    fn phase2_step0_block_metrics() {
+        use torus_state::spawn_count::{totals, SpawnSite};
+        let (config, db) = oracle_fixture_db();
+        let mut ctx = make_exec_ctx(&config, &db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        let user = |action, h: u64, k: u64| {
+            torus_types::eip712::sign_native_action(
+                action,
+                NONCE_BASE + h * 1_000 + 100 + k,
+                &oracle_key(71),
+            )
+        };
+        let mut blocks = vec![
+            make_block(1, vec![oracle_sub(61, 1, 100), oracle_sub(62, 1, 100)]),
+            make_block(
+                2,
+                vec![
+                    oracle_sub(61, 2, 100),
+                    user(NativeAction::CancelAllOrders { market_id: None }, 2, 0),
+                    user(NativeAction::CancelOrder { order_id: 999 }, 2, 1),
+                ],
+            ),
+        ];
+        link_blocks(&mut blocks);
+        for b in &blocks {
+            ctx.execute_committed_block(b, vec![]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        let text = metrics.encode();
+        for (name, want) in [
+            ("torus_exec_block_seconds_count", 2.0),
+            ("torus_exec_oracle_only_block_seconds_count", 1.0),
+            ("torus_exec_cancel_all_total", 1.0),
+            ("torus_exec_by_id_actions_total", 1.0),
+        ] {
+            assert_eq!(metric_value(&text, name), want, "{name}:\n{text}");
+        }
+        let now = totals();
+        let sites = torus_telemetry::EXEC_SPAWN_SITES;
+        for (site, i) in [
+            ("match", SpawnSite::Match),
+            ("settle", SpawnSite::Settle),
+            ("save_books", SpawnSite::SaveBooks),
+            ("margin_prepare", SpawnSite::MarginPrepare),
+            ("open_orders", SpawnSite::OpenOrders),
+            ("end_resident", SpawnSite::EndResident),
+            ("flush_digest", SpawnSite::FlushDigest),
+            ("root_buckets", SpawnSite::RootBuckets),
+            ("load_books", SpawnSite::LoadBooks),
+        ] {
+            assert_eq!(sites[i as usize], site);
+            let v = metric_value(&text, &format!("torus_exec_thread_spawns_{site}"));
+            assert!(v <= now[i as usize] as f64, "{site}: {v}");
+        }
     }
 
     fn signed_bid(seed: u8, nonce: u64, price: i64, qty: i64) -> SignedNativeAction {

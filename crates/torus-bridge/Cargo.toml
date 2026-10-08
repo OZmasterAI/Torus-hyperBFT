@@ -36,6 +36,9 @@ k256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 alloy-eips = { workspace = true }
 criterion = { workspace = true }
+# Item 6 Phase 2 step 0.2: tests/ubench_hasher.rs (SipHash vs foldhash, P2-5).
+# Already in Cargo.lock through hashbrown.
+foldhash = "0.2"
 
 [[test]]
 name = "l3_savebooks_ubench"

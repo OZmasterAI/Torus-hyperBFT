@@ -12,6 +12,44 @@ use torus_state::cf::{
 };
 use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
 
+/// Item 6 Phase 2 step 0.4: the full-scan cancel-all, frozen as the
+/// reference for P2-1 (`NativeExecContext::test_cancel_all_full_scan` routes
+/// every cancel-all here): every book in ascending id, stops then orders,
+/// dirty marks and the margin sum (`cancel_orders_and_stops` as of
+/// `d3ba3c0a`, without the step 0.2 counters).
+pub(super) fn cancel_orders_and_stops_full_scan<T: StateBackend>(
+    ctx: &mut NativeExecContext<T>,
+    trader: &Address,
+    market: Option<MarketId>,
+) -> FixedPoint {
+    let market_ids: Vec<MarketId> = match market {
+        Some(m) => vec![m],
+        None => {
+            let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+            v.sort_unstable();
+            v
+        }
+    };
+    let mut total = FixedPoint::ZERO;
+    for mid in market_ids {
+        let Some(book) = ctx.order_books.get_mut(&mid) else {
+            continue;
+        };
+        let stops = book.take_pending_stops(trader);
+        let cancelled = book.cancel_all(*trader, market);
+        if stops.is_empty() && cancelled.is_empty() {
+            continue;
+        }
+        ctx.dirty_books.insert(mid);
+        let cfg = ctx.margin_configs.get(&mid);
+        total += NativeExecutor::cancelled_orders_margin(cfg, &cancelled);
+        for &(price, qty) in &stops {
+            total += NativeExecutor::stop_reservation(cfg, price, qty);
+        }
+    }
+    total
+}
+
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
@@ -149,6 +187,7 @@ struct RunFingerprint {
     total_gas: Vec<u64>,
     dirty: Vec<Vec<MarketId>>,
     books: Vec<(MarketId, Vec<u8>)>,
+    pending_stops: usize,
     trade_index: u32,
     next_global_order_id: u128,
     state_root: B256,
@@ -197,8 +236,19 @@ fn resting_after_setup() -> Vec<(Address, u128)> {
 }
 
 fn run(blocks: &[Vec<(Address, NativeAction)>], mode: BookMode, batch: bool) -> RunFingerprint {
+    run_with(blocks, mode, batch, false)
+}
+
+/// `full_scan`: the step 0.4 reference cancel-all (`test_cancel_all_full_scan`).
+fn run_with(
+    blocks: &[Vec<(Address, NativeAction)>],
+    mode: BookMode,
+    batch: bool,
+    full_scan: bool,
+) -> RunFingerprint {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut ctx = new_ctx(&dir, mode);
+    ctx.test_cancel_all_full_scan = full_scan;
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
     let mut dirty = Vec::new();
@@ -232,6 +282,11 @@ fn run(blocks: &[Vec<(Address, NativeAction)>], mode: BookMode, batch: bool) -> 
         .map(|(&m, b)| (m, borsh::to_vec(b).unwrap()))
         .collect();
     books.sort_unstable();
+    let pending_stops = ctx
+        .order_books
+        .values()
+        .map(|b| b.pending_stop_count())
+        .sum();
     let mut cf_dump = Vec::new();
     for cf in [
         CF_NATIVE_BALANCES,
@@ -252,6 +307,7 @@ fn run(blocks: &[Vec<(Address, NativeAction)>], mode: BookMode, batch: bool) -> 
         total_gas,
         dirty,
         books,
+        pending_stops,
         trade_index: ctx.trade_index,
         next_global_order_id: ctx.next_global_order_id,
         state_root: compute_native_state_root(&ctx.state).expect("state root"),
@@ -371,5 +427,154 @@ fn cancel_all_of_stop_only_senders_persists_stop_removal() {
             assert_eq!(book.pending_stop_count(), 0, "{mode:?} batch={batch}");
             assert_eq!(book.open_order_count(&addr(3)), 1);
         }
+    }
+}
+
+fn stop_buy(market_id: MarketId, trigger: i64) -> NativeAction {
+    NativeAction::PlaceOrder(PlaceOrderParams {
+        market_id,
+        is_buy: true,
+        // s515: a stop-market needs a positive price cap.
+        price: fp(trigger + 10),
+        quantity: fp(1),
+        order_type: OrderType::StopMarket {
+            trigger: fp(trigger),
+        },
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    })
+}
+
+/// Four books; addr(1) rests in markets 1 and 2, addr(2) has only a stop in
+/// market 3, addr(3) has nothing; addr(4) rests in every market.
+fn counter_setup(mode: BookMode, batch: bool) -> (tempfile::TempDir, NativeExecContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut ctx = new_ctx(&dir, mode);
+    let mut setup = vec![
+        (addr(1), gtc(1, true, 99, 1)),
+        (addr(1), gtc(2, false, 110, 1)),
+        (addr(2), stop_buy(3, 200)),
+    ];
+    for m in MARKETS {
+        setup.push((addr(4), gtc(m, true, 98, 1)));
+    }
+    NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, batch);
+    ctx.save_order_books();
+    ctx.dirty_books.clear();
+    ctx.phase_accum = ExecPhaseAccum::default();
+    (dir, ctx)
+}
+
+/// Item 6 Phase 2 step 0.2 (P2-1): every cancel-all counts the books it
+/// visited and the books where its sender had orders or stops, the same on
+/// the batched run and the per-action path. A cancel-all with `None` visits
+/// every book today (P2-1 cuts that to the sender's books).
+#[test]
+fn cancel_all_counters_count_visited_and_hit_books() {
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        for batch in [false, true] {
+            let (_dir, mut ctx) = counter_setup(mode, batch);
+            let block = vec![
+                (addr(1), cancel_all(None)),
+                (addr(2), cancel_all(None)),
+                (addr(3), cancel_all(Some(4))),
+                (addr(1), cancel_all(None)),
+                (addr(3), cancel_all(Some(77))),
+            ];
+            NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, batch);
+            let a = ctx.phase_accum;
+            let what = format!("{mode:?} batch={batch}");
+            assert_eq!(a.cancel_alls, 5, "{what}");
+            // 4 + 4 + 1 + 4 + 0 (market 77 has no book).
+            assert_eq!(a.cancel_all_books_visited, 13, "{what}");
+            // addr(1): markets 1 and 2; addr(2): its stop in 3; the repeat
+            // finds nothing left.
+            assert_eq!(a.cancel_all_books_hit, 3, "{what}");
+            assert_eq!((a.by_id_actions, a.by_id_books_probed), (0, 0), "{what}");
+        }
+    }
+}
+
+/// Step 0.2 (P2-1b): `CancelOrder` / `ModifyOrder` count the books probed to
+/// find the order: a missing id probes every book (twice for a cancel: the
+/// ownership pass and the cancel pass).
+#[test]
+fn by_id_counters_count_books_probed() {
+    let (_dir, mut ctx) = counter_setup(BookMode::Classic, true);
+    let own = (0..ctx.next_global_order_id)
+        .find(|&id| {
+            ctx.order_books[&1]
+                .get_order(id)
+                .is_some_and(|o| o.trader == addr(1))
+        })
+        .expect("addr(1) rests in market 1");
+    let missing = ctx.next_global_order_id + 1_000;
+    let modify = |order_id| NativeAction::ModifyOrder {
+        order_id,
+        new_price: None,
+        new_qty: Some(fp(1)),
+    };
+    let block = vec![
+        (addr(1), NativeAction::CancelOrder { order_id: missing }),
+        (addr(1), modify(missing)),
+    ];
+    let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
+    assert!(r.results.iter().all(|r| !r.success), "{:?}", r.results);
+    assert_eq!(ctx.phase_accum.by_id_actions, 2);
+    assert_eq!(ctx.phase_accum.by_id_books_probed, 8 + 4);
+
+    ctx.phase_accum = ExecPhaseAccum::default();
+    let block = vec![(addr(1), NativeAction::CancelOrder { order_id: own })];
+    let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
+    assert!(r.results[0].success, "{:?}", r.results);
+    assert_eq!(ctx.phase_accum.by_id_actions, 1);
+    // Found: each pass stops at market 1, wherever the map puts it.
+    let probed = ctx.phase_accum.by_id_books_probed;
+    assert!((2..=8).contains(&probed), "{probed}");
+    assert_eq!(ctx.phase_accum.cancel_alls, 0);
+}
+
+/// Item 6 Phase 2 step 0.4: the production cancel-all (batched runs, the
+/// single-action path) and the frozen full-scan reference
+/// (`test_cancel_all_full_scan`: one action at a time over every book) give
+/// identical results, gas, dirty marks, books, pending stops, CF dumps and
+/// state roots in all four book modes. P2-1's book index must keep this.
+#[test]
+fn cancel_all_matches_the_full_scan_reference() {
+    let resting = resting_after_setup();
+    for (seed, mode) in [
+        (5u64, BookMode::Classic),
+        (6, BookMode::OrderRows),
+        (7, BookMode::LevelAuthority),
+        (8, BookMode::LevelAuthorityChunked),
+    ] {
+        let mut blocks = setup_blocks();
+        // Pending stops for ten senders across the books.
+        let stops: Vec<_> = (1..=10u8)
+            .flat_map(|s| {
+                [
+                    (addr(s), stop_buy(MARKETS[s as usize % 4], 200 + s as i64)),
+                    (addr(s), stop_buy(1, 300)),
+                ]
+            })
+            .collect();
+        let placed = stops.len();
+        blocks.push(stops);
+        blocks.extend(mixed_blocks(seed, &resting));
+        let reference = run_with(&blocks, mode, true, true);
+        let current = run_with(&blocks, mode, true, false);
+        let flat: Vec<_> = current.results.iter().flatten().collect();
+        assert!(flat.iter().filter(|r| r.0 == "cancel_all").count() > 60);
+        assert!(
+            current.pending_stops < placed,
+            "cancel-alls must take stops: {}",
+            current.pending_stops
+        );
+        assert!(current.trade_index > 10);
+        assert_eq!(
+            reference, current,
+            "{mode:?}: cancel-all diverged from the full-scan reference"
+        );
     }
 }

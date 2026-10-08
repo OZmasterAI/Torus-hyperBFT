@@ -6908,6 +6908,7 @@ dependencies = [
  "borsh 1.6.1",
  "criterion",
  "ed25519-dalek",
+ "foldhash 0.2.0",
  "k256",
  "revm",
  "rocksdb",

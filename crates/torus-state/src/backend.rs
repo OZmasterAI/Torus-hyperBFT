@@ -1613,6 +1613,7 @@ fn flush_pending_after_batch(
                 .map(|c| c.writes.len() + c.deletes.len())
                 .sum();
             if entries >= PARALLEL_DIGEST_MIN_ENTRIES {
+                crate::spawn_count::add(crate::spawn_count::SpawnSite::FlushDigest, 1);
                 Err(scope.spawn(move || block_digest(&layers)))
             } else {
                 Ok(block_digest(&layers))
@@ -4588,7 +4589,14 @@ mod tests {
             writes.push((cf, i.to_le_bytes().to_vec(), v));
         }
         let ov = rsh_overlay(&db, &writes);
+        let digests =
+            || crate::spawn_count::totals()[crate::spawn_count::SpawnSite::FlushDigest as usize];
+        let before = digests();
         let stats = ov.flush_with_native_trie_stats(&db, Some(1), None, None).unwrap();
+        assert!(
+            digests() > before,
+            "item 6 step 0.2: the digest spawn is counted"
+        );
         assert_eq!(stats.state_hash_entries, writes.len());
         let want = next_running_hash(&[0; 32], 1, &rsh_expected(&writes));
         assert_eq!(read_running_hash(&db), Some((1, want)));

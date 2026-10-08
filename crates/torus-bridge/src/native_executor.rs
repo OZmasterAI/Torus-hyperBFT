@@ -2643,6 +2643,10 @@ fn drain_books_parallel(
                 })
             })
             .collect();
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::SaveBooks,
+            handles.len(),
+        );
         let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
         for h in handles {
             match h.join() {
@@ -3301,7 +3305,14 @@ pub fn end_resident_on_worker(
         slot
     });
     match spawned {
-        Ok(handle) => holder.rows_pending = Some(PendingRows { handle, height, metrics }),
+        Ok(handle) => {
+            torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+            holder.rows_pending = Some(PendingRows {
+                handle,
+                height,
+                metrics,
+            })
+        }
         Err(e) => {
             // The job (R included) was dropped with the closure.
             tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
@@ -3717,6 +3728,15 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// thread needs the PRODUCTION share, not a µbench's. Node-local
     /// instrumentation: never read by execution, never part of the state root.
     pub save_split: SaveSplitAccum,
+
+    /// Item 6 Phase 2 step 0.4: test-only reference switch (no runtime flag,
+    /// D16). `true` runs every cancel-all (user runs and single actions, the
+    /// liquidation step's cancels) one action at a time through the frozen
+    /// full scan of every book (`cancel_batch_exec_tests.rs`
+    /// `cancel_orders_and_stops_full_scan`), the reference P2-1's book index
+    /// is compared against.
+    #[cfg(test)]
+    pub(crate) test_cancel_all_full_scan: bool,
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
@@ -3773,6 +3793,16 @@ pub struct ExecPhaseAccum {
     /// B-blind (s92): non-pool sells topped up (in full or partly) after
     /// Phase 2 ([`NativeExecutor::sell_top_ups`]). A count, not a span.
     pub sell_top_ups: u64,
+    /// Item 6 Phase 2 step 0.2 (P2-1): cancel-alls executed (user
+    /// `CancelAllOrders` and the liquidation step's cancels), the books they
+    /// visited, and the books where the sender had orders or stops.
+    pub cancel_alls: u64,
+    pub cancel_all_books_visited: u64,
+    pub cancel_all_books_hit: u64,
+    /// Step 0.2 (P2-1b): `CancelOrder` / `ModifyOrder` executed, and the
+    /// books they probed to find the order.
+    pub by_id_actions: u64,
+    pub by_id_books_probed: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4142,6 +4172,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
+            #[cfg(test)]
+            test_cancel_all_full_scan: false,
         }
     }
 
@@ -4738,6 +4770,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                         })
                     })
                     .collect();
+                torus_state::spawn_count::add(
+                    torus_state::spawn_count::SpawnSite::LoadBooks,
+                    handles.len(),
+                );
                 // Join every worker; re-raise a panic like the serial loop.
                 let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
                 for h in handles {
@@ -6751,6 +6787,10 @@ impl NativeExecutor {
         let shard = groups.len().div_ceil(workers);
 
         type WorkerOut = (Vec<(usize, PrepOutcome)>, FoldOut);
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::MarginPrepare,
+            groups.len().div_ceil(shard),
+        );
         let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(shard)
@@ -7128,6 +7168,10 @@ impl NativeExecutor {
                 let mut slots: Vec<Option<Result<MarketSettlePlan, String>>> =
                     (0..mrs.len()).map(|_| None).collect();
                 let plan_for = &plan_for;
+                torus_state::spawn_count::add(
+                    torus_state::spawn_count::SpawnSite::Settle,
+                    chunks.len(),
+                );
                 let chunk_out: Vec<Vec<(usize, Result<MarketSettlePlan, String>)>> =
                     std::thread::scope(|s| {
                         let handles: Vec<_> = chunks
@@ -8898,8 +8942,10 @@ impl NativeExecutor {
         sender: &Address,
         order_id: u128,
     ) -> NativeActionResult {
+        ctx.phase_accum.by_id_actions += 1;
         // Check ownership before cancelling (cheaper than cancel + re-insert).
         for book in ctx.order_books.values() {
+            ctx.phase_accum.by_id_books_probed += 1;
             if let Some(order) = book.get_order(order_id) {
                 if order.trader != *sender {
                     return NativeActionResult::err(
@@ -8914,6 +8960,7 @@ impl NativeExecutor {
             }
         }
         for book in ctx.order_books.values_mut() {
+            ctx.phase_accum.by_id_books_probed += 1;
             if let Ok(cancelled) = book.cancel_order(order_id) {
                 // FIX 2 (ECON-FIND-05): Release order margin on cancel.
                 let notional = cancelled.price * cancelled.remaining_qty;
@@ -8963,6 +9010,10 @@ impl NativeExecutor {
         trader: &Address,
         market: Option<MarketId>,
     ) -> FixedPoint {
+        #[cfg(test)]
+        if ctx.test_cancel_all_full_scan {
+            return cancel_batch_exec_tests::cancel_orders_and_stops_full_scan(ctx, trader, market);
+        }
         let market_ids: Vec<MarketId> = match market {
             Some(m) => vec![m],
             None => {
@@ -8972,13 +9023,16 @@ impl NativeExecutor {
             }
         };
         let mut total = FixedPoint::ZERO;
+        ctx.phase_accum.cancel_alls += 1;
         for mid in market_ids {
             let Some(book) = ctx.order_books.get_mut(&mid) else { continue };
+            ctx.phase_accum.cancel_all_books_visited += 1;
             let stops = book.take_pending_stops(trader);
             let cancelled = book.cancel_all(*trader, market);
             if stops.is_empty() && cancelled.is_empty() {
                 continue;
             }
+            ctx.phase_accum.cancel_all_books_hit += 1;
             ctx.dirty_books.insert(mid);
             let cfg = ctx.margin_configs.get(&mid);
             total += Self::cancelled_orders_margin(cfg, &cancelled);
@@ -9033,6 +9087,14 @@ impl NativeExecutor {
         if let [(_, sender, market_id)] = run {
             return vec![Self::exec_cancel_all(ctx, sender, *market_id)];
         }
+        // Step 0.4 reference: one action at a time, each a full scan.
+        #[cfg(test)]
+        if ctx.test_cancel_all_full_scan {
+            return run
+                .iter()
+                .map(|(_, sender, m)| Self::exec_cancel_all(ctx, sender, *m))
+                .collect();
+        }
         // The order `exec_cancel_all` iterates for `None`. Cancels never add
         // or remove books, so every action of the run would see this order.
         let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
@@ -9054,6 +9116,7 @@ impl NativeExecutor {
             }
             let mut per_action = vec![Vec::new(); run.len()];
             let mut stops_k = vec![(false, FixedPoint::ZERO); run.len()];
+            ctx.phase_accum.cancel_all_books_visited += members.len() as u64;
             if !senders.is_empty() {
                 let cfg = ctx.margin_configs.get(mid);
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
@@ -9074,6 +9137,7 @@ impl NativeExecutor {
         }
 
         let mut results = Vec::with_capacity(run.len());
+        ctx.phase_accum.cancel_alls += run.len() as u64;
         for (k, (_, sender, _)) in run.iter().enumerate() {
             // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`.
             let mut total_margin_release = FixedPoint::ZERO;
@@ -9083,6 +9147,7 @@ impl NativeExecutor {
                 if orders.is_empty() && !took_stops {
                     continue;
                 }
+                ctx.phase_accum.cancel_all_books_hit += 1;
                 ctx.dirty_books.insert(*mid);
                 let cfg = ctx.margin_configs.get(mid);
                 total_margin_release += Self::cancelled_orders_margin(cfg, orders);
@@ -9136,12 +9201,13 @@ impl NativeExecutor {
         if new_price.is_none() && new_qty.is_none() {
             return err("nothing to modify: no new price or quantity".to_string());
         }
+        ctx.phase_accum.by_id_actions += 1;
         // Order ids are global, so at most one book holds it.
-        let Some((market_id, old)) = ctx
-            .order_books
-            .iter()
-            .find_map(|(mid, b)| b.get_order(order_id).map(|o| (*mid, o.clone())))
-        else {
+        let probed = &mut ctx.phase_accum.by_id_books_probed;
+        let Some((market_id, old)) = ctx.order_books.iter().find_map(|(mid, b)| {
+            *probed += 1;
+            b.get_order(order_id).map(|o| (*mid, o.clone()))
+        }) else {
             return err(format!("order {order_id} not found"));
         };
         if old.trader != *sender {

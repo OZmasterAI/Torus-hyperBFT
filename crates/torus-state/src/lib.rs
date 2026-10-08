@@ -17,6 +17,7 @@ pub mod resident_rows;
 pub mod running_hash;
 pub mod shard_store;
 pub mod snapshot;
+pub mod spawn_count;
 pub mod trade_rows;
 pub mod trie;
 pub mod trie_cursor;

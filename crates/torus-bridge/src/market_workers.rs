@@ -155,6 +155,7 @@ impl MarketWorkerPool {
                 Self::match_market(market_id, book, requests, timestamp, makers)
             };
 
+        torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::Match, chunks.len());
         std::thread::scope(|s| {
             let handles: Vec<_> = chunks
                 .into_iter()
