@@ -5,7 +5,8 @@ review log rows 1-16); base moved to main `e934fa0e` before step 1 (9.11): 0.1, 
 Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block; owner (s27 / s101): P2-5 joins the
 gate set, the +7% stays (9.9), P2-3 goes to the backlog (9.10). Step 1: the 9.8 test-only feature
 and P2-1 (C1) built (ozarchy s30, review log rows 18-19); its gate cell is open. C1 review gaps
-closed and the index size gauges added (ozarchy s31, rows 20-21); 18c s104 decisions in 9.12. Next: P2-1b, then P2-5,
+closed and the index size gauges added (ozarchy s31, rows 20-21); 18c s104 decisions in 9.12. P2-1 gate missed
+(row 24), accepted by 18c s104 (row 25, 9.14). Next: merge main `12979d4b`, the row 23 lows, P2-1b, then P2-5,
 P2-2, the P2-4 design check (section 4). Owner decisions recorded s96 (section 9, with the options
 not chosen) and s27 / s101 (9.8-9.10). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
@@ -179,6 +180,8 @@ covers before step 0 closes.
     result as today's full scan, and a stale entry is dropped.
   - Expected saving (estimate): ~10-20 us per cancel or modify by id; adds one map
     insert and one remove per resting order (~0.05-0.1 us each).
+    Recheck before the gate against the per-visit cost P2-1's gate measured (~4 us per
+    skipped cancel-all visit, review log row 25; 9.14).
   - Risk: a missing entry for a resting order would turn a valid cancel into
     "not found": the one failure mode, so every insert and remove path is tested.
   - Tests (first): differential vs a `#[cfg(test)]` full-scan reference (random places,
@@ -465,6 +468,7 @@ Standard shape (results doc 21.4, as section 22):
 | 22 | 1 (P2-1) | 18c s104 answers before the gate cell: gate on the no-perf estimate, phase 1 down by >= ~1.9 ms per native block (half of ~3.7, results doc 25.1), measured on cells without perf; 2 cells per arm, mirrored, 2 more if the result lands within ~1.4-2.4 ms. Pre-existing, not Phase 2: `exec_modify_order` limits only the modified reduce-only order and runs no sweep (fills stay safe through the match-time maker cap; the effect is overstated resting reduce-only size until the next placement or fill). The reduce-only part of `OrderBook::traders_present` is unreachable today (row 20 planted bug fails nothing) | fix the modify sweep after the P2-1 gate as its own small branch (consensus, fresh genesis), not in Phase 2; keep the reduce-only chain in `traders_present` as a safeguard, commented as unreachable; push step 1 before the gate cell (18c reviews read-only meanwhile); merge main (`12979d4b`) only after the gate cell |
 | 23 | 1 (P2-1) | 18c s104 read-only review of `2ecc2bdf` (no suite rerun): approve, no critical / high / medium; index completeness, ascending order, skipped no-op books and the test feature's isolation check out. Lows: (1) `native_executor.rs:4426` with `TORUS_RESIDENT_BOOKS` unset (the code default) the index is rebuilt in every block with a cancel-all (one pass over all (trader, market) pairs vs ~300 lookups before; unmeasured, the gate runs resident); (2) the index gauge counts all entries, not stale ones, and reads 0 before the first build; (3) `ResidentBooks::trader_index` (:3026) and `TraderIndexSnapshot` (:2909) are `pub` with no production caller | after the gate cell: (1) use the index only in resident mode, keep the full scan otherwise, plus a test that the non-resident path is unchanged; (2) for the 9.12 prune, compare the gauge with `torus_exec_resting_orders` and have the prune report how many entries it removed; (3) gate both on `test-reference-paths` |
 | 24 | Gate P2-1 | Campaign `ozarchy-p21g` (results doc section 30): `2ecc2bdf` vs `e934fa0e`, 2 cells per arm mirrored, no perf, all rc 0 / AGREE / PASS. Phase 1 -0.44 ms per native block (val0; -0.30 all validators; -3.2% per 1k fills) vs >= 1.9 ms: **missed**, outside the 1.4-2.4 ms band (no extra cells). Cancel-alls visit 189.1 / 188.6 books, sender present in 92.4 (stale entries kept by "never removed eagerly"); index 135k-634k entries, ~200 markets per trader; no visible upkeep cost; matched/s 1.010x | miss recorded (section 4 rule); options to 18c: A accept and continue, B drop a market from the trader's set when their last order / stop there leaves the book (then one more gate cell), C bring the 9.12 prune forward |
+| 25 | Gate P2-1 | 18c s104 answer to row 24: **A, accept and continue.** The cell's own counters give ~4 us per skipped book visit (0.44 ms / 111 avoided visits), so B's further ~97 visits per cancel-all are worth ~0.4 ms, still below the 1.9 ms gate, at the cost of a fill-path check and another gate cell. The bench's ~200 markets per trader is near the worst case for stale entries | P2-1 stays as built; C (the 9.12 background prune) stays before mainnet, off the fill path, its gauges showing the entries it removes. Next: merge main `12979d4b` (sync point), the row 23 lows, then P2-1b; before P2-1b's gate, recheck its estimate against the measured per-visit cost (step 0.3's split seems to overstate the per-book saving) (9.14) |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -708,3 +712,22 @@ still applies, so the off (non-resident) path stays exactly as it was.
 Order after the P2-1 gate cell (18c s104): merge main `12979d4b` into the branch (sync point, as
 9.11), the row 23 lows, then the reduce-only modify sweep as its own small branch (consensus, fresh
 genesis; row 22); the defaults branch after Phase 2.
+
+### 9.14 P2-1 gate missed: accept and continue (18c s104 / ozarchy s31, 2026-10-08)
+
+**Chosen: A, accept P2-1 as built and continue** (review log rows 24-25). Phase 1 fell 0.44 ms per
+native block against the >= 1.9 ms gate. The cell's counters give ~4 us per skipped book visit
+(0.44 ms / 111 avoided visits per cancel-all), so B's further ~97 visits are worth ~0.4 ms, still
+below the gate. The bench's ~200 markets per trader is near the worst case for stale entries.
+9.12 (a) stands: the background prune (C) comes before mainnet, off the fill path, and its gauges
+show how many entries it removes. Before P2-1b's gate, its estimate (section 3) is rechecked
+against the measured per-visit cost, since step 0.3's split (row 13) seems to overstate the
+per-book saving.
+
+| option | note |
+|---|---|
+| **A. accept, continue (chosen)** | no fill-path cost; ~0.4 ms left on the table, below the gate either way |
+| B. drop the market when the trader's last order / stop there leaves the book, one more gate cell | ~0.4 ms (from the per-visit cost); a check on the fill path, another cell |
+| C. bring the 9.12 prune forward | same bound as B at best; stays before mainnet instead |
+
+Order: merge main `12979d4b` (sync point, as 9.11), the row 23 lows, then P2-1b (step 1b).
