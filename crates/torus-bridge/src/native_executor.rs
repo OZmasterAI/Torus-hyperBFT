@@ -19,9 +19,9 @@ use torus_core::margin::{
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    band_reference, market_row_shape, price_band_violation, reduce_only_allowance, shape_violation, AccountMargins,
-    Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult, PriceBand, ReduceOnlyPositions,
-    ShapeViolation, TakerMarginLimit, TriggeredStop,
+    band_reference, market_row_shape, order_price_violation, price_band_violation, reduce_only_allowance,
+    shape_violation, AccountMargins, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
+    PriceBand, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
@@ -7241,6 +7241,10 @@ impl NativeExecutor {
 
         // ---- Pass B: deterministic apply, markets ascending by id ----
         let pass_b_timer = std::time::Instant::now();
+        // One allocation for every market's position entries: merging 300
+        // caches into an unreserved map rehashes it at each doubling
+        // (capacity only; ubench_position_cache: ~1.2 -> ~0.7 us/entry).
+        pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
         for (mbr, plan) in market_results.into_iter().zip(plans) {
             let market_id = mbr.market_id;
 
@@ -8287,29 +8291,17 @@ impl NativeExecutor {
     /// zero margin and matched at any price.
     /// Item 6 M1 (row 41): a `Limit` price must be positive too (the book
     /// rejects it; checked here so it is rejected before the book).
+    /// Row 46 follow-up: the rule and its text are
+    /// [`torus_core::order_book::order_price_violation`] (shared with the
+    /// RPC intake check).
     fn validate_order_price(params: &PlaceOrderParams) -> Result<(), Rejection> {
-        let reject = match params.order_type {
-            OrderType::Limit if params.price <= FixedPoint::ZERO => Err(format!(
-                "limit order requires a positive price, got {}",
-                params.price
-            )),
-            OrderType::Market | OrderType::StopMarket { .. } if params.price <= FixedPoint::ZERO => {
-                Err(format!(
-                    "market order requires a positive price cap (worst acceptable price), got {}",
-                    params.price
-                ))
-            }
-            OrderType::StopLimit { limit, .. } if limit <= FixedPoint::ZERO => Err(format!(
-                "stop-limit order requires a positive limit price, got {limit}"
-            )),
-            _ => Ok(()),
-        };
-        reject.map_err(|msg| (FailureReason::Price, msg))
+        order_price_violation(params).map_or(Ok(()), |msg| Err((FailureReason::Price, msg)))
     }
 
     /// Fix A (s92): the book's dust and off-tick rejects
     /// (`OrderBook::place_order_with_accounts`, same rules, same order: dust
-    /// for every order type, then the tick for `Limit` only), applied BEFORE
+    /// for every order type, then the tick for a `Limit` price and, since
+    /// row 45, a `StopLimit`'s limit), applied BEFORE
     /// the book so such an order takes no open-order slot, reserves nothing,
     /// gets no order id and no in-batch projection / D2 pool. `shape` = the
     /// market book's `(tick_size, lot_size)`; a market without a book uses

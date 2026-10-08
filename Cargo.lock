@@ -7155,6 +7155,7 @@ dependencies = [
  "hex",
  "hotstuff_rs",
  "k256",
+ "libc",
  "rand 0.8.5",
  "rayon",
  "serde",

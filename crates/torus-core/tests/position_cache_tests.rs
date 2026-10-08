@@ -395,3 +395,223 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
     drop(pm);
     drop(dir);
 }
+
+// ============================================================================
+// Position v2 savings: reserve before merge, in-place fill update
+// ============================================================================
+
+/// Pass B shape: per-market caches merged into one batch cache give the same
+/// flush whether or not the batch cache reserved the total entry count first.
+#[test]
+fn reserve_then_merge_flushes_like_plain_merge() {
+    let fills: Vec<FillSpec> = (0..60u8)
+        .map(|i| {
+            (
+                i % 7,
+                u64::from(i % 5) + 1,
+                i % 3 != 0,
+                i64::from(i % 4) + 1,
+                100 + i64::from(i),
+            )
+        })
+        .collect();
+    let per_market = |pm: &PositionManager| -> Vec<PositionCache> {
+        (1..=5u64)
+            .map(|m| {
+                let mut c = PositionCache::new();
+                for &(t, fm, is_buy, qty, price) in fills.iter().filter(|f| f.1 == m) {
+                    pm.apply_fill_cached(
+                        &mut c,
+                        &addr(t),
+                        fm,
+                        is_buy,
+                        fp(qty),
+                        fp(price),
+                        MarginType::Cross,
+                    )
+                    .unwrap();
+                }
+                c
+            })
+            .collect()
+    };
+    let (_d1, plain_pm) = setup();
+    let (_d2, reserved_pm) = setup();
+    let mut plain = PositionCache::new();
+    for c in per_market(&plain_pm) {
+        plain.merge_disjoint(c);
+    }
+    let caches = per_market(&reserved_pm);
+    let total: usize = caches.iter().map(PositionCache::len).sum();
+    assert_eq!(total, 35, "7 traders x 5 markets, every key touched");
+    let mut reserved = PositionCache::new();
+    reserved.reserve(total);
+    for c in caches {
+        reserved.merge_disjoint(c);
+    }
+    assert_eq!((plain.len(), reserved.len()), (total, total));
+    plain.flush_all(&plain_pm).unwrap();
+    reserved.flush_all(&reserved_pm).unwrap();
+    assert!(!dump_cf(&plain_pm, CF_NATIVE_POSITIONS).is_empty());
+    assert_state_identical(&plain_pm, &reserved_pm);
+}
+
+/// StateBackend wrapper whose position reads fail while `fail` is set.
+#[derive(Clone)]
+struct FlakyBackend {
+    inner: StateDb,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StateBackend for FlakyBackend {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if cf == CF_NATIVE_POSITIONS && self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StateError::InvalidData("injected read failure".into()));
+        }
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        StateBackend::iterate_cf(&self.inner, cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// A backend read error on a cache miss leaves the cache untouched (no
+/// memoized `None`, no dirty mark), and fills on dirty entries are never
+/// lost: every later read sees the latest write, and the flush writes it.
+#[test]
+fn cached_fill_read_error_caches_nothing_and_dirty_hits_keep_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pm = PositionManager::new(FlakyBackend {
+        inner: StateDb::open(dir.path()).unwrap(),
+        fail: fail.clone(),
+    });
+    let trader = addr(4);
+    // Backend row: long 3 @100.
+    pm.apply_fill(&trader, 2, true, fp(3), fp(100), MarginType::Cross)
+        .unwrap();
+
+    let mut cache = PositionCache::new();
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(pm
+        .apply_fill_cached(
+            &mut cache,
+            &trader,
+            2,
+            true,
+            fp(1),
+            fp(110),
+            MarginType::Cross
+        )
+        .is_err());
+    assert_eq!(cache.len(), 0, "a failed miss must not be memoized");
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    cache.flush_all(&pm).unwrap();
+    assert_eq!(pm.get_position(&trader, 2).unwrap().unwrap().size, fp(3));
+
+    // Miss (reads the backend row), then two dirty hits.
+    for (is_buy, qty) in [(true, 1), (true, 2), (false, 4)] {
+        pm.apply_fill_cached(
+            &mut cache,
+            &trader,
+            2,
+            is_buy,
+            fp(qty),
+            fp(100),
+            MarginType::Cross,
+        )
+        .unwrap();
+    }
+    let bytes = |p: Option<torus_core::position::Position>| p.map(|p| borsh::to_vec(&p).unwrap());
+    let cached = cache.load(&pm, &trader, 2).unwrap().unwrap();
+    assert_eq!(
+        (cached.is_long, cached.size),
+        (true, fp(2)),
+        "3 + 1 + 2 - 4"
+    );
+    let cached = bytes(Some(cached));
+    assert_eq!(
+        bytes(cache.load(&pm, &trader, 2).unwrap()),
+        cached,
+        "load keeps the entry"
+    );
+    assert_eq!(
+        pm.get_position(&trader, 2).unwrap().unwrap().size,
+        fp(3),
+        "no write before flush"
+    );
+    cache.flush_all(&pm).unwrap();
+    assert_eq!(bytes(pm.get_position(&trader, 2).unwrap()), cached);
+
+    // Full close through a dirty hit flushes the delete.
+    pm.apply_fill_cached(
+        &mut cache,
+        &trader,
+        2,
+        false,
+        fp(2),
+        fp(100),
+        MarginType::Cross,
+    )
+    .unwrap();
+    assert!(cache.load(&pm, &trader, 2).unwrap().is_none());
+    cache.flush_all(&pm).unwrap();
+    assert!(pm.get_position(&trader, 2).unwrap().is_none());
+}
+
+/// A stored row whose fields name another key (never written by
+/// `put_position`; only a corrupt or hand-written row) keeps the classic
+/// semantics through the cache: every fill re-reads the row under its key
+/// and writes the result under the key its fields name.
+#[test]
+fn row_with_mismatched_fields_matches_the_classic_path() {
+    use torus_core::position::Position;
+    let row = Position {
+        trader: addr(2),
+        market_id: 9,
+        is_long: true,
+        size: fp(5),
+        entry_price: fp(100),
+        cost_basis: fp(500),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    let fills: Vec<FillSpec> = vec![
+        (1, 4, true, 1, 100),
+        (1, 4, true, 2, 105),
+        (1, 4, false, 1, 110),
+    ];
+    let (_d1, reference) = setup();
+    let (_d2, cached) = setup();
+    for pm in [&reference, &cached] {
+        pm.state()
+            .put_cf_raw(
+                CF_NATIVE_POSITIONS,
+                &position_key(&addr(1), 4),
+                &borsh::to_vec(&row).unwrap(),
+            )
+            .unwrap();
+    }
+    run_reference(&reference, &fills);
+    run_cached(&cached, &fills);
+    assert_eq!(
+        dump_cf(&cached, CF_NATIVE_POSITIONS).len(),
+        2,
+        "K untouched, K' written"
+    );
+    assert_state_identical(&cached, &reference);
+}

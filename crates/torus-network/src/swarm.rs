@@ -3044,16 +3044,6 @@ struct BodyFetchAdmissionTrace {
 /// Only called with tracing enabled. Capture fixed-size metadata at the queue
 /// boundary, then release its mutex before formatting or invoking the logger.
 /// This is post-decode/tee admission, not a timestamp of bytes arriving on wire.
-fn enqueue_body_fetch_traced(
-    shared: &SharedState,
-    sender: VerifyingKey,
-    msg: hotstuff_rs::networking::messages::Message,
-    meta: BodyFetchTraceMetadata,
-    emit: impl FnOnce(BodyFetchAdmissionTrace),
-) -> bool {
-    enqueue_body_fetch_traced_stages(shared, sender, msg, meta, None, emit)
-}
-
 fn enqueue_body_fetch_traced_stages(
     shared: &SharedState,
     sender: VerifyingKey,
@@ -3207,16 +3197,6 @@ fn enqueue_consensus_inbound_traced(
 /// what makes the direct fan sender-side-only and mixed-fleet safe. Returns
 /// `false` when the payload is not a consensus message so the caller can
 /// penalize the malformed envelope.
-fn handle_consensus_direct(
-    payload: &[u8],
-    sender_vk: VerifyingKey,
-    shared: &SharedState,
-    peer_scoring: &mut PeerScoring,
-    peer: &PeerId,
-) -> bool {
-    handle_consensus_direct_traced(payload, sender_vk, shared, peer_scoring, peer, None)
-}
-
 fn handle_consensus_direct_traced(
     payload: &[u8],
     sender_vk: VerifyingKey,
@@ -3675,7 +3655,7 @@ mod tests {
             let meta = body_fetch_trace_metadata(&message).unwrap();
             let expected = message.try_to_vec().unwrap();
             let mut emitted = 0;
-            assert!(enqueue_body_fetch_traced(&shared, test_vk(1), message, meta, |record| {
+            assert!(enqueue_body_fetch_traced_stages(&shared, test_vk(1), message, meta, None, |record| {
                 // The real production emission boundary must not hold the mutex.
                 assert!(shared.inbound.try_lock().is_ok());
                 emitted += 1;
@@ -3732,7 +3712,7 @@ mod tests {
         shared.inbound.lock().unwrap().resize_with(MAX_INBOUND_QUEUE, || (original_sender, message.clone()));
         let expected = message.try_to_vec().unwrap();
         let mut emitted = 0;
-        assert!(!enqueue_body_fetch_traced(&shared, test_vk(2), message, meta, |record| {
+        assert!(!enqueue_body_fetch_traced_stages(&shared, test_vk(2), message, meta, None, |record| {
             emitted += 1;
             let queue = shared.inbound.try_lock().expect("logger runs outside queue lock");
             assert!(!record.admitted);
@@ -5001,8 +4981,8 @@ mod tests {
     /// gossip mirror and the direct fan is enqueued exactly ONCE when the fan
     /// is enabled — and, rollback-critical, TWICE with the fan off (exact-today
     /// duplicate tolerance, e.g. pacemaker rebroadcasts). Exercises the REAL
-    /// receive seams (`handle_consensus_gossip` / `handle_consensus_direct`)
-    /// in both arrival orders. MUST fail before B2 (no dedup, no
+    /// receive seams (`handle_consensus_gossip` /
+    /// `handle_consensus_direct_traced`) in both arrival orders. MUST fail before B2 (no dedup, no
     /// `handle_consensus_direct`).
     #[test]
     fn dedup_same_payload_via_both_paths_enqueues_once() {
@@ -5023,7 +5003,7 @@ mod tests {
                 };
                 let deliver_direct = |scoring: &mut PeerScoring| {
                     assert!(
-                        handle_consensus_direct(&msg_bytes, sender, &shared, scoring, &peer),
+                        handle_consensus_direct_traced(&msg_bytes, sender, &shared, scoring, &peer, None),
                         "a hotstuff message must be consumed by the direct branch"
                     );
                 };
@@ -5096,7 +5076,7 @@ mod tests {
             // one-shot message. Only the latter may be suppressed.
             for _ in 0..2 {
                 assert!(
-                    handle_consensus_direct(&msg_bytes, sender, &shared, &mut scoring, &peer),
+                    handle_consensus_direct_traced(&msg_bytes, sender, &shared, &mut scoring, &peer, None),
                     "{name}: consensus message must be consumed by the direct branch"
                 );
             }

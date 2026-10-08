@@ -115,7 +115,7 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
     let with_key: BTreeSet<Address> = r.keys().filter(|k| k.len() == 28).map(|k| Address::from_slice(&k[..20])).collect();
     assert_eq!(rec.traders, with_key, "{tag}: trader set != traders of R's 28-byte keys");
     // adl-budget C2: per market, the traders of R's 28-byte keys `t ‖ m`.
-    let mut by_market: HashMap<MarketId, BTreeSet<Address>> = HashMap::new();
+    let mut by_market = Holders::default();
     for k in r.keys().filter(|k| k.len() == 28) {
         let m = MarketId::from_be_bytes(k[20..].try_into().unwrap());
         by_market.entry(m).or_default().insert(Address::from_slice(&k[..20]));
@@ -416,6 +416,225 @@ fn holder_lists_with_the_dirty_traders_cover_the_walk() {
     println!("HOLDERS compared={compared} extra={extra} new_holders={new_holders}");
     assert!(compared > 5_000, "non-vacuous: {compared}");
     assert!(extra > 50 && new_holders > 50, "deleted and new keys in the block: {extra} / {new_holders}");
+}
+
+/// One scripted block's op: `t ‖ m` written with a position of `raw` / `long`,
+/// deleted, or a longer key under `t` written / deleted (irregular).
+#[derive(Clone, Copy)]
+enum Op {
+    Put(u64, MarketId, u64, bool),
+    Del(u64, MarketId),
+    Long(u64, MarketId, bool),
+}
+
+/// adl-budget C2 perf (`set_holder` only when a key appears or disappears):
+/// after every scripted block the holder lists == the traders of R's keys
+/// per market (`check`: and the warm records == a cold build) == C1 (the
+/// walk's traders holding `m`). Blocks: opens over several traders and
+/// markets, size changes, a write leaving a position unchanged (same bytes),
+/// flips, closes, a tombstone of a key never held, a close + reopen of the
+/// same key in one block (and an open + close), a trader going flat, a
+/// market at `MarketId::MAX`, and a trader turning opaque and back (its
+/// keys followed per key from the delta meanwhile).
+#[test]
+fn holder_lists_follow_scripted_blocks_bit_identically() {
+    use torus_core::liquidation as liq;
+    use Op::*;
+    let blocks: Vec<Vec<Op>> = vec![
+        vec![
+            Put(0, 1, 10, true),
+            Put(0, 2, 11, true),
+            Put(1, 1, 12, false),
+            Put(2, 3, 13, true),
+            Put(3, 1, 14, true),
+            Put(3, 4, 15, false),
+        ],
+        // size change, unchanged write, flip, close, open, tombstone of a key never held
+        vec![
+            Put(0, 1, 20, true),
+            Put(1, 1, 12, false),
+            Put(2, 3, 13, false),
+            Del(3, 4),
+            Put(4, 2, 16, true),
+            Del(4, 3),
+        ],
+        // close + reopen in one block, open + close in one block, MAX market
+        vec![
+            Del(0, 2),
+            Put(0, 2, 30, false),
+            Del(3, 1),
+            Put(3, 1, 31, true),
+            Put(1, 4, 32, true),
+            Del(1, 4),
+            Put(2, MarketId::MAX, 33, true),
+        ],
+        // trader 0 flat, trader 2 opaque (a longer key) with a write and a close of its own
+        vec![
+            Del(0, 1),
+            Del(0, 2),
+            Put(1, 1, 40, true),
+            Long(2, 3, true),
+            Put(2, 1, 41, true),
+            Del(2, MarketId::MAX),
+        ],
+        // trader 2 still opaque: an unchanged write, an open, a close
+        vec![
+            Put(2, 1, 41, true),
+            Put(2, 2, 50, false),
+            Del(2, 3),
+            Put(0, 1, 51, true),
+        ],
+        // trader 2 regular again; reopen of a key closed while opaque
+        vec![
+            Long(2, 3, false),
+            Put(2, 3, 60, true),
+            Put(4, 2, 16, true),
+            Del(1, 1),
+            Put(1, 1, 61, false),
+        ],
+        // everyone flat but trader 4
+        vec![
+            Del(0, 1),
+            Del(1, 1),
+            Del(2, 1),
+            Del(2, 2),
+            Del(2, 3),
+            Del(3, 1),
+        ],
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut rows = ResidentRows::build(&db).unwrap();
+    let mut rec = TraderPositions::build(&rows);
+    let mut stats = Stats::default();
+    let markets: Vec<MarketId> = (0..=5).chain([MarketId::MAX]).collect();
+    for (h, ops) in blocks.iter().enumerate() {
+        let o = NativeStateOverlay::new(db.clone());
+        for &op in ops {
+            match op {
+                Put(i, m, raw, long) => {
+                    let t = trader(i);
+                    o.put_cf_raw(
+                        CF_NATIVE_POSITIONS,
+                        &position_key(&t, m),
+                        &bytes(&position(t, m, raw, long)),
+                    )
+                    .unwrap();
+                }
+                Del(i, m) => o
+                    .delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&trader(i), m))
+                    .unwrap(),
+                Long(i, m, true) => {
+                    o.put_cf_raw(
+                        CF_NATIVE_POSITIONS,
+                        &[&position_key(&trader(i), m)[..], &[1]].concat(),
+                        &[1],
+                    )
+                    .unwrap();
+                }
+                Long(i, m, false) => {
+                    o.delete_cf_raw(
+                        CF_NATIVE_POSITIONS,
+                        &[&position_key(&trader(i), m)[..], &[1]].concat(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let delta = o.own_pending_delta();
+        o.flush(&db).unwrap();
+        rows.apply(&delta);
+        rec.apply(&delta, &rows, None);
+        let tag = format!("block {}", h + 1);
+        check(&rec, &rows, &db, &mut stats, &tag);
+        let walk = liq::traders_after(&db, None, usize::MAX).unwrap();
+        for &m in &markets {
+            let c1: Vec<Address> = walk
+                .iter()
+                .copied()
+                .filter(|t| {
+                    db.get_cf_raw(CF_NATIVE_POSITIONS, &position_key(t, m))
+                        .unwrap()
+                        .is_some()
+                })
+                .collect();
+            assert_eq!(
+                rec.holders_with(m, &[]),
+                c1,
+                "{tag} m {m}: holder list == C1"
+            );
+        }
+    }
+    assert!(
+        stats.opaque > 0 && stats.regular > 0,
+        "non-vacuous: {stats:?}"
+    );
+    assert_eq!(
+        rec.holders.len(),
+        1,
+        "only trader 4 holds a market at the end"
+    );
+}
+
+/// adl-budget C2 perf: `apply` touches the holder index only where a key
+/// appears or disappears. Sentinels planted in the index (a holder dropped,
+/// a non-holder added) survive a block that rewrites the dropped holder's
+/// key (presence unchanged) and tombstones the added one's never-held key;
+/// the same block's open and close still move their holders.
+#[test]
+fn holder_index_untouched_when_presence_does_not_change() {
+    let (t0, t1) = (trader(0), trader(1));
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    for (t, m) in [(t0, 1), (t0, 2), (t1, 1)] {
+        db.put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &position_key(&t, m),
+            &bytes(&position(t, m, 1, true)),
+        )
+        .unwrap();
+    }
+    let mut rows = ResidentRows::build(&db).unwrap();
+    let mut rec = TraderPositions::build(&rows);
+    rec.holders.get_mut(&1).unwrap().remove(&t0);
+    rec.holders.entry(3).or_default().insert(t1);
+    let o = NativeStateOverlay::new(db.clone());
+    o.put_cf_raw(
+        CF_NATIVE_POSITIONS,
+        &position_key(&t0, 1),
+        &bytes(&position(t0, 1, 2, false)),
+    )
+    .unwrap();
+    o.delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t1, 3))
+        .unwrap();
+    o.put_cf_raw(
+        CF_NATIVE_POSITIONS,
+        &position_key(&t1, 2),
+        &bytes(&position(t1, 2, 3, true)),
+    )
+    .unwrap();
+    o.delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t0, 2))
+        .unwrap();
+    let delta = o.own_pending_delta();
+    o.flush(&db).unwrap();
+    rows.apply(&delta);
+    rec.apply(&delta, &rows, None);
+    let set = |m: MarketId| {
+        rec.holders
+            .get(&m)
+            .map(|s| s.iter().copied().collect::<Vec<_>>())
+    };
+    assert_eq!(
+        set(1),
+        Some(vec![t1]),
+        "rewrite of a held key: index untouched"
+    );
+    assert_eq!(
+        set(3),
+        Some(vec![t1]),
+        "tombstone of a never-held key: index untouched"
+    );
+    assert_eq!(set(2), Some(vec![t1]), "open and close: holders moved");
 }
 
 /// One seek of [`Spy`]: its start, its prefix bound (`None`: unbounded) and

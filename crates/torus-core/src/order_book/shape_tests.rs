@@ -75,6 +75,33 @@ fn shape_violation_messages() {
     );
 }
 
+/// Row 46 follow-up: the positive-price rule (executor and RPC intake, the
+/// executor's text): a `Limit` price, a `Market` / `StopMarket` cap and a
+/// `StopLimit` limit (not its `price` field) must be > 0.
+#[test]
+fn order_price_violation_rules() {
+    let trig = fpr(90 * S);
+    let stop_limit = |limit| OrderType::StopLimit { trigger: trig, limit: fpr(limit) };
+    let cap = "market order requires a positive price cap (worst acceptable price), got";
+    for (price, ty, want) in [
+        (0, OrderType::Limit, "limit order requires a positive price, got 0.00000000".to_string()),
+        (-S, OrderType::Limit, "limit order requires a positive price, got -1.00000000".to_string()),
+        (0, OrderType::Market, format!("{cap} 0.00000000")),
+        (-S, OrderType::StopMarket { trigger: trig }, format!("{cap} -1.00000000")),
+        (S, stop_limit(0), "stop-limit order requires a positive limit price, got 0.00000000".to_string()),
+    ] {
+        assert_eq!(order_price_violation(&order(price, S, ty)), Some(want));
+    }
+    for (price, ty) in [
+        (1, OrderType::Limit),
+        (1, OrderType::Market),
+        (1, OrderType::StopMarket { trigger: trig }),
+        (0, stop_limit(1)),
+    ] {
+        assert_eq!(order_price_violation(&order(price, S, ty)), None);
+    }
+}
+
 /// The row's (tick, lot) as stored (raw, no clamping); `None` for a row
 /// that does not decode exactly (placeholders, truncated, trailing bytes).
 #[test]

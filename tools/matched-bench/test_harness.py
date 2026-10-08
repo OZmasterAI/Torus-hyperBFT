@@ -288,30 +288,51 @@ class SummarizeTest(unittest.TestCase):
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
             f.write(self.BENCH_LOG_CAPPED)
-        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1",
-                                            "--open-order-budget", "900"])
+        s, _ = run_summarize(
+            self.d, extra=["--max-in-flight", "1", "--open-order-budget", "900"]
+        )
         self.assertEqual(s["cell"]["max_in_flight"], 1)
         self.assertEqual(s["cell"]["open_order_budget"], 900)
         ing = s["ingest"]
         self.assertEqual(ing["bench_submit_rate"], 610.0)
-        self.assertEqual(ing["econ_mix"], {
-            "place": 69000, "cancel_all": 4251,
-            "place_share": 0.942, "cancel_all_share": 0.058,
-            "sent_place": 70000, "sent_cancel_all": 4300})
-        self.assertEqual(ing["in_flight"], {
-            "cap": 1, "released_committed": 72000, "released_refused": 1300,
-            "released_timeout": 950, "in_flight_at_end": 4,
-            "tail_url": "http://127.0.0.1:8647", "tail_fetched": 3600,
-            "tail_errors": 12, "tail_missed": 1})
+        self.assertEqual(
+            ing["econ_mix"],
+            {
+                "place": 69000,
+                "cancel_all": 4251,
+                "place_share": 0.942,
+                "cancel_all_share": 0.058,
+                "sent_place": 70000,
+                "sent_cancel_all": 4300,
+            },
+        )
+        self.assertEqual(
+            ing["in_flight"],
+            {
+                "cap": 1,
+                "released_committed": 72000,
+                "released_refused": 1300,
+                "released_timeout": 950,
+                "in_flight_at_end": 4,
+                "tail_url": "http://127.0.0.1:8647",
+                "tail_fetched": 3600,
+                "tail_errors": 12,
+                "tail_missed": 1,
+            },
+        )
 
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
-        s, _ = run_summarize(self.d, extra=[
-            "--node-env", json.dumps({"TORUS_RPC_MAX_RESPONSE_MB": "64"})])
+        s, _ = run_summarize(
+            self.d,
+            extra=["--node-env", json.dumps({"TORUS_RPC_MAX_RESPONSE_MB": "64"})],
+        )
         self.assertEqual(s["cell"]["rpc_max_response_mb"], 64)
         s, _ = run_summarize(self.d)
-        self.assertIsNone(s["cell"]["rpc_max_response_mb"], "unset = node default 10 MiB")
+        self.assertIsNone(
+            s["cell"]["rpc_max_response_mb"], "unset = node default 10 MiB"
+        )
 
     def test_uncapped_legacy_cell_reports_none_for_the_new_fields(self):
         write_cell(self.d, 1_000, 1_000)  # bench.log: legacy one-liner, no rate
@@ -827,23 +848,38 @@ class CrashKillGuardTest(unittest.TestCase):
             self.assertIn('"MAX_IN_FLIGHT",', f.read())
         with open(os.path.join(HERE, "resummarize.sh")) as f:
             res = f.read()
-        self.assertIn("--max-in-flight \"$(j '.cell.max_in_flight // \"\"')\"", res)
-        self.assertIn("--open-order-budget \"$(j '.cell.open_order_budget // \"\"')\"", res)
-        lines = [l for l in src.splitlines() if "MAX_IN_FLIGHT" in l
-                 and not l.lstrip().startswith(("#", "log ", "--", "python3", "if "))]
-        snippet = ("RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
-                   "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"')
+        self.assertIn('--max-in-flight "$(j \'.cell.max_in_flight // ""\')"', res)
+        self.assertIn(
+            '--open-order-budget "$(j \'.cell.open_order_budget // ""\')"', res
+        )
+        lines = [
+            l
+            for l in src.splitlines()
+            if "MAX_IN_FLIGHT" in l
+            and not l.lstrip().startswith(("#", "log ", "--", "python3", "if "))
+        ]
+        snippet = (
+            "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
+            "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+        )
 
         def run(**env):
             base = {k: v for k, v in os.environ.items() if k != "MAX_IN_FLIGHT"}
-            return subprocess.run(["bash", "-c", snippet], capture_output=True,
-                                  text=True, env=dict(base, **env))
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
 
         r = run()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
         r = run(MAX_IN_FLIGHT="1")
-        self.assertEqual(r.stdout.strip(), "--max-in-flight 1 --in-flight-watch-rpc "
-                         "http://127.0.0.1:8647", r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "--max-in-flight 1 --in-flight-watch-rpc http://127.0.0.1:8647",
+            r.stderr,
+        )
         for bad in ("x", "0", "-1", "1.5"):
             r = run(MAX_IN_FLIGHT=bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
@@ -858,14 +894,18 @@ class CrashKillGuardTest(unittest.TestCase):
         summary.json records it as cell.rpc_max_response_mb."""
         with open(RUN_CELL_SH) as f:
             src = f.read()
-        on = src.index('if [ -n "$MAX_IN_FLIGHT" ]; then\n    export TORUS_RPC_MAX_RESPONSE_MB')
+        on = src.index(
+            'if [ -n "$MAX_IN_FLIGHT" ]; then\n    export TORUS_RPC_MAX_RESPONSE_MB'
+        )
         block = src[on : src.index("\nfi", on)]
         self.assertIn("export TORUS_RPC_MAX_RESPONSE_MB=64", block)
         self.assertIn("log ", block)
         self.assertLess(src.index("for v in $(env | grep -oE '^TORUS_"), on)
         self.assertLess(on, src.index("for kv in $EXTRA_ENV; do export"))
         self.assertLess(on, src.index("NODE_ENV_JSON=$("))
-        self.assertIn("TORUS_RPC_MAX_RESPONSE_MB=64", src[: src.index("set -uo pipefail")])
+        self.assertIn(
+            "TORUS_RPC_MAX_RESPONSE_MB=64", src[: src.index("set -uo pipefail")]
+        )
 
     def test_spam_cancel_reaches_the_bench_only_when_set(self):
         """SPAM_CANCEL_KEYS / SPAM_CANCEL_RATE / SPAM_CANCEL_FUNDED=1 -> bench
@@ -879,29 +919,46 @@ class CrashKillGuardTest(unittest.TestCase):
             self.assertIn(f"{v.lower()}='${{{v}:-unset}}'", src)
         # Run run-cell.sh's own SPAM_CANCEL lines (defaults, validation, flag
         # mapping) in bash and look at the resulting bench flags.
-        lines = [l for l in src.splitlines() if "SPAM_CANCEL" in l
-                 and not l.lstrip().startswith(("#", "log "))]
+        lines = [
+            l
+            for l in src.splitlines()
+            if "SPAM_CANCEL" in l and not l.lstrip().startswith(("#", "log "))
+        ]
         snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
 
         def run(**env):
-            base = {k: v for k, v in os.environ.items()
-                    if not k.startswith("SPAM_CANCEL")}
-            return subprocess.run(["bash", "-c", snippet], capture_output=True,
-                                  text=True, env=dict(base, **env))
+            base = {
+                k: v for k, v in os.environ.items() if not k.startswith("SPAM_CANCEL")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
 
         r = run()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
         r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="250.5")
-        self.assertEqual(r.stdout.strip(),
-                         "--spam-cancel-keys 8 --spam-cancel-rate 250.5", r.stderr)
+        self.assertEqual(
+            r.stdout.strip(), "--spam-cancel-keys 8 --spam-cancel-rate 250.5", r.stderr
+        )
         r = run(SPAM_CANCEL_KEYS="8", SPAM_CANCEL_RATE="100", SPAM_CANCEL_FUNDED="1")
-        self.assertEqual(r.stdout.strip(), "--spam-cancel-keys 8 "
-                         "--spam-cancel-rate 100 --spam-cancel-funded", r.stderr)
-        for bad in ({"SPAM_CANCEL_KEYS": "x"},
-                    {"SPAM_CANCEL_KEYS": "8"},  # no rate
-                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "fast"},
-                    {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "1",
-                     "SPAM_CANCEL_FUNDED": "yes"}):
+        self.assertEqual(
+            r.stdout.strip(),
+            "--spam-cancel-keys 8 --spam-cancel-rate 100 --spam-cancel-funded",
+            r.stderr,
+        )
+        for bad in (
+            {"SPAM_CANCEL_KEYS": "x"},
+            {"SPAM_CANCEL_KEYS": "8"},  # no rate
+            {"SPAM_CANCEL_KEYS": "8", "SPAM_CANCEL_RATE": "fast"},
+            {
+                "SPAM_CANCEL_KEYS": "8",
+                "SPAM_CANCEL_RATE": "1",
+                "SPAM_CANCEL_FUNDED": "yes",
+            },
+        ):
             r = run(**bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
             self.assertIn("FATAL", r.stderr)
@@ -956,9 +1013,14 @@ class CrashKillGuardTest(unittest.TestCase):
             self.assertIn(f'export {knob}="${{{knob}:-0}}"', env_src)
         self.assertNotIn("TORUS_CANCEL_BLOCK_SHARE_PCT=", env_src)
         r = subprocess.run(
-            ["bash", "-c", f'source "{wsl_env}"; '
-             'echo "$TORUS_INGRESS_MIN_COLLATERAL $TORUS_ADDR_RATE_LIMIT $TORUS_RPC_IP_WEIGHT_PER_MIN"'],
-            capture_output=True, text=True,
+            [
+                "bash",
+                "-c",
+                f'source "{wsl_env}"; '
+                'echo "$TORUS_INGRESS_MIN_COLLATERAL $TORUS_ADDR_RATE_LIMIT $TORUS_RPC_IP_WEIGHT_PER_MIN"',
+            ],
+            capture_output=True,
+            text=True,
             env={k: v for k, v in os.environ.items() if not k.startswith("TORUS_")},
         )
         self.assertEqual(r.stdout.strip(), "0 0 0", r.stderr)
@@ -1973,8 +2035,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
-                        BENCH_ALLOW_UNDETACHED="1", **env
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
                     ),
                 )
                 self.assertEqual(r.returncode, 2, r.stderr)
@@ -1994,8 +2059,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
         block = self.fn("    ORACLE_CMD=(", '\n    log "oracle feed: ${ORACLE_CMD[*]}"')
         for walk, want in (("0", []), ("10", ["--walk-bp", "10"])):
             script = (
-                'BENCH=bt RPCS=(r0 r1) ORACLE_KEYS=k MARKETS=3 ORACLE_PRICE=30000 '
-                "ORACLE_INTERVAL_MS=2000 OUT=o ORACLE_WALK_BP=%s\n" % walk
+                "BENCH=bt RPCS=(r0 r1) ORACLE_KEYS=k MARKETS=3 ORACLE_PRICE=30000 "
+                "ORACLE_INTERVAL_MS=2000 OUT=o ORACLE_WALK_BP=%s\n"
+                % walk
                 + block
                 + '\nprintf "%s\\n" "${ORACLE_CMD[@]}"\n'
             )
@@ -2032,9 +2098,18 @@ class OracleFeedHarnessTest(unittest.TestCase):
             wt = os.path.dirname(os.path.dirname(HERE))
             for env, msg in (
                 (dict(ORACLE_FEED_DRAIN="2"), "ORACLE_FEED_DRAIN must be 0 or 1"),
-                (dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="yes"), "ORACLE_FEED_DRAIN must be 0 or 1"),
-                (dict(ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
-                (dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="yes"),
+                    "ORACLE_FEED_DRAIN must be 0 or 1",
+                ),
+                (
+                    dict(ORACLE_FEED_DRAIN="1"),
+                    "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1",
+                ),
+                (
+                    dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"),
+                    "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1",
+                ),
             ):
                 r = subprocess.run(
                     [RUN_CELL_SH, wt, "oracle-drain-pre-x"],
@@ -2042,8 +2117,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
-                        BENCH_ALLOW_UNDETACHED="1", **env
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
                     ),
                 )
                 self.assertEqual(r.returncode, 2, (env, r.stderr))
@@ -2059,36 +2137,57 @@ class OracleFeedHarnessTest(unittest.TestCase):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
         (T = SIGSTOPped) and its argv."""
-        pause = self.fn('ORACLE_ALIVE_END=""\n', "\n# ------------------------------------------------"
-                        "---------------- 7. drain")
-        drain = self.fn("# ---------------------------------------------------------------- 7. drain",
-                        "\nsleep 2\n")
+        pause = self.fn(
+            'ORACLE_ALIVE_END=""\n',
+            "\n# ------------------------------------------------"
+            "---------------- 7. drain",
+        )
+        drain = self.fn(
+            "# ---------------------------------------------------------------- 7. drain",
+            "\nsleep 2\n",
+        )
         tmp = tempfile.mkdtemp(prefix="oracle-drain-flow-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         # what the (stubbed) health.py runs would have left behind
         os.makedirs(os.path.join(tmp, "feed-stop-settle"))
         with open(os.path.join(tmp, "drain.json"), "w") as f:
-            json.dump({"drained": True, "feed_live": {
-                "max_exec_lag": 2, "native_intervals": 4, "single_block_intervals": 3,
-                "native_blocks": 5, "chain_ms": {"p50": 50.0, "p95": 200.0, "max": 200.0}}}, f)
+            json.dump(
+                {
+                    "drained": True,
+                    "feed_live": {
+                        "max_exec_lag": 2,
+                        "native_intervals": 4,
+                        "single_block_intervals": 3,
+                        "native_blocks": 5,
+                        "chain_ms": {"p50": 50.0, "p95": 200.0, "max": 200.0},
+                    },
+                },
+                f,
+            )
         with open(os.path.join(tmp, "feed-stop-settle", "drain.json"), "w") as f:
             json.dump({"drained": True, "elapsed_s": 12.7}, f)
         script = (
             self.fn("alive() {", "\nstop_sampler() {")
             + '\nlog() { echo "LOG $*"; }\n'
-            + "oracle_marks() { echo '{\"markets\":300,\"usable\":300}'; }\n"
-            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n' % tmp
+            + 'oracle_marks() { echo \'{"markets":300,"usable":300}\'; }\n'
+            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n'
+            % tmp
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
-              "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s T_BENCH1=$(date +%%s)\n" % (tmp, mode)
+            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s T_BENCH1=$(date +%%s)\n"
+            % (tmp, mode)
             + "METS=(9161 9162 9163)\n"
-            + pause + "\n" + drain
+            + pause
+            + "\n"
+            + drain
             + '\ncat "$OUT/py.log"; echo "END $(ps -o stat= -p "$FEED" | cut -c1)"\n'
             # the real exit-path stop must still end the feed paused after the drain
             + 'stop_oracle_feed; alive "$FEED" && echo FEED_STILL_ALIVE; echo "STOPPED rc=$ORACLE_RC"\n'
         )
-        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return tmp, r.stdout
 
@@ -2098,8 +2197,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
         urls = " ".join("http://127.0.0.1:%d/metrics" % p for p in (9161, 9162, 9163))
         self.assertEqual(
             py,
-            ["PY T /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s"
-             % (out_dir, urls)],
+            [
+                "PY T /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s"
+                % (out_dir, urls)
+            ],
         )
         self.assertIn("LOG oracle feed paused (SIGSTOP) for drain + digest", out)
         self.assertIn("END T", out)
@@ -2112,26 +2213,41 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertEqual(len(py), 2, out)
         # live through the drain, judged by the feed-live criterion; the
         # mempool bound = 2 rounds x 3 validators x ceil(300/256) chunks
-        self.assertTrue(py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0])
+        self.assertTrue(
+            py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0]
+        )
         self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12"), py[0])
         # paused right after it, then a legacy quiet settle before the digest
         self.assertTrue(
-            py[1].startswith("PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "
-                             "--quiet 10 --urls " % out_dir), py[1])
+            py[1].startswith(
+                "PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "
+                "--quiet 10 --urls " % out_dir
+            ),
+            py[1],
+        )
         self.assertNotIn("--feed-live", py[1])
         self.assertTrue(os.path.isdir(os.path.join(out_dir, "feed-stop-settle")))
         self.assertIn("LOG feed-live drain:", out)
         self.assertIn("quiet_window_native_block_exec_ms", out)
-        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        settle = [
+            l
+            for l in out.splitlines()
+            if "feed-stop-settle" in l and l.startswith("LOG ")
+        ]
         self.assertEqual(len(settle), 1, out)
         self.assertRegex(settle[0], r"settle drained=1 after 12s")
-        self.assertIn("quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
-                      "max=200.0 native_blocks=5 single_block_intervals=3/4", out)
+        self.assertIn(
+            "quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
+            "max=200.0 native_blocks=5 single_block_intervals=3/4",
+            out,
+        )
         self.assertIn("END T", out)
         self.assertNotIn("FEED_STILL_ALIVE", out)
         self.assertIn("STOPPED rc=143", out)
         # the existing exit paths still stop it (TERM + CONT): unchanged
-        self.assertIn('kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src)
+        self.assertIn(
+            'kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src
+        )
 
     def test_bad_walk_env_fails_preflight(self):
         tmp = tempfile.mkdtemp(prefix="oracle-walk-pre-")
@@ -2146,8 +2262,16 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 os.chmod(p, 0o755)
             wt = os.path.dirname(os.path.dirname(HERE))
             for env, rc, msg in (
-                (dict(ORACLE_FEED="1", ORACLE_WALK_BP="x"), 2, "ORACLE_WALK_BP must be"),
-                (dict(ORACLE_FEED="1", ORACLE_WALK_BP="1250"), 2, "ORACLE_WALK_BP must be"),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_WALK_BP="x"),
+                    2,
+                    "ORACLE_WALK_BP must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_WALK_BP="1250"),
+                    2,
+                    "ORACLE_WALK_BP must be",
+                ),
                 (dict(ORACLE_WALK_BP="10"), 2, "needs ORACLE_FEED=1"),
                 (dict(ORACLE_FEED="1", ORACLE_WALK_BP="10"), 1, "has no --walk-bp"),
             ):
@@ -2157,8 +2281,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     text=True,
                     timeout=30,
                     env=dict(
-                        os.environ, TARGET_DIR=tmp, RESULTS_ROOT=tmp,
-                        BENCH_ALLOW_UNDETACHED="1", **env
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
                     ),
                 )
                 self.assertEqual(r.returncode, rc, (env, r.stderr))
@@ -2169,7 +2296,6 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(tmp)
-
 
 
 # ----------------------------------- cells run detached from the caller's shell
@@ -2214,19 +2340,25 @@ class DetachTest(unittest.TestCase):
         env.update(RESULTS_ROOT=results, DATA_ROOT=os.path.join(self.d, "data"))
         r = subprocess.run(
             ["bash", RUN_CELL_SH, wt, "probe-label"],
-            capture_output=True, text=True, timeout=30, env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
         )
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("detach.sh", r.stderr)
         self.assertFalse(os.path.exists(results), "refused cell must not write results")
         self.assertFalse(os.path.exists(os.path.join(self.d, "data")))
 
-    def _detach(self, name, script):
+    def _detach(self, name, script, extra_env=None):
         log = os.path.join(self.d, "out.log")
         r = subprocess.run(
             ["bash", DETACH_SH, name, log, "bash", "-c", script],
-            capture_output=True, text=True, timeout=30,
-            env=dict(os.environ, DETACH_PROBE="carried"), cwd=self.d,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=dict(os.environ, DETACH_PROBE="carried", **(extra_env or {})),
+            cwd=self.d,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         deadline = time.time() + 20
@@ -2252,8 +2384,12 @@ class DetachTest(unittest.TestCase):
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
         self.assertEqual(kv["PARENT"], "systemd")
-        self.assertEqual(kv["PROBE"], "carried", "caller's exported env must carry over")
-        self.assertEqual(kv["PWD"], self.d, "caller's working directory must carry over")
+        self.assertEqual(
+            kv["PROBE"], "carried", "caller's exported env must carry over"
+        )
+        self.assertEqual(
+            kv["PWD"], self.d, "caller's working directory must carry over"
+        )
 
     @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
     def test_run_cell_guard_accepts_a_detached_unit(self):
@@ -2261,15 +2397,45 @@ class DetachTest(unittest.TestCase):
             line = next(l for l in f if l.startswith("BENCH_UNIT_RE="))
         out = self._detach(
             "test-guard-%d" % os.getpid(),
-            line + 'grep -qE "$BENCH_UNIT_RE" /proc/self/cgroup && echo IN=1; echo DONE',
+            line
+            + 'grep -qE "$BENCH_UNIT_RE" /proc/self/cgroup && echo IN=1; echo DONE',
         )
         self.assertIn("IN=1", out)
 
+    @unittest.skipUnless(_have_user_systemd(), "needs systemd --user")
+    def test_detach_keeps_secrets_out_of_the_unit_env(self):
+        """2026-10-08: a bench unit carried the launching Claude session's
+        CLAUDE_CODE_MESSAGING_TOKEN, and `systemctl --user show` printed it into
+        an agent transcript. Secrets must not reach the unit; other vars must."""
+        secrets = {
+            "CLAUDE_CODE_MESSAGING_TOKEN": "s1",
+            "ANTHROPIC_API_KEY": "s2",
+            "FIRECRAWL_API_KEY": "s3",
+            "GH_TOKEN": "s4",
+            "MY_SECRET": "s5",
+            "DB_PASSWORD": "s6",
+        }
+        out = self._detach(
+            "test-secrets-%d" % os.getpid(),
+            "env | sort; echo DONE",
+            extra_env=dict(secrets, TORUS_BOOK_CF_TARGET_FILE_MB="64"),
+        )
+        names = {l.split("=", 1)[0] for l in out.splitlines() if "=" in l}
+        for k in secrets:
+            self.assertNotIn(k, names, "%s must not reach the bench unit" % k)
+        self.assertIn("TORUS_BOOK_CF_TARGET_FILE_MB", names)
+        self.assertIn("DETACH_PROBE", names)
+
     def test_detach_needs_a_name_a_log_and_a_command(self):
-        r = subprocess.run(["bash", DETACH_SH, "x", "/tmp/x.log"],
-                           capture_output=True, text=True, timeout=10)
+        r = subprocess.run(
+            ["bash", DETACH_SH, "x", "/tmp/x.log"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         self.assertEqual(r.returncode, 2)
         self.assertIn("usage", r.stderr)
+
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):

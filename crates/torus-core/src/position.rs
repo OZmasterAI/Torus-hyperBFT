@@ -2,6 +2,7 @@
 //!
 //! Stores positions in CF_NATIVE_POSITIONS and native balances in CF_NATIVE_BALANCES.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
@@ -444,15 +445,25 @@ impl<T: StateBackend> PositionManager<T> {
         fill_price: FixedPoint,
         margin_type: MarginType,
     ) -> Result<FillEffect, CoreError> {
-        let existing = cache.load(self, trader, market_id)?;
-        let start_size = signed_size(&existing);
-        let (new_pos, pnl) =
-            fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
-        match new_pos {
-            Some(pos) => cache.set(pos),
-            None => cache.remove(trader, market_id),
-        }
-        Ok(FillEffect { start_size, closed_pnl: pnl })
+        cache.update_in_place(self, trader, market_id, |existing| {
+            let start_size = signed_size(&existing);
+            let (new_pos, pnl) = fill_transition(
+                existing,
+                trader,
+                market_id,
+                is_buy,
+                fill_qty,
+                fill_price,
+                margin_type,
+            );
+            (
+                new_pos,
+                FillEffect {
+                    start_size,
+                    closed_pnl: pnl,
+                },
+            )
+        })
     }
 
     /// Credit (or debit if negative) realized PnL to native balance.
@@ -645,6 +656,55 @@ impl PositionCache {
         Ok(pos)
     }
 
+    /// The fill path's read-modify-write: [`load`], then `f`, then [`set`]
+    /// (`Some`) or [`remove`] (`None`) — with one map lookup and no copy of
+    /// the cached row. `f` gets the row by value and its result is written
+    /// back to the same slot and marked dirty before returning. A backend
+    /// read error on a miss returns before anything is cached, as in
+    /// `load`. A panic in `f` leaves the slot empty; no caller keeps using a
+    /// cache after a panic (parallel settle drops a panicked market's cache,
+    /// and the sequential path unwinds out of the batch that owns it).
+    ///
+    /// [`load`]: Self::load
+    /// [`set`]: Self::set
+    /// [`remove`]: Self::remove
+    fn update_in_place<T: StateBackend, R>(
+        &mut self,
+        positions: &PositionManager<T>,
+        trader: &Address,
+        market_id: MarketId,
+        f: impl FnOnce(Option<Position>) -> (Option<Position>, R),
+    ) -> Result<R, CoreError> {
+        let key = (*trader, market_id);
+        let slot = match self.map.entry(key) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(positions.get_position(trader, market_id)?),
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|p| (p.trader, p.market_id) != key)
+        {
+            // A stored row whose fields name another key (`put_position`
+            // never writes one): `set` files the result under the fields'
+            // key, so keep the exact load + set sequence.
+            let (new_pos, out) = f(slot.clone());
+            match new_pos {
+                Some(pos) => self.set(pos),
+                None => self.remove(trader, market_id),
+            }
+            return Ok(out);
+        }
+        let (new_pos, out) = f(slot.take());
+        // `fill_transition` opens with (trader, market_id) or keeps the
+        // row's own fields, which match the key here: same slot as `set`.
+        debug_assert!(new_pos
+            .as_ref()
+            .is_none_or(|p| (p.trader, p.market_id) == key));
+        *slot = new_pos;
+        self.dirty.insert(key);
+        Ok(out)
+    }
+
     /// Store an updated position and mark it dirty (no backend write yet).
     pub fn set(&mut self, pos: Position) {
         let key = (pos.trader, pos.market_id);
@@ -669,6 +729,26 @@ impl PositionCache {
     pub fn merge_disjoint(&mut self, other: PositionCache) {
         self.map.extend(other.map);
         self.dirty.extend(other.dirty);
+    }
+
+    /// Number of cached entries (live rows, misses and tombstones).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Reserve room for `additional` more entries (and dirty marks), so a
+    /// run of [`merge_disjoint`] calls does not rehash as the map grows.
+    /// Capacity only: no entry or iteration order that matters changes
+    /// (`flush_all` sorts its keys).
+    ///
+    /// [`merge_disjoint`]: Self::merge_disjoint
+    pub fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+        self.dirty.reserve(additional);
     }
 
     /// Write every dirty row to the backend once, in sorted key order
