@@ -405,15 +405,31 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
 #[test]
 fn reserve_then_merge_flushes_like_plain_merge() {
     let fills: Vec<FillSpec> = (0..60u8)
-        .map(|i| (i % 7, u64::from(i % 5) + 1, i % 3 != 0, i64::from(i % 4) + 1, 100 + i64::from(i)))
+        .map(|i| {
+            (
+                i % 7,
+                u64::from(i % 5) + 1,
+                i % 3 != 0,
+                i64::from(i % 4) + 1,
+                100 + i64::from(i),
+            )
+        })
         .collect();
     let per_market = |pm: &PositionManager| -> Vec<PositionCache> {
         (1..=5u64)
             .map(|m| {
                 let mut c = PositionCache::new();
                 for &(t, fm, is_buy, qty, price) in fills.iter().filter(|f| f.1 == m) {
-                    pm.apply_fill_cached(&mut c, &addr(t), fm, is_buy, fp(qty), fp(price), MarginType::Cross)
-                        .unwrap();
+                    pm.apply_fill_cached(
+                        &mut c,
+                        &addr(t),
+                        fm,
+                        is_buy,
+                        fp(qty),
+                        fp(price),
+                        MarginType::Cross,
+                    )
+                    .unwrap();
                 }
                 c
             })
@@ -485,12 +501,21 @@ fn cached_fill_read_error_caches_nothing_and_dirty_hits_keep_updates() {
     });
     let trader = addr(4);
     // Backend row: long 3 @100.
-    pm.apply_fill(&trader, 2, true, fp(3), fp(100), MarginType::Cross).unwrap();
+    pm.apply_fill(&trader, 2, true, fp(3), fp(100), MarginType::Cross)
+        .unwrap();
 
     let mut cache = PositionCache::new();
     fail.store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(pm
-        .apply_fill_cached(&mut cache, &trader, 2, true, fp(1), fp(110), MarginType::Cross)
+        .apply_fill_cached(
+            &mut cache,
+            &trader,
+            2,
+            true,
+            fp(1),
+            fp(110),
+            MarginType::Cross
+        )
         .is_err());
     assert_eq!(cache.len(), 0, "a failed miss must not be memoized");
     fail.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -499,21 +524,49 @@ fn cached_fill_read_error_caches_nothing_and_dirty_hits_keep_updates() {
 
     // Miss (reads the backend row), then two dirty hits.
     for (is_buy, qty) in [(true, 1), (true, 2), (false, 4)] {
-        pm.apply_fill_cached(&mut cache, &trader, 2, is_buy, fp(qty), fp(100), MarginType::Cross)
-            .unwrap();
+        pm.apply_fill_cached(
+            &mut cache,
+            &trader,
+            2,
+            is_buy,
+            fp(qty),
+            fp(100),
+            MarginType::Cross,
+        )
+        .unwrap();
     }
     let bytes = |p: Option<torus_core::position::Position>| p.map(|p| borsh::to_vec(&p).unwrap());
     let cached = cache.load(&pm, &trader, 2).unwrap().unwrap();
-    assert_eq!((cached.is_long, cached.size), (true, fp(2)), "3 + 1 + 2 - 4");
+    assert_eq!(
+        (cached.is_long, cached.size),
+        (true, fp(2)),
+        "3 + 1 + 2 - 4"
+    );
     let cached = bytes(Some(cached));
-    assert_eq!(bytes(cache.load(&pm, &trader, 2).unwrap()), cached, "load keeps the entry");
-    assert_eq!(pm.get_position(&trader, 2).unwrap().unwrap().size, fp(3), "no write before flush");
+    assert_eq!(
+        bytes(cache.load(&pm, &trader, 2).unwrap()),
+        cached,
+        "load keeps the entry"
+    );
+    assert_eq!(
+        pm.get_position(&trader, 2).unwrap().unwrap().size,
+        fp(3),
+        "no write before flush"
+    );
     cache.flush_all(&pm).unwrap();
     assert_eq!(bytes(pm.get_position(&trader, 2).unwrap()), cached);
 
     // Full close through a dirty hit flushes the delete.
-    pm.apply_fill_cached(&mut cache, &trader, 2, false, fp(2), fp(100), MarginType::Cross)
-        .unwrap();
+    pm.apply_fill_cached(
+        &mut cache,
+        &trader,
+        2,
+        false,
+        fp(2),
+        fp(100),
+        MarginType::Cross,
+    )
+    .unwrap();
     assert!(cache.load(&pm, &trader, 2).unwrap().is_none());
     cache.flush_all(&pm).unwrap();
     assert!(pm.get_position(&trader, 2).unwrap().is_none());
@@ -537,16 +590,28 @@ fn row_with_mismatched_fields_matches_the_classic_path() {
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
     };
-    let fills: Vec<FillSpec> = vec![(1, 4, true, 1, 100), (1, 4, true, 2, 105), (1, 4, false, 1, 110)];
+    let fills: Vec<FillSpec> = vec![
+        (1, 4, true, 1, 100),
+        (1, 4, true, 2, 105),
+        (1, 4, false, 1, 110),
+    ];
     let (_d1, reference) = setup();
     let (_d2, cached) = setup();
     for pm in [&reference, &cached] {
         pm.state()
-            .put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&addr(1), 4), &borsh::to_vec(&row).unwrap())
+            .put_cf_raw(
+                CF_NATIVE_POSITIONS,
+                &position_key(&addr(1), 4),
+                &borsh::to_vec(&row).unwrap(),
+            )
             .unwrap();
     }
     run_reference(&reference, &fills);
     run_cached(&cached, &fills);
-    assert_eq!(dump_cf(&cached, CF_NATIVE_POSITIONS).len(), 2, "K untouched, K' written");
+    assert_eq!(
+        dump_cf(&cached, CF_NATIVE_POSITIONS).len(),
+        2,
+        "K untouched, K' written"
+    );
     assert_state_identical(&cached, &reference);
 }

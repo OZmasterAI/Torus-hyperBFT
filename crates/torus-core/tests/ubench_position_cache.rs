@@ -70,8 +70,14 @@ fn ubench_position_cache_apply() {
         for &(m, b, s, q, p) in &fills {
             let c = &mut caches[(m - 1) as usize];
             let (q, p) = (FixedPoint::from_raw(q), FixedPoint::from_raw(p));
-            black_box(pm.apply_fill_cached_effect(c, &b, m, true, q, p, MarginType::Cross).unwrap());
-            black_box(pm.apply_fill_cached_effect(c, &s, m, false, q, p, MarginType::Cross).unwrap());
+            black_box(
+                pm.apply_fill_cached_effect(c, &b, m, true, q, p, MarginType::Cross)
+                    .unwrap(),
+            );
+            black_box(
+                pm.apply_fill_cached_effect(c, &s, m, false, q, p, MarginType::Cross)
+                    .unwrap(),
+            );
         }
     };
     run(&mut caches); // warm: every key now cached

@@ -448,9 +448,21 @@ impl<T: StateBackend> PositionManager<T> {
         cache.update_in_place(self, trader, market_id, |existing| {
             let start_size = signed_size(&existing);
             let (new_pos, pnl) = fill_transition(
-                existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type,
+                existing,
+                trader,
+                market_id,
+                is_buy,
+                fill_qty,
+                fill_price,
+                margin_type,
             );
-            (new_pos, FillEffect { start_size, closed_pnl: pnl })
+            (
+                new_pos,
+                FillEffect {
+                    start_size,
+                    closed_pnl: pnl,
+                },
+            )
         })
     }
 
@@ -668,7 +680,10 @@ impl PositionCache {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(positions.get_position(trader, market_id)?),
         };
-        if slot.as_ref().is_some_and(|p| (p.trader, p.market_id) != key) {
+        if slot
+            .as_ref()
+            .is_some_and(|p| (p.trader, p.market_id) != key)
+        {
             // A stored row whose fields name another key (`put_position`
             // never writes one): `set` files the result under the fields'
             // key, so keep the exact load + set sequence.
@@ -682,7 +697,9 @@ impl PositionCache {
         let (new_pos, out) = f(slot.take());
         // `fill_transition` opens with (trader, market_id) or keeps the
         // row's own fields, which match the key here: same slot as `set`.
-        debug_assert!(new_pos.as_ref().is_none_or(|p| (p.trader, p.market_id) == key));
+        debug_assert!(new_pos
+            .as_ref()
+            .is_none_or(|p| (p.trader, p.market_id) == key));
         *slot = new_pos;
         self.dirty.insert(key);
         Ok(out)
