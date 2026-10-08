@@ -1,6 +1,6 @@
 # Per-cell results (every cell dir with a `summary.json`)
 
-Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table.
+Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`).
 
 
 ## 14236fa: Baseline `14236fa` (C3 + C4 + PF1 + cooldown fix) at 300 markets, with perf on r1/r2
@@ -307,6 +307,71 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p2s0-300m-crab-warm` | OK | 2026-10-06 14:30 | main-59fa407 @ 59fa407b | 1cf9f647 | 300 | 60 | 400 | - | 183,555.4 | 183,555.4 | 198,359.6 | 243,020.3 | 5.0 | 115.6 | 133.72 | 4.12 | AGREE | PASS | ACCEPT |
 | `ozarchy-p2s0-300m-main-r1` | OK | 2026-10-06 14:42 | main @ 1cd786da | 31a95c65 | 300 | 120 | 400 | TORUS_NATIVE_TRIE_MAINTENANCE=0 | 174,529.6 | 174,606.6 | 188,677.4 | 231,657.4 | 5.2 | 132.0 | 275.58 | 4.52 | AGREE | PASS | ACCEPT |
 | `ozarchy-p2s0-300m-main-r2` | OK | 2026-10-06 14:55 | main @ 1cd786da | 31a95c65 | 300 | 120 | 400 | TORUS_NATIVE_TRIE_MAINTENANCE=0 | 167,084.2 | 165,862.7 | 179,709.0 | 220,547.5 | 4.5 | 137.8 | 319.73 | 4.66 | AGREE | PASS | ACCEPT |
+
+## p2s0b: Phase 2 step 0 (Gate 0): step 0 `707f132f` vs base main `d3ba3c0a`, standard shape (N=4 + budget 900): counter overhead ABBA, s-prof (perf), s-byid, s-w10; plus a 10-market smoke cell
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2s0b-300m-b-r1` | OK | 2026-10-08 03:26 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 169,294.6 | 169,189.1 | 179,506.5 | 226,250.6 | 5.1 | 126.1 | 152.16 | 4.51 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-b-r2` | OK | 2026-10-08 03:33 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 159,922.0 | 160,493.6 | 173,530.0 | 211,680.6 | 4.9 | 128.8 | 164.22 | 4.74 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-byid` | OK | 2026-10-08 03:56 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 120 | 400 | - | 160,459.5 | 159,320.2 | 166,928.2 | 212,687.4 | 4.8 | 126.1 | 158.62 | 4.74 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-prof` | OK | 2026-10-08 03:49 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 120 | 400 | - | 155,194.3 | 153,462.0 | 181,577.4 | 204,943.4 | 3.6 | 144.7 | 217.57 | 4.67 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-r1` | OK | 2026-10-08 03:19 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 120 | 400 | - | 165,622.1 | 165,417.7 | 179,733.6 | 219,678.5 | 4.9 | 124.9 | 155.65 | 4.56 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-r2` | OK | 2026-10-08 03:42 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 120 | 400 | - | 163,860.6 | 163,725.6 | 174,092.5 | 217,347.1 | 4.8 | 130.5 | 159.94 | 4.61 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-w10` | OK | 2026-10-08 04:03 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 120 | 400 | - | 164,322.3 | 164,110.8 | 172,025.3 | 217,493.6 | 4.8 | 185.8 | 199.60 | 4.70 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-300m-s-warm` | OK | 2026-10-08 03:13 | p2s0b-707f132f @ 707f132f | 0a742915 | 300 | 60 | 400 | - | 166,463.9 | 166,463.9 | 181,175.1 | 219,533.8 | 4.9 | 102.7 | 145.98 | 4.36 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0b-smoke-10m-byid` | OK | 2026-10-08 03:08 | p2s0b-707f132f @ 707f132f | 0a742915 | 10 | 30 | 400 | - | 209,870.5 | 209,870.5 | 0.0 | 265,119.8 | 12.3 | 57.8 | 42.21 | 2.84 | AGREE | PASS | ACCEPT |
+
+## p2s0r: Regression check main `d3ba3c0a` vs `35e69b3`: A `35e69b3`, B `d3ba3c0a`, C = B + 64 MiB book SSTs, D = `d3ba3c0a` combined build; A B C D D C B A, plus two 10-market smoke cells
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2s0r-300m-a-r1` | OK | 2026-10-08 05:08 | main-35e69b3 @ 35e69b3d | 9f5c53bb | 300 | 120 | 400 | - | 181,932.9 | 181,608.1 | 193,919.6 | 241,886.9 | 5.4 | 129.2 | 142.38 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-a-r2` | OK | 2026-10-08 05:51 | main-35e69b3 @ 35e69b3d | 9f5c53bb | 300 | 120 | 400 | - | 178,052.2 | 176,997.8 | 191,220.8 | 236,876.5 | 5.2 | 127.1 | 148.51 | 4.34 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-b-r1` | OK | 2026-10-08 05:14 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 167,115.2 | 166,499.8 | 177,980.2 | 222,106.5 | 5.0 | 130.8 | 159.71 | 4.50 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-b-r2` | OK | 2026-10-08 05:45 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 170,144.9 | 168,992.4 | 180,547.3 | 225,919.0 | 4.9 | 137.8 | 161.03 | 4.42 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-b-warm` | OK | 2026-10-08 05:02 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 60 | 400 | - | 166,866.9 | 166,866.9 | 182,174.7 | 221,292.1 | 5.0 | 100.8 | 131.09 | 4.41 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-c-r1` | OK | 2026-10-08 05:20 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | TORUS_BOOK_CF_TARGET_FILE_MB=64 | 168,039.8 | 167,857.5 | 179,268.0 | 223,103.8 | 5.0 | 130.0 | 156.23 | 4.51 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-c-r2` | OK | 2026-10-08 05:39 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | TORUS_BOOK_CF_TARGET_FILE_MB=64 | 170,336.9 | 170,402.0 | 180,021.2 | 226,048.3 | 5.2 | 125.5 | 157.89 | 4.44 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-d-r1` | OK | 2026-10-08 05:26 | main-d3ba3c0a @ d3ba3c0a | d76b4427 | 300 | 120 | 400 | - | 172,577.4 | 171,838.4 | 181,040.6 | 228,932.3 | 5.1 | 133.0 | 153.64 | 4.40 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-300m-d-r2` | OK | 2026-10-08 05:33 | main-d3ba3c0a @ d3ba3c0a | d76b4427 | 300 | 120 | 400 | - | 169,287.3 | 169,471.8 | 179,836.0 | 224,793.7 | 5.2 | 120.7 | 150.84 | 4.40 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-smoke-10m-a` | OK | 2026-10-08 04:36 | main-35e69b3 @ 35e69b3d | 9f5c53bb | 10 | 30 | 400 | - | 233,487.4 | 233,487.4 | 0.0 | 294,462.8 | 8.4 | 72.4 | 61.67 | 2.91 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0r-smoke-10m-c` | OK | 2026-10-08 04:38 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 10 | 30 | 400 | TORUS_BOOK_CF_TARGET_FILE_MB=64 | 227,623.1 | 227,623.1 | 0.0 | 287,784.5 | 8.8 | 67.1 | 55.77 | 3.05 | AGREE | PASS | ACCEPT |
+
+## p2s0x: Bisect of the section 26 regression: a `35e69b3`, p0 `8582e827`, p1 `a746c408`, p2 `2ebe1a14`, p3 `9e695364`, b `d3ba3c0a`; mirrored order
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2s0x-300m-a-r1` | OK | 2026-10-08 13:32 | main-35e69b3 @ 35e69b3d | 7a66c678 | 300 | 120 | 400 | - | 185,495.5 | 185,470.0 | 193,507.1 | 245,607.8 | 5.4 | 136.5 | 139.07 | 4.20 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-a-r2` | OK | 2026-10-08 14:39 | main-35e69b3 @ 35e69b3d | 7a66c678 | 300 | 120 | 400 | - | 182,789.3 | 181,290.5 | 191,239.8 | 243,547.6 | 5.3 | 131.5 | 145.35 | 4.24 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-b-r1` | OK | 2026-10-08 14:02 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 171,985.0 | 170,650.2 | 180,215.4 | 227,799.4 | 4.8 | 130.8 | 155.48 | 4.44 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-b-r2` | OK | 2026-10-08 14:09 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 120 | 400 | - | 168,984.8 | 168,367.6 | 181,507.4 | 224,336.1 | 5.0 | 125.0 | 157.07 | 4.42 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-b-warm` | OK | 2026-10-08 13:27 | main-d3ba3c0a @ d3ba3c0a | 193ae781 | 300 | 60 | 400 | - | 175,334.5 | 175,334.5 | 186,183.3 | 232,058.6 | 4.7 | 111.6 | 133.66 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p0-r1` | OK | 2026-10-08 13:38 | bisect-8582e827 @ 8582e827 | 58ebd01a | 300 | 120 | 400 | - | 183,251.8 | 183,029.9 | 194,873.4 | 243,420.1 | 5.5 | 128.5 | 146.16 | 4.22 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p0-r2` | OK | 2026-10-08 14:34 | bisect-8582e827 @ 8582e827 | 58ebd01a | 300 | 120 | 400 | - | 180,164.3 | 179,530.0 | 191,366.3 | 238,908.9 | 5.4 | 129.1 | 145.29 | 4.28 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p1-r1` | OK | 2026-10-08 13:44 | bisect-a746c408 @ a746c408 | 41b606d3 | 300 | 120 | 400 | - | 179,508.8 | 177,495.3 | 190,848.6 | 238,591.1 | 5.5 | 122.9 | 137.45 | 4.20 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p1-r2` | OK | 2026-10-08 14:27 | bisect-a746c408 @ a746c408 | 41b606d3 | 300 | 120 | 400 | - | 173,414.7 | 172,473.1 | 185,907.2 | 231,089.6 | 5.0 | 129.9 | 151.95 | 4.37 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p2-r1` | OK | 2026-10-08 13:50 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 171,552.4 | 171,231.9 | 184,611.4 | 227,297.8 | 5.2 | 136.4 | 156.28 | 4.32 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p2-r2` | OK | 2026-10-08 14:22 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 178,988.5 | 177,640.5 | 189,515.7 | 237,865.1 | 5.3 | 134.2 | 152.57 | 4.24 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p3-r1` | OK | 2026-10-08 13:57 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 167,546.6 | 167,100.9 | 178,333.1 | 222,723.6 | 5.0 | 127.9 | 152.87 | 4.45 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0x-300m-p3-r2` | OK | 2026-10-08 14:15 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 170,863.4 | 170,862.2 | 179,684.5 | 226,892.5 | 5.1 | 135.4 | 157.37 | 4.46 | AGREE | PASS | ACCEPT |
+
+## p2s0y: Perf A/B p2 `2ebe1a14` vs p3 `9e695364` (prof and xstat cells); `p2-warm`, `p2-rec1`, `p3-rec1` are the first launch (5-event inherited `perf record`, distorted, reference only)
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2s0y-300m-p2-prof1` | OK | 2026-10-08 16:09 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 165,523.9 | 165,309.8 | 188,566.4 | 218,708.8 | 4.1 | 150.3 | 210.08 | 4.45 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-prof2` | OK | 2026-10-08 16:28 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 165,228.0 | 165,196.1 | 191,308.4 | 218,385.0 | 4.0 | 156.0 | 212.88 | 4.37 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-rec1` | OK | 2026-10-08 15:51 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 109,445.5 | 110,030.9 | 159,640.7 | 144,102.6 | 2.6 | 156.1 | 314.41 | 5.64 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-warm` | OK | 2026-10-08 15:44 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 60 | 400 | - | 175,115.7 | 175,115.7 | 187,748.3 | 231,473.4 | 4.7 | 99.2 | 136.02 | 4.24 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-warm2` | OK | 2026-10-08 16:02 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 60 | 400 | - | 170,799.2 | 170,799.2 | 188,076.0 | 225,985.8 | 4.6 | 110.4 | 157.61 | 4.19 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-xstat1` | OK | 2026-10-08 16:34 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 172,823.4 | 172,405.6 | 185,544.1 | 230,168.4 | 5.2 | 137.2 | 150.04 | 4.34 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p2-xstat2` | OK | 2026-10-08 16:52 | bisect-2ebe1a14 @ 2ebe1a14 | b7798354 | 300 | 120 | 400 | - | 177,606.5 | 177,373.2 | 188,438.0 | 235,633.7 | 5.2 | 138.9 | 151.28 | 4.25 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p3-prof1` | OK | 2026-10-08 16:15 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 166,815.9 | 166,556.2 | 192,503.0 | 220,490.9 | 4.0 | 158.0 | 214.33 | 4.41 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p3-prof2` | OK | 2026-10-08 16:22 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 162,123.3 | 160,762.4 | 193,712.0 | 213,780.2 | 3.8 | 149.1 | 216.56 | 4.47 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p3-rec1` | OK | 2026-10-08 15:57 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 110,853.3 | 108,984.6 | 160,763.6 | 145,679.9 | 2.4 | 149.8 | 321.82 | 5.68 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p3-xstat1` | OK | 2026-10-08 16:41 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 169,545.4 | 168,473.1 | 179,766.7 | 224,968.8 | 4.9 | 129.9 | 154.62 | 4.44 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2s0y-300m-p3-xstat2` | OK | 2026-10-08 16:46 | bisect-9e695364 @ 9e695364 | 2549ecdf | 300 | 120 | 400 | - | 173,464.7 | 173,072.6 | 180,380.9 | 230,372.4 | 5.0 | 129.1 | 154.41 | 4.32 | AGREE | PASS | ACCEPT |
 
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
