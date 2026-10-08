@@ -155,8 +155,18 @@ struct RunFingerprint {
     state_root: B256,
 }
 
+/// A resident context (P2-1's cancel-all index is used only with resident
+/// books, row 23). The holder is not kept: the context carries the books
+/// and the index across the test's blocks itself.
 fn new_ctx(dir: &tempfile::TempDir, mode: BookMode) -> NativeExecContext {
+    new_ctx_with(dir, mode, true)
+}
+
+/// `resident: false`: the code default (`TORUS_RESIDENT_BOOKS` unset), every
+/// cancel-all scans every book (row 23).
+fn new_ctx_with(dir: &tempfile::TempDir, mode: BookMode, resident: bool) -> NativeExecContext {
     let db = StateDb::open(dir.path()).expect("open db");
+    let mut holder = ResidentBooks::default();
     let ctx = NativeExecContext::new_with_mode(
         db,
         1,
@@ -168,7 +178,7 @@ fn new_ctx(dir: &tempfile::TempDir, mode: BookMode) -> NativeExecContext {
         addr(100),
         addr(101),
         mode,
-        None,
+        resident.then_some(&mut holder),
     );
     for s in 1..=SENDERS + 4 {
         let bal = NativeBalance {
@@ -220,8 +230,20 @@ fn run_observed(
     full_scan: bool,
     observe: &mut dyn FnMut(&NativeExecContext),
 ) -> RunFingerprint {
+    run_observed_in(blocks, mode, batch, full_scan, true, observe)
+}
+
+/// [`run_observed`] with `resident` books or without (row 23).
+fn run_observed_in(
+    blocks: &[Vec<(Address, NativeAction)>],
+    mode: BookMode,
+    batch: bool,
+    full_scan: bool,
+    resident: bool,
+    observe: &mut dyn FnMut(&NativeExecContext),
+) -> RunFingerprint {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut ctx = new_ctx(&dir, mode);
+    let mut ctx = new_ctx_with(&dir, mode, resident);
     ctx.test_cancel_all_full_scan = full_scan;
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
@@ -609,6 +631,83 @@ fn cancel_all_matches_the_full_scan_reference() {
         assert_eq!(
             reference, current,
             "{mode:?}: cancel-all diverged from the full-scan reference"
+        );
+    }
+}
+
+/// Row 23 (18c s104): without resident books (`TORUS_RESIDENT_BOOKS` unset,
+/// the code default) every block loads its books, so an index would be
+/// rebuilt in every block with a cancel-all. That path keeps the full scan:
+/// every cancel-all visits every book (4 + 4 + 1 + 4, the step 0 count of
+/// `cancel_all_counters_count_visited_and_hit_books`) and no index is built.
+#[test]
+fn non_resident_cancel_all_keeps_the_full_scan() {
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        for batch in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut ctx = new_ctx_with(&dir, mode, false);
+            assert!(!ctx.resident_mode());
+            let mut setup = vec![
+                (addr(1), gtc(1, true, 99, 1)),
+                (addr(1), gtc(2, false, 110, 1)),
+                (addr(2), stop_buy(3, 200)),
+            ];
+            for m in MARKETS {
+                setup.push((addr(4), gtc(m, true, 98, 1)));
+            }
+            NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, batch);
+            ctx.save_order_books();
+            ctx.dirty_books.clear();
+            ctx.phase_accum = ExecPhaseAccum::default();
+            let block = vec![
+                (addr(1), cancel_all(None)),
+                (addr(2), cancel_all(None)),
+                (addr(3), cancel_all(Some(4))),
+                (addr(1), cancel_all(None)),
+                (addr(3), cancel_all(Some(77))),
+            ];
+            let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, batch);
+            assert!(r.results.iter().all(|r| r.success), "{:?}", r.results);
+            let a = ctx.phase_accum;
+            let what = format!("{mode:?} batch={batch}");
+            assert_eq!(a.cancel_alls, 5, "{what}");
+            assert_eq!(a.cancel_all_books_visited, 13, "{what}: every book");
+            assert_eq!(a.cancel_all_books_hit, 3, "{what}");
+            assert!(ctx.trader_index().0.is_none(), "{what}: index built");
+            assert_eq!(ctx.cancel_index_size(), (0, 0), "{what}");
+        }
+    }
+}
+
+/// Row 23: the non-resident full scan (batched runs and the single path)
+/// matches the frozen reference in all four book modes, and never builds the
+/// cancel-all index.
+#[test]
+fn non_resident_cancel_all_matches_the_full_scan_reference() {
+    let resting = resting_after_setup();
+    for (seed, mode) in [
+        (5u64, BookMode::Classic),
+        (6, BookMode::OrderRows),
+        (7, BookMode::LevelAuthority),
+        (8, BookMode::LevelAuthorityChunked),
+    ] {
+        let mut blocks = setup_blocks();
+        blocks.push(
+            (1..=10u8)
+                .map(|s| (addr(s), stop_buy(MARKETS[s as usize % 4], 200 + s as i64)))
+                .collect(),
+        );
+        blocks.extend(mixed_blocks(seed, &resting));
+        let no_index = &mut |ctx: &NativeExecContext| {
+            assert!(ctx.trader_index().0.is_none(), "{mode:?}: index built");
+        };
+        let reference = run_observed_in(&blocks, mode, true, true, false, no_index);
+        let current = run_observed_in(&blocks, mode, true, false, false, no_index);
+        let flat: Vec<_> = current.results.iter().flatten().collect();
+        assert!(flat.iter().filter(|r| r.0 == "cancel_all").count() > 60);
+        assert_eq!(
+            reference, current,
+            "{mode:?}: non-resident cancel-all diverged from the full-scan reference"
         );
     }
 }

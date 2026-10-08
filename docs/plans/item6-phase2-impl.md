@@ -6,7 +6,7 @@ Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block; owner (s27 / s101):
 gate set, the +7% stays (9.9), P2-3 goes to the backlog (9.10). Step 1: the 9.8 test-only feature
 and P2-1 (C1) built (ozarchy s30, review log rows 18-19); its gate cell is open. C1 review gaps
 closed and the index size gauges added (ozarchy s31, rows 20-21); 18c s104 decisions in 9.12. P2-1 gate missed
-(row 24), accepted by 18c s104 (row 25, 9.14). Next: merge main `12979d4b`, the row 23 lows, P2-1b, then P2-5,
+(row 24), accepted by 18c s104 (row 25, 9.14); main `12979d4b` merged, row 23 lows done (row 26). Next: P2-1b, then P2-5,
 P2-2, the P2-4 design check (section 4). Owner decisions recorded s96 (section 9, with the options
 not chosen) and s27 / s101 (9.8-9.10). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
@@ -469,6 +469,7 @@ Standard shape (results doc 21.4, as section 22):
 | 23 | 1 (P2-1) | 18c s104 read-only review of `2ecc2bdf` (no suite rerun): approve, no critical / high / medium; index completeness, ascending order, skipped no-op books and the test feature's isolation check out. Lows: (1) `native_executor.rs:4426` with `TORUS_RESIDENT_BOOKS` unset (the code default) the index is rebuilt in every block with a cancel-all (one pass over all (trader, market) pairs vs ~300 lookups before; unmeasured, the gate runs resident); (2) the index gauge counts all entries, not stale ones, and reads 0 before the first build; (3) `ResidentBooks::trader_index` (:3026) and `TraderIndexSnapshot` (:2909) are `pub` with no production caller | after the gate cell: (1) use the index only in resident mode, keep the full scan otherwise, plus a test that the non-resident path is unchanged; (2) for the 9.12 prune, compare the gauge with `torus_exec_resting_orders` and have the prune report how many entries it removed; (3) gate both on `test-reference-paths` |
 | 24 | Gate P2-1 | Campaign `ozarchy-p21g` (results doc section 30): `2ecc2bdf` vs `e934fa0e`, 2 cells per arm mirrored, no perf, all rc 0 / AGREE / PASS. Phase 1 -0.44 ms per native block (val0; -0.30 all validators; -3.2% per 1k fills) vs >= 1.9 ms: **missed**, outside the 1.4-2.4 ms band (no extra cells). Cancel-alls visit 189.1 / 188.6 books, sender present in 92.4 (stale entries kept by "never removed eagerly"); index 135k-634k entries, ~200 markets per trader; no visible upkeep cost; matched/s 1.010x | miss recorded (section 4 rule); options to 18c: A accept and continue, B drop a market from the trader's set when their last order / stop there leaves the book (then one more gate cell), C bring the 9.12 prune forward |
 | 25 | Gate P2-1 | 18c s104 answer to row 24: **A, accept and continue.** The cell's own counters give ~4 us per skipped book visit (0.44 ms / 111 avoided visits), so B's further ~97 visits per cancel-all are worth ~0.4 ms, still below the 1.9 ms gate, at the cost of a fill-path check and another gate cell. The bench's ~200 markets per trader is near the worst case for stale entries | P2-1 stays as built; C (the 9.12 background prune) stays before mainnet, off the fill path, its gauges showing the entries it removes. Next: merge main `12979d4b` (sync point), the row 23 lows, then P2-1b; before P2-1b's gate, recheck its estimate against the measured per-visit cost (step 0.3's split seems to overstate the per-book saving) (9.14) |
+| 26 | 1 (P2-1) | Row 23 lows after the gate and the `12979d4b` merge: (1) the cancel-all index is used only with resident books (`NativeExecContext::resident`); without them the single cancel-all scans every book again and a run goes through `exec_cancel_all_run_every_book`, the pre-P2-1 run body unchanged (`90632a75^`), so no index is built (`non_resident_cancel_all_keeps_the_full_scan`: 13 books visited as in step 0, index `None`; `non_resident_cancel_all_matches_the_full_scan_reference`, four modes; both failed before the fix). The bridge tests' `new_ctx` is now resident so the P2-1 tests keep testing the index; (2) gauge doc: counts stale entries too, `(0, 0)` until the first cancel-all after a load and always without resident books; the prune spec in 9.12 (a); (3) `TraderIndexSnapshot`, `ResidentBooks::trader_index` and their helpers compiled only under `test` / `test-reference-paths` | rdeps(torus-bridge) 1494 / 0; no new fmt hunks in the two files |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -680,6 +681,9 @@ without ever cancelling-all is a memory-growth path (node-local, no consensus ef
 native block from a kept entry count, O(1); bench columns `cancel_all.index_entries_end` /
 `index_traders_end`; row 21). Before mainnet: a background prune with fixed work per block (check
 K traders per block in turn, drop the markets where they hold nothing), node-local (section 7).
+Row 23 (2) for the prune: compare the entries gauge with `torus_exec_resting_orders` (the gauge counts
+stale entries too, so their gap is the stale share), and have the prune report how many entries it
+removed (a counter next to the gauges).
 
 | option | note |
 |---|---|

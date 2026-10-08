@@ -2904,8 +2904,8 @@ struct ResidentInner {
     height: u64,
 }
 
-/// Item 6 Phase 2 P2-1 (tests / ops introspection): trader -> markets,
-/// ascending.
+/// Item 6 Phase 2 P2-1 (tests): trader -> markets, ascending.
+#[cfg(any(test, feature = "test-reference-paths"))]
 pub type TraderIndexSnapshot = std::collections::BTreeMap<Address, Vec<MarketId>>;
 
 /// Item 6 Phase 2 P2-1: the node-local cancel-all index, trader -> the
@@ -2994,13 +2994,15 @@ impl TraderMarkets {
         }
     }
 
+    #[cfg(any(test, feature = "test-reference-paths"))]
     fn snapshot(&self) -> TraderIndexSnapshot {
         self.map.iter().map(|(t, ms)| (*t, ms.clone())).collect()
     }
 }
 
-/// P2-1 introspection: `(carried, rebuilt)` — `index` (`None`: not built)
+/// P2-1 (tests): `(carried, rebuilt)` — `index` (`None`: not built)
 /// and the index a load would build from `books` now (exact).
+#[cfg(any(test, feature = "test-reference-paths"))]
 fn trader_index_snapshot(
     index: Option<&TraderMarkets>,
     books: &HashMap<MarketId, OrderBook>,
@@ -3018,11 +3020,12 @@ fn trader_index_snapshot(
 }
 
 impl ResidentBooks {
-    /// Item 6 Phase 2 P2-1 (tests / ops introspection): `(carried, rebuilt)`
-    /// — the cancel-all index carried with the books (`None`: not built
-    /// since the last load) and the one a load would build from them now.
-    /// The carried index covers the rebuilt one (it may also list markets
-    /// where a trader has nothing left). `None`: no resident books.
+    /// Item 6 Phase 2 P2-1 (tests): `(carried, rebuilt)` — the cancel-all
+    /// index carried with the books (`None`: not built since the last load)
+    /// and the one a load would build from them now. The carried index
+    /// covers the rebuilt one (it may also list markets where a trader has
+    /// nothing left). `None`: no resident books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
     pub fn trader_index(&self) -> Option<(Option<TraderIndexSnapshot>, TraderIndexSnapshot)> {
         self.inner
             .as_ref()
@@ -4444,8 +4447,10 @@ impl<T: StateBackend> NativeExecContext<T> {
     }
 
     /// Item 6 Phase 2 P2-1 (s104, node-local gauges): the cancel-all index's
-    /// `((trader, market) entries, traders)`; `(0, 0)` while not built.
-    /// O(1): the index keeps its entry count.
+    /// `((trader, market) entries, traders)`; `(0, 0)` while not built (until
+    /// the first cancel-all after a load, and always without resident books).
+    /// Counts every entry, stale ones too. O(1): the index keeps its entry
+    /// count.
     pub fn cancel_index_size(&self) -> (u64, u64) {
         self.trader_markets
             .as_ref()
@@ -9208,11 +9213,12 @@ impl NativeExecutor {
     /// they reserved — orders at `price × remaining` (FIX 2), stops at
     /// [`Self::stop_reservation`]. A market that lost anything is dirty. The
     /// caller releases the sum (`min(order_margin)`). Shared by the user
-    /// `CancelAll` and the liquidation step. Item 6 Phase 2 P2-1: only the
-    /// markets the cancel-all index lists for `trader` are visited (in
-    /// ascending id, as the full scan); the others hold nothing of the
-    /// trader's, so the scan changed nothing there. The visited markets
-    /// leave the index.
+    /// `CancelAll` and the liquidation step. Item 6 Phase 2 P2-1: with
+    /// resident books, only the markets the cancel-all index lists for
+    /// `trader` are visited (in ascending id, as the full scan); the others
+    /// hold nothing of the trader's, so the scan changed nothing there. The
+    /// visited markets leave the index. Without resident books every book is
+    /// visited (row 23: an index would be rebuilt in every block).
     fn cancel_orders_and_stops<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         trader: &Address,
@@ -9222,11 +9228,22 @@ impl NativeExecutor {
         if ctx.test_cancel_all_full_scan {
             return reference_paths::cancel_orders_and_stops_full_scan(ctx, trader, market);
         }
-        let index = ctx.cancel_index();
-        let market_ids: Vec<MarketId> = match market {
-            Some(m) if index.remove(trader, m) => vec![m],
-            Some(_) => Vec::new(),
-            None => index.take(trader),
+        let market_ids: Vec<MarketId> = if ctx.resident {
+            let index = ctx.cancel_index();
+            match market {
+                Some(m) if index.remove(trader, m) => vec![m],
+                Some(_) => Vec::new(),
+                None => index.take(trader),
+            }
+        } else {
+            match market {
+                Some(m) => vec![m],
+                None => {
+                    let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+                    v.sort_unstable();
+                    v
+                }
+            }
         };
         let mut total = FixedPoint::ZERO;
         ctx.phase_accum.cancel_alls += 1;
@@ -9301,6 +9318,9 @@ impl NativeExecutor {
                 .iter()
                 .map(|(_, sender, m)| Self::exec_cancel_all(ctx, sender, *m))
                 .collect();
+        }
+        if !ctx.resident {
+            return Self::exec_cancel_all_run_every_book(ctx, run);
         }
         // P2-1: the markets each action visits — its sender's markets in the
         // cancel-all index (`None`), or its target if the index lists it —
@@ -9378,6 +9398,79 @@ impl NativeExecutor {
                 ctx.dirty_books.insert(mid);
                 let cfg = ctx.margin_configs.get(&mid);
                 total_margin_release += Self::cancelled_orders_margin(cfg, &orders);
+                total_margin_release += stops;
+            }
+            Self::release_order_margin(ctx, sender, total_margin_release);
+            results.push(NativeActionResult::ok("cancel_all", 500));
+        }
+        results
+    }
+
+    /// Row 23 (18c s104): [`Self::exec_cancel_all_run`] without resident
+    /// books, as before P2-1: every book, one `cancel_all_many` per book over
+    /// the run's senders targeting it. Without resident books every block
+    /// loads its books, so P2-1's index would be rebuilt in every block with
+    /// a cancel-all.
+    fn exec_cancel_all_run_every_book<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        run: &[(usize, Address, Option<MarketId>)],
+    ) -> Vec<NativeActionResult> {
+        // The order `exec_cancel_all` iterates for `None`. Cancels never add
+        // or remove books, so every action of the run would see this order.
+        let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+        // cancelled[m][k]: the orders action k removed from market_ids[m].
+        let mut cancelled: Vec<Vec<Vec<torus_core::order_book::Order>>> =
+            Vec::with_capacity(market_ids.len());
+        // C4 (s517): (took a stop?, their reservations) of action k in market_ids[m].
+        let mut stop_release: Vec<Vec<(bool, FixedPoint)>> = Vec::with_capacity(market_ids.len());
+        let mut members: Vec<usize> = Vec::with_capacity(run.len());
+        let mut senders: Vec<Address> = Vec::with_capacity(run.len());
+        for mid in &market_ids {
+            members.clear();
+            senders.clear();
+            for (k, &(_, sender, target)) in run.iter().enumerate() {
+                if target.is_none_or(|t| t == *mid) {
+                    members.push(k);
+                    senders.push(sender);
+                }
+            }
+            let mut per_action = vec![Vec::new(); run.len()];
+            let mut stops_k = vec![(false, FixedPoint::ZERO); run.len()];
+            ctx.phase_accum.cancel_all_books_visited += members.len() as u64;
+            if !senders.is_empty() {
+                let cfg = ctx.margin_configs.get(mid);
+                let book = ctx.order_books.get_mut(mid).expect("key just listed");
+                // C4: each member's stops first, in run order (a repeated
+                // sender finds none, as its sequential second call would).
+                for &k in &members {
+                    for (price, qty) in book.take_pending_stops(&run[k].1) {
+                        stops_k[k].0 = true;
+                        stops_k[k].1 += Self::stop_reservation(cfg, price, qty);
+                    }
+                }
+                for (&k, orders) in members.iter().zip(book.cancel_all_many(&senders)) {
+                    per_action[k] = orders;
+                }
+            }
+            cancelled.push(per_action);
+            stop_release.push(stops_k);
+        }
+
+        let mut results = Vec::with_capacity(run.len());
+        ctx.phase_accum.cancel_alls += run.len() as u64;
+        for (k, (_, sender, _)) in run.iter().enumerate() {
+            // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`.
+            let mut total_margin_release = FixedPoint::ZERO;
+            for (m, mid) in market_ids.iter().enumerate() {
+                let orders = &cancelled[m][k];
+                let (took_stops, stops) = stop_release[m][k];
+                if orders.is_empty() && !took_stops {
+                    continue;
+                }
+                ctx.phase_accum.cancel_all_books_hit += 1;
+                ctx.dirty_books.insert(*mid);
+                let cfg = ctx.margin_configs.get(mid);
+                total_margin_release += Self::cancelled_orders_margin(cfg, orders);
                 total_margin_release += stops;
             }
             Self::release_order_margin(ctx, sender, total_margin_release);
