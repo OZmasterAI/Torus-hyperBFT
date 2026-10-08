@@ -104,7 +104,8 @@ impl StateOverlay {
             }
         }
         for (hash, bytecode) in &bundle.contracts {
-            self.code.insert(*hash, bytecode.bytes().to_vec());
+            self.code
+                .insert(*hash, bytecode.original_byte_slice().to_vec());
         }
     }
 }

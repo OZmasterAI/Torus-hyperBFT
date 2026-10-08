@@ -81,7 +81,7 @@ impl BlockCommitter {
         }
 
         for (code_hash, bytecode) in &bundle.contracts {
-            let raw = bytecode.bytes();
+            let raw = bytecode.original_bytes();
             batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
         }
 
@@ -255,7 +255,7 @@ impl BlockCommitter {
         }
 
         for (code_hash, bytecode) in &bundle.contracts {
-            let raw = bytecode.bytes();
+            let raw = bytecode.original_bytes();
             batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
         }
         if let Some(native) = native_writes {
