@@ -227,6 +227,29 @@ class PhaseMappingTests(unittest.TestCase):
         for i, n in enumerate(names):
             self.assertEqual(f0.get(f"delta_{n[len('torus_') :]}_total"), 3 + i, n)
 
+    def test_phase2_step0_series_are_sampled(self):
+        """Item 6 Phase 2 step 0.2: the cancel-all / by-id counters, the
+        per-site spawn gauges (names as torus-telemetry EXEC_SPAWN_SITES) and
+        the oracle-only block histogram (sum, count, buckets) are sampled, and
+        run-cell.sh snapshots /proc/<pid>/stat into procstat.raw."""
+        script = (Path(__file__).parent / "run-cell.sh").read_text()
+        wide = re.search(r'^WIDE_COLS="([^"]+)"', script, re.M).group(1).split()
+        buckets = re.search(r'^BUCKET_METRICS="([^"]+)"', script, re.M).group(1).split()
+        lib = (Path(__file__).parents[2] / "crates/torus-telemetry/src/lib.rs").read_text()
+        sites = re.findall(r'"([a-z_]+)"', re.search(r"EXEC_SPAWN_SITES: \[&str; 9\] = \[([^\]]*)\]", lib).group(1))
+        self.assertEqual(len(sites), 9)
+        summarize = (Path(__file__).parent / "summarize.py").read_text()
+        ours = re.search(r"^SPAWN_SITES = \[([^\]]*)\]", summarize, re.M)
+        self.assertIsNotNone(ours, "summarize.py has no SPAWN_SITES")
+        self.assertEqual(re.findall(r'"([a-z_]+)"', ours.group(1)), sites)
+        for name in ["torus_exec_cancel_all_total", "torus_exec_cancel_all_books_visited_total",
+                     "torus_exec_cancel_all_books_hit_total", "torus_exec_by_id_actions_total",
+                     "torus_exec_by_id_books_probed_total", "torus_exec_oracle_only_block_seconds_sum",
+                     "torus_exec_oracle_only_block_seconds_count"] + [f"torus_exec_thread_spawns_{s}" for s in sites]:
+            self.assertIn(name, wide)
+        self.assertIn("torus_exec_oracle_only_block_seconds_bucket", buckets)
+        self.assertIn('procstat.raw', script)
+
 
 if __name__ == "__main__":
     unittest.main()

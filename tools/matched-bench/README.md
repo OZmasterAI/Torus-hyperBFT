@@ -500,3 +500,42 @@ python3 tools/matched-bench/test_health.py
 python3 tools/matched-bench/test_summarize.py
 python3 tools/matched-bench/test_harness.py
 ```
+
+## Item 6 Phase 2 step 0.2 columns
+
+Node-local counters (never hashed, no state change), sampled in `WIDE_COLS`
+and reported per node in `summary.json`. All read 0 / None on an older node
+binary.
+
+- `phase_by_node.<val>.cancel_all` (P2-1): `cancel_alls`, `per_native_block`,
+  `books_visited_per_cancel_all`, `books_hit_per_cancel_all` (books where the
+  sender had orders or stops). Counts user cancel-alls and the liquidation
+  step's cancels. Series `torus_exec_cancel_all_total`,
+  `torus_exec_cancel_all_books_visited_total`,
+  `torus_exec_cancel_all_books_hit_total`.
+- `phase_by_node.<val>.by_id` (P2-1b): `CancelOrder` / `ModifyOrder` executed
+  and `books_probed_per_action` (`torus_exec_by_id_actions_total`,
+  `torus_exec_by_id_books_probed_total`).
+- `phase_by_node.<val>.thread_spawns` (P2-3): threads spawned per site per
+  native block (`match`, `settle`, `save_books`, `margin_prepare`,
+  `open_orders`, `end_resident`, `flush_digest`, `root_buckets`,
+  `load_books`), their total per native block and per minute. Series
+  `torus_exec_thread_spawns_<site>`: gauges holding the process total, set
+  after every executed block.
+- `phase_by_node.<val>.oracle_only_blocks`: exec ms per oracle-only block
+  (every native action a `SubmitOraclePrices`, no EVM tx) from the node's own
+  timer over bench + drain: `blocks`, `ms_avg`, `ms_p50`, `ms_p95`
+  (`torus_exec_oracle_only_block_seconds`, buckets in `buckets.csv`).
+- `proc_cpu_by_node.<val>`: user / sys CPU of the node process from
+  `/proc/<pid>/stat` (`procstat.raw`, taken with the schedstat snapshots):
+  `load` (before -> bench end, divided by the sampler's load-window native
+  blocks and fills) and `whole_run` (before -> after, divided by the
+  metrics-before/after deltas): `*_ms`, `*_ms_per_native_block`,
+  `*_ms_per_1k_fills`.
+- `ingest.cancel_by_id`: the bench's `Cancel-by-id` line (cancel / modify
+  sent and accepted, id lookups, lookup errors, draws without an own order)
+  when the cell sets `CANCEL_BY_ID_FRACTION` / `MODIFY_FRACTION`.
+
+Self-tests: `test_summarize.py` (`main_phase2_step0`),
+`test_phase_mapping.py` (`test_phase2_step0_series_are_sampled`),
+`test_harness.py` (`test_cancel_by_id_*`).

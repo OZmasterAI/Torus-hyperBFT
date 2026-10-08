@@ -172,6 +172,11 @@ SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6
        "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"],
        "end_resident": END_RESIDENT_SUB}
 
+# Item 6 Phase 2 step 0.2: `torus_exec_thread_spawns_<site>` (process totals,
+# torus-telemetry EXEC_SPAWN_SITES order); 0 on an older binary.
+SPAWN_SITES = ["match", "settle", "save_books", "margin_prepare", "open_orders", "end_resident",
+               "flush_digest", "root_buckets", "load_books"]
+
 
 def hist_quantile(pairs, q):
     """Prometheus histogram_quantile over CUMULATIVE bucket-count deltas.
@@ -444,6 +449,25 @@ def node_phase(node, rs, hi, buckets, window):
     p["actions_per_exec_block"] = round((m(b, "native_actions_processed_total") - m(a, "native_actions_processed_total")) / nblk, 1)
     dbc = m(b, "exec_root_dirty_buckets_count") - m(a, "exec_root_dirty_buckets_count")
     p["dirty_buckets_per_flush"] = round((m(b, "exec_root_dirty_buckets_sum") - m(a, "exec_root_dirty_buckets_sum")) / dbc, 1) if dbc else None
+    # Item 6 Phase 2 step 0.2: books per cancel-all (P2-1) and per by-id
+    # action (P2-1b), thread spawns per site (P2-3). 0 / None on an older binary.
+    def dlt(k):
+        return m(b, k) - m(a, k)
+    nca, nid = dlt("exec_cancel_all_total"), dlt("exec_by_id_actions_total")
+    p["cancel_all"] = {
+        "cancel_alls": nca,
+        "per_native_block": round(nca / nblk, 2),
+        "books_visited_per_cancel_all": round(dlt("exec_cancel_all_books_visited_total") / nca, 1) if nca else None,
+        "books_hit_per_cancel_all": round(dlt("exec_cancel_all_books_hit_total") / nca, 2) if nca else None}
+    p["by_id"] = {
+        "actions": nid,
+        "per_native_block": round(nid / nblk, 2),
+        "books_probed_per_action": round(dlt("exec_by_id_books_probed_total") / nid, 1) if nid else None}
+    spawns = {k: dlt("exec_thread_spawns_" + k) for k in SPAWN_SITES}
+    p["thread_spawns"] = {
+        "per_native_block": {k: round(v / nblk, 2) for k, v in spawns.items()},
+        "total_per_native_block": round(sum(spawns.values()) / nblk, 2),
+        "total_per_minute": round(sum(spawns.values()) / span * 60, 1) if span else None}
 
     # ------------------------------------------------ bl1 exec-chain ruler
     # The campaign's PRIMARY number is the exec CRITICAL CHAIN per NATIVE
@@ -608,6 +632,22 @@ for node, rs in rows.items():
         p = node_phase(node, rs, td, BUCKETS, "bench+drain [t_bench0, t_drain]")
     if p is not None:
         phase[node] = p
+
+# Item 6 Phase 2 step 0.2: exec ms per ORACLE-ONLY block from the node's own
+# per-block timer, over bench + drain whatever the phase window (a feed-drain
+# cell's oracle-only blocks are in its drain).
+for node, rs in rows.items():
+    sel = [r for r in rs if t0 <= r["ts"] <= td]
+    if node not in phase or len(sel) < 2:
+        continue
+    n = m(sel[-1], "exec_oracle_only_block_seconds_count") - m(sel[0], "exec_oracle_only_block_seconds_count")
+    tot = m(sel[-1], "exec_oracle_only_block_seconds_sum") - m(sel[0], "exec_oracle_only_block_seconds_sum")
+    pairs = BUCKETS.get((node, "torus_exec_oracle_only_block_seconds_bucket"))
+    q = {k: hist_quantile(pairs, x) for k, x in (("ms_p50", 0.50), ("ms_p95", 0.95))}
+    phase[node]["oracle_only_blocks"] = dict(
+        {"window": "bench+drain [t_bench0, t_drain]", "blocks": n,
+         "ms_avg": round(tot / n * 1000, 2) if n else None},
+        **{k: round(v * 1000, 2) if v is not None else None for k, v in q.items()})
 
 # ---------------------------------------------------------------- consensus (metrics-before/after)
 # Per-view consensus-thread means from the WHOLE-RUN metrics-before/after
@@ -775,6 +815,55 @@ for node, threads in (SCHED_RAW or {}).items():
             e["runqueue_wait_ms_whole_run"] = round((t["after"][1] - b0[1]) / 1e6, 1)
         d["threads"][tname] = e
     sched[node] = d
+
+# ---------------------------------------------------------------- process CPU (item 6 Phase 2 step 0.2)
+# $OUT/procstat.raw: "phase valN pid utime stime" (clock ticks, /proc/<pid>/stat)
+# at the schedstat snapshots. `load` = before -> bench_end (~3 s wider than
+# [t0, t1] on the front), per native block and per 1k fills of the sampler's
+# load window; `whole_run` = before -> after, over metrics-before/after (None
+# without them).
+def proc_cpu():
+    snaps = {}
+    try:
+        with open(os.path.join(OUT, "procstat.raw")) as f:
+            for line in f:
+                p_ = line.split()
+                if len(p_) == 5:
+                    snaps.setdefault(p_[1], {})[p_[0]] = (int(p_[2]), int(p_[3]), int(p_[4]))
+    except (OSError, ValueError):
+        return {}
+    tck = os.sysconf("SC_CLK_TCK")
+    out = {}
+    for node, sn in snaps.items():
+        b0 = sn.get("before")
+        if not b0 or "bench_end" not in sn:
+            out[node] = None
+            continue
+
+        def win(b1, nblk, fills):
+            user, sys_ = (b1[1] - b0[1]) * 1000.0 / tck, (b1[2] - b0[2]) * 1000.0 / tck
+            d = {"user_ms": round(user, 1), "sys_ms": round(sys_, 1), "native_blocks": nblk, "fills": fills}
+            for k, v in (("user", user), ("sys", sys_)):
+                d[k + "_ms_per_native_block"] = round(v / nblk, 2) if nblk else None
+                d[k + "_ms_per_1k_fills"] = round(v / fills * 1000, 3) if fills else None
+            return d
+
+        sel = [r for r in rows.get(node, []) if t0 <= r["ts"] <= t1]
+        a, b = (sel[0], sel[-1]) if len(sel) >= 2 else (None, None)
+        e = {"pid": sn["bench_end"][0],
+             "load": win(sn["bench_end"], m(b, "exec_engine_seconds_count") - m(a, "exec_engine_seconds_count"),
+                         m(b, "orders_matched_total") - m(a, "orders_matched_total"))}
+        if "after" in sn:
+            mb = read_metrics(os.path.join(OUT, "metrics-before-%s.txt" % node))
+            ma = read_metrics(os.path.join(OUT, "metrics-after-%s.txt" % node))
+            def md(k):
+                return ma.get(k, 0.0) - mb.get(k, 0.0)
+            e["whole_run"] = win(sn["after"], md("torus_exec_native_blocks_total"), md("torus_orders_matched_total"))
+        out[node] = e
+    return out
+
+
+proc_cpu_by_node = proc_cpu()
 
 # ---------------------------------------------------------------- agreement
 def _nums(raw, cast=float):
@@ -1062,12 +1151,13 @@ def parse_dissem(raw):
 
 def parse_bench_log(path):
     """bench.log end-of-run lines -> (submit rate actions/s, econ mix, in-flight
-    releases); each None when its line is absent (older bench, cap off)."""
+    releases, cancel-by-id counts); each None when its line is absent (older
+    bench, cap off, no cancel-by-id cell)."""
     try:
         with open(path, errors="replace") as f:
             text = f.read()
     except OSError:
-        return None, None, None
+        return None, None, None, None
     m = re.search(r"Submitted \(load-gen accepted\): [0-9,]+ native actions \(([0-9.]+)/s\)", text)
     rate = float(m.group(1)) if m else None
     m = re.search(r"Econ mix \(load-gen accepted\): place (\d+) \(([0-9.]+)%\) \| "
@@ -1086,10 +1176,15 @@ def parse_bench_log(path):
         "in_flight_at_end": int(m.group(5)), "tail_url": m.group(6),
         "tail_fetched": int(m.group(7)), "tail_errors": int(m.group(8)),
         "tail_missed": int(m.group(9))}
-    return rate, mix, inflight
+    m = re.search(r"Cancel-by-id \(load-gen\): cancel sent (\d+) accepted (\d+) \| modify sent (\d+) "
+                  r"accepted (\d+) \| lookups (\d+) errors (\d+) \| no own order (\d+)", text)
+    by_id = None if not m else dict(zip(
+        ("cancel_sent", "cancel_accepted", "modify_sent", "modify_accepted", "lookups",
+         "lookup_errors", "no_own_order"), map(int, m.groups())))
+    return rate, mix, inflight, by_id
 
 
-bench_submit_rate, econ_mix, in_flight = parse_bench_log(os.path.join(OUT, "bench.log"))
+bench_submit_rate, econ_mix, in_flight, cancel_by_id = parse_bench_log(os.path.join(OUT, "bench.log"))
 dissem = parse_dissem(A.dissem)
 if dissem:
     dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
@@ -1203,6 +1298,7 @@ summary = {
     "ingest": {"bench_submitted_actions": int(A.bench_submitted or 0),
                "bench_submit_rate": bench_submit_rate,
                "econ_mix": econ_mix,
+               "cancel_by_id": cancel_by_id,
                "in_flight": in_flight,
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],
@@ -1211,6 +1307,7 @@ summary = {
     "phase_by_node": phase,
     "consensus_by_node": consensus,
     "sched_by_node": sched,
+    "proc_cpu_by_node": proc_cpu_by_node,
     "agreement": agreement,
     "liveness": liveness,
     "validity": validity,

@@ -792,9 +792,87 @@ def main_feed_drain():
     print("test_summarize.py feed-drain: OK")
 
 
+def main_phase2_step0():
+    """Item 6 Phase 2 step 0.2: per cancel-all books visited / hit, per by-id
+    action books probed, thread spawns per site per native block and per
+    minute, exec ms per oracle-only block (node timer + buckets), and the
+    nodes' user / sys CPU per native block and per 1k fills from the
+    /proc/<pid>/stat snapshots (procstat.raw)."""
+    step0 = {
+        "exec_cancel_all_total": 40,
+        "exec_cancel_all_books_visited_total": 12000,
+        "exec_cancel_all_books_hit_total": 200,
+        "exec_by_id_actions_total": 20,
+        "exec_by_id_books_probed_total": 6000,
+        "exec_thread_spawns_match": 620,
+        "exec_thread_spawns_end_resident": 10,
+    }
+    saved = dict(COUNTERS)
+    COUNTERS.update(step0)
+    try:
+        with tempfile.TemporaryDirectory() as out:
+            write_fixture(out, include_r6=True, bl1="serial")
+            # Oracle-only blocks: 10 at 5 ms mean; 4 at or below 4 ms, all at
+            # or below 8 ms => p50 = 4 + 4 * (5 - 4) / 6 ms.
+            with open(os.path.join(out, "sampler.csv")) as f:
+                lines = f.read().splitlines()
+            lines[0] += ",torus_exec_oracle_only_block_seconds_sum,torus_exec_oracle_only_block_seconds_count"
+            for i in range(1, len(lines)):
+                lines[i] += ",0.0,0.0" if lines[i].startswith("1000,") else ",0.05,10.0"
+            with open(os.path.join(out, "sampler.csv"), "w") as f:
+                f.write("\n".join(lines) + "\n")
+            with open(os.path.join(out, "buckets.csv"), "a") as f:
+                for ts, scale in ((1000, 0), (1000 + SPAN, 1)):
+                    for le, cum in (("0.004", 4), ("0.008", 10), ("+Inf", 10)):
+                        f.write("%d,val0,torus_exec_oracle_only_block_seconds_bucket,%s,%d\n" % (ts, le, cum * scale))
+            tck = os.sysconf("SC_CLK_TCK")
+            with open(os.path.join(out, "procstat.raw"), "w") as f:
+                f.write("before val0 4242 1000 200\n")
+                f.write("bench_end val0 4242 %d %d\n" % (1000 + 3 * tck, 200 + tck))
+                f.write("after val0 4242 %d %d\n" % (1000 + 4 * tck, 200 + 2 * tck))
+                f.write("before val1 4243 7 7\n")
+            s = run(out)
+        p0 = s["phase_by_node"]["val0"]
+        ca = p0["cancel_all"]
+        close(ca["cancel_alls"], 40, "cancel_alls")
+        close(ca["per_native_block"], 4.0, "cancel-alls per native block")
+        close(ca["books_visited_per_cancel_all"], 300.0, "books visited per cancel-all")
+        close(ca["books_hit_per_cancel_all"], 5.0, "books hit per cancel-all")
+        bi = p0["by_id"]
+        close(bi["actions"], 20, "by-id actions")
+        close(bi["books_probed_per_action"], 300.0, "books probed per by-id action")
+        ts_ = p0["thread_spawns"]
+        close(ts_["per_native_block"]["match"], 62.0, "match spawns per native block")
+        close(ts_["per_native_block"]["end_resident"], 1.0, "end_resident spawns per native block")
+        close(ts_["per_native_block"]["flush_digest"], 0.0, "absent site reads 0")
+        close(ts_["total_per_native_block"], 63.0, "spawns per native block")
+        close(ts_["total_per_minute"], 630 / SPAN * 60, "spawns per minute")
+        oo = p0["oracle_only_blocks"]
+        close(oo["blocks"], 10, "oracle-only blocks")
+        close(oo["ms_avg"], 5.0, "oracle-only ms avg")
+        close(oo["ms_p50"], 4.0 + 4.0 * 1 / 6, "oracle-only p50")
+        pc = s["proc_cpu_by_node"]["val0"]
+        assert pc["pid"] == 4242, pc
+        ld, wr = pc["load"], pc["whole_run"]
+        close(ld["user_ms"], 3000.0, "load user ms")
+        close(ld["sys_ms"], 1000.0, "load sys ms")
+        # load window: 10 native blocks, 15000 fills (the fixture's sampler).
+        close(ld["sys_ms_per_native_block"], 100.0, "sys ms per native block")
+        close(ld["sys_ms_per_1k_fills"], 1000.0 / 15, "sys ms per 1k fills")
+        close(ld["user_ms_per_1k_fills"], 200.0, "user ms per 1k fills")
+        close(wr["sys_ms"], 2000.0, "whole-run sys ms")
+        assert wr["sys_ms_per_native_block"] is None, "no metrics-before/after in the fixture"
+        assert s["proc_cpu_by_node"]["val1"] is None, "val1 has no bench_end snapshot"
+    finally:
+        COUNTERS.clear()
+        COUNTERS.update(saved)
+    print("test_summarize.py phase2-step0: OK")
+
+
 if __name__ == "__main__":
     main()
     main_end_resident()
     main_end_resident_worker()
     main_s58()
     main_feed_drain()
+    main_phase2_step0()
