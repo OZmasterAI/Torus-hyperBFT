@@ -16,6 +16,28 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `perf/item6-phase2` `1a6573dc` (2026-10-08, s27 / s101)
+
+Item 6 Phase 2 step 0 (0.1, 0.2, 0.4) on main `d3ba3c0a`: node-local counters, harness columns, the
+cancel-by-id bench cell, the hasher µbench, test-only reference paths. Worktree `wt/item6-phase2`,
+`CARGO_TARGET_DIR=~/.cargo-target-read-gas`; suite 4 baseline `d3ba3c0a` in a detached worktree
+(`wt/item6-phase2-base`) with the 14 differing `.rs` files touched (base clippy checked 20 crates,
+candidate 21; the unchanged `hotstuff_rs` replayed its cached lints). Base suites on `d3ba3c0a`
+(same target dir, before the branch had changes): nextest 3,059 passed / 0 failed (35 skipped), doc
+1 / 0.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,073 passed, 0 failed**, 36 skipped, 0 flaky (+14 tests, +1 ignored µbench) | 141 s (82.0 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 7 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,074 passed, 0 failed**, 43 ignored (160 result lines); the known liquidation event-capture flake did not fire | 400 s |
+| 4 | clippy (no `-D`) / fmt vs `d3ba3c0a` | 0 / 1 (fmt: old debt) | clippy 270 = 270, **0 new**; fmt 3,349 = 3,349, **0 new** (rustfmt applied to this branch's own lines only) | 28 s / 25 s |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **167 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Logs: `~/bench-results-matched/presuite-item6-p2s0/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`).
+
 ## `fix/read-gas-followup` `105a6e28` (2026-10-08, s101)
 
 `b26bd3b3` plus the review fixes (docs, comments, `lock_db` in `request_locked`, a chmod drop guard in
