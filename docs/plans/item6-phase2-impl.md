@@ -6,7 +6,7 @@ Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block; owner (s27 / s101):
 gate set, the +7% stays (9.9), P2-3 goes to the backlog (9.10). Step 1: the 9.8 test-only feature
 and P2-1 (C1) built (ozarchy s30, review log rows 18-19); its gate cell is open. C1 review gaps
 closed and the index size gauges added (ozarchy s31, rows 20-21); 18c s104 decisions in 9.12. P2-1 gate missed
-(row 24), accepted by 18c s104 (row 25, 9.14); main `12979d4b` merged, row 23 lows done (row 26). Next: P2-1b, then P2-5,
+(row 24), accepted by 18c s104 (row 25, 9.14); main `12979d4b` merged, row 23 lows done (row 26); P2-1b C dropped (row 27, 9.15). Next: P2-5, then
 P2-2, the P2-4 design check (section 4). Owner decisions recorded s96 (section 9, with the options
 not chosen) and s27 / s101 (9.8-9.10). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
@@ -166,7 +166,7 @@ covers before step 0 closes.
   - counter test: a cancel-all visits only the sender's markets (fails today: 300).
 - Gate P2-1: phase 1 ms per native block down by at least half the step 0.3 estimate;
   correctness tests green.
-- P2-1b, CancelOrder / ModifyOrder by id (`exec_cancel_order` :8814,
+- P2-1b (**dropped from Phase 2, 9.15**), CancelOrder / ModifyOrder by id (`exec_cancel_order` :8814,
   `exec_modify_order` :9045) still loop over all books to find an order id (the cancel
   probes every book twice). Not measured: the standard shape sends no single cancels.
   Owner s96: option C now, B later as its own consensus item (9.2). Step 0.2 adds a
@@ -180,8 +180,8 @@ covers before step 0 closes.
     result as today's full scan, and a stale entry is dropped.
   - Expected saving (estimate): ~10-20 us per cancel or modify by id; adds one map
     insert and one remove per resting order (~0.05-0.1 us each).
-    Recheck before the gate against the per-visit cost P2-1's gate measured (~4 us per
-    skipped cancel-all visit, review log row 25; 9.14).
+    Rechecked (row 27): ~10-30 us per by-id action; upkeep ~0.6-1.4 ms per native block
+    (~21k rests + ~21k removals at 14-34 ns). **Dropped from Phase 2 (18c s106, 9.15).**
   - Risk: a missing entry for a resting order would turn a valid cancel into
     "not found": the one failure mode, so every insert and remove path is tested.
   - Tests (first): differential vs a `#[cfg(test)]` full-scan reference (random places,
@@ -358,7 +358,7 @@ microbench estimate before it counts (s82 caveat, 9.9).
 
 ## 4. Steps and order
 
-Order (owner s27 / s101, 9.9 and 9.10): step 0, then P2-1 (+ 1b), P2-5, P2-2, the P2-4
+Order (owner s27 / s101, 9.9 and 9.10; 1b dropped, 9.15): step 0, then P2-1, P2-5, P2-2, the P2-4
 design check. P2-1 is the largest measured item; P2-5 joins the gate set at the step 0
 checkpoint and goes right after it; P2-3 is in the backlog (9.10). Was (s96, section 22.4):
 P2-1, P2-3, P2-2, P2-4, with P2-5 as the fallback. P2-2 is small, touches different code and can
@@ -393,7 +393,7 @@ each commit, one full `cargo test --workspace` before the merge.
 | step | commit | gate |
 |---|---|---|
 | 1 | P2-1 cancel-all index (starts with the test-only feature, 9.8) | P2-1 above |
-| 1b | P2-1b order id -> market map (option C, 9.2) | P2-1b above |
+| ~~1b~~ | ~~P2-1b order id -> market map (option C, 9.2)~~ dropped (9.15) | - |
 | 2 | P2-5 hasher (9.9) | P2-5 above; the cell must confirm the microbench |
 | 3 | P2-2 batch flush | P2-2 above |
 | 4 | P2-4 design check (read-only); build only if it passes | P2-4 above |
@@ -433,7 +433,7 @@ Standard shape (results doc 21.4, as section 22):
   and optional O1 / O2 (Phase 1 plan section 5).
 - The flush worker (74.4 ms) and row 77: Phase 3 (coalesced state checkpoints).
 - Phases 3-5 in full (`item6-phases-2-5-plans.md`).
-- P2-1b option B (market in the order id): later, as its own consensus item (9.2).
+- P2-1b: option C dropped (9.15); option B (market in the order id) later, as its own consensus item (9.2).
 - Backlog items in Phase 1 plan 9.13 (maker over-commit, governance errors, etc.).
 - Before mainnet: a background prune of the P2-1 cancel-all index with fixed work per block
   (check K traders per block in turn, drop the markets where they hold nothing), node-local
@@ -470,6 +470,7 @@ Standard shape (results doc 21.4, as section 22):
 | 24 | Gate P2-1 | Campaign `ozarchy-p21g` (results doc section 30): `2ecc2bdf` vs `e934fa0e`, 2 cells per arm mirrored, no perf, all rc 0 / AGREE / PASS. Phase 1 -0.44 ms per native block (val0; -0.30 all validators; -3.2% per 1k fills) vs >= 1.9 ms: **missed**, outside the 1.4-2.4 ms band (no extra cells). Cancel-alls visit 189.1 / 188.6 books, sender present in 92.4 (stale entries kept by "never removed eagerly"); index 135k-634k entries, ~200 markets per trader; no visible upkeep cost; matched/s 1.010x | miss recorded (section 4 rule); options to 18c: A accept and continue, B drop a market from the trader's set when their last order / stop there leaves the book (then one more gate cell), C bring the 9.12 prune forward |
 | 25 | Gate P2-1 | 18c s104 answer to row 24: **A, accept and continue.** The cell's own counters give ~4 us per skipped book visit (0.44 ms / 111 avoided visits), so B's further ~97 visits per cancel-all are worth ~0.4 ms, still below the 1.9 ms gate, at the cost of a fill-path check and another gate cell. The bench's ~200 markets per trader is near the worst case for stale entries | P2-1 stays as built; C (the 9.12 background prune) stays before mainnet, off the fill path, its gauges showing the entries it removes. Next: merge main `12979d4b` (sync point), the row 23 lows, then P2-1b; before P2-1b's gate, recheck its estimate against the measured per-visit cost (step 0.3's split seems to overstate the per-book saving) (9.14) |
 | 26 | 1 (P2-1) | Row 23 lows after the gate and the `12979d4b` merge: (1) the cancel-all index is used only with resident books (`NativeExecContext::resident`); without them the single cancel-all scans every book again and a run goes through `exec_cancel_all_run_every_book`, the pre-P2-1 run body unchanged (`90632a75^`), so no index is built (`non_resident_cancel_all_keeps_the_full_scan`: 13 books visited as in step 0, index `None`; `non_resident_cancel_all_matches_the_full_scan_reference`, four modes; both failed before the fix). The bridge tests' `new_ctx` is now resident so the P2-1 tests keep testing the index; (2) gauge doc: counts stale entries too, `(0, 0)` until the first cancel-all after a load and always without resident books; the prune spec in 9.12 (a) (stale share from the prune's own checked / removed counters, not from `torus_exec_resting_orders`, which counts orders without stops: Codex P3); (3) `TraderIndexSnapshot`, `ResidentBooks::trader_index` and their helpers compiled only under `test` / `test-reference-paths` | rdeps(torus-bridge) 1494 / 0; no new fmt hunks in the two files |
+| 27 | 1b (P2-1b) | Estimate recheck before building (ozarchy s31, 18c s106 checked): (a) row 25's "~4 us per visit" is per book per native block; per skipped visit 0.44 ms / (59.2 x 111) ~ 0.07 us (A unchanged, B ~0.4 ms); (b) saving ~457 probes x 0.02-0.07 us ~ 10-30 us per by-id action; (c) upkeep: the p21g cell rested 19.1M orders over 910 native blocks, ~21k inserts + ~21k removals per native block, ~0.6-1.4 ms per block at 14-34 ns (`ubench_hasher` order-id churn, hot cache) on the standard shape, which sends no by-id actions; break-even ~20-140 by-id actions per native block, s-byid delivered 1.22 (12-37 us saved vs >= 0.6 ms upkeep); (d) s-byid's ~2.5 ms per by-id action was mostly not probes (likely split cancel-all runs, inferred), which P2-1 may have cut | **P2-1b C dropped from Phase 2** (9.15); B (market in the order id) stays the later consensus item. P2-5 next. s-byid pair `bdd5b470` vs `e934fa0e` on a quiet host only for (d) and B's priority (no P2-5 cargo builds or tests while it runs) |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -721,9 +722,10 @@ genesis; row 22); the defaults branch after Phase 2.
 ### 9.14 P2-1 gate missed: accept and continue (18c s104 / ozarchy s31, 2026-10-08)
 
 **Chosen: A, accept P2-1 as built and continue** (review log rows 24-25). Phase 1 fell 0.44 ms per
-native block against the >= 1.9 ms gate. The cell's counters give ~4 us per skipped book visit
-(0.44 ms / 111 avoided visits per cancel-all), so B's further ~97 visits are worth ~0.4 ms, still
-below the gate. The bench's ~200 markets per trader is near the worst case for stale entries.
+native block against the >= 1.9 ms gate. Per skipped visit the cell gives ~0.07 us
+(0.44 ms / (59.2 cancel-alls x 111 avoided visits); row 25 first wrote "~4 us", which is per book per
+native block, corrected in row 27), so B's further ~97 visits are worth ~97 x 59 x 0.07 us ~ 0.4 ms,
+still below the gate. The bench's ~200 markets per trader is near the worst case for stale entries.
 9.12 (a) stands: the background prune (C) comes before mainnet, off the fill path, and its gauges
 show how many entries it removes. Before P2-1b's gate, its estimate (section 3) is rechecked
 against the measured per-visit cost, since step 0.3's split (row 13) seems to overstate the
@@ -735,4 +737,23 @@ per-book saving.
 | B. drop the market when the trader's last order / stop there leaves the book, one more gate cell | ~0.4 ms (from the per-visit cost); a check on the fill path, another cell |
 | C. bring the 9.12 prune forward | same bound as B at best; stays before mainnet instead |
 
-Order: merge main `12979d4b` (sync point, as 9.11), the row 23 lows, then P2-1b (step 1b).
+Order: merge main `12979d4b` (sync point, as 9.11), the row 23 lows, then P2-1b (step 1b; dropped
+after the recheck, 9.15).
+
+### 9.15 P2-1b option C dropped from Phase 2 (18c s106 / ozarchy s31, 2026-10-09)
+
+**Chosen: drop C; B (market in the order id) stays the later consensus item (9.2).** The recheck
+(review log row 27) puts C's saving at ~10-30 us per by-id action and its upkeep at ~0.6-1.4 ms per
+native block (an insert per resting order and a removal per order leaving the book, ~21k each per
+native block on the standard shape). C loses even on the cancel-by-id cell (1.22 by-id actions per
+native block: 12-37 us saved vs >= 0.6 ms upkeep), break-even is ~20-140 by-id actions per native
+block, and no by-id cell can change the upkeep side. B needs no per-order upkeep. The s-byid pair
+(`bdd5b470` vs `e934fa0e`) runs only to settle what a by-id action costs with P2-1 in (row 27 (d))
+and B's priority, on a quiet host.
+
+| option | note |
+|---|---|
+| **drop C, keep B for later (chosen)** | no upkeep on the standard shape; by-id keeps the scan until B |
+| build C as specified | loses at today's and the bench's by-id share; gate "standard shape not worse" misses by ~0.6-1.4 ms |
+
+Order: P2-5 (step 2), P2-2, the P2-4 design check (section 4).

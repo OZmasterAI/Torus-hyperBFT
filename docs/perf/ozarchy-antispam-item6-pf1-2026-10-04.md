@@ -3181,8 +3181,8 @@ the index visits (step 0 cells: ~300 = every book), so do not compare it with ol
 
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
   still visit 189 books, the sender has something in 92 (stale index entries, "never removed
-  eagerly"). 18c s104: **A, accept and continue** (~4 us per skipped visit, so B's further ~97
-  visits are worth ~0.4 ms, still below the gate); the background prune stays before mainnet
+  eagerly"). 18c s104: **A, accept and continue** (~0.07 us per skipped visit, 0.44 ms /
+  (59.2 x 111), so B's further ~97 visits are worth ~0.4 ms, still below the gate); the background prune stays before mainnet
   (phase2 plan 9.14, review log row 25).
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
