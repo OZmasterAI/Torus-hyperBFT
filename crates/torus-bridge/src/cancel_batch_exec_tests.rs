@@ -616,9 +616,16 @@ fn cancel_all_matches_the_full_scan_reference() {
 /// P2-1 invariant (plan section 3): every (trader, market) where the book
 /// holds an order, a stop or a reduce-only entry of the trader's is listed
 /// by the cancel-all index, once built (a superset is allowed). Returns
-/// whether the index was built.
+/// whether the index was built. Also: the index size the gauges export
+/// (s104) is the index's (trader, market) entries and traders (0 / 0 when
+/// not built).
 fn assert_index_covers_books(ctx: &NativeExecContext, what: &str) -> bool {
     let (carried, rebuilt) = ctx.trader_index();
+    let size = carried.as_ref().map_or((0, 0), |c| {
+        let entries: usize = c.values().map(Vec::len).sum();
+        (entries as u64, c.len() as u64)
+    });
+    assert_eq!(ctx.cancel_index_size(), size, "{what}: index size");
     let Some(carried) = carried else {
         return false;
     };

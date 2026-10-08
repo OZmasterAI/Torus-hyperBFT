@@ -806,6 +806,9 @@ def main_phase2_step0():
         "exec_by_id_books_probed_total": 6000,
         "exec_thread_spawns_match": 620,
         "exec_thread_spawns_end_resident": 10,
+        # P2-1 (s104): the cancel-all index size gauges at the window's end.
+        "exec_cancel_all_index_entries": 900,
+        "exec_cancel_all_index_traders": 300,
     }
     saved = dict(COUNTERS)
     COUNTERS.update(step0)
@@ -838,6 +841,8 @@ def main_phase2_step0():
         close(ca["per_native_block"], 4.0, "cancel-alls per native block")
         close(ca["books_visited_per_cancel_all"], 300.0, "books visited per cancel-all")
         close(ca["books_hit_per_cancel_all"], 5.0, "books hit per cancel-all")
+        close(ca["index_entries_end"], 900, "index (trader, market) entries at the end")
+        close(ca["index_traders_end"], 300, "index traders at the end")
         bi = p0["by_id"]
         close(bi["actions"], 20, "by-id actions")
         close(bi["books_probed_per_action"], 300.0, "books probed per by-id action")

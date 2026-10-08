@@ -2921,6 +2921,8 @@ pub type TraderIndexSnapshot = std::collections::BTreeMap<Address, Vec<MarketId>
 #[derive(Default)]
 struct TraderMarkets {
     map: HashMap<Address, Vec<MarketId>>,
+    /// (trader, market) entries over all of `map` (s104 size gauge).
+    entries: usize,
 }
 
 impl TraderMarkets {
@@ -2943,12 +2945,15 @@ impl TraderMarkets {
         let markets = self.map.entry(trader).or_default();
         if let Err(at) = markets.binary_search(&market) {
             markets.insert(at, market);
+            self.entries += 1;
         }
     }
 
     /// `trader`'s markets, ascending, taken out of the index.
     fn take(&mut self, trader: &Address) -> Vec<MarketId> {
-        self.map.remove(trader).unwrap_or_default()
+        let markets = self.map.remove(trader).unwrap_or_default();
+        self.entries -= markets.len();
+        markets
     }
 
     /// Whether the index lists `market` for `trader`; takes it out.
@@ -2960,10 +2965,16 @@ impl TraderMarkets {
             return false;
         };
         markets.remove(at);
+        self.entries -= 1;
         if markets.is_empty() {
             self.map.remove(trader);
         }
         true
+    }
+
+    /// (s104 size gauges) `((trader, market) entries, traders)`.
+    fn size(&self) -> (u64, u64) {
+        (self.entries as u64, self.map.len() as u64)
     }
 
     /// Feed `book`'s log (market `market`) into `index`. Called wherever an
@@ -4430,6 +4441,15 @@ impl<T: StateBackend> NativeExecContext<T> {
                     .all(|b| b.new_traders_logged() == 0),
             "P2-1: a book's new-trader log was not fed into the cancel-all index"
         );
+    }
+
+    /// Item 6 Phase 2 P2-1 (s104, node-local gauges): the cancel-all index's
+    /// `((trader, market) entries, traders)`; `(0, 0)` while not built.
+    /// O(1): the index keeps its entry count.
+    pub fn cancel_index_size(&self) -> (u64, u64) {
+        self.trader_markets
+            .as_ref()
+            .map_or((0, 0), TraderMarkets::size)
     }
 
     /// P2-1 (tests): `(carried, rebuilt)` as [`ResidentBooks::trader_index`].

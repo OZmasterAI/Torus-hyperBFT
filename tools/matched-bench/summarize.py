@@ -458,7 +458,10 @@ def node_phase(node, rs, hi, buckets, window):
         "cancel_alls": nca,
         "per_native_block": round(nca / nblk, 2),
         "books_visited_per_cancel_all": round(dlt("exec_cancel_all_books_visited_total") / nca, 1) if nca else None,
-        "books_hit_per_cancel_all": round(dlt("exec_cancel_all_books_hit_total") / nca, 2) if nca else None}
+        "books_hit_per_cancel_all": round(dlt("exec_cancel_all_books_hit_total") / nca, 2) if nca else None,
+        # P2-1 (s104): the cancel-all index size gauges at the window's end.
+        "index_entries_end": m(b, "exec_cancel_all_index_entries"),
+        "index_traders_end": m(b, "exec_cancel_all_index_traders")}
     p["by_id"] = {
         "actions": nid,
         "per_native_block": round(nid / nblk, 2),

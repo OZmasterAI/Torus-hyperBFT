@@ -2516,6 +2516,10 @@ impl ExecutionContext {
                     .inc_by(accum.cancel_all_books_hit);
                 m.exec_by_id_actions.inc_by(accum.by_id_actions);
                 m.exec_by_id_books_probed.inc_by(accum.by_id_books_probed);
+                // P2-1 (s104): the cancel-all index size, once per block.
+                let (entries, traders) = ctx.cancel_index_size();
+                m.exec_cancel_all_index_entries.set(entries as i64);
+                m.exec_cancel_all_index_traders.set(traders as i64);
             }
 
             // v2 action status: the executed/skipped record plus the native
@@ -19941,9 +19945,27 @@ mod crash_recovery_tests {
     }
 
     /// P2-1: the carried cancel-all index (once built) covers the books;
-    /// returns whether `ctx`'s holder carried a built index.
+    /// returns whether `ctx`'s holder carried a built index. s104: with
+    /// resident books, the index size gauges show the holder's index (0 / 0
+    /// while not built).
     fn p2_index_covers_books(ctx: &ExecutionContext, what: &str) -> bool {
         let index = ctx.resident_books.lock().unwrap().trader_index();
+        if let (Some((carried, _)), Some(m)) = (&index, ctx.metrics.as_ref()) {
+            let (entries, traders) = carried.as_ref().map_or((0, 0), |c| {
+                (
+                    c.values().map(Vec::len).sum::<usize>() as i64,
+                    c.len() as i64,
+                )
+            });
+            assert_eq!(
+                (
+                    m.exec_cancel_all_index_entries.get(),
+                    m.exec_cancel_all_index_traders.get()
+                ),
+                (entries, traders),
+                "{what}: index size gauges"
+            );
+        }
         let Some((Some(carried), rebuilt)) = index else {
             return false;
         };

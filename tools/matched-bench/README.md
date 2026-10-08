@@ -512,7 +512,11 @@ binary.
   sender had orders or stops). Counts user cancel-alls and the liquidation
   step's cancels. Series `torus_exec_cancel_all_total`,
   `torus_exec_cancel_all_books_visited_total`,
-  `torus_exec_cancel_all_books_hit_total`.
+  `torus_exec_cancel_all_books_hit_total`. Also `index_entries_end` /
+  `index_traders_end`: the cancel-all index size at the window's end
+  ((trader, market) entries and traders; 0 while not built), gauges
+  `torus_exec_cancel_all_index_entries` / `_traders` set once per native
+  block.
 - `phase_by_node.<val>.by_id` (P2-1b): `CancelOrder` / `ModifyOrder` executed
   and `books_probed_per_action` (`torus_exec_by_id_actions_total`,
   `torus_exec_by_id_books_probed_total`).

@@ -540,6 +540,12 @@ pub struct Metrics {
     /// books they probed to find the order.
     pub exec_by_id_actions: Counter,
     pub exec_by_id_books_probed: Counter,
+    /// Item 6 Phase 2 P2-1 (s104): size of the node-local cancel-all index
+    /// at the end of the last native block: (trader, market) entries and
+    /// traders (0 while not built). Entries are never removed on the fill
+    /// path, so this tracks the index's memory growth.
+    pub exec_cancel_all_index_entries: Gauge,
+    pub exec_cancel_all_index_traders: Gauge,
     /// Step 0.2 (P2-3): threads spawned per execution-path site since process
     /// start (`torus_state::spawn_count`), one gauge per
     /// [`EXEC_SPAWN_SITES`] entry, set after every executed block.
@@ -2067,6 +2073,22 @@ impl Metrics {
         ] {
             registry.register(name, help, c.clone());
         }
+        let [exec_cancel_all_index_entries, exec_cancel_all_index_traders]: [Gauge; 2] =
+            Default::default();
+        for (name, help, g) in [
+            (
+                "torus_exec_cancel_all_index_entries",
+                "Item 6 P2-1: (trader, market) entries in the cancel-all index after the last native block",
+                &exec_cancel_all_index_entries,
+            ),
+            (
+                "torus_exec_cancel_all_index_traders",
+                "Item 6 P2-1: traders in the cancel-all index after the last native block",
+                &exec_cancel_all_index_traders,
+            ),
+        ] {
+            registry.register(name, help, g.clone());
+        }
         let exec_thread_spawns: [Gauge; 9] = Default::default();
         for (site, g) in EXEC_SPAWN_SITES.iter().zip(&exec_thread_spawns) {
             registry.register(
@@ -2657,6 +2679,8 @@ impl Metrics {
             exec_cancel_all_books_hit,
             exec_by_id_actions,
             exec_by_id_books_probed,
+            exec_cancel_all_index_entries,
+            exec_cancel_all_index_traders,
             exec_thread_spawns,
             exec_oracle_only_block_seconds,
             exec_queue_depth,
@@ -2950,7 +2974,8 @@ mod tests {
 
     /// Item 6 Phase 2 step 0.2: the cancel-all / by-id counters, the
     /// per-site spawn gauges and the oracle-only block histogram exist from
-    /// start-up under the names `run-cell.sh` samples.
+    /// start-up under the names `run-cell.sh` samples. P2-1 (s104): so do
+    /// the cancel-all index size gauges.
     #[test]
     fn phase2_step0_metrics_are_exported() {
         let m = Metrics::new();
@@ -2961,8 +2986,12 @@ mod tests {
         m.exec_by_id_books_probed.inc_by(900);
         m.exec_thread_spawns[1].set(42);
         m.exec_oracle_only_block_seconds.observe(0.004);
+        m.exec_cancel_all_index_entries.set(5);
+        m.exec_cancel_all_index_traders.set(2);
         let text = m.encode();
         for (name, want) in [
+            ("torus_exec_cancel_all_index_entries", 5),
+            ("torus_exec_cancel_all_index_traders", 2),
             ("torus_exec_cancel_all_total", 2),
             ("torus_exec_cancel_all_books_visited_total", 600),
             ("torus_exec_cancel_all_books_hit_total", 7),

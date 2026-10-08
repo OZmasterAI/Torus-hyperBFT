@@ -245,7 +245,8 @@ class PhaseMappingTests(unittest.TestCase):
         for name in ["torus_exec_cancel_all_total", "torus_exec_cancel_all_books_visited_total",
                      "torus_exec_cancel_all_books_hit_total", "torus_exec_by_id_actions_total",
                      "torus_exec_by_id_books_probed_total", "torus_exec_oracle_only_block_seconds_sum",
-                     "torus_exec_oracle_only_block_seconds_count"] + [f"torus_exec_thread_spawns_{s}" for s in sites]:
+                     "torus_exec_oracle_only_block_seconds_count", "torus_exec_cancel_all_index_entries",
+                     "torus_exec_cancel_all_index_traders"] + [f"torus_exec_thread_spawns_{s}" for s in sites]:
             self.assertIn(name, wide)
         self.assertIn("torus_exec_oracle_only_block_seconds_bucket", buckets)
         self.assertIn('procstat.raw', script)
