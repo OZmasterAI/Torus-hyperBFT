@@ -62,10 +62,10 @@ Both are estimates from the 0.3 split; as a share of engine time 4.7-5.6%, again
 P2-1 + P2-2 + P2-5: ~3.7 + ~3.2 + ~10.3 = **~17 ms per native block (~14% of engine) on the
 standard cells** (~5.0 + ~4.6 + ~15.8 = ~25 ms in the perf window, at section 22's engine for
 P2-5). P2-3 (~0.8 ms) is no longer in the set (9.10). P2-5's ~10 ms is a microbench estimate and
-counts only once a cell confirms it (9.9). Note: on the standard cells the base runs ~9% below
-section 23.1's `35e69b3` cells (not interleaved; results doc Open, regression check
-`ozarchy-p2s0r`); the +7% is still measured against `d3ba3c0a`, so this does not change the
-gate's reference.
+counts only once a cell confirms it (9.9). Note: the base `d3ba3c0a` is 6.3% below `35e69b3` on
+the standard shape (results doc section 26, interleaved; not the 4 MiB book SSTs, not the build
+style; bisect of the merges in between is a separate owner job). The +7% is still measured
+against `d3ba3c0a`, so this does not change the gate's reference.
 
 ## 2. What the step 0 profile measured (section 22.1, crab r2, load window)
 

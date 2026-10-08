@@ -2736,13 +2736,95 @@ anything there; "work" = per cancelled order, stop or hit.
   same shape** (164.7k vs 181.5k matched/s; engine 4.51-4.74 vs 4.29 ms/1k;
   native blocks 4.76-5.13 vs 5.45 per s). Not interleaved: bench binary,
   base and day differ. The step 0 / base comparison is not affected.
+  **Checked in section 26:** interleaved, `d3ba3c0a` is 6.3% below `35e69b3`
+  (not the 4 MiB SSTs, not the build style); the rest was the day or window.
+
+## 26. Regression check: main `d3ba3c0a` vs `35e69b3` (2026-10-08)
+
+The ~9% gap of section 25.4 (not interleaved), checked with interleaved arms
+(owner s101). Arms, all with bench `fff899ca` (from `707f132f`), the step 0.2
+harness (`wt/p2s0b-707f132f`), oracle feed 30000 / 2000 ms walk 0, trie off by
+default, standard shape (N=4 + budget 900, 300 markets, cap 400, rate 76,000,
+`RETRY_BUSY=1`, 120 s), no perf:
+
+- **A** = main `35e69b3` (the section 23.1 node), node `9f5c53bb`. The 23.1
+  binary (`c2ea1ff8`) was pruned; rebuilt as 23.1 did (same worktree path and
+  target-dir path, same flags, `-p torus-node -p bench-throughput`, unseeded,
+  every workspace crate compiled from the 35e69b3 tree). Not bit-identical to
+  `c2ea1ff8` (cause not found); A reproduces 23.1's matched/s (below).
+- **B** = main `d3ba3c0a`, node-only build `193ae781` (the section 25 base).
+- **C** = B's binary + `TORUS_BOOK_CF_TARGET_FILE_MB=64` (the book CF SST size
+  before `d3ba3c0a`). The harness passes it through `EXTRA_ENV` unfiltered; the
+  driver checked the variable on all 3 nodes and `target_file_size_base=67108864`
+  for `cf_native_order_books` in each validator's RocksDB OPTIONS (B: 4194304;
+  A: 67108864, the old default).
+- **D** = `d3ba3c0a` built like A (`-p torus-node -p bench-throughput`), node
+  `d76b4427`. Added because the combined build gives a different node binary
+  than B's node-only build (bench-side `reqwest` / `hyper-rustls` / `tower`
+  features unify into the node). It isolates build style.
+
+Order: B warm (60 s), then A B C D D C B A; 04:59-05:51. All 9 cells rc 0,
+AGREE, liveness PASS, accepted, no deaths, exe md5 3/3 as staged, oracle stale
+0, no tail WARNING, max 675 open fds. Driver
+`~/bench-results-matched/ozarchy-p2s0r-campaign.sh`, table
+`ozarchy-p2s0r-table.txt`. (A first launch at 04:38 never started a cell: five
+looping `gh api graphql` processes from another app held the load at ~7, and
+the driver's quiet-host check gave up after 900 s; they were stopped by the
+owner and the campaign relaunched.)
+
+| cell | matched/s | submit/s | placed/s | native blk/s | fills/blk | engine ms/blk \| ms/1k | phase 1 | margin | match | settle | flush worker | chain | exec busy |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B warm | 166,867 | 1,046 | 221,292 | 5.000 | 23,699 | 104.5 \| 4.41 | 17.4 | 24.1 | 13.0 | 37.9 | 43.0 | 131.1 | 0.942 |
+| A r1 | 181,933 | 1,044 | 241,887 | 5.361 | 26,822 | 115.0 \| 4.29 | 21.3 | 26.9 | 13.6 | 40.6 | 49.1 | 142.4 | 0.967 |
+| B r1 | 167,115 | 983 | 222,106 | 4.992 | 27,953 | 125.8 \| 4.50 | 22.5 | 29.4 | 15.6 | 44.4 | 56.6 | 159.7 | 0.965 |
+| C r1 | 168,040 | 994 | 223,104 | 5.049 | 27,564 | 124.4 \| 4.51 | 23.1 | 28.9 | 14.7 | 44.9 | 51.5 | 156.2 | 0.961 |
+| D r1 | 172,577 | 989 | 228,932 | 5.106 | 27,579 | 121.4 \| 4.40 | 22.3 | 28.4 | 14.5 | 43.4 | 52.3 | 153.6 | 0.967 |
+| D r2 | 169,287 | 989 | 224,794 | 5.164 | 26,695 | 117.6 \| 4.40 | 20.6 | 26.6 | 14.1 | 42.5 | 50.2 | 150.8 | 0.965 |
+| C r2 | 170,337 | 1,000 | 226,048 | 5.163 | 28,180 | 125.2 \| 4.44 | 22.0 | 29.0 | 14.8 | 45.2 | 51.5 | 157.9 | 0.966 |
+| B r2 | 170,145 | 991 | 225,919 | 4.869 | 28,839 | 127.5 \| 4.42 | 21.9 | 30.3 | 15.9 | 45.8 | 52.8 | 161.0 | 0.959 |
+| A r2 | 178,052 | 1,032 | 236,876 | 5.244 | 27,410 | 119.0 \| 4.34 | 21.1 | 27.6 | 14.3 | 42.4 | 52.6 | 148.5 | 0.968 |
+
+ms per native block (val0, bench + drain window); submit/s = load-generator
+accepted actions per s; exec busy = execution-thread busy fraction (load
+window).
+
+| mean of r1, r2 | A | B | C | D | B/A | C/A | D/A | C/B | D/B |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | 179,993 | 168,630 | 169,188 | 170,932 | **0.937** | 0.940 | 0.950 | **1.003** | 1.014 |
+| submit/s | 1,038 | 987 | 997 | 989 | 0.951 | 0.961 | 0.953 | 1.010 | 1.002 |
+| placed/s | 239,382 | 224,013 | 224,576 | 226,863 | 0.936 | 0.938 | 0.948 | 1.003 | 1.013 |
+| native blk/s | 5.30 | 4.93 | 5.11 | 5.13 | 0.930 | 0.963 | 0.968 | 1.036 | 1.041 |
+| engine ms/1k | 4.31 | 4.46 | 4.47 | 4.40 | 1.034 | 1.037 | 1.020 | 1.003 | 0.987 |
+| chain ms/blk | 145.4 | 160.4 | 157.1 | 152.2 | 1.103 | 1.080 | 1.047 | 0.979 | 0.949 |
+
+- **Verdict (owner rules): B < A and C ≈ B.** `d3ba3c0a` is 6.3% below
+  `35e69b3` on matched/s (both B cells below both A cells), and the 64 MiB
+  book SSTs do not bring it back (C/B 1.003x). The 4 MiB SSTs are not the
+  cause. Next: the owner's bisect of the merges in between (ADL budget / dirty
+  check, exact cost basis, row 50 follow-ups), as a separate job.
+- **Not the build style:** D/B 1.014x, within the ~5% cell resolution (D sits
+  between B and A on engine ms/blk: 119.5 vs 126.7 / 117.0, a hint worth one
+  more pair if the bisect lands on nothing).
+- **Not the load generator:** with `MAX_IN_FLIGHT=4` the generator is closed
+  loop (a slot frees when its action commits), so submit/s follows the chain.
+  The execution thread is 96-97% busy on every arm and placed per submitted
+  action is the same (A 231, B 227), so the chain, not the generator, sets the
+  rate. The cost is on the node: engine +3.4% per 1k fills, chain +10% per
+  native block.
+- **Size of the gap:** A matches section 23.1's `35e69b3` cells (179,993 vs
+  181,500 / 180,501), and B is 2.4% above section 25's base cells (168,630 vs
+  164,608): of the ~9% in section 25.4, ~6% is the code and ~2-3% was the day
+  or window.
+- **For Phase 2:** the +7% gate is measured against `d3ba3c0a` (plan 9.7), so
+  the gate's reference does not move; the regression is for 18c / the owner.
 
 ## Open
 
-- **Phase 2 base `d3ba3c0a` runs ~9% below `35e69b3`** on the standard shape
-  (section 25.4, not interleaved): one `d3ba3c0a` / `35e69b3` pair with the
-  same bench would show whether main lost throughput between them (ADL
-  budget, read-precompile gas, 4 MiB book SSTs) or the host drifted.
+- **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
+  interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
+  build style (D/B 1.014x), not the load generator. Next: bisect of the merges
+  between them (ADL budget / dirty check, exact cost basis, row 50 follow-ups;
+  owner, separate job).
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
