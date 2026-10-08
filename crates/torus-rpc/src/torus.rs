@@ -445,13 +445,15 @@ fn check_price_band(
 /// 0); the tick to a `Limit` price and a `StopLimit` limit, only when tick >
 /// 0. Message = the executor's ("order rejected: ...").
 /// Row 46 (s94 B): first, as the executor does (`validate_order_price`,
-/// same text), a `Limit` price must be positive.
+/// same text), a `Limit` price must be positive; row 46 follow-up: the whole
+/// rule (`torus_core::order_book::order_price_violation`), so also a
+/// `Market` / `StopMarket` cap and a `StopLimit` limit.
 fn check_tick_lot(
     p: &torus_types::PlaceOrderParams,
     (tick, lot): (FixedPoint, FixedPoint),
 ) -> Result<(), String> {
-    if matches!(p.order_type, torus_types::OrderType::Limit) && p.price <= FixedPoint::ZERO {
-        return Err(format!("limit order requires a positive price, got {}", p.price));
+    if let Some(msg) = torus_core::order_book::order_price_violation(p) {
+        return Err(msg);
     }
     match torus_core::order_book::shape_violation(p, tick, lot) {
         Some(v) => Err(v.placement_message()),
@@ -1110,11 +1112,11 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Compute unrealized PnL at the usable oracle price; fall back to entry price.
-                let mark_price = self
+                // Unrealized PnL at the usable oracle price; 0 without one
+                // (valued at entry, as the margin math does).
+                let unrealized = self
                     .usable_oracle_price(mid)
-                    .map_or(p.entry_price, |op| op.price);
-                let unrealized = p.unrealized_pnl(mark_price);
+                    .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
 
                 // Simplified liquidation price estimate.
                 let liquidation_price =
@@ -2923,6 +2925,8 @@ mod tick_lot_ingress_tests {
     /// Row 46 (s94 B): a Limit with a price <= 0 is refused at intake with
     /// the executor's text (`validate_order_price`), checked before the
     /// tick / lot as the executor does (a sub-lot one gets the price text).
+    /// Row 46 follow-up: so are a Market / StopMarket cap <= 0 and a
+    /// StopLimit limit <= 0 (`torus_core::order_book::order_price_violation`).
     #[test]
     fn limit_price_not_positive_is_refused_with_the_executors_text() {
         use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
@@ -2934,12 +2938,22 @@ mod tick_lot_ingress_tests {
         let trader = rb(1);
         let bal = NativeBalance { available: FixedPoint::from_raw(1_000_000 * S), order_margin: FixedPoint::ZERO };
         ctx.positions.put_native_balance(&trader, &bal).unwrap();
-        for (price, qty, want) in [
-            (0, S, "limit order requires a positive price, got 0.00000000"),
-            (-S, S, "limit order requires a positive price, got -1.00000000"),
-            (0, S / 2, "limit order requires a positive price, got 0.00000000"),
+        let trig = FixedPoint::from_raw(100 * S);
+        let cap = "market order requires a positive price cap (worst acceptable price), got 0.00000000";
+        for (price, qty, ty, want) in [
+            (0, S, OrderType::Limit, "limit order requires a positive price, got 0.00000000"),
+            (-S, S, OrderType::Limit, "limit order requires a positive price, got -1.00000000"),
+            (0, S / 2, OrderType::Limit, "limit order requires a positive price, got 0.00000000"),
+            (0, S, OrderType::Market, cap),
+            (0, S, OrderType::StopMarket { trigger: trig }, cap),
+            (
+                100 * S,
+                S,
+                OrderType::StopLimit { trigger: trig, limit: FixedPoint::ZERO },
+                "stop-limit order requires a positive limit price, got 0.00000000",
+            ),
         ] {
-            let p = order(1, price, qty, OrderType::Limit);
+            let p = order(1, price, qty, ty);
             assert_eq!(place(&state, p.clone()).unwrap_err(), want);
             let exec = NativeExecutor::execute(&mut ctx, &trader, &NativeAction::PlaceOrder(p));
             assert_eq!(exec.error.as_deref(), Some(want));

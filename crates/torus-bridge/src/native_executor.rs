@@ -6,6 +6,7 @@
 //!
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -18,9 +19,9 @@ use torus_core::margin::{
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
-    band_reference, market_row_shape, price_band_violation, reduce_only_allowance, shape_violation, AccountMargins,
-    Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult, PriceBand, ReduceOnlyPositions,
-    ShapeViolation, TakerMarginLimit, TriggeredStop,
+    band_reference, market_row_shape, order_price_violation, price_band_violation, reduce_only_allowance,
+    shape_violation, AccountMargins, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
+    PriceBand, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
     open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
@@ -49,7 +50,10 @@ use crate::market_workers::{MarketWorkerPool, MatchRequest};
 pub struct NativeActionResult {
     pub action_type: &'static str,
     pub success: bool,
-    pub error: Option<String>,
+    /// Why it failed. Borrowed for a book rejection (its reason's
+    /// [`FailureReason::book_reject_message`]: no allocation per rejected
+    /// order), owned for a message built at the check.
+    pub error: Option<Cow<'static, str>>,
     pub gas_used: u64,
     /// Why it failed, set where the check failed (v2 action status stores
     /// it; never derived from `error`). `Other` for a success and for any
@@ -77,7 +81,7 @@ impl NativeActionResult {
         Self {
             action_type,
             success: false,
-            error: Some(error),
+            error: Some(Cow::Owned(error)),
             gas_used: 0,
             reason,
         }
@@ -103,34 +107,16 @@ impl NativeActionResult {
     fn placed(result: &PlaceResult) -> Self {
         match result.reject {
             None => Self::ok("place_order", PLACE_ORDER_GAS),
+            // The message is the reason's canonical one (torus-state, one
+            // table for the executor and the action status record).
             Some(reason) => Self {
+                action_type: "place_order",
+                success: false,
+                error: Some(Cow::Borrowed(reason.book_reject_message())),
                 gas_used: PLACE_ORDER_GAS,
-                ..Self::rejected("place_order", (reason, book_reject_message(reason).to_string()))
+                reason,
             },
         }
-    }
-}
-
-/// Row 50: the message of a book rejection (the reason is the record's).
-fn book_reject_message(reason: FailureReason) -> &'static str {
-    match reason {
-        FailureReason::IocCancel => {
-            "order rejected: IOC order could not immediately match against any resting order"
-        }
-        FailureReason::BadAloPx => "order rejected: post-only order would have immediately matched",
-        FailureReason::MarketNoLiquidity => {
-            "order rejected: no liquidity for the market order within its price cap"
-        }
-        FailureReason::FokCancel => "order rejected: FOK order could not be filled completely",
-        FailureReason::ReduceOnly => "reduce-only order rejected: would not reduce the position",
-        FailureReason::Margin => "insufficient margin: none left for the first fill (match time)",
-        FailureReason::BadTriggerPx => {
-            "order rejected: stop trigger price is on the wrong side of the last trade"
-        }
-        FailureReason::Lot => "order rejected: quantity below the lot size",
-        FailureReason::Price => "order rejected: price must be positive",
-        FailureReason::Tick => "order rejected: price is not a multiple of the tick",
-        _ => "order rejected by the book",
     }
 }
 
@@ -5566,7 +5552,7 @@ impl NativeExecutor {
                 NativeActionResult {
                     action_type: "place_order_batch",
                     success: ok == total,
-                    error: (ok != total).then(|| format!("{ok}/{total} orders placed")),
+                    error: (ok != total).then(|| format!("{ok}/{total} orders placed").into()),
                     gas_used: batch.total_gas,
                     // The first failing order's reason.
                     reason: batch
@@ -8257,29 +8243,17 @@ impl NativeExecutor {
     /// zero margin and matched at any price.
     /// Item 6 M1 (row 41): a `Limit` price must be positive too (the book
     /// rejects it; checked here so it is rejected before the book).
+    /// Row 46 follow-up: the rule and its text are
+    /// [`torus_core::order_book::order_price_violation`] (shared with the
+    /// RPC intake check).
     fn validate_order_price(params: &PlaceOrderParams) -> Result<(), Rejection> {
-        let reject = match params.order_type {
-            OrderType::Limit if params.price <= FixedPoint::ZERO => Err(format!(
-                "limit order requires a positive price, got {}",
-                params.price
-            )),
-            OrderType::Market | OrderType::StopMarket { .. } if params.price <= FixedPoint::ZERO => {
-                Err(format!(
-                    "market order requires a positive price cap (worst acceptable price), got {}",
-                    params.price
-                ))
-            }
-            OrderType::StopLimit { limit, .. } if limit <= FixedPoint::ZERO => Err(format!(
-                "stop-limit order requires a positive limit price, got {limit}"
-            )),
-            _ => Ok(()),
-        };
-        reject.map_err(|msg| (FailureReason::Price, msg))
+        order_price_violation(params).map_or(Ok(()), |msg| Err((FailureReason::Price, msg)))
     }
 
     /// Fix A (s92): the book's dust and off-tick rejects
     /// (`OrderBook::place_order_with_accounts`, same rules, same order: dust
-    /// for every order type, then the tick for `Limit` only), applied BEFORE
+    /// for every order type, then the tick for a `Limit` price and, since
+    /// row 45, a `StopLimit`'s limit), applied BEFORE
     /// the book so such an order takes no open-order slot, reserves nothing,
     /// gets no order id and no in-batch projection / D2 pool. `shape` = the
     /// market book's `(tick_size, lot_size)`; a market without a book uses
@@ -10808,13 +10782,17 @@ mod maker_accounts_tests {
                     } else {
                         FixedPoint::from_raw(1 + rng.below(500 * FixedPoint::SCALE as u64) as i128)
                     };
+                    let is_long = rng.below(2) == 0;
+                    let entry_price = fp(1 + rng.below(50_000) as i64);
                     ctx.positions
                         .put_position(&Position {
                             trader: *t,
                             market_id: m,
-                            is_long: rng.below(2) == 0,
+                            is_long,
                             size,
-                            entry_price: fp(1 + rng.below(50_000) as i64),
+                            entry_price,
+                            // The huge size overflows the notional anyway.
+                            cost_basis: entry_price.checked_mul(size).unwrap_or(FixedPoint::MAX),
                             realized_pnl: FixedPoint::ZERO,
                             isolated_margin: FixedPoint::ZERO,
                             margin_type: if rng.below(40) == 0 { MarginType::Isolated } else { MarginType::Cross },

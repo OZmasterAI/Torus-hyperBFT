@@ -57,5 +57,9 @@ hotstuff_rs = { workspace = true }
 # borsh is v1 and its traits don't match hotstuff_rs types.
 borsh = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+# getrlimit/setrlimit: raise the soft open-file limit at startup.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }

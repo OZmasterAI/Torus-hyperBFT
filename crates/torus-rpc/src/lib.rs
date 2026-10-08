@@ -3270,7 +3270,9 @@ mod tests {
                         0,
                         1,
                         torus_state::action_status::FailureReason::IocCancel,
-                        "order rejected: IOC order could not immediately match".to_string(),
+                        torus_state::action_status::FailureReason::IocCancel
+                            .book_reject_message()
+                            .to_string(),
                     )
                 },
             ],
@@ -3320,8 +3322,9 @@ mod tests {
                 {
                     "index": 3,
                     "status": "rejected",
-                    "reason": "iocCancelRejected",
-                    "message": "order rejected: IOC order could not immediately match",
+                    "reason": "ioc_cancel",
+                    "rejectStatus": "iocCancelRejected",
+                    "message": "order rejected: IOC order could not immediately match against any resting order",
                     "order": 0,
                     "failedOrders": 1
                 }
@@ -4038,6 +4041,7 @@ mod tests {
             is_long: true,
             size: fp(5),
             entry_price: fp(50000),
+            cost_basis: fp(50000) * fp(5),
             realized_pnl: fp(100),
             isolated_margin: fp(2500),
             margin_type: MarginType::Isolated,
@@ -4155,6 +4159,7 @@ mod tests {
             is_long: true,
             size: fp(2),
             entry_price: fp(50000),
+            cost_basis: fp(50000) * fp(2),
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(500),
             margin_type: MarginType::Isolated,
@@ -4202,6 +4207,7 @@ mod tests {
             is_long: market_id % 2 == 0,
             size,
             entry_price: fp(100),
+            cost_basis: fp(100) * size,
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
@@ -4550,6 +4556,7 @@ mod tests {
             is_long: true,
             size: fp(10),
             entry_price: fp(50000),
+            cost_basis: fp(50000) * fp(10),
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(5000),
             margin_type: MarginType::Cross,
@@ -4561,6 +4568,7 @@ mod tests {
             is_long: false,
             size: fp(7),
             entry_price: fp(50000),
+            cost_basis: fp(50000) * fp(7),
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(3500),
             margin_type: MarginType::Cross,
@@ -4698,6 +4706,7 @@ mod tests {
                 is_long: true,
                 size: fp(5),
                 entry_price: fp(50000),
+                cost_basis: fp(50000) * fp(5),
                 realized_pnl: fp(100),
                 isolated_margin: fp(2500),
                 margin_type: MarginType::Isolated,
@@ -4764,6 +4773,7 @@ mod tests {
                     is_long: true,
                     size: fp(5),
                     entry_price: fp(50000),
+                    cost_basis: fp(50000) * fp(5),
                     realized_pnl: fp(100),
                     isolated_margin: fp(2500),
                     margin_type: MarginType::Isolated,

@@ -360,7 +360,7 @@ fn metrics_do_not_change_results() {
         NativeExecutor::execute_batch(&mut ctx, &actions)
             .results
             .into_iter()
-            .map(|r| (r.success, r.error))
+            .map(|r| (r.success, r.error.map(String::from)))
             .collect()
     };
     assert_eq!(run(true), run(false));

@@ -36,37 +36,52 @@ pub const ADDR_CORE_WRITER_STAKING: u16 = 0x0811;
 pub const ADDR_LOCKBOX: u16 = 0x0820;
 
 /// FIX EVM-PF-10: Gas costs for Torus precompiles.
-/// Read-only queries (cold SLOAD equivalent).
-pub const GAS_PRECOMPILE_READ: u64 = 2_600;
-/// HL-parity (read precompiles charged flat gas for unbounded output): a reader
-/// (0x0800-0x0803) also pays this per work unit — a row (or 32 bytes of a
-/// whole-book blob) it read, and a 32-byte word it returned — and its work is
-/// capped by the units its gas limit pays for ([`ReadMeter`]). Tunable before
-/// a network freezes its gas schedule.
-pub const GAS_PRECOMPILE_READ_PER_UNIT: u64 = 50;
+///
+/// Base gas of every reader call (0x0800-0x0803). s99 owner decision (item6
+/// plan 9.16, revisit later): single reads at Hyperliquid level, ~16,500 gas
+/// per position read. getPosition = this base + its 5 answer words = 16,500;
+/// a 30M-gas block of cold getPosition calls (ozarchy, block cache cold) runs
+/// in ~32-37 ms (`docs/perf/read-precompile-gas.md`, section s99). The base
+/// pays for a reader's point reads (getPosition, getBalances, getPrice, the
+/// staking point rows, the classic blob probe) and a scan's fixed cost.
+pub const GAS_PRECOMPILE_READ: u64 = 16_400;
+/// Gas per hashed row a reader's prefix scan returned (s99: scans 500 gas per
+/// scanned row + 20 per returned word or blob chunk).
+pub const GAS_PRECOMPILE_READ_PER_ROW: u64 = 500;
+/// Gas per 32-byte word a reader returned, and per 32 bytes of a classic
+/// whole-book blob it read (sized and charged before it is read).
+pub const GAS_PRECOMPILE_READ_PER_WORD: u64 = 20;
+/// Most price levels per side one getOrderBook call answers (s99 owner
+/// decision, final): the 64 best bids and the 64 best asks of a mode 2 / 3
+/// market (level rows), no revert past the cap (see [`book_levels`]).
+pub const READER_MAX_LEVELS_PER_SIDE: u64 = 64;
 /// State-mutating writes (SSTORE equivalent range).
 pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
-/// Gas of a reader call (0x0800-0x0803) that used `units` work units: the
-/// base [`GAS_PRECOMPILE_READ`] plus [`GAS_PRECOMPILE_READ_PER_UNIT`] each.
+/// Gas of a reader call (0x0800-0x0803) whose meter used `used` gas above
+/// the base ([`ReadMeter::used`]): [`GAS_PRECOMPILE_READ`] + `used`.
 /// Charged by the EVM provider after the call, on success and on revert.
-pub const fn reader_gas(units: u64) -> u64 {
-    GAS_PRECOMPILE_READ.saturating_add(GAS_PRECOMPILE_READ_PER_UNIT.saturating_mul(units))
+pub const fn reader_gas(used: u64) -> u64 {
+    GAS_PRECOMPILE_READ.saturating_add(used)
 }
 
-/// The work units a reader call with `gas_limit` may use: what its gas pays
-/// for above the base (0 when it does not even cover the base).
+/// The gas a reader call with `gas_limit` may use above the base (0 when it
+/// does not even cover the base): its [`ReadMeter`] cap.
 pub const fn reader_budget(gas_limit: u64) -> u64 {
-    gas_limit.saturating_sub(GAS_PRECOMPILE_READ) / GAS_PRECOMPILE_READ_PER_UNIT
+    gas_limit.saturating_sub(GAS_PRECOMPILE_READ)
 }
 
-/// Work meter of one reader call: rows read and words returned, capped at
-/// what the caller's gas pays for. A reader charges BEFORE it does the work
-/// it charges for where it can (scans stop at the budget, a classic blob is
-/// charged before it is decoded), so the node's work per call is bounded by
-/// the call's gas, not only its price.
+/// Work meter of one reader call, in gas above the base: 500 per row read
+/// ([`GAS_PRECOMPILE_READ_PER_ROW`]) and 20 per word returned or 32 blob bytes
+/// read ([`GAS_PRECOMPILE_READ_PER_WORD`]), capped at what the caller's gas
+/// pays for. A reader charges BEFORE it does the work it charges for where it
+/// can (scans stop at the budget, a classic blob is charged before it is
+/// decoded), so the node's work per call is bounded by the call's gas, not
+/// only its price. RocksDB deletion markers a scan steps over are never
+/// charged: their count is node-local (flush / compaction history), and gas
+/// is a block result.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadMeter {
     max: u64,
@@ -84,7 +99,7 @@ impl ReadMeter {
         Self { max, used: 0 }
     }
 
-    /// Units used so far.
+    /// Gas used so far above the base.
     pub const fn used(&self) -> u64 {
         self.used
     }
@@ -97,27 +112,42 @@ impl ReadMeter {
         self.max.saturating_sub(self.used)
     }
 
-    /// Use `units`; out of gas once the total exceeds the cap.
-    fn charge(&mut self, units: u64) -> Result<(), CoreError> {
-        self.used = self.used.saturating_add(units);
+    /// Rows the remaining gas pays for.
+    fn rows_left(&self) -> u64 {
+        self.remaining() / GAS_PRECOMPILE_READ_PER_ROW
+    }
+
+    /// Use `gas`; out of gas once the total exceeds the cap.
+    fn charge(&mut self, gas: u64) -> Result<(), CoreError> {
+        self.used = self.used.saturating_add(gas);
         if self.used > self.max {
             return Err(CoreError::PrecompileOutOfGas);
         }
         Ok(())
     }
 
-    /// Out of gas unless `units` more would still fit (a check, no charge).
-    fn require(&self, units: u64) -> Result<(), CoreError> {
-        if units > self.remaining() {
+    fn charge_rows(&mut self, rows: u64) -> Result<(), CoreError> {
+        self.charge(rows.saturating_mul(GAS_PRECOMPILE_READ_PER_ROW))
+    }
+
+    /// Words returned, or 32-byte blob chunks read.
+    fn charge_words(&mut self, words: u64) -> Result<(), CoreError> {
+        self.charge(words.saturating_mul(GAS_PRECOMPILE_READ_PER_WORD))
+    }
+
+    /// Out of gas unless `words` more would still fit (a check, no charge).
+    fn require_words(&self, words: u64) -> Result<(), CoreError> {
+        if words.saturating_mul(GAS_PRECOMPILE_READ_PER_WORD) > self.remaining() {
             return Err(CoreError::PrecompileOutOfGas);
         }
         Ok(())
     }
 }
 
-/// Consensus rows of `cf` whose key starts with `prefix`, in key order, each
-/// charged one unit. Only keys the running state hash covers
-/// (`running_hash::key_is_hashed`) are charged and returned: a node-local row
+/// Consensus rows of `cf` whose key starts with `prefix`, in key order, at
+/// most `max_rows` (the first ones; `None` = all), each charged a row. Only
+/// keys the running state hash covers (`running_hash::key_is_hashed`) are
+/// charged and returned: a node-local row
 /// (the `__book_mode__` marker in `cf_native_markets`) is skipped, so the
 /// charge — a block result — is the same on every node.
 ///
@@ -125,17 +155,21 @@ impl ReadMeter {
 /// at all (node-local, e.g. `cf_book_order_rows`) is an error, never "charge
 /// everything" — its rows differ between nodes.
 ///
-/// Metered: pages of at most 64 rows through `iterate_cf_prefix_from` (RocksDB
-/// bounded at the prefix end), each page no larger than the rows still
-/// allowed + 1; out of gas as soon as the charged rows exceed the budget. A
-/// scan therefore reads at most `remaining + 1` rows, plus the node-local rows
-/// it skips, plus the RocksDB deletion markers inside the prefix that the
-/// iterator steps over uncharged (bounded only by compaction). Unlimited: one
+/// Metered (or capped): pages of at most 64 rows through
+/// `iterate_cf_prefix_from` (RocksDB bounded at the prefix end), each page no
+/// larger than the rows still allowed + 1 and the rows `max_rows` still
+/// allows; out of gas as soon as the charged rows exceed the budget. A scan
+/// therefore reads at most `min(rows paid + 1, max_rows)` rows, plus the
+/// node-local rows it skips, plus the RocksDB deletion markers inside the
+/// prefix that the iterator steps over uncharged (node-local; bounded by the
+/// background compaction a delete flush schedules for the order ranges,
+/// `StateDb::compact_range_in_background`). Unlimited and uncapped: one
 /// `iterate_cf` (the pre-existing read). A missing CF reads as empty.
 fn scan_prefix_metered(
     state: &impl StateBackend,
     cf: &'static str,
     prefix: &[u8],
+    max_rows: Option<u64>,
     meter: &mut ReadMeter,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoreError> {
     const PAGE: u64 = 64;
@@ -149,26 +183,31 @@ fn scan_prefix_metered(
         )));
     };
     let consensus = |k: &[u8]| torus_state::running_hash::key_is_hashed(hashed_id, k);
-    if meter.is_unlimited() {
+    if meter.is_unlimited() && max_rows.is_none() {
         let p = (!prefix.is_empty()).then_some(prefix);
         let mut rows = state.iterate_cf(cf, p).or_else(missing_is_empty)?;
         rows.retain(|(k, _)| consensus(k));
-        meter.charge(rows.len() as u64)?;
+        meter.charge_rows(rows.len() as u64)?;
         return Ok(rows);
     }
+    let max_rows = max_rows.unwrap_or(u64::MAX);
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut start = prefix.to_vec();
-    loop {
-        // Rows still allowed, plus one that proves the budget is exceeded.
-        let left = meter.remaining().saturating_sub(out.len() as u64).saturating_add(1);
-        let page = left.min(PAGE) as usize;
+    while (out.len() as u64) < max_rows {
+        // Rows still paid for, plus one that proves the budget is exceeded,
+        // and never past the cap.
+        let left = meter
+            .rows_left()
+            .saturating_sub(out.len() as u64)
+            .saturating_add(1);
+        let page = left.min(PAGE).min(max_rows - out.len() as u64) as usize;
         let rows = state
             .iterate_cf_prefix_from(cf, prefix, &start, page)
             .or_else(missing_is_empty)?;
         let ended = rows.len() < page;
         let last = rows.last().map(|(k, _)| k.clone());
         out.extend(rows.into_iter().filter(|(k, _)| consensus(k)));
-        if out.len() as u64 > meter.remaining() {
+        if out.len() as u64 > meter.rows_left() {
             return Err(CoreError::PrecompileOutOfGas);
         }
         match last {
@@ -180,12 +219,12 @@ fn scan_prefix_metered(
             _ => break,
         }
     }
-    meter.charge(out.len() as u64)?;
+    meter.charge_rows(out.len() as u64)?;
     Ok(out)
 }
 
 /// Base gas cost for a precompile by address ID (a reader's full cost is
-/// [`reader_gas`] of the units it used).
+/// [`reader_gas`] of the gas its [`ReadMeter`] used).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
         0x0800..=0x0803 => GAS_PRECOMPILE_READ,
@@ -557,7 +596,7 @@ fn execute_precompile_inner(
     // Readers: the answer's words are work too, charged once it is built.
     let read = |out: Result<Vec<u8>, CoreError>, meter: &mut ReadMeter| {
         let out = out?;
-        meter.charge((out.len() as u64).div_ceil(32))?;
+        meter.charge_words((out.len() as u64).div_ceil(32))?;
         Ok(out)
     };
     match id {
@@ -593,10 +632,6 @@ fn order_book_reader(
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
         read_position(state_db, &trader, market_id, now)
-    } else if sel == selector_for("getOpenOrders(address,bytes32)") {
-        let trader = abi::decode_address(&abi::word(input, 0)?);
-        let market_id = abi::decode_market_id(&abi::word(input, 1)?);
-        read_open_orders(state_db, &trader, market_id, meter)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
@@ -622,27 +657,20 @@ type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
 ///   `torus-bridge/tests/book_read_modes_tests.rs::
 ///   classic_precompile_behaviour_is_unchanged`.
 ///
-/// GAS / WORK: metered by `meter` ([`ReadMeter`]): one unit per book row read
-/// (per 32 bytes of a classic blob, sized and charged before it is read) and
-/// per word returned; the market's rows are scanned only up to the budget
-/// (at most `remaining + 1` rows), so a call's work is bounded by its gas, and
-/// the metered layout choice reads only this market's hashed rows (see
-/// [`metered_levels`]). A deep book needs a large gas limit; returning
-/// only the top N levels (`feat/precompile-0800-topn-gas`) stays the way to
-/// serve deep books cheaply.
+/// GAS / WORK: metered by `meter` ([`ReadMeter`]): 500 per book row read
+/// (20 per 32 bytes of a classic blob, sized and charged before it is read)
+/// and 20 per word returned; the market's rows are scanned only up to the
+/// budget and the 64-levels-per-side cap ([`READER_MAX_LEVELS_PER_SIDE`]),
+/// and only this market's hashed rows are read (see [`book_levels`]).
 fn read_order_book(
     state_db: &impl StateBackend,
     market_id: MarketId,
     meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     // The answer has at least its 8-word head: a budget below it reads nothing.
-    meter.require(8)?;
-    // (price, quantity) per level, best-first — the shape both arms feed.
-    let (bids, asks) = if meter.is_unlimited() {
-        unmetered_levels(state_db, market_id)?
-    } else {
-        metered_levels(state_db, market_id, meter)?
-    };
+    meter.require_words(8)?;
+    // (price, quantity) per level, best-first.
+    let (bids, asks) = book_levels(state_db, market_id, meter)?;
 
     let bid_prices: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
     let bid_qtys: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
@@ -667,52 +695,77 @@ fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreE
     Ok((pairs(&snapshot.bids), pairs(&snapshot.asks)))
 }
 
-fn depth_pairs(depth: crate::book_reader::BookDepth) -> (PriceQtyLevels, PriceQtyLevels) {
-    let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
-        levels.into_iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>()
-    };
-    (pairs(depth.bids), pairs(depth.asks))
-}
-
-/// Unmetered (non-EVM callers): the DB-wide layout (`detect_layout`: the
-/// node-local marker, else a sniff), then the pre-existing reads.
-fn unmetered_levels(
-    state_db: &impl StateBackend,
-    market_id: MarketId,
-) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
-    match crate::book_reader::detect_layout(state_db)? {
-        layout if layout.is_rows() => Ok(depth_pairs(crate::book_reader::read_book_depth(
-            state_db, market_id, layout,
-        )?)),
-        _ => match state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &market_id.to_be_bytes())? {
-            Some(data) => classic_levels(&data),
-            None => Ok((vec![], vec![])),
-        },
-    }
-}
-
-/// Metered (the EVM): everything read and charged is a hashed consensus row
-/// of THIS market, so the charge is the same on every node — never the
-/// node-local `__book_mode__` marker or a DB-wide sniff. Classic iff the
-/// market's 8-byte whole-book key exists: sized with a length probe and
-/// charged (32 bytes a unit) BEFORE it is read. Otherwise the market's own
-/// rows (bounded scan) give the row layout.
-fn metered_levels(
+/// The levels getOrderBook answers. Everything read and charged is a hashed
+/// consensus row of THIS market, so the charge is the same on every node —
+/// never the node-local `__book_mode__` marker or a DB-wide sniff. Every
+/// caller (metered or not) gets the same answer.
+///
+/// * Classic iff the market's 8-byte whole-book key exists: sized with a
+///   length probe and charged (20 gas per 32 bytes) BEFORE it is read, then
+///   decoded whole (a blob cannot be read in part; no cap).
+/// * Modes 2 / 3 (level rows, `market ‖ 0x03 ‖ side ‖ price`, 26-byte keys):
+///   the [`READER_MAX_LEVELS_PER_SIDE`] (64) best levels per side, best-first
+///   (two bounded scans, bids then asks: at most 128 rows). A key of another
+///   length under those prefixes is a corrupt row store: revert.
+/// * Mode 1 (order rows `market ‖ 0x01 ‖ order_id`, no price index): not
+///   served (s99 owner decision, final). When the market has no level row, one
+///   order row is probed (charged, 500 gas); if there is one, the call reverts
+///   as an unsupported layout (16,400 + 500 = 16,900 gas through the EVM).
+///
+/// Meta and stop rows are not read. A market with neither level nor order
+/// rows is an empty book. Not checked here (owner s100: it would cost an
+/// extra read per call): a market holding both level and order rows, or rows
+/// without a meta row. The writers never produce either (one mode per
+/// process, the meta row saved with every book; a DB of another mode
+/// fail-stops at load; test `row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market`),
+/// and the RPC readers (`book_reader::read_book_depth`) still reject both.
+fn book_levels(
     state_db: &impl StateBackend,
     market_id: MarketId,
     meter: &mut ReadMeter,
 ) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
+    use crate::book_reader::{depth_from_rows, BookLayout};
+    use crate::book_rows::{ROW_TAG_LEVEL, ROW_TAG_ORDER, SIDE_TAG_ASK, SIDE_TAG_BID};
+
     let key = market_id.to_be_bytes();
     if let Some(len) = state_db.get_cf_len(CF_NATIVE_ORDER_BOOKS, &key)? {
-        meter.charge((len as u64).div_ceil(32))?;
+        meter.charge_words((len as u64).div_ceil(32))?;
         let data = state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)?.unwrap_or_default();
         return classic_levels(&data);
     }
-    let rows = scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &key, meter)?;
-    let layout = crate::book_reader::layout_of_market_rows(market_id, &rows)?;
-    Ok(depth_pairs(crate::book_reader::depth_from_market_rows(
-        state_db, market_id, layout, &rows,
-    )?))
+    let sub = |tags: &[u8]| [&key[..], tags].concat();
+    let side = |tag: u8, meter: &mut ReadMeter| {
+        let prefix = sub(&[ROW_TAG_LEVEL, tag]);
+        let max = Some(READER_MAX_LEVELS_PER_SIDE);
+        scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &prefix, max, meter)
+    };
+    let mut rows = side(SIDE_TAG_BID, meter)?;
+    rows.extend(side(SIDE_TAG_ASK, meter)?);
+    if let Some((k, _)) = rows.iter().find(|(k, _)| k.len() != 26) {
+        return Err(CoreError::BookLayout(format!(
+            "market {market_id}: level row key of {} bytes (corrupt row store)",
+            k.len()
+        )));
+    }
+    if rows.is_empty() {
+        let orders = sub(&[ROW_TAG_ORDER]);
+        if !scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &orders, Some(1), meter)?
+            .is_empty()
+        {
+            return Err(CoreError::BookLayout(format!(
+                "market {market_id}: getOrderBook does not serve the order-row layout \
+                 (TORUS_BOOK_ROWS=1)"
+            )));
+        }
+    }
+    let depth = depth_from_rows(market_id, BookLayout::LevelAuthority, &rows)?;
+    let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
+        levels
+            .into_iter()
+            .map(|l| (l.price, l.quantity))
+            .collect::<Vec<_>>()
+    };
+    Ok((pairs(depth.bids), pairs(depth.asks)))
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
@@ -760,41 +813,6 @@ fn read_position(
     out.extend_from_slice(&abi::encode_fp_as_i128(pos.realized_pnl));
     out.extend_from_slice(&abi::encode_fp_as_u128(pos.isolated_margin));
     Ok(out)
-}
-
-/// getOpenOrders → (bytes32[] order_ids, uint128[] prices, uint128[] quantities, uint8[] sides)
-fn read_open_orders(
-    state_db: &impl StateBackend,
-    trader: &Address,
-    market_id: MarketId,
-    meter: &mut ReadMeter,
-) -> Result<Vec<u8>, CoreError> {
-    // Prefix: trader(20) + market_id(8)
-    let mut prefix = [0u8; 28];
-    prefix[..20].copy_from_slice(trader.as_slice());
-    prefix[20..28].copy_from_slice(&market_id.to_be_bytes());
-
-    let entries = scan_prefix_metered(state_db, CF_NATIVE_ORDERS, &prefix, meter)?;
-    let mut order_ids = Vec::new();
-    let mut prices = Vec::new();
-    let mut quantities = Vec::new();
-    let mut sides = Vec::new();
-
-    for (_key, value) in &entries {
-        if let Ok(order) = StoredOrder::try_from_slice(value) {
-            order_ids.push(abi::encode_order_id(order.order_id));
-            prices.push(abi::encode_fp_as_u128(order.price));
-            quantities.push(abi::encode_fp_as_u128(order.remaining_qty));
-            sides.push(abi::encode_u8(order.side));
-        }
-    }
-
-    Ok(abi::encode_arrays_response(&[
-        &order_ids,
-        &prices,
-        &quantities,
-        &sides,
-    ]))
 }
 
 // ============================================================================
@@ -851,7 +869,7 @@ fn read_balances(state_db: &impl StateBackend, trader: &Address) -> Result<Vec<u
 
 /// getMarkets → (bytes32[] market_ids, bool[] active)
 fn read_markets(state_db: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
-    let entries = scan_prefix_metered(state_db, CF_NATIVE_MARKETS, &[], meter)?;
+    let entries = scan_prefix_metered(state_db, CF_NATIVE_MARKETS, &[], None, meter)?;
     let mut market_ids = Vec::new();
     let mut active_flags = Vec::new();
 
@@ -935,7 +953,7 @@ fn read_all_oracle_prices(
     meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let prefix = b"agg";
-    let entries = scan_prefix_metered(state_db, CF_NATIVE_ORACLE, prefix, meter)?;
+    let entries = scan_prefix_metered(state_db, CF_NATIVE_ORACLE, prefix, None, meter)?;
 
     let mut market_ids = Vec::new();
     let mut prices = Vec::new();
@@ -1018,7 +1036,13 @@ fn read_staking_info(
     let mut total_delegated = U256::ZERO;
     let mut first_validator = Address::ZERO;
 
-    let entries = scan_prefix_metered(state_db, CF_STAKING_DELEGATIONS, staker.as_slice(), meter)?;
+    let entries = scan_prefix_metered(
+        state_db,
+        CF_STAKING_DELEGATIONS,
+        staker.as_slice(),
+        None,
+        meter,
+    )?;
     for (key, value) in &entries {
         if key.len() != 40 {
             break;
@@ -1066,7 +1090,7 @@ fn read_staking_info(
 
 /// getValidators → (address[] validators, uint128[] stakes, uint128[] commissions)
 fn read_validators(state_db: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
-    let entries = scan_prefix_metered(state_db, CF_STAKING_VALIDATORS, &[], meter)?;
+    let entries = scan_prefix_metered(state_db, CF_STAKING_VALIDATORS, &[], None, meter)?;
     let mut validators = Vec::new();
     let mut stakes = Vec::new();
     let mut commissions = Vec::new();
@@ -1168,8 +1192,7 @@ fn core_writer(
         CoreWriterQueue::enqueue(state_db, &action)?;
         // HL-parity: no order id. The executor assigns the real one from the
         // global counter when the queue drains next block, so it cannot be known
-        // here (the old `(block + 1) << 64 | seq` never matched it). Contracts
-        // read their orders back via getOpenOrders (0x0800).
+        // here (the old `(block + 1) << 64 | seq` never matched it).
         Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
         let order_id = abi::decode_order_id(&abi::word(input, 0)?);
@@ -1755,45 +1778,6 @@ impl BorshDeserialize for OrderBookSnapshot {
     }
 }
 
-/// An open order stored in CF_NATIVE_ORDERS.
-/// Key: trader(20) + market_id(8) + order_id(16) = 44 bytes.
-/// Value: borsh-serialized StoredOrder.
-#[derive(Clone, Debug)]
-pub struct StoredOrder {
-    pub order_id: OrderId,
-    pub price: FixedPoint,
-    pub remaining_qty: FixedPoint,
-    pub side: u8, // 0 = Buy, 1 = Sell
-}
-
-impl BorshSerialize for StoredOrder {
-    fn serialize<W: IoWrite>(&self, w: &mut W) -> io::Result<()> {
-        w.write_all(&self.order_id.to_be_bytes())?;
-        borsh_write_fp(&self.price, w)?;
-        borsh_write_fp(&self.remaining_qty, w)?;
-        w.write_all(&[self.side])?;
-        Ok(())
-    }
-}
-
-impl BorshDeserialize for StoredOrder {
-    fn deserialize_reader<R: IoRead>(r: &mut R) -> io::Result<Self> {
-        let mut ob = [0u8; 16];
-        r.read_exact(&mut ob)?;
-        let order_id = u128::from_be_bytes(ob);
-        let price = borsh_read_fp(r)?;
-        let remaining_qty = borsh_read_fp(r)?;
-        let mut sb = [0u8; 1];
-        r.read_exact(&mut sb)?;
-        Ok(Self {
-            order_id,
-            price,
-            remaining_qty,
-            side: sb[0],
-        })
-    }
-}
-
 /// Write a legacy order-book snapshot to CF_NATIVE_ORDER_BOOKS under the
 /// CLASSIC 8-byte market key.
 ///
@@ -1833,23 +1817,6 @@ pub fn write_order_book_snapshot(
     Ok(())
 }
 
-/// Write a stored order to CF_NATIVE_ORDERS.
-/// Key: trader(20) + market_id(8) + order_id(16).
-pub fn write_stored_order(
-    state_db: &StateDb,
-    trader: &Address,
-    market_id: MarketId,
-    order: &StoredOrder,
-) -> Result<(), CoreError> {
-    let mut key = [0u8; 44];
-    key[..20].copy_from_slice(trader.as_slice());
-    key[20..28].copy_from_slice(&market_id.to_be_bytes());
-    key[28..44].copy_from_slice(&order.order_id.to_be_bytes());
-    let data = borsh::to_vec(order).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    state_db.put_cf_raw(CF_NATIVE_ORDERS, &key, &data)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod scan_prefix_metered_tests {
     use super::*;
@@ -1865,12 +1832,12 @@ mod scan_prefix_metered_tests {
         db.put_cf_raw(CF_BOOK_ORDER_ROWS, b"row", b"v").unwrap();
         assert!(torus_state::running_hash::hashed_cf_id(CF_BOOK_ORDER_ROWS).is_none());
         for mut meter in [ReadMeter::with_max(1_000), ReadMeter::unlimited()] {
-            let r = scan_prefix_metered(&db, CF_BOOK_ORDER_ROWS, b"", &mut meter);
+            let r = scan_prefix_metered(&db, CF_BOOK_ORDER_ROWS, b"", None, &mut meter);
             assert!(r.is_err(), "unhashed CF scanned: {r:?}");
             assert_eq!(meter.used(), 0);
         }
         // A hashed CF still scans.
         let mut meter = ReadMeter::with_max(1_000);
-        assert!(scan_prefix_metered(&db, CF_NATIVE_MARKETS, b"", &mut meter).is_ok());
+        assert!(scan_prefix_metered(&db, CF_NATIVE_MARKETS, b"", None, &mut meter).is_ok());
     }
 }

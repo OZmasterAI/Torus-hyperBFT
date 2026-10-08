@@ -254,6 +254,9 @@ impl PositionTerms {
 
 /// [`PositionTerms`] of `pos` valued at `mark` (else entry, see
 /// [`position_price`]) with its market's `tiers`. `Err` = overflow.
+/// s100 item 2: UPnL = `n − cost_basis` (long) or `cost_basis − n` (short),
+/// `n` = size × mark (one rounding); at mark 0 exactly `∓cost_basis`.
+/// Without a mark it stays 0 (s517 decision 2).
 pub fn position_terms(
     pos: &Position,
     mark: Option<FixedPoint>,
@@ -262,9 +265,13 @@ pub fn position_terms(
     let of = |_| CoreError::Overflow("account margin overflows i128".into());
     let px = position_price(pos, mark);
     let n = pos.size.checked_mul(px).map_err(of)?;
-    let diff = if pos.is_long { px - pos.entry_price } else { pos.entry_price - px };
+    let upnl = match mark {
+        None => FixedPoint::ZERO,
+        Some(_) if pos.is_long => n.checked_sub(pos.cost_basis).map_err(of)?,
+        Some(_) => pos.cost_basis.checked_sub(n).map_err(of)?,
+    };
     Ok(PositionTerms {
-        upnl: diff.checked_mul(pos.size).map_err(of)?,
+        upnl,
         notional: n,
         position_im: order_initial_margin(tiers, n),
         maintenance: maintenance_margin(tiers, n),
@@ -806,6 +813,7 @@ mod tests {
             is_long: true,
             size: fp(1),
             entry_price: fp(50_000),
+            cost_basis: fp(50_000) * fp(1),
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
@@ -841,6 +849,7 @@ mod tests {
             is_long: true,
             size: fp(1),
             entry_price: fp(50_000),
+            cost_basis: fp(50_000) * fp(1),
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(600), // above 500 maintenance
             margin_type: MarginType::Isolated,

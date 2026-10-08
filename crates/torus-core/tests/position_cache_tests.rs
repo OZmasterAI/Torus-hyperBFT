@@ -366,6 +366,7 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
             is_long: i == 0,
             size: FixedPoint::MAX,
             entry_price: FixedPoint::MIN,
+            cost_basis: FixedPoint::from_raw(i128::MIN + 1),
             realized_pnl: FixedPoint::from_raw(-1),
             isolated_margin: FixedPoint::ZERO,
             margin_type,
@@ -376,7 +377,7 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
         };
         let position_bytes = borsh::to_vec(&position).unwrap();
         let balance_bytes = borsh::to_vec(&balance).unwrap();
-        assert_eq!(position_bytes.len(), 95);
+        assert_eq!(position_bytes.len(), 111, "v2: + 16-byte cost_basis (s100)");
         assert_eq!(balance_bytes.len(), 33);
         let key = position_key(&position.trader, position.market_id);
         owned.put_position(&position).unwrap();

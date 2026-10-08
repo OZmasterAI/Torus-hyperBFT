@@ -571,7 +571,8 @@ fn precompile_charges_correct_gas() {
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
-    // BalanceReader (read-only) costs GAS_PRECOMPILE_READ = 2600.
+    // BalanceReader (read-only) getBalances: GAS_PRECOMPILE_READ (16,400) + 4
+    // answer words x 20 = 16,480 (s99 pricing).
     let precompile_addr = Address::new([
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x01,
     ]);
@@ -600,23 +601,65 @@ fn precompile_charges_correct_gas() {
     let (result, _bundle) = executor.execute_tx(&db, &block_cfg, tx).unwrap();
 
     assert!(result.success);
-    // Gas = 21000 (base) + 2600 (precompile read) + calldata costs.
+    // Gas = 21000 (base) + 16,480 (precompile read) + calldata costs.
     // Just verify gas_used includes base tx + precompile cost.
     assert!(
-        result.gas_used >= 21_000 + 2_600,
-        "gas should include base tx (21k) + precompile read (2.6k), got {}",
+        result.gas_used >= 21_000 + 16_480,
+        "gas should include base tx (21k) + precompile read (16.48k), got {}",
         result.gas_used,
     );
 }
 
+/// s99: getOpenOrders was removed from 0x0800. Its selector reverts like any
+/// unknown selector and the tx pays exactly the reader base (16,400) on top of
+/// its intrinsic gas (Cancun: 21,000 + 16 per nonzero / 4 per zero calldata
+/// byte).
+#[test]
+fn removed_get_open_orders_reverts_for_exactly_the_base() {
+    use torus_core::precompiles::GAS_PRECOMPILE_READ;
+    let (_dir, db) = open_test_db();
+    db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+        .unwrap();
+    let mut data =
+        alloy_primitives::keccak256("getOpenOrders(address,bytes32)".as_bytes())[..4].to_vec();
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(BOB.as_slice());
+    data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+    let intrinsic: u64 = 21_000
+        + data
+            .iter()
+            .map(|&b| if b == 0 { 4 } else { 16 })
+            .sum::<u64>();
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        // OrderBookReader precompile at 0x0800.
+        kind: TxKind::Call(Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00,
+        ])),
+        data: Bytes::from(data),
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_tx(&db, &block_cfg, tx)
+        .unwrap()
+        .0;
+    assert!(!r.success, "the removed selector reverts");
+    assert_eq!(GAS_PRECOMPILE_READ, 16_400);
+    assert_eq!(r.gas_used, intrinsic + GAS_PRECOMPILE_READ);
+}
+
 /// HL-parity: a reader precompile's gas scales with its work, not a flat
-/// 2,600: one unit per row read plus one per 32-byte word returned.
+/// base: 500 per row read plus 20 per 32-byte word returned (s99).
 /// `getMarkets()` reads 1 row and returns 2 words per market: 200 markets cost
-/// exactly 600 x GAS_PRECOMPILE_READ_PER_UNIT more than none, and a gas limit
-/// that only covers the empty answer runs out of gas.
+/// exactly 200 x 500 + 400 x 20 more than none, and a gas limit that only
+/// covers the empty answer runs out of gas.
 #[test]
 fn reader_precompile_gas_scales_with_returned_words() {
-    use torus_core::precompiles::GAS_PRECOMPILE_READ_PER_UNIT;
+    use torus_core::precompiles::{GAS_PRECOMPILE_READ_PER_ROW, GAS_PRECOMPILE_READ_PER_WORD};
     let block_cfg = default_block_cfg();
     let get_markets = |db: &StateDb, gas_limit: u64| {
         let tx = TxEnv {
@@ -653,8 +696,8 @@ fn reader_precompile_gas_scales_with_returned_words() {
     assert_eq!(r1.output.len(), (4 + 400) * 32);
     assert_eq!(
         r1.gas_used - r0.gas_used,
-        600 * GAS_PRECOMPILE_READ_PER_UNIT,
-        "gas grows by one unit per row read and per word returned"
+        200 * GAS_PRECOMPILE_READ_PER_ROW + 400 * GAS_PRECOMPILE_READ_PER_WORD,
+        "gas grows by 500 per row read and 20 per word returned"
     );
 
     let (_d2, full2) = funded_db(200);
@@ -684,7 +727,7 @@ fn get_markets_loop_code(calls: usize, stipend: u32) -> Vec<u8> {
 
 /// Review (blocking): the attack is a contract looping CALLs into a reader
 /// with a tight stipend. Each call with a stipend below the work of a
-/// 200-market getMarkets (600 units) runs out of gas and costs the caller only
+/// 200-market getMarkets (200 rows + 404 words) runs out of gas and costs the caller only
 /// its stipend; the node's work per call is bounded by that stipend
 /// (torus-bridge precompile_work_bound_tests). With enough gas every call
 /// succeeds.
@@ -713,23 +756,25 @@ fn tight_stipend_reader_calls_run_out_of_gas() {
         (U256::from_be_slice(&r.output).to::<u64>(), r.gas_used)
     };
 
-    let (ok, gas) = run(2_600 + 50 * 20);
+    let (ok, gas) = run(16_400 + 500 * 20);
     assert_eq!(ok, 0, "every tight call ran out of gas");
-    assert!(gas < 21_000 + 20 * (3_600 + 1_000), "each call costs about its stipend, got {gas}");
+    assert!(
+        gas < 21_000 + 20 * (26_400 + 1_000),
+        "each call costs about its stipend, got {gas}"
+    );
 
-    let (ok, _) = run(2_600 + 50 * 700);
+    let (ok, _) = run(16_400 + 500 * 200 + 20 * 404 + 1_000);
     assert_eq!(ok, 20, "with enough gas every call succeeds");
 }
 
 /// Re-review: the exact boundary through the EVM. getMarkets over 200 markets
-/// is 200 rows + 404 words = 604 units: a stipend of exactly 2,600 + 604 x 50
-/// succeeds, one gas less runs out of gas.
+/// is 200 rows + 404 words: a stipend of exactly 16,400 + 200 x 500 + 404 x 20
+/// = 124,480 succeeds, one gas less runs out of gas.
 #[test]
 fn reader_stipend_exact_boundary() {
-    use torus_core::precompiles::{GAS_PRECOMPILE_READ, GAS_PRECOMPILE_READ_PER_UNIT};
     let block_cfg = default_block_cfg();
     let contract = Address::with_last_byte(0x78);
-    let exact = (GAS_PRECOMPILE_READ + 604 * GAS_PRECOMPILE_READ_PER_UNIT) as u32;
+    let exact = 124_480u32;
     for (stipend, want) in [(exact, 1u64), (exact - 1, 0)] {
         let (_dir, db) = open_test_db();
         db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19)))).unwrap();

@@ -1,8 +1,8 @@
 //! Stress tests (task 2.10.7).
 //!
-//! High-throughput tests verifying correctness invariants under sustained load.
-//! All tests in this file are marked `#[ignore]` — run with:
-//!   cargo test -p torus-integration-tests -- --ignored
+//! High-throughput tests verifying correctness invariants under sustained load,
+//! including exact value conservation. They run in every suite (a few seconds
+//! in a debug build).
 
 mod common;
 
@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use alloy_primitives::Address;
 use torus_bridge::native_executor::NativeExecutor;
+use torus_core::position::OPEN_ORDER_BASE_LIMIT;
 use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 use crate::common::TestHarness;
@@ -88,10 +89,10 @@ fn verify_all_book_invariants(ctx: &torus_bridge::native_executor::NativeExecCon
     }
 }
 
-/// Check value conservation: sum(available) + sum(unrealized PnL) ≈ sum(initial funding).
-///
-/// Allows a small epsilon for FixedPoint rounding from repeated multiply/divide
-/// in volume-weighted average entry price calculations.
+/// Check value conservation: sum(available + order margin) + sum(unrealized PnL) ==
+/// sum(initial funding), exactly (s100 item 2: one rounding per fill, shared by both
+/// sides). The order margin of resting orders is collateral too (s100: it was left
+/// out, so these ignored tests failed by the reserved margin).
 fn verify_value_conservation(
     h: &TestHarness,
     traders: &[Address],
@@ -103,7 +104,7 @@ fn verify_value_conservation(
 
     for trader in traders {
         let bal = h.positions.get_native_balance(trader).unwrap();
-        total_available = total_available + bal.available;
+        total_available = total_available + bal.available + bal.order_margin;
 
         let positions = h.positions.positions_for_trader(trader).unwrap();
         for pos in &positions {
@@ -113,12 +114,9 @@ fn verify_value_conservation(
 
     let actual = total_available + total_unrealized;
     let diff_raw = (actual - total_initial).raw();
-    let abs_diff = diff_raw.unsigned_abs();
-    // Allow up to 0.00001 (1000 raw units) of rounding drift from
-    // repeated FixedPoint multiply/divide in entry price averaging.
-    assert!(
-        abs_diff < 1000,
-        "Value conservation violated beyond epsilon: available({total_available}) + unrealized({total_unrealized}) = {actual}, expected {total_initial}, diff_raw={diff_raw}"
+    assert_eq!(
+        diff_raw, 0,
+        "Value conservation violated: available({total_available}) + unrealized({total_unrealized}) = {actual}, expected {total_initial}"
     );
 }
 
@@ -129,7 +127,6 @@ fn verify_value_conservation(
 /// Sustained throughput: 1 market, 100 traders, 10,000 orders in 50 blocks.
 /// Verifies no panics, book invariants, and value conservation.
 #[test]
-#[ignore]
 fn test_sustained_throughput() {
     let h = TestHarness::new();
     let market = 1u64;
@@ -192,7 +189,6 @@ fn test_sustained_throughput() {
 /// Multi-market: 5 markets, 50 traders, 1000 orders per market.
 /// Verifies per-market invariants independently and no cross-market contamination.
 #[test]
-#[ignore]
 fn test_multi_market_stress() {
     let h = TestHarness::new();
     let num_markets = 5u64;
@@ -249,7 +245,6 @@ fn test_multi_market_stress() {
 /// Position accumulation: 2 traders, 500 back-and-forth trades.
 /// Verifies entry price has no drift and realized PnL is exact.
 #[test]
-#[ignore]
 fn test_position_accumulation_precision() {
     let h = TestHarness::new();
     let market = 1u64;
@@ -418,24 +413,32 @@ fn test_position_accumulation_precision() {
 /// Deep book sweep: 10,000 resting orders across 1,000 price levels,
 /// then one large market order sweeping 100+ levels.
 #[test]
-#[ignore]
 fn test_deep_book_sweep() {
     let h = TestHarness::new();
     let market = 1u64;
-    let maker = addr(1);
-    let taker = addr(2);
     let orders_per_level = 10usize;
     let num_levels = 1000usize;
+    let total_orders = num_levels * orders_per_level;
 
-    h.fund_native(&maker, fp(1_000_000_000));
-    h.fund_native(&taker, fp(1_000_000_000));
+    // A new user may hold OPEN_ORDER_BASE_LIMIT (1000) open orders over all
+    // markets, so the 10,000 resting orders come from 10 makers in turn.
+    let per_maker = OPEN_ORDER_BASE_LIMIT as usize;
+    let num_makers = total_orders.div_ceil(per_maker);
+    let makers: Vec<Address> = (1..=num_makers).map(|i| addr(i as u8)).collect();
+    let taker = addr(num_makers as u8 + 1);
+    let funding = fp(1_000_000_000);
+    for t in makers.iter().chain([&taker]) {
+        h.fund_native(t, funding);
+    }
+    let total_initial = fp((num_makers as i64 + 1) * 1_000_000_000);
 
     let mut ctx = h.exec_context(1);
 
     // Place 10,000 resting BUY orders: 10 per level, prices 1000..1999.
     for level in 0..num_levels {
         let price = fp(1000 + level as i64);
-        for _ in 0..orders_per_level {
+        for i in 0..orders_per_level {
+            let maker = makers[(level * orders_per_level + i) / per_maker];
             let action = NativeAction::PlaceOrder(PlaceOrderParams {
                 market_id: market,
                 is_buy: true,
@@ -454,7 +457,7 @@ fn test_deep_book_sweep() {
     let book = ctx.order_books.get(&market).unwrap();
     assert_eq!(
         book.order_count(),
-        num_levels * orders_per_level,
+        total_orders,
         "All 10,000 orders should be resting"
     );
     assert_eq!(book.bid_levels(), num_levels);
@@ -506,16 +509,26 @@ fn test_deep_book_sweep() {
     assert!(!pos.is_long, "taker sold = short");
     assert_eq!(pos.size, sweep_qty);
 
-    // Volume-weighted average entry price ≈ mean(1900..=1999) = 1949.5
-    // Allow small rounding drift from repeated FixedPoint division.
-    let expected_entry = TestHarness::fp_dec(19495, 1); // 1949.5
-    let entry_diff = (pos.entry_price - expected_entry).raw().unsigned_abs();
-    assert!(
-        entry_diff < 1000,
-        "Entry price too far from expected: got {} expected {expected_entry}, diff_raw={}",
-        pos.entry_price,
-        pos.entry_price.raw() - expected_entry.raw()
+    // The cost basis is exact: the sum of the 1,000 fill notionals,
+    // 10 x sum(1900..=1999) = 1,949,500.
+    let expected_basis = fp(10 * (1900..=1999).sum::<i64>());
+    assert_eq!(expected_basis, fp(1_949_500));
+    assert_eq!(
+        pos.cost_basis, expected_basis,
+        "taker cost basis must be exact"
     );
+
+    // Entry = basis / size (truncated); here the division is exact,
+    // mean(1900..=1999) = 1949.5, so entry x size equals the basis.
+    let expected_entry = TestHarness::fp_dec(19495, 1);
+    assert_eq!(pos.entry_price, expected_entry);
+    assert_eq!(pos.entry_price * pos.size, pos.cost_basis);
+
+    // Value conservation over all makers + the taker. The makers' long sizes
+    // sum to the taker's short size, so the mark terms cancel exactly at any
+    // whole-number mark; the best bid after the sweep is used.
+    let traders: Vec<Address> = makers.iter().copied().chain([taker]).collect();
+    verify_value_conservation(&h, &traders, fp(1899), total_initial);
 
     println!("Deep book sweep: 1,000 fills across 100 levels in {sweep_elapsed:.2?}");
 }

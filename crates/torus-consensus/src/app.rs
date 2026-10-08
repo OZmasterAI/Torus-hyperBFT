@@ -4422,9 +4422,7 @@ impl TorusApp {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("torus-stub-{}-{}", std::process::id(), id));
-        let _ = std::fs::create_dir_all(&dir);
-        let state_db = StateDb::open(&dir).expect("open stub state db");
+        let state_db = StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db");
         let config = ChainConfig {
             chain_id: TORUS_CHAIN_ID,
             chain_name: "torus-test".to_string(),
@@ -6526,6 +6524,84 @@ impl TorusApp {
     }
 }
 
+/// Parent of the scratch DB dirs opened by `TorusApp::stub` and the test
+/// fixtures: `<tmp>/torus-consensus-test-dbs/<pid>/`.
+const SCRATCH_DB_ROOT: &str = "torus-consensus-test-dbs";
+
+/// A fresh, created scratch DB dir `<tmp>/SCRATCH_DB_ROOT/<pid>/<prefix>-<n>`.
+/// The DB stays open until its test ends, so nothing removes the dir on drop;
+/// instead the first call in each process removes the dirs of processes that
+/// have exited (nextest runs one process per test, so finished tests' dirs go
+/// at the next test's start).
+fn scratch_db_dir(prefix: &str) -> std::path::PathBuf {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(SCRATCH_DB_ROOT);
+    SWEEP.call_once(|| sweep_dead_process_dirs(&root));
+    let name = format!("{prefix}-{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+    let dir = root.join(std::process::id().to_string()).join(name);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Remove every `<parent>/<pid>` dir whose process has exited. Needs `/proc`
+/// (Linux); without it, and for names that are not pids, does nothing.
+fn sweep_dead_process_dirs(parent: &std::path::Path) {
+    let proc = std::path::Path::new("/proc");
+    if !proc.join("self").exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.parse::<u32>().is_ok()) else {
+            continue;
+        };
+        if !proc.join(pid).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_db_dir_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_removes_only_dirs_of_exited_processes() {
+        let parent = tempfile::tempdir().unwrap();
+        // Above the kernel's pid_max (2^22), so never a live process.
+        let dead = parent.path().join("4294967295");
+        let own = parent.path().join(std::process::id().to_string());
+        let other = parent.path().join("not-a-pid");
+        for d in [&dead, &own, &other] {
+            std::fs::create_dir_all(d.join("db")).unwrap();
+        }
+        sweep_dead_process_dirs(parent.path());
+        assert!(!dead.exists(), "dir of an exited process is removed");
+        assert!(own.exists(), "dir of a live process is kept");
+        assert!(other.exists(), "non-pid names are left alone");
+    }
+
+    #[test]
+    fn scratch_db_dir_is_per_process_and_created() {
+        let dir = scratch_db_dir("torus-unit");
+        assert!(dir.is_dir());
+        assert_eq!(
+            dir.parent().unwrap(),
+            std::env::temp_dir()
+                .join(SCRATCH_DB_ROOT)
+                .join(std::process::id().to_string())
+        );
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("torus-unit-"));
+        let next = scratch_db_dir("torus-unit");
+        assert_ne!(dir, next, "every call gets a fresh dir");
+    }
+}
+
 #[cfg(test)]
 mod exec_throttle_tests {
     use super::*;
@@ -6674,17 +6750,8 @@ mod exec_throttle_tests {
         std::env::set_var("TORUS_EXEC_THROTTLE_WATERMARKS", "4,8,12");
 
         let (config, state_db) = {
-            // Reuse the crash-test fixture helpers (same file, different module).
-            use std::sync::atomic::{AtomicU64 as CounterU64, Ordering as CounterOrdering};
-            static COUNTER: CounterU64 = CounterU64::new(9000);
-            let id = COUNTER.fetch_add(1, CounterOrdering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "torus-throttle-test-{}-{}",
-                std::process::id(),
-                id
-            ));
-            let _ = std::fs::create_dir_all(&dir);
-            let state_db = StateDb::open(&dir).expect("open test db");
+            let state_db =
+                StateDb::open(&scratch_db_dir("torus-throttle-test")).expect("open test db");
             let config = ChainConfig {
                 chain_id: torus_evm::TORUS_CHAIN_ID,
                 chain_name: "throttle-test".to_string(),
@@ -7397,7 +7464,6 @@ mod crash_recovery_tests {
     use torus_types::{Bloom, FixedPoint, NativeAction, SignedNativeAction, B256, U256};
 
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
-        use std::sync::atomic::{AtomicU64, Ordering};
         // Native trie maintenance is a process-global flag that only ever
         // goes off -> on (resolved off from the env on first use, forced on
         // by tests that read the maintained root). Tests in this module that
@@ -7410,12 +7476,7 @@ mod crash_recovery_tests {
         // fixture DB, so every run in every test sees the same mode in
         // `cargo test` and in nextest.
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
-        static COUNTER: AtomicU64 = AtomicU64::new(1000);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("torus-crash-test-{}-{}", std::process::id(), id));
-        let _ = std::fs::create_dir_all(&dir);
-        let state_db = StateDb::open(&dir).expect("open test db");
+        let state_db = StateDb::open(&scratch_db_dir("torus-crash-test")).expect("open test db");
         let config = ChainConfig {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
