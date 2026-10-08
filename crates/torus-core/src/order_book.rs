@@ -478,8 +478,9 @@ impl ShapeViolation {
 /// Item 6 M1: the placement shape rule of a market with `tick` / `lot` —
 /// [`OrderBook::place_order_with_accounts`]'s dust and tick rejects, same
 /// order (lot first, for every order type; then the tick when `tick > 0`
-/// for a `Limit` price), plus (row 40) a `StopLimit`'s limit, which is the
-/// `Limit` price it is placed at when triggered.
+/// for a `Limit` price and (row 40; the book too since row 45) a
+/// `StopLimit`'s limit, which is the `Limit` price it is placed at when
+/// triggered).
 pub fn shape_violation(params: &PlaceOrderParams, tick: FixedPoint, lot: FixedPoint) -> Option<ShapeViolation> {
     if params.quantity < lot {
         return Some(ShapeViolation::BelowLot { quantity: params.quantity, lot });
@@ -490,6 +491,27 @@ pub fn shape_violation(params: &PlaceOrderParams, tick: FixedPoint, lot: FixedPo
         OrderType::Market | OrderType::StopMarket { .. } => return None,
     };
     (tick > FixedPoint::ZERO && price.raw() % tick.raw() != 0).then_some(ShapeViolation::OffTick { price, tick })
+}
+
+/// s515 (BUG 1) / item 6 M1 (row 41) / row 46 follow-up: the placement price
+/// rule, one text for the executor's pre-book reject and the RPC intake
+/// check (checked before [`shape_violation`]). A `Limit` price must be
+/// positive; a `Market` / `StopMarket` price is a required worst-acceptable
+/// cap, positive too; a `StopLimit`'s limit must be positive.
+pub fn order_price_violation(params: &PlaceOrderParams) -> Option<String> {
+    match params.order_type {
+        OrderType::Limit if params.price <= FixedPoint::ZERO => {
+            Some(format!("limit order requires a positive price, got {}", params.price))
+        }
+        OrderType::Market | OrderType::StopMarket { .. } if params.price <= FixedPoint::ZERO => Some(format!(
+            "market order requires a positive price cap (worst acceptable price), got {}",
+            params.price
+        )),
+        OrderType::StopLimit { limit, .. } if limit <= FixedPoint::ZERO => {
+            Some(format!("stop-limit order requires a positive limit price, got {limit}"))
+        }
+        _ => None,
+    }
 }
 
 /// Item 6 M1 (row 42): `(tick, lot)` of a `CF_NATIVE_MARKETS` row in the
