@@ -2911,15 +2911,150 @@ call in `native_executor.rs`), not a count of positions (18c s104;
   diff of pass B and match, perf stat cache misses); 18c builds bit-identical
   savings meanwhile. The Phase 2 gate stays measured against `d3ba3c0a`.
 
+## 28. Perf A/B of the exact cost basis merge: p2 `2ebe1a14` vs p3 `9e695364` (campaign `ozarchy-p2s0y`, 2026-10-08)
+
+Asked by 18c (s104) after reading the code could not explain section 27's
+p2 -> p3 step. The section 27 binaries (p2 `b7798354`, p3 `2549ecdf`), bench
+`fff899ca`, harness and standard shape as section 27. Driver
+`~/bench-results-matched/ozarchy-p2s0y-campaign.sh`, sidecar
+`ozarchy-p2s0y-tools/perf2-sidecar.sh`, analysis `ozarchy-p2s0y-tools/p2s0y.py`
+(`cells`, `rec`, `cmp`, `stat`); reports `ozarchy-p2s0y-{cells,xstat-cmp,prof-cmp,stat}.txt`
+and `ozarchy-p2s0y-perfdiff-prof{1,2}.txt`. All cells rc 0, exe md5 3/3 as
+staged, trie off, oracle stale 0, no deaths; load 1.7-1.98 before each cell;
+`perf_event_paranoid=2`, all events `:u`, no sysctl change.
+
+Cells, each mirrored p2 p3 p3 p2 after a 60 s p2 warm-up (15:58-16:52, unit
+`bench-ozarchy-p2s0y-2.service`):
+
+- **prof:** W1 whole-process `cycles:u` at 499 Hz with frame-pointer call
+  graphs (35-80 s, the section 22 / 25 setting); W2 `perf stat` on the
+  execution thread only (`-t <exec tid> --no-inherit`, 82-102 s). Costs ~3-6%
+  of matched/s.
+- **xstat:** W1 a 5-event `perf record` on the execution thread only, no
+  inherit (cycles, instructions, L1d load misses, DRAM demand fills
+  `ls_dmnd_fills_from_sys.mem_io_local`, one more); W2 whole-process `perf
+  stat`. Costs ~0-2%: the closest to clean cells.
+- The execution thread is the `torus-execution` task with the most CPU
+  (~2,700 ticks vs 3 for the next).
+
+| cell | node | matched/s | fills/blk | engine ms/1k | settle | pass B | match | pass B / 1k fills | match / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|
+| p2 warm2 | b7798354 | 170,799 | 29,722 | 4.19 | 43.6 | 25.2 | 14.1 | 0.848 | 0.475 |
+| p2 prof1 | b7798354 | 165,524 | 37,455 | 4.45 | 58.9 | 32.2 | 22.0 | 0.861 | 0.587 |
+| p3 prof1 | 2549ecdf | 166,816 | 38,353 | 4.41 | 59.9 | 32.9 | 22.6 | 0.858 | 0.589 |
+| p3 prof2 | 2549ecdf | 162,123 | 38,042 | 4.47 | 61.9 | 33.9 | 23.6 | 0.892 | 0.620 |
+| p2 prof2 | b7798354 | 165,228 | 37,990 | 4.37 | 59.0 | 31.8 | 22.8 | 0.836 | 0.601 |
+| p2 xstat1 | b7798354 | 172,823 | 27,274 | 4.34 | 41.0 | 23.5 | 14.5 | 0.861 | 0.531 |
+| p3 xstat1 | 2549ecdf | 169,545 | 27,562 | 4.44 | 44.4 | 25.9 | 14.7 | 0.939 | 0.534 |
+| p3 xstat2 | 2549ecdf | 173,465 | 28,161 | 4.32 | 43.7 | 25.7 | 14.5 | 0.912 | 0.516 |
+| p2 xstat2 | b7798354 | 177,606 | 28,020 | 4.25 | 42.2 | 24.3 | 14.6 | 0.867 | 0.520 |
+
+ms per native block (val0) unless per 1k fills. xstat means: matched/s p2
+175,215 vs p3 171,505 (**-2.1%**, r1/r2 spread 2.7% / 2.3%), pass B per 1k
+fills 0.864 vs 0.926 (**+7.1%**), match per 1k fills 0.526 vs 0.525 (flat),
+engine ms/1k 4.30 vs 4.38.
+
+### 28.1 Pass B: all in `PositionCache::merge_disjoint`
+
+Execution thread, xstat W1, inline-expanded, mean of 2 cells per arm, per 1k
+fills:
+
+| | Mcycles p2 -> p3 | Minstr | IPC | DRAM fills (k) |
+|---|---|---|---|---|
+| pass B total | 2.465 -> 2.622 (**+6.4%**) | 2.645 -> 2.656 (+0.4%) | 1.07 -> 1.01 | 8.23 -> 9.33 (+13%) |
+| `PositionCache::merge_disjoint` (`self.map.extend`) | **0.815 -> 0.979 (+20%)** | 1.08 -> 1.16 | 1.33 -> 1.19 | **2.33 -> 3.49 (+50%)** |
+| of which `reserve_rehash_inner` | 0.265 -> 0.334 | 0.57 -> 0.56 | 2.17 -> 1.69 | 0.51 -> 1.11 (2.2x) |
+| `persist_trade` | 0.361 -> 0.363 | flat | 0.81 / 0.80 | flat |
+| `bal_cache` / hashing | 0.75 -> 0.71 | | | |
+
+- **Verdict: memory traffic in one function, not more work.** Pass B
+  instructions per fill are unchanged; `merge_disjoint` alone is +0.164
+  Mcycles per 1k fills, the whole pass B delta (+0.157). Per cell it splits
+  cleanly: 0.817 / 0.812 Mcycles in the p2 cells, 0.987 / 0.971 in p3 (DRAM
+  fills 2.35 / 2.30 vs 3.77 / 3.20). The rest of the execution thread is
+  +2.4% cycles (margin +0.09, cache flush +0.02), instructions flat (+-1%)
+  in every class, DRAM fills +7%.
+- The whole-process cycles profile (prof) agrees: pass B 2.128 -> 2.338
+  Mcycles per 1k fills (+9.9%), `merge_disjoint` 0.718 -> 0.830,
+  `find_or_find_insert_index` and `RawTable` +25-33%.
+- **Likely mechanism (inferred from the layout, not measured):** the map
+  entry `((Address, u64), Option<Position>)` with 16-byte-aligned `i128`
+  FixedPoint is 32 + 96 = 128 B in p2 (two cache lines) and 32 + 112 = 144 B
+  in p3: +12.5% bytes per insert and rehash, and entries no longer line up
+  with cache lines. The 2.2x rehash DRAM fills are more than the bytes alone;
+  a table crossing a cache or allocator threshold may add to it (not tested).
+- **Fix (18c, `perf/position-v2-savings` `37b28dd6`, off `bf2edda6`):**
+  `5d197a3b` reserves the batch `PositionCache` (map and dirty set) for the
+  summed entry count before pass B's merges, so `extend` no longer rehashes
+  (18c microbench 1,179-1,359 -> 665-1,018 ns per entry); `37b28dd6` updates
+  the cached position in place on the fill path instead of cloning the 144 B
+  entry (pass A). A u64 fast path for FixedPoint multiply was dropped (the
+  bench's products are all above 2^64). If reserve leaves most of pass B's
+  +7%, 18c's next steps are boxing Position in the cache map, or keeping the
+  per-market caches separate and sorting their dirty keys once at flush.
+
+### 28.2 Match: no regression
+
+- Whole-process `cycles:u`: match workers do slightly less work per fill in
+  p3 (7.145 -> 6.759 Mcycles per 1k fills, 0.95x); the match share on the
+  execution thread (spawn and join) is 0.636 -> 0.681. Self-time movers
+  (`match_at_level`, `match_market`, `place_order_with_accounts`,
+  `__divti3`) all sit at 0.91-1.0x, none consistent across pairs.
+- Timers in the xstat cells: 0.550 vs 0.551 ms per 1k fills. Section 27's
+  match rise does not reproduce: noise.
+- Stock `perf diff` (`--comms torus-execution`, relative) is not usable
+  here: the two pairs disagree in direction for every symbol above +-0.15%,
+  and the `HashMap<(Address,u64),Option<Position>>` frames move only because
+  inlining changed (`extend` is its own frame only in p3). The inline-aware
+  tables above are the reliable view.
+
+### 28.3 perf stat (per 1k fills, mean of 2 cells, p3 / p2)
+
+| event | execution thread (prof W2) | spread p2 / p3 | whole process (xstat W2) |
+|---|---|---|---|
+| cycles | 1.017 | 4.5% / 1.5% | 1.027 |
+| instructions | 1.003 | 2.4% / 0.9% | 1.035 |
+| IPC | 1.537 -> 1.516 | | 1.699 -> 1.712 |
+| L1d load misses | 1.012 | 2.8% / 0.5% | 1.067 |
+| DRAM fills | 1.025 | 3.8% / 0.5% | - |
+| fills from another CCX | 1.008 | 10.5% / 5.6% | - |
+| cache-references / cache-misses | - | | 1.040 / 1.049 |
+
+The whole-process r1/r2 spread is 7-10%, larger than the effect, so that
+column cannot resolve a 3% change (cache-misses per 1k instructions 3.64 vs
+3.69). The execution-thread table's header in `ozarchy-p2s0y-stat.txt` says
+"val0 whole process"; it is the execution thread only.
+
+### 28.4 Profiling notes for this shape
+
+- **Do not reuse the 5-event inherited `perf record`** (section 9.2's
+  `ozarchy-ipc-tools/ipc-sidecar.sh`) on the standard shape: every
+  short-lived worker thread (~15k spawns per minute) inherits all 5
+  sampling events. The first p2s0y layout (cells `p2-rec1`, `p3-rec1`,
+  unit `bench-ozarchy-p2s0y.service`) ran at 109-111k matched/s (~-37%),
+  821 s of system CPU in a 50 s window, match and pass A timers ~10x. Kept
+  for reference only; profile the execution thread with `-t <tid>
+  --no-inherit` instead, or use plain `cycles:u` whole-process.
+- **Zen 3 events:** `LLC-loads` / `LLC-load-misses` are not supported on this
+  host; use `ls_dmnd_fills_from_sys.mem_io_local` (DRAM demand fills). With
+  the NMI watchdog on only 5 counters are free: 5 events per window keeps
+  them unmultiplexed. `ls_dmnd_fills_from_sys.ext_cache_local` is a fill from
+  another CCX's cache, not an L3 hit (the section 9 sidecar's comment calls
+  it "L3 fill"; section 9.2's tables do not use it).
+
 ## Open
 
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
   build style (D/B 1.014x), not the load generator. **Bisected** (section
   27): `a746c408` (ADL budget; `TraderPositions::apply` 1.8x per fill from C2's
-  `set_holder`, ~38% of the gap; ozarchy fixes it) and `9e695364` (exact cost
-  basis; settle pass B +10% and engine +4% per fill, ~44%; perf A/B p2 vs p3
-  on ozarchy, 18c builds savings).
+  `set_holder`, ~38% of the gap) and `9e695364` (exact cost basis; settle
+  pass B +10% and engine +4% per fill, ~44%). Profiled (section 28): pass B's
+  extra time is all `PositionCache::merge_disjoint` (more DRAM fills, same
+  instructions); match does not regress. Fixes: `perf/c2-set-holder`
+  `d7bd1c36` (ozarchy, suites green, not pushed) and 18c's
+  `perf/position-v2-savings` `37b28dd6`; 5-arm A/B against `d3ba3c0a`
+  (campaign `ozarchy-c2h`) running.
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
