@@ -16,6 +16,34 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `perf/item6-phase2` `f5eaff1b` (2026-10-08, s31, after merging main 12979d4b)
+
+Phase 2 at `82aa528d` (step 1: the C1 cancel-all index and its tests, the index size gauges, the gate
+cell docs) with main `12979d4b` merged in (`f5eaff1b`). The merge was clean; git auto-merged `app.rs`
+(`torus-consensus`), `backend.rs` (`torus-state`) and `lib.rs` (`torus-telemetry`). Worktree
+`wt/item6-phase2`, target dir `~/.cargo-target-item6-phase2`. The suite 4 baseline `12979d4b` ran in a
+temporary detached worktree (`wt/base-12979d4b`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`). That target dir no longer existed, so the base build was cold.
+The worktree was removed afterwards. Both clippy runs cover the same 21 workspace crates. Suite 3 was
+not requested for this run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,116 passed, 0 failed**, 34 skipped, 0 flaky (1 slow) | 135 s (97.6 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 6 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `12979d4b` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**; fmt 3,359 = 3,359, **0 new** | 17 s / 4 s (base 87 s cold / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 30 s |
+
+Compared with `744e55ee` (3,085 passed, 34 skipped): 31 more tests, skipped unchanged. Main's side
+(`e934fa0e..12979d4b`) adds 8 tests and Phase 2's step 1 (`744e55ee..82aa528d`) adds 23. Neither side
+adds a clippy or fmt finding. The fmt total moved from 3,352 to 3,359 because main `12979d4b` itself
+has 7 more hunks than `e934fa0e` (old debt from main, not from the branch).
+
+Logs: `~/bench-results-matched/presuite-item6-p2-1297/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`).
+
 ## `perf/item6-phase2` `744e55ee` (2026-10-08, s29, after merging main e934fa0e)
 
 Step 0 (`1a6573dc`) with main `e934fa0e` merged in (`c1a3bdb8`; the code merged without conflicts, git
