@@ -2818,13 +2818,96 @@ window).
 - **For Phase 2:** the +7% gate is measured against `d3ba3c0a` (plan 9.7), so
   the gate's reference does not move; the regression is for 18c / the owner.
 
+## 27. Bisect of the section 26 regression (campaign `ozarchy-p2s0x`, 2026-10-08)
+
+Five more node-only builds on the first-parent path from `35e69b3` to
+`d3ba3c0a`, each from its own detached worktree into its own fresh, unseeded
+target dir, flags as section 26 (`--release`, line-tables-only, mold, frame
+pointers; `ozarchy-p2s0x-build.sh`). B is section 26's `193ae781`. Same bench
+`fff899ca`, harness, oracle feed and standard shape as section 26.
+
+| arm | commit | node | merges since the previous arm (first parent) |
+|---|---|---|---|
+| a | `35e69b3` | `7a66c678` | - |
+| p0 | `8582e827` (`a746c408^1`) | `58ebd01a` | B batch, row 74 storage halt, row 50 rejected status, StateDb compaction join, test flakes, dev debuginfo, docs |
+| p1 | `a746c408` | `41b606d3` | `perf/adl-budget` (ADL work budget, C2 holder lists) |
+| p2 | `2ebe1a14` (`9e695364^1`) | `b7798354` | ADL dirty check, 9.11 counter, governance params, item 7 step 0, read-precompile gas, antispam eviction metric, row 80, row 50 follow-ups |
+| p3 | `9e695364` | `2549ecdf` | `fix/exact-cost-basis` (Position v2, cost basis) |
+| b | `d3ba3c0a` | `193ae781` | `fix/test-dir-leak`, `fix/read-gas-followup` (4 MiB book SSTs) |
+
+Order: b warm (60 s), then a p0 p1 p2 p3 b b p3 p2 p1 p0 a (120 s each);
+13:23-14:39. All 13 cells rc 0, AGREE, liveness PASS, accepted, no deaths, exe
+md5 3/3 as staged, trie off, oracle stale 0, no tail WARNING, max 439 open
+fds; load before each cell 1.6-2.1. Driver
+`~/bench-results-matched/ozarchy-p2s0x-campaign.sh` (copy of the section 26
+driver), log `ozarchy-p2s0x.log`, cells `ozarchy-p2s0x-300m-<tag>/`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | settle | settle pass B | match | end_resident | end_resident positions | positions / 1k fills | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| b warm | 175,335 | 4.68 | 24,920 | 4.29 | 133.7 | 38.7 | 22.3 | 12.7 | 21.4 | 9.13 | 0.366 | 7.7 |
+| a r1 | 185,496 | 5.44 | 26,698 | 4.20 | 139.1 | 40.1 | 23.1 | 13.8 | 16.9 | 5.28 | 0.198 | 4.6 |
+| p0 r1 | 183,252 | 5.46 | 27,880 | 4.22 | 146.2 | 41.8 | 24.0 | 13.9 | 18.0 | 5.60 | 0.201 | 5.3 |
+| p1 r1 | 179,509 | 5.46 | 25,650 | 4.20 | 137.4 | 38.7 | 22.4 | 12.6 | 21.0 | 9.57 | 0.373 | 8.8 |
+| p2 r1 | 171,552 | 5.17 | 28,280 | 4.32 | 156.3 | 42.0 | 23.7 | 14.8 | 25.2 | 11.24 | 0.397 | 10.7 |
+| p3 r1 | 167,547 | 5.05 | 26,730 | 4.45 | 152.9 | 42.7 | 24.9 | 14.9 | 23.9 | 10.68 | 0.400 | 10.7 |
+| b r1 | 171,985 | 4.83 | 27,920 | 4.44 | 155.5 | 45.1 | 26.8 | 15.3 | 23.7 | 10.47 | 0.375 | 9.6 |
+| b r2 | 168,985 | 5.03 | 27,870 | 4.42 | 157.1 | 44.7 | 26.8 | 14.4 | 23.8 | 10.41 | 0.374 | 10.0 |
+| p3 r2 | 170,863 | 5.13 | 28,040 | 4.46 | 157.4 | 44.6 | 26.2 | 15.1 | 23.5 | 10.47 | 0.374 | 9.8 |
+| p2 r2 | 178,989 | 5.36 | 28,320 | 4.24 | 152.6 | 42.8 | 24.5 | 14.3 | 23.1 | 10.52 | 0.372 | 9.5 |
+| p1 r2 | 173,415 | 5.04 | 27,380 | 4.37 | 151.9 | 42.6 | 24.5 | 14.4 | 23.1 | 10.43 | 0.381 | 9.8 |
+| p0 r2 | 180,164 | 5.37 | 27,340 | 4.28 | 145.3 | 40.3 | 22.9 | 15.1 | 18.8 | 5.83 | 0.213 | 5.5 |
+| a r2 | 182,789 | 5.34 | 27,740 | 4.24 | 145.3 | 40.4 | 22.7 | 14.5 | 17.9 | 5.49 | 0.198 | 4.8 |
+
+ms per native block (val0) unless per 1k fills; end_resident positions in
+thousands per block.
+
+| mean of r1, r2 | matched/s | r1/r2 spread | vs a | vs b | engine ms/1k | chain ms / 1k fills | settle pass B ms / 1k fills | positions / 1k fills |
+|---|---|---|---|---|---|---|---|---|
+| a | 184,142 | 1.5% | 1.000 | 1.080 | 4.22 | 5.22 | 0.840 | 0.198 |
+| p0 | 181,708 | 1.7% | 0.987 | 1.066 | 4.25 | 5.28 | 0.848 | 0.207 |
+| p1 | 176,462 | 3.5% | 0.958 | 1.035 | 4.29 | 5.46 | 0.884 | 0.377 |
+| p2 | 175,270 | 4.2% | 0.952 | 1.028 | 4.28 | 5.46 | 0.851 | 0.384 |
+| p3 | 169,205 | 2.0% | 0.919 | 0.992 | 4.46 | 5.66 | 0.933 | 0.387 |
+| b | 170,485 | 1.8% | **0.926** | 1.000 | 4.43 | 5.60 | 0.959 | 0.374 |
+
+| step | matched/s | share of the a -> b gap | what moves |
+|---|---|---|---|
+| a -> p0 | -1.3% | 18% | nothing clear; within noise |
+| **p0 -> p1 (`a746c408`)** | **-2.9%** | **38%** | end_resident positions per 1k fills 0.207 -> 0.377 (1.8x), end_resident wait +3.9 ms per block; engine per fill unchanged |
+| p1 -> p2 | -0.7% | 9% | within noise (the p1 and p2 cells overlap) |
+| **p2 -> p3 (`9e695364`)** | **-3.5%** | **44%** | engine ms/1k 4.28 -> 4.46 (+4%), settle pass B per 1k fills 0.851 -> 0.933 (+10%) |
+| p3 -> b | +0.8% | -9% | within noise |
+
+- **Verdict: two merges, `a746c408` (ADL budget) and `9e695364` (exact cost
+  basis), together ~80% of the gap.** The rest is spread over steps within
+  noise. B/A 0.926 repeats section 26 (0.937).
+- **Confidence:** matched/s alone does not settle it. The anchors' r1/r2
+  spread is 1.5-1.8% (a, b) and up to 4.2% (p1, p2), and the two culprit steps
+  are only ~2x that. The per-fill metrics split cleanly at the same two steps
+  in every cell: end_resident positions per 1k fills 0.198-0.213 in all a and
+  p0 cells, 0.372-0.400 in every cell from p1 on; engine ms/1k 4.32 / 4.24 in
+  the p2 cells, 4.45 / 4.46 in p3; settle pass B per 1k fills 0.839 / 0.863 in
+  p2, 0.932 / 0.934 in p3. Chain ms per 1k fills rises at the same two steps
+  (+3.4%, +3.8%) and is flat elsewhere. High confidence that both merges cost
+  throughput, moderate on the exact split.
+- **Section 26's 1.9x end_resident positions per 1k fills** (0.203 -> 0.386
+  there) is all `a746c408`.
+- **Against section 26:** a is 2.3% higher (184,142 vs 179,993), b 1.1%
+  higher (170,485 vs 168,630). Settle pass B per 1k fills a -> b is +14% here
+  vs +6.9% in `ozarchy-p2s0r-phasecmp-ab.txt`; match per 1k fills +2% here vs
+  +6% there.
+- **Next (owner decision):** why `a746c408` keeps ~1.8x the positions resident
+  per fill and why Position v2 makes settle pass B ~10% dearer per fill (code
+  reading first, no new bench).
+
 ## Open
 
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
-  build style (D/B 1.014x), not the load generator. Next: bisect of the merges
-  between them (ADL budget / dirty check, exact cost basis, row 50 follow-ups;
-  owner, separate job).
+  build style (D/B 1.014x), not the load generator. **Bisected** (section
+  27): `a746c408` (ADL budget; ~1.8x end_resident positions per fill, ~38% of
+  the gap) and `9e695364` (exact cost basis; settle pass B +10% and engine +4%
+  per fill, ~44%). Next: why, from the code (owner decision).
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
