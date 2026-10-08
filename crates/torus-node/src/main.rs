@@ -405,6 +405,41 @@ mod commit_lag_cap_tests {
     }
 }
 
+/// macOS `OPEN_MAX` (<sys/syslimits.h>; not exported by libc): setrlimit
+/// rejects a soft NOFILE above it even when the hard limit is RLIM_INFINITY.
+#[cfg(target_os = "macos")]
+const MACOS_OPEN_MAX: libc::rlim_t = 10240;
+
+/// Raise the soft RLIMIT_NOFILE to the hard limit (Go does this at startup).
+/// RocksDB keeps every SST open (max_open_files = -1) and the book CF writes
+/// 4 MiB SSTs (~256 files/GB), while a systemd service starts at soft 1024.
+/// Never lowers. Returns (old soft, new soft, hard).
+#[cfg(unix)]
+fn raise_nofile_limit() -> std::io::Result<(libc::rlim_t, libc::rlim_t, libc::rlim_t)> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let old = lim.rlim_cur;
+    #[cfg(target_os = "macos")]
+    let target = lim.rlim_max.min(MACOS_OPEN_MAX);
+    #[cfg(not(target_os = "macos"))]
+    let target = lim.rlim_max;
+    if old >= target {
+        return Ok((old, old, lim.rlim_max));
+    }
+    lim.rlim_cur = target;
+    // SAFETY: `lim` is a valid rlimit read by the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((old, target, lim.rlim_max))
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -451,6 +486,14 @@ async fn main() {
         data_dir = %cli.data_dir.display(),
         "starting torus-node"
     );
+
+    // Before the StateDb opens (every SST stays open) and any socket listens.
+    #[cfg(unix)]
+    match raise_nofile_limit() {
+        Ok((old, new, hard)) if new > old => info!(old, new, hard, "raised open-file soft limit"),
+        Ok(_) => {}
+        Err(e) => warn!(%e, "could not raise open-file soft limit"),
+    }
 
     if let Err(e) = run(cli).await {
         error!(%e, "node exited with error");
@@ -1366,6 +1409,41 @@ mod tests {
         assert!(
             PROGRESS_MSG_BUFFER_BYTES >= flush,
             "buffer {PROGRESS_MSG_BUFFER_BYTES} B < one reconnect flush from 3 peers {flush} B"
+        );
+    }
+
+    /// RocksDB keeps every SST open (max_open_files = -1) and the book CF
+    /// writes 4 MiB SSTs; a systemd service starts with soft NOFILE 1024.
+    /// Startup must lift the soft limit to the hard limit, and only raise.
+    #[cfg(unix)]
+    #[test]
+    fn raise_nofile_limit_lifts_soft_to_hard_and_is_idempotent() {
+        let get = || {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+            lim
+        };
+        let mut lim = get();
+        if lim.rlim_max < 1024 {
+            eprintln!("skip: hard NOFILE {} < 1024", lim.rlim_max);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let want = lim.rlim_max.min(MACOS_OPEN_MAX);
+        #[cfg(not(target_os = "macos"))]
+        let want = lim.rlim_max;
+        lim.rlim_cur = 1024;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+
+        let (old, new, hard) = raise_nofile_limit().expect("raise");
+        assert_eq!((old, new, hard), (1024, want, lim.rlim_max));
+        assert_eq!(get().rlim_cur, want);
+        assert_eq!(
+            raise_nofile_limit().expect("raise again"),
+            (want, want, hard)
         );
     }
 
