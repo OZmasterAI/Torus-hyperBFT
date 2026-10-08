@@ -671,6 +671,26 @@ impl PositionCache {
         self.dirty.extend(other.dirty);
     }
 
+    /// Number of cached entries (live rows, misses and tombstones).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Reserve room for `additional` more entries (and dirty marks), so a
+    /// run of [`merge_disjoint`] calls does not rehash as the map grows.
+    /// Capacity only: no entry or iteration order that matters changes
+    /// (`flush_all` sorts its keys).
+    ///
+    /// [`merge_disjoint`]: Self::merge_disjoint
+    pub fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+        self.dirty.reserve(additional);
+    }
+
     /// Write every dirty row to the backend once, in sorted key order
     /// (deterministic write sequence; see type-level docs). Clean entries
     /// (read-only hits/misses) are untouched. Clears the dirty set.

@@ -395,3 +395,47 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
     drop(pm);
     drop(dir);
 }
+
+// ============================================================================
+// Position v2 savings: reserve before merge, in-place fill update
+// ============================================================================
+
+/// Pass B shape: per-market caches merged into one batch cache give the same
+/// flush whether or not the batch cache reserved the total entry count first.
+#[test]
+fn reserve_then_merge_flushes_like_plain_merge() {
+    let fills: Vec<FillSpec> = (0..60u8)
+        .map(|i| (i % 7, u64::from(i % 5) + 1, i % 3 != 0, i64::from(i % 4) + 1, 100 + i64::from(i)))
+        .collect();
+    let per_market = |pm: &PositionManager| -> Vec<PositionCache> {
+        (1..=5u64)
+            .map(|m| {
+                let mut c = PositionCache::new();
+                for &(t, fm, is_buy, qty, price) in fills.iter().filter(|f| f.1 == m) {
+                    pm.apply_fill_cached(&mut c, &addr(t), fm, is_buy, fp(qty), fp(price), MarginType::Cross)
+                        .unwrap();
+                }
+                c
+            })
+            .collect()
+    };
+    let (_d1, plain_pm) = setup();
+    let (_d2, reserved_pm) = setup();
+    let mut plain = PositionCache::new();
+    for c in per_market(&plain_pm) {
+        plain.merge_disjoint(c);
+    }
+    let caches = per_market(&reserved_pm);
+    let total: usize = caches.iter().map(PositionCache::len).sum();
+    assert_eq!(total, 35, "7 traders x 5 markets, every key touched");
+    let mut reserved = PositionCache::new();
+    reserved.reserve(total);
+    for c in caches {
+        reserved.merge_disjoint(c);
+    }
+    assert_eq!((plain.len(), reserved.len()), (total, total));
+    plain.flush_all(&plain_pm).unwrap();
+    reserved.flush_all(&reserved_pm).unwrap();
+    assert!(!dump_cf(&plain_pm, CF_NATIVE_POSITIONS).is_empty());
+    assert_state_identical(&plain_pm, &reserved_pm);
+}
