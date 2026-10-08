@@ -886,7 +886,11 @@ impl HashExtras {
             }
         }
         for (code_hash, bytecode) in &bundle.contracts {
-            self.put(CF_CODE, code_hash.as_slice(), bytecode.bytes().as_ref());
+            self.put(
+                CF_CODE,
+                code_hash.as_slice(),
+                bytecode.original_byte_slice(),
+            );
         }
     }
 }
@@ -4412,6 +4416,13 @@ mod tests {
         }
         // live account + 2 slots + code + destroyed account
         assert_eq!(seen, 5);
+        // Review #5: CF_CODE holds the original runtime, not revm's padded copy.
+        assert_eq!(
+            db.get_cf_raw(CF_CODE, code.hash_slow().as_slice())
+                .unwrap()
+                .as_deref(),
+            Some(&[0x60u8, 0x00][..])
+        );
     }
 
     fn flush_block(db: &StateDb, h: u64) {

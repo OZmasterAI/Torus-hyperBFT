@@ -10330,12 +10330,40 @@ mod crash_recovery_tests {
                 self.clone()
             }
         }
+        /// The global default for threads without a capture: records nothing,
+        /// but its interest in every callsite is "sometimes". tracing caches
+        /// each callsite's interest for the whole process, and while the
+        /// capture is the only live subscriber that interest comes from the
+        /// default of whichever thread hits the callsite first, so a first
+        /// hit elsewhere (no subscriber) was cached as never (650a9fa5).
+        struct Sometimes;
+        impl tracing::Subscriber for Sometimes {
+            fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| tracing::subscriber::set_global_default(Sometimes).expect("no other global subscriber"));
         let buf = Buf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            // The callsite's first hit is on another thread (as TorusApp::new
+            // in a parallel test would): the capture must still see ours.
+            std::thread::spawn(|| log_async_validate_resolution(true)).join().unwrap();
             log_async_validate_resolution(true);
             log_async_validate_resolution(false);
         });

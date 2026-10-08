@@ -167,6 +167,49 @@ fn exec_skipped_tx_leaves_aligned_receipts() {
     assert_eq!(validated.receipts[1].tx_index, 2);
 }
 
+/// Review #5 (s104): both BlockCommitter code writers persist the ORIGINAL
+/// runtime, not revm's analysis-padded copy, so code reloaded from CF_CODE
+/// (a later block, a restarted node) has the deploy-time length and hash.
+#[test]
+fn committer_paths_store_original_runtime_bytes() {
+    use revm::bytecode::Bytecode;
+    use revm::database::BundleState;
+    use revm::DatabaseRef;
+    const RUNTIME: [u8; 2] = [0x60, 0x00]; // PUSH1 0: revm pads a trailing STOP
+    let runtime = RUNTIME;
+    let code = Bytecode::new_raw(Bytes::from_static(&RUNTIME));
+    assert_ne!(code.bytes().len(), runtime.len(), "fixture must be padded");
+    let mut bundle = BundleState::default();
+    bundle.contracts.insert(code.hash_slow(), code.clone());
+
+    let check = |db: &StateDb, path: &str| {
+        let stored = db
+            .get_code(&code.hash_slow())
+            .unwrap()
+            .expect("code stored");
+        assert_eq!(
+            stored, runtime,
+            "{path}: CF_CODE must hold the original runtime"
+        );
+        let reloaded = db.code_by_hash_ref(code.hash_slow()).unwrap();
+        assert_eq!(reloaded.len(), runtime.len(), "{path}: reloaded length");
+        assert_eq!(
+            reloaded.hash_slow(),
+            code.hash_slow(),
+            "{path}: reloaded hash"
+        );
+    };
+
+    let (_d1, db) = open_test_db();
+    let batch = BlockCommitter::pending_bundle_batch(&db, &bundle, None).unwrap();
+    db.write(batch).unwrap();
+    check(&db, "pending_bundle_batch");
+
+    let (_d2, db) = open_test_db();
+    BlockCommitter::commit_block(&db, &block_with_txs(vec![]), &bundle, &[]).unwrap();
+    check(&db, "commit_block");
+}
+
 #[test]
 fn tx_location_index_follows_receipts_under_skips() {
     let (_dir, db) = open_test_db();

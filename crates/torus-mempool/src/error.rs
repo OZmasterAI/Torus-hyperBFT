@@ -54,6 +54,9 @@ pub enum MempoolError {
     UnsupportedTxType { tx_type: u8 },
     /// D4 (S392): max fee per gas is below the current base fee.
     FeeTooLow { max_fee: u128, base_fee: u64 },
+    /// Review #2 (s104): EIP-1559 max priority fee above the max fee (revm
+    /// rejects it at execution).
+    PriorityFeeAboveMaxFee { priority_fee: u128, max_fee: u128 },
 }
 
 impl fmt::Display for MempoolError {
@@ -115,6 +118,13 @@ impl fmt::Display for MempoolError {
                     "max fee per gas ({max_fee}) below current base fee ({base_fee})"
                 )
             }
+            Self::PriorityFeeAboveMaxFee {
+                priority_fee,
+                max_fee,
+            } => write!(
+                f,
+                "max priority fee per gas ({priority_fee}) above max fee per gas ({max_fee})"
+            ),
         }
     }
 }

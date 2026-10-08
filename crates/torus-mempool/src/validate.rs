@@ -86,6 +86,15 @@ pub fn validate_evm_tx(
     if max_fee < base_fee as u128 {
         return Err(MempoolError::FeeTooLow { max_fee, base_fee });
     }
+    // Review #2 (s104): execution types the TxEnv, so revm rejects a tip above
+    // the max fee (PriorityFeeGreaterThanMaxFee); reject it here for the same
+    // reason as the floor above.
+    if priority_fee > max_fee {
+        return Err(MempoolError::PriorityFeeAboveMaxFee {
+            priority_fee,
+            max_fee,
+        });
+    }
 
     // Sender recovery
     let sender = recover_sender(&tx)?;

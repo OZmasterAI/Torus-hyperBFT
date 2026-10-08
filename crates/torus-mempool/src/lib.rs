@@ -798,9 +798,6 @@ impl Mempool {
                             accounts[0]
                         )));
                     }
-                    if let Some(m) = self.metrics.get() {
-                        m.mempool_oracle_evicted.inc();
-                    }
                     self.record_oracle_dropped("replaced_by_newer", 1);
                 }
             }
@@ -3441,6 +3438,44 @@ mod tests {
         assert_eq!(pool.pending_nonce(&addr), 1);
     }
 
+    /// Review #2 (s104): a typed EIP-1559 TxEnv makes revm reject
+    /// max_priority_fee_per_gas > max_fee_per_gas, so admission rejects it too
+    /// instead of stranding the sender's nonce on a tx execution always skips.
+    #[test]
+    fn admission_rejects_priority_fee_above_max_fee() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(99);
+        let addr = address_from_key(&k);
+        fund(&state, &addr, U256::from(10u64.pow(18)), 0);
+
+        let err = pool
+            .add_evm_tx(create_eip1559_tx(
+                &k,
+                0,
+                2_000_000_000,
+                2_000_000_001,
+                21_000,
+                U256::ZERO,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::PriorityFeeAboveMaxFee { .. }),
+            "expected PriorityFeeAboveMaxFee, got: {err}"
+        );
+        // priority == max_fee is valid.
+        pool.add_evm_tx(create_eip1559_tx(
+            &k,
+            0,
+            2_000_000_000,
+            2_000_000_000,
+            21_000,
+            U256::ZERO,
+        ))
+        .unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 1);
+    }
+
     #[test]
     fn drain_recheck_drops_below_floor_txs() {
         let (_dir, state) = setup();
@@ -3632,11 +3667,15 @@ mod tests {
             Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("oracle pending cap"), "{m}"),
             other => panic!("expected the cap, got {other:?}"),
         }
-        assert_eq!(metrics.mempool_oracle_evicted.get(), 0, "duplicate / older evict nothing");
+        assert_eq!(oracle_drops(&metrics)[0], 0, "duplicate / older evict nothing");
         // Newer: evicts V's oldest (nonce `now`), admitted.
         pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
         assert_eq!(pool.native_pool_size(), 4);
-        assert_eq!(metrics.mempool_oracle_evicted.get(), 1, "one pooled submission evicted");
+        assert_eq!(
+            oracle_drops(&metrics)[0],
+            1,
+            "one pooled submission evicted"
+        );
         // Another validator is unaffected; V's non-oracle actions are not capped.
         pool.add_native_action(oracle_from(&kw, now)).unwrap();
         pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
@@ -3670,9 +3709,8 @@ mod tests {
     }
 
     /// The per-validator cap (4): a newer submission evicting the oldest
-    /// pooled one counts `replaced_by_newer` (and still the old unlabelled
-    /// counter); one older than every pooled one counts `cap_rejected`; a
-    /// duplicate (gossip echo) counts nothing.
+    /// pooled one counts `replaced_by_newer`; one older than every pooled one
+    /// counts `cap_rejected`; a duplicate (gossip echo) counts nothing.
     #[test]
     fn oracle_dropped_counts_the_per_validator_cap_paths() {
         use torus_economics::ValidatorStatus::Active;
@@ -3703,12 +3741,13 @@ mod tests {
             [1, 1, 0, 0],
             "newer: replaced_by_newer"
         );
-        assert_eq!(
-            metrics.mempool_oracle_evicted.get(),
-            1,
-            "the old counter is kept"
-        );
         let text = metrics.encode();
+        assert!(
+            text.contains("torus_mempool_oracle_dropped_total{reason=\"replaced_by_newer\"} 1\n"),
+            "{text}"
+        );
+        // s104: the unlabelled duplicate of `replaced_by_newer` is gone.
+        assert!(!text.contains("torus_mempool_oracle_evicted"), "{text}");
         assert!(
             text.contains("torus_mempool_oracle_dropped_total{reason=\"cap_rejected\"} 1\n"),
             "{text}"
@@ -3819,7 +3858,6 @@ mod tests {
             [0, 0, 0, 4],
             "committed: not counted; each expiry path: counted"
         );
-        assert_eq!(metrics.mempool_oracle_evicted.get(), 0);
     }
 
     /// M4: the deepest pacing tier selects cancels, then oracle submissions;

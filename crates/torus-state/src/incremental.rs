@@ -304,7 +304,7 @@ pub fn apply_bundle_plain(
     // bytecode — all calls saw empty code. Caught by the D6 uniswap e2e (S392).
     let cf_code = db.cf_handle(CF_CODE)?;
     for (code_hash, bytecode) in &bundle.contracts {
-        let raw = bytecode.bytes();
+        let raw = bytecode.original_bytes();
         batch.put_cf(cf_code, code_hash.as_slice(), raw.as_ref());
     }
     Ok(())
