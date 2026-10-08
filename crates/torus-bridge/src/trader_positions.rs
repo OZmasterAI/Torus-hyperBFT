@@ -58,10 +58,14 @@ pub(crate) struct TraderPositions {
     traders: BTreeSet<Address>,
     /// adl-budget C2: per market `m`, every trader with the 28-byte key
     /// `t ‖ m` in R (regular or opaque), ascending. A market without one has
-    /// no entry. Followed per key from the delta (a write adds, a tombstone
-    /// removes): O(log n) per changed key.
-    holders: HashMap<MarketId, BTreeSet<Address>>,
+    /// no entry. A regular trader's keys are followed on its record (only a
+    /// key that appears or disappears touches the index); an opaque or
+    /// re-decoded trader's per key from the delta (a write adds, a tombstone
+    /// removes). foldhash (alloy's map): never iterated, so no order to keep.
+    holders: Holders,
 }
+
+type Holders = alloy_primitives::map::HashMap<MarketId, BTreeSet<Address>>;
 
 /// The market of a 28-byte positions key `t ‖ m`.
 fn market_of(key: &[u8]) -> MarketId {
@@ -162,12 +166,13 @@ impl TraderPositions {
             if group.iter().any(|(k, _)| k.len() == KEY) {
                 keyed.push(t);
             }
-            // C2: R after the block holds `t ‖ m` iff the delta wrote it.
-            for &(k, v) in group.iter().filter(|(k, _)| k.len() == KEY) {
-                self.set_holder(t, market_of(k), v.is_some());
-            }
             changes.clear();
             if !self.follow(t, &group, &mut changes, seen.as_deref_mut()) {
+                // C2: R after the block holds `t ‖ m` iff the delta wrote it
+                // (`follow` may have moved some of these already).
+                for &(k, v) in group.iter().filter(|(k, _)| k.len() == KEY) {
+                    Self::set_holder(&mut self.holders, t, market_of(k), v.is_some());
+                }
                 reload.push(t);
                 if let Some(f) = seen.as_deref_mut() {
                     f(&t, None);
@@ -203,6 +208,7 @@ impl TraderPositions {
 
     /// One trader's entries of the delta (`group`, key order) on its record;
     /// `false`: its rows must be re-decoded (opaque, or an irregular write).
+    /// C2: a key it adds to or removes from the record moves its holder.
     /// With `seen`, the changed rows are collected into `changes` and handed
     /// to it with the record after them.
     fn follow(
@@ -224,6 +230,7 @@ impl TraderPositions {
                 None => {
                     let m = MarketId::from_be_bytes(k[TRADER..].try_into().expect("28-byte key"));
                     if let Ok(i) = ps.binary_search_by_key(&m, |p| p.market_id) {
+                        Self::set_holder(&mut self.holders, t, m, false);
                         let old = ps.remove(i);
                         if collect {
                             changes.push((Some(old), None));
@@ -239,6 +246,7 @@ impl TraderPositions {
                     let old = match ps.binary_search_by_key(&p.market_id, |q| q.market_id) {
                         Ok(i) => Some(std::mem::replace(&mut ps[i], p)),
                         Err(i) => {
+                            Self::set_holder(&mut self.holders, t, p.market_id, true);
                             ps.insert(i, p);
                             None
                         }
@@ -259,13 +267,13 @@ impl TraderPositions {
     }
 
     /// C2: whether R holds `t ‖ m` now.
-    fn set_holder(&mut self, t: Address, m: MarketId, holds: bool) {
+    fn set_holder(holders: &mut Holders, t: Address, m: MarketId, holds: bool) {
         if holds {
-            self.holders.entry(m).or_default().insert(t);
-        } else if let Some(set) = self.holders.get_mut(&m) {
+            holders.entry(m).or_default().insert(t);
+        } else if let Some(set) = holders.get_mut(&m) {
             set.remove(&t);
             if set.is_empty() {
-                self.holders.remove(&m);
+                holders.remove(&m);
             }
         }
     }

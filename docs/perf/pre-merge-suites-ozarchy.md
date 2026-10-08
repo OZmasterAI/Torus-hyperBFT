@@ -16,6 +16,26 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `perf/c2-set-holder` `d7bd1c36` (2026-10-08)
+
+C2 holder index moved only when a position key appears or disappears, foldhash market map (18c s104
+request, results doc section 27). Base main `bf2edda6`. Worktree `wt/c2-set-holder`,
+`CARGO_TARGET_DIR=~/.cargo-target-c2-set-holder`; suite 4 baseline `bf2edda6` in a detached worktree
+`wt/c2-set-holder-base` (same target dir, the 2 differing `.rs` files touched: base clippy re-checked
+torus-bridge and its 5 dependents). Suite 4 ran as `cargo clippy --workspace --all-targets` and
+`cargo fmt --all --check` compared with `norm.py`, not through `run-local.sh check`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,068 passed, 0 failed**, 31 skipped, 0 flaky | 200 s (82.2 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 3 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,069 passed, 0 failed**, 38 ignored (159 result lines) | 406 s |
+| 4 | clippy (no `-D`) / fmt vs `bf2edda6` | – | clippy 268 = 268, **0 new**; fmt 3,354 = 3,354, **0 new** | 7 s / – |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | – | not run (no `tools/` change) | – |
+
+Logs: `~/bench-results-matched/presuite-c2-set-holder/`.
+
 ## `fix/read-gas-followup` `105a6e28` (2026-10-08, s101)
 
 `b26bd3b3` plus the review fixes (docs, comments, `lock_db` in `request_locked`, a chmod drop guard in
