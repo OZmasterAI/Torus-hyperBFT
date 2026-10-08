@@ -2545,8 +2545,204 @@ bench as section 24. Dir `ozarchy-adlcells-300m-s750vs`.
 - Harness nit: `funnel-val*.csv` has a 14-name header and 15 values per row
   (columns after `rej_margin` shifted by one).
 
+## 25. Phase 2 step 0 (Gate 0) (`perf/item6-phase2` @ `707f132f`, 2026-10-08)
+
+Step 0 node = `707f132f` (= `1a6573dc` + docs: counters, harness columns,
+cancel-by-id cell), node `0a742915`; base = main `d3ba3c0a` (plan 9.7), node
+`193ae781`. Both arms: bench `fff899ca` (from `707f132f`, byte-identical; the
+cancel-by-id flags off unless set), the step 0.2 `run-cell.sh` /
+`summarize.py` (detached copy `wt/p2s0b-707f132f`), oracle feed 30000 / 2000 ms,
+walk 0, trie off by default. Builds: `--release`, line-tables-only, mold,
+frame pointers; the base in an unseeded target dir (a reflink-seeded first
+attempt kept step 0 crates as fresh and gave a mixed binary; discarded).
+Standard shape (section 21.4): N=4 + budget 900, 300 markets uniform, cap 400,
+rate 76,000, `RETRY_BUSY=1`, 120 s. Order: s-warm (60 s), overhead check
+ABBA s-r1, b-r1, b-r2, s-r2 (no perf), s-prof (perf on val0, `cycles:u` 499 Hz,
+45 s from 35 s into the load), s-byid (`CANCEL_BY_ID_FRACTION=0.1
+MODIFY_FRACTION=0.05`), s-w10 (`ORACLE_WALK_BP=10` + `ORACLE_FEED_DRAIN=1`, no
+perf); 03:10-04:03. All 8 cells rc 0, AGREE, liveness PASS, accepted, no
+deaths, exe md5 3/3 as staged, oracle stale 0 / fresh 300, block tail 0 errors
+/ 0 missed, no tail WARNING; cancel-alls 37.4-39.7% of actions. Each cell ran
+as its own unit through `detach.sh`; the root-only `signal_generate` trace was
+not running (no sudo on the agent side; the death watcher saw no death). Open
+files: max 657 per validator (soft limit in the `detach.sh` units 65,536, hard
+524,288), so `LimitNOFILE` was not changed. Driver
+`~/bench-results-matched/ozarchy-p2s0b-campaign.sh`, tables
+`ozarchy-p2s0b-cells.txt`, `ozarchy-p2s0b-pernode.txt`, tools
+`ozarchy-p2s0b-tools/`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/blk \| ms/1k | phase 1 | margin | match | settle | cache flush | flush worker | chain |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| s-warm (60 s) | 166,464 | 4.887 | 26,424 | 115.2 \| 4.36 | 21.3 | 26.6 | 13.6 | 40.8 | 11.3 | 52.5 | 146.0 |
+| s-r1 | 165,622 | 4.869 | 26,878 | 122.6 \| 4.56 | 21.7 | 28.0 | 15.2 | 43.8 | 12.1 | 51.1 | 155.7 |
+| b-r1 | 169,295 | 5.131 | 26,861 | 121.1 \| 4.51 | 21.5 | 28.4 | 14.8 | 43.7 | 11.6 | 50.1 | 152.2 |
+| b-r2 | 159,922 | 4.902 | 27,358 | 129.6 \| 4.74 | 22.8 | 28.7 | 16.2 | 46.6 | 12.5 | 54.1 | 164.2 |
+| s-r2 | 163,861 | 4.762 | 27,230 | 125.7 \| 4.61 | 21.8 | 29.3 | 15.5 | 46.4 | 12.6 | 51.2 | 159.9 |
+| s-prof (perf) | 155,194 | 3.637 | 36,586 | 170.8 \| 4.67 | 29.9 | 38.8 | 23.4 | 62.4 | 16.1 | 71.5 | 217.6 |
+| s-byid | 160,460 | 4.762 | 26,505 | 125.6 \| 4.74 | 25.1 | 27.9 | 14.7 | 43.7 | 11.9 | 51.8 | 158.6 |
+| s-w10 (walk 10, drain) | 164,322 | 4.813 | 34,141 | 160.6 \| 4.70 | 26.6 | 34.1 | 18.6 | 55.8 | 14.7 | 63.0 | 199.6 |
+
+ms per native block, val0, from the node's timers over bench + drain (harness
+`phase_by_node`). New columns (step 0.2):
+
+| cell | cancel-alls / blk | books visited / hit per cancel-all | spawns / blk (match, settle, save books, end_resident) | spawns / min | user \| sys CPU ms / blk | user \| sys CPU ms / 1k | oracle-only blocks: n, avg, p50, p95 ms |
+|---|---|---|---|---|---|---|---|
+| s-warm | 52.2 | 298.8 / 93.1 | 42.7 (13.8, 13.0, 15.0, 1.0) | 14,793 | 1,031 \| 84.9 | 30.3 \| 2.49 | 2, 3.6, 3.4, 4.9 |
+| s-r1 | 58.7 | 299.5 / 86.8 | 52.4 (17.1, 15.9, 18.4, 1.0) | 17,977 | 1,014 \| 76.7 | 29.8 \| 2.26 | 8, 39.9, 7.6, 112 |
+| b-r1 | - | - | - | - | 968 \| 75.5 | 29.3 \| 2.29 | - |
+| b-r2 | - | - | - | - | 983 \| 74.2 | 30.1 \| 2.28 | - |
+| s-r2 | 56.8 | 299.3 / 88.6 | 47.5 (15.2, 14.5, 16.9, 1.0) | 15,816 | 1,020 \| 77.2 | 29.6 \| 2.24 | 5, 40.4, 4.6, 124 |
+| s-prof | 72.2 | 299.3 / 92.3 | 54.9 (17.4, 16.9, 19.6, 1.0) | 13,423 | 1,286 \| 398 | 30.1 \| 9.33 | 12, 18.7, 6.6, 77.9 |
+| s-byid | 57.0 | 299.3 / 88.8 | 48.2 (15.6, 14.5, 17.1, 1.0) | 16,260 | 1,012 \| 78.0 | 30.0 \| 2.32 | 4, 48.7, 7.6, 121 |
+| s-w10 | 72.1 | 299.7 / 88.8 | 58.2 (18.8, 17.5, 21.0, 1.0) | 16,820 | 1,020 \| 72.9 | 29.9 \| 2.14 | 41, 19.3, 4.0, 100 |
+
+Process CPU is the whole node (all ~190 threads), load window. The base has no
+counters (-). Spawn sites `margin_prepare`, `open_orders`, `flush_digest`,
+`root_buckets` and `load_books` read 0 per native block on this shape.
+
+- **Overhead check: the counters cost nothing measurable.** Step 0 / base
+  (ABBA, 2 cells per arm): matched/s 164,741 / 164,608 = **1.001x**; engine
+  ms/1k 0.991x, phase 1 0.982x, chain 0.998x, user CPU / 1k 0.999x, sys CPU /
+  1k 0.986x. The two base cells alone differ by 5.6% (169,295 / 159,922), so
+  the resolution is the usual ~5%.
+- **Gate 0 met:** counters in the harness, standard-shape cells on the step 0
+  node with the new columns (s-r1, s-r2), estimates in the plan.
+- **Cancel-all:** 57-59 per native block (72-79 in the perf and walk-10 cells,
+  whose blocks are larger). Every call visits all ~300 books; the sender has
+  orders or stops in **87-93 of them (29-31%)**.
+- **Thread spawns: 47.5-52.4 per native block, 15.8-18.0k per minute** (exact
+  node counters; section 22's perf lower bound was 15.6k per minute; in s-prof
+  perf saw 11.5k distinct exec tids per minute vs the counter's 13.4k). Three
+  sites spawn ~15-19 threads each per block (match, settle, save books) plus
+  one end-resident thread. A C microbench on this host (pthread create + join,
+  2 MiB stacks, idle host, `ozarchy-p2s0b-spawn/`): 16.7 us per thread in a
+  scope of 16 (0.27 ms per scope), 30 us for a single thread. So ~0.8 ms per
+  native block of exec-thread wall at idle-host cost (estimate; more under
+  load). Its CPU (~50 x 17 us) is ~1% of the process sys time (77 ms per
+  native block), so sys CPU per 1k fills cannot show the pool's effect.
+- **Sys CPU:** 2.14-2.32 ms per 1k fills on both arms without perf; 9.33 with
+  perf on (section 22: 2 -> 9).
+- **Oracle-only blocks (node timer):** few in the standard cells (2-8, the feed
+  is paused for the drain), mean 40 ms, p95 112-124 ms: the first blocks after
+  the load, which wait on the flush backlog (row 77). With walk 10 and the feed
+  live through the drain: 41 blocks, mean 19.3, p50 4.0, p95 100 ms (section
+  22.3 from perf / logs: 15 blocks, mean 14.4, p50 4.7, p90 48). p50 / p95 are
+  bucket interpolations.
+- **Walk 10 vs walk 0** (s-w10 vs mean s-r1 / s-r2): matched/s 0.997x, engine
+  ms/1k 1.025x (section 22.2: 0.975x, 1.07x).
+
+### 25.1 0.3: what the cancel-all time is spent on (s-prof, load window)
+
+perf on val0 in the load window: 175 native blocks, 37,633 fills and 79.4
+cancel-alls per native block, 300.0 books visited / 94.7 hit per cancel-all.
+Inline-expanded (`llvm-addr2line -i`) exec-thread samples under
+`exec_cancel_all_run` / `exec_cancel_all` / `cancel_orders_and_stops`, split
+by line (`ozarchy-p2s0b-tools/split.py`, lines at `707f132f`). "Scan" = paid
+per (book x run member) or per (action x market) whether or not the sender has
+anything there; "work" = per cancelled order, stop or hit.
+
+| part | ms per native block | kind |
+|---|---|---|
+| cancel-all inclusive | **30.0** (0.80 ms/1k) | |
+| `apply_cancel_all_many`: removal from the levels, journals, index | 10.3 | work |
+| plan: locate targets (`order_index` / `order_seq` get + `partition_point`, cancel_batch.rs:352-361) | 9.7 | work |
+| plan: `trader_orders.get(sender)` probe (:338) | 3.5 | scan |
+| run: store / drop per book (`per_action`, the `cancel_all_many` result; native_executor.rs:9131-9137, 9159-9160) | 2.0 | scan |
+| plan: sort + levels; per-target push | 1.2 | work |
+| margin of cancelled orders, hit bookkeeping, release | 1.5 | work |
+| run: results loop over all markets per action (:9141-9149) | 0.9 | scan |
+| plan: first-occurrence sort + allocs, probe loop (:323-346) | 0.5 | scan |
+| run: `get_mut` / `margin_configs.get`, allocs, members filter per book (:9108-9122) | 0.3 | scan |
+| `take_pending_stops` (`any` over the book's stops + take) | 0.05 | scan / work |
+| sequential fallback (`owners < 2`) | 0.01 | |
+| **scan / work** | **7.3 / 22.7** | |
+
+- **Section 22's "book scan 18.2 ms" was mostly work.** It was the self time
+  of `cancel_all_many` with the plan and apply code inlined into it; per line,
+  three quarters of cancel-all is removing orders that are really cancelled
+  (locate, `partition_point`, removal), which scales with orders cancelled.
+  The members filter (0.05) and `take_pending_stops` (0.05) cost almost
+  nothing; the probes cost 3.5.
+- **P2-1 estimate: ~5.0 ms per native block in this window** (7.3 ms of scan
+  x (1 - 94.7 / 300) visited-but-empty books), **~3.7 ms on the standard
+  no-perf cells** (58 instead of 79 cancel-alls per block). The index's own
+  upkeep (one insert per resting order or per (trader, market) per block) is
+  not in that number. The plan's 5-18 ms range assumed most of the 18.2 ms was
+  scan.
+- **Cache flush (for P2-2, same window, `flush_all` inclusive 17.6 ms per
+  native block):** `put_position` 9.7 (overlay `BTreeMap` insert of the owned
+  key, backend.rs:2056: 7.2; `intern_cf` 0.8; serialise + buffer 1.2), the
+  second lookup `map.get` (position.rs:684) 3.5, the key sort (:682) 3.05,
+  balance cache 0.5 (`ozarchy-p2s0b-tools/flushsplit.py`). The batch API
+  removes the second lookup, `intern_cf` and the per-row lock: ~4.6 ms here,
+  ~3.2 ms on the standard cells (cache flush 12.1-12.6 ms there) (estimate).
+  The per-row `BTreeMap` insert (7.2) stays unless the CF map is built in bulk
+  from the sorted rows (not in the plan).
+
+### 25.2 Cancel / modify by id (P2-1b, s-byid)
+
+- **Delivered share is small:** the bench sent 658 cancels and 300 modifies,
+  all accepted (1.22 by-id actions per native block), not the 10% / 5% of
+  fires asked: 16,445 of 17,361 `torus_getOpenOrders` lookups (one market per
+  lookup) found no own order in that market. Lookup errors 0.
+- **Books probed per by-id action: 457** (val0; 456-459 on all validators),
+  i.e. 1.5 passes over the 300 books (cancel probes twice, modify once, both
+  stop at the order).
+- **Phase 1: 25.1-25.8 ms per native block on the three validators vs
+  21.7-23.4 in s-r1 / s-r2: +3.1 ms per block, ~2.5 ms per by-id action.** The
+  probes themselves are ~457 SipHash lookups (~10-20 us). The rest is not
+  split (no perf in this cell); likely cause (inferred, not measured): a single
+  cancel or modify between cancel-alls splits a cancel-all run, and each run
+  pays its per-book work over all 300 books again (25.1). P2-1's index cuts
+  that too; P2-1b's map cuts only the probes. A perf cell with a larger by-id
+  share is needed before P2-1b's gate is read.
+
+### 25.3 Hasher microbench (P2-5)
+
+`ubench_hasher` from `707f132f` (release, same flags), 10 processes x best of
+30 reps of 2M ops, pinned to CPU 8; median [min-max] over the processes,
+`ozarchy-p2s0b-hasher/summary.txt`:
+
+| case | SipHash ns | foldhash ns | ratio |
+|---|---|---|---|
+| `hash_one` Address | 16.57 [16.56-16.58] | 10.06 [10.05-10.06] | 0.607 [0.607-0.607] |
+| `hash_one` order id | 14.32 [14.31-14.35] | 1.87 [1.87-1.87] | 0.131 [0.130-0.131] |
+| Address map get | 23.88 [23.73-24.45] | 12.86 [12.76-13.34] | 0.540 [0.536-0.551] |
+| (Address, market) map get | 49.46 [47.16-50.76] | 28.11 [27.88-28.27] | 0.566 [0.551-0.597] |
+| order-id map get | 21.84 [21.23-22.34] | 6.28 [5.98-6.46] | 0.287 [0.282-0.291] |
+| order-id churn | 33.70 [33.33-34.13] | 13.74 [9.86-16.04] | 0.408 [0.296-0.470] |
+| Address set insert | 22.46 [22.31-22.83] | 21.70 [21.50-21.84] | 0.964 [0.946-0.974] |
+
+- `hash_one` mean ratio 0.369 (spread < 0.1%); the test's estimate is **15.8
+  ms per native block** at section 22's 190 ms engine and 13.2% hash share;
+  at the standard cells' engine (124 ms per native block) the same share gives
+  **~10.3 ms** (estimate). Map-level ratios (0.29-0.57) are the better guide
+  per map; order-id churn is the noisiest case (foldhash 9.9-16.0 ns).
+
+### 25.4 Verdict
+
+- Counters: no measurable cost (1.001x); later Phase 2 arms can carry them.
+- **Step 0 checkpoint: P2-1 + P2-2 come out below 13 ms per native block:**
+  ~5.0 + ~4.6 = ~9.6 ms in the perf window (37.6k fills per block, close to
+  section 22's 39.2k), ~3.7 + ~3.2 = ~6.9 ms on the standard no-perf cells
+  (27k fills, engine 124 ms). As a share of engine time that is 4.7-5.6%,
+  against the ~6.8% that 13 ms of 190 stood for. Owner decision (plan 9.1):
+  pull P2-5 (~10 ms on the standard cells, estimate) into the gate set, or
+  accept a lower gate.
+- P2-3: ~50 spawns per native block, ~0.8 ms of exec-thread wall at idle-host
+  spawn cost (estimate); its gate should read the spawn counter and matched/s,
+  not sys CPU (the spawns are ~1% of it).
+- **Unexplained: both arms are ~9% below section 23.1's `35e69b3` cells on the
+  same shape** (164.7k vs 181.5k matched/s; engine 4.51-4.74 vs 4.29 ms/1k;
+  native blocks 4.76-5.13 vs 5.45 per s). Not interleaved: bench binary,
+  base and day differ. The step 0 / base comparison is not affected.
+
 ## Open
 
+- **Phase 2 base `d3ba3c0a` runs ~9% below `35e69b3`** on the standard shape
+  (section 25.4, not interleaved): one `d3ba3c0a` / `35e69b3` pair with the
+  same bench would show whether main lost throughput between them (ADL
+  budget, read-precompile gas, 4 MiB book SSTs) or the host drifted.
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).

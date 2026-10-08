@@ -1,8 +1,9 @@
 # Implementation Plan: item 6 Phase 2 (per-block work in proportion to fills)
 
-Status: step 0 parts 0.1, 0.2 and 0.4 built on `perf/item6-phase2` (ozarchy, s27 / s101) from
-main `d3ba3c0a` (9.7; review log rows 1-11); 0.3 and Gate 0 next (bench-runner). Owner decisions
-recorded s96 (section 9, with the options not chosen). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
+Status: step 0 done on `perf/item6-phase2` (ozarchy, s27 / s101) from main `d3ba3c0a` (9.7;
+review log rows 1-16): 0.1, 0.2 and 0.4 built, 0.3 and Gate 0 measured (results doc section 25).
+Step 0 checkpoint: P2-1 + P2-2 below 13 ms per native block, owner decision pending (section 1).
+Owner decisions recorded s96 (section 9, with the options not chosen) and s27 (9.8). Written 2026-10-06 (after s94) from the Phase 2 step 0 profile
 (ozarchy results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` section 22, on
 `integrate/s94-batch`; "section 22" below). Short form and the phases after this one:
 `item6-phases-2-5-plans.md`. Design: `market-scaling-in-memory-design.md` section 3, Phase 2.
@@ -49,6 +50,16 @@ Rule of thumb used in section 9: about +0.4-0.55% matched/s per ms saved per nat
 Checkpoint after step 0 (owner s96, 9.1): if steps 0.2 / 0.3 put P2-1 + P2-2 below 13 ms per
 native block, the owner decides between pulling P2-5 (hasher) into the gate set and
 accepting a lower gate (as Gates 3 / 4 were accepted missed in 9.12).
+
+**Step 0 result (results doc section 25, 2026-10-08): below 13 ms.** P2-1 ~5.0 + P2-2 ~4.6 =
+~9.6 ms per native block in the perf window (37.6k fills per block, close to section 22's 39.2k);
+~3.7 + ~3.2 = ~6.9 ms on the standard no-perf cells (27k fills, engine 124 ms per native block).
+Both are estimates from the 0.3 split; as a share of engine time 4.7-5.6%, against the ~6.8% that
+13 ms of 190 stood for. With P2-5 (~10 ms on the standard cells, microbench estimate, 25.3) and
+P2-3 (~0.8 ms) the set would reach ~18 ms (~14% of engine) on those cells. **Owner: pull P2-5
+into the gate set, or accept a lower gate.** Note: on the standard cells the base runs ~9% below
+section 23.1's `35e69b3` cells (not interleaved; results doc Open); the +7% is still measured
+against `d3ba3c0a`, so this does not change the gate's reference.
 
 ## 2. What the step 0 profile measured (section 22.1, crab r2, load window)
 
@@ -110,6 +121,17 @@ covers before step 0 closes.
 - Expected saving (estimate): 5-18 ms per native block. The ceiling depends on how many
   of the 300 books a bench sender rests in, which section 22 did not count; step 0.2 adds
   that counter and step 0.3 splits the 18.2 ms scan into probes vs `partition_point`.
+- **Step 0 estimate (results doc 25.1): ~5.0 ms per native block in the perf window, ~3.7 ms
+  on the standard no-perf cells.** Cancel-all is 30.0 ms per native block in the s-prof load
+  window (79.4 cancel-alls per block); split by line, 22.7 ms is work per cancelled order
+  (`apply_cancel_all_many` removal 10.3, locating targets with `order_index` / `order_seq` gets
+  and `partition_point` 9.7, margin and bookkeeping 2.7) and only 7.3 ms is scan per book
+  (`trader_orders.get` probe 3.5, per-book result store / drop 2.0, the results loop over all
+  markets 0.9, plan setup 0.5, members filter and per-book lookups 0.3, `take_pending_stops`
+  0.05). Each cancel-all visits ~300 books and the sender has orders or stops in 87-95 of them
+  (29-31%), so the index removes ~70% of the scan. Section 22's 18.2 ms "scan" was
+  `cancel_all_many` self time with the plan and apply code inlined, i.e. mostly work. Index
+  upkeep is not in the estimate: keep it per (trader, market), not per order.
 - Risk: consensus-relevant only through results and state, which must be identical. A
   missed index entry (a market where the trader rests but the index does not list it)
   would leave orders on the book: that is the one failure mode, so every insert path is
@@ -176,6 +198,13 @@ covers before step 0 closes.
   so the sort and the second lookup go (e.g. collect `(key, &row)` pairs once, then sort).
   Same for `BalanceCache`.
 - Expected saving (estimate): 5-10 ms per native block of the 15.9.
+- **Step 0 estimate (results doc 25.1, s-prof, `flush_all` 17.6 ms per native block): ~4.6 ms in
+  the perf window, ~3.2 ms on the standard cells** (cache flush 12.1-12.6 ms there). Split:
+  `put_position` 9.7 (overlay `BTreeMap` insert of the owned key, `backend.rs:2056`, 7.2;
+  `intern_cf` 0.8; serialise + buffer 1.2), the second lookup `map.get` (`position.rs:684`) 3.5,
+  the key sort 3.05, balance cache 0.5. The batch API removes the second lookup, `intern_cf` and
+  the per-row lock; the per-row `BTreeMap` insert stays unless the CF map is built in bulk from
+  the sorted rows (not in this plan; would need the CF map to be empty or small at the flush).
 - Risk: the overlay's pending set, its journal (`record`, used by writer-precompile
   checkpoints, T4.4) and the write order must be identical, because the flush and the
   running state hash read them. A partial-failure path must keep today's
@@ -218,6 +247,16 @@ covers before step 0 closes.
   The ms saving is not known: section 22 measured sys CPU 2 -> 9 ms per 1k fills with
   perf on, and `cycles:u` cannot rank spawn cost. Step 0.2 measures sys time and spawn
   latency first.
+- **Step 0 estimate (results doc section 25): ~0.8 ms per native block of exec-thread wall,
+  +0.5-1% matched/s.** Counted: 47.5-52.4 spawns per native block, 15.8-18.0k per minute on
+  the standard cells, from three sites only (match, settle, save books, ~15-19 threads each)
+  plus one end-resident thread; `margin_prepare`, `open_orders`, `flush_digest`,
+  `root_buckets` and `load_books` spawn nothing on this shape. Spawn + join cost on ozarchy
+  (C microbench, 2 MiB stacks, idle host): 16.7 us per thread in a scope of 16, i.e. ~0.27 ms
+  per scope, ~0.8 ms per block; more under load (not measured). Process sys CPU is 2.14-2.32
+  ms per 1k fills (74-85 ms per native block, all threads); the spawns are ~1% of it, so the
+  gate's "sys CPU per 1k fills down" cannot be read at cell resolution: read the spawn counter
+  (~0 per block after warm-up) and matched/s (not down) instead.
 - Risk: results must not depend on the pool. Today results are scattered back by index
   or sorted by `MarketId`, so the pool changes scheduling only. Each site keeps its panic
   rule exactly: match contains a worker panic as `MarketWorkerPanic` (T1.5); settle pass
@@ -275,6 +314,11 @@ covers before step 0 closes.
   by map, hottest first.
 - Expected saving (estimate, the least certain in this plan): 5-20 ms per native block,
   +2-7% matched/s. A microbench of the hot maps comes first and sets the estimate.
+- **Step 0 microbench (results doc 25.3, 10 processes x 30 reps, spread < 1% except order-id
+  churn):** `hash_one` Address 0.607x, order id 0.131x; map gets 0.29x (order id) to 0.57x
+  (`(Address, MarketId)`), order-id churn 0.41x (0.30-0.47), Address set insert 0.96x.
+  Estimate 15.8 ms per native block at section 22's 190 ms engine, ~10.3 ms at the standard
+  cells' 124 ms (13.2% hash share x engine x 0.631).
 - Role: the fallback at the step 0 checkpoint (section 1). If the checkpoint does not need
   it, it is built after steps 1-3 and measured on its own.
 - Risk: std's `RandomState` is already seeded per process, so a map whose iteration order
@@ -381,8 +425,13 @@ Standard shape (results doc 21.4, as section 22):
 | 7 | 0.4 | Full-scan cancel-all reference: frozen copy in `cancel_batch_exec_tests.rs`; `#[cfg(test)]` switch `test_cancel_all_full_scan` routes runs, single cancel-alls and the liquidation step's cancels to it, one action at a time. Differential `cancel_all_matches_the_full_scan_reference` (4 book modes, stops, partial fills, repeated senders): results, gas, dirty marks, books, stops, CF dumps, state root equal | P2-1 keeps it green |
 | 8 | 0.4 | Per-row flush reference: `PositionCache::flush_all_per_row` (`#[cfg(test)]`) with an overlay differential (pending delta, reads, checkpoint revert; a mutation that drops deletes fails it). The balance cache already has a frozen per-row reference (`balance_cache_tests.rs` `OldBalanceCache`, exact write sequence) | P2-2 keeps both green; the overlay batch-API property test comes with the API (step 3) |
 | 9 | 0.4 | Scoped-spawns reference: today's code is the reference. A `#[cfg(test)]` switch with one arm would be dead code, so step 2 adds it with the pool (pool vs `thread::scope` per site). Step 0 adds the per-site spawn counts; the serial-vs-parallel differentials (`engine_parallel_tests`, `save_books_parallel_tests`, `parallel_settle_tests`, `parallel_matching_tests`, `load_books_parallel_tests`) stay the cross-check | for review |
-| 10 | 0.4 | `#[cfg(test)]` is per crate: the bridge and core switches cannot be set from torus-consensus tests, so the app-level differential (CF dumps + `h_n`, serial and pipelined) cannot flip them. Options for step 1: a test-only cargo feature on torus-bridge enabled from torus-consensus dev-dependencies (like `save-timings`), or the differential at the bridge level only | owner / 18c decision before step 1 |
+| 10 | 0.4 | `#[cfg(test)]` is per crate: the bridge and core switches cannot be set from torus-consensus tests, so the app-level differential (CF dumps + `h_n`, serial and pipelined) cannot flip them. Options for step 1: a test-only cargo feature on torus-bridge enabled from torus-consensus dev-dependencies (like `save-timings`), or the differential at the bridge level only | decided: option A, test-only cargo feature (9.8) |
 | 11 | 0.1-0.4 | Suites on `1a6573dc` (ozarchy): nextest 3073 / 0 (36 skipped), doc 1 / 0, `cargo test --workspace` 3074 / 0 (43 ignored), clippy 270 = base, fmt 3349 = base (0 new), matched-bench 167 passed; goldens A/B unchanged (in the suites) | `docs/perf/pre-merge-suites-ozarchy.md` |
+| 12 | Gate 0 | Campaign `ozarchy-p2s0b` (results doc section 25, 2026-10-08): step 0 `707f132f` vs base `d3ba3c0a`, same bench, standard shape, 8 cells all rc 0 / AGREE / PASS, no deaths. Overhead (ABBA, 2 cells per arm): matched/s 1.001x, engine ms/1k 0.991x, sys CPU / 1k 0.986x. Max 657 open fds per validator (unit soft limit 65,536): `LimitNOFILE` not changed | counters cost nothing measurable; later arms carry them. Gate 0 met |
+| 13 | 0.3 | Cancel-all split (s-prof, inline-expanded): 30.0 ms per native block = 22.7 work per cancelled order + 7.3 scan per book; sender present in 87-95 of 300 books | P2-1 estimate ~5.0 ms (perf window) / ~3.7 ms (standard cells), not 5-18 (section 3) |
+| 14 | 0.2 / 0.3 | Cache flush split: second lookup 3.5, `intern_cf` 0.8, sort 3.05, `BTreeMap` insert 7.2 of 17.6 ms; spawns 47.5-52.4 per block from 3 sites, ~17 us each (C microbench); sys CPU 2.2 ms / 1k, spawns ~1% of it | P2-2 ~4.6 / ~3.2 ms; P2-3 ~0.8 ms, gate on the spawn counter + matched/s (not sys CPU). Checkpoint: P2-1 + P2-2 < 13 ms, owner decides P2-5 vs lower gate (section 1) |
+| 15 | 0.2 | Cancel-by-id cell: 1.22 by-id actions per native block (16,445 of 17,361 id lookups found no own order in the market), 457 books probed per action, phase 1 +3.1 ms per block (~2.5 ms per action) on all 3 validators; the probes are ~10-20 us of it | P2-1b's map alone cuts only the probes; the rest is likely run splitting (inferred), which P2-1 cuts. Read P2-1b's gate with a perf cell and a larger by-id share |
+| 16 | 0.2 | Hasher microbench, 10 x 30 reps: `hash_one` 0.369x mean, map gets 0.29-0.57x; estimate 15.8 ms (190 ms engine) / ~10.3 ms (124 ms) per native block | P2-5 input for the checkpoint |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -510,3 +559,19 @@ and its follow-up (`d3ba3c0a`, book CF SST 4 MiB), the test-dir leak fix (`f7fe1
 reference. ozarchy builds step 0; who builds steps 1-4 is decided after Gate 0. Main moved on
 to `35953ff8` (`fix/raise-nofile-limit`, `crates/torus-node` only) after the branch was cut;
 it is merged into the branch later with a plain merge, not a rebase.
+
+### 9.8 App-level differential: test-only cargo feature (option A) (2026-10-08, s27)
+
+`#[cfg(test)]` switches work per crate, so torus-consensus tests cannot flip the torus-bridge /
+torus-core reference paths (review log row 10).
+
+**Chosen: A**, a test-only cargo feature on torus-bridge that turns on the reference paths
+(full-scan cancel-all, per-row flush, and later the scoped spawns), enabled from
+torus-consensus's dev-dependencies the way the existing `save-timings` feature is. This keeps
+the app-level differential (CF dumps + `h_n`, serial and pipelined, all four BookModes). Built
+at the start of step 1, before the cancel-all index.
+
+| option | note |
+|---|---|
+| **A. test-only cargo feature on torus-bridge (chosen)** | keeps the app-level differential, serial and pipelined |
+| B. bridge-level differentials only | loses the pipelined app-level check |
