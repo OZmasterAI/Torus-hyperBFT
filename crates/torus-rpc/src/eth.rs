@@ -28,7 +28,8 @@
 
 use std::sync::atomic::Ordering::Relaxed;
 
-use alloy_consensus::{transaction::SignerRecoverable, Transaction as _, TxEnvelope};
+use alloy_consensus::{transaction::SignerRecoverable, Transaction as _, TxEnvelope, TxType};
+use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rlp::Decodable;
 use jsonrpsee::core::{async_trait, RpcResult, SubscriptionResult};
@@ -252,6 +253,48 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
     }
 }
 
+/// EIP-2718 type of an eth_call / eth_estimateGas request (s104 follow-up c).
+/// Without `type` it is inferred as geth does: a 1559 fee field => 2, else an
+/// access list => 1, else 0. Only 0, 1 and 2 execute (decode.rs and the
+/// mempool refuse other envelopes). Fields the chosen envelope cannot carry
+/// are refused, so a call is costed like the tx it simulates.
+fn call_tx_type(call: &CallRequest) -> Result<u8, RpcError> {
+    let has_1559_fee = call.max_fee_per_gas.is_some() || call.max_priority_fee_per_gas.is_some();
+    if call.gas_price.is_some() && has_1559_fee {
+        // geth's message for the same request.
+        return Err(RpcError::InvalidParams(
+            "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified".into(),
+        ));
+    }
+    let Some(t) = &call.tx_type else {
+        return Ok(if has_1559_fee {
+            TxType::Eip1559
+        } else if call.access_list.is_some() {
+            TxType::Eip2930
+        } else {
+            TxType::Legacy
+        } as u8);
+    };
+    let t = parse_u64(t)?;
+    let foreign = match t {
+        0 if call.access_list.is_some() => Some("accessList"),
+        0 | 1 if has_1559_fee => Some("maxFeePerGas/maxPriorityFeePerGas"),
+        2 if call.gas_price.is_some() => Some("gasPrice"),
+        0..=2 => None,
+        _ => {
+            return Err(RpcError::InvalidParams(format!(
+                "transaction type not supported: {t:#x} (only 0x0, 0x1, 0x2)"
+            )))
+        }
+    };
+    if let Some(field) = foreign {
+        return Err(RpcError::InvalidParams(format!(
+            "{field} is not valid for transaction type {t:#x}"
+        )));
+    }
+    Ok(t as u8)
+}
+
 fn build_call_tx_env(call: &CallRequest, chain_id: u64) -> Result<TxEnv, RpcError> {
     let caller = match &call.from {
         Some(f) => parse_address(f)?,
@@ -274,22 +317,48 @@ fn build_call_tx_env(call: &CallRequest, chain_id: u64) -> Result<TxEnv, RpcErro
         Some(g) => parse_u64(g)?,
         None => DEFAULT_BLOCK_GAS_LIMIT,
     };
-    let gas_price = match &call.gas_price {
+    let tx_type = call_tx_type(call)?;
+    // Fee fields as decode.rs sets them for the same envelope: legacy/2930 pay
+    // gas_price; 1559 puts max fee in gas_price and the tip in
+    // gas_priority_fee (an absent tip is 0, geth CallDefaults), so revm charges
+    // min(max_fee, base_fee + tip). call_tx_type rules out the other fields.
+    let gas_price = match call.gas_price.as_ref().or(call.max_fee_per_gas.as_ref()) {
         Some(p) => parse_u128(p)?,
-        None => match &call.max_fee_per_gas {
-            Some(f) => parse_u128(f)?,
-            None => 0,
-        },
+        None => 0,
     };
-    let gas_priority_fee = match &call.max_priority_fee_per_gas {
-        Some(p) => Some(parse_u128(p)?),
-        None => None,
+    let gas_priority_fee = if tx_type == TxType::Eip1559 as u8 {
+        Some(match &call.max_priority_fee_per_gas {
+            Some(p) => parse_u128(p)?,
+            None => 0,
+        })
+    } else {
+        None
+    };
+    let access_list = match &call.access_list {
+        Some(items) => AccessList(
+            items
+                .iter()
+                .map(|i| {
+                    Ok(AccessListItem {
+                        address: parse_address(&i.address)?,
+                        storage_keys: i
+                            .storage_keys
+                            .iter()
+                            .map(|k| parse_b256(k))
+                            .collect::<Result<_, RpcError>>()?,
+                    })
+                })
+                .collect::<Result<_, RpcError>>()?,
+        ),
+        None => AccessList::default(),
     };
     let nonce = match &call.nonce {
         Some(n) => Some(parse_u64(n)?),
         None => None,
     };
     Ok(TxEnv {
+        tx_type,
+        access_list,
         caller,
         gas_limit,
         gas_price,
@@ -1316,5 +1385,170 @@ impl EthApiServer for RpcState {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod call_typing_tests {
+    use super::*;
+
+    const TO: &str = "0x00000000000000000000000000000000000000bb";
+
+    fn req(v: serde_json::Value) -> CallRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn env(v: serde_json::Value) -> Result<TxEnv, RpcError> {
+        build_call_tx_env(&req(v), 7)
+    }
+
+    fn one_entry_list() -> serde_json::Value {
+        serde_json::json!([{
+            "address": "0x00000000000000000000000000000000000000cc",
+            "storageKeys": [
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000000000000000000000000000002"
+            ]
+        }])
+    }
+
+    /// geth's call-args JSON: `type` is a hex quantity, `accessList` is a list
+    /// of `{address, storageKeys}`.
+    #[test]
+    fn call_request_deserializes_geth_type_and_access_list() {
+        let r = req(serde_json::json!({ "to": TO, "type": "0x1", "accessList": one_entry_list() }));
+        assert_eq!(r.tx_type.as_deref(), Some("0x1"));
+        let al = r.access_list.unwrap();
+        assert_eq!(al.len(), 1);
+        assert_eq!(al[0].address, "0x00000000000000000000000000000000000000cc");
+        assert_eq!(al[0].storage_keys.len(), 2);
+    }
+
+    /// No `type`: 1559 fee fields => 2, else an access list => 1, else 0 (geth).
+    #[test]
+    fn call_tx_type_is_inferred_like_geth() {
+        let cases = [
+            (serde_json::json!({ "to": TO, "maxFeePerGas": "0x5" }), 2u8),
+            (
+                serde_json::json!({ "to": TO, "maxPriorityFeePerGas": "0x0" }),
+                2,
+            ),
+            (
+                serde_json::json!({ "to": TO, "maxFeePerGas": "0x5", "accessList": one_entry_list() }),
+                2,
+            ),
+            (
+                serde_json::json!({ "to": TO, "accessList": one_entry_list() }),
+                1,
+            ),
+            (
+                serde_json::json!({ "to": TO, "gasPrice": "0x5", "accessList": [] }),
+                1,
+            ),
+            (serde_json::json!({ "to": TO, "gasPrice": "0x5" }), 0),
+            (serde_json::json!({ "to": TO }), 0),
+        ];
+        for (json, want) in cases {
+            let tx = env(json.clone()).unwrap();
+            assert_eq!(tx.tx_type, want, "{json}");
+        }
+    }
+
+    /// The typed TxEnv carries what decode.rs puts there for the same envelope:
+    /// access list for 1 and 2, max fee in gas_price and Some(tip) for 2.
+    #[test]
+    fn typed_call_env_matches_block_decode() {
+        let t1 =
+            env(serde_json::json!({ "to": TO, "gasPrice": "0x3", "accessList": one_entry_list() }))
+                .unwrap();
+        assert_eq!(t1.gas_price, 3);
+        assert_eq!(t1.gas_priority_fee, None);
+        assert_eq!(t1.access_list.len(), 1);
+        assert_eq!(t1.access_list[0].storage_keys.len(), 2);
+
+        let t2 = env(serde_json::json!({ "to": TO, "maxFeePerGas": "0x9", "maxPriorityFeePerGas": "0x2", "accessList": one_entry_list() })).unwrap();
+        assert_eq!(t2.gas_price, 9);
+        assert_eq!(t2.gas_priority_fee, Some(2));
+        assert_eq!(t2.access_list.len(), 1);
+
+        // geth CallDefaults: an absent tip is 0 on a 1559 call.
+        let t2_no_tip = env(serde_json::json!({ "to": TO, "maxFeePerGas": "0x9" })).unwrap();
+        assert_eq!(t2_no_tip.gas_priority_fee, Some(0));
+        assert_eq!(t2_no_tip.gas_price, 9);
+    }
+
+    /// A plain call is built exactly as before typing: legacy, price 0, no tip,
+    /// no access list.
+    #[test]
+    fn plain_call_env_is_unchanged() {
+        let tx = env(serde_json::json!({ "to": TO, "data": "0xdeadbeef" })).unwrap();
+        assert_eq!(tx.tx_type, 0);
+        assert_eq!(tx.gas_price, 0);
+        assert_eq!(tx.gas_priority_fee, None);
+        assert!(tx.access_list.is_empty());
+        assert_eq!(tx.chain_id, Some(7));
+        assert_eq!(tx.data.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Only 0, 1 and 2 execute (decode.rs / mempool refuse the rest).
+    #[test]
+    fn explicit_unsupported_type_is_rejected() {
+        for t in ["0x3", "0x4", "0x7e"] {
+            let e = env(serde_json::json!({ "to": TO, "type": t })).unwrap_err();
+            assert!(matches!(e, RpcError::InvalidParams(_)), "{t}: {e}");
+            assert!(
+                e.to_string().contains("transaction type not supported"),
+                "{t}: {e}"
+            );
+        }
+        for t in ["0x0", "0x1", "0x2"] {
+            assert!(
+                env(serde_json::json!({ "to": TO, "type": t })).is_ok(),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            env(serde_json::json!({ "to": TO, "type": "0x1" }))
+                .unwrap()
+                .tx_type,
+            1
+        );
+        assert_eq!(
+            env(serde_json::json!({ "to": TO, "type": "0x2" }))
+                .unwrap()
+                .gas_priority_fee,
+            Some(0)
+        );
+    }
+
+    /// geth: "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified".
+    #[test]
+    fn gas_price_mixed_with_1559_fields_is_rejected() {
+        for extra in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            let mut j = serde_json::json!({ "to": TO, "gasPrice": "0x1" });
+            j[extra] = serde_json::json!("0x1");
+            let e = env(j).unwrap_err();
+            assert!(matches!(e, RpcError::InvalidParams(_)), "{extra}: {e}");
+            assert!(
+                e.to_string()
+                    .contains("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+                "{extra}: {e}"
+            );
+        }
+    }
+
+    /// An explicit type must not carry fields its envelope cannot hold.
+    #[test]
+    fn explicit_type_with_foreign_fields_is_rejected() {
+        let bad = [
+            serde_json::json!({ "to": TO, "type": "0x0", "accessList": one_entry_list() }),
+            serde_json::json!({ "to": TO, "type": "0x0", "maxFeePerGas": "0x1" }),
+            serde_json::json!({ "to": TO, "type": "0x1", "maxPriorityFeePerGas": "0x1" }),
+            serde_json::json!({ "to": TO, "type": "0x2", "gasPrice": "0x1" }),
+        ];
+        for j in bad {
+            let e = env(j.clone()).unwrap_err();
+            assert!(matches!(e, RpcError::InvalidParams(_)), "{j}: {e}");
+        }
     }
 }
