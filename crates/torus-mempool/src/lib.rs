@@ -205,7 +205,7 @@ impl Mempool {
         let verified_cap = config.verified_sender_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         Self {
-            evm: RwLock::new(evm_pool::EvmPool::new()),
+            evm: RwLock::new(evm_pool::EvmPool::new(initial_base_fee)),
             native: RwLock::new(native_pool),
             state,
             da_store,
@@ -513,10 +513,15 @@ impl Mempool {
         drained
     }
 
-    /// Update the D4 fee floor from a committed block header's base fee.
+    /// Update the D4 fee floor from a committed block header's base fee, and
+    /// re-key the EVM pool's eviction index at it (fix (a), s104: eviction
+    /// ranks by effective tip, which depends on the base fee). Stored under
+    /// the EVM lock so the floor and the pool's index never disagree.
     pub fn set_base_fee(&self, base_fee: u64) {
+        let mut pool = self.evm.write().unwrap();
         self.current_base_fee
             .store(base_fee, std::sync::atomic::Ordering::Relaxed);
+        pool.set_base_fee(base_fee);
     }
 
     /// Current D4 fee floor in wei.
@@ -626,7 +631,9 @@ impl Mempool {
             // ms against this node's clock, scope) — the same as RPC intake.
             torus_types::ActionSignature::Session { .. } => action
                 .resolve_sender(now_ms(), |pk| self.state.get_session(pk).ok().flatten())
-                .map_err(|e| MempoolError::NativeValidationFailed(format!("gossip session: {e}")))?,
+                .map_err(|e| {
+                    MempoolError::NativeValidationFailed(format!("gossip session: {e}"))
+                })?,
         };
         if verified_sender != claimed_sender {
             return Err(MempoolError::NativeValidationFailed(
@@ -858,7 +865,10 @@ impl Mempool {
             return Some(accounts);
         }
         let key = torus_state::cf::oracle_signer_key(sender);
-        let raw = self.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).ok()??;
+        let raw = self
+            .state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key)
+            .ok()??;
         if raw.len() != 20 {
             return None;
         }
@@ -1535,7 +1545,10 @@ mod tests {
             torus_types::compute_action_hash(&b),
         ];
         let (got, timing) = pool.get_native_da_batch_timed(&hashes);
-        assert!(got.iter().all(Option::is_some), "flushed bodies are readable");
+        assert!(
+            got.iter().all(Option::is_some),
+            "flushed bodies are readable"
+        );
         assert_eq!(timing.flushed, 2);
         assert!(timing.flush.is_some(), "a miss flushes");
         assert!(timing.read.multi_get > std::time::Duration::ZERO);
@@ -1553,14 +1566,19 @@ mod tests {
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
         let durable = gauge_test_action(1);
         let buffered = gauge_test_action(2);
-        pool.mirror_native_to_da(std::slice::from_ref(&durable)).unwrap();
+        pool.mirror_native_to_da(std::slice::from_ref(&durable))
+            .unwrap();
         pool.mirror_to_da(&buffered);
 
         let (got, timing) =
             pool.get_native_da_batch_timed(&[torus_types::compute_action_hash(&durable)]);
         assert!(got[0].is_some());
         assert!(timing.flush.is_none());
-        assert_eq!(pool.da_pending.lock().unwrap().actions.len(), 1, "unrelated body left buffered");
+        assert_eq!(
+            pool.da_pending.lock().unwrap().actions.len(),
+            1,
+            "unrelated body left buffered"
+        );
 
         let (got, timing) =
             pool.get_native_da_batch_timed(&[torus_types::compute_action_hash(&buffered)]);
@@ -1568,10 +1586,13 @@ mod tests {
         assert!(timing.flush.is_some());
         assert_eq!(timing.flushed, 1);
         assert!(pool.da_pending.lock().unwrap().actions.is_empty());
-        assert!(NativeDaStore::new(state)
-            .get(&torus_types::compute_action_hash(&buffered))
-            .unwrap()
-            .is_some(), "flushed body is in the store");
+        assert!(
+            NativeDaStore::new(state)
+                .get(&torus_types::compute_action_hash(&buffered))
+                .unwrap()
+                .is_some(),
+            "flushed body is in the store"
+        );
     }
 
     fn gauge_test_action(nonce: u64) -> SignedNativeAction {
@@ -1602,12 +1623,15 @@ mod tests {
     #[test]
     fn native_size_gauge_tracks_admission_drain_reinsert_and_commit() {
         let (_dir, state) = setup();
-        let pool = Mempool::new(state, MempoolConfig {
-            native_pool_max_size: 2,
-            native_per_sender_cap: 3,
-            native_per_block_cap: 2,
-            ..MempoolConfig::default()
-        });
+        let pool = Mempool::new(
+            state,
+            MempoolConfig {
+                native_pool_max_size: 2,
+                native_per_sender_cap: 3,
+                native_per_block_cap: 2,
+                ..MempoolConfig::default()
+            },
+        );
         let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
         pool.set_metrics(metrics.clone());
         let now = now_ms();
@@ -1615,13 +1639,19 @@ mod tests {
         let second = gauge_test_action(now + 1);
         let sender = first.recover_sender().unwrap();
         assert_eq!(metrics.mempool_native_size.get(), 0);
-        pool.add_native_action_presigned(sender, first.clone()).unwrap();
+        pool.add_native_action_presigned(sender, first.clone())
+            .unwrap();
         assert_eq!(metrics.mempool_native_size.get(), 1);
-        assert!(pool.add_native_action_presigned(sender, first.clone()).is_err());
+        assert!(pool
+            .add_native_action_presigned(sender, first.clone())
+            .is_err());
         assert_eq!(metrics.mempool_native_size.get(), 1);
-        pool.add_native_action_from_gossip_trusted(sender, second.clone()).unwrap();
+        pool.add_native_action_from_gossip_trusted(sender, second.clone())
+            .unwrap();
         assert_eq!(metrics.mempool_native_size.get(), 2);
-        assert!(pool.submit_native_action(sender, gauge_test_action(now + 2)).is_err());
+        assert!(pool
+            .submit_native_action(sender, gauge_test_action(now + 2))
+            .is_err());
         assert_eq!(metrics.mempool_native_size.get(), 2);
         // Selection alone does not remove live actions.
         assert_eq!(pool.select_native_for_block(10).len(), 2);
@@ -1660,12 +1690,22 @@ mod tests {
             let exclude = std::collections::HashSet::new();
             match selector {
                 0 => assert!(pool.drain_native(10).is_empty()),
-                1 => assert!(pool.select_native_for_block_with_senders_excluding(
-                    10, &exclude, usize::MAX, usize::MAX,
-                ).is_empty()),
-                _ => assert!(pool.select_native_cancels_for_block_with_senders_excluding(
-                    10, &exclude, usize::MAX, usize::MAX,
-                ).is_empty()),
+                1 => assert!(pool
+                    .select_native_for_block_with_senders_excluding(
+                        10,
+                        &exclude,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .is_empty()),
+                _ => assert!(pool
+                    .select_native_cancels_for_block_with_senders_excluding(
+                        10,
+                        &exclude,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .is_empty()),
             }
             assert_eq!(pool.native_pool_size(), 0);
             assert_eq!(metrics.mempool_native_size.get(), 0);
@@ -1744,7 +1784,10 @@ mod tests {
         // The body is DA-mirrored (proposer push / gossip), as for any block body.
         pool.mirror_native_to_da(std::slice::from_ref(&signed))
             .expect("healthy temp-db mirror");
-        assert!(pool.get_native_da(&hash).is_some(), "precondition: body in durable DA store");
+        assert!(
+            pool.get_native_da(&hash).is_some(),
+            "precondition: body in durable DA store"
+        );
 
         // The block commits: the in-memory selection pool is pruned...
         pool.remove_committed_native(&[hash]);
@@ -1881,9 +1924,15 @@ mod tests {
         // Still buffered: the batch read must flush before reading.
         let got = pool.get_native_da_batch(&[h2, absent, h1]);
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].as_ref().map(torus_types::compute_action_hash), Some(h2));
+        assert_eq!(
+            got[0].as_ref().map(torus_types::compute_action_hash),
+            Some(h2)
+        );
         assert!(got[1].is_none(), "absent body reads as None in place");
-        assert_eq!(got[2].as_ref().map(torus_types::compute_action_hash), Some(h1));
+        assert_eq!(
+            got[2].as_ref().map(torus_types::compute_action_hash),
+            Some(h1)
+        );
         assert!(pool.get_native_da_batch(&[]).is_empty());
     }
 
@@ -2028,8 +2077,7 @@ mod tests {
         let hash = torus_types::compute_action_hash(&action);
 
         assert_eq!(pool.da_flush_failures(), 0);
-        let res: Result<(), StateError> =
-            pool.mirror_native_to_da(std::slice::from_ref(&action));
+        let res: Result<(), StateError> = pool.mirror_native_to_da(std::slice::from_ref(&action));
         assert!(res.is_ok(), "healthy temp-db mirror returns Ok(())");
         assert!(
             raw_store.get(&hash).unwrap().is_some(),
@@ -2075,7 +2123,8 @@ mod tests {
 
         let (_dir, state) = setup();
         let pool = Mempool::new(state.clone(), MempoolConfig::default());
-        pool.mirror_native_to_da(std::slice::from_ref(&stored)).unwrap();
+        pool.mirror_native_to_da(std::slice::from_ref(&stored))
+            .unwrap();
         assert_eq!(pool.mirror_missing_native_to_da(&both, &hashes).unwrap(), 1);
         assert!(NativeDaStore::new(state).get(&hashes[1]).unwrap().is_some());
         assert_eq!(pool.da_flush_failures(), 0);
@@ -2102,7 +2151,11 @@ mod tests {
             .iter()
             .map(torus_types::compute_action_hash)
             .collect();
-        assert_eq!(requeued, vec![hashes[1]], "only the absent body is re-queued");
+        assert_eq!(
+            requeued,
+            vec![hashes[1]],
+            "only the absent body is re-queued"
+        );
     }
 
     /// The re-queued (failed) batch is the OLDEST pending work, so it must land at
@@ -2359,8 +2412,11 @@ mod tests {
         );
         let sender = action.recover_sender().unwrap();
 
-        pool.add_native_action_presigned(sender, action.clone()).unwrap();
-        assert!(pool.add_native_action_presigned(sender, action.clone()).is_err());
+        pool.add_native_action_presigned(sender, action.clone())
+            .unwrap();
+        assert!(pool
+            .add_native_action_presigned(sender, action.clone())
+            .is_err());
         pool.add_native_action(torus_types::eip712::sign_native_action(
             torus_types::NativeAction::ClaimRewards,
             now_ms() + 1,
@@ -2739,8 +2795,8 @@ mod tests {
 
         let k5 = key(15);
         fund(&state, &address_from_key(&k5), U256::from(10u64.pow(18)), 0);
-        // At the D4 floor (1 gwei) but not outbidding the cheapest pooled tx
-        // (same max fee, lower priority fee) — still PoolFull, not FeeTooLow.
+        // At the D4 floor (1 gwei), so its effective tip is 0: it does not
+        // outbid the cheapest pooled tip (0.2 gwei) — PoolFull, not FeeTooLow.
         let err = pool
             .add_evm_tx(create_eip1559_tx(
                 &k5,
@@ -3534,6 +3590,222 @@ mod tests {
         assert_eq!(pool.evm_pool_size(), 1);
     }
 
+    // ---- fix (b): intrinsic gas and EIP-3860 initcode size at admission ----
+
+    /// Fresh funded sender per case so admission depends on gas alone.
+    fn intrinsic_case(state: &StateDb, seed: u8) -> SigningKey {
+        let k = key(seed);
+        fund(state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+        k
+    }
+
+    /// revm's own figure for the chain's spec (executor.rs runs CANCUN).
+    fn revm_intrinsic(input: &[u8], is_create: bool, accounts: u64, slots: u64) -> u64 {
+        revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+            revm::primitives::hardfork::SpecId::CANCUN,
+            input,
+            is_create,
+            accounts,
+            slots,
+            0,
+        )
+        .initial_gas
+    }
+
+    /// `need - 1` is rejected with IntrinsicGasTooLow { need, .. }, `need` is admitted.
+    fn assert_intrinsic_boundary(pool: &Mempool, need: u64, make: impl Fn(u64) -> Vec<u8>) {
+        let err = pool.add_evm_tx(make(need - 1)).unwrap_err();
+        match err {
+            MempoolError::IntrinsicGasTooLow { need: n, got } => {
+                assert_eq!((n, got), (need, need - 1));
+            }
+            other => panic!("expected IntrinsicGasTooLow at {}, got: {other}", need - 1),
+        }
+        pool.add_evm_tx(make(need))
+            .unwrap_or_else(|e| panic!("gas limit {need} must be admitted: {e}"));
+    }
+
+    fn eip1559_with(
+        k: &SigningKey,
+        gas_limit: u64,
+        to: TxKind,
+        input: Vec<u8>,
+        access_list: alloy_eips::eip2930::AccessList,
+    ) -> Vec<u8> {
+        sign_envelope(
+            k,
+            TxEip1559 {
+                chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                nonce: 0,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                gas_limit,
+                to,
+                value: U256::ZERO,
+                input: input.into(),
+                access_list,
+            },
+        )
+    }
+
+    #[test]
+    fn intrinsic_gas_plain_transfer() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        assert_eq!(revm_intrinsic(&[], false, 0, 0), 21_000);
+
+        let k = intrinsic_case(&state, 200);
+        assert_intrinsic_boundary(&pool, 21_000, |gas| {
+            create_eip1559_tx(&k, 0, 2_000_000_000, 1, gas, U256::ZERO)
+        });
+
+        // Legacy envelope, same rule.
+        let k = intrinsic_case(&state, 201);
+        assert_intrinsic_boundary(&pool, 21_000, |gas_limit| {
+            sign_envelope(
+                &k,
+                alloy_consensus::TxLegacy {
+                    chain_id: Some(torus_types::eip712::TORUS_CHAIN_ID),
+                    nonce: 0,
+                    gas_price: 2_000_000_000,
+                    gas_limit,
+                    to: TxKind::Call(Address::ZERO),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                },
+            )
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_calldata() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 3 zero bytes x 4 + 5 non-zero bytes x 16 = 92.
+        let input = vec![0, 1, 0, 2, 3, 0, 4, 5];
+        let need = 21_000 + 3 * 4 + 5 * 16;
+        assert_eq!(revm_intrinsic(&input, false, 0, 0), need);
+
+        let k = intrinsic_case(&state, 202);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(
+                &k,
+                gas,
+                TxKind::Call(Address::ZERO),
+                input.clone(),
+                Default::default(),
+            )
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_contract_creation_and_initcode_words() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 33 non-zero bytes = 2 initcode words (EIP-3860, 2 gas each) + 32k create.
+        let input = vec![0x60; 33];
+        let need = 21_000 + 32_000 + 33 * 16 + 2 * 2;
+        assert_eq!(revm_intrinsic(&input, true, 0, 0), need);
+
+        let k = intrinsic_case(&state, 203);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(&k, gas, TxKind::Create, input.clone(), Default::default())
+        });
+    }
+
+    #[test]
+    fn intrinsic_gas_access_list() {
+        use alloy_eips::eip2930::{AccessList, AccessListItem};
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        // 2 addresses x 2400 + 3 storage keys x 1900.
+        let list = AccessList(vec![
+            AccessListItem {
+                address: Address::repeat_byte(1),
+                storage_keys: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+            },
+            AccessListItem {
+                address: Address::repeat_byte(2),
+                storage_keys: vec![B256::repeat_byte(3)],
+            },
+        ]);
+        let need = 21_000 + 2 * 2_400 + 3 * 1_900;
+        assert_eq!(revm_intrinsic(&[], false, 2, 3), need);
+
+        let k = intrinsic_case(&state, 204);
+        assert_intrinsic_boundary(&pool, need, |gas| {
+            eip1559_with(&k, gas, TxKind::Call(Address::ZERO), vec![], list.clone())
+        });
+
+        // EIP-2930 envelope, same rule.
+        let k = intrinsic_case(&state, 205);
+        assert_intrinsic_boundary(&pool, need, |gas_limit| {
+            sign_envelope(
+                &k,
+                alloy_consensus::TxEip2930 {
+                    chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                    nonce: 0,
+                    gas_price: 2_000_000_000,
+                    gas_limit,
+                    to: TxKind::Call(Address::ZERO),
+                    value: U256::ZERO,
+                    access_list: list.clone(),
+                    input: Bytes::new(),
+                },
+            )
+        });
+    }
+
+    /// EIP-3860: revm (Shanghai+) rejects create txs whose initcode exceeds
+    /// 49,152 bytes, so admission must too.
+    #[test]
+    fn initcode_size_limit_at_admission() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let max = revm::primitives::eip3860::MAX_INITCODE_SIZE;
+        assert_eq!(max, 49_152);
+
+        let k = intrinsic_case(&state, 206);
+        let too_big = vec![0u8; max + 1];
+        let err = pool
+            .add_evm_tx(eip1559_with(
+                &k,
+                1_000_000,
+                TxKind::Create,
+                too_big,
+                Default::default(),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::InitCodeTooLarge { size, max: m } if size == max + 1 && m == max),
+            "expected InitCodeTooLarge, got: {err}"
+        );
+
+        let at_limit = vec![0u8; max];
+        let need = revm_intrinsic(&at_limit, true, 0, 0);
+        pool.add_evm_tx(eip1559_with(
+            &k,
+            need,
+            TxKind::Create,
+            at_limit,
+            Default::default(),
+        ))
+        .expect("initcode at the limit is admitted");
+
+        // A call (not a create) with the same calldata size has no initcode limit.
+        let k = intrinsic_case(&state, 207);
+        let data = vec![0u8; max + 1];
+        let need = revm_intrinsic(&data, false, 0, 0);
+        pool.add_evm_tx(eip1559_with(
+            &k,
+            need,
+            TxKind::Call(Address::ZERO),
+            data,
+            Default::default(),
+        ))
+        .expect("large calldata on a call is not initcode");
+    }
+
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----
 
     fn put_oracle_validator(
@@ -3604,36 +3876,69 @@ mod tests {
         // Admitted: V itself (RPC path) and S through every insert path.
         pool.add_native_action(oracle_from(&kv, now)).unwrap();
         pool.add_native_action(oracle_from(&ks, now)).unwrap();
-        pool.add_native_action_presigned(s, oracle_from(&ks, now + 1)).unwrap();
-        assert_eq!(pool.drain_native(100).len(), 3, "stay under the per-validator cap");
-        pool.add_native_action_from_gossip(s, oracle_from(&ks, now + 2)).unwrap();
-        pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3)).unwrap();
+        pool.add_native_action_presigned(s, oracle_from(&ks, now + 1))
+            .unwrap();
+        assert_eq!(
+            pool.drain_native(100).len(),
+            3,
+            "stay under the per-validator cap"
+        );
+        pool.add_native_action_from_gossip(s, oracle_from(&ks, now + 2))
+            .unwrap();
+        pool.add_native_action_from_gossip_trusted(s, oracle_from(&ks, now + 3))
+            .unwrap();
         assert_eq!(pool.native_pool_size(), 2);
 
         // Rejected: a jailed validator and its signer.
         let (kj, kjs) = (key(33), key(34));
         let (j, js) = (address_from_key(&kj), address_from_key(&kjs));
         put_oracle_validator(&state, j, Jailed, Some(js));
-        assert_gate_rejects(pool.add_native_action(oracle_from(&kj, now)), "jailed validator");
-        assert_gate_rejects(pool.add_native_action(oracle_from(&kjs, now)), "jailed validator's signer");
+        assert_gate_rejects(
+            pool.add_native_action(oracle_from(&kj, now)),
+            "jailed validator",
+        );
+        assert_gate_rejects(
+            pool.add_native_action(oracle_from(&kjs, now)),
+            "jailed validator's signer",
+        );
         // A stranger, on every path.
         let kx = key(35);
         let x = address_from_key(&kx);
         assert_gate_rejects(pool.add_native_action(oracle_from(&kx, now)), "stranger");
-        assert_gate_rejects(pool.add_native_action_presigned(x, oracle_from(&kx, now)), "stranger presigned");
-        assert_gate_rejects(pool.add_native_action_from_gossip(x, oracle_from(&kx, now)), "stranger gossip");
-        assert_gate_rejects(pool.add_native_action_from_gossip_trusted(x, oracle_from(&kx, now)), "stranger trusted");
+        assert_gate_rejects(
+            pool.add_native_action_presigned(x, oracle_from(&kx, now)),
+            "stranger presigned",
+        );
+        assert_gate_rejects(
+            pool.add_native_action_from_gossip(x, oracle_from(&kx, now)),
+            "stranger gossip",
+        );
+        assert_gate_rejects(
+            pool.add_native_action_from_gossip_trusted(x, oracle_from(&kx, now)),
+            "stranger trusted",
+        );
         // A stale index entry: "sgn"||T -> V while V.oracle_signer == Some(S).
         let kt = key(36);
         let t = address_from_key(&kt);
         state
-            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::oracle_signer_key(&t),
+                v.as_slice(),
+            )
             .unwrap();
-        assert_gate_rejects(pool.add_native_action(oracle_from(&kt, now)), "stale index entry");
+        assert_gate_rejects(
+            pool.add_native_action(oracle_from(&kt, now)),
+            "stale index entry",
+        );
         assert_eq!(pool.native_pool_size(), 2);
         // Non-oracle actions are not gated.
-        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kx))
-            .unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &kx,
+        ))
+        .unwrap();
     }
 
     /// Review M1(a): at the cap of 4 per validator (own address + signer), a
@@ -3648,7 +3953,11 @@ mod tests {
         let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
         pool.set_metrics(metrics.clone());
         let (kv, ks, kw) = (key(41), key(42), key(43));
-        let (v, s, w) = (address_from_key(&kv), address_from_key(&ks), address_from_key(&kw));
+        let (v, s, w) = (
+            address_from_key(&kv),
+            address_from_key(&ks),
+            address_from_key(&kw),
+        );
         put_oracle_validator(&state, v, Active, Some(s));
         put_oracle_validator(&state, w, Active, None);
         let now = now_ms();
@@ -3664,10 +3973,16 @@ mod tests {
         ));
         // Older than everything pooled: rejected, nothing evicted.
         match pool.add_native_action(oracle_from(&kv, now - 5)) {
-            Err(MempoolError::NativeValidationFailed(m)) => assert!(m.contains("oracle pending cap"), "{m}"),
+            Err(MempoolError::NativeValidationFailed(m)) => {
+                assert!(m.contains("oracle pending cap"), "{m}")
+            }
             other => panic!("expected the cap, got {other:?}"),
         }
-        assert_eq!(oracle_drops(&metrics)[0], 0, "duplicate / older evict nothing");
+        assert_eq!(
+            oracle_drops(&metrics)[0],
+            0,
+            "duplicate / older evict nothing"
+        );
         // Newer: evicts V's oldest (nonce `now`), admitted.
         pool.add_native_action(oracle_from(&kv, now + 10)).unwrap();
         assert_eq!(pool.native_pool_size(), 4);
@@ -3678,17 +3993,29 @@ mod tests {
         );
         // Another validator is unaffected; V's non-oracle actions are not capped.
         pool.add_native_action(oracle_from(&kw, now)).unwrap();
-        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now + 3, &kv))
-            .unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now + 3,
+            &kv,
+        ))
+        .unwrap();
         let mut vs: Vec<u64> = pool
             .drain_native(100)
             .into_iter()
             .filter(|a| crate::native_pool::is_oracle_submission(&a.action))
-            .filter(|a| a.recover_sender().map(|x| x == v || x == s).unwrap_or(false))
+            .filter(|a| {
+                a.recover_sender()
+                    .map(|x| x == v || x == s)
+                    .unwrap_or(false)
+            })
             .map(|a| a.nonce)
             .collect();
         vs.sort_unstable();
-        assert_eq!(vs, vec![now + 1, now + 2, now + 3, now + 10], "the oldest (now) was evicted");
+        assert_eq!(
+            vs,
+            vec![now + 1, now + 2, now + 3, now + 10],
+            "the oldest (now) was evicted"
+        );
     }
 
     // ---- plan 9.14 C (s100): torus_mempool_oracle_dropped{reason} ----
@@ -3871,8 +4198,12 @@ mod tests {
         let v = address_from_key(&kv);
         put_oracle_validator(&state, v, Active, None);
         let now = now_ms();
-        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
-            .unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &kc,
+        ))
+        .unwrap();
         pool.add_native_action(oracle_from(&kv, now)).unwrap();
         pool.add_native_action(torus_types::eip712::sign_native_action(
             torus_types::NativeAction::CancelOrder { order_id: 3 },
@@ -3917,11 +4248,18 @@ mod tests {
         let kv = key(61);
         let v = address_from_key(&kv);
         put_oracle_validator(&state, v, Active, None);
-        pool.add_native_action(oracle_from(&kv, now)).expect("oracle admitted into a full pool");
+        pool.add_native_action(oracle_from(&kv, now))
+            .expect("oracle admitted into a full pool");
         assert_eq!(pool.native_pool_size(), 40);
         let sel = pool.select_native_for_block(20);
-        assert!(sel[..5].iter().all(|a| is_cancel(&a.action)), "ceil(25% of 20) cancels");
-        assert!(crate::native_pool::is_oracle_submission(&sel[5].action), "oracle right after the cap");
+        assert!(
+            sel[..5].iter().all(|a| is_cancel(&a.action)),
+            "ceil(25% of 20) cancels"
+        );
+        assert!(
+            crate::native_pool::is_oracle_submission(&sel[5].action),
+            "oracle right after the cap"
+        );
         let paced = pool.select_native_cancels_for_block_with_senders_excluding(
             20,
             &std::collections::HashSet::new(),
@@ -3950,14 +4288,28 @@ mod tests {
         pool.add_native_action(oracle_from(&kv, now)).unwrap();
         pool.add_native_action(oracle_from(&kv, now + 1)).unwrap();
         let kc = key(63);
-        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kc))
-            .unwrap();
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &kc,
+        ))
+        .unwrap();
         assert_eq!(pool.native_pool_size(), 3);
-        assert!(!pool.native_admission_backlogged(), "1 normal entry < limit 2");
+        assert!(
+            !pool.native_admission_backlogged(),
+            "1 normal entry < limit 2"
+        );
         let kd = key(64);
-        pool.add_native_action(torus_types::eip712::sign_native_action(torus_types::NativeAction::ClaimRewards, now, &kd))
-            .unwrap();
-        assert!(pool.native_admission_backlogged(), "2 normal entries reach the limit");
+        pool.add_native_action(torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now,
+            &kd,
+        ))
+        .unwrap();
+        assert!(
+            pool.native_admission_backlogged(),
+            "2 normal entries reach the limit"
+        );
     }
 
     // ---- Anti-spam item A: funded-account check ----
@@ -4351,7 +4703,9 @@ mod tests {
             .unwrap();
         put_native(&pool.state, &s, 0, 0); // ...so fund, exhaust, then unfund
         assert_eq!(used(&pool, &ks), 4);
-        assert!(pool.addr_rate_admits(&s, &order_batch(&ks, t0 + 1, 1).action).is_err());
+        assert!(pool
+            .addr_rate_admits(&s, &order_batch(&ks, t0 + 1, 1).action)
+            .is_err());
         // The signer's oracle submissions: never refused by B at RPC, admitted
         // unfunded by A on every path, and not charged.
         for i in 0..3 {
@@ -4415,7 +4769,11 @@ mod tests {
         let (v, t) = (address_from_key(&kv), address_from_key(&kt));
         put_oracle_validator(&pool.state, v, Active, Some(address_from_key(&ks)));
         pool.state
-            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &torus_state::cf::oracle_signer_key(&t), v.as_slice())
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::oracle_signer_key(&t),
+                v.as_slice(),
+            )
             .unwrap();
         assert!(matches!(
             pool.add_native_action_presigned(t, oracle_from(&kt, t0)),
