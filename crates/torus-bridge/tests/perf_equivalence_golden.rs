@@ -160,7 +160,8 @@ fn listed_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
 }
 
 /// Contexts pin `BookMode::Classic`: the goldens were taken on the Classic
-/// layout (the code default before plan 9.13, now `TORUS_BOOK_ROWS=0`).
+/// layout (the code default, `TORUS_BOOK_ROWS` unset or `=0`); the pin keeps
+/// them independent of the process env.
 fn seed_ctx(db: &StateDb) -> NativeExecContext {
     NativeExecContext::new_with_mode(
         db.clone(),

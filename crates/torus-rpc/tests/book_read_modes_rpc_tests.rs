@@ -1,6 +1,6 @@
 //! `torus_getOrderBook` / `torus_getOpenOrders` / `torus_getMarkPrice` must
 //! serve the book layout that is actually ON DISK — Classic whole-book blobs
-//! (`TORUS_BOOK_ROWS=0`), per-order rows (=1) and level-authority rows
+//! (`TORUS_BOOK_ROWS` unset), per-order rows (=1) and level-authority rows
 //! (=2) — instead of silently returning an empty book / `[]` / `0` for the two
 //! row layouts.
 //!

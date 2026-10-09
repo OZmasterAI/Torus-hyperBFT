@@ -2183,8 +2183,7 @@ mod parallel_engine_toggle_tests {
 // (`TORUS_BOOK_ROWS=2`)
 // ============================================================================
 //
-// Classic path (`TORUS_BOOK_ROWS=0`; the default before plan 9.13): each
-// market's ENTIRE `OrderBook` is Borsh-serialized
+// Classic path (default): each market's ENTIRE `OrderBook` is Borsh-serialized
 // into one `CF_NATIVE_ORDER_BOOKS` row per touched block — O(book depth) bytes
 // serialized AND state-root-hashed per block, the 2GB-RSS / swap driver once
 // books hold >1M resting orders.
@@ -2218,8 +2217,12 @@ mod parallel_engine_toggle_tests {
 //     there is no migration, and load refuses to start (fail-stop via
 //     ctx.fatal_error) when the CF's on-disk content OR the node-local
 //     `__book_mode__` marker does not match the configured mode.
-// Default (unset/other) = mode 3 (plan 9.13: the benched configuration);
-// `TORUS_BOOK_ROWS=0` = Classic, byte-identical persistence to pre-9.13.
+// Default (unset/other) = Classic = byte-identical persistence to today.
+// Classic stays the default (plan 9.13, 18c s107 after an adversarial review):
+// genesis carries no book mode, so a compiled default flip would fork a
+// mixed-binary fleet on the same fresh genesis (the `__book_mode__` marker only
+// catches a mismatch against a DB that already has history). Mode 3 as the
+// default needs the book mode in genesis first.
 // ###########################################################################
 //
 // Row schema: see `torus_core::book_rows` (frozen key/value layouts; level
@@ -2236,8 +2239,7 @@ mod parallel_engine_toggle_tests {
 /// Consensus-visible book persistence mode (see the warning above).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BookMode {
-    /// Whole-book borsh blob per market (8-byte key) — `TORUS_BOOK_ROWS=0`
-    /// (the default before plan 9.13).
+    /// Whole-book borsh blob per market (8-byte key) — exact-today default.
     Classic,
     /// C4 per-order rows in the root CF (`TORUS_BOOK_ROWS=1`).
     OrderRows,
@@ -2285,12 +2287,10 @@ impl BookMode {
     }
 }
 
-/// Runtime mode: `TORUS_BOOK_ROWS=0` → Classic (the pre-9.13 default), `=1` →
-/// OrderRows, `=2` → LevelAuthority, `=3` → LevelAuthorityChunked; anything
-/// else (INCLUDING UNSET) → LevelAuthorityChunked (plan 9.13: the benched
-/// configuration). Read once per process. Fleet-uniform, fresh genesis to
-/// change: a DB written in another mode fail-stops at the `__book_mode__`
-/// marker / content check.
+/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority,
+/// `=3` → LevelAuthorityChunked; anything else (INCLUDING UNSET) → Classic —
+/// byte-identical state root to today. Read once per process. Fleet-uniform,
+/// fresh genesis to change.
 fn book_mode() -> BookMode {
     static MODE: std::sync::OnceLock<BookMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
@@ -2301,8 +2301,8 @@ fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     match v.as_deref().map(str::trim) {
         Some("1") => BookMode::OrderRows,
         Some("2") => BookMode::LevelAuthority,
-        Some("0") => BookMode::Classic,
-        _ => BookMode::LevelAuthorityChunked,
+        Some("3") => BookMode::LevelAuthorityChunked,
+        _ => BookMode::Classic,
     }
 }
 
@@ -2766,17 +2766,18 @@ fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order)
 mod book_rows_toggle_tests {
     use super::{parse_book_rows_mode, BookMode};
 
-    /// 9.13: unset = the benched mode 3 (chunked level authority).
+    /// Unset = Classic (consensus-visible: stays the default until the book
+    /// mode is in genesis; plan 9.13, 18c s107). Mode 3 only when set.
     #[test]
-    fn default_is_level_authority_chunked() {
-        assert_eq!(parse_book_rows_mode(None), BookMode::LevelAuthorityChunked);
-        assert_eq!(
+    fn default_is_classic() {
+        assert_eq!(parse_book_rows_mode(None), BookMode::Classic);
+        assert_ne!(
             parse_book_rows_mode(None),
             parse_book_rows_mode(Some("3".to_string()))
         );
     }
 
-    /// `"0"` is the explicit Classic switch (the pre-9.13 default layout).
+    /// `"0"` is the explicit Classic switch (same layout as unset).
     #[test]
     fn zero_is_classic() {
         assert_eq!(
@@ -2832,14 +2833,13 @@ mod book_rows_toggle_tests {
         assert_eq!(bytes.len(), 4);
     }
 
-    /// Anything else falls back to the default (mode 3); a DB written in
-    /// another mode then fail-stops at the marker / content check.
+    /// Anything else falls back to the default (Classic).
     #[test]
-    fn anything_else_is_the_default() {
+    fn anything_else_stays_classic() {
         for v in ["true", "on", "", "yes", "4", "12", "level"] {
             assert_eq!(
                 parse_book_rows_mode(Some(v.to_string())),
-                BookMode::LevelAuthorityChunked,
+                BookMode::Classic,
                 "{v}"
             );
         }

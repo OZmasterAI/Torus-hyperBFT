@@ -15593,8 +15593,8 @@ mod crash_recovery_tests {
         fund_pipeline_fixture(&state_db);
         let blocks = pipeline_fixture_blocks();
         let gate = crate::exec_pipeline::WorkerGate::new();
-        // Classic pinned (the seed below is classic; the code default is mode
-        // 3 since plan 9.13).
+        // Classic pinned (the seed below is classic; the pin keeps the test
+        // independent of `TORUS_BOOK_ROWS` in the process env).
         let ctx = book_pipeline_ctx(
             &state_db,
             true,
@@ -16419,27 +16419,66 @@ mod crash_recovery_tests {
         }
     }
 
-    /// Plan 9.13: a fresh-genesis node on the compiled defaults (env UNSET:
-    /// the production `new_env` path, `test_book_mode` None) writes exactly
-    /// what the bench node writes with `TORUS_BOOK_ROWS=3` +
-    /// `TORUS_RESIDENT_BOOKS=1` (`book_pipeline_ctx` in mode 3): same running
-    /// state hash, same native root, same rows in every CF, serial and
-    /// pipelined; and the DB carries the mode-3 marker.
+    /// Plan 9.13 (18c s107: `TORUS_BOOK_ROWS` stays Classic by default, mode 3
+    /// only when set; the book mode is not in genesis). Two equivalences, each
+    /// on running state hash, native root, every CF and the `__book_mode__`
+    /// marker, serial and pipelined:
+    /// 1. a fresh-genesis node on the compiled defaults (env UNSET: the
+    ///    production `new_env` path, `test_book_mode` None) = a node with the
+    ///    node-local knobs set explicitly as in `run-cell.sh` `RECORD_ENV` but
+    ///    `TORUS_BOOK_ROWS=0` (Classic, resident holder forced on, member cache
+    ///    256 MB built explicitly); both write the Classic marker.
+    /// 2. a mode-3 node configured explicitly (`BookMode::LevelAuthorityChunked`,
+    ///    resident, explicit 256 MB member cache) = the bench config
+    ///    (`book_pipeline_ctx` in mode 3 on the env-resolved knobs); both write
+    ///    the mode-3 marker, and their root differs from the Classic one (the
+    ///    comparison is not vacuous).
+    ///
+    /// The process-global knobs (`TORUS_NATIVE_ROOT_CACHE`,
+    /// `TORUS_PARALLEL_SETTLE`, `TORUS_ROCKSDB_PIPELINED_WRITE`) are
+    /// `OnceLock`s shared by every run here; their unset = `RECORD_ENV` value
+    /// is pinned by the parse tests.
     #[test]
     fn env_unset_compiled_defaults_equal_the_bench_config() {
         use torus_bridge::native_executor::BookMode;
-        for k in ["TORUS_BOOK_ROWS", "TORUS_RESIDENT_BOOKS"] {
+        for k in [
+            "TORUS_BOOK_ROWS",
+            "TORUS_RESIDENT_BOOKS",
+            "TORUS_NATIVE_ROOT_CACHE",
+            "TORUS_BUCKET_MEMBER_CACHE_MB",
+        ] {
             assert!(std::env::var(k).is_err(), "{k} must be unset for this test");
         }
+        const MEMBER_CACHE_256_MB: usize = 256 * 1024 * 1024;
+        assert!(torus_state::native_trie::native_root_cache_enabled());
+        assert_eq!(
+            torus_state::native_trie::member_cache_budget_bytes(),
+            MEMBER_CACHE_256_MB
+        );
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
-        let run = |on: bool, bench: bool| {
+        // `None` = env unset; `Some((mode, explicit))`: mode pinned with the
+        // resident holder, `explicit` = member cache budget set explicitly.
+        let run = |on: bool, cfg: Option<(BookMode, bool)>| {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_book_fixture(&state_db);
             torus_state::running_hash::capture_begin(&state_db);
-            let ctx = if bench {
-                book_pipeline_ctx(&state_db, on, None, BookMode::LevelAuthorityChunked)
-            } else {
-                pipeline_ctx(&state_db, on, None)
+            let ctx = match cfg {
+                None => pipeline_ctx(&state_db, on, None),
+                Some((mode, explicit)) => {
+                    let mut ctx = pipeline_ctx(&state_db, false, None);
+                    ctx.test_book_mode = Some(mode);
+                    if explicit {
+                        ctx.member_cache = Arc::new(std::sync::Mutex::new(
+                            torus_state::native_trie::NativeMemberCache::with_budget(
+                                MEMBER_CACHE_256_MB,
+                            ),
+                        ));
+                    }
+                    if on {
+                        ctx.attach_flush_worker(None);
+                    }
+                    ctx
+                }
             };
             for b in &book_fixture_blocks() {
                 dispatch_and_execute(&ctx, &state_db, b);
@@ -16457,19 +16496,25 @@ mod crash_recovery_tests {
             .unwrap();
             (hash, root, dump_all_cfs(&state_db), marker)
         };
+        type Run = (Option<(u64, [u8; 32])>, B256, Vec<CfDump>, Option<Vec<u8>>);
+        let check = |what: &str, a: &Run, b: &Run| {
+            assert!(a.0.is_some(), "{what}: running hash written");
+            assert_eq!(a.0, b.0, "{what}: running state hash");
+            assert_eq!(a.1, b.1, "{what}: native root");
+            assert_dumps_equal(&a.2, &b.2, what);
+            assert_eq!(a.3, b.3, "{what}: book mode marker");
+        };
         for on in [false, true] {
-            let (h_env, r_env, d_env, m_env) = run(on, false);
-            let (h_bench, r_bench, d_bench, m_bench) = run(on, true);
-            assert_eq!(
-                m_bench,
-                Some(vec![3]),
-                "bench run must write the mode-3 marker"
-            );
-            assert_eq!(m_env, m_bench, "on={on}: env-unset node must run mode 3");
-            assert!(h_env.is_some(), "on={on}: running hash written");
-            assert_eq!(h_env, h_bench, "on={on}: running state hash");
-            assert_eq!(r_env, r_bench, "on={on}: native root");
-            assert_dumps_equal(&d_env, &d_bench, &format!("on={on}: env unset vs bench"));
+            let env = run(on, None);
+            let classic = run(on, Some((BookMode::Classic, true)));
+            assert_eq!(env.3, Some(vec![0]), "on={on}: env-unset node must run Classic");
+            check(&format!("on={on}: env unset vs explicit knobs, BOOK_ROWS=0"), &env, &classic);
+
+            let mode3 = run(on, Some((BookMode::LevelAuthorityChunked, true)));
+            let bench = run(on, Some((BookMode::LevelAuthorityChunked, false)));
+            assert_eq!(bench.3, Some(vec![3]), "on={on}: bench run must write the mode-3 marker");
+            check(&format!("on={on}: explicit mode 3 vs bench"), &mode3, &bench);
+            assert_ne!(env.1, bench.1, "on={on}: Classic and mode-3 roots must differ");
         }
     }
 
@@ -21260,8 +21305,9 @@ mod crash_recovery_tests {
         let gate = crate::exec_pipeline::WorkerGate::new();
         let new_ctx = |attach: bool| {
             let mut ctx = make_exec_ctx(&config, &db);
-            // `None`: Classic without the resident holder (the env default
-            // before plan 9.13), pinned since the default is now mode 3.
+            // `None`: Classic without the resident holder (the per-block
+            // reload, `TORUS_RESIDENT_BOOKS=0`), pinned since the env default
+            // attaches the resident holder (plan 9.13).
             ctx.test_book_mode =
                 Some(mode.unwrap_or(torus_bridge::native_executor::BookMode::Classic));
             ctx.test_no_resident = mode.is_none();
@@ -21414,7 +21460,7 @@ mod crash_recovery_tests {
     /// identical per-block consensus write sets (every `h_n`), running hash
     /// and full CF dump (state, books, trades, action status), serial and
     /// pipelined, in `mode` (`None`: classic without the resident holder, the
-    /// env default before plan 9.13). The switch reaches the context (the reference
+    /// `TORUS_RESIDENT_BOOKS=0` reload path). The switch reaches the context (the reference
     /// cancel-all keeps no counters) and the sequence is non-vacuous. P2-1:
     /// production uses the cancel-all index, whose carried copy covers the
     /// books after every block (resident modes, `p2_run`); a replica
