@@ -59,7 +59,11 @@ impl RocksKVStore {
 
 impl KVGet for RocksKVStore {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle(CF_NAME)?;
+        // R01b: a missing CF is a broken store, not "absent" (as `write`).
+        let cf = self
+            .db
+            .cf_handle(CF_NAME)
+            .expect("cf_consensus_meta missing");
         // R01b: a read error is a local storage fault, never "absent" (hotstuff
         // would act on a block / PC / view it reads as never written). The
         // trait is infallible, so fail here; on the consensus threads the
@@ -134,7 +138,11 @@ pub struct RocksSnapshot<'a> {
 
 impl KVGet for RocksSnapshot<'_> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle(CF_NAME)?;
+        // R01b: a missing CF is a broken store, not "absent" (as `write`).
+        let cf = self
+            .db
+            .cf_handle(CF_NAME)
+            .expect("cf_consensus_meta missing");
         // R01b: as `RocksKVStore::get`, an error is a fault, not `None`.
         self.snap
             .get_cf(cf, key)
@@ -316,6 +324,23 @@ mod tests {
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.clear()))
             .expect_err("an iterator error must not be dropped");
         assert!(panic_text(err).contains("consensus KV clear: iterator read failed"));
+    }
+
+    /// R01b: a missing `cf_consensus_meta` is a broken store, not "absent":
+    /// reads fail like writes do (they used to return `None`).
+    #[test]
+    fn kv_missing_cf_read_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let store = RocksKVStore::new(Arc::new(DB::open(&opts, dir.path()).unwrap()));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get(b"k")))
+            .expect_err("a read without the CF must not return");
+        assert!(panic_text(err).contains("cf_consensus_meta missing"));
+        let snap = store.snapshot();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.get(b"k")))
+            .expect_err("a snapshot read without the CF must not return");
+        assert!(panic_text(err).contains("cf_consensus_meta missing"));
     }
 
     #[test]
