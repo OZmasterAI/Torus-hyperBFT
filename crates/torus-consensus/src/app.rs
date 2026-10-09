@@ -653,6 +653,11 @@ struct ExecutionContext {
     /// read in `CoreWriterQueue::drain` does.
     #[cfg(test)]
     test_core_writer_read_fault: bool,
+    /// R02 branch 2 test seam: `Some(site)` makes that one storage access
+    /// (nonce read / put, session read, applied-height read) fail with an
+    /// I/O error, as a failed RocksDB access does.
+    #[cfg(test)]
+    test_replay_fault: Option<ReplayFault>,
     /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
     /// once at construction): copied into every block's context; with
     /// metrics attached the liquidation step logs the value sum over all
@@ -669,18 +674,46 @@ fn liq_value_sum_enabled() -> bool {
 
 // ---- Standalone helpers (used by both execution thread and crash recovery) ----
 
+/// The durable watermark of the last natively applied height. `Ok(None)` = no
+/// marker (nothing applied yet). R02: `Err` = this node cannot read its own
+/// marker, or the stored bytes are not a u64 (every write is 8 bytes) — a
+/// local fault. Callers fail-stop (or refuse) instead of guessing a height.
+fn native_applied_height(state_db: &StateDb) -> Result<Option<u64>, torus_state::StateError> {
+    let Some(data) = state_db.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = data.as_slice().try_into().map_err(|_| {
+        torus_state::StateError::InvalidData(format!(
+            "native applied-height marker is {} bytes, want 8",
+            data.len()
+        ))
+    })?;
+    Ok(Some(u64::from_be_bytes(bytes)))
+}
+
+/// Test view of [`native_applied_height`]: panics on a read error.
+#[cfg(test)]
 fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
-    state_db
-        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-        .ok()
-        .flatten()
-        .and_then(|data| {
-            if data.len() == 8 {
-                Some(u64::from_be_bytes(data[..8].try_into().ok()?))
-            } else {
-                None
-            }
-        })
+    native_applied_height(state_db).expect("native applied-height marker read")
+}
+
+/// R02 branch 2 test seam: the storage access [`ExecutionContext::test_replay_fault`]
+/// makes fail.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayFault {
+    NonceRead,
+    NoncePut,
+    SessionRead,
+    AppliedRead,
+}
+
+/// R02 test seam: the error an injected fault returns (a failed RocksDB access).
+#[cfg(test)]
+fn injected_fault(what: &str) -> torus_state::StateError {
+    torus_state::StateError::Io(std::io::Error::other(format!(
+        "injected {what} failure (test)"
+    )))
 }
 
 /// Test fixture: a bare marker write (simulates a DB at a given applied height).
@@ -1614,12 +1647,56 @@ impl ExecutionContext {
         self.execute_committed_block_with(torus_block, pending_slashes, DurableRows::default())
     }
 
+    /// [`native_applied_height`] of this context's DB (the R02 test seam can
+    /// make the read fail).
+    fn applied_height(&self) -> Result<Option<u64>, torus_state::StateError> {
+        #[cfg(test)]
+        if self.test_replay_fault == Some(ReplayFault::AppliedRead) {
+            return Err(injected_fault("applied-height read"));
+        }
+        native_applied_height(&self.state_db)
+    }
+
+    /// R02: a local storage fault on the replay-guard / session path. Latch
+    /// the fail-stop: the caller returns, nothing of the block flushes, the
+    /// marker stays put and the restart replays the block. `persist_header`
+    /// keeps the pre-fold contract (header persisted at exec when it would
+    /// have ridden the flush), as the due-check does.
+    fn fail_stop_on_fault(
+        &self,
+        block: &TorusBlock,
+        persist_header: bool,
+        what: &str,
+        e: &torus_state::StateError,
+    ) {
+        tracing::error!(
+            %e,
+            height = block.header.height,
+            "FATAL: {what} failed — halting execution pipeline (fail-stop)"
+        );
+        self.exec_failed.store(true, Ordering::SeqCst);
+        if persist_header {
+            persist_block_header(&self.state_db, block);
+        }
+    }
+
     /// bl2 exec pipeline: attach the flush worker W (see `exec_pipeline.rs`).
     /// Seeds W's durable height AND `exec_applied` from the durable marker, so
     /// the skip-check is exact from the first pipelined block. `gate` is the
     /// test hook (park / inject-failure); production passes `None`.
     fn attach_flush_worker(&mut self, gate: Option<Arc<crate::exec_pipeline::WorkerGate>>) {
-        let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+        // R02: never seed W from a guessed height.
+        let applied = match self.applied_height() {
+            Ok(applied) => applied.unwrap_or(0),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    "FATAL: applied-height marker read failed — flush worker not attached (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
         let env = crate::exec_pipeline::WorkerEnv {
             state_db: self.state_db.clone(),
             trie_cache: self.trie_cache.clone(),
@@ -1749,7 +1826,21 @@ impl ExecutionContext {
         // bl2 exec pipeline: the durable marker lags by the worker depth, so a
         // height re-delivered while its batch is still on W must be recognised
         // by E's own logical watermark (`exec_applied`), not the DB (design F3).
-        let durable_applied = read_native_applied_height(&self.state_db);
+        // R02: a read error is not "nothing applied" — re-executing an
+        // applied block is never a safe guess. Fail-stop.
+        let durable_applied = match self.applied_height() {
+            Ok(applied) => applied,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    height,
+                    "FATAL: applied-height marker read failed — cannot tell whether this block is \
+                     applied (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
         let logical_applied = if self.flush_worker.is_some() {
             Some(self.exec_applied.load(Ordering::SeqCst)).filter(|a| *a > 0)
         } else {
@@ -2079,11 +2170,27 @@ impl ExecutionContext {
             let verify_timer = std::time::Instant::now();
             // A8: header SECONDS -> the MILLISECONDS of session expiry and nonces.
             let block_ms = torus_types::eip712::block_timestamp_ms(torus_block.header.timestamp);
+            // R02: a session read error is a local fault, not "no session"
+            // (which drops the action). The callback keeps the first one; the
+            // block fail-stops right after the verification pass.
+            let session_fault = std::cell::OnceCell::new();
             let resolved_senders = if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached(
                     &torus_block.native_actions,
                     block_ms,
-                    |pubkey| overlay.get_session(pubkey).ok().flatten(),
+                    |pubkey| {
+                        let session = overlay.get_session(pubkey);
+                        #[cfg(test)]
+                        let session = if self.test_replay_fault == Some(ReplayFault::SessionRead) {
+                            Err(injected_fault("session read"))
+                        } else {
+                            session
+                        };
+                        session.unwrap_or_else(|e| {
+                            let _ = session_fault.set(e);
+                            None
+                        })
+                    },
                     // Exec trust-cache read (gated by --exec-trust-cache, default
                     // off): when enabled, a HIT reuses a locally-verified sender
                     // (keyed by the signature-committing key) and skips the secp256k1
@@ -2100,6 +2207,10 @@ impl ExecutionContext {
             } else {
                 vec![]
             };
+            if let Some(e) = session_fault.into_inner() {
+                self.fail_stop_on_fault(torus_block, fold_header, "session read", &e);
+                return;
+            }
             if let Some(ref m) = self.metrics {
                 m.exec_verify_seconds
                     .observe(verify_timer.elapsed().as_secs_f64());
@@ -2190,10 +2301,31 @@ impl ExecutionContext {
                     continue;
                 }
                 let nonce_key = torus_state::cf::native_nonce_key(&sender, signed.nonce);
-                let already_committed =
-                    StateBackend::get_cf_raw(&overlay, torus_state::cf::CF_NATIVE_NONCES, &nonce_key)
-                        .unwrap_or(None)
-                        .is_some();
+                let consumed = StateBackend::get_cf_raw(
+                    &overlay,
+                    torus_state::cf::CF_NATIVE_NONCES,
+                    &nonce_key,
+                );
+                #[cfg(test)]
+                let consumed = if self.test_replay_fault == Some(ReplayFault::NonceRead) {
+                    Err(injected_fault("nonce read"))
+                } else {
+                    consumed
+                };
+                // R02: a read error is not "not consumed" (that would execute
+                // a replay). Fail-stop.
+                let already_committed = match consumed {
+                    Ok(row) => row.is_some(),
+                    Err(e) => {
+                        self.fail_stop_on_fault(
+                            torus_block,
+                            fold_header,
+                            "replay-guard nonce read",
+                            &e,
+                        );
+                        return;
+                    }
+                };
                 if already_committed || !seen_in_block.insert((sender, signed.nonce)) {
                     tracing::warn!(
                         %sender,
@@ -2632,11 +2764,24 @@ impl ExecutionContext {
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
                 let nonce_key = torus_state::cf::native_nonce_key(sender, *nonce);
-                let _ = overlay.put_cf_raw(
+                let put = overlay.put_cf_raw(
                     torus_state::cf::CF_NATIVE_NONCES,
                     &nonce_key,
                     &torus_block.header.height.to_be_bytes(),
                 );
+                #[cfg(test)]
+                let put = if self.test_replay_fault == Some(ReplayFault::NoncePut) {
+                    Err(injected_fault("nonce put"))
+                } else {
+                    put
+                };
+                // R02: a lost nonce row would let the action replay. The
+                // overlay put fails only on a code bug (unregistered CF,
+                // frozen overlay); fail-stop all the same.
+                if let Err(e) = put {
+                    self.fail_stop_on_fault(torus_block, fold_header, "nonce put", &e);
+                    return;
+                }
             }
 
             // O3: this block's fills (their rows go to the background writer
@@ -3224,6 +3369,10 @@ pub struct TorusApp {
     /// Tests: the local clock (UNIX s) the pre-vote timestamp check reads.
     #[cfg(test)]
     test_now_secs: Option<u64>,
+    /// R02 branch 2 test seam: `true` makes [`Self::applied_height`] fail
+    /// with an I/O error, as a failed RocksDB read does.
+    #[cfg(test)]
+    test_applied_read_fault: bool,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     in_flight_hashes: InFlightHashLedger,
@@ -4099,6 +4248,8 @@ impl TorusApp {
             test_adl_work: None,
             #[cfg(test)]
             test_core_writer_read_fault: false,
+            #[cfg(test)]
+            test_replay_fault: None,
             liq_value_sum: liq_value_sum_enabled(),
         };
 
@@ -4201,6 +4352,8 @@ impl TorusApp {
             cached_vs_updates: None,
             #[cfg(test)]
             test_now_secs: None,
+            #[cfg(test)]
+            test_applied_read_fault: false,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             in_flight_hashes: InFlightHashLedger::default(),
@@ -4281,8 +4434,20 @@ impl TorusApp {
         // arrived pre-crash. The manifests for H..K are on disk; park them here (same
         // park+heal path FIX 1b uses) so the heal loop can drive the peer pull. No-op
         // for a clean restart (dispatched heights had their manifests pruned).
-        {
-            let applied = read_native_applied_height(&app.state_db).unwrap_or(0);
+        'reconcile: {
+            // R02: a read error latches the fail-stop (parking from height 1
+            // would rewind the frontier) and skips the reconcile.
+            let applied = match app.applied_height() {
+                Ok(applied) => applied.unwrap_or(0),
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        "FATAL: boot: applied-height marker read failed — manifest reconcile skipped (fail-stop)"
+                    );
+                    app.exec_failed.store(true, Ordering::SeqCst);
+                    break 'reconcile;
+                }
+            };
             let manifest_heights = manifest_heights_above(&app.state_db, applied);
             if let Some(&manifest_max) = manifest_heights.iter().max() {
                 let first = applied + 1;
@@ -4325,6 +4490,42 @@ impl TorusApp {
 
     pub fn leader_state(&self) -> Arc<LeaderState> {
         self.leader_state.clone()
+    }
+
+    /// [`native_applied_height`] of the app's DB (the R02 test seam can make
+    /// the read fail).
+    fn applied_height(&self) -> Result<Option<u64>, torus_state::StateError> {
+        #[cfg(test)]
+        if self.test_applied_read_fault {
+            return Err(injected_fault("applied-height read"));
+        }
+        native_applied_height(&self.state_db)
+    }
+
+    /// The strict-order execution frontier, seeded on first use from the
+    /// durable applied marker (mid-chain / post-replay); with nothing applied
+    /// yet (fresh genesis) the first committed height seen (`height`) defines
+    /// the baseline. `None` = the marker read failed (fail-stop latched).
+    fn exec_next_height_or_seed(&mut self, height: u64) -> Option<u64> {
+        if let Some(next) = self.exec_next_height {
+            return Some(next);
+        }
+        // R02: never seed the frontier from a guessed height. Fail-stop.
+        let next = match self.applied_height() {
+            Ok(applied) => applied.map_or(height, |a| a + 1),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    height,
+                    "FATAL: applied-height marker read failed — cannot seed the execution frontier \
+                     (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return None;
+            }
+        };
+        self.exec_next_height = Some(next);
+        Some(next)
     }
 
     /// T1.5: true once the execution pipeline is dead (panic, fatal error, or
@@ -4448,10 +4649,14 @@ impl TorusApp {
 
     /// Create a stub `TorusApp` without a database (for consensus-only tests).
     pub fn stub() -> Self {
+        Self::stub_on(StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db"))
+    }
+
+    /// [`Self::stub`] on a given database (a restart test reopens one).
+    fn stub_on(state_db: StateDb) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let state_db = StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db");
         let config = ChainConfig {
             chain_id: TORUS_CHAIN_ID,
             chain_name: "torus-test".to_string(),
@@ -4498,7 +4703,20 @@ impl TorusApp {
             _ => return (genesis, None),
         };
 
-        let applied = read_native_applied_height(state_db).unwrap_or(0);
+        // R02: never replay from a guessed height (0 would re-execute the
+        // whole chain). Fail-stop: the node does not start executing.
+        let applied = match exec_ctx.applied_height() {
+            Ok(applied) => applied.unwrap_or(0),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    committed_height = committed,
+                    "FATAL: crash recovery: applied-height marker read failed — not replaying (fail-stop)"
+                );
+                exec_ctx.exec_failed.store(true, Ordering::SeqCst);
+                return (genesis, None);
+            }
+        };
         if applied >= committed {
             return (genesis, None);
         }
@@ -4860,7 +5078,19 @@ impl TorusApp {
                 return Ok(cached_result.clone());
             }
         }
-        let applied = read_native_applied_height(&self.state_db).unwrap_or(0);
+        // R02: a read error refuses the boundary for now (liveness only),
+        // never "applied = 0".
+        let applied = match self.applied_height() {
+            Ok(applied) => applied.unwrap_or(0),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    height,
+                    "epoch boundary: applied-height marker read failed — validator-set plan not ready"
+                );
+                return Err(EpochPlanNotReady);
+            }
+        };
         let needed = height.saturating_sub(self.epoch_length);
         if applied < needed {
             tracing::warn!(
@@ -5769,11 +5999,9 @@ impl App<RocksKVStore> for TorusApp {
         // `enqueue_for_execution` exactly, so the first-delivery path is
         // unchanged. (`last_header` needs no advance here: a height below the
         // exec frontier is at or below the durable header frontier too.)
-        let next_expected = *self.exec_next_height.get_or_insert_with(|| {
-            read_native_applied_height(&self.state_db)
-                .map(|a| a + 1)
-                .unwrap_or(height)
-        });
+        let Some(next_expected) = self.exec_next_height_or_seed(height) else {
+            return;
+        };
         if height < next_expected {
             tracing::debug!(
                 height,
@@ -6059,14 +6287,9 @@ impl TorusApp {
         source: ExecSource,
         slashes: Vec<PendingSlash>,
     ) {
-        let next = *self.exec_next_height.get_or_insert_with(|| {
-            // Seed from the durable applied marker (mid-chain / post-replay); with
-            // nothing applied yet (fresh genesis) the first committed height we see
-            // defines the baseline.
-            read_native_applied_height(&self.state_db)
-                .map(|a| a + 1)
-                .unwrap_or(height)
-        });
+        let Some(next) = self.exec_next_height_or_seed(height) else {
+            return;
+        };
 
         // Below the frontier we already sent to exec: a benign re-delivery. A
         // genuine conflicting re-commit at an applied height is caught on the exec
@@ -11040,6 +11263,8 @@ mod crash_recovery_tests {
             test_adl_work: None,
             #[cfg(test)]
             test_core_writer_read_fault: false,
+            #[cfg(test)]
+            test_replay_fault: None,
             liq_value_sum: liq_value_sum_enabled(),
         }
     }
@@ -19057,6 +19282,374 @@ mod crash_recovery_tests {
                 "R02: replay vs no fault",
             );
         }
+    }
+
+    /// R02 branch 2: a fresh on-disk test DB (running hash on from height 1,
+    /// as `make_test_config_and_db`) and its directory, so a restart test can
+    /// close and reopen it.
+    fn r02_reopenable_db() -> (std::path::PathBuf, StateDb) {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let dir = scratch_db_dir("torus-r02-replay");
+        let db = StateDb::open(&dir).expect("open test db");
+        torus_state::running_hash::configure_activation(&db, Some(1))
+            .expect("configure running hash activation");
+        (dir, db)
+    }
+
+    /// R02 branch 2 driver, serial and pipelined. Control: `blocks` on a
+    /// fresh DB (`setup` seeds it), then `check` on the result. Fault: the
+    /// same chain with `fault` injected into the LAST block. That block must
+    /// fail-stop: `exec_failed`, the applied marker at the previous height,
+    /// every CF exactly as before the block (nothing flushed, so nothing of
+    /// the block executed). Restart: close and reopen the DB, replay with a
+    /// fresh context and no fault; every CF, so also the applied marker and
+    /// the running state hash (CF_CONSENSUS_META), equals the control.
+    fn r02_assert_fault_fail_stops_then_replays(
+        blocks: &[TorusBlock],
+        setup: &dyn Fn(&StateDb),
+        fault: ReplayFault,
+        check: &dyn Fn(&StateDb),
+    ) {
+        let (last, prefix) = blocks.split_last().expect("at least one block");
+        let top = last.header.height;
+        for on in [false, true] {
+            let (_c, db_ref) = make_test_config_and_db();
+            setup(&db_ref);
+            let ctx = pipeline_ctx(&db_ref, on, None);
+            for b in blocks {
+                dispatch_and_execute(&ctx, &db_ref, b);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: control");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db_ref), Some(top), "on={on}");
+            check(&db_ref);
+
+            let (dir, db) = r02_reopenable_db();
+            setup(&db);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            for b in prefix {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            let durable = persist_committed_block_durably(&db, last);
+            let before = dump_all_cfs(&db);
+            ctx.test_replay_fault = Some(fault);
+            ctx.execute_committed_block_with(last, vec![], durable);
+            ctx.pipeline_barrier();
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on} {fault:?}: must fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(
+                read_native_applied_height(&db),
+                prefix.last().map(|b| b.header.height),
+                "on={on} {fault:?}: the faulted block is not applied"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                "R02: nothing of the block flushed",
+            );
+
+            // Restart: reopen, replay the faulted height without the fault.
+            drop(db);
+            let db = StateDb::open(&dir).expect("reopen");
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(top), "on={on}");
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "R02: restart replay vs no fault",
+            );
+        }
+    }
+
+    /// The `ClaimRewards` action R02 branch 2 replays: `nonce` is in the
+    /// window of every `make_block` height used here.
+    fn r02_claim(nonce: u64) -> SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x52; 32]).unwrap();
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key)
+    }
+
+    fn r02_nonce_consumed(db: &StateDb, signed: &SignedNativeAction) -> bool {
+        let key =
+            torus_state::cf::native_nonce_key(&signed.recover_sender().unwrap(), signed.nonce);
+        db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &key)
+            .unwrap()
+            .is_some()
+    }
+
+    /// R02 (audit option A, branch 2; the audit's P0 example): a replay-guard
+    /// read of CF_NATIVE_NONCES that fails fail-stops the block. RED before:
+    /// `.unwrap_or(None)` read the error as "not consumed", so block 2's
+    /// replay of `a` (consumed in block 1) executed a second time. Control:
+    /// without a fault the consumed nonce still rejects the replay and the
+    /// fresh `b` executes.
+    #[test]
+    fn r02_nonce_read_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![a, b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::NonceRead, &|db| {
+            assert_eq!(
+                action_status(db, 2).expect("block 2 record").native_skipped,
+                vec![true, false],
+                "the replayed `a` is skipped, the fresh `b` executes"
+            );
+            assert!(r02_nonce_consumed(db, &b));
+        });
+    }
+
+    /// R02 branch 2: a failed CF_NATIVE_NONCES put fail-stops the block. The
+    /// put goes into the block's overlay, which fails only on an unregistered
+    /// CF or a frozen overlay (a code bug), but a lost nonce row would let the
+    /// action replay later, so it is fatal, never ignored. RED before:
+    /// `let _ =` dropped the error and the block flushed without the row.
+    #[test]
+    fn r02_nonce_put_fault_fail_stops_block() {
+        let a = r02_claim(block_time_ms(1));
+        let blocks = [make_block(1, vec![a.clone()])];
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::NoncePut, &|db| {
+            assert_eq!(
+                action_status(db, 1).expect("record").native_skipped,
+                vec![false]
+            );
+            assert!(r02_nonce_consumed(db, &a));
+        });
+    }
+
+    /// R02 (audit option A, branch 2): a session read that fails in the
+    /// batch-verify callback fail-stops the block. RED before: `.ok().flatten()`
+    /// turned the error into "no session" and the action was dropped (the
+    /// block flushed with it skipped). Control: with the session present it
+    /// executes; with no session row it is still dropped, no fail-stop.
+    #[test]
+    fn r02_session_read_fault_fail_stops_block() {
+        let session_key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+        let ms = block_time_ms(1);
+        let block = make_block(
+            1,
+            vec![torus_types::eip712::sign_native_action_with_session(
+                NativeAction::CancelOrder { order_id: 1 },
+                ms,
+                &session_key,
+            )],
+        );
+        let put_session = |db: &StateDb| {
+            db.put_session(
+                &session_key.verifying_key().to_bytes(),
+                &torus_types::SessionData {
+                    owner: Address::new([0x53; 20]),
+                    expiry: ms + 60_000,
+                    scope: torus_types::SessionScope::Trading,
+                    created_at: 0,
+                },
+            )
+            .unwrap();
+        };
+        r02_assert_fault_fail_stops_then_replays(
+            std::slice::from_ref(&block),
+            &put_session,
+            ReplayFault::SessionRead,
+            &|db| {
+                assert_eq!(
+                    action_status(db, 1).expect("record").native_skipped,
+                    vec![false]
+                );
+            },
+        );
+        // Control: a missing session is ordinary state — dropped, no fail-stop.
+        for on in [false, true] {
+            let (_c, db) = make_test_config_and_db();
+            let ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &block);
+            assert!(ctx.pipeline_barrier());
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: no fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(1));
+            assert_eq!(
+                action_status(&db, 1).expect("record").native_skipped,
+                vec![true]
+            );
+        }
+    }
+
+    /// R02 branch 2: the "already applied?" check reads the durable marker; a
+    /// failed read fail-stops instead of re-executing. RED before: the error
+    /// read as "nothing applied" and the serial path executed block 1 again.
+    /// Control: the re-delivery without a fault is skipped, no fail-stop.
+    /// Restart (reopen) lands the control state.
+    #[test]
+    fn r02_applied_height_read_fault_on_redelivery_fail_stops() {
+        let block = make_block(1, vec![r02_claim(block_time_ms(1))]);
+        for on in [false, true] {
+            let (_c, db_ref) = make_test_config_and_db();
+            let ctx = pipeline_ctx(&db_ref, on, None);
+            dispatch_and_execute(&ctx, &db_ref, &block);
+            dispatch_and_execute(&ctx, &db_ref, &block);
+            assert!(ctx.pipeline_barrier());
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: control");
+            drop(ctx);
+
+            let (dir, db) = r02_reopenable_db();
+            let mut ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &block);
+            assert!(ctx.pipeline_barrier());
+            let durable = persist_committed_block_durably(&db, &block);
+            let before = dump_all_cfs(&db);
+            ctx.test_replay_fault = Some(ReplayFault::AppliedRead);
+            ctx.execute_committed_block_with(&block, vec![], durable);
+            ctx.pipeline_barrier();
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: must fail-stop"
+            );
+            drop(ctx);
+            assert_dumps_equal(&before, &dump_all_cfs(&db), "R02: no re-execution");
+
+            drop(db);
+            let db = StateDb::open(&dir).expect("reopen");
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(1), "on={on}");
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "R02: restart vs no fault",
+            );
+        }
+    }
+
+    /// R02 branch 2: boot replay reads the marker to find the gap; a failed
+    /// read fail-stops instead of replaying from height 1. RED before: the
+    /// error read as height 0 and every committed block executed again. The
+    /// next boot (no fault) finds no gap and the state is untouched.
+    #[test]
+    fn r02_applied_height_read_fault_at_boot_replay_fail_stops() {
+        let ms = block_time_ms(1);
+        let mut blocks = vec![
+            make_block(1, vec![r02_claim(ms)]),
+            make_block(2, vec![r02_claim(ms + 1)]),
+        ];
+        link_blocks(&mut blocks);
+        let (dir, db) = r02_reopenable_db();
+        let ctx = pipeline_ctx(&db, false, None);
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        drop(ctx);
+        let before = dump_all_cfs(&db);
+        let mut ctx = pipeline_ctx(&db, false, None);
+        ctx.test_replay_fault = Some(ReplayFault::AppliedRead);
+        let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+        assert_eq!(parked, None);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        drop(ctx);
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "R02: nothing replayed");
+
+        drop(db);
+        let db = StateDb::open(&dir).expect("reopen");
+        let ctx = pipeline_ctx(&db, false, None);
+        let _ = TorusApp::replay_committed(&db, &ctx);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), Some(2));
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "R02: restart finds no gap");
+    }
+
+    /// R02 branch 2: the flush worker is seeded from the marker; a failed
+    /// read fail-stops and attaches no worker. RED before: it attached with
+    /// durable height 0.
+    #[test]
+    fn r02_applied_height_read_fault_at_worker_attach_fail_stops() {
+        let (_c, db) = make_test_config_and_db();
+        let (config, _) = make_test_config_and_db();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.test_replay_fault = Some(ReplayFault::AppliedRead);
+        ctx.attach_flush_worker(None);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "must fail-stop");
+        assert!(ctx.flush_worker.is_none(), "no worker on a guessed height");
+    }
+
+    /// R02 branch 2: `exec_next_height` is seeded from the marker on the
+    /// first commit; a failed read fail-stops (nothing seeded, nothing sent,
+    /// nothing written) instead of seeding at the incoming height. RED before:
+    /// the error read as "nothing applied" and the block was dispatched with
+    /// the frontier seeded there. Restart: a reopened node executes the block
+    /// and lands exactly the state of a node that never faulted.
+    #[test]
+    fn r02_applied_height_read_fault_at_exec_seed_fail_stops() {
+        let block = make_block(1, vec![r02_claim(block_time_ms(1))]);
+        // Control: a node that never faulted.
+        let (_d, db_ref) = r02_reopenable_db();
+        let mut app = TorusApp::stub_on(db_ref.clone());
+        app.enqueue_for_execution(1, ExecSource::Ready(block.clone()), vec![]);
+        assert_eq!(app.exec_next_height, Some(2));
+        drop(app); // joins the execution thread
+        assert_eq!(read_native_applied_height(&db_ref), Some(1));
+
+        for via_commit_guard in [false, true] {
+            let (dir, db) = r02_reopenable_db();
+            let mut app = TorusApp::stub_on(db.clone());
+            let before = dump_all_cfs(&db);
+            app.test_applied_read_fault = true;
+            if via_commit_guard {
+                // `on_committed_block`'s re-delivery guard seeds the same way.
+                assert_eq!(app.exec_next_height_or_seed(1), None);
+            } else {
+                app.enqueue_for_execution(1, ExecSource::Ready(block.clone()), vec![]);
+            }
+            assert!(app.is_exec_failed(), "must fail-stop");
+            assert_eq!(app.exec_next_height, None, "nothing seeded");
+            drop(app); // joins the execution thread
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                "R02: nothing dispatched or written",
+            );
+            drop(db);
+
+            let db = StateDb::open(&dir).expect("reopen");
+            let mut app = TorusApp::stub_on(db.clone());
+            app.enqueue_for_execution(1, ExecSource::Ready(block.clone()), vec![]);
+            drop(app);
+            assert_eq!(read_native_applied_height(&db), Some(1));
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "R02: restart vs no fault",
+            );
+        }
+    }
+
+    /// R02 branch 2: the epoch-plan check reads the marker; a failed read is
+    /// EpochPlanNotReady (refuse the boundary block for now: liveness only),
+    /// never "applied = 0". RED before: at the first boundary (needed = 0)
+    /// the error passed as applied 0 and the plan was used.
+    #[test]
+    fn r02_applied_height_read_fault_epoch_plan_not_ready() {
+        let mut app = TorusApp::stub();
+        let boundary = app.epoch_length;
+        assert!(app.epoch_validator_set_updates(boundary).is_ok(), "control");
+        app.cached_vs_updates = None;
+        app.test_applied_read_fault = true;
+        assert!(app.epoch_validator_set_updates(boundary).is_err());
     }
 
     /// Item 6 C1, P6: crash between E's hand-off and W's write with R on —
