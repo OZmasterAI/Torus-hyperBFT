@@ -9733,6 +9733,19 @@ impl NativeExecutor {
         NativeActionResult::err(action_type, e.to_string())
     }
 
+    /// R02: `latch_local_fault` for a [`CoreError`]: latch the fail-stop
+    /// (`fatal_error`) when `err` is a local fault
+    /// (`CoreError::is_local_fault`). The first latched fault is kept.
+    pub fn latch_core_fault<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        step: &str,
+        err: &CoreError,
+    ) {
+        if err.is_local_fault() && ctx.fatal_error.is_none() {
+            ctx.fatal_error = Some(format!("{step}: {err}"));
+        }
+    }
+
     // ========================================================================
     // Staking handlers
     // ========================================================================
