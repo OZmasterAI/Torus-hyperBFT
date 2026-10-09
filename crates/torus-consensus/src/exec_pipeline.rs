@@ -303,6 +303,12 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if inject_fail {
                 return Err(JobError::Write("injected write failure (test gate)".into()));
             }
+            // R01b: the shared fail-stop may be set outside W (DA latch, exec
+            // thread). Once it is, nothing more is written — not even a block
+            // handed off before it; restart replays from the durable marker.
+            if env.exec_failed.load(Ordering::SeqCst) {
+                return Err(JobError::Write("fail-stop latched — refusing to write".into()));
+            }
             run_job(&env, &mut job)
         }));
         let wall = timer.elapsed().as_secs_f64();
@@ -643,6 +649,30 @@ mod tests {
                 .is_err(),
             "no job may be accepted after the latch"
         );
+    }
+
+    /// R01b follow-up: once the shared fail-stop is set from outside W (e.g.
+    /// the DA latch), W writes no queued job and reports the failure.
+    #[test]
+    fn external_failstop_refuses_queued_job() {
+        let (env, _dir) = temp_env(None);
+        let db = env.state_db.clone();
+        env.exec_failed.store(true, Ordering::SeqCst);
+        let worker = FlushWorker::spawn(env, 0);
+        let _ = worker.submit(Job::Marker {
+            height: 1,
+            pending: Arc::new(FrozenPending::marker_only(1)),
+        });
+        assert!(!worker.wait_idle(), "wait_idle must report the failure");
+        assert!(worker.failed());
+        assert_eq!(worker.durable_height(), 0);
+        let marker = db
+            .get_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            )
+            .unwrap();
+        assert_eq!(marker, None, "no marker written after the external latch");
     }
 
     /// Drop drains: a job handed off right before drop is durable after drop.

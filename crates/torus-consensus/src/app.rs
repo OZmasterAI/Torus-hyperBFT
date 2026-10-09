@@ -1751,6 +1751,11 @@ impl ExecutionContext {
             return false;
         };
         let height = job.height();
+        // R01b: the latch may have gone up mid-block (DA writes); hand off nothing.
+        if self.exec_failed.load(Ordering::SeqCst) {
+            tracing::error!(height, "fail-stop latched mid-block — block not handed off");
+            return false;
+        }
         let pending = match &job {
             crate::exec_pipeline::Job::Flush { pending, .. }
             | crate::exec_pipeline::Job::Marker { pending, .. } => pending.clone(),
@@ -1786,11 +1791,17 @@ impl ExecutionContext {
     /// and its writer-precompile rows (since bug (c) the prefix of the flush
     /// batch) — overlapping keys agree with what lands. The consensus thread
     /// writes no consensus state (epoch rotation runs at execution, bug (b)).
-    /// R01 test seam: `Err` (nothing written) for a serial flush of the height
-    /// a test injected a write fault at (`test_fail_flush_at`); always `Ok`
-    /// outside tests.
+    /// Checked right before every serial flush: `Err` (nothing written) once
+    /// the fail-stop is latched (R01b: the DA latch can go up mid-block), and
+    /// the R01 test seam — a serial flush of the height a test injected a
+    /// write fault at (`test_fail_flush_at`).
     #[inline]
-    fn injected_flush_fault(&self, height: u64) -> Result<(), torus_state::StateError> {
+    fn pre_flush_check(&self, height: u64) -> Result<(), torus_state::StateError> {
+        if self.exec_failed.load(Ordering::SeqCst) {
+            return Err(torus_state::StateError::Io(std::io::Error::other(
+                "fail-stop latched mid-block — refusing to write",
+            )));
+        }
         #[cfg(test)]
         if self.test_fail_flush_at == Some(height) {
             return Err(torus_state::StateError::Io(std::io::Error::other(
@@ -1813,7 +1824,7 @@ impl ExecutionContext {
     /// marker — the same rule as the native flush and the flush worker.
     fn flush_marker_only(&self, pending: torus_state::FrozenPending) -> bool {
         let height = pending.height();
-        let flushed = self.injected_flush_fault(height).and_then(|()| {
+        let flushed = self.pre_flush_check(height).and_then(|()| {
             pending.flush_with_native_trie_stats(&self.state_db, Some(height), None, None)
         });
         if let Err(e) = flushed {
@@ -2997,7 +3008,7 @@ impl ExecutionContext {
                 };
                 // Bug (c): the block's EVM batch (if any) is the prefix of this
                 // ONE atomic write.
-                self.injected_flush_fault(height).and_then(|()| {
+                self.pre_flush_check(height).and_then(|()| {
                     overlay.flush_after_batch_with_native_trie_stats(
                         evm_batch.take().unwrap_or_default(),
                         &self.state_db,
@@ -3278,7 +3289,7 @@ impl ExecutionContext {
                 // its EVM batch rides the marker flush — one atomic write.
                 let pending = torus_state::FrozenPending::marker_only(height)
                     .with_hash_extras(hash_extras.take().unwrap_or_default());
-                if let Err(e) = self.injected_flush_fault(height).and_then(|()| {
+                if let Err(e) = self.pre_flush_check(height).and_then(|()| {
                     pending.flush_after_batch_with_native_trie_stats(
                         prefix,
                         &self.state_db,
@@ -15013,6 +15024,83 @@ mod crash_recovery_tests {
         let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
         let seen = sink_wants.is_some().then(|| seen.lock().unwrap().clone());
         (dump_all_cfs(&state_db), root, seen)
+    }
+
+    /// R01b follow-up: a fill sink that, once armed, makes three REAL DA store
+    /// writes fail (read-only store) on a mempool sharing the exec latch — the
+    /// DA fail-stop goes up after the block has started executing.
+    struct DaFailSink {
+        armed: Arc<AtomicBool>,
+        pool: Mempool,
+        action: SignedNativeAction,
+    }
+
+    impl torus_state::trade_rows::FillSink for DaFailSink {
+        fn wants_fills(&self) -> bool {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                for _ in 0..3 {
+                    let one = std::slice::from_ref(&self.action);
+                    assert!(self.pool.mirror_native_to_da(one).is_err());
+                }
+            }
+            false
+        }
+        fn send_fills(&self, _block: Arc<torus_state::trade_rows::BlockFills>) {}
+    }
+
+    /// R01b follow-up (Codex torus-adversarial on 85857762): once `exec_failed`
+    /// is set mid-block by the DA latch, nothing of that block is written —
+    /// no state flush, no applied marker, no nonce — serial and pipelined.
+    /// Blocks before it (no latch) flush normally.
+    #[test]
+    fn da_latch_mid_block_writes_nothing() {
+        for on in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let ctx = pipeline_ctx(&state_db, on, None);
+            let da_dir = tempfile::tempdir().unwrap();
+            drop(StateDb::open(da_dir.path()).unwrap());
+            let pool = Mempool::new(
+                StateDb::open_read_only(da_dir.path()).unwrap(),
+                torus_mempool::MempoolConfig::default(),
+            );
+            pool.set_fail_stop_latch(ctx.exec_failed.clone());
+            let blocks = pipeline_fixture_blocks();
+            let armed = Arc::new(AtomicBool::new(false));
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> = Arc::new(DaFailSink {
+                armed: armed.clone(),
+                pool,
+                action: blocks[0].native_actions[0].clone(),
+            });
+            assert!(ctx.fill_sink.set(sink).is_ok());
+
+            for b in &blocks[..2] {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}: no latch before block 3");
+            let applied = read_native_applied_height(&state_db);
+            assert_eq!(applied, Some(2), "on={on}: normal blocks flush");
+
+            let block3 = &blocks[2];
+            let durable = persist_committed_block_durably(&state_db, block3);
+            let before = dump_all_cfs(&state_db);
+            armed.store(true, Ordering::SeqCst);
+            ctx.execute_committed_block_with(block3, vec![], durable);
+            assert!(!armed.load(Ordering::SeqCst), "on={on}: the sink ran mid-block");
+            assert!(ctx.exec_failed.load(Ordering::SeqCst), "on={on}: DA latch set");
+            drop(ctx); // drains + joins W
+
+            let applied = read_native_applied_height(&state_db);
+            assert_eq!(applied, Some(2), "on={on}: marker stays at H-1");
+            assert!(
+                !cf_rows(&dump_all_cfs(&state_db), torus_state::cf::CF_NATIVE_NONCES)
+                    .iter()
+                    .any(|(_, v)| v.as_slice() == 3u64.to_be_bytes()),
+                "on={on}: no nonce of block 3 consumed"
+            );
+            let after = dump_all_cfs(&state_db);
+            assert_dumps_equal(&before, &after, &format!("on={on}: nothing flushed"));
+        }
     }
 
     fn cf_rows<'a>(dump: &'a [CfDump], cf: &str) -> &'a [(Vec<u8>, Vec<u8>)] {
