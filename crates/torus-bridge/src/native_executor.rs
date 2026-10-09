@@ -363,12 +363,11 @@ impl BalanceCache {
         positions: &PositionManager<T>,
     ) -> Result<(), CoreError> {
         self.dirty.sort_unstable();
-        // P2-2: one backend batch, same rows and order as a put per address.
-        positions.put_native_balances(
-            self.dirty
-                .iter()
-                .filter_map(|addr| self.map.get(addr).map(|entry| (addr, &entry.balance))),
-        )?;
+        for addr in &self.dirty {
+            if let Some(entry) = self.map.get(addr) {
+                positions.put_native_balance(addr, &entry.balance)?;
+            }
+        }
         // A partial flush must leave EVERY entry dirty, including writes that
         // succeeded before the error. Only a wholly successful flush resets
         // the flags/list, preserving the original all-dirty retry behavior.

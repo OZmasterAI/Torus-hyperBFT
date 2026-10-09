@@ -220,22 +220,6 @@ impl BorshDeserialize for NativeBalance {
 // ============================================================================
 
 /// Position key: trader(20) + market_id(8) = 28 bytes.
-/// A position row's bytes. Capacity hint matches the fixed v2 layout; Vec can
-/// still grow if the codec changes. Avoids retaining borsh::to_vec's 1 KiB
-/// starter buffer.
-fn encode_position(pos: &Position) -> Result<Vec<u8>, CoreError> {
-    let mut data = Vec::with_capacity(POSITION_V2_LEN);
-    pos.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    Ok(data)
-}
-
-/// A native balance row's bytes (fixed v1 layout, growable hint).
-fn encode_balance(bal: &NativeBalance) -> Result<Vec<u8>, CoreError> {
-    let mut data = Vec::with_capacity(33);
-    bal.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
-    Ok(data)
-}
-
 pub fn position_key(trader: &Address, market_id: MarketId) -> [u8; 28] {
     let mut key = [0u8; 28];
     key[..20].copy_from_slice(trader.as_slice());
@@ -307,33 +291,11 @@ impl<T: StateBackend> PositionManager<T> {
 
     pub fn put_position(&self, pos: &Position) -> Result<(), CoreError> {
         let key = position_key(&pos.trader, pos.market_id);
-        self.state
-            .put_cf_raw_owned(CF_NATIVE_POSITIONS, &key, encode_position(pos)?)?;
-        Ok(())
-    }
-
-    /// Item 6 Phase 2 P2-2: per `(key, row)` in order, [`Self::put_position`]
-    /// (`Some`, keyed by the row's own fields) or [`Self::delete_position`]
-    /// (`None`, keyed by `key`), as one backend batch
-    /// ([`StateBackend::write_cf_raw_many`]). Every row is encoded before any
-    /// is written, so an encode error writes none (per row: the rows before it).
-    pub fn write_positions<'a>(
-        &self,
-        rows: impl IntoIterator<Item = ((Address, MarketId), Option<&'a Position>)>,
-    ) -> Result<(), CoreError> {
-        let rows = rows
-            .into_iter()
-            .map(|(key, pos)| {
-                Ok(match pos {
-                    Some(pos) => (
-                        position_key(&pos.trader, pos.market_id).to_vec(),
-                        Some(encode_position(pos)?),
-                    ),
-                    None => (position_key(&key.0, key.1).to_vec(), None),
-                })
-            })
-            .collect::<Result<Vec<_>, CoreError>>()?;
-        self.state.write_cf_raw_many(CF_NATIVE_POSITIONS, rows)?;
+        // Capacity hint matches the fixed v2 layout; Vec can still grow if the
+        // codec changes. Avoid retaining borsh::to_vec's 1 KiB starter buffer.
+        let mut data = Vec::with_capacity(POSITION_V2_LEN);
+        pos.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        self.state.put_cf_raw_owned(CF_NATIVE_POSITIONS, &key, data)?;
         Ok(())
     }
 
@@ -375,22 +337,10 @@ impl<T: StateBackend> PositionManager<T> {
         trader: &Address,
         bal: &NativeBalance,
     ) -> Result<(), CoreError> {
+        let mut data = Vec::with_capacity(33); // fixed v1 layout, growable hint
+        bal.serialize(&mut data).map_err(|e| CoreError::Borsh(e.to_string()))?;
         self.state
-            .put_cf_raw_owned(CF_NATIVE_BALANCES, trader.as_slice(), encode_balance(bal)?)?;
-        Ok(())
-    }
-
-    /// Item 6 Phase 2 P2-2: [`Self::put_native_balance`] per row, in order, as
-    /// one backend batch (every row encoded first, as [`Self::write_positions`]).
-    pub fn put_native_balances<'a>(
-        &self,
-        rows: impl IntoIterator<Item = (&'a Address, &'a NativeBalance)>,
-    ) -> Result<(), CoreError> {
-        let rows = rows
-            .into_iter()
-            .map(|(trader, bal)| Ok((trader.as_slice().to_vec(), Some(encode_balance(bal)?))))
-            .collect::<Result<Vec<_>, CoreError>>()?;
-        self.state.write_cf_raw_many(CF_NATIVE_BALANCES, rows)?;
+            .put_cf_raw_owned(CF_NATIVE_BALANCES, trader.as_slice(), data)?;
         Ok(())
     }
 
@@ -803,22 +753,20 @@ impl PositionCache {
 
     /// Write every dirty row to the backend once, in sorted key order
     /// (deterministic write sequence; see type-level docs). Clean entries
-    /// (read-only hits/misses) are untouched. Clears the dirty set; an error
-    /// leaves every entry dirty. Item 6 Phase 2 P2-2: one lookup per dirty
-    /// key and one backend batch ([`PositionManager::write_positions`]): the
-    /// same rows in the same order as [`Self::flush_all_per_row`].
+    /// (read-only hits/misses) are untouched. Clears the dirty set.
     pub fn flush_all<T: StateBackend>(
         &mut self,
         positions: &PositionManager<T>,
     ) -> Result<(), CoreError> {
-        let mut rows: Vec<((Address, MarketId), Option<&Position>)> = self
-            .dirty
-            .iter()
-            .filter_map(|key| self.map.get(key).map(|entry| (*key, entry.as_ref())))
-            .collect();
-        // Dirty keys are distinct: an unstable sort gives the sorted order.
-        rows.sort_unstable_by_key(|(key, _)| *key);
-        positions.write_positions(rows)?;
+        let mut keys: Vec<(Address, MarketId)> = self.dirty.iter().copied().collect();
+        keys.sort();
+        for key in keys {
+            match self.map.get(&key) {
+                Some(Some(pos)) => positions.put_position(pos)?,
+                Some(None) => positions.delete_position(&key.0, key.1)?,
+                None => {}
+            }
+        }
         self.dirty.clear();
         Ok(())
     }
