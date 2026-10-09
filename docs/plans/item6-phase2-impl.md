@@ -480,6 +480,7 @@ Standard shape (results doc 21.4, as section 22):
 | 34 | Gate P2-2 | Campaign `ozarchy-p22g` (results doc section 33): base `e934fa0e`, p25 `029581e5`, p22 `29320f6b`, 2 cells per arm interleaved, all rc 0 / AGREE / PASS. **Cache flush p22 14.71 vs p25 11.86 ms per native block (+2.85 ms, +24%; ~13 pooled sd, all 3 validators)**, vs the gate's -5 ms and the -3.2 ms estimate: **regressed**. Engine p22/p25 +2.36 ms (1 sd), matched/s 0.990x (not resolved). Pass B +1.00 ms (not touched by the change; cause not established). **Cumulative head to head: p25/base 1.0495x (pairwise 1.045-1.054x)**, p22/base 1.039x; +7% is ~2.0% away from p25. Cause not profiled (no perf); suspected: every row encoded into an owned list before the inserts (the rows go cold before the `BTreeMap` insert touches them; per row they were inserted while hot) and the write lock held for the whole batch | by row 33's rule (drop only if it regresses) P2-2 as built is out; decision below (owner / 18c) |
 | 35 | after Gate P2-2 | 18c s106: revert OK (numbers checked: +2.85 ms ~13 sd is a regression by row 33; cumulative 1.0495x, gap ~2.0%, ~5 ms engine at ~0.42% per ms). Host load checked per cell (`cpu.csv`, mid-run load1 21.7-36.3 with no arm pattern; the busiest cell, base r1, flushed normally; validator CPU 12.3-12.6 cores in every cell) | **P2-2 reverted** (`d7c0e596`, `3fe595d3`; history kept; code = `029581e5`). Next: merge main `f5f28f89` (sync point), the R01 fault test, the P2-4 design check alongside it (paper work; states up front whether it can close the ~2.0% gap, else flag with the options: lower the phase gate to the measured figure vs more items, owner decides). A streaming P2-2 (encode + insert per row under one lock) only after a microbench of old vs batch vs streaming at cell-sized batches (~21k rows per block); at its ~3.2 ms estimate it would be ~1.3% alone |
 | 36 | 4 (P2-4 design check, read-only) | **P2-4 cannot close the ~2.0% gap on the walk-0 standard shape** (row 33 (2)): at walk 0 the marks never move (feed 30000 every 2 s, `walk_bp=0`), so `fill_block_marks` keeps the version (`native_executor.rs:10552-10555`, plan's :10033 is stale), the sums cache carries across blocks (`into_carry`, :1207-1234), clean traders hit `cached_sums` and traders who filled take the incremental `delta_sums` (:1626). Options (a) skip-by-bound and (b) re-value moved markets save ~0 at walk 0 (no mark moves); cache carry, incremental sums and skipping position-less traders are already built. The 10.7 ms (section 22) is `run_liquidations_with` inclusive over 2,048 traders per block (`liquidation.rs:58`): all `*_sums` together 6.14 ms per block incl. the margin phase, `cached_sums` 0.64; the rest is mostly per-trader reads (`get_native_balance`, `clear_cooldown` / `set_pending` `get_cf_raw`, nearly always no-ops: 981 liquidation-CF writes in ~750 blocks). Two exact walk-0 candidates outside P2-4's scope (estimates, need a walk-0 perf split first): reuse decoded records in `delta_sums` ~1-2 ms; a node-local index of cooldown / pending rows that skips the two reads per healthy trader ~1-3 ms (shadow test vs the CF); together ~2-4 ms, ~0.8-1.7% of the 2.0%. P2-4's walk-10 rule still holds (24.7 - 10.7 = 14 ms there) but moves the walk-0 phase gate ~0% | **flag to the owner (row 33 (2)):** lower the phase gate to the measured 1.0495x vs `e934fa0e`, or add items (the two walk-0 candidates, a streaming P2-2 at ~1.3% if its microbench passes, row 35). Not built |
+| 37 | phase gate | 18c s106 owner decision on row 36: **A, lower the phase gate to the measured 1.0495x vs `e934fa0e`; Phase 2 closes with P2-1 + P2-5** (9.16). Estimate vs delivered per native block: P2-1 3.7 -> 0.44 ms, P2-2 3.2 -> -2.85 ms (reverted), P2-5 10.3 -> 8.59 ms. The two walk-0 candidates (`delta_sums` decode reuse ~1-2 ms, node-local cooldown / pending row index ~1-3 ms) and a streaming P2-2 (~1.3% if its microbench passes) go to the backlog as input to Phase 3's step 0 profile, built only where that profile confirms them | Phase 2 build done. Order: push `perf/item6-phase2`; the R01 fault test (`fix/r01-write-fail-stop` `01d991ab`, `/mnt/r01`); merge main `9793f1ec`; final suites on the branch head; 18c's final review, then the merge to main; after it (sync point) compiled defaults (9.13), the reduce-only modify sweep fix, C2 holder sets, and 18c starts R02's loader / save branch; then the Phase 3 plan (step 0 re-profile first) |
 
 ## 9. Owner decisions (s96, 2026-10-06)
 
@@ -492,6 +493,7 @@ are kept because some may matter later. Impact is an estimate unless marked meas
 
 **Chosen: keep +7%** (300 markets) against the Phase 2 base (9.6), with the step 0
 checkpoint (section 1): below 13 ms of P2-1 + P2-2, the owner picks P2-5 or a lower gate.
+Superseded by 9.16 (2026-10-09): the gate is lowered to the measured 1.0495x.
 
 | option | needs (ms per native block) | note |
 |---|---|---|
@@ -766,3 +768,35 @@ and B's priority, on a quiet host.
 | build C as specified | loses at today's and the bench's by-id share; gate "standard shape not worse" misses by ~0.6-1.4 ms |
 
 Order: P2-5 (step 2), P2-2, the P2-4 design check (section 4).
+
+### 9.16 Phase gate lowered to the measured 1.0495x; Phase 2 closes with P2-1 + P2-5 (18c s106 / ozarchy s34, 2026-10-09)
+
+**Chosen: A, lower the phase gate (9.1) to the measured 1.0495x vs `e934fa0e`** (results doc section 33,
+head to head p25/base, pairwise 1.045-1.054x; review log rows 34-37). Phase 2 closes with P2-1 and
+P2-5. P2-4 cannot close the ~2.0% gap at walk 0 (row 36), and P2-2 regressed and was reverted (row 35).
+
+| item | estimate (ms per native block) | delivered (measured) | status |
+|---|---|---|---|
+| P2-1 cancel-all index | 3.7 | 0.44 (phase 1, val0; row 24) | kept (9.14) |
+| P2-2 batch cache flush | 3.2 | -2.85 (cache flush +2.85, regressed; row 34) | reverted (row 35) |
+| P2-5 keyed fast hasher | 10.3 | 8.59 (engine, val0; row 30) | kept |
+| cumulative matched/s | +7% gate | 1.0495x head to head | gate lowered to this |
+
+| option | note |
+|---|---|
+| **A. lower the gate to 1.0495x, close with P2-1 + P2-5 (chosen)** | no more Phase 2 items; the candidates below feed Phase 3's step 0 |
+| B. add items to reach +7% | the two walk-0 candidates (~2-4 ms, ~0.8-1.7%) plus a streaming P2-2 (~1.3%), each needing a perf split or microbench and a gate cell; not sure to close the gap |
+
+Backlog, not built now (input to Phase 3's step 0 profile; build only what that profile confirms):
+- reuse decoded records in `delta_sums` (~1-2 ms per native block at walk 0, row 36);
+- a node-local index of cooldown / pending rows that skips the two reads per healthy trader
+  (~1-3 ms, shadow test vs the CF, row 36);
+- streaming P2-2 (one lock, rows streamed, ~1.3% matched/s) only if an old / batch / streaming
+  microbench at ~21k rows per block passes (row 35).
+
+Order: push `perf/item6-phase2`; then (a) the R01 fault test on `/mnt/r01`
+(`fix/r01-write-fail-stop` `01d991ab`); (b) merge main `9793f1ec` (eth_call / estimateGas typing,
+RPC only); (c) final suites on the branch head, then 18c's final review before the merge to main;
+(d) after the merge (sync point): node compiled defaults = benched config (9.13), the reduce-only
+modify sweep fix, C2 holder sets, and 18c starts R02's loader / save branch; (e) the Phase 3 plan,
+step 0 re-profile first.
