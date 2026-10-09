@@ -648,6 +648,11 @@ struct ExecutionContext {
     /// empty blocks); `None` = `liq::ADL_WORK_PER_BLOCK`.
     #[cfg(test)]
     test_adl_work: Option<u64>,
+    /// R02 test seam: `true` makes the CoreWriter step's queue read fail
+    /// with an I/O error before anything is drained, as a failed RocksDB
+    /// read in `CoreWriterQueue::drain` does.
+    #[cfg(test)]
+    test_core_writer_read_fault: bool,
     /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
     /// once at construction): copied into every block's context; with
     /// metrics attached the liquidation step logs the value sum over all
@@ -2406,7 +2411,29 @@ impl ExecutionContext {
             // exec thread inside the engine window but outside every
             // execute_batch phase timer — time it separately.
             let tail_timer = std::time::Instant::now();
-            let _ = NativeExecutor::drain_core_writer(&mut ctx);
+            #[cfg(test)] // R02 test seam: the queue read fails.
+            let drained = if self.test_core_writer_read_fault {
+                Err(torus_core::error::CoreError::State(
+                    torus_state::StateError::Io(std::io::Error::other(
+                        "injected CoreWriter queue read failure (test)",
+                    )),
+                ))
+            } else {
+                NativeExecutor::drain_core_writer(&mut ctx)
+            };
+            #[cfg(not(test))]
+            let drained = NativeExecutor::drain_core_writer(&mut ctx);
+            // R02: a failed drain latches the fail-stop (checked after the
+            // liquidation step below), never a silently skipped queue.
+            // `CoreWriterQueue::drain` fails only on a state read / delete
+            // (`CoreError::State`, a local fault). Any other Err cannot occur
+            // today; it would still leave the queue undrained, so it is fatal
+            // too (the `get_or_insert_with`).
+            if let Err(e) = drained {
+                NativeExecutor::latch_core_fault(&mut ctx, "core_writer drain", &e);
+                ctx.fatal_error
+                    .get_or_insert_with(|| format!("core_writer drain: {e}"));
+            }
             // Item 3: the liquidation step — end of the block, on the block-start
             // mark (`begin_block_oracle` above). The EVM ran before this phase:
             // precompile readers see a block's liquidations from the next block.
@@ -2423,8 +2450,8 @@ impl ExecutionContext {
             };
             #[cfg(not(test))]
             let _ = NativeExecutor::run_liquidations(&mut ctx);
-            // F11: a storage fault in the step (or in CoreWriter) fail-stops
-            // exactly like the batches' check above.
+            // F11: a storage fault in the step (or, R02, in the CoreWriter
+            // drain above) fail-stops exactly like the batches' check above.
             if let Some(reason) = ctx.fatal_error.take() {
                 tracing::error!(
                     height,
@@ -4070,6 +4097,8 @@ impl TorusApp {
             test_engine_threads: None,
             #[cfg(test)]
             test_adl_work: None,
+            #[cfg(test)]
+            test_core_writer_read_fault: false,
             liq_value_sum: liq_value_sum_enabled(),
         };
 
@@ -11009,6 +11038,8 @@ mod crash_recovery_tests {
             test_engine_threads: None,
             #[cfg(test)]
             test_adl_work: None,
+            #[cfg(test)]
+            test_core_writer_read_fault: false,
             liq_value_sum: liq_value_sum_enabled(),
         }
     }
@@ -18924,6 +18955,107 @@ mod crash_recovery_tests {
         }
         for d in &dumps[1..] {
             assert_dumps_equal(&dumps[0], d, "lockbox sequence: with/without R, serial/pipelined");
+        }
+    }
+
+    /// R02 (audit option A, branch 1; APP:2409): a block whose CoreWriter
+    /// queue read fails fail-stops — `exec_failed`, applied marker unchanged,
+    /// nothing of the block flushed (every CF as before it ran; the queued
+    /// deposit row still there) — and the restart's replay then matches an
+    /// uninterrupted run. RED before R02: the drain's `Err` was dropped
+    /// (`let _ =`), so the block flushed and was marked applied with the
+    /// deposit never credited and its row stranded (no later height drains
+    /// it). The no-fault run is the control (drain credits as before; also
+    /// `resident_rows_lockbox_deposit_then_orders_identical_without_r`).
+    #[test]
+    fn r02_core_writer_queue_read_fault_fail_stops_block() {
+        use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let trader = Address::repeat_byte(0x5A);
+        let credit = FixedPoint::from_raw(7 * FixedPoint::SCALE);
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        // A lockbox deposit queued by block 1's EVM, due in block 2.
+        let setup = || {
+            let (_cfg, db) = make_test_config_and_db();
+            let qa = QueuedAction {
+                trader,
+                kind: QueuedActionKind::LockboxDeposit { amount: credit },
+                block_queued: 1,
+            };
+            CoreWriterQueue::enqueue(&db, &qa).unwrap();
+            db
+        };
+        let balance = |db: &StateDb| {
+            torus_core::position::PositionManager::new(db.clone())
+                .get_native_balance(&trader)
+                .unwrap()
+                .available
+        };
+        let queued = |db: &StateDb| {
+            StateBackend::iterate_cf(db, CF_CORE_WRITER_QUEUE, None)
+                .unwrap()
+                .len()
+        };
+        let idle = |ctx: &ExecutionContext| {
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+        };
+        for on in [false, true] {
+            // Control: no fault — block 2's drain credits the deposit.
+            let db_ref = setup();
+            let ctx = pipeline_ctx(&db_ref, on, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db_ref, b);
+            }
+            idle(&ctx);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db_ref), Some(2), "on={on}");
+            assert_eq!(balance(&db_ref), credit, "on={on}: drained and credited");
+            assert_eq!(queued(&db_ref), 0, "on={on}");
+
+            // Fault: block 2's queue read fails.
+            let db = setup();
+            let mut ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            idle(&ctx);
+            let durable = persist_committed_block_durably(&db, &blocks[1]);
+            let before = dump_all_cfs(&db);
+            ctx.test_core_writer_read_fault = true;
+            ctx.execute_committed_block_with(&blocks[1], vec![], durable);
+            idle(&ctx);
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: must fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(1),
+                "on={on}: block 2 not applied"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                "R02: nothing of block 2 flushed",
+            );
+            assert_eq!(queued(&db), 1, "on={on}: the deposit row stays queued");
+            assert_eq!(balance(&db), FixedPoint::ZERO, "on={on}");
+
+            // Restart: the replay runs block 2 again (no fault) and matches.
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "R02: replay vs no fault",
+            );
         }
     }
 

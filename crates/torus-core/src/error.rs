@@ -123,3 +123,126 @@ pub enum CoreError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
+
+impl CoreError {
+    /// R02: a LOCAL fault — this node's storage failed, bytes it stored do
+    /// not decode, or a column family is missing — so its post-state for the
+    /// block cannot be trusted and the node must fail-stop. Same rule as
+    /// `torus_economics::EconomicsError::is_local_fault`. Every other variant
+    /// is a validation, user, oracle or invariant error that every validator
+    /// hits alike on the same state; halting on those would stop the chain.
+    /// `BookLayout` is not one: it also reports a read that does not serve
+    /// the chain's layout (`getOrderBook` under order rows), which every
+    /// validator hits alike; the book loaders fail-stop on it themselves.
+    pub fn is_local_fault(&self) -> bool {
+        matches!(self, Self::State(_) | Self::Borsh(_) | Self::MissingCf(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use torus_state::StateError;
+
+    /// R02: the expected class of every variant. Exhaustive on purpose (no
+    /// `_` arm): a new variant does not compile here until someone decides
+    /// whether it is a local fault.
+    fn expected_local(e: &CoreError) -> bool {
+        use CoreError::*;
+        match e {
+            State(_) | Borsh(_) | MissingCf(_) => true,
+            OrderNotFound(_)
+            | InvalidQuantity
+            | InvalidPrice
+            | InvalidTickSize { .. }
+            | InvalidTriggerPrice
+            | MaxOrdersExceeded { .. }
+            | InvalidOraclePrice { .. }
+            | DustOrder { .. }
+            | InsufficientMargin { .. }
+            | MaxLeverageExceeded { .. }
+            | NotLiquidatable { .. }
+            | OraclePriceStale { .. }
+            | NoOraclePrice(_)
+            | InsufficientOracleSubmissions { .. }
+            | InsufficientNativeBalance { .. }
+            | InsufficientEvmBalance { .. }
+            | InvalidPrecompileInput(_)
+            | PrecompileOutOfGas
+            | UnknownSelector(_)
+            | MarketNotFound(_)
+            | BookLayout(_)
+            | StaleOraclePrice(_)
+            | Overflow(_)
+            | InvalidInput(_) => false,
+        }
+    }
+
+    #[test]
+    fn only_storage_decode_and_missing_cf_errors_are_local_faults() {
+        let fp = FixedPoint::ONE;
+        let every_variant = [
+            CoreError::OrderNotFound(1),
+            CoreError::InvalidQuantity,
+            CoreError::InvalidPrice,
+            CoreError::InvalidTickSize {
+                price: fp,
+                tick_size: fp,
+            },
+            CoreError::InvalidTriggerPrice,
+            CoreError::MaxOrdersExceeded { count: 1, max: 1 },
+            CoreError::InvalidOraclePrice { market_id: 1 },
+            CoreError::DustOrder {
+                qty: fp,
+                lot_size: fp,
+            },
+            CoreError::InsufficientMargin {
+                required: fp,
+                available: fp,
+            },
+            CoreError::MaxLeverageExceeded {
+                leverage: 2,
+                max_leverage: 1,
+                notional: fp,
+            },
+            CoreError::NotLiquidatable {
+                equity: fp,
+                maintenance: fp,
+            },
+            CoreError::OraclePriceStale {
+                market_id: 1,
+                last_block: 1,
+                current_block: 2,
+            },
+            CoreError::NoOraclePrice(1),
+            CoreError::InsufficientOracleSubmissions { got: 0, need: 1 },
+            CoreError::InsufficientNativeBalance { have: fp, need: fp },
+            CoreError::InsufficientEvmBalance {
+                have: U256::ZERO,
+                need: U256::from(1u8),
+            },
+            CoreError::InvalidPrecompileInput("x".into()),
+            CoreError::PrecompileOutOfGas,
+            CoreError::UnknownSelector(0),
+            CoreError::MarketNotFound(1),
+            CoreError::State(StateError::InvalidData("x".into())),
+            CoreError::State(StateError::Io(std::io::Error::other("x"))),
+            CoreError::State(StateError::MissingColumnFamily("x".into())),
+            CoreError::Borsh("x".into()),
+            CoreError::MissingCf("x"),
+            CoreError::BookLayout("x".into()),
+            CoreError::StaleOraclePrice(1),
+            CoreError::Overflow("x".into()),
+            CoreError::InvalidInput("x".into()),
+        ];
+        let local: Vec<String> = every_variant
+            .iter()
+            .filter(|e| e.is_local_fault())
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(local.len(), 5, "{local:?}");
+        for e in &every_variant {
+            assert_eq!(e.is_local_fault(), expected_local(e), "{e}");
+        }
+    }
+}
