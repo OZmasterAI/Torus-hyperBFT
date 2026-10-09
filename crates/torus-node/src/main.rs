@@ -481,6 +481,8 @@ async fn main() {
     // 1. Tracing
     std::env::set_var("RUST_LOG", &cli.log_level);
     torus_telemetry::init_tracing(false);
+    // R01b: a panic on a consensus / execution thread fail-stops the node.
+    install_fail_stop_panic_hook(|code| std::process::exit(code));
     info!(
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %cli.data_dir.display(),
@@ -1378,10 +1380,104 @@ mod hex {
 /// peers with headroom; the scaffold's 1024 held one header (s75 fix E).
 const PROGRESS_MSG_BUFFER_BYTES: u64 = 1 << 20;
 
+/// R01b: threads whose panic fail-stops the node (exit 70). The ONE list;
+/// names must match the spawn sites:
+/// - `hotstuff-algo`: hotstuff_rs `algorithm.rs` `Algorithm::start`
+/// - `hotstuff-syncsv`: hotstuff_rs `block_sync/server.rs` `BlockSyncServer::start`
+/// - `hotstuff-bodyserve`: hotstuff_rs `hotstuff/block_data_server.rs` `start`
+/// - `torus-execution`: torus-consensus `app.rs` `TorusApp::new`
+/// - `torus-flush-worker`: torus-consensus `exec_pipeline.rs` `FlushWorker::spawn`
+/// - `torus-async-validate`: torus-consensus `app.rs` `AsyncValidateWorker::spawn`
+///
+/// The three hotstuff threads read the consensus KV store, whose read and
+/// write faults panic (the hotstuff_rs `KVStore` trait is infallible).
+const FAIL_STOP_THREADS: &[&str] = &[
+    "hotstuff-algo",
+    "hotstuff-syncsv",
+    "hotstuff-bodyserve",
+    "torus-execution",
+    "torus-flush-worker",
+    "torus-async-validate",
+];
+
+/// sysexits.h EX_SOFTWARE, the node's fail-stop exit code.
+const FAIL_STOP_EXIT_CODE: i32 = 70;
+
+/// R01b A: chain a panic hook that fail-stops the node (`exit(70)`) when the
+/// panicking thread is one of [`FAIL_STOP_THREADS`]. The previous hook runs
+/// first, so the panic message and backtrace still print. A panic on any other
+/// thread (RPC, network tasks), or one inside a recovering
+/// `torus_bridge::panic_scope::catch_recoverable`, keeps today's behaviour.
+///
+/// It exits from the panicking thread itself rather than through the
+/// `exec_failed` poller: a panic hook runs before the unwind, so this cannot
+/// be lost to a stuck tokio runtime, a thread that never drops its
+/// `TorusApp`, or an unwind that deadlocks. Same exit code as the poller.
+fn install_fail_stop_panic_hook(exit: fn(i32)) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let thread = std::thread::current();
+        let Some(name) = thread.name().filter(|n| FAIL_STOP_THREADS.contains(n)) else {
+            return;
+        };
+        if torus_bridge::panic_scope::in_recoverable_scope() {
+            return;
+        }
+        error!(
+            thread = name,
+            "FATAL: {name} thread panicked ({info}) — terminating node (fail-stop, exit {FAIL_STOP_EXIT_CODE})"
+        );
+        exit(FAIL_STOP_EXIT_CODE);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// R01b A: a panic on a listed thread calls the injected exit with 70; a
+    /// panic on an unlisted thread, or one caught by a recovering
+    /// `catch_recoverable` on a listed thread, does not.
+    #[test]
+    fn r01b_fail_stop_panic_hook_exits_70_on_listed_threads_only() {
+        static EXITS: std::sync::Mutex<Vec<(String, i32)>> = std::sync::Mutex::new(Vec::new());
+        fn record(code: i32) {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            EXITS.lock().unwrap().push((name, code));
+        }
+        install_fail_stop_panic_hook(record);
+        let run = |name: &str, f: fn()| {
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(f)
+                .unwrap()
+                .join()
+        };
+        assert!(run("hotstuff-algo", || panic!("injected consensus write failure")).is_err());
+        assert!(run("torus-flush-worker", || panic!("injected")).is_err());
+        assert!(run("rpc-worker", || panic!("injected")).is_err());
+        assert!(run("torus-execution", || {
+            let r = torus_bridge::panic_scope::catch_recoverable(|| panic!("recovered"));
+            assert!(r.is_err());
+        })
+        .is_ok());
+        let exits: Vec<_> = EXITS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| !n.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(
+            exits,
+            vec![
+                ("hotstuff-algo".to_string(), 70),
+                ("torus-flush-worker".to_string(), 70)
+            ]
+        );
+    }
 
     /// s75 fix E: on reconnect every peer flushes up to 256 queued direct
     /// sends (torus-network `PendingSendQueue`), possibly all for views ahead

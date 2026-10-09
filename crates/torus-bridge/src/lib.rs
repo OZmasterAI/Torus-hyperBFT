@@ -8,6 +8,7 @@ pub mod decode;
 pub mod error;
 pub mod market_workers;
 pub mod native_executor;
+pub mod panic_scope;
 pub mod proposer;
 pub mod state_root;
 pub mod validator;
