@@ -4429,10 +4429,12 @@ mod tests {
         rsh_overlay(db, &writes).flush_with_native_trie_stats(db, Some(h), None, None).unwrap();
     }
 
-    /// Review finding 5: a skipped height (a failed serial flush, after which
-    /// the next block's flush advanced the applied marker past it) must never
-    /// be chained over from the stale `h_{n-2}`: the stored hash stays at the
-    /// last valid height and no later checkpoint is ever written.
+    /// Review finding 5: a skipped height must never be chained over from the
+    /// stale `h_{n-2}`: the stored hash stays at the last valid height and no
+    /// later checkpoint is ever written. Since R01 a failed flush fail-stops
+    /// the node before the next block runs, so consensus no longer produces
+    /// the gap (it was: a failed serial flush, then the next block's flush
+    /// advanced the applied marker past it); this pins the guard.
     #[test]
     fn running_hash_gap_is_never_chained_over() {
         let (db, _d) = rsh_db();

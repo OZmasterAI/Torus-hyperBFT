@@ -1,0 +1,10 @@
+verdict:            EXIT_70 (exit code 70; 70 = R01 fail-stop)
+fs went ro at:      not seen
+first failure:      2026-10-09T03:46:45.465329Z ERROR torus_mempool: native DA store batch write failed: rocksdb: IO error: While appending to file: /mnt/r01/ro-native-1/v3/000053.log: Read-only file system
+R01 line:           2026-10-09T03:46:59.685298Z ERROR torus_consensus::app: FATAL: native overlay flush + applied-height marker failed — block NOT marked applied; fail-stop (restart replays it) e=rocksdb: IO error: While appending to file: /mnt/r01/ro-native-1/v3/000053.log: Read-only file system height=676 has_evm=false
+failed height H:    676
+last applied (RPC): 675  (H-1 expected: 675)
+remounted:          /dev/loop0 rw,relatime; owner oz:oz / oz:oz
+restart boot lines:
+2026-10-09T03:47:31.860179Z  WARN torus_consensus::app: crash recovery: execution gap detected, replaying committed_height=667 applied_height=635 gap=32
+RESULT: checkpoints 400..800 MATCH on all 4 (hash-compare.txt)

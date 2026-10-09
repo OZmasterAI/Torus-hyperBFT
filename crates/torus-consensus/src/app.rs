@@ -571,7 +571,8 @@ struct ExecutionContext {
     post_flush_writer: Option<torus_state::BackgroundCfWriter>,
     /// T1.5 fail-stop latch, shared with `TorusApp` on the consensus thread.
     /// Set (never cleared) when block execution hits a fatal error (e.g. a
-    /// market worker panicked and its book is lost). The execution loop exits
+    /// market worker panicked and its book is lost) or a durable write of a
+    /// block's state or applied marker fails (R01). The execution loop exits
     /// on it and the node stops producing, voting, and finalizing.
     exec_failed: Arc<AtomicBool>,
     /// Package D rank 1: local mirror of the `exec_queue_depth` gauge —
@@ -638,6 +639,12 @@ struct ExecutionContext {
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
     test_crash_after_evm_section: bool,
+    /// Test-only write-fault injection (R01): `Some(h)` makes every serial
+    /// flush of height `h` (native state + marker, EVM marker, marker only)
+    /// return an I/O error before anything is written, as a failed atomic
+    /// RocksDB write does.
+    #[cfg(test)]
+    test_fail_flush_at: Option<u64>,
     /// Test-only stand-in for `TORUS_PARALLEL_ENGINE` (a process-global
     /// `OnceLock`): `Some(n)` runs native batches through
     /// `execute_batch_engine_mode(n)`; `None` = production `execute_batch`.
@@ -724,27 +731,6 @@ fn write_native_applied_height(state_db: &StateDb, height: u64) {
         META_NATIVE_APPLIED_HEIGHT,
         &height.to_be_bytes(),
     );
-}
-
-/// Serial-path applied-height advance for a block that skipped the native
-/// flush: the same marker bytes as [`write_native_applied_height`], written
-/// through the one hashed flush so the running state hash advances with the
-/// marker in the same atomic batch.
-///
-/// A failure keeps the existing serial semantics (logged, not latched): if a
-/// later height's flush then lands first, that flush finds no `h(n-1)` and
-/// marks this node hash-unverified (no chaining over the gap, no attesting,
-/// no fail-stop decisions) — see `torus_state::running_hash::chain_step`.
-fn flush_marker_only(state_db: &StateDb, pending: torus_state::FrozenPending) {
-    let height = pending.height();
-    if let Err(e) = pending.flush_with_native_trie_stats(state_db, Some(height), None, None) {
-        tracing::error!(
-            %e,
-            height,
-            "applied-height marker flush failed (restart will replay; if a later height flushes \
-             first, the running state hash goes unverified)"
-        );
-    }
 }
 
 fn find_last_committed_height(state_db: &StateDb) -> Option<u64> {
@@ -1776,6 +1762,48 @@ impl ExecutionContext {
     /// and its writer-precompile rows (since bug (c) the prefix of the flush
     /// batch) — overlapping keys agree with what lands. The consensus thread
     /// writes no consensus state (epoch rotation runs at execution, bug (b)).
+    /// R01 test seam: `Err` (nothing written) for a serial flush of the height
+    /// a test injected a write fault at (`test_fail_flush_at`); always `Ok`
+    /// outside tests.
+    #[inline]
+    fn injected_flush_fault(&self, height: u64) -> Result<(), torus_state::StateError> {
+        #[cfg(test)]
+        if self.test_fail_flush_at == Some(height) {
+            return Err(torus_state::StateError::Io(std::io::Error::other(
+                "injected write failure (test)",
+            )));
+        }
+        let _ = height;
+        Ok(())
+    }
+
+    /// Serial-path applied-height advance for a block that skipped the native
+    /// flush: the same marker bytes as [`write_native_applied_height`], written
+    /// through the one hashed flush so the running state hash advances with the
+    /// marker in the same atomic batch.
+    ///
+    /// R01: a failure latches the fail-stop (`exec_failed`) and returns
+    /// `false`; the caller must return without executing anything further.
+    /// The marker stays at the previous height, so no later height can flush
+    /// over the gap, and the restart replays this block from the durable
+    /// marker — the same rule as the native flush and the flush worker.
+    fn flush_marker_only(&self, pending: torus_state::FrozenPending) -> bool {
+        let height = pending.height();
+        let flushed = self.injected_flush_fault(height).and_then(|()| {
+            pending.flush_with_native_trie_stats(&self.state_db, Some(height), None, None)
+        });
+        if let Err(e) = flushed {
+            tracing::error!(
+                %e,
+                height,
+                "FATAL: applied-height marker flush failed — fail-stop (restart replays it)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
     fn running_hash_extras(
         out_of_batch: torus_state::OutOfBatchRecorder,
         bundle_extras: torus_state::HashExtras,
@@ -2893,13 +2921,15 @@ impl ExecutionContext {
                 };
                 // Bug (c): the block's EVM batch (if any) is the prefix of this
                 // ONE atomic write.
-                overlay.flush_after_batch_with_native_trie_stats(
-                    evm_batch.take().unwrap_or_default(),
-                    &self.state_db,
-                    Some(height),
-                    cache_opt,
-                    member_opt,
-                )
+                self.injected_flush_fault(height).and_then(|()| {
+                    overlay.flush_after_batch_with_native_trie_stats(
+                        evm_batch.take().unwrap_or_default(),
+                        &self.state_db,
+                        Some(height),
+                        cache_opt,
+                        member_opt,
+                    )
+                })
             };
             resident_ok = flush_stats.is_ok();
             match &flush_stats {
@@ -2931,21 +2961,28 @@ impl ExecutionContext {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(%e, height, "native overlay flush + applied-height marker failed (block NOT marked applied — restart will replay; if a later height flushes first, the running state hash goes unverified)");
-                    // r3: the folded header did not land with the batch; keep the
-                    // pre-fold contract (header persisted at exec) via the
-                    // standalone put so the committed height stays visible to
-                    // `find_last_committed_height` for the replay.
-                    if header_folded {
+                    // R01: NEITHER this block's state (EVM prefix included,
+                    // bug (c)) NOR its applied marker is durable. Executing the
+                    // next block on top would build on a base without them and,
+                    // once its own flush lands, move the marker past this height
+                    // (replay would skip it). Fail-stop for every block, like
+                    // the flush worker; restart replays from the durable marker.
+                    tracing::error!(
+                        %e,
+                        height,
+                        has_evm,
+                        "FATAL: native overlay flush + applied-height marker failed — block NOT \
+                         marked applied; fail-stop (restart replays it)"
+                    );
+                    // r3: the header (folded, or meant to be) did not land with
+                    // the batch; keep the pre-fold contract (header persisted
+                    // at exec) via the standalone put so the committed height
+                    // stays visible to `find_last_committed_height` for the replay.
+                    if fold_header {
                         persist_block_header(&self.state_db, torus_block);
                     }
-                    if has_evm {
-                        // Bug (c): the EVM writes were in the failed batch. Do not
-                        // execute the next block on a base without them.
-                        tracing::error!(height, "FATAL: EVM block flush failed — fail-stop (restart replays it)");
-                        self.exec_failed.store(true, Ordering::SeqCst);
-                        return;
-                    }
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
                 }
             }
             if fold_header && !header_folded {
@@ -3165,23 +3202,24 @@ impl ExecutionContext {
                 // its EVM batch rides the marker flush — one atomic write.
                 let pending = torus_state::FrozenPending::marker_only(height)
                     .with_hash_extras(hash_extras.take().unwrap_or_default());
-                if let Err(e) = pending.flush_after_batch_with_native_trie_stats(
-                    prefix,
-                    &self.state_db,
-                    Some(height),
-                    None,
-                    None,
-                ) {
+                if let Err(e) = self.injected_flush_fault(height).and_then(|()| {
+                    pending.flush_after_batch_with_native_trie_stats(
+                        prefix,
+                        &self.state_db,
+                        Some(height),
+                        None,
+                        None,
+                    )
+                }) {
                     tracing::error!(%e, height, "FATAL: EVM block marker flush failed — fail-stop (restart replays it)");
                     self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
-            } else {
-                flush_marker_only(
-                    &self.state_db,
-                    torus_state::FrozenPending::marker_only(height)
-                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
-                );
+            } else if !self.flush_marker_only(
+                torus_state::FrozenPending::marker_only(height)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default()),
+            ) {
+                return;
             }
             // r2 resident-books-stale-rebuild: this block never built a context,
             // so the order books are untouched — the rank8 resident holder is
@@ -3191,10 +3229,10 @@ impl ExecutionContext {
             // reload (the "resident books stale" multi-second stall proven on
             // devnet with empty blocks between native ones). Successor-only:
             // any other sequence drains the holder (rebuild = safe direction).
-            // Should the marker put above have failed, the guard's marker
-            // check still trips next block — memory never outranks the DB.
-            // Under the bl2 pipeline the advance stays on E (the holder is an
-            // E-only object): the handoff above returned only once W RECEIVED
+            // A failed marker flush above returned early with the fail-stop
+            // latched (R01), so the holder is never advanced past a marker
+            // that did not land. Under the bl2 pipeline the advance stays on
+            // E (the holder is an E-only object): the handoff above returned only once W RECEIVED
             // Marker(N), so the next native block's overlay reads the marker
             // through its parent layer (Marker jobs carry a 1-key pending set)
             // and the guard sees N whether or not W has made it durable yet. A
@@ -4242,6 +4280,8 @@ impl TorusApp {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_fail_flush_at: None,
             #[cfg(test)]
             test_engine_threads: None,
             #[cfg(test)]
@@ -11258,6 +11298,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
+            test_fail_flush_at: None,
+            #[cfg(test)]
             test_engine_threads: None,
             #[cfg(test)]
             test_adl_work: None,
@@ -15128,6 +15170,306 @@ mod crash_recovery_tests {
         drop(ctx2);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
         assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+    }
+
+    // ---- R01: a failed serial write of a block's state or marker fail-stops ----
+
+    /// R01: nothing of `fail_at` or above is durable: the applied marker and
+    /// the running state hash stay at `fail_at - 1` (no hash-unverified gap),
+    /// and no nonce, action-status record or trade row of `fail_at..` exists.
+    fn r01_assert_nothing_durable_from(db: &StateDb, fail_at: u64) {
+        let below = fail_at.checked_sub(1).filter(|h| *h > 0);
+        assert_eq!(
+            read_native_applied_height(db),
+            below,
+            "applied marker below the failed height"
+        );
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(db).map(|(h, _)| h),
+            below,
+            "running state hash below the failed height"
+        );
+        assert_eq!(
+            torus_state::running_hash::read_unverified_since(db),
+            None,
+            "no later height flushed over the gap (hash-unverified)"
+        );
+        let be = |v: &[u8]| u64::from_be_bytes(v.try_into().expect("8-byte height"));
+        let nonces = StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_NONCES, None).unwrap();
+        assert!(
+            nonces.iter().all(|(_, v)| be(v) < fail_at),
+            "no nonce consumed at or above {fail_at}"
+        );
+        let status =
+            StateBackend::iterate_cf(db, torus_state::cf::CF_BLOCK_ACTION_STATUS, None).unwrap();
+        assert!(
+            status.iter().all(|(k, _)| be(k) < fail_at),
+            "no action-status record at or above {fail_at}"
+        );
+        let trades = StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        assert!(
+            trades
+                .iter()
+                .all(|(k, _)| torus_state::trade_rows::parse_trade_key(k).unwrap().1 < fail_at),
+            "no trade row at or above {fail_at}"
+        );
+    }
+
+    /// R01 live path: `blocks[..fail_at]` arrive through the dispatch path on
+    /// a context (exec pipeline `on`/off) whose serial flush of `fail_at`
+    /// fails. The fail-stop latches at `fail_at` (not before), nothing of
+    /// `fail_at` is durable, and the next committed block is refused (not
+    /// executed: its header would be written by execution). Returns the DB.
+    fn r01_run_with_flush_fault(
+        blocks: &[TorusBlock],
+        fund: fn(&StateDb),
+        fail_at: u64,
+        on: bool,
+    ) -> StateDb {
+        let (_cfg, db) = make_test_config_and_db();
+        fund(&db);
+        let mut ctx = pipeline_ctx(&db, on, None);
+        ctx.test_fail_flush_at = Some(fail_at);
+        for b in &blocks[..fail_at as usize] {
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "latched before height {} (on={on})",
+                b.header.height
+            );
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(
+            ctx.exec_failed.load(Ordering::SeqCst),
+            "a failed flush at {fail_at} must latch the fail-stop (on={on})"
+        );
+        let next = &blocks[fail_at as usize];
+        ctx.execute_committed_block(next, vec![]);
+        drop(ctx); // drains + joins W
+        assert!(
+            load_replay_header(&db, next.header.height).is_none(),
+            "block {} must not execute on top of the failed height (on={on})",
+            next.header.height
+        );
+        r01_assert_nothing_durable_from(&db, fail_at);
+        db
+    }
+
+    /// R01 restart: close and reopen the faulted DB, replay from the durable
+    /// marker on a fresh serial context (as `TorusApp::new` does at boot; the
+    /// replay must end at `replayed_to`), deliver the rest of `blocks`, and
+    /// compare with an uninterrupted run of `blocks`: every CF (economic rows,
+    /// consensus meta with the marker and the running hash), the applied
+    /// height and the running state hash.
+    fn r01_restart_and_compare(
+        db: StateDb,
+        blocks: &[TorusBlock],
+        fund: fn(&StateDb),
+        replayed_to: u64,
+    ) {
+        let dir = db.inner().path().to_path_buf();
+        drop(db);
+        let db = StateDb::open(&dir).expect("reopen the state db");
+        torus_state::running_hash::configure_activation(&db, Some(1))
+            .expect("configure running hash activation");
+        let ctx = pipeline_ctx(&db, false, None);
+        let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+        assert_eq!(parked, None);
+        assert_eq!(
+            last.height, replayed_to,
+            "the replay re-executes the failed height"
+        );
+        for b in &blocks[replayed_to as usize..] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "restart must not fail-stop"
+        );
+        drop(ctx);
+
+        let (_c, db_ref) = make_test_config_and_db();
+        fund(&db_ref);
+        let ctx_ref = pipeline_ctx(&db_ref, false, None);
+        for b in blocks {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        assert!(!ctx_ref.exec_failed.load(Ordering::SeqCst));
+        drop(ctx_ref);
+
+        let top = blocks.last().unwrap().header.height;
+        assert_eq!(read_native_applied_height(&db_ref), Some(top));
+        assert_eq!(read_native_applied_height(&db), Some(top), "applied height");
+        let hash = torus_state::running_hash::read_running_hash(&db);
+        assert_eq!(hash.map(|(h, _)| h), Some(top));
+        assert_eq!(
+            hash,
+            torus_state::running_hash::read_running_hash(&db_ref),
+            "running state hash after the restart vs uninterrupted"
+        );
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "restart after a failed flush vs uninterrupted",
+        );
+    }
+
+    /// R01: a native-only block (3: a fill) whose serial flush of state +
+    /// applied marker fails fail-stops like an EVM block; RED on main: only
+    /// EVM blocks latched, so 4 executed on a base without 3's fill.
+    #[test]
+    fn r01_native_only_flush_failure_fail_stops_and_restart_matches() {
+        let blocks = pipeline_fixture_blocks();
+        let db = r01_run_with_flush_fault(&blocks, fund_pipeline_fixture, 3, false);
+        r01_restart_and_compare(db, &blocks[..6], fund_pipeline_fixture, 3);
+    }
+
+    /// R01: a marker-only flush (2: empty, no native phase) that fails
+    /// fail-stops; RED on main: logged only, so 3 executed and its flush
+    /// advanced the marker past 2.
+    #[test]
+    fn r01_marker_only_flush_failure_fail_stops_and_restart_matches() {
+        let blocks = pipeline_fixture_blocks();
+        let db = r01_run_with_flush_fault(&blocks, fund_pipeline_fixture, 2, false);
+        r01_restart_and_compare(db, &blocks[..4], fund_pipeline_fixture, 2);
+    }
+
+    /// R01: epoch-boundary blocks always run serially, with the exec pipeline
+    /// on (barrier) as well as off: a native boundary block (4) and an empty
+    /// one (8, native phase for the validator-set plan) whose flush fails
+    /// fail-stop; RED on main for both.
+    #[test]
+    fn r01_epoch_boundary_flush_failure_fail_stops_and_restart_matches() {
+        let blocks = pipeline_fixture_blocks();
+        for on in [false, true] {
+            for (fail_at, top) in [(4u64, 6usize), (8, 10)] {
+                let db = r01_run_with_flush_fault(&blocks, fund_pipeline_fixture, fail_at, on);
+                r01_restart_and_compare(db, &blocks[..top], fund_pipeline_fixture, fail_at);
+            }
+        }
+    }
+
+    /// R01 replay path: a boot replay whose flush of a gap height fails stops
+    /// there (`Failed`, fail-stop latched, nothing of it or later executed),
+    /// and the next restart replays the whole gap to the uninterrupted state.
+    /// Cases: a native boundary block (4) and an empty marker-only block (7).
+    /// RED on main: the replay ran on past the failed height.
+    #[test]
+    fn r01_replay_flush_failure_fail_stops_and_restart_matches() {
+        let blocks = pipeline_fixture_blocks();
+        // (executed before the crash, failing height, committed top)
+        for (executed, fail_at, top) in [(2usize, 4u64, 6usize), (5, 7, 9)] {
+            let (_c, db) = make_test_config_and_db();
+            fund_pipeline_fixture(&db);
+            let ctx = pipeline_ctx(&db, false, None);
+            for b in &blocks[..executed] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            // Committed (header + body durable at dispatch), never executed.
+            for b in &blocks[executed..top] {
+                persist_committed_block_durably(&db, b);
+            }
+            let mut ctx = pipeline_ctx(&db, false, None);
+            ctx.test_fail_flush_at = Some(fail_at);
+            let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "replay: a failed flush at {fail_at} must latch the fail-stop"
+            );
+            assert_eq!(
+                last.height,
+                fail_at - 1,
+                "the replay stops at the failed height"
+            );
+            drop(ctx);
+            r01_assert_nothing_durable_from(&db, fail_at);
+            r01_restart_and_compare(db, &blocks[..top], fund_pipeline_fixture, top as u64);
+        }
+    }
+
+    /// R01: the execution loop itself halts on the latch: a native-only flush
+    /// failure at 3 ends the loop with its channel still open (blocks 4 and 5
+    /// queued behind it are never executed). RED on main: the loop ran on.
+    #[test]
+    fn r01_execution_loop_halts_on_native_flush_failure() {
+        let blocks = pipeline_fixture_blocks();
+        let (_c, db) = make_test_config_and_db();
+        fund_pipeline_fixture(&db);
+        let mut ctx = pipeline_ctx(&db, false, None);
+        ctx.test_fail_flush_at = Some(3);
+        let latch = ctx.exec_failed.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let handle = std::thread::spawn(move || execution_loop(rx, ctx));
+        for b in &blocks[..5] {
+            let durable = persist_committed_block_durably(&db, b);
+            let msg = CommittedBlockMsg {
+                torus_block: b.clone(),
+                pending_slashes: vec![],
+                durable,
+            };
+            if tx.send(msg).is_err() {
+                break; // the loop already exited
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let halted = handle.is_finished();
+        drop(tx); // unblocks a loop that did not halt (RED) so the test ends
+        handle.join().unwrap();
+        assert!(
+            halted,
+            "the execution loop must exit on the fail-stop, channel still open"
+        );
+        assert!(latch.load(Ordering::SeqCst));
+        r01_assert_nothing_durable_from(&db, 3);
+    }
+
+    /// R01 regression guard: an EVM block whose flush fails still fail-stops
+    /// as before (both arms: with fee revenue the EVM batch rides the native
+    /// flush; at base fee 0 there is no native phase and it rides the marker
+    /// flush), and the restart matches the uninterrupted run.
+    #[test]
+    fn r01_evm_block_flush_failure_still_fail_stops_and_restart_matches() {
+        fn fund(db: &StateDb) {
+            let key = k256::ecdsa::SigningKey::from_slice(&[66u8; 32]).unwrap();
+            let funded = revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            };
+            db.put_account(&k256_address(&key), &funded).unwrap();
+        }
+        let key = k256::ecdsa::SigningKey::from_slice(&[66u8; 32]).unwrap();
+        for base_fee in [None, Some(0u64)] {
+            let mut b1 = make_block(1, vec![]);
+            b1.evm_transactions = vec![signed_sstore_create(&key, 0)];
+            b1.header.evm_tx_count = 1;
+            if let Some(fee) = base_fee {
+                b1.header.base_fee_per_gas = fee;
+            }
+            let mut blocks = vec![b1, make_block(2, vec![]), make_block(3, vec![])];
+            link_blocks(&mut blocks);
+            let db = r01_run_with_flush_fault(&blocks, fund, 1, false);
+            r01_restart_and_compare(db, &blocks, fund, 1);
+            // The tx really executed after the restart (the case is not vacuous).
+            let (_c, db_ref) = make_test_config_and_db();
+            fund(&db_ref);
+            let ctx_ref = pipeline_ctx(&db_ref, false, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx_ref, &db_ref, b);
+            }
+            drop(ctx_ref);
+            let sender = db_ref.get_account(&k256_address(&key)).unwrap().unwrap();
+            assert_eq!(
+                sender.nonce, 1,
+                "the EVM tx executed (base_fee={base_fee:?})"
+            );
+        }
     }
 
     /// §5 `exec_pipeline_fold_header_runs_serial` (F9): a block whose header is
