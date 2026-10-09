@@ -3452,15 +3452,120 @@ warm (182,495 matched/s) excluded.
   sd with blocks +7.8% bigger at flat per-fill cost; end_resident wait per 1k fills +4.4% (~4
   sd). Not decided here: accept B (`3efff0d6`, node `0c100f3b`: 187,075 matched/s, 5.547 native
   blk/s) as the Phase 3 step 0 baseline and go on to (d), or a 4-pair rerun (plan review log row
-  38).
+  38). (Decided in section 35: accepted.)
+
+## 35. R01 / R02 split of the p3s0 step: 1b389700 / 3aa516e0 / 3efff0d6 (campaign ozarchy-p3s1, 2026-10-09)
+
+18c's follow-up to section 34: split the p3s0 step (`1b389700` -> `3efff0d6`) into its two code
+steps with three arms. A = `perf/item6-phase2` `1b389700` (the Phase 2 bench head; node
+`86477b00`, the staged p3s0 A binary). B = `3aa516e0` (Phase 2 + main `95b01af2` merged on the
+branch: R02 branches 1-2 `4bef6406` / `ed2354fb` and the eth_call / estimateGas typing `9793f1ec`,
+no R01; node `db344840`, built fresh for this campaign: node-only, detached worktree
+`wt/p3s1-3aa516e0`, fresh target dir, same flags as p3s0). C = main `3efff0d6` (B + R01
+`19f8f534`; the other merge on the way, `1720e823`, is docs-only; node `0c100f3b`, the staged
+p3s0 B binary). Code diffs (outside `docs/`): A -> B touches `native_executor.rs`, `app.rs`,
+`torus-core` `error.rs`, `torus-rpc` (`eth.rs`, `types.rs`) and `torus-types` `lib.rs` (plus
+tests); B -> C touches `app.rs`, `torus-state` `backend.rs` and `running_hash.rs` (plus
+`tools/r01-fault/`). All arms run bench `6c7ad1a7` and the `bdd5b470` harness. Standard shape as
+sections 26-34, no perf. Order: A warm (60 s, excluded), then rounds ABC, BCA, CAB, ACB (n = 4 per
+arm), 09:21-10:40, units `bench-ozarchy-p3s1-300m-<tag>.service`. All 13 cells rc 0, AGREE,
+liveness PASS, accepted, node md5 = staged md5 of the arm (3/3), oracle stale 0, 0 panic / ERROR
+lines, no exit 70, no deaths, fds max 726; oracle 396 / 396 accepted in every counted cell except
+a-r1 (392 / 396; warm 216 / 216). The startup INFO line `running state hash fail-stop
+(TORUS_STATE_HASH_FAILSTOP) on=false` appears once in every node log, on all three arms. Driver
+`/home/oz/bench-results-matched/ozarchy-p3s1-campaign.sh` (build `ozarchy-p3s1-build.sh`,
+analysis `ozarchy-p3s1-analysis.py`), tables `ozarchy-p3s1-handoff-tables.txt`.
+
+| cell | **matched/s** | native blk/s | fills/blk | txs/blk | engine / 1k | chain | end_resident wait | end_resident wait / 1k | end_resident wait / 1k (val0-2) | residual untimed | residual untimed / 1k | residual untimed / 1k (val0-2) | view timeouts | oracle |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A warm (excl.) | **189,575** | 4.935 | 25,293 | 112.2 | 3.91 | 125.6 | 6.18 | 0.244 | 0.245 | 9.96 | 0.394 | 0.381 | 1 | 216/216 |
+| A r1 (outlier, excl.) | **172,338** | 4.333 | 28,868 | 135.2 | 3.90 | 157.7 | 5.65 | 0.196 | 0.193 | 25.89 | 0.897 | 0.877 | 6 | 392/396 |
+| B r1 | **186,859** | 5.648 | 25,959 | 125.5 | 4.00 | 133.1 | 5.99 | 0.231 | 0.240 | 10.58 | 0.408 | 0.411 | 1 | 396/396 |
+| C r1 | **184,015** | 5.504 | 27,105 | 132.2 | 4.05 | 139.9 | 6.49 | 0.239 | 0.243 | 10.99 | 0.405 | 0.405 | 1 | 396/396 |
+| B r2 | **186,917** | 5.705 | 26,547 | 126.9 | 4.02 | 135.9 | 6.06 | 0.228 | 0.252 | 10.72 | 0.404 | 0.408 | 1 | 396/396 |
+| C r2 | **188,821** | 5.902 | 25,544 | 128.2 | 3.94 | 129.3 | 5.71 | 0.224 | 0.234 | 11.41 | 0.447 | 0.439 | 2 | 396/396 |
+| A r2 | **190,894** | 5.740 | 27,298 | 127.9 | 3.98 | 137.3 | 6.00 | 0.220 | 0.226 | 10.54 | 0.386 | 0.387 | 2 | 396/396 |
+| C r3 | **186,727** | 5.697 | 26,345 | 132.3 | 4.01 | 135.1 | 6.16 | 0.234 | 0.233 | 10.95 | 0.416 | 0.411 | 0 | 396/396 |
+| A r3 | **189,614** | 5.642 | 28,066 | 136.3 | 3.93 | 140.5 | 5.81 | 0.207 | 0.223 | 11.08 | 0.395 | 0.394 | 2 | 396/396 |
+| B r3 | **187,295** | 5.025 | 32,320 | 144.5 | 4.03 | 162.8 | 6.60 | 0.204 | 0.205 | 11.55 | 0.357 | 0.358 | 2 | 396/396 |
+| A r4 | **186,557** | 5.358 | 28,434 | 131.2 | 3.99 | 144.4 | 6.38 | 0.224 | 0.226 | 11.73 | 0.413 | 0.397 | 0 | 396/396 |
+| C r4 | **185,703** | 5.228 | 27,956 | 132.8 | 4.05 | 142.5 | 6.86 | 0.245 | 0.246 | 9.60 | 0.343 | 0.347 | 1 | 396/396 |
+| B r4 | **189,383** | 5.639 | 29,536 | 141.3 | 3.94 | 148.5 | 6.38 | 0.216 | 0.222 | 12.25 | 0.415 | 0.406 | 0 | 396/396 |
+
+Run order, top to bottom. ms per native block (val0) unless per 1k fills; (val0-2) = mean over
+the three validators; txs/blk is the headline (bench window) figure; view timeouts = val0, load
+window.
+
+| mean ± sd | matched/s | native blk/s | fills/blk | txs/blk | end_resident wait | end_resident wait / 1k | end_resident wait / 1k (val0-2) | residual untimed | residual untimed / 1k | residual untimed / 1k (val0-2) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A (`1b389700`, n = 3, a-r1 excluded) | 189,022 ± 2,228 | 5.580 ± 0.198 | 27,933 ± 579 | 131.8 | 6.063 ± 0.290 | 0.217 ± 0.009 | 0.225 ± 0.002 | 11.117 ± 0.596 | 0.398 ± 0.013 | 0.393 ± 0.005 |
+| A incl. a-r1 (n = 4) | 184,851 ± 8,538 | 5.268 ± 0.644 | 28,167 ± 665 | 132.7 | 5.960 ± 0.314 | 0.212 ± 0.013 | 0.217 ± 0.016 | 14.810 ± 7.403 | 0.523 ± 0.250 | 0.514 ± 0.242 |
+| B (`3aa516e0`, n = 4) | 187,614 ± 1,195 | 5.504 ± 0.321 | 28,590 ± 2,938 | 134.6 | 6.258 ± 0.285 | 0.220 ± 0.012 | 0.230 ± 0.021 | 11.275 ± 0.778 | 0.396 ± 0.026 | 0.396 ± 0.025 |
+| C (`3efff0d6`, n = 4) | 186,317 ± 2,010 | 5.583 ± 0.287 | 26,737 ± 1,033 | 131.4 | 6.305 ± 0.489 | 0.236 ± 0.009 | 0.239 ± 0.007 | 10.738 ± 0.786 | 0.403 ± 0.043 | 0.401 ± 0.039 |
+
+Steps: ratio of means (difference in pooled sd, pooled sd = sqrt((sd1^2 + sd2^2) / 2)); A is the
+n = 3 arm (a-r1 excluded).
+
+| metric | B / A (R02 + EVM typing) | C / B (R01) | C / A (the p3s0 step) |
+|---|---|---|---|
+| **matched/s** | **0.9926x (-0.79)** | **0.9931x (-0.78)** | **0.9857x (-1.27)** |
+| native blk/s | 0.9864x (-0.28) | 1.0143x (+0.26) | 1.0005x (+0.01) |
+| fills/blk | 1.0235x (+0.31) | 0.9352x (-0.84) | 0.9572x (-1.43) |
+| engine / 1k fills | 1.0078x (+0.85) | 1.0038x (+0.32) | 1.0116x (+1.06) |
+| end_resident wait (ms / blk) | 1.0320x (+0.68) | 1.0076x (+0.12) | 1.0399x (+0.60) |
+| end_resident wait / 1k | 1.0127x (+0.26) | 1.0716x (+1.45) | 1.0852x (+2.02) |
+| end_resident wait / 1k (val0-2) | 1.0212x (+0.32) | 1.0407x (+0.61) | 1.0627x (+2.93) |
+| residual untimed (ms / blk) | 1.0142x (+0.23) | 0.9523x (-0.69) | 0.9659x (-0.54) |
+| residual untimed / 1k | 0.9952x (-0.09) | 1.0175x (+0.19) | 1.0125x (+0.16) |
+| residual untimed / 1k (val0-2) | 1.0080x (+0.17) | 1.0118x (+0.14) | 1.0200x (+0.28) |
+
+- **Residual untimed: p3s0's +11% per 1k fills does not hold up.** Flat at both steps: B / A
+  0.995x (-0.09 sd), C / B 1.017x (+0.19 sd), C / A 1.012x (+0.16 sd); per native block 11.12
+  (A), 11.28 (B), 10.74 ms (C).
+- **end_resident wait per 1k fills: the rise holds up, and it sits in the R01 step (C / B).** C / B
+  1.072x (+1.45 sd; per round 1.04, 0.98, 1.15, 1.14), B / A (R02 + EVM typing) 1.013x (+0.26 sd),
+  flat; C / A 1.085x (+2.02 sd; val0-2 1.063x, +2.93 sd), vs +4.4% in p3s0. It is small per block:
+  6.06 -> 6.31 ms per native block over both steps (+0.24 ms, 0.6 sd), ~0.13% of the ~179 ms wall
+  time per native block (A 179.3, C 179.5). Much of the per-fill rise at C / B comes from C's
+  smaller blocks: per block that step is +0.05 ms (1.008x, +0.12 sd) while fills per block fall to
+  0.935x; per block the larger share of the +0.24 ms is at B / A (+0.19 ms, +0.68 sd). Neither
+  per-block step is resolved. Consistent with R01's change on the flush + applied-marker write
+  that runs before the end_resident hand-off (its failure now fail-stops); the mechanism is not
+  profiled.
+- **Native blk/s flat: p3s0's -4% did not reproduce.** B / A 0.986x (-0.28 sd), C / B 1.014x
+  (+0.26 sd), C / A 1.0005x (+0.01 sd), vs 0.9603x (-3.7 sd) in p3s0. Fills per block went the
+  other way this time: C / A 0.957x (-1.43 sd; paired by round 0.94, 0.94, 0.94, 0.98), where p3s0
+  had +7.8%.
+- **matched/s: each step about -0.7% (-0.8 sd), C / A -1.4% (-1.3 sd).** B / A 0.9926x (-0.79 sd),
+  C / B 0.9931x (-0.78 sd; per round 0.98, 1.01, 1.00, 0.98), C / A 0.9857x (-2,705 matched/s,
+  -1.27 sd). Not resolved at either step, but the same direction as p3s0 (0.9886x, -0.9 sd): two
+  campaigns now show a ~1-1.4% drift A -> C inside noise; if it is real it is split across both
+  steps, not in one. With a-r1 included, A's mean drops to 184,851 (sd 8,538) and the sign flips
+  (B / A 1.0149x, C / A 1.0079x), which is why a-r1 is excluded (below).
+- **Caveats.** a-r1 is valid by every criterion but an outlier: 6 view timeouts on val0 (9 on
+  val1, 9 on val2; every other cell 0-2 on val0, 0-3 on any node), residual untimed 25.89 ms per
+  native block (the others 9.60-12.25), 172,338 matched/s, 4.333 native blk/s, wall 230.8 ms per
+  native block (the other counted cells 169-199), oracle 392 / 396 (4 rejected, a send error to
+  val2). Host load was not higher: `cpu.csv` load1 mean 20.1 vs 18.8-32.0 in the other cells. It
+  is the first counted cell (right after the warm cell); cause not established. The main tables
+  use A at n = 3, with the a-r1-included row given for comparison. Fills per block shift between
+  arms again (b-r3 32,320, the other counted cells 25,544-29,536), so per-1k-fill ratios carry a
+  denominator effect.
+- **18c decision: accepted** (s107; plan review log row 39). `3efff0d6` (node `0c100f3b`: 186,317
+  matched/s, 5.583 native blk/s at n = 4) is the Phase 3 step 0 baseline. The +0.24 ms per native
+  block of end_resident wait is recorded as a known small R01 cost (flush + applied-marker check);
+  the ~1% matched/s drift (two campaigns, -1.3 sd, spread over both steps) as unresolved.
+  Excluding a-r1 accepted; both tables kept. Next (18c): the Phase 3 step 0 re-profile runs on the
+  head Phase 3 builds on (after (d), with R01b if merged), with matched/s reported next to this
+  baseline as a third campaign for the drift.
 
 ## Open
 
-- **R01/R02 cost check, pending 18c** (section 34, plan review log row 38): main `3efff0d6` vs
-  `1b389700` matched/s 0.9886x (-0.9 sd, within noise), native blk/s 0.9603x (-3.7 sd) with
-  fills/blk +7.8%; per-fill cost flat except end_resident wait (+4.4% per 1k fills) and residual
-  untimed (+11% per 1k fills, 2.1 sd). 18c to decide: accept as the Phase 3 step 0 baseline and
-  go on to (d), or a 4-pair rerun.
+- **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
+  rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
+  two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
+  (18c, section 35). Third data point: the Phase 3 step 0 re-profile, with matched/s reported next
+  to this baseline.
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
   still visit 189 books, the sender has something in 92 (stale index entries, "never removed
   eagerly"). 18c s104: **A, accept and continue** (~0.07 us per skipped visit, 0.44 ms /
