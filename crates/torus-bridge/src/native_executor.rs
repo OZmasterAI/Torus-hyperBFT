@@ -1418,6 +1418,16 @@ impl BlockMarks {
     }
 }
 
+/// R02: record `e` on a reader fault channel ([`NativeExecContext::reader_fault`])
+/// when it is a local fault (`CoreError::is_local_fault`; the first is kept).
+/// For readers that hold no `&mut` context; the caller then returns its
+/// "absent" value, which the block never uses (it fail-stops).
+fn note_reader_fault(cell: &std::sync::OnceLock<String>, step: &str, e: &CoreError) {
+    if e.is_local_fault() {
+        let _ = cell.set(format!("{step}: {e}"));
+    }
+}
+
 /// R02: the mark rule of every reader (`get_price(m, now).usable()`) with
 /// absence split from failure: no aggregate row, a stale or non-positive
 /// one is `Ok(None)` (as before); a local fault (the read failed, the row
@@ -1459,9 +1469,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// (the first is kept); the caller then returns its "absent" value, which
     /// the block never uses (it fail-stops).
     fn note_fault(&self, step: &str, e: &CoreError) {
-        if e.is_local_fault() {
-            let _ = self.fault.set(format!("{step}: {e}"));
-        }
+        note_reader_fault(self.fault, step, e);
     }
 
     /// s515 review 4 mark: the aggregated oracle price while usable
@@ -1798,11 +1806,16 @@ impl<T: StateBackend> AccountReader<'_, T> {
         free
     }
 
-    /// F1: `maker`'s signed position in `market_id` and its valuation price;
-    /// a read error snapshots as flat (deterministic).
+    /// F1: `maker`'s signed position in `market_id` and its valuation price.
+    /// R02 branch 5: a local fault (the read failed, the `Position` row does
+    /// not decode) is recorded on the reader fault channel (the block
+    /// fail-stops) and snapshots as flat meanwhile; `MakerAccountSource`
+    /// returns a plain value, so the channel is the only route.
     fn maker_position_px(&self, maker: &Address, market_id: MarketId) -> (FixedPoint, FixedPoint) {
-        self.position_px(maker, market_id)
-            .unwrap_or((FixedPoint::ZERO, FixedPoint::ZERO))
+        self.position_px(maker, market_id).unwrap_or_else(|e| {
+            self.note_fault("maker position read", &e);
+            (FixedPoint::ZERO, FixedPoint::ZERO)
+        })
     }
 }
 
@@ -1810,7 +1823,8 @@ impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
     /// F1 (s517 #4): a maker's account as the book first sees it — balance
     /// and positions from the backend (Phase 3: the frozen post-Phase-1
     /// state; single path: current state). A read error snapshots as free 0
-    /// / flat (deterministic).
+    /// / flat; R02 branch 5: a local fault in the position read fail-stops
+    /// ([`Self::maker_position_px`]).
     fn maker_account(&self, maker: &Address, market_id: MarketId) -> MakerAccount {
         let (signed_pos, px) = self.maker_position_px(maker, market_id);
         MakerAccount { free: self.maker_free(maker), signed_pos, px }
@@ -6474,10 +6488,13 @@ impl NativeExecutor {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
             // checked against (`shapes` holds every batch market).
             let mut book = ctx.order_books.remove(&market_id).unwrap_or_else(|| {
-                let (tick, lot) = markets
-                    .get(&market_id)
-                    .map(|m| m.shape)
-                    .unwrap_or_else(|| Self::market_shape(&ctx.state, market_id));
+                let (tick, lot) = markets.get(&market_id).map(|m| m.shape).unwrap_or_else(|| {
+                    // R02 branch 5: a failed read fail-stops (reader channel).
+                    Self::market_shape(&ctx.state, market_id).unwrap_or_else(|e| {
+                        reader.note_fault("market shape read", &e);
+                        (FixedPoint::ONE, FixedPoint::ONE)
+                    })
+                });
                 OrderBook::new(market_id, tick, lot)
             });
 
@@ -8322,9 +8339,12 @@ impl NativeExecutor {
             let price = Self::reservation_price(params, mark);
             let mut qty = params.quantity;
             if params.reduce_only && !Self::is_stop(params) {
-                // A position read error polices as flat in the book; keep the
-                // full reservation then (conservative).
-                if let Ok(pos) = Self::signed_position(&ctx.positions, &sender, params.market_id) {
+                // R02 branch 5: a local fault in the position read is recorded
+                // on the reader channel (the block fail-stops); the full
+                // reservation is kept meanwhile.
+                let pos = Self::signed_position(&ctx.positions, &sender, params.market_id)
+                    .inspect_err(|e| note_reader_fault(&ctx.reader_fault, "reduce-only reservation position read", e));
+                if let Ok(pos) = pos {
                     let resting = ctx.order_books.get(&params.market_id).map_or(FixedPoint::ZERO, |b| {
                         b.orders_for_trader(&sender)
                             .iter()
@@ -8354,10 +8374,17 @@ impl NativeExecutor {
                 let key = (sender, params.market_id, params.is_buy);
                 let (allowance, used) = closing.entry(key).or_insert((None, FixedPoint::ZERO));
                 if Self::never_rests(params) {
-                    // A read error frees nothing — charges whole (conservative).
+                    // R02 branch 5: a local fault in the read is recorded on
+                    // the reader channel (the block fail-stops); it frees
+                    // nothing meanwhile (charges whole).
                     let allowance = *allowance.get_or_insert_with(|| {
-                        Self::signed_position(&ctx.positions, &sender, params.market_id)
-                            .map_or(FixedPoint::ZERO, |pos| reduce_only_allowance(pos, params.is_buy))
+                        match Self::signed_position(&ctx.positions, &sender, params.market_id) {
+                            Ok(pos) => reduce_only_allowance(pos, params.is_buy),
+                            Err(e) => {
+                                note_reader_fault(&ctx.reader_fault, "closing allowance position read", &e);
+                                FixedPoint::ZERO
+                            }
+                        }
                     });
                     let left = (allowance - *used).max(FixedPoint::ZERO);
                     qty -= qty.min(left);
@@ -8391,7 +8418,10 @@ impl NativeExecutor {
         for &(_, _, p) in orders {
             out.entry(p.market_id)
                 .or_insert_with(|| Phase2Market {
-                    shape: Self::book_shape(books, state, p.market_id),
+                    shape: Self::book_shape(books, state, p.market_id).unwrap_or_else(|e| {
+                        reader.note_fault("market shape read", &e);
+                        (FixedPoint::ONE, FixedPoint::ONE)
+                    }),
                     bid_floor: books.get(&p.market_id).and_then(OrderBook::best_bid),
                     cfg: reader.margin_configs.get(&p.market_id),
                     mark: None,
@@ -8402,7 +8432,10 @@ impl NativeExecutor {
         }
         // s94 option 2: the band of every batch market (its mark from the
         // block table; the stale fallback reads the books after Phase 1).
-        let bps = Self::price_band_bps(state);
+        let bps = Self::price_band_bps(state).unwrap_or_else(|e| {
+            reader.note_fault("price band param read", &e);
+            torus_types::PRICE_BAND_DEFAULT_BPS
+        });
         // Independent reads per market: iteration order is irrelevant.
         out.into_iter()
             .map(|(m, mut market)| {
@@ -8414,13 +8447,13 @@ impl NativeExecutor {
     }
 
     /// s94 option 2: the band width in force — governance key
-    /// [`torus_types::PRICE_BAND_PARAM`] in `CF_FEE_CONFIG` (default ±50%).
-    fn price_band_bps<T: StateBackend>(state: &T) -> u64 {
-        let stored = state
-            .get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::PRICE_BAND_PARAM.as_bytes())
-            .ok()
-            .flatten();
-        torus_types::price_band_bps(stored.as_deref())
+    /// [`torus_types::PRICE_BAND_PARAM`] in `CF_FEE_CONFIG` (default ±50%
+    /// when absent or invalid: deterministic, every validator holds the same
+    /// bytes). R02 branch 5: a failed read is the `Err` (a local fault), never
+    /// the default.
+    fn price_band_bps<T: StateBackend>(state: &T) -> Result<u64, CoreError> {
+        let stored = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::PRICE_BAND_PARAM.as_bytes())?;
+        Ok(torus_types::price_band_bps(stored.as_deref()))
     }
 
     /// s94 option 2: `market_id`'s band — its usable `mark`, else the book
@@ -8457,7 +8490,12 @@ impl NativeExecutor {
     fn market_band<T: StateBackend>(ctx: &NativeExecContext<T>, market_id: MarketId) -> Option<PriceBand> {
         let reader = AccountReader::of(ctx);
         let mark = reader.mark(market_id);
-        Self::price_band(&reader, ctx.order_books.get(&market_id), market_id, mark, Self::price_band_bps(&ctx.state))
+        // R02 branch 5: a failed band read fail-stops (reader channel).
+        let bps = Self::price_band_bps(&ctx.state).unwrap_or_else(|e| {
+            reader.note_fault("price band param read", &e);
+            torus_types::PRICE_BAND_DEFAULT_BPS
+        });
+        Self::price_band(&reader, ctx.order_books.get(&market_id), market_id, mark, bps)
     }
 
     /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid
@@ -8611,25 +8649,24 @@ impl NativeExecutor {
         books: &HashMap<MarketId, OrderBook>,
         state: &T,
         market_id: MarketId,
-    ) -> (FixedPoint, FixedPoint) {
+    ) -> Result<(FixedPoint, FixedPoint), CoreError> {
         books
             .get(&market_id)
-            .map_or_else(|| Self::market_shape(state, market_id), |b| (b.tick_size, b.lot_size))
+            .map_or_else(|| Self::market_shape(state, market_id), |b| Ok((b.tick_size, b.lot_size)))
     }
 
     /// Item 6 M1 (row 42): the `(tick, lot)` a NEW book of `market_id` is
     /// created with — its `CF_NATIVE_MARKETS` row's
     /// ([`market_row_shape`], the row the RPC intake check reads), `(ONE,
-    /// ONE)` when there is no row, it does not decode or the read fails.
-    /// Every node reads the same row (governance / genesis writes only), so
-    /// every path creates the same book. A book that exists keeps its own.
-    fn market_shape<T: StateBackend>(state: &T, market_id: MarketId) -> (FixedPoint, FixedPoint) {
-        state
-            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())
-            .ok()
-            .flatten()
+    /// ONE)` when there is no row or it does not decode (deterministic: every
+    /// node reads the same row, governance / genesis writes only, so every
+    /// path creates the same book). R02 branch 5: a failed read is the `Err`
+    /// (a local fault), never `(ONE, ONE)`. A book that exists keeps its own.
+    fn market_shape<T: StateBackend>(state: &T, market_id: MarketId) -> Result<(FixedPoint, FixedPoint), CoreError> {
+        Ok(state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
             .and_then(|row| market_row_shape(&row))
-            .unwrap_or((FixedPoint::ONE, FixedPoint::ONE))
+            .unwrap_or((FixedPoint::ONE, FixedPoint::ONE)))
     }
 
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
@@ -8663,9 +8700,10 @@ impl NativeExecutor {
 
     /// s515 (BUG 2): the positions `book` must police — every trader with a
     /// resting reduce-only order there plus the given reduce-only senders.
-    /// A position row that fails to read polices as flat (every node reads
-    /// the same bytes, so this stays deterministic). Item 6 C7: read through
-    /// `reader` (decoded records for clean traders).
+    /// No position row polices as flat. R02 branch 5: a local fault (the
+    /// read failed, the row does not decode) is recorded on the reader fault
+    /// channel (the block fail-stops) and polices as flat meanwhile. Item 6
+    /// C7: read through `reader` (decoded records for clean traders).
     ///
     /// Item 6 M1: `known` = positions already read (the batch's Phase 2
     /// reads, [`PreparedOrder::pre_pos`]); only the other traders are read.
@@ -8686,7 +8724,11 @@ impl NativeExecutor {
             let pos = match reader.get_position(&t, market_id) {
                 Ok(Some(p)) if p.is_long => p.size,
                 Ok(Some(p)) => -p.size,
-                Ok(None) | Err(_) => FixedPoint::ZERO,
+                Ok(None) => FixedPoint::ZERO,
+                Err(e) => {
+                    reader.note_fault("reduce-only policed position read", &e);
+                    FixedPoint::ZERO
+                }
             };
             out.insert(t, pos);
         }
@@ -8812,7 +8854,11 @@ impl NativeExecutor {
         // s515 (BUG 2): reduce-only needs a position it can reduce.
         // Item 6 M1 (row 42): a missing book is created below with `shape`.
         let mut ro_pos = None;
-        let shape = Self::book_shape(&ctx.order_books, &ctx.state, market_id);
+        // R02 branch 5: a failed market-row read fail-stops.
+        let shape = Self::book_shape(&ctx.order_books, &ctx.state, market_id).unwrap_or_else(|e| {
+            Self::latch_core_fault(ctx, "market shape read", &e);
+            (FixedPoint::ONE, FixedPoint::ONE)
+        });
         // s94 option 2: the band (its reference is also option 1's mark).
         let band = Self::market_band(ctx, market_id);
         let pre_check = Self::validate_order_price(params)
@@ -8857,10 +8903,16 @@ impl NativeExecutor {
             _ => params.quantity,
         };
         // Review 5 (F2): an order that never rests reserves only for what it
-        // would open beyond closing the current position (a read error
-        // charges it whole — conservative; the book then treats it as flat).
+        // would open beyond closing the current position. R02 branch 5: a
+        // local fault in the read fail-stops (it charges whole meanwhile).
         if Self::never_rests(params) && ro_pos.is_none() {
-            ro_pos = Self::signed_position(&ctx.positions, sender, market_id).ok();
+            ro_pos = match Self::signed_position(&ctx.positions, sender, market_id) {
+                Ok(pos) => Some(pos),
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "never-rests position read", &e);
+                    None
+                }
+            };
         }
         if Self::never_rests(params) {
             if let Some(pos) = ro_pos {
