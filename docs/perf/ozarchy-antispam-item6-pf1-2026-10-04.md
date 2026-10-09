@@ -3560,8 +3560,137 @@ n = 3 arm (a-r1 excluded).
   head Phase 3 builds on (after (d), with R01b if merged), with matched/s reported next to this
   baseline as a third campaign for the drift.
 
+## 36. Classic vs mode 3 book layout control (campaign ozarchy-bkm, 2026-10-09)
+
+18c's request (s107), as input to the owner's decision on the book mode in genesis (mode 3 vs
+Classic on testnet): no Classic vs mode 3 measurement existed. The only earlier comparison is an
+August mode 3 vs mode 2 run (10 markets, a different shape; per project memory, mode 3's
+save_books was ~40% below mode 2's early in the run); it is not in this doc and not comparable.
+One node for both arms: main `1eced05c` (`3efff0d6` + R02 branch 3; `b88b0c90` on top is docs
+only; node `3fdad0ae`), built node-only from detached worktree `wt/bkm-1eced05c` into a fresh
+target dir, same flags as p3s1. Bench `6c7ad1a7` (the p2byid staged binary, reused) and the
+`bdd5b470` harness (`tools/matched-bench` identical in `bdd5b470` and `1eced05c`). The arms differ
+only by env. A = Classic: `EXTRA_ENV='TORUS_BOOK_ROWS=0'` (`run-cell.sh` exports RECORD_ENV's
+`TORUS_BOOK_ROWS=3` first and EXTRA_ENV after it, so 0 wins). B = mode 3 (`LevelAuthorityChunked`):
+RECORD_ENV's `TORUS_BOOK_ROWS=3`, the bench config of sections 26-35. Standard shape as sections
+26-35 (N = 4 + budget 900, cap 400, rate 76,000, RETRY_BUSY=1, 120 s, oracle feed 30000 / 2000 ms
+walk 0, trie off, no perf) at 300 markets, then the same settings at 10 markets (as the p2s0r
+10-market smoke cells). Per shape: A warm (60 s, excluded), then A B B A (n = 2 per arm),
+12:20-13:14, units `bench-ozarchy-bkm-<mk>-<tag>.service`. Book mode verified per validator in
+every cell: the summary's node env, `/proc/<pid>/environ` `TORUS_BOOK_ROWS`, the `order books
+loaded from DB (level authority)` load_books line (modes 2/3 only), and the `__book_mode__` marker
+byte read from the WAL at bench start (`ozarchy-bkm-walmarker.py`). A: 0, 0/0/0, 0/0/0 lines, byte
+0/0/0; B: 3, 3/3/3, 1/1/1 lines, byte 3/3/3; no `book-mode marker mismatch` line. All 10 cells rc
+0, AGREE, liveness PASS, accepted, node md5 = staged md5 (3/3), 4 MiB book CF, oracle stale 0 with
+every sent mark accepted (300m 396 / 396, b-r1 402 / 402; 10m 198 / 198; warm 216 / 216 and
+108 / 108), 0 panic / ERROR lines, no exit 70, no deaths, fds max 657. The driver unit held the
+suite lock (`flock /tmp/claude-1000/torus-suite.lock`) from 12:18:45 to the end, so no test suite
+ran during the cells; every cell started with no cargo / rustc running and load1 < 2 (1.69-1.95).
+Host processes other than the nodes and the load generator are not recorded during a cell. Driver
+`/home/oz/bench-results-matched/ozarchy-bkm-campaign.sh` (build `ozarchy-bkm-build.sh`, analysis
+`ozarchy-bkm-analysis.py`, WAL marker reader `ozarchy-bkm-walmarker.py`), tables
+`ozarchy-bkm-handoff-tables.txt`.
+
+### 36.1 300 markets
+
+| cell | book mode (env: /proc, la, wal) | **matched/s** | native blk/s | fills/blk | txs/blk | block | engine / 1k | save_books | save_books drain | save_books write (W) | save_books / 1k | flush | flush / 1k | flush / 1k (val0-2) | handoff wait | view timeouts | load1 max | oracle |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A warm (excl.) | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **183,408** | 5.317 | 25,163 | 107.1 | 125.90 | 4.01 | 4.54 | n/a | n/a | 0.180 | 33.00 | 1.311 | 1.278 | 0.41 | 7 | 25.1 | 216/216 |
+| A r1 | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **192,143** | 5.837 | 26,852 | 133.6 | 134.12 | 4.01 | 4.96 | n/a | n/a | 0.185 | 31.18 | 1.161 | 1.186 | 0.64 | 5 | 31.6 | 396/396 |
+| B r1 | 3: 3/3/3, la 1/1/1, wal 3/3/3 | **173,470** | 4.886 | 28,929 | 130.2 | 162.90 | 4.43 | 5.48 | 5.18 | 17.94 | 0.189 | 60.58 | 2.094 | 2.143 | 3.59 | 5 | 52.8 | 402/402 |
+| B r2 | 3: 3/3/3, la 1/1/1, wal 3/3/3 | **190,422** | 5.574 | 27,856 | 134.7 | 141.06 | 3.99 | 4.39 | 4.20 | 16.08 | 0.158 | 54.53 | 1.958 | 1.955 | 3.57 | 5 | 53.2 | 396/396 |
+| A r2 | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **185,148** | 5.500 | 29,438 | 141.7 | 150.17 | 4.09 | 6.00 | n/a | n/a | 0.204 | 37.70 | 1.281 | 1.293 | 0.67 | 6 | 42.7 | 396/396 |
+
+Run order, top to bottom. ms per native block (val0) unless per 1k fills; (val0-2) = mean over
+the three validators; txs/blk is the headline (bench window) figure. book mode = the summary's
+node env: `/proc` environ val0-2, level-authority load lines (la) val0-2, WAL marker byte val0-2.
+save_books drain / write = mode 3's two-pass save: pass 1 (drain) runs on the exec thread inside
+save_books; pass 2 (write) runs on the flush worker W inside the flush wall (deferred book save,
+`exec_pipeline.rs`), so write is not part of save_books. Classic has no two-pass save (its split
+counters stay 0): n/a, it is not instrumented that way. handoff wait = the exec thread blocked
+handing the block's job to W. view timeouts = val0, load window; load1 max = `cpu.csv` (summary
+`cpu.load1_max`).
+
+| mean (r1/r2 spread) | matched/s | native blk/s | fills/blk | txs/blk | block | block / 1k | engine / 1k | save_books | save_books drain | save_books write (W) | save_books / 1k | save_books / 1k (val0-2) | flush | flush / 1k | flush / 1k (val0-2) | handoff wait | state write (W) | wall / committed blk |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A (Classic, `TORUS_BOOK_ROWS=0`) | 188,646 (6,994) | 5.668 (0.337) | 28,145 (2,586) | 137.6 (8.1) | 142.14 (16.05) | 5.048 (0.106) | 4.05 (0.08) | 5.48 (1.04) | n/a | n/a | 0.194 (0.019) | 0.203 (0.023) | 34.44 (6.52) | 1.221 (0.119) | 1.240 (0.107) | 0.66 (0.03) | 34.28 (6.54) | 176.6 (10.5) |
+| B (mode 3, `TORUS_BOOK_ROWS=3`) | 181,946 (16,952) | 5.230 (0.688) | 28,392 (1,073) | 132.4 (4.5) | 151.98 (21.84) | 5.347 (0.567) | 4.21 (0.44) | 4.94 (1.09) | 4.69 (0.98) | 17.01 (1.86) | 0.174 (0.032) | 0.177 (0.030) | 57.55 (6.05) | 2.026 (0.137) | 2.049 (0.188) | 3.58 (0.02) | 34.64 (4.09) | 192.1 (25.3) |
+| B / A | **0.9645x** | 0.9226x | 1.0088x | 0.9622x | 1.0692x | 1.0593x | 1.0395x | 0.9005x | n/a | n/a | 0.8932x | 0.8748x | 1.6712x | 1.6593x | 1.6532x | 5.4656x | 1.0104x | 1.0878x |
+| B / A pairwise (r1 / r2) | 0.9028 / 1.0285 | 0.837 / 1.013 | 1.077 / 0.946 | 0.975 / 0.951 | 1.215 / 0.939 | 1.127 / 0.993 | 1.105 / 0.976 | 1.105 / 0.732 | n/a | n/a | 1.026 / 0.773 | 1.005 / 0.758 | 1.943 / 1.446 | 1.803 / 1.529 | 1.807 / 1.512 | 5.609 / 5.328 | 1.183 / 0.868 | 1.195 / 0.987 |
+
+A warm (183,408 matched/s) excluded. state write (W) = the flush's state write, wall / committed
+blk = headline `wall_ms_per_committed_block`. Spread = |r1 - r2|; ratios are ratios of means,
+pairwise = b-r1 / a-r1 and b-r2 / a-r2.
+
+### 36.2 10 markets
+
+| cell | book mode (env: /proc, la, wal) | **matched/s** | native blk/s | fills/blk | txs/blk | block | engine / 1k | save_books | save_books drain | save_books write (W) | save_books / 1k | flush | flush / 1k | flush / 1k (val0-2) | handoff wait | view timeouts | load1 max | oracle |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A warm (excl.) | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **267,447** | 12.889 | 16,342 | 80.7 | 48.41 | 2.24 | 2.35 | n/a | n/a | 0.144 | 9.17 | 0.561 | 0.552 | 0.62 | 15 | 31.6 | 108/108 |
+| A r1 | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **265,844** | 12.756 | 18,026 | 89.5 | 52.96 | 2.22 | 2.67 | n/a | n/a | 0.148 | 9.64 | 0.535 | 0.538 | 0.59 | 18 | 30.9 | 198/198 |
+| B r1 | 3: 3/3/3, la 1/1/1, wal 3/3/3 | **270,635** | 11.959 | 19,421 | 96.3 | 57.82 | 2.20 | 2.87 | 2.78 | 6.53 | 0.148 | 19.89 | 1.024 | 1.030 | 1.74 | 22 | 33.1 | 198/198 |
+| B r2 | 3: 3/3/3, la 1/1/1, wal 3/3/3 | **271,231** | 12.293 | 19,251 | 94.3 | 54.64 | 2.11 | 2.66 | 2.62 | 6.45 | 0.138 | 19.72 | 1.024 | 1.028 | 1.39 | 22 | 24.2 | 198/198 |
+| A r2 | 0: 0/0/0, la 0/0/0, wal 0/0/0 | **269,275** | 13.211 | 18,198 | 89.3 | 53.11 | 2.21 | 2.60 | n/a | n/a | 0.143 | 9.42 | 0.518 | 0.518 | 0.63 | 19 | 32.6 | 198/198 |
+
+| mean (r1/r2 spread) | matched/s | native blk/s | fills/blk | txs/blk | block | block / 1k | engine / 1k | save_books | save_books drain | save_books write (W) | save_books / 1k | save_books / 1k (val0-2) | flush | flush / 1k | flush / 1k (val0-2) | handoff wait | state write (W) | wall / committed blk |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A (Classic, `TORUS_BOOK_ROWS=0`) | 267,559 (3,431) | 12.983 (0.455) | 18,112 (172) | 89.4 (0.2) | 53.03 (0.15) | 2.928 (0.020) | 2.21 (0.01) | 2.63 (0.07) | n/a | n/a | 0.145 (0.005) | 0.146 (0.006) | 9.53 (0.22) | 0.526 (0.017) | 0.528 (0.020) | 0.61 (0.04) | 9.45 (0.22) | 77.1 (2.7) |
+| B (mode 3, `TORUS_BOOK_ROWS=3`) | 270,933 (596) | 12.126 (0.334) | 19,336 (171) | 95.3 (2.0) | 56.23 (3.18) | 2.908 (0.139) | 2.16 (0.09) | 2.77 (0.21) | 2.70 (0.16) | 6.49 (0.08) | 0.143 (0.010) | 0.143 (0.010) | 19.80 (0.17) | 1.024 (0.000) | 1.029 (0.002) | 1.56 (0.35) | 11.66 (0.16) | 82.4 (2.3) |
+| B / A | **1.0126x** | 0.9340x | 1.0676x | 1.0660x | 1.0602x | 0.9930x | 0.9729x | 1.0493x | n/a | n/a | 0.9827x | 0.9816x | 2.0782x | 1.9465x | 1.9490x | 2.5656x | 1.2339x | 1.0701x |
+| B / A pairwise (r1 / r2) | 1.0180 / 1.0073 | 0.938 / 0.931 | 1.077 / 1.058 | 1.076 / 1.056 | 1.092 / 1.029 | 1.013 / 0.973 | 0.991 / 0.955 | 1.075 / 1.023 | n/a | n/a | 0.998 / 0.967 | 0.997 / 0.966 | 2.063 / 2.093 | 1.915 / 1.979 | 1.915 / 1.984 | 2.949 / 2.206 | 1.228 / 1.240 | 1.066 / 1.074 |
+
+Columns as in 36.1. A warm (267,447 matched/s) excluded.
+
+- **Verdict: no throughput case for mode 3 over Classic at this shape; flush per fill is the one
+  consistent effect.** matched/s B / A 1.0126x at 10m (+3,374; pairwise 1.0180 / 1.0073, both
+  up, small) and 0.9645x at 300m (-6,700; pairwise 0.9028 / 1.0285: not resolved, b-r1 at
+  173,470 carries it). Mode 3's flush per 1k fills is 1.95x at 10m (0.526 -> 1.024; pairwise
+  1.92 / 1.98) and 1.66x at 300m (1.221 -> 2.026; pairwise 1.80 / 1.53); per native block
+  9.53 -> 19.80 ms (2.078x; pairwise 2.06 / 2.09) and 34.44 -> 57.55 ms (1.671x; pairwise
+  1.94 / 1.45). Flush is off-chain (pipelined on W), so it costs throughput only if it becomes the
+  bottleneck. save_books on the exec thread is flat per fill: 0.98x at 10m (pairwise 1.00 /
+  0.97), 0.89x at 300m (pairwise 1.03 / 0.77; r1/r2 spreads 10-18%, noisy). Any case for mode 3
+  rests on its state root / design properties, which this campaign does not measure.
+- **Native blk/s lower with mode 3, blocks bigger; per-fill block time flat at 10m.** 10m: native
+  blk/s 0.934x (pairwise 0.938 / 0.931) with fills/blk +6.8% (pairwise 1.077 / 1.058), txs/blk
+  95.3 vs 89.4; val0 block ms 1.060x (53.03 -> 56.23), per 1k fills 0.993x; engine per 1k fills
+  0.973x. 300m: native blk/s 0.923x (pairwise 0.837 / 1.013), block ms 1.069x (142.14 -> 151.98;
+  pairwise 1.215 / 0.939), per 1k fills 1.059x (pairwise 1.127 / 0.993), fills/blk 1.009x, engine
+  per 1k fills 1.040x (pairwise 1.105 / 0.976): only b-r1 moves, so not resolved.
+- **Where (the flush rise):** mode 3's deferred book save writes its pass 2 on the flush worker,
+  inside the flush wall (save_books write 17.01 ms per native block at 300m, 6.49 at 10m), ~74% /
+  ~63% of the flush rise (+23.12 / +10.28 ms). The flush's state write is flat at 300m (34.28 ->
+  34.64 ms, 1.010x) and +2.21 ms at 10m (1.234x, both pairs); the rest of the rise (~5.8 ms at
+  300m, ~1.6 ms at 10m) is not split by the counters. It already shows a little on the exec
+  thread: handoff wait 0.66 -> 3.58 ms per native block at 300m (pairwise 5.6x / 5.3x), 0.61 ->
+  1.56 ms at 10m (2.9x / 2.2x), ~2.4% / ~2.8% of mode 3's block ms. Flush is ~38% / ~35% of mode
+  3's block ms (Classic ~24% / ~18%), so W still has headroom at this shape. On the exec thread,
+  mode 3's save_books is almost all pass 1 (drain 4.69 of 4.94 ms at 300m, 2.70 of 2.77 at 10m);
+  Classic's single-pass save_books (4.96-6.00 / 2.60-2.67 ms) has no split to compare against.
+- **Caveats.** n = 2 per arm and shape. At 300m the r1/r2 spreads are large (B's matched/s 16,952
+  vs A's 6,994; block ms 11-14%; save_books 19-22%): b-r1 is the slow cell (173,470 matched/s,
+  block 162.90 ms, engine per 1k fills 4.43, wall 204.7 ms per committed block), so the 300m
+  matched/s, native blk/s, block and save_books ratios are not resolved; the 10m ratios and the
+  flush ratios hold in both pairs. Host load: at 300m both mode 3 cells peaked at load1 52.8 /
+  53.2 vs 31.6 / 42.7 for Classic (mean 29.4 / 30.3 vs 20.2 / 23.2); at 10m there is no arm
+  pattern (B 33.1 / 24.2, A 30.9 / 32.6). Whether mode 3's extra W work raises the load is not
+  separated. View timeouts (val0): 5-6 in every counted 300m cell (warm 7), no arm pattern; at 10m
+  18 / 19 Classic vs 22 / 22 mode 3 (warm 15). Host level: mode 3 here 181,946 matched/s at 300m
+  vs section 35's C arm 186,317 (node `0c100f3b`, not interleaved), so only the interleaved
+  ratios carry.
+- **Input to the owner's decision (book mode in genesis: mode 3 vs Classic on testnet), pending.**
+  Facts for it: on throughput, mode 3 is +1.3% at 10m and unresolved at 300m; it raises
+  flush per fill (1.95x / 1.66x), off-chain, with +0.95 / +2.9 ms of exec-thread handoff wait per
+  native block; save_books per fill is flat. Not decided here (plan review log row 41).
+
 ## Open
 
+- **Book mode in genesis (mode 3 vs Classic on testnet), pending the owner** (section 36, plan
+  review log row 41): Classic vs mode 3 on one node (`1eced05c`), n = 2: matched/s 1.013x at 10
+  markets, 0.9645x at 300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain;
+  exec-thread handoff wait +0.95 / +2.9 ms per native block); save_books per fill flat. No
+  throughput case for mode 3 at this shape; any case rests on its state root / design properties
+  (not measured).
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
