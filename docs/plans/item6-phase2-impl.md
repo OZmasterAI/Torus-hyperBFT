@@ -765,6 +765,12 @@ a devnet override over genesis, `torus-node/src/main.rs` `resolve_commit_lag_cap
 default would override every genesis value. Set `commit_lag_backoff_cap: 8` in the testnet genesis
 instead. `run-cell.sh` `RECORD_ENV` stays explicit (older binaries).
 
+**Testnet genesis to-do** (items to set when the testnet genesis is built; add here as decided):
+- `chain_config.commit_lag_backoff_cap: 8`. Owner, via 18c s108 (2026-10-09): stays out of the
+  compiled defaults, set in the testnet genesis instead (the S470 value the benches run by env).
+- No book mode in genesis; the testnet runs Classic (the compiled default). Owner, via 18c s107,
+  above.
+
 ### 9.14 P2-1 gate missed: accept and continue (18c s104 / ozarchy s31, 2026-10-08)
 
 **Chosen: A, accept P2-1 as built and continue** (review log rows 24-25). Phase 1 fell 0.44 ms per
