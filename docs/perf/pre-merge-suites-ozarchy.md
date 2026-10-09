@@ -16,6 +16,39 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## perf/item6-phase2 ab6f01dc (2026-10-09, s31, P2-2 reverted, main f5f28f89 merged)
+
+Phase 2 with P2-2 reverted (`3fe595d3`, code equal to `029581e5`) and main `f5f28f89` merged in
+(`ab6f01dc`: EVM mempool effective tip + intrinsic gas, mempool rustfmt). Worktree `wt/item6-phase2`,
+clean at `ab6f01dc` before and after the run; target dir `~/.cargo-target-item6-phase2`. The suite 4
+baseline `f5f28f89` ran in a temporary detached worktree (`wt/base-f5f28f89`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`, warm); the worktree was removed afterwards. A torus-state source
+file was touched before each clippy run. The first candidate clippy run still re-linted only 14 crates
+(the base, a fresh checkout, re-linted all 21), so candidate clippy was run again with the source root
+of each of the other 7 crates touched too (`hotstuff_rs`, `torus-explorer`, `torus-faucet`,
+`torus-telemetry`, `torus-tx-flood`, `torus-types`, `torus-wallet`). That run covers the same 21 crates
+and gives the same result (268, 0 new). Suites 3 and 5 were not run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,134 passed, 0 failed**, 34 skipped, 0 flaky | 128 s (81.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 7 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `f5f28f89` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,300 vs 3,304, **0 new**, 4 gone | 24 s (21-crate rerun 26 s) / 4 s (base 11 s / 3 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Compared with `f5eaff1b` (3,116) and P2-5 (3,119): 18 more than `f5eaff1b` and 15 more than P2-5. The
+15 are main's tests from `12979d4b..f5f28f89` (all in the `ecce8431` mempool fix; 15 added, none
+removed). The 3 over `f5eaff1b` are the Phase 2 tests up to P2-5. Skipped is unchanged at 34. The 4 fmt
+hunks that are gone (`crates/torus-bridge/src/native_executor.rs` 3, `crates/torus-bridge/tests/ubench_econ.rs` 1)
+are lines that Phase 2 rewrote, as in the P2-5 row (3,355 vs 3,359). The fmt total moved from 3,359 to
+3,300 because main's mempool rustfmt removed 55 hunks of old debt.
+
+Logs: `~/bench-results-matched/presuite-item6-p2-f5f2/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`; the 21-crate clippy rerun is `4-cand-clippy-all21.log`, `norm-all21.py`,
+`4-delta-all21.txt`).
+
 ## `perf/item6-phase2` `f5eaff1b` (2026-10-08, s31, after merging main 12979d4b)
 
 Phase 2 at `82aa528d` (step 1: the C1 cancel-all index and its tests, the index size gauges, the gate
