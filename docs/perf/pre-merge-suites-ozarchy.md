@@ -16,6 +16,40 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## perf/c2-holder-hashset dde72cd3 (2026-10-09, s107, rebased onto main b88b0c90)
+
+C2 holder sets as foldhash `HashSet` (tests `de1aab28`, change `98d0f081`, docs `dde72cd3`), rebased
+onto main `b88b0c90` (`1eced05c` + docs). Worktree `wt/c2-holder-hashset`, clean at `dde72cd3` before
+and after the run; target dir `~/.cargo-target-c2-holder-hashset`. The suite 4 baseline `b88b0c90` ran
+in a temporary detached worktree (`wt/base-b88b0c90`) with its own target dir
+(`~/.cargo-target-c2-holder-hashset-base`, cold). The source roots of all 21 workspace members were
+touched on each side before clippy, and both sides re-linted 21 crates. Every cargo command ran under
+`flock /tmp/claude-1000/torus-suite.lock` because another builder and the ozarchy-bkm campaign share
+the host, so the base fmt check waited ~55 min for the campaign. Suite 5 was not run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,197 passed, 0 failed**, 35 skipped, 0 flaky | 112 s (83.8 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 25 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,198 passed, 0 failed**, 42 ignored (165 result lines) | 402 s |
+| 4 | clippy (no `-D`) / fmt vs `b88b0c90` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,353 vs 3,352, **0 new hunks on branch lines** (see below) | 129 s / 9 s (base 600 s cold; fmt waited on the lock) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Compared with main `1eced05c` (18c: nextest 3,196, one-process 3,197): +1 test
+(`holders_with_ascending_whatever_the_insertion_order`) and +1 skipped (the ignored µbench
+`ubench_trader_positions_apply`), both in `crates/torus-bridge/src/trader_positions_tests.rs`. Suite 3's
+3,198 = nextest's 3,197 + the 1 doc test, and its 42 ignored = 35 + 7.
+
+Fmt: the one extra hunk is in `trader_positions_tests.rs`. It is a split, not a new finding. The branch
+inserts the `holders_with` reference check (lines 124-139) between two old-debt lines of `check`, so
+rustfmt reports the old `let mut prefixes` hunk on its own instead of inside the previous hunk. A
+content diff of the rustfmt output for the two versions of the file (the base taken with `git show
+b88b0c90:...`) shows no `-` or `+` line from the branch. `trader_positions.rs` has no fmt delta.
+
+Logs: `~/bench-results-matched/presuite-c2hh-b88b/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt`, `3-full.log`, `3-full.rc`).
+
 ## perf/item6-phase2 3aa516e0 (2026-10-09, s34, Phase 2 close-out, main 95b01af2 merged)
 
 Phase 2 close-out (P2-1 + P2-5, P2-2 reverted, plan 9.16) with main `9793f1ec` merged in (`5777366e`:

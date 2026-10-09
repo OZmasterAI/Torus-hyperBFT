@@ -59,15 +59,16 @@ pub(crate) struct TraderPositions {
     /// ascending: the candidates of the liquidation walk.
     traders: BTreeSet<Address>,
     /// adl-budget C2: per market `m`, every trader with the 28-byte key
-    /// `t ‖ m` in R (regular or opaque), ascending. A market without one has
-    /// no entry. A regular trader's keys are followed on its record (only a
-    /// key that appears or disappears touches the index); an opaque or
-    /// re-decoded trader's per key from the delta (a write adds, a tombstone
-    /// removes). foldhash (alloy's map): never iterated, so no order to keep.
+    /// `t ‖ m` in R (regular or opaque). A market without one has no entry.
+    /// A regular trader's keys are followed on its record (only a key that
+    /// appears or disappears touches the index); an opaque or re-decoded
+    /// trader's per key from the delta (a write adds, a tombstone removes).
+    /// foldhash (alloy's map and set), unordered: the only iteration is
+    /// [`Self::holders_with`], which sorts (c2-holder-hashset).
     holders: Holders,
 }
 
-type Holders = HashMap<MarketId, BTreeSet<Address>>;
+type Holders = HashMap<MarketId, HashSet<Address>>;
 
 /// The market of a 28-byte positions key `t ‖ m`.
 fn market_of(key: &[u8]) -> MarketId {
@@ -289,32 +290,11 @@ impl TraderPositions {
     /// exactly as C1 skips a trader of the whole set that does not hold `m`.
     pub(crate) fn holders_with(&self, m: MarketId, dirty: &[Address]) -> Vec<Address> {
         let base = self.holders.get(&m);
-        let mut out = Vec::with_capacity(base.map_or(0, BTreeSet::len) + dirty.len());
-        let mut a = base.into_iter().flatten().peekable();
-        let mut b = dirty.iter().peekable();
-        loop {
-            let t = match (a.peek(), b.peek()) {
-                (None, None) => break,
-                (Some(&&x), Some(&&y)) if x == y => {
-                    a.next();
-                    b.next();
-                    x
-                }
-                (Some(&&x), Some(&&y)) if x < y => {
-                    a.next();
-                    x
-                }
-                (Some(&&x), None) => {
-                    a.next();
-                    x
-                }
-                (_, Some(&&y)) => {
-                    b.next();
-                    y
-                }
-            };
-            out.push(t);
-        }
+        let mut out = Vec::with_capacity(base.map_or(0, HashSet::len) + dirty.len());
+        out.extend(base.into_iter().flatten().chain(dirty));
+        // The set is unordered (c2-holder-hashset): sorted here, ADL only.
+        out.sort_unstable();
+        out.dedup();
         out
     }
 
