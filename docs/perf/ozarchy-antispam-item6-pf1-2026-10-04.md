@@ -3678,19 +3678,22 @@ Columns as in 36.1. A warm (267,447 matched/s) excluded.
   18 / 19 Classic vs 22 / 22 mode 3 (warm 15). Host level: mode 3 here 181,946 matched/s at 300m
   vs section 35's C arm 186,317 (node `0c100f3b`, not interleaved), so only the interleaved
   ratios carry.
-- **Input to the owner's decision (book mode in genesis: mode 3 vs Classic on testnet), pending.**
-  Facts for it: on throughput, mode 3 is +1.3% at 10m and unresolved at 300m; it raises
-  flush per fill (1.95x / 1.66x), off-chain, with +0.95 / +2.9 ms of exec-thread handoff wait per
-  native block; save_books per fill is flat. Not decided here (plan review log row 41).
+- **Owner decision (via 18c s107): Classic on testnet; the book mode does not go into genesis
+  now** (plan 9.13, review log row 41). Basis: on throughput, mode 3 is +1.3% at 10m and
+  unresolved at 300m; it raises flush per fill (1.95x / 1.66x), off-chain, with +0.95 / +2.9 ms
+  of exec-thread handoff wait per native block; save_books per fill is flat. Classic stays the
+  compiled default (`feat/compiled-defaults`). Revisit mode 3 only with a deep-book shape, before
+  mainnet. For the record: the Phase 1 / 2 numbers in this doc were measured with mode 3 set by
+  env; Classic performs about the same at this shape.
 
 ## Open
 
-- **Book mode in genesis (mode 3 vs Classic on testnet), pending the owner** (section 36, plan
-  review log row 41): Classic vs mode 3 on one node (`1eced05c`), n = 2: matched/s 1.013x at 10
-  markets, 0.9645x at 300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain;
-  exec-thread handoff wait +0.95 / +2.9 ms per native block); save_books per fill flat. No
-  throughput case for mode 3 at this shape; any case rests on its state root / design properties
-  (not measured).
+- **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
+  41; owner via 18c s107: Classic on testnet, no book mode in genesis now). At the standard shape
+  Classic vs mode 3 on one node (`1eced05c`), n = 2: matched/s 1.013x at 10 markets, 0.9645x at
+  300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
+  wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
+  the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
