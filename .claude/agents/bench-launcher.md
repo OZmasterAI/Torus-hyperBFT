@@ -66,6 +66,8 @@ cache rebuild per campaign).
      until [ -e <RUN_DIR>/campaign.done ] || ! systemctl --user is-active -q bench-<name>.service; do sleep 60; done; cat <RUN_DIR>/campaign.done; tail -20 <RUN_DIR>/campaign.log
      ```
      You are woken when it exits (one cache rebuild in total). Do not check on the run in between.
+     Report only `waiting for <unit>, expected ~HH:MM`, never a hand-back. An empty output
+     file means the wait is still running: never read it, kill it or restart it.
    - **Woken with no `campaign.done`**: the unit died (stopped, killed, reboot). Run
      `systemctl --user status bench-<name>.service` once, report "run died" with the log tail,
      and stop. Never start the wait again.
