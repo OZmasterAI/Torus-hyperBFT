@@ -16,6 +16,41 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## perf/item6-phase2 3aa516e0 (2026-10-09, s34, Phase 2 close-out, main 95b01af2 merged)
+
+Phase 2 close-out (P2-1 + P2-5, P2-2 reverted, plan 9.16) with main `9793f1ec` merged in (`5777366e`:
+eth_call/eth_estimateGas typed TxEnv) and then main `95b01af2` (`3aa516e0`: R02 branches 1-2, CoreWriter
+drain fail-stop; replay-guard, session and applied-height read errors fail-stop;
+`read_native_applied_height` -> `native_applied_height` returning `Result`). Worktree `wt/item6-phase2`,
+clean at `3aa516e0` before and after the run; target dir `~/.cargo-target-item6-phase2`. The suite 4
+baseline `95b01af2` ran in a temporary detached worktree (`wt/base-95b01af2`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`, warm); the worktree was removed afterwards. To avoid the 14-crate
+trap of the previous section, the source root (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`) of all 21
+workspace members was touched on each side before its clippy run; both sides re-linted 21 crates.
+Suites 3 and 5 were not run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,158 passed, 0 failed**, 34 skipped, 0 flaky | 85 s (83.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 8 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `95b01af2` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,299 vs 3,303, **0 new**, 4 gone | 32 s / 4 s (base 11 s / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Compared with `ab6f01dc` (3,134): 24 more, all from main, in 145 test binaries (144 before). The `9793f1ec`
+merge adds 10 (`crates/torus-rpc/src/eth.rs` 7, `crates/torus-rpc/tests/eth_compliance_tests.rs` 3). The
+`95b01af2` merge adds 14 (`crates/torus-consensus/src/app.rs` 9, the new
+`crates/torus-bridge/tests/r02_fail_stop_tests.rs` 4, `crates/torus-core/src/error.rs` 1). No test was
+removed. The Phase 2 commits after `ab6f01dc` (`7f75dd26`, `1b389700`) change docs only, so the Phase 2
+tests are unchanged. Skipped is unchanged at 34. The 4 fmt hunks that are gone
+(`crates/torus-bridge/src/native_executor.rs` 3, `crates/torus-bridge/tests/ubench_econ.rs` 1) are the same
+Phase 2 lines as in the previous section. Both fmt totals are one lower than there (3,300 / 3,304) because
+main's R02 change to `crates/torus-consensus/src/app.rs` removed one hunk of old debt.
+
+Logs: `~/bench-results-matched/presuite-item6-p2-95b0/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21).
+
 ## perf/item6-phase2 ab6f01dc (2026-10-09, s31, P2-2 reverted, main f5f28f89 merged)
 
 Phase 2 with P2-2 reverted (`3fe595d3`, code equal to `029581e5`) and main `f5f28f89` merged in
