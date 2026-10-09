@@ -231,6 +231,11 @@ pub struct CallRequest {
     pub data: Option<String>,
     pub input: Option<String>,
     pub nonce: Option<String>,
+    /// EIP-2718 type as a hex quantity (geth `type`); inferred when absent.
+    #[serde(rename = "type")]
+    pub tx_type: Option<String>,
+    /// EIP-2930 access list (geth `accessList`).
+    pub access_list: Option<Vec<RpcAccessListItem>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
