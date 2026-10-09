@@ -123,7 +123,7 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                 let bt_snapshot = self.block_tree_camera.snapshot();
                 let blocks_res = bt_snapshot.blocks_from_height_to_newest(
                     start_height,
-                    std::cmp::min(limit, self.config.request_limit),
+                    effective_sync_limit(limit, self.config.request_limit),
                 );
                 let highest_pc_res = bt_snapshot.highest_pc();
 
@@ -214,4 +214,25 @@ pub(crate) struct BlockSyncServerConfiguration {
 
     /// How often the sync server should broadcast [`BlockSyncAdvertiseMessage`]s.
     pub(crate) advertise_time: Duration,
+}
+
+/// The number of blocks to serve for a peer's `limit`. A limit of 0 is treated as
+/// `request_limit`: `blocks_from_height_to_newest` stops only when `len == limit`,
+/// so 0 would collect and send the whole chain.
+fn effective_sync_limit(limit: u32, request_limit: u32) -> u32 {
+    if limit == 0 { request_limit } else { limit.min(request_limit) }
+}
+
+#[cfg(test)]
+mod request_limit_tests {
+    use super::effective_sync_limit;
+
+    /// A peer's limit of 0 must not mean "everything": `blocks_from_height_to_newest`
+    /// stops only at `len == limit`, so 0 would return the whole chain.
+    #[test]
+    fn zero_limit_is_capped_at_request_limit() {
+        assert_eq!(effective_sync_limit(0, 32), 32);
+        assert_eq!(effective_sync_limit(10, 32), 10);
+        assert_eq!(effective_sync_limit(u32::MAX, 32), 32);
+    }
 }
