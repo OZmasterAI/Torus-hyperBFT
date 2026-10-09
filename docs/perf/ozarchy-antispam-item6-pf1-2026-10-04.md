@@ -3256,6 +3256,56 @@ Every by-id action sent was accepted; ~18.9-19.0k lookups per cell, ~18.0-18.2k 
   cell in every cell, both arms. Next if 18c wants p2 - ref resolved: one more std cell per arm
   (~6 min each); to find where the 2-3 ms goes: a perf cell on p2 with a larger by-id share.
 
+## 32. P2-5 gate cell: hasher 631becaa vs bdd5b470 (campaign ozarchy-p25g, 2026-10-09)
+
+Phase 2 P2-5 (plan 9.9): execution-path `HashMap` / `HashSet` from std SipHash to alloy's map
+(std `HashMap` + `foldhash::fast::RandomState`; node-local, bit-identical). Gate: engine ms per
+native block down by >= ~5 ms (half of the ~10.3 ms microbench estimate, section 25.3) with
+AGREE; matched/s reported because of the s82 caveat (an ahash A/B cut hash CPU with no matched/s
+gain). Arms: ref = `bdd5b470` (node `e28bb121`, the p2byid staged binary, reused), p25 =
+`631becaa` (node `2587e57f`, node-only build from detached worktree `wt/p25g-631becaa` into a
+fresh target dir). Both arms run bench `6c7ad1a7` (from `bdd5b470`) and the `bdd5b470` harness
+(`tools/` has no diff to `631becaa`). Standard shape as sections 26-31, no perf. Order: ref warm
+(60 s, excluded), then ref p25 p25 ref, 01:42-02:11, units `bench-ozarchy-p25g-300m-<tag>.service`.
+All cells rc 0, AGREE, liveness PASS, accepted, node md5 = staged md5 of the arm (3/3), 4 MiB book
+CF, trie off (default), oracle stale 0, 0 panic / fail-stop lines, no deaths. The driver's
+extension band (3.5-6.5 ms) read 8.59 ms, so no r3 cells. Driver
+`/home/oz/bench-results-matched/ozarchy-p25g-campaign.sh`, tables `ozarchy-p25g-handoff-tables.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **engine** | engine / 1k | chain | phase 1 | margin | match | settle | pass B | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ref r1 | 180,589 | 5.293 | 27,980 | **119.27** | 4.26 | 148.4 | 21.40 | 27.59 | 15.33 | 39.80 | 21.93 | 5.98 |
+| p25 r1 | 186,414 | 5.648 | 27,157 | **108.05** | 3.98 | 139.7 | 18.32 | 23.77 | 13.47 | 38.56 | 20.92 | 6.86 |
+| p25 r2 | 187,902 | 5.610 | 28,548 | **115.25** | 4.04 | 145.3 | 19.32 | 25.10 | 14.20 | 40.76 | 21.81 | 6.36 |
+| ref r2 | 180,763 | 5.238 | 28,259 | **121.21** | 4.29 | 149.9 | 22.32 | 28.00 | 15.01 | 41.14 | 22.84 | 5.87 |
+
+ms per native block (val0) unless per 1k fills; end_resident wait is the mean
+(`phases.end_resident_wait.ms`; its p50 is 0.4 in every cell). ref warm (180,472 matched/s) excluded.
+
+| mean | matched/s | native blk/s | fills/blk | engine (r1/r2 spread) | engine / 1k | chain | phase 1 / 1k | margin / 1k | match / 1k | settle / 1k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ref | 180,676 | 5.266 | 28,120 | 120.24 (1.94) | 4.275 | 149.1 | 0.777 | 0.988 | 0.540 | 1.439 |
+| p25 | 187,158 | 5.629 | 27,853 | 111.65 (7.20) | 4.010 | 142.5 | 0.676 | 0.877 | 0.497 | 1.424 |
+| p25 / ref | 1.036x | 1.069x | 0.990x | **-8.59 ms** | 0.938x | 0.955x | 0.869x | 0.888x | 0.921x | 0.989x |
+
+- **Verdict: gate met.** Engine -8.59 ms per native block (val0; all three validators -8.43),
+  -7.5 ms at equal fills (per 1k fills -6.2%), vs >= ~5 ms; AGREE on every cell. That is ~73%
+  of the ~10.3 ms estimate. Pairwise -4.02 to -13.16 ms raw (one pair under 5 ms: p25 r2 ran 5%
+  more fills, the busiest host load of the campaign); per 1k fills -0.22 to -0.31 (-6.2 to
+  -8.7 ms at ref fills), arms do not overlap (ref 4.26-4.29, p25 3.98-4.04).
+- **Where:** phase margin -3.36, phase 1 -3.04, match -1.34, settle -0.81 (pass B -1.02),
+  post-engine tail -0.22, untimed +0.18; these sum to the engine step. Per 1k fills phase 1 -13%,
+  margin -11%, match -8% separate cleanly, settle -1% is flat. Exec thread on-CPU per committed
+  block 145.1 -> 132.5 ms; user CPU per 1k fills -1.6%, sys flat.
+- **Throughput (s82 caveat):** matched/s 1.036x (pairwise +3.1 to +4.0%; spread ref 174, p25
+  1,488), native blk/s 1.069x. Unlike s82 it moved: the exec thread is busy 0.964 of the load
+  window in both arms, so engine time is on the critical path in this shape. Chain -6.7 ms, less
+  than the engine step (end_resident wait +0.7, verify +0.3, residual +1.0, each 1-2.7 sd).
+- **Caveats:** n = 2 per arm; raw engine spread 7.2 ms on p25 (fills and host load), so the raw
+  step is ~2.3 pooled sd and the fills-normalised one ~8 sd; end_resident wait +0.7 ms not
+  established; no perf, so the per-map split is inferred from the phase deltas. ref matches the
+  earlier `e28bb121` cell (p2byid p2 std r1, 179,851 matched/s).
+
 ## Open
 
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls

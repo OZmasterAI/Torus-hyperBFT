@@ -404,6 +404,16 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p2byid-300m-ref-std-r1` | OK | 2026-10-09 01:05 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 179,192.3 | 177,854.4 | 189,745.5 | 238,030.9 | 5.5 | 122.1 | 140.57 | 4.29 | AGREE | PASS | ACCEPT |
 | `ozarchy-p2byid-300m-ref-warm` | OK | 2026-10-09 00:42 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 60 | 400 | - | 182,389.8 | 182,389.8 | 193,182.4 | 241,955.8 | 5.0 | 100.2 | 126.34 | 4.17 | AGREE | PASS | ACCEPT |
 
+## p25g: P2-5 hasher gate cell: p25 `631becaa` vs ref `bdd5b470`; `ref-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p25g-300m-p25-r1` | OK | 2026-10-09 01:59 | p25g-631becaa @ 631becaa | 2587e57f | 300 | 120 | 400 | - | 186,413.8 | 186,233.2 | 194,309.7 | 248,015.2 | 5.6 | 129.3 | 139.70 | 3.98 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-p25-r2` | OK | 2026-10-09 02:05 | p25g-631becaa @ 631becaa | 2587e57f | 300 | 120 | 400 | - | 187,902.0 | 187,707.6 | 200,267.7 | 249,839.6 | 5.6 | 138.7 | 145.27 | 4.04 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-r1` | OK | 2026-10-09 01:53 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 180,588.6 | 179,833.6 | 191,864.7 | 239,965.3 | 5.3 | 129.6 | 148.38 | 4.26 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-r2` | OK | 2026-10-09 02:11 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 180,762.5 | 180,347.8 | 192,192.0 | 239,741.7 | 5.2 | 136.6 | 149.90 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-warm` | OK | 2026-10-09 01:46 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 60 | 400 | - | 180,472.0 | 180,472.0 | 192,347.5 | 238,689.9 | 4.7 | 111.2 | 139.95 | 4.17 | AGREE | PASS | ACCEPT |
+
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
