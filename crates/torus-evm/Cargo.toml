@@ -14,4 +14,6 @@ sha3 = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# R02 branch 5: a DB opened without one column family (a real local read fault).
+rocksdb = { workspace = true }
 tempfile = { workspace = true }

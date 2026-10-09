@@ -111,6 +111,14 @@ pub enum CoreError {
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
 
+    /// R02 branch 5 (owner option A): a precompile hit a LOCAL storage fault
+    /// that it must not answer around (0x0800 getPosition: the UPnL oracle
+    /// read failed on this node). Local. Never a revert: the EVM precompile
+    /// provider records it, aborts the execution (`EvmError::LocalFault`)
+    /// and the consensus app fail-stops the node.
+    #[error("precompile local fault: {0}")]
+    PrecompileLocalFault(String),
+
     /// The persisted order-book layout is not one this read serves (unknown
     /// mode marker, mixed layouts, a key shape this build cannot read,
     /// getOrderBook under the order-row layout): the same on every validator
@@ -156,7 +164,11 @@ impl CoreError {
     pub fn is_local_fault(&self) -> bool {
         matches!(
             self,
-            Self::State(_) | Self::Borsh(_) | Self::MissingCf(_) | Self::BookCorrupt(_)
+            Self::State(_)
+                | Self::Borsh(_)
+                | Self::MissingCf(_)
+                | Self::BookCorrupt(_)
+                | Self::PrecompileLocalFault(_)
         )
     }
 }
@@ -172,7 +184,7 @@ mod tests {
     fn expected_local(e: &CoreError) -> bool {
         use CoreError::*;
         match e {
-            State(_) | Borsh(_) | MissingCf(_) | BookCorrupt(_) => true,
+            State(_) | Borsh(_) | MissingCf(_) | BookCorrupt(_) | PrecompileLocalFault(_) => true,
             OrderNotFound(_)
             | InvalidQuantity
             | InvalidPrice
@@ -254,6 +266,7 @@ mod tests {
             CoreError::Borsh("x".into()),
             CoreError::DeterministicDecode("x".into()),
             CoreError::MissingCf("x"),
+            CoreError::PrecompileLocalFault("x".into()),
             CoreError::BookLayout("x".into()),
             CoreError::BookCorrupt("x".into()),
             CoreError::StaleOraclePrice(1),
@@ -265,7 +278,7 @@ mod tests {
             .filter(|e| e.is_local_fault())
             .map(|e| e.to_string())
             .collect();
-        assert_eq!(local.len(), 6, "{local:?}");
+        assert_eq!(local.len(), 7, "{local:?}");
         for e in &every_variant {
             assert_eq!(e.is_local_fault(), expected_local(e), "{e}");
         }

@@ -723,6 +723,14 @@ enum ReplayFault {
     /// `price_band`) recorded a local fault on the context's reader channel
     /// during the block's batches.
     OracleReaderFault,
+    /// R02 branch 5: the block's EVM execution returns
+    /// `EvmError::LocalFault` (a precompile hit a local storage fault;
+    /// torus-evm `r02_precompile_fault_tests` shows a real read gets there).
+    EvmLocalFault,
+    /// R02 branch 5 control: the block's EVM execution returns an ordinary
+    /// error (`EvmError::Internal`), which keeps today's "logged, EVM section
+    /// skipped" handling.
+    EvmSectionError,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2041,11 +2049,22 @@ impl ExecutionContext {
         // tx has one). A failed EVM section executes none of them.
         let mut evm_skipped = vec![true; torus_block.evm_transactions.len()];
         if has_evm {
-            match self.validator.validate_block_for_catchup(
+            let validated = self.validator.validate_block_for_catchup(
                 torus_block,
                 &self.state_db,
                 &self.evm_executor,
-            ) {
+            );
+            #[cfg(test)]
+            let validated = match self.test_replay_fault {
+                Some(ReplayFault::EvmLocalFault) => Err(torus_bridge::BridgeError::Evm(
+                    torus_evm::EvmError::LocalFault("getPosition oracle read: injected (test)".into()),
+                )),
+                Some(ReplayFault::EvmSectionError) => Err(torus_bridge::BridgeError::Evm(
+                    torus_evm::EvmError::Internal("injected EVM section error (test)".into()),
+                )),
+                _ => validated,
+            };
+            match validated {
                 Ok(validated) => {
                     for receipt in &validated.receipts {
                         if let Some(skipped) = evm_skipped.get_mut(receipt.tx_index as usize) {
@@ -2104,6 +2123,20 @@ impl ExecutionContext {
                         tracing::error!(%e, height, "failed to commit block metadata");
                     }
                     bundle = validated.bundle;
+                }
+                // R02 branch 5 (owner option A): a precompile hit a LOCAL
+                // storage fault (it aborted the execution instead of answering
+                // around it). Fail-stop: nothing of the block is flushed, the
+                // applied marker stays below it, the restart replays it. Only
+                // this variant: every other EVM error keeps the arm below.
+                Err(torus_bridge::BridgeError::Evm(torus_evm::EvmError::LocalFault(reason))) => {
+                    tracing::error!(
+                        height,
+                        %reason,
+                        "FATAL: local storage fault in the EVM section — halting execution pipeline (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
                 }
                 Err(e) => {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
@@ -20197,6 +20230,102 @@ mod crash_recovery_tests {
             drop(ctx);
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
             assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "R02: replay vs no fault");
+        }
+    }
+    /// R02 branch 5 fixture: block 1 a native claim; block 2 a native claim
+    /// plus one EVM tx of a funded key (`input` to `to`). `setup` funds it.
+    fn r02_evm_blocks(
+        key: &k256::ecdsa::SigningKey,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+    ) -> (Vec<TorusBlock>, SignedNativeAction) {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut b2 = make_block(2, vec![b.clone()]);
+        b2.evm_transactions = vec![signed_eip1559(key, 0, to, input)];
+        b2.header.evm_tx_count = 1;
+        let mut blocks = vec![make_block(1, vec![a]), b2];
+        link_blocks(&mut blocks);
+        (blocks, b)
+    }
+
+    fn r02_fund(db: &StateDb, key: &k256::ecdsa::SigningKey) {
+        let funded = revm::state::AccountInfo {
+            balance: U256::from(10u128.pow(18)),
+            nonce: 0,
+            code_hash: KECCAK_EMPTY_CODE,
+            code: None,
+            account_id: None,
+        };
+        db.put_account(&k256_address(key), &funded).unwrap();
+    }
+
+    fn r02_evm_nonce(db: &StateDb, key: &k256::ecdsa::SigningKey) -> u64 {
+        db.get_account(&k256_address(key)).unwrap().map_or(0, |a| a.nonce)
+    }
+
+    /// The OrderBookReader precompile (0x0800).
+    fn r02_reader_precompile() -> alloy_primitives::TxKind {
+        use torus_core::precompiles::{precompile_address, ADDR_ORDER_BOOK_READER};
+        alloy_primitives::TxKind::Call(precompile_address(ADDR_ORDER_BOOK_READER))
+    }
+
+    /// The status of block `height`'s EVM tx 0 receipt (`None`: no receipt).
+    fn r02_receipt_status(db: &StateDb, height: u64) -> Option<bool> {
+        let key = [height.to_be_bytes().as_slice(), &0u32.to_be_bytes()].concat();
+        db.get_cf_raw(torus_state::cf::CF_RECEIPTS, &key)
+            .unwrap()
+            .map(|r| serde_json::from_slice::<torus_types::Receipt>(&r).unwrap().status)
+    }
+
+    /// R02 branch 5 (owner option A): the block's EVM execution reports a
+    /// LOCAL storage fault (`EvmError::LocalFault`: a precompile's read failed
+    /// on this node and the provider aborted instead of answering; torus-evm
+    /// `r02_precompile_fault_tests` drives a real read there). The block
+    /// fail-stops: exec_failed, applied marker unchanged, nothing flushed
+    /// (neither the EVM bundle nor the native part); the restart's replay
+    /// matches a run without the fault. Serial and pipelined. RED before:
+    /// the failed EVM section was logged and skipped and the block flushed.
+    #[test]
+    fn r02_evm_local_fault_fail_stops_block() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x55; 32]).unwrap();
+        let (blocks, b) = r02_evm_blocks(&key, alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55]);
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|db| r02_fund(db, &key), ReplayFault::EvmLocalFault, &|db| {
+            assert!(r02_nonce_consumed(db, &b));
+            assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
+            assert_eq!(r02_receipt_status(db, 2), Some(true));
+        });
+    }
+
+    /// R02 branch 5: every other EVM outcome keeps today's handling, no
+    /// fail-stop. (a) An ordinary EVM execution error (`EvmError::Internal`):
+    /// logged, the EVM section skipped, the native part applied. (b) A real
+    /// precompile revert (unknown selector to 0x0800): a reverted receipt,
+    /// the block applied.
+    #[test]
+    fn r02_ordinary_evm_errors_do_not_fail_stop() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x56; 32]).unwrap();
+        let cases = [
+            ("(a) section error", alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55], Some(ReplayFault::EvmSectionError), 0, None),
+            ("(b) precompile revert", r02_reader_precompile(), vec![0xDE, 0xAD, 0xBE, 0xEF], None, 1, Some(false)),
+        ];
+        for (what, to, input, fault, evm_nonce, receipt) in cases {
+            let (blocks, b) = r02_evm_blocks(&key, to, input);
+            for on in [false, true] {
+                let (_c, db) = make_test_config_and_db();
+                r02_fund(&db, &key);
+                let mut ctx = pipeline_ctx(&db, on, None);
+                dispatch_and_execute(&ctx, &db, &blocks[0]);
+                ctx.test_replay_fault = fault;
+                dispatch_and_execute(&ctx, &db, &blocks[1]);
+                assert!(ctx.pipeline_barrier(), "{what} on={on}");
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what} on={on}: no fail-stop");
+                drop(ctx);
+                assert_eq!(read_native_applied_height(&db), Some(2), "{what} on={on}");
+                assert!(r02_nonce_consumed(&db, &b), "{what} on={on}: native part applied");
+                assert_eq!(r02_evm_nonce(&db, &key), evm_nonce, "{what} on={on}");
+                assert_eq!(r02_receipt_status(&db, 2), receipt, "{what} on={on}");
+            }
         }
     }
 
