@@ -1845,13 +1845,16 @@ mod tests {
 
     // ---- rank-root: cached-path gates ----
 
+    /// 9.13: unset = the benched configuration (on); only `"0"` disables.
     #[test]
-    fn root_cache_toggle_default_off_only_one_enables() {
-        assert!(!parse_native_root_cache_toggle(None));
+    fn root_cache_toggle_default_on_only_zero_disables() {
+        assert!(parse_native_root_cache_toggle(None));
         assert!(parse_native_root_cache_toggle(Some("1".to_string())));
         assert!(parse_native_root_cache_toggle(Some(" 1 ".to_string())));
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_native_root_cache_toggle(Some(v.to_string())), "{v}");
+        assert!(!parse_native_root_cache_toggle(Some("0".to_string())));
+        assert!(!parse_native_root_cache_toggle(Some(" 0 ".to_string())));
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_native_root_cache_toggle(Some(v.to_string())), "{v}");
         }
     }
 
@@ -2088,14 +2091,16 @@ mod tests {
         );
     }
 
+    /// 9.13: unset / garbage = the benched 256 MB; `"0"` disables.
     #[test]
-    fn round3_parse_member_cache_mb_default_off() {
-        assert_eq!(parse_member_cache_mb(None), 0);
+    fn round3_parse_member_cache_mb_default_256() {
+        assert_eq!(parse_member_cache_mb(None), 256 * 1024 * 1024);
         assert_eq!(parse_member_cache_mb(Some("0".into())), 0);
+        assert_eq!(parse_member_cache_mb(Some(" 0 ".into())), 0);
         assert_eq!(parse_member_cache_mb(Some("1".into())), 1024 * 1024);
         assert_eq!(parse_member_cache_mb(Some(" 8 ".into())), 8 * 1024 * 1024);
         for v in ["", "x", "-1", "on"] {
-            assert_eq!(parse_member_cache_mb(Some(v.into())), 0, "{v}");
+            assert_eq!(parse_member_cache_mb(Some(v.into())), 256 * 1024 * 1024, "{v}");
         }
     }
 

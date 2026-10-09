@@ -1743,8 +1743,22 @@ mod sync_wal_tests {
         assert_eq!(t.l0_slowdown_trigger, None);
         assert_eq!(t.l0_stop_trigger, None);
         assert_eq!(t.max_write_buffer_number, 4);
-        assert!(!t.pipelined_write);
+        // 9.13: pipelined write is on by default (the benched configuration).
+        assert!(t.pipelined_write);
         assert_eq!(t, DbTuning::default());
+    }
+
+    /// 9.13: the explicit off values restore the pre-9.13 default; anything
+    /// else (on words, garbage) is the default, on.
+    #[test]
+    fn db_tuning_pipelined_write_off_values() {
+        let p = |v: &str| DbTuning::from_raw(None, None, None, None, Some(v.into())).pipelined_write;
+        for v in ["0", " 0 ", "false", "FALSE", "no", "off"] {
+            assert!(!p(v), "{v}");
+        }
+        for v in ["1", "true", "TRUE", "yes", "on", "", "x"] {
+            assert!(p(v), "{v}");
+        }
     }
 
     #[test]

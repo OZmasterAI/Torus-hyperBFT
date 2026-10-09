@@ -540,9 +540,10 @@ fn settle_worker_cap() -> usize {
 mod parallel_settle_toggle_tests {
     use super::parse_parallel_settle_toggle;
 
+    /// 9.13: unset = the benched configuration (on).
     #[test]
-    fn default_is_off() {
-        assert!(!parse_parallel_settle_toggle(None));
+    fn default_is_on() {
+        assert!(parse_parallel_settle_toggle(None));
     }
 
     #[test]
@@ -551,10 +552,18 @@ mod parallel_settle_toggle_tests {
         assert!(parse_parallel_settle_toggle(Some(" 1 ".to_string())));
     }
 
+    /// `"0"` is the explicit off switch (the pre-9.13 default path).
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+    fn zero_disables() {
+        assert!(!parse_parallel_settle_toggle(Some("0".to_string())));
+        assert!(!parse_parallel_settle_toggle(Some(" 0 ".to_string())));
+    }
+
+    /// Anything else falls back to the default (on).
+    #[test]
+    fn anything_else_is_the_default() {
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
         }
     }
 }
@@ -3694,9 +3703,10 @@ mod end_resident_worker_tests;
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
 
+    /// 9.13: unset = the benched configuration (on).
     #[test]
-    fn default_is_off() {
-        assert!(!parse_resident_books_toggle(None));
+    fn default_is_on() {
+        assert!(parse_resident_books_toggle(None));
     }
 
     #[test]
@@ -3705,10 +3715,18 @@ mod resident_books_toggle_tests {
         assert!(parse_resident_books_toggle(Some(" 1 ".to_string())));
     }
 
+    /// `"0"` is the explicit off switch (the pre-9.13 default path).
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_resident_books_toggle(Some(v.to_string())), "{v}");
+    fn zero_disables() {
+        assert!(!parse_resident_books_toggle(Some("0".to_string())));
+        assert!(!parse_resident_books_toggle(Some(" 0 ".to_string())));
+    }
+
+    /// Anything else falls back to the default (on).
+    #[test]
+    fn anything_else_is_the_default() {
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_resident_books_toggle(Some(v.to_string())), "{v}");
         }
     }
 }
