@@ -381,8 +381,10 @@ pub fn parse_verified_sender_cache_cap(raw: Option<String>) -> usize {
 /// floor WARNs (still honored): the exec hot path would lose its recover skip.
 pub fn verified_sender_cache_cap() -> usize {
     let cap = native_total_block_cap();
-    let resolved =
-        resolve_verified_sender_cache_cap(std::env::var("TORUS_VERIFIED_SENDER_CACHE_CAP").ok(), cap);
+    let resolved = resolve_verified_sender_cache_cap(
+        std::env::var("TORUS_VERIFIED_SENDER_CACHE_CAP").ok(),
+        cap,
+    );
     let floor = verified_sender_cache_in_flight_floor(cap);
     if resolved < floor {
         tracing::warn!(
@@ -503,7 +505,10 @@ mod tests {
         // "unset env => byte-identical to run-cell.sh BLOCK_CAP=400" contract:
         // the per-block native TOTAL cap and per-SENDER cap defaults must not
         // drift; the trust-cache FLOOR constant stays the historical 16_384.
-        assert_eq!(NATIVE_TOTAL_BLOCK_CAP, 400, "per-block total native cap default (s76 sweep)");
+        assert_eq!(
+            NATIVE_TOTAL_BLOCK_CAP, 400,
+            "per-block total native cap default (s76 sweep)"
+        );
         assert_eq!(NATIVE_PER_BLOCK_CAP, 64, "per-sender native cap default");
         assert_eq!(
             VERIFIED_SENDER_CACHE_CAP, 16_384,
@@ -525,9 +530,16 @@ mod tests {
         let orders = (n * b * 5 / 4).max(50_000);
         let cache = (64 * n * 5 / 2).max(16_384);
         let bytes = (n * b * 150).max(6_000_000).min(12_000_000);
-        assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, orders, "orders-per-block companion cap");
+        assert_eq!(
+            NATIVE_ORDERS_PER_BLOCK_CAP, orders,
+            "orders-per-block companion cap"
+        );
         assert_eq!(NATIVE_ORDERS_PER_BLOCK_CAP, 200_000);
-        assert_eq!(default_verified_sender_cache_cap(n), cache, "trust-cache derived default");
+        assert_eq!(
+            default_verified_sender_cache_cap(n),
+            cache,
+            "trust-cache derived default"
+        );
         assert_eq!(default_verified_sender_cache_cap(n), 64_000);
         assert_eq!(NATIVE_BLOCK_BYTES_CAP, bytes, "block bytes companion cap");
         assert_eq!(NATIVE_BLOCK_BYTES_CAP, 12_000_000);
@@ -562,7 +574,10 @@ mod tests {
         );
         // A valid override is honored — this is the lever a cap-400 bench uses to
         // keep the trust-cache in-flight window (64 * cap) covered.
-        assert_eq!(parse_verified_sender_cache_cap(Some("40000".into())), 40_000);
+        assert_eq!(
+            parse_verified_sender_cache_cap(Some("40000".into())),
+            40_000
+        );
         assert_eq!(
             parse_verified_sender_cache_cap(Some("  40000  ".into())),
             40_000,
@@ -587,9 +602,15 @@ mod tests {
         // cap 100 (the pre-r4 compiled default / `TORUS_NATIVE_TOTAL_BLOCK_CAP=100`
         // control): 64*100*2.5 = 16_000 < 16_384 => the historical default is
         // byte-identical. s76's compiled cap 400 => 64_000 (bundle value).
-        assert_eq!(default_verified_sender_cache_cap(100), VERIFIED_SENDER_CACHE_CAP);
+        assert_eq!(
+            default_verified_sender_cache_cap(100),
+            VERIFIED_SENDER_CACHE_CAP
+        );
         assert_eq!(default_verified_sender_cache_cap(100), 16_384);
-        assert_eq!(default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP), 64_000);
+        assert_eq!(
+            default_verified_sender_cache_cap(NATIVE_TOTAL_BLOCK_CAP),
+            64_000
+        );
         // Never BELOW the compiled default (a lowered cap keeps the 16_384).
         assert_eq!(default_verified_sender_cache_cap(10), 16_384);
         assert_eq!(default_verified_sender_cache_cap(0), 16_384);
@@ -606,12 +627,24 @@ mod tests {
     fn resolve_verified_sender_cache_cap_prefers_explicit_env_over_derived_default() {
         // Unset / malformed / 0 => the cap-derived default.
         assert_eq!(resolve_verified_sender_cache_cap(None, 300), 48_000);
-        assert_eq!(resolve_verified_sender_cache_cap(Some("nope".into()), 300), 48_000);
-        assert_eq!(resolve_verified_sender_cache_cap(Some("0".into()), 300), 48_000);
+        assert_eq!(
+            resolve_verified_sender_cache_cap(Some("nope".into()), 300),
+            48_000
+        );
+        assert_eq!(
+            resolve_verified_sender_cache_cap(Some("0".into()), 300),
+            48_000
+        );
         // An explicit value is honored verbatim, even below the derived default
         // (operator sizing wins; a too-small cache is slower, never incorrect).
-        assert_eq!(resolve_verified_sender_cache_cap(Some("40000".into()), 300), 40_000);
-        assert_eq!(resolve_verified_sender_cache_cap(Some("1000".into()), 300), 1_000);
+        assert_eq!(
+            resolve_verified_sender_cache_cap(Some("40000".into()), 300),
+            40_000
+        );
+        assert_eq!(
+            resolve_verified_sender_cache_cap(Some("1000".into()), 300),
+            1_000
+        );
         // The legacy single-arg parser is the compiled-cap view of the same seam.
         assert_eq!(
             parse_verified_sender_cache_cap(None),

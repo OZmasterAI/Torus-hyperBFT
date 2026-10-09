@@ -576,10 +576,16 @@ impl NativePool {
         bytes_cap: usize,
         orders_cap: usize,
     ) -> Vec<(Address, SignedNativeAction)> {
-        self.select_entries_before(limit, exclude, bytes_cap, orders_cap, Bound::Excluded(FIRST_NORMAL))
-            .into_iter()
-            .map(|(_, entry)| (entry.sender, entry.action.clone()))
-            .collect()
+        self.select_entries_before(
+            limit,
+            exclude,
+            bytes_cap,
+            orders_cap,
+            Bound::Excluded(FIRST_NORMAL),
+        )
+        .into_iter()
+        .map(|(_, entry)| (entry.sender, entry.action.clone()))
+        .collect()
     }
 
     /// Evict entries whose nonce has aged out of the protocol validity window.
@@ -687,10 +693,16 @@ impl NativePool {
         assert_eq!(self.expiry_index.len(), self.entries.len());
         assert_eq!(
             self.priority_count,
-            self.entries.values().filter(|e| e.priority != PRIO_NORMAL).count()
+            self.entries
+                .values()
+                .filter(|e| e.priority != PRIO_NORMAL)
+                .count()
         );
         for key in self.entries.keys() {
-            assert!(self.expiry_index.contains(&expiry_key(key)), "missing expiry key");
+            assert!(
+                self.expiry_index.contains(&expiry_key(key)),
+                "missing expiry key"
+            );
         }
         let mut indexed: HashSet<SortKey> = HashSet::new();
         for (hash, keys) in &self.hash_index {
@@ -807,15 +819,26 @@ mod tests {
                 .unwrap();
             pool.insert(
                 sender,
-                make_action(2, NativeAction::CancelOrder { order_id: i as u128 }),
-            ).unwrap();
+                make_action(
+                    2,
+                    NativeAction::CancelOrder {
+                        order_id: i as u128,
+                    },
+                ),
+            )
+            .unwrap();
         }
         for limit in [0, 1, usize::MAX] {
             assert!(pool.select_for_block(limit).is_empty());
             assert!(pool.select_for_block_with_senders(limit).is_empty());
-            assert!(pool.select_cancels_for_block_with_senders_excluding(
-                limit, &HashSet::new(), usize::MAX, usize::MAX,
-            ).is_empty());
+            assert!(pool
+                .select_cancels_for_block_with_senders_excluding(
+                    limit,
+                    &HashSet::new(),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .is_empty());
             assert!(pool.drain(limit).is_empty());
             assert_eq!(pool.size(), 8);
             assert_eq!(pool.expiry_index.len(), 8);
@@ -1049,19 +1072,35 @@ mod tests {
         assert_eq!(pool.size(), 400);
 
         // Historical cap: exactly 100 selected — the old ceiling.
-        let capped =
-            pool.select_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        let capped = pool.select_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(capped.len(), 100, "limit=100 reproduces today's ceiling");
 
         // Raised cap: the block carries all 400 — proof the limit is the sole
         // count gate and 400 is reachable end-to-end in selection.
-        let raised =
-            pool.select_for_block_with_senders_excluding(400, &HashSet::new(), usize::MAX, usize::MAX);
-        assert_eq!(raised.len(), 400, "limit=400 genuinely selects >100 actions");
+        let raised = pool.select_for_block_with_senders_excluding(
+            400,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(
+            raised.len(),
+            400,
+            "limit=400 genuinely selects >100 actions"
+        );
 
         // A limit between the two resolves exactly, no hidden clamp near 100.
-        let mid =
-            pool.select_for_block_with_senders_excluding(250, &HashSet::new(), usize::MAX, usize::MAX);
+        let mid = pool.select_for_block_with_senders_excluding(
+            250,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(mid.len(), 250);
     }
 
@@ -1517,7 +1556,11 @@ mod tests {
             usize::MAX,
             usize::MAX,
         );
-        assert_eq!(normal.len(), 6, "pacing defers non-cancels, never drops them");
+        assert_eq!(
+            normal.len(),
+            6,
+            "pacing defers non-cancels, never drops them"
+        );
     }
 
     #[test]
@@ -1589,7 +1632,8 @@ mod tests {
         let mut pool = NativePool::new(100, 64, 16);
         let action = make_action(1, NativeAction::ClaimRewards);
         let hash = compute_action_hash(&action);
-        pool.insert(Address::repeat_byte(1), action.clone()).unwrap();
+        pool.insert(Address::repeat_byte(1), action.clone())
+            .unwrap();
         pool.insert(Address::repeat_byte(2), action).unwrap();
         assert_eq!(pool.size(), 2, "same-hash duplicates coexist");
         pool.assert_index_consistent();
@@ -1653,7 +1697,8 @@ mod tests {
         let mut pool = NativePool::new(100, 64, 16);
         let action = make_action(1, NativeAction::ClaimRewards);
         let hash = compute_action_hash(&action);
-        pool.insert(Address::repeat_byte(1), action.clone()).unwrap();
+        pool.insert(Address::repeat_byte(1), action.clone())
+            .unwrap();
         pool.insert(Address::repeat_byte(2), action).unwrap();
 
         let drained = pool.drain(1);
@@ -1734,8 +1779,16 @@ mod tests {
     #[test]
     fn selection_order_is_cancels_then_oracle_then_rest() {
         let mut pool = NativePool::new(100, 64, 64);
-        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
-        pool.insert(Address::repeat_byte(5), make_action(2, NativeAction::CancelOrder { order_id: 9 })).unwrap();
+        pool.insert(
+            Address::repeat_byte(1),
+            make_action(1, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        pool.insert(
+            Address::repeat_byte(5),
+            make_action(2, NativeAction::CancelOrder { order_id: 9 }),
+        )
+        .unwrap();
         pool.insert(Address::repeat_byte(9), oracle(3)).unwrap();
         let sel = pool.select_for_block(10);
         let kinds: Vec<u8> = sel.iter().map(|a| priority_class(&a.action)).collect();
@@ -1743,17 +1796,32 @@ mod tests {
         assert!(is_cancel(&sel[0].action));
         assert!(is_oracle_submission(&sel[1].action));
         assert!(matches!(sel[2].action, NativeAction::ClaimRewards));
-        assert!(is_priority(&sel[0].action) && is_priority(&sel[1].action) && !is_priority(&sel[2].action));
+        assert!(
+            is_priority(&sel[0].action)
+                && is_priority(&sel[1].action)
+                && !is_priority(&sel[2].action)
+        );
         pool.assert_index_consistent();
     }
 
     #[test]
     fn full_pool_oracle_submission_evicts_a_normal_entry() {
         let mut pool = NativePool::new(2, 64, 64);
-        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
-        pool.insert(Address::repeat_byte(2), make_action(2, NativeAction::ClaimRewards)).unwrap();
+        pool.insert(
+            Address::repeat_byte(1),
+            make_action(1, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        pool.insert(
+            Address::repeat_byte(2),
+            make_action(2, NativeAction::ClaimRewards),
+        )
+        .unwrap();
         assert!(matches!(
-            pool.insert(Address::repeat_byte(3), make_action(3, NativeAction::ClaimRewards)),
+            pool.insert(
+                Address::repeat_byte(3),
+                make_action(3, NativeAction::ClaimRewards)
+            ),
             Err(MempoolError::NativePoolFull)
         ));
         pool.insert(Address::repeat_byte(4), oracle(4)).unwrap();
@@ -1769,9 +1837,17 @@ mod tests {
     #[test]
     fn full_pool_of_cancels_oracle_evicts_the_last_cancel() {
         let mut pool = NativePool::new(3, 64, 64);
-        let cancel = |n| make_action(n, NativeAction::CancelOrder { order_id: n as u128 });
+        let cancel = |n| {
+            make_action(
+                n,
+                NativeAction::CancelOrder {
+                    order_id: n as u128,
+                },
+            )
+        };
         for i in 1..=3u8 {
-            pool.insert(Address::repeat_byte(i), cancel(i as u64)).unwrap();
+            pool.insert(Address::repeat_byte(i), cancel(i as u64))
+                .unwrap();
         }
         assert!(matches!(
             pool.insert(Address::repeat_byte(9), cancel(9)),
@@ -1783,15 +1859,25 @@ mod tests {
         let senders: Vec<Address> = pool.entries.values().map(|e| e.sender).collect();
         assert_eq!(
             senders,
-            vec![Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(0xEE)],
+            vec![
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                Address::repeat_byte(0xEE)
+            ],
             "the last cancel in selection order was evicted"
         );
         // ...a cancel never evicts an oracle submission.
         let mut pool = NativePool::new(1, 64, 64);
         pool.insert(Address::repeat_byte(2), oracle(2)).unwrap();
-        assert!(matches!(pool.insert(Address::repeat_byte(1), cancel(1)), Err(MempoolError::NativePoolFull)));
+        assert!(matches!(
+            pool.insert(Address::repeat_byte(1), cancel(1)),
+            Err(MempoolError::NativePoolFull)
+        ));
         // ...and oracle submissions never evict each other.
-        assert!(matches!(pool.insert(Address::repeat_byte(3), oracle(3)), Err(MempoolError::NativePoolFull)));
+        assert!(matches!(
+            pool.insert(Address::repeat_byte(3), oracle(3)),
+            Err(MempoolError::NativePoolFull)
+        ));
         pool.assert_index_consistent();
     }
 
@@ -1803,19 +1889,41 @@ mod tests {
         let mut pool = mixed_pool(40, 30, 25);
         let v = Address::repeat_byte(0xEE);
         pool.insert(v, oracle(5_000)).unwrap();
-        let sel = pool.select_for_block_with_senders_excluding(20, &HashSet::new(), usize::MAX, usize::MAX);
+        let sel = pool.select_for_block_with_senders_excluding(
+            20,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(sel.len(), 20);
-        assert!(cancel_flags(&sel)[..5].iter().all(|c| *c), "ceil(25% of 20) cancels first");
+        assert!(
+            cancel_flags(&sel)[..5].iter().all(|c| *c),
+            "ceil(25% of 20) cancels first"
+        );
         assert_eq!(sel[5].0, v);
         assert!(is_oracle_submission(&sel[5].1.action));
         assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
         // The pacing tier: cancels alone would fill all 10 slots.
-        let paced = pool.select_cancels_for_block_with_senders_excluding(10, &HashSet::new(), usize::MAX, usize::MAX);
+        let paced = pool.select_cancels_for_block_with_senders_excluding(
+            10,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(paced.len(), 10);
-        assert!(cancel_flags(&paced)[..3].iter().all(|c| *c), "ceil(25% of 10)");
+        assert!(
+            cancel_flags(&paced)[..3].iter().all(|c| *c),
+            "ceil(25% of 10)"
+        );
         assert_eq!(paced[3].0, v, "the oracle lane follows the cancel share");
-        assert!(cancel_flags(&paced)[4..].iter().all(|c| *c), "work-conserving: cancels fill the rest");
-        assert!(paced.iter().all(|(_, a)| is_priority(&a.action)), "never a normal entry");
+        assert!(
+            cancel_flags(&paced)[4..].iter().all(|c| *c),
+            "work-conserving: cancels fill the rest"
+        );
+        assert!(
+            paced.iter().all(|(_, a)| is_priority(&a.action)),
+            "never a normal entry"
+        );
         // drain takes the same block.
         let drained = pool.drain(20);
         assert!(is_oracle_submission(&drained[5].action));
@@ -1824,7 +1932,11 @@ mod tests {
 
     #[test]
     fn oracle_pending_counts_across_validator_and_signer() {
-        let (v, s, other) = (Address::repeat_byte(7), Address::repeat_byte(8), Address::repeat_byte(9));
+        let (v, s, other) = (
+            Address::repeat_byte(7),
+            Address::repeat_byte(8),
+            Address::repeat_byte(9),
+        );
         let mut pool = NativePool::new(100, 64, 64);
         let first = oracle(1);
         let first_hash = compute_action_hash(&first);
@@ -1832,8 +1944,10 @@ mod tests {
         pool.insert(v, oracle(2)).unwrap();
         pool.insert(s, oracle(3)).unwrap();
         pool.insert(other, oracle(4)).unwrap();
-        pool.insert(v, make_action(5, NativeAction::ClaimRewards)).unwrap();
-        pool.insert(v, make_action(6, NativeAction::CancelOrder { order_id: 1 })).unwrap();
+        pool.insert(v, make_action(5, NativeAction::ClaimRewards))
+            .unwrap();
+        pool.insert(v, make_action(6, NativeAction::CancelOrder { order_id: 1 }))
+            .unwrap();
         assert_eq!(pool.oracle_pending(&[v, s]), 3);
         assert_eq!(pool.oracle_pending(&[v]), 2);
         assert_eq!(pool.oracle_pending(&[]), 0);
@@ -1845,10 +1959,23 @@ mod tests {
     #[test]
     fn priority_only_selection_takes_cancels_and_oracle() {
         let mut pool = NativePool::new(100, 64, 64);
-        pool.insert(Address::repeat_byte(1), make_action(1, NativeAction::ClaimRewards)).unwrap();
-        pool.insert(Address::repeat_byte(5), make_action(2, NativeAction::CancelOrder { order_id: 9 })).unwrap();
+        pool.insert(
+            Address::repeat_byte(1),
+            make_action(1, NativeAction::ClaimRewards),
+        )
+        .unwrap();
+        pool.insert(
+            Address::repeat_byte(5),
+            make_action(2, NativeAction::CancelOrder { order_id: 9 }),
+        )
+        .unwrap();
         pool.insert(Address::repeat_byte(9), oracle(3)).unwrap();
-        let sel = pool.select_cancels_for_block_with_senders_excluding(100, &HashSet::new(), usize::MAX, usize::MAX);
+        let sel = pool.select_cancels_for_block_with_senders_excluding(
+            100,
+            &HashSet::new(),
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(sel.len(), 2);
         assert!(is_cancel(&sel[0].1.action));
         assert!(is_oracle_submission(&sel[1].1.action));
