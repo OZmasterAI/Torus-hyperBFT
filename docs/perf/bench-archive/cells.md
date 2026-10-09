@@ -414,6 +414,18 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p25g-300m-ref-r2` | OK | 2026-10-09 02:11 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 180,762.5 | 180,347.8 | 192,192.0 | 239,741.7 | 5.2 | 136.6 | 149.90 | 4.29 | AGREE | PASS | ACCEPT |
 | `ozarchy-p25g-300m-ref-warm` | OK | 2026-10-09 01:46 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 60 | 400 | - | 180,472.0 | 180,472.0 | 192,347.5 | 238,689.9 | 4.7 | 111.2 | 139.95 | 4.17 | AGREE | PASS | ACCEPT |
 
+## p22g: P2-2 batch cache flush gate cell: p22 `29320f6b` vs p25 `029581e5`, plus base main `e934fa0e` (cumulative); `base-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p22g-300m-base-r1` | OK | 2026-10-09 03:01 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 180,885.8 | 180,119.7 | 191,451.5 | 240,014.3 | 5.2 | 128.4 | 149.00 | 4.31 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-base-r2` | OK | 2026-10-09 03:32 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 181,749.3 | 180,960.8 | 193,540.8 | 241,509.1 | 5.5 | 125.6 | 143.65 | 4.22 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-base-warm` | OK | 2026-10-09 02:55 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 60 | 400 | - | 183,625.6 | 183,625.6 | 191,948.6 | 242,706.7 | 5.0 | 111.9 | 138.19 | 4.23 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p22-r1` | OK | 2026-10-09 03:14 | p22g-29320f6b @ 29320f6b | 5639b084 | 300 | 120 | 400 | - | 189,882.1 | 188,346.7 | 198,899.2 | 251,758.8 | 5.5 | 134.8 | 143.07 | 4.01 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p22-r2` | OK | 2026-10-09 03:20 | p22g-29320f6b @ 29320f6b | 5639b084 | 300 | 120 | 400 | - | 186,740.1 | 185,188.5 | 198,284.5 | 247,552.2 | 5.6 | 127.2 | 137.34 | 4.07 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p25-r1` | OK | 2026-10-09 03:07 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 190,714.8 | 189,834.1 | 204,010.7 | 253,241.3 | 5.8 | 130.7 | 135.15 | 3.98 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p25-r2` | OK | 2026-10-09 03:26 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 189,881.2 | 188,869.5 | 197,942.2 | 251,612.5 | 5.6 | 137.1 | 138.33 | 3.97 | AGREE | PASS | ACCEPT |
+
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |

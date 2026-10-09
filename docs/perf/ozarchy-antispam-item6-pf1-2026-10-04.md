@@ -3306,6 +3306,81 @@ ms per native block (val0) unless per 1k fills; end_resident wait is the mean
   established; no perf, so the per-map split is inferred from the phase deltas. ref matches the
   earlier `e28bb121` cell (p2byid p2 std r1, 179,851 matched/s).
 
+## 33. P2-2 gate cell and cumulative vs e934fa0e (campaign ozarchy-p22g, 2026-10-09)
+
+Phase 2 P2-2 (plan section 3): batch cache flush, `StateBackend::write_cf_raw_many` with one batch
+per `PositionCache` and `BalanceCache` flush (node-local, bit-identical). Gate: `cache_flush_ns`
+per native block down by >= 5 ms vs the P2-1 + P2-5 arm with AGREE; the step 0 estimate was
+~3.2 ms on the standard cells (plan row 14), so a miss was expected. The campaign also measures
+the cumulative Phase 2 gain head to head against main `e934fa0e` (plan rows 31 and 33). Arms:
+base = `e934fa0e` (node `8d7d596c`, the p2byid staged ref binary, reused), p25 = `029581e5`
+(node `2587e57f`, the p25g staged binary, built from `631becaa`; the two differ only in docs),
+p22 = `29320f6b` (node `5639b084`, node-only build of `b7e66ce5` + the test-only reference from
+detached worktree `wt/p22g-29320f6b` into a fresh target dir, same RUSTFLAGS as p25g). All arms
+run bench `6c7ad1a7` and the `bdd5b470` harness (`tools/` has no diff to `29320f6b`). Standard
+shape as sections 26-32, no perf. Order: base warm (60 s, excluded), then base p25 p22 p22 p25
+base, 02:52-03:32, units `bench-ozarchy-p22g-300m-<tag>.service`. All cells rc 0, AGREE (block
+hash, state digest and counters equal on val0-2), liveness PASS, accepted, node md5 = staged md5
+of the arm (3/3), 4 MiB book CF, trie off (default), oracle stale 0 (396 / 396 accepted), 0 panic
+/ fail-stop / error lines, no deaths, fds max under 800. Driver
+`/home/oz/bench-results-matched/ozarchy-p22g-campaign.sh`, tables `ozarchy-p22g-handoff-tables.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **engine** | engine / 1k | chain | phase 1 | margin | match | settle | pass B | **cache flush** | cache flush / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base r1 | 180,886 | 5.244 | 27,891 | **120.17** | 4.31 | 149.0 | 22.02 | 28.66 | 14.61 | 41.78 | 23.43 | **12.28** | 0.440 | 6.17 |
+| p25 r1 | 190,715 | 5.836 | 26,929 | **107.23** | 3.98 | 135.2 | 17.75 | 23.36 | 13.66 | 38.22 | 20.41 | **11.64** | 0.432 | 6.09 |
+| p22 r1 | 189,882 | 5.545 | 28,115 | **112.87** | 4.01 | 143.1 | 18.52 | 24.20 | 13.43 | 42.56 | 21.69 | **14.74** | 0.524 | 6.02 |
+| p22 r2 | 186,740 | 5.590 | 26,719 | **108.77** | 4.07 | 137.3 | 18.35 | 22.40 | 12.27 | 41.62 | 21.38 | **14.67** | 0.549 | 5.49 |
+| p25 r2 | 189,881 | 5.626 | 27,600 | **109.70** | 3.97 | 138.3 | 18.23 | 24.15 | 13.41 | 38.51 | 20.67 | **12.08** | 0.438 | 5.95 |
+| base r2 | 181,749 | 5.467 | 27,124 | **114.46** | 4.22 | 143.7 | 21.06 | 27.56 | 14.17 | 39.12 | 21.83 | **11.57** | 0.427 | 6.41 |
+
+ms per native block (val0) unless per 1k fills; the cache flush is timed inside settle (plan
+step 0 notes), so settle includes it. base warm (183,626 matched/s) excluded.
+
+| mean (r1/r2 spread) | matched/s | native blk/s | fills/blk | engine | engine / 1k | chain | phase 1 | margin | match | settle | pass B | cache flush | cache flush / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 181,318 (864) | 5.355 (0.223) | 27,507 | 117.32 (5.71) | 4.264 (0.089) | 146.3 | 21.54 | 28.11 | 14.39 | 40.45 | 22.63 | 11.93 (0.71) | 0.433 (0.014) | 6.29 |
+| p25 | 190,298 (834) | 5.731 (0.210) | 27,265 | 108.47 (2.47) | 3.978 (0.007) | 136.7 | 17.99 | 23.76 | 13.54 | 38.37 | 20.54 | 11.86 (0.44) | 0.435 (0.005) | 6.02 |
+| p22 | 188,311 (3,142) | 5.567 (0.045) | 27,417 | 110.82 (4.10) | 4.043 (0.056) | 140.2 | 18.44 | 23.30 | 12.85 | 42.09 | 21.54 | 14.71 (0.07) | 0.537 (0.025) | 5.76 |
+| p22 / p25 | 0.990x | 0.972x | 1.006x | +2.36 ms | 1.016x | 1.025x | 1.025x | 0.981x | 0.949x | 1.097x | 1.048x | **+2.85 ms (1.240x)** | 1.234x | 0.956x |
+| p25 / base | **1.0495x** | 1.070x | 0.991x | -8.85 ms | 0.933x | 0.934x | 0.835x | 0.845x | 0.941x | 0.949x | 0.908x | -0.07 ms | 1.003x | 0.957x |
+| p22 / base | **1.039x** | 1.040x | 0.997x | -6.50 ms | 0.948x | 0.958x | 0.856x | 0.829x | 0.893x | 1.041x | 0.952x | +2.78 ms | 1.238x | 0.915x |
+
+- **Verdict P2-2: gate missed, and the sign is reversed.** Cache flush per native block +2.85 ms
+  (11.86 -> 14.71, +24%) instead of -5 ms (gate) or -3.2 ms (estimate); per 1k fills 0.435 ->
+  0.537. Pairwise +2.59 to +3.10 ms; pooled sd 0.22 ms, step ~13 sd; all three validators in
+  both replicates (p22 14.43-15.04, p25 11.44-12.08, base 11.37-12.48 ms) do not overlap. base
+  and p25 are equal (-0.07 ms, 0.2 sd), as expected (P2-1 and P2-5 do not touch the flush).
+- **Where:** settle +3.73 ms (7.6 sd) = cache flush +2.85 plus pass B +1.00 (4.9 sd; pass B
+  per 1k fills 0.753 -> 0.785); pass A, post-engine tail and untimed are flat. Engine +2.36 ms
+  (1.0 sd; +1.8 ms at equal fills, per 1k fills 1.016x, 2.3 sd), the rest offset by match
+  -0.69 and margin -0.46, both inside their noise. The pass B step is not explained by the
+  change (pass B runs before the flush); a carry-over from the batch (allocator / cache state
+  for the next block) is a possibility, not established.
+- **Throughput p22 / p25:** matched/s 0.990x (-1,987, 1.2 pooled sd; pairwise 0.979-1.000x),
+  native blk/s 0.972x (1.5 sd): **not resolved**. At P2-5's measured rate (~0.4% matched/s per
+  ms of engine, plan row 31) the +2.85 ms flush step predicts ~-1.1%, so the measured -1.0% is
+  in line with it but the cells cannot separate it from zero.
+- **Mechanism (hypothesis, no perf in this campaign):** the batch removes the second lookup,
+  `intern_cf` and the per-row lock (~3.2 ms in the step 0 split), but it encodes every row into
+  an owned `(Vec<u8>, Option<Vec<u8>>)` list first (key `to_vec` and value buffer allocated in
+  one pass, consumed in a second, so cold by the time the overlay inserts them; the rows `Vec`
+  grows from a `filter_map` without a size hint) and holds the overlay write lock for the whole
+  batch. The measured step is ~6 ms worse than the estimate; which part costs it needs a
+  profile or a `flush_all` microbench (old vs new at the cell's dirty-row count).
+- **Cumulative vs `e934fa0e` (head to head):** p25 / base **1.0495x** (pairwise 1.045-1.054x,
+  +8,980 matched/s, 15 pooled sd; native blk/s 1.070x), at or just above the top of the chained
+  estimate ~1.040-1.046x (row 31). p22 / base **1.039x** (pairwise 1.027-1.050x, 4.3 sd), below
+  the ~1.053-1.060x expected after P2-2 (row 31) because P2-2 regressed instead of saving
+  ~3.2 ms. Against the +7% phase gate: ~2.0% short with p25, ~3.0% short with p22. Engine per
+  1k fills p25 / base 0.933x (6.4 sd); phase 1 -3.55 ms and margin -4.36 ms (both ~6.5 sd).
+- **Caveats:** n = 2 per arm; p22's matched/s spread (3,142) is ~3.7x the other arms', so the
+  p22 throughput ratios are the weakest numbers here. The host ran ~1-3% faster than in earlier
+  campaigns (base 181,318 vs `e934fa0e` 175,993 in section 30 and 179,192 in section 31; p25's
+  node 190,298 vs 187,158 in section 32), so only the interleaved ratios carry; no perf, so the
+  mechanism above is inferred. Plan row 33 (1): keep P2-2 on a non-overlapping gain, drop it
+  only if it regresses; its gate metric regresses cleanly, matched/s is not resolved.
+
 ## Open
 
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
