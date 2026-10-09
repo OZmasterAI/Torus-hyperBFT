@@ -454,6 +454,21 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p3s1-300m-c-r3` | OK | 2026-10-09 10:08 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 186,727.4 | 185,108.9 | 199,068.1 | 247,741.1 | 5.7 | 132.3 | 135.06 | 4.01 | AGREE | PASS | ACCEPT |
 | `ozarchy-p3s1-300m-c-r4` | OK | 2026-10-09 10:34 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 185,702.9 | 184,722.6 | 197,846.6 | 246,303.7 | 5.2 | 132.8 | 142.47 | 4.05 | AGREE | PASS | ACCEPT |
 
+## bkm: Classic vs mode 3 book layout control: one node main `1eced05c`, A Classic (`TORUS_BOOK_ROWS=0`) vs B mode 3 (`TORUS_BOOK_ROWS=3`), 300 and 10 markets, per shape a-warm A B B A; `a-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-bkm-10m-a-r1` | OK | 2026-10-09 12:57 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 10 | 120 | 400 | TORUS_BOOK_ROWS=0 | 265,844.0 | 267,474.4 | 277,012.5 | 336,327.1 | 12.8 | 89.5 | 52.96 | 2.22 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-10m-a-r2` | OK | 2026-10-09 13:13 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 10 | 120 | 400 | TORUS_BOOK_ROWS=0 | 269,274.9 | 268,227.0 | 280,651.4 | 341,192.7 | 13.2 | 89.3 | 53.11 | 2.21 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-10m-a-warm` | OK | 2026-10-09 12:52 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 10 | 60 | 400 | TORUS_BOOK_ROWS=0 | 267,446.7 | 267,446.7 | 280,819.1 | 338,691.1 | 12.9 | 80.7 | 48.41 | 2.24 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-10m-b-r1` | OK | 2026-10-09 13:03 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 10 | 120 | 400 | - | 270,635.2 | 274,536.9 | 287,566.8 | 342,675.5 | 12.0 | 96.3 | 57.82 | 2.20 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-10m-b-r2` | OK | 2026-10-09 13:08 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 10 | 120 | 400 | - | 271,231.4 | 268,790.5 | 280,761.0 | 343,646.0 | 12.3 | 94.3 | 54.64 | 2.11 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-300m-a-r1` | OK | 2026-10-09 12:29 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 300 | 120 | 400 | TORUS_BOOK_ROWS=0 | 192,142.6 | 190,519.0 | 199,686.9 | 255,191.9 | 5.8 | 133.6 | 134.10 | 4.01 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-300m-a-r2` | OK | 2026-10-09 12:48 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 300 | 120 | 400 | TORUS_BOOK_ROWS=0 | 185,148.5 | 184,920.4 | 198,733.3 | 245,281.6 | 5.5 | 141.7 | 150.16 | 4.09 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-300m-a-warm` | OK | 2026-10-09 12:23 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 300 | 60 | 400 | TORUS_BOOK_ROWS=0 | 183,407.8 | 183,407.8 | 199,797.2 | 243,523.6 | 5.3 | 107.1 | 125.88 | 4.01 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-300m-b-r1` | OK | 2026-10-09 12:35 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 300 | 120 | 400 | - | 173,469.5 | 173,506.0 | 199,360.2 | 229,908.6 | 4.9 | 130.2 | 162.81 | 4.43 | AGREE | PASS | ACCEPT |
+| `ozarchy-bkm-300m-b-r2` | OK | 2026-10-09 12:41 | bkm-1eced05c @ 1eced05c | 3fdad0ae | 300 | 120 | 400 | - | 190,421.7 | 188,865.2 | 199,498.8 | 252,928.2 | 5.6 | 134.7 | 141.04 | 3.99 | AGREE | PASS | ACCEPT |
+
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
