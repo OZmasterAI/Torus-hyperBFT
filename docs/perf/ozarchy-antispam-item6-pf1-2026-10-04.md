@@ -3589,7 +3589,16 @@ n = 3 arm (a-r1 excluded).
 - **Low priority, after Phase 2 (18c s104):** `TraderPositions::apply` per
   1k fills is still 0.229 after the C2 fix vs 0.201 / 0.213 before
   `a746c408` (section 29): find what is left of that step when convenient.
-  The Phase 2 +7% gate stays measured against `d3ba3c0a`.
+  The Phase 2 +7% gate stays measured against `d3ba3c0a`. **C2 holder sets
+  (s107, `perf/c2-holder-hashset`):** per-market holder sets as foldhash
+  `HashSet`, sorted only in `holders_with` (ADL). µbench
+  `ubench_trader_positions_apply` (ABBA x3): `apply` 0.881x at 30% of the
+  writes opening / closing a key, 0.944x at 5%, neutral at 0% (control);
+  `ubench_adl` drain unchanged. Node estimate ~0.229 -> ~0.215-0.222 ms per
+  1k fills, not measured in a campaign (phase2 impl review log row 40).
+  18c s107: approved (Codex torus-adversarial: approve, no findings); no
+  separate node bench, the Phase 3 step 0 re-profile reports the apply
+  figure.
 - Native trie maintenance is off by default since `db6c9de` (owner
   decision); only `TORUS_NATIVE_TRIE_MAINTENANCE=1` enables it (section
   12).
