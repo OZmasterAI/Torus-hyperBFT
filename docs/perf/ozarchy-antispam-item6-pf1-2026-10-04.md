@@ -3552,9 +3552,10 @@ n = 3 arm (a-r1 excluded).
   arms again (b-r3 32,320, the other counted cells 25,544-29,536), so per-1k-fill ratios carry a
   denominator effect.
 - **18c decision: accepted** (s107; plan review log row 39). `3efff0d6` (node `0c100f3b`: 186,317
-  matched/s, 5.583 native blk/s at n = 4) is the Phase 3 step 0 baseline. The +0.24 ms per native
-  block of end_resident wait is recorded as a known small R01 cost (flush + applied-marker check);
-  the ~1% matched/s drift (two campaigns, -1.3 sd, spread over both steps) as unresolved.
+  matched/s, 5.583 native blk/s at n = 4) is the Phase 3 step 0 baseline. The end_resident wait is
+  recorded as a known small cost of the `1b389700` -> `3efff0d6` step (+0.24 ms/blk, mostly at R02
+  branches 1-2 + EVM; R01 +0.05 ms); not resolved per step (18c s107, corrected from "R01 cost"
+  after the per-block split above); the ~1% matched/s drift (two campaigns, -1.3 sd, spread over both steps) as unresolved.
   Excluding a-r1 accepted; both tables kept. Next (18c): the Phase 3 step 0 re-profile runs on the
   head Phase 3 builds on (after (d), with R01b if merged), with matched/s reported next to this
   baseline as a third campaign for the drift.
