@@ -16507,14 +16507,33 @@ mod crash_recovery_tests {
         for on in [false, true] {
             let env = run(on, None);
             let classic = run(on, Some((BookMode::Classic, true)));
-            assert_eq!(env.3, Some(vec![0]), "on={on}: env-unset node must run Classic");
-            check(&format!("on={on}: env unset vs explicit knobs, BOOK_ROWS=0"), &env, &classic);
+            assert_eq!(
+                env.3,
+                Some(vec![0]),
+                "on={on}: env-unset node must run Classic"
+            );
+            check(
+                &format!("on={on}: env unset vs explicit knobs, BOOK_ROWS=0"),
+                &env,
+                &classic,
+            );
 
             let mode3 = run(on, Some((BookMode::LevelAuthorityChunked, true)));
             let bench = run(on, Some((BookMode::LevelAuthorityChunked, false)));
-            assert_eq!(bench.3, Some(vec![3]), "on={on}: bench run must write the mode-3 marker");
-            check(&format!("on={on}: explicit mode 3 vs bench"), &mode3, &bench);
-            assert_ne!(env.1, bench.1, "on={on}: Classic and mode-3 roots must differ");
+            assert_eq!(
+                bench.3,
+                Some(vec![3]),
+                "on={on}: bench run must write the mode-3 marker"
+            );
+            check(
+                &format!("on={on}: explicit mode 3 vs bench"),
+                &mode3,
+                &bench,
+            );
+            assert_ne!(
+                env.1, bench.1,
+                "on={on}: Classic and mode-3 roots must differ"
+            );
         }
     }
 
