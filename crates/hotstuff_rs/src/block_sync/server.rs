@@ -83,7 +83,11 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
     }
 
     pub(crate) fn start(mut self) -> JoinHandle<()> {
-        thread::spawn(move || loop {
+        // Named (R01b) so the node's fail-stop panic hook covers it: it reads
+        // the block tree, and a consensus KV read fault panics.
+        thread::Builder::new()
+            .name("hotstuff-syncsv".into())
+            .spawn(move || loop {
             match self.shutdown_signal.try_recv() {
                 Ok(()) => return,
                 Err(TryRecvError::Empty) => (),
@@ -192,6 +196,7 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
 
             thread::yield_now();
         })
+        .expect("spawn the block sync server thread")
     }
 }
 

@@ -88,7 +88,9 @@ impl<N: Network + 'static, K: KVStore> BlockDataServer<N, K> {
             return Served::WrongChain;
         }
         let entry = body_fetch_trace_enabled().then(BodyFetchTraceStamp::capture);
-        // A read error is treated as a miss: the algorithm thread retries it.
+        // Absent (or a non-storage `KVGetError`, e.g. a row that does not
+        // decode) is a miss: the algorithm thread retries it. A storage read
+        // error panics in the KV store (R01b) and fail-stops the node.
         let block = match self.camera.snapshot().block(&req.block_hash) {
             Ok(Some(block)) => block,
             _ => {

@@ -575,6 +575,12 @@ struct ExecutionContext {
     /// block's state or applied marker fails (R01). The execution loop exits
     /// on it and the node stops producing, voting, and finalizing.
     exec_failed: Arc<AtomicBool>,
+    /// R01b D: set by `TorusApp::drop` on a deliberate stop (a drop that is
+    /// not a panic unwinding). The loop reads it when its channel closes:
+    /// unset = the consensus side died (e.g. `hotstuff-algo` panicked on a
+    /// failed consensus write), so it latches `exec_failed` instead of
+    /// exiting as if the node were shutting down.
+    exec_shutdown: Arc<AtomicBool>,
     /// Package D rank 1: local mirror of the `exec_queue_depth` gauge —
     /// incremented on the consensus side before a block enters the exec
     /// channel, decremented here AFTER it executes — so proposer pacing can
@@ -3407,7 +3413,18 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             return;
         }
     }
-    tracing::info!("execution pipeline thread shutting down");
+    // R01b D: the channel closed. Only a deliberate stop sets `exec_shutdown`;
+    // otherwise the consensus side died (its `TorusApp` dropped by a panic) and
+    // the node must fail-stop, not keep answering RPC over frozen state.
+    if ctx.exec_shutdown.load(Ordering::SeqCst) {
+        tracing::info!("execution pipeline thread shutting down");
+    } else {
+        ctx.exec_failed.store(true, Ordering::SeqCst);
+        tracing::error!(
+            "FATAL: execution channel closed without a node shutdown (consensus thread died?) \
+             — latching fail-stop"
+        );
+    }
 }
 
 use crate::kv_store::RocksKVStore;
@@ -3489,6 +3506,9 @@ pub struct TorusApp {
     /// set (never cleared) the node stops producing, voting, and finalizing —
     /// exec-thread death must be a loud halt, not zombie-advance.
     exec_failed: Arc<AtomicBool>,
+    /// R01b D: the deliberate-stop flag shared with the execution thread (see
+    /// `ExecutionContext::exec_shutdown`).
+    exec_shutdown: Arc<AtomicBool>,
     leader_state: Arc<LeaderState>,
     pre_proposal_tx: Option<std::sync::mpsc::SyncSender<PreProposalBundle>>,
     /// RARE pull-fallback transport (Task 6): fetch missing native-action bodies
@@ -4273,6 +4293,13 @@ impl TorusApp {
         // T1.5 fail-stop latch, shared between the execution pipeline thread
         // and the consensus-side TorusApp (see `exec_failed` field docs).
         let exec_failed = Arc::new(AtomicBool::new(false));
+        // R01b D: deliberate-stop flag (see `ExecutionContext::exec_shutdown`).
+        let exec_shutdown = Arc::new(AtomicBool::new(false));
+        // R01b DA (ii): repeated native DA store write failures latch the same
+        // fail-stop (the node binary exits 70 on it).
+        if let Some(ref m) = mempool {
+            m.set_fail_stop_latch(exec_failed.clone());
+        }
 
         // Rank 1: metrics-free exec-backlog mirror, shared with the exec thread
         // (inc at dispatch, dec after execution — see field docs).
@@ -4321,6 +4348,7 @@ impl TorusApp {
                 torus_state::BackgroundCfWriter::spawn(state_db.clone(), "torus-post-flush-writer", 256)
             }),
             exec_failed: exec_failed.clone(),
+            exec_shutdown: exec_shutdown.clone(),
             exec_queue_len: exec_queue_len.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
             trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -4467,6 +4495,7 @@ impl TorusApp {
             exec_tx: Some(exec_tx),
             exec_handle: Some(exec_handle),
             exec_failed,
+            exec_shutdown,
             leader_state,
             pre_proposal_tx: None,
             da_fetcher: None,
@@ -4641,6 +4670,15 @@ impl TorusApp {
     /// alert once the execution pipeline has died).
     pub fn exec_failed_handle(&self) -> Arc<AtomicBool> {
         self.exec_failed.clone()
+    }
+
+    /// Test-only: swap the exec channel's sender. The real execution thread
+    /// is detached on purpose, so this is a deliberate stop of that thread
+    /// (R01b D: sets the shutdown flag so its channel close does not latch).
+    #[cfg(test)]
+    fn replace_exec_tx(&mut self, tx: SyncSender<CommittedBlockMsg>) {
+        self.exec_shutdown.store(true, Ordering::SeqCst);
+        self.exec_tx = Some(tx);
     }
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
@@ -5243,6 +5281,14 @@ impl TorusApp {
 
 impl Drop for TorusApp {
     fn drop(&mut self) {
+        // R01b D: a drop that is not a panic unwinding is a deliberate stop
+        // (node shutdown: `Replica` drop ends `hotstuff-algo` normally; test
+        // teardown). A drop BY an unwind (a `hotstuff-algo` panic, e.g. a
+        // failed consensus write) leaves the flag unset, so the execution
+        // thread latches the fail-stop when its channel closes below.
+        if !std::thread::panicking() {
+            self.exec_shutdown.store(true, Ordering::SeqCst);
+        }
         self.exec_tx.take();
         if let Some(handle) = self.exec_handle.take() {
             let _ = handle.join();
@@ -7301,7 +7347,7 @@ mod exec_dispatch_tests {
         cap: usize,
     ) -> std::sync::mpsc::Receiver<CommittedBlockMsg> {
         let (tx, rx) = std::sync::mpsc::sync_channel(cap);
-        app.exec_tx = Some(tx);
+        app.replace_exec_tx(tx);
         rx
     }
 
@@ -9156,7 +9202,7 @@ mod crash_recovery_tests {
         // exits cleanly on its closed channel).
         let (dead_tx, dead_rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1);
         drop(dead_rx);
-        app.exec_tx = Some(dead_tx);
+        app.replace_exec_tx(dead_tx);
 
         let committed = |height: u64| {
             let datum = bincode::serialize(&make_block(height, vec![])).unwrap();
@@ -9246,7 +9292,7 @@ mod crash_recovery_tests {
 
             let mut app = TorusApp::new(db.clone(), &config, None, None, None);
             let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
-            app.exec_tx = Some(tx);
+            app.replace_exec_tx(tx);
             if observed {
                 let evidence = EquivocationEvidence {
                     view: ViewNumber::new(7),
@@ -11341,6 +11387,7 @@ mod crash_recovery_tests {
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
             exec_failed: Arc::new(AtomicBool::new(false)),
+            exec_shutdown: Arc::new(AtomicBool::new(false)),
             exec_queue_len: Arc::new(AtomicU64::new(0)),
             resident_books: std::sync::Mutex::new(Default::default()),
             trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -14194,7 +14241,7 @@ mod crash_recovery_tests {
 
         // Capture what on_committed_block hands to the execution pipeline.
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
-        app.exec_tx = Some(tx);
+        app.replace_exec_tx(tx);
 
         // A STALE same-height re-proposal cached only 40 of those actions — the
         // devnet "proposer executed 40 of its own 59" state.
@@ -14362,7 +14409,7 @@ mod crash_recovery_tests {
         ));
         let mut app = TorusApp::new(state_db.clone(), config, None, Some(mempool.clone()), None);
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
-        app.exec_tx = Some(tx);
+        app.replace_exec_tx(tx);
         (app, rx, mempool)
     }
 
@@ -15489,6 +15536,60 @@ mod crash_recovery_tests {
         );
         assert!(latch.load(Ordering::SeqCst));
         r01_assert_nothing_durable_from(&db, 3);
+    }
+
+    /// R01b D: the exec channel closing while the node is NOT stopping (the
+    /// consensus thread died and its `TorusApp` was dropped by the unwind)
+    /// latches the fail-stop. RED on main: the loop logged "shutting down".
+    #[test]
+    fn r01b_exec_channel_close_without_shutdown_latches() {
+        let (config, db) = make_test_config_and_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let latch = ctx.exec_failed.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1);
+        let handle = std::thread::spawn(move || execution_loop(rx, ctx));
+        drop(tx);
+        handle.join().unwrap();
+        assert!(latch.load(Ordering::SeqCst), "an unexplained channel close must fail-stop");
+    }
+
+    /// R01b D: the same close after a deliberate stop does not latch.
+    #[test]
+    fn r01b_exec_channel_close_after_shutdown_does_not_latch() {
+        let (config, db) = make_test_config_and_db();
+        let ctx = make_exec_ctx(&config, &db);
+        let latch = ctx.exec_failed.clone();
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1);
+        let handle = std::thread::spawn(move || execution_loop(rx, ctx));
+        drop(tx);
+        handle.join().unwrap();
+        assert!(!latch.load(Ordering::SeqCst));
+    }
+
+    /// R01b D: a `TorusApp` dropped normally (node shutdown, test teardown)
+    /// stops the execution thread without latching.
+    #[test]
+    fn r01b_torus_app_normal_drop_does_not_latch() {
+        let app = TorusApp::stub();
+        let latch = app.exec_failed_handle();
+        drop(app); // joins the execution thread
+        assert!(!latch.load(Ordering::SeqCst));
+    }
+
+    /// R01b D: a `TorusApp` dropped by a panic unwinding its thread (the
+    /// `hotstuff-algo` case: a failed consensus write) latches the fail-stop
+    /// once the execution thread sees its channel close.
+    #[test]
+    fn r01b_torus_app_dropped_by_unwind_latches() {
+        let app = TorusApp::stub();
+        let latch = app.exec_failed_handle();
+        let t = std::thread::spawn(move || {
+            let _app = app;
+            panic!("simulated consensus write failure");
+        });
+        assert!(t.join().is_err());
+        assert!(latch.load(Ordering::SeqCst), "consensus-thread death must fail-stop");
     }
 
     /// R01 regression guard: an EVM block whose flush fails still fail-stops

@@ -133,6 +133,11 @@ const DA_MIRROR_BATCH_MAX: usize = 128;
 /// ... or once the oldest pending body has waited this long.
 const DA_MIRROR_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// R01b DA (ii): consecutive DA store write failures (any mirror path) that
+/// latch the node fail-stop. One or two can be a transient error the re-queue
+/// retries; a third in a row means the store refuses writes.
+const DA_FAIL_STOP_AFTER: u32 = 3;
+
 /// Buffered ingress DA mirrors awaiting a coalesced flush (T2.2).
 struct PendingDaMirrors {
     actions: Vec<SignedNativeAction>,
@@ -155,6 +160,14 @@ pub struct Mempool {
     /// for a later flush to retry — never silently dropped — and this counter
     /// surfaces the (rare) durability retries for ops/telemetry.
     da_flush_failures: std::sync::atomic::AtomicU64,
+    /// R01b DA (ii): DA store writes (bodies and shards) that failed IN A ROW
+    /// (reset by a successful write; see `account_da_write`). At [`DA_FAIL_STOP_AFTER`] the
+    /// node fail-stop latch is set: a store that keeps refusing writes (full
+    /// disk, read-only fs) would otherwise leave a node that only re-queues.
+    da_write_failures_in_a_row: std::sync::atomic::AtomicU32,
+    /// R01b DA (ii): the node's fail-stop latch (`TorusApp`'s `exec_failed`),
+    /// set once at startup. Unset (tests, rpc-only) = count and log only.
+    fail_stop: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     config: MempoolConfig,
     /// Current base fee in wei — the D4 admission/drain fee floor. Written from
     /// committed block headers; read on every add_evm_tx and drain.
@@ -214,6 +227,8 @@ impl Mempool {
                 first_at: None,
             }),
             da_flush_failures: std::sync::atomic::AtomicU64::new(0),
+            da_write_failures_in_a_row: std::sync::atomic::AtomicU32::new(0),
+            fail_stop: std::sync::OnceLock::new(),
             config,
             current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
@@ -1060,7 +1075,14 @@ impl Mempool {
     /// One atomic WriteBatch + one arrival-notifier wake for the whole block —
     /// this runs on the leader's produce_block critical path (S395).
     pub fn mirror_native_to_da(&self, actions: &[SignedNativeAction]) -> Result<(), StateError> {
-        if let Err(e) = self.da_store.put_batch(actions) {
+        // R01b: nothing to write is not a write; it must not touch the
+        // failure streak.
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let result = self.da_store.put_batch(actions);
+        self.account_da_write(&result);
+        if let Err(e) = result {
             tracing::error!("native DA store batch write failed: {e}");
             // S459: parity with `flush_da_mirrors`/`mirror_to_da` — a proposer/validator
             // durability write must never be silently dropped. Re-queue for a later
@@ -1134,7 +1156,13 @@ impl Mempool {
         actions: &[SignedNativeAction],
         params: ErasureParams,
     ) -> Result<(), StateError> {
-        self.da_store.put_shards_batch(actions, params)
+        // R01b: a shard write is a DA store write; counted like the bodies.
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let result = self.da_store.put_shards_batch(actions, params);
+        self.account_da_write(&result);
+        result
     }
 
     /// Best-effort durable mirror of one native-action body, COALESCED (T2.2):
@@ -1165,7 +1193,9 @@ impl Mempool {
             }
         };
         if let Some(actions) = flush {
-            if let Err(e) = self.da_store.put_batch(&actions) {
+            let result = self.da_store.put_batch(&actions);
+            self.account_da_write(&result);
+            if let Err(e) = result {
                 tracing::error!("native DA store batch write failed: {e}");
                 // T2 hardening: a failed batch is re-queued, never dropped — its
                 // actions are still selectable and their bodies must stay durable.
@@ -1188,7 +1218,9 @@ impl Mempool {
             pending.first_at = None;
             std::mem::take(&mut pending.actions)
         };
-        if let Err(e) = self.da_store.put_batch(&actions) {
+        let result = self.da_store.put_batch(&actions);
+        self.account_da_write(&result);
+        if let Err(e) = result {
             tracing::error!("native DA store batch write failed: {e}");
             // T2 hardening: on a durable-write failure the taken batch would
             // otherwise be lost while its pool entries stay selectable. Re-queue
@@ -1220,6 +1252,39 @@ impl Mempool {
         pending.actions = actions;
         if pending.first_at.is_none() {
             pending.first_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// R01b DA (ii): install the node's fail-stop latch (set once; a second
+    /// call is ignored). See `da_write_failures_in_a_row`.
+    pub fn set_fail_stop_latch(&self, latch: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let _ = self.fail_stop.set(latch);
+    }
+
+    /// R01b DA (ii): the ONE accounting point for every DA store write (body
+    /// mirrors: `mirror_native_to_da`, `mirror_to_da`, `flush_da_mirrors`;
+    /// shard custody: `mirror_native_shards`). Call it only for a write that
+    /// was attempted (non-empty). `Ok` resets the streak; a storage error
+    /// counts and at [`DA_FAIL_STOP_AFTER`] in a row latches the fail-stop.
+    /// `InvalidData` (encode / params, before anything reaches the store) is
+    /// not a store fault and leaves the streak as it is.
+    fn account_da_write(&self, result: &Result<(), StateError>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        match result {
+            Ok(()) => self.da_write_failures_in_a_row.store(0, SeqCst),
+            Err(StateError::InvalidData(_)) => {}
+            Err(_) => {
+                let in_a_row = self.da_write_failures_in_a_row.fetch_add(1, SeqCst) + 1;
+                if in_a_row >= DA_FAIL_STOP_AFTER {
+                    tracing::error!(
+                        in_a_row,
+                        "FATAL: native DA store writes keep failing — latching fail-stop"
+                    );
+                    if let Some(latch) = self.fail_stop.get() {
+                        latch.store(true, SeqCst);
+                    }
+                }
+            }
         }
     }
 
@@ -2156,6 +2221,160 @@ mod tests {
             vec![hashes[1]],
             "only the absent body is re-queued"
         );
+    }
+
+    /// R01b DA (ii): 3 CONSECUTIVE DA store write failures, across the mirror
+    /// paths, latch the node's fail-stop; 2 do not. Read-only store = every
+    /// `put_batch` fails for real.
+    #[test]
+    fn r01b_three_consecutive_da_write_failures_latch_fail_stop() {
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        drop(StateDb::open(dir.path()).unwrap());
+        let pool = Mempool::new(
+            StateDb::open_read_only(dir.path()).unwrap(),
+            MempoolConfig::default(),
+        );
+        let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pool.set_fail_stop_latch(latch.clone());
+        let latched = || latch.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(pool
+            .mirror_native_to_da(std::slice::from_ref(&action))
+            .is_err());
+        pool.flush_da_mirrors();
+        assert!(!latched(), "2 consecutive failures must not latch");
+        pool.flush_da_mirrors();
+        assert!(
+            latched(),
+            "the 3rd consecutive failure must latch the fail-stop"
+        );
+    }
+
+    /// R01b (review): a read-only pool with the fail-stop latch installed, and
+    /// one signed action.
+    fn r01b_failing_pool() -> (
+        tempfile::TempDir,
+        Mempool,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        SignedNativeAction,
+    ) {
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        drop(StateDb::open(dir.path()).unwrap());
+        let pool = Mempool::new(
+            StateDb::open_read_only(dir.path()).unwrap(),
+            MempoolConfig::default(),
+        );
+        let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pool.set_fail_stop_latch(latch.clone());
+        (dir, pool, latch, action)
+    }
+
+    /// R01b (review P2-1): empty mirror calls write nothing, so they must not
+    /// reset the failure streak (they used to: 6 real failures, no latch).
+    #[test]
+    fn r01b_empty_da_calls_do_not_reset_failure_streak() {
+        let (_dir, pool, latch, action) = r01b_failing_pool();
+        let latched = || latch.load(std::sync::atomic::Ordering::SeqCst);
+        let empty_calls = || {
+            assert!(pool.mirror_native_to_da(&[]).is_ok());
+            pool.reinsert_native(Vec::new());
+            assert!(pool
+                .mirror_native_shards(&[], ErasureParams::new(2, 3))
+                .is_ok());
+        };
+        assert!(pool
+            .mirror_native_to_da(std::slice::from_ref(&action))
+            .is_err());
+        empty_calls();
+        pool.flush_da_mirrors(); // retries the re-queued body: 2nd failure
+        empty_calls();
+        assert!(!latched());
+        pool.flush_da_mirrors(); // 3rd failure
+        assert!(
+            latched(),
+            "empty calls between failures must not hide a broken store"
+        );
+    }
+
+    /// R01b (review P2-2): shard custody writes are DA store writes too: 3
+    /// failures in a row latch.
+    #[test]
+    fn r01b_three_shard_write_failures_latch() {
+        let (_dir, pool, latch, action) = r01b_failing_pool();
+        let latched = || latch.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            assert!(pool
+                .mirror_native_shards(std::slice::from_ref(&action), ErasureParams::new(2, 3))
+                .is_err());
+        }
+        assert!(!latched());
+        assert!(pool
+            .mirror_native_shards(std::slice::from_ref(&action), ErasureParams::new(2, 3))
+            .is_err());
+        assert!(latched(), "3 shard write failures in a row must latch");
+    }
+
+    /// R01b DA (ii): a successful DA write resets the consecutive count.
+    #[test]
+    fn r01b_da_write_success_resets_failure_count() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, MempoolConfig::default());
+        let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pool.set_fail_stop_latch(latch.clone());
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let action = torus_types::eip712::sign_native_action(
+            torus_types::NativeAction::ClaimRewards,
+            now_ms(),
+            &key,
+        );
+        let fail =
+            || pool.account_da_write(&Err(StateError::Io(std::io::Error::other("injected"))));
+        // Two failures...
+        fail();
+        fail();
+        // ...a real successful store write...
+        assert!(pool
+            .mirror_native_to_da(std::slice::from_ref(&action))
+            .is_ok());
+        // ...so two more failures are again only two in a row.
+        fail();
+        fail();
+        assert!(!latch.load(std::sync::atomic::Ordering::SeqCst));
+        // A non-store error (encode / params) neither counts nor resets.
+        pool.account_da_write(&Err(StateError::InvalidData("bad params".into())));
+        assert!(!latch.load(std::sync::atomic::Ordering::SeqCst));
+        fail();
+        assert!(latch.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// The re-queued (failed) batch is the OLDEST pending work, so it must land at

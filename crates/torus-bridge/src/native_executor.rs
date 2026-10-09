@@ -7411,7 +7411,10 @@ impl NativeExecutor {
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 let cfg = margin_configs.get(&mbr.market_id);
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // R01b: RECOVERED (sequential fallback below), and with one
+                // chunk this runs on `torus-execution` itself, so it must not
+                // trip the node's fail-stop panic hook.
+                crate::panic_scope::catch_recoverable(|| {
                     Self::compute_market_settle_plan(
                         positions,
                         cfg,
@@ -7419,7 +7422,7 @@ impl NativeExecutor {
                         prepared,
                         record_fills,
                     )
-                }))
+                })
                 .map_err(|payload| {
                     if let Some(s) = payload.downcast_ref::<&'static str>() {
                         (*s).to_string()
