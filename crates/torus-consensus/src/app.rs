@@ -16400,6 +16400,56 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Plan 9.13: a fresh-genesis node on the compiled defaults (env UNSET:
+    /// the production `new_env` path, `test_book_mode` None) writes exactly
+    /// what the bench node writes with `TORUS_BOOK_ROWS=3` +
+    /// `TORUS_RESIDENT_BOOKS=1` (`book_pipeline_ctx` in mode 3): same running
+    /// state hash, same native root, same rows in every CF, serial and
+    /// pipelined; and the DB carries the mode-3 marker.
+    #[test]
+    fn env_unset_compiled_defaults_equal_the_bench_config() {
+        use torus_bridge::native_executor::BookMode;
+        for k in ["TORUS_BOOK_ROWS", "TORUS_RESIDENT_BOOKS"] {
+            assert!(std::env::var(k).is_err(), "{k} must be unset for this test");
+        }
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let run = |on: bool, bench: bool| {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_book_fixture(&state_db);
+            torus_state::running_hash::capture_begin(&state_db);
+            let ctx = if bench {
+                book_pipeline_ctx(&state_db, on, None, BookMode::LevelAuthorityChunked)
+            } else {
+                pipeline_ctx(&state_db, on, None)
+            };
+            for b in &book_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+            drop(ctx);
+            let _ = torus_state::running_hash::capture_take(&state_db);
+            let hash = torus_state::running_hash::read_running_hash(&state_db);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            let marker = StateBackend::get_cf_raw(
+                &state_db,
+                torus_state::cf::CF_NATIVE_MARKETS,
+                b"__book_mode__",
+            )
+            .unwrap();
+            (hash, root, dump_all_cfs(&state_db), marker)
+        };
+        for on in [false, true] {
+            let (h_env, r_env, d_env, m_env) = run(on, false);
+            let (h_bench, r_bench, d_bench, m_bench) = run(on, true);
+            assert_eq!(m_bench, Some(vec![3]), "bench run must write the mode-3 marker");
+            assert_eq!(m_env, m_bench, "on={on}: env-unset node must run mode 3");
+            assert!(h_env.is_some(), "on={on}: running hash written");
+            assert_eq!(h_env, h_bench, "on={on}: running state hash");
+            assert_eq!(r_env, r_bench, "on={on}: native root");
+            assert_dumps_equal(&d_env, &d_bench, &format!("on={on}: env unset vs bench"));
+        }
+    }
+
     const KECCAK_EMPTY_CODE: B256 = B256::new([
         0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03,
         0xc0, 0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85,

@@ -2761,9 +2761,18 @@ fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order)
 mod book_rows_toggle_tests {
     use super::{parse_book_rows_mode, BookMode};
 
+    /// 9.13: unset = the benched mode 3 (chunked level authority).
     #[test]
-    fn default_is_classic() {
-        assert_eq!(parse_book_rows_mode(None), BookMode::Classic);
+    fn default_is_level_authority_chunked() {
+        assert_eq!(parse_book_rows_mode(None), BookMode::LevelAuthorityChunked);
+        assert_eq!(parse_book_rows_mode(None), parse_book_rows_mode(Some("3".to_string())));
+    }
+
+    /// `"0"` is the explicit Classic switch (the pre-9.13 default layout).
+    #[test]
+    fn zero_is_classic() {
+        assert_eq!(parse_book_rows_mode(Some("0".to_string())), BookMode::Classic);
+        assert_eq!(parse_book_rows_mode(Some(" 0 ".to_string())), BookMode::Classic);
     }
 
     #[test]
@@ -2809,10 +2818,16 @@ mod book_rows_toggle_tests {
         assert_eq!(bytes.len(), 4);
     }
 
+    /// Anything else falls back to the default (mode 3); a DB written in
+    /// another mode then fail-stops at the marker / content check.
     #[test]
-    fn anything_else_stays_classic() {
-        for v in ["0", "true", "on", "", "yes", "4", "12", "level"] {
-            assert_eq!(parse_book_rows_mode(Some(v.to_string())), BookMode::Classic, "{v}");
+    fn anything_else_is_the_default() {
+        for v in ["true", "on", "", "yes", "4", "12", "level"] {
+            assert_eq!(
+                parse_book_rows_mode(Some(v.to_string())),
+                BookMode::LevelAuthorityChunked,
+                "{v}"
+            );
         }
     }
 }
