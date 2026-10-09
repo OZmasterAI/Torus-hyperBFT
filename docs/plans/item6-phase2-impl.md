@@ -734,12 +734,18 @@ genesis; row 22); the defaults branch after Phase 2.
 pipelined write, `RESIDENT_BOOKS`, `NATIVE_ROOT_CACHE`, `PARALLEL_SETTLE`, member cache 256 MB:
 node-local, value-neutral (RocksDB write scheduling / caches with root self-check / differential
 tests `root_cache_tests`, `resident_books_tests`, `parallel_settle_tests`), default on, `=0` keeps
-each old path unchanged. `BUCKET_HASH=8` was already the compiled default. `BOOK_ROWS=3`:
-consensus-visible (state-root format), default now mode 3, `=0` = Classic; an existing DB written in
-another mode fail-stops at the `__book_mode__` marker / content check (`fail_stop_matrix_all_mode_pairs`,
-`book_mode_marker_catches_wrong_flag_on_empty_books`); env unset = the bench config in running hash,
-native root and every CF (`env_unset_compiled_defaults_equal_the_bench_config`). Fleet-uniform: an old
-binary (Classic default) and a new one on the same chain fork. **`COMMIT_LAG_BACKOFF_CAP` not
+each old path unchanged. `BUCKET_HASH=8` was already the compiled default. **`BOOK_ROWS` stays
+Classic by default** (18c s107, after the adversarial Codex review; the mode-3 default commit
+`f80ef36c` is reverted): the book mode is consensus-visible (state-root format) but genesis carries no
+book mode, so a compiled default flip forks a mixed-binary fleet on the same fresh genesis, and the
+`__book_mode__` marker cannot see the disagreement before the DB has history (the s450 ship-blocker).
+Mode 3 runs only when set (`TORUS_BOOK_ROWS=3`, as `RECORD_ENV` does).
+`env_unset_compiled_defaults_equal_the_bench_config`: env unset = the explicit knobs with
+`BOOK_ROWS=0`, and explicit mode 3 = the bench config, in running hash, native root, every CF and the
+marker, serial and pipelined. Mode 3 as the default needs the book mode in genesis first (owner
+decision pending). If approved: its own branch, bundled with the reduce-only sweep fix's fresh genesis;
+first step = check the s450 mode-2 test gaps against mode 3 (resident path re-verify, match-workers
+state-root determinism, multi-market chunking). **`COMMIT_LAG_BACKOFF_CAP` not
 changed:** a genesis parameter (`chain_config.commit_lag_backoff_cap`, consensus-liveness, the env is
 a devnet override over genesis, `torus-node/src/main.rs` `resolve_commit_lag_cap`); a compiled env
 default would override every genesis value. Set `commit_lag_backoff_cap: 8` in the testnet genesis

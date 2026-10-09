@@ -77,8 +77,10 @@ python3 tools/matched-bench/test_harness.py
    `EXTRA_ENV='TORUS_BOOK_ROWS=2'` for a mode-2 control) — ambient
    `TORUS_*` vars are unset first, `EXTRA_ENV` is applied last (so it overrides).
    Since plan 9.13 (`feat/compiled-defaults`) the node's compiled defaults equal
-   these values except `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default
-   0); the explicit export is kept so older binaries run the same configuration.
+   these values except `TORUS_BOOK_ROWS` (consensus-visible, stays Classic until
+   the book mode is in genesis; the cell needs the explicit `=3`) and
+   `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default 0); the other
+   exports are kept so older binaries run the same configuration.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
    bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,
