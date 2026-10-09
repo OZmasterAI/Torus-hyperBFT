@@ -426,6 +426,34 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p22g-300m-p25-r1` | OK | 2026-10-09 03:07 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 190,714.8 | 189,834.1 | 204,010.7 | 253,241.3 | 5.8 | 130.7 | 135.15 | 3.98 | AGREE | PASS | ACCEPT |
 | `ozarchy-p22g-300m-p25-r2` | OK | 2026-10-09 03:26 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 189,881.2 | 188,869.5 | 197,942.2 | 251,612.5 | 5.6 | 137.1 | 138.33 | 3.97 | AGREE | PASS | ACCEPT |
 
+## p3s0: R01/R02 cost check and Phase 3 step 0 baseline: B main `3efff0d6` vs A `perf/item6-phase2` `1b389700`, a-warm A B B A; `a-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p3s0-300m-a-r1` | OK | 2026-10-09 07:33 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 189,568.9 | 188,127.0 | 199,692.8 | 251,350.7 | 5.7 | 127.1 | 133.27 | 4.03 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-a-r2` | OK | 2026-10-09 07:53 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 188,913.8 | 189,086.4 | 198,447.4 | 250,089.5 | 5.8 | 129.6 | 133.00 | 4.04 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-a-warm` | OK | 2026-10-09 07:28 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 60 | 400 | - | 182,494.8 | 182,494.8 | 194,769.2 | 241,366.7 | 5.0 | 101.2 | 127.57 | 4.03 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-b-r1` | OK | 2026-10-09 07:40 | p3s0-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 189,484.7 | 188,672.2 | 200,912.7 | 251,079.1 | 5.5 | 138.4 | 141.27 | 3.95 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-b-r2` | OK | 2026-10-09 07:46 | p3s0-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 184,665.7 | 184,707.4 | 199,734.5 | 245,023.7 | 5.6 | 134.4 | 146.60 | 4.03 | AGREE | PASS | ACCEPT |
+
+## p3s1: R01 / R02 split of the p3s0 step: A `perf/item6-phase2` `1b389700`, B `3aa516e0` (+ R02 + EVM typing), C main `3efff0d6` (+ R01), a-warm then rounds ABC BCA CAB ACB; `a-warm` excluded, `a-r1` an outlier excluded from the main tables
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p3s1-300m-a-r1` | OK | 2026-10-09 09:31 | p3s1-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 172,337.6 | 172,004.9 | 198,132.4 | 227,576.4 | 4.3 | 135.2 | 157.73 | 3.90 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-a-r2` | OK | 2026-10-09 10:01 | p3s1-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 190,894.1 | 189,353.5 | 201,078.6 | 253,147.6 | 5.7 | 127.9 | 137.31 | 3.98 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-a-r3` | OK | 2026-10-09 10:15 | p3s1-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 189,614.1 | 188,591.3 | 201,017.4 | 251,931.0 | 5.6 | 136.3 | 140.46 | 3.93 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-a-r4` | OK | 2026-10-09 10:28 | p3s1-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 186,557.0 | 185,676.0 | 197,116.6 | 248,463.7 | 5.4 | 131.2 | 144.44 | 3.99 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-a-warm` | OK | 2026-10-09 09:25 | p3s1-1b389700 @ 1b389700 | 86477b00 | 300 | 60 | 400 | - | 189,574.8 | 189,574.8 | 201,876.0 | 251,474.6 | 4.9 | 112.2 | 125.57 | 3.91 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-b-r1` | OK | 2026-10-09 09:36 | p3s1-3aa516e0 @ 3aa516e0 | db344840 | 300 | 120 | 400 | - | 186,859.2 | 186,463.1 | 196,504.1 | 248,268.9 | 5.6 | 125.5 | 133.09 | 4.00 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-b-r2` | OK | 2026-10-09 09:49 | p3s1-3aa516e0 @ 3aa516e0 | db344840 | 300 | 120 | 400 | - | 186,917.3 | 185,757.2 | 202,202.0 | 248,134.8 | 5.7 | 126.9 | 135.95 | 4.02 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-b-r3` | OK | 2026-10-09 10:21 | p3s1-3aa516e0 @ 3aa516e0 | db344840 | 300 | 120 | 400 | - | 187,294.7 | 187,533.6 | 201,181.4 | 247,669.8 | 5.0 | 144.5 | 162.80 | 4.03 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-b-r4` | OK | 2026-10-09 10:40 | p3s1-3aa516e0 @ 3aa516e0 | db344840 | 300 | 120 | 400 | - | 189,383.2 | 189,034.9 | 203,190.8 | 251,127.8 | 5.6 | 141.3 | 148.50 | 3.94 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-c-r1` | OK | 2026-10-09 09:43 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 184,014.7 | 183,392.0 | 195,136.4 | 244,345.5 | 5.5 | 132.2 | 139.94 | 4.05 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-c-r2` | OK | 2026-10-09 09:55 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 188,821.0 | 187,353.9 | 201,560.1 | 250,454.4 | 5.9 | 128.2 | 129.31 | 3.94 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-c-r3` | OK | 2026-10-09 10:08 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 186,727.4 | 185,108.9 | 199,068.1 | 247,741.1 | 5.7 | 132.3 | 135.06 | 4.01 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s1-300m-c-r4` | OK | 2026-10-09 10:34 | p3s1-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 185,702.9 | 184,722.6 | 197,846.6 | 246,303.7 | 5.2 | 132.8 | 142.47 | 4.05 | AGREE | PASS | ACCEPT |
+
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
