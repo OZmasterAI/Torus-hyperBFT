@@ -476,10 +476,10 @@ struct MarketSettlePlan {
     volumes: VolumeCache,
 }
 
-/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
-/// path; anything else (INCLUDING UNSET) keeps today's sequential loop.
-/// Default OFF — unset env is byte-identical to the pre-C3 serial semantics.
-/// Read once per process.
+/// C3 runtime toggle for the parallel settle path. Default ON (plan 9.13:
+/// compiled defaults = the benched configuration); `TORUS_PARALLEL_SETTLE=0`
+/// keeps the sequential loop (byte-identical state either way). Read once per
+/// process.
 fn parallel_settle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -487,11 +487,10 @@ fn parallel_settle_enabled() -> bool {
     })
 }
 
-/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"1"` enables the
-/// parallel path (exact-today default — unset/`"0"`/garbage all mean the
-/// classic sequential settle loop).
+/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"0"` disables
+/// (the sequential settle loop); unset / anything else = on.
 fn parse_parallel_settle_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// C3 auto-mode work gate: parallel settle pays a thread scope + plan handoff,
@@ -540,9 +539,10 @@ fn settle_worker_cap() -> usize {
 mod parallel_settle_toggle_tests {
     use super::parse_parallel_settle_toggle;
 
+    /// 9.13: unset = the benched configuration (on).
     #[test]
-    fn default_is_off() {
-        assert!(!parse_parallel_settle_toggle(None));
+    fn default_is_on() {
+        assert!(parse_parallel_settle_toggle(None));
     }
 
     #[test]
@@ -551,10 +551,18 @@ mod parallel_settle_toggle_tests {
         assert!(parse_parallel_settle_toggle(Some(" 1 ".to_string())));
     }
 
+    /// `"0"` is the explicit off switch (the pre-9.13 default path).
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
+    fn zero_disables() {
+        assert!(!parse_parallel_settle_toggle(Some("0".to_string())));
+        assert!(!parse_parallel_settle_toggle(Some(" 0 ".to_string())));
+    }
+
+    /// Anything else falls back to the default (on).
+    #[test]
+    fn anything_else_is_the_default() {
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_parallel_settle_toggle(Some(v.to_string())), "{v}");
         }
     }
 }
@@ -2224,6 +2232,11 @@ mod parallel_engine_toggle_tests {
 //     ctx.fatal_error) when the CF's on-disk content OR the node-local
 //     `__book_mode__` marker does not match the configured mode.
 // Default (unset/other) = Classic = byte-identical persistence to today.
+// Classic stays the default (plan 9.13, 18c s107 after an adversarial review):
+// genesis carries no book mode, so a compiled default flip would fork a
+// mixed-binary fleet on the same fresh genesis (the `__book_mode__` marker only
+// catches a mismatch against a DB that already has history). Mode 3 as the
+// default needs the book mode in genesis first.
 // ###########################################################################
 //
 // Row schema: see `torus_core::book_rows` (frozen key/value layouts; level
@@ -2767,9 +2780,28 @@ fn parse_book_order_row(v: &[u8]) -> Result<(u64, torus_core::order_book::Order)
 mod book_rows_toggle_tests {
     use super::{parse_book_rows_mode, BookMode};
 
+    /// Unset = Classic (consensus-visible: stays the default until the book
+    /// mode is in genesis; plan 9.13, 18c s107). Mode 3 only when set.
     #[test]
     fn default_is_classic() {
         assert_eq!(parse_book_rows_mode(None), BookMode::Classic);
+        assert_ne!(
+            parse_book_rows_mode(None),
+            parse_book_rows_mode(Some("3".to_string()))
+        );
+    }
+
+    /// `"0"` is the explicit Classic switch (same layout as unset).
+    #[test]
+    fn zero_is_classic() {
+        assert_eq!(
+            parse_book_rows_mode(Some("0".to_string())),
+            BookMode::Classic
+        );
+        assert_eq!(
+            parse_book_rows_mode(Some(" 0 ".to_string())),
+            BookMode::Classic
+        );
     }
 
     #[test]
@@ -2815,10 +2847,15 @@ mod book_rows_toggle_tests {
         assert_eq!(bytes.len(), 4);
     }
 
+    /// Anything else falls back to the default (Classic).
     #[test]
     fn anything_else_stays_classic() {
-        for v in ["0", "true", "on", "", "yes", "4", "12", "level"] {
-            assert_eq!(parse_book_rows_mode(Some(v.to_string())), BookMode::Classic, "{v}");
+        for v in ["true", "on", "", "yes", "4", "12", "level"] {
+            assert_eq!(
+                parse_book_rows_mode(Some(v.to_string())),
+                BookMode::Classic,
+                "{v}"
+            );
         }
     }
 }
@@ -2867,16 +2904,17 @@ mod book_rows_toggle_tests {
 // block_height=379 → 377/378 were empty) and forced a multi-second full
 // reload. Only a direct successor advances; anything else drains the holder.
 
-/// rank8 runtime toggle: `TORUS_RESIDENT_BOOKS=1` enables resident books;
-/// anything else (INCLUDING UNSET) keeps the per-block reload — exact-today.
+/// rank8 runtime toggle for resident books. Default ON (plan 9.13: compiled
+/// defaults = the benched configuration); `TORUS_RESIDENT_BOOKS=0` keeps the
+/// per-block reload, the pre-9.13 path unchanged.
 fn resident_books_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_resident_books_toggle(std::env::var("TORUS_RESIDENT_BOOKS").ok()))
 }
 
-/// Pure parse of the `TORUS_RESIDENT_BOOKS` value: only `"1"` enables.
+/// Pure parse of the `TORUS_RESIDENT_BOOKS` value: only `"0"` disables.
 fn parse_resident_books_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// bl1 resident-books-untouched-advance kill-switch:
@@ -3708,9 +3746,10 @@ mod end_resident_worker_tests;
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
 
+    /// 9.13: unset = the benched configuration (on).
     #[test]
-    fn default_is_off() {
-        assert!(!parse_resident_books_toggle(None));
+    fn default_is_on() {
+        assert!(parse_resident_books_toggle(None));
     }
 
     #[test]
@@ -3719,10 +3758,18 @@ mod resident_books_toggle_tests {
         assert!(parse_resident_books_toggle(Some(" 1 ".to_string())));
     }
 
+    /// `"0"` is the explicit off switch (the pre-9.13 default path).
     #[test]
-    fn anything_else_stays_off() {
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_resident_books_toggle(Some(v.to_string())), "{v}");
+    fn zero_disables() {
+        assert!(!parse_resident_books_toggle(Some("0".to_string())));
+        assert!(!parse_resident_books_toggle(Some(" 0 ".to_string())));
+    }
+
+    /// Anything else falls back to the default (on).
+    #[test]
+    fn anything_else_is_the_default() {
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_resident_books_toggle(Some(v.to_string())), "{v}");
         }
     }
 }
@@ -4135,7 +4182,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// rank8 live-node entry: every mode from env (`TORUS_BOOK_ROWS`,
     /// `TORUS_RESIDENT_BOOKS`). The caller owns the cross-block holder; with
-    /// `TORUS_RESIDENT_BOOKS` unset this is exactly [`Self::new`] and the
+    /// `TORUS_RESIDENT_BOOKS=0` this is exactly [`Self::new`] and the
     /// holder is never touched.
     #[allow(clippy::too_many_arguments)]
     pub fn new_env(

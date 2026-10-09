@@ -415,18 +415,19 @@ pub fn persisted_native_root(db: &StateDb) -> Result<B256, StateError> {
 // not the trie) do not invalidate it. The cache mutates only after the
 // atomic batch containing the ops commits; any flush error invalidates.
 
-/// Runtime toggle: `TORUS_NATIVE_ROOT_CACHE=1` enables the in-RAM node cache
-/// + clean-write elision; anything else (INCLUDING UNSET) runs the persisted-
-/// node path exactly as today. Read once per process.
+/// Runtime toggle for the in-RAM node cache + clean-write elision. Default ON
+/// (plan 9.13: compiled defaults = the benched configuration);
+/// `TORUS_NATIVE_ROOT_CACHE=0` runs the persisted-node path unchanged. Read
+/// once per process.
 pub fn native_root_cache_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
         .get_or_init(|| parse_native_root_cache_toggle(std::env::var("TORUS_NATIVE_ROOT_CACHE").ok()))
 }
 
-/// Pure parse: only `"1"` enables.
+/// Pure parse: only `"0"` disables.
 fn parse_native_root_cache_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// rank-root: cross-block in-RAM image of the persisted native trie.
@@ -634,7 +635,8 @@ fn read_bucket_members(db: &StateDb, bucket: u16) -> Result<Members, StateError>
 // + path) and are node-local + VALUE-NEUTRAL (persisted bytes AND the root are
 // byte-identical to the serial/uncached path for any input). The parallel
 // rehash defaults ON at [`DEFAULT_BUCKET_HASH_THREADS`] workers (matched-200k
-// r5 sweep); the member cache still defaults OFF.
+// r5 sweep); the member cache defaults ON at [`DEFAULT_MEMBER_CACHE_MB`]
+// (plan 9.13).
 //
 // PARALLELISM & DETERMINISM: dirty buckets are independent, so each bucket's
 // member-merge + leaf hash is computed on a worker thread (scoped threads — the
@@ -721,9 +723,13 @@ fn parse_bucket_hash_min_buckets(v: Option<String>) -> usize {
     }
 }
 
+/// Compiled default for `TORUS_BUCKET_MEMBER_CACHE_MB` (unset / garbage): the
+/// benched value (plan 9.13, `run-cell.sh` `RECORD_ENV`).
+pub const DEFAULT_MEMBER_CACHE_MB: usize = 256;
+
 /// `TORUS_BUCKET_MEMBER_CACHE_MB` = RAM budget (MB) for the bucket-member cache.
-/// `>= 1` enables; unset / `"0"` / garbage → `0` (disabled = exact-today). Read
-/// once per process.
+/// `>= 1` = that budget; `"0"` disables (the uncached path); unset / garbage →
+/// [`DEFAULT_MEMBER_CACHE_MB`]. Read once per process.
 pub fn member_cache_budget_bytes() -> usize {
     static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *B.get_or_init(|| parse_member_cache_mb(std::env::var("TORUS_BUCKET_MEMBER_CACHE_MB").ok()))
@@ -731,10 +737,12 @@ pub fn member_cache_budget_bytes() -> usize {
 
 /// Pure parse for [`member_cache_budget_bytes`].
 fn parse_member_cache_mb(v: Option<String>) -> usize {
-    match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
-        Some(mb) if mb >= 1 => mb.saturating_mul(1024 * 1024),
-        _ => 0,
-    }
+    let mb = v
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MEMBER_CACHE_MB);
+    mb.saturating_mul(1024 * 1024)
 }
 
 /// Per-member RAM proxy added to key+value bytes (BTreeMap node + two Vec
@@ -1845,13 +1853,16 @@ mod tests {
 
     // ---- rank-root: cached-path gates ----
 
+    /// 9.13: unset = the benched configuration (on); only `"0"` disables.
     #[test]
-    fn root_cache_toggle_default_off_only_one_enables() {
-        assert!(!parse_native_root_cache_toggle(None));
+    fn root_cache_toggle_default_on_only_zero_disables() {
+        assert!(parse_native_root_cache_toggle(None));
         assert!(parse_native_root_cache_toggle(Some("1".to_string())));
         assert!(parse_native_root_cache_toggle(Some(" 1 ".to_string())));
-        for v in ["0", "true", "on", "", "yes", "2"] {
-            assert!(!parse_native_root_cache_toggle(Some(v.to_string())), "{v}");
+        assert!(!parse_native_root_cache_toggle(Some("0".to_string())));
+        assert!(!parse_native_root_cache_toggle(Some(" 0 ".to_string())));
+        for v in ["true", "on", "", "yes", "2", "off"] {
+            assert!(parse_native_root_cache_toggle(Some(v.to_string())), "{v}");
         }
     }
 
@@ -2088,14 +2099,20 @@ mod tests {
         );
     }
 
+    /// 9.13: unset / garbage = the benched 256 MB; `"0"` disables.
     #[test]
-    fn round3_parse_member_cache_mb_default_off() {
-        assert_eq!(parse_member_cache_mb(None), 0);
+    fn round3_parse_member_cache_mb_default_256() {
+        assert_eq!(parse_member_cache_mb(None), 256 * 1024 * 1024);
         assert_eq!(parse_member_cache_mb(Some("0".into())), 0);
+        assert_eq!(parse_member_cache_mb(Some(" 0 ".into())), 0);
         assert_eq!(parse_member_cache_mb(Some("1".into())), 1024 * 1024);
         assert_eq!(parse_member_cache_mb(Some(" 8 ".into())), 8 * 1024 * 1024);
         for v in ["", "x", "-1", "on"] {
-            assert_eq!(parse_member_cache_mb(Some(v.into())), 0, "{v}");
+            assert_eq!(
+                parse_member_cache_mb(Some(v.into())),
+                256 * 1024 * 1024,
+                "{v}"
+            );
         }
     }
 

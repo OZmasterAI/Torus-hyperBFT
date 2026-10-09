@@ -20,7 +20,7 @@ Live path (`torus-consensus/src/app.rs:1334-1358`): the engine timer wraps
 | 1 | all non-PlaceOrder actions (cancels, transfers, staking, oracle, gov) execute inline, mutating balances/books directly | serial — inherently order-dependent, cross-market shared state |
 | 2 | per PlaceOrder: margin reserve (`reserve_for_qty`, balance check + debit via `BalanceCache`), global order-id assignment, partition into per-market batches | **serial** |
 | 3 | matching: `MarketWorkerPool::match_parallel` — one scoped thread per market owns that market's `OrderBook`; in-market matching is order-sequential (must be) | **already parallel per market, always on** (not env-gated) |
-| 4 | settlement: taker margin release, `apply_fill_cached` position transitions, realized-PnL credits, trade-row persistence (`trade_index` stamping), A5 maker/STP releases | serial by default; `TORUS_PARALLEL_SETTLE=1` enables the pass-A/pass-B parallel path **but its auto work-gate is `TORUS_PARALLEL_SETTLE_MIN_FILLS` = 1024 fills — never met at cap-400 (≤ ~400 fills), so in every gate cell settlement runs on one thread** |
+| 4 | settlement: taker margin release, `apply_fill_cached` position transitions, realized-PnL credits, trade-row persistence (`trade_index` stamping), A5 maker/STP releases | `TORUS_PARALLEL_SETTLE` (on by default since plan 9.13; `=0` = serial) enables the pass-A/pass-B parallel path **but its auto work-gate is `TORUS_PARALLEL_SETTLE_MIN_FILLS` = 1024 fills — never met at cap-400 (≤ ~400 fills), so in every gate cell settlement runs on one thread** |
 | flush | `PositionCache`/`BalanceCache` flush to overlay, sorted keys | serial (cheap, deterministic bytes) |
 
 Correction to the mission brief: the *match loop across markets* is **not**

@@ -369,7 +369,9 @@ pub struct StateDb {
 ///   (default 4 = exact-today; RocksDB slows writes at `n-1` unflushed
 ///   memtables and stops at `n`).
 /// - `TORUS_ROCKSDB_PIPELINED_WRITE` — `enable_pipelined_write` (WAL and
-///   memtable stages of consecutive write groups overlap; default off).
+///   memtable stages of consecutive write groups overlap). Default on (plan
+///   9.13: the benched configuration); `0` / `false` / `FALSE` / `no` / `off`
+///   turn it off.
 /// - `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB` — whole-MiB WAL flush trigger (default
 ///   512; invalid values fall back to it). `0` restores RocksDB's automatic
 ///   threshold (4x aggregate CF buffer capacity, ~86 GiB here), under which a
@@ -434,9 +436,9 @@ impl DbTuning {
             l0_stop_trigger: pos_i32(l0_stop),
             // Below 2 the DB could not switch memtables at all; clamp.
             max_write_buffer_number: pos_i32(max_write_buffers).unwrap_or(4).max(2),
-            pipelined_write: matches!(
+            pipelined_write: !matches!(
                 pipelined.as_deref().map(str::trim),
-                Some("1" | "true" | "TRUE" | "yes" | "on")
+                Some("0" | "false" | "FALSE" | "no" | "off")
             ),
             max_total_wal_size: parse_max_total_wal_mib(None),
         }
@@ -1743,8 +1745,23 @@ mod sync_wal_tests {
         assert_eq!(t.l0_slowdown_trigger, None);
         assert_eq!(t.l0_stop_trigger, None);
         assert_eq!(t.max_write_buffer_number, 4);
-        assert!(!t.pipelined_write);
+        // 9.13: pipelined write is on by default (the benched configuration).
+        assert!(t.pipelined_write);
         assert_eq!(t, DbTuning::default());
+    }
+
+    /// 9.13: the explicit off values restore the pre-9.13 default; anything
+    /// else (on words, garbage) is the default, on.
+    #[test]
+    fn db_tuning_pipelined_write_off_values() {
+        let p =
+            |v: &str| DbTuning::from_raw(None, None, None, None, Some(v.into())).pipelined_write;
+        for v in ["0", " 0 ", "false", "FALSE", "no", "off"] {
+            assert!(!p(v), "{v}");
+        }
+        for v in ["1", "true", "TRUE", "yes", "on", "", "x"] {
+            assert!(p(v), "{v}");
+        }
     }
 
     #[test]

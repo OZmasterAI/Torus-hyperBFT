@@ -162,7 +162,7 @@ fn new_ctx(dir: &tempfile::TempDir, mode: BookMode) -> NativeExecContext {
     new_ctx_with(dir, mode, true)
 }
 
-/// `resident: false`: the code default (`TORUS_RESIDENT_BOOKS` unset), every
+/// `resident: false`: the off path (`TORUS_RESIDENT_BOOKS=0`), every
 /// cancel-all scans every book (row 23).
 fn new_ctx_with(dir: &tempfile::TempDir, mode: BookMode, resident: bool) -> NativeExecContext {
     let db = StateDb::open(dir.path()).expect("open db");
@@ -635,8 +635,8 @@ fn cancel_all_matches_the_full_scan_reference() {
     }
 }
 
-/// Row 23 (18c s104): without resident books (`TORUS_RESIDENT_BOOKS` unset,
-/// the code default) every block loads its books, so an index would be
+/// Row 23 (18c s104): without resident books (`TORUS_RESIDENT_BOOKS=0`; the
+/// code default before plan 9.13) every block loads its books, so an index would be
 /// rebuilt in every block with a cancel-all. That path keeps the full scan:
 /// every cancel-all visits every book (4 + 4 + 1 + 4, the step 0 count of
 /// `cancel_all_counters_count_visited_and_hit_books`) and no index is built.

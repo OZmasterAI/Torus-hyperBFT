@@ -76,6 +76,11 @@ python3 tools/matched-bench/test_harness.py
    `TORUS_BOOK_ROWS=2` — the harness moved to mode 3 with the r2 merge, pass
    `EXTRA_ENV='TORUS_BOOK_ROWS=2'` for a mode-2 control) — ambient
    `TORUS_*` vars are unset first, `EXTRA_ENV` is applied last (so it overrides).
+   Since plan 9.13 (`feat/compiled-defaults`) the node's compiled defaults equal
+   these values except `TORUS_BOOK_ROWS` (consensus-visible, stays Classic until
+   the book mode is in genesis; the cell needs the explicit `=3`) and
+   `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default 0); the other
+   exports are kept so older binaries run the same configuration.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
    bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,
@@ -296,7 +301,7 @@ Node knobs the cell can A/B via `EXTRA_ENV` (all node-local, format-neutral):
 before r3), `TORUS_BG_WRITER_LOW_PRI` (default 1), `TORUS_ROCKSDB_STATS`
 (0/1/2, default 1), `TORUS_ROCKSDB_L0_SLOWDOWN` / `TORUS_ROCKSDB_L0_STOP`
 (RocksDB 20/36 when unset), `TORUS_ROCKSDB_MAX_WRITE_BUFFERS` (4),
-`TORUS_ROCKSDB_PIPELINED_WRITE` (0), `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (5).
+`TORUS_ROCKSDB_PIPELINED_WRITE` (1 since plan 9.13; `0` = off), `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (5).
 
 ## Exec critical chain vs 100 ms (bl1 exec-chain-sub-100-attribution)
 
