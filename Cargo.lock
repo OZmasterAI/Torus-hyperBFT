@@ -6995,6 +6995,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "revm",
+ "rocksdb",
  "sha3",
  "tempfile",
  "torus-core",

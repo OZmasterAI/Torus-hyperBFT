@@ -774,7 +774,9 @@ fn book_levels(
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)
 ///
 /// Item 2: UPnL uses the oracle price only while usable at `now` (block
-/// timestamp, s) — the rule of `OraclePrice::usable`; otherwise 0.
+/// timestamp, s) — the rule of `OraclePrice::usable`; otherwise 0. R02
+/// branch 5: a failed oracle read is `CoreError::PrecompileLocalFault`
+/// (the node fail-stops), never 0.
 fn read_position(
     state_db: &impl StateBackend,
     trader: &Address,
@@ -799,14 +801,14 @@ fn read_position(
     // Compute unrealized PnL using oracle price
     let unrealized_pnl = match get_oracle_price_fp(state_db, market_id, now) {
         Ok(mark) => pos.unrealized_pnl(mark),
-        // No usable price (absent, stale, non-positive): UPnL 0.
+        // No usable price (absent, stale, non-positive, short row: the same
+        // bytes on every validator): UPnL 0.
         Err(e) if !e.is_local_fault() => FixedPoint::ZERO,
-        // R02 OPEN (branch 3, owner decision pending): the aggregate read
-        // failed on THIS node. Still UPnL 0 as before: the EVM path has no
-        // fail-stop channel yet (a precompile `Err` is a consensus-visible
-        // revert, and a failed EVM section is logged and skipped), so the
-        // fault cannot stop the block from here without a new rule.
-        Err(_) => FixedPoint::ZERO,
+        // R02 branch 5 (owner option A): the aggregate read failed on THIS
+        // node. Not UPnL 0 (an answer only this node gives) and not a revert
+        // (equally consensus-visible): `PrecompileLocalFault`, which the EVM
+        // provider turns into an aborted execution and the node fail-stops.
+        Err(e) => return Err(CoreError::PrecompileLocalFault(format!("getPosition oracle read: {e}"))),
     };
 
     // Signed size: positive for long, negative for short
@@ -1885,6 +1887,66 @@ mod r02_oracle_price_tests {
                 Err(e) => assert!(!ok && !e.is_local_fault(), "market {m}: {e}"),
             }
         }
+    }
+
+    /// The DB with the oracle CF's reads failing (everything else works).
+    #[derive(Clone)]
+    struct FailingOracleRead(StateDb);
+
+    impl StateBackend for FailingOracleRead {
+        fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+            if cf == CF_NATIVE_ORACLE {
+                return Err(StateError::Io(std::io::Error::other("injected read failure")));
+            }
+            self.0.get_cf_raw(cf, key)
+        }
+        fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+            self.0.put_cf_raw(cf, key, value)
+        }
+        fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+            self.0.delete_cf_raw(cf, key)
+        }
+        fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+            self.0.iterate_cf(cf, prefix)
+        }
+        fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+            self.0.atomic_write(ops)
+        }
+    }
+
+    /// R02 branch 5 (owner option A): getPosition's UPnL oracle read fails on
+    /// this node -> `PrecompileLocalFault` (local), never UPnL 0. RED before:
+    /// the output carried UPnL 0. A failed POSITION read keeps today's error
+    /// (a plain `State` revert; not part of this decision).
+    #[test]
+    fn r02_get_position_oracle_read_fault_is_a_precompile_local_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let trader = Address::new([7; 20]);
+        crate::position::PositionManager::new(db.clone())
+            .put_position(&Position {
+                trader,
+                market_id: 1,
+                is_long: true,
+                size: FixedPoint::ONE,
+                entry_price: FixedPoint::ONE,
+                cost_basis: FixedPoint::ONE,
+                realized_pnl: FixedPoint::ZERO,
+                isolated_margin: FixedPoint::ZERO,
+                margin_type: crate::position::MarginType::Cross,
+            })
+            .unwrap();
+        match read_position(&FailingOracleRead(db.clone()), &trader, 1, 1_000) {
+            Err(e @ CoreError::PrecompileLocalFault(_)) => {
+                assert!(e.is_local_fault());
+                assert!(e.to_string().contains("getPosition oracle read: state error"), "{e}");
+            }
+            other => panic!("expected PrecompileLocalFault, got {other:?}"),
+        }
+        let healthy = read_position(&db, &trader, 1, 1_000).expect("no oracle row: UPnL 0");
+        assert_eq!(&healthy[64..96], &[0u8; 32]);
+        let e = read_position(&FailingRead, &trader, 1, 1_000).expect_err("position read failed");
+        assert!(matches!(e, CoreError::State(_)), "{e}");
     }
 }
 

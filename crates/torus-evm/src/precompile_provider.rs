@@ -18,6 +18,8 @@ use torus_core::precompiles::{
 };
 use torus_state::NativeStateOverlay;
 
+use std::sync::{Arc, OnceLock};
+
 /// Precompile provider combining standard Ethereum precompiles with
 /// Torus cross-VM precompiles (order book, balance, oracle, staking readers
 /// and core writer / lockbox).
@@ -37,6 +39,12 @@ pub struct TorusPrecompiles {
     /// eth_call / eth_estimateGas simulation: deny state-mutating (writer) precompiles so
     /// a simulation can't durably mutate the shared `StateDb` outside consensus.
     read_only: bool,
+    /// R02 branch 5 (owner option A): the first LOCAL storage fault a precompile
+    /// hit (`CoreError::PrecompileLocalFault`). Set before [`Self::run`] aborts
+    /// the execution with a fatal error; the executor reads it
+    /// ([`Self::local_fault`]) to return `EvmError::LocalFault`. Per provider,
+    /// i.e. per executed block / tx.
+    local_fault: Arc<OnceLock<String>>,
 }
 
 impl TorusPrecompiles {
@@ -66,7 +74,14 @@ impl TorusPrecompiles {
             current_block,
             current_timestamp,
             read_only,
+            local_fault: Arc::default(),
         }
+    }
+
+    /// R02 branch 5: a handle on this provider's local-fault cell (see the
+    /// field); take it before the provider moves into the EVM.
+    pub fn local_fault(&self) -> Arc<OnceLock<String>> {
+        self.local_fault.clone()
     }
 }
 
@@ -189,6 +204,17 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             }
             other => other,
         };
+
+        // R02 branch 5 (owner option A): a LOCAL storage fault is never a
+        // revert (its bytes and gas would be an answer only this node gives):
+        // record it and abort the execution with a fatal error (revm maps it
+        // to `EVMError::Custom`, no receipt); the executor returns
+        // `EvmError::LocalFault` and the node fail-stops. Only this variant:
+        // every other precompile error stays a revert, exactly as before.
+        if let Err(CoreError::PrecompileLocalFault(msg)) = &result {
+            let _ = self.local_fault.set(msg.clone());
+            return Err(format!("precompile local fault: {msg}"));
+        }
 
         // A reader over its budget runs out of gas (its stipend is spent).
         if matches!(result, Err(CoreError::PrecompileOutOfGas)) {

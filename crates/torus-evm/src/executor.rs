@@ -208,20 +208,24 @@ impl EvmExecutor {
         // buffer in `journal` during execution and only become durable if the tx
         // succeeds, so an EVM revert also reverts native side effects.
         let journal = NativeStateOverlay::new(state_db.clone());
+        let precompiles = TorusPrecompiles::with_mode(
+            SpecId::CANCUN,
+            journal.clone(),
+            block_cfg.number,
+            block_cfg.timestamp,
+            call_mode,
+        );
+        let local_fault = precompiles.local_fault();
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
                 journal: journal.clone(),
             })
-            .with_precompiles(TorusPrecompiles::with_mode(
-                SpecId::CANCUN,
-                journal.clone(),
-                block_cfg.number,
-                block_cfg.timestamp,
-                call_mode,
-            ));
+            .with_precompiles(precompiles);
         // T4.4: run via the inspector path so `NativeJournalInspector` sees every call frame
         // and can checkpoint/revert the writer-precompile journal at frame boundaries.
-        let result = evm.inspect_tx_commit(tx).map_err(map_evm_err)?;
+        let result = evm
+            .inspect_tx_commit(tx)
+            .map_err(|e| local_fault_or(&local_fault, e))?;
 
         // T4.4: persist journaled precompile writes only on tx success (never in call
         // mode, where writer precompiles are denied and the journal stays empty).
@@ -278,16 +282,15 @@ impl EvmExecutor {
         // here, so a block that errors part-way (or a crash before the bundle
         // commit) leaves no queued action behind.
         let journal = NativeStateOverlay::new(state_db.clone());
+        let precompiles =
+            TorusPrecompiles::new(SpecId::CANCUN, journal.clone(), block_cfg.number, block_cfg.timestamp);
+        // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
+        let local_fault = precompiles.local_fault();
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
                 journal: journal.clone(),
             })
-            .with_precompiles(TorusPrecompiles::new(
-                SpecId::CANCUN,
-                journal.clone(),
-                block_cfg.number,
-                block_cfg.timestamp,
-            ));
+            .with_precompiles(precompiles);
 
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;
@@ -309,7 +312,7 @@ impl EvmExecutor {
                     journal.revert_tx();
                     continue;
                 }
-                Err(e) => return Err(map_evm_err(e)),
+                Err(e) => return Err(local_fault_or(&local_fault, e)),
             };
             included_indices.push(idx);
             let gas_used = result.gas().used();
@@ -422,16 +425,15 @@ impl EvmExecutor {
         // state from the underlying `state_db` (the overlay base).
         // F1 (s515): block-scoped, returned in `native_writes` (see `execute_block`).
         let journal = NativeStateOverlay::new(overlay.base().clone());
+        let precompiles =
+            TorusPrecompiles::new(SpecId::CANCUN, journal.clone(), block_cfg.number, block_cfg.timestamp);
+        // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
+        let local_fault = precompiles.local_fault();
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
                 journal: journal.clone(),
             })
-            .with_precompiles(TorusPrecompiles::new(
-                SpecId::CANCUN,
-                journal.clone(),
-                block_cfg.number,
-                block_cfg.timestamp,
-            ));
+            .with_precompiles(precompiles);
 
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut cumulative_gas: u64 = 0;
@@ -453,7 +455,7 @@ impl EvmExecutor {
                     journal.revert_tx();
                     continue;
                 }
-                Err(e) => return Err(map_evm_err(e)),
+                Err(e) => return Err(local_fault_or(&local_fault, e)),
             };
             included_indices.push(idx);
             let gas_used = result.gas().used();
@@ -603,6 +605,21 @@ fn calc_effective_gas_price(base_fee: u64, max_fee: u128, priority_fee: Option<u
         None => max_fee,
     };
     u64::try_from(result).unwrap_or(u64::MAX)
+}
+
+/// R02 branch 5 (owner option A): an execution error is `EvmError::LocalFault`
+/// when a precompile recorded a local storage fault in `cell` (it aborted the
+/// execution with a fatal error for exactly that reason), else the usual
+/// mapping ([`map_evm_err`]). The consensus app fail-stops on `LocalFault`
+/// only.
+fn local_fault_or<DB: core::fmt::Debug, TX: core::fmt::Debug>(
+    cell: &std::sync::OnceLock<String>,
+    err: EVMError<DB, TX>,
+) -> EvmError {
+    match cell.get() {
+        Some(msg) => EvmError::LocalFault(msg.clone()),
+        None => map_evm_err(err),
+    }
 }
 
 /// Map a revm [`EVMError`] into our [`EvmError`].
