@@ -12,3 +12,6 @@ test reproduces them.
   survives.
 - The performance explorer synthesis is in
   `../perf/s65-explorer-synthesis-2026-09-27.md`.
+- `finding-consensus-write-panic-2026-10-09.md`: from the R01 fault test (not
+  part of R01). A failed consensus write panics the `hotstuff-algo` thread and
+  leaves a live node that no longer works (no exit 70). Not fixed.
