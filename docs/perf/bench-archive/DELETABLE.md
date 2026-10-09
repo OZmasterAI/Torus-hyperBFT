@@ -24,6 +24,8 @@ out of 8.69 GiB in the 211 inventoried dirs.
 
 **Added `c2h` (after the campaign finished): Tier A 3.90 GiB (4,192,376,800 bytes, 8 files); Tier B 0.35 GiB (373,635,377 bytes, 84 files); A + B 4.25 GiB (4,566,012,177 bytes)**, out of 4.28 GiB in its 18 dirs. **All s29 additions incl. c2h: Tier A 16.41 GiB (17,622,426,552 bytes); Tier B 1.50 GiB (1,612,045,811 bytes); A + B 17.91 GiB (19,234,472,363 bytes)**.
 
+**Added `p3s0` (2026-10-09, after the campaign finished; sizes taken ~08:20): Tier A 1.95 GiB (2,097,210,160 bytes, 4 files: the staged A / B `torus-node` and `bench-throughput` in `ozarchy-p3s0-stage`); Tier B 0.13 GiB (136,305,683 bytes, 30 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 5 cells); A + B 2.08 GiB (2,233,515,843 bytes)**, out of 2.09 GiB in its 7 dirs (section 34 of the ozarchy doc; the last command block). `ozarchy-p3s0-stage/b/` is the proposed Phase 3 step 0 baseline binary: see the note in its block. The campaigns between `c2h` and `p3s0` (`p21g`, `p2byid`, `p25g`, `p22g`) are not listed yet.
+
 ## Per campaign
 
 A campaign here is a group of dirs from the same run (for example all `ozarchy-mif-300m-*` cells). The command blocks further down are in this order.
@@ -82,6 +84,7 @@ A campaign here is a group of dirs from the same run (for example all `ozarchy-m
 | `c2h` | C2 holder-index fix and Position v2 savings A/B vs `d3ba3c0a` (b, base, fix, sav, both; `sav-r1` failed), staged binaries | 15 | 3998.2 MiB | 356.3 MiB | 4354.5 MiB |
 | **total (2026-10-07)** | | 183 | **3.88 GiB** | **4.42 GiB** | **8.30 GiB** |
 | **total added s29** (incl. `c2h`) | | 66 | **16.41 GiB** | **1.50 GiB** | **17.91 GiB** |
+| `p3s0` | R01/R02 cost check and Phase 3 step 0 baseline: main `3efff0d6` vs `1b389700` (a-warm A B B A), staged binaries | 6 | 2000.1 MiB | 130.0 MiB | 2130.1 MiB |
 
 ## Largest Tier A files
 
@@ -2199,6 +2202,56 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-c2h-300m-sav-r3/val2.log.gz'
 ```
 
+### `p3s0` (A 2000.1 MiB, B 130.0 MiB; dirs: `ozarchy-p3s0-300m-a-r1`, `ozarchy-p3s0-300m-a-r2`, `ozarchy-p3s0-300m-a-warm` ...)
+
+`ozarchy-p3s0-stage/b/` holds B's node `0c100f3b` (main `3efff0d6`), the proposed Phase 3 step 0 baseline (results doc section 34, pending 18c): keep it while Phase 3 step 0 may reuse it. The stage binaries were copied with `cp --reflink=auto` (bench from `ozarchy-p2byid-stage/p2`), so the space freed can be less than listed.
+
+Tier A, 2000.1 MiB, 4 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-stage/a/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-stage/a/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-stage/b/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-stage/b/release/torus-node'
+```
+
+Tier B, 130.0 MiB, 30 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-r2/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-a-warm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r1/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s0-300m-b-r2/val2.log.gz'
+```
+
 ## Grand total freed
 
 * Tier A: **3.88 GiB** (4,169,742,007 bytes), 88 files
@@ -2209,6 +2262,7 @@ rm -- \
 * Added s29: Tier A + B **13.66 GiB** (14,668,460,186 bytes), out of 13.82 GiB in the 64 dirs added
 * Added `c2h`: Tier A **3.90 GiB** (4,192,376,800 bytes), 8 files; Tier B **0.35 GiB** (373,635,377 bytes), 84 files; A + B **4.25 GiB**
 * All s29 additions incl. `c2h`: Tier A **16.41 GiB** (17,622,426,552 bytes), 78 files; Tier B **1.50 GiB** (1,612,045,811 bytes), 375 files; A + B **17.91 GiB** (19,234,472,363 bytes)
+* Added `p3s0` (2026-10-09): Tier A **1.95 GiB** (2,097,210,160 bytes), 4 files; Tier B **0.13 GiB** (136,305,683 bytes), 30 files; A + B **2.08 GiB** (2,233,515,843 bytes), out of 2.09 GiB in its 7 dirs
 
 ## After the deletes
 

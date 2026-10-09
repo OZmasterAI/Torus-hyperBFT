@@ -3381,8 +3381,86 @@ step 0 notes), so settle includes it. base warm (183,626 matched/s) excluded.
   mechanism above is inferred. Plan row 33 (1): keep P2-2 on a non-overlapping gain, drop it
   only if it regresses; its gate metric regresses cleanly, matched/s is not resolved.
 
+## 34. R01/R02 cost check and Phase 3 step 0 baseline: main 3efff0d6 vs 1b389700 (campaign ozarchy-p3s0, 2026-10-09)
+
+18c asked, after the Phase 2 merge, whether main with the R01 / R02 fail-stop checks costs anything
+against the Phase 2 bench head, and for the Phase 3 step 0 baseline. 18c's stop rule: "if 3efff0d6
+is more than noise below 1b389700, stop and report before (d)" ((d) = the sync-point items of plan
+9.16). Arms: A = `perf/item6-phase2` `1b389700` (the Phase 2 bench head, P2-1 + P2-5; node
+`86477b00`), B = main `3efff0d6` (the Phase 2 merge; over A it adds R01 `19f8f534`, every failed
+serial state or marker write fail-stops; R02 branches 1-2 `4bef6406` / `ed2354fb`, CoreWriter
+drain errors and replay-guard / session / applied-height read errors fail-stop; and the eth_call /
+estimateGas typing `9793f1ec`, RPC only; node `0c100f3b`). Both nodes built fresh (node-only, from
+detached worktrees `wt/p3s0-1b389700` / `wt/p3s0-3efff0d6` into fresh target dirs, same flags as
+p22g, one after the other): the p25g node (`2587e57f`) is not `1b389700`'s code, which differs from
+`029581e5` / `631becaa` in 7 files of `crates/torus-mempool` (main `f5f28f89` merged on the
+branch). Both arms run bench `6c7ad1a7` (the p2byid staged binary, reused) and the `bdd5b470`
+harness (`tools/matched-bench` is identical in `bdd5b470`, `1b389700` and `3efff0d6`; `3efff0d6`
+adds only `tools/r01-fault/`). Standard shape as sections 26-33, no perf. Order: A warm (60 s,
+excluded), then A B B A, 07:22-07:53, units `bench-ozarchy-p3s0-300m-<tag>.service`. All cells rc
+0, AGREE (block hash, state digest and counters equal on val0-2), liveness PASS, accepted, node md5
+= staged md5 of the arm (3/3), 4 MiB book CF, trie off (default), oracle stale 0 (396 / 396
+accepted; warm 216 / 216), 0 panic / ERROR lines, no exit 70, no deaths, fds max 724. The only
+fail-stop match in the node logs is the startup INFO line `running state hash fail-stop
+(TORUS_STATE_HASH_FAILSTOP) on=false`, on both arms. Driver
+`/home/oz/bench-results-matched/ozarchy-p3s0-campaign.sh` (build `ozarchy-p3s0-build.sh`), tables
+`ozarchy-p3s0-handoff-tables.txt`.
+
+| cell | **matched/s** | native blk/s | fills/blk | txs/blk | engine | engine / 1k | chain | phase 1 | margin | match | settle | pass B | cache flush | end_resident wait | end_resident wait / 1k |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A r1 | **189,569** | 5.748 | 26,325 | 127.1 | 106.06 | 4.03 | 133.3 | 17.63 | 23.52 | 12.92 | 38.21 | 20.65 | 11.81 | 5.73 | 0.218 |
+| B r1 | **189,485** | 5.492 | 27,862 | 138.4 | 110.14 | 3.95 | 141.3 | 18.77 | 24.30 | 13.23 | 39.41 | 21.10 | 12.27 | 6.36 | 0.228 |
+| B r2 | **184,666** | 5.602 | 28,674 | 134.4 | 115.58 | 4.03 | 146.6 | 19.13 | 25.02 | 14.52 | 41.13 | 22.24 | 12.48 | 6.61 | 0.231 |
+| A r2 | **188,914** | 5.805 | 26,145 | 129.6 | 105.53 | 4.04 | 133.0 | 18.53 | 23.11 | 12.79 | 36.88 | 19.84 | 11.25 | 5.80 | 0.222 |
+
+ms per native block (val0) unless per 1k fills; txs/blk is the headline (bench window) figure. A
+warm (182,495 matched/s) excluded.
+
+| mean (r1/r2 spread) | matched/s | native blk/s | fills/blk | txs/blk | engine | engine / 1k | chain | phase 1 | margin | match | settle | pass B | cache flush | end_resident wait | end_resident wait / 1k |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A (`1b389700`) | 189,241 (655) | 5.777 (0.057) | 26,235 (180) | 128.4 | 105.80 (0.53) | 4.035 (0.010) | 133.1 | 18.08 | 23.32 | 12.86 | 37.55 | 20.25 | 11.53 (0.56) | 5.77 (0.07) | 0.220 (0.004) |
+| B (`3efff0d6`) | 187,075 (4,819) | 5.547 (0.110) | 28,268 (812) | 136.4 | 112.86 (5.44) | 3.990 (0.080) | 143.9 | 18.95 | 24.66 | 13.88 | 40.27 | 21.67 | 12.38 (0.21) | 6.49 (0.25) | 0.229 (0.002) |
+| B / A | **0.9886x** | 0.9603x | 1.0775x | 1.063x | +7.07 ms (1.067x) | 0.9888x | 1.081x | 1.048x | 1.058x | 1.079x | 1.073x | 1.070x | 1.073x | 1.125x | 1.044x |
+
+- **Verdict: matched/s within noise; per-fill cost flat.** matched/s B / A 0.9886x (-2,166, -0.9
+  pooled sd of 2,432; pairwise B1/A1 0.9996x, B2/A2 0.9775x). Per fill: engine per 1k fills
+  0.989x (-1.1 sd; pairwise 0.980x / 0.998x), chain per 1k fills 5.075 -> 5.092 ms (+0.3%, 0.7
+  sd), cache flush and pass B per 1k fills 0.996x / 0.993x.
+- **Native blk/s 0.9603x (-3.7 sd; pairwise 0.9555x / 0.9650x), with bigger blocks:** fills per
+  native block +7.8% (+2,033, +4.9 sd; pairwise 1.058x / 1.097x), txs/blk ~136 vs ~128, actions
+  per block ~152.6 vs ~140.9, wall ms per committed block ~180.3 vs ~173.2. The per-block times
+  grow with the block: engine +7.07 ms (2.6 sd), chain +10.8 ms (4.1 sd), margin +1.35 ms (3.3
+  sd), settle +2.73 ms (2.5 sd), cache flush +0.85 ms (2.8 sd); per fill each of them is flat.
+  Whether B's slower block rate makes its blocks bigger (more actions waiting per block) or the
+  bigger blocks slow the rate is not resolved at n = 2. The -0.23 blk/s step is about one r1/r2
+  spread of section 33's base and p25 arms (0.21-0.22).
+- **Where (what rose per fill):** end_resident wait +0.72 ms per native block (5.77 -> 6.49,
+  +12.5%, +5.5 sd; pairwise 1.110x / 1.140x) and +4.4% per 1k fills (0.220 -> 0.229, ~4 sd;
+  pairwise 1.049x / 1.039x). It is the exec thread's join on the previous block's end_resident
+  worker and sits on the write path R01 touches (the flush + applied-marker write whose failure
+  R01 now fail-stops). Residual untimed exec-thread time also rose: +1.90 ms per native block
+  (9.56 -> 11.45, 4.9 sd; val0-2 of both B cells 10.67-12.15 vs A 8.83-9.74), +11% per 1k fills
+  (0.364 -> 0.405, 2.1 sd; pairwise 1.19x / 1.04x); save_books per 1k fills +3.3% (2.2 sd).
+  verify, replay guard and the end_resident worker per 1k fills are flat (0.99-1.00x). A cause in
+  R01 / R02 is **not established**: no perf, and at n = 2 the rise cannot be split from the
+  bigger blocks (cause or effect of them).
+- **Caveats:** n = 2 per arm; B's matched/s spread (4,819, b-r2 at 184,666) is ~7x A's (655),
+  so B's matched/s and the B2/A2 pair are the weakest numbers here. Host level: A here 189,241
+  matched/s vs the p25 arm's 190,298 in section 33 (0.994x); not the same binary (A includes the
+  main `f5f28f89` mempool merge, p25 does not), so only the interleaved ratios carry.
+- **Stop rule: pending 18c.** Facts for it: matched/s -0.9 sd (inside noise); native blk/s -3.7
+  sd with blocks +7.8% bigger at flat per-fill cost; end_resident wait per 1k fills +4.4% (~4
+  sd). Not decided here: accept B (`3efff0d6`, node `0c100f3b`: 187,075 matched/s, 5.547 native
+  blk/s) as the Phase 3 step 0 baseline and go on to (d), or a 4-pair rerun (plan review log row
+  38).
+
 ## Open
 
+- **R01/R02 cost check, pending 18c** (section 34, plan review log row 38): main `3efff0d6` vs
+  `1b389700` matched/s 0.9886x (-0.9 sd, within noise), native blk/s 0.9603x (-3.7 sd) with
+  fills/blk +7.8%; per-fill cost flat except end_resident wait (+4.4% per 1k fills) and residual
+  untimed (+11% per 1k fills, 2.1 sd). 18c to decide: accept as the Phase 3 step 0 baseline and
+  go on to (d), or a 4-pair rerun.
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
   still visit 189 books, the sender has something in 92 (stale index entries, "never removed
   eagerly"). 18c s104: **A, accept and continue** (~0.07 us per skipped visit, 0.44 ms /

@@ -426,6 +426,16 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p22g-300m-p25-r1` | OK | 2026-10-09 03:07 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 190,714.8 | 189,834.1 | 204,010.7 | 253,241.3 | 5.8 | 130.7 | 135.15 | 3.98 | AGREE | PASS | ACCEPT |
 | `ozarchy-p22g-300m-p25-r2` | OK | 2026-10-09 03:26 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 189,881.2 | 188,869.5 | 197,942.2 | 251,612.5 | 5.6 | 137.1 | 138.33 | 3.97 | AGREE | PASS | ACCEPT |
 
+## p3s0: R01/R02 cost check and Phase 3 step 0 baseline: B main `3efff0d6` vs A `perf/item6-phase2` `1b389700`, a-warm A B B A; `a-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p3s0-300m-a-r1` | OK | 2026-10-09 07:33 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 189,568.9 | 188,127.0 | 199,692.8 | 251,350.7 | 5.7 | 127.1 | 133.27 | 4.03 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-a-r2` | OK | 2026-10-09 07:53 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 120 | 400 | - | 188,913.8 | 189,086.4 | 198,447.4 | 250,089.5 | 5.8 | 129.6 | 133.00 | 4.04 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-a-warm` | OK | 2026-10-09 07:28 | p3s0-1b389700 @ 1b389700 | 86477b00 | 300 | 60 | 400 | - | 182,494.8 | 182,494.8 | 194,769.2 | 241,366.7 | 5.0 | 101.2 | 127.57 | 4.03 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-b-r1` | OK | 2026-10-09 07:40 | p3s0-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 189,484.7 | 188,672.2 | 200,912.7 | 251,079.1 | 5.5 | 138.4 | 141.27 | 3.95 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3s0-300m-b-r2` | OK | 2026-10-09 07:46 | p3s0-3efff0d6 @ 3efff0d6 | 0c100f3b | 300 | 120 | 400 | - | 184,665.7 | 184,707.4 | 199,734.5 | 245,023.7 | 5.6 | 134.4 | 146.60 | 4.03 | AGREE | PASS | ACCEPT |
+
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
