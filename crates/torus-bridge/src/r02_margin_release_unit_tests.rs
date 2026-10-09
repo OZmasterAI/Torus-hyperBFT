@@ -289,6 +289,7 @@ fn top_up(fault: bool) -> ([u64; 3], Rows, Option<String>, usize) {
     }
     let counts = NativeExecutor::sell_top_ups(
         &ctx.positions,
+        &ctx.reader_fault,
         &markets,
         &HashMap::default(),
         &pools,
