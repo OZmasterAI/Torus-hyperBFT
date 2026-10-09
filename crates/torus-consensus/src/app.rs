@@ -583,7 +583,7 @@ struct ExecutionContext {
     exec_queue_len: Arc<AtomicU64>,
     /// rank8: cross-block resident order-book holder (`TORUS_RESIDENT_BOOKS`).
     /// Only the execution thread touches it (Mutex is uncontended); with the
-    /// flag unset it stays empty forever and execution is byte-identical to
+    /// flag off (`=0`) it stays empty forever and execution is byte-identical to
     /// the per-block reload path.
     resident_books: std::sync::Mutex<torus_bridge::native_executor::ResidentBooks>,
     /// rank-root: cross-block in-RAM native-trie node cache
@@ -600,7 +600,7 @@ struct ExecutionContext {
     /// CF_NATIVE_HASHED prefix-scan on resident buckets
     /// (`TORUS_BUCKET_MEMBER_CACHE_MB`). Value-neutral; self-authenticating on
     /// the persisted root (shares the trie cache's staleness cause). Disabled
-    /// (budget 0) = exact-today.
+    /// (`=0`, budget 0) = the uncached path.
     member_cache: Arc<std::sync::Mutex<torus_state::native_trie::NativeMemberCache>>,
     /// bl2 exec pipeline (`TORUS_EXEC_PIPELINE=1`): the flush worker W.
     /// `None` (default) = the serial exec chain, exact-today. Constructed AFTER

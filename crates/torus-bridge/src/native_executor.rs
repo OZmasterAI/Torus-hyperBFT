@@ -476,10 +476,10 @@ struct MarketSettlePlan {
     volumes: VolumeCache,
 }
 
-/// C3 runtime toggle: `TORUS_PARALLEL_SETTLE=1` enables the parallel settle
-/// path; anything else (INCLUDING UNSET) keeps today's sequential loop.
-/// Default OFF — unset env is byte-identical to the pre-C3 serial semantics.
-/// Read once per process.
+/// C3 runtime toggle for the parallel settle path. Default ON (plan 9.13:
+/// compiled defaults = the benched configuration); `TORUS_PARALLEL_SETTLE=0`
+/// keeps the sequential loop (byte-identical state either way). Read once per
+/// process.
 fn parallel_settle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -487,11 +487,10 @@ fn parallel_settle_enabled() -> bool {
     })
 }
 
-/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"1"` enables the
-/// parallel path (exact-today default — unset/`"0"`/garbage all mean the
-/// classic sequential settle loop).
+/// Pure parse of the `TORUS_PARALLEL_SETTLE` value: only `"0"` disables
+/// (the sequential settle loop); unset / anything else = on.
 fn parse_parallel_settle_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// C3 auto-mode work gate: parallel settle pays a thread scope + plan handoff,
@@ -2862,16 +2861,17 @@ mod book_rows_toggle_tests {
 // block_height=379 → 377/378 were empty) and forced a multi-second full
 // reload. Only a direct successor advances; anything else drains the holder.
 
-/// rank8 runtime toggle: `TORUS_RESIDENT_BOOKS=1` enables resident books;
-/// anything else (INCLUDING UNSET) keeps the per-block reload — exact-today.
+/// rank8 runtime toggle for resident books. Default ON (plan 9.13: compiled
+/// defaults = the benched configuration); `TORUS_RESIDENT_BOOKS=0` keeps the
+/// per-block reload, the pre-9.13 path unchanged.
 fn resident_books_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_resident_books_toggle(std::env::var("TORUS_RESIDENT_BOOKS").ok()))
 }
 
-/// Pure parse of the `TORUS_RESIDENT_BOOKS` value: only `"1"` enables.
+/// Pure parse of the `TORUS_RESIDENT_BOOKS` value: only `"0"` disables.
 fn parse_resident_books_toggle(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
 /// bl1 resident-books-untouched-advance kill-switch:
@@ -4139,7 +4139,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// rank8 live-node entry: every mode from env (`TORUS_BOOK_ROWS`,
     /// `TORUS_RESIDENT_BOOKS`). The caller owns the cross-block holder; with
-    /// `TORUS_RESIDENT_BOOKS` unset this is exactly [`Self::new`] and the
+    /// `TORUS_RESIDENT_BOOKS=0` this is exactly [`Self::new`] and the
     /// holder is never touched.
     #[allow(clippy::too_many_arguments)]
     pub fn new_env(
