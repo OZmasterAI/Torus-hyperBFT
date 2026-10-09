@@ -333,7 +333,14 @@ impl<T: StateBackend> OracleManager<T> {
         // When only one reporter passes filters, cap deviation at 10% from last known price
         // to prevent a single validator from manipulating the oracle.
         if filtered.len() == 1 {
-            if let Ok(last_price) = self.get_last_valid_price(market_id, now) {
+            // R02: no last price (absent or stale) skips the cap; a local
+            // fault (failed read, undecodable row) propagates, never skips it.
+            let last = match self.get_last_valid_price(market_id, now) {
+                Ok(p) => Some(p),
+                Err(e) if e.is_local_fault() => return Err(e),
+                Err(_) => None,
+            };
+            if let Some(last_price) = last {
                 if last_price > FixedPoint::ZERO {
                     let single_price = filtered[0].0;
                     let diff = if single_price > last_price {
@@ -380,6 +387,18 @@ impl<T: StateBackend> OracleManager<T> {
             num_reporters: stored.num_reporters as usize,
             timestamp: stored.timestamp,
         })
+    }
+
+    /// R02: [`Self::get_price`] with absence split from failure: no aggregate
+    /// row is `Ok(None)`; `Err` is only a local fault (the read failed or the
+    /// stored row does not decode, `CoreError::is_local_fault`), which the
+    /// caller must fail-stop on, never read as "no price".
+    pub fn get_price_opt(&self, market_id: MarketId, now: u64) -> Result<Option<OraclePrice>, CoreError> {
+        match self.get_price(market_id, now) {
+            Ok(p) => Ok(Some(p)),
+            Err(CoreError::NoOraclePrice(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Block-start step: delete every submission row (all markets) whose block

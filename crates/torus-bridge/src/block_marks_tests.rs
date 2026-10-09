@@ -1,7 +1,7 @@
 //! Item 6 Phase 1 (C2, plan 2.3): the block mark table.
 //!
 //! - The table == `get_price(m, now).usable()` (today's per-read call) for
-//!   every market: fresh, stale by time, absent, non-positive, undecodable,
+//!   every market: fresh, stale by time, absent, non-positive,
 //!   a delisted market whose last aggregate is still fresh, and an unlisted
 //!   book market; a market outside the table reads the oracle directly.
 //! - `version` changes exactly when the table or `margin_configs` differ from
@@ -43,12 +43,13 @@ fn ctx_at<T: StateBackend>(state: T, h: u64, now: u64) -> NativeExecContext<T> {
 }
 
 /// Listed 1..=6 (configs), 7 has a fresh aggregate but no market row
-/// (delisted), 8 an undecodable aggregate and no row.
+/// (delisted). R02: an undecodable aggregate is a local fault, not "no
+/// mark" (the block fail-stops: `tests/r02_oracle_marks_tests.rs`).
 fn seed(db: &StateDb) {
     for m in 1..=6u64 {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
     }
-    let rows: [(MarketId, Option<Vec<u8>>); 8] = [
+    let rows: [(MarketId, Option<Vec<u8>>); 7] = [
         (1, Some(agg_row(fp(100).raw(), NOW - 5))),  // fresh
         (2, Some(agg_row(fp(200).raw(), NOW - 61))), // stale by time
         (3, None),                                   // absent
@@ -56,7 +57,6 @@ fn seed(db: &StateDb) {
         (5, Some(agg_row(-fp(3).raw(), NOW - 5))),   // negative
         (6, Some(agg_row(fp(600).raw(), NOW - 60))), // fresh at the 60 s edge
         (7, Some(agg_row(fp(700).raw(), NOW - 5))),  // delisted, fresh
-        (8, Some(b"garbage".to_vec())),              // undecodable
     ];
     for (m, row) in rows {
         if let Some(row) = row {
@@ -80,8 +80,8 @@ fn table_equals_get_price_usable_for_every_market() {
         // Every listed / configured market and every aggregate row is in the table.
         let mut keys: Vec<MarketId> = table.marks.keys().copied().collect();
         keys.sort_unstable();
-        assert_eq!(keys, (1..=8).collect::<Vec<_>>(), "now {now}");
-        for m in 1..=8u64 {
+        assert_eq!(keys, (1..=7).collect::<Vec<_>>(), "now {now}");
+        for m in 1..=7u64 {
             assert_eq!(table.marks[&m], oracle_mark(&ctx, m), "now {now}: table market {m}");
         }
         let reader = AccountReader::of(&ctx);
@@ -89,7 +89,7 @@ fn table_equals_get_price_usable_for_every_market() {
             assert_eq!(reader.mark(m), oracle_mark(&ctx, m), "now {now}: reader market {m}");
         }
         assert_eq!(table.marks[&1].is_some(), fresh_1, "now {now}: market 1 goes stale by time");
-        for m in [2, 3, 4, 5, 8] {
+        for m in [2, 3, 4, 5] {
             assert_eq!(table.marks[&m], None, "now {now}: market {m}");
         }
         assert_eq!(table.marks[&7], (now == NOW).then(|| fp(700)), "now {now}: delisted market 7");

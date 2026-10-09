@@ -719,6 +719,10 @@ enum ReplayFault {
     NoncePut,
     SessionRead,
     AppliedRead,
+    /// R02 branch 3: a reader without `&mut ctx` (`AccountReader::mark`,
+    /// `price_band`) recorded a local fault on the context's reader channel
+    /// during the block's batches.
+    OracleReaderFault,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2539,6 +2543,12 @@ impl ExecutionContext {
             // (the fail-stop check after the batches catches it).
             let _ = NativeExecutor::begin_block_oracle(&mut ctx);
             #[cfg(test)]
+            if self.test_replay_fault == Some(ReplayFault::OracleReaderFault) {
+                let _ = ctx
+                    .reader_fault
+                    .set("oracle mark read: injected aggregate read failure (test)".into());
+            }
+            #[cfg(test)]
             let engine_threads = self.test_engine_threads;
             #[cfg(not(test))]
             let engine_threads: Option<usize> = None;
@@ -2553,10 +2563,12 @@ impl ExecutionContext {
             let mut post_results = run_batch(&mut ctx, &post_evm);
             // T1.5 FAIL-STOP: a market worker panicked mid-match — its book
             // was consumed and this block's post-state is unreconstructable.
+            // R02: `take_fatal_error` also returns a local fault a reader
+            // recorded (oracle mark / price-band reads), as the two checks below.
             // Do NOT run the remaining phases, do NOT flush the overlay or
             // mark the block applied; latch the failure so the execution loop
             // halts and consensus stops instead of zombie-advancing.
-            if let Some(reason) = ctx.fatal_error.take() {
+            if let Some(reason) = ctx.take_fatal_error() {
                 tracing::error!(
                     height,
                     %reason,
@@ -2625,7 +2637,7 @@ impl ExecutionContext {
             let _ = NativeExecutor::run_liquidations(&mut ctx);
             // F11: a storage fault in the step (or, R02, in the CoreWriter
             // drain above) fail-stops exactly like the batches' check above.
-            if let Some(reason) = ctx.fatal_error.take() {
+            if let Some(reason) = ctx.take_fatal_error() {
                 tracing::error!(
                     height,
                     %reason,
@@ -2643,7 +2655,7 @@ impl ExecutionContext {
             // Row 74: a local storage fault in governance, staking (the
             // batches' handlers latch too, caught above), fees or the epoch
             // boundary fail-stops exactly like the checks above.
-            if let Some(reason) = ctx.fatal_error.take() {
+            if let Some(reason) = ctx.take_fatal_error() {
                 tracing::error!(
                     height,
                     %reason,
@@ -20106,6 +20118,86 @@ mod crash_recovery_tests {
         app.cached_vs_updates = None;
         app.test_applied_read_fault = true;
         assert!(app.epoch_validator_set_updates(boundary).is_err());
+    }
+
+    /// R02 branch 3: a local fault recorded by a reader without `&mut ctx`
+    /// (`AccountReader::mark` / `price_band`: the oracle aggregate read
+    /// failed; torus-bridge `r02_oracle_marks_tests` shows the real reads
+    /// land there) fail-stops the block like `fatal_error`: the committer's
+    /// checks use `take_fatal_error`. RED before: the checks read
+    /// `fatal_error` only, so the block flushed on the reader's "no mark".
+    #[test]
+    fn r02_oracle_reader_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![make_block(1, vec![a.clone()]), make_block(2, vec![b.clone()])];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|_| {},
+            ReplayFault::OracleReaderFault,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &a));
+                assert!(r02_nonce_consumed(db, &b));
+            },
+        );
+    }
+
+    /// R02 branch 3: an oracle aggregate row that does not decode on this
+    /// node (a delisted market's: only the block mark table reads it) is a
+    /// local fault: the block fail-stops (exec_failed, marker unchanged,
+    /// nothing flushed). Once the row is repaired, the restart's replay
+    /// matches a run that never had it. RED before: the row read as "no
+    /// mark" and the block flushed.
+    #[test]
+    fn r02_undecodable_oracle_aggregate_fail_stops_block() {
+        use torus_state::cf::CF_NATIVE_ORACLE;
+        let garbage_key = [b"agg".as_slice(), &7u64.to_be_bytes()].concat();
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![make_block(1, vec![a]), make_block(2, vec![b])];
+        link_blocks(&mut blocks);
+        for on in [false, true] {
+            let (_c, db_ref) = make_test_config_and_db();
+            let ctx = pipeline_ctx(&db_ref, on, None);
+            for blk in &blocks {
+                dispatch_and_execute(&ctx, &db_ref, blk);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: control");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db_ref), Some(2), "on={on}");
+
+            let (dir, db) = r02_reopenable_db();
+            let ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            drop(ctx);
+            // The row goes bad on disk; a fresh context (as after a
+            // restart) reads it (the resident rows are built from the DB).
+            db.put_cf_raw(CF_NATIVE_ORACLE, &garbage_key, b"garbage").unwrap();
+            let ctx = pipeline_ctx(&db, on, None);
+            let durable = persist_committed_block_durably(&db, &blocks[1]);
+            let before = dump_all_cfs(&db);
+            ctx.execute_committed_block_with(&blocks[1], vec![], durable);
+            ctx.pipeline_barrier();
+            assert!(ctx.exec_failed.load(Ordering::SeqCst), "on={on}: must fail-stop");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(1), "on={on}: block 2 not applied");
+            assert_dumps_equal(&before, &dump_all_cfs(&db), "R02: nothing of block 2 flushed");
+
+            // Repair the row, restart, replay block 2.
+            db.delete_cf_raw(CF_NATIVE_ORACLE, &garbage_key).unwrap();
+            drop(db);
+            let db = StateDb::open(&dir).expect("reopen");
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "R02: replay vs no fault");
+        }
     }
 
     /// Item 6 C1, P6: crash between E's hand-off and W's write with R on —
