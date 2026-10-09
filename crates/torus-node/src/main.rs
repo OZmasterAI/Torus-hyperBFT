@@ -1387,17 +1387,21 @@ const PROGRESS_MSG_BUFFER_BYTES: u64 = 1 << 20;
 /// - `hotstuff-bodyserve`: hotstuff_rs `hotstuff/block_data_server.rs` `start`
 /// - `torus-execution`: torus-consensus `app.rs` `TorusApp::new`
 /// - `torus-flush-worker`: torus-consensus `exec_pipeline.rs` `FlushWorker::spawn`
-/// - `torus-async-validate`: torus-consensus `app.rs` `AsyncValidateWorker::spawn`
 ///
 /// The three hotstuff threads read the consensus KV store, whose read and
 /// write faults panic (the hotstuff_rs `KVStore` trait is infallible).
+///
+/// NOT listed: `torus-async-validate` (torus-consensus `AsyncValidateWorker`).
+/// It is fed raw, unauthenticated proposal bytes before any chain-id / view /
+/// QC check, never reads the consensus KV store, and its DA writes are covered
+/// by the mempool's 3-failure latch; listing it would let one peer's bytes
+/// that hit a future panic there stop every validator at once.
 const FAIL_STOP_THREADS: &[&str] = &[
     "hotstuff-algo",
     "hotstuff-syncsv",
     "hotstuff-bodyserve",
     "torus-execution",
     "torus-flush-worker",
-    "torus-async-validate",
 ];
 
 /// sysexits.h EX_SOFTWARE, the node's fail-stop exit code.
@@ -1438,8 +1442,11 @@ mod tests {
     use clap::Parser;
 
     /// R01b A: a panic on a listed thread calls the injected exit with 70; a
-    /// panic on an unlisted thread, or one caught by a recovering
-    /// `catch_recoverable` on a listed thread, does not.
+    /// panic on an unlisted thread (incl. `torus-async-validate`, which is fed
+    /// unauthenticated proposal bytes), or one caught by a recovering
+    /// `catch_recoverable` on a listed thread, does not. Only this test's own
+    /// thread names are asserted, and the default hook is restored at the end
+    /// so the hook does not outlive the test in a one-process run.
     #[test]
     fn r01b_fail_stop_panic_hook_exits_70_on_listed_threads_only() {
         static EXITS: std::sync::Mutex<Vec<(String, i32)>> = std::sync::Mutex::new(Vec::new());
@@ -1455,9 +1462,10 @@ mod tests {
                 .unwrap()
                 .join()
         };
-        assert!(run("hotstuff-algo", || panic!("injected consensus write failure")).is_err());
+        assert!(run("hotstuff-algo", || panic!("injected write failure")).is_err());
         assert!(run("torus-flush-worker", || panic!("injected")).is_err());
         assert!(run("rpc-worker", || panic!("injected")).is_err());
+        assert!(run("torus-async-validate", || panic!("injected")).is_err());
         assert!(run("torus-execution", || {
             let r = torus_bridge::panic_scope::catch_recoverable(|| panic!("recovered"));
             assert!(r.is_err());
@@ -1467,9 +1475,20 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _)| !n.is_empty())
+            .filter(|(n, _)| {
+                [
+                    "hotstuff-algo",
+                    "torus-flush-worker",
+                    "rpc-worker",
+                    "torus-async-validate",
+                    "torus-execution",
+                ]
+                .contains(&n.as_str())
+            })
             .cloned()
             .collect();
+        // Back to the default hook (drops ours and the one it chained).
+        drop(std::panic::take_hook());
         assert_eq!(
             exits,
             vec![
