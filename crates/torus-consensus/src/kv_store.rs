@@ -60,7 +60,13 @@ impl RocksKVStore {
 impl KVGet for RocksKVStore {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let cf = self.db.cf_handle(CF_NAME)?;
-        self.db.get_cf(cf, key).ok().flatten()
+        // R01b: a read error is a local storage fault, never "absent" (hotstuff
+        // would act on a block / PC / view it reads as never written). The
+        // trait is infallible, so fail here; on the consensus threads the
+        // node's panic hook turns this into a fail-stop (exit 70).
+        self.db
+            .get_cf(cf, key)
+            .unwrap_or_else(|e| panic!("consensus KV read failed: {e}"))
     }
 }
 
@@ -129,7 +135,10 @@ pub struct RocksSnapshot<'a> {
 impl KVGet for RocksSnapshot<'_> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let cf = self.db.cf_handle(CF_NAME)?;
-        self.snap.get_cf(cf, key).ok().flatten()
+        // R01b: as `RocksKVStore::get`, an error is a fault, not `None`.
+        self.snap
+            .get_cf(cf, key)
+            .unwrap_or_else(|e| panic!("consensus KV snapshot read failed: {e}"))
     }
 }
 
@@ -181,7 +190,11 @@ impl KVStore for RocksKVStore {
             .expect("cf_consensus_meta missing");
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = rocksdb::WriteBatch::default();
-        for (key, _) in iter.flatten() {
+        // R01b: an iterator error must fail, not silently skip rows (which
+        // would leave them behind while `clear` reports success).
+        for item in iter {
+            let (key, _) =
+                item.unwrap_or_else(|e| panic!("consensus KV clear: iterator read failed: {e}"));
             batch.delete_cf(cf, &key);
         }
         if !batch.is_empty() {
@@ -238,6 +251,71 @@ mod tests {
         // Clear
         store.clear();
         assert!(store.get(b"key2").is_none());
+    }
+
+    /// R01b: a store whose only SST has a corrupted data block, reopened cold,
+    /// so every read of `key` (and a full scan) hits a checksum error.
+    fn corrupted_store(key: &[u8]) -> (TempDir, RocksKVStore) {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut store = RocksKVStore::open(dir.path());
+            let mut wb = RocksWriteBatch::new();
+            wb.set(key, &[0xab; 4096]);
+            store.write(wb);
+            let cf = store.db.cf_handle(CF_NAME).unwrap();
+            store.db.flush_cf(cf).unwrap();
+        }
+        let ssts: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sst"))
+            .collect();
+        assert_eq!(ssts.len(), 1, "one flushed SST expected: {ssts:?}");
+        // The first data block starts at offset 0; garbling it breaks its
+        // checksum without touching the footer / index RocksDB reads at open.
+        let mut bytes = std::fs::read(&ssts[0]).unwrap();
+        bytes[..64].fill(0xff);
+        std::fs::write(&ssts[0], bytes).unwrap();
+        let store = RocksKVStore::open(dir.path());
+        (dir, store)
+    }
+
+    fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
+        p.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// R01b: a RocksDB read error must not read as "absent" (`None`): hotstuff
+    /// would treat a missing block / PC / view as never written. It fails
+    /// instead (a panic, which the node's hook turns into exit 70 on the
+    /// consensus threads).
+    #[test]
+    fn kv_store_read_error_is_not_none() {
+        let (_dir, store) = corrupted_store(b"k");
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get(b"k")))
+            .expect_err("a read error must not return");
+        assert!(panic_text(err).contains("consensus KV read failed"));
+    }
+
+    #[test]
+    fn kv_snapshot_read_error_is_not_none() {
+        let (_dir, store) = corrupted_store(b"k");
+        let snap = store.snapshot();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.get(b"k")))
+            .expect_err("a snapshot read error must not return");
+        assert!(panic_text(err).contains("consensus KV snapshot read failed"));
+    }
+
+    /// R01b: `clear` must not skip rows it failed to read (it used to
+    /// `flatten()` iterator errors away and report success).
+    #[test]
+    fn kv_clear_iterator_error_fails() {
+        let (_dir, mut store) = corrupted_store(b"k");
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.clear()))
+            .expect_err("an iterator error must not be dropped");
+        assert!(panic_text(err).contains("consensus KV clear: iterator read failed"));
     }
 
     #[test]
