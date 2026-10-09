@@ -108,8 +108,17 @@ impl BookDepth {
     }
 }
 
+/// A layout / config mismatch every validator with the same chain and build
+/// sees alike: deterministic, NOT a local fault (R02, owner s106).
 fn layout_err(msg: impl Into<String>) -> CoreError {
     CoreError::BookLayout(msg.into())
+}
+
+/// R02 branch 3: a row corrupt on THIS node (does not decode, contradicts
+/// another row, stale or lost node-local store): a local fault. Same message
+/// text as [`layout_err`].
+fn corrupt_err(msg: impl Into<String>) -> CoreError {
+    CoreError::BookCorrupt(msg.into())
 }
 
 /// Raw `(key, value)` rows straight off a column family.
@@ -162,12 +171,15 @@ fn key_shape(key: &[u8]) -> Option<KeyShape> {
 ///    read back identically, so `OrderRows` is returned.
 pub fn detect_layout<S: StateBackend>(state: &S) -> Result<BookLayout, CoreError> {
     if let Some(bytes) = state.get_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY)? {
+        // R02: a marker that is not one byte is a corrupt row (local); one
+        // byte that is no known mode is a build / layout mismatch.
+        let err = if bytes.len() == 1 { layout_err } else { corrupt_err };
         return match (bytes.len() == 1)
             .then(|| BookLayout::from_marker_byte(bytes[0]))
             .flatten()
         {
             Some(layout) => Ok(layout),
-            None => Err(layout_err(format!(
+            None => Err(err(format!(
                 "__book_mode__ marker row is not a known mode discriminant ({bytes:02x?}) \
                  — refusing to guess the on-disk book layout"
             ))),
@@ -224,13 +236,13 @@ pub fn detect_layout<S: StateBackend>(state: &S) -> Result<BookLayout, CoreError
             // Meta rows + a populated node-local store = mode 2 with every
             // level currently... impossible (orders imply levels), so this is
             // a stale/half-written CF.
-            return Err(layout_err(
+            return Err(corrupt_err(
                 "cf_book_order_rows holds order rows but cf_native_order_books has no \
                  level rows — split-brain between the node-local order store and the \
                  consensus root (corrupt DB)",
             ));
         }
-        return Err(layout_err(
+        return Err(corrupt_err(
             "cf_book_order_rows is non-empty but cf_native_order_books has no book rows \
              at all — split-brain between the node-local order store and the consensus \
              root (corrupt DB)",
@@ -278,7 +290,7 @@ fn read_meta<S: StateBackend>(
         match key_shape(key) {
             Some(KeyShape::Meta) => {
                 meta = Some(BookMetaRow::decode(value).map_err(|e| {
-                    layout_err(format!("market {market_id}: {e}"))
+                    corrupt_err(format!("market {market_id}: {e}"))
                 })?);
             }
             Some(KeyShape::ClassicBlob) => {
@@ -298,7 +310,7 @@ fn read_meta<S: StateBackend>(
         }
     }
     if meta.is_none() && has_other_rows {
-        return Err(layout_err(format!(
+        return Err(corrupt_err(format!(
             "market {market_id} has order/stop/level rows but no meta row (corrupt row \
              store) — refusing to serve a partial book"
         )));
@@ -374,17 +386,17 @@ pub fn depth_from_rows(
                     continue;
                 }
                 if value.len() != LEVEL_ROW_VALUE_LEN {
-                    return Err(layout_err(format!(
+                    return Err(corrupt_err(format!(
                         "market {market_id}: level row value len {} != {LEVEL_ROW_VALUE_LEN} \
                          (corrupt level row)",
                         value.len()
                     )));
                 }
                 let data = LevelRowData::decode(value)
-                    .map_err(|e| layout_err(format!("market {market_id}: {e}")))?;
+                    .map_err(|e| corrupt_err(format!("market {market_id}: {e}")))?;
                 let tag = key[9];
                 let side = side_from_tag(tag).ok_or_else(|| {
-                    layout_err(format!(
+                    corrupt_err(format!(
                         "market {market_id}: level row has unknown side tag {tag:#04x}"
                     ))
                 })?;
@@ -459,7 +471,7 @@ pub fn read_last_trade_price<S: StateBackend>(
     match state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &book_meta_key(market_id))? {
         None => Ok(None),
         Some(value) => Ok(BookMetaRow::decode(&value)
-            .map_err(|e| layout_err(format!("market {market_id}: {e}")))?
+            .map_err(|e| corrupt_err(format!("market {market_id}: {e}")))?
             .last_trade_price),
     }
 }
@@ -538,7 +550,7 @@ pub fn read_open_orders<S: StateBackend>(
                         Some(&mid.to_be_bytes()),
                     )?;
                     if has_levels && store.is_empty() {
-                        return Err(layout_err(format!(
+                        return Err(corrupt_err(format!(
                             "market {mid}: cf_native_order_books commits level rows but the \
                              node-local cf_book_order_rows store holds no orders for it — \
                              the order store is stale or lost (refusing to report an empty \
@@ -568,7 +580,7 @@ pub fn read_open_orders<S: StateBackend>(
                         .iter()
                         .find(|mid| !markets_in_store.contains(mid))
                     {
-                        return Err(layout_err(format!(
+                        return Err(corrupt_err(format!(
                             "market {missing}: cf_native_order_books commits level rows but \
                              the node-local cf_book_order_rows store holds no orders for it \
                              — the order store is stale or lost (refusing to report an empty \
@@ -580,7 +592,7 @@ pub fn read_open_orders<S: StateBackend>(
             };
             for (key, value) in &store {
                 if key.len() != 25 || key[8] != ROW_TAG_ORDER {
-                    return Err(layout_err(format!(
+                    return Err(corrupt_err(format!(
                         "unrecognized cf_book_order_rows key (len {}) — corrupt node-local \
                          order store",
                         key.len()
@@ -638,7 +650,7 @@ pub fn rebuild_book<S: StateBackend>(
                 .iter()
                 .any(|(k, _)| key_shape(k) == Some(KeyShape::LevelRow));
             if has_levels && store.is_empty() {
-                return Err(layout_err(format!(
+                return Err(corrupt_err(format!(
                     "market {market_id}: cf_native_order_books commits level rows but the \
                      node-local cf_book_order_rows store holds no orders for it — the order \
                      store is stale or lost (refusing to serve an empty book)"
@@ -654,7 +666,7 @@ pub fn rebuild_book<S: StateBackend>(
         let (seq, order) = decode_order_row(value, market_id)?;
         check_row_id(key, &order, market_id, CF_NATIVE_ORDER_BOOKS)?;
         if seq >= meta.next_seq {
-            return Err(layout_err(format!(
+            return Err(corrupt_err(format!(
                 "market {market_id}: order row seq {seq} >= meta next_seq {} (corrupt row \
                  store)",
                 meta.next_seq
@@ -687,12 +699,12 @@ pub fn rebuild_book<S: StateBackend>(
         match book.restore_stop_row(&bytes) {
             Ok(id) if id == stop_id => {}
             Ok(id) => {
-                return Err(layout_err(format!(
+                return Err(corrupt_err(format!(
                     "market {market_id}: stop row key id {stop_id} != payload id {id} \
                      (corrupt row store)"
                 )))
             }
-            Err(e) => return Err(layout_err(format!("market {market_id}: {e}"))),
+            Err(e) => return Err(corrupt_err(format!("market {market_id}: {e}"))),
         }
     }
     Ok(Some(book))
@@ -718,7 +730,7 @@ pub fn book_depth(book: &OrderBook) -> BookDepth {
 fn decode_classic_book(blob: &[u8], market_id: MarketId) -> Result<OrderBook, CoreError> {
     use borsh::BorshDeserialize;
     OrderBook::try_from_slice(blob).map_err(|e| {
-        layout_err(format!(
+        corrupt_err(format!(
             "market {market_id}: cf_native_order_books value is not a classic whole-book \
              blob: {e}"
         ))
@@ -727,7 +739,7 @@ fn decode_classic_book(blob: &[u8], market_id: MarketId) -> Result<OrderBook, Co
 
 fn decode_order_row(value: &[u8], market_id: MarketId) -> Result<(u64, Order), CoreError> {
     OrderBook::decode_order_row(value)
-        .map_err(|e| layout_err(format!("market {market_id}: book order row: {e}")))
+        .map_err(|e| corrupt_err(format!("market {market_id}: book order row: {e}")))
 }
 
 /// The order id is in the key AND inside the payload — disagreement means the
@@ -740,7 +752,7 @@ fn check_row_id(
 ) -> Result<(), CoreError> {
     let key_id = u128::from_be_bytes(key[9..25].try_into().expect("25-byte order row key"));
     if key_id != order.id {
-        return Err(layout_err(format!(
+        return Err(corrupt_err(format!(
             "market {market_id}: {cf} row key id {key_id} != payload id {} (corrupt row \
              store)",
             order.id

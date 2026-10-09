@@ -743,7 +743,8 @@ fn a_wrong_length_level_key_reverts() {
     key.push(0);
     db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, b"junk").unwrap();
     let r = order_book(&db, &mut ReadMeter::with_max(30_000_000));
-    assert!(matches!(r, Err(CoreError::BookLayout(_))), "{r:?}");
+    // R02 branch 3: a corrupt row on this node (a local fault); same revert text.
+    assert!(matches!(r, Err(CoreError::BookCorrupt(_))), "{r:?}");
 }
 
 // ---------------------------------------------------------------------------

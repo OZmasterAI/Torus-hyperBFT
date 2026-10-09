@@ -742,7 +742,7 @@ fn book_levels(
     let mut rows = side(SIDE_TAG_BID, meter)?;
     rows.extend(side(SIDE_TAG_ASK, meter)?);
     if let Some((k, _)) = rows.iter().find(|(k, _)| k.len() != 26) {
-        return Err(CoreError::BookLayout(format!(
+        return Err(CoreError::BookCorrupt(format!(
             "market {market_id}: level row key of {} bytes (corrupt row store)",
             k.len()
         )));
