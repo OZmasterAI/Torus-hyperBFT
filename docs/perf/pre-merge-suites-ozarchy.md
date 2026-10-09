@@ -16,6 +16,84 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `merge/compiled-defaults` `bb8b384e` (2026-10-09, feat/compiled-defaults `64d41d70` + main `e58b92b0`)
+
+The 9.13 compiled defaults branch (`64d41d70`, previous section) with main `e58b92b0` merged in
+(`bb8b384e`: main `d2b2736b` + docs; R01/R01b, R02 reader and precompile faults, kv-store write panic,
+mempool, block-sync). Under this tree resident books, root cache, parallel settle, member cache 256 MB
+and pipelined write are on when the env is unset; `TORUS_BOOK_ROWS` stays Classic. Worktree
+`wt/merge-compiled-defaults`, clean at `bb8b384e` before and after the run; target dir
+`~/.cargo-target-compiled-defaults`. The suite 4 baseline `e58b92b0` ran in a temporary detached
+worktree (`wt/base-e58b92b0`, removed afterwards) with its own target dir
+(`~/.cargo-target-compiled-defaults-base`, warm from the `1eced05c` run); the source roots of all 21
+members were touched on each side before clippy, and both sides re-linted 21 crates. Every cargo
+command held `/tmp/claude-1000/torus-suite.lock`. Suite 5 ran on 18c on `bb8b384e`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,236 passed, 0 failed**, 35 skipped, 0 flaky | 131 s (82.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 5 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,237 passed, 0 failed**, 42 ignored (167 result lines) | 406 s |
+| 4 | clippy (no `-D`) / fmt vs `e58b92b0` | 0 / 1 (fmt: old debt) | clippy 268 vs 269, **0 new**, 1 gone; fmt 3,396 vs 3,400, **0 new**, 4 gone | 17 s / 4 s (base 12 s / 4 s) |
+| 5 | uniswap | **PASSED** | 18c on `bb8b384e`: D6 swap status `0x1` | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+No test failed under the new compiled defaults, so no test needed its knobs pinned: main's R01, R01b and
+R02 tests, written under the old defaults, pass unchanged. Compared with the previous section (3,201 run,
+34 skipped): main adds 36 tests, 35 run and 1 ignored (the µbench in
+`crates/torus-bridge/src/trader_positions_tests.rs`). By file: `tests/r02_reader_faults_tests.rs` 10,
+`torus-consensus/src/app.rs` 7, `tests/r02_precompile_fault_tests.rs` 4, `torus-consensus/src/kv_store.rs`
+4, `torus-mempool/src/lib.rs` 4, `trader_positions_tests.rs` 2, and 1 each in `panic_scope.rs`,
+`exec_pipeline.rs`, `precompiles.rs`, `block_sync/server.rs` and `torus-node/src/main.rs`.
+
+Suite 4: the clippy finding and the 4 fmt hunks that are gone are the same branch lines as in the
+previous section (`native_trie.rs` doc-list indentation; fmt `native_executor.rs` 1,
+`perf_equivalence_golden.rs` 2, `native_trie.rs` 1). No fmt fix was needed.
+
+Suite 3's 3,237 = nextest's 3,236 + the 1 doc test, and its 42 ignored = nextest's 35 skipped + the 7
+ignored doc tests. No test failed in the shared process.
+
+Logs: `~/bench-results-matched/presuite-merge-compiled-defaults-bb8b/` (`run.sh`, `1-nextest.log` ...
+`6-test_*.log`, `norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21,
+`3-full.log`, `3-full.rc`).
+
+## `feat/compiled-defaults` `63449230` (2026-10-09, s107, BOOK_ROWS default reverted to Classic)
+
+Plan 9.13 node-local compiled defaults (`ebbe6e4c`: pipelined write, resident books, root cache,
+parallel settle, member cache 256 MB on when unset) with the `TORUS_BOOK_ROWS` = 3 default (`f80ef36c`)
+reverted (`1d5d7bd0`, 18c s107 after the adversarial Codex review: genesis carries no book mode) and
+the docs update (`63449230`). Base `1eced05c`; `git merge-tree` against origin/main `b88b0c90` (docs only
+over the base) is clean, so the branch was not rebased. Worktree `wt/compiled-defaults`, clean before
+and after the run; target dir `~/.cargo-target-compiled-defaults`. The suite 4 baseline ran in a
+temporary detached worktree (`wt/base-1eced05c`, removed afterwards) with its own cold target dir
+(`~/.cargo-target-compiled-defaults-base`); the source roots of all 21 members were touched on each side
+before clippy. Every cargo command held `/tmp/claude-1000/torus-suite.lock` (a parallel builder and a
+bench campaign share the host); the base clippy wall includes ~50 min waiting on that lock. Suite 5 was
+not run (18c).
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,201 passed, 0 failed**, 34 skipped, 0 flaky | 451 s (83.6 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 33 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,202 passed, 0 failed**, 41 ignored (165 result lines) | 400 s |
+| 4 | clippy (no `-D`) / fmt vs `1eced05c` | 0 / 1 (fmt: old debt) | clippy 267 vs 268, **0 new**, 1 gone; fmt 3,348 vs 3,352, **0 new**, 4 gone (after `36bc63ac`) | 275 s / 4 s |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 30 s |
+
+Suite 4: the first fmt check found **2 new hunks** in `crates/torus-consensus/src/app.rs`, both in the
+rewritten `env_unset_compiled_defaults_equal_the_bench_config`; `36bc63ac` applies rustfmt's layout to
+those lines only (the adapted test passes again). The clippy finding that is gone is the doc-list
+indentation in `crates/torus-state/src/native_trie.rs` (`ebbe6e4c`); the 4 fmt hunks that are gone are in
+`native_executor.rs` (1), `perf_equivalence_golden.rs` (2) and `native_trie.rs` (1). Suites 1-3 and 6 ran at
+`63449230`; `36bc63ac` changes only formatting.
+
+Suite 3's 3,202 = nextest's 3,201 + the 1 doc test, and its 41 ignored = nextest's 34 skipped + the 7
+ignored doc tests. No test failed in the shared process.
+
+Logs: `~/bench-results-matched/presuite-compiled-defaults-6344/` (`run.sh`, `1-nextest.log` ...
+`6-test_*.log`, `norm.py`, `4-delta.txt` (first fmt check), `4-delta-after-fmt-fix.txt`,
+`4-cand-fmt-pre-fix.log`).
+
 ## perf/c2-holder-hashset dde72cd3 (2026-10-09, s107, rebased onto main b88b0c90)
 
 C2 holder sets as foldhash `HashSet` (tests `de1aab28`, change `98d0f081`, docs `dde72cd3`), rebased

@@ -693,8 +693,8 @@ fn a5_maker_release_survives_parallel_settle() {
 
 #[test]
 fn default_mode_multi_market_settles() {
-    // Whatever TORUS_PARALLEL_SETTLE says in this environment (default OFF —
-    // unset means the classic sequential loop), the plain execute_batch entry
+    // Whatever TORUS_PARALLEL_SETTLE says in this environment (default ON
+    // since plan 9.13; `=0` is the classic sequential loop), the plain execute_batch entry
     // point must settle a cross-market batch with the same observable outcome
     // as explicit sequential mode.
     let batches = fuzz_batches(0x0BAD_F00D);
