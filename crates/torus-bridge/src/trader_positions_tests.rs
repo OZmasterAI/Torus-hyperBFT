@@ -5,7 +5,7 @@
 //! decode or name another trader / market, short keys) never break it: their
 //! trader reads through the overlay, as today.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use torus_core::position::{position_key, MarginType, PositionManager};
@@ -121,6 +121,22 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
         by_market.entry(m).or_default().insert(Address::from_slice(&k[..20]));
     }
     assert_eq!(rec.holders, by_market, "{tag}: holder lists != traders of R's keys per market");
+    // c2-holder-hashset: `holders_with` == the BTreeSet reference (ascending
+    // traders of R's keys `t ‖ m`) in every market, whatever the set's type.
+    let mut want: BTreeMap<MarketId, BTreeSet<Address>> = BTreeMap::new();
+    for k in r.keys().filter(|k| k.len() == 28) {
+        want.entry(MarketId::from_be_bytes(k[20..].try_into().unwrap()))
+            .or_default()
+            .insert(Address::from_slice(&k[..20]));
+    }
+    for m in (0..=MARKETS + 1).chain([MarketId::MAX]) {
+        let reference: Vec<Address> = want.get(&m).into_iter().flatten().copied().collect();
+        assert_eq!(
+            rec.holders_with(m, &[]),
+            reference,
+            "{tag}: holders_with({m}) != the BTreeSet reference"
+        );
+    }
     let mut prefixes: BTreeSet<Address> =
         r.keys().filter(|k| k.len() >= 20).map(|k| Address::from_slice(&k[..20])).collect();
     prefixes.extend((0..=TRADERS).map(trader));
@@ -733,4 +749,213 @@ fn has_key_seeks_only_under_the_traders_prefix() {
         }
     }
     o.detach_resident();
+}
+
+/// c2-holder-hashset: `holders_with` is ascending (and merges `dirty` in
+/// order) whatever order the holders entered the index: across blocks, by
+/// the record path (`follow`) and the per-key path of an opaque trader, a
+/// holder removed and re-added last.
+#[test]
+fn holders_with_ascending_whatever_the_insertion_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut rows = ResidentRows::build(&db).unwrap();
+    let mut rec = TraderPositions::build(&rows);
+    let mut block = |f: &dyn Fn(&NativeStateOverlay)| {
+        let o = NativeStateOverlay::new(db.clone());
+        f(&o);
+        let delta = o.own_pending_delta();
+        o.flush(&db).unwrap();
+        rows.apply(&delta);
+        rec.apply(&delta, &rows, None);
+        assert!(rec.same_as(&TraderPositions::build(&rows)), "warm == cold");
+        rec.holders_with(1, &[])
+    };
+    let open = |o: &NativeStateOverlay, i: u64| {
+        let t = trader(i);
+        o.put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &position_key(&t, 1),
+            &bytes(&position(t, 1, i, true)),
+        )
+        .unwrap();
+    };
+    let ts = |is: &[u64]| is.iter().map(|&i| trader(i)).collect::<Vec<_>>();
+    assert_eq!(block(&|o| open(o, 5)), ts(&[5]));
+    assert_eq!(block(&|o| open(o, 1)), ts(&[1, 5]));
+    assert_eq!(block(&|o| open(o, 9)), ts(&[1, 5, 9]));
+    // Opaque (a longer key under it): its holder moves per key from the delta.
+    let opaque = |o: &NativeStateOverlay| {
+        let t = trader(3);
+        o.put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &[&position_key(&t, 1)[..], &[1]].concat(),
+            &[7],
+        )
+        .unwrap();
+        open(o, 3);
+    };
+    assert_eq!(block(&opaque), ts(&[1, 3, 5, 9]));
+    assert_eq!(block(&|o| open(o, 7)), ts(&[1, 3, 5, 7, 9]));
+    assert_eq!(
+        block(&|o| o
+            .delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&trader(1), 1))
+            .unwrap()),
+        ts(&[3, 5, 7, 9])
+    );
+    assert_eq!(block(&|o| open(o, 1)), ts(&[1, 3, 5, 7, 9]));
+    assert!(rec.get(&trader(3)).is_none(), "trader 3 opaque");
+    assert_eq!(
+        rec.holders_with(1, &ts(&[0, 4, 5, 10])),
+        ts(&[0, 1, 3, 4, 5, 7, 9, 10]),
+        "merged with dirty"
+    );
+    assert_eq!(
+        rec.holders_with(2, &ts(&[2, 6])),
+        ts(&[2, 6]),
+        "no holder: dirty only"
+    );
+    assert_eq!(rec.holders_with(2, &[]), ts(&[]));
+}
+
+/// c2-holder-hashset µbench: [`TraderPositions::apply`] (with a `seen`
+/// callback, like the node) over `UB_TP_BLOCKS` (20) blocks of
+/// `UB_TP_WRITES` (50,000, ~2 per fill) position writes over `UB_TP_TRADERS`
+/// (10,000) traders x `UB_TP_MARKETS` (300) markets, R starting with
+/// `UB_TP_DENSITY_PCT` (10) % of the keys held. `UB_TP_TOGGLE_PCT` (30) % of
+/// the writes open or close a key (the holder index moves), the rest rewrite
+/// a held key. Deltas are made once (untimed); `UB_TP_REPS` (5) passes over
+/// them from a fresh build. Prints ms per block and per 1k fills (writes / 2).
+///
+///   cargo test -p torus-bridge --release --lib ubench_trader_positions_apply -- --ignored --nocapture
+#[test]
+#[ignore = "µbench"]
+fn ubench_trader_positions_apply() {
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (traders, markets) = (env("UB_TP_TRADERS", 10_000), env("UB_TP_MARKETS", 300));
+    let (blocks, writes, reps) = (
+        env("UB_TP_BLOCKS", 20),
+        env("UB_TP_WRITES", 50_000),
+        env("UB_TP_REPS", 5),
+    );
+    let (density, toggle) = (env("UB_TP_DENSITY_PCT", 10), env("UB_TP_TOGGLE_PCT", 30));
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut rng = Lcg(0xC2_4A54);
+    let mut held: Vec<(u64, MarketId)> = Vec::new();
+    let mut slot: HashMap<(u64, MarketId), usize> = HashMap::default();
+    let o = NativeStateOverlay::new(db.clone());
+    for i in 0..traders {
+        for m in 1..=markets {
+            if rng.below(100) < density {
+                let t = trader(i);
+                o.put_cf_raw(
+                    CF_NATIVE_POSITIONS,
+                    &position_key(&t, m),
+                    &bytes(&position(t, m, rng.below(1_000), true)),
+                )
+                .unwrap();
+                slot.insert((i, m), held.len());
+                held.push((i, m));
+            }
+        }
+    }
+    o.flush(&db).unwrap();
+    let rows0 = ResidentRows::build(&db).unwrap();
+    let mut rows = rows0.clone();
+    let mut deltas = Vec::new();
+    for _ in 0..blocks {
+        let o = NativeStateOverlay::new(db.clone());
+        for _ in 0..writes {
+            if rng.below(100) < toggle {
+                // Half closes of a held key, half opens (a held pick
+                // rewrites): R's size stays about where it started.
+                let close = rng.below(2) == 0;
+                let (i, m) = if close {
+                    held[rng.below(held.len() as u64) as usize]
+                } else {
+                    (rng.below(traders), 1 + rng.below(markets))
+                };
+                let t = trader(i);
+                if !close && slot.contains_key(&(i, m)) {
+                    o.put_cf_raw(
+                        CF_NATIVE_POSITIONS,
+                        &position_key(&t, m),
+                        &bytes(&position(t, m, rng.below(1_000), true)),
+                    )
+                    .unwrap();
+                } else if let Some(at) = slot.remove(&(i, m)) {
+                    o.delete_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m))
+                        .unwrap();
+                    held.swap_remove(at);
+                    if let Some(moved) = held.get(at) {
+                        slot.insert(*moved, at);
+                    }
+                } else {
+                    o.put_cf_raw(
+                        CF_NATIVE_POSITIONS,
+                        &position_key(&t, m),
+                        &bytes(&position(t, m, rng.below(1_000), true)),
+                    )
+                    .unwrap();
+                    slot.insert((i, m), held.len());
+                    held.push((i, m));
+                }
+            } else {
+                let (i, m) = held[rng.below(held.len() as u64) as usize];
+                let t = trader(i);
+                o.put_cf_raw(
+                    CF_NATIVE_POSITIONS,
+                    &position_key(&t, m),
+                    &bytes(&position(t, m, rng.below(1_000), false)),
+                )
+                .unwrap();
+            }
+        }
+        let delta = o.own_pending_delta();
+        o.flush(&db).unwrap();
+        rows.apply(&delta);
+        deltas.push((delta, rows.clone()));
+    }
+    let mut per_rep = Vec::new();
+    for rep in 0..reps {
+        let mut rec = TraderPositions::build(&rows0);
+        let mut ns = 0u128;
+        let mut sink = 0usize;
+        for (delta, rows) in &deltas {
+            let start = std::time::Instant::now();
+            rec.apply(
+                delta,
+                rows,
+                Some(&mut |_: &Address, r: Option<(&[Change], &[Position])>| {
+                    sink += r.map_or(1, |(c, _)| c.len())
+                }),
+            );
+            ns += start.elapsed().as_nanos();
+        }
+        if rep == 0 {
+            assert!(
+                rec.same_as(&TraderPositions::build(&deltas.last().unwrap().1)),
+                "warm == cold"
+            );
+        }
+        let ms_block = ns as f64 / 1e6 / blocks as f64;
+        per_rep.push(ms_block);
+        println!(
+            "UB_TP rep {rep} ms_per_block {ms_block:.3} ms_per_1k_fills {:.4} (sink {sink})",
+            ms_block / (writes as f64 / 2.0) * 1e3
+        );
+    }
+    per_rep.sort_by(f64::total_cmp);
+    let med = per_rep[per_rep.len() / 2];
+    println!(
+        "UB_TP traders {traders} markets {markets} held {} blocks {blocks} writes {writes} toggle {toggle}% median ms_per_block {med:.3} ms_per_1k_fills {:.4}",
+        held.len(),
+        med / (writes as f64 / 2.0) * 1e3
+    );
 }
