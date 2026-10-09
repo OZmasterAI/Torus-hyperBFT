@@ -730,6 +730,21 @@ Order after the P2-1 gate cell (18c s104): merge main `12979d4b` into the branch
 9.11), the row 23 lows, then the reduce-only modify sweep as its own small branch (consensus, fresh
 genesis; row 22); the defaults branch after Phase 2.
 
+**Built on `feat/compiled-defaults`** (from main `1eced05c`; ozarchy s107), per-knob check:
+pipelined write, `RESIDENT_BOOKS`, `NATIVE_ROOT_CACHE`, `PARALLEL_SETTLE`, member cache 256 MB:
+node-local, value-neutral (RocksDB write scheduling / caches with root self-check / differential
+tests `root_cache_tests`, `resident_books_tests`, `parallel_settle_tests`), default on, `=0` keeps
+each old path unchanged. `BUCKET_HASH=8` was already the compiled default. `BOOK_ROWS=3`:
+consensus-visible (state-root format), default now mode 3, `=0` = Classic; an existing DB written in
+another mode fail-stops at the `__book_mode__` marker / content check (`fail_stop_matrix_all_mode_pairs`,
+`book_mode_marker_catches_wrong_flag_on_empty_books`); env unset = the bench config in running hash,
+native root and every CF (`env_unset_compiled_defaults_equal_the_bench_config`). Fleet-uniform: an old
+binary (Classic default) and a new one on the same chain fork. **`COMMIT_LAG_BACKOFF_CAP` not
+changed:** a genesis parameter (`chain_config.commit_lag_backoff_cap`, consensus-liveness, the env is
+a devnet override over genesis, `torus-node/src/main.rs` `resolve_commit_lag_cap`); a compiled env
+default would override every genesis value. Set `commit_lag_backoff_cap: 8` in the testnet genesis
+instead. `run-cell.sh` `RECORD_ENV` stays explicit (older binaries).
+
 ### 9.14 P2-1 gate missed: accept and continue (18c s104 / ozarchy s31, 2026-10-08)
 
 **Chosen: A, accept P2-1 as built and continue** (review log rows 24-25). Phase 1 fell 0.44 ms per

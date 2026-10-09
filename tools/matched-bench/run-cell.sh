@@ -287,8 +287,9 @@ RUN_DIR="$DATA_ROOT/run"
 # RE-PROOF5 record cell (R190) node env, with TORUS_BOOK_ROWS bumped 2 -> 3
 # after the r2 merge (level-hash-seq-chunked: mode 3 chunked level digest,
 # consensus-visible, fleet-uniform, fresh genesis — all three hold here since
-# every cell is CLEAN=1 with one env for all 3 nodes). The node-code default
-# stays Classic (unset). EXTRA_ENV entries are applied AFTER these, so a cell
+# every cell is CLEAN=1 with one env for all 3 nodes). Since plan 9.13 the
+# node-code defaults equal this list except TORUS_COMMIT_LAG_BACKOFF_CAP
+# (genesis-sourced, 0); the explicit export keeps OLDER binaries equivalent. EXTRA_ENV entries are applied AFTER these, so a cell
 # can override any of them (e.g. EXTRA_ENV='TORUS_BOOK_ROWS=2' for a mode-2
 # control, or 'TORUS_PARALLEL_SETTLE=0').
 # TORUS_PARALLEL_BUCKET_HASH: 4 -> 8 after the r5 root-and-save-workers sweep
