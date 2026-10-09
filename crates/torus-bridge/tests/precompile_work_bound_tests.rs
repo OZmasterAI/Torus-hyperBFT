@@ -358,7 +358,7 @@ fn the_node_local_marker_changes_neither_gas_nor_answer() {
     }
 }
 
-/// Classic layout (the default, TORUS_BOOK_ROWS unset): the whole-book blob is
+/// Classic layout (`TORUS_BOOK_ROWS=0`; the default before plan 9.13): the whole-book blob is
 /// sized with a length probe and charged (20 gas per 32 bytes) BEFORE it is
 /// read. An under-budget call reads no value bytes at all; with enough budget
 /// the production blob still fails to decode, and the revert pays for the

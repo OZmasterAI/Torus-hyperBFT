@@ -2183,7 +2183,8 @@ mod parallel_engine_toggle_tests {
 // (`TORUS_BOOK_ROWS=2`)
 // ============================================================================
 //
-// Classic path (default): each market's ENTIRE `OrderBook` is Borsh-serialized
+// Classic path (`TORUS_BOOK_ROWS=0`; the default before plan 9.13): each
+// market's ENTIRE `OrderBook` is Borsh-serialized
 // into one `CF_NATIVE_ORDER_BOOKS` row per touched block — O(book depth) bytes
 // serialized AND state-root-hashed per block, the 2GB-RSS / swap driver once
 // books hold >1M resting orders.
@@ -2217,7 +2218,8 @@ mod parallel_engine_toggle_tests {
 //     there is no migration, and load refuses to start (fail-stop via
 //     ctx.fatal_error) when the CF's on-disk content OR the node-local
 //     `__book_mode__` marker does not match the configured mode.
-// Default (unset/other) = Classic = byte-identical persistence to today.
+// Default (unset/other) = mode 3 (plan 9.13: the benched configuration);
+// `TORUS_BOOK_ROWS=0` = Classic, byte-identical persistence to pre-9.13.
 // ###########################################################################
 //
 // Row schema: see `torus_core::book_rows` (frozen key/value layouts; level
@@ -2234,7 +2236,8 @@ mod parallel_engine_toggle_tests {
 /// Consensus-visible book persistence mode (see the warning above).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BookMode {
-    /// Whole-book borsh blob per market (8-byte key) — exact-today default.
+    /// Whole-book borsh blob per market (8-byte key) — `TORUS_BOOK_ROWS=0`
+    /// (the default before plan 9.13).
     Classic,
     /// C4 per-order rows in the root CF (`TORUS_BOOK_ROWS=1`).
     OrderRows,
@@ -2282,10 +2285,12 @@ impl BookMode {
     }
 }
 
-/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority,
-/// `=3` → LevelAuthorityChunked; anything else (INCLUDING UNSET) → Classic —
-/// byte-identical state root to today. Read once per process. Fleet-uniform,
-/// fresh genesis to change.
+/// Runtime mode: `TORUS_BOOK_ROWS=0` → Classic (the pre-9.13 default), `=1` →
+/// OrderRows, `=2` → LevelAuthority, `=3` → LevelAuthorityChunked; anything
+/// else (INCLUDING UNSET) → LevelAuthorityChunked (plan 9.13: the benched
+/// configuration). Read once per process. Fleet-uniform, fresh genesis to
+/// change: a DB written in another mode fail-stops at the `__book_mode__`
+/// marker / content check.
 fn book_mode() -> BookMode {
     static MODE: std::sync::OnceLock<BookMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
@@ -2296,8 +2301,8 @@ fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     match v.as_deref().map(str::trim) {
         Some("1") => BookMode::OrderRows,
         Some("2") => BookMode::LevelAuthority,
-        Some("3") => BookMode::LevelAuthorityChunked,
-        _ => BookMode::Classic,
+        Some("0") => BookMode::Classic,
+        _ => BookMode::LevelAuthorityChunked,
     }
 }
 

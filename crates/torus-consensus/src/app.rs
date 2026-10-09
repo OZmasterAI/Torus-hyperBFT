@@ -629,6 +629,10 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
+    /// resident holder (the per-block reload, `TORUS_RESIDENT_BOOKS=0`).
+    #[cfg(test)]
+    test_no_resident: bool,
     /// Item 6 Phase 1 (step 0.4): test-only reference switch — `true` runs
     /// every native block without the resident rows R (`begin_resident(None,
     /// ..)` = today's path: R's CFs are read from the DB). The node has no
@@ -2476,6 +2480,10 @@ impl ExecutionContext {
             let test_book_mode = self.test_book_mode;
             #[cfg(not(test))]
             let test_book_mode: Option<torus_bridge::native_executor::BookMode> = None;
+            #[cfg(test)]
+            let test_no_resident = self.test_no_resident;
+            #[cfg(not(test))]
+            let test_no_resident = false;
             let mut ctx = match test_book_mode {
                 Some(mode) => NativeExecContext::new_with_mode(
                     overlay.clone(),
@@ -2488,7 +2496,7 @@ impl ExecutionContext {
                     self.treasury_address,
                     self.dev_pool_address,
                     mode,
-                    Some(&mut resident_books),
+                    (!test_no_resident).then_some(&mut resident_books),
                 ),
                 None => NativeExecContext::new_env(
                     overlay.clone(),
@@ -4336,6 +4344,8 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_no_resident: false,
             #[cfg(test)]
             test_no_resident_rows: false,
             #[cfg(test)]
@@ -11356,6 +11366,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
+            test_no_resident: false,
+            #[cfg(test)]
             test_no_resident_rows: false,
             #[cfg(test)]
             test_reference_paths: false,
@@ -15581,7 +15593,14 @@ mod crash_recovery_tests {
         fund_pipeline_fixture(&state_db);
         let blocks = pipeline_fixture_blocks();
         let gate = crate::exec_pipeline::WorkerGate::new();
-        let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+        // Classic pinned (the seed below is classic; the code default is mode
+        // 3 since plan 9.13).
+        let ctx = book_pipeline_ctx(
+            &state_db,
+            true,
+            Some(gate.clone()),
+            torus_bridge::native_executor::BookMode::Classic,
+        );
 
         // Native 1 through the pipeline, drained: marker(1) durable.
         dispatch_and_execute(&ctx, &state_db, &blocks[0]);
@@ -21237,7 +21256,11 @@ mod crash_recovery_tests {
         let gate = crate::exec_pipeline::WorkerGate::new();
         let new_ctx = |attach: bool| {
             let mut ctx = make_exec_ctx(&config, &db);
-            ctx.test_book_mode = mode;
+            // `None`: Classic without the resident holder (the env default
+            // before plan 9.13), pinned since the default is now mode 3.
+            ctx.test_book_mode =
+                Some(mode.unwrap_or(torus_bridge::native_executor::BookMode::Classic));
+            ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
             ctx.metrics = Some(metrics.clone());
             if pipelined && attach {
@@ -21386,8 +21409,8 @@ mod crash_recovery_tests {
     /// Plan 9.8: the reference paths and the production paths give
     /// identical per-block consensus write sets (every `h_n`), running hash
     /// and full CF dump (state, books, trades, action status), serial and
-    /// pipelined, in `mode` (`None`: the env default, classic without the
-    /// resident holder). The switch reaches the context (the reference
+    /// pipelined, in `mode` (`None`: classic without the resident holder, the
+    /// env default before plan 9.13). The switch reaches the context (the reference
     /// cancel-all keeps no counters) and the sequence is non-vacuous. P2-1:
     /// production uses the cancel-all index, whose carried copy covers the
     /// books after every block (resident modes, `p2_run`); a replica
