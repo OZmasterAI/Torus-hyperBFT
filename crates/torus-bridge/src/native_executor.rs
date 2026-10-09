@@ -379,6 +379,29 @@ impl BalanceCache {
         }
         Ok(())
     }
+
+    /// Item 6 Phase 2 P2-2 (plan 9.12 (b)): the per-row flush, frozen as the
+    /// reference for the batch write: one `put_native_balance` per dirty
+    /// address in sorted order (`flush_all` before P2-2). Test-only, reached
+    /// through `NativeExecContext::test_flush_per_row`.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    fn flush_all_per_row<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+    ) -> Result<(), CoreError> {
+        self.dirty.sort_unstable();
+        for addr in &self.dirty {
+            if let Some(entry) = self.map.get(addr) {
+                positions.put_native_balance(addr, &entry.balance)?;
+            }
+        }
+        for addr in self.dirty.drain(..) {
+            if let Some(entry) = self.map.get_mut(&addr) {
+                entry.dirty = false;
+            }
+        }
+        Ok(())
+    }
 }
 
 // Item 3 (s517): the end-of-block liquidation step (child module: sees the
@@ -6665,7 +6688,15 @@ impl NativeExecutor {
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
-        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        let bal_flushed = if ctx.test_flush_per_row {
+            bal_cache.flush_all_per_row(&ctx.positions)
+        } else {
+            bal_cache.flush_all(&ctx.positions)
+        };
+        #[cfg(not(any(test, feature = "test-reference-paths")))]
+        let bal_flushed = bal_cache.flush_all(&ctx.positions);
+        if let Err(e) = bal_flushed {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
         }
         let mut volumes: Vec<_> = vol_cache.into_iter().collect();
