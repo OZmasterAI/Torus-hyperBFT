@@ -7,10 +7,13 @@
 //! Task 2.5.1: NativeExecutor dispatch table + batch execution.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
+// Item 6 Phase 2 P2-5: std's HashMap with foldhash, seeded per process
+// (alloy's default `map-foldhash`), instead of SipHash.
+use alloy_primitives::map::{HashMap, HashSet};
 use torus_core::error::CoreError;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
@@ -249,9 +252,9 @@ mod volume_cache_probe {
                 .iter()
                 .map(|f| {
                     let mut v = if sized {
-                        VolumeCache::with_capacity(2 * f.len())
+                        VolumeCache::with_capacity_and_hasher(2 * f.len(), Default::default())
                     } else {
-                        VolumeCache::new()
+                        VolumeCache::default()
                     };
                     add_fill_volumes(&mut v, f, 2 * f.len());
                     v
@@ -264,7 +267,7 @@ mod volume_cache_probe {
         }
         let built = plans(true);
         let distinct = {
-            let mut all = VolumeCache::new();
+            let mut all = VolumeCache::default();
             for p in &built {
                 all.extend(p.iter().map(|(t, v)| (*t, *v)));
             }
@@ -273,7 +276,7 @@ mod volume_cache_probe {
         let max_plan = built.iter().map(VolumeCache::len).max().unwrap_or(0);
         for (name, cap) in [("new", 0), ("max plan len", max_plan), ("distinct", distinct)] {
             let (min, med) = median_ms(|| {
-                let mut merged = VolumeCache::with_capacity(cap);
+                let mut merged = VolumeCache::with_capacity_and_hasher(cap, Default::default());
                 for p in &built {
                     for (t, add) in p {
                         *merged.entry(*t).or_insert(FixedPoint::ZERO) += *add;
@@ -297,7 +300,7 @@ struct CachedBalance {
 impl BalanceCache {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: HashMap::default(),
             dirty: Vec::new(),
         }
     }
@@ -671,7 +674,6 @@ const OPEN_COUNT_WORK_PER_THREAD: usize = 100_000;
 #[cfg(test)]
 mod open_order_count_tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn trader(n: u64) -> Address {
         let mut b = [0u8; 20];
@@ -718,7 +720,7 @@ mod open_order_count_tests {
             let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ seed);
             let big = seed == 8;
             let (n_books, universe) = if big { (40, 1600) } else { (1 + rng.below(30), 400) };
-            let mut books: HashMap<MarketId, OrderBook> = HashMap::new();
+            let mut books: HashMap<MarketId, OrderBook> = HashMap::default();
             for m in 1..=n_books {
                 let mut book = OrderBook::new(m, fp(1), fp(1));
                 let traders = match (big, rng.below(4)) {
@@ -747,7 +749,7 @@ mod open_order_count_tests {
             };
             let got = NativeExecutor::open_order_counts(&books, senders.iter());
 
-            let mut idx: HashMap<Address, usize> = HashMap::new();
+            let mut idx: HashMap<Address, usize> = HashMap::default();
             for s in &senders {
                 let next = idx.len();
                 idx.entry(*s).or_insert(next);
@@ -846,7 +848,7 @@ struct AccountReader<'a, T: StateBackend> {
     /// adl-dirty-check (node-local): the ADL drain's dirty traders
     /// (`DrainCache::dirty_traders`, ranking reader only), in place of a
     /// `layer_touches` per read. `None` elsewhere.
-    drain_dirty: Option<&'a std::collections::HashSet<Address>>,
+    drain_dirty: Option<&'a HashSet<Address>>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -1264,7 +1266,7 @@ impl BlockSums {
 /// * `id`: keys each Phase 3 worker's maker cache ([`MAKER_FREE`]).
 pub(crate) struct BatchSums {
     id: u64,
-    dirty: Option<std::collections::HashSet<Address>>,
+    dirty: Option<HashSet<Address>>,
     memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
 }
 
@@ -1300,7 +1302,7 @@ thread_local! {
     /// `.0` ([`BatchSums::id`]; another batch clears it). A maker's free
     /// margin is the same in every market of a batch (frozen backend).
     static MAKER_FREE: std::cell::RefCell<(u64, HashMap<Address, FixedPoint>)> =
-        std::cell::RefCell::new((0, HashMap::new()));
+        std::cell::RefCell::new((0, HashMap::default()));
 }
 
 /// Item 6 Phase 1 (C2, plan 2.3): every market's mark for the whole block,
@@ -1757,7 +1759,7 @@ impl<T: StateBackend> AccountReader<'_, T> {
         MAKER_FREE.with(|c| {
             let mut c = c.borrow_mut();
             if c.0 != b.id {
-                *c = (b.id, HashMap::new());
+                *c = (b.id, HashMap::default());
             }
             c.1.insert(*maker, free);
         });
@@ -1977,8 +1979,8 @@ mod projections_tests {
         for round in 0..200 {
             let markets = [3u64, 12, 40][round % 3];
             let mut fold = SenderFold::with_capacity(0);
-            let mut want: HashMap<(Address, MarketId), Projection> = HashMap::new();
-            let mut want_released: HashMap<Address, FixedPoint> = HashMap::new();
+            let mut want: HashMap<(Address, MarketId), Projection> = HashMap::default();
+            let mut want_released: HashMap<Address, FixedPoint> = HashMap::default();
             for step in 0..600 {
                 // Runs of one sender, as in a batch, and switches.
                 let sender = Address::repeat_byte(1 + next(4) as u8);
@@ -2024,7 +2026,10 @@ mod projections_tests {
 impl SenderFold {
     /// Pre-sized: `senders` expected.
     fn with_capacity(senders: usize) -> Self {
-        Self { senders: HashMap::with_capacity(senders), cur: None }
+        Self {
+            senders: HashMap::with_capacity_and_hasher(senders, Default::default()),
+            cur: None,
+        }
     }
 
     /// `sender`'s state (default when new), held out of the map until the
@@ -2048,7 +2053,10 @@ impl SenderFold {
             self.senders.insert(a, st);
         }
         let mut out = FoldOut {
-            cache: BalanceCache { map: HashMap::with_capacity(self.senders.len()), dirty: Vec::new() },
+            cache: BalanceCache {
+                map: HashMap::with_capacity_and_hasher(self.senders.len(), Default::default()),
+                dirty: Vec::new(),
+            },
             ..FoldOut::default()
         };
         for (sender, st) in self.senders {
@@ -2643,6 +2651,10 @@ fn drain_books_parallel(
                 })
             })
             .collect();
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::SaveBooks,
+            handles.len(),
+        );
         let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
         for h in handles {
             match h.join() {
@@ -2891,13 +2903,143 @@ struct RowsSlot {
 
 struct ResidentInner {
     books: HashMap<MarketId, OrderBook>,
+    /// Item 6 Phase 2 P2-1: the books' cancel-all index (`None`: not built
+    /// since the last load; the next cancel-all builds it from the books).
+    trader_markets: Option<TraderMarkets>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
     height: u64,
 }
 
+/// Item 6 Phase 2 P2-1 (tests): trader -> markets, ascending.
+#[cfg(any(test, feature = "test-reference-paths"))]
+pub type TraderIndexSnapshot = std::collections::BTreeMap<Address, Vec<MarketId>>;
+
+/// Item 6 Phase 2 P2-1: the node-local cancel-all index, trader -> the
+/// markets (ascending) where the trader may have resting orders, pending
+/// stops or reduce-only entries. A SUPERSET of [`OrderBook::traders_present`]
+/// over all books: fed from each book's `new_traders` log at every site where
+/// an order can rest or a stop be stored ([`Self::absorb`]), never removed
+/// eagerly; a cancel-all of the trader takes the markets it visits out (the
+/// trader has nothing left there). Built from the books at the first
+/// cancel-all after a load ([`NativeExecContext::cancel_index`]), carried
+/// with the resident books. Never hashed, never persisted: a missing entry
+/// would leave orders on a book, an extra one costs one probe.
+#[derive(Default)]
+struct TraderMarkets {
+    map: HashMap<Address, Vec<MarketId>>,
+    /// (trader, market) entries over all of `map` (s104 size gauge).
+    entries: usize,
+}
+
+impl TraderMarkets {
+    /// The index of `books` as they are (their logs are emptied: the scan
+    /// already sees everything logged).
+    fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
+        for book in books.values_mut() {
+            book.drain_new_traders();
+        }
+        let mut index = Self::default();
+        for (&market, book) in books.iter() {
+            for trader in book.traders_present() {
+                index.insert(*trader, market);
+            }
+        }
+        index
+    }
+
+    fn insert(&mut self, trader: Address, market: MarketId) {
+        let markets = self.map.entry(trader).or_default();
+        if let Err(at) = markets.binary_search(&market) {
+            markets.insert(at, market);
+            self.entries += 1;
+        }
+    }
+
+    /// `trader`'s markets, ascending, taken out of the index.
+    fn take(&mut self, trader: &Address) -> Vec<MarketId> {
+        let markets = self.map.remove(trader).unwrap_or_default();
+        self.entries -= markets.len();
+        markets
+    }
+
+    /// Whether the index lists `market` for `trader`; takes it out.
+    fn remove(&mut self, trader: &Address, market: MarketId) -> bool {
+        let Some(markets) = self.map.get_mut(trader) else {
+            return false;
+        };
+        let Ok(at) = markets.binary_search(&market) else {
+            return false;
+        };
+        markets.remove(at);
+        self.entries -= 1;
+        if markets.is_empty() {
+            self.map.remove(trader);
+        }
+        true
+    }
+
+    /// (s104 size gauges) `((trader, market) entries, traders)`.
+    fn size(&self) -> (u64, u64) {
+        (self.entries as u64, self.map.len() as u64)
+    }
+
+    /// Feed `book`'s log (market `market`) into `index`. Called wherever an
+    /// order can rest or a stop be stored: after the single-action
+    /// placement, for every book the batch matching hands back, after a
+    /// modify. Without an index the log is dropped: the build scans the books.
+    fn absorb(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        match index {
+            Some(index) => {
+                for trader in book.drain_new_traders() {
+                    index.insert(trader, market);
+                }
+            }
+            None => {
+                book.drain_new_traders();
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    fn snapshot(&self) -> TraderIndexSnapshot {
+        self.map.iter().map(|(t, ms)| (*t, ms.clone())).collect()
+    }
+}
+
+/// P2-1 (tests): `(carried, rebuilt)` — `index` (`None`: not built)
+/// and the index a load would build from `books` now (exact).
+#[cfg(any(test, feature = "test-reference-paths"))]
+fn trader_index_snapshot(
+    index: Option<&TraderMarkets>,
+    books: &HashMap<MarketId, OrderBook>,
+) -> (Option<TraderIndexSnapshot>, TraderIndexSnapshot) {
+    let mut rebuilt = TraderIndexSnapshot::new();
+    for (&market, book) in books {
+        for trader in book.traders_present() {
+            let markets = rebuilt.entry(*trader).or_default();
+            if let Err(at) = markets.binary_search(&market) {
+                markets.insert(at, market);
+            }
+        }
+    }
+    (index.map(TraderMarkets::snapshot), rebuilt)
+}
+
 impl ResidentBooks {
+    /// Item 6 Phase 2 P2-1 (tests): `(carried, rebuilt)` — the cancel-all
+    /// index carried with the books (`None`: not built since the last load)
+    /// and the one a load would build from them now. The carried index
+    /// covers the rebuilt one (it may also list markets where a trader has
+    /// nothing left). `None`: no resident books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn trader_index(&self) -> Option<(Option<TraderIndexSnapshot>, TraderIndexSnapshot)> {
+        self.inner
+            .as_ref()
+            .map(|inner| trader_index_snapshot(inner.trader_markets.as_ref(), &inner.books))
+    }
+
     /// Drop any resident state (books and rows) — the next block rebuilds
     /// from the DB. Waits for an `end_resident` worker first (step 2).
     pub fn invalidate(&mut self) {
@@ -3301,7 +3443,14 @@ pub fn end_resident_on_worker(
         slot
     });
     match spawned {
-        Ok(handle) => holder.rows_pending = Some(PendingRows { handle, height, metrics }),
+        Ok(handle) => {
+            torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+            holder.rows_pending = Some(PendingRows {
+                handle,
+                height,
+                metrics,
+            })
+        }
         Err(e) => {
             // The job (R included) was dropped with the closure.
             tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
@@ -3493,6 +3642,10 @@ mod cancel_batch_toggle_tests {
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
 
+#[cfg(any(test, feature = "test-reference-paths"))]
+#[path = "reference_paths.rs"]
+mod reference_paths;
+
 #[cfg(test)]
 #[path = "block_marks_tests.rs"]
 mod block_marks_tests;
@@ -3576,7 +3729,7 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// byte-identical in final state (state-root-safe even in mixed
     /// deployments) and turns the old O(all resting orders) rewrite into
     /// O(touched) (S395).
-    pub dirty_books: std::collections::HashSet<MarketId>,
+    pub dirty_books: HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
     /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
@@ -3588,6 +3741,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Item 6 C3: the block's margin sums cache ([`Self::attach_resident_block`]
     /// to [`Self::detach_resident_block`]; `None`: every valuation builds).
     sums: Option<BlockSums>,
+    /// Item 6 Phase 2 P2-1: the cancel-all index of `order_books`
+    /// ([`TraderMarkets`]; `None` until the first cancel-all after a load
+    /// builds it, carried in the resident holder).
+    trader_markets: Option<TraderMarkets>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -3717,6 +3874,22 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// thread needs the PRODUCTION share, not a µbench's. Node-local
     /// instrumentation: never read by execution, never part of the state root.
     pub save_split: SaveSplitAccum,
+
+    /// Item 6 Phase 2 step 0.4: test-only reference switch (no runtime flag,
+    /// D16). `true` runs every cancel-all (user runs and single actions, the
+    /// liquidation step's cancels) one action at a time through the frozen
+    /// full scan of every book (`reference_paths.rs`
+    /// `cancel_orders_and_stops_full_scan`), the reference P2-1's book index
+    /// is compared against. Other crates' tests reach it through the
+    /// test-only `test-reference-paths` feature (plan 9.8). Default off.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_cancel_all_full_scan: bool,
+    /// Item 6 Phase 2 (plan 9.8): test-only reference switch. `true` flushes
+    /// the batch position cache through the frozen per-row reference
+    /// (`PositionCache::flush_all_per_row`), the reference P2-2's batch
+    /// overlay writes are compared against. Default off.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_flush_per_row: bool,
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
@@ -3773,6 +3946,16 @@ pub struct ExecPhaseAccum {
     /// B-blind (s92): non-pool sells topped up (in full or partly) after
     /// Phase 2 ([`NativeExecutor::sell_top_ups`]). A count, not a span.
     pub sell_top_ups: u64,
+    /// Item 6 Phase 2 step 0.2 (P2-1): cancel-alls executed (user
+    /// `CancelAllOrders` and the liquidation step's cancels), the books they
+    /// visited, and the books where the sender had orders or stops.
+    pub cancel_alls: u64,
+    pub cancel_all_books_visited: u64,
+    pub cancel_all_books_hit: u64,
+    /// Step 0.2 (P2-1b): `CancelOrder` / `ModifyOrder` executed, and the
+    /// books they probed to find the order.
+    pub by_id_actions: u64,
+    pub by_id_books_probed: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4034,8 +4217,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         // "what we can" would silently diverge from the fleet, so latch a
         // fatal instead: the committer fail-stops before flushing anything.
         let mut load_timings = LoadTimings::default();
-        let (order_books, scanned_next_id, mut load_error) = match reused_inner {
-            Some(inner) => (inner.books, inner.next_global_order_id, None),
+        // P2-1: the resident books bring their index; a load starts without
+        // one (the first cancel-all builds it from the books).
+        let mut trader_markets = None;
+        let (mut order_books, scanned_next_id, mut load_error) = match reused_inner {
+            Some(inner) => {
+                trader_markets = inner.trader_markets;
+                (inner.books, inner.next_global_order_id, None)
+            }
             None => match book_mode {
                 BookMode::Classic => Self::load_order_books(&state),
                 BookMode::OrderRows => Self::load_order_books_rows(&state),
@@ -4049,6 +4238,13 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             },
         };
+        if trader_markets.is_none() {
+            // P2-1: what the load inserted is in the books; the index build
+            // scans them.
+            for book in order_books.values_mut() {
+                book.drain_new_traders();
+            }
+        }
 
         // 3c robustness marker: `__book_mode__` (node-local, non-root) catches
         // wrong-flag restarts even on chains whose books are still empty
@@ -4087,7 +4283,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 if load_error.is_none() {
                     load_error = Some(format!("margin configs: {e}"));
                 }
-                HashMap::new()
+                HashMap::default()
             }
         };
         load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
@@ -4099,11 +4295,12 @@ impl<T: StateBackend> NativeExecContext<T> {
             governance,
             state,
             order_books,
-            dirty_books: std::collections::HashSet::new(),
+            dirty_books: HashSet::default(),
             margin_configs,
             block_marks: None,
             prev_marks: None,
             sums: None,
+            trader_markets,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -4142,6 +4339,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_cancel_all_full_scan: false,
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_flush_per_row: false,
         }
     }
 
@@ -4217,8 +4418,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             resident.invalidate();
             return;
         }
+        self.debug_assert_index_fed();
         resident.inner = Some(ResidentInner {
             books: std::mem::take(&mut self.order_books),
+            trader_markets: self.trader_markets.take(),
             next_global_order_id: self.next_global_order_id,
             height: self.block_height,
         });
@@ -4227,6 +4430,45 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// rank8 staleness guard input: the DB's native applied-height marker.
     fn read_applied_marker(state: &T) -> Option<u64> {
         applied_marker(state)
+    }
+
+    /// Item 6 Phase 2 P2-1: the cancel-all index, built from the books on
+    /// first use after a load.
+    fn cancel_index(&mut self) -> &mut TraderMarkets {
+        let books = &mut self.order_books;
+        self.trader_markets
+            .get_or_insert_with(|| TraderMarkets::build(books))
+    }
+
+    /// P2-1 (debug builds): with an index, every book's log was fed into it
+    /// at its site ([`TraderMarkets::absorb`]); a log left over means a site
+    /// that rests orders or stores stops does not feed the index.
+    fn debug_assert_index_fed(&self) {
+        debug_assert!(
+            self.trader_markets.is_none()
+                || self
+                    .order_books
+                    .values()
+                    .all(|b| b.new_traders_logged() == 0),
+            "P2-1: a book's new-trader log was not fed into the cancel-all index"
+        );
+    }
+
+    /// Item 6 Phase 2 P2-1 (s104, node-local gauges): the cancel-all index's
+    /// `((trader, market) entries, traders)`; `(0, 0)` while not built (until
+    /// the first cancel-all after a load, and always without resident books).
+    /// Counts every entry, stale ones too. O(1): the index keeps its entry
+    /// count.
+    pub fn cancel_index_size(&self) -> (u64, u64) {
+        self.trader_markets
+            .as_ref()
+            .map_or((0, 0), TraderMarkets::size)
+    }
+
+    /// P2-1 (tests): `(carried, rebuilt)` as [`ResidentBooks::trader_index`].
+    #[cfg(test)]
+    pub(crate) fn trader_index(&self) -> (Option<TraderIndexSnapshot>, TraderIndexSnapshot) {
+        trader_index_snapshot(self.trader_markets.as_ref(), &self.order_books)
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -4295,14 +4537,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         use borsh::BorshDeserialize;
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
 
         if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             for (key, value) in entries {
                 if Self::is_book_row_key(&key) {
                     return (
-                        HashMap::new(),
+                        HashMap::default(),
                         1,
                         Some(
                             "C4: cf_native_order_books holds per-order/level rows but \
@@ -4387,7 +4629,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (HashMap::default(), 1, Some(msg));
 
         // Per-market accumulators.
         #[derive(Default)]
@@ -4399,7 +4641,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         fn acc(m: &mut HashMap<MarketId, Acc>, id: MarketId) -> &mut Acc {
             m.entry(id).or_default()
         }
-        let mut accs: HashMap<MarketId, Acc> = HashMap::new();
+        let mut accs: HashMap<MarketId, Acc> = HashMap::default();
 
         let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             Ok(e) => e,
@@ -4447,7 +4689,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
 
         // Deterministic rebuild order (market id ascending).
@@ -4493,7 +4735,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     ) -> (HashMap<MarketId, OrderBook>, u128, Option<String>) {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 
-        let fail = |msg: String| (HashMap::new(), 1, Some(msg));
+        let fail = |msg: String| (HashMap::default(), 1, Some(msg));
 
         let load_start = std::time::Instant::now();
         let t0 = load_start;
@@ -4505,7 +4747,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             /// level key (26 B) -> stored 52 B value
             levels: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
         }
-        let mut roots: HashMap<MarketId, RootAcc> = HashMap::new();
+        let mut roots: HashMap<MarketId, RootAcc> = HashMap::default();
 
         let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
             Ok(e) => e,
@@ -4565,7 +4807,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         let t0 = std::time::Instant::now();
         // ---- Node-local order-row store scan ----
         let mut store_orders: HashMap<MarketId, Vec<(u64, torus_core::order_book::Order)>> =
-            HashMap::new();
+            HashMap::default();
         let store_entries = match state.iterate_cf(CF_BOOK_ORDER_ROWS, None) {
             Ok(e) => e,
             Err(e) => return fail(format!("3c: order-row store scan failed: {e}")),
@@ -4738,6 +4980,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                         })
                     })
                     .collect();
+                torus_state::spawn_count::add(
+                    torus_state::spawn_count::SpawnSite::LoadBooks,
+                    handles.len(),
+                );
                 // Join every worker; re-raise a panic like the serial loop.
                 let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
                 for h in handles {
@@ -4759,7 +5005,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         };
         timings.books_wall_ns = t_books.elapsed().as_nanos();
 
-        let mut books = HashMap::new();
+        let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
         for (market_id, loaded) in results {
             let (book, rebuild_ns, verify_ns) = match loaded {
@@ -5295,7 +5541,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut prefix = [0u8; 9];
         prefix[..8].copy_from_slice(&market_id.to_be_bytes());
         prefix[8] = ROW_TAG_STOP;
-        let persisted: std::collections::HashSet<u128> = state
+        let persisted: HashSet<u128> = state
             .iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&prefix))
             .map(|rows| {
                 rows.iter()
@@ -5306,7 +5552,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             .unwrap_or_default();
 
         let mut written = 0usize;
-        let mut live = std::collections::HashSet::with_capacity(stops.len());
+        let mut live = HashSet::with_capacity_and_hasher(stops.len(), Default::default());
         for (id, bytes) in stops {
             live.insert(id);
             if !persisted.contains(&id) {
@@ -5383,10 +5629,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         let stops = book.stop_rows();
 
         // Fresh key set per CF.
-        let mut keep_root: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
-        let mut keep_store: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        let mut keep_root: HashSet<Vec<u8>> =
+            HashSet::default();
+        let mut keep_store: HashSet<Vec<u8>> =
+            HashSet::default();
         keep_root.insert(book_meta_key(market_id).to_vec());
         for (id, _) in &stops {
             keep_root.insert(book_stop_key(market_id, *id).to_vec());
@@ -5952,6 +6198,7 @@ impl NativeExecutor {
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
 
         if place_order_indices.is_empty() {
+            ctx.debug_assert_index_fed();
             return NativeBatchResult { results, total_gas };
         }
 
@@ -5960,7 +6207,7 @@ impl NativeExecutor {
         // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
         // — the prepared order carries an 8-byte reference through Phases 2-4
         // instead of a per-order deep clone of `PlaceOrderParams`.
-        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+        let mut market_batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
 
         // Open orders after Phase 1 of every sender with an order that takes
         // an open-order slot (read by the serial loop and the sharded workers).
@@ -5982,7 +6229,7 @@ impl NativeExecutor {
         // read-modify-writes per fill; they hit this map and flush once
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
-        let mut vol_cache = VolumeCache::new();
+        let mut vol_cache = VolumeCache::default();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
         let engine_threads = match engine_mode {
@@ -6044,7 +6291,7 @@ impl NativeExecutor {
             // groups is irrelevant — shards are disjoint — but keep it
             // deterministic anyway).
             let mut groups: Vec<(Address, Vec<(usize, &PlaceOrderParams)>)> = Vec::new();
-            let mut group_of: HashMap<Address, usize> = HashMap::new();
+            let mut group_of: HashMap<Address, usize> = HashMap::default();
             for &i in &place_order_indices {
                 let (sender, entry) = &flat[i];
                 let params: &PlaceOrderParams = match entry {
@@ -6152,7 +6399,8 @@ impl NativeExecutor {
             m.sell_top_ups_partial.inc_by(partial);
             m.sell_top_ups_none.inc_by(none);
         }
-        let mut pools: HashMap<(Address, MarketId), FixedPoint> = HashMap::with_capacity(pool_takers.len());
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
+            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
         for (&sender, &(market_id, pos_net)) in &pool_takers {
             let available = bal_cache
                 .load(&ctx.positions, &sender)
@@ -6171,7 +6419,7 @@ impl NativeExecutor {
         // ---- Phase 3: Parallel matching ----
         let match_timer = std::time::Instant::now();
         let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
-            HashMap::new();
+            HashMap::default();
 
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
@@ -6323,6 +6571,8 @@ impl NativeExecutor {
         // after settlement, in market-id / order / trigger order.
         let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
         for mbr in market_results.iter_mut() {
+            // P2-1: what rested or was stored in this book feeds the index.
+            TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
             mbr.book.clear_reduce_only_positions();
             // Plan 9.11 (telemetry): this book's charged maker fills.
             if let Some(m) = ctx.metrics.as_deref() {
@@ -6402,7 +6652,16 @@ impl NativeExecutor {
         // r6: the two sorted flush_all walks are the tail of Phase 4 and were
         // only ever visible lumped into `exec_phase_settle_seconds`.
         let cache_flush_timer = std::time::Instant::now();
-        if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+        // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        let pos_flushed = if ctx.test_flush_per_row {
+            pos_cache.flush_all_per_row(&ctx.positions)
+        } else {
+            pos_cache.flush_all(&ctx.positions)
+        };
+        #[cfg(not(any(test, feature = "test-reference-paths")))]
+        let pos_flushed = pos_cache.flush_all(&ctx.positions);
+        if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
@@ -6431,6 +6690,7 @@ impl NativeExecutor {
                 .observe(settle_elapsed.as_secs_f64());
         }
 
+        ctx.debug_assert_index_fed();
         NativeBatchResult { results, total_gas }
     }
 
@@ -6751,6 +7011,10 @@ impl NativeExecutor {
         let shard = groups.len().div_ceil(workers);
 
         type WorkerOut = (Vec<(usize, PrepOutcome)>, FoldOut);
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::MarginPrepare,
+            groups.len().div_ceil(shard),
+        );
         let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(shard)
@@ -7128,6 +7392,10 @@ impl NativeExecutor {
                 let mut slots: Vec<Option<Result<MarketSettlePlan, String>>> =
                     (0..mrs.len()).map(|_| None).collect();
                 let plan_for = &plan_for;
+                torus_state::spawn_count::add(
+                    torus_state::spawn_count::SpawnSite::Settle,
+                    chunks.len(),
+                );
                 let chunk_out: Vec<Vec<(usize, Result<MarketSettlePlan, String>)>> =
                     std::thread::scope(|s| {
                         let handles: Vec<_> = chunks
@@ -7368,7 +7636,7 @@ impl NativeExecutor {
         // At most two traders per fill: sized up front, the map never
         // regrows (s84: regrowth was a third of the cum_volume time).
         let fill_sides: usize = mbr.results.iter().map(|m| 2 * m.result.fills.len()).sum();
-        let mut volumes = VolumeCache::with_capacity(fill_sides);
+        let mut volumes = VolumeCache::with_capacity_and_hasher(fill_sides, Default::default());
 
         for (match_result, prep) in mbr.results.iter().zip(prepared.iter()) {
             let result = &match_result.result;
@@ -7769,7 +8037,7 @@ impl NativeExecutor {
         books: &HashMap<MarketId, OrderBook>,
         senders: impl Iterator<Item = &'a Address>,
     ) -> HashMap<Address, u32> {
-        let mut idx: HashMap<Address, usize> = HashMap::new();
+        let mut idx: HashMap<Address, usize> = HashMap::default();
         for sender in senders {
             let next = idx.len();
             idx.entry(*sender).or_insert(next);
@@ -7986,11 +8254,14 @@ impl NativeExecutor {
         // never rest; without one in the batch they are not tracked (the
         // map is otherwise only written). Pre-sized: one key per order at most.
         let track_closing = orders.iter().any(|(_, _, p)| Self::never_rests(p));
-        let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::new();
-        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::new();
+        let mut growth: HashMap<(Address, MarketId), FixedPoint> = HashMap::default();
+        let mut marks: HashMap<MarketId, Option<FixedPoint>> = HashMap::default();
         let mut closing: HashMap<(Address, MarketId, bool), (Option<FixedPoint>, FixedPoint)> =
-            HashMap::with_capacity(if track_closing { orders.len() } else { 0 });
-        let mut out = HashMap::new();
+            HashMap::with_capacity_and_hasher(
+                if track_closing { orders.len() } else { 0 },
+                Default::default(),
+            );
+        let mut out = HashMap::default();
         for &(i, sender, params) in orders {
             let mark = if matches!(params.order_type, OrderType::Market) {
                 *marks
@@ -8067,7 +8338,7 @@ impl NativeExecutor {
         reader: &AccountReader<'a, T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
     ) -> HashMap<MarketId, Phase2Market<'a>> {
-        let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::new();
+        let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::default();
         for &(_, _, p) in orders {
             out.entry(p.market_id)
                 .or_insert_with(|| Phase2Market {
@@ -8700,6 +8971,8 @@ impl NativeExecutor {
             margin_limit.as_ref(),
             Some(&reader),
         );
+        // P2-1: the rest of the order / its stop feeds the cancel-all index.
+        TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
         book.clear_reduce_only_positions();
         // Plan 9.11 (telemetry): this placement's charged maker fills.
         if let Some(m) = ctx.metrics.as_deref() {
@@ -8890,8 +9163,10 @@ impl NativeExecutor {
         sender: &Address,
         order_id: u128,
     ) -> NativeActionResult {
+        ctx.phase_accum.by_id_actions += 1;
         // Check ownership before cancelling (cheaper than cancel + re-insert).
         for book in ctx.order_books.values() {
+            ctx.phase_accum.by_id_books_probed += 1;
             if let Some(order) = book.get_order(order_id) {
                 if order.trader != *sender {
                     return NativeActionResult::err(
@@ -8906,6 +9181,7 @@ impl NativeExecutor {
             }
         }
         for book in ctx.order_books.values_mut() {
+            ctx.phase_accum.by_id_books_probed += 1;
             if let Ok(cancelled) = book.cancel_order(order_id) {
                 // FIX 2 (ECON-FIND-05): Release order margin on cancel.
                 let notional = cancelled.price * cancelled.remaining_qty;
@@ -8949,28 +9225,49 @@ impl NativeExecutor {
     /// they reserved — orders at `price × remaining` (FIX 2), stops at
     /// [`Self::stop_reservation`]. A market that lost anything is dirty. The
     /// caller releases the sum (`min(order_margin)`). Shared by the user
-    /// `CancelAll` and the liquidation step.
+    /// `CancelAll` and the liquidation step. Item 6 Phase 2 P2-1: with
+    /// resident books, only the markets the cancel-all index lists for
+    /// `trader` are visited (in ascending id, as the full scan); the others
+    /// hold nothing of the trader's, so the scan changed nothing there. The
+    /// visited markets leave the index. Without resident books every book is
+    /// visited (row 23: an index would be rebuilt in every block).
     fn cancel_orders_and_stops<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         trader: &Address,
         market: Option<MarketId>,
     ) -> FixedPoint {
-        let market_ids: Vec<MarketId> = match market {
-            Some(m) => vec![m],
-            None => {
-                let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
-                v.sort_unstable();
-                v
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        if ctx.test_cancel_all_full_scan {
+            return reference_paths::cancel_orders_and_stops_full_scan(ctx, trader, market);
+        }
+        let market_ids: Vec<MarketId> = if ctx.resident {
+            let index = ctx.cancel_index();
+            match market {
+                Some(m) if index.remove(trader, m) => vec![m],
+                Some(_) => Vec::new(),
+                None => index.take(trader),
+            }
+        } else {
+            match market {
+                Some(m) => vec![m],
+                None => {
+                    let mut v: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+                    v.sort_unstable();
+                    v
+                }
             }
         };
         let mut total = FixedPoint::ZERO;
+        ctx.phase_accum.cancel_alls += 1;
         for mid in market_ids {
             let Some(book) = ctx.order_books.get_mut(&mid) else { continue };
+            ctx.phase_accum.cancel_all_books_visited += 1;
             let stops = book.take_pending_stops(trader);
             let cancelled = book.cancel_all(*trader, market);
             if stops.is_empty() && cancelled.is_empty() {
                 continue;
             }
+            ctx.phase_accum.cancel_all_books_hit += 1;
             ctx.dirty_books.insert(mid);
             let cfg = ctx.margin_configs.get(&mid);
             total += Self::cancelled_orders_margin(cfg, &cancelled);
@@ -9012,7 +9309,8 @@ impl NativeExecutor {
     /// sender, market), state-equivalent to `exec_cancel_all` per action in
     /// run order. Book work goes first: one `OrderBook::cancel_all_many` per
     /// market over the run's senders targeting it, in run order (a repeated
-    /// sender gets the empty result the sequential second call gets). Then,
+    /// sender gets the empty result the sequential second call gets; P2-1:
+    /// only the markets the cancel-all index lists for a sender). Then,
     /// per action in run order, exactly `exec_cancel_all`'s bookkeeping:
     /// dirty marks, the margin sum over the same market and order sequence,
     /// and one balance release. Book removal never reads balances and a
@@ -9025,6 +9323,110 @@ impl NativeExecutor {
         if let [(_, sender, market_id)] = run {
             return vec![Self::exec_cancel_all(ctx, sender, *market_id)];
         }
+        // Step 0.4 reference: one action at a time, each a full scan.
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        if ctx.test_cancel_all_full_scan {
+            return run
+                .iter()
+                .map(|(_, sender, m)| Self::exec_cancel_all(ctx, sender, *m))
+                .collect();
+        }
+        if !ctx.resident {
+            return Self::exec_cancel_all_run_every_book(ctx, run);
+        }
+        // P2-1: the markets each action visits — its sender's markets in the
+        // cancel-all index (`None`), or its target if the index lists it —
+        // taken out of the index (after the run the sender has nothing left
+        // there). A repeated sender finds its markets taken: it visits none,
+        // as its sequential second call finds nothing. Other markets hold
+        // nothing of the sender's, so skipping them changes no book, result
+        // or sum. Sorted: markets ascending, actions in run order within one.
+        let index = ctx.cancel_index();
+        let mut visits: Vec<(MarketId, usize)> = Vec::new();
+        for (k, &(_, sender, target)) in run.iter().enumerate() {
+            match target {
+                Some(m) => {
+                    if index.remove(&sender, m) {
+                        visits.push((m, k));
+                    }
+                }
+                None => visits.extend(index.take(&sender).into_iter().map(|m| (m, k))),
+            }
+        }
+        visits.sort_unstable();
+        // (action, market, its cancelled orders, its stops' reservations) for
+        // every visit that removed something, markets ascending.
+        let mut hits: Vec<(
+            usize,
+            MarketId,
+            Vec<torus_core::order_book::Order>,
+            FixedPoint,
+        )> = Vec::new();
+        let mut senders: Vec<Address> = Vec::with_capacity(run.len());
+        let mut stops_k: Vec<(bool, FixedPoint)> = Vec::with_capacity(run.len());
+        for group in visits.chunk_by(|a, b| a.0 == b.0) {
+            let mid = group[0].0;
+            let Some(book) = ctx.order_books.get_mut(&mid) else {
+                continue;
+            };
+            ctx.phase_accum.cancel_all_books_visited += group.len() as u64;
+            let cfg = ctx.margin_configs.get(&mid);
+            senders.clear();
+            stops_k.clear();
+            // C4: each member's stops first, in run order.
+            for &(_, k) in group {
+                let sender = run[k].1;
+                let mut took = (false, FixedPoint::ZERO);
+                for (price, qty) in book.take_pending_stops(&sender) {
+                    took.0 = true;
+                    took.1 += Self::stop_reservation(cfg, price, qty);
+                }
+                stops_k.push(took);
+                senders.push(sender);
+            }
+            let cancelled = book.cancel_all_many(&senders);
+            for ((&(_, k), &(took_stops, stops)), orders) in
+                group.iter().zip(&stops_k).zip(cancelled)
+            {
+                if took_stops || !orders.is_empty() {
+                    hits.push((k, mid, orders, stops));
+                }
+            }
+        }
+        // Per action in run order, its markets ascending (stable sort).
+        hits.sort_by_key(|h| h.0);
+
+        let mut results = Vec::with_capacity(run.len());
+        ctx.phase_accum.cancel_alls += run.len() as u64;
+        let mut hits = hits.into_iter().peekable();
+        for (k, (_, sender, _)) in run.iter().enumerate() {
+            // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`, summed
+            // in ascending market order like it (P2-1; was the book map's
+            // order: the terms are non-negative, so the sum and whether the
+            // `checked_add` overflows do not depend on the order).
+            let mut total_margin_release = FixedPoint::ZERO;
+            while let Some((_, mid, orders, stops)) = hits.next_if(|h| h.0 == k) {
+                ctx.phase_accum.cancel_all_books_hit += 1;
+                ctx.dirty_books.insert(mid);
+                let cfg = ctx.margin_configs.get(&mid);
+                total_margin_release += Self::cancelled_orders_margin(cfg, &orders);
+                total_margin_release += stops;
+            }
+            Self::release_order_margin(ctx, sender, total_margin_release);
+            results.push(NativeActionResult::ok("cancel_all", 500));
+        }
+        results
+    }
+
+    /// Row 23 (18c s104): [`Self::exec_cancel_all_run`] without resident
+    /// books, as before P2-1: every book, one `cancel_all_many` per book over
+    /// the run's senders targeting it. Without resident books every block
+    /// loads its books, so P2-1's index would be rebuilt in every block with
+    /// a cancel-all.
+    fn exec_cancel_all_run_every_book<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        run: &[(usize, Address, Option<MarketId>)],
+    ) -> Vec<NativeActionResult> {
         // The order `exec_cancel_all` iterates for `None`. Cancels never add
         // or remove books, so every action of the run would see this order.
         let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
@@ -9046,6 +9448,7 @@ impl NativeExecutor {
             }
             let mut per_action = vec![Vec::new(); run.len()];
             let mut stops_k = vec![(false, FixedPoint::ZERO); run.len()];
+            ctx.phase_accum.cancel_all_books_visited += members.len() as u64;
             if !senders.is_empty() {
                 let cfg = ctx.margin_configs.get(mid);
                 let book = ctx.order_books.get_mut(mid).expect("key just listed");
@@ -9066,6 +9469,7 @@ impl NativeExecutor {
         }
 
         let mut results = Vec::with_capacity(run.len());
+        ctx.phase_accum.cancel_alls += run.len() as u64;
         for (k, (_, sender, _)) in run.iter().enumerate() {
             // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`.
             let mut total_margin_release = FixedPoint::ZERO;
@@ -9075,6 +9479,7 @@ impl NativeExecutor {
                 if orders.is_empty() && !took_stops {
                     continue;
                 }
+                ctx.phase_accum.cancel_all_books_hit += 1;
                 ctx.dirty_books.insert(*mid);
                 let cfg = ctx.margin_configs.get(mid);
                 total_margin_release += Self::cancelled_orders_margin(cfg, orders);
@@ -9128,12 +9533,13 @@ impl NativeExecutor {
         if new_price.is_none() && new_qty.is_none() {
             return err("nothing to modify: no new price or quantity".to_string());
         }
+        ctx.phase_accum.by_id_actions += 1;
         // Order ids are global, so at most one book holds it.
-        let Some((market_id, old)) = ctx
-            .order_books
-            .iter()
-            .find_map(|(mid, b)| b.get_order(order_id).map(|o| (*mid, o.clone())))
-        else {
+        let probed = &mut ctx.phase_accum.by_id_books_probed;
+        let Some((market_id, old)) = ctx.order_books.iter().find_map(|(mid, b)| {
+            *probed += 1;
+            b.get_order(order_id).map(|o| (*mid, o.clone()))
+        }) else {
             return err(format!("order {order_id} not found"));
         };
         if old.trader != *sender {
@@ -9282,11 +9688,15 @@ impl NativeExecutor {
             .get_mut(&market_id)
             .expect("market found above");
         // Unchanged fields stay `None`: a qty-only decrease keeps time priority.
-        if let Err(e) = book.modify_order(
+        let modified = book.modify_order(
             order_id,
             (price != old.price).then_some(price),
             (qty != old.remaining_qty).then_some(qty),
-        ) {
+        );
+        // P2-1: a re-inserted order feeds the index (its market is listed
+        // already: the old order rested there).
+        TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
+        if let Err(e) = modified {
             // Unreachable (the order was found above) — undo the reserve.
             Self::release_order_margin(ctx, sender, extra);
             return err(e.to_string());
@@ -10982,17 +11392,17 @@ mod option_b_fold_pool_tests {
             let place_orders: Vec<(usize, Address, &PlaceOrderParams)> =
                 orders.iter().enumerate().map(|(i, (s, p))| (i, *s, p)).collect();
             let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
-            let open_at_start = HashMap::new();
+            let open_at_start = HashMap::default();
             let reader = AccountReader::of(&ctx);
             let markets = NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
 
             let mut fold = SenderFold::default();
-            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
             let mut results: Vec<NativeActionResult> =
                 (0..orders.len()).map(|_| NativeActionResult::ok("pending", 0)).collect();
             let mut next_id = 1u128;
-            let mut first_seen: HashMap<Address, bool> = HashMap::new();
-            let mut want_excess: HashMap<Address, FixedPoint> = HashMap::new();
+            let mut first_seen: HashMap<Address, bool> = HashMap::default();
+            let mut want_excess: HashMap<Address, FixedPoint> = HashMap::default();
             for (i, (s, p)) in orders.iter().enumerate() {
                 let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, s, p);
                 if let PrepOutcome::Pass(pass) = &outcome {
@@ -11047,7 +11457,7 @@ mod option_b_fold_pool_tests {
             let (mut outcomes, sharded_out) =
                 NativeExecutor::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, 2, orders.len())
                     .expect("no worker panic");
-            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::new();
+            let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
             let mut next_id = 1u128;
             for (i, (s, p)) in orders.iter().enumerate() {
                 let o = outcomes[i].take().unwrap();

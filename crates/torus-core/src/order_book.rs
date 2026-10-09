@@ -9,7 +9,10 @@
 //! - All arithmetic via FixedPoint (no f64)
 //! - Deterministic: same input sequence → same state
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+// Item 6 Phase 2 P2-5: std's HashMap with foldhash, seeded per process
+// (alloy's default `map-foldhash`).
+use alloy_primitives::map::{HashMap, HashSet};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -68,6 +71,10 @@ pub fn open_order_counts(
             .chunks(books.len().div_ceil(threads))
             .map(|chunk| s.spawn(move || count(chunk)))
             .collect();
+        torus_state::spawn_count::add(
+            torus_state::spawn_count::SpawnSite::OpenOrders,
+            workers.len(),
+        );
         let mut total = vec![0usize; senders.len()];
         for worker in workers {
             let counts = worker.join().expect("open-order count worker panicked");
@@ -695,7 +702,7 @@ impl AccountMargins {
     pub fn new(tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>) -> Self {
         Self {
             tiers,
-            traders: HashMap::new(),
+            traders: HashMap::default(),
             mark: None,
             pre_batch: false,
             charged_maker_fills: 0,
@@ -1242,6 +1249,15 @@ pub struct OrderBook {
     /// same sites that journal the level). Drained per level by
     /// `take_level_ops`; a mark whose level is not journaled stays until it is.
     dirty_chunks: BTreeSet<(u8, i128, u64)>,
+
+    // ---- Item 6 Phase 2 P2-1: cancel-all index feed (in-RAM only) ----
+    /// Traders that came into this book since the executor last drained it
+    /// ([`Self::drain_new_traders`]): pushed when a trader's first resting
+    /// order goes in (its `trader_orders` entry was absent or empty) and for
+    /// every stored stop. The executor's trader -> markets index (a superset
+    /// of [`Self::traders_present`] over all books) is kept from it. Never
+    /// serialized, never read by matching, saving or hashing.
+    new_traders: Vec<Address>,
 }
 
 /// One chunk's aggregate for the chunked level digest: the keccak of its
@@ -1261,8 +1277,8 @@ impl OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: HashMap::default(),
+            trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
@@ -1271,17 +1287,18 @@ impl OrderBook {
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
             account_margins: AccountMargins::default(),
-            order_seq: HashMap::new(),
+            order_seq: HashMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: HashSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: HashSet::default(),
+            level_epoch: HashMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
+            new_traders: Vec::new(),
         }
     }
 
@@ -1406,6 +1423,8 @@ impl OrderBook {
                     }
                 }
             }
+            // P2-1: a stored stop feeds the cancel-all index.
+            self.new_traders.push(trader);
             self.pending_stops.push(StopOrder {
                 id: order_id,
                 trader,
@@ -2709,7 +2728,7 @@ impl OrderBook {
         book.entry(price).or_default().push_back(order);
 
         self.order_index.insert(id, OrderLocation { side, price });
-        self.trader_orders.entry(trader).or_default().push(id);
+        self.push_trader_order(trader, id);
 
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -2972,6 +2991,44 @@ impl OrderBook {
         }
     }
 
+    /// Append `id` to `trader`'s resting ids (every insert path goes through
+    /// here). P2-1: a trader with no resting order in this book until now
+    /// feeds the cancel-all index.
+    fn push_trader_order(&mut self, trader: Address, id: OrderId) {
+        let ids = self.trader_orders.entry(trader).or_default();
+        if ids.is_empty() {
+            self.new_traders.push(trader);
+        }
+        ids.push(id);
+    }
+
+    /// Item 6 Phase 2 P2-1: the traders logged since the last call (see the
+    /// `new_traders` field), in log order, possibly repeated; the log is
+    /// empty afterwards (also when the iterator is dropped unread).
+    pub fn drain_new_traders(&mut self) -> std::vec::Drain<'_, Address> {
+        self.new_traders.drain(..)
+    }
+
+    /// P2-1: entries in the log [`Self::drain_new_traders`] empties.
+    pub fn new_traders_logged(&self) -> usize {
+        self.new_traders.len()
+    }
+
+    /// P2-1: every trader a cancel-all of theirs would change this book for:
+    /// resting orders, pending stops, or reduce-only index entries (which
+    /// `cancel_all` also drops). May repeat a trader.
+    pub fn traders_present(&self) -> impl Iterator<Item = &Address> {
+        self.trader_orders
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(trader, _)| trader)
+            .chain(self.pending_stops.iter().map(|s| &s.trader))
+            // Unreachable today (18c s104): every path that removes a resting
+            // order also drops its reduce-only entry, so each entry's trader is
+            // already listed through `trader_orders`. Kept as a safeguard.
+            .chain(self.reduce_only_index.iter().map(|(trader, _)| trader))
+    }
+
     /// Rebuild one pending stop from its row bytes (see [`Self::stop_rows`]).
     /// Callers MUST append in ascending id order. Returns the stop's id.
     pub fn restore_stop_row(&mut self, bytes: &[u8]) -> io::Result<OrderId> {
@@ -2986,6 +3043,7 @@ impl OrderBook {
             }
         }
         let id = stop.id;
+        self.new_traders.push(stop.trader);
         self.pending_stops.push(stop);
         Ok(id)
     }
@@ -3096,7 +3154,7 @@ impl OrderBook {
         }
         queue.push_back(order);
         self.order_index.insert(id, OrderLocation { side, price });
-        self.trader_orders.entry(trader).or_default().push(id);
+        self.push_trader_order(trader, id);
         self.order_seq.insert(id, seq);
         self.row_exists.insert(id);
         // A loaded order implies its level's persisted row exists (save-path
@@ -3440,7 +3498,7 @@ impl OrderBook {
             Some(c) => c.max_entries = max_entries,
             None => {
                 self.level_hash_cache = Some(Box::new(LevelHashCache {
-                    entries: HashMap::new(),
+                    entries: HashMap::default(),
                     max_entries,
                     tick: 0,
                     hits: 0,
@@ -4170,8 +4228,8 @@ impl BorshDeserialize for OrderBook {
             market_id,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            trader_orders: HashMap::new(),
+            order_index: HashMap::default(),
+            trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
             tick_size,
             lot_size,
@@ -4180,17 +4238,18 @@ impl BorshDeserialize for OrderBook {
             reduce_only_index: BTreeSet::new(),
             reduce_only_positions: ReduceOnlyPositions::default(),
             account_margins: AccountMargins::default(),
-            order_seq: HashMap::new(),
+            order_seq: HashMap::default(),
             next_seq: 1,
             row_journal: BTreeSet::new(),
-            row_exists: HashSet::new(),
+            row_exists: HashSet::default(),
             level_journal: BTreeSet::new(),
-            level_exists: HashSet::new(),
-            level_epoch: HashMap::new(),
+            level_exists: HashSet::default(),
+            level_epoch: HashMap::default(),
             level_hash_cache: None,
             level_hash_chunked: false,
-            level_chunks: HashMap::new(),
+            level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
+            new_traders: Vec::new(),
         };
 
         for _ in 0..order_count {
@@ -4205,6 +4264,7 @@ impl BorshDeserialize for OrderBook {
 
         for _ in 0..stop_count {
             let stop = StopOrder::deserialize_reader(r)?;
+            book.new_traders.push(stop.trader);
             book.pending_stops.push(stop);
         }
 
@@ -5022,7 +5082,7 @@ mod tests {
         assert_eq!(counts, want);
         assert_eq!(counts, [14, 11, 12, 11, 10]);
         // Fewer senders than traders in the book (the other walk).
-        let one: HashMap<Address, usize> = [(addr(1), 0)].into();
+        let one: HashMap<Address, usize> = [(addr(1), 0)].into_iter().collect();
         let mut counts = vec![0];
         ob.add_open_order_counts(&one, &mut counts);
         assert_eq!(counts, [4]);
@@ -5057,6 +5117,12 @@ mod tests {
             assert_eq!(open_order_counts(&refs, &senders, threads, 0), want, "threads={threads}");
             assert_eq!(open_order_counts(&refs, &senders, threads, 1 << 20), want);
         }
+        // Item 6 Phase 2 step 0.2: the workers are counted (process-wide
+        // counter: a lower bound under concurrent tests).
+        use torus_state::spawn_count::{totals, SpawnSite};
+        let before = totals()[SpawnSite::OpenOrders as usize];
+        open_order_counts(&refs, &senders, 3, 0);
+        assert!(totals()[SpawnSite::OpenOrders as usize] >= before + 3);
     }
 
     #[test]

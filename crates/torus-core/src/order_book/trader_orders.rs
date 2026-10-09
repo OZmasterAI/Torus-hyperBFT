@@ -2,7 +2,7 @@
 //! (arrival order; decode/load order after a reload). `cancel_all` returns
 //! orders in this order, so removal must never reorder it.
 
-use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
 use std::fmt;
 
 use torus_types::OrderId;
@@ -44,7 +44,7 @@ impl TraderOrders {
                 large.live += 1;
             }
             None if self.slots.len() == SMALL => {
-                let mut pos = HashMap::with_capacity(2 * SMALL);
+                let mut pos = HashMap::with_capacity_and_hasher(2 * SMALL, Default::default());
                 for (slot, id) in self.slots.iter().enumerate() {
                     pos.insert(*id, slot);
                 }

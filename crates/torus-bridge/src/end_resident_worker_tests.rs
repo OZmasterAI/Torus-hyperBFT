@@ -139,6 +139,11 @@ fn worker_slot_equals_inline_slot_after_every_block() {
     seed(&db_worker);
     let mut inline = ResidentBooks::default();
     let mut worker = ResidentBooks::default();
+    let spawned = || {
+        torus_state::spawn_count::totals()
+            [torus_state::spawn_count::SpawnSite::EndResident as usize]
+    };
+    let spawned_before = spawned();
     for h in 1..=16 {
         block(&db_inline, &mut inline, h, Mode::Inline, None, true, None);
         block(&db_worker, &mut worker, h, Mode::Worker, None, true, None);
@@ -156,6 +161,9 @@ fn worker_slot_equals_inline_slot_after_every_block() {
     assert_eq!(dump_rows(worker.rows().unwrap()), dump_rows(inline.rows().unwrap()));
     assert_eq!((inline.rows_builds(), worker.rows_builds()), (1, 1), "R built once");
     assert_eq!(worker.rows_shared_fallbacks(), 0);
+    // Item 6 Phase 2 step 0.2: one counted spawn per worker block (a lower
+    // bound: the counter is process-wide).
+    assert!(spawned() >= spawned_before + 16);
 }
 
 /// Ordering: `begin_resident` of the next block waits for the worker, then

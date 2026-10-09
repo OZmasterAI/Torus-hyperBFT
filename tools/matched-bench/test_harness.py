@@ -344,6 +344,21 @@ class SummarizeTest(unittest.TestCase):
         self.assertIsNone(s["ingest"]["econ_mix"])
         self.assertIsNone(s["ingest"]["in_flight"])
 
+    def test_cancel_by_id_line_is_ingested(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + (
+                "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
+                "accepted 440 | lookups 700 errors 3 | no own order 25\n"))
+        s, _ = run_summarize(self.d)
+        self.assertEqual(s["ingest"]["cancel_by_id"], {
+            "cancel_sent": 900, "cancel_accepted": 880, "modify_sent": 450,
+            "modify_accepted": 440, "lookups": 700, "lookup_errors": 3, "no_own_order": 25})
+        write_cell(self.d, 1_000, 1_000)
+        s, _ = run_summarize(self.d)
+        self.assertIsNone(s["ingest"]["cancel_by_id"])
+
     def test_first120_equals_avg_on_a_120s_cell(self):
         write_cell(self.d, 40_000, 0, dur=120)
         write_agreement(self.d, ["same"] * 3)
@@ -944,6 +959,37 @@ class CrashKillGuardTest(unittest.TestCase):
                 "SPAM_CANCEL_FUNDED": "yes",
             },
         ):
+            r = run(**bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+
+    def test_cancel_by_id_reaches_the_bench_only_when_set(self):
+        """Item 6 Phase 2 step 0.2: CANCEL_BY_ID_FRACTION / MODIFY_FRACTION ->
+        bench --cancel-by-id-fraction / --modify-fraction, validated as
+        fractions and logged. Unset = flags omitted (older bench binaries and
+        prior cells unchanged)."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        for v in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION"):
+            self.assertIn(f"{v}=${{{v}:-}}", src)
+            self.assertIn(f"'${{{v}:-unset}}'", src)
+        lines = [l for l in src.splitlines()
+                 if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
+                 and not l.lstrip().startswith(("#", "log "))]
+        snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+
+        def run(**env):
+            base = {k: v for k, v in os.environ.items()
+                    if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")}
+            return subprocess.run(["bash", "-c", snippet], capture_output=True,
+                                  text=True, env=dict(base, **env))
+
+        r = run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        r = run(CANCEL_BY_ID_FRACTION="0.1", MODIFY_FRACTION="0.05")
+        self.assertEqual(r.stdout.strip(),
+                         "--cancel-by-id-fraction 0.1 --modify-fraction 0.05", r.stderr)
+        for bad in ({"CANCEL_BY_ID_FRACTION": "2"}, {"MODIFY_FRACTION": "x"}):
             r = run(**bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
             self.assertIn("FATAL", r.stderr)

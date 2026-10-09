@@ -25,7 +25,9 @@
 //! `m` (merged with the block's dirty traders of `m`) instead of every
 //! trader ([`TraderPositions::holders_with`], [`dirty_by_market`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+
+use alloy_primitives::map::{HashMap, HashSet};
 use std::ops::Bound;
 
 use alloy_primitives::Address;
@@ -65,7 +67,7 @@ pub(crate) struct TraderPositions {
     holders: Holders,
 }
 
-type Holders = alloy_primitives::map::HashMap<MarketId, BTreeSet<Address>>;
+type Holders = HashMap<MarketId, BTreeSet<Address>>;
 
 /// The market of a 28-byte positions key `t ‖ m`.
 fn market_of(key: &[u8]) -> MarketId {
@@ -438,7 +440,7 @@ pub(crate) fn dirty_by_market_and_traders<B: StateBackend>(
 type ByMarket = HashMap<MarketId, Vec<Address>>;
 
 fn by_market(pending: &[Vec<u8>]) -> ByMarket {
-    let mut out = ByMarket::new();
+    let mut out = ByMarket::default();
     // Key-sorted (`t ‖ m`): per market the traders come ascending.
     for k in pending.iter().filter(|k| k.len() == KEY) {
         out.entry(market_of(k)).or_default().push(Address::from_slice(&k[..TRADER]));

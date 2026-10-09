@@ -1100,6 +1100,7 @@ fn run_buckets(
     // sets out of its own disjoint slice; the chunks stay non-overlapping, so the
     // partition and hence the per-bucket work is unchanged.
     let chunks: Vec<&mut [BucketWork<'_>]> = work.chunks_mut(chunk_size).collect();
+    crate::spawn_count::add(crate::spawn_count::SpawnSite::RootBuckets, chunks.len());
 
     // Contain worker panics so a bug in one worker fails the apply cleanly
     // (nothing is appended to the batch) instead of unwinding the exec thread.
@@ -2339,7 +2340,14 @@ mod tests {
             }
             (persisted_native_root(&db).unwrap(), dump(&db, CF_NATIVE_TRIE))
         };
+        let buckets =
+            || crate::spawn_count::totals()[crate::spawn_count::SpawnSite::RootBuckets as usize];
+        let before = buckets();
         let (root0, trie0) = run();
+        assert!(
+            buckets() > before,
+            "item 6 step 0.2: bucket workers are counted"
+        );
         assert_eq!(root0, native_root_full_of_seq(&seq), "seq root mismatch");
         for k in 0..19 {
             let (r, t) = run();

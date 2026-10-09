@@ -99,8 +99,16 @@ fn parallel_load_is_byte_identical_to_serial_for_any_worker_count() {
         assert_eq!(serial.0.len(), (MARKETS - 1) as usize, "markets 1..=9 have books");
         assert!(serial.1 > 1, "next global order id recovered");
         for workers in [2, 3, 4, 9, 16] {
+            let spawned = || {
+                torus_state::spawn_count::totals()
+                    [torus_state::spawn_count::SpawnSite::LoadBooks as usize]
+            };
+            let before = spawned();
             let parallel = load(&db, chunked, workers);
             assert!(parallel == serial, "chunked={chunked} workers={workers} differs from serial");
+            // Item 6 Phase 2 step 0.2: the load workers are counted (a lower
+            // bound: the counter is process-wide).
+            assert!(spawned() >= before + 2, "workers={workers}");
         }
     }
 }

@@ -10,6 +10,8 @@
 use super::*;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+
+use alloy_primitives::map::HashSet;
 use torus_core::liquidation::{self as liq, Health, LIQUIDATOR_VAULT};
 use torus_core::margin::maintenance_margin;
 use torus_core::position::Position;
@@ -117,8 +119,8 @@ struct DrainCache {
     traders: Option<Vec<Address>>,
     av: HashMap<Address, FixedPoint>,
     dirty: Option<HashMap<MarketId, Vec<Address>>>,
-    dirty_traders: Option<std::collections::HashSet<Address>>,
-    seen: std::collections::HashSet<Address>,
+    dirty_traders: Option<HashSet<Address>>,
+    seen: HashSet<Address>,
 }
 
 impl DrainCache {

@@ -16,6 +16,141 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## perf/item6-phase2 3aa516e0 (2026-10-09, s34, Phase 2 close-out, main 95b01af2 merged)
+
+Phase 2 close-out (P2-1 + P2-5, P2-2 reverted, plan 9.16) with main `9793f1ec` merged in (`5777366e`:
+eth_call/eth_estimateGas typed TxEnv) and then main `95b01af2` (`3aa516e0`: R02 branches 1-2, CoreWriter
+drain fail-stop; replay-guard, session and applied-height read errors fail-stop;
+`read_native_applied_height` -> `native_applied_height` returning `Result`). Worktree `wt/item6-phase2`,
+clean at `3aa516e0` before and after the run; target dir `~/.cargo-target-item6-phase2`. The suite 4
+baseline `95b01af2` ran in a temporary detached worktree (`wt/base-95b01af2`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`, warm); the worktree was removed afterwards. To avoid the 14-crate
+trap of the previous section, the source root (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`) of all 21
+workspace members was touched on each side before its clippy run; both sides re-linted 21 crates.
+Suite 5 was not run. Suite 3 (the one-process run, TESTING.md "Before merging to main") was added
+afterwards at 18c's request, from the same worktree at `c74a92a6` (docs only over `3aa516e0`; no source
+diff outside `docs/`).
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,158 passed, 0 failed**, 34 skipped, 0 flaky | 85 s (83.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 8 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,159 passed, 0 failed**, 41 ignored (162 result lines) | 449 s |
+| 4 | clippy (no `-D`) / fmt vs `95b01af2` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,299 vs 3,303, **0 new**, 4 gone | 32 s / 4 s (base 11 s / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Compared with `ab6f01dc` (3,134): 24 more, all from main, in 145 test binaries (144 before). The `9793f1ec`
+merge adds 10 (`crates/torus-rpc/src/eth.rs` 7, `crates/torus-rpc/tests/eth_compliance_tests.rs` 3). The
+`95b01af2` merge adds 14 (`crates/torus-consensus/src/app.rs` 9, the new
+`crates/torus-bridge/tests/r02_fail_stop_tests.rs` 4, `crates/torus-core/src/error.rs` 1). No test was
+removed. The Phase 2 commits after `ab6f01dc` (`7f75dd26`, `1b389700`) change docs only, so the Phase 2
+tests are unchanged. Skipped is unchanged at 34. The 4 fmt hunks that are gone
+(`crates/torus-bridge/src/native_executor.rs` 3, `crates/torus-bridge/tests/ubench_econ.rs` 1) are the same
+Phase 2 lines as in the previous section. Both fmt totals are one lower than there (3,300 / 3,304) because
+main's R02 change to `crates/torus-consensus/src/app.rs` removed one hunk of old debt.
+
+Suite 3's 3,159 = nextest's 3,158 + the 1 doc test, and its 41 ignored = nextest's 34 skipped + the 7
+ignored doc tests (as 18c's runs on main: one-process = nextest + 1). No test failed in the shared process.
+
+Logs: `~/bench-results-matched/presuite-item6-p2-95b0/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21, `3-full.log`, `3-full.rc`).
+
+## perf/item6-phase2 ab6f01dc (2026-10-09, s31, P2-2 reverted, main f5f28f89 merged)
+
+Phase 2 with P2-2 reverted (`3fe595d3`, code equal to `029581e5`) and main `f5f28f89` merged in
+(`ab6f01dc`: EVM mempool effective tip + intrinsic gas, mempool rustfmt). Worktree `wt/item6-phase2`,
+clean at `ab6f01dc` before and after the run; target dir `~/.cargo-target-item6-phase2`. The suite 4
+baseline `f5f28f89` ran in a temporary detached worktree (`wt/base-f5f28f89`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`, warm); the worktree was removed afterwards. A torus-state source
+file was touched before each clippy run. The first candidate clippy run still re-linted only 14 crates
+(the base, a fresh checkout, re-linted all 21), so candidate clippy was run again with the source root
+of each of the other 7 crates touched too (`hotstuff_rs`, `torus-explorer`, `torus-faucet`,
+`torus-telemetry`, `torus-tx-flood`, `torus-types`, `torus-wallet`). That run covers the same 21 crates
+and gives the same result (268, 0 new). Suites 3 and 5 were not run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,134 passed, 0 failed**, 34 skipped, 0 flaky | 128 s (81.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 7 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `f5f28f89` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,300 vs 3,304, **0 new**, 4 gone | 24 s (21-crate rerun 26 s) / 4 s (base 11 s / 3 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Compared with `f5eaff1b` (3,116) and P2-5 (3,119): 18 more than `f5eaff1b` and 15 more than P2-5. The
+15 are main's tests from `12979d4b..f5f28f89` (all in the `ecce8431` mempool fix; 15 added, none
+removed). The 3 over `f5eaff1b` are the Phase 2 tests up to P2-5. Skipped is unchanged at 34. The 4 fmt
+hunks that are gone (`crates/torus-bridge/src/native_executor.rs` 3, `crates/torus-bridge/tests/ubench_econ.rs` 1)
+are lines that Phase 2 rewrote, as in the P2-5 row (3,355 vs 3,359). The fmt total moved from 3,359 to
+3,300 because main's mempool rustfmt removed 55 hunks of old debt.
+
+Logs: `~/bench-results-matched/presuite-item6-p2-f5f2/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`; the 21-crate clippy rerun is `4-cand-clippy-all21.log`, `norm-all21.py`,
+`4-delta-all21.txt`).
+
+## `perf/item6-phase2` `f5eaff1b` (2026-10-08, s31, after merging main 12979d4b)
+
+Phase 2 at `82aa528d` (step 1: the C1 cancel-all index and its tests, the index size gauges, the gate
+cell docs) with main `12979d4b` merged in (`f5eaff1b`). The merge was clean; git auto-merged `app.rs`
+(`torus-consensus`), `backend.rs` (`torus-state`) and `lib.rs` (`torus-telemetry`). Worktree
+`wt/item6-phase2`, target dir `~/.cargo-target-item6-phase2`. The suite 4 baseline `12979d4b` ran in a
+temporary detached worktree (`wt/base-12979d4b`) with its own target dir
+(`~/.cargo-target-item6-phase2-base`). That target dir no longer existed, so the base build was cold.
+The worktree was removed afterwards. Both clippy runs cover the same 21 workspace crates. Suite 3 was
+not requested for this run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,116 passed, 0 failed**, 34 skipped, 0 flaky (1 slow) | 135 s (97.6 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 6 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `12979d4b` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**; fmt 3,359 = 3,359, **0 new** | 17 s / 4 s (base 87 s cold / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 30 s |
+
+Compared with `744e55ee` (3,085 passed, 34 skipped): 31 more tests, skipped unchanged. Main's side
+(`e934fa0e..12979d4b`) adds 8 tests and Phase 2's step 1 (`744e55ee..82aa528d`) adds 23. Neither side
+adds a clippy or fmt finding. The fmt total moved from 3,352 to 3,359 because main `12979d4b` itself
+has 7 more hunks than `e934fa0e` (old debt from main, not from the branch).
+
+Logs: `~/bench-results-matched/presuite-item6-p2-1297/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`).
+
+## `perf/item6-phase2` `744e55ee` (2026-10-08, s29, after merging main e934fa0e)
+
+Step 0 (`1a6573dc`) with main `e934fa0e` merged in (`c1a3bdb8`; the code merged without conflicts, git
+auto-merged `native_executor.rs`, `position.rs` and `test_harness.py`), plus the plan update `744e55ee`.
+Run before pushing and before step 1. Worktree `wt/item6-phase2`, new target dir
+`CARGO_TARGET_DIR=~/.cargo-target-item6-phase2`. The suite 4 baseline `e934fa0e` ran in a temporary
+detached worktree with its own target dir (`~/.cargo-target-item6-phase2-base`, so no `touch` was needed),
+and the worktree was removed afterwards. Both clippy runs checked the same 20 workspace crates. Suite 3
+was not requested for this run.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,085 passed, 0 failed**, 34 skipped, 0 flaky (= main `b8e3b606` 3,071 / 33 + step 0's 14 tests and 1 ignored µbench) | 205 s (82.2 s of tests; cold target dir) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 3 s |
+| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 4 | clippy (no `-D`) / fmt vs `e934fa0e` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**; fmt 3,352 = 3,352, **0 new** | 22 s / 4 s (base 87 s cold / 4 s) |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK (`test_harness.py` 109 tests) | 29 s |
+
+Neither step 0 nor the merge adds a finding. Step 0 alone had 0 new findings vs `d3ba3c0a` (the
+`1a6573dc` entry below), and the merged branch matches `e934fa0e` exactly. The step 0 tests are part
+of suite 1:
+* reference paths: `cancel_all_matches_the_full_scan_reference` (`torus-bridge`
+  `cancel_batch_exec_tests.rs`) and `flush_all_matches_the_per_row_reference` (`torus-core`
+  `position.rs`)
+* counters: `cancel_all_counters_count_visited_and_hit_books`, `by_id_counters_count_books_probed`,
+  `parallel_engine_counts_spawns_per_site`, `add_counts_at_its_site` (`torus-state` `spawn_count.rs`),
+  `phase2_step0_block_metrics` (`torus-consensus` `app.rs`) and `phase2_step0_metrics_are_exported`
+  (`torus-telemetry`)
+* bench client: the `by_id.rs` tests
+
+Logs: `~/bench-results-matched/presuite-item6-p2-e934/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`).
+
 ## main `b8e3b606` (2026-10-08, s104 merges)
 
 The s104 merges on top of the owner's local commits, never tested together before this run: `91f51ca0`
@@ -66,6 +201,28 @@ torus-bridge and its 5 dependents). Suite 4 ran as `cargo clippy --workspace --a
 | 6 | matched-bench | – | not run (no `tools/` change) | – |
 
 Logs: `~/bench-results-matched/presuite-c2-set-holder/`.
+
+## `perf/item6-phase2` `1a6573dc` (2026-10-08, s27 / s101)
+
+Item 6 Phase 2 step 0 (0.1, 0.2, 0.4) on main `d3ba3c0a`: node-local counters, harness columns, the
+cancel-by-id bench cell, the hasher µbench, test-only reference paths. Worktree `wt/item6-phase2`,
+`CARGO_TARGET_DIR=~/.cargo-target-read-gas`; suite 4 baseline `d3ba3c0a` in a detached worktree
+(`wt/item6-phase2-base`) with the 14 differing `.rs` files touched (base clippy checked 20 crates,
+candidate 21; the unchanged `hotstuff_rs` replayed its cached lints). Base suites on `d3ba3c0a`
+(same target dir, before the branch had changes): nextest 3,059 passed / 0 failed (35 skipped), doc
+1 / 0.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,073 passed, 0 failed**, 36 skipped, 0 flaky (+14 tests, +1 ignored µbench) | 141 s (82.0 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 7 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,074 passed, 0 failed**, 43 ignored (160 result lines); the known liquidation event-capture flake did not fire | 400 s |
+| 4 | clippy (no `-D`) / fmt vs `d3ba3c0a` | 0 / 1 (fmt: old debt) | clippy 270 = 270, **0 new**; fmt 3,349 = 3,349, **0 new** (rustfmt applied to this branch's own lines only) | 28 s / 25 s |
+| 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
+| 6 | matched-bench | 0 | **167 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Logs: `~/bench-results-matched/presuite-item6-p2s0/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
+`norm.py`).
 
 ## `fix/read-gas-followup` `105a6e28` (2026-10-08, s101)
 

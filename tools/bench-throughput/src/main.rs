@@ -15,6 +15,7 @@ use torus_types::{
     TimeInForce,
 };
 
+mod by_id;
 mod in_flight;
 mod oracle_feed;
 
@@ -177,6 +178,17 @@ enum Command {
         /// cells stay reproducible.
         #[arg(long, default_value_t = 0)]
         open_order_budget: u64,
+        /// econ (item 6 Phase 2 step 0.2, the P2-1b cell): per-fire
+        /// probability of a CancelOrder of one of the sender's own resting
+        /// orders instead of the drawn action (ids from torus_getOpenOrders on
+        /// the --in-flight-watch-rpc node, else the last --rpc-urls entry; see
+        /// by_id.rs). 0 (default) = off, so prior cells stay reproducible.
+        #[arg(long, default_value_t = 0.0)]
+        cancel_by_id_fraction: f64,
+        /// econ: as --cancel-by-id-fraction, for a ModifyOrder (new price one
+        /// tick away from the mid). 0 (default) = off.
+        #[arg(long, default_value_t = 0.0)]
+        modify_fraction: f64,
         /// econ: when the node sheds an action as busy (admission limit or
         /// full pool), back off and resend the SAME action instead of drawing
         /// a new one. The node sheds only non-cancels, so without this the
@@ -624,6 +636,10 @@ struct EconShape {
     /// Max estimated open orders per sender (0 = off); see
     /// `econ_action_budgeted`.
     open_order_budget: u64,
+    /// Per-fire probabilities of a CancelOrder / ModifyOrder of an own
+    /// resting order instead of the drawn action (0 = off; `by_id.rs`).
+    cancel_by_id_fraction: f64,
+    modify_fraction: f64,
     /// Resend a shed action until admitted instead of drawing a new one; see
     /// `submit_until_admitted`.
     retry_busy: bool,
@@ -653,6 +669,8 @@ impl EconShape {
             cross_fraction: cross_fraction.clamp(0.0, 1.0),
             cancel_fraction: cancel_fraction.clamp(0.0, 1.0),
             open_order_budget: 0,
+            cancel_by_id_fraction: 0.0,
+            modify_fraction: 0.0,
             retry_busy: false,
         }
     }
@@ -2109,6 +2127,24 @@ mod busy_retry_tests {
         assert!(!EconShape::new(1500, 0, 5, 0.5, 0.05).retry_busy);
     }
 
+    /// Item 6 Phase 2 step 0.2: the cancel-by-id cell is off unless asked
+    /// for (no draw, so the load stays byte-identical; `by_id::tests`).
+    #[test]
+    fn econ_shape_defaults_cancel_by_id_off() {
+        let s = EconShape::new(1500, 0, 5, 0.5, 0.05);
+        assert_eq!((s.cancel_by_id_fraction, s.modify_fraction), (0.0, 0.0));
+        let cli = Cli::try_parse_from(["bench", "consensus", "--econ"]).unwrap();
+        let Command::Consensus {
+            cancel_by_id_fraction,
+            modify_fraction,
+            ..
+        } = cli.command
+        else {
+            panic!("consensus");
+        };
+        assert_eq!((cancel_by_id_fraction, modify_fraction), (0.0, 0.0));
+    }
+
     #[tokio::test]
     async fn resends_the_same_payload_until_admitted() {
         let calls = AtomicUsize::new(0);
@@ -3240,6 +3276,13 @@ async fn run_consensus(
             shape.cross_fraction * 100.0,
             shape.cancel_fraction * 100.0,
         );
+        if shape.cancel_by_id_fraction + shape.modify_fraction > 0.0 {
+            println!(
+                "Cancel-by-id: cancel {:.1}% | modify {:.1}% of fires (own orders via torus_getOpenOrders)",
+                shape.cancel_by_id_fraction * 100.0,
+                shape.modify_fraction * 100.0,
+            );
+        }
         if rate_total > 0.0 {
             println!(
                 "Rate: {rate_total:.1} actions/s aggregate ({:.3}/s per sender)",
@@ -3472,6 +3515,13 @@ async fn run_consensus(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rpc_urls = Arc::new(rpc_urls);
 
+    // Cancel-by-id cell: own order ids are read from the in-flight watch node
+    // (else the last url, cap_plan's default), never from val0's ingress.
+    let by_id_url = Arc::new(cap_plan.as_ref().map_or_else(
+        || rpc_urls.last().cloned().unwrap_or_default(),
+        |(_, u)| u.clone(),
+    ));
+    let by_id_stats = Arc::new(by_id::Stats::default());
     // --max-in-flight: the shared cap state and its one block-body tail.
     let cap: Option<Arc<in_flight::Cap>> =
         cap_plan.map(|(n, url)| Arc::new(in_flight::Cap::new(num_senders, n, url)));
@@ -3634,6 +3684,7 @@ async fn run_consensus(
         let url_count = urls.len();
         let cap = cap.clone();
         let mix = mix.clone();
+        let (by_id_url, by_id_stats) = (by_id_url.clone(), by_id_stats.clone());
         let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
@@ -3663,6 +3714,8 @@ async fn run_consensus(
                 let mut last_nonce = 0u64;
                 let mut open_orders = 0u64;
                 let mut next_fire = Instant::now();
+                // Cancel-by-id cell: this sender's resting orders, each used once.
+                let mut own_orders: Vec<by_id::OwnOrder> = Vec::new();
                 while Instant::now() < deadline {
                     if let Some(iv) = econ_pace {
                         let now = Instant::now();
@@ -3694,10 +3747,38 @@ async fn run_consensus(
                             FireBudget::Capped { estimate, cancel_pending }
                         }
                     };
-                    let actions =
-                        econ_fire(&mut rng, sender_idx, plan, batch_size, &shape, submit_batch, &mut budget);
+                    // Cancel-by-id cell (off: no draw, byte-identical load).
+                    let mut by_id_kind =
+                        by_id::draw(&mut rng, shape.cancel_by_id_fraction, shape.modify_fraction);
+                    let mut actions = Vec::new();
+                    if let Some(kind) = by_id_kind {
+                        if own_orders.is_empty() {
+                            let market = plan.pick(&mut rng, sender_idx);
+                            by_id_stats.lookups.fetch_add(1, Ordering::Relaxed);
+                            match by_id::fetch(&client, &by_id_url, key_address(&key), market).await {
+                                Ok(orders) => own_orders = orders,
+                                Err(_) => {
+                                    by_id_stats.lookup_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        match own_orders.pop() {
+                            Some(o) => actions.push(by_id::action(kind, o)),
+                            None => {
+                                by_id_stats.no_order.fetch_add(1, Ordering::Relaxed);
+                                by_id_kind = None;
+                            }
+                        }
+                    }
+                    if actions.is_empty() {
+                        actions =
+                            econ_fire(&mut rng, sender_idx, plan, batch_size, &shape, submit_batch, &mut budget);
+                    }
                     if actions.is_empty() {
                         continue; // ready() rules this out; never spin on it
+                    }
+                    if actions.iter().any(|a| matches!(a, NativeAction::CancelAllOrders { .. })) {
+                        own_orders.clear();
                     }
                     // Generate inline (cheap), sign+encode on the blocking pool
                     // (the expensive ECDSA/serialize part). Nonces are wall-clock
@@ -3736,7 +3817,11 @@ async fn run_consensus(
                         Ok(p) => p.into_iter().unzip(),
                         Err(_) => break, // signer panicked — stop this sender
                     };
-                    let cancels: Vec<bool> = shapes.iter().map(|(_, (_, c))| *c).collect();
+                    // A by-id fire counts in its own stats, not the econ mix.
+                    let cancels: Vec<bool> = match by_id_kind {
+                        Some(_) => Vec::new(),
+                        None => shapes.iter().map(|(_, (_, c))| *c).collect(),
+                    };
                     if let Some(c) = &cap {
                         // Registered BEFORE the send, so a fast commit finds it.
                         let entries: Vec<(u64, u64, u64, bool)> = keys
@@ -3770,15 +3855,21 @@ async fn run_consensus(
                         )
                         .await;
                         record_econ_fire(&result, &keys, &cancels, cap.as_deref(), &mix, &submitted);
+                        if let Some(k) = by_id_kind {
+                            by_id_stats.record(k, &result);
+                        }
                         continue;
                     }
                     let client = client.clone();
                     let submitted = submitted.clone();
-                    let (cap, mix) = (cap.clone(), mix.clone());
+                    let (cap, mix, by_id_stats) = (cap.clone(), mix.clone(), by_id_stats.clone());
                     tokio::spawn(async move {
                         let _permit = permit;
                         let result = submit_items(&client, &url, &payloads, req_id, bin).await;
                         record_econ_fire(&result, &keys, &cancels, cap.as_deref(), &mix, &submitted);
+                        if let Some(k) = by_id_kind {
+                            by_id_stats.record(k, &result);
+                        }
                     });
                 }
                 return;
@@ -4077,6 +4168,9 @@ async fn run_consensus(
     if econ.is_some() {
         println!("{}", mix.report());
     }
+    if econ.is_some_and(|e| e.cancel_by_id_fraction + e.modify_fraction > 0.0) {
+        println!("{}", by_id_stats.report());
+    }
     if let Some(c) = &cap {
         if let Some(h) = tail_handle {
             h.abort();
@@ -4310,6 +4404,8 @@ async fn main() {
             cross_fraction,
             cancel_fraction,
             open_order_budget,
+            cancel_by_id_fraction,
+            modify_fraction,
             retry_busy,
             max_in_flight,
             in_flight_watch_rpc,
@@ -4360,6 +4456,8 @@ async fn main() {
             };
             let econ_shape = econ.then(|| EconShape {
                 open_order_budget,
+                cancel_by_id_fraction: cancel_by_id_fraction.clamp(0.0, 1.0),
+                modify_fraction: modify_fraction.clamp(0.0, 1.0),
                 retry_busy,
                 ..EconShape::new(target_margin, econ_mid, band, cross_fraction, cancel_fraction)
             });

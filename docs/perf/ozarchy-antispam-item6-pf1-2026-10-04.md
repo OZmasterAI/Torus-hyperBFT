@@ -3121,8 +3121,273 @@ ms per native block (val0) unless per 1k fills; `apply` is the
   per arm. 18c s104: both branches go to main as separate `--no-ff` merges
   if each recovers its share.
 
+## 30. P2-1 gate cell: cancel-all index `2ecc2bdf` vs main `e934fa0e` (campaign `ozarchy-p21g`, 2026-10-08)
+
+Phase 2 step 1 (C1, the trader -> markets cancel-all index; plan P2-1, review log rows 17-23)
+against the Phase 2 reference main `e934fa0e` (phase2 plan 9.11). Gate (18c s104): phase 1 down
+by >= ~1.9 ms per native block (half of the ~3.7 ms no-perf estimate, section 25.1), 2 cells per
+arm mirrored, 2 more if the drop lands within ~1.4-2.4 ms. Node-only builds from new detached
+worktrees into fresh target dirs (c2h method; ref `28479dd1`, p21 `6f42e5c4`); both arms run the
+same bench `84e73617` (rebuilt from `2ecc2bdf`; `tools/bench-throughput` has no diff since
+`707f132f`, the `fff899ca` copy was pruned) and the `2ecc2bdf` harness (it samples the new index
+gauges). Standard shape as sections 26-29, no perf. Order: ref warm (60 s), then ref p21 p21 ref,
+23:01-23:30, unit `bench-p21g.service`. All cells rc 0, AGREE, liveness PASS, accepted, exe md5
+3/3, 4 MiB book CF, trie off, oracle stale 0, no deaths. Driver `ozarchy-p21g-campaign.sh`,
+analysis `ozarchy-p21g-tools/p21g.py`, table `ozarchy-p21g-table.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | engine ms/1k | chain | **phase 1** | phase 1 / 1k fills | match / 1k | settle / 1k | pass B / 1k | `apply` / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ref r1 | 177,160 | 5.179 | 26,943 | 4.28 | 146.1 | **21.64** | 0.803 | 0.539 | 1.460 | 0.807 | 0.221 | 6.91 |
+| p21 r1 | 177,372 | 5.230 | 28,303 | 4.29 | 151.8 | **22.10** | 0.781 | 0.534 | 1.452 | 0.808 | 0.224 | 5.91 |
+| p21 r2 | 178,050 | 5.423 | 27,027 | 4.31 | 144.3 | **20.68** | 0.765 | 0.531 | 1.473 | 0.835 | 0.218 | 5.63 |
+| ref r2 | 174,826 | 5.333 | 27,746 | 4.31 | 151.7 | **22.02** | 0.794 | 0.514 | 1.510 | 0.846 | 0.233 | 7.11 |
+
+ms per native block (val0) unless per 1k fills; ref warm (180,752 matched/s) excluded.
+
+| mean | matched/s | native blk/s | chain | phase 1 | phase 1 / 1k fills | match / 1k | settle / 1k |
+|---|---|---|---|---|---|---|---|
+| ref | 175,993 | 5.256 | 148.9 | 21.83 | 0.798 | 0.526 | 1.485 |
+| p21 | 177,711 | 5.327 | 148.0 | 21.39 | 0.773 | 0.533 | 1.463 |
+| p21 / ref | 1.010x | 1.013x | 0.994x | **-0.44 ms** | 0.968x | 1.012x | 0.985x |
+
+| p21 cell | cancel-alls / blk | books visited / hit per cancel-all | index entries / traders at end |
+|---|---|---|---|
+| r1 | 59.2 | 189.1 / 92.4 | 252,457 / 1,317 |
+| r2 | 56.4 | 188.6 / 92.4 | 347,123 / 1,701 |
+
+Identical on all three validators. ref (main) has no cancel-all counters.
+**`torus_exec_cancel_all_books_visited` changed meaning at P2-1:** it now counts only the books
+the index visits (step 0 cells: ~300 = every book), so do not compare it with older cells.
+
+- **Verdict: gate missed.** Phase 1 -0.44 ms per native block (val0) vs >= 1.9 ms; all three
+  validators -0.30 ms; per 1k fills -3.2% (~0.7 ms per block at equal fills). Pairwise drops
+  -0.46 to +1.34 ms, below the 1.4-2.4 ms band, so no extra cells. Spread: ref 0.38 ms, p21
+  1.42 ms. Plan rule (section 4): the miss goes into the review log (row 24) and the work
+  continues.
+- **Why (from the counters, not profiled):** each cancel-all visits 189 books, not the ~87-95
+  where the sender has something (books hit 92.4, as in step 0). About half the visits are stale
+  index entries: "never removed eagerly" (phase2 plan 9.12) keeps a market listed after the
+  trader's orders there have filled. The index swings between ~135k and ~634k entries during a
+  cell (~690-2,700 traders, ~200 markets per trader) rather than growing. Scaling the ~3.7 ms
+  estimate by the empty visits actually avoided (111 of ~208) gives ~2.0 ms, still above the
+  0.44 ms measured, so the per-book saving also looks smaller than section 25.1's split implied.
+- **Upkeep:** none visible (match per fill +1.2%, settle -1.5%, within noise). end_resident wait
+  7.01 -> 5.77 ms, not established at n = 2.
+- Options for 18c: (A) accept, continue; (B) remove a market from the trader's set when the
+  trader's last order or stop in that book leaves it, then one more gate cell; (C) bring the
+  9.12 background prune forward.
+
+## 31. Cancel-by-id cost with P2-1 in: bdd5b470 vs e934fa0e (campaign ozarchy-p2byid, 2026-10-09)
+
+Plan review log row 27 (d), phase2 plan 9.15: what does one CancelOrder / ModifyOrder by id cost
+in phase 1 now that the P2-1 cancel-all index is in (used with resident books)? Step 0 (section
+25.2, s-byid on `707f132f`): +3.1 ms per native block, ~2.5 ms per by-id action, 457 books probed
+per action. Input to the priority of consensus item B (market in the order id); not a gate. Arms:
+ref = main `e934fa0e` (node `8d7d596c`; rebuilt, the p21g `28479dd1` binary was gone), p2 =
+`perf/item6-phase2` `bdd5b470` (node `e28bb121`). Node-only builds from new detached worktrees
+(`wt/p2byid-e934fa0e`, `wt/p2byid-bdd5b470`) into fresh target dirs (p21g method,
+`ozarchy-p2byid-build.sh`); both arms run the same bench `6c7ad1a7` (built from `bdd5b470`) and
+the `bdd5b470` harness. Standard shape as section 30, no perf; by-id cells add
+`CANCEL_BY_ID_FRACTION=0.1 MODIFY_FRACTION=0.05`. Order: ref warm (60 s, excluded), then
+ref-byid-r1 p2-byid-r1 p2-std-r1 ref-std-r1 p2-byid-r2 ref-byid-r2, 00:37-01:18, units
+`bench-ozarchy-p2byid-300m-<tag>.service`. All cells rc 0, AGREE, liveness PASS, accepted, node md5 =
+staged md5 of the arm, 4 MiB book CF, oracle stale 0, 0 panic / fail-stop lines, no deaths. Driver
+`/home/oz/bench-results-matched/ozarchy-p2byid-campaign.sh`, analysis
+`ozarchy-p2byid-tools/p2byid.py` (from `p21g.py`), table `ozarchy-p2byid-tools/p2byid-table.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **phase 1** | phase 1 val0-2 | phase 1 / 1k fills | by-id / blk | books probed / by-id | cancel-alls / blk | visited / hit per cancel-all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ref byid r1 | 179,228 | 5.352 | 26,647 | **22.71** | 22.82 | 0.852 | 0.903 | - | - | - |
+| p2 byid r1 | 176,114 | 5.057 | 27,719 | **24.25** | 24.62 | 0.875 | 1.058 | 454.1 | 58.6 | 184.3 / 89.7 |
+| p2 std r1 | 179,851 | 5.455 | 27,264 | **21.15** | 21.49 | 0.776 | - | - | 57.9 | 186.4 / 90.5 |
+| ref std r1 | 179,192 | 5.528 | 26,417 | **20.73** | 21.20 | 0.785 | - | - | - | - |
+| p2 byid r2 | 177,731 | 5.333 | 27,670 | **24.28** | 24.33 | 0.878 | 1.031 | 439.6 | 57.6 | 186.9 / 91.0 |
+| ref byid r2 | 173,816 | 5.455 | 25,742 | **22.91** | 22.88 | 0.890 | 1.163 | - | - | - |
+
+ms per native block (val0) unless noted; "phase 1 val0-2" = mean of the three validators.
+By-id / blk = bench-side accepted cancels + modifies (bench.log `Cancel-by-id (load-gen)` line,
+same bench binary both arms) / val0 phase-window native blocks; used for both arms because main has
+no by-id or cancel-all node counters. On p2 the node count equals the bench count (881, 863).
+Every by-id action sent was accepted; ~18.9-19.0k lookups per cell, ~18.0-18.2k found no own order,
+0 errors (delivered 0.90-1.16 per block vs step 0's 1.22). ref warm (182,390 matched/s) excluded.
+
+| mean | n | matched/s | native blk/s | fills/blk | phase 1 (r1/r2 spread) | phase 1 val0-2 (spread) | phase 1 / 1k fills | by-id / blk |
+|---|---|---|---|---|---|---|---|---|
+| ref byid | 2 | 176,522 | 5.404 | 26,195 | 22.81 (0.20) | 22.85 (0.06) | 0.871 | 1.033 |
+| ref std | 1 | 179,192 | 5.528 | 26,417 | 20.73 | 21.20 | 0.785 | - |
+| p2 byid | 2 | 176,922 | 5.195 | 27,694 | 24.27 (0.03) | 24.48 (0.30) | 0.876 | 1.044 |
+| p2 std | 1 | 179,851 | 5.455 | 27,264 | 21.15 | 21.49 | 0.776 | - |
+| p2 / ref byid | | 1.002x | 0.961x | 1.057x | +1.46 ms | +1.63 ms | 1.006x | |
+| p2 / ref std | | 1.004x | 0.987x | 1.032x | +0.42 ms | +0.30 ms | 0.989x | |
+
+| ms per by-id action = (phase 1 byid - phase 1 std) / by-id per blk | ref | p2 | p2 - ref |
+|---|---|---|---|
+| val0: step per native block | +2.08 | +3.12 | |
+| val0: per action (r1, r2 against the one std cell) | **2.01** (2.19, 1.88) | **2.98** (2.93, 3.04) | +0.97 |
+| mean val0-2: per action | 1.60 (1.79, 1.45) | 2.86 (2.96, 2.75) | +1.26 |
+| per 1k fills step x byid fills: per action | 2.19 | 2.66 | +0.47 |
+
+- **Verdict on (d): P2-1 did not cut the by-id cost.** One by-id action costs ~2.0 ms of phase 1
+  on main and ~3.0 ms on `bdd5b470` (val0), on either side of step 0's ~2.5 ms. p2 is not
+  lower; the +0.97 ms (p2 - ref) is not resolved. The input to item B's priority stays at
+  step 0's level: ~2-3 ms of phase 1 per by-id action, ~1 action per native block in this shape.
+- **Noise:** the by-id cells repeat closely (phase 1 r1/r2 0.20 ms ref, 0.03 ms p2; per action
+  0.31 / 0.11 ms), but both lean on one std cell per arm. On this shape section 30's std pairs
+  differ by 0.38 ms (ref) and 1.42 ms (p21), pooled sd ~0.74 ms per cell, so ~0.7 ms per action
+  per arm and ~1.0 ms on p2 - ref: the +0.97 is ~1 sd. A P2-1 cut to below ~1 ms per action
+  (~2 ms under p2's 2.98, ~2-3 sd) would have shown. Against section 30's std means (other
+  binaries, reference only) the figures are ref 0.95, p2 2.75 ms per action: p2 is still not lower.
+  The fills-normalised variant narrows p2 - ref to +0.47 ms (p2 by-id cells ran 5.7% more fills
+  per block).
+- **Why it did not move (sized, not profiled):** the probes are 454 / 440 books per action (all
+  validators within 440-458, step 0 457), ~10-20 us (section 25.2), <1% of the cost. P2-1 cut the
+  cancel-all walk to ~185 visited books (vs ~300 in step 0), but at ~0.07 us per visit (section 30)
+  even one extra full cancel-all pass per by-id action is ~13-21 us, also <1%. So the "a by-id
+  action splits a cancel-all run" mechanism (25.2, inferred), if it is the cause, does not cost
+  through book visits; the 2-3 ms is elsewhere and these cells do not split it (no perf).
+- **Harness limit:** it exposes cancel-alls per native block (by-id cells 58.6 / 57.6 vs 57.9 std
+  on p2) and visited / hit per cancel-all (184-187 / 90-91, unchanged by by-id), not the number of
+  cancel-all runs or how many runs the by-id actions split.
+- **Throughput:** matched/s p2 / ref 1.002x (by-id), 1.004x (std), inside the ref by-id r1/r2
+  spread (5,412, 3.1%). By-id lowers native blk/s on both arms (ref -0.12, p2 -0.26), within or
+  near the r1/r2 spread (0.10, 0.28).
+- **Caveats:** std cells n = 1 per arm; the delivered by-id share is ~1 per block (most lookups
+  find no own order), so the per-action figure rests on a ~2-3 ms step; consensus timeouts 5-8 per
+  cell in every cell, both arms. Next if 18c wants p2 - ref resolved: one more std cell per arm
+  (~6 min each); to find where the 2-3 ms goes: a perf cell on p2 with a larger by-id share.
+
+## 32. P2-5 gate cell: hasher 631becaa vs bdd5b470 (campaign ozarchy-p25g, 2026-10-09)
+
+Phase 2 P2-5 (plan 9.9): execution-path `HashMap` / `HashSet` from std SipHash to alloy's map
+(std `HashMap` + `foldhash::fast::RandomState`; node-local, bit-identical). Gate: engine ms per
+native block down by >= ~5 ms (half of the ~10.3 ms microbench estimate, section 25.3) with
+AGREE; matched/s reported because of the s82 caveat (an ahash A/B cut hash CPU with no matched/s
+gain). Arms: ref = `bdd5b470` (node `e28bb121`, the p2byid staged binary, reused), p25 =
+`631becaa` (node `2587e57f`, node-only build from detached worktree `wt/p25g-631becaa` into a
+fresh target dir). Both arms run bench `6c7ad1a7` (from `bdd5b470`) and the `bdd5b470` harness
+(`tools/` has no diff to `631becaa`). Standard shape as sections 26-31, no perf. Order: ref warm
+(60 s, excluded), then ref p25 p25 ref, 01:42-02:11, units `bench-ozarchy-p25g-300m-<tag>.service`.
+All cells rc 0, AGREE, liveness PASS, accepted, node md5 = staged md5 of the arm (3/3), 4 MiB book
+CF, trie off (default), oracle stale 0, 0 panic / fail-stop lines, no deaths. The driver's
+extension band (3.5-6.5 ms) read 8.59 ms, so no r3 cells. Driver
+`/home/oz/bench-results-matched/ozarchy-p25g-campaign.sh`, tables `ozarchy-p25g-handoff-tables.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **engine** | engine / 1k | chain | phase 1 | margin | match | settle | pass B | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ref r1 | 180,589 | 5.293 | 27,980 | **119.27** | 4.26 | 148.4 | 21.40 | 27.59 | 15.33 | 39.80 | 21.93 | 5.98 |
+| p25 r1 | 186,414 | 5.648 | 27,157 | **108.05** | 3.98 | 139.7 | 18.32 | 23.77 | 13.47 | 38.56 | 20.92 | 6.86 |
+| p25 r2 | 187,902 | 5.610 | 28,548 | **115.25** | 4.04 | 145.3 | 19.32 | 25.10 | 14.20 | 40.76 | 21.81 | 6.36 |
+| ref r2 | 180,763 | 5.238 | 28,259 | **121.21** | 4.29 | 149.9 | 22.32 | 28.00 | 15.01 | 41.14 | 22.84 | 5.87 |
+
+ms per native block (val0) unless per 1k fills; end_resident wait is the mean
+(`phases.end_resident_wait.ms`; its p50 is 0.4 in every cell). ref warm (180,472 matched/s) excluded.
+
+| mean | matched/s | native blk/s | fills/blk | engine (r1/r2 spread) | engine / 1k | chain | phase 1 / 1k | margin / 1k | match / 1k | settle / 1k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ref | 180,676 | 5.266 | 28,120 | 120.24 (1.94) | 4.275 | 149.1 | 0.777 | 0.988 | 0.540 | 1.439 |
+| p25 | 187,158 | 5.629 | 27,853 | 111.65 (7.20) | 4.010 | 142.5 | 0.676 | 0.877 | 0.497 | 1.424 |
+| p25 / ref | 1.036x | 1.069x | 0.990x | **-8.59 ms** | 0.938x | 0.955x | 0.869x | 0.888x | 0.921x | 0.989x |
+
+- **Verdict: gate met.** Engine -8.59 ms per native block (val0; all three validators -8.43),
+  -7.5 ms at equal fills (per 1k fills -6.2%), vs >= ~5 ms; AGREE on every cell. That is ~73%
+  of the ~10.3 ms estimate. Pairwise -4.02 to -13.16 ms raw (one pair under 5 ms: p25 r2 ran 5%
+  more fills, the busiest host load of the campaign); per 1k fills -0.22 to -0.31 (-6.2 to
+  -8.7 ms at ref fills), arms do not overlap (ref 4.26-4.29, p25 3.98-4.04).
+- **Where:** phase margin -3.36, phase 1 -3.04, match -1.34, settle -0.81 (pass B -1.02),
+  post-engine tail -0.22, untimed +0.18; these sum to the engine step. Per 1k fills phase 1 -13%,
+  margin -11%, match -8% separate cleanly, settle -1% is flat. Exec thread on-CPU per committed
+  block 145.1 -> 132.5 ms; user CPU per 1k fills -1.6%, sys flat.
+- **Throughput (s82 caveat):** matched/s 1.036x (pairwise +3.1 to +4.0%; spread ref 174, p25
+  1,488), native blk/s 1.069x. Unlike s82 it moved: the exec thread is busy 0.964 of the load
+  window in both arms, so engine time is on the critical path in this shape. Chain -6.7 ms, less
+  than the engine step (end_resident wait +0.7, verify +0.3, residual +1.0, each 1-2.7 sd).
+- **Caveats:** n = 2 per arm; raw engine spread 7.2 ms on p25 (fills and host load), so the raw
+  step is ~2.3 pooled sd and the fills-normalised one ~8 sd; end_resident wait +0.7 ms not
+  established; no perf, so the per-map split is inferred from the phase deltas. ref matches the
+  earlier `e28bb121` cell (p2byid p2 std r1, 179,851 matched/s).
+
+## 33. P2-2 gate cell and cumulative vs e934fa0e (campaign ozarchy-p22g, 2026-10-09)
+
+Phase 2 P2-2 (plan section 3): batch cache flush, `StateBackend::write_cf_raw_many` with one batch
+per `PositionCache` and `BalanceCache` flush (node-local, bit-identical). Gate: `cache_flush_ns`
+per native block down by >= 5 ms vs the P2-1 + P2-5 arm with AGREE; the step 0 estimate was
+~3.2 ms on the standard cells (plan row 14), so a miss was expected. The campaign also measures
+the cumulative Phase 2 gain head to head against main `e934fa0e` (plan rows 31 and 33). Arms:
+base = `e934fa0e` (node `8d7d596c`, the p2byid staged ref binary, reused), p25 = `029581e5`
+(node `2587e57f`, the p25g staged binary, built from `631becaa`; the two differ only in docs),
+p22 = `29320f6b` (node `5639b084`, node-only build of `b7e66ce5` + the test-only reference from
+detached worktree `wt/p22g-29320f6b` into a fresh target dir, same RUSTFLAGS as p25g). All arms
+run bench `6c7ad1a7` and the `bdd5b470` harness (`tools/` has no diff to `29320f6b`). Standard
+shape as sections 26-32, no perf. Order: base warm (60 s, excluded), then base p25 p22 p22 p25
+base, 02:52-03:32, units `bench-ozarchy-p22g-300m-<tag>.service`. All cells rc 0, AGREE (block
+hash, state digest and counters equal on val0-2), liveness PASS, accepted, node md5 = staged md5
+of the arm (3/3), 4 MiB book CF, trie off (default), oracle stale 0 (396 / 396 accepted), 0 panic
+/ fail-stop / error lines, no deaths, fds max under 800. Driver
+`/home/oz/bench-results-matched/ozarchy-p22g-campaign.sh`, tables `ozarchy-p22g-handoff-tables.txt`.
+
+| cell | matched/s | native blk/s | fills/blk | **engine** | engine / 1k | chain | phase 1 | margin | match | settle | pass B | **cache flush** | cache flush / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base r1 | 180,886 | 5.244 | 27,891 | **120.17** | 4.31 | 149.0 | 22.02 | 28.66 | 14.61 | 41.78 | 23.43 | **12.28** | 0.440 | 6.17 |
+| p25 r1 | 190,715 | 5.836 | 26,929 | **107.23** | 3.98 | 135.2 | 17.75 | 23.36 | 13.66 | 38.22 | 20.41 | **11.64** | 0.432 | 6.09 |
+| p22 r1 | 189,882 | 5.545 | 28,115 | **112.87** | 4.01 | 143.1 | 18.52 | 24.20 | 13.43 | 42.56 | 21.69 | **14.74** | 0.524 | 6.02 |
+| p22 r2 | 186,740 | 5.590 | 26,719 | **108.77** | 4.07 | 137.3 | 18.35 | 22.40 | 12.27 | 41.62 | 21.38 | **14.67** | 0.549 | 5.49 |
+| p25 r2 | 189,881 | 5.626 | 27,600 | **109.70** | 3.97 | 138.3 | 18.23 | 24.15 | 13.41 | 38.51 | 20.67 | **12.08** | 0.438 | 5.95 |
+| base r2 | 181,749 | 5.467 | 27,124 | **114.46** | 4.22 | 143.7 | 21.06 | 27.56 | 14.17 | 39.12 | 21.83 | **11.57** | 0.427 | 6.41 |
+
+ms per native block (val0) unless per 1k fills; the cache flush is timed inside settle (plan
+step 0 notes), so settle includes it. base warm (183,626 matched/s) excluded.
+
+| mean (r1/r2 spread) | matched/s | native blk/s | fills/blk | engine | engine / 1k | chain | phase 1 | margin | match | settle | pass B | cache flush | cache flush / 1k | end_resident wait |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 181,318 (864) | 5.355 (0.223) | 27,507 | 117.32 (5.71) | 4.264 (0.089) | 146.3 | 21.54 | 28.11 | 14.39 | 40.45 | 22.63 | 11.93 (0.71) | 0.433 (0.014) | 6.29 |
+| p25 | 190,298 (834) | 5.731 (0.210) | 27,265 | 108.47 (2.47) | 3.978 (0.007) | 136.7 | 17.99 | 23.76 | 13.54 | 38.37 | 20.54 | 11.86 (0.44) | 0.435 (0.005) | 6.02 |
+| p22 | 188,311 (3,142) | 5.567 (0.045) | 27,417 | 110.82 (4.10) | 4.043 (0.056) | 140.2 | 18.44 | 23.30 | 12.85 | 42.09 | 21.54 | 14.71 (0.07) | 0.537 (0.025) | 5.76 |
+| p22 / p25 | 0.990x | 0.972x | 1.006x | +2.36 ms | 1.016x | 1.025x | 1.025x | 0.981x | 0.949x | 1.097x | 1.048x | **+2.85 ms (1.240x)** | 1.234x | 0.956x |
+| p25 / base | **1.0495x** | 1.070x | 0.991x | -8.85 ms | 0.933x | 0.934x | 0.835x | 0.845x | 0.941x | 0.949x | 0.908x | -0.07 ms | 1.003x | 0.957x |
+| p22 / base | **1.039x** | 1.040x | 0.997x | -6.50 ms | 0.948x | 0.958x | 0.856x | 0.829x | 0.893x | 1.041x | 0.952x | +2.78 ms | 1.238x | 0.915x |
+
+- **Verdict P2-2: gate missed, and the sign is reversed.** Cache flush per native block +2.85 ms
+  (11.86 -> 14.71, +24%) instead of -5 ms (gate) or -3.2 ms (estimate); per 1k fills 0.435 ->
+  0.537. Pairwise +2.59 to +3.10 ms; pooled sd 0.22 ms, step ~13 sd; all three validators in
+  both replicates (p22 14.43-15.04, p25 11.44-12.08, base 11.37-12.48 ms) do not overlap. base
+  and p25 are equal (-0.07 ms, 0.2 sd), as expected (P2-1 and P2-5 do not touch the flush).
+- **Where:** settle +3.73 ms (7.6 sd) = cache flush +2.85 plus pass B +1.00 (4.9 sd; pass B
+  per 1k fills 0.753 -> 0.785); pass A, post-engine tail and untimed are flat. Engine +2.36 ms
+  (1.0 sd; +1.8 ms at equal fills, per 1k fills 1.016x, 2.3 sd), the rest offset by match
+  -0.69 and margin -0.46, both inside their noise. The pass B step is not explained by the
+  change (pass B runs before the flush); a carry-over from the batch (allocator / cache state
+  for the next block) is a possibility, not established.
+- **Throughput p22 / p25:** matched/s 0.990x (-1,987, 1.2 pooled sd; pairwise 0.979-1.000x),
+  native blk/s 0.972x (1.5 sd): **not resolved**. At P2-5's measured rate (~0.4% matched/s per
+  ms of engine, plan row 31) the +2.85 ms flush step predicts ~-1.1%, so the measured -1.0% is
+  in line with it but the cells cannot separate it from zero.
+- **Mechanism (hypothesis, no perf in this campaign):** the batch removes the second lookup,
+  `intern_cf` and the per-row lock (~3.2 ms in the step 0 split), but it encodes every row into
+  an owned `(Vec<u8>, Option<Vec<u8>>)` list first (key `to_vec` and value buffer allocated in
+  one pass, consumed in a second, so cold by the time the overlay inserts them; the rows `Vec`
+  grows from a `filter_map` without a size hint) and holds the overlay write lock for the whole
+  batch. The measured step is ~6 ms worse than the estimate; which part costs it needs a
+  profile or a `flush_all` microbench (old vs new at the cell's dirty-row count).
+- **Cumulative vs `e934fa0e` (head to head):** p25 / base **1.0495x** (pairwise 1.045-1.054x,
+  +8,980 matched/s, 15 pooled sd; native blk/s 1.070x), at or just above the top of the chained
+  estimate ~1.040-1.046x (row 31). p22 / base **1.039x** (pairwise 1.027-1.050x, 4.3 sd), below
+  the ~1.053-1.060x expected after P2-2 (row 31) because P2-2 regressed instead of saving
+  ~3.2 ms. Against the +7% phase gate: ~2.0% short with p25, ~3.0% short with p22. Engine per
+  1k fills p25 / base 0.933x (6.4 sd); phase 1 -3.55 ms and margin -4.36 ms (both ~6.5 sd).
+- **Caveats:** n = 2 per arm; p22's matched/s spread (3,142) is ~3.7x the other arms', so the
+  p22 throughput ratios are the weakest numbers here. The host ran ~1-3% faster than in earlier
+  campaigns (base 181,318 vs `e934fa0e` 175,993 in section 30 and 179,192 in section 31; p25's
+  node 190,298 vs 187,158 in section 32), so only the interleaved ratios carry; no perf, so the
+  mechanism above is inferred. Plan row 33 (1): keep P2-2 on a non-overlapping gain, drop it
+  only if it regresses; its gate metric regresses cleanly, matched/s is not resolved.
+
 ## Open
 
+- **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
+  still visit 189 books, the sender has something in 92 (stale index entries, "never removed
+  eagerly"). 18c s104: **A, accept and continue** (~0.07 us per skipped visit, 0.44 ms /
+  (59.2 x 111), so B's further ~97 visits are worth ~0.4 ms, still below the gate); the background prune stays before mainnet
+  (phase2 plan 9.14, review log row 25).
 - **`d3ba3c0a` is 6.3% below `35e69b3`** on the standard shape (section 26,
   interleaved, same bench): not the 4 MiB book SSTs (C/B 1.003x), not the
   build style (D/B 1.014x), not the load generator. **Bisected** (section

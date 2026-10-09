@@ -1,6 +1,6 @@
 # Per-cell results (every cell dir with a `summary.json`)
 
-Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`). After the c2h campaign finished: added `c2h` (14 cells).
+Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`, `liveness`, `validity`) with no rounding beyond one decimal (two for ms columns). `matched/s avg` is `headline.matched_s_avg`; `first120`, `best60` as in the harness. Empty = field absent in that `summary.json`. Cells with status FAILED were interrupted before the summary was written. The skipped dirs are not in this table. Updated 2026-10-08 (s29): added the cells of `p2s0b`, `p2s0r`, `p2s0x` and `p2s0y` (45 cells; the 4 dirs skipped at archive time have no `summary.json`). After the c2h campaign finished: added `c2h` (14 cells). 2026-10-09: added `p2byid` (7 cells).
 
 
 ## 14236fa: Baseline `14236fa` (C3 + C4 + PF1 + cooldown fix) at 300 markets, with perf on r1/r2
@@ -391,6 +391,40 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-c2h-300m-sav-r1` | UNVERIFIED | 2026-10-08 18:16 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 135,694.4 | 133,782.9 | 171,276.0 | 178,545.7 | 3.4 | 126.0 | 169.37 | 3.98 | AGREE | UNKNOWN | UNVERIFIED |
 | `ozarchy-c2h-300m-sav-r2` | OK | 2026-10-08 18:33 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 178,036.6 | 177,179.0 | 189,469.0 | 236,627.5 | 5.1 | 131.6 | 150.37 | 4.17 | AGREE | PASS | ACCEPT |
 | `ozarchy-c2h-300m-sav-r3` | OK | 2026-10-08 19:06 | v2-savings @ 37b28dd6 | 4fcbf7cb | 300 | 120 | 400 | - | 176,912.5 | 176,991.8 | 188,521.7 | 234,400.6 | 5.1 | 130.9 | 154.80 | 4.23 | AGREE | PASS | ACCEPT |
+
+## p2byid: Cancel-by-id cost with P2-1 in: p2 `bdd5b470` vs ref main `e934fa0e`, by-id cells (bench flags `--cancel-by-id-fraction 0.1 --modify-fraction 0.05`, not in extra env) and std cells; `ref-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p2byid-300m-p2-byid-r1` | OK | 2026-10-09 00:54 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 176,114.0 | 175,254.7 | 185,940.9 | 232,517.3 | 5.1 | 139.4 | 150.19 | 4.40 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-p2-byid-r2` | OK | 2026-10-09 01:11 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 177,730.6 | 177,967.5 | 187,942.1 | 235,498.8 | 5.3 | 127.5 | 149.06 | 4.37 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-p2-std-r1` | OK | 2026-10-09 01:00 | p2byid-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 179,851.2 | 177,949.1 | 187,550.4 | 238,403.1 | 5.5 | 129.9 | 146.09 | 4.27 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-byid-r1` | OK | 2026-10-09 00:48 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 179,228.2 | 178,558.5 | 190,142.6 | 238,251.5 | 5.4 | 127.8 | 143.40 | 4.33 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-byid-r2` | OK | 2026-10-09 01:18 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 173,816.0 | 172,096.1 | 186,523.8 | 230,660.5 | 5.5 | 127.9 | 140.64 | 4.38 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-std-r1` | OK | 2026-10-09 01:05 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 179,192.3 | 177,854.4 | 189,745.5 | 238,030.9 | 5.5 | 122.1 | 140.57 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p2byid-300m-ref-warm` | OK | 2026-10-09 00:42 | p2byid-e934fa0e @ e934fa0e | 8d7d596c | 300 | 60 | 400 | - | 182,389.8 | 182,389.8 | 193,182.4 | 241,955.8 | 5.0 | 100.2 | 126.34 | 4.17 | AGREE | PASS | ACCEPT |
+
+## p25g: P2-5 hasher gate cell: p25 `631becaa` vs ref `bdd5b470`; `ref-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p25g-300m-p25-r1` | OK | 2026-10-09 01:59 | p25g-631becaa @ 631becaa | 2587e57f | 300 | 120 | 400 | - | 186,413.8 | 186,233.2 | 194,309.7 | 248,015.2 | 5.6 | 129.3 | 139.70 | 3.98 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-p25-r2` | OK | 2026-10-09 02:05 | p25g-631becaa @ 631becaa | 2587e57f | 300 | 120 | 400 | - | 187,902.0 | 187,707.6 | 200,267.7 | 249,839.6 | 5.6 | 138.7 | 145.27 | 4.04 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-r1` | OK | 2026-10-09 01:53 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 180,588.6 | 179,833.6 | 191,864.7 | 239,965.3 | 5.3 | 129.6 | 148.38 | 4.26 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-r2` | OK | 2026-10-09 02:11 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 120 | 400 | - | 180,762.5 | 180,347.8 | 192,192.0 | 239,741.7 | 5.2 | 136.6 | 149.90 | 4.29 | AGREE | PASS | ACCEPT |
+| `ozarchy-p25g-300m-ref-warm` | OK | 2026-10-09 01:46 | p25g-bdd5b470 @ bdd5b470 | e28bb121 | 300 | 60 | 400 | - | 180,472.0 | 180,472.0 | 192,347.5 | 238,689.9 | 4.7 | 111.2 | 139.95 | 4.17 | AGREE | PASS | ACCEPT |
+
+## p22g: P2-2 batch cache flush gate cell: p22 `29320f6b` vs p25 `029581e5`, plus base main `e934fa0e` (cumulative); `base-warm` excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p22g-300m-base-r1` | OK | 2026-10-09 03:01 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 180,885.8 | 180,119.7 | 191,451.5 | 240,014.3 | 5.2 | 128.4 | 149.00 | 4.31 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-base-r2` | OK | 2026-10-09 03:32 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 120 | 400 | - | 181,749.3 | 180,960.8 | 193,540.8 | 241,509.1 | 5.5 | 125.6 | 143.65 | 4.22 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-base-warm` | OK | 2026-10-09 02:55 | p22g-e934fa0e @ e934fa0e | 8d7d596c | 300 | 60 | 400 | - | 183,625.6 | 183,625.6 | 191,948.6 | 242,706.7 | 5.0 | 111.9 | 138.19 | 4.23 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p22-r1` | OK | 2026-10-09 03:14 | p22g-29320f6b @ 29320f6b | 5639b084 | 300 | 120 | 400 | - | 189,882.1 | 188,346.7 | 198,899.2 | 251,758.8 | 5.5 | 134.8 | 143.07 | 4.01 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p22-r2` | OK | 2026-10-09 03:20 | p22g-29320f6b @ 29320f6b | 5639b084 | 300 | 120 | 400 | - | 186,740.1 | 185,188.5 | 198,284.5 | 247,552.2 | 5.6 | 127.2 | 137.34 | 4.07 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p25-r1` | OK | 2026-10-09 03:07 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 190,714.8 | 189,834.1 | 204,010.7 | 253,241.3 | 5.8 | 130.7 | 135.15 | 3.98 | AGREE | PASS | ACCEPT |
+| `ozarchy-p22g-300m-p25-r2` | OK | 2026-10-09 03:26 | p22g-029581e5 @ 029581e5 | 2587e57f | 300 | 120 | 400 | - | 189,881.2 | 188,869.5 | 197,942.2 | 251,612.5 | 5.6 | 137.1 | 138.33 | 3.97 | AGREE | PASS | ACCEPT |
 
 ## pf1: PF1 gate at 10 markets: `0ebfd71` (crab + PF1) vs main `92a02ed`
 

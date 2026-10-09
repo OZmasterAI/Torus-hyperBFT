@@ -315,7 +315,7 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
     let mut rng = Lcg(seed);
     let mut holder = ResidentBooks::default();
     let mut parent: Option<Arc<FrozenPending>> = None;
-    let mut books = HashMap::new();
+    let mut books = HashMap::default();
     let mut next_id: u128 = 1;
     let mut prices: Vec<FixedPoint> = vec![fp(MID); MARKETS as usize + 1];
     let mut out = Vec::new();

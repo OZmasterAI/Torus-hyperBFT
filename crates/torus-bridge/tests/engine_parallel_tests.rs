@@ -1676,3 +1676,52 @@ fn b_blind_shapes_identical() {
         }
     }
 }
+
+// ============================================================================
+// Item 6 Phase 2 step 0.2: thread spawns per site
+// ============================================================================
+
+/// The sharded engine path spawns at the match, settle, margin-prepare and
+/// save-books sites and counts each spawn (`torus_state::spawn_count`; the
+/// counters are process-wide, so other tests only add to the deltas).
+#[test]
+fn parallel_engine_counts_spawns_per_site() {
+    use torus_state::spawn_count::{totals, SpawnSite};
+    let before = totals();
+    let (_dir, db) = open_test_db();
+    let mut ctx = NativeExecContext::new_with_mode(
+        db,
+        1,
+        1000,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        BookMode::LevelAuthority,
+        None,
+    );
+    ctx.save_books_workers = 4;
+    ctx.save_books_min_ops = 0;
+    for n in 1..=48u8 {
+        fund_native(&ctx, &addr(n), fp(1_000_000));
+    }
+    for batch in fuzz_batches(0x5EED_0002) {
+        NativeExecutor::execute_batch_engine_mode(&mut ctx, &batch, 4);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    }
+    ctx.save_order_books();
+    let after = totals();
+    for site in [
+        SpawnSite::Match,
+        SpawnSite::Settle,
+        SpawnSite::MarginPrepare,
+        SpawnSite::SaveBooks,
+    ] {
+        assert!(
+            after[site as usize] > before[site as usize],
+            "{site:?}: no spawn counted"
+        );
+    }
+}

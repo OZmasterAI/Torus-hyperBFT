@@ -3,9 +3,9 @@
 //! Stores positions in CF_NATIVE_POSITIONS and native balances in CF_NATIVE_BALANCES.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
+use alloy_primitives::map::{HashMap, HashSet};
 use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
@@ -770,6 +770,29 @@ impl PositionCache {
         self.dirty.clear();
         Ok(())
     }
+
+    /// Item 6 Phase 2 step 0.4: the per-row flush, frozen as the reference
+    /// for P2-2's batch overlay writes: one `put_position` /
+    /// `delete_position` per dirty key in key order (`flush_all` as of
+    /// `d3ba3c0a`). Test-only, no runtime flag (D16); other crates' tests
+    /// reach it through the `test-reference-paths` feature (plan 9.8).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn flush_all_per_row<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+    ) -> Result<(), CoreError> {
+        let mut keys: Vec<(Address, MarketId)> = self.dirty.iter().copied().collect();
+        keys.sort();
+        for key in keys {
+            match self.map.get(&key) {
+                Some(Some(pos)) => positions.put_position(pos)?,
+                Some(None) => positions.delete_position(&key.0, key.1)?,
+                None => {}
+            }
+        }
+        self.dirty.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -991,5 +1014,127 @@ mod tests {
             Position::try_from_slice(&bytes[..POSITION_V2_LEN - 1]).is_err(),
             "truncated"
         );
+    }
+
+    /// Item 6 Phase 2 step 0.4: `flush_all` leaves the overlay exactly as
+    /// the per-row reference does: the same pending writes and tombstones,
+    /// the same reads, and (through a checkpoint opened before the flush) the
+    /// same undo journal. Random sets / removes over rows the DB already
+    /// holds, rows written earlier in the block, and new rows; several
+    /// flushes per cache.
+    #[test]
+    fn flush_all_matches_the_per_row_reference() {
+        use torus_state::cf::CF_NATIVE_POSITIONS;
+        use torus_state::{NativeStateOverlay, StateDb};
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let pos = |t: u8, m: MarketId, size: i128, entry: i128| Position {
+            trader: Address::new([t; 20]),
+            market_id: m,
+            is_long: size > 0,
+            size: raw(size.abs() * S),
+            entry_price: raw(entry * S),
+            // One fill: cost_basis = size x entry.
+            cost_basis: raw(size.abs() * entry * S),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        };
+        let base = PositionManager::new(db.clone());
+        for t in 1..=6u8 {
+            base.put_position(&pos(t, 1, t as i128, 100)).unwrap();
+        }
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        let overlays = [
+            NativeStateOverlay::new(db.clone()),
+            NativeStateOverlay::new(db.clone()),
+        ];
+        let managers = overlays.each_ref().map(|o| PositionManager::new(o.clone()));
+        // Written earlier in the block, before the checkpoint.
+        for m in &managers {
+            m.put_position(&pos(2, 2, -3, 90)).unwrap();
+        }
+        let mut caches = [PositionCache::new(), PositionCache::new()];
+        let keys = |o: &NativeStateOverlay| -> Vec<Option<Vec<u8>>> {
+            (1..=9u8)
+                .flat_map(|t| (1..=3).map(move |m| position_key(&Address::new([t; 20]), m)))
+                .map(|k| o.get_cf_raw(CF_NATIVE_POSITIONS, &k).unwrap())
+                .collect()
+        };
+        for round in 0..6 {
+            for o in &overlays {
+                o.checkpoint();
+            }
+            for _ in 0..40 {
+                let (t, m) = (1 + next(9) as u8, 1 + next(3));
+                let op = next(4);
+                for (c, mgr) in caches.iter_mut().zip(&managers) {
+                    match op {
+                        0 => c.remove(&Address::new([t; 20]), m),
+                        1 => {
+                            c.load(mgr, &Address::new([t; 20]), m).unwrap();
+                        }
+                        _ => c.set(pos(t, m, 1 + (round * 7 + t as i128) % 5, 95 + op as i128)),
+                    }
+                }
+            }
+            let [c0, c1] = &mut caches;
+            c0.flush_all(&managers[0]).unwrap();
+            c1.flush_all_per_row(&managers[1]).unwrap();
+            assert_eq!(
+                overlays[0].own_pending_delta(),
+                overlays[1].own_pending_delta(),
+                "round {round}"
+            );
+            assert_eq!(
+                keys(&overlays[0]),
+                keys(&overlays[1]),
+                "round {round}: reads"
+            );
+            if round % 2 == 1 {
+                for o in &overlays {
+                    o.revert_to_checkpoint();
+                }
+                assert_eq!(
+                    overlays[0].own_pending_delta(),
+                    overlays[1].own_pending_delta(),
+                    "round {round}: reverted"
+                );
+                assert_eq!(
+                    keys(&overlays[0]),
+                    keys(&overlays[1]),
+                    "round {round}: reverted reads"
+                );
+            } else {
+                for o in &overlays {
+                    o.commit_checkpoint();
+                }
+            }
+        }
+        assert!(!overlays[0].own_pending_delta().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod exec_hasher_tests {
+    use super::*;
+    use std::hash::BuildHasher;
+
+    /// Item 6 Phase 2 P2-5: the execution maps' hasher (alloy's default
+    /// `map-foldhash`) is seeded per map, so keys a trader chooses cannot be
+    /// aimed at one bucket. Fails if feature unification ever gives alloy's
+    /// map an unseeded hasher (e.g. `map-fxhash` without `map-foldhash`).
+    #[test]
+    fn exec_map_hasher_is_seeded_per_map() {
+        let a = HashMap::<(Address, MarketId), ()>::default();
+        let b = HashMap::<(Address, MarketId), ()>::default();
+        let key = (Address::ZERO, 1);
+        assert_ne!(a.hasher().hash_one(key), b.hasher().hash_one(key));
     }
 }

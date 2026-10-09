@@ -530,6 +530,30 @@ pub struct Metrics {
     /// block's advance), once per worker joined: the part of
     /// `exec_end_resident_seconds` still on the critical path.
     pub exec_end_resident_wait_seconds: Histogram,
+    /// Item 6 Phase 2 step 0.2 (P2-1): cancel-alls executed (user
+    /// `CancelAllOrders` and the liquidation step's cancels), the books they
+    /// visited, and the books where the sender had orders or stops. Counted
+    /// on the exec context, added once per native block.
+    pub exec_cancel_all: Counter,
+    pub exec_cancel_all_books_visited: Counter,
+    pub exec_cancel_all_books_hit: Counter,
+    /// Step 0.2 (P2-1b): `CancelOrder` / `ModifyOrder` executed, and the
+    /// books they probed to find the order.
+    pub exec_by_id_actions: Counter,
+    pub exec_by_id_books_probed: Counter,
+    /// Item 6 Phase 2 P2-1 (s104): size of the node-local cancel-all index
+    /// at the end of the last native block: (trader, market) entries and
+    /// traders (0 while not built). Entries are never removed on the fill
+    /// path, so this tracks the index's memory growth.
+    pub exec_cancel_all_index_entries: Gauge,
+    pub exec_cancel_all_index_traders: Gauge,
+    /// Step 0.2 (P2-3): threads spawned per execution-path site since process
+    /// start (`torus_state::spawn_count`), one gauge per
+    /// [`EXEC_SPAWN_SITES`] entry, set after every executed block.
+    pub exec_thread_spawns: [Gauge; 9],
+    /// Step 0.2: the exec wall (`exec_block_seconds`) of oracle-only blocks:
+    /// every native action a `SubmitOraclePrices`, no EVM transaction.
+    pub exec_oracle_only_block_seconds: Histogram,
     /// Committed blocks handed to the exec channel but not yet fully executed.
     /// Pinned near the channel bound (64) = execution is the bottleneck.
     pub exec_queue_depth: Gauge,
@@ -2011,6 +2035,69 @@ impl Metrics {
             exec_end_resident_wait_seconds.clone(),
         );
 
+        // Item 6 Phase 2 step 0.2: node-local counters (never hashed).
+        let [exec_cancel_all, exec_cancel_all_books_visited, exec_cancel_all_books_hit, exec_by_id_actions, exec_by_id_books_probed]: [Counter; 5] =
+            Default::default();
+        for (name, help, c) in [
+            (
+                "torus_exec_cancel_all",
+                "Item 6 P2-1: cancel-alls executed (user and liquidation step)",
+                &exec_cancel_all,
+            ),
+            (
+                "torus_exec_cancel_all_books_visited",
+                "Item 6 P2-1: books the cancel-alls visited",
+                &exec_cancel_all_books_visited,
+            ),
+            (
+                "torus_exec_cancel_all_books_hit",
+                "Item 6 P2-1: books where the cancel-all sender had orders or stops",
+                &exec_cancel_all_books_hit,
+            ),
+            (
+                "torus_exec_by_id_actions",
+                "Item 6 P2-1b: CancelOrder / ModifyOrder executed",
+                &exec_by_id_actions,
+            ),
+            (
+                "torus_exec_by_id_books_probed",
+                "Item 6 P2-1b: books CancelOrder / ModifyOrder probed to find the order",
+                &exec_by_id_books_probed,
+            ),
+        ] {
+            registry.register(name, help, c.clone());
+        }
+        let [exec_cancel_all_index_entries, exec_cancel_all_index_traders]: [Gauge; 2] =
+            Default::default();
+        for (name, help, g) in [
+            (
+                "torus_exec_cancel_all_index_entries",
+                "Item 6 P2-1: (trader, market) entries in the cancel-all index after the last native block",
+                &exec_cancel_all_index_entries,
+            ),
+            (
+                "torus_exec_cancel_all_index_traders",
+                "Item 6 P2-1: traders in the cancel-all index after the last native block",
+                &exec_cancel_all_index_traders,
+            ),
+        ] {
+            registry.register(name, help, g.clone());
+        }
+        let exec_thread_spawns: [Gauge; 9] = Default::default();
+        for (site, g) in EXEC_SPAWN_SITES.iter().zip(&exec_thread_spawns) {
+            registry.register(
+                format!("torus_exec_thread_spawns_{site}"),
+                "Item 6 P2-3: threads spawned at this execution-path site since process start",
+                g.clone(),
+            );
+        }
+        let exec_oracle_only_block_seconds = Histogram::new(exponential_buckets(0.001, 1.5, 20));
+        registry.register(
+            "torus_exec_oracle_only_block_seconds",
+            "Item 6: exec wall per oracle-only block (only SubmitOraclePrices, no EVM tx)",
+            exec_oracle_only_block_seconds.clone(),
+        );
+
         let exec_queue_depth = Gauge::default();
         registry.register(
             "torus_exec_queue_depth",
@@ -2580,6 +2667,15 @@ impl Metrics {
             exec_end_resident_rows_seconds,
             exec_end_resident_positions_seconds,
             exec_end_resident_wait_seconds,
+            exec_cancel_all,
+            exec_cancel_all_books_visited,
+            exec_cancel_all_books_hit,
+            exec_by_id_actions,
+            exec_by_id_books_probed,
+            exec_cancel_all_index_entries,
+            exec_cancel_all_index_traders,
+            exec_thread_spawns,
+            exec_oracle_only_block_seconds,
             exec_queue_depth,
             exec_throttle_tier,
             exec_dispatch_deferred,
@@ -2769,6 +2865,21 @@ pub async fn serve_metrics(
     }
 }
 
+/// Item 6 Phase 2 step 0.2: the name suffixes of
+/// [`Metrics::exec_thread_spawns`], in `torus_state::spawn_count::SpawnSite`
+/// order (pinned by a torus-consensus test).
+pub const EXEC_SPAWN_SITES: [&str; 9] = [
+    "match",
+    "settle",
+    "save_books",
+    "margin_prepare",
+    "open_orders",
+    "end_resident",
+    "flush_digest",
+    "root_buckets",
+    "load_books",
+];
+
 /// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
 pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
 
@@ -2852,6 +2963,52 @@ mod tests {
         }
         let buckets: Vec<usize> = [-5, 0, 1, 2, 3, 5, 6, 10, 11, 30, 31, 1_000].map(margin_cut_tick_bucket).to_vec();
         assert_eq!(buckets, vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
+    }
+
+    /// Item 6 Phase 2 step 0.2: the cancel-all / by-id counters, the
+    /// per-site spawn gauges and the oracle-only block histogram exist from
+    /// start-up under the names `run-cell.sh` samples. P2-1 (s104): so do
+    /// the cancel-all index size gauges.
+    #[test]
+    fn phase2_step0_metrics_are_exported() {
+        let m = Metrics::new();
+        m.exec_cancel_all.inc_by(2);
+        m.exec_cancel_all_books_visited.inc_by(600);
+        m.exec_cancel_all_books_hit.inc_by(7);
+        m.exec_by_id_actions.inc_by(3);
+        m.exec_by_id_books_probed.inc_by(900);
+        m.exec_thread_spawns[1].set(42);
+        m.exec_oracle_only_block_seconds.observe(0.004);
+        m.exec_cancel_all_index_entries.set(5);
+        m.exec_cancel_all_index_traders.set(2);
+        let text = m.encode();
+        for (name, want) in [
+            ("torus_exec_cancel_all_index_entries", 5),
+            ("torus_exec_cancel_all_index_traders", 2),
+            ("torus_exec_cancel_all_total", 2),
+            ("torus_exec_cancel_all_books_visited_total", 600),
+            ("torus_exec_cancel_all_books_hit_total", 7),
+            ("torus_exec_by_id_actions_total", 3),
+            ("torus_exec_by_id_books_probed_total", 900),
+            ("torus_exec_oracle_only_block_seconds_count", 1),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {want}\n")),
+                "{name}:\n{text}"
+            );
+        }
+        assert_eq!(EXEC_SPAWN_SITES.len(), m.exec_thread_spawns.len());
+        for (i, site) in EXEC_SPAWN_SITES.iter().enumerate() {
+            let want = if i == 1 { 42 } else { 0 };
+            assert!(
+                text.contains(&format!("torus_exec_thread_spawns_{site} {want}\n")),
+                "{site}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("torus_exec_oracle_only_block_seconds_bucket{le=\"0.001\"} 0\n"),
+            "{text}"
+        );
     }
 
     #[test]

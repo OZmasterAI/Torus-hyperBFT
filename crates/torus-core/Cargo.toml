@@ -15,6 +15,13 @@ thiserror = { workspace = true }
 borsh = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Item 6 Phase 2 (plan 9.8): TEST-ONLY. Compiles the frozen reference paths
+# (`PositionCache::flush_all_per_row`) into non-test builds so torus-bridge's
+# `test-reference-paths` feature can switch to them from other crates' tests.
+# Never enabled by a normal dependency: no node build reaches it.
+test-reference-paths = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
