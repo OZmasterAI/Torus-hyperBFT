@@ -2108,7 +2108,11 @@ mod tests {
         assert_eq!(parse_member_cache_mb(Some("1".into())), 1024 * 1024);
         assert_eq!(parse_member_cache_mb(Some(" 8 ".into())), 8 * 1024 * 1024);
         for v in ["", "x", "-1", "on"] {
-            assert_eq!(parse_member_cache_mb(Some(v.into())), 256 * 1024 * 1024, "{v}");
+            assert_eq!(
+                parse_member_cache_mb(Some(v.into())),
+                256 * 1024 * 1024,
+                "{v}"
+            );
         }
     }
 

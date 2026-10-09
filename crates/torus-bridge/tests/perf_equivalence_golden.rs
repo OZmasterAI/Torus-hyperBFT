@@ -50,8 +50,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{keccak256, Address, U256};
 use torus_bridge::native_executor::{
-    begin_resident, end_resident, end_resident_on_worker, BookMode, NativeExecContext, NativeExecutor,
-    ResidentBooks,
+    begin_resident, end_resident, end_resident_on_worker, BookMode, NativeExecContext,
+    NativeExecutor, ResidentBooks,
 };
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::liquidation as liq;
@@ -163,8 +163,17 @@ fn listed_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
 /// layout (the code default before plan 9.13, now `TORUS_BOOK_ROWS=0`).
 fn seed_ctx(db: &StateDb) -> NativeExecContext {
     NativeExecContext::new_with_mode(
-        db.clone(), 0, 1_000, 0, 1_000_000, 100, addr(99), addr(100), addr(101),
-        BookMode::Classic, None,
+        db.clone(),
+        0,
+        1_000,
+        0,
+        1_000_000,
+        100,
+        addr(99),
+        addr(100),
+        addr(101),
+        BookMode::Classic,
+        None,
     )
 }
 
@@ -336,8 +345,17 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
         let mut rows = begin_resident(resident.then_some(&mut holder), &mut overlay, h, Some(&metrics));
         let mut ctx = NativeExecContext::new_with_mode(
-            overlay.clone(), h, b.ts, 0, 1_000_000, 100, addr(99), addr(100), addr(101),
-            BookMode::Classic, None,
+            overlay.clone(),
+            h,
+            b.ts,
+            0,
+            1_000_000,
+            100,
+            addr(99),
+            addr(100),
+            addr(101),
+            BookMode::Classic,
+            None,
         );
         ctx.attach_resident_block(&mut rows);
         ctx.order_books = std::mem::take(&mut books);

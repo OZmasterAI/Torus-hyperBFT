@@ -1754,7 +1754,8 @@ mod sync_wal_tests {
     /// else (on words, garbage) is the default, on.
     #[test]
     fn db_tuning_pipelined_write_off_values() {
-        let p = |v: &str| DbTuning::from_raw(None, None, None, None, Some(v.into())).pipelined_write;
+        let p =
+            |v: &str| DbTuning::from_raw(None, None, None, None, Some(v.into())).pipelined_write;
         for v in ["0", " 0 ", "false", "FALSE", "no", "off"] {
             assert!(!p(v), "{v}");
         }

@@ -2770,14 +2770,23 @@ mod book_rows_toggle_tests {
     #[test]
     fn default_is_level_authority_chunked() {
         assert_eq!(parse_book_rows_mode(None), BookMode::LevelAuthorityChunked);
-        assert_eq!(parse_book_rows_mode(None), parse_book_rows_mode(Some("3".to_string())));
+        assert_eq!(
+            parse_book_rows_mode(None),
+            parse_book_rows_mode(Some("3".to_string()))
+        );
     }
 
     /// `"0"` is the explicit Classic switch (the pre-9.13 default layout).
     #[test]
     fn zero_is_classic() {
-        assert_eq!(parse_book_rows_mode(Some("0".to_string())), BookMode::Classic);
-        assert_eq!(parse_book_rows_mode(Some(" 0 ".to_string())), BookMode::Classic);
+        assert_eq!(
+            parse_book_rows_mode(Some("0".to_string())),
+            BookMode::Classic
+        );
+        assert_eq!(
+            parse_book_rows_mode(Some(" 0 ".to_string())),
+            BookMode::Classic
+        );
     }
 
     #[test]

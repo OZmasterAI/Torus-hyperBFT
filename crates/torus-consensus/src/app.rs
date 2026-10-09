@@ -16460,7 +16460,11 @@ mod crash_recovery_tests {
         for on in [false, true] {
             let (h_env, r_env, d_env, m_env) = run(on, false);
             let (h_bench, r_bench, d_bench, m_bench) = run(on, true);
-            assert_eq!(m_bench, Some(vec![3]), "bench run must write the mode-3 marker");
+            assert_eq!(
+                m_bench,
+                Some(vec![3]),
+                "bench run must write the mode-3 marker"
+            );
             assert_eq!(m_env, m_bench, "on={on}: env-unset node must run mode 3");
             assert!(h_env.is_some(), "on={on}: running hash written");
             assert_eq!(h_env, h_bench, "on={on}: running state hash");
