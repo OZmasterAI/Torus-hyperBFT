@@ -27,13 +27,15 @@ baseline `95b01af2` ran in a temporary detached worktree (`wt/base-95b01af2`) wi
 (`~/.cargo-target-item6-phase2-base`, warm); the worktree was removed afterwards. To avoid the 14-crate
 trap of the previous section, the source root (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`) of all 21
 workspace members was touched on each side before its clippy run; both sides re-linted 21 crates.
-Suites 3 and 5 were not run.
+Suite 5 was not run. Suite 3 (the one-process run, TESTING.md "Before merging to main") was added
+afterwards at 18c's request, from the same worktree at `c74a92a6` (docs only over `3aa516e0`; no source
+diff outside `docs/`).
 
 | # | suite | exit | totals | wall |
 |---|---|---|---|---|
 | 1 | nextest `--workspace` | 0 | **3,158 passed, 0 failed**, 34 skipped, 0 flaky | 85 s (83.7 s of tests) |
 | 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 8 s |
-| 3 | `cargo test --workspace --no-fail-fast` | – | not run (not requested) | – |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,159 passed, 0 failed**, 41 ignored (162 result lines) | 449 s |
 | 4 | clippy (no `-D`) / fmt vs `95b01af2` | 0 / 1 (fmt: old debt) | clippy 268 = 268, **0 new**, 0 gone; fmt 3,299 vs 3,303, **0 new**, 4 gone | 32 s / 4 s (base 11 s / 4 s) |
 | 5 | uniswap | – | 18c (no Foundry on ozarchy) | – |
 | 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
@@ -48,8 +50,11 @@ tests are unchanged. Skipped is unchanged at 34. The 4 fmt hunks that are gone
 Phase 2 lines as in the previous section. Both fmt totals are one lower than there (3,300 / 3,304) because
 main's R02 change to `crates/torus-consensus/src/app.rs` removed one hunk of old debt.
 
+Suite 3's 3,159 = nextest's 3,158 + the 1 doc test, and its 41 ignored = nextest's 34 skipped + the 7
+ignored doc tests (as 18c's runs on main: one-process = nextest + 1). No test failed in the shared process.
+
 Logs: `~/bench-results-matched/presuite-item6-p2-95b0/` (`run.sh`, `1-nextest.log` ... `6-test_*.log`,
-`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21).
+`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21, `3-full.log`, `3-full.rc`).
 
 ## perf/item6-phase2 ab6f01dc (2026-10-09, s31, P2-2 reverted, main f5f28f89 merged)
 
