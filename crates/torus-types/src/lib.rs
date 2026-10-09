@@ -462,7 +462,12 @@ pub struct TorusBlockHeader {
     pub logs_bloom: Bloom,
     /// Gas used by EVM transactions.
     pub evm_gas_used: u64,
-    /// Total EVM fee revenue in wei: sum(gas_used * effective_gas_price).
+    /// EVM fee revenue in wei handed to the native fee distributor: the
+    /// base-fee part only, `sum(gas_used * min(effective_gas_price,
+    /// base_fee_per_gas))` over this block's receipts
+    /// (`torus_bridge::proposer::compute_fee_revenue`). The tip part
+    /// (`effective_gas_price - base_fee_per_gas`) is not included: revm already
+    /// paid it to the block beneficiary (the proposer).
     pub evm_fee_revenue: u128,
     /// Gas limit for EVM transactions in this block.
     pub evm_gas_limit: u64,

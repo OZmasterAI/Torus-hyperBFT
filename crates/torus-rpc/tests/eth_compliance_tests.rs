@@ -354,3 +354,182 @@ async fn unknown_method_returns_method_not_found() {
 
     handle.stop().unwrap();
 }
+
+/// Commit a header at height 1 with `base_fee` and mark it executed, so
+/// `latest` is that header (same layout as the D2 test above).
+fn store_head_with_base_fee(state: &StateDb, base_fee: u64) {
+    let header = torus_types::TorusBlockHeader {
+        height: 1,
+        parent_hash: alloy_primitives::B256::ZERO,
+        timestamp: 1000,
+        proposer: alloy_primitives::Address::repeat_byte(0x99),
+        state_root: alloy_primitives::B256::ZERO,
+        receipts_root: alloy_primitives::B256::ZERO,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        evm_gas_used: 0,
+        evm_fee_revenue: 0,
+        evm_gas_limit: 30_000_000,
+        native_action_count: 0,
+        evm_tx_count: 0,
+        base_fee_per_gas: base_fee,
+        epoch: 0,
+        validator_set_hash: alloy_primitives::B256::ZERO,
+        sig_attestation: [0u8; 64],
+    };
+    let block_hash = alloy_primitives::keccak256(header.canonical_header_bytes());
+    let mut data = block_hash.to_vec();
+    data.extend(serde_json::to_vec(&header).unwrap());
+    state
+        .put_cf_raw(
+            torus_state::cf::CF_BLOCK_HEADERS,
+            &1u64.to_be_bytes(),
+            &data,
+        )
+        .unwrap();
+    state
+        .put_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            &1u64.to_be_bytes(),
+        )
+        .unwrap();
+}
+
+fn access_list_1_addr_2_keys() -> serde_json::Value {
+    serde_json::json!([{
+        "address": "0x00000000000000000000000000000000000000cc",
+        "storageKeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000000000000000000000000000002"
+        ]
+    }])
+}
+
+/// s104 follow-up (c): eth_estimateGas charges the EIP-2930 intrinsic cost of
+/// an access list, as the real typed tx does: 2400 per address + 1900 per
+/// storage key. The plain call (no fee fields, no list) estimates as before:
+/// 21000 + 4 nonzero calldata bytes * 16 = 21064.
+#[tokio::test]
+async fn estimate_gas_charges_access_list_intrinsic_gas() {
+    let (_dir, state, mempool, executor) = setup();
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let plain = serde_json::json!({
+        "from": "0x00000000000000000000000000000000000000ee",
+        "to": "0x00000000000000000000000000000000000000bb",
+        "data": "0xdeadbeef"
+    });
+    let est = |v: serde_json::Value| {
+        let client = &client;
+        async move {
+            let s: String = client
+                .request("eth_estimateGas", rpc_params![v])
+                .await
+                .unwrap();
+            u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
+        }
+    };
+    let base = est(plain.clone()).await;
+    assert_eq!(base, 21_064, "plain call estimate unchanged");
+
+    let mut with_list = plain.clone();
+    with_list["accessList"] = access_list_1_addr_2_keys();
+    assert_eq!(est(with_list.clone()).await, base + 2400 + 2 * 1900);
+
+    // Same list on an explicit type 1 and on an inferred type 2 call.
+    let mut typed1 = with_list.clone();
+    typed1["type"] = serde_json::json!("0x1");
+    assert_eq!(est(typed1).await, base + 6200);
+    let mut typed2 = with_list;
+    typed2["maxFeePerGas"] = serde_json::json!("0x0");
+    assert_eq!(est(typed2).await, base + 6200);
+
+    // eth_call output for the plain request is unchanged.
+    let out: String = client
+        .request("eth_call", rpc_params![plain, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(out, "0x");
+    handle.stop().unwrap();
+}
+
+/// An explicit unsupported type (blob / set-code) is refused as invalid params.
+#[tokio::test]
+async fn eth_call_rejects_unsupported_tx_type() {
+    let (_dir, state, mempool, executor) = setup();
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    for t in ["0x3", "0x4"] {
+        let call = serde_json::json!({
+            "to": "0x00000000000000000000000000000000000000bb",
+            "type": t
+        });
+        let call_err = client
+            .request::<String, _>("eth_call", rpc_params![call.clone(), "latest"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            call_err.contains("transaction type not supported"),
+            "{t}: {call_err}"
+        );
+        let est_err = client
+            .request::<String, _>("eth_estimateGas", rpc_params![call])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            est_err.contains("transaction type not supported"),
+            "{t}: {est_err}"
+        );
+    }
+    handle.stop().unwrap();
+}
+
+/// Call-simulation mode skips the base-fee check (D2), so a typed 1559 call
+/// whose maxFeePerGas is below the block base fee still runs, as the same
+/// request did when it was built untyped. A bare call still works too.
+#[tokio::test]
+async fn typed_1559_call_below_base_fee_still_runs() {
+    let (_dir, state, mempool, executor) = setup();
+    store_head_with_base_fee(&state, 1_000_000_000);
+    let sender = alloy_primitives::Address::repeat_byte(0xee);
+    state
+        .put_account(
+            &sender,
+            &revm::state::AccountInfo {
+                balance: alloy_primitives::U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: alloy_primitives::B256::ZERO,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let typed = serde_json::json!({
+        "from": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "to": "0x00000000000000000000000000000000000000bb",
+        "maxFeePerGas": "0x1",
+        "maxPriorityFeePerGas": "0x1"
+    });
+    let r: Result<String, _> = client
+        .request("eth_call", rpc_params![typed.clone(), "latest"])
+        .await;
+    assert!(r.is_ok(), "typed call below base fee: {:?}", r.err());
+    let e: Result<String, _> = client.request("eth_estimateGas", rpc_params![typed]).await;
+    assert!(e.is_ok(), "typed estimate below base fee: {:?}", e.err());
+    let bare = serde_json::json!({ "to": "0x00000000000000000000000000000000000000bb" });
+    let r: Result<String, _> = client
+        .request("eth_call", rpc_params![bare, "latest"])
+        .await;
+    assert!(r.is_ok(), "bare call: {:?}", r.err());
+    handle.stop().unwrap();
+}
