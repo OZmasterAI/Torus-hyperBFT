@@ -1,0 +1,7 @@
+=== attempt 1: HIT  exit=70  v3 applied at fill=1174  last applied seen=1174  free after fill=0
+    first failure: thread 'hotstuff-algo' (85380) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    R01 line:      2026-10-09T15:21:33.119077Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    thread 'hotstuff-algo' (85380) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    2026-10-09T15:21:33.119077Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+--- restart (after HIT) boot lines:
+2026-10-09T15:21:33.384832Z  INFO torus_consensus::app: bl2 exec pipeline ENABLED (TORUS_EXEC_PIPELINE=1): flush worker attached after replay applied=1182

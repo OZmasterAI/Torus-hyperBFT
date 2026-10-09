@@ -1,0 +1,8 @@
+=== attempt 1: HIT  exit=70  v3 applied at fill=1008  last applied seen=1008  free after fill=0
+    first failure: 2026-10-09T15:23:14.570207Z ERROR torus_mempool: native DA store batch write failed: rocksdb: IO error: No space left on device: While appending to file: /mnt/r01/r01b-c5-pipeon-native/v3/000004.log: No space left on device
+    R01 line:      2026-10-09T15:23:14.953915Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+    2026-10-09T15:23:14.953915Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+    2026-10-09T15:23:15.175185Z ERROR torus_node: FATAL: execution pipeline has died (fail-stop latch set) — terminating node to avoid finalizing over frozen state
+    2026-10-09T15:23:15.236390Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=4
+--- restart (after HIT) boot lines:
+2026-10-09T15:23:15.955174Z  INFO torus_consensus::app: bl2 exec pipeline ENABLED (TORUS_EXEC_PIPELINE=1): flush worker attached after replay applied=1009

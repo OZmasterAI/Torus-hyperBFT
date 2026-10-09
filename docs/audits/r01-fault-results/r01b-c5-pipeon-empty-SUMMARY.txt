@@ -1,0 +1,21 @@
+case:               r01b-c5-pipeon-empty
+events:             [17:20:30] CASE=r01b-c5-pipeon-empty PIPE=1 LOAD=none BS=100 RATE=3 MODE=live EPOCH=100 WARM_S=60 ALIGN=0 GAP_KB=0 WANT='FATAL: .* thread panicked|FATAL: native DA store writes keep failing|FATAL: execution|FATAL: native overlay flush|FATAL: applied-height marker flush'
+events:             [17:20:30] node md5 6efff7f212e0 worktree commit d2b2736b
+attempts:
+  === attempt 1: HIT  exit=70  v3 applied at fill=1174  last applied seen=1174  free after fill=0
+FATAL/panic lines before the first fill error (warm-up): 0
+first failure line: thread 'hotstuff-algo' (85380) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+first FATAL line:   2026-10-09T15:21:33.119077Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+all FATAL lines:
+  2026-10-09T15:21:33.119077Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+first error ts:     2026-10-09T15:21:33.119077Z
+last FATAL ts:      2026-10-09T15:21:33.119077Z
+fill logged:        [17:21:33] attempt 1: v3 applied=1174 peers=1184 fill=3856961536 free-after=0
+last block done before exit (marker): height=1182
+last executing before exit:           height=1182
+restart gap line:   
+first exec after restart (H):  height=1183
+FATAL/panic after restart (run-case): 0
+run-case RESULT:    [17:21:49] RESULT: PASS-candidate H= exit=70; checkpoints 100..1200 match on all 4 [17:22:08] RESULT: checkpoints 100..1400 MATCH on all 4 
+check-hashes:       [17:22:08] RESULT: checkpoints 100..1400 MATCH on all 4  (14 checkpoints)
+check-hashes v3 FATAL/panic: 0

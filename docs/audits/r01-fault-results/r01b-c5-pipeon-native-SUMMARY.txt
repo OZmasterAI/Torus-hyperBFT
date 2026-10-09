@@ -1,0 +1,23 @@
+case:               r01b-c5-pipeon-native
+events:             [17:22:11] CASE=r01b-c5-pipeon-native PIPE=1 LOAD=native BS=100 RATE=3 MODE=live EPOCH=100 WARM_S=60 ALIGN=0 GAP_KB=0 WANT='FATAL: .* thread panicked|FATAL: native DA store writes keep failing|FATAL: execution|FATAL: native overlay flush|FATAL: applied-height marker flush'
+events:             [17:22:11] node md5 6efff7f212e0 worktree commit d2b2736b
+attempts:
+  === attempt 1: HIT  exit=70  v3 applied at fill=1008  last applied seen=1008  free after fill=0
+FATAL/panic lines before the first fill error (warm-up): 0
+first failure line: 2026-10-09T15:23:14.570207Z ERROR torus_mempool: native DA store batch write failed: rocksdb: IO error: No space left on device: While appending to file: /mnt/r01/r01b-c5-pipeon-native/v3/000004.log: No space left on device
+first FATAL line:   2026-10-09T15:23:14.953915Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+all FATAL lines:
+  2026-10-09T15:23:14.953915Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+  2026-10-09T15:23:15.175185Z ERROR torus_node: FATAL: execution pipeline has died (fail-stop latch set) — terminating node to avoid finalizing over frozen state
+  2026-10-09T15:23:15.236390Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=4
+first error ts:     2026-10-09T15:23:14.570207Z
+last FATAL ts:      2026-10-09T15:23:15.236390Z
+fill logged:        [17:23:14] attempt 1: v3 applied=1008 peers=1008 fill=3758551040 free-after=0
+last block done before exit (marker): height=1009
+last executing before exit:           height=1009
+restart gap line:   
+first exec after restart (H):  height=1010
+FATAL/panic after restart (run-case): 0
+run-case RESULT:    [17:24:32] RESULT: PASS-candidate H= exit=70; checkpoints 100..1100 match on all 4 [17:24:53] RESULT: checkpoints 100..1400 MATCH on all 4 
+check-hashes:       [17:24:53] RESULT: checkpoints 100..1400 MATCH on all 4  (14 checkpoints)
+check-hashes v3 FATAL/panic: 0
