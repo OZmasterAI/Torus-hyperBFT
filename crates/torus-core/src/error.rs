@@ -100,6 +100,14 @@ pub enum CoreError {
     #[error("borsh error: {0}")]
     Borsh(String),
 
+    /// R02 branch 3: consensus bytes that every validator holds identically
+    /// and decodes alike fail to decode as the type a reader expects (the
+    /// classic getOrderBook reads a production whole-book blob as the legacy
+    /// `OrderBookSnapshot`). NOT a local fault. Prints exactly like `Borsh`,
+    /// so the EVM revert bytes are unchanged.
+    #[error("borsh error: {0}")]
+    DeterministicDecode(String),
+
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
 
@@ -186,6 +194,7 @@ mod tests {
             | UnknownSelector(_)
             | MarketNotFound(_)
             | BookLayout(_)
+            | DeterministicDecode(_)
             | StaleOraclePrice(_)
             | Overflow(_)
             | InvalidInput(_) => false,
@@ -243,6 +252,7 @@ mod tests {
             CoreError::State(StateError::Io(std::io::Error::other("x"))),
             CoreError::State(StateError::MissingColumnFamily("x".into())),
             CoreError::Borsh("x".into()),
+            CoreError::DeterministicDecode("x".into()),
             CoreError::MissingCf("x"),
             CoreError::BookLayout("x".into()),
             CoreError::BookCorrupt("x".into()),

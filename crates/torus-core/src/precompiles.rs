@@ -689,8 +689,11 @@ fn read_order_book(
 /// whole-book blob reverts — pre-existing, pinned by
 /// `classic_precompile_behaviour_is_unchanged`).
 fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
-    let snapshot =
-        OrderBookSnapshot::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))?;
+    // R02: every validator decodes the same consensus blob alike (a
+    // production `OrderBook` blob is not a snapshot): deterministic, not a
+    // local fault; same revert text as before (`borsh error: ...`).
+    let snapshot = OrderBookSnapshot::try_from_slice(data)
+        .map_err(|e| CoreError::DeterministicDecode(e.to_string()))?;
     let pairs = |levels: &[PriceLevel]| levels.iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>();
     Ok((pairs(&snapshot.bids), pairs(&snapshot.asks)))
 }
