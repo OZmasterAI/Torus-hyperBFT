@@ -383,9 +383,13 @@ fn classic_blob_is_sized_and_charged_before_it_is_read() {
     let mut big = ReadMeter::with_max(30_000_000);
     let r = order_book(&db, &mut big);
     assert!(
-        matches!(r, Err(CoreError::Borsh(_))),
+        matches!(r, Err(CoreError::DeterministicDecode(_))),
         "production blob still reverts: {r:?}"
     );
+    // R02 branch 3: deterministic (not a local fault), same text as `Borsh`.
+    let e = r.unwrap_err();
+    assert!(!e.is_local_fault());
+    assert_eq!(e.to_string(), "borsh error: Not all bytes read");
     assert_eq!(
         big.used(),
         chunks * WORD,
@@ -743,7 +747,8 @@ fn a_wrong_length_level_key_reverts() {
     key.push(0);
     db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, b"junk").unwrap();
     let r = order_book(&db, &mut ReadMeter::with_max(30_000_000));
-    assert!(matches!(r, Err(CoreError::BookLayout(_))), "{r:?}");
+    // R02 branch 3: a corrupt row on this node (a local fault); same revert text.
+    assert!(matches!(r, Err(CoreError::BookCorrupt(_))), "{r:?}");
 }
 
 // ---------------------------------------------------------------------------

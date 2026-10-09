@@ -264,9 +264,11 @@ fn every_reader_in_a_block_sees_the_block_start_mark() {
     assert_eq!(mark(&next, 1), Some((fp(300), 7)));
 }
 
-/// Market 2's stored aggregate is corrupt (its 2-reporter fallback read fails),
-/// market 3 has no data: both are error RESULTS; market 1 aggregates and the
-/// block goes on.
+/// Market 2 has too few reporters and no last aggregate (its 2-reporter
+/// fallback finds no price), market 3 has no data: both are error RESULTS;
+/// market 1 aggregates and the block goes on. R02: a stored aggregate that
+/// does not decode is a local fault and fail-stops instead
+/// (`r02_oracle_marks_tests.rs`).
 #[test]
 fn aggregation_errors_are_per_market_and_never_abort_the_block() {
     let (_d, db) = oracle_db();
@@ -276,8 +278,6 @@ fn aggregation_errors_are_per_market_and_never_abort_the_block() {
         submit(V2, &[(1, fp(100)), (2, fp(10))]),
         submit(V3, &[(1, fp(100))]),
     ]);
-    db.put_cf_raw(CF_NATIVE_ORACLE, &[b"agg".as_slice(), &2u64.to_be_bytes()].concat(), &[1, 2, 3])
-        .unwrap();
     let mut ctx = ctx_at(db.clone(), 6);
     let agg = NativeExecutor::begin_block_oracle(&mut ctx);
     assert_eq!(agg.iter().map(|r| r.success).collect::<Vec<_>>(), vec![true, false, false]);

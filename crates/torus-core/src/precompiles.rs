@@ -689,8 +689,11 @@ fn read_order_book(
 /// whole-book blob reverts — pre-existing, pinned by
 /// `classic_precompile_behaviour_is_unchanged`).
 fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
-    let snapshot =
-        OrderBookSnapshot::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))?;
+    // R02: every validator decodes the same consensus blob alike (a
+    // production `OrderBook` blob is not a snapshot): deterministic, not a
+    // local fault; same revert text as before (`borsh error: ...`).
+    let snapshot = OrderBookSnapshot::try_from_slice(data)
+        .map_err(|e| CoreError::DeterministicDecode(e.to_string()))?;
     let pairs = |levels: &[PriceLevel]| levels.iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>();
     Ok((pairs(&snapshot.bids), pairs(&snapshot.asks)))
 }
@@ -742,7 +745,7 @@ fn book_levels(
     let mut rows = side(SIDE_TAG_BID, meter)?;
     rows.extend(side(SIDE_TAG_ASK, meter)?);
     if let Some((k, _)) = rows.iter().find(|(k, _)| k.len() != 26) {
-        return Err(CoreError::BookLayout(format!(
+        return Err(CoreError::BookCorrupt(format!(
             "market {market_id}: level row key of {} bytes (corrupt row store)",
             k.len()
         )));
@@ -796,6 +799,13 @@ fn read_position(
     // Compute unrealized PnL using oracle price
     let unrealized_pnl = match get_oracle_price_fp(state_db, market_id, now) {
         Ok(mark) => pos.unrealized_pnl(mark),
+        // No usable price (absent, stale, non-positive): UPnL 0.
+        Err(e) if !e.is_local_fault() => FixedPoint::ZERO,
+        // R02 OPEN (branch 3, owner decision pending): the aggregate read
+        // failed on THIS node. Still UPnL 0 as before: the EVM path has no
+        // fail-stop channel yet (a precompile `Err` is a consensus-visible
+        // revert, and a failed EVM section is logged and skipped), so the
+        // fault cannot stop the block from here without a new rule.
         Err(_) => FixedPoint::ZERO,
     };
 
@@ -1815,6 +1825,67 @@ pub fn write_order_book_snapshot(
     let data = borsh::to_vec(snapshot).map_err(|e| CoreError::Borsh(e.to_string()))?;
     state_db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data)?;
     Ok(())
+}
+
+/// R02 branch 3: `get_oracle_price_fp` (0x0800 getPosition's UPnL price)
+/// keeps absence and failure apart up to the EVM boundary: a failed read is
+/// a local-fault `Err`; no row, a stale, non-positive or short row are not.
+#[cfg(test)]
+mod r02_oracle_price_tests {
+    use super::*;
+    use torus_state::{AtomicWriteOp, StateError};
+
+    #[derive(Clone)]
+    struct FailingRead;
+
+    impl StateBackend for FailingRead {
+        fn get_cf_raw(&self, _cf: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+            Err(StateError::Io(std::io::Error::other("injected read failure")))
+        }
+        fn put_cf_raw(&self, _cf: &str, _key: &[u8], _value: &[u8]) -> Result<(), StateError> {
+            unreachable!()
+        }
+        fn delete_cf_raw(&self, _cf: &str, _key: &[u8]) -> Result<(), StateError> {
+            unreachable!()
+        }
+        fn iterate_cf(&self, _cf: &str, _prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+            unreachable!()
+        }
+        fn atomic_write(&self, _ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+            unreachable!()
+        }
+    }
+
+    fn row(price_raw: i128, ts: u64) -> Vec<u8> {
+        [price_raw.to_be_bytes().as_slice(), &1u64.to_be_bytes(), &3u32.to_be_bytes(), &ts.to_be_bytes()].concat()
+    }
+
+    #[test]
+    fn r02_oracle_price_fp_failed_read_is_a_local_fault() {
+        let e = get_oracle_price_fp(&FailingRead, 1, 1_000).expect_err("read failed");
+        assert!(e.is_local_fault(), "{e}");
+    }
+
+    #[test]
+    fn r02_oracle_price_fp_absence_is_not_a_local_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let e = get_oracle_price_fp(&db, 1, 1_000).expect_err("no row");
+        assert!(!e.is_local_fault(), "{e}");
+        let fresh = FixedPoint::from_raw(5 * FixedPoint::SCALE);
+        for (m, data, ok) in [
+            (2, row(fresh.raw(), 1_000), true),
+            (3, row(fresh.raw(), 1_000 - DEFAULT_MAX_ORACLE_AGE_SECS - 1), false),
+            (4, row(0, 1_000), false),
+            (5, vec![1, 2, 3], false),
+        ] {
+            db.put_cf_raw(CF_NATIVE_ORACLE, &oracle_agg_key(m), &data).unwrap();
+            match get_oracle_price_fp(&db, m, 1_000) {
+                Ok(p) => assert!(ok && p == fresh, "market {m}"),
+                Err(e) => assert!(!ok && !e.is_local_fault(), "market {m}: {e}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

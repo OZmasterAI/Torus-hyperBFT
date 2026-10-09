@@ -849,6 +849,10 @@ struct AccountReader<'a, T: StateBackend> {
     /// (`DrainCache::dirty_traders`, ranking reader only), in place of a
     /// `layer_touches` per read. `None` elsewhere.
     drain_dirty: Option<&'a HashSet<Address>>,
+    /// R02: the context's reader fault channel
+    /// ([`NativeExecContext::reader_fault`]); the first local fault a read
+    /// of this reader hits is kept there (any thread).
+    fault: &'a std::sync::OnceLock<String>,
 }
 
 /// Item 6 Phase 1 (C3, plan 2.4, S1): the position-dependent part of an
@@ -1379,15 +1383,16 @@ impl BlockMarks {
         self.dense.get(m as usize).copied().flatten()
     }
 
-    /// The per-read mark rule for each of `markets`.
+    /// The per-read mark rule ([`usable_mark`]) for each of `markets`; the
+    /// first local fault is the `Err` (R02).
     fn read<T: StateBackend>(
         oracle: &OracleManager<T>,
         now: u64,
         markets: impl IntoIterator<Item = MarketId>,
-    ) -> HashMap<MarketId, Option<FixedPoint>> {
+    ) -> Result<HashMap<MarketId, Option<FixedPoint>>, CoreError> {
         markets
             .into_iter()
-            .map(|m| (m, oracle.get_price(m, now).ok().and_then(|p| p.usable())))
+            .map(|m| Ok((m, usable_mark(oracle, m, now)?)))
             .collect()
     }
 
@@ -1413,6 +1418,18 @@ impl BlockMarks {
     }
 }
 
+/// R02: the mark rule of every reader (`get_price(m, now).usable()`) with
+/// absence split from failure: no aggregate row, a stale or non-positive
+/// one is `Ok(None)` (as before); a local fault (the read failed, the row
+/// does not decode) is the `Err`, never "no mark".
+fn usable_mark<T: StateBackend>(
+    oracle: &OracleManager<T>,
+    market_id: MarketId,
+    now: u64,
+) -> Result<Option<FixedPoint>, CoreError> {
+    Ok(oracle.get_price_opt(market_id, now)?.and_then(|p| p.usable()))
+}
+
 /// Item 6 C2: a block's mark table and the margin configs it was valued
 /// with, carried to the next block in the resident rows slot (via
 /// [`ResidentBlock`]) to decide whether the version changes.
@@ -1434,20 +1451,35 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             batch: None,
             dense_tiers: None,
             drain_dirty: None,
+            fault: &ctx.reader_fault,
+        }
+    }
+
+    /// R02: record `e` on the reader fault channel when it is a local fault
+    /// (the first is kept); the caller then returns its "absent" value, which
+    /// the block never uses (it fail-stops).
+    fn note_fault(&self, step: &str, e: &CoreError) {
+        if e.is_local_fault() {
+            let _ = self.fault.set(format!("{step}: {e}"));
         }
     }
 
     /// s515 review 4 mark: the aggregated oracle price while usable
     /// ([`OraclePrice::usable`](torus_core::oracle::OraclePrice::usable):
     /// time-based, stale 60 s of block time after the last fresh aggregate),
-    /// `None` when absent, stale, non-positive or unreadable. Only oracle
+    /// `None` when absent, stale or non-positive. R02: a read that fails on
+    /// this node is recorded on the reader fault channel (the block
+    /// fail-stops) and reads `None` meanwhile. Only oracle
     /// aggregation writes that row, before any action of the block, so every
     /// placement of a block (single, batch serial, batch sharded) reads the
     /// same value on every validator.
     fn mark(&self, market_id: MarketId) -> Option<FixedPoint> {
         match self.marks.and_then(|t| t.get(market_id)) {
             Some(mark) => mark,
-            None => self.oracle.get_price(market_id, self.now).ok().and_then(|p| p.usable()),
+            None => usable_mark(self.oracle, market_id, self.now).unwrap_or_else(|e| {
+                self.note_fault("oracle mark read", &e);
+                None
+            }),
         }
     }
 
@@ -3814,6 +3846,14 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// post-state is unreconstructable — the committer MUST treat this as
     /// fatal (fail-stop the node), never flush state or mark the block applied.
     pub fatal_error: Option<String>,
+    /// R02: the fault channel of the readers that hold no `&mut` context
+    /// ([`AccountReader`]: the oracle mark and price-band reads, also on the
+    /// Phase 2 / 3 worker threads). The first LOCAL fault
+    /// (`CoreError::is_local_fault`) a reader hits is kept here; the reader
+    /// then returns its "absent" value, which is never used because the
+    /// block fail-stops: [`Self::take_fatal_error`] (the committer's check)
+    /// returns it like `fatal_error`.
+    pub reader_fault: std::sync::OnceLock<String>,
 
     /// Book persistence mode (`TORUS_BOOK_ROWS`). CONSENSUS-VISIBLE — see the
     /// module-level schema comment: fleet-uniform, fresh genesis required,
@@ -4324,6 +4364,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             metrics: None,
             liq_value_sum: false,
             fatal_error: load_error,
+            reader_fault: std::sync::OnceLock::new(),
             book_mode,
             book_mode_marker_present,
             resident: resident_mode,
@@ -4404,17 +4445,24 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.resident && !self.resident_reused
     }
 
+    /// The block's fail-stop reason, taken: `fatal_error`, else the first
+    /// fault a reader recorded (R02, [`Self::reader_fault`]). The committer
+    /// checks this (never `fatal_error` alone) before it flushes anything.
+    pub fn take_fatal_error(&mut self) -> Option<String> {
+        self.fatal_error.take().or_else(|| self.reader_fault.take())
+    }
+
     /// rank8: hand the books (their journals ride inside, journal-in-book)
     /// and the order-id high-water mark back to the cross-block holder. Call
     /// AFTER `save_order_books`. No-op for non-resident contexts. A context
-    /// that latched `fatal_error` INVALIDATES the holder instead — its
+    /// that latched `fatal_error` (or a reader fault) INVALIDATES the holder instead — its
     /// in-memory state may not match what was (not) persisted, so the next
     /// block must rebuild from the DB.
     pub fn stash_resident(&mut self, resident: &mut ResidentBooks) {
         if !self.resident {
             return;
         }
-        if self.fatal_error.is_some() {
+        if self.fatal_error.is_some() || self.reader_fault.get().is_some() {
             resident.invalidate();
             return;
         }
@@ -6276,6 +6324,7 @@ impl NativeExecutor {
             batch: batch_sums.as_ref(),
             dense_tiers: Some(&dense_tiers),
             drain_dirty: None,
+            fault: &ctx.reader_fault,
         };
         // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
         // configs and marks: each batch market's, once (item 6 M1).
@@ -8387,7 +8436,14 @@ impl NativeExecutor {
     ) -> Option<PriceBand> {
         let last = match mark {
             Some(_) => None,
-            None => reader.oracle.get_price(market_id, reader.now).ok().map(|p| p.price),
+            // R02: absence is "never marked"; a local fault fail-stops.
+            None => match reader.oracle.get_price_opt(market_id, reader.now) {
+                Ok(p) => p.map(|p| p.price),
+                Err(e) => {
+                    reader.note_fault("price band oracle read", &e);
+                    None
+                }
+            },
         };
         let reference = match book {
             Some(b) => b.band_reference(mark, last),
@@ -8848,6 +8904,7 @@ impl NativeExecutor {
             batch: None,
             dense_tiers: None,
             drain_dirty: None,
+            fault: &ctx.reader_fault,
         };
         let needs_account = !params.reduce_only;
         let mut account = None;
@@ -10561,7 +10618,14 @@ impl NativeExecutor {
             .chain(aggregated)
             .chain(ctx.order_books.keys().copied())
             .collect();
-        let marks = BlockMarks::read(&ctx.oracle, ctx.timestamp, markets);
+        // R02: a local fault in a mark read fail-stops (no table).
+        let marks = match BlockMarks::read(&ctx.oracle, ctx.timestamp, markets) {
+            Ok(marks) => marks,
+            Err(e) => {
+                Self::latch_core_fault(ctx, "block mark table", &e);
+                return;
+            }
+        };
         let version = match prev {
             Some(p) if p.marks.marks == marks && p.configs == ctx.margin_configs => p.marks.version,
             _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
@@ -10573,7 +10637,8 @@ impl NativeExecutor {
     }
 
     /// Aggregate oracle prices for `markets` at the block timestamp — called by
-    /// [`Self::begin_block_oracle`]. One result per market.
+    /// [`Self::begin_block_oracle`]. One result per market; R02: a local
+    /// fault also latches `fatal_error`.
     pub fn aggregate_oracle_prices<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         markets: &[MarketId],
@@ -10586,7 +10651,12 @@ impl NativeExecutor {
                 .aggregate_price(market_id, ctx.block_height, ctx.timestamp, validator_stakes)
             {
                 Ok(_) => results.push(NativeActionResult::ok("oracle_aggregate", 500)),
-                Err(e) => results.push(NativeActionResult::err("oracle_aggregate", e.to_string())),
+                Err(e) => {
+                    // R02: per-market errors are results, except a local
+                    // fault (failed read, undecodable row): fail-stop.
+                    Self::latch_core_fault(ctx, "oracle aggregate", &e);
+                    results.push(NativeActionResult::err("oracle_aggregate", e.to_string()))
+                }
             }
         }
         results
@@ -11228,7 +11298,7 @@ mod maker_accounts_tests {
                 }
             }
             let plain = AccountReader::of(&ctx);
-            let table = BlockMarks::new(BlockMarks::read(&ctx.oracle, now, markets.iter().copied()), 7);
+            let table = BlockMarks::new(BlockMarks::read(&ctx.oracle, now, markets.iter().copied()).unwrap(), 7);
             // The block's view: an overlay with R (nothing pending), its context.
             let mut overlay = NativeStateOverlay::new(db.clone());
             overlay.attach_resident(Arc::new(torus_state::ResidentRows::build(&overlay).unwrap()));

@@ -100,16 +100,34 @@ pub enum CoreError {
     #[error("borsh error: {0}")]
     Borsh(String),
 
+    /// R02 branch 3: consensus bytes that every validator holds identically
+    /// and decodes alike fail to decode as the type a reader expects (the
+    /// classic getOrderBook reads a production whole-book blob as the legacy
+    /// `OrderBookSnapshot`). NOT a local fault. Prints exactly like `Borsh`,
+    /// so the EVM revert bytes are unchanged.
+    #[error("borsh error: {0}")]
+    DeterministicDecode(String),
+
     #[error("missing column family: {0}")]
     MissingCf(&'static str),
 
-    /// The persisted order-book layout could not be decoded (wrong / mixed /
-    /// corrupt row layout, missing meta row, stale node-local order store).
+    /// The persisted order-book layout is not one this read serves (unknown
+    /// mode marker, mixed layouts, a key shape this build cannot read,
+    /// getOrderBook under the order-row layout): the same on every validator
+    /// with the same chain and build, so NOT a local fault (R02 owner s106).
     /// Readers MUST surface this instead of reporting an empty book — a
     /// silently empty book is indistinguishable from "no orders" and has
     /// already shipped one production bug.
     #[error("order-book layout error: {0}")]
     BookLayout(String),
+
+    /// R02 branch 3: a persisted book row that does not decode or contradicts
+    /// another on THIS node (corrupt meta / order / level / stop / classic
+    /// row, missing meta row, ids or seqs that disagree, a stale or lost
+    /// node-local order store). A local fault. Same message text as
+    /// `BookLayout`, so RPC errors and EVM revert data are unchanged.
+    #[error("order-book layout error: {0}")]
+    BookCorrupt(String),
 
     // FIX ECON-FIND-20: Stale oracle fallback price
     #[error("stale oracle price for market {0}")]
@@ -131,11 +149,15 @@ impl CoreError {
     /// `torus_economics::EconomicsError::is_local_fault`. Every other variant
     /// is a validation, user, oracle or invariant error that every validator
     /// hits alike on the same state; halting on those would stop the chain.
-    /// `BookLayout` is not one: it also reports a read that does not serve
-    /// the chain's layout (`getOrderBook` under order rows), which every
+    /// `BookLayout` is not one: it reports a read that does not serve the
+    /// chain's layout (`getOrderBook` under order rows), which every
     /// validator hits alike; the book loaders fail-stop on it themselves.
+    /// `BookCorrupt` (a book row corrupt on this node) is one.
     pub fn is_local_fault(&self) -> bool {
-        matches!(self, Self::State(_) | Self::Borsh(_) | Self::MissingCf(_))
+        matches!(
+            self,
+            Self::State(_) | Self::Borsh(_) | Self::MissingCf(_) | Self::BookCorrupt(_)
+        )
     }
 }
 
@@ -150,7 +172,7 @@ mod tests {
     fn expected_local(e: &CoreError) -> bool {
         use CoreError::*;
         match e {
-            State(_) | Borsh(_) | MissingCf(_) => true,
+            State(_) | Borsh(_) | MissingCf(_) | BookCorrupt(_) => true,
             OrderNotFound(_)
             | InvalidQuantity
             | InvalidPrice
@@ -172,6 +194,7 @@ mod tests {
             | UnknownSelector(_)
             | MarketNotFound(_)
             | BookLayout(_)
+            | DeterministicDecode(_)
             | StaleOraclePrice(_)
             | Overflow(_)
             | InvalidInput(_) => false,
@@ -229,8 +252,10 @@ mod tests {
             CoreError::State(StateError::Io(std::io::Error::other("x"))),
             CoreError::State(StateError::MissingColumnFamily("x".into())),
             CoreError::Borsh("x".into()),
+            CoreError::DeterministicDecode("x".into()),
             CoreError::MissingCf("x"),
             CoreError::BookLayout("x".into()),
+            CoreError::BookCorrupt("x".into()),
             CoreError::StaleOraclePrice(1),
             CoreError::Overflow("x".into()),
             CoreError::InvalidInput("x".into()),
@@ -240,7 +265,7 @@ mod tests {
             .filter(|e| e.is_local_fault())
             .map(|e| e.to_string())
             .collect();
-        assert_eq!(local.len(), 5, "{local:?}");
+        assert_eq!(local.len(), 6, "{local:?}");
         for e in &every_variant {
             assert_eq!(e.is_local_fault(), expected_local(e), "{e}");
         }

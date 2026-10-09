@@ -532,4 +532,18 @@ fn classic_precompile_behaviour_is_unchanged() {
     let err = call_get_order_book(&db, 1)
         .expect_err("classic arm still rejects the production blob (unchanged)");
     assert!(err.contains("borsh"), "{err}");
+    // R02 branch 3: the revert bytes (`format!("{e}")` in the EVM provider)
+    // are byte-identical to main, and the error is deterministic (every
+    // validator decodes the same consensus bytes alike), not a local fault.
+    assert_eq!(err, R02_CLASSIC_REVERT_TEXT);
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let mut input = alloy_primitives::keccak256(b"getOrderBook(bytes32)")[..4].to_vec();
+    let mut word = [0u8; 32];
+    word[24..32].copy_from_slice(&1u64.to_be_bytes());
+    input.extend_from_slice(&word);
+    let e = execute_precompile(&address, &input, &addr(0), &db, 100, 0).expect_err("reverts");
+    assert!(!e.is_local_fault(), "r02: a deterministic decode failure is not a local fault: {e}");
 }
+
+/// The classic getOrderBook revert text on main 3efff0d6 (captured there).
+const R02_CLASSIC_REVERT_TEXT: &str = "borsh error: Not all bytes read";
