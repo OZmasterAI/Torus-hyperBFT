@@ -4295,6 +4295,11 @@ impl TorusApp {
         let exec_failed = Arc::new(AtomicBool::new(false));
         // R01b D: deliberate-stop flag (see `ExecutionContext::exec_shutdown`).
         let exec_shutdown = Arc::new(AtomicBool::new(false));
+        // R01b DA (ii): repeated native DA store write failures latch the same
+        // fail-stop (the node binary exits 70 on it).
+        if let Some(ref m) = mempool {
+            m.set_fail_stop_latch(exec_failed.clone());
+        }
 
         // Rank 1: metrics-free exec-backlog mirror, shared with the exec thread
         // (inc at dispatch, dec after execution — see field docs).
