@@ -16,6 +16,47 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `merge/compiled-defaults` `bb8b384e` (2026-10-09, feat/compiled-defaults `64d41d70` + main `e58b92b0`)
+
+The 9.13 compiled defaults branch (`64d41d70`, previous section) with main `e58b92b0` merged in
+(`bb8b384e`: main `d2b2736b` + docs; R01/R01b, R02 reader and precompile faults, kv-store write panic,
+mempool, block-sync). Under this tree resident books, root cache, parallel settle, member cache 256 MB
+and pipelined write are on when the env is unset; `TORUS_BOOK_ROWS` stays Classic. Worktree
+`wt/merge-compiled-defaults`, clean at `bb8b384e` before and after the run; target dir
+`~/.cargo-target-compiled-defaults`. The suite 4 baseline `e58b92b0` ran in a temporary detached
+worktree (`wt/base-e58b92b0`, removed afterwards) with its own target dir
+(`~/.cargo-target-compiled-defaults-base`, warm from the `1eced05c` run); the source roots of all 21
+members were touched on each side before clippy, and both sides re-linted 21 crates. Every cargo
+command held `/tmp/claude-1000/torus-suite.lock`. Suite 5 ran on 18c on `bb8b384e`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,236 passed, 0 failed**, 35 skipped, 0 flaky | 131 s (82.7 s of tests) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 5 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,237 passed, 0 failed**, 42 ignored (167 result lines) | 406 s |
+| 4 | clippy (no `-D`) / fmt vs `e58b92b0` | 0 / 1 (fmt: old debt) | clippy 268 vs 269, **0 new**, 1 gone; fmt 3,396 vs 3,400, **0 new**, 4 gone | 17 s / 4 s (base 12 s / 4 s) |
+| 5 | uniswap | **PASSED** | 18c on `bb8b384e`: D6 swap status `0x1` | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+No test failed under the new compiled defaults, so no test needed its knobs pinned: main's R01, R01b and
+R02 tests, written under the old defaults, pass unchanged. Compared with the previous section (3,201 run,
+34 skipped): main adds 36 tests, 35 run and 1 ignored (the µbench in
+`crates/torus-bridge/src/trader_positions_tests.rs`). By file: `tests/r02_reader_faults_tests.rs` 10,
+`torus-consensus/src/app.rs` 7, `tests/r02_precompile_fault_tests.rs` 4, `torus-consensus/src/kv_store.rs`
+4, `torus-mempool/src/lib.rs` 4, `trader_positions_tests.rs` 2, and 1 each in `panic_scope.rs`,
+`exec_pipeline.rs`, `precompiles.rs`, `block_sync/server.rs` and `torus-node/src/main.rs`.
+
+Suite 4: the clippy finding and the 4 fmt hunks that are gone are the same branch lines as in the
+previous section (`native_trie.rs` doc-list indentation; fmt `native_executor.rs` 1,
+`perf_equivalence_golden.rs` 2, `native_trie.rs` 1). No fmt fix was needed.
+
+Suite 3's 3,237 = nextest's 3,236 + the 1 doc test, and its 42 ignored = nextest's 35 skipped + the 7
+ignored doc tests. No test failed in the shared process.
+
+Logs: `~/bench-results-matched/presuite-merge-compiled-defaults-bb8b/` (`run.sh`, `1-nextest.log` ...
+`6-test_*.log`, `norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21,
+`3-full.log`, `3-full.rc`).
+
 ## `feat/compiled-defaults` `63449230` (2026-10-09, s107, BOOK_ROWS default reverted to Classic)
 
 Plan 9.13 node-local compiled defaults (`ebbe6e4c`: pipelined write, resident books, root cache,
