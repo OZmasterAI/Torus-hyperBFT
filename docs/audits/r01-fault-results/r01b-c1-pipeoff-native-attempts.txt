@@ -1,0 +1,8 @@
+=== attempt 1: HIT  exit=70  v3 applied at fill=947  last applied seen=947  free after fill=0
+    first failure: 2026-10-09T15:18:41.276175Z ERROR torus_mempool: native DA store batch write failed: rocksdb: IO error: No space left on device: While appending to file: /mnt/r01/r01b-c1-pipeoff-native/v3/000004.log: No space left on device
+    R01 line:      2026-10-09T15:18:41.610186Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+    2026-10-09T15:18:41.610186Z ERROR torus_mempool: FATAL: native DA store writes keep failing — latching fail-stop in_a_row=3
+    2026-10-09T15:18:41.770785Z ERROR torus_node: FATAL: execution pipeline has died (fail-stop latch set) — terminating node to avoid finalizing over frozen state
+    thread 'hotstuff-algo' (77177) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    2026-10-09T15:18:41.845253Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+--- restart (after HIT) boot lines:

@@ -1,0 +1,6 @@
+=== attempt 1: HIT  exit=70  v3 applied at fill=1271  last applied seen=1271  free after fill=0
+    first failure: thread 'hotstuff-algo' (71229) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    R01 line:      2026-10-09T15:16:02.358778Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    thread 'hotstuff-algo' (71229) panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+    2026-10-09T15:16:02.358778Z ERROR torus_node: FATAL: hotstuff-algo thread panicked (panicked at crates/torus-consensus/src/kv_store.rs:187:30:
+--- restart (after HIT) boot lines:
