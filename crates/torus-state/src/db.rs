@@ -373,7 +373,9 @@ pub struct StateDb {
 ///   9.13: the benched configuration); `0` / `false` / `FALSE` / `no` / `off`
 ///   turn it off.
 /// - `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB` — whole-MiB WAL flush trigger (default
-///   512; invalid values fall back to it). `0` restores RocksDB's automatic
+///   2048 since s109, the tw baseline: acc2 -6.3% node CPU vs 512, restart
+///   DB open 1.3 -> 4.0 s, restart to first commit unchanged; invalid values
+///   fall back to it). `0` restores RocksDB's automatic
 ///   threshold (4x aggregate CF buffer capacity, ~86 GiB here), under which a
 ///   cold CF pins every WAL segment since open: s74 crash A/B, restart DB open
 ///   20.5 s -> 7.9 s. A soft flush trigger, not a hard disk limit; WAL
@@ -510,9 +512,9 @@ impl DbTuning {
     }
 }
 
-pub const DEFAULT_MAX_TOTAL_WAL_MIB: u64 = 512;
+pub const DEFAULT_MAX_TOTAL_WAL_MIB: u64 = 2048;
 
-/// `max_total_wal_size` in bytes: unset or invalid => the 512 MiB default,
+/// `max_total_wal_size` in bytes: unset or invalid => the 2048 MiB default,
 /// `0` => None (RocksDB's automatic threshold), N => N MiB (checked).
 pub fn parse_max_total_wal_mib(raw: Option<&str>) -> Option<u64> {
     let mib = raw.and_then(valid_wal_mib).unwrap_or(DEFAULT_MAX_TOTAL_WAL_MIB);

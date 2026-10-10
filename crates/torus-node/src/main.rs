@@ -663,6 +663,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // s109 tw baseline: trade-history rows off on validators, on for
+    // --rpc-only (RPC / explorer serve them); TORUS_TRADE_HISTORY overrides.
+    let trade_history = torus_consensus::app::set_trade_history_default(cli.rpc_only);
+    info!(
+        trade_history,
+        "trade history (TORUS_TRADE_HISTORY; default off on validators, on for --rpc-only)"
+    );
     let mut app = TorusApp::new(
         state_db.clone(),
         &chain_config,

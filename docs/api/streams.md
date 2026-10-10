@@ -7,9 +7,10 @@ A node pushes fills to WebSocket clients through two JSON-RPC subscriptions:
 - `userFills`: the fills of one address, with its position effect.
 
 Both are fed from execution (the fills each executed block produced), not read
-back from the database. They work on nodes running with
-`TORUS_TRADE_HISTORY=0`. On such nodes the history RPCs return nothing, but
-the streams still deliver.
+back from the database. They work on nodes without trade history: validators
+by default (s109), or any node with `TORUS_TRADE_HISTORY=0`. On such nodes the
+history RPCs return nothing, but the streams still deliver. `--rpc-only` nodes
+keep trade history on unless `TORUS_TRADE_HISTORY=0`.
 
 ## Subscribing
 

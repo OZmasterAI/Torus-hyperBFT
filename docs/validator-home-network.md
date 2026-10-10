@@ -69,3 +69,7 @@ itself; a long outage just means you are offline until it does.
 - **Upload bandwidth**: when you are leader you send each block to every validator. A slow upload
   (below about 50 Mbit/s) makes your leader turns slow for the whole chain. Check with any speed test.
 - **Keys**: keep `validator.keystore` private and backed up offline. Nobody else needs it.
+- **Defaults (s109, tw baseline)**: validators write no trade-history rows (the history RPCs return
+  nothing; streams still work) and use a 2048 MiB WAL budget (`TORUS_ROCKSDB_MAX_TOTAL_WAL_MB`). Leave
+  both unset. `--rpc-only` nodes keep trade history on; set `TORUS_TRADE_HISTORY=1` only on a validator
+  that must also serve history.

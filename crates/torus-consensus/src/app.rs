@@ -374,15 +374,33 @@ fn parse_nonblocking_dispatch_toggle(raw: Option<String>) -> bool {
     }
 }
 
-/// s77: parse `TORUS_TRADE_HISTORY`. Unset, empty or anything but `"0"` ⇒ on
-/// (today's behavior); `"0"` ⇒ no trade-history rows are written. Node-local:
+/// s77: parse `TORUS_TRADE_HISTORY`. `"0"` ⇒ no trade-history rows are
+/// written; any other value ⇒ on; unset or empty ⇒ `default_on`, the node
+/// role's default (s109: off on validators, on for `--rpc-only`). Node-local:
 /// the two trade CFs are outside the native consensus root.
-fn parse_trade_history_toggle(raw: Option<String>) -> bool {
-    raw.map_or(true, |v| v.trim() != "0")
+fn parse_trade_history_toggle(raw: Option<String>, default_on: bool) -> bool {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => default_on,
+        Some(v) => v != "0",
+    }
+}
+
+/// Role default for an unset `TORUS_TRADE_HISTORY`, set once by the node
+/// binary before [`TorusApp::new`]. Unset (tests, tools) = on, as before s109.
+static TRADE_HISTORY_DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set the role default for an unset `TORUS_TRADE_HISTORY` (the node binary:
+/// `--rpc-only`). First call wins; returns the effective setting.
+pub fn set_trade_history_default(default_on: bool) -> bool {
+    let _ = TRADE_HISTORY_DEFAULT.set(default_on);
+    trade_history_enabled()
 }
 
 fn trade_history_enabled() -> bool {
-    parse_trade_history_toggle(std::env::var("TORUS_TRADE_HISTORY").ok())
+    parse_trade_history_toggle(
+        std::env::var("TORUS_TRADE_HISTORY").ok(),
+        *TRADE_HISTORY_DEFAULT.get().unwrap_or(&true),
+    )
 }
 
 /// Effective dispatch mode. Fresh env read per call, like
@@ -7406,12 +7424,23 @@ mod exec_dispatch_tests {
     }
 
     #[test]
-    fn trade_history_toggle_defaults_on_and_zero_disables() {
-        assert!(parse_trade_history_toggle(None));
-        assert!(parse_trade_history_toggle(Some("".into())));
-        assert!(parse_trade_history_toggle(Some("1".into())));
-        assert!(!parse_trade_history_toggle(Some("0".into())));
-        assert!(!parse_trade_history_toggle(Some(" 0 ".into())));
+    fn trade_history_toggle_unset_follows_role_default_and_env_wins() {
+        // Unset / empty: the role default (validators off, --rpc-only on; s109).
+        for default_on in [true, false] {
+            assert_eq!(parse_trade_history_toggle(None, default_on), default_on);
+            assert_eq!(
+                parse_trade_history_toggle(Some("".into()), default_on),
+                default_on
+            );
+            assert_eq!(
+                parse_trade_history_toggle(Some(" ".into()), default_on),
+                default_on
+            );
+            // Explicit values win over the role.
+            assert!(parse_trade_history_toggle(Some("1".into()), default_on));
+            assert!(!parse_trade_history_toggle(Some("0".into()), default_on));
+            assert!(!parse_trade_history_toggle(Some(" 0 ".into()), default_on));
+        }
     }
 
     #[test]
