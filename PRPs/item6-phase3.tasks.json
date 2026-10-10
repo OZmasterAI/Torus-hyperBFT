@@ -1,0 +1,119 @@
+{
+  "prp": "item6-phase3",
+  "created": "2026-10-11T00:00:00Z",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Clamp pruner cutoff to durable applied marker",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/pruner.rs"
+      ],
+      "validate": "cargo nextest run -p torus-state --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(pruner)'",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "name": "Checkpoint interval / max-bytes settings + deferred book mode refusal",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/exec_pipeline.rs"
+      ],
+      "validate": "cargo nextest run -p torus-consensus --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(checkpoint_interval)'",
+      "depends_on": []
+    },
+    {
+      "id": 3,
+      "name": "Running hash h(n-1) in memory on W",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/running_hash.rs",
+        "crates/torus-consensus/src/exec_pipeline.rs"
+      ],
+      "validate": "cargo nextest run -p torus-state -p torus-consensus --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(running_hash)'",
+      "depends_on": []
+    },
+    {
+      "id": 4,
+      "name": "Since-checkpoint layer type L + overlay read order",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/checkpoint_layer.rs",
+        "crates/torus-state/src/backend.rs"
+      ],
+      "validate": "cargo nextest run -p torus-state --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(layer_)'",
+      "depends_on": []
+    },
+    {
+      "id": 5,
+      "name": "W jobs Digest and Checkpoint, buffered channel",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/exec_pipeline.rs",
+        "crates/torus-state/src/backend.rs",
+        "crates/torus-state/src/running_hash.rs"
+      ],
+      "validate": "cargo nextest run -p torus-consensus --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(exec_pipeline) | test(digest_) | test(checkpoint_)'",
+      "depends_on": [
+        3,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "name": "E side: layer upkeep, triggers, barriers, guards, shutdown",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs",
+        "crates/torus-bridge/src/native_executor.rs"
+      ],
+      "validate": "cargo nextest run -p torus-consensus --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(checkpoint_)'",
+      "depends_on": [
+        2,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Crash/replay, replicas, trie maintenance at interval > 0",
+      "status": "pending",
+      "files": [
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo nextest run --workspace --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar",
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Validator ingress readers on published view",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/backend.rs",
+        "crates/torus-mempool/src/lib.rs",
+        "crates/torus-mempool/src/funded.rs",
+        "crates/torus-mempool/src/validate.rs",
+        "crates/torus-consensus/src/app.rs"
+      ],
+      "validate": "cargo nextest run -p torus-mempool -p torus-consensus --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(ingress_view)'",
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "id": 9,
+      "name": "D13 trade-history retention pruning",
+      "status": "pending",
+      "files": [
+        "crates/torus-state/src/pruner.rs",
+        "crates/torus-state/src/trade_rows.rs",
+        "crates/torus-node/src/main.rs"
+      ],
+      "validate": "cargo nextest run -p torus-state -p torus-rpc --cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar -E 'test(trades)'",
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}
