@@ -896,11 +896,14 @@ fn run_volumes(
     Vec<(String, Vec<u8>, Vec<u8>)>,
     B256,
 ) {
-    run_volumes_counted(blocks, threads, before_last).0
+    let (run, _, fatal) = run_volumes_counted(blocks, threads, before_last);
+    assert_eq!(fatal, None);
+    run
 }
 
 /// `run_volumes` plus the number of parallel settles that fell back to the
-/// sequential loop.
+/// sequential loop and the last block's fail-stop (R02: taken, so the
+/// state is dumped as before; earlier blocks may not fail-stop).
 #[allow(clippy::type_complexity)]
 fn run_volumes_counted(
     blocks: &[Vec<(Address, NativeAction)>],
@@ -914,6 +917,7 @@ fn run_volumes_counted(
         B256,
     ),
     u64,
+    Option<String>,
 ) {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db);
@@ -922,11 +926,15 @@ fn run_volumes_counted(
     }
     ctx.positions.put_cum_volume(&addr(1), fp(5_000_000)).unwrap();
     let mut results = Vec::new();
+    let mut last_fatal = None;
     for (k, block) in blocks.iter().enumerate() {
         if k + 1 == blocks.len() {
             before_last(&ctx);
         }
         let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, block, threads);
+        if k + 1 == blocks.len() {
+            last_fatal = ctx.fatal_error.take();
+        }
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         results.push(
             r.results
@@ -941,7 +949,11 @@ fn run_volumes_counted(
         .collect();
     let root = compute_native_state_root(&ctx.state).expect("state root");
     let fallbacks = ctx.phase_accum.settle_fallbacks;
-    ((volumes, results, state_dump(&ctx), root), fallbacks)
+    (
+        (volumes, results, state_dump(&ctx), root),
+        fallbacks,
+        last_fatal,
+    )
 }
 
 #[test]
@@ -1034,8 +1046,17 @@ fn cum_volume_pass_b_balance_failure_stops_at_the_failed_side() {
     let corrupt = |ctx: &NativeExecContext| {
         ctx.state.put_cf_raw(CF_NATIVE_BALANCES, m.as_slice(), b"\xff").unwrap();
     };
-    let (golden, serial_fallbacks) = run_volumes_counted(&blocks, 0, corrupt);
+    let (golden, serial_fallbacks, fatal) = run_volumes_counted(&blocks, 0, corrupt);
     assert_eq!(serial_fallbacks, 0);
+    // R02 branch 4: the unreadable row is a local fault; m's consumed ask
+    // releases its margin after the failed fill and that read fail-stops
+    // the block (the same in every mode).
+    assert!(
+        fatal
+            .as_deref()
+            .is_some_and(|f| f.starts_with("settle maker release balance read: borsh")),
+        "{fatal:?}"
+    );
     let failed = &golden.1[3][0];
     assert!(
         failed.1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
@@ -1047,8 +1068,9 @@ fn cum_volume_pass_b_balance_failure_stops_at_the_failed_side() {
         vec![fp(5_000_100), fp(100), fp(101), fp(100), fp(100)]
     );
     for threads in [2usize, 4] {
-        let (run, fallbacks) = run_volumes_counted(&blocks, threads, corrupt);
+        let (run, fallbacks, run_fatal) = run_volumes_counted(&blocks, threads, corrupt);
         assert_eq!(fallbacks, 0, "threads={threads}: pass B must handle it");
+        assert_eq!(run_fatal, fatal, "threads={threads}");
         assert_eq!(golden, run, "threads={threads}");
     }
 }
@@ -1086,8 +1108,17 @@ fn cum_volume_pass_b_stop_mid_market_keeps_later_orders_and_other_markets() {
     let corrupt = |ctx: &NativeExecContext| {
         ctx.state.put_cf_raw(CF_NATIVE_BALANCES, m.as_slice(), b"\xff").unwrap();
     };
-    let (golden, serial_fallbacks) = run_volumes_counted(&blocks, 0, corrupt);
+    let (golden, serial_fallbacks, fatal) = run_volumes_counted(&blocks, 0, corrupt);
     assert_eq!(serial_fallbacks, 0);
+    // R02 branch 4: the unreadable row is a local fault; m's consumed ask
+    // releases its margin after the failed fill and that read fail-stops
+    // the block (the same in every mode).
+    assert!(
+        fatal
+            .as_deref()
+            .is_some_and(|f| f.starts_with("settle maker release balance read: borsh")),
+        "{fatal:?}"
+    );
     let last = &golden.1[3];
     assert!(
         last[0].1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
@@ -1099,8 +1130,9 @@ fn cum_volume_pass_b_stop_mid_market_keeps_later_orders_and_other_markets() {
         vec![fp(5_000_100), fp(198), fp(101), fp(300), fp(202)]
     );
     for threads in [2usize, 4] {
-        let (run, fallbacks) = run_volumes_counted(&blocks, threads, corrupt);
+        let (run, fallbacks, run_fatal) = run_volumes_counted(&blocks, threads, corrupt);
         assert_eq!(fallbacks, 0, "threads={threads}: pass B must handle it");
+        assert_eq!(run_fatal, fatal, "threads={threads}");
         assert_eq!(golden, run, "threads={threads}");
     }
 }

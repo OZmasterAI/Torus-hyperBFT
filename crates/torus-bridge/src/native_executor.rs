@@ -3743,6 +3743,10 @@ mod sums_cache_tests;
 mod end_resident_worker_tests;
 
 #[cfg(test)]
+#[path = "r02_margin_release_unit_tests.rs"]
+mod r02_margin_release_unit_tests;
+
+#[cfg(test)]
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
 
@@ -6496,6 +6500,7 @@ impl NativeExecutor {
         // they run before the pools are read.
         let [full, partial, none] = Self::sell_top_ups(
             &ctx.positions,
+            &ctx.reader_fault,
             &markets,
             &basis,
             &pool_takers,
@@ -7242,11 +7247,17 @@ impl NativeExecutor {
                     );
 
                     if margin_to_release > FixedPoint::ZERO {
-                        if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                            let release = margin_to_release.min(bal.order_margin);
-                            bal.order_margin -= release;
-                            bal.available += release;
-                            bal_cache.set(&prep.sender, bal);
+                        match bal_cache.load(&ctx.positions, &prep.sender) {
+                            Ok(mut bal) => {
+                                let release = margin_to_release.min(bal.order_margin);
+                                bal.order_margin -= release;
+                                bal.available += release;
+                                bal_cache.set(&prep.sender, bal);
+                            }
+                            // R02: a local fault fail-stops (nothing released meanwhile).
+                            Err(e) => {
+                                Self::latch_core_fault(ctx, "settle taker release balance read", &e)
+                            }
                         }
                     }
                 }
@@ -7354,11 +7365,15 @@ impl NativeExecutor {
             for (trader, amount) in
                 Self::maker_margin_releases(ctx, market_id, mbr.results.iter().map(|m| &m.result))
             {
-                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
-                    let release = amount.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    bal_cache.set(&trader, bal);
+                match bal_cache.load(&ctx.positions, &trader) {
+                    Ok(mut bal) => {
+                        let release = amount.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                        bal_cache.set(&trader, bal);
+                    }
+                    // R02: a local fault fail-stops (nothing released meanwhile).
+                    Err(e) => Self::latch_core_fault(ctx, "settle maker release balance read", &e),
                 }
             }
         }
@@ -7628,11 +7643,17 @@ impl NativeExecutor {
                 // Taker-side margin release (amount precomputed; clamp here,
                 // where the balance authority lives).
                 if oplan.margin_release > FixedPoint::ZERO {
-                    if let Ok(mut bal) = bal_cache.load(&ctx.positions, &prep.sender) {
-                        let release = oplan.margin_release.min(bal.order_margin);
-                        bal.order_margin -= release;
-                        bal.available += release;
-                        bal_cache.set(&prep.sender, bal);
+                    match bal_cache.load(&ctx.positions, &prep.sender) {
+                        Ok(mut bal) => {
+                            let release = oplan.margin_release.min(bal.order_margin);
+                            bal.order_margin -= release;
+                            bal.available += release;
+                            bal_cache.set(&prep.sender, bal);
+                        }
+                        // R02: as sequential.
+                        Err(e) => {
+                            Self::latch_core_fault(ctx, "settle taker release balance read", &e)
+                        }
                     }
                 }
 
@@ -7723,11 +7744,15 @@ impl NativeExecutor {
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
             for (trader, amount) in plan.maker_releases {
-                if let Ok(mut bal) = bal_cache.load(&ctx.positions, &trader) {
-                    let release = amount.min(bal.order_margin);
-                    bal.order_margin -= release;
-                    bal.available += release;
-                    bal_cache.set(&trader, bal);
+                match bal_cache.load(&ctx.positions, &trader) {
+                    Ok(mut bal) => {
+                        let release = amount.min(bal.order_margin);
+                        bal.order_margin -= release;
+                        bal.available += release;
+                        bal_cache.set(&trader, bal);
+                    }
+                    // R02: a local fault fail-stops (nothing released meanwhile).
+                    Err(e) => Self::latch_core_fault(ctx, "settle maker release balance read", &e),
                 }
             }
         }
@@ -8579,6 +8604,7 @@ impl NativeExecutor {
     #[allow(clippy::too_many_arguments)]
     fn sell_top_ups<T: StateBackend>(
         positions: &PositionManager<T>,
+        fault: &std::sync::OnceLock<String>,
         markets: &HashMap<MarketId, Phase2Market<'_>>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         pools: &HashMap<Address, (MarketId, FixedPoint)>,
@@ -8605,7 +8631,15 @@ impl NativeExecutor {
             if extra <= FixedPoint::ZERO {
                 continue;
             }
-            let Ok(mut bal) = bal_cache.load(positions, &p.sender) else { continue };
+            // R02: a local fault fail-stops (`fault`: the reader fault
+            // channel); no top-up meanwhile.
+            let mut bal = match bal_cache.load(positions, &p.sender) {
+                Ok(bal) => bal,
+                Err(e) => {
+                    note_reader_fault(fault, "sell top-up balance read", &e);
+                    continue;
+                }
+            };
             let pos_net = pools.get(&p.sender).map_or(FixedPoint::ZERO, |v| v.1);
             let excess = excess_by_sender.get(&p.sender).copied().unwrap_or(FixedPoint::ZERO);
             let grant = extra.min(bal.available + pos_net - excess);
@@ -8806,7 +8840,9 @@ impl NativeExecutor {
     }
 
     /// Move up to `amount` of `trader`'s order margin back to available
-    /// (clamped so legacy state can't underflow).
+    /// (clamped so legacy state can't underflow). R02: a local fault on the
+    /// balance read, or a failed write, fail-stops the block (the reader
+    /// fault channel: this holds `&ctx` only); nothing is released meanwhile.
     fn release_order_margin<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         trader: &Address,
@@ -8815,11 +8851,18 @@ impl NativeExecutor {
         if amount <= FixedPoint::ZERO {
             return;
         }
-        if let Ok(mut bal) = ctx.positions.get_native_balance(trader) {
-            let release = amount.min(bal.order_margin);
-            bal.order_margin -= release;
-            bal.available += release;
-            let _ = ctx.positions.put_native_balance(trader, &bal);
+        match ctx.positions.get_native_balance(trader) {
+            Ok(mut bal) => {
+                let release = amount.min(bal.order_margin);
+                bal.order_margin -= release;
+                bal.available += release;
+                if let Err(e) = ctx.positions.put_native_balance(trader, &bal) {
+                    let _ = ctx
+                        .reader_fault
+                        .set(format!("release order margin balance write: {e}"));
+                }
+            }
+            Err(e) => note_reader_fault(&ctx.reader_fault, "release order margin balance read", &e),
         }
     }
 
