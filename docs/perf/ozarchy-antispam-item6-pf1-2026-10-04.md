@@ -3923,6 +3923,108 @@ compactions go from L0 (LZ4) to the bottom level (ZSTD) and write nearly what th
   and pin the gate's baseline (Classic `9b7e29b2`; against p3s0r mode 3, Classic alone is already
   -8%). Restart -> ready is still not measured.
 
+## 38. Trades + DA compaction tuning, screen (campaign ozarchy-acc, 2026-10-10)
+
+Owner decision s108 (via 18c) after section 37: option 3, tune the append-only CFs' compaction first
+as its own small item; gate baseline Classic on `9b7e29b2` (node `6a71ba5f`). Design
+`docs/plans/append-cf-compaction.md` on `perf/append-cf-compaction`. The branch (`fa8b646f`, on main
+`62896827`) adds two node-local env knobs, both exact-today when unset:
+`TORUS_ROCKSDB_APPEND_CF_CODEC` = `zstd1` (bottommost ZSTD level 1) or `lz4` (LZ4 at every level) on
+`cf_native_trades`, `cf_native_user_trades`, `cf_native_pending` only; `TORUS_ROCKSDB_WAL_COMPRESSION`
+= `zstd`. The existing `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB` (default 512) is the third lever. Tests:
+OPTIONS shows each codec on the three CFs only; a data dir opens default -> new -> default -> new and
+back, reading every row; Codex quick review no findings. Owner (18c, during the run): no disk-space
+limit; prefer ZSTD level 1, LZ4 only if it clearly saves more CPU; report disk growth per day.
+
+Setup as p3s0cf (Classic: `TORUS_BOOK_ROWS` empty, the six node-local knobs empty, cap 8, 300
+markets, standard shape, fresh genesis per cell, RocksDB `LOG` copied per cell), no perf. New node
+`2ede76eb` / bench `a33d82f5` from `fa8b646f`; control c on the kept stage `6a71ba5f` (`9b7e29b2`).
+Arms: c control (n = 1); b new binary, knobs unset; z `zstd1`; l `lz4`; w
+`TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=2048`; d `TORUS_ROCKSDB_WAL_COMPRESSION=zstd` (n = 2 each). Cells
+13:19-14:27: b-warm (excluded), then interleaved rounds. All 11 cells rc 0, AGREE, PASS, ACCEPT,
+oracle stale 0, no deaths, 0 panic / ERROR lines; node md5 3/3 per arm; the knob reached all three
+validators (`/proc` environ) and the OPTIONS file shows the intended codec in every cell (z: ZSTD
+level 1 on the three CFs only; l: LZ4; d: `wal_compression` ZSTD). Driver
+`ozarchy-acc-campaign.sh`, tables `ozarchy-acc-run/handoff-tables.txt`, analysis scripts in
+`/tmp/claude-1000/ozarchy-acc-analysis/` (to be copied to the bench archive with the confirm run).
+
+### 38.1 Node CPU and throughput
+
+Node CPU-s per 1M fills = val0-2 mean of `summary.json` `proc_cpu` over the load window (not the
+val0 thread-table figure of 37.2 / 37.5, ~27.4 on Classic; compare arms only within this table).
+↓ = lower is better, ↑ = higher is better.
+
+| arm | node CPU-s/1M ↓ (r1 / r2) | step vs b (sd) | resolved? | matched/s ↑ (r1 / r2) |
+|---|---|---|---|---|
+| c control `6a71ba5f` | 29.83 (n = 1) | +0.50 | n = 1 | 188,523 |
+| b new, knobs unset | **29.33** (29.25 / 29.40) | - | - | 190,674 (190,887 / 190,461) |
+| z `zstd1` | 29.33 (29.92 / 28.73) | 0.00 (0.84) | no | 190,411 (188,484 / 192,338) |
+| l `lz4` | 28.31 (28.59 / 28.02) | **-1.02, -3.5%** (0.40) | yes, 3.4 sd | 187,111 (185,035 / 189,187) |
+| w WAL budget 2048 MiB | 27.65 (27.81 / 27.48) | **-1.68, -5.7%** (0.23) | yes, 9 sd | 193,013 (189,537 / 196,490) |
+| d WAL compression | 29.72 (29.77 / 29.66) | **+0.39, +1.3%** (0.08) | yes, 4 sd | 197,486 (195,394 / 199,577) |
+
+matched/s is not resolved in any arm (r1 / r2 spreads 2-3.6%; d's +3.6% is 3.2 sd but inside the
+spreads of other arms). c is 0.50 above b on one cell, not explained; every arm is compared with b of
+the same campaign. In val0's thread table the savings sit in the RocksDB background threads (l -1.54,
+w -1.65, z -0.19 at 1.3 sd); d adds to the write path (flush worker +0.34, trade writer +0.24); exec,
+gossip, ingress and tokio move 0.2 or less in every arm.
+
+### 38.2 Compaction CPU by CF group (CPU-s per 1M fills, val0-2, from the LOG; ↓)
+
+| arm | trades | DA | state rows | bodies | all |
+|---|---|---|---|---|---|
+| b | 1.76 | 0.89 | 0.60 | 0.15 | 3.43 |
+| z | 1.60 | 0.85 | 0.58 | 0.15 | 3.22 |
+| l | 0.74 | 0.41 | 0.60 | 0.17 | 1.95 |
+| w | 0.84 | 0.52 | 0.35 | 0.11 | 1.83 |
+| d | 1.74 | 0.85 | 0.56 | 0.15 | 3.33 |
+
+l halves trades + DA compaction (no LZ4 -> ZSTD re-compression; -1.48 compaction, -1.02 node: part of
+the saving comes back elsewhere). w cuts every group: the 512 MiB WAL budget forces flushes of all CFs
+when the WAL fills (val0: 97 in b, 27 in w), so b runs 557 flushes and 170 compactions, w 236 and 79.
+The compaction backlog is not larger in w, so the saving does not look like compaction pushed past
+the 120 s window, but 120 s cannot rule that out.
+
+### 38.3 Disk (per validator)
+
+| arm | all writes MB/s ↓ | WAL writes MB/s ↓ | flush / compaction SST MB/s ↓ | GB per 1M fills ↓ | data dir at end GB ↓ | SST growth GB/day ↓ | trades + DA GB/day ↓ |
+|---|---|---|---|---|---|---|---|
+| b | 180 | ~139 | 17.4 / 22.2 | 1.09 | 1.40 | 680 | 511 |
+| z | 181 | ~138 | 17.4 / 22.2 | 1.08 | 1.22 | 672 | 498 |
+| l | 191 | ~138 | 17.3 / **30.7** | 1.17 | 1.72 | **912** | **754** |
+| w | 168 | ~136 | 16.8 / **12.3** | 1.00 | **2.71** (1.73 WAL) | 657 | 503 |
+| d | **56** | **13.1** | 17.9 / 23.0 | **0.32** | 1.04 | 705 | 528 |
+
+- Writes are per-thread `write_bytes` over the load window. The RocksDB WAL ticker
+  (`torus_rocksdb_wal_bytes`) counts bytes before compression, so it does not show d's saving: d's
+  ticker reads 143 MB/s while the WAL threads wrote 13.1.
+- GB/day extrapolates the live SST set's growth over a 120 s window at bench load (76,000 / s offered,
+  ~190k matched / s) to a day. The chain is young (L0 compacts straight into the bottom level), so this
+  is not a steady-state rate; compare arms, not absolutes. Append-CF SST per 1M fills: b 0.036 GB, l
+  0.054 GB (+50%).
+- w keeps up to 2 GiB of WAL on disk (1.73 GB at the end), and memtables average 405 MB vs 230. Its
+  restart -> ready (WAL replay) was not measured; the harness has no restart step. The 512 MiB
+  default came from the s74 crash A/B (restart DB open 20.5 s -> 7.9 s), so a larger budget can give
+  back restart time.
+- d adds ~9 ms to the flush per native block and ~1.4 ms to commit persist.
+
+### 38.4 Reading
+
+- **No single setting reaches the -10% gate (2.75 CPU-s/1M).** w (an existing knob) is -1.68 (61% of
+  it, about the -6% alternative), l -1.02, z nothing resolved, d +0.39.
+- **ZSTD level 1 vs LZ4 (owner rule):** l - z on node CPU is -1.02 at 1.5 sd (z's replicates are
+  wide): not resolved. On compaction CPU the gap is -1.27 at 7.5 sd, so the mechanism is real, at +48%
+  append-CF SST growth. Not "clearly" more CPU, so ZSTD level 1 stands; on its own it changes nothing
+  measurable.
+- **w + a codec was not measured.** Both cut the same trades / DA compaction, so the combination is
+  likely -1.8 to -2.4 (estimate), still short of 2.75.
+- **d is the SSD-wear lever:** -69% of all bytes written per validator (WAL 139 -> 13 MB/s) for +1.3%
+  node CPU and ~9 ms more flush per block. A separate decision for the owner; it also bears on the
+  Phase 3 coalescing question (section 37: the per-block state-row rewrite is 56% of the WAL).
+- **Next, before any default changes:** n = 4 confirm of b, w, w + z (and w + z + d if the owner
+  wants the full combination), with a restart -> ready step for the w arms (WAL replay of up to
+  2 GiB, against the s74 restart result).
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -3931,12 +4033,12 @@ compactions go from L0 (LZ4) to the bottom level (ZSTD) and write nearly what th
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Phase 3 step 0 decision pending** (section 37, plan review log row 42): on Classic (testnet)
-  removing all state-row persistence work is at most ~1.76 CPU-s/1M (6.4%), 2.20 (8.0%) with
-  streaming P2-2, against 2.75 for the -10% gate; append-only compaction (trades + DA, 2.43
-  CPU-s/1M, mostly LZ4 -> ZSTD re-compression) is the larger lever. 18c / the owner: lower the
-  gate (~-6%), add trades / DA compaction tuning to Phase 3, or do that tuning first as its own
-  item; and pin the gate's baseline.
+- **Trades + DA compaction tuning, confirm pending** (sections 37-38, plan review log rows 42-43;
+  owner s108: option 3, baseline Classic `9b7e29b2`). Screen: WAL budget 2048 MiB -1.68 node CPU-s/1M
+  (-5.7%), LZ4 on the append CFs -1.02, ZSTD level 1 nothing resolved, WAL compression +0.39 CPU
+  for -69% bytes written; none reaches 2.75 (-10%). Next: n = 4 confirm (b, w, w + z, maybe
+  w + z + d) with restart -> ready; then the Phase 3 decision (state-row work at ~-6%, or effort to
+  signature checks / execution; SSD wear weighed too).
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
