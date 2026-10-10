@@ -3747,6 +3747,10 @@ mod end_resident_worker_tests;
 mod r02_margin_release_unit_tests;
 
 #[cfg(test)]
+#[path = "r02_action_rejects_unit_tests.rs"]
+mod r02_action_rejects_unit_tests;
+
+#[cfg(test)]
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
 
