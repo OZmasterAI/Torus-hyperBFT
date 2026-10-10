@@ -16,6 +16,34 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## main `f4c57d01` (2026-10-10, s40; compiled defaults `8f131571` + R02 branch 4 `fix/r02-margin-releases` `4fea98e2`)
+
+18c merged R02 branch 4 (margin release and sell top-up local faults fail-stop the block) onto main
+`8f131571` before these suites, at the owner's request (18c s108). `f4c57d01` has the same tree as
+`4fea98e2` (`git diff` empty), so 18c's suite 1 on the branch covers it. Suites 2-4 and 6 ran here.
+Candidate in a detached worktree `wt/main-f4c57d01`, clean at `f4c57d01` before and after the run; target
+dir `~/.cargo-target-compiled-defaults`. The suite 4 baseline `8f131571` ran in a detached worktree
+(`wt/base-8f131571`) with its own target dir (`~/.cargo-target-compiled-defaults-base`). The source roots
+of all 21 members were touched on each side before clippy, and both sides re-linted 21 crates. Every
+cargo command held `/tmp/claude-1000/torus-suite.lock`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,248 passed, 0 failed** (18c, on `4fea98e2` = same tree) | – |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 18 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,249 passed, 0 failed**, 42 ignored (168 result lines) | 464 s |
+| 4 | clippy (no `-D`) / fmt vs `8f131571` | 0 / 1 (fmt: old debt) | clippy 268 vs 268, **0 new**, 0 gone; fmt 3,396 vs 3,396, **0 new**, 0 gone | 101 s / 4 s (base 11 s / 4 s) |
+| 5 | uniswap | not run | – | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Suite 3's 3,249 = 18c's nextest 3,248 + the 1 doc test. No test failed in the shared process. Suite 4:
+branch 4 adds no clippy finding and no fmt hunk. Suite 5 was not asked for this merge (18c s108: suites
+2-4 and 6).
+
+Logs: `~/bench-results-matched/presuite-main-f4c5/` (`run.sh`, `2-doc.log` ... `6-test_*.log`,
+`norm.py`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt` = 21 / 21, `3-full.log`,
+`3-full.rc`).
+
 ## `merge/compiled-defaults` `bb8b384e` (2026-10-09, feat/compiled-defaults `64d41d70` + main `e58b92b0`)
 
 The 9.13 compiled defaults branch (`64d41d70`, previous section) with main `e58b92b0` merged in
