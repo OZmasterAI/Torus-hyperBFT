@@ -6944,7 +6944,7 @@ impl NativeExecutor {
                         funnel: RejectReason::Other,
                         reason: FailureReason::Other,
                         msg: e.to_string(),
-                    }
+                    };
                 }
             };
             // F1 (s517, D1 strict HL): the account check is the ONLY
@@ -6961,7 +6961,7 @@ impl NativeExecutor {
                                 funnel: RejectReason::Other,
                                 reason: FailureReason::Other,
                                 msg: e.to_string(),
-                            }
+                            };
                         }
                     },
                 };
@@ -6979,7 +6979,7 @@ impl NativeExecutor {
                             funnel: RejectReason::Other,
                             reason: FailureReason::Other,
                             msg: e.to_string(),
-                        }
+                        };
                     }
                 };
                 // Decision s517: only a match-checked order sees the
