@@ -30,7 +30,7 @@ out of 8.69 GiB in the 211 inventoried dirs.
 
 **Added `bkm` (2026-10-09, after the campaign finished; sizes taken ~13:26): Tier A 0.98 GiB (1,048,651,624 bytes, 2 files: the staged `torus-node` and `bench-throughput` in `ozarchy-bkm-stage`); Tier B 0.25 GiB (269,403,334 bytes, 60 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 10 cells); A + B 1.23 GiB (1,318,054,958 bytes)**, out of 1.24 GiB in its 12 dirs (section 36 of the ozarchy doc; the last command block). Both arms ran the one node in `ozarchy-bkm-stage/m` (main `1eced05c`, node `3fdad0ae`); it is not a baseline binary.
 
-**Added `p3s0r` (2026-10-10, after p3s0r, p3s0c and p3s0cf finished; sizes taken ~12:30): Tier A 6 files: `perf.data` of the 4 perf cells, `perf.folded` of m-p1 / m-p2 (the 1.14 GiB, 1,221,473,660 bytes, measured at 12:30 also counted the staged `torus-node` and `bench-throughput` in `ozarchy-p3s0r-stage`, which are kept as the Phase 3 baseline and are no longer in the command, 18c s108; re-measure Tier A and A + B); Tier B 0.48 GiB (520,359,540 bytes, 114 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 19 cells); A + B 1.62 GiB (1,741,833,200 bytes)**, out of 1.82 GiB in its 22 dirs (section 37 of the ozarchy doc; the last command block). All three campaigns ran the one node in `ozarchy-p3s0r-stage/m` (main `9b7e29b2`, node `6a71ba5f`): keep it while Phase 3 may A/B against it.
+**Added `p3s0r` (2026-10-10, after p3s0r, p3s0c and p3s0cf finished; sizes taken ~12:30): Tier A 0.16 GiB (166,634,172 bytes, 6 files: `perf.data` of the 4 perf cells, `perf.folded` of m-p1 / m-p2; re-measured 2026-10-10 after the staged `torus-node` and `bench-throughput` in `ozarchy-p3s0r-stage`, 1,054,839,488 bytes, were kept as the Phase 3 baseline, 18c s108); Tier B 0.48 GiB (520,359,540 bytes, 114 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 19 cells); A + B 0.64 GiB (686,993,712 bytes)**, out of 1.82 GiB in its 22 dirs (section 37 of the ozarchy doc; the last command block). All three campaigns ran the one node in `ozarchy-p3s0r-stage/m` (main `9b7e29b2`, node `6a71ba5f`): keep it while Phase 3 may A/B against it.
 
 ## Per campaign
 
@@ -93,7 +93,7 @@ A campaign here is a group of dirs from the same run (for example all `ozarchy-m
 | `p3s0` | R01/R02 cost check and Phase 3 step 0 baseline: main `3efff0d6` vs `1b389700` (a-warm A B B A), staged binaries | 6 | 2000.1 MiB | 130.0 MiB | 2130.1 MiB |
 | `p3s1` | R01 / R02 split of the p3s0 step: `1b389700` / `3aa516e0` / `3efff0d6` (a-warm, rounds ABC BCA CAB ACB), staged B binaries | 14 | 1000.0 MiB | 342.4 MiB | 1342.4 MiB |
 | `bkm` | Classic vs mode 3 book layout control on one node main `1eced05c` (300 and 10 markets, per shape a-warm A B B A), staged binaries | 11 | 1000.1 MiB | 256.9 MiB | 1257.0 MiB |
-| `p3s0r` | Phase 3 step 0 re-profile on main `9b7e29b2`, mode 3 and Classic (p3s0r, p3s0c, p3s0cf), staged binaries, perf data | 22 | 1164.9 MiB | 496.3 MiB | 1661.1 MiB |
+| `p3s0r` | Phase 3 step 0 re-profile on main `9b7e29b2`, mode 3 and Classic (p3s0r, p3s0c, p3s0cf), perf data (staged binaries kept) | 22 | 158.9 MiB | 496.3 MiB | 655.2 MiB |
 
 ## Largest Tier A files
 
@@ -2435,11 +2435,11 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-bkm-300m-b-r2/val2.log.gz'
 ```
 
-### `p3s0r` (A 1164.9 MiB before the kept stage binaries were taken out, re-measure; B 496.3 MiB; dirs: `ozarchy-p3s0c-300m-k-p1`, `ozarchy-p3s0c-300m-k-p2`, `ozarchy-p3s0c-300m-k-r1` ...)
+### `p3s0r` (A 158.9 MiB, B 496.3 MiB; dirs: `ozarchy-p3s0c-300m-k-p1`, `ozarchy-p3s0c-300m-k-p2`, `ozarchy-p3s0c-300m-k-r1` ...)
 
 `ozarchy-p3s0r-stage/m/` holds the one node all three campaigns ran (`6a71ba5f`, main `9b7e29b2`; arms differ only by `TORUS_BOOK_ROWS`), the Classic baseline proposed for Phase 3's gate (section 37.7): keep it while Phase 3 may A/B against it. `tasks.txt` is the source of the per-thread CPU tables in 37.2 / 37.5; the derived numbers are in `ozarchy-p3s0r-analysis.txt` and the p3s0c / p3s0cf handoff tables. Do not delete the `rocksdb-LOG-val*.txt` files (37.6); they are not listed.
 
-Tier A, 6 files (the 1164.9 MiB measured at 12:30 included the 2 staged binaries in `ozarchy-p3s0r-stage/m/release/`, about 1 GiB of the stage dir's 1006.0 MiB; they are now kept as the Phase 3 baseline and removed from this command, 18c s108; re-measure the total):
+Tier A, 158.9 MiB, 6 files (the 2 staged binaries in `ozarchy-p3s0r-stage/m/release/`, 1006.0 MiB, are kept as the Phase 3 baseline and not in this command, 18c s108):
 
 ```
 rm -- \
@@ -2584,7 +2584,7 @@ rm -- \
 * Added `p3s0` (2026-10-09): Tier A **1.95 GiB** (2,097,210,160 bytes), 4 files; Tier B **0.13 GiB** (136,305,683 bytes), 30 files; A + B **2.08 GiB** (2,233,515,843 bytes), out of 2.09 GiB in its 7 dirs
 * Added `p3s1` (2026-10-09): Tier A **0.98 GiB** (1,048,619,192 bytes), 2 files; Tier B **0.33 GiB** (359,037,973 bytes), 78 files; A + B **1.31 GiB** (1,407,657,165 bytes), out of 1.33 GiB in its 15 dirs
 * Added `bkm` (2026-10-09): Tier A **0.98 GiB** (1,048,651,624 bytes), 2 files; Tier B **0.25 GiB** (269,403,334 bytes), 60 files; A + B **1.23 GiB** (1,318,054,958 bytes), out of 1.24 GiB in its 12 dirs
-* Added `p3s0r` (2026-10-10): Tier A **1.14 GiB** (1,221,473,660 bytes), 8 files; Tier B **0.48 GiB** (520,359,540 bytes), 114 files; A + B **1.62 GiB** (1,741,833,200 bytes), out of 1.82 GiB in its 22 dirs
+* Added `p3s0r` (2026-10-10): Tier A **0.16 GiB** (166,634,172 bytes), 6 files; Tier B **0.48 GiB** (520,359,540 bytes), 114 files; A + B **0.64 GiB** (686,993,712 bytes), out of 1.82 GiB in its 22 dirs
 
 ## After the deletes
 
