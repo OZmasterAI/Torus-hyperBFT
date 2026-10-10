@@ -107,6 +107,12 @@ Inputs:
 
 Results doc section 41, plan row 46.
 
+**Done (campaign `ozarchy-p3s`, 2026-10-11):** results doc section 41; review log row 46 is in
+`item6-phase2-impl.md` section 8 (rows 42-45 live there; this file has no review log). Coalescing
+(state bytes / keys) 5.95x / 1.58x at min(15 s, 100 blocks), 6.34x / 1.64x at min(30 s, 100 blocks);
+layer peak ~214-219 MB key + value; restart budget 21-22 s (gate 60 s); CPU ceiling 1.55 CPU-s/1M
+(6.2%), factor-scaled ~0.82 (3.3%): **owner decision needed before step 1** (stop rule).
+
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,
 or drop Phase 3.
