@@ -34,7 +34,7 @@ out of 8.69 GiB in the 211 inventoried dirs.
 
 **Added `acc` (2026-10-10, after acc and acc2 finished; sizes taken ~21:30): Tier A none (no perf cells; the staged `torus-node` and `bench-throughput` in `ozarchy-acc-stage/n` are kept while the owner decides the node defaults); Tier B 1.04 GiB (1,121,126,052 bytes, 233 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 38 cells, except `ozarchy-acc2-300m-rs-wd-r1/val1.log.gz`, kept for the one crash-in-hole ERROR of section 39.3); A + B 1.04 GiB**, out of 2.43 GiB in its 43 dirs (sections 38 and 39 of the ozarchy doc; the last command block).
 
-**Added `acc3` (2026-10-10, after acc3 finished; sizes taken ~23:30): Tier A none (no perf cells); Tier B 0.34 GiB (361,807,699 bytes, 78 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 13 cells); A + B 0.34 GiB**, out of 0.44 GiB in its 15 dirs (section 40 of the ozarchy doc; the last command block). The recovery check's evidence (`crash-restart-tail.log`, `restart-metrics.json`, `state-digest-val*.txt` of `warm-twd-rs`) is not in the command.
+**Added `acc3` (2026-10-10, after acc3 finished; sizes taken ~23:15): Tier A none (no perf cells); Tier B 0.34 GiB (361,807,699 bytes, 78 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 13 cells); A + B 0.34 GiB**, out of 0.44 GiB in its 15 dirs (section 40 of the ozarchy doc; the last command block). The recovery check's evidence (`crash-restart-tail.log`, `restart-metrics.json`, `state-digest-val*.txt` of `warm-twd-rs`) is not in the command.
 
 ## Per campaign
 
