@@ -47,8 +47,8 @@ on Classic before tw). The per-block running-hash digest stays on W, so its cost
   (`app.rs:3157`, `app.rs:1020`, `native_da.rs`). Phase 3 coalesces state rows only.
 - Modes 2/3 deferred book save: W applies pass 2 reading the DB as "every height < N durable"
   (`exec_pipeline.rs:374`). That is false with an interval, so **interval > 0 requires a
-  non-deferred book mode** (Classic, the compiled default, or OrderRows). In modes 2/3, books are
-  saved on E (`save_order_books_deferred` returns `None`) or the node refuses to start.
+  non-deferred book mode** (Classic, the compiled default, or OrderRows). With modes 2/3 and an
+  interval set, the node refuses to start (owner s109, 6.1).
 - Resident staleness guards: `begin_resident` (`native_executor.rs:3379`) checks height, marker
   and parent; `new_with_mode` (`:4285`) checks marker == holder height. They must read the
   marker through the overlay (layer included), never the DB. Otherwise R and the books rebuild
@@ -127,9 +127,12 @@ Each task: test first (fails before), then code, then verify with
 **Task 1.2: settings**
 - Test first: `checkpoint_interval_parse` (unset / "0" -> None; "15000" -> 15 s; garbage -> None
   with a warning) and `checkpoint_interval_refuses_deferred_book_modes` (interval > 0 with
-  `TORUS_BOOK_ROWS=2|3` -> startup error or forced on-E save, owner's pick in 6.1).
+  `TORUS_BOOK_ROWS=2|3` -> startup error naming both settings; interval > 0 with Classic or
+  OrderRows, and interval unset with any mode -> starts).
 - Code: `exec_pipeline.rs` next to `parse_exec_pipeline_toggle`: `parse_checkpoint_interval`,
-  `parse_checkpoint_max_bytes`.
+  `parse_checkpoint_max_bytes`, and a pure `check_checkpoint_book_mode(interval, book_mode)`
+  that returns the error. Node start (where `FlushWorker` is attached, `app.rs:4485-4490`)
+  calls it with `book_mode()` (`native_executor.rs:2313`) and exits on error.
 - Verify: `cargo nextest run -p torus-consensus $F -E 'test(checkpoint_interval)'`.
 
 **Task 1.3: running hash h(n-1) in memory on W (interval 0, no behaviour change)**
@@ -274,8 +277,8 @@ defaults.
 
 ## 6. Open decisions
 
-1. Interval > 0 with book mode 2/3: refuse to start, or fall back to the on-E save? Recommend
-   refuse (explicit; nobody runs 2/3 now).
+1. Decided (owner s109): interval > 0 with book mode 2/3 refuses to start (task 1.2). If mode 3
+   is chosen before mainnet (9.13), W's pass 2 must read through the layer (separate task then).
 2. Who builds steps 1-3: 18c builder or archy? Step 1 is L-sized and consensus-adjacent.
 
 ## 7. Rollback
