@@ -3686,6 +3686,115 @@ Columns as in 36.1. A warm (267,447 matched/s) excluded.
   mainnet. For the record: the Phase 1 / 2 numbers in this doc were measured with mode 3 set by
   env; Classic performs about the same at this shape.
 
+## 37. Phase 3 step 0 re-profile: main 9b7e29b2, mode 3 with a Classic side arm (campaign ozarchy-p3s0r, 2026-10-10)
+
+**Caveat first.** The main arm ran mode 3 (`TORUS_BOOK_ROWS=3`, the bench config of sections
+26-35, kept for comparability with p3s1). The owner chose Classic for testnet (section 36), and
+Classic is the node default. Classic here is a side arm of n = 2 without perf. Phase 3 targets the
+persistence path, where the two modes differ most (flush worker CPU, disk bytes; 37.3), so the step
+0 decision waits for Classic cells: 2 more no-perf (n = 4) and 2 perf, first thing in the next
+ozarchy session.
+
+Node `6a71ba5f` and bench `001e3176`, both built from main `9b7e29b2` (compiled defaults
+`8f131571`, R02 branch 4, the reduce-only modify sweep fix; every cell generates a fresh genesis).
+Harness `tools/matched-bench` at `9b7e29b2`. Arm m: the six node-local plan-9.13 knobs exported
+empty (empty parses as unset, so the compiled defaults apply), `TORUS_BOOK_ROWS=3` and
+`TORUS_COMMIT_LAG_BACKOFF_CAP=8` from RECORD_ENV (cap 8 by env = the testnet genesis value; the
+generated genesis carries 0). Arm k: arm m with `TORUS_BOOK_ROWS` empty (Classic). Standard shape
+as sections 26-36 (N = 4 + budget 900, cap 400, rate 76,000, RETRY_BUSY=1, 120 s, oracle feed
+30000 / 2000 ms walk 0) at 300 markets. Cells, 08:31-09:23: m-warm (60 s, excluded), m-r1 m-p1
+m-r2 k-r1 m-r3 m-p2 m-r4 k-r2. Perf on m-p1 / m-p2 only: cycles:u 499 Hz, frame pointers, val0
+whole process, 45 s from 35 s after bench start. All 9 cells rc 0, AGREE, liveness PASS, oracle
+stale 0, no deaths, node md5 = staged md5 (3/3). Driver
+`/home/oz/bench-results-matched/ozarchy-p3s0r-campaign.sh` (build `ozarchy-p3s0r-build.sh`,
+analysis `ozarchy-p3s0r-analysis.sh`, tables `ozarchy-p3s0r-analysis.txt`).
+
+### 37.1 Throughput (no-perf cells, val0)
+
+| arm | n | matched/s | native blk/s | fills/blk | block ms | engine / 1k | cache_flush ms | flush ms | flush / 1k |
+|---|---|---|---|---|---|---|---|---|---|
+| m mode 3 | 4 | **186,504 ± 3,163** | 5.649 ± 0.164 | 27,104 | 138.29 ± 4.63 | 4.014 ± 0.058 | 12.17 ± 0.52 | 53.09 ± 2.75 | 1.958 ± 0.055 |
+| k Classic | 2 | **190,958 ± 1,147** | 5.771 ± 0.022 | 27,475 | 136.84 ± 1.85 | 3.980 ± 0.015 | 12.07 ± 0.11 | 31.30 ± 0.08 | 1.139 ± 0.016 |
+| p3s1 C `3efff0d6` (section 35) | 4 | 186,317 ± 2,010 | 5.583 ± 0.287 | | | | | | |
+
+m vs p3s1 C: 1.001x matched/s. Different node and genesis, so this is a third data point for the
+open ~1% drift item (it does not repeat the drift), not an A/B. The perf cells ran 177,931 ±
+2,067 matched/s (-4.6%) at 35,175 / 31,961 fills per block, and perf multiplies sys CPU about 4x
+(2.25 -> 8.5-9.1 CPU-s per 1M fills), so the per-block numbers in this section come from the
+no-perf cells; the perf cells only rank costs.
+
+### 37.2 Node CPU (val0, CPU-s per 1M fills, no-perf, threads.py over the load window)
+
+| group | m mode 3 (n = 4) | k Classic (n = 2) |
+|---|---|---|
+| total (user + sys) | **29.87 ± 0.26** | **27.59** (0.924x) |
+| short-lived exec workers (exited threads) | 7.93 | 6.33 |
+| exec main thread | 4.11 | 4.27 |
+| gossip (signature recovery) | 4.22 | 4.23 |
+| ingress (verify + nonce read) | 3.80 | 3.74 |
+| RocksDB background | 3.77 | 3.87 |
+| tokio | 1.96 | 1.95 |
+| flush worker | 1.74 | 0.97 |
+| other | 1.54 | 1.55 |
+| rpc | 0.80 | 0.71 |
+
+On mode 3, execution (main + workers) is 12.0 (40%), signature work (gossip + ingress) 8.0 (27%),
+and flush worker + RocksDB background 5.5 (18%). Counting the trade writer and hotstuff threads in
+whole (per-block thread table: 18.2 and 28.7 ms per native block, ~1.7 per 1M) lifts the
+persistence group to ~7.2 (~24%), an upper bound. **Phase 3's gate of about -10% node CPU-s/1M is
+~3.0 CPU-s/1M: more than half of flush worker + RocksDB.** In the flush worker (m-p1), RocksDB
+writes are 45% (memtable insert 36%) and the mode-3 deferred book save (`write_drained_book`) 29%.
+
+### 37.3 Disk writes (val0, write_bytes)
+
+| | m mode 3 (n = 4) | k Classic (n = 2) |
+|---|---|---|
+| GB per 1M fills | **0.704 ± 0.005** | **0.940 ± 0.011** (1.34x) |
+| MB per native block | 23.26 ± 0.35 | 31.11 ± 0.42 |
+| flush worker | 5.19 | 12.83 |
+| RocksDB background | 7.39 | 7.12 |
+| trade writer | 4.43 | 4.44 |
+| gossip | 2.83 | 2.86 |
+| hotstuff | 2.62 | 2.58 |
+| rpc | 0.78 | 0.75 |
+
+MB per native block by thread group, val0-2 pooled. Only the state path can coalesce: the flush
+worker's batch and the part of RocksDB's background writes (memtable flush + compaction) that
+belongs to state CFs. Trade rows, gossip and hotstuff writes are append-only. On mode 3 that is at
+most (5.19 + 7.39) / 23.26 = **54% of the bytes**, less the non-state share of the background
+writes (not split here). Classic writes 2.5x the flush worker bytes (whole books per block), so
+its coalescable share is larger; the Classic follow-up measures it.
+
+### 37.4 Phase 2 backlog candidates (plan review log row 37), perf m-p1
+
+ms per native block at 35,541 fills per block, converted from cycles at the rate that maps
+`PositionCache::flush_all` to its timed 15.17 ms (~2.77 GHz).
+
+- **`delta_sums` decode reuse: not confirmed.** `delta_sums` is 0.63 ms of
+  `run_liquidations_with`'s 9.96 ms; the borsh decode is 19% of it (~0.12 ms). The liquidation
+  pass's cost is the view: `liq_view` 62%, `resident_changes` 33%, `traders_after` 30%
+  (inclusive, overlapping).
+- **Node-local cooldown / pending row index: not confirmed.** `clear_cooldown` 0.13 ms +
+  `set_pending` 0.22 ms per native block.
+- **Streaming P2-2: the cost is there.** `cache_flush` 12.17 ± 0.52 ms per native block (no-perf,
+  0.449 per 1k fills, 11% of engine); in perf `put_position` is 56% of `flush_all`. The saving
+  still depends on its microbench.
+
+- **C2 `TraderPositions::apply` (row 40 asked for it):** 45.7% / 44.7% of `flush_all` cycles in
+  m-p1 / m-p2, i.e. ~6.9 / ~6.1 ms per native block at 35,175 / 31,961 fills, **~0.19 ms per 1k
+  fills** (perf cells; row 40 expected ~0.215-0.222 from ~0.229).
+
+Restart -> ready (the third Phase 3 gate) was not measured.
+
+### 37.5 Reading
+
+On mode 3, Phase 3's target items are **not the top cost**: the persistence group is third
+(18-24% of node CPU) behind execution (40%) and signature work (27%), and the -10% CPU gate needs
+coalescing to remove more than half of it. Only up to ~54% of the disk bytes can coalesce. The
+Classic arm, the testnet configuration, shifts both: 7.6% less node CPU, flush worker CPU 0.56x,
+disk bytes 1.34x. The step 0 decision (keep Phase 3 as planned, change its gate, or re-order the
+phases) is for 18c / the owner after the Classic cells.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -3694,11 +3803,15 @@ Columns as in 36.1. A warm (267,447 matched/s) excluded.
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
+- **Phase 3 step 0 decision pending** (section 37, plan review log row 42): on mode 3 the
+  persistence group is third (18-24% of node CPU) and up to ~54% of disk bytes can coalesce.
+  Classic cells (2 more no-perf for n = 4, 2 perf) run first in the next ozarchy session; then
+  18c / the owner decide whether Phase 3's plan or gate changes before any code.
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
-  (18c, section 35). Third data point: the Phase 3 step 0 re-profile, with matched/s reported next
-  to this baseline.
+  (18c, section 35). Third data point (section 37): main `9b7e29b2` on mode 3 ran 186,504 ±
+  3,163, 1.001x of p3s1 C (different node and genesis, not an A/B).
 - **P2-1 gate missed** (section 30): phase 1 -0.44 ms per native block vs >= 1.9 ms; cancel-alls
   still visit 189 books, the sender has something in 92 (stale index entries, "never removed
   eagerly"). 18c s104: **A, accept and continue** (~0.07 us per skipped visit, 0.44 ms /
