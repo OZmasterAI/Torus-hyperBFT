@@ -378,6 +378,13 @@ pub struct StateDb {
 ///   cold CF pins every WAL segment since open: s74 crash A/B, restart DB open
 ///   20.5 s -> 7.9 s. A soft flush trigger, not a hard disk limit; WAL
 ///   durability is unchanged.
+/// - `TORUS_ROCKSDB_APPEND_CF_CODEC` — bottommost codec of the append-only CFs
+///   (trades, user trades, DA; [`AppendCfCodec`]). Unset = exact-today.
+/// - `TORUS_ROCKSDB_WAL_COMPRESSION` — `zstd` / `1` / `on` compress WAL records
+///   (ZSTD, the only WAL codec). Default off = exact-today.
+///
+/// Both only change how NEW files / WAL records are written; RocksDB reads
+/// every codec it was built with, so a data dir opens in place either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbTuning {
     pub stats_level: u8,
@@ -386,6 +393,42 @@ pub struct DbTuning {
     pub max_write_buffer_number: i32,
     pub pipelined_write: bool,
     pub max_total_wal_size: Option<u64>,
+    pub append_cf_codec: AppendCfCodec,
+    pub wal_compression: bool,
+}
+
+/// Bottommost codec of the append-only CFs (`cf_native_trades`,
+/// `cf_native_user_trades`, `cf_native_pending`). Their L0 files compact
+/// straight into the bottom level, so every byte is re-compressed LZ4 -> ZSTD
+/// once (Phase 3 step 0: 2.43 node CPU-s per 1M fills on Classic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppendCfCodec {
+    /// ZSTD at RocksDB's default level, like every other CF (exact-today).
+    #[default]
+    Today,
+    /// ZSTD level 1.
+    Zstd1,
+    /// LZ4 at every level: no re-compression, larger files.
+    Lz4,
+}
+
+/// The CFs [`AppendCfCodec`] applies to.
+pub const APPEND_ONLY_CFS: [&str; 3] = [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_NATIVE_PENDING];
+
+/// Pure parse of `TORUS_ROCKSDB_APPEND_CF_CODEC`: `zstd1` / `lz4`; anything
+/// else (unset included) is [`AppendCfCodec::Today`].
+pub fn parse_append_cf_codec(raw: Option<&str>) -> AppendCfCodec {
+    match raw.map(str::trim) {
+        Some("zstd1") => AppendCfCodec::Zstd1,
+        Some("lz4") => AppendCfCodec::Lz4,
+        _ => AppendCfCodec::Today,
+    }
+}
+
+/// Pure parse of `TORUS_ROCKSDB_WAL_COMPRESSION`: `zstd` / `1` / `on` = on;
+/// anything else (unset included) = off.
+pub fn parse_wal_compression(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("zstd" | "1" | "on"))
 }
 
 impl Default for DbTuning {
@@ -410,6 +453,26 @@ impl DbTuning {
         if let Some(value) = raw.as_deref() {
             if valid_wal_mib(value).is_none() {
                 tracing::warn!(value, "invalid TORUS_ROCKSDB_MAX_TOTAL_WAL_MB; using the {DEFAULT_MAX_TOTAL_WAL_MIB} MiB default");
+            }
+        }
+        let raw = v("TORUS_ROCKSDB_APPEND_CF_CODEC");
+        tuning.append_cf_codec = parse_append_cf_codec(raw.as_deref());
+        if let (Some(value), AppendCfCodec::Today) = (raw.as_deref(), tuning.append_cf_codec) {
+            if !value.trim().is_empty() {
+                tracing::warn!(
+                    value,
+                    "unknown TORUS_ROCKSDB_APPEND_CF_CODEC (zstd1 | lz4); using today's codec"
+                );
+            }
+        }
+        let raw = v("TORUS_ROCKSDB_WAL_COMPRESSION");
+        tuning.wal_compression = parse_wal_compression(raw.as_deref());
+        if let (Some(value), false) = (raw.as_deref(), tuning.wal_compression) {
+            if !matches!(value.trim(), "0" | "off" | "") {
+                tracing::warn!(
+                    value,
+                    "unknown TORUS_ROCKSDB_WAL_COMPRESSION (zstd | 1 | on); WAL compression off"
+                );
             }
         }
         tuning
@@ -441,6 +504,8 @@ impl DbTuning {
                 Some("0" | "false" | "FALSE" | "no" | "off")
             ),
             max_total_wal_size: parse_max_total_wal_mib(None),
+            append_cf_codec: AppendCfCodec::Today,
+            wal_compression: false,
         }
     }
 }
@@ -590,6 +655,9 @@ impl StateDb {
         if let Some(bytes) = tuning.max_total_wal_size.filter(|&bytes| bytes > 0) {
             opts.set_max_total_wal_size(bytes);
         }
+        if tuning.wal_compression {
+            opts.set_wal_compression_type(DBCompressionType::Zstd);
+        }
         // DB-wide: parallelize flush/compaction and smooth fsync spikes during
         // heavy block writes. (Stock defaults run only 2 background jobs.)
         //
@@ -694,6 +762,18 @@ impl StateDb {
                 };
                 if *name == CF_NATIVE_ORDER_BOOKS {
                     opts.set_target_file_size_base(book_cf_target_file);
+                }
+                if APPEND_ONLY_CFS.contains(name) {
+                    match tuning.append_cf_codec {
+                        AppendCfCodec::Today => {}
+                        // window_bits -14 and strategy 0 are RocksDB's defaults.
+                        AppendCfCodec::Zstd1 => {
+                            opts.set_bottommost_compression_options(-14, 1, 0, 0, true)
+                        }
+                        AppendCfCodec::Lz4 => {
+                            opts.set_bottommost_compression_type(DBCompressionType::Lz4)
+                        }
+                    }
                 }
                 ColumnFamilyDescriptor::new(*name, opts)
             })
@@ -1861,6 +1941,7 @@ mod sync_wal_tests {
             max_write_buffer_number: 6,
             pipelined_write: true,
             max_total_wal_size: None,
+            ..Default::default()
         };
         {
             let db = StateDb::open_with_tuning(dir.path(), &t).expect("open");
