@@ -9805,6 +9805,7 @@ impl NativeExecutor {
                  cancel and place a new order instead)"
             ));
         }
+        let mut ro_pos = None;
         if old.reduce_only {
             let pos = match Self::signed_position(&ctx.positions, sender, market_id) {
                 Ok(pos) => pos,
@@ -9818,6 +9819,7 @@ impl NativeExecutor {
                 );
             }
             qty = qty.min(allowance);
+            ro_pos = Some(pos);
         }
         if price == old.price && qty == old.remaining_qty {
             return NativeActionResult::ok("modify_order", 800);
@@ -9905,6 +9907,32 @@ impl NativeExecutor {
         }
         ctx.dirty_books.insert(market_id);
         Self::release_order_margin(ctx, sender, -extra);
+        // Plan row 22: a reduce-only modify re-fits the sender's resting
+        // reduce-only orders like a placement does (oldest id first; a modify
+        // keeps the id, so the modified order may be cut or cancelled too).
+        // Each cut releases what its quantity reserved.
+        if let Some(pos) = ro_pos {
+            let book = ctx
+                .order_books
+                .get_mut(&market_id)
+                .expect("market found above");
+            let cuts: Vec<_> = book
+                .sweep_reduce_only_at(*sender, pos)
+                .into_iter()
+                .map(|c| {
+                    let left = book
+                        .get_order(c.order_id)
+                        .map_or(FixedPoint::ZERO, |o| o.remaining_qty);
+                    (c, left)
+                })
+                .collect();
+            let cfg = ctx.margin_configs.get(&market_id);
+            for (c, left) in cuts {
+                let release = Self::reserve_for_qty_cfg(cfg, c.price, left + c.qty)
+                    - Self::reserve_for_qty_cfg(cfg, c.price, left);
+                Self::release_order_margin(ctx, sender, release);
+            }
+        }
         NativeActionResult::ok("modify_order", 800)
     }
 
