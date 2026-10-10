@@ -7608,8 +7608,11 @@ impl NativeExecutor {
             ctx.phase_accum.settle_fallbacks += 1;
             // R02 (Codex P2): a worker's LOCAL fill fault fail-stops even if
             // the sequential retry no longer hits it (transient), with the
-            // step sequential uses; first in the sequential order, first
-            // fault wins. Panics and non-local errors: fallback only.
+            // step sequential uses (first in the sequential order). Latched
+            // only AFTER the retry and only if it latched nothing, so the
+            // sequential loop's own first fault keeps precedence (pass A
+            // reads no balances: it can see a later fault of the same
+            // order). Panics and non-local errors: fallback only.
             let fault = plans.iter().find_map(|p| {
                 p.as_ref()
                     .ok()?
@@ -7617,10 +7620,7 @@ impl NativeExecutor {
                     .iter()
                     .find_map(|o| o.fill_fault.clone())
             });
-            if let (Some(f), None) = (fault, &ctx.fatal_error) {
-                ctx.fatal_error = Some(f);
-            }
-            return Self::settle_market_results_sequential(
+            Self::settle_market_results_sequential(
                 ctx,
                 market_results,
                 market_batches,
@@ -7630,6 +7630,10 @@ impl NativeExecutor {
                 pos_cache,
                 vol_cache,
             );
+            if let (Some(f), None) = (fault, &ctx.fatal_error) {
+                ctx.fatal_error = Some(f);
+            }
+            return;
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
 

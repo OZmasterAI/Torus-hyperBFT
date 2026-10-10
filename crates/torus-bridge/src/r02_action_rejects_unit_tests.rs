@@ -233,11 +233,13 @@ fn r02_settle_taker_fill_without_fault_unchanged() {
 type ArmedRow = (&'static str, Vec<u8>);
 
 /// The armed `(cf, key)` point read fails ONCE (a transient local fault);
-/// later reads succeed. `hits` counts the injected failures.
+/// later reads succeed. Point reads of the `persistent` rows always fail.
+/// `hits` counts the injected failures.
 #[derive(Clone)]
 struct OneShot {
     inner: StateDb,
     armed: Arc<std::sync::Mutex<Option<ArmedRow>>>,
+    persistent: Arc<std::sync::Mutex<Vec<ArmedRow>>>,
     hits: Arc<std::sync::Mutex<usize>>,
 }
 
@@ -255,6 +257,17 @@ impl StateBackend for OneShot {
             )));
         }
         drop(armed);
+        let persistent = self.persistent.lock().unwrap();
+        if persistent
+            .iter()
+            .any(|(c, k)| *c == cf && k.as_slice() == key)
+        {
+            *self.hits.lock().unwrap() += 1;
+            return Err(StateError::Io(std::io::Error::other(
+                "persistent IO failure",
+            )));
+        }
+        drop(persistent);
         self.inner.get_cf_raw(cf, key)
     }
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
@@ -281,10 +294,19 @@ impl StateBackend for OneShot {
 /// sequential, `Some(w)` = parallel with pass A over at most `w` chunks).
 /// Returns the fail-stop, the injected hits and the fallbacks.
 fn settle_one_shot_maker_fault(workers: Option<usize>) -> (Option<String>, usize, u64) {
+    settle_two_markets(workers, false)
+}
+
+/// [`settle_one_shot_maker_fault`]; `precedence`: instead, `TAKER` holds a
+/// market-1 long (its sell closes it: a PnL credit, so its balance is read)
+/// and both its balance read and `MAKER`'s market-1 position read fail
+/// persistently.
+fn settle_two_markets(workers: Option<usize>, precedence: bool) -> (Option<String>, usize, u64) {
     let dir = tempfile::tempdir().unwrap();
     let backend = OneShot {
         inner: StateDb::open(dir.path()).unwrap(),
         armed: Arc::default(),
+        persistent: Arc::default(),
         hits: Arc::default(),
     };
     let mut ctx = NativeExecContext::new(
@@ -355,10 +377,19 @@ fn settle_one_shot_maker_fault(workers: Option<usize>) -> (Option<String>, usize
         PositionCache::new(),
         VolumeCache::default(),
     );
-    *backend.armed.lock().unwrap() = Some((
+    let maker_pos = (
         torus_state::cf::CF_NATIVE_POSITIONS,
         torus_core::position::position_key(&MAKER, 1).to_vec(),
-    ));
+    );
+    if precedence {
+        ctx.positions
+            .apply_fill(&TAKER, 1, true, fp(1), fp(99), MarginType::Cross)
+            .unwrap();
+        *backend.persistent.lock().unwrap() =
+            vec![maker_pos, (CF_NATIVE_BALANCES, TAKER.as_slice().to_vec())];
+    } else {
+        *backend.armed.lock().unwrap() = Some(maker_pos);
+    }
     match workers {
         Some(w) => NativeExecutor::settle_market_results_parallel(
             &mut ctx,
@@ -404,6 +435,31 @@ fn r02_parallel_settle_transient_position_fault_fail_stops_like_sequential() {
     for w in [2, 4] {
         let (par, hits, fallbacks) = settle_one_shot_maker_fault(Some(w));
         assert_eq!(hits, 1, "workers {w}: fault injected once (in pass A)");
+        assert_eq!(fallbacks, 1, "workers {w}: fell back to sequential");
+        assert_eq!(
+            par.as_deref(),
+            Some(seq.as_str()),
+            "workers {w}: same fail-stop"
+        );
+    }
+}
+
+/// Codex quick review P2: one order whose taker balance read (its PnL
+/// credit) AND maker position read both fail. Sequential latches "settle
+/// taker fill" first (it never reaches the maker); pass A reads no
+/// balances, so it sees the maker fault only. The fallback must keep
+/// sequential's precedence. RED before the fix: parallel reported "settle
+/// maker fill".
+#[test]
+fn r02_parallel_settle_fallback_keeps_sequential_fault_precedence() {
+    let (seq, hits, fallbacks) = settle_two_markets(None, true);
+    assert!(hits > 0, "sequential: fault injected");
+    assert_eq!(fallbacks, 0);
+    let seq = seq.expect("sequential must fail-stop");
+    assert!(seq.starts_with("settle taker fill: "), "{seq}");
+    for w in [2, 4] {
+        let (par, hits, fallbacks) = settle_two_markets(Some(w), true);
+        assert!(hits > 0, "workers {w}: fault injected");
         assert_eq!(fallbacks, 1, "workers {w}: fell back to sequential");
         assert_eq!(
             par.as_deref(),
