@@ -829,13 +829,13 @@ fn ro_resting_after_prefix() -> Vec<(Address, u128)> {
 ///
 /// `ro` (review gap 2, reduce-only): `Some(the reduce-only orders resting
 /// after the prefix)` ([`ro_resting_after_prefix`]). The blocks start with
-/// [`ro_prefix_blocks`] and a block of modifies that leave every sender a
-/// reduce-only leftover (below); then a third of the places and stops become
+/// [`ro_prefix_blocks`] and a block of modifies that grow every sender's
+/// first reduce-only order past the budget its pair shares (below); then a third of the places and stops become
 /// home-book actions: reduce-only orders resting on the reducing side,
 /// crossing to close, on the increasing side (rejected while the position
 /// has not flipped), reduce-only stop-limits, modifies of the prefix's
-/// reduce-only orders up to 3 (each is clamped to the position alone, so
-/// the pair can exceed it: leftovers no sweep has cut), plus plain crossing
+/// reduce-only orders up to 3 (plan row 22: each modify sweeps, so the pair
+/// never exceeds the position), plus plain crossing
 /// places of 1-6 that reduce, close, flip or grow the position the resting
 /// reduce-only orders depend on. The extra draws happen only with `ro`, so
 /// `ro: None` keeps the existing seeds' sequences.
@@ -849,8 +849,8 @@ fn index_blocks(
     if let Some(ro_ids) = ro {
         blocks.extend(ro_prefix_blocks());
         // Each sender's first reduce-only order modified up to 3: with the
-        // second (1) the pair exceeds the position (3), a leftover no sweep
-        // cuts until the sender places or fills in its home book again.
+        // second (1) the pair would exceed the position (3); plan row 22:
+        // the modify's sweep cancels the second.
         let mut seen = std::collections::BTreeSet::new();
         blocks.push(
             ro_ids
@@ -1114,8 +1114,8 @@ impl RoStats {
 /// state roots, and the index covers the books (reduce-only entries
 /// included) after every block. Non-vacuous: reduce-only orders rest, get
 /// rejected (flat / increasing side), and positions they depend on are
-/// reduced, closed and flipped while they rest; leftovers that can no
-/// longer reduce stay until a sweep or a cancel-all takes them.
+/// reduced, closed and flipped while they rest. Plan row 22: no leftover
+/// (a resting reduce-only order a sweep would cut) survives a block.
 #[test]
 fn cancel_all_index_matches_the_full_scan_reference_reduce_only() {
     let resting = resting_after_setup();
@@ -1165,7 +1165,7 @@ fn cancel_all_index_matches_the_full_scan_reference_reduce_only() {
                 "{what}: {stats:?}"
             );
             assert!(
-                stats.leftovers >= 20 && stats.removed >= 20,
+                stats.leftovers == 0 && stats.removed >= 20,
                 "{what}: {stats:?}"
             );
             assert_eq!(

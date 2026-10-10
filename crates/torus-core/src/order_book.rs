@@ -1822,6 +1822,23 @@ impl OrderBook {
         Some(budget)
     }
 
+    /// Plan row 22: the placement sweep ([`Self::sweep_reduce_only`]) for one
+    /// trader at `signed_pos`, outside a placement — run after a reduce-only
+    /// modify. The installed policing positions are kept. Returns the cuts;
+    /// the caller releases their margin.
+    pub fn sweep_reduce_only_at(
+        &mut self,
+        trader: Address,
+        signed_pos: FixedPoint,
+    ) -> Vec<ReduceOnlyCut> {
+        let saved = std::mem::take(&mut self.reduce_only_positions);
+        self.reduce_only_positions.insert(trader, signed_pos);
+        let mut cuts = Vec::new();
+        self.sweep_reduce_only(trader, &mut cuts);
+        self.reduce_only_positions = saved;
+        cuts
+    }
+
     /// s515: traders owning (possibly stale) resting reduce-only orders in
     /// this book, ascending — the executor loads their positions into
     /// [`ReduceOnlyPositions`] before placing.

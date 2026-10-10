@@ -9805,6 +9805,7 @@ impl NativeExecutor {
                  cancel and place a new order instead)"
             ));
         }
+        let mut ro_pos = None;
         if old.reduce_only {
             let pos = match Self::signed_position(&ctx.positions, sender, market_id) {
                 Ok(pos) => pos,
@@ -9818,8 +9819,14 @@ impl NativeExecutor {
                 );
             }
             qty = qty.min(allowance);
+            ro_pos = Some(pos);
         }
         if price == old.price && qty == old.remaining_qty {
+            // Plan row 22: a reduce-only modify sweeps even when it changes
+            // nothing (a leftover may rest past the budget).
+            if let Some(pos) = ro_pos {
+                Self::sweep_reduce_only_after_modify(ctx, sender, market_id, pos);
+            }
             return NativeActionResult::ok("modify_order", 800);
         }
 
@@ -9905,7 +9912,45 @@ impl NativeExecutor {
         }
         ctx.dirty_books.insert(market_id);
         Self::release_order_margin(ctx, sender, -extra);
+        if let Some(pos) = ro_pos {
+            Self::sweep_reduce_only_after_modify(ctx, sender, market_id, pos);
+        }
         NativeActionResult::ok("modify_order", 800)
+    }
+
+    /// Plan row 22: a reduce-only modify re-fits the sender's resting
+    /// reduce-only orders like a placement does (oldest id first; a modify
+    /// keeps the id, so the modified order may be cut or cancelled too).
+    /// Each cut releases what its quantity reserved.
+    fn sweep_reduce_only_after_modify<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        market_id: MarketId,
+        pos: FixedPoint,
+    ) {
+        let book = ctx
+            .order_books
+            .get_mut(&market_id)
+            .expect("market found above");
+        let cuts: Vec<_> = book
+            .sweep_reduce_only_at(*sender, pos)
+            .into_iter()
+            .map(|c| {
+                let left = book
+                    .get_order(c.order_id)
+                    .map_or(FixedPoint::ZERO, |o| o.remaining_qty);
+                (c, left)
+            })
+            .collect();
+        if !cuts.is_empty() {
+            ctx.dirty_books.insert(market_id);
+        }
+        let cfg = ctx.margin_configs.get(&market_id);
+        for (c, left) in cuts {
+            let release = Self::reserve_for_qty_cfg(cfg, c.price, left + c.qty)
+                - Self::reserve_for_qty_cfg(cfg, c.price, left);
+            Self::release_order_margin(ctx, sender, release);
+        }
     }
 
     /// Row 74: latch the fail-stop (`fatal_error`) when `e` is a LOCAL fault
