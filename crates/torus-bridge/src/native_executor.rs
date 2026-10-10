@@ -458,6 +458,12 @@ struct OrderSettlePlan {
     /// First position-side fill-application failure, pre-formatted like the
     /// sequential path ("taker fill failed: …" / "maker fill failed: …").
     fill_error: Option<String>,
+    /// R02 (Codex P2): when that failure is a LOCAL fault
+    /// (`CoreError::is_local_fault`), the fail-stop reason the sequential
+    /// loop latches for it ("settle taker|maker fill: …"). Latched before
+    /// the fallback, so a transient fault that the sequential retry no
+    /// longer hits still fail-stops, as in sequential mode.
+    fill_fault: Option<String>,
 }
 
 /// C3: one market's full settlement plan, computed off-thread by a pure pass
@@ -3747,6 +3753,10 @@ mod end_resident_worker_tests;
 mod r02_margin_release_unit_tests;
 
 #[cfg(test)]
+#[path = "r02_action_rejects_unit_tests.rs"]
+mod r02_action_rejects_unit_tests;
+
+#[cfg(test)]
 mod resident_books_toggle_tests {
     use super::parse_resident_books_toggle;
 
@@ -6836,7 +6846,14 @@ impl NativeExecutor {
     ) -> PrepOutcome {
         let st = fold.state(sender);
         // Open-order limit first: a rejected order reserves nothing.
-        let taken = match Self::take_open_slot(&mut st.open_slots, reader.positions, open_at_start, sender, params) {
+        let taken = match Self::take_open_slot(
+            &mut st.open_slots,
+            reader.positions,
+            reader.fault,
+            open_at_start,
+            sender,
+            params,
+        ) {
             Ok(taken) => taken,
             Err((funnel, msg)) => return PrepOutcome::Reject { funnel, reason: funnel.failure(), msg },
         };
@@ -6921,11 +6938,13 @@ impl NativeExecutor {
             let bal = match SenderState::load_balance(&mut st.balance, reader.positions, sender) {
                 Ok(bal) => bal,
                 Err(e) => {
+                    // R02: a local fault fail-stops (rejected meanwhile).
+                    reader.note_fault("phase 2 balance read", &e);
                     return PrepOutcome::Reject {
                         funnel: RejectReason::Other,
                         reason: FailureReason::Other,
                         msg: e.to_string(),
-                    }
+                    };
                 }
             };
             // F1 (s517, D1 strict HL): the account check is the ONLY
@@ -6937,11 +6956,12 @@ impl NativeExecutor {
                     None => match reader.pos_net(sender) {
                         Ok(v) => *st.pos_net.insert(v),
                         Err(e) => {
+                            reader.note_fault("phase 2 pos_net read", &e);
                             return PrepOutcome::Reject {
                                 funnel: RejectReason::Other,
                                 reason: FailureReason::Other,
                                 msg: e.to_string(),
-                            }
+                            };
                         }
                     },
                 };
@@ -6954,11 +6974,12 @@ impl NativeExecutor {
                 }) {
                     Ok(e) => e,
                     Err(e) => {
+                        reader.note_fault("phase 2 position read", &e);
                         return PrepOutcome::Reject {
                             funnel: RejectReason::Other,
                             reason: FailureReason::Other,
                             msg: e.to_string(),
-                        }
+                        };
                     }
                 };
                 // Decision s517: only a match-checked order sees the
@@ -7290,6 +7311,9 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
+                            // R02: a local fault fail-stops (the book has
+                            // matched; the result is kept meanwhile).
+                            Self::latch_core_fault(ctx, "settle taker fill", &e);
                             results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
                                 (FailureReason::Fill, format!("taker fill failed: {e}")),
@@ -7311,6 +7335,7 @@ impl NativeExecutor {
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
+                            Self::latch_core_fault(ctx, "settle maker fill", &e);
                             results[prep.index] = NativeActionResult::rejected(
                                 "place_order",
                                 (FailureReason::Fill, format!("maker fill failed: {e}")),
@@ -7428,9 +7453,9 @@ impl NativeExecutor {
     /// BALANCE-ROW READ at PnL-credit time (backend IO/corruption): both
     /// modes fail the order and skip its trades, but the sequential loop also
     /// stops applying that order's later-fill POSITION deltas, while the plan
-    /// already computed them. A node whose balance rows fail to read is
-    /// already diverging from healthy peers under sequential settle (the
-    /// order soft-fails node-locally); the state root catches it either way.
+    /// already computed them. R02 branch 6a: such a read is a local fault
+    /// and both modes fail-stop the block on it (same step), so neither
+    /// post-state is ever flushed.
     #[allow(clippy::too_many_arguments)]
     fn settle_market_results_parallel<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
@@ -7581,7 +7606,21 @@ impl NativeExecutor {
                 "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
             );
             ctx.phase_accum.settle_fallbacks += 1;
-            return Self::settle_market_results_sequential(
+            // R02 (Codex P2): a worker's LOCAL fill fault fail-stops even if
+            // the sequential retry no longer hits it (transient), with the
+            // step sequential uses (first in the sequential order). Latched
+            // only AFTER the retry and only if it latched nothing, so the
+            // sequential loop's own first fault keeps precedence (pass A
+            // reads no balances: it can see a later fault of the same
+            // order). Panics and non-local errors: fallback only.
+            let fault = plans.iter().find_map(|p| {
+                p.as_ref()
+                    .ok()?
+                    .orders
+                    .iter()
+                    .find_map(|o| o.fill_fault.clone())
+            });
+            Self::settle_market_results_sequential(
                 ctx,
                 market_results,
                 market_batches,
@@ -7591,6 +7630,10 @@ impl NativeExecutor {
                 pos_cache,
                 vol_cache,
             );
+            if let (Some(f), None) = (fault, &ctx.fatal_error) {
+                ctx.fatal_error = Some(f);
+            }
+            return;
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
 
@@ -7675,6 +7718,8 @@ impl NativeExecutor {
                             bal_cache.set(trader, bal);
                         }
                         Err(e) => {
+                            // R02: as sequential (same step).
+                            Self::latch_core_fault(ctx, &format!("settle {side} fill"), &e);
                             fill_failed = Some(format!("{side} fill failed: {e}"));
                             sides_applied = *at;
                             break;
@@ -7792,6 +7837,7 @@ impl NativeExecutor {
             let mut pnl_events: Vec<(&'static str, Address, FixedPoint, usize)> = Vec::new();
             let mut fill_effects = Vec::new();
             let mut fill_error: Option<String> = None;
+            let mut fill_fault: Option<String> = None;
             'fills: for (k, fill) in result.fills.iter().enumerate() {
                 let taker_is_buy = fill.maker_side != Side::Buy;
                 let mut pair = [FillEffect::default(); 2];
@@ -7820,6 +7866,9 @@ impl NativeExecutor {
                         }
                         Err(e) => {
                             fill_error = Some(format!("{side} fill failed: {e}"));
+                            if e.is_local_fault() {
+                                fill_fault = Some(format!("settle {side} fill: {e}"));
+                            }
                             break 'fills;
                         }
                     }
@@ -7839,6 +7888,7 @@ impl NativeExecutor {
                 pnl_events,
                 fill_effects,
                 fill_error,
+                fill_fault,
             });
         }
 
@@ -8118,10 +8168,13 @@ impl NativeExecutor {
     /// off-tick orders are rejected before the book (fix A, s92). Returns
     /// the slots with this order counted; the caller stores them only once the
     /// order also passed its price / shape checks and margin reserve, so a
-    /// rejected order takes no slot.
+    /// rejected order takes no slot. R02: a local fault on the `cum_volume`
+    /// read is recorded on `fault` (the reader fault channel: the block
+    /// fail-stops); the order is rejected meanwhile, as before.
     fn take_open_slot<T: StateBackend>(
         slots: &mut Option<OpenSlots>,
         positions: &PositionManager<T>,
+        fault: &std::sync::OnceLock<String>,
         open_at_start: &HashMap<Address, u32>,
         sender: &Address,
         params: &PlaceOrderParams,
@@ -8132,9 +8185,10 @@ impl NativeExecutor {
         let s = match *slots {
             Some(s) => s,
             None => {
-                let volume = positions
-                    .get_cum_volume(sender)
-                    .map_err(|e| (RejectReason::Other, e.to_string()))?;
+                let volume = positions.get_cum_volume(sender).map_err(|e| {
+                    note_reader_fault(fault, "open order slot cum_volume read", &e);
+                    (RejectReason::Other, e.to_string())
+                })?;
                 *slots.insert(OpenSlots {
                     open: open_at_start.get(sender).copied().unwrap_or(0),
                     limit: open_order_limit(volume),
@@ -8875,6 +8929,7 @@ impl NativeExecutor {
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
             &ctx.positions,
+            &ctx.reader_fault,
             &open_at_start,
             sender,
             params,
@@ -8970,7 +9025,15 @@ impl NativeExecutor {
                         ro_pos = Some(pos);
                         Self::reduce_only_violation(pos, params).map(|m| (FailureReason::ReduceOnly, m))
                     }
-                    Err(e) => Some((FailureReason::Other, e.to_string())),
+                    // R02: a local fault fail-stops (rejected meanwhile).
+                    Err(e) => {
+                        note_reader_fault(
+                            &ctx.reader_fault,
+                            "reduce-only placement position read",
+                            &e,
+                        );
+                        Some((FailureReason::Other, e.to_string()))
+                    }
                 }
             });
         if let Some(rejection) = pre_check {
@@ -9067,6 +9130,9 @@ impl NativeExecutor {
                         let (signed, px, pos_net) = match acct {
                             Ok(a) => a,
                             Err(e) => {
+                                // R02: a local fault fail-stops (`reader`
+                                // borrows `ctx`: its fault channel).
+                                reader.note_fault("place order account read", &e);
                                 // Funnel (perf A1): died pre-book on a state read error.
                                 if let Some(ref m) = ctx.metrics {
                                     m.orders_rejected_other.inc();
@@ -9098,6 +9164,7 @@ impl NativeExecutor {
                         bal.available -= order_margin_required;
                         bal.order_margin += order_margin_required;
                         if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                            reader.note_fault("place order balance write", &e);
                             // Funnel (perf A1): died pre-book on a balance write error.
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_other.inc();
@@ -9107,6 +9174,7 @@ impl NativeExecutor {
                     }
                 }
                 Err(e) => {
+                    reader.note_fault("place order balance read", &e);
                     // Funnel (perf A1): died pre-book on a balance read error.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -9244,6 +9312,9 @@ impl NativeExecutor {
                 }) {
                 Ok(effect) => effect,
                 Err(e) => {
+                    // R02: a local fault fail-stops (the book has matched;
+                    // the result is kept meanwhile).
+                    Self::latch_core_fault(ctx, "place order taker fill", &e);
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -9270,6 +9341,7 @@ impl NativeExecutor {
                 }) {
                 Ok(effect) => effect,
                 Err(e) => {
+                    Self::latch_core_fault(ctx, "place order maker fill", &e);
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -9993,6 +10065,19 @@ impl NativeExecutor {
         }
     }
 
+    /// R02: a [`CoreError`] as the action's error result (unchanged), after
+    /// [`Self::latch_core_fault`] (the Lockbox mixes local faults with
+    /// `InsufficientNativeBalance` / `InsufficientEvmBalance` / `Overflow`,
+    /// which every validator hits alike and never latch).
+    fn core_err<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action_type: &'static str,
+        e: CoreError,
+    ) -> NativeActionResult {
+        Self::latch_core_fault(ctx, action_type, &e);
+        NativeActionResult::err(action_type, e.to_string())
+    }
+
     // ========================================================================
     // Staking handlers
     // ========================================================================
@@ -10571,7 +10656,7 @@ impl NativeExecutor {
         };
         match Lockbox::deposit_to_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("deposit_to_native", 1500),
-            Err(e) => NativeActionResult::err("deposit_to_native", e.to_string()),
+            Err(e) => Self::core_err(ctx, "deposit_to_native", e),
         }
     }
 
@@ -10591,7 +10676,7 @@ impl NativeExecutor {
         }
         match Lockbox::withdraw_from_native(&ctx.state, sender, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_from_native", 1500),
-            Err(e) => NativeActionResult::err("withdraw_from_native", e.to_string()),
+            Err(e) => Self::core_err(ctx, "withdraw_from_native", e),
         }
     }
 
@@ -10611,7 +10696,7 @@ impl NativeExecutor {
         }
         match Lockbox::withdraw_from_native_to(&ctx.state, sender, to, fp_amount) {
             Ok(()) => NativeActionResult::ok("withdraw_to", 1500),
-            Err(e) => NativeActionResult::err("withdraw_to", e.to_string()),
+            Err(e) => Self::core_err(ctx, "withdraw_to", e),
         }
     }
 
@@ -10621,22 +10706,25 @@ impl NativeExecutor {
     /// max(Σ position IM, 10% × Σ position notional) (D3, SAFE variant: the
     /// resting orders' reservations are not collateral for the positions).
     /// `amount > available` (incl. any amount while `available < 0`) is left
-    /// to the Lockbox's own cash check (error text unchanged).
+    /// to the Lockbox's own cash check (error text unchanged). R02: a local
+    /// fault on either read fail-stops (the reader fault channel); rejected
+    /// meanwhile, as before.
     fn check_withdrawal_margin<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         sender: &Address,
         amount: FixedPoint,
     ) -> Result<(), Rejection> {
-        let bal = ctx
-            .positions
-            .get_native_balance(sender)
-            .map_err(|e| (FailureReason::Other, e.to_string()))?;
+        let bal = ctx.positions.get_native_balance(sender).map_err(|e| {
+            note_reader_fault(&ctx.reader_fault, "withdrawal margin balance read", &e);
+            (FailureReason::Other, e.to_string())
+        })?;
         if amount <= FixedPoint::ZERO || amount > bal.available {
             return Ok(());
         }
-        let view = AccountReader::of(ctx)
-            .view(sender, &bal)
-            .map_err(|e| (FailureReason::Other, e.to_string()))?;
+        let view = AccountReader::of(ctx).view(sender, &bal).map_err(|e| {
+            note_reader_fault(&ctx.reader_fault, "withdrawal margin account read", &e);
+            (FailureReason::Other, e.to_string())
+        })?;
         if view.withdrawal_allowed(amount) {
             return Ok(());
         }
@@ -10729,9 +10817,11 @@ impl NativeExecutor {
         let QueuedActionKind::LockboxDeposit { amount } = qa.kind else {
             return NativeActionResult::err("lockbox_deposit", "not a lockbox deposit".into());
         };
+        // R02: a local fault fail-stops (the EVM value is already burned;
+        // never a node-local loss).
         match Lockbox::credit_native(&ctx.state, &qa.trader, amount) {
             Ok(()) => NativeActionResult::ok("lockbox_deposit", 1500),
-            Err(e) => NativeActionResult::err("lockbox_deposit", e.to_string()),
+            Err(e) => Self::core_err(ctx, "lockbox_deposit", e),
         }
     }
 

@@ -16,6 +16,47 @@ The suites:
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
 
+## `fix/r02-action-rejects` `3a7cb58b` (2026-10-10, s42; R02 branch 6a)
+
+R02 branch 6a (action-level local faults fail-stop the block instead of a reject; parallel settle
+latches a worker's local fill fault and the sequential fallback keeps the sequential fault
+precedence; both Codex P2s fixed), suites 1-4 and 6 at 18c's request (18c s108). 18c ran nextest
+3,280 / 0 and the uniswap e2e (suite 5, PASS) on the branch; suite 1 was run here too. Candidate in a
+detached worktree `wt/r02-6a-3a7cb58b` (`3a7cb58b` = `origin/fix/r02-action-rejects` after a
+fetch), clean before and after the run; new target dir `~/.cargo-target-r02-6a`. The suite 4
+baseline `9b7e29b2` ran in a detached worktree (`wt/base-9b7e29b2`, clean before and after) with the
+reused target dir `~/.cargo-target-compiled-defaults-base` (last warmed at `8f131571`). The source
+roots of all 21 members were touched on each side before clippy, and both sides re-linted 21
+workspace crates. Every cargo command held `/tmp/claude-1000/torus-suite.lock`.
+
+| # | suite | exit | totals | wall |
+|---|---|---|---|---|
+| 1 | nextest `--workspace` | 0 | **3,280 passed, 0 failed**, 35 skipped, no flaky | 211 s (cold build; tests 84 s) |
+| 2 | doc tests | 0 | **1 passed, 0 failed**, 7 ignored | 4 s |
+| 3 | `cargo test --workspace --no-fail-fast` | 0 | **3,281 passed, 0 failed**, 42 ignored (169 result lines) | 411 s |
+| 4 | clippy (no `-D`) / fmt vs `9b7e29b2` | 0 / 1 (fmt: old debt) | clippy 268 vs 268, **0 new**, 0 gone; fmt 3,398 vs 3,396 hunks, **3 new**, 1 gone (below) | 22 s / 4 s (base 12 s / 4 s) |
+| 5 | uniswap | not run here | PASS on 18c | – |
+| 6 | matched-bench | 0 | **168 passed**, 18 subtests; 8 of 8 scripts OK | 29 s |
+
+Suite 3's 3,281 = suite 1's 3,280 + the 1 doc test. No test failed in the shared process.
+
+Suite 4 fmt, hunks mapped to base lines through the branch diff (per-file counts alone mislead
+here):
+- **New (3), from this branch:** `crates/torus-bridge/src/native_executor.rs` at 6944, 6961 and
+  6979. The branch turned three `Err(e) => return PrepOutcome::Reject { .. }` arms into blocks
+  (`note_fault`, then `return PrepOutcome::Reject { .. }` with no trailing `;`); rustfmt wants `};`.
+  A `cargo fmt` of those three lines clears them.
+- **Gone (1):** the base hunk at `native_executor.rs:8872` (the `take_open_slot` call is formatted
+  now that the branch added the `&ctx.reader_fault` argument).
+- **Unchanged debt, moved:** in `tests/r02_reader_faults_tests.rs` an old hunk (base line 182) splits
+  in two around comments the branch inserted (+1); in `tests/engine_parallel_tests.rs` the old
+  `assert_eq!` hunk in the `threads` loop (base 1013) was rewritten by the branch (-1).
+
+Logs: `~/bench-results-matched/presuite-r02-6a-3a7c/` (`run.sh`, `1-nextest.log` ...
+`6-test_*.log`, `*.rc`, `4-delta.txt`, `4-cand-checked.txt` / `4-base-checked.txt`, `4-fmt-map.txt`
+(line-mapped fmt comparison), `4-fmt-attr.txt` (hunks on lines the branch changed), helpers
+`norm.py`, `hunks.py`, `attr.py`, `mapfmt.py`, `show.py`).
+
 ## main `f4c57d01` (2026-10-10, s40; compiled defaults `8f131571` + R02 branch 4 `fix/r02-margin-releases` `4fea98e2`)
 
 18c merged R02 branch 4 (margin release and sell top-up local faults fail-stop the block) onto main

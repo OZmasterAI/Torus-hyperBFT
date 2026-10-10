@@ -170,8 +170,28 @@ fn r02_maker_position_read_fault_fail_stops() {
         assert_eq!(ctx.take_fatal_error(), None);
         backend.arm(CF_NATIVE_POSITIONS, &position_key(&addr(2), M));
         exec(&mut ctx, mode, &[order(1, true, 100, 1, TimeInForce::GTC, false)]);
-        assert_injected(ctx.take_fatal_error(), "maker position read", &format!("mode {mode:?}"));
+        // R02 branch 6a: the same read fails again when the maker's fill is
+        // applied, which latches `fatal_error` (taken first); the snapshot's
+        // fault is on the reader fault channel (taken next).
+        assert_injected(
+            ctx.take_fatal_error(),
+            maker_fill_step(mode),
+            &format!("mode {mode:?}"),
+        );
+        assert_injected(
+            ctx.take_fatal_error(),
+            "maker position read",
+            &format!("mode {mode:?}"),
+        );
         assert_eq!(ctx.take_fatal_error(), None, "mode {mode:?}: taken once");
+    }
+}
+
+/// R02 branch 6a: the step that latches when a maker's fill does not apply.
+fn maker_fill_step(mode: Option<usize>) -> &'static str {
+    match mode {
+        None => "place order maker fill",
+        Some(_) => "settle maker fill",
     }
 }
 
@@ -185,8 +205,19 @@ fn r02_maker_position_undecodable_row_fail_stops() {
         assert!(exec(&mut ctx, None, &[order(2, false, 100, 1, TimeInForce::GTC, false)])[0].0, "maker rests");
         db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&addr(2), M), b"garbage").unwrap();
         exec(&mut ctx, mode, &[order(1, true, 100, 1, TimeInForce::GTC, false)]);
+        let snap = ctx
+            .reader_fault
+            .get()
+            .cloned()
+            .unwrap_or_else(|| panic!("mode {mode:?}: snapshot fault"));
+        assert!(snap.starts_with("maker position read: borsh"), "mode {mode:?}: {snap}");
+        // R02 branch 6a: the fill's apply latches too (reported first).
         let reason = ctx.take_fatal_error().unwrap_or_else(|| panic!("mode {mode:?}: must fail-stop"));
-        assert!(reason.starts_with("maker position read: borsh"), "mode {mode:?}: {reason}");
+        let step = maker_fill_step(mode);
+        assert!(
+            reason.starts_with(&format!("{step}: borsh")),
+            "mode {mode:?}: {reason}"
+        );
     }
 }
 

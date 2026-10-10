@@ -1002,7 +1002,15 @@ fn cum_volume_stops_at_the_failed_fill_like_positions() {
         let key = torus_core::position::position_key(&m2, 1);
         ctx.state.put_cf_raw(CF_NATIVE_POSITIONS, &key, b"\xff").unwrap();
     };
-    let golden = run_volumes(&blocks, 0, corrupt);
+    let (golden, _, fatal) = run_volumes_counted(&blocks, 0, corrupt);
+    // R02 branch 6a: the unreadable row is a local fault; the fill that does
+    // not apply fail-stops the block (the same in every mode).
+    assert!(
+        fatal
+            .as_deref()
+            .is_some_and(|f| f.starts_with("settle maker fill: borsh")),
+        "{fatal:?}"
+    );
     let failed = &golden.1[1][0];
     assert!(
         failed.1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
@@ -1013,7 +1021,9 @@ fn cum_volume_stops_at_the_failed_fill_like_positions() {
         vec![fp(5_000_100), FixedPoint::ZERO, fp(201), fp(100), fp(100)]
     );
     for threads in [2usize, 4] {
-        assert_eq!(golden, run_volumes(&blocks, threads, corrupt), "threads={threads}");
+        let (run, _, run_fatal) = run_volumes_counted(&blocks, threads, corrupt);
+        assert_eq!(run_fatal, fatal, "threads={threads}");
+        assert_eq!(golden, run, "threads={threads}");
     }
 }
 
@@ -1048,13 +1058,13 @@ fn cum_volume_pass_b_balance_failure_stops_at_the_failed_side() {
     };
     let (golden, serial_fallbacks, fatal) = run_volumes_counted(&blocks, 0, corrupt);
     assert_eq!(serial_fallbacks, 0);
-    // R02 branch 4: the unreadable row is a local fault; m's consumed ask
-    // releases its margin after the failed fill and that read fail-stops
-    // the block (the same in every mode).
+    // R02 branch 6a: the unreadable row is a local fault; m's fill that
+    // does not apply (its PnL credit) fail-stops the block first (branch 4's
+    // later maker release read would too), the same in every mode.
     assert!(
         fatal
             .as_deref()
-            .is_some_and(|f| f.starts_with("settle maker release balance read: borsh")),
+            .is_some_and(|f| f.starts_with("settle maker fill: borsh")),
         "{fatal:?}"
     );
     let failed = &golden.1[3][0];
@@ -1110,13 +1120,13 @@ fn cum_volume_pass_b_stop_mid_market_keeps_later_orders_and_other_markets() {
     };
     let (golden, serial_fallbacks, fatal) = run_volumes_counted(&blocks, 0, corrupt);
     assert_eq!(serial_fallbacks, 0);
-    // R02 branch 4: the unreadable row is a local fault; m's consumed ask
-    // releases its margin after the failed fill and that read fail-stops
-    // the block (the same in every mode).
+    // R02 branch 6a: the unreadable row is a local fault; m's fill that
+    // does not apply (its PnL credit) fail-stops the block first (branch 4's
+    // later maker release read would too), the same in every mode.
     assert!(
         fatal
             .as_deref()
-            .is_some_and(|f| f.starts_with("settle maker release balance read: borsh")),
+            .is_some_and(|f| f.starts_with("settle maker fill: borsh")),
         "{fatal:?}"
     );
     let last = &golden.1[3];
