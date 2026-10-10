@@ -236,15 +236,23 @@ fn bal(db: &StateDb, trader: u8) -> NativeBalance {
 /// An undecodable position row for `trader` in market 7 (a local fault: the
 /// row is only ever written by `put_position`).
 fn corrupt_position(db: &StateDb, trader: u8) {
-    db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&addr(trader), 7), b"\xff")
-        .unwrap();
+    db.put_cf_raw(
+        CF_NATIVE_POSITIONS,
+        &position_key(&addr(trader), 7),
+        b"\xff",
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // 1. take_open_slot: the cum_volume read (single + batch).
 // ---------------------------------------------------------------------------
 
-const PLACE_MODES: [Mode; 3] = [Mode::Single, Mode::Settle { parallel: false }, Mode::Sharded];
+const PLACE_MODES: [Mode; 3] = [
+    Mode::Single,
+    Mode::Settle { parallel: false },
+    Mode::Sharded,
+];
 
 /// Trader 1 rests a GTC bid on market 1; trader 4 one on market 2 (two
 /// senders: the sharded prepare engages).
@@ -340,7 +348,12 @@ fn r02_place_balance_read_fault_fail_stops() {
         } else {
             "phase 2 balance read"
         };
-        assert_injected(ctx.take_fatal_error(), step, INJECTED_READ, &format!("{mode:?}"));
+        assert_injected(
+            ctx.take_fatal_error(),
+            step,
+            INJECTED_READ,
+            &format!("{mode:?}"),
+        );
     }
 }
 
@@ -384,7 +397,12 @@ fn r02_place_position_read_fault_fail_stops() {
         } else {
             "phase 2 position read"
         };
-        assert_injected(ctx.take_fatal_error(), step, INJECTED_READ, &format!("{mode:?}"));
+        assert_injected(
+            ctx.take_fatal_error(),
+            step,
+            INJECTED_READ,
+            &format!("{mode:?}"),
+        );
     }
 }
 
@@ -483,7 +501,10 @@ fn assert_settle_path(ctx: &Ctx, mode: Mode, fallbacks: u64) {
             "{mode:?}: settle path pinned"
         );
         let want = if parallel { fallbacks } else { 0 };
-        assert_eq!(ctx.phase_accum.settle_fallbacks, want, "{mode:?}: fallbacks");
+        assert_eq!(
+            ctx.phase_accum.settle_fallbacks, want,
+            "{mode:?}: fallbacks"
+        );
     }
 }
 
@@ -493,7 +514,10 @@ fn assert_settle_path(ctx: &Ctx, mode: Mode, fallbacks: u64) {
 /// (until branch 4's later release read).
 #[test]
 fn r02_settle_maker_pnl_balance_read_fault_fail_stops() {
-    for mode in [Mode::Settle { parallel: false }, Mode::Settle { parallel: true }] {
+    for mode in [
+        Mode::Settle { parallel: false },
+        Mode::Settle { parallel: true },
+    ] {
         let (_d, _db, backend, mut ctx) = setup();
         rest_closing_maker(&mut ctx);
         backend.arm_read(CF_NATIVE_BALANCES, addr(2).as_slice());
@@ -501,7 +525,9 @@ fn r02_settle_maker_pnl_balance_read_fault_fail_stops() {
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
         assert_settle_path(&ctx, mode, 0);
         assert!(
-            r[0].1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+            r[0].1
+                .as_deref()
+                .is_some_and(|e| e.starts_with("maker fill failed")),
             "{mode:?}: result shape kept: {r:?}"
         );
         assert_injected(
@@ -517,7 +543,10 @@ fn r02_settle_maker_pnl_balance_read_fault_fail_stops() {
 /// parallel falls back to it). RED before R02.
 #[test]
 fn r02_settle_maker_position_read_fault_fail_stops() {
-    for mode in [Mode::Settle { parallel: false }, Mode::Settle { parallel: true }] {
+    for mode in [
+        Mode::Settle { parallel: false },
+        Mode::Settle { parallel: true },
+    ] {
         let (_d, _db, backend, mut ctx) = setup();
         rest_closing_maker(&mut ctx);
         backend.arm_read(CF_NATIVE_POSITIONS, &position_key(&addr(2), 1));
@@ -525,7 +554,9 @@ fn r02_settle_maker_position_read_fault_fail_stops() {
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
         assert_settle_path(&ctx, mode, 1);
         assert!(
-            r[0].1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+            r[0].1
+                .as_deref()
+                .is_some_and(|e| e.starts_with("maker fill failed")),
             "{mode:?}: result shape kept: {r:?}"
         );
         assert_injected(
@@ -543,7 +574,10 @@ fn r02_settle_maker_position_read_fault_fail_stops() {
 #[test]
 fn r02_settle_maker_undecodable_balance_fail_stops_at_the_fill() {
     let mut seen = None;
-    for mode in [Mode::Settle { parallel: false }, Mode::Settle { parallel: true }] {
+    for mode in [
+        Mode::Settle { parallel: false },
+        Mode::Settle { parallel: true },
+    ] {
         let (_d, db, _backend, mut ctx) = setup();
         rest_closing_maker(&mut ctx);
         db.put_cf_raw(CF_NATIVE_BALANCES, addr(2).as_slice(), b"x")
@@ -574,7 +608,9 @@ fn r02_place_taker_fill_fault_fail_stops_single() {
     let r = exec(&mut ctx, Mode::Single, &fill_block());
     assert!(backend.hits() > 0, "fault injected");
     assert!(
-        r[0].1.as_deref().is_some_and(|e| e.starts_with("taker fill failed")),
+        r[0].1
+            .as_deref()
+            .is_some_and(|e| e.starts_with("taker fill failed")),
         "result shape kept: {r:?}"
     );
     assert_injected(
@@ -595,7 +631,9 @@ fn r02_place_maker_fill_fault_fail_stops_single() {
     let r = exec(&mut ctx, Mode::Single, &fill_block());
     assert!(backend.hits() > 0, "fault injected");
     assert!(
-        r[0].1.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+        r[0].1
+            .as_deref()
+            .is_some_and(|e| e.starts_with("maker fill failed")),
         "result shape kept: {r:?}"
     );
     assert_injected(
@@ -718,7 +756,12 @@ fn r02_lockbox_withdraw_write_fault_fail_stops() {
     let r = NativeExecutor::execute(&mut ctx, &addr(1), &withdraw_to(10, 9));
     assert!(backend.hits() > 0, "fault injected");
     assert!(!r.success, "result shape kept: {r:?}");
-    assert_injected(ctx.take_fatal_error(), "withdraw_to", INJECTED_WRITE, "withdraw_to");
+    assert_injected(
+        ctx.take_fatal_error(),
+        "withdraw_to",
+        INJECTED_WRITE,
+        "withdraw_to",
+    );
 }
 
 /// `TransferToPerp`: the Lockbox's EVM balance read fails. RED before R02.

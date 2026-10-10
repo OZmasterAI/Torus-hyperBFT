@@ -79,7 +79,10 @@ fn limit(is_buy: bool, price: i64, tif: TimeInForce) -> PlaceOrderParams {
 /// `MAKER`'s bid at 101 (realized PnL +1 for the taker), settled by the
 /// pinned loop with fresh caches. Returns the result, the fail-stop, the
 /// injected hits and the fallbacks.
-fn settle_closing_taker(parallel: bool, fault: bool) -> (NativeActionResult, Option<String>, usize, u64) {
+fn settle_closing_taker(
+    parallel: bool,
+    fault: bool,
+) -> (NativeActionResult, Option<String>, usize, u64) {
     let dir = tempfile::tempdir().unwrap();
     let backend = FailBal {
         inner: StateDb::open(dir.path()).unwrap(),
@@ -191,7 +194,9 @@ fn r02_settle_taker_fill_balance_read_fault_fail_stops() {
         assert!(hits > 0, "parallel {parallel}: fault injected");
         assert_eq!(fallbacks, 0, "parallel {parallel}: pass B handles it");
         assert!(
-            r.error.as_deref().is_some_and(|e| e.starts_with("taker fill failed")),
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("taker fill failed")),
             "parallel {parallel}: result shape kept: {r:?}"
         );
         let reason = fatal.unwrap_or_else(|| panic!("parallel {parallel}: must fail-stop"));
