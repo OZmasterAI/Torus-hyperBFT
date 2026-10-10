@@ -4142,6 +4142,89 @@ commit after it. Scored on restart metrics, not matched/s.
   after restart; the uncompressed WAL bytes wd replays. n = 6 of rs-w and rs-wd (~1 h) would
   resolve wd vs w on DB open and restart -> first commit.
 
+## 40. Phase 3 baseline candidates: trade history off + WAL 2048, with and without WAL compression (campaign ozarchy-acc3, 2026-10-10)
+
+Owner decisions (18c, after section 39; `docs/acc-confirm` merged as `73503705`): validators run trade
+history off (`TORUS_TRADE_HISTORY=0`; RPC / explorer nodes keep it on) and WAL budget 2048 MiB. WAL
+compression is decided by this run, with no more restart timing runs and no ZSTD level 1 arm (it
+changed nothing in the screen, and with trade history off there is even less to compress). One
+kill-restart on t + w + d as a recovery check only. The winner becomes the Phase 3 baseline.
+
+Setup as section 39 (Classic, cap 8, 300 markets, standard shape, fresh genesis and data dir per
+cell, RocksDB `LOG` copied per cell, no perf), node `2ede76eb` / bench `a33d82f5` (`fa8b646f`, stage
+`ozarchy-acc-stage/n`). Arms:
+- **b:** knobs unset.
+- **tw:** `TORUS_TRADE_HISTORY=0` + `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=2048`.
+- **twd:** tw + `TORUS_ROCKSDB_WAL_COMPRESSION=zstd`.
+
+Cells 21:54-23:11: the warm-up `warm-twd-rs` (the recovery check, excluded from every number below),
+then 4 rounds (b tw twd / tw twd b / twd b tw / twd tw b). All 12 measured cells rc 0, AGREE, PASS,
+ACCEPT, oracle stale 0, 6 hard checks OK each, no ERROR or panic line in the 36 node logs. Node md5
+`2ede76eb` in every cell; env and `LOG` settings match each arm (`max_total_wal_size` 512 / 2048 MiB,
+`wal_compression` ZSTD on twd only); tw and twd hold 0 trade data rows on every validator, b ~1.9M
+(positive control). Every measured cell runs `launch-3val.sh` with `CLEAN=1`, which wipes the data
+dirs, so the warm-up kill cannot carry into a measured cell. Driver `ozarchy-acc3-campaign.sh`, tables
+`ozarchy-acc3-run/handoff-tables.txt` (the tables script reproduces section 39.1 on the acc2 cells),
+analysis scripts in `ozarchy-acc3-tools/` (archived in `tools/`).
+
+### 40.1 Node CPU and throughput (n = 4; ↓ lower is better, ↑ higher is better)
+
+| arm | node CPU-s/1M ↓ mean (sd) | vs b | matched/s ↑ mean (sd) | r1..r4 range | vs b |
+|---|---|---|---|---|---|
+| b | 28.75 (0.24) | - | 187,202 (2,171) | 185,297-189,822 | - |
+| tw | **24.93** (0.07) | **-3.82, -13.3%** (21.9 sd) | 203,992 (1,144) | 202,622-205,405 | **+9.0%** (9.7 sd) |
+| twd | 25.53 (0.18) | **-3.22, -11.2%** (15.2 sd) | 207,676 (4,197) | 201,877-211,919 | **+10.9%** (6.1 sd) |
+
+- **twd vs tw, CPU:** +0.59 CPU-s/1M (+2.4%, 4.3 sd; the r1..r4 ranges do not overlap): resolved,
+  the cost of compressing the WAL. Section 39 measured the same cost without trade history off
+  (+0.45).
+- **twd vs tw, matched/s:** +3,684 (+1.8%, 1.2 sd; paired by round t = 1.55; twd-r3 is below every
+  tw cell): not resolved. Section 39's wd vs w was +2.8% at 3.1 sd, so the direction is the same.
+- b reproduces section 39 (28.75 vs 28.80 CPU-s/1M; 187.2k vs 188.2k matched/s).
+- Both arms clear the Phase 3 -10% gate (2.75 CPU-s/1M) against b.
+
+### 40.2 Disk (per validator; ↓ lower is better in every column)
+
+| arm | all writes MB/s | WAL writes MB/s | flush + compaction MB/s | data dir at end GB (SST / WAL) | SST growth GB/day | trades + DA GB/day |
+|---|---|---|---|---|---|---|
+| b | 168.1 | 137.1 | 40.7 | 1.33 (0.96 / 0.36) | 647 | 489 |
+| tw | 131.3 (-22%) | 118.7 | 19.1 | 2.01 (0.44 / 1.57) | 322 (-50%) | 147 |
+| twd | **28.0 (-83%)** | **10.2 (-93%)** | 18.9 | **0.60 (0.45 / 0.15)** | 323 | 136 |
+
+- Columns and methods as section 39.2 (SST growth by the window method; `handoff-tables.txt` uses
+  end-of-cell live SST instead: 677 / 309 / 317).
+- **twd vs tw:** all writes -103 MB/s (40 sd), WAL writes -109 MB/s (45 sd), data dir -1.41 GB
+  (5.1 sd): resolved. Flush + compaction, SST growth and trades + DA growth: not resolved (0.1-0.8 sd).
+- tw's data dir is noisy because its WAL on disk ranges 1.04-2.00 GB across the cells; twd's WAL
+  stays 0.12-0.17 GB.
+- **All 3 validators write to one disk on the bench host.** twd's write cut, and any matched/s gain
+  that comes from less disk contention, may be smaller with a disk per validator; not measured.
+
+### 40.3 Recovery check (warm-twd-rs): pass
+
+120 s cell on twd, `SIGKILL` of val1 at bench + 40 s (80 s of load left after the restart), restart on
+the same data dir with the same env. No timing was scored (owner); the numbers are recorded only.
+- **val1 rejoined and committed:** 1,843 post-restart `on_committed_block` lines, heights 643-2,485
+  (down 1.01 s, DB open 2.09 s, 12 WAL files / 107 MB replayed, 66 blocks rewound, first commit after
+  17.7 s).
+- **All 3 validators agree:** `state-digest-val0/1/2.txt` identical; agreement AGREE.
+- **No ERROR or panic line** in the restarted node's log.
+- The crash gate reads FAIL (cell rc 2, validity REJECT, liveness UNKNOWN), for the same reason as
+  section 39.3: its fail-stop pattern matches the INFO config line `running state hash fail-stop
+  (TORUS_STATE_HASH_FAILSTOP) on=false`. Liveness UNKNOWN is a harness gap (val1 progress metrics
+  missing after the restart), not a node fault.
+
+### 40.4 Reading
+
+- **tw vs twd is CPU against disk.** tw is 0.59 CPU-s/1M (2.4%) cheaper, resolved. twd writes 4.7x
+  fewer bytes per validator (28 vs 131 MB/s) and keeps a 3.4x smaller, steady data dir. matched/s is
+  a tie in this run (twd +1.8%, not resolved), leaning to twd across sections 39-40.
+- Against b both are large: -13.3% / -11.2% node CPU, +9.0% / +10.9% matched/s, -50% SST growth.
+- **The WAL compression knob is only on `perf/append-cf-compaction` (`fa8b646f`), not on main.**
+  A twd baseline needs that branch merged; a tw baseline runs on main with existing knobs.
+- Not measured: a disk per validator; production-like growth; matched/s of the warm-up cell. About 4
+  more interleaved tw / twd pairs (~25 min) would bring the matched/s standard error near 1,500.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -4150,13 +4233,13 @@ commit after it. Scored on restart metrics, not matched/s.
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Trades + DA compaction tuning, owner decision pending** (sections 37-39, plan review log rows
-  42-44; owner s108: option 3, baseline Classic `9b7e29b2`). ZSTD level 1 dropped (owner, after the
-  screen). Confirm (n = 4, node CPU-s/1M vs b 28.80): trade history off -3.44 (-11.9%, +8.2%
-  matched/s), WAL budget 2048 MiB -1.83 (-6.3%), WAL 2048 + WAL ZSTD -1.38 (-4.8%, +5.2% matched/s,
-  -74% bytes written); the 2048 arms add 1.7-2.7 s DB open on restart, restart -> first commit
-  unchanged at n = 3. Next: owner's validator defaults (trade history, WAL budget, WAL
-  compression), then the Phase 3 decision; optional n = 6 restart cells of w / wd.
+- **Phase 3 baseline: WAL compression decision pending** (sections 37-40, plan review log rows
+  42-45; owner s108: option 3). Owner (after section 39): validators run trade history off, WAL
+  budget 2048 MiB; ZSTD level 1 dropped. Section 40 (n = 4, vs b 28.75 CPU-s/1M): tw -13.3% node
+  CPU / +9.0% matched/s; twd -11.2% / +10.9% and -83% bytes written. twd vs tw: +2.4% CPU
+  (resolved), +1.8% matched/s (not resolved), 4.7x fewer bytes written, 3.4x smaller data dir.
+  Recovery check on twd passed. Next: owner picks tw or twd as the Phase 3 baseline (twd needs
+  `perf/append-cf-compaction` merged); optional ~4 more tw / twd pairs for matched/s.
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
