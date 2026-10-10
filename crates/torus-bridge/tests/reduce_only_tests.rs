@@ -734,3 +734,35 @@ fn reduce_only_modify_of_order_past_the_budget_cancels_it() {
         assert_bal(&ctx, &t, fp(FUNDING - 22), fp(22), "B's margin released");
     }
 }
+
+#[test]
+fn reduce_only_modify_that_changes_nothing_still_sweeps() {
+    for path in PATHS {
+        let (t, m) = (addr(1), addr(2));
+        let (_d, mut ctx) = fresh(path, &[t, m]);
+        open_long_4(&mut ctx, path, t, m);
+        let r = run(&mut ctx, path, &[place(t, ro(limit(1, false, 110, 4)))]);
+        assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+        let a = resting_by_id(&ctx, &t)[0].0;
+        // A leftover past the budget A uses up (as in the test above).
+        let book = ctx.order_books.get_mut(&1).unwrap();
+        book.set_next_order_id(1_000_000);
+        book.place_order(ro(limit(1, false, 120, 2)), t, 1000);
+        let mut bal = ctx.positions.get_native_balance(&t).unwrap();
+        bal.available -= fp(12);
+        bal.order_margin += fp(12);
+        ctx.positions.put_native_balance(&t, &bal).unwrap();
+
+        // Same quantity, and one clamped back to it (6 -> position 4).
+        for qty in [4, 6] {
+            let r = run(&mut ctx, path, &[modify(t, a, None, Some(qty))]);
+            assert!(r[0].success, "{path:?}: {:?}", r[0].error);
+            assert_eq!(
+                resting_by_id(&ctx, &t),
+                vec![(a, fp(110), fp(4))],
+                "{path:?} {qty}: B swept"
+            );
+            assert_bal(&ctx, &t, fp(FUNDING - 22), fp(22), "B's margin released");
+        }
+    }
+}
