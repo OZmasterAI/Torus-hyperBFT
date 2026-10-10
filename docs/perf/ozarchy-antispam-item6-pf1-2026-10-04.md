@@ -4025,6 +4025,123 @@ the 120 s window, but 120 s cannot rule that out.
   wants the full combination), with a restart -> ready step for the w arms (WAL replay of up to
   2 GiB, against the s74 restart result).
 
+## 39. Trades + DA compaction tuning, confirm (campaign ozarchy-acc2, 2026-10-10)
+
+Owner (18c, after section 38; screen merged as `233c026a`): ZSTD level 1 changed nothing measurable
+(CPU, matched/s and SST growth all equal to b), so it is dropped from the plan, with no w + z or
+w + z + d arms. Confirm n = 4 per arm, interleaved: b, w, w + d, and b with trade history off.
+matched/s is reported with its resolution (d's +3.6% in the screen needed confirming). Restart ->
+ready is measured for both WAL 2048 arms. Trade history is node-local (RPC / explorer only), and
+validators do not need it; the owner wants its cost before setting validator defaults.
+
+Setup as section 38 (Classic, cap 8, 300 markets, standard shape, fresh genesis per cell, RocksDB
+`LOG` copied per cell, no perf), same node `2ede76eb` / bench `a33d82f5` (`fa8b646f`, stage
+`ozarchy-acc-stage/n`), no old-binary control. Arms:
+- **b:** knobs unset.
+- **w:** `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=2048`.
+- **wd:** w + `TORUS_ROCKSDB_WAL_COMPRESSION=zstd`.
+- **t:** `TORUS_TRADE_HISTORY=0`.
+
+Cells 18:32-21:21: b-warm (excluded), then 4 rounds with the arm order rotated each round (b w wd t /
+w wd t b / wd t b w / t b w wd), then a restart block (9 cells, below). All 16 throughput cells rc 0,
+AGREE, PASS, ACCEPT, oracle stale 0, no panic or ERROR line. Node md5 3/3 per cell, the knobs in every
+validator's `/proc` environ, `max_total_wal_size` in the `LOG` 512 MiB for b / t and 2048 MiB for w /
+wd, and `wal_compression` ZSTD on wd only. Trade history off in t: `cf_native_trades` and
+`cf_native_user_trades` hold 0 data rows on all 3 validators in all 4 t cells. Each holds only the
+range tombstone that `ensure_trade_history_format` writes once on a fresh DB, and every history-on
+cell shows rows as a positive control. The first launch stopped at t-r1 (18:59) on a stricter
+version of that check (zero table files, which counted the tombstone file); the check was corrected
+to count data rows and the campaign resumed at t-r1 (19:02). Driver `ozarchy-acc2-campaign.sh`,
+tables `ozarchy-acc2-run/handoff-tables.txt`, analyst scripts copied to `docs/perf/bench-archive/tools/ozarchy-acc2-tools/`.
+The screen's `/tmp/claude-1000/ozarchy-acc-analysis/` (section 38) was gone from `/tmp` by the
+time of this write-up, so it is not in the bench archive.
+
+### 39.1 Node CPU and throughput (n = 4; ↓ lower is better, ↑ higher is better)
+
+Node CPU-s per 1M fills is the val0-2 mean of `summary.json` `proc_cpu`, as in 38.1 (val2 runs ~2.7
+above val0 / val1 in every cell; b's val0 alone is 27.89, in line with the 27.48 of 37.5).
+
+| arm | matched/s ↑ mean (sd) | vs b | step / sd | node CPU-s/1M ↓ mean (sd) | vs b | step / sd |
+|---|---|---|---|---|---|---|
+| b | 188,229 (1,678) | - | - | 28.80 (0.06) | - | - |
+| w WAL 2048 MiB | 192,732 (1,547) | +2.4% | 2.8, marginal | 26.97 (0.10) | **-1.83, -6.3%** | 22 |
+| wd WAL 2048 + WAL ZSTD | 198,071 (1,914) | **+5.2%** | 5.5 | 27.42 (0.14) | **-1.38, -4.8%** | 13 |
+| t trade history off | 203,669 (2,991) | **+8.2%** | 6.4 | 25.36 (0.32) | **-3.44, -11.9%** | 15 |
+
+- w confirms the screen (-1.68 there, -1.83 here).
+- wd vs w: +0.45 CPU-s/1M (3.7 sd), the cost of compressing the WAL, and +2.8% matched/s (3.1 sd).
+  The screen's d arm (+3.6%, n = 2) had WAL compression without the 2048 cap, so it is not the same
+  arm, but the direction is confirmed. CPU does not explain wd's gain (ZSTD adds CPU); less I/O
+  contention on the shared disk is the likely cause, not measured.
+- t alone passes the Phase 3 -10% gate (2.75): -3.44.
+- b rose from 186.6k to 190.3k across its four cells: ~1% drift is part of the noise, and matched/s
+  is medium confidence.
+
+### 39.2 Disk (per validator; ↓ lower is better in every column)
+
+| arm | all writes MB/s | WAL writes MB/s | RocksDB flush + compaction MB/s | data dir at end GB (SST / WAL) | SST growth GB/day | trades + DA GB/day |
+|---|---|---|---|---|---|---|
+| b | 163.8 | 133.3 | 40.0 | 1.35 (0.94 / 0.40) | 634 | 476 |
+| w | 160.9 | 138.3 | 31.4 | 2.71 (0.96 / 1.74) | 661 | 499 |
+| wd | **43.3 (-74%)** | **13.0 (-90%)** | 32.0 | 1.20 (1.03 / 0.17) | 703 (+11%) | 538 |
+| t | 130.7 (-20%) | 116.1 | 21.3 | **0.81 (0.41 / 0.40)** | **292 (-54%)** | **129** (DA only) |
+
+- All writes: `io-ticks.txt` over the bench window, 3 node processes summed, / 3. WAL writes: the
+  threads not named `rocksdb:*` (`io-threads-*.txt`); flush + compaction: `rocksdb:low` / `high`.
+  The thread window runs ~6 s into the drain, so the last two columns are close to, not on, the
+  first column's window.
+- SST growth: live SST at the end of the bench window minus at its start (`LOG` `time_micros`),
+  extrapolated from 120 s to 24 h at bench load: a load-test rate, not a production rate.
+  `handoff-tables.txt` divides end-of-cell live SST (including pre-bench and drain data) by the bench
+  seconds instead (662 / 682 / 728 / 291).
+- w's change in all writes and SST growth is not resolved; wd's +11% SST growth is (5.4 sd).
+- t removes 33 MB/s of writes, 0.53 GB of data dir, 342 GB/day of SST growth and 347 GB/day of
+  append-CF growth (-73%) per validator.
+- **All 3 validators write to one disk on the bench host.** The write cut from wd, and possibly its
+  matched/s gain, may be smaller with a disk per validator; not measured.
+
+### 39.3 Restart (n = 3 per arm; ↓ lower is better)
+
+Restart cells: 180 s, `SIGKILL` of val1 at bench + 60 s, restart on the same data dir with the same
+env (`CRASH_KILL_AT_S=60`, the s74 crash path of `run-cell.sh`). "Ready" = restart until val0's first
+commit after it. Scored on restart metrics, not matched/s.
+
+| arm | DB open s | WAL files replayed | WAL MB replayed (on disk) | restart -> first commit s | max commit gap s |
+|---|---|---|---|---|---|
+| b | 1.32 (0.23) | 4.0 | 424 | 16.75 (1.89) | 17.63 |
+| w | 3.99 (0.12) | 16.0 | 1,961 | 16.44 (0.65) | 17.61 |
+| wd | 3.04 (0.77) | 13.7 | 153 (compressed) | 16.25 (1.27) | 16.97 |
+
+- DB open: w +2.67 s vs b (~15 sd), wd +1.72 s (3 sd); wd vs w -0.95 s (1.7 sd, not resolved). Open
+  time follows the number of WAL files more than their bytes: wd's files are ~13x smaller on disk
+  and it opens almost as slowly as w.
+- Restart -> first commit is not resolved (steps -0.3 / -0.5 s, sd 1.3-1.9 s): it is dominated by
+  the ~13-15 s view-sync freeze, not by the DB open.
+- The crash gate reads FAIL (rc 2) in all 9 cells: its "panic / fail-stop after the restart" pattern
+  matches the INFO config line `running state hash fail-stop ... on=false`; no panic line exists.
+  Rewind 63-66 blocks. Liveness of the restarted val1 reads UNKNOWN (not measured).
+- rs-wd-r1: the restarted val1 logged one ERROR, `FIX 6 / F-1 ... crash-in-hole ... parking the
+  manifest-backed heights for heal` (applied 746, manifest max 747, 1 height parked): the kill
+  landed between the durable commit manifest and execution, and the existing heal path handled it.
+  The cell reads AGREE; it is the only ERROR in the 75 node logs of the campaign.
+
+### 39.4 Reading
+
+- **Trade history off is the largest lever measured on Classic:** -11.9% node CPU (alone past the
+  -10% gate), +8.2% matched/s, -54% SST growth, -40% data dir per validator, and it only turns off
+  node-local trade storage (RPC / explorer). The owner's validator-default decision.
+- **WAL budget 2048 MiB confirmed:** -6.3% node CPU, matched/s +2.4% (marginal), at 2x the data dir
+  (up to 2 GiB WAL kept) and +2.7 s DB open on restart; restart -> first commit unchanged at n = 3.
+- **wd is the best WAL arm on throughput and disk:** -4.8% node CPU, +5.2% matched/s, -74% bytes
+  written per validator, data dir below b. It costs +0.45 CPU-s/1M against w, +11% SST growth, and
+  +1.7 s DB open vs b. Part of the gain may come from the shared disk.
+- The knobs are node-local and need no consensus change; t and w / wd stack on different paths (t
+  removes the trade CF rows, w / wd change WAL and flush behaviour), but the combination was not
+  measured.
+- **Not measured:** a disk per validator; production-like (old chain) growth; a "caught up" signal
+  after restart; the uncompressed WAL bytes wd replays. n = 6 of rs-w and rs-wd (~1 h) would
+  resolve wd vs w on DB open and restart -> first commit.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -4033,12 +4150,13 @@ the 120 s window, but 120 s cannot rule that out.
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Trades + DA compaction tuning, confirm pending** (sections 37-38, plan review log rows 42-43;
-  owner s108: option 3, baseline Classic `9b7e29b2`). Screen: WAL budget 2048 MiB -1.68 node CPU-s/1M
-  (-5.7%), LZ4 on the append CFs -1.02, ZSTD level 1 nothing resolved, WAL compression +0.39 CPU
-  for -69% bytes written; none reaches 2.75 (-10%). Next: n = 4 confirm (b, w, w + z, maybe
-  w + z + d) with restart -> ready; then the Phase 3 decision (state-row work at ~-6%, or effort to
-  signature checks / execution; SSD wear weighed too).
+- **Trades + DA compaction tuning, owner decision pending** (sections 37-39, plan review log rows
+  42-44; owner s108: option 3, baseline Classic `9b7e29b2`). ZSTD level 1 dropped (owner, after the
+  screen). Confirm (n = 4, node CPU-s/1M vs b 28.80): trade history off -3.44 (-11.9%, +8.2%
+  matched/s), WAL budget 2048 MiB -1.83 (-6.3%), WAL 2048 + WAL ZSTD -1.38 (-4.8%, +5.2% matched/s,
+  -74% bytes written); the 2048 arms add 1.7-2.7 s DB open on restart, restart -> first commit
+  unchanged at n = 3. Next: owner's validator defaults (trade history, WAL budget, WAL
+  compression), then the Phase 3 decision; optional n = 6 restart cells of w / wd.
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
