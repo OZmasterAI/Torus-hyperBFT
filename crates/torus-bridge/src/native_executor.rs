@@ -458,6 +458,12 @@ struct OrderSettlePlan {
     /// First position-side fill-application failure, pre-formatted like the
     /// sequential path ("taker fill failed: …" / "maker fill failed: …").
     fill_error: Option<String>,
+    /// R02 (Codex P2): when that failure is a LOCAL fault
+    /// (`CoreError::is_local_fault`), the fail-stop reason the sequential
+    /// loop latches for it ("settle taker|maker fill: …"). Latched before
+    /// the fallback, so a transient fault that the sequential retry no
+    /// longer hits still fail-stops, as in sequential mode.
+    fill_fault: Option<String>,
 }
 
 /// C3: one market's full settlement plan, computed off-thread by a pure pass
@@ -7600,6 +7606,20 @@ impl NativeExecutor {
                 "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
             );
             ctx.phase_accum.settle_fallbacks += 1;
+            // R02 (Codex P2): a worker's LOCAL fill fault fail-stops even if
+            // the sequential retry no longer hits it (transient), with the
+            // step sequential uses; first in the sequential order, first
+            // fault wins. Panics and non-local errors: fallback only.
+            let fault = plans.iter().find_map(|p| {
+                p.as_ref()
+                    .ok()?
+                    .orders
+                    .iter()
+                    .find_map(|o| o.fill_fault.clone())
+            });
+            if let (Some(f), None) = (fault, &ctx.fatal_error) {
+                ctx.fatal_error = Some(f);
+            }
             return Self::settle_market_results_sequential(
                 ctx,
                 market_results,
@@ -7813,6 +7833,7 @@ impl NativeExecutor {
             let mut pnl_events: Vec<(&'static str, Address, FixedPoint, usize)> = Vec::new();
             let mut fill_effects = Vec::new();
             let mut fill_error: Option<String> = None;
+            let mut fill_fault: Option<String> = None;
             'fills: for (k, fill) in result.fills.iter().enumerate() {
                 let taker_is_buy = fill.maker_side != Side::Buy;
                 let mut pair = [FillEffect::default(); 2];
@@ -7841,6 +7862,9 @@ impl NativeExecutor {
                         }
                         Err(e) => {
                             fill_error = Some(format!("{side} fill failed: {e}"));
+                            if e.is_local_fault() {
+                                fill_fault = Some(format!("settle {side} fill: {e}"));
+                            }
                             break 'fills;
                         }
                     }
@@ -7860,6 +7884,7 @@ impl NativeExecutor {
                 pnl_events,
                 fill_effects,
                 fill_error,
+                fill_fault,
             });
         }
 
