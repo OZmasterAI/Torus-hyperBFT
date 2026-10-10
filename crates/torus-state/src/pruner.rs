@@ -142,7 +142,13 @@ impl StatePruner {
             return Ok(0);
         }
 
-        let cutoff = current_height.saturating_sub(self.config.retention_blocks);
+        // Crash replay re-executes `(applied, committed]` from the stored
+        // bodies, so never prune at or above the durable applied marker
+        // (absent = nothing applied = prune nothing).
+        let applied = crate::running_hash::read_applied_height(&self.db).unwrap_or(0);
+        let cutoff = current_height
+            .saturating_sub(self.config.retention_blocks)
+            .min(applied);
         let already_pruned = self.pruned_up_to.load(Ordering::Acquire);
 
         if cutoff <= already_pruned {
@@ -313,8 +319,66 @@ mod tests {
                     .unwrap();
             }
         }
+        // Every stored block is applied (the tests below prune by retention only).
+        set_applied(&db, 19);
 
         db
+    }
+
+    fn set_applied(db: &StateDb, height: u64) {
+        db.put_cf_raw(
+            crate::cf::CF_CONSENSUS_META,
+            crate::cf::META_NATIVE_APPLIED_HEIGHT,
+            &height.to_be_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// Crash replay re-executes `(applied, committed]` from the stored bodies:
+    /// the pruner must never delete a body execution has not applied, however
+    /// far the committed height (what the pruner is driven by) runs ahead.
+    #[test]
+    fn pruner_never_deletes_bodies_above_applied_marker() {
+        let dir = TempDir::new().unwrap();
+        let db = setup_db_with_data(dir.path());
+        set_applied(&db, 5);
+        let config = PrunerConfig {
+            retention_blocks: 2,
+            prune_interval_blocks: 1,
+            batch_size: 100,
+        };
+        let mut pruner = StatePruner::new(db.clone(), config, Arc::new(AtomicU64::new(0)));
+
+        pruner.maybe_prune(19).unwrap();
+
+        assert!(
+            pruner.pruned_height() <= 5,
+            "cutoff {} above the applied marker",
+            pruner.pruned_height()
+        );
+        for h in 5..20 {
+            assert!(
+                body_exists(&db, h),
+                "body {h} (not yet replay-safe) was pruned"
+            );
+        }
+
+        // No marker at all = nothing applied: nothing is pruned.
+        let dir2 = TempDir::new().unwrap();
+        let db2 = StateDb::open(dir2.path()).unwrap();
+        db2.put_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes(), b"b")
+            .unwrap();
+        let mut pruner2 = StatePruner::new(
+            db2.clone(),
+            PrunerConfig {
+                retention_blocks: 0,
+                prune_interval_blocks: 1,
+                batch_size: 100,
+            },
+            Arc::new(AtomicU64::new(0)),
+        );
+        pruner2.maybe_prune(10).unwrap();
+        assert!(body_exists(&db2, 3));
     }
 
     fn body_exists(db: &StateDb, height: u64) -> bool {
