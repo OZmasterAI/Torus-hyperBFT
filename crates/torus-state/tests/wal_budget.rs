@@ -19,11 +19,12 @@ const MIB: u64 = 1 << 20;
 const ROWS: u64 = 64;
 const VALUE_BYTES: usize = 64 * 1024;
 
-const DEFAULT: Option<u64> = Some(512 * MIB);
+const DEFAULT: Option<u64> = Some(2048 * MIB);
 
 #[test]
-fn wal_budget_parser_defaults_to_512_mib_and_checks_overflow() {
-    // s74 crash A/B: unset caps the WAL at 512 MiB; explicit 0 opts out.
+fn wal_budget_parser_defaults_to_2048_mib_and_checks_overflow() {
+    // s74 crash A/B capped the WAL at 512 MiB; acc2 / acc3 (s109) raised the
+    // default to 2048 MiB (tw baseline). Explicit 0 opts out.
     assert_eq!(DbTuning::default().max_total_wal_size, DEFAULT);
     assert_eq!(parse_max_total_wal_mib(None), DEFAULT);
     for value in ["0", "000", " 0 "] {
@@ -83,7 +84,7 @@ fn wal_budget_unset_zero_and_explicit_options_are_persisted() {
     }
     let dir = tempfile::tempdir().unwrap();
     let _db = StateDb::open_with_tuning(dir.path(), &DbTuning::default()).unwrap();
-    assert_eq!(persisted_wal_option(dir.path()), 512 * MIB);
+    assert_eq!(persisted_wal_option(dir.path()), 2048 * MIB);
 }
 
 fn cold_sst_bytes(db: &StateDb) -> u64 {
