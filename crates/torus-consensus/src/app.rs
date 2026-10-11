@@ -16817,6 +16817,58 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Item 6 Phase 3 task 1.3: W chains `h_n` from an in-memory `h(n-1)`
+    /// (seeded from META at spawn, advanced after each durable batch). Over
+    /// the `running_hash_identical_serial_pipelined_restart_every_book_mode`
+    /// sequence (pipelined, with and without restarts, every book mode) W's
+    /// in-memory prev equals the META row after EVERY block, and the final
+    /// stored hash still equals the serial run.
+    #[test]
+    fn running_hash_prev_from_memory_equals_meta() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            let mut finals = Vec::new();
+            for (on, restarts) in [
+                (false, &[][..]),
+                (true, &[][..]),
+                (true, &[1, 3, 6, 9, 12][..]),
+            ] {
+                let (_cfg, state_db) = make_test_config_and_db();
+                fund_book_fixture(&state_db);
+                let mut ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                let mut checked = 0;
+                for b in &book_fixture_blocks() {
+                    dispatch_and_execute(&ctx, &state_db, b);
+                    if let Some(w) = ctx.flush_worker.as_ref() {
+                        assert!(w.wait_idle(), "{mode:?} h{}: W failed", b.header.height);
+                        let meta = torus_state::running_hash::read_running_hash(&state_db);
+                        assert!(meta.is_some(), "{mode:?} h{}: hash written", b.header.height);
+                        assert_eq!(
+                            w.running_hash_prev(),
+                            meta,
+                            "{mode:?} {restarts:?} h{}: W's in-memory prev != META",
+                            b.header.height
+                        );
+                        checked += 1;
+                    }
+                    if restarts.contains(&b.header.height) {
+                        drop(ctx);
+                        ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                    }
+                }
+                assert!(!on || checked > 0, "{mode:?}: compared nothing");
+                drop(ctx);
+                finals.push(torus_state::running_hash::read_running_hash(&state_db).unwrap());
+            }
+            assert!(finals.windows(2).all(|w| w[0] == w[1]), "{mode:?}: {finals:?}");
+        }
+    }
+
     /// Plan 9.13 (18c s107: `TORUS_BOOK_ROWS` stays Classic by default, mode 3
     /// only when set; the book mode is not in genesis). Two equivalences, each
     /// on running state hash, native root, every CF and the `__book_mode__`

@@ -330,6 +330,12 @@ impl FlushWorker {
         self.shared.durable_height.load(Ordering::SeqCst)
     }
 
+    /// Item 6 Phase 3: W's in-memory `(height, h_height)` of the last hashed
+    /// block (what the next digest chains from).
+    pub fn running_hash_prev(&self) -> Option<(u64, [u8; 32])> {
+        None
+    }
+
     /// Jobs handed off and not yet durable (what `torus_flush_worker_depth`
     /// reports).
     pub fn outstanding(&self) -> usize {
