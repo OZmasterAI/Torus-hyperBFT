@@ -1563,6 +1563,8 @@ fn parse_sync_wal_toggle(raw: Option<String>) -> bool {
 
 /// The sessions of `owner` among the `CF_SESSIONS` rows of a scan. A row
 /// that does not decode is skipped (decode policy, as the trait default).
+/// R02 (inventory 1c): a scan error is this node's storage fault and
+/// propagates (it was dropped: an undercount).
 fn count_owner_sessions<K, V, E>(
     rows: impl IntoIterator<Item = Result<(K, V), E>>,
     owner: &alloy_primitives::Address,
@@ -1572,7 +1574,8 @@ where
     StateError: From<E>,
 {
     let mut count = 0;
-    for (_key, value) in rows.into_iter().flatten() {
+    for row in rows {
+        let (_key, value) = row?;
         if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(value.as_ref()) {
             if data.owner == *owner {
                 count += 1;
@@ -1603,7 +1606,9 @@ mod count_sessions_tests {
     fn r02_iterator_error_propagates() {
         let rows = vec![
             row(1),
-            Err(StateError::Io(std::io::Error::other("injected scan failure"))),
+            Err(StateError::Io(std::io::Error::other(
+                "injected scan failure",
+            ))),
             row(1),
         ];
         let err = count_owner_sessions(rows, &Address::repeat_byte(1))
@@ -1616,7 +1621,10 @@ mod count_sessions_tests {
     #[test]
     fn counts_only_the_owners_decodable_rows() {
         let rows = vec![row(1), row(2), Ok((vec![9], b"\xff".to_vec())), row(1)];
-        assert_eq!(count_owner_sessions(rows, &Address::repeat_byte(1)).unwrap(), 2);
+        assert_eq!(
+            count_owner_sessions(rows, &Address::repeat_byte(1)).unwrap(),
+            2
+        );
     }
 
     /// Control: the real scan.
@@ -1633,9 +1641,18 @@ mod count_sessions_tests {
             };
             db.put_session(&[k; 32], &data).unwrap();
         }
-        db.put_cf_raw(crate::cf::CF_SESSIONS, &[4; 32], b"\xff").unwrap();
-        assert_eq!(db.count_sessions_for_owner(&Address::repeat_byte(1)).unwrap(), 2);
-        assert_eq!(db.count_sessions_for_owner(&Address::repeat_byte(2)).unwrap(), 1);
+        db.put_cf_raw(crate::cf::CF_SESSIONS, &[4; 32], b"\xff")
+            .unwrap();
+        assert_eq!(
+            db.count_sessions_for_owner(&Address::repeat_byte(1))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.count_sessions_for_owner(&Address::repeat_byte(2))
+                .unwrap(),
+            1
+        );
     }
 }
 

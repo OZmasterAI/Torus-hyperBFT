@@ -48,6 +48,19 @@ use crate::market_workers::{MarketWorkerPool, MatchRequest};
 // Result types
 // ============================================================================
 
+/// R02 branch 6b: why `resolve_oracle_reporter` found no reporter, typed so a
+/// local fault is told apart from "not a reporter" without string matching.
+#[derive(Debug)]
+enum OracleReporterError {
+    /// The sender is neither a validator nor a validator's current hot
+    /// signer: an ordinary reject every validator hits alike.
+    NotReporter,
+    /// A validator record read failed (the step names which one).
+    Validator(&'static str, torus_economics::EconomicsError),
+    /// The hot-signer index read failed.
+    Index(torus_state::StateError),
+}
+
 /// Result of executing a single native action.
 #[derive(Clone, Debug)]
 pub struct NativeActionResult {
@@ -10328,6 +10341,20 @@ impl NativeExecutor {
         NativeActionResult::err(action_type, e.to_string())
     }
 
+    /// R02: a [`torus_state::StateError`] from a direct backend read or write
+    /// (or a stored row that does not decode) is always a local fault
+    /// (`CoreError::State`): latch the fail-stop under `step` and return the
+    /// error's text, for the action's unchanged error result.
+    fn latch_state_fault<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        step: &str,
+        e: torus_state::StateError,
+    ) -> String {
+        let msg = e.to_string();
+        Self::latch_core_fault(ctx, step, &CoreError::State(e));
+        msg
+    }
+
     // ========================================================================
     // Staking handlers
     // ========================================================================
@@ -10561,6 +10588,8 @@ impl NativeExecutor {
                 );
             }
             Err(e) => {
+                // R02 branch 6b: a scan fault fail-stops (result kept).
+                let e = Self::latch_state_fault(ctx, "create session count read", e);
                 return NativeActionResult::err("create_session", format!("state error: {e}"));
             }
             _ => {}
@@ -10575,6 +10604,7 @@ impl NativeExecutor {
                 );
             }
             Err(e) => {
+                let e = Self::latch_state_fault(ctx, "create session read", e);
                 return NativeActionResult::err("create_session", format!("state error: {e}"));
             }
             _ => {}
@@ -10589,7 +10619,10 @@ impl NativeExecutor {
         };
         match ctx.state.put_session(session_pubkey, &data) {
             Ok(()) => NativeActionResult::ok("create_session", 5000),
-            Err(e) => NativeActionResult::err("create_session", format!("store failed: {e}")),
+            Err(e) => {
+                let e = Self::latch_state_fault(ctx, "create session write", e);
+                NativeActionResult::err("create_session", format!("store failed: {e}"))
+            }
         }
     }
 
@@ -10609,13 +10642,18 @@ impl NativeExecutor {
                 return NativeActionResult::err("revoke_session", "session not found".into());
             }
             Err(e) => {
+                // R02 branch 6b: a local fault fail-stops (result kept).
+                let e = Self::latch_state_fault(ctx, "revoke session read", e);
                 return NativeActionResult::err("revoke_session", format!("state error: {e}"));
             }
         }
 
         match ctx.state.delete_session(session_pubkey) {
             Ok(()) => NativeActionResult::ok("revoke_session", 2000),
-            Err(e) => NativeActionResult::err("revoke_session", format!("delete failed: {e}")),
+            Err(e) => {
+                let e = Self::latch_state_fault(ctx, "revoke session delete", e);
+                NativeActionResult::err("revoke_session", format!("delete failed: {e}"))
+            }
         }
     }
 
@@ -10632,9 +10670,24 @@ impl NativeExecutor {
         // FIX 18 (ECON-FIND-19): the REPORTER must be an active, non-jailed
         // validator. s517: the reporter is the sender itself (direct submission)
         // or the validator whose registered hot oracle signer the sender is.
+        // R02 branch 6b: a local fault on the reporter's reads fail-stops
+        // (result kept); "not a reporter" stays an ordinary reject.
         let (reporter, status) = match Self::resolve_oracle_reporter(ctx, sender) {
             Ok(r) => r,
-            Err(m) => return NativeActionResult::err("submit_oracle_prices", m),
+            Err(OracleReporterError::NotReporter) => {
+                return NativeActionResult::err(
+                    "submit_oracle_prices",
+                    format!("{sender} is not a registered validator or oracle signer"),
+                )
+            }
+            Err(OracleReporterError::Validator(step, e)) => {
+                Self::latch_local_fault(ctx, step, &e);
+                return NativeActionResult::err("submit_oracle_prices", e.to_string());
+            }
+            Err(OracleReporterError::Index(e)) => {
+                let m = Self::latch_state_fault(ctx, "oracle signer index read", e);
+                return NativeActionResult::err("submit_oracle_prices", m);
+            }
         };
         if status != torus_economics::types::ValidatorStatus::Active {
             return NativeActionResult::err(
@@ -10669,7 +10722,10 @@ impl NativeExecutor {
             match ctx.governance.market_exists(market_id) {
                 Ok(true) => {}
                 Ok(false) => return err(format!("market {market_id} is not listed")),
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    Self::latch_local_fault(ctx, "oracle market read", &e);
+                    return err(e.to_string());
+                }
             }
             if !valid_oracle_price(price) {
                 return err(format!("invalid oracle price {price} for market {market_id}"));
@@ -10684,7 +10740,10 @@ impl NativeExecutor {
             match ctx.oracle.stored_sample_ms(market_id, &reporter) {
                 Ok(Some(stored)) if stored >= sample_ms => {}
                 Ok(_) => newer.push((market_id, price)),
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "oracle sample read", &e);
+                    return err(e.to_string());
+                }
             }
         }
         for (market_id, price) in newer {
@@ -10696,6 +10755,9 @@ impl NativeExecutor {
                 ctx.block_height,
                 ctx.timestamp,
             ) {
+                // A mid-loop fault leaves the earlier rows in the overlay;
+                // the fail-stop discards it (never flushed).
+                Self::latch_core_fault(ctx, "oracle submission write", &e);
                 return NativeActionResult::err("submit_oracle_prices", e.to_string());
             }
         }
@@ -10709,20 +10771,26 @@ impl NativeExecutor {
     fn resolve_oracle_reporter<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         sender: &Address,
-    ) -> Result<(Address, torus_economics::types::ValidatorStatus), String> {
-        if let Some(v) = ctx.staking.get_validator(sender).map_err(|e| e.to_string())? {
+    ) -> Result<(Address, torus_economics::types::ValidatorStatus), OracleReporterError> {
+        use OracleReporterError::{Index, NotReporter, Validator};
+        let validator =
+            |a: &Address, step| ctx.staking.get_validator(a).map_err(|e| Validator(step, e));
+        if let Some(v) = validator(sender, "oracle reporter validator read")? {
             return Ok((*sender, v.status));
         }
         let key = torus_state::cf::oracle_signer_key(sender);
-        let raw = ctx.state.get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key).map_err(|e| e.to_string())?;
+        let raw = ctx
+            .state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key)
+            .map_err(Index)?;
         if let Some(v) = raw.filter(|b| b.len() == 20).map(|b| Address::from_slice(&b)) {
-            if let Some(rec) = ctx.staking.get_validator(&v).map_err(|e| e.to_string())? {
+            if let Some(rec) = validator(&v, "oracle signer validator read")? {
                 if rec.oracle_signer == Some(*sender) {
                     return Ok((v, rec.status));
                 }
             }
         }
-        Err(format!("{sender} is not a registered validator or oracle signer"))
+        Err(NotReporter)
     }
 
     /// `SetOracleSigner` (s517): set, rotate or (with `Address::ZERO`) clear
@@ -10746,7 +10814,13 @@ impl NativeExecutor {
             Ok(Some(v)) if v.status != ValidatorStatus::Tombstoned || new.is_none() => v,
             Ok(Some(_)) => return err(format!("validator {sender} is tombstoned")),
             Ok(None) => return err(format!("{sender} is not a registered validator")),
-            Err(e) => return err(e.to_string()),
+            Err(e) => {
+                // R02 branch 6b: local faults on the reads and writes below
+                // fail-stop (results kept). A write fault after an earlier
+                // write leaves it in the overlay, which the fail-stop discards.
+                Self::latch_local_fault(ctx, "set oracle signer validator read", &e);
+                return err(e.to_string());
+            }
         };
         if v.oracle_signer == new {
             return NativeActionResult::ok("set_oracle_signer", 1000);
@@ -10755,7 +10829,10 @@ impl NativeExecutor {
             match ctx.staking.get_validator(&s) {
                 Ok(None) => {}
                 Ok(Some(_)) => return err(format!("signer {s} is a validator")),
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    Self::latch_local_fault(ctx, "set oracle signer signer read", &e);
+                    return err(e.to_string());
+                }
             }
             // Review M3: proof of possession — the signer key signed
             // (this validator, chain id, nonce), so nobody can squat a signer
@@ -10776,24 +10853,32 @@ impl NativeExecutor {
                         alloy_primitives::hex::encode(owner)
                     ))
                 }
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    let m = Self::latch_state_fault(ctx, "set oracle signer index read", e);
+                    return err(m);
+                }
             }
         }
         // Writes (validation complete).
         if let Some(old) = v.oracle_signer {
             if let Err(e) = ctx.state.delete_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&old)) {
-                return err(e.to_string());
+                let m = Self::latch_state_fault(ctx, "set oracle signer index delete", e);
+                return err(m);
             }
         }
         if let Some(s) = new {
             if let Err(e) = ctx.state.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&s), sender.as_slice()) {
-                return err(e.to_string());
+                let m = Self::latch_state_fault(ctx, "set oracle signer index write", e);
+                return err(m);
             }
         }
         v.oracle_signer = new;
         match ctx.staking.put_validator(sender, &v) {
             Ok(()) => NativeActionResult::ok("set_oracle_signer", 2000),
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                Self::latch_local_fault(ctx, "set oracle signer validator write", &e);
+                err(e.to_string())
+            }
         }
     }
 

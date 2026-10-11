@@ -185,7 +185,10 @@ fn assert_injected(ctx: &mut Ctx, step: &str, injected: &str) {
 
 /// The action is rejected with an error containing `needle` (text kept).
 fn assert_rejected(r: &NativeActionResult, needle: &str) {
-    assert!(!r.success, "expected a rejection containing {needle:?}: {r:?}");
+    assert!(
+        !r.success,
+        "expected a rejection containing {needle:?}: {r:?}"
+    );
     let e = r.error.as_deref().unwrap_or("");
     assert!(e.contains(needle), "error {e:?} lacks {needle:?}");
 }
@@ -398,8 +401,12 @@ fn oracle_setup() -> (tempfile::TempDir, StateDb, Failing, Ctx) {
 /// `V1` with hot signer `S` (record and index).
 fn register_signer(db: &StateDb) {
     put_validator(db, V1, ValidatorStatus::Active, Some(S));
-    db.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S), addr(V1).as_slice())
-        .unwrap();
+    db.put_cf_raw(
+        CF_NATIVE_ORACLE,
+        &oracle_signer_key(&S),
+        addr(V1).as_slice(),
+    )
+    .unwrap();
 }
 
 fn submit(prices: &[(MarketId, i64)]) -> NativeAction {
@@ -527,7 +534,10 @@ fn r02_oracle_submit_deterministic_rejects_unchanged() {
     assert_plain_reject(
         &mut ctx,
         &r,
-        &format!("{} is not a registered validator or oracle signer", addr(77)),
+        &format!(
+            "{} is not a registered validator or oracle signer",
+            addr(77)
+        ),
     );
     put_validator(&db, 3, ValidatorStatus::Jailed, None);
     let r = exec(&mut ctx, addr(3), &submit(&[(1, 100)]));
@@ -535,10 +545,18 @@ fn r02_oracle_submit_deterministic_rejects_unchanged() {
     let r = exec(&mut ctx, addr(V1), &submit(&[(5, 100)]));
     assert_plain_reject(&mut ctx, &r, "market 5 is not listed");
     // A stale index entry (V2 never named S): not a reporter.
-    db.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S), addr(V2).as_slice())
-        .unwrap();
+    db.put_cf_raw(
+        CF_NATIVE_ORACLE,
+        &oracle_signer_key(&S),
+        addr(V2).as_slice(),
+    )
+    .unwrap();
     let r = exec(&mut ctx, S, &submit(&[(1, 100)]));
-    assert_plain_reject(&mut ctx, &r, "is not a registered validator or oracle signer");
+    assert_plain_reject(
+        &mut ctx,
+        &r,
+        "is not a registered validator or oracle signer",
+    );
     let late = NativeAction::SubmitOraclePrices(OracleSubmission {
         prices: vec![(1, fp(100))],
         timestamp: 1,
@@ -603,7 +621,8 @@ fn r02_set_oracle_signer_index_write_fault_fail_stops() {
     let r = exec(&mut ctx, addr(V1), &set(V1, S2));
     assert_rejected(&r, &format!("io: {INJECTED_WRITE}"));
     assert_eq!(
-        db.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S)).unwrap(),
+        db.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S))
+            .unwrap(),
         None,
         "the old entry was deleted before the fault"
     );
@@ -617,7 +636,11 @@ fn r02_set_oracle_signer_validator_write_fault_fail_stops() {
     backend.arm_write(CF_STAKING_VALIDATORS, addr(V1).as_slice());
     let r = exec(&mut ctx, addr(V1), &set(V1, S));
     assert_rejected(&r, &format!("state error: io: {INJECTED_WRITE}"));
-    assert_injected(&mut ctx, "set oracle signer validator write", INJECTED_WRITE);
+    assert_injected(
+        &mut ctx,
+        "set oracle signer validator write",
+        INJECTED_WRITE,
+    );
 }
 
 /// Controls: not a validator, tombstoned, the signer is a validator, the
