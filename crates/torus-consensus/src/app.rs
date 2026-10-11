@@ -1275,7 +1275,19 @@ fn detect_conflicting_commit<B: StateBackend>(
         Ok(Some(d)) if d.len() >= 32 => d,
         // No persisted header (or a truncated one) to compare against — cannot
         // assert a conflict, so preserve the benign silent-skip behavior.
-        _ => return false,
+        Ok(_) => return false,
+        // R02 branch 8 (C): this node cannot read its own header — a local
+        // fault, not "no header". Fail-stop instead of skipping the check.
+        Err(e) => {
+            tracing::error!(
+                %e,
+                height,
+                "FATAL: committed header read failed in the conflicting-commit check — \
+                 halting execution pipeline (fail-stop)"
+            );
+            exec_failed.store(true, Ordering::SeqCst);
+            return true;
+        }
     };
     if data[..32] == incoming_hash.as_slice()[..] {
         // Same block re-arriving at an already-applied height: benign duplicate.
@@ -1493,7 +1505,19 @@ fn detect_parent_link_violation<B: StateBackend>(
         match state_db.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes()) {
             Ok(Some(d)) if d.len() >= 32 => alloy_primitives::B256::from_slice(&d[..32]),
             // Parent header not resolvable — cannot assert a conflict.
-            _ => return false,
+            Ok(_) => return false,
+            // R02 branch 8 (C): a read fault is not "not resolvable":
+            // fail-stop instead of allowing the block unchecked.
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    height,
+                    "FATAL: parent header read failed in the parent-link check — \
+                     halting execution pipeline (fail-stop)"
+                );
+                exec_failed.store(true, Ordering::SeqCst);
+                return true;
+            }
         }
     };
     if *parent_hash == expected {
@@ -2246,7 +2270,19 @@ impl ExecutionContext {
         // height and are drained only on the native path — run it for them too, or an
         // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
         // value is already burned, so a stranded credit is lost value).
-        let core_writer_due = self.core_writer_due(height).unwrap_or(true);
+        // R02 branch 8 (B): a queue read error is a node fault: fail-stop
+        // (C4), never "assume due" — as the oracle / liquidation due-checks.
+        let core_writer_due = match self.core_writer_due(height) {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::error!(%e, height, "FATAL: CoreWriter due-check read failed — halting execution pipeline (fail-stop)");
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if fold_header {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
+        };
         // bl2 exec pipeline: the overlay is built BEFORE verify so that the
         // session lookup and the nonce replay guard below read through it —
         // on the fast path its parent layer is the previous block's (possibly
@@ -4595,20 +4631,24 @@ impl TorusApp {
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
-        let proposer_address = signing_key
-            .as_ref()
-            .and_then(|sk| {
-                let pubkey = sk.verifying_key();
-                staking
-                    .find_validator_by_pubkey(pubkey.as_bytes())
-                    .ok()
-                    .flatten()
-                    .map(|v| {
-                        tracing::info!(address = %v.address, "resolved proposer address from signing key");
-                        v.address
-                    })
-            })
-            .unwrap_or(Address::ZERO);
+        // R02 branch 8 (D1): a read error stops startup; not a validator
+        // (`Ok(None)`) proposes as `Address::ZERO`, as before.
+        let proposer_address = match signing_key.as_ref() {
+            None => Address::ZERO,
+            Some(sk) => match staking.find_validator_by_pubkey(sk.verifying_key().as_bytes()) {
+                Ok(Some(v)) => {
+                    tracing::info!(address = %v.address, "resolved proposer address from signing key");
+                    v.address
+                }
+                Ok(None) => Address::ZERO,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot resolve the proposer address from the signing key: \
+                         validator rows read failed: {e}"
+                    ))
+                }
+            },
+        };
 
         // bl2 exec pipeline: the flush worker is constructed only NOW — after the
         // (serial) boot replay — so the durable marker equals the replayed top
