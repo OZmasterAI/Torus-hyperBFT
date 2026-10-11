@@ -1364,6 +1364,169 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Item 6 Phase 3 step 2 follow-up (owner s112): the rows block n wrote
+    /// (a session, a market listing, an oracle mark, the governance price
+    /// band) for the RPC submit checks, into `s`.
+    fn seed_ingress_rows<S: torus_state::backend::StateBackend + Clone>(
+        s: &S,
+        session_pubkey: &[u8; 32],
+        now_ms: u64,
+    ) {
+        use torus_types::FixedPoint;
+        s.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &1u64.to_be_bytes(),
+            b"listed",
+        )
+        .unwrap();
+        s.put_session(
+            session_pubkey,
+            &torus_types::SessionData {
+                owner: Address::from([9; 20]),
+                expiry: now_ms + 600_000,
+                scope: torus_types::SessionScope::Full,
+                created_at: now_ms,
+            },
+        )
+        .unwrap();
+        s.put_cf_raw(
+            torus_state::cf::CF_FEE_CONFIG,
+            torus_types::PRICE_BAND_PARAM.as_bytes(),
+            b"1000",
+        )
+        .unwrap();
+        let oracle = torus_core::oracle::OracleManager::new(
+            s.clone(),
+            torus_core::oracle::OracleConfig::default(),
+        );
+        let mark = FixedPoint::from_raw(100 * FixedPoint::SCALE);
+        let reporters = [
+            Address::repeat_byte(150),
+            Address::repeat_byte(151),
+            Address::repeat_byte(152),
+        ];
+        let secs = now_ms / 1_000;
+        for v in &reporters {
+            oracle.submit_price(v, 1, mark, 5, secs).unwrap();
+        }
+        let stakes: Vec<_> = reporters
+            .iter()
+            .map(|v| (*v, FixedPoint::from_raw(FixedPoint::SCALE)))
+            .collect();
+        assert_eq!(oracle.aggregate_price(1, 5, secs, &stakes).unwrap(), mark);
+    }
+
+    /// Submits through the server: a session-signed order on market 1 at
+    /// 100, then key-signed orders at 120 (outside the governance band of
+    /// 10% around the mark 100) and 105. `in_view`: the rows of
+    /// [`seed_ingress_rows`] exist only in block 5's frozen set, published
+    /// to the mempool as the ingress view (interval "never": nothing durable
+    /// yet); else they are in the DB (interval 0). Returns per item
+    /// `Ok(())` (accepted) or the error.
+    async fn submit_against_block_rows(in_view: bool) -> Vec<Result<(), String>> {
+        use jsonrpsee::core::client::ClientT;
+        use torus_types::{ActionSignature, FixedPoint, NativeAction, PlaceOrderParams};
+        let (_dir, state, mempool, executor) = setup();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let order = |price: i128| PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(price * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let session = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::PlaceOrder(order(100)),
+            now,
+            &([8u8; 32].into()),
+        );
+        let ActionSignature::Session { session_pubkey, .. } = &session.signature else {
+            panic!("expected session signature")
+        };
+        if in_view {
+            let o = torus_state::NativeStateOverlay::new(state.clone());
+            seed_ingress_rows(&o, session_pubkey, now);
+            mempool.publish_read_view(Some(torus_state::ReadView::new(
+                state.clone(),
+                5,
+                vec![o.freeze(5)],
+                None,
+            )));
+        } else {
+            seed_ingress_rows(&state, session_pubkey, now);
+        }
+        let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let keyed = |price, nonce| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::PlaceOrder(order(price)),
+                nonce,
+                &key,
+            )
+        };
+        let encode = |a: &torus_types::SignedNativeAction| {
+            format!("0x{}", hex::encode(serde_json::to_vec(a).unwrap()))
+        };
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let mut out = Vec::new();
+        // Single endpoint: the session order.
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![encode(&session)],
+            )
+            .await;
+        out.push(single.map(|_| ()).map_err(|e| e.to_string()));
+        // Batch endpoint: outside, then inside the band.
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![
+                    encode(&keyed(120, now + 1)),
+                    encode(&keyed(105, now + 2))
+                ]],
+            )
+            .await
+            .unwrap();
+        out.extend(results.into_iter().map(|r| match (r.hash, r.error) {
+            (Some(_), None) => Ok(()),
+            (_, e) => Err(e.unwrap_or_default()),
+        }));
+        handle.stop().unwrap();
+        out
+    }
+
+    /// Item 6 Phase 3 step 2 follow-up (owner s112): RPC submit verification
+    /// (session, market, price band) reads the published ingress view, so a
+    /// session / listing / mark / band written at block n is seen at n + 1
+    /// with the interval "never" exactly as with interval 0.
+    #[tokio::test]
+    async fn rpc_submit_sees_ingress_view() {
+        let zero = submit_against_block_rows(false).await;
+        assert_eq!(zero[0], Ok(()), "interval 0: session order accepted");
+        assert!(
+            zero[1]
+                .as_ref()
+                .is_err_and(|e| e.contains("10.00% from the reference price 100")),
+            "interval 0: 120 outside the 10% band: {:?}",
+            zero[1]
+        );
+        assert_eq!(zero[2], Ok(()), "interval 0: 105 inside the band");
+        let never = submit_against_block_rows(true).await;
+        assert_eq!(
+            never, zero,
+            "interval never (rows in the view) vs interval 0"
+        );
+    }
+
     /// Sprint 5 Task 2 (instrumentation): per-phase cost of `verify_one_action`
     /// at bs 1/100/500. Prints µs per phase under --nocapture; asserts only
     /// correctness so timing noise can't flake CI.
