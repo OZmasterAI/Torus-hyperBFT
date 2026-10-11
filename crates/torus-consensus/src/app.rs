@@ -759,6 +759,17 @@ enum ReplayFault {
     /// error (`EvmError::Internal`), which keeps today's "logged, EVM section
     /// skipped" handling.
     EvmSectionError,
+    /// R02 branch 7: the block's book save latched a failed book write
+    /// (torus-bridge `r02_load_save_tests` shows every save write gets
+    /// there).
+    BookSave,
+    /// R02 branch 7: the rows slot's applied-marker read in
+    /// `begin_resident` failed (torus-bridge `r02_load_save_unit_tests`
+    /// shows a real read gets there).
+    ResidentMarkerRead,
+    /// R02 branch 7: the pipelined path's applied-marker put into the
+    /// block's overlay failed.
+    AppliedMarkerPut,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2515,6 +2526,21 @@ impl ExecutionContext {
                 height,
                 self.metrics.as_deref(),
             );
+            #[cfg(test)]
+            if self.test_replay_fault == Some(ReplayFault::ResidentMarkerRead) {
+                resident_rows.test_inject_marker_fault(injected_fault("applied marker read"));
+            }
+            // R02 branch 7: the rows slot's applied-marker read failed (a
+            // local fault): fail-stop, never "stale -> rebuild".
+            if let Some(e) = resident_rows.take_marker_fault() {
+                self.fail_stop_on_fault(
+                    torus_block,
+                    fold_header,
+                    "resident rows applied-marker read",
+                    &e,
+                );
+                return;
+            }
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -2867,6 +2893,26 @@ impl ExecutionContext {
             if deferred_books.is_none() {
                 ctx.save_order_books();
             }
+            #[cfg(test)]
+            if self.test_replay_fault == Some(ReplayFault::BookSave) {
+                ctx.fatal_error
+                    .get_or_insert_with(|| "book save: injected book write failure (test)".into());
+            }
+            // R02 branch 7: a failed book write (or the stop-row scan) of the
+            // save fail-stops exactly like the checks above: nothing flushed,
+            // the resident books not stashed (the next block rebuilds).
+            if let Some(reason) = ctx.take_fatal_error() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native book save failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
@@ -2957,11 +3003,24 @@ impl ExecutionContext {
                 // final key/value set is identical to the serial batch) so the
                 // next block's resident-book staleness guard reads N through the
                 // parent layer while W is still writing it (design F5/F7).
-                let _ = overlay.put_cf_raw(
+                let put = overlay.put_cf_raw(
                     CF_CONSENSUS_META,
                     META_NATIVE_APPLIED_HEIGHT,
                     &height.to_be_bytes(),
                 );
+                #[cfg(test)]
+                let put = if self.test_replay_fault == Some(ReplayFault::AppliedMarkerPut) {
+                    Err(injected_fault("applied marker put"))
+                } else {
+                    put
+                };
+                // R02 branch 7: the next block's staleness guards read this
+                // marker through the parent layer; a lost put fail-stops (the
+                // overlay put fails only on a code bug), like the nonce put.
+                if let Err(e) = put {
+                    self.fail_stop_on_fault(torus_block, fold_header, "applied marker put", &e);
+                    return;
+                }
                 let evm_addrs = overlay.dirty_evm_accounts();
                 drop(ctx);
                 let frozen = overlay.freeze(height);
@@ -20166,9 +20225,21 @@ mod crash_recovery_tests {
         fault: ReplayFault,
         check: &dyn Fn(&StateDb),
     ) {
+        r02_assert_fault_fail_stops_then_replays_on(&[false, true], blocks, setup, fault, check);
+    }
+
+    /// [`r02_assert_fault_fail_stops_then_replays`] for the exec-pipeline
+    /// settings `ons` only (a fault site on one path).
+    fn r02_assert_fault_fail_stops_then_replays_on(
+        ons: &[bool],
+        blocks: &[TorusBlock],
+        setup: &dyn Fn(&StateDb),
+        fault: ReplayFault,
+        check: &dyn Fn(&StateDb),
+    ) {
         let (last, prefix) = blocks.split_last().expect("at least one block");
         let top = last.header.height;
-        for on in [false, true] {
+        for &on in ons {
             let (_c, db_ref) = make_test_config_and_db();
             setup(&db_ref);
             let ctx = pipeline_ctx(&db_ref, on, None);
@@ -20524,6 +20595,78 @@ mod crash_recovery_tests {
             &blocks,
             &|_| {},
             ReplayFault::OracleReaderFault,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &a));
+                assert!(r02_nonce_consumed(db, &b));
+            },
+        );
+    }
+
+    /// R02 branch 7: the block's book save latched a failed book write
+    /// (torus-bridge `r02_load_save_tests` drives every save write there):
+    /// the block fail-stops (exec_failed, marker unchanged, nothing flushed)
+    /// and the restart's replay matches a run that never faulted. RED
+    /// before: no check after the save, the block flushed without its book
+    /// rows.
+    #[test]
+    fn r02_book_save_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::BookSave, &|db| {
+            assert!(r02_nonce_consumed(db, &a));
+            assert!(r02_nonce_consumed(db, &b));
+        });
+    }
+
+    /// R02 branch 7: the rows slot's applied-marker read in `begin_resident`
+    /// fails: the block fail-stops (exec_failed, marker unchanged, nothing
+    /// flushed) and the restart's replay matches a run that never faulted.
+    /// RED before: the fault read as "stale" (R rebuilt), the block flushed.
+    #[test]
+    fn r02_resident_marker_read_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|_| {},
+            ReplayFault::ResidentMarkerRead,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &a));
+                assert!(r02_nonce_consumed(db, &b));
+            },
+        );
+    }
+
+    /// R02 branch 7 (inventory 1f "W"): the pipelined path's applied-marker
+    /// put into the overlay fails: the block fail-stops (nothing handed to
+    /// W, marker unchanged) and the restart's replay matches a run that
+    /// never faulted. Pipelined only (the serial path writes the marker in
+    /// its flush batch). RED before: `let _ =` dropped the error and the
+    /// block flushed without the overlay marker.
+    #[test]
+    fn r02_applied_marker_put_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays_on(
+            &[true],
+            &blocks,
+            &|_| {},
+            ReplayFault::AppliedMarkerPut,
             &|db| {
                 assert!(r02_nonce_consumed(db, &a));
                 assert!(r02_nonce_consumed(db, &b));

@@ -1782,7 +1782,10 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
 
 impl<T: StateBackend> AccountReader<'_, T> {
     /// F1 (s517 #4): a maker's snapshot free margin — balance and positions
-    /// from the backend. A read error snapshots as 0 (deterministic).
+    /// from the backend. An error every validator hits alike snapshots as 0
+    /// (deterministic). R02 branch 7: a local fault (the read failed, a row
+    /// does not decode) is recorded on the reader fault channel (the block
+    /// fail-stops) and snapshots as 0 meanwhile.
     /// C6c: on a batch reader, once per maker per Phase 3 worker
     /// ([`MAKER_FREE`]).
     fn maker_free(&self, maker: &Address) -> FixedPoint {
@@ -1790,7 +1793,13 @@ impl<T: StateBackend> AccountReader<'_, T> {
             self.positions
                 .get_native_balance(maker)
                 .and_then(|b| self.view(maker, &b))
-                .map_or(FixedPoint::ZERO, |v| v.free())
+                .map_or_else(
+                    |e| {
+                        self.note_fault("maker free read", &e);
+                        FixedPoint::ZERO
+                    },
+                    |v| v.free(),
+                )
         };
         let Some(b) = self.batch else {
             return compute();
@@ -2616,19 +2625,21 @@ impl DeferredBookSave {
 /// meaning as `save_order_books`'s return). `state`'s reads (stop-row diff,
 /// meta compare) must see the durable post-state of every height below this
 /// block — the flush worker's view, since it flushes strictly in order.
+/// R02 branch 7: the first failed write (or stop-row scan) is the `Err`; the
+/// flush worker then fails the job (fail-stop: nothing of the block lands).
 pub fn apply_deferred_book_save<T: StateBackend>(
     state: &T,
     metrics: Option<&torus_telemetry::Metrics>,
     save: DeferredBookSave,
-) -> usize {
+) -> Result<usize, String> {
     let mut acc = SaveTimings::default();
     let mut written = 0usize;
     for b in save.books {
         written += NativeExecContext::<T>::write_drained_book(
             state, metrics, b.drained, b.stops, &b.meta, false, &mut acc,
-        );
+        )?;
     }
-    written
+    Ok(written)
 }
 
 /// Drain one book's journals (mode 2). Enables/refreshes (or drops, budget 0)
@@ -3284,16 +3295,68 @@ impl ResidentBooks {
     }
 }
 
+/// R02 branch 7: a failed book write (or stop-row scan) of the save latches
+/// the block's fail-stop (`fatal_error`; the first fault is kept), never a
+/// logged-and-skipped row.
+fn latch_save_fault(fatal: &mut Option<String>, reason: String) {
+    if fatal.is_none() {
+        *fatal = Some(reason);
+    }
+}
+
 /// The DB's native applied-height marker as `state` sees it (through an
 /// overlay: own pending -> parent layer -> DB). Staleness-guard input for the
-/// resident books and the resident rows.
-fn applied_marker<B: StateBackend>(state: &B) -> Option<u64> {
+/// resident books and the resident rows. `Ok(None)`: no marker row (test
+/// envs / pre-marker DBs), or a row that is not 8 bytes (read as absent, as
+/// before). R02 branch 7: a failed read is the `Err`, never "no marker":
+/// a local fault, the caller fail-stops the block.
+fn applied_marker<B: StateBackend>(
+    state: &B,
+) -> Result<Option<u64>, torus_state::error::StateError> {
     use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
-    let bytes = state
-        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-        .ok()
-        .flatten()?;
-    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+    let Some(bytes) = state.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)? else {
+        return Ok(None);
+    };
+    Ok(bytes.try_into().ok().map(u64::from_be_bytes))
+}
+
+/// The applied-marker half of the resident staleness guards (books and
+/// rows): the marker agrees with the holder's height `held`, or there is no
+/// marker row (the height check is then the only guard). A failed marker
+/// read never gets here (R02 branch 7: the callers fail-stop on it).
+fn resident_marker_ok(marker: Option<u64>, held: u64) -> bool {
+    marker.is_none_or(|m| m == held)
+}
+
+/// Item 6 Phase 1: [`begin_resident`]'s reuse decision for the rows slot
+/// held at `slot_height`: the slot is the post-state of `height - 1`, the
+/// applied marker read through `state` (pending -> parent -> DB) agrees
+/// with it when present, and C6a (B0): the overlay reads R's CFs without
+/// its parent layer, so R must already hold it — the parent (if any,
+/// `parent_height`) is the block R reflects. `Ok(false)`: stale (logged;
+/// the caller rebuilds R). R02 branch 7: `Err`, the marker read failed (a
+/// local fault): the block fail-stops, R is neither reused nor rebuilt.
+fn rows_slot_reusable<B: StateBackend>(
+    state: &B,
+    slot_height: u64,
+    height: u64,
+    parent_height: Option<u64>,
+) -> Result<bool, torus_state::error::StateError> {
+    let marker = applied_marker(state)?;
+    let height_ok = slot_height + 1 == height;
+    let marker_ok = resident_marker_ok(marker, slot_height);
+    let parent_ok = parent_height.is_none_or(|p| p == slot_height);
+    if height_ok && marker_ok && parent_ok {
+        return Ok(true);
+    }
+    tracing::warn!(
+        rows_height = slot_height,
+        height,
+        applied_marker = ?marker,
+        parent_height,
+        "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
+    );
+    Ok(false)
 }
 
 /// Item 6 Phase 1: one block's handle on the resident rows R, from
@@ -3315,6 +3378,10 @@ pub struct ResidentBlock {
     sums: Option<BlockSums>,
     /// Item 6 cut 5: [`Self::drop_later`].
     retired: Retired,
+    /// R02: the applied-marker read of the slot's staleness guard failed
+    /// (a local fault). The caller fail-stops the block
+    /// ([`Self::take_marker_fault`]).
+    marker_fault: Option<torus_state::error::StateError>,
     /// Step 2 tests: runs first inside the `end_resident` worker (hold it,
     /// or panic in it).
     #[cfg(test)]
@@ -3355,6 +3422,19 @@ impl ResidentBlock {
         self.rebuilt
     }
 
+    /// R02: the local fault of the rows slot's applied-marker read, if any.
+    /// `Some`: the block must fail-stop (R was neither reused nor built).
+    pub fn take_marker_fault(&mut self) -> Option<torus_state::error::StateError> {
+        self.marker_fault.take()
+    }
+
+    /// R02 test seam (bridge feature `test-reference-paths`, torus-consensus
+    /// dev-dependency only): record `e` as the applied-marker read fault.
+    #[cfg(feature = "test-reference-paths")]
+    pub fn test_inject_marker_fault(&mut self, e: torus_state::error::StateError) {
+        self.marker_fault = Some(e);
+    }
+
     /// Item 6 cut 5: drop `value` with this block's `end_resident` work — on
     /// its worker under [`end_resident_on_worker`] (off the execution
     /// thread), else where the block is dropped. For the block's large
@@ -3389,6 +3469,7 @@ pub fn begin_resident(
         marks: None,
         sums: None,
         retired: Retired::default(),
+        marker_fault: None,
         #[cfg(test)]
         worker_hook: None,
     };
@@ -3400,26 +3481,32 @@ pub fn begin_resident(
     holder.settle_rows();
     debug_assert!(!overlay.has_resident(), "begin_resident on an overlay that already has R");
     let reused = holder.rows.take().and_then(|slot| {
-        let marker = applied_marker(&*overlay);
-        let height_ok = slot.height + 1 == height;
-        let marker_ok = marker.is_none_or(|m| m == slot.height);
-        // C6a (B0): the overlay reads R's CFs without its parent layer, so R
-        // must already hold it: the parent (if any) is the block R reflects.
-        let parent_ok = overlay.parent_height().is_none_or(|p| p == slot.height);
-        if height_ok && marker_ok && parent_ok {
-            block.marks = slot.marks;
-            block.sums = Some(BlockSums { records: Some(slot.positions), ..BlockSums::new(slot.sums) });
-            return Some(slot.rows);
+        match rows_slot_reusable(&*overlay, slot.height, height, overlay.parent_height()) {
+            Ok(true) => {
+                block.marks = slot.marks;
+                block.sums = Some(BlockSums {
+                    records: Some(slot.positions),
+                    ..BlockSums::new(slot.sums)
+                });
+                Some(slot.rows)
+            }
+            Ok(false) => None,
+            Err(e) => {
+                block.marker_fault = Some(e);
+                None
+            }
         }
-        tracing::warn!(
-            rows_height = slot.height,
-            height,
-            applied_marker = marker,
-            parent_height = overlay.parent_height(),
-            "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
-        );
-        None
     });
+    // R02 branch 7: a failed marker read fail-stops the block (the caller
+    // checks `take_marker_fault`); nothing is built or attached.
+    if let Some(e) = &block.marker_fault {
+        tracing::error!(
+            %e,
+            height,
+            "item 6: resident rows applied-marker read failed — block fail-stops"
+        );
+        return block;
+    }
     let rows = match reused {
         Some(rows) => rows,
         None => {
@@ -3755,6 +3842,10 @@ mod r02_margin_release_unit_tests;
 #[cfg(test)]
 #[path = "r02_action_rejects_unit_tests.rs"]
 mod r02_action_rejects_unit_tests;
+
+#[cfg(test)]
+#[path = "r02_load_save_unit_tests.rs"]
+mod r02_load_save_unit_tests;
 
 #[cfg(test)]
 mod resident_books_toggle_tests {
@@ -4291,19 +4382,32 @@ impl<T: StateBackend> NativeExecContext<T> {
         // is re-read, so a stale holder can never leak into execution.
         let resident_mode = resident.is_some();
         let mut reused_inner: Option<ResidentInner> = None;
+        // R02 branch 7: a failed applied-marker read is a local fault: the
+        // block fail-stops (`fatal_error`, kept first), the holder is
+        // dropped; never "no marker" (reuse).
+        let mut marker_fault: Option<String> = None;
         if let Some(holder) = resident {
             if let Some(inner) = holder.inner.take() {
-                let applied_marker = Self::read_applied_marker(&state);
-                let marker_ok = match applied_marker {
-                    Some(applied) => applied == inner.height,
-                    // No marker row (test envs / pre-marker DBs): the height
-                    // sequence check below is the only guard available.
-                    None => true,
+                let applied_marker = match Self::read_applied_marker(&state) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::error!(
+                            %e,
+                            resident_height = inner.height,
+                            block_height,
+                            "rank8: resident books applied-marker read failed — block fail-stops"
+                        );
+                        marker_fault = Some(format!("book load: applied marker read: {e}"));
+                        None
+                    }
                 };
+                // No marker row (test envs / pre-marker DBs): the height
+                // sequence check below is the only guard available.
+                let marker_ok = applied_marker.is_some_and(|m| resident_marker_ok(m, inner.height));
                 let height_ok = inner.height + 1 == block_height;
                 if height_ok && marker_ok {
                     reused_inner = Some(inner);
-                } else {
+                } else if marker_fault.is_none() {
                     // Attribute the trip: "height" = the holder is not the
                     // block's predecessor (a block advanced without the holder
                     // — see `ResidentBooks::advance_untouched`), "marker" =
@@ -4317,7 +4421,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     tracing::warn!(
                         resident_height = inner.height,
                         block_height,
-                        applied_marker,
+                        applied_marker = ?applied_marker.flatten(),
                         reason,
                         "rank8: resident books stale (height/marker mismatch) — rebuilding from persisted state"
                     );
@@ -4335,7 +4439,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         // P2-1: the resident books bring their index; a load starts without
         // one (the first cancel-all builds it from the books).
         let mut trader_markets = None;
-        let (mut order_books, scanned_next_id, mut load_error) = match reused_inner {
+        let (mut order_books, scanned_next_id, load_error) = match reused_inner {
             Some(inner) => {
                 trader_markets = inner.trader_markets;
                 (inner.books, inner.next_global_order_id, None)
@@ -4353,6 +4457,8 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             },
         };
+        // R02 branch 7: the applied-marker fault came first.
+        let mut load_error = marker_fault.or(load_error);
         if trader_markets.is_none() {
             // P2-1: what the load inserted is in the books; the index build
             // scans them.
@@ -4366,8 +4472,8 @@ impl<T: StateBackend> NativeExecContext<T> {
         // (content sniffing has nothing to sniff there). Checked regardless of
         // resident reuse (one point read).
         let book_mode_marker_present = match Self::load_book_mode_marker(&state) {
-            Some(byte) if byte == book_mode.marker_byte() => true,
-            Some(byte) => {
+            Ok(Some(byte)) if byte == book_mode.marker_byte() => true,
+            Ok(Some(byte)) => {
                 if load_error.is_none() {
                     load_error = Some(format!(
                         "book-mode marker mismatch: DB was written under mode {byte} but \
@@ -4378,7 +4484,15 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
                 true
             }
-            None => false,
+            Ok(None) => false,
+            // R02 branch 7: a local fault, never "no marker" (check skipped,
+            // marker rewritten). Present: the save must not rewrite it.
+            Err(e) => {
+                if load_error.is_none() {
+                    load_error = Some(format!("book load: book-mode marker read: {e}"));
+                }
+                true
+            }
         };
 
         // S395: the durable counter row is authoritative when present — the
@@ -4386,7 +4500,17 @@ impl<T: StateBackend> NativeExecContext<T> {
         // order ids across a restart. max() keeps back-compat with DBs written
         // before the counter row existed. (Resident reuse feeds the carried
         // high-water mark through the same max.)
-        let persisted_next_id = Self::load_next_global_order_id(&state);
+        let persisted_next_id = match Self::load_next_global_order_id(&state) {
+            Ok(id) => id,
+            // R02 branch 7: a local fault, never "no counter row" (order-id
+            // reuse once the books drain).
+            Err(e) => {
+                if load_error.is_none() {
+                    load_error = Some(format!("book load: next_global_order_id read: {e}"));
+                }
+                None
+            }
+        };
         let next_global_order_id = scanned_next_id.max(persisted_next_id.unwrap_or(1));
 
         // Item 3 (F2, F8, D11): margin configs from the market listings. A read
@@ -4551,7 +4675,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     }
 
     /// rank8 staleness guard input: the DB's native applied-height marker.
-    fn read_applied_marker(state: &T) -> Option<u64> {
+    fn read_applied_marker(state: &T) -> Result<Option<u64>, torus_state::error::StateError> {
         applied_marker(state)
     }
 
@@ -4663,30 +4787,42 @@ impl<T: StateBackend> NativeExecContext<T> {
         let mut books = HashMap::default();
         let mut max_order_id: u128 = 0;
 
-        if let Ok(entries) = state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
-            for (key, value) in entries {
-                if Self::is_book_row_key(&key) {
-                    return (
-                        HashMap::default(),
-                        1,
-                        Some(
-                            "C4: cf_native_order_books holds per-order/level rows but \
-                             TORUS_BOOK_ROWS is not set — the flag must match the \
-                             DB's history (fleet-uniform; changing it needs a fresh \
-                             genesis)"
-                                .to_string(),
-                        ),
-                    );
-                }
-                if key.len() == 8 {
-                    let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
-                    if let Ok(book) = OrderBook::try_from_slice(&value) {
-                        let book_next_id = book.next_order_id();
-                        if book_next_id > max_order_id {
-                            max_order_id = book_next_id;
-                        }
-                        books.insert(market_id, book);
+        // R02 branch 7: a failed scan is a local fault (fatal, like the row
+        // modes' loaders), never "no books".
+        let entries = match state.iterate_cf(CF_NATIVE_ORDER_BOOKS, None) {
+            Ok(entries) => entries,
+            Err(e) => {
+                return (
+                    HashMap::default(),
+                    1,
+                    Some(format!("book load: cf_native_order_books scan: {e}")),
+                )
+            }
+        };
+        for (key, value) in entries {
+            if Self::is_book_row_key(&key) {
+                return (
+                    HashMap::default(),
+                    1,
+                    Some(
+                        "C4: cf_native_order_books holds per-order/level rows but \
+                         TORUS_BOOK_ROWS is not set — the flag must match the \
+                         DB's history (fleet-uniform; changing it needs a fresh \
+                         genesis)"
+                            .to_string(),
+                    ),
+                );
+            }
+            if key.len() == 8 {
+                let market_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+                // Decode policy (R02 item 8, owner's call): an undecodable
+                // blob is skipped, as before (same bytes on every node).
+                if let Ok(book) = OrderBook::try_from_slice(&value) {
+                    let book_next_id = book.next_order_id();
+                    if book_next_id > max_order_id {
+                        max_order_id = book_next_id;
                     }
+                    books.insert(market_id, book);
                 }
             }
         }
@@ -5195,14 +5331,15 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// empty.
     const BOOK_MODE_MARKER_KEY: &'static [u8] = b"__book_mode__";
 
-    /// Read the persisted book-mode marker byte, if the row exists.
-    fn load_book_mode_marker(state: &T) -> Option<u8> {
+    /// Read the persisted book-mode marker byte, if the row exists (a row
+    /// that is not 1 byte reads as absent, as before). R02 branch 7: a
+    /// failed read is the `Err` (the caller latches a load error).
+    fn load_book_mode_marker(state: &T) -> Result<Option<u8>, torus_state::error::StateError> {
         use torus_state::cf::CF_NATIVE_MARKETS;
-        let bytes = state
-            .get_cf_raw(CF_NATIVE_MARKETS, Self::BOOK_MODE_MARKER_KEY)
-            .ok()
-            .flatten()?;
-        (bytes.len() == 1).then(|| bytes[0])
+        let Some(bytes) = state.get_cf_raw(CF_NATIVE_MARKETS, Self::BOOK_MODE_MARKER_KEY)? else {
+            return Ok(None);
+        };
+        Ok((bytes.len() == 1).then(|| bytes[0]))
     }
 
     /// Item 3 (F2, F8, D11): one [`market_margin_config`] per listed market
@@ -5230,14 +5367,19 @@ impl<T: StateBackend> NativeExecContext<T> {
     const NEXT_GLOBAL_ORDER_ID_KEY: &'static [u8] = b"__next_global_order_id__";
 
     /// Read the persisted counter, if the row exists (DBs written before S395
-    /// have none — the caller falls back to the book-maxima scan).
-    fn load_next_global_order_id(state: &T) -> Option<u128> {
+    /// have none — the caller falls back to the book-maxima scan; a row that
+    /// is not 16 bytes reads as absent, as before). R02 branch 7: a failed
+    /// read is the `Err` (the caller latches a load error), never "no row",
+    /// which would bring back order-id reuse.
+    fn load_next_global_order_id(
+        state: &T,
+    ) -> Result<Option<u128>, torus_state::error::StateError> {
         use torus_state::cf::CF_NATIVE_MARKETS;
-        let bytes = state
-            .get_cf_raw(CF_NATIVE_MARKETS, Self::NEXT_GLOBAL_ORDER_ID_KEY)
-            .ok()
-            .flatten()?;
-        Some(u128::from_be_bytes(bytes.try_into().ok()?))
+        let Some(bytes) = state.get_cf_raw(CF_NATIVE_MARKETS, Self::NEXT_GLOBAL_ORDER_ID_KEY)?
+        else {
+            return Ok(None);
+        };
+        Ok(bytes.try_into().ok().map(u128::from_be_bytes))
     }
 
     /// FIX 1 (ECON-FIND-02) + S395 dirty-only rewrite: persist the order books
@@ -5313,7 +5455,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                             if let Err(e) =
                                 self.state.put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, data)
                             {
-                                tracing::error!(market_id, %e, "failed to persist order book");
+                                latch_save_fault(
+                                    &mut self.fatal_error,
+                                    format!("book save: order book put (market {market_id}): {e}"),
+                                );
                             } else {
                                 written += 1;
                             }
@@ -5337,17 +5482,29 @@ impl<T: StateBackend> NativeExecContext<T> {
                         };
                         match res {
                             Ok(()) => written += 1,
-                            Err(e) => tracing::error!(
-                                market_id, order_id = %order_id, %e,
-                                "C4: order row write failed"
+                            Err(e) => latch_save_fault(
+                                &mut self.fatal_error,
+                                format!(
+                                    "book save: order row write (market {market_id}, order \
+                                     {order_id}): {e}"
+                                ),
                             ),
                         }
                     }
                     // Mode 1 has no level rows: drop journaled levels unhashed.
                     book.discard_level_ops();
-                    written += Self::diff_stop_rows(&self.state, market_id, book.stop_rows());
-                    written +=
-                        Self::write_meta_if_moved(&self.state, market_id, &book_meta_value(book));
+                    let rest = Self::diff_stop_rows(&self.state, market_id, book.stop_rows())
+                        .and_then(|n| {
+                            Ok(n + Self::write_meta_if_moved(
+                                &self.state,
+                                market_id,
+                                &book_meta_value(book),
+                            )?)
+                        });
+                    match rest {
+                        Ok(n) => written += n,
+                        Err(e) => latch_save_fault(&mut self.fatal_error, e),
+                    }
                 }
                 // Modes 2/3 are saved by the two-pass path above (`dirty` is
                 // empty here under either level-authority variant).
@@ -5363,7 +5520,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 Self::NEXT_GLOBAL_ORDER_ID_KEY,
                 &self.next_global_order_id.to_be_bytes(),
             ) {
-                tracing::error!(%e, "failed to persist next_global_order_id");
+                latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: next_global_order_id put: {e}"),
+                );
             }
         }
 
@@ -5375,7 +5535,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 &[self.book_mode.marker_byte()],
             ) {
                 Ok(()) => self.book_mode_marker_present = true,
-                Err(e) => tracing::error!(%e, "failed to persist __book_mode__ marker"),
+                Err(e) => latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: book-mode marker put: {e}"),
+                ),
             }
         }
 
@@ -5425,7 +5588,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 continue;
             };
             let (stops, meta) = (book.stop_rows(), book_meta_value(book));
-            written += Self::write_drained_book(
+            match Self::write_drained_book(
                 &self.state,
                 self.metrics.as_deref(),
                 d,
@@ -5433,7 +5596,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 &meta,
                 timed,
                 acc,
-            );
+            ) {
+                Ok(n) => written += n,
+                Err(e) => latch_save_fault(&mut self.fatal_error, e),
+            }
         }
         self.save_split.write_ns += write_timer.elapsed().as_nanos();
         written
@@ -5553,7 +5719,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 Self::NEXT_GLOBAL_ORDER_ID_KEY,
                 &self.next_global_order_id.to_be_bytes(),
             ) {
-                tracing::error!(%e, "failed to persist next_global_order_id");
+                latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: next_global_order_id put: {e}"),
+                );
             }
         }
         if !self.book_mode_marker_present {
@@ -5563,7 +5732,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 &[self.book_mode.marker_byte()],
             ) {
                 Ok(()) => self.book_mode_marker_present = true,
-                Err(e) => tracing::error!(%e, "failed to persist __book_mode__ marker"),
+                Err(e) => latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: book-mode marker put: {e}"),
+                ),
             }
         }
         Some(DeferredBookSave { books })
@@ -5575,6 +5747,8 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// `stops` / `meta` are the book's `stop_rows()` / `book_meta_value`
     /// captured at save time — passed in (not read from the book) so the
     /// deferred save's flush worker can run this against its snapshots.
+    /// R02 branch 7: the first failed write (or stop-row scan) is the `Err`
+    /// (the fail-stop reason); the rest of the book is not written.
     fn write_drained_book(
         state: &T,
         metrics: Option<&torus_telemetry::Metrics>,
@@ -5583,7 +5757,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         meta: &[u8],
         timed: bool,
         acc: &mut SaveTimings,
-    ) -> usize {
+    ) -> Result<usize, String> {
         use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
         let market_id = drained.market_id;
         let mut written = 0usize;
@@ -5603,10 +5777,10 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             };
             if let Err(e) = res {
-                tracing::error!(
-                    market_id, order_id = %order_id, %e,
-                    "3c: node-local order row write failed"
-                );
+                return Err(format!(
+                    "book save: node-local order row write (market {market_id}, order \
+                     {order_id}): {e}"
+                ));
             }
         }
         if let Some(t) = t_rows {
@@ -5629,19 +5803,23 @@ impl<T: StateBackend> NativeExecContext<T> {
             };
             match res {
                 Ok(()) => written += 1,
-                Err(e) => tracing::error!(market_id, %e, "3c: level row write failed"),
+                Err(e) => {
+                    return Err(format!(
+                        "book save: level row write (market {market_id}): {e}"
+                    ))
+                }
             }
         }
         if let Some(t) = t_levels {
             acc.levels_ns += t.elapsed().as_nanos();
         }
         let t_stops = timed.then(std::time::Instant::now);
-        written += Self::diff_stop_rows(state, market_id, stops);
+        written += Self::diff_stop_rows(state, market_id, stops)?;
         if let Some(t) = t_stops {
             acc.stops_ns += t.elapsed().as_nanos();
         }
         let t_meta = timed.then(std::time::Instant::now);
-        written += Self::write_meta_if_moved(state, market_id, meta);
+        written += Self::write_meta_if_moved(state, market_id, meta)?;
         if let Some(t) = t_meta {
             acc.meta_ns += t.elapsed().as_nanos();
         }
@@ -5651,15 +5829,20 @@ impl<T: StateBackend> NativeExecContext<T> {
             m.exec_book_levels_written.inc_by(levels_written as u64);
             m.exec_book_levels_deleted.inc_by(levels_deleted as u64);
         }
-        written
+        Ok(written)
     }
 
     /// Shared modes 1/2: pending stops are immutable per id → put new ids,
     /// delete gone ids. Stateless diff against the persisted stop rows (one
     /// bounded prefix scan over `market ‖ 0x02` — the stop set is tiny).
     /// `stops` = the book's `stop_rows()` (captured at save time on the
-    /// deferred path).
-    fn diff_stop_rows(state: &T, market_id: MarketId, stops: Vec<(OrderId, Vec<u8>)>) -> usize {
+    /// deferred path). R02 branch 7: a failed scan or write is the `Err`
+    /// (the fail-stop reason), never "no persisted stops" / a skipped row.
+    fn diff_stop_rows(
+        state: &T,
+        market_id: MarketId,
+        stops: Vec<(OrderId, Vec<u8>)>,
+    ) -> Result<usize, String> {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
         let mut prefix = [0u8; 9];
         prefix[..8].copy_from_slice(&market_id.to_be_bytes());
@@ -5672,7 +5855,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     .map(|(k, _)| u128::from_be_bytes(k[9..25].try_into().unwrap()))
                     .collect()
             })
-            .unwrap_or_default();
+            .map_err(|e| format!("book save: stop rows scan (market {market_id}): {e}"))?;
 
         let mut written = 0usize;
         let mut live = HashSet::with_capacity_and_hasher(stops.len(), Default::default());
@@ -5680,45 +5863,48 @@ impl<T: StateBackend> NativeExecContext<T> {
             live.insert(id);
             if !persisted.contains(&id) {
                 let key = book_stop_key(market_id, id);
-                if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes) {
-                    tracing::error!(market_id, stop_id = %id, %e, "stop row put failed");
-                } else {
-                    written += 1;
-                }
+                state
+                    .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &bytes)
+                    .map_err(|e| {
+                        format!("book save: stop row put (market {market_id}, stop {id}): {e}")
+                    })?;
+                written += 1;
             }
         }
         let mut gone: Vec<u128> = persisted.difference(&live).copied().collect();
         gone.sort_unstable();
         for id in gone {
             let key = book_stop_key(market_id, id);
-            if let Err(e) = state.delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-                tracing::error!(market_id, stop_id = %id, %e, "stop row delete failed");
-            } else {
-                written += 1;
-            }
+            state
+                .delete_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)
+                .map_err(|e| {
+                    format!("book save: stop row delete (market {market_id}, stop {id}): {e}")
+                })?;
+            written += 1;
         }
-        written
+        Ok(written)
     }
 
     /// Shared modes 1/2: rewrite the meta row only when its bytes moved
     /// (stateless compare against the persisted row — one point read).
     /// `meta` = `book_meta_value(book)` (captured at save time on the
-    /// deferred path).
-    fn write_meta_if_moved(state: &T, market_id: MarketId, meta: &[u8]) -> usize {
+    /// deferred path). A failed compare read rewrites the same bytes (kept:
+    /// idempotent); R02 branch 7: a failed put is the `Err` (the fail-stop
+    /// reason).
+    fn write_meta_if_moved(state: &T, market_id: MarketId, meta: &[u8]) -> Result<usize, String> {
         use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
         let key = book_meta_key(market_id);
         match state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key) {
-            Ok(Some(existing)) if existing == meta => return 0,
+            Ok(Some(existing)) if existing == meta => return Ok(0),
             Ok(_) => {}
             Err(e) => {
                 tracing::error!(market_id, %e, "meta row read failed");
             }
         }
-        if let Err(e) = state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, meta) {
-            tracing::error!(market_id, %e, "meta row put failed");
-            return 0;
-        }
-        1
+        state
+            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, meta)
+            .map_err(|e| format!("book save: meta row put (market {market_id}): {e}"))?;
+        Ok(1)
     }
 
     /// Persist ONE book IN FULL under `mode` — genesis seeding, tests,
@@ -6524,15 +6710,13 @@ impl NativeExecutor {
             m.sell_top_ups_partial.inc_by(partial);
             m.sell_top_ups_none.inc_by(none);
         }
-        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
-            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
-        for (&sender, &(market_id, pos_net)) in &pool_takers {
-            let available = bal_cache
-                .load(&ctx.positions, &sender)
-                .map_or(FixedPoint::ZERO, |b| b.available);
-            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
-            pools.insert((sender, market_id), available + pos_net - excess);
-        }
+        let pools = Self::d2_pools(
+            &ctx.positions,
+            &ctx.reader_fault,
+            &pool_takers,
+            &excess_by_sender,
+            &mut bal_cache,
+        );
 
         let margin_elapsed = margin_timer.elapsed();
         ctx.phase_accum.margin_ns += margin_elapsed.as_nanos();
@@ -6609,7 +6793,7 @@ impl NativeExecutor {
                     // taker passed an account check, so it has `pre_pos`).
                     let px = match p.pre_pos {
                         Some((_, px)) => px,
-                        None => reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px),
+                        None => Self::d2_taker_px(&reader, &p.sender, market_id),
                     };
                     #[cfg(test)]
                     if let Some(s) = reader.sums.filter(|s| s.shadow) {
@@ -8627,6 +8811,56 @@ impl NativeExecutor {
         Self::price_band(&reader, ctx.order_books.get(&market_id), market_id, mark, bps)
     }
 
+    /// F1 (s517, D2): each pooled sender's exclusive budget in its pool
+    /// market — `available + pos_net - excess` (see the caller). The sender
+    /// passed an account check, so Phase 2 cached its balance. R02 branch 7:
+    /// a local fault on the balance read is recorded on `fault` (the block
+    /// fail-stops); the pool reads `available` 0 meanwhile.
+    /// D2: a checked taker's valuation price when Phase 2 left no
+    /// `pre_pos` (unreachable: every checked taker passed an account check,
+    /// which reads it): its `position_px`. R02 branch 7: a local fault is
+    /// recorded on the reader fault channel (the block fail-stops) and
+    /// reads `0` meanwhile, like the other D2 reads.
+    fn d2_taker_px<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        sender: &Address,
+        market_id: MarketId,
+    ) -> FixedPoint {
+        reader.position_px(sender, market_id).map_or_else(
+            |e| {
+                reader.note_fault("D2 taker position read", &e);
+                FixedPoint::ZERO
+            },
+            |(_, px)| px,
+        )
+    }
+
+    fn d2_pools<T: StateBackend>(
+        positions: &PositionManager<T>,
+        fault: &std::sync::OnceLock<String>,
+        pool_takers: &HashMap<Address, (MarketId, FixedPoint)>,
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        bal_cache: &mut BalanceCache,
+    ) -> HashMap<(Address, MarketId), FixedPoint> {
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
+            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
+        for (&sender, &(market_id, pos_net)) in pool_takers {
+            let available = match bal_cache.load(positions, &sender) {
+                Ok(b) => b.available,
+                Err(e) => {
+                    note_reader_fault(fault, "D2 pool balance read", &e);
+                    FixedPoint::ZERO
+                }
+            };
+            let excess = excess_by_sender
+                .get(&sender)
+                .copied()
+                .unwrap_or(FixedPoint::ZERO);
+            pools.insert((sender, market_id), available + pos_net - excess);
+        }
+        pools
+    }
+
     /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid
     /// bound). After the Phase-2 fold each non-pool sell that takes a bid
     /// floor ([`PreparedOrder::top_up_candidate`]: [`takes_bid_floor`], its
@@ -9454,32 +9688,32 @@ impl NativeExecutor {
                 break;
             }
         }
+        let mut found = None;
         for book in ctx.order_books.values_mut() {
             ctx.phase_accum.by_id_books_probed += 1;
             if let Ok(cancelled) = book.cancel_order(order_id) {
-                // FIX 2 (ECON-FIND-05): Release order margin on cancel.
-                let notional = cancelled.price * cancelled.remaining_qty;
-                let market_id = book.market_id;
-                ctx.dirty_books.insert(market_id);
-                let max_lev = ctx
-                    .margin_configs
-                    .get(&market_id)
-                    .map(|c| effective_max_leverage(&c.tiers, notional))
-                    .unwrap_or(20);
-                let margin_to_release = Self::margin_at_integer_leverage(notional, max_lev);
-
-                if margin_to_release > FixedPoint::ZERO {
-                    if let Ok(mut bal) = ctx.positions.get_native_balance(&cancelled.trader) {
-                        let release = margin_to_release.min(bal.order_margin);
-                        bal.order_margin -= release;
-                        bal.available += release;
-                        let _ = ctx.positions.put_native_balance(&cancelled.trader, &bal);
-                    }
-                }
-                return NativeActionResult::ok("cancel_order", 500);
+                found = Some((book.market_id, cancelled));
+                break;
             }
         }
-        NativeActionResult::err("cancel_order", format!("order {order_id} not found"))
+        let Some((market_id, cancelled)) = found else {
+            return NativeActionResult::err("cancel_order", format!("order {order_id} not found"));
+        };
+        // FIX 2 (ECON-FIND-05): Release order margin on cancel.
+        let notional = cancelled.price * cancelled.remaining_qty;
+        ctx.dirty_books.insert(market_id);
+        let max_lev = ctx
+            .margin_configs
+            .get(&market_id)
+            .map(|c| effective_max_leverage(&c.tiers, notional))
+            .unwrap_or(20);
+        let margin_to_release = Self::margin_at_integer_leverage(notional, max_lev);
+        // R02 branch 7: the shared release (`min(order_margin)`, nothing
+        // when <= 0): a local fault on its balance read, or a failed write,
+        // fail-stops the block (was: skipped / `let _ =`). The result stays
+        // `ok`.
+        Self::release_order_margin(ctx, &cancelled.trader, margin_to_release);
+        NativeActionResult::ok("cancel_order", 500)
     }
 
     fn exec_cancel_all<T: StateBackend>(
@@ -9881,7 +10115,11 @@ impl NativeExecutor {
         if old.reduce_only {
             let pos = match Self::signed_position(&ctx.positions, sender, market_id) {
                 Ok(pos) => pos,
-                Err(e) => return err(e.to_string()),
+                // R02 branch 7: a local fault fail-stops (result kept).
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order reduce-only position read", &e);
+                    return err(e.to_string());
+                }
             };
             let allowance = reduce_only_allowance(pos, is_buy);
             if allowance == FixedPoint::ZERO {
@@ -9919,14 +10157,20 @@ impl NativeExecutor {
         // margin (UPnL counts). No `available >= extra` gate: the debit below may
         // take `available` negative. Reduce-only orders only reduce.
         if !old.reduce_only {
-            let reader = AccountReader::of(ctx);
-            let acct = reader
-                .position_px(sender, market_id)
-                .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
-                .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)));
+            let acct = {
+                let reader = AccountReader::of(ctx);
+                reader
+                    .position_px(sender, market_id)
+                    .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
+                    .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)))
+            };
             let ((signed, px, pos_net), bal) = match acct {
                 Ok(a) => a,
-                Err(e) => return err(e.to_string()),
+                // R02 branch 7: a local fault fail-stops (result kept).
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order account read", &e);
+                    return err(e.to_string());
+                }
             };
             let px = if px > FixedPoint::ZERO { px } else { price };
             let tiers = cfg.map(|c| c.tiers.as_slice());
@@ -9953,13 +10197,19 @@ impl NativeExecutor {
             }
         }
         if extra > FixedPoint::ZERO {
+            // R02 branch 7: a local fault on the read, or a failed write,
+            // fail-stops (result kept).
             let mut bal = match ctx.positions.get_native_balance(sender) {
                 Ok(bal) => bal,
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order balance read", &e);
+                    return err(e.to_string());
+                }
             };
             bal.available -= extra;
             bal.order_margin += extra;
             if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                Self::latch_core_fault(ctx, "modify order balance write", &e);
                 return err(e.to_string());
             }
         }
