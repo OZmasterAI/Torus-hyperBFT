@@ -384,7 +384,7 @@ impl StateBackend for StateDb {
 /// `(String, Vec<u8>)` composite-key map — proven by
 /// `interned_overlay_stores_identical_rocksdb_keys` below.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct CfId(u8);
+pub(crate) struct CfId(u8);
 
 /// Number of registered CFs — one overlay bucket per CF.
 const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
@@ -401,7 +401,7 @@ impl CfId {
 /// such a CF cannot exist in any target database and no overlay entry for it
 /// could ever flush.
 #[inline]
-fn intern_cf(name: &str) -> Option<CfId> {
+pub(crate) fn intern_cf(name: &str) -> Option<CfId> {
     static TABLE: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
         crate::cf::ALL_CF_NAMES
@@ -432,12 +432,12 @@ type DeleteGroup<'a> = (&'a [u8], u64, &'a [u8], &'a [u8]);
 /// composite allocation per get/put, and lookups borrow the caller's `&[u8]`
 /// directly (zero allocations on the read path).
 #[derive(Default)]
-struct CfPending {
-    writes: BTreeMap<Vec<u8>, Vec<u8>>,
+pub(crate) struct CfPending {
+    pub(crate) writes: BTreeMap<Vec<u8>, Vec<u8>>,
     /// `BTreeSet` (was a `HashSet` over composite keys) so delete flush order is
     /// deterministic; final state never depended on it (put/delete keys are
     /// disjoint by invariant), this just removes the last order wobble.
-    deletes: BTreeSet<Vec<u8>>,
+    pub(crate) deletes: BTreeSet<Vec<u8>>,
 }
 
 impl CfPending {
@@ -458,9 +458,9 @@ fn overlay_visit() {
     OVERLAY_VISITS.with(|c| c.set(c.get() + 1));
 }
 
-struct PendingState {
+pub(crate) struct PendingState {
     /// Indexed by [`CfId`] — one bucket per registered CF.
-    cfs: [CfPending; NUM_CFS],
+    pub(crate) cfs: [CfPending; NUM_CFS],
     /// T4.4: append-only undo trail for writer-precompile side effects. `checkpoints`
     /// holds savepoint lengths into this log so a call frame that reverts can roll its
     /// native writes back (see [`NativeStateOverlay::checkpoint`]).
@@ -478,7 +478,7 @@ struct PendingState {
 }
 
 impl PendingState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cfs: std::array::from_fn(|_| CfPending::default()),
             journal_log: Vec::new(),
@@ -645,7 +645,7 @@ impl PendingState {
     ///
     /// Semantics preserved from pre-C2: a missing CF errors on the WRITE path
     /// and is silently skipped on the DELETE path.
-    fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
+    pub(crate) fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
         for (idx, cfp) in self.cfs.iter().enumerate() {
             let name = CfId(idx as u8).name();
             if !cfp.writes.is_empty() {
@@ -962,6 +962,11 @@ fn resident_delta_of(state: &PendingState) -> ResidentDelta {
 }
 
 impl FrozenPending {
+    /// The frozen pending set (crate-internal: the checkpoint layer merges it).
+    pub(crate) fn pending_state(&self) -> &PendingState {
+        &self.state
+    }
+
     /// The block height whose post-state this set completes.
     pub fn height(&self) -> u64 {
         self.height
@@ -1134,6 +1139,12 @@ pub struct NativeStateOverlay {
     /// parent is the block R reflects). Set by [`Self::attach_resident`]
     /// BEFORE the overlay is cloned (clones made earlier do not see it).
     resident: Option<Arc<ResidentRows>>,
+    /// Item 6 Phase 3: the since-checkpoint layer L (heights S+1..parent-1,
+    /// last value per key), read after `parent`.
+    layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    /// Item 6 Phase 3: the checkpoint in flight C (handed to the flush worker,
+    /// not durable yet), read after L and before the DB.
+    inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -1164,12 +1175,36 @@ impl NativeStateOverlay {
     /// (see [`FrozenPending`]). The parent never flushes through this overlay:
     /// `flush*` / `dirty_*` cover this overlay's own writes only.
     pub fn with_parent(db: StateDb, parent: Option<Arc<FrozenPending>>) -> Self {
+        Self::with_layers(db, parent, None, None)
+    }
+
+    /// Item 6 Phase 3: overlay whose reads fall through own pending -> R ->
+    /// `parent` -> `layer` (L) -> `inflight` (C) -> DB. `None`s skip a layer:
+    /// `with_layers(db, parent, None, None)` is [`Self::with_parent`].
+    pub fn with_layers(
+        db: StateDb,
+        parent: Option<Arc<FrozenPending>>,
+        layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+        inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    ) -> Self {
         Self {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
             parent,
             resident: None,
+            layer,
+            inflight,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layer_for_tests(&self) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
+        self.layer.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inflight_for_tests(&self) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
+        self.inflight.clone()
     }
 
     /// Height of the layered parent, if any (debug assertions / tests).

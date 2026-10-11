@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bg_writer;
 pub mod block_body;
 pub mod cf;
+pub mod checkpoint_layer;
 pub mod db;
 pub mod erasure;
 pub mod error;
@@ -26,6 +27,7 @@ pub use backend::{
     AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
     OutOfBatchRecorder, StateBackend,
 };
+pub use checkpoint_layer::CheckpointLayer;
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
