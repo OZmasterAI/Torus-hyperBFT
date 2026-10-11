@@ -1297,16 +1297,7 @@ impl StateDb {
         owner: &alloy_primitives::Address,
     ) -> Result<usize, StateError> {
         let cf = self.cf(crate::cf::CF_SESSIONS)?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut count = 0;
-        for (_key, value) in iter.flatten() {
-            if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(&value) {
-                if data.owner == *owner {
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
+        count_owner_sessions(self.db.iterator_cf(cf, rocksdb::IteratorMode::Start), owner)
     }
 
     /// List all column family names that were opened.
@@ -1567,6 +1558,84 @@ fn parse_sync_wal_toggle(raw: Option<String>) -> bool {
     match raw {
         Some(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
         None => false,
+    }
+}
+
+/// The sessions of `owner` among the `CF_SESSIONS` rows of a scan. A row
+/// that does not decode is skipped (decode policy, as the trait default).
+fn count_owner_sessions<K, V, E>(
+    rows: impl IntoIterator<Item = Result<(K, V), E>>,
+    owner: &alloy_primitives::Address,
+) -> Result<usize, StateError>
+where
+    V: AsRef<[u8]>,
+    StateError: From<E>,
+{
+    let mut count = 0;
+    for (_key, value) in rows.into_iter().flatten() {
+        if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(value.as_ref()) {
+            if data.owner == *owner {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod count_sessions_tests {
+    use super::*;
+
+    fn row(owner: u8) -> Result<(Vec<u8>, Vec<u8>), StateError> {
+        let data = torus_types::SessionData {
+            owner: Address::repeat_byte(owner),
+            expiry: 2,
+            scope: torus_types::SessionScope::Trading,
+            created_at: 1,
+        };
+        Ok((vec![owner], serde_json::to_vec(&data).unwrap()))
+    }
+
+    /// R02 (inventory 1c): an iterator error is this node's storage fault;
+    /// it propagates instead of being dropped (an undercount lets an owner
+    /// past the session limit on this node alone).
+    #[test]
+    fn r02_iterator_error_propagates() {
+        let rows = vec![
+            row(1),
+            Err(StateError::Io(std::io::Error::other("injected scan failure"))),
+            row(1),
+        ];
+        let err = count_owner_sessions(rows, &Address::repeat_byte(1))
+            .expect_err("the scan error must propagate");
+        assert!(err.to_string().contains("injected scan failure"), "{err}");
+    }
+
+    /// Control: other owners and undecodable rows are not counted (decode
+    /// policy unchanged).
+    #[test]
+    fn counts_only_the_owners_decodable_rows() {
+        let rows = vec![row(1), row(2), Ok((vec![9], b"\xff".to_vec())), row(1)];
+        assert_eq!(count_owner_sessions(rows, &Address::repeat_byte(1)).unwrap(), 2);
+    }
+
+    /// Control: the real scan.
+    #[test]
+    fn counts_sessions_in_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        for (k, owner) in [(1u8, 1u8), (2, 1), (3, 2)] {
+            let data = torus_types::SessionData {
+                owner: Address::repeat_byte(owner),
+                expiry: 2,
+                scope: torus_types::SessionScope::Trading,
+                created_at: 1,
+            };
+            db.put_session(&[k; 32], &data).unwrap();
+        }
+        db.put_cf_raw(crate::cf::CF_SESSIONS, &[4; 32], b"\xff").unwrap();
+        assert_eq!(db.count_sessions_for_owner(&Address::repeat_byte(1)).unwrap(), 2);
+        assert_eq!(db.count_sessions_for_owner(&Address::repeat_byte(2)).unwrap(), 1);
     }
 }
 
