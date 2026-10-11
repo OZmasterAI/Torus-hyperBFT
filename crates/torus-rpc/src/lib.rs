@@ -252,6 +252,10 @@ pub struct RpcState {
     pub(crate) notifier: BlockNotifier,
     /// Block height up to which historical data has been pruned (0 = archive mode).
     pub(crate) pruned_up_to: Arc<AtomicU64>,
+    /// D13: trade-history rows of blocks below this height are pruned or
+    /// being pruned (0 = all kept). Shared with the node's `StatePruner`
+    /// (`--trade-retention-blocks`); the trade methods never serve below it.
+    pub(crate) trades_pruned_up_to: Arc<AtomicU64>,
     /// Per-sender tx submission rate limiter (Batch EK: EVM-FIND-19).
     pub(crate) tx_submit_limiter: TxSubmitLimiter,
     /// Global cap on active WebSocket subscriptions (HIGH-NEW-05).
@@ -305,6 +309,9 @@ impl RpcServer {
         notifier: BlockNotifier,
     ) -> Self {
         let latest = find_latest_height(&state_db);
+        // Persisted by the pruner: blocks pruned before a restart stay
+        // `DataPruned` whatever this run's flags (a read fault = 0).
+        let trades_cut = torus_state::read_trades_pruned_height(&state_db).unwrap_or(0);
         Self {
             state: RpcState {
                 state: state_db,
@@ -315,6 +322,7 @@ impl RpcServer {
                 latest_height: Arc::new(AtomicU64::new(latest)),
                 notifier,
                 pruned_up_to: Arc::new(AtomicU64::new(0)),
+                trades_pruned_up_to: Arc::new(AtomicU64::new(trades_cut)),
                 tx_submit_limiter: TxSubmitLimiter::new(50), // 50 tx per 10s per sender
                 active_subscriptions: Arc::new(AtomicUsize::new(0)),
                 all_market_trades: true,
@@ -387,6 +395,12 @@ impl RpcServer {
     /// Get a shared handle to the pruned-up-to atomic.
     pub fn pruned_up_to(&self) -> Arc<AtomicU64> {
         self.state.pruned_up_to.clone()
+    }
+
+    /// Shared handle to the trade-history cutoff (D13): pass it to
+    /// `StatePruner::with_trades_pruned_handle`.
+    pub fn trades_pruned_up_to(&self) -> Arc<AtomicU64> {
+        self.state.trades_pruned_up_to.clone()
     }
 
     /// Allow or reject all-markets `newTrades` subscriptions (s80 fix 2).
@@ -3906,6 +3920,329 @@ mod tests {
         fills.push(tfill(1030, 2, b, a, 7, 8, 1));
         fills.push(tfill(1031, 2, b, a, 9, 10, 0));
         store_block_fills(state, 7, 1_700_000_007, &fills);
+    }
+
+    /// D13: two markets and two traders with a fill in every block 0..20.
+    fn store_trade_blocks(state: &StateDb) -> (Address, Address) {
+        let (a, b) = (Address::from([0xA1; 20]), Address::from([0xB2; 20]));
+        store_market(state, 1, "BTC", "USD");
+        store_market(state, 2, "ETH", "USD");
+        for block in 0..20u64 {
+            store_block_fills(
+                state,
+                block,
+                1_700_000_000 + block,
+                &[tfill(0, 1, a, b, 100, 1, 0), tfill(1, 2, b, a, 200, 2, 1)],
+            );
+        }
+        (a, b)
+    }
+
+    /// Server whose trade cutoff handle is returned (the node passes it to
+    /// the pruner, `StatePruner::with_trades_pruned_handle`).
+    async fn trade_cut_client(
+        state: StateDb,
+        mempool: Arc<Mempool>,
+        executor: Arc<EvmExecutor>,
+    ) -> (
+        ServerHandle,
+        jsonrpsee::http_client::HttpClient,
+        Arc<AtomicU64>,
+    ) {
+        let server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let cut = server.trades_pruned_up_to();
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        (handle, client, cut)
+    }
+
+    fn blocks_of(trades: &[RpcTrade]) -> Vec<String> {
+        trades.iter().map(|t| t.block_number.clone()).collect()
+    }
+
+    fn hex_blocks(blocks: impl IntoIterator<Item = u64>) -> Vec<String> {
+        blocks.into_iter().map(hex_u64).collect()
+    }
+
+    /// D13 (`pruner_prunes_trades_below_retention`, RPC half): after the
+    /// pruner ran with trade retention 10 at height 19 (cutoff 9), every trade
+    /// method serves only blocks 9..=19. A query entirely below the cutoff is a
+    /// `DataPruned` error; one reaching below it is clamped to the kept range.
+    #[tokio::test]
+    async fn rpc_trade_methods_serve_only_retained_trades() {
+        use jsonrpsee::core::client::ClientT;
+        let (_dir, state, mempool, executor) = setup();
+        let (a, _) = store_trade_blocks(&state);
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &19u64.to_be_bytes(),
+            )
+            .unwrap();
+        let (handle, client, cut) = trade_cut_client(state.clone(), mempool, executor).await;
+        let config = torus_state::PrunerConfig {
+            retention_blocks: u64::MAX,
+            prune_interval_blocks: 1,
+            batch_size: 100,
+            trade_retention_blocks: Some(10),
+        };
+        let mut pruner =
+            torus_state::StatePruner::new(state.clone(), config, Arc::new(AtomicU64::new(0)))
+                .with_trades_pruned_handle(cut.clone());
+        pruner.maybe_prune(19).unwrap();
+        assert_eq!(cut.load(Ordering::Acquire), 9);
+
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistory",
+                jsonrpsee::rpc_params!["0x1", 1000u32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks((9..20).rev()));
+
+        // Range reaching below the cutoff: the kept part.
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x1", "0x0", "0x13", 100u64],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks(9..20));
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x2", "0x9", "0x9", 100u64],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks([9]));
+        // Entirely below: pruned error.
+        let e = client
+            .request::<Vec<RpcTrade>, _>(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x1", "0x0", "0x8", 100u64],
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("pruned"), "{e}");
+
+        let t: Vec<RpcTrade> = client
+            .request("torus_getBlockTrades", jsonrpsee::rpc_params![9u64])
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 2);
+        let e = client
+            .request::<Vec<RpcTrade>, _>("torus_getBlockTrades", jsonrpsee::rpc_params![8u64])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("block 8 has been pruned"), "{e}");
+
+        let u: Vec<RpcUserTrade> = client
+            .request(
+                "torus_getUserTrades",
+                jsonrpsee::rpc_params![hex_address(a), Option::<String>::None, 1000u32],
+            )
+            .await
+            .unwrap();
+        let ub: Vec<String> = u.iter().map(|t| t.block_number.clone()).collect();
+        // Two entries (maker in market 1, taker in market 2) per block.
+        assert_eq!(ub, hex_blocks((9..20).rev().flat_map(|b| [b, b])));
+        handle.stop().unwrap();
+    }
+
+    /// The cutoff is persisted: after a restart with a larger N (cutoff 9 ->
+    /// 5) or without the flag, blocks pruned before the restart are still
+    /// `DataPruned`, not an empty "no trades" result.
+    #[tokio::test]
+    async fn rpc_trades_stay_pruned_after_restart_with_larger_n() {
+        use jsonrpsee::core::client::ClientT;
+        let (_dir, state, mempool, executor) = setup();
+        store_trade_blocks(&state);
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &19u64.to_be_bytes(),
+            )
+            .unwrap();
+        let config = |n: Option<u64>| torus_state::PrunerConfig {
+            retention_blocks: u64::MAX,
+            prune_interval_blocks: 1,
+            batch_size: 100,
+            trade_retention_blocks: n,
+        };
+        let (handle, _client, cut) =
+            trade_cut_client(state.clone(), mempool.clone(), executor.clone()).await;
+        let mut pruner = torus_state::StatePruner::new(
+            state.clone(),
+            config(Some(10)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_trades_pruned_handle(cut.clone());
+        pruner.maybe_prune(19).unwrap();
+        assert_eq!(cut.load(Ordering::Acquire), 9);
+        handle.stop().unwrap();
+        drop(pruner);
+
+        // Restart with N = 15 (cutoff 5): block 6 is gone, so DataPruned.
+        let (handle, client, cut) =
+            trade_cut_client(state.clone(), mempool.clone(), executor.clone()).await;
+        let mut pruner = torus_state::StatePruner::new(
+            state.clone(),
+            config(Some(15)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_trades_pruned_handle(cut.clone());
+        pruner.maybe_prune(20).unwrap();
+        for block in [6u64, 8] {
+            let e = client
+                .request::<Vec<RpcTrade>, _>("torus_getBlockTrades", jsonrpsee::rpc_params![block])
+                .await
+                .unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("block {block} has been pruned")),
+                "{e}"
+            );
+        }
+        let e = client
+            .request::<Vec<RpcTrade>, _>(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x1", "0x5", "0x8", 100u64],
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("pruned"), "{e}");
+        handle.stop().unwrap();
+        drop(pruner);
+
+        // Restart without the flag and no pruner at all: still DataPruned.
+        let (handle, client, _cut) = trade_cut_client(state.clone(), mempool, executor).await;
+        let e = client
+            .request::<Vec<RpcTrade>, _>("torus_getBlockTrades", jsonrpsee::rpc_params![8u64])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("block 8 has been pruned"), "{e}");
+        let t: Vec<RpcTrade> = client
+            .request("torus_getBlockTrades", jsonrpsee::rpc_params![9u64])
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 2);
+        handle.stop().unwrap();
+    }
+
+    /// The cutoff is raised before a pass deletes, so rows still on disk
+    /// below it are never served (no half-pruned ranges), and the unset
+    /// cutoff (0, no `--trade-retention-blocks`) serves everything as today.
+    #[tokio::test]
+    async fn rpc_trades_hidden_below_cutoff_before_rows_are_deleted() {
+        use jsonrpsee::core::client::ClientT;
+        let (_dir, state, mempool, executor) = setup();
+        let (a, _) = store_trade_blocks(&state);
+        let (handle, client, cut) = trade_cut_client(state.clone(), mempool, executor).await;
+
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x1", "0x0", "0x13", 100u64],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks(0..20), "unset: everything");
+
+        cut.store(12, Ordering::Release);
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistory",
+                jsonrpsee::rpc_params!["0x2", 1000u32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks((12..20).rev()));
+        let t: Vec<RpcTrade> = client
+            .request(
+                "torus_getTradeHistoryRange",
+                jsonrpsee::rpc_params!["0x1", "0x3", "0xc", 100u64],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&t), hex_blocks([12]));
+        assert!(client
+            .request::<Vec<RpcTrade>, _>("torus_getBlockTrades", jsonrpsee::rpc_params![11u64])
+            .await
+            .is_err());
+        let u: Vec<RpcUserTrade> = client
+            .request(
+                "torus_getUserTrades",
+                jsonrpsee::rpc_params![hex_address(a), "0x1", 1000u32],
+            )
+            .await
+            .unwrap();
+        let ub: Vec<String> = u.iter().map(|t| t.block_number.clone()).collect();
+        assert_eq!(ub, hex_blocks((12..20).rev()));
+        handle.stop().unwrap();
+    }
+
+    /// A pass that raises the cutoff while a trade read is in flight may
+    /// delete rows the read already passed (getBlockTrades scans one iterator
+    /// per market): the read is redone against the new cutoff, so a
+    /// half-pruned result is never served.
+    #[test]
+    fn trades_read_retries_when_the_cutoff_moves_mid_read() {
+        let (_dir, state, mempool, executor) = setup();
+        let server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let cut = server.trades_pruned_up_to();
+        let rpc = server.state();
+
+        // Stable cutoff: one read.
+        let mut floors = Vec::new();
+        let out = rpc.with_trade_floor(|f| {
+            floors.push(f);
+            Ok(f)
+        });
+        assert_eq!((out.unwrap(), floors.as_slice()), (0, &[0][..]));
+
+        // The cutoff moves during the first read: read again at the new one.
+        let mut floors = Vec::new();
+        let out = rpc.with_trade_floor(|f| {
+            floors.push(f);
+            if floors.len() == 1 {
+                cut.store(7, Ordering::Release);
+            }
+            Ok(f)
+        });
+        assert_eq!((out.unwrap(), floors.as_slice()), (7, &[0, 7][..]));
+
+        // It keeps moving: give up with an error instead of a torn result.
+        let out = rpc.with_trade_floor(|f| {
+            cut.store(f + 1, Ordering::Release);
+            Ok(f)
+        });
+        assert!(out.is_err());
+
+        // A read error (e.g. DataPruned) is returned as is.
+        let out: jsonrpsee::core::RpcResult<u64> =
+            rpc.with_trade_floor(|f| Err(crate::error::RpcError::DataPruned { block: f }.into()));
+        assert!(out.unwrap_err().message().contains("pruned"));
     }
 
     #[tokio::test]
