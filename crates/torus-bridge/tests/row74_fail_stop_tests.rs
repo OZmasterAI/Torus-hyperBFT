@@ -384,3 +384,181 @@ fn distribute_fees_ok_does_not_halt() {
     assert!(r.success, "{:?}", r.error);
     assert!(ctx.fatal_error.is_none());
 }
+
+// ----------------------------------------------------------------------------
+// R18 / R02 (s111): governance snapshot reads
+// ----------------------------------------------------------------------------
+
+/// A backend whose READ of one `(cf, key)` fails with an I/O error (an
+/// injected storage fault); everything else, writes included, goes through.
+#[derive(Clone)]
+struct FailingRead<B: StateBackend> {
+    inner: B,
+    cf: &'static str,
+    key: Vec<u8>,
+}
+
+impl<B: StateBackend> StateBackend for FailingRead<B> {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if cf == self.cf && key == self.key.as_slice() {
+            return Err(StateError::Io(std::io::Error::other(
+                "injected read failure",
+            )));
+        }
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// `snapmeta` ++ id: proposal `id`'s snapshot record.
+fn snap_meta_key(id: u64) -> Vec<u8> {
+    let mut k = b"snapmeta".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `snap` ++ id ++ voter: a voter's snapshot weight row.
+fn snap_weight_key(id: u64, voter: &Address) -> Vec<u8> {
+    let mut k = b"snap".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k.extend_from_slice(voter.as_slice());
+    k
+}
+
+/// Proposal 1 submitted and voted yes by its proposer (passes at block 200).
+fn setup_voted(db: &StateDb) {
+    let voter = setup_staker(db);
+    submit_text_proposal(db, &voter);
+    let mut ctx = make_ctx(db.clone(), 2);
+    let r = NativeExecutor::execute(
+        &mut ctx,
+        &voter,
+        &NativeAction::Vote {
+            proposal_id: 1,
+            option: VoteOption::Yes,
+        },
+    );
+    assert!(r.success, "{:?}", r.error);
+}
+
+/// An I/O error reading the snapshot record at finalize: one error result
+/// and the node fail-stops; the proposal is not rejected.
+#[test]
+fn governance_snapshot_record_read_fault_latches_fatal_error() {
+    let (_dir, db) = open_test_db();
+    setup_voted(&db);
+    let faulty = FailingRead {
+        inner: db.clone(),
+        cf: CF_GOVERNANCE_VOTES,
+        key: snap_meta_key(1),
+    };
+    let mut ctx = make_ctx(faulty, 200);
+    let results = NativeExecutor::process_governance(&mut ctx);
+    assert_eq!(results.len(), 1);
+    assert_err(
+        &results[0],
+        "governance_process",
+        "state error: io: injected read failure",
+    );
+    let fatal = ctx
+        .fatal_error
+        .as_deref()
+        .expect("a storage fault must fail-stop");
+    assert!(fatal.contains("governance"), "{fatal}");
+    let p = make_ctx(db.clone(), 200)
+        .governance
+        .get_proposal(1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        p.status,
+        torus_economics::governance::ProposalStatus::Active
+    );
+}
+
+/// A missing snapshot record is the same on every validator: the proposal
+/// is rejected, the step succeeds, no halt.
+#[test]
+fn governance_missing_snapshot_record_rejects_without_halt() {
+    let (_dir, db) = open_test_db();
+    setup_voted(&db);
+    db.delete_cf_raw(CF_GOVERNANCE_VOTES, &snap_meta_key(1))
+        .unwrap();
+    let mut ctx = make_ctx(db.clone(), 200);
+    let results = NativeExecutor::process_governance(&mut ctx);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].success, "{:?}", results[0].error);
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    let p = ctx.governance.get_proposal(1).unwrap().unwrap();
+    assert_eq!(
+        p.status,
+        torus_economics::governance::ProposalStatus::Rejected
+    );
+}
+
+/// An I/O error reading the voter's snapshot weight: the vote (yes or
+/// abstain) fails and the node fail-stops.
+#[test]
+fn vote_snapshot_weight_read_fault_latches_fatal_error() {
+    for option in [VoteOption::Yes, VoteOption::Abstain] {
+        let (_dir, db) = open_test_db();
+        let voter = setup_staker(&db);
+        submit_text_proposal(&db, &voter);
+        let faulty = FailingRead {
+            inner: db.clone(),
+            cf: CF_GOVERNANCE_VOTES,
+            key: snap_weight_key(1, &voter),
+        };
+        let mut ctx = make_ctx(faulty, 2);
+        let r = NativeExecutor::execute(
+            &mut ctx,
+            &voter,
+            &NativeAction::Vote {
+                proposal_id: 1,
+                option,
+            },
+        );
+        assert_err(&r, "vote", "state error: io: injected read failure");
+        assert!(ctx.fatal_error.is_some(), "a storage fault must fail-stop");
+    }
+}
+
+/// No snapshot weight row (no stake at submit): NoVotingWeight, no halt.
+#[test]
+fn vote_missing_snapshot_weight_does_not_halt() {
+    for option in [VoteOption::Yes, VoteOption::Abstain] {
+        let (_dir, db) = open_test_db();
+        let voter = setup_staker(&db);
+        submit_text_proposal(&db, &voter);
+        let mut ctx = make_ctx(db.clone(), 2);
+        let r = NativeExecutor::execute(
+            &mut ctx,
+            &addr(3),
+            &NativeAction::Vote {
+                proposal_id: 1,
+                option,
+            },
+        );
+        assert_err(
+            &r,
+            "vote",
+            &format!("voter {} has no voting weight", addr(3)),
+        );
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    }
+}

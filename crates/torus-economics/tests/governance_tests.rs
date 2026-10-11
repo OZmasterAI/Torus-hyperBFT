@@ -2192,3 +2192,256 @@ fn r18_snapshot_rows_and_record_are_deleted_at_finalize() {
     );
     assert_eq!(snapshot_rows(gov.state(), second), (0, false));
 }
+
+// ============================================================================
+// R18 / R02 (s111): a storage fault on a snapshot read fails-stop (a local
+// fault: `EconomicsError::is_local_fault`); a missing or undecodable snapshot
+// row is the same bytes on every validator and keeps a deterministic result.
+// ============================================================================
+
+/// `snap` ++ id ++ voter: a voter's snapshot weight row (32 bytes).
+fn snap_weight_key(id: u64, voter: &Address) -> Vec<u8> {
+    let mut k = b"snap".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k.extend_from_slice(voter.as_slice());
+    k
+}
+
+/// `snapmeta` ++ id: a proposal's snapshot record (16 bytes).
+fn snap_meta_key(id: u64) -> Vec<u8> {
+    let mut k = b"snapmeta".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `snap` ++ id: the prefix finalize iterates to delete the weight rows.
+fn snap_prefix(id: u64) -> Vec<u8> {
+    let mut k = b"snap".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `StateDb` whose READ of one `(cf, key)` fails with an I/O error (an
+/// injected backend fault): `get_cf_raw` of that key, and `iterate_cf` with
+/// exactly that key as prefix. Writes go through.
+#[derive(Clone)]
+struct FailingRead {
+    inner: StateDb,
+    cf: &'static str,
+    key: Vec<u8>,
+}
+
+impl FailingRead {
+    fn new(inner: StateDb, cf: &'static str, key: &[u8]) -> Self {
+        Self {
+            inner,
+            cf,
+            key: key.to_vec(),
+        }
+    }
+    fn fail() -> StateError {
+        StateError::Io(std::io::Error::other("injected read failure"))
+    }
+}
+
+impl StateBackend for FailingRead {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if cf == self.cf && key == self.key.as_slice() {
+            return Err(Self::fail());
+        }
+        StateBackend::get_cf_raw(&self.inner, cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        StateBackend::put_cf_raw(&self.inner, cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        StateBackend::delete_cf_raw(&self.inner, cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        if cf == self.cf && prefix == Some(self.key.as_slice()) {
+            return Err(Self::fail());
+        }
+        StateBackend::iterate_cf(&self.inner, cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        StateBackend::atomic_write(&self.inner, ops)
+    }
+}
+
+/// Proposal 1 by addr(2) (500 delegated), addr(2) voted yes: it passes at
+/// block 101 on a healthy backend.
+fn setup_voted_proposal() -> (tempfile::TempDir, GovernanceManager, u64) {
+    let (dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    (dir, gov, id)
+}
+
+fn assert_local_fault<T: std::fmt::Debug>(r: Result<T, EconomicsError>, what: &str) {
+    match r {
+        Err(e) => {
+            assert!(e.is_local_fault(), "{what}: {e}");
+            assert!(e.to_string().contains("injected"), "{what}: {e}");
+        }
+        Ok(v) => panic!("{what}: expected a local fault, got Ok({v:?})"),
+    }
+}
+
+/// An I/O error reading the snapshot record is a local fault: finalize and
+/// the block step return it (the executor fail-stops); the proposal is NOT
+/// rejected and nothing is written. The healthy backend then passes it.
+#[test]
+fn r18_record_read_io_error_is_a_local_fault_not_a_reject() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    let before = dump_all(gov.state());
+    let faulty = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_meta_key(id),
+    ));
+    assert_local_fault(faulty.finalize_proposal(id, 101), "finalize");
+    assert_local_fault(faulty.process_pending_proposals(101), "process");
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+    assert_eq!(
+        gov.get_proposal(id).unwrap().unwrap().status,
+        ProposalStatus::Active
+    );
+    assert_eq!(
+        gov.finalize_proposal(id, 101).unwrap(),
+        ProposalOutcome::Passed(id)
+    );
+}
+
+/// A missing snapshot record is deterministic: the proposal is rejected (no
+/// error, no halt) and its remaining snapshot rows are deleted.
+#[test]
+fn r18_missing_record_rejects() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    gov.state()
+        .delete_cf_raw(CF_GOVERNANCE_VOTES, &snap_meta_key(id))
+        .unwrap();
+    assert_eq!(
+        gov.process_pending_proposals(101).unwrap(),
+        vec![ProposalOutcome::Rejected(id)]
+    );
+    assert_eq!(snapshot_rows(gov.state(), id), (0, false));
+}
+
+/// An undecodable snapshot record (wrong length) is deterministic too: read
+/// as absent, the proposal is rejected and the record deleted.
+#[test]
+fn r18_undecodable_record_rejects() {
+    for bad in [&b""[..], &b"\x01\x02\x03"[..], &[0u8; 49][..]] {
+        let (_dir, gov, id) = setup_voted_proposal();
+        gov.state()
+            .put_cf_raw(CF_GOVERNANCE_VOTES, &snap_meta_key(id), bad)
+            .unwrap();
+        assert_eq!(
+            gov.process_pending_proposals(101).unwrap(),
+            vec![ProposalOutcome::Rejected(id)],
+            "record {bad:?}"
+        );
+        assert_eq!(snapshot_rows(gov.state(), id), (0, false));
+    }
+}
+
+/// An I/O error reading a voter's snapshot weight row is a local fault for
+/// yes / no and abstain votes: no tally or vote row is written.
+#[test]
+fn r18_weight_read_io_error_is_a_local_fault_for_votes_and_abstain() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    let before = dump_all(gov.state());
+    let faulty = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_weight_key(id, &addr(2)),
+    ));
+    assert_local_fault(faulty.cast_vote(addr(2), id, true, 10), "yes");
+    assert_local_fault(faulty.cast_vote(addr(2), id, false, 10), "no");
+    assert_local_fault(faulty.cast_vote_abstain(addr(2), id, 10), "abstain");
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+}
+
+/// A missing or undecodable weight row is deterministic: NoVotingWeight for
+/// yes / no and abstain (not a local fault), nothing written.
+#[test]
+fn r18_missing_or_undecodable_weight_row_is_no_voting_weight() {
+    for bad in [None, Some(&b"\x01"[..]), Some(&[1u8; 33][..])] {
+        let (_dir, gov, staking) = setup();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+        let id = gov
+            .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+            .unwrap();
+        let key = snap_weight_key(id, &addr(2));
+        match bad {
+            None => gov
+                .state()
+                .delete_cf_raw(CF_GOVERNANCE_VOTES, &key)
+                .unwrap(),
+            Some(b) => gov
+                .state()
+                .put_cf_raw(CF_GOVERNANCE_VOTES, &key, b)
+                .unwrap(),
+        }
+        let before = dump_all(gov.state());
+        for r in [
+            gov.cast_vote(addr(2), id, true, 10),
+            gov.cast_vote(addr(2), id, false, 10),
+            gov.cast_vote_abstain(addr(2), id, 10),
+        ] {
+            match r {
+                Err(e @ EconomicsError::NoVotingWeight(a)) => {
+                    assert_eq!(a, addr(2));
+                    assert!(!e.is_local_fault());
+                }
+                other => panic!("row {bad:?}: expected NoVotingWeight, got {other:?}"),
+            }
+        }
+        assert_eq!(dump_all(gov.state()), before, "row {bad:?}");
+    }
+}
+
+/// The finalize deletes: an I/O error listing the weight rows, or a write
+/// fault on the atomic status + delete batch, is a local fault; the
+/// proposal stays Active and nothing is written.
+#[test]
+fn r18_snapshot_delete_faults_are_local_faults() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    let before = dump_all(gov.state());
+
+    let list_fault = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_prefix(id),
+    ));
+    assert_local_fault(list_fault.finalize_proposal(id, 101), "iterate");
+
+    for key in [snap_meta_key(id), snap_weight_key(id, &addr(2))] {
+        let write_fault = GovernanceManager::new(PoisonedKey::new(
+            gov.state().clone(),
+            CF_GOVERNANCE_VOTES,
+            &key,
+        ));
+        assert_local_fault(write_fault.finalize_proposal(id, 101), "delete");
+    }
+
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+    assert_eq!(
+        gov.get_proposal(id).unwrap().unwrap().status,
+        ProposalStatus::Active
+    );
+}
