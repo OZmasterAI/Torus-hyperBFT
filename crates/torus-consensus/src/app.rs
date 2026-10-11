@@ -648,6 +648,10 @@ struct ExecutionContext {
     /// books (resident holder not the predecessor) must then barrier first,
     /// so the reload reads them from the DB. Cleared by every barrier.
     last_job_books_deferred: AtomicBool,
+    /// Item 6 Phase 3: coalesced state checkpoints. `None` (interval unset
+    /// or 0, the default) = today's per-block `Job::Flush`, byte for byte.
+    /// Read by `attach_flush_worker`; set before it.
+    checkpoint: Option<crate::exec_pipeline::CheckpointPolicy>,
     /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
     /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
     /// every native context in `mode` with the resident holder attached.
@@ -4568,6 +4572,7 @@ impl TorusApp {
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
+            checkpoint: None,
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -4668,6 +4673,7 @@ impl TorusApp {
             torus_bridge::native_executor::configured_book_mode(),
         )?;
         if crate::exec_pipeline::exec_pipeline_enabled() {
+            exec_ctx.checkpoint = crate::exec_pipeline::CheckpointPolicy::from_env();
             exec_ctx.attach_flush_worker(None);
         }
 
@@ -11637,6 +11643,7 @@ mod crash_recovery_tests {
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
+            checkpoint: None,
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -21983,6 +21990,9 @@ mod crash_recovery_tests {
         /// by the next block.
         ro_resting_max: usize,
         ro_moved: u64,
+        /// Item 6 Phase 3: the most heights executed above the durable
+        /// applied marker after any block (0 with a per-block flush).
+        max_lag: u64,
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -22116,6 +22126,19 @@ mod crash_recovery_tests {
         reference: bool,
         fault: &P2Fault,
     ) -> P2Run {
+        p2_run_with(blocks, pipelined, mode, reference, fault, None)
+    }
+
+    /// [`p2_run`] with the item 6 Phase 3 checkpoint policy `ckpt` on the
+    /// pipelined contexts (`None` = per-block flush).
+    fn p2_run_with(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        reference: bool,
+        fault: &P2Fault,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> P2Run {
         let (config, db) = p2_fixture();
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
@@ -22131,11 +22154,13 @@ mod crash_recovery_tests {
             ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
             ctx.metrics = Some(metrics.clone());
+            ctx.checkpoint = ckpt;
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
             }
             ctx
         };
+        let mut max_lag = 0;
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -22211,6 +22236,7 @@ mod crash_recovery_tests {
                 if let Some(w) = ctx.flush_worker.as_ref() {
                     assert!(w.wait_idle(), "{what}: W failed");
                 }
+                max_lag = max_lag.max(h - read_native_applied_height(&db).unwrap_or(0));
             }
             let h = h.max(skip_to);
             v4_last = p2_v4_resting(&db);
@@ -22271,6 +22297,7 @@ mod crash_recovery_tests {
             faults,
             ro_resting_max,
             ro_moved,
+            max_lag,
         }
     }
 
@@ -22410,6 +22437,204 @@ mod crash_recovery_tests {
                     "{what}: V4 liquidated"
                 );
             }
+        }
+    }
+
+    // ---- Item 6 Phase 3 task 1.6: the E side of the checkpoint interval ----
+
+    fn ckpt_every(n: u64) -> crate::exec_pipeline::CheckpointPolicy {
+        crate::exec_pipeline::CheckpointPolicy {
+            every_blocks: Some(n),
+            ..Default::default()
+        }
+    }
+
+    /// Never by time: only attest heights, barriers and shutdown.
+    fn ckpt_never() -> crate::exec_pipeline::CheckpointPolicy {
+        crate::exec_pipeline::CheckpointPolicy::default()
+    }
+
+    /// The 130 P2 blocks in Classic with resident books: serial, pipelined
+    /// per block, and pipelined with a checkpoint every 5 blocks and never by
+    /// time (only the attest height 100, the epoch boundaries 50 / 100 and
+    /// shutdown) give the same per-block consensus write sets (every `h_n`),
+    /// running hash and full CF dump. The checkpoint runs really kept blocks
+    /// above the durable marker.
+    #[test]
+    fn checkpoint_interval_matches_per_block_classic() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let serial = p2_run(&blocks, false, mode, false, &P2Fault::None);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        assert_eq!(per_block.max_lag, 0, "per-block flush: every block durable");
+        assert!(serial.hash.is_some());
+        let all: Vec<u64> = (1..=P2_BLOCKS).collect();
+        for (name, policy, min_lag) in [("every 5", ckpt_every(5), 4), ("never", ckpt_never(), 40)] {
+            let run = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(policy));
+            assert!(run.max_lag >= min_lag, "{name}: max lag {} < {min_lag}", run.max_lag);
+            for (what, base) in [("serial", &serial), ("per-block", &per_block)] {
+                assert_write_sets_equal(&base.captured, &run.captured, &format!("{name} vs {what}"));
+                assert_eq!(base.hash, run.hash, "{name} vs {what}: running hash");
+                assert_dumps_equal(&base.dump, &run.dump, &format!("{name} vs {what}"));
+            }
+            assert_eq!(
+                run.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+                all,
+                "{name}: every height hashed once"
+            );
+        }
+    }
+
+    /// Item 6 Phase 3: the barrier fixture. `pipeline_fixture_blocks` (13
+    /// blocks, epoch length 4) with an EVM tx in block 6 and a buffered slash
+    /// at block 10; `policy` on a pipelined context (`None`: per block;
+    /// `on = false`: serial). Returns the DB, the per-block write sets and
+    /// the durable marker after each block.
+    fn ckpt_barrier_run(
+        on: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> (StateDb, CapturedWrites, Vec<Option<u64>>) {
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let validator = Address::repeat_byte(0x77);
+        let mut blocks = pipeline_fixture_blocks();
+        blocks[5].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[5].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        register_proposer(&db, validator);
+        torus_state::running_hash::capture_begin(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = policy;
+        if on {
+            ctx.attach_flush_worker(None);
+        }
+        let mut markers = Vec::new();
+        for b in &blocks {
+            let h = b.header.height;
+            let durable = persist_committed_block_durably(&db, b);
+            let slashes = if h == 10 {
+                vec![PendingSlash {
+                    validator,
+                    fraction_bps: 500,
+                    reason: SlashReason::DoubleSign,
+                    tombstone: false,
+                }]
+            } else {
+                vec![]
+            };
+            ctx.execute_committed_block_with(b, slashes, durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            markers.push(read_native_applied_height(&db));
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        (db, captured, markers)
+    }
+
+    /// Barrier blocks (EVM 6, slash 10, epoch boundaries 4 / 8 / 12) drain
+    /// the since-checkpoint layer: with checkpoints never by time, the
+    /// durable marker after every block is the last barrier at or below it
+    /// (S == that height after each barrier), and shutdown checkpoints 13.
+    /// Write sets, running hash and CF dump equal the per-block and serial
+    /// runs.
+    #[test]
+    fn checkpoint_barriers_drain_layer() {
+        let (db, captured, markers) = ckpt_barrier_run(true, Some(ckpt_never()));
+        let expected: Vec<Option<u64>> = (1..=13u64)
+            .map(|h| [4u64, 6, 8, 10, 12].into_iter().filter(|b| *b <= h).max())
+            .collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        assert_eq!(read_native_applied_height(&db), Some(13), "shutdown checkpoint");
+        let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        assert_eq!(
+            db.get_account(&k256_address(&evm_sender)).unwrap().unwrap().nonce,
+            1,
+            "the EVM tx executed"
+        );
+        for (what, on, policy) in [("per-block", true, None), ("serial", false, None)] {
+            let (db_ref, captured_ref, _) = ckpt_barrier_run(on, policy);
+            assert_write_sets_equal(&captured_ref, &captured, &format!("never vs {what}"));
+            assert_eq!(
+                torus_state::running_hash::read_running_hash(&db_ref),
+                torus_state::running_hash::read_running_hash(&db),
+                "{what}: running hash"
+            );
+            assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), &format!("never vs {what}"));
+        }
+    }
+
+    /// Every attest height (`h % 100 == 0`) forces a checkpoint: 105 empty
+    /// blocks without an epoch boundary, checkpoints never by time; nothing
+    /// is durable before 100, the marker and the attest checkpoint row of
+    /// 100 are durable right after it. Same dump as the per-block run.
+    #[test]
+    fn checkpoint_attest_heights_force_checkpoint() {
+        let mut blocks: Vec<TorusBlock> = (1..=105).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let run = |policy: Option<crate::exec_pipeline::CheckpointPolicy>| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 1_000;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = policy;
+            ctx.attach_flush_worker(None);
+            let mut markers = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                let h = b.header.height;
+                markers.push(read_native_applied_height(&db));
+                if h == 100 {
+                    assert!(
+                        torus_state::running_hash::read_checkpoint(&db, 100).is_some(),
+                        "attest checkpoint row 100 durable right after block 100"
+                    );
+                }
+            }
+            drop(ctx);
+            (db, markers)
+        };
+        let (db, markers) = run(Some(ckpt_never()));
+        let expected: Vec<Option<u64>> =
+            (1..=105u64).map(|h| (h >= 100).then_some(100)).collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        assert_eq!(read_native_applied_height(&db), Some(105), "shutdown checkpoint");
+        let (db_ref, _) = run(None);
+        assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "never vs per-block");
+    }
+
+    /// The resident staleness guards read the applied marker through the
+    /// overlay (parent layer first), never the DB: over the 130 P2 blocks
+    /// with checkpoints never by time, R and the books are built once, as
+    /// with a per-block flush.
+    #[test]
+    fn resident_guards_do_not_trip_with_interval() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let never = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()));
+        assert!(never.max_lag >= 40, "max lag {}", never.max_lag);
+        for (what, run) in [("per-block", &per_block), ("never", &never)] {
+            assert_eq!(run.metrics.exec_resident_rows_rebuilds.get(), 1, "{what}: R builds");
+            assert_eq!(run.metrics.exec_resident_rebuilds.get(), 1, "{what}: book builds");
         }
     }
 

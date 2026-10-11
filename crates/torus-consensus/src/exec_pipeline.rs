@@ -102,6 +102,33 @@ pub fn parse_checkpoint_max_bytes(v: Option<String>) -> Option<u64> {
     }
 }
 
+/// Item 6 Phase 3: when E closes the since-checkpoint layer into a
+/// checkpoint (checked at the end of every pipelined block). Attest heights
+/// (`h % 100 == 0`), barriers and shutdown always checkpoint; these are the
+/// node-local extra triggers. `CheckpointPolicy::default()` = only those
+/// ("never by time").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    /// Wall time on E since the last checkpoint (`TORUS_CHECKPOINT_INTERVAL_MS`).
+    pub interval: Option<std::time::Duration>,
+    /// Since-checkpoint layer bytes (`TORUS_CHECKPOINT_MAX_BYTES`).
+    pub max_bytes: Option<u64>,
+    /// Every n blocks since the last checkpoint (tests).
+    pub every_blocks: Option<u64>,
+}
+
+impl CheckpointPolicy {
+    /// The node's policy from the environment: `None` (interval unset or 0)
+    /// = today's per-block flush.
+    pub fn from_env() -> Option<Self> {
+        checkpoint_interval().map(|interval| Self {
+            interval: Some(interval),
+            max_bytes: checkpoint_max_bytes(),
+            every_blocks: None,
+        })
+    }
+}
+
 /// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1): in
 /// modes 2/3 W applies the deferred book save reading the DB as "every height
 /// < N durable", which is false with a since-checkpoint layer. The node
