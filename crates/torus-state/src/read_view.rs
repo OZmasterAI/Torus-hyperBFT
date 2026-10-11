@@ -47,14 +47,23 @@ use crate::{StateDb, StateError};
 /// sessions (gossip session lookup), native balances (min collateral, the
 /// item B volume row), EVM accounts (spot balance, `add_evm_tx` nonce and
 /// balance, `pending_nonce`), positions (funded path 3), the validator table
-/// (duty exemption, oracle reporter) and the oracle CF (signer index).
-pub const INGRESS_CFS: [&str; 6] = [
+/// (duty exemption, oracle reporter) and the oracle CF (signer index; the
+/// aggregate mark of the RPC submit price band). The RPC submit checks also
+/// read the market listings (unknown market, tick / lot) and the fee-config
+/// CF (governance price band width): a listing or a band change executed in
+/// a block not yet checkpointed must not be refused at a validator's RPC.
+/// Both are small per block: the markets CF gets the 16-byte order-id
+/// counter row when orders flowed (and a row per governance listing); the
+/// fee-config CF only governance rows.
+pub const INGRESS_CFS: [&str; 8] = [
     crate::cf::CF_SESSIONS,
     crate::cf::CF_NATIVE_BALANCES,
     crate::cf::CF_ACCOUNTS,
     crate::cf::CF_NATIVE_POSITIONS,
     crate::cf::CF_STAKING_VALIDATORS,
     crate::cf::CF_NATIVE_ORACLE,
+    crate::cf::CF_NATIVE_MARKETS,
+    crate::cf::CF_FEE_CONFIG,
 ];
 
 fn ingress_ids() -> &'static [CfId] {

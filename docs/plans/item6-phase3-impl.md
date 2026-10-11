@@ -251,7 +251,7 @@ Readers (reader audit s109):
   balance only (native credits to `CF_ACCOUNTS`).
 
 Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
-`docs/validator-home-network.md`).
+`docs/validator-home-network.md`), except the RPC submit checks (owner s112, follow-up below).
 
 - Test first: `ingress_view_matches_interval_zero`. A session created at n, a balance credited
   at n, an EVM credit at n; gossip admission at n+1 accepts with interval "never" exactly as with
@@ -266,7 +266,7 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   un-coalesced state bytes, ~885 MB per plan-15 s window on tw (section 41: 7,966 MB / 9
   windows; Classic book blobs 77%), vs ~150 MB for L. So the view answers only the ingress CFs
   (`read_view::INGRESS_CFS`: sessions, native balances, accounts, positions, validators,
-  oracle; other CFs read the DB) and the end-of-block merge thread also cuts block n-1 down to
+  oracle; markets and fee config since the s112 follow-up; other CFs read the DB) and the end-of-block merge thread also cuts block n-1 down to
   those CFs (`FrozenPending::slice`), swapped in at `settle`: full sets only for the newest two
   blocks. What is left is mostly positions (~23% of written state bytes, 1.5x coalescing), so
   **estimate** ~150-200 MB per window on tw; archy to measure RSS in step 4.
@@ -278,9 +278,22 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   interval 0 after every block without waiting for W, at every 3 / never / C parked in
   flight; barriers drop the view), `ingress_view_serves_duty_oracle_and_funded_checks`,
   `read_view_*` (random model, newest layer wins, DB-only, ingress CFs only, slices).
-- Still on the DB (plan: validator RPC stays): RPC-submit checks in `torus.rs`
-  `verify_one_action_with` (markets, price band, session lookup), and `eth_head`
-  (`eth.rs` `eth_head`: durable marker), so `eth_blockNumber` moves in checkpoint steps. The
+- **Follow-up (owner s112): RPC submit on the view.** `torus.rs` `verify_one_action_with`
+  (session lookup, known market + tick / lot, price band: oracle mark + governance band width)
+  is generic over `StateBackend`; both submit endpoints (`submitNativeAction`,
+  `submitNativeActions[Bin]`) pass `mempool.ingress_state()` (fetched once per call; interval 0:
+  the DB alone, unchanged). The market listings (`CF_NATIVE_MARKETS`, a governance
+  `MarketListing` executes in a block) and the band width (`CF_FEE_CONFIG`, governance
+  `ParameterChange`) can change inside a window, so `INGRESS_CFS` gains both (8 CFs). Memory:
+  per block the markets CF gets one 16-byte order-id counter row when orders flowed (key 24 B)
+  plus a row per listing; the fee-config CF only governance rows: ~100 B per block with
+  overhead, ~10 KB per plan-15 s window, negligible next to positions. Test (RED first:
+  `unknown market_id 1` x3): `torus-rpc` `rpc_submit_sees_ingress_view` (rows of block 5 only
+  in the published view vs in the DB; session order accepted, 120 refused by the 10% band, 105
+  accepted, through both endpoints).
+- Still on the DB (plan: validator RPC stays): the other `torus_*` / `eth_*` reads and
+  `eth_head` (`eth.rs` `eth_head`: durable marker), so `eth_blockNumber` moves in checkpoint
+  steps. The
   step 1 bench stall (section 45: the in-flight tail polls `eth_blockNumber` on val2) is NOT
   removed by step 2; owner options in the step 2 report.
 

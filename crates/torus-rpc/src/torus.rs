@@ -24,6 +24,7 @@ use torus_economics::types::{
     FEE_START_VALIDATOR_BPS, TRANSITION_EPOCHS,
 };
 use torus_economics::{lerp_bps, PermanentStakeInfo};
+use torus_state::backend::StateBackend;
 use torus_state::cf::{
     CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS,
     CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
@@ -346,9 +347,9 @@ fn screen_payload(
 /// Row 44 (s94 B): a row that does not decode gets the executor's 1 / 1
 /// (`NativeExecutor::market_shape`).
 /// A batch is one signed action, so one bad order rejects all of it.
-pub(crate) fn validate_known_markets(
+pub(crate) fn validate_known_markets<S: StateBackend>(
     action: &torus_types::NativeAction,
-    state_db: &torus_state::StateDb,
+    state_db: &S,
 ) -> Result<(), String> {
     // `(tick, lot)` of a listed market (item 6 M1: the decoder the executor
     // creates books with); `(ONE, ONE)` when the row does not decode as a
@@ -409,9 +410,9 @@ pub(crate) fn validate_known_markets(
 /// its block-state fallback reference. Width: the governance key
 /// (`torus_types::price_band_bps`). A batch is one signed action, so one
 /// order outside rejects all of it. Modify orders are left to the executor.
-fn check_price_band(
+fn check_price_band<S: StateBackend + Clone>(
     action: &torus_types::NativeAction,
-    state_db: &torus_state::StateDb,
+    state_db: &S,
     now_secs: u64,
 ) -> Result<(), String> {
     let orders = match action {
@@ -465,11 +466,18 @@ fn check_tick_lot(
 /// native action. Blocking-pool work (ecrecover); the batch endpoint runs a
 /// whole batch of these inside one `spawn_blocking`. Error is a per-item
 /// message, never a call-level failure.
-fn verify_one_action_with(
+///
+/// `state_db`: the submit endpoints pass the mempool's ingress state
+/// ([`torus_mempool::Mempool::ingress_state`], item 6 Phase 3 step 2
+/// follow-up): with a checkpoint interval set, the session, market and price
+/// band (oracle mark, band parameter) rows of blocks not yet checkpointed are
+/// read from the published view, as the mempool's own checks read them;
+/// interval 0 (no view) reads the DB as before.
+fn verify_one_action_with<S: StateBackend + Clone>(
     decode: DecodeFn,
     signed_action: &str,
     chain_id: u64,
-    state_db: &torus_state::StateDb,
+    state_db: &S,
     current_time_ms: u64,
     action_bytes: &mut Vec<u8>,
 ) -> Result<
@@ -502,10 +510,10 @@ fn verify_one_action_with(
 }
 
 /// JSON-ingress wrapper shared by the single-action endpoint and tests.
-pub(crate) fn verify_one_action(
+pub(crate) fn verify_one_action<S: StateBackend + Clone>(
     signed_action: &str,
     chain_id: u64,
-    state_db: &torus_state::StateDb,
+    state_db: &S,
     current_time_ms: u64,
 ) -> Result<
     (
@@ -721,7 +729,9 @@ impl RpcState {
             })
             .collect();
 
-        let state_db = self.state.clone();
+        // Item 6 Phase 3 step 2 follow-up: the published ingress view (the
+        // DB alone at interval 0), fetched once per batch.
+        let state_db = self.mempool.ingress_state();
         let chain_id = self.chain_id;
         let verify_t0 = std::time::Instant::now();
         let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
@@ -1557,7 +1567,8 @@ impl TorusApiServer for RpcState {
         // re-serializing serde_json + keccak in its own copy of the pipeline.
         // (B1: the leader-forward now carries the parsed action itself, so the
         // canonical bytes are no longer needed for the forward payload.)
-        let state_db = self.state.clone();
+        // Item 6 Phase 3 step 2 follow-up: the published ingress view.
+        let state_db = self.mempool.ingress_state();
         let chain_id = self.chain_id;
         let (sender, action, hash) = tokio::task::spawn_blocking(move || {
             let current_time_ms = std::time::SystemTime::now()
