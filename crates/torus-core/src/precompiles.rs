@@ -1471,12 +1471,18 @@ impl CoreWriterQueue {
 
     /// Count pending actions for a given block number.
     pub fn pending_count(state_db: &StateDb, block_number: u64) -> Result<usize, CoreError> {
+        let prefix = block_number.to_be_bytes();
+        // P3 proto: the coalesced layer holds queue rows; read through it.
+        if state_db.p3().is_some_and(|d| d.is_live()) {
+            return torus_state::StateBackend::iterate_cf(state_db, CF_CORE_WRITER_QUEUE, Some(&prefix))
+                .map(|rows| rows.len())
+                .map_err(CoreError::State);
+        }
         let db = state_db.inner();
         let cf = db
             .cf_handle(CF_CORE_WRITER_QUEUE)
             .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
 
-        let prefix = block_number.to_be_bytes();
         let iter = torus_state::db::prefix_iter(db, &cf, &prefix);
 
         let mut count = 0usize;

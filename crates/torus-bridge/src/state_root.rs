@@ -183,6 +183,16 @@ pub fn compute_native_state_root(
         CF_STAKING_VALIDATORS,
         CF_NATIVE_LIQUIDATION, // item 3: tag 6 (tag order)
     ] {
+        // P3 proto: read through the coalesced layer when it is live.
+        if state_db.p3().is_some_and(|d| d.is_live()) {
+            for (key, value) in torus_state::StateBackend::iterate_cf(state_db, cf_name, None)? {
+                data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                data.extend_from_slice(&key);
+                data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                data.extend_from_slice(&value);
+            }
+            continue;
+        }
         if let Some(cf) = db.cf_handle(cf_name) {
             let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for item in iter {
@@ -220,9 +230,21 @@ fn compute_post_bundle_evm_root(
 
     let mut accounts: BTreeMap<Address, AccountInfo> = BTreeMap::new();
     let cf = state_db.cf_handle(CF_ACCOUNTS)?;
-    let iter = state_db
-        .inner()
-        .iterator_cf(cf, rocksdb::IteratorMode::Start);
+    // P3 proto: read through the coalesced layer when it is live.
+    let p3_rows = if state_db.p3().is_some_and(|d| d.is_live()) {
+        Some(torus_state::StateBackend::iterate_cf(state_db, CF_ACCOUNTS, None)?)
+    } else {
+        None
+    };
+    let iter: Box<dyn Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), StateError>>> = match p3_rows {
+        Some(rows) => Box::new(rows.into_iter().map(|(k, v)| Ok((k.into_boxed_slice(), v.into_boxed_slice())))),
+        None => Box::new(
+            state_db
+                .inner()
+                .iterator_cf(cf, rocksdb::IteratorMode::Start)
+                .map(|r| r.map_err(StateError::from)),
+        ),
+    };
     for item in iter {
         let (key, value) = item?;
         if key.len() != 20 {

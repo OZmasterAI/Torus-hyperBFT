@@ -597,6 +597,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         default_chain_config()
     };
 
+    // P3 PROTOTYPE (proto/p3-coalesce, not for merge): coalesced checkpoint
+    // layer (`TORUS_P3_PROTO=all|books`; unset = exact-today). Enabled after
+    // genesis init and before any component executes a block.
+    if let Some(mode) = torus_state::p3proto::mode_from_env() {
+        state_db.enable_p3_proto(mode, torus_state::p3proto::interval_from_env())?;
+    }
+
     info!(
         chain_id = chain_config.chain_id,
         epoch_length = chain_config.epoch_length,
@@ -1315,8 +1322,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 13. Wait for shutdown signal
     info!("node is running — press Ctrl+C to shut down");
-    tokio::signal::ctrl_c().await?;
+    if state_db.p3().is_some() {
+        // P3 proto: SIGTERM is a graceful stop too (flush the layer).
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = term.recv() => {}
+        }
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
     info!("shutdown signal received, stopping...");
+    if let Err(e) = state_db.p3_shutdown_flush() {
+        tracing::error!(%e, "p3proto: shutdown flush FAILED (restart replays from the last checkpoint)");
+    }
 
     Ok(())
 }

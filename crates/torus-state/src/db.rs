@@ -349,6 +349,9 @@ pub struct StateDb {
     /// 2 = tickers + histograms). Decides which parts of `runtime_stats` are
     /// meaningful.
     stats_level: u8,
+    /// P3 PROTOTYPE (not for merge): the coalesced checkpoint layer, shared by
+    /// every clone; unset = exact-today.
+    p3: Arc<std::sync::OnceLock<Arc<crate::p3proto::Deferred>>>,
 }
 
 /// r3 exec-write-stall-attribution: node-local RocksDB tuning read once at DB
@@ -787,6 +790,7 @@ impl StateDb {
             opts: (tuning.stats_level >= 1).then(|| Arc::new(opts)),
             stats_level: tuning.stats_level,
             range_compaction: Arc::default(),
+            p3: Arc::default(),
         })
     }
 
@@ -797,6 +801,7 @@ impl StateDb {
             opts: None,
             stats_level: 0,
             range_compaction: Arc::default(),
+            p3: Arc::default(),
         }
     }
 
@@ -878,6 +883,7 @@ impl StateDb {
             opts: None,
             stats_level: 0,
             range_compaction: Arc::default(),
+            p3: Arc::default(),
         })
     }
 
@@ -1076,8 +1082,96 @@ impl StateDb {
 
     /// Atomically apply a WriteBatch to the database.
     pub fn write(&self, batch: WriteBatch) -> Result<(), StateError> {
+        if let Some(p3) = self.p3() {
+            if p3.generic_write(self, &batch, None)? {
+                return Ok(());
+            }
+        }
         self.db.write(batch)?;
         Ok(())
+    }
+
+    /// P3 proto: the RocksDB write itself, bypassing the layer.
+    pub(crate) fn raw_write(&self, batch: WriteBatch) -> Result<(), StateError> {
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// P3 proto: [`Self::raw_write`] with explicit options.
+    pub(crate) fn raw_write_opt(
+        &self,
+        batch: WriteBatch,
+        opts: &rocksdb::WriteOptions,
+    ) -> Result<(), StateError> {
+        self.db.write_opt(batch, opts)?;
+        Ok(())
+    }
+
+    /// P3 PROTOTYPE: the coalesced checkpoint layer, if enabled.
+    #[inline]
+    pub fn p3(&self) -> Option<&Arc<crate::p3proto::Deferred>> {
+        self.p3.get()
+    }
+
+    /// P3 PROTOTYPE: enable the coalesced checkpoint layer (`TORUS_P3_PROTO`).
+    /// Call once at boot, after genesis init and before execution starts.
+    pub fn enable_p3_proto(
+        &self,
+        mode: crate::p3proto::Mode,
+        interval: u64,
+    ) -> Result<(), StateError> {
+        let d = crate::p3proto::Deferred::enable(self, mode, interval)?;
+        self.p3
+            .set(Arc::new(d))
+            .map_err(|_| StateError::InvalidData("p3proto enabled twice".into()))
+    }
+
+    /// P3 PROTOTYPE: flush and close the layer (graceful shutdown). No-op when off.
+    pub fn p3_shutdown_flush(&self) -> Result<(), StateError> {
+        match self.p3() {
+            Some(p3) => p3.shutdown_flush(self),
+            None => Ok(()),
+        }
+    }
+
+    /// P3 proto: (layer, CF index) when `cf` is deferred by a live layer.
+    #[inline]
+    pub(crate) fn p3_slot(&self, cf: &str) -> Option<(&crate::p3proto::Deferred, usize)> {
+        let p3 = self.p3.get()?;
+        p3.slot_of(cf).map(|i| (&**p3, i))
+    }
+
+    /// The value RocksDB itself holds (never the P3 layer): durable-state
+    /// readers such as the pruner's applied-marker clamp.
+    pub fn get_cf_raw_durable(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        let cf = self.cf(cf_name)?;
+        Ok(self.db.get_cf(cf, key)?)
+    }
+
+    /// P3 proto: run `f` over the merged (layer over RocksDB) forward scan of
+    /// a deferred CF from `start`, ending at the first key outside `prefix`.
+    /// The CF's layer read lock is held for the whole scan, so a checkpoint
+    /// cannot drop its `flushing` layer between the layer view and the
+    /// RocksDB iterator.
+    pub(crate) fn p3_scan<R>(
+        &self,
+        p3: &crate::p3proto::Deferred,
+        idx: usize,
+        start: &[u8],
+        prefix: Option<&[u8]>,
+        f: impl FnOnce(
+            &mut dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), StateError>>,
+        ) -> Result<R, StateError>,
+    ) -> Result<R, StateError> {
+        let cf = self.cf(ALL_CF_NAMES[idx])?;
+        let slot = p3.slots[idx].read().unwrap();
+        let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        let dbi = match prefix {
+            Some(p) => self.db.iterator_cf_opt(cf, prefix_read_opts(p), mode),
+            None => self.db.iterator_cf(cf, mode),
+        };
+        let mut it = crate::p3proto::MergedIter::new(&slot, start, prefix, dbi);
+        f(&mut it)
     }
 
     /// Atomically apply a WriteBatch with explicit [`rocksdb::WriteOptions`]
@@ -1088,6 +1182,11 @@ impl StateDb {
         batch: WriteBatch,
         opts: &rocksdb::WriteOptions,
     ) -> Result<(), StateError> {
+        if let Some(p3) = self.p3() {
+            if p3.generic_write(self, &batch, Some(opts))? {
+                return Ok(());
+            }
+        }
         self.db.write_opt(batch, opts)?;
         Ok(())
     }
@@ -1110,8 +1209,7 @@ impl StateDb {
 
     /// Get account info by address. Returns `None` for non-existent accounts.
     pub fn get_account(&self, address: &Address) -> Result<Option<AccountInfo>, StateError> {
-        let cf = self.cf(CF_ACCOUNTS)?;
-        match self.db.get_cf(cf, address.as_slice())? {
+        match self.get_cf_raw(CF_ACCOUNTS, address.as_slice())? {
             Some(data) => Ok(Some(decode_account_info(&data)?)),
             None => Ok(None),
         }
@@ -1119,26 +1217,20 @@ impl StateDb {
 
     /// Store account info. The `code` field is stored separately in cf_code.
     pub fn put_account(&self, address: &Address, info: &AccountInfo) -> Result<(), StateError> {
-        let cf = self.cf(CF_ACCOUNTS)?;
-        self.db
-            .put_cf(cf, address.as_slice(), encode_account_info(info))?;
-        Ok(())
+        self.put_cf_raw(CF_ACCOUNTS, address.as_slice(), &encode_account_info(info))
     }
 
     /// Delete an account.
     pub fn delete_account(&self, address: &Address) -> Result<(), StateError> {
-        let cf = self.cf(CF_ACCOUNTS)?;
-        self.db.delete_cf(cf, address.as_slice())?;
-        Ok(())
+        self.delete_cf_raw(CF_ACCOUNTS, address.as_slice())
     }
 
     // ---- Storage operations (cf_storage) ----
 
     /// Get a storage slot value. Returns `U256::ZERO` for unset slots.
     pub fn get_storage(&self, address: &Address, index: &U256) -> Result<U256, StateError> {
-        let cf = self.cf(CF_STORAGE)?;
         let key = storage_key(address, index);
-        match self.db.get_cf(cf, key)? {
+        match self.get_cf_raw(CF_STORAGE, &key)? {
             Some(data) => {
                 if data.len() != 32 {
                     return Err(StateError::InvalidData(format!(
@@ -1159,29 +1251,24 @@ impl StateDb {
         index: &U256,
         value: &U256,
     ) -> Result<(), StateError> {
-        let cf = self.cf(CF_STORAGE)?;
         let key = storage_key(address, index);
         if value.is_zero() {
-            self.db.delete_cf(cf, key)?;
+            self.delete_cf_raw(CF_STORAGE, &key)
         } else {
-            self.db.put_cf(cf, key, value.to_be_bytes::<32>())?;
+            self.put_cf_raw(CF_STORAGE, &key, &value.to_be_bytes::<32>())
         }
-        Ok(())
     }
 
     // ---- Code operations (cf_code) ----
 
     /// Get contract bytecode by its keccak256 hash.
     pub fn get_code(&self, code_hash: &B256) -> Result<Option<Vec<u8>>, StateError> {
-        let cf = self.cf(CF_CODE)?;
-        Ok(self.db.get_cf(cf, code_hash.as_slice())?)
+        self.get_cf_raw(CF_CODE, code_hash.as_slice())
     }
 
     /// Store contract bytecode keyed by its keccak256 hash.
     pub fn put_code(&self, code_hash: &B256, code: &[u8]) -> Result<(), StateError> {
-        let cf = self.cf(CF_CODE)?;
-        self.db.put_cf(cf, code_hash.as_slice(), code)?;
-        Ok(())
+        self.put_cf_raw(CF_CODE, code_hash.as_slice(), code)
     }
 
     // ---- Block hash operations ----
@@ -1211,6 +1298,11 @@ impl StateDb {
 
     /// Get a raw value from any column family.
     pub fn get_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf_name) {
+            if let Some(hit) = p3.lookup(i, key) {
+                return Ok(hit);
+            }
+        }
         let cf = self.cf(cf_name)?;
         Ok(self.db.get_cf(cf, key)?)
     }
@@ -1228,6 +1320,9 @@ impl StateDb {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        if self.p3_slot(cf_name).is_some() {
+            return keys.iter().map(|k| self.get_cf_raw(cf_name, k)).collect();
+        }
         let cf = self.cf(cf_name)?;
         self.db
             .multi_get_cf(keys.iter().map(|k| (cf, *k)))
@@ -1240,12 +1335,22 @@ impl StateDb {
     /// (pinned read). For hot paths that only need to know a (multi-KB) value is
     /// already local — e.g. the native-DA pre-warm filter.
     pub fn exists_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<bool, StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf_name) {
+            if let Some(hit) = p3.lookup(i, key) {
+                return Ok(hit.is_some());
+            }
+        }
         let cf = self.cf(cf_name)?;
         Ok(self.db.get_pinned_cf(cf, key)?.is_some())
     }
 
     /// Put a raw value into any column family.
     pub fn put_cf_raw(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf_name) {
+            if p3.put_one(i, key, Some(value)) {
+                return Ok(());
+            }
+        }
         let cf = self.cf(cf_name)?;
         self.db.put_cf(cf, key, value)?;
         Ok(())
@@ -1253,6 +1358,11 @@ impl StateDb {
 
     /// Delete a key from any column family.
     pub fn delete_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<(), StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf_name) {
+            if p3.put_one(i, key, None) {
+                return Ok(());
+            }
+        }
         let cf = self.cf(cf_name)?;
         self.db.delete_cf(cf, key)?;
         Ok(())
@@ -1296,10 +1406,9 @@ impl StateDb {
         &self,
         owner: &alloy_primitives::Address,
     ) -> Result<usize, StateError> {
-        let cf = self.cf(crate::cf::CF_SESSIONS)?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let rows = crate::backend::StateBackend::iterate_cf(self, crate::cf::CF_SESSIONS, None)?;
         let mut count = 0;
-        for (_key, value) in iter.flatten() {
+        for (_key, value) in rows {
             if let Ok(data) = serde_json::from_slice::<torus_types::SessionData>(&value) {
                 if data.owner == *owner {
                     count += 1;
@@ -1318,11 +1427,9 @@ impl StateDb {
 
     /// Collect all accounts from the database.
     pub fn all_accounts(&self) -> Result<Vec<(Address, AccountInfo)>, StateError> {
-        let cf = self.cf(CF_ACCOUNTS)?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let rows = crate::backend::StateBackend::iterate_cf(self, CF_ACCOUNTS, None)?;
         let mut accounts = Vec::new();
-        for item in iter {
-            let (key, value) = item?;
+        for (key, value) in rows {
             if key.len() != 20 {
                 return Err(StateError::InvalidData(format!(
                     "account key len {} != 20",
@@ -1338,15 +1445,10 @@ impl StateDb {
 
     /// Collect all storage slots for a given address.
     pub fn account_storage(&self, address: &Address) -> Result<Vec<(U256, U256)>, StateError> {
-        let cf = self.cf(CF_STORAGE)?;
         let prefix = address.as_slice();
-        let iter = prefix_iter(&self.db, &cf, prefix);
+        let rows = crate::backend::StateBackend::iterate_cf(self, CF_STORAGE, Some(prefix))?;
         let mut slots = Vec::new();
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(prefix) {
-                break;
-            }
+        for (key, value) in rows {
             if key.len() != 52 {
                 return Err(StateError::InvalidData(format!(
                     "storage key len {} != 52",

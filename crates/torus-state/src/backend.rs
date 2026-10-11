@@ -202,6 +202,9 @@ impl StateBackend for StateDb {
 
     /// Pinned get: the value stays in RocksDB's block, only its length is read.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        if self.p3_slot(cf).is_some() {
+            return Ok(StateDb::get_cf_raw(self, cf, key)?.map(|v| v.len()));
+        }
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -219,6 +222,9 @@ impl StateBackend for StateDb {
         let mut out = Vec::new();
         if limit == 0 {
             return Ok(out);
+        }
+        if let Some((p3, i)) = self.p3_slot(cf) {
+            return self.p3_scan(p3, i, start, Some(prefix), |it| it.take(limit).collect());
         }
         let db = self.inner();
         let cf_handle = db
@@ -251,6 +257,9 @@ impl StateBackend for StateDb {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf) {
+            return self.p3_scan(p3, i, prefix.unwrap_or(&[]), prefix, |it| it.collect());
+        }
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -289,6 +298,9 @@ impl StateBackend for StateDb {
         if limit == 0 {
             return Ok(out);
         }
+        if let Some((p3, i)) = self.p3_slot(cf) {
+            return self.p3_scan(p3, i, start, None, |it| it.take(limit).collect());
+        }
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -307,6 +319,9 @@ impl StateBackend for StateDb {
     /// First key at/after `prefix` only (keys are sorted: if it does not
     /// start with `prefix`, none does).
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        if let Some((p3, i)) = self.p3_slot(cf) {
+            return self.p3_scan(p3, i, prefix, Some(prefix), |it| it.next().transpose().map(|r| r.is_some()));
+        }
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -662,6 +677,42 @@ impl PendingState {
                         batch.delete_cf(cf, key);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// P3 proto: [`Self::append_to_batch`] for the CFs the layer does NOT
+    /// defer; the deferred CFs' rows are cloned into `staged` instead.
+    fn split_for_p3(
+        &self,
+        db: &rocksdb::DB,
+        batch: &mut WriteBatch,
+        p3: &crate::p3proto::Deferred,
+        staged: &mut Vec<crate::p3proto::Staged>,
+    ) -> Result<(), StateError> {
+        for (idx, cfp) in self.cfs.iter().enumerate() {
+            if cfp.is_empty() {
+                continue;
+            }
+            if p3.covers_idx(idx) {
+                for (key, value) in &cfp.writes {
+                    staged.push((idx, key.clone(), Some(value.clone())));
+                }
+                for key in &cfp.deletes {
+                    staged.push((idx, key.clone(), None));
+                }
+                continue;
+            }
+            let name = CfId(idx as u8).name();
+            let cf = db
+                .cf_handle(name)
+                .ok_or_else(|| StateError::MissingColumnFamily(name.to_string()))?;
+            for (key, value) in &cfp.writes {
+                batch.put_cf(cf, key, value);
+            }
+            for key in &cfp.deletes {
+                batch.delete_cf(cf, key);
             }
         }
         Ok(())
@@ -1625,13 +1676,34 @@ fn flush_pending_after_batch(
         });
 
         let build_timer = std::time::Instant::now();
-        let mut batch = prefix;
-        state.append_to_batch(raw, &mut batch)?;
-        // Deferred book save: the sidecar (worker-side book writes) joins the
-        // SAME atomic batch, appended after the main set (last-wins on the — in
-        // practice disjoint — key sets).
-        if let Some(side) = sidecar {
-            side.append_to_batch(raw, &mut batch)?;
+        // P3 PROTOTYPE: with the layer live, the deferred CFs' rows are staged
+        // for the layer instead of serialized into the batch.
+        let p3 = target.p3().map(|d| &**d);
+        let mut p3_prefix = None;
+        let mut p3_staged: Vec<crate::p3proto::Staged> = Vec::new();
+        let mut batch = match p3 {
+            Some(_) => {
+                p3_prefix = Some(prefix);
+                WriteBatch::default()
+            }
+            None => prefix,
+        };
+        match p3 {
+            Some(p3) => {
+                state.split_for_p3(raw, &mut batch, p3, &mut p3_staged)?;
+                if let Some(side) = sidecar {
+                    side.split_for_p3(raw, &mut batch, p3, &mut p3_staged)?;
+                }
+            }
+            None => {
+                state.append_to_batch(raw, &mut batch)?;
+                // Deferred book save: the sidecar (worker-side book writes) joins the
+                // SAME atomic batch, appended after the main set (last-wins on the — in
+                // practice disjoint — key sets).
+                if let Some(side) = sidecar {
+                    side.append_to_batch(raw, &mut batch)?;
+                }
+            }
         }
 
         // Native-root dirty map, folded into the SAME batch. BORROWED from the
@@ -1782,7 +1854,10 @@ fn flush_pending_after_batch(
         // appended: this is the batch RocksDB actually gets.
         stats.batch_bytes = batch.size_in_bytes();
         let write_timer = std::time::Instant::now();
-        let write_result = target.write(batch);
+        let write_result = match (p3, p3_prefix) {
+            (Some(p3), Some(prefix)) => p3.block_write(target, applied_height, prefix, p3_staged, batch),
+            _ => target.write(batch),
+        };
         stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
         // Legacy total kept intact so `torus_exec_state_write_seconds` stays
         // comparable across the split.
@@ -2149,6 +2224,11 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, None, id, start, limit, base);
         }
         let parent = self.parent.as_ref().map(|p| &p.state);
+        if let Some((p3, i)) = self.db.p3_slot(cf) {
+            return self.db.p3_scan(p3, i, start, None, |it| {
+                merge_from(&pending, parent, id, start, limit, it)
+            });
+        }
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2211,6 +2291,14 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, None, id, start, limit, base).map(cut);
         }
         let parent = self.parent.as_ref().map(|p| &p.state);
+        if let Some((p3, i)) = self.db.p3_slot(cf) {
+            return self
+                .db
+                .p3_scan(p3, i, start, Some(prefix), |it| {
+                    merge_from(&pending, parent, id, start, limit, it)
+                })
+                .map(cut);
+        }
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2260,6 +2348,17 @@ impl StateBackend for NativeStateOverlay {
                 .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
                 .take_while(|(k, _)| k.starts_with(prefix))
                 .any(|(k, _)| live(k)));
+        }
+        if let Some((p3, i)) = self.db.p3_slot(cf) {
+            return self.db.p3_scan(p3, i, prefix, Some(prefix), |it| {
+                for item in it {
+                    let (key, _) = item?;
+                    if live(&key) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            });
         }
         let db = self.db.inner();
         let cf_handle = db

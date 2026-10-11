@@ -145,7 +145,14 @@ impl StatePruner {
         // Crash replay re-executes `(applied, committed]` from the stored
         // bodies, so never prune at or above the durable applied marker
         // (absent = nothing applied = prune nothing).
-        let applied = crate::running_hash::read_applied_height(&self.db).unwrap_or(0);
+        // P3 proto: the marker RocksDB holds, not the coalesced layer's.
+        let applied = self
+            .db
+            .get_cf_raw_durable(crate::cf::CF_CONSENSUS_META, crate::cf::META_NATIVE_APPLIED_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_slice().try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0);
         let cutoff = current_height
             .saturating_sub(self.config.retention_blocks)
             .min(applied);

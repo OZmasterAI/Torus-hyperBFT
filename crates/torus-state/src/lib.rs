@@ -12,6 +12,7 @@ pub mod incremental;
 pub mod native_da;
 pub mod native_trie;
 pub mod overlay;
+pub mod p3proto;
 pub mod pruner;
 pub mod resident_rows;
 pub mod running_hash;
