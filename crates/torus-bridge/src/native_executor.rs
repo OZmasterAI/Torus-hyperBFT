@@ -10342,9 +10342,9 @@ impl NativeExecutor {
     }
 
     /// R02: a [`torus_state::StateError`] from a direct backend read or write
-    /// (or a stored row that does not decode) is always a local fault
-    /// (`CoreError::State`): latch the fail-stop under `step` and return the
-    /// error's text, for the action's unchanged error result.
+    /// is a local fault (`CoreError::State`): latch the fail-stop under
+    /// `step` and return the error's text, for the action's unchanged error
+    /// result.
     fn latch_state_fault<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         step: &str,
@@ -10353,6 +10353,39 @@ impl NativeExecutor {
         let msg = e.to_string();
         Self::latch_core_fault(ctx, step, &CoreError::State(e));
         msg
+    }
+
+    // R02 branch 6b (owner decision): at the session and oracle action sites,
+    // a committed row that does not DECODE is not a local fault: every
+    // validator holds the same bytes, so a decode-triggered fail-stop would
+    // halt the whole chain. The action keeps main's ordinary reject; only a
+    // backend storage / I-O error latches. These helpers are scoped to those
+    // sites (`is_local_fault` itself is unchanged).
+
+    /// A typed read whose decode failure surfaces as
+    /// `StateError::InvalidData` (`get_session`): that is the reject's text
+    /// only; any other `StateError` latches as [`Self::latch_state_fault`].
+    fn latch_state_read_fault<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        step: &str,
+        e: torus_state::StateError,
+    ) -> String {
+        match e {
+            torus_state::StateError::InvalidData(_) => e.to_string(),
+            e => Self::latch_state_fault(ctx, step, e),
+        }
+    }
+
+    /// A `StakingManager::get_validator` error: `EconomicsError::Borsh` (the
+    /// record does not decode) never latches; a storage error does.
+    fn latch_validator_read_fault<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        step: &str,
+        e: &torus_economics::EconomicsError,
+    ) {
+        if !matches!(e, torus_economics::EconomicsError::Borsh(_)) {
+            Self::latch_local_fault(ctx, step, e);
+        }
     }
 
     // ========================================================================
@@ -10604,7 +10637,7 @@ impl NativeExecutor {
                 );
             }
             Err(e) => {
-                let e = Self::latch_state_fault(ctx, "create session read", e);
+                let e = Self::latch_state_read_fault(ctx, "create session read", e);
                 return NativeActionResult::err("create_session", format!("state error: {e}"));
             }
             _ => {}
@@ -10643,7 +10676,7 @@ impl NativeExecutor {
             }
             Err(e) => {
                 // R02 branch 6b: a local fault fail-stops (result kept).
-                let e = Self::latch_state_fault(ctx, "revoke session read", e);
+                let e = Self::latch_state_read_fault(ctx, "revoke session read", e);
                 return NativeActionResult::err("revoke_session", format!("state error: {e}"));
             }
         }
@@ -10671,7 +10704,8 @@ impl NativeExecutor {
         // validator. s517: the reporter is the sender itself (direct submission)
         // or the validator whose registered hot oracle signer the sender is.
         // R02 branch 6b: a local fault on the reporter's reads fail-stops
-        // (result kept); "not a reporter" stays an ordinary reject.
+        // (result kept); "not a reporter" and an undecodable validator
+        // record stay ordinary rejects.
         let (reporter, status) = match Self::resolve_oracle_reporter(ctx, sender) {
             Ok(r) => r,
             Err(OracleReporterError::NotReporter) => {
@@ -10681,7 +10715,7 @@ impl NativeExecutor {
                 )
             }
             Err(OracleReporterError::Validator(step, e)) => {
-                Self::latch_local_fault(ctx, step, &e);
+                Self::latch_validator_read_fault(ctx, step, &e);
                 return NativeActionResult::err("submit_oracle_prices", e.to_string());
             }
             Err(OracleReporterError::Index(e)) => {
@@ -10740,6 +10774,9 @@ impl NativeExecutor {
             match ctx.oracle.stored_sample_ms(market_id, &reporter) {
                 Ok(Some(stored)) if stored >= sample_ms => {}
                 Ok(_) => newer.push((market_id, price)),
+                // A stored submission that does not decode
+                // (`CoreError::Borsh`) keeps main's reject, no fail-stop.
+                Err(e @ CoreError::Borsh(_)) => return err(e.to_string()),
                 Err(e) => {
                     Self::latch_core_fault(ctx, "oracle sample read", &e);
                     return err(e.to_string());
@@ -10816,9 +10853,10 @@ impl NativeExecutor {
             Ok(None) => return err(format!("{sender} is not a registered validator")),
             Err(e) => {
                 // R02 branch 6b: local faults on the reads and writes below
-                // fail-stop (results kept). A write fault after an earlier
+                // fail-stop (results kept); an undecodable validator record
+                // stays an ordinary reject. A write fault after an earlier
                 // write leaves it in the overlay, which the fail-stop discards.
-                Self::latch_local_fault(ctx, "set oracle signer validator read", &e);
+                Self::latch_validator_read_fault(ctx, "set oracle signer validator read", &e);
                 return err(e.to_string());
             }
         };
@@ -10830,7 +10868,7 @@ impl NativeExecutor {
                 Ok(None) => {}
                 Ok(Some(_)) => return err(format!("signer {s} is a validator")),
                 Err(e) => {
-                    Self::latch_local_fault(ctx, "set oracle signer signer read", &e);
+                    Self::latch_validator_read_fault(ctx, "set oracle signer signer read", &e);
                     return err(e.to_string());
                 }
             }
