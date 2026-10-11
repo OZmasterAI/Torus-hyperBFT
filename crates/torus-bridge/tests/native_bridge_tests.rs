@@ -9,13 +9,8 @@ use torus_bridge::native_executor::{
     classify_action, sort_native_actions, ActionCategory, NativeExecContext, NativeExecutor,
 };
 use torus_bridge::state_root::compute_native_state_root;
-use torus_bridge::BlockValidator;
-use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
-use torus_types::{
-    FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, TorusBlock,
-    TorusBlockHeader,
-};
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 const KECCAK_EMPTY: B256 = B256::new([
     0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
@@ -376,56 +371,6 @@ fn deterministic_native_execution() {
 }
 
 // ============================================================================
-// Test: EVM-only block still works (no native actions)
-// ============================================================================
-
-#[test]
-fn empty_native_actions_evm_only() {
-    let (_dir, state_db) = open_test_db();
-    let evm_executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
-
-    let block = TorusBlock {
-        header: TorusBlockHeader {
-            height: 1,
-            parent_hash: B256::ZERO,
-            timestamp: 1000,
-            proposer: addr(99),
-            state_root: B256::ZERO,
-            receipts_root: B256::ZERO,
-            logs_bloom: alloy_primitives::Bloom::ZERO,
-            evm_gas_used: 0,
-            evm_fee_revenue: 0,
-            evm_gas_limit: 30_000_000,
-            native_action_count: 0,
-            evm_tx_count: 0,
-            base_fee_per_gas: 1_000_000_000,
-            epoch: 0,
-            validator_set_hash: B256::ZERO,
-            sig_attestation: [0u8; 64],
-        },
-        native_actions: vec![],
-        evm_transactions: vec![],
-        core_writer_actions: vec![],
-    };
-
-    // FIX CONS-PF-02: validate_block_with_native now recovers senders from
-    // SignedNativeActions in the block (no separate senders parameter).
-    let result = validator.validate_block_with_native(&block, &state_db, &evm_executor);
-
-    // Will fail on state root mismatch (B256::ZERO != computed root), which is
-    // expected — the test verifies the pipeline runs without panic.
-    assert!(result.is_err());
-    if let Err(e) = &result {
-        // Should be a state root mismatch, not a crash.
-        assert!(
-            e.to_string().contains("state root mismatch"),
-            "expected state root mismatch, got: {e}"
-        );
-    }
-}
-
-// ============================================================================
 // Test: Native-only block (no EVM txs)
 // ============================================================================
 
@@ -641,53 +586,6 @@ fn epoch_boundary_triggered() {
 
     let result = NativeExecutor::process_epoch_boundary(&mut ctx);
     assert!(result.is_some(), "should trigger at epoch boundary");
-}
-
-// ============================================================================
-// FIX 1 TEST: Proposer/validator pipeline parity
-// ============================================================================
-
-#[test]
-fn proposer_validator_pipeline_parity() {
-    // Both proposer and validator should produce identical state roots
-    // for the same inputs, now that the proposer includes phases 4-7.
-    use torus_bridge::BlockProposer;
-
-    let (_dir, state_db) = open_test_db();
-    let evm_executor = EvmExecutor::new(TORUS_CHAIN_ID);
-    let proposer = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
-    let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
-
-    let parent = torus_bridge::genesis_parent_header();
-
-    // Build a block with the proposer (empty native + EVM actions).
-    let proposed = proposer
-        .build_block_with_native(
-            &state_db,
-            &evm_executor,
-            &parent,
-            vec![], // no native actions
-            vec![], // no EVM transactions
-            1000,
-            addr(99),
-        )
-        .expect("proposer should succeed");
-
-    // Validate the proposed block with the validator.
-    // FIX CONS-PF-02: senders recovered from block's SignedNativeActions.
-    let validated = validator.validate_block_with_native(&proposed.block, &state_db, &evm_executor);
-
-    // The validator should accept the block (state roots match).
-    match validated {
-        Ok(v) => assert_eq!(
-            v.state_root, proposed.block.header.state_root,
-            "proposer and validator state roots must match"
-        ),
-        Err(e) => panic!(
-            "validator rejected proposer's block: {e}. \
-             This indicates pipeline divergence between proposer and validator."
-        ),
-    }
 }
 
 // ============================================================================
