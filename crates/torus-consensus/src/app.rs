@@ -770,6 +770,9 @@ enum ReplayFault {
     /// R02 branch 7: the pipelined path's applied-marker put into the
     /// block's overlay failed.
     AppliedMarkerPut,
+    /// R02 branch 8 (B): the CoreWriter due-check's queue read
+    /// (`CoreWriterQueue::pending_count`) failed.
+    CoreWriterDueRead,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -1262,8 +1265,8 @@ fn recovery_exec_source(state_db: &StateDb, height: u64) -> ExecSource {
 /// `true` so the caller aborts instead of silently dropping the divergent block.
 /// A same-hash duplicate, or no persisted header, returns `false` (unchanged
 /// silent-skip behavior).
-fn detect_conflicting_commit(
-    state_db: &StateDb,
+fn detect_conflicting_commit<B: StateBackend>(
+    state_db: &B,
     height: u64,
     incoming_hash: &alloy_primitives::B256,
     exec_failed: &std::sync::atomic::AtomicBool,
@@ -1272,7 +1275,19 @@ fn detect_conflicting_commit(
         Ok(Some(d)) if d.len() >= 32 => d,
         // No persisted header (or a truncated one) to compare against — cannot
         // assert a conflict, so preserve the benign silent-skip behavior.
-        _ => return false,
+        Ok(_) => return false,
+        // R02 branch 8 (C): this node cannot read its own header — a local
+        // fault, not "no header". Fail-stop instead of skipping the check.
+        Err(e) => {
+            tracing::error!(
+                %e,
+                height,
+                "FATAL: committed header read failed in the conflicting-commit check — \
+                 halting execution pipeline (fail-stop)"
+            );
+            exec_failed.store(true, Ordering::SeqCst);
+            return true;
+        }
     };
     if data[..32] == incoming_hash.as_slice()[..] {
         // Same block re-arriving at an already-applied height: benign duplicate.
@@ -1475,8 +1490,8 @@ where
 /// and the committed chain is that parent chain, so a certified block cannot
 /// trip this. It stays as a safety latch: a mismatch here means local
 /// corruption or conflicting commits, never a Byzantine proposal.
-fn detect_parent_link_violation(
-    state_db: &StateDb,
+fn detect_parent_link_violation<B: StateBackend>(
+    state_db: &B,
     height: u64,
     parent_hash: &alloy_primitives::B256,
     exec_failed: &std::sync::atomic::AtomicBool,
@@ -1490,7 +1505,19 @@ fn detect_parent_link_violation(
         match state_db.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes()) {
             Ok(Some(d)) if d.len() >= 32 => alloy_primitives::B256::from_slice(&d[..32]),
             // Parent header not resolvable — cannot assert a conflict.
-            _ => return false,
+            Ok(_) => return false,
+            // R02 branch 8 (C): a read fault is not "not resolvable":
+            // fail-stop instead of allowing the block unchecked.
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    height,
+                    "FATAL: parent header read failed in the parent-link check — \
+                     halting execution pipeline (fail-stop)"
+                );
+                exec_failed.store(true, Ordering::SeqCst);
+                return true;
+            }
         }
     };
     if *parent_hash == expected {
@@ -1688,6 +1715,19 @@ impl ExecutionContext {
         pending_slashes: Vec<PendingSlash>,
     ) {
         self.execute_committed_block_with(torus_block, pending_slashes, DurableRows::default())
+    }
+
+    /// [`NativeExecutor::core_writer_due`] on this context's DB (the R02
+    /// test seam can make the queue read fail).
+    fn core_writer_due(&self, height: u64) -> Result<bool, torus_bridge::BridgeError> {
+        #[cfg(test)]
+        if self.test_replay_fault == Some(ReplayFault::CoreWriterDueRead) {
+            return Err(torus_core::error::CoreError::State(injected_fault(
+                "CoreWriter due-check read",
+            ))
+            .into());
+        }
+        Ok(NativeExecutor::core_writer_due(&self.state_db, height)?)
     }
 
     /// [`native_applied_height`] of this context's DB (the R02 test seam can
@@ -2230,7 +2270,19 @@ impl ExecutionContext {
         // height and are drained only on the native path — run it for them too, or an
         // otherwise-empty block would strand them (EVM-PF-05: a lockbox deposit's EVM
         // value is already burned, so a stranded credit is lost value).
-        let core_writer_due = NativeExecutor::core_writer_due(&self.state_db, height);
+        // R02 branch 8 (B): a queue read error is a node fault: fail-stop
+        // (C4), never "assume due" — as the oracle / liquidation due-checks.
+        let core_writer_due = match self.core_writer_due(height) {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::error!(%e, height, "FATAL: CoreWriter due-check read failed — halting execution pipeline (fail-stop)");
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if fold_header {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
+        };
         // bl2 exec pipeline: the overlay is built BEFORE verify so that the
         // session lookup and the nonce replay guard below read through it —
         // on the fast path its parent layer is the previous block's (possibly
@@ -4388,6 +4440,8 @@ const RECONSTRUCT_RETRIES: usize = 1;
 const RECONSTRUCT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl TorusApp {
+    /// [`Self::try_new`], panicking on a startup error (tests, embedders).
+    /// The node binary calls `try_new` and exits with the error.
     pub fn new(
         state_db: StateDb,
         config: &ChainConfig,
@@ -4395,6 +4449,22 @@ impl TorusApp {
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Self {
+        Self::try_new(state_db, config, metrics, mempool, signing_key)
+            .unwrap_or_else(|e| panic!("TorusApp startup failed: {e}"))
+    }
+
+    /// Build the app: boot replay, execution thread, proposer identity.
+    /// R02 branch 8 (D1): `Err` when this node cannot read its own validator
+    /// rows to resolve the signing key's proposer address (a local storage
+    /// fault) — startup stops instead of proposing as `Address::ZERO`. A key
+    /// that is not a validator (`Ok(None)`) still yields `Address::ZERO`.
+    pub fn try_new(
+        state_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, String> {
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
             config.chain_id,
@@ -4559,6 +4629,27 @@ impl TorusApp {
         // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
         state_hash.relatch_at_boot(&state_db, &exec_failed);
 
+        // The proposer identity, resolved from the replayed state before the
+        // execution thread starts.
+        // R02 branch 8 (D1): a read error stops startup; not a validator
+        // (`Ok(None)`) proposes as `Address::ZERO`, as before.
+        let proposer_address = match signing_key.as_ref() {
+            None => Address::ZERO,
+            Some(sk) => match staking.find_validator_by_pubkey(sk.verifying_key().as_bytes()) {
+                Ok(Some(v)) => {
+                    tracing::info!(address = %v.address, "resolved proposer address from signing key");
+                    v.address
+                }
+                Ok(None) => Address::ZERO,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot resolve the proposer address from the signing key: \
+                         validator rows read failed: {e}"
+                    ))
+                }
+            },
+        };
+
         // bl2 exec pipeline: the flush worker is constructed only NOW — after the
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
@@ -4596,16 +4687,7 @@ impl TorusApp {
             proposer,
             validator,
             evm_executor: EvmExecutor::new(config.chain_id),
-            proposer_address: signing_key.as_ref().and_then(|sk| {
-                let pubkey = sk.verifying_key();
-                staking.find_validator_by_pubkey(pubkey.as_bytes())
-                    .ok()
-                    .flatten()
-                    .map(|v| {
-                        tracing::info!(address = %v.address, "resolved proposer address from signing key");
-                        v.address
-                    })
-            }).unwrap_or(Address::ZERO),
+            proposer_address,
             last_header,
             staking,
             epoch_length: config.epoch_length,
@@ -4747,7 +4829,7 @@ impl TorusApp {
             }
         }
 
-        app
+        Ok(app)
     }
 
     pub fn leader_state(&self) -> Arc<LeaderState> {
@@ -20197,6 +20279,168 @@ mod crash_recovery_tests {
                 "R02: replay vs no fault",
             );
         }
+    }
+
+    /// R02 branch 8 (B; owner s111): the CoreWriter due-check's queue read
+    /// (`NativeExecutor::core_writer_due` -> `CoreWriterQueue::pending_count`)
+    /// failing fail-stops the block, as the oracle / liquidation due-checks
+    /// do (C4): `exec_failed`, applied marker unchanged, nothing of the block
+    /// flushed; the restart's replay matches the no-fault run. RED before: the
+    /// error read as "due" (fail-open), the native phase ran and the block
+    /// was applied on a guess. Control (no fault): two empty blocks apply.
+    #[test]
+    fn r02_core_writer_due_read_fault_fail_stops_block() {
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|_| {},
+            ReplayFault::CoreWriterDueRead,
+            &|_| {},
+        );
+    }
+
+    /// R02 branch 8 (C) test backend: point reads of `CF_BLOCK_HEADERS` fail.
+    #[derive(Clone)]
+    struct R02FailHeaders(StateDb);
+
+    impl StateBackend for R02FailHeaders {
+        fn get_cf_raw(
+            &self,
+            cf: &str,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>, torus_state::StateError> {
+            if cf == CF_BLOCK_HEADERS {
+                return Err(injected_fault("block header read"));
+            }
+            self.0.get_cf_raw(cf, key)
+        }
+        fn put_cf_raw(
+            &self,
+            cf: &str,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<(), torus_state::StateError> {
+            self.0.put_cf_raw(cf, key, value)
+        }
+        fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::StateError> {
+            self.0.delete_cf_raw(cf, key)
+        }
+        #[allow(clippy::type_complexity)]
+        fn iterate_cf(
+            &self,
+            cf: &str,
+            prefix: Option<&[u8]>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::StateError> {
+            StateBackend::iterate_cf(&self.0, cf, prefix)
+        }
+        fn atomic_write(
+            &self,
+            ops: &[torus_state::AtomicWriteOp<'_>],
+        ) -> Result<(), torus_state::StateError> {
+            StateBackend::atomic_write(&self.0, ops)
+        }
+    }
+
+    /// R02 branch 8 (C; owner s111): the conflicting-commit check's header
+    /// read failing fail-stops (latch, `true` = caller returns) instead of
+    /// skipping the check. RED before: `Err` read as "no header", returned
+    /// `false` and the block was silently skipped as a duplicate. Unchanged:
+    /// a missing or truncated header still skips (decode-as-absent kept).
+    #[test]
+    fn r02_conflicting_commit_header_read_fault_fail_stops() {
+        let (_c, db) = make_test_config_and_db();
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let latch = AtomicBool::new(false);
+        assert!(
+            detect_conflicting_commit(&R02FailHeaders(db.clone()), 5, &hash, &latch),
+            "a header read fault must fail-stop"
+        );
+        assert!(latch.load(Ordering::SeqCst), "fail-stop latched");
+
+        // Control: no header / a truncated header still skip, no latch.
+        let latch = AtomicBool::new(false);
+        assert!(!detect_conflicting_commit(&db, 5, &hash, &latch));
+        db.put_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes(), &[0u8; 8])
+            .unwrap();
+        assert!(!detect_conflicting_commit(&db, 5, &hash, &latch));
+        assert!(!latch.load(Ordering::SeqCst));
+    }
+
+    /// R02 branch 8 (C; owner s111): the parent-link check's read of the
+    /// height-1 header failing fail-stops instead of allowing the block.
+    /// RED before: `Err` read as "parent not resolvable", returned `false`.
+    /// Unchanged: height 1 (synthetic genesis parent, no read) and a missing
+    /// or truncated parent header still allow.
+    #[test]
+    fn r02_parent_link_header_read_fault_fail_stops() {
+        let (_c, db) = make_test_config_and_db();
+        let parent = alloy_primitives::B256::repeat_byte(0x22);
+        let latch = AtomicBool::new(false);
+        assert!(
+            detect_parent_link_violation(&R02FailHeaders(db.clone()), 6, &parent, &latch),
+            "a parent header read fault must fail-stop"
+        );
+        assert!(latch.load(Ordering::SeqCst), "fail-stop latched");
+
+        // Control: no read at height 1; a missing / truncated parent allows.
+        let latch = AtomicBool::new(false);
+        let genesis = alloy_primitives::keccak256(
+            torus_bridge::genesis_parent_header().canonical_header_bytes(),
+        );
+        assert!(!detect_parent_link_violation(
+            &R02FailHeaders(db.clone()),
+            1,
+            &genesis,
+            &latch
+        ));
+        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        db.put_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes(), &[0u8; 8])
+            .unwrap();
+        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        assert!(!latch.load(Ordering::SeqCst));
+    }
+
+    /// R02 branch 8 (D1; owner s111): with a signing key, a failed read of
+    /// the validator rows (here an undecodable `CF_STAKING_VALIDATORS` row:
+    /// `all_validators` returns `Err`) stops startup with a clear error
+    /// instead of proposing as `Address::ZERO`. RED before: the error read as
+    /// "not a validator". Control: a key that is not a validator (`Ok(None)`)
+    /// still starts with `Address::ZERO`; no key never reads the rows.
+    #[test]
+    fn r02_proposer_address_read_fault_fails_startup() {
+        let sk = || ed25519_dalek::SigningKey::from_bytes(&[0x37; 32]);
+        let corrupt = |db: &StateDb| {
+            db.put_cf_raw(
+                torus_state::cf::CF_STAKING_VALIDATORS,
+                Address::repeat_byte(0x44).as_slice(),
+                &[0xFF],
+            )
+            .unwrap();
+        };
+
+        let (config, db) = make_test_config_and_db();
+        corrupt(&db);
+        match TorusApp::try_new(db, &config, None, None, Some(sk())) {
+            Ok(app) => panic!(
+                "startup must fail on a validator-row read fault, got proposer {}",
+                app.proposer_address
+            ),
+            Err(e) => assert!(e.contains("proposer address"), "{e}"),
+        }
+
+        // Control: not a validator -> Address::ZERO, as before.
+        let (config, db) = make_test_config_and_db();
+        let app = TorusApp::try_new(db, &config, None, None, Some(sk()))
+            .unwrap_or_else(|e| panic!("control: {e}"));
+        assert_eq!(app.proposer_address, Address::ZERO);
+
+        // Control: no signing key (RPC-only) never reads the rows.
+        let (config, db) = make_test_config_and_db();
+        corrupt(&db);
+        let app = TorusApp::try_new(db, &config, None, None, None)
+            .unwrap_or_else(|e| panic!("no key: {e}"));
+        assert_eq!(app.proposer_address, Address::ZERO);
     }
 
     /// R02 branch 2: a fresh on-disk test DB (running hash on from height 1,
