@@ -54,6 +54,36 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
     !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
+/// Item 6 Phase 3: coalesced state checkpoints. `TORUS_CHECKPOINT_INTERVAL_MS`
+/// is the node-local interval of execution time between checkpoints; unset or
+/// `0` keeps today's per-block flush byte for byte.
+pub fn checkpoint_interval() -> Option<std::time::Duration> {
+    parse_checkpoint_interval(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok())
+}
+
+/// `TORUS_CHECKPOINT_MAX_BYTES`: cap on the since-checkpoint layer's bytes.
+pub fn checkpoint_max_bytes() -> Option<u64> {
+    parse_checkpoint_max_bytes(std::env::var("TORUS_CHECKPOINT_MAX_BYTES").ok())
+}
+
+/// Pure parse of `TORUS_CHECKPOINT_INTERVAL_MS`.
+pub fn parse_checkpoint_interval(_v: Option<String>) -> Option<std::time::Duration> {
+    None
+}
+
+/// Pure parse of `TORUS_CHECKPOINT_MAX_BYTES`.
+pub fn parse_checkpoint_max_bytes(_v: Option<String>) -> Option<u64> {
+    None
+}
+
+/// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1).
+pub fn check_checkpoint_book_mode(
+    _interval: Option<std::time::Duration>,
+    _mode: torus_bridge::native_executor::BookMode,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// One unit of work for W, in commit order.
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
@@ -542,6 +572,56 @@ mod tests {
         }
         assert!(!parse_exec_pipeline_toggle(Some("0".to_string())));
         assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
+    }
+
+    #[test]
+    fn checkpoint_interval_parse() {
+        use std::time::Duration;
+        assert_eq!(parse_checkpoint_interval(None), None);
+        assert_eq!(parse_checkpoint_interval(Some("0".into())), None);
+        assert_eq!(parse_checkpoint_interval(Some(" 0 ".into())), None);
+        assert_eq!(
+            parse_checkpoint_interval(Some("15000".into())),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            parse_checkpoint_interval(Some(" 1 ".into())),
+            Some(Duration::from_millis(1))
+        );
+        for bad in ["", "abc", "-5", "15s", "1.5"] {
+            assert_eq!(parse_checkpoint_interval(Some(bad.into())), None, "{bad:?}");
+        }
+        assert_eq!(parse_checkpoint_max_bytes(None), None);
+        assert_eq!(parse_checkpoint_max_bytes(Some("0".into())), None);
+        assert_eq!(
+            parse_checkpoint_max_bytes(Some("268435456".into())),
+            Some(268_435_456)
+        );
+        assert_eq!(parse_checkpoint_max_bytes(Some("lots".into())), None);
+    }
+
+    #[test]
+    fn checkpoint_interval_refuses_deferred_book_modes() {
+        use std::time::Duration;
+        use torus_bridge::native_executor::BookMode;
+        let on = Some(Duration::from_secs(15));
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            let err = check_checkpoint_book_mode(on, mode)
+                .expect_err("interval > 0 with a deferred book mode must refuse to start");
+            assert!(err.contains("TORUS_CHECKPOINT_INTERVAL_MS"), "{err}");
+            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+        }
+        for mode in [BookMode::Classic, BookMode::OrderRows] {
+            assert_eq!(check_checkpoint_book_mode(on, mode), Ok(()), "{mode:?}");
+        }
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            assert_eq!(check_checkpoint_book_mode(None, mode), Ok(()), "{mode:?}");
+        }
     }
 
     fn temp_env(gate: Option<Arc<WorkerGate>>) -> (WorkerEnv, tempfile::TempDir) {
