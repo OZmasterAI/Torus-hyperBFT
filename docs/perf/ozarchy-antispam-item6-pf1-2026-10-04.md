@@ -4657,6 +4657,221 @@ end-of-cell `data-du.txt` snapshot.
   arms' capacity (e.g. ~190k matched/s), so CPU-s/1M is compared at equal fills without the fit (4
   pairs, ~50 min). (3) A disk per validator: not possible on this host.
 
+## 43. Phase 3 prototype vs control with the disk taken out: shared NVMe vs tmpfs upper bound (campaign ozarchy-p3t, 2026-10-11)
+
+**The CPU saving is work removed. Most of the blocks/s gain was relief from disk contention.** The
+all-rows prototype cuts node CPU-s/1M by **5.2%** on the shared NVMe (CI 4.3-6.1%) and by **4.8%** with
+every data dir on tmpfs (CI 2.2-7.4%). The two are equal within noise (paired difference +0.4 pp,
+CI -3.9 to +4.7). The matched/s gain shrinks from **+5.8%** (shared NVMe, CI 3.5-8.1%) to **+3.1%** (tmpfs,
+CI -1.0 to +7.3%, not resolved). The native blocks/s gain drops from **+14.0%** to **+1.6%** (CI -4.5 to
++7.6). On tmpfs the paired difference in the blocks/s gain is -12.8 pp (CI -23.3 to -2.4), so that part
+of the p3p result came from the shared disk. **The tmpfs arms are an UPPER BOUND (no device I/O at all),
+not a separate-disk result.** ozarchy has one NVMe. A disk per validator could not be tested here.
+
+**Inference (not measured): a production validator with its own disk should land between the
+two rows below.** Its disk carries only its own writes, so it has less contention than the shared
+NVMe but more than tmpfs. Expect a prototype gain of about +3% to +6% matched/s, between +2% and +14%
+native blocks/s (the blocks/s gain depends on how loaded the disk is), and a CPU-s/1M saving of about
+5% in either case.
+
+Owner request (Phase 3 un-shelved, s111, gate: matched/s and blocks/s up, no CPU regression,
+restart <= 60 s, crash correctness): repeat the p3p a vs c comparison with the validators not
+sharing a disk, to test whether +4.7% matched/s / +6.1% blocks/s holds.
+
+Setup as section 42 (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900,
+fresh genesis and data dir per cell, RocksDB `LOG` copied per cell). **One node binary for every arm:**
+`proto/p3-coalesce` `682a8df5` (node `6e40fa3c`, bench `19f7ac94`; the staged copy from p3p, md5 checked;
+its build dir is gone), harness `9b7e29b2` (the p3p tools copy). Arms:
+- **cd / ad:** control / `TORUS_P3_PROTO=all`, data dirs on the shared NVMe (btrfs `/home`, zstd:3;
+  = p3p arms c / a).
+- **cm / am:** the same, with all 3 validators' data dirs on tmpfs (`DATA_ROOT=/dev/shm/ozarchy-p3t-devnet`;
+  `/dev/shm` is a 32 GB tmpfs, no sudo needed). Only the data dirs move. `run/` is a symlink back to
+  `/home/oz/torus-wsl-devnet/run`, so node logs, the pids file and every sampler path are the same
+  in both modes. Every cell checks each node's `--data-dir` filesystem type (`fschk`, tmpfs or btrfs).
+- **Fit check before launch:** p3p data dirs ended at 1.4-2.5 GB per validator, the WAL peaked at 2.27 GB
+  (p3p restart cells' 1 s WAL samples), node RSS 4-5 GB. Estimate: ~3.5 GB per validator, ~10.5 GB for
+  three; 53 GB available. Measured peak (2 s `du` samples): 2.68-2.77 GB per validator; MemAvailable never
+  below 33.3 GB.
+
+Cells 16:07-17:46 (driver `ozarchy-p3t-campaign.sh`, analyst scripts `tools/ozarchy-p3t-tools/a-*.py`):
+warm-up w0 (cd, 60 s, excluded), then 4 rounds of 120 s cells in a 4x4 Williams square (cd ad am cm / ad cm
+cd am / cm am ad cd / am cd cm ad; each arm follows every other arm once). All 17 cells are rc 0, PASS,
+AGREE, ACCEPT, with no deaths. Every cell passed its hard checks (as section 42 plus the data-dir
+filesystem). The host had no `cargo`, `rustc` or `rust-analyzer` running before any cell. Caveat: the
+gated shell here cannot delete the tmpfs data after a tmpfs cell. The next tmpfs cell's `CLEAN=1`
+wipes it, so up to one cell's tmpfs data (~7 GB) stayed in RAM during the disk cells that followed
+(MemAvailable was logged and stayed >= 33 GB). It was deleted after the campaign.
+
+### 43.1 Per arm (r1-r4, n = 4; ↓ lower is better, ↑ higher is better)
+
+Node CPU-s/1M = val0-2 `proc_cpu` whole run / fills, mean of the 3 validators (section 42). Writes per
+validator over the bench window from `io-ticks.txt`: device = `write_bytes` (bytes sent to the block
+layer; 0 on tmpfs by definition), wchar = bytes passed to `write()` (file and socket; mode-independent).
+RSS = per-node maximum of `cpu.csv`, mean of the 3 nodes.
+
+| arm | matched/s ↑ mean (sd) | native blk/s ↑ mean (sd) | node CPU-s/1M ↓ mean (sd) | user / sys per 1M | device writes MB/s/val | wchar MB/s/val | RSS GB | data peak GB/val |
+|---|---|---|---|---|---|---|---|---|
+| cd (shared NVMe) | 200,770 (1,048) | 5.70 (0.43) | 25.090 (0.152) | 23.37 / 1.73 | 131.4 | 144.7 | 3.62 | 2.68 |
+| ad (shared NVMe) | **212,362** (3,117) | **6.50** (0.21) | **23.787** (0.085) | 22.29 / 1.50 | 64.0 | 78.6 | 4.51 | 2.77 |
+| cm (tmpfs, upper bound) | 211,117 (4,787) | 6.67 (0.20) | 25.068 (0.423) | 23.20 / 1.87 | 0 | 148.6 | 3.58 | 2.75 |
+| am (tmpfs, upper bound) | **217,742** (5,318) | **6.77** (0.26) | **23.861** (0.317) | 22.24 / 1.62 | 0 | 78.8 | 4.67 | 2.77 |
+
+Per cell (r1..r4): matched/s cd 200,108 / 199,669 / 201,433 / 201,868; ad 209,397 / 211,182 / 212,158 /
+216,711; cm 211,607 / 216,328 / 211,808 / 204,724; am 219,374 / 220,062 / 209,893 / 221,640. Native blk/s
+cd 6.22 / 5.56 / 5.82 / 5.20; ad 6.64 / 6.25 / 6.38 / 6.71; cm 6.75 / 6.88 / 6.63 / 6.42; am 6.93 / 6.73 /
+6.42 / 7.01.
+
+cd reproduces p3p's c (24.996 CPU-s/1M, 204,486 matched/s), and ad reproduces p3p's a (23.770, 214,120),
+both within their spreads.
+
+### 43.2 a vs c in each storage mode, and the storage effect (Welch 95% intervals)
+
+| comparison | matched/s | native blk/s | node CPU-s/1M (whole run) | CPU at equal fills (ANCOVA) | wchar | RSS |
+|---|---|---|---|---|---|---|
+| ad vs cd, shared NVMe | **+5.77%** [+3.50, +8.05] | **+13.98%** [+2.26, +25.70] | **-5.19%** [-6.08, -4.30] | **-2.98%** [-4.61, -1.36] | -45.7% | +0.89 GB (+24.8%) |
+| am vs cm, tmpfs UPPER BOUND | +3.14% [-1.01, +7.29] | +1.60% [-4.45, +7.64] | **-4.82%** [-7.39, -2.24] | **-4.19%** [-5.34, -3.04] | -47.0% | +1.09 GB (+30.4%) |
+| cm vs cd (control: tmpfs vs disk) | +5.15% [+1.27, +9.04] | +16.97% [+5.43, +28.51] | -0.09% [-2.57, +2.40] | +2.12% [+0.53, +3.72] | +2.7% | -0.9% |
+| am vs ad (prototype: tmpfs vs disk) | +2.53% [-1.20, +6.27] | +4.26% [-2.14, +10.66] | +0.31% [-1.89, +2.50] | +0.82% [-0.38, +2.02] | +0.2% | +3.5% |
+| p3p a vs c (section 42, shared NVMe) | +4.71% | +6.1% | -4.90% [-2.4, -7.4] | -2.1% | (writes -51%) | +0.8 GB |
+
+- **Paired by round (gain on tmpfs minus gain on disk, df 3):** matched/s -2.58 pp [-7.63, +2.47];
+  blocks/s **-12.80 pp [-23.25, -2.35]**; CPU-s/1M +0.40 pp [-3.87, +4.67]. Per-round a/c matched/s gain:
+  disk 4.6 / 5.8 / 5.3 / 7.4%, tmpfs 3.7 / 1.7 / -0.9 / 8.3%.
+- **Equal fills:** common within-arm slope 12.87 ± 2.79 CPU-s per 1M fills (section 42: 10.1 ± 2.1), residual
+  sd 4.87 CPU-s per node (df 11). Node CPU per validator per cell: cd 652, ad 649, cm 682, am 658 CPU-s.
+- **Blocks/s on the shared disk is noisy for the control** (cd sd 0.43, r4-cd 5.20). This control
+  variance is why the disk blocks/s gain here (+14%) is larger than in p3p (+6.1%), with a wide CI.
+  Moving the control to tmpfs gives +17% blocks/s, about as much as the prototype gives on disk (+14%).
+- **The tmpfs control costs a little more CPU at equal fills (+2.1%)** and has more sys time (1.87 vs
+  1.73 per 1M). On tmpfs the node's `write()` copies into shmem and is charged to the node. On btrfs,
+  writeback and zstd compression run in kernel workers that are not charged to the node. So disk-arm
+  node CPU excludes the kernel's writeback / compression CPU, which favours the arm that writes more
+  (the control). That makes the disk-arm CPU saving conservative, not inflated.
+- RSS: +0.9-1.1 GB per node for the prototype in both modes (section 42: +0.8 GB). The tmpfs arms hold
+  the data dirs in shmem too (2.7-2.8 GB per validator, outside node RSS).
+
+### 43.3 Reading
+
+- **CPU-s/1M (the "no CPU regression" gate):** the saving is the same with or without device I/O
+  (-5.2% shared NVMe, -4.8% tmpfs; difference +0.4 pp, CI ±4.3). It is work removed from the node
+  (flush worker + RocksDB, section 42.2), not a side effect of disk contention. At equal fills it is
+  -3.0% (disk) / -4.2% (tmpfs). Both are clear of zero.
+- **matched/s:** the gain persists in direction but shrinks: +5.8% with the shared disk, +3.1% (not
+  resolved, n = 4) with no device I/O. About half of the shared-disk gain is consistent with disk
+  contention relief and about half with work removed. The per-round tmpfs gains are noisy (-0.9 to
+  +8.3%).
+- **Native blocks/s:** most of the gain is disk contention. The control gains +17% blocks/s just from
+  tmpfs. With tmpfs the prototype adds only +1.6% (not resolved). The paired difference (-12.8 pp)
+  excludes zero.
+- **For the Phase 3 gate (inference, see the line at the top):** on a validator with its own disk,
+  expect matched/s up by roughly +3% to +6% and CPU-s/1M down by ~5%. A blocks/s gain above +2% is
+  likely only on a busy disk.
+- **Confidence:** high for the CPU saving (both modes, every cell). Medium for the matched/s split (n = 4
+  per arm, tmpfs CI crosses zero). Medium for blocks/s (control on disk is noisy).
+- Not measured: a real per-validator disk; restart / crash in tmpfs (not needed: no restart cells).
+
+## 44. P2-3 worker pool sizing: thread spawns, spawn/join cost and what a pool would save (campaign ozarchy-p23, 2026-10-11)
+
+**A persistent pool would save about 0.05-0.15 node CPU-s/1M (0.2-0.6%; hard ceiling 0.28, 1.1%) and
+about 0.9-1.4 ms of execution-thread wall per native block (~0.5-0.8% of a ~170 ms block).** Main
+`4e7fa146` spawns **41.0 threads per native block** (36.6-43.4 over 4 cells), all from the execution
+thread, in about 2.5 scopes per block. Section 25 estimated ~0.8 ms per block, and these numbers
+confirm it; the pool remains a small win.
+
+Owner request (after Phase 3 un-shelved): size P2-3 (`item6-phase2-impl.md` P2-3, backlog since 9.10)
+from a profile only. Questions: spawns per native block, call sites, CPU-s/1M in spawn/join (clone,
+thread start, stack mmap/munmap, join/futex), and ms per native block on the execution thread.
+
+Setup: main `4e7fa146` (worktree `wt/p23-4e7fa146`, fresh target `~/.cargo-target-p23`, frame pointers +
+line tables + mold as p3s), node `169567f2`, bench `74cef98f`; harness `9b7e29b2`; tw defaults, Classic,
+300 markets, the standard shape (MAX_IN_FLIGHT 4, budget 900), data on the shared NVMe. Cells 17:48-18:40 (driver
+`ozarchy-p23-campaign.sh`): w0 (60 s, excluded), then p1 u1 p2 u2 p3 u3 p4 u4 (120 s). The p cells run
+`prof-sidecar.sh` (the Phase 2 step 0 method: `perf record -e cycles:u -F 499 -g --call-graph fp` on val0,
+45 s from bench + 35 s). All 9 cells are rc 0, AGREE, ACCEPT, with no deaths, all hard checks OK, and the
+host quiet before every cell. No sudo (`perf_event_paranoid` 2, no tracefs): no kernel samples and no
+sched/clone tracepoints.
+
+| cells | matched/s | native blk/s | node CPU-s/1M |
+|---|---|---|---|
+| u1-u4 (unprofiled) | 197,867 / 197,743 / 200,742 / 199,591 | 5.91 / 6.02 / 5.45 / 6.13 | 25.13 / 25.32 / 25.18 / 25.30 |
+| p1-p4 (perf on val0) | 191,658 / 196,034 / 191,698 / 191,875 | 4.46 / 4.81 / 4.60 / 4.57 | 26.58 / 26.17 / 26.55 / 26.33 |
+
+### 44.1 Spawns per native block and call sites (exact counts)
+
+`perf record -p` inherits its events into every new thread and writes a `PERF_RECORD_FORK` / `EXIT`
+for each one, so `perf script --show-task-events` gives **every** thread creation in val0's
+window. These are exact counts, not a lower bound. Blocks = `torus_exec_native_blocks_total`
+delta over the window (`prof-metrics-before/after`).
+
+| cell | window | native blocks | spawns | per native block | scopes per block (forks < 2 ms apart) | child lifetime median / p90 |
+|---|---|---|---|---|---|---|
+| p1 | 48.3 s | 205 | 8,897 | 43.4 | 2.63 | 6.9 / 19.5 ms |
+| p2 | 47.8 s | 238 | 8,708 | 36.6 | 2.32 | 7.3 / 18.1 ms |
+| p3 | 48.0 s | 211 | 9,098 | 43.1 | 2.60 | 6.9 / 17.2 ms |
+| p4 | 48.3 s | 203 | 8,291 | 40.8 | 2.53 | 8.6 / 19.5 ms |
+
+- **Parent: the execution thread (`torus-execution`) for 100% of spawns.** The flush worker spawned
+  nothing in these windows (state hash off, so there is no digest spawn).
+- Scope sizes per native block: one single-thread spawn (0.99-1.01 per block: `end_resident_on_worker`),
+  one full 32-thread scope (0.91-1.04 per block; 32 = host parallelism) and 0.42-0.60 smaller scopes (mean
+  15-16 threads).
+- **Sites** (the outermost torus frame of each spawned thread's samples; share of spawned-thread
+  cycles / threads seen): `MarketWorkerPool::match_parallel_capped` 56.5-58.6% / ~3,500-4,500 threads per
+  cell; `NativeExecutor::settle_market_results` 26.9-30.7% / ~3,100-4,100; `end_resident_on_worker`
+  12.1-14.3% / ~1 per block. About 3,000-7,300 threads per cell had no torus frame in their samples
+  (spawn glue only). No `drain_books_parallel`, `phase2_parallel_prepare`, `open_order_counts` or digest
+  spawns appear. Section 25 counted 47.5-52.4 per block including save-books, so save books now spawns
+  nothing on the execution thread on this shape.
+- Section 22 / the P2-3 text quote ">= 62 per native block" from the crab-era 1 Hz tid count (lower
+  bound). The exact figure on main is 41.
+
+### 44.2 Cost per spawn
+
+- **User side (perf, `cycles:u`):** spawn/join glue as the leaf frame (`pthread_create`, `clone3`,
+  `mmap` / `mprotect` / `munmap`, `sigaltstack`, `thread_start`, scope / join, TLS dtors) is
+  **0.038-0.045%** of val0 user cycles (0.08-0.15% of the execution thread's), i.e. ~0.01 CPU-s/1M.
+- **Kernel side, in the node (unprofiled u cells, 1 Hz task sampler):** CPU of the threads that were not
+  alive at two samples (= the spawned workers) is user 156-160 s and **sys 3.6-3.8 s per 140 s window =
+  0.142-0.147 CPU-s/1M**, ~100-120 us sys per spawned thread (at 41 spawns per block). This is an upper bound for the
+  worker-side kernel cost, because it also holds the workers' own syscalls. The parent-side
+  `clone` lands in the execution thread's sys (3.3-3.5 s per window, 0.13 CPU-s/1M, together with all
+  its other syscalls).
+- **Microbench** (`ozarchy-p23-tools/spawnbench.rs`, Rust `std::thread::scope` like the node, 190 parked
+  threads, 1 GiB touched heap, 3 runs, idle host): scope spawn + join **47-60 us CPU per thread** (user
+  4-11, sys 37-50) vs a persistent pool **5-9 us per task**. Caller wall in `spawn()` 15-20 us per thread
+  (25-33 us when the workers are busy). One 32-thread scope with empty jobs takes 0.72-0.74 ms vs
+  0.04 ms on the pool. With 3 ms of work per job it takes 3.91-3.96 ms vs 3.13-3.19 ms (+0.75 ms).
+  A single spawn costs 0.042 vs 0.009 ms.
+- **Perf trap:** with perf attached, val0 sys rises from 1.7 to 7.0-7.6 CPU-s/1M (other validators
+  and unprofiled cells stay at 1.6-1.8). Inherited perf events on ~185 new threads per second are
+  charged as sys. Profiled-cell sys time therefore says nothing about spawn cost. p cells run 3-4%
+  fewer matched/s and ~22% fewer native blocks/s than u cells.
+
+### 44.3 What a persistent pool would save
+
+Spawns per 1M fills: 41.0 per block / ~31,200 fills per native block (u cells, 29.8-34.0k) ≈ **1,310**.
+
+| | low | high | basis |
+|---|---|---|---|
+| node CPU-s/1M | **0.05** (1,310 x 38 us) | **0.15** (1,310 x (~105 us sys + ~10 us user glue)) | microbench saving per spawn (scope - pool) / in-node exited-thread sys + perf user glue |
+| hard ceiling | | 0.28 (1.1%) | all exited-thread sys + all execution-thread sys |
+| execution-thread wall ms per native block | **0.9** (1.0 x 0.70 + 0.5 x 0.33 + 1.0 x 0.03) | **1.4** (busy workers: 41 x 33 us) | microbench scope - pool per scope size x scopes per block |
+| share of a native block (~170 ms at 5.9 blk/s) | 0.5% | 0.8% | |
+
+Counted: the clone / thread start / stack mmap-mprotect-munmap / sigaltstack / TLS setup and teardown /
+join wake-up of every spawn, on both the parent and the worker side, and the critical-path delay of
+spawning 32 workers serially from the execution thread. Not counted: cold caches and TLB on a new
+thread (a pool keeps them warm, so the true saving may be a little higher). A pool's own wake-up
+latency under load is counted only as the microbench pool figure. Kernel time inside the node is
+measured only as an upper bound (no kernel samples without sudo).
+
+**Reading:** P2-3 stays a small win. About 41 spawns per block cost ~0.05-0.15 CPU-s/1M and ~0.9-1.4 ms per
+native block on the execution thread, so a pool is worth +0.5-1% matched/s at most (section 25 said
++0.5-1%). If it is built, the three sites are `match_parallel_capped`, `settle_market_results`
+(32-way scopes) and the per-block `end_resident_on_worker` thread. The P2-3 gate's "sys CPU per 1k
+fills down" is still unreadable at cell resolution (the saving is ~3-9% of process sys, 1.7 CPU-s/1M).
+Read the fork count (perf task events, ~0 per block after warm-up) and matched/s instead.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -4674,6 +4889,14 @@ end-of-cell `data-du.txt` snapshot.
   WAL -56% / -50%; all rows hold ~0.8 GB more RAM per node. Digest measured ~0.3 CPU-s/1M. SIGKILL
   restart with all rows 21.3 s mean to the first commit (gate 60 s). To resolve the 5% line instead:
   4 more c / a pairs, or a fixed-load pair (section 42.7).
+- **Phase 3 un-shelved (owner s111); disk isolation measured** (section 43, plan review log row 48). With
+  every data dir on tmpfs (an UPPER BOUND, not a separate-disk result; ozarchy has one NVMe) the
+  prototype still saves 4.8% node CPU-s/1M (5.2% on the shared NVMe): the CPU saving is work removed.
+  The matched/s gain shrinks from +5.8% to +3.1% (not resolved), and the blocks/s gain from +14% to
+  +1.6% (disk contention). Inference: a validator with its own disk lands between the two.
+- **P2-3 worker pool (backlog): sized** (section 44, plan review log row 49). Main `4e7fa146` spawns 41
+  threads per native block (exact perf FORK counts), all on the execution thread (match 32-way, settle,
+  end-resident). A pool saves ~0.05-0.15 CPU-s/1M (ceiling 0.28) and ~0.9-1.4 ms per native block.
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b

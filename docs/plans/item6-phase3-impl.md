@@ -126,6 +126,12 @@ measured ~0.3 CPU-s/1M. SIGKILL restart -> first commit 21.3 s mean (gate 60 s).
 rule: shelve Phase 3 and keep the disk-write numbers (borderline: the 5% line is inside both CIs;
 owner to confirm).** Steps 1-4 below are on hold.
 
+**Disk isolation (campaign `ozarchy-p3t`, 2026-10-11):** results doc section 43, review log row 48. Same prototype node, with all
+3 data dirs on tmpfs as an UPPER BOUND (no device I/O; not a separate-disk result, ozarchy has one NVMe) next to the shared NVMe.
+CPU-s/1M -5.2% (shared NVMe) / -4.8% (tmpfs): the CPU saving is work removed. matched/s +5.8% / +3.1% (tmpfs not resolved),
+native blocks/s +14.0% / +1.6%: most of the blocks/s gain was disk contention. Inference: a validator with its own disk lands
+between the two (about +3% to +6% matched/s, ~5% less CPU-s/1M; a blocks/s gain above +2% only on a busy disk).
+
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,
 or drop Phase 3.
