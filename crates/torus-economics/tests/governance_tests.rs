@@ -12,7 +12,7 @@ use torus_economics::{
 };
 use torus_state::cf::{
     ALL_CF_NAMES, CF_ACCOUNTS, CF_CONSENSUS_META, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS,
-    CF_NATIVE_MARKETS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS,
+    CF_GOVERNANCE_VOTES, CF_NATIVE_MARKETS, CF_STAKING_PERMANENT, CF_STAKING_REWARDS,
 };
 use torus_state::error::StateError;
 use torus_state::{AtomicWriteOp, StateBackend, StateDb};
@@ -1903,4 +1903,545 @@ fn every_payload_kind_writes_exactly_its_rows_on_success() {
         want.sort_by(|a, b| (order(a.0), &a.1).cmp(&(order(b.0), &b.1)));
         assert_eq!(changed, want, "{name}");
     }
+}
+
+// ============================================================================
+// R18 (s111): complete proposal snapshot. Weights, quorum denominator and
+// the two thresholds are fixed when the proposal is submitted.
+// ============================================================================
+
+/// R18 test 1: an address with no stake at submit cannot vote, even if it
+/// stakes during the voting period (no snapshot row -> no weight).
+#[test]
+fn r18_stake_after_submit_then_vote_has_no_weight() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+
+    // addr(3) delegates, addr(4) permanently stakes, both after submit.
+    setup_voter(&staking, 3, validator, wei(1_000), U256::ZERO);
+    setup_voter(&staking, 4, validator, U256::ZERO, wei(1_000));
+    for v in [3u8, 4] {
+        assert!(matches!(
+            gov.cast_vote(addr(v), id, true, 10),
+            Err(EconomicsError::NoVotingWeight(a)) if a == addr(v)
+        ));
+        assert!(matches!(
+            gov.cast_vote_abstain(addr(v), id, 10),
+            Err(EconomicsError::NoVotingWeight(a)) if a == addr(v)
+        ));
+    }
+    let p = gov.get_proposal(id).unwrap().unwrap();
+    assert_eq!((p.votes_for, p.votes_against), (U256::ZERO, U256::ZERO));
+}
+
+/// R18 test 2: abstain records the snapshot weight, not the live one.
+#[test]
+fn r18_abstain_counts_the_snapshot_weight() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(100), wei(100));
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+
+    // addr(3) adds stake after submit: live weight 400 + 150 = 550.
+    fund(staking.state(), &addr(3), wei(300));
+    staking.delegate(addr(3), validator, wei(300)).unwrap();
+    gov.cast_vote_abstain(addr(3), id, 10).unwrap();
+
+    // Snapshot weight: 100 + 100 * 3/2 = 250.
+    assert_eq!(
+        gov.get_vote(id, &addr(3)).unwrap().unwrap().weight,
+        wei(250)
+    );
+    let p = gov.get_proposal(id).unwrap().unwrap();
+    assert_eq!((p.votes_for, p.votes_against), (U256::ZERO, U256::ZERO));
+}
+
+/// R18 test 3: undelegating after voting does not shrink the quorum
+/// denominator. Snapshot 2,000, quorum 33% = 660; addr(2) votes 600 and
+/// undelegates: still rejected (a live denominator of 1,400 gives 462).
+#[test]
+fn r18_vote_then_undelegate_keeps_denominator_and_outcome() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(600), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(1_400), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    staking
+        .undelegate(addr(2), validator, wei(600), 11)
+        .unwrap();
+
+    assert_eq!(
+        gov.get_vote(id, &addr(2)).unwrap().unwrap().weight,
+        wei(600)
+    );
+    assert_eq!(
+        gov.finalize_proposal(id, 101).unwrap(),
+        ProposalOutcome::Rejected(id)
+    );
+}
+
+/// R18 test 4a: a `quorum_bps` change that passes and executes while a
+/// proposal is running does not apply to it. 25% participation fails the
+/// 33% quorum frozen at submit (the live 10% would pass it).
+#[test]
+fn r18_quorum_change_mid_vote_does_not_affect_running_proposal() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(1_500), U256::ZERO);
+
+    let change = gov
+        .submit_proposal(
+            addr(2),
+            "Q".into(),
+            "D".into(),
+            Some(ExecutionPayload::ParameterChange {
+                param_key: "quorum_bps".into(),
+                new_value: "1000".into(),
+            }),
+            0,
+        )
+        .unwrap();
+    gov.cast_vote(addr(2), change, true, 1).unwrap();
+    gov.cast_vote(addr(3), change, true, 1).unwrap();
+
+    let running = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 50)
+        .unwrap();
+    gov.cast_vote(addr(2), running, true, 51).unwrap();
+
+    assert_eq!(
+        gov.finalize_proposal(change, 101).unwrap(),
+        ProposalOutcome::Passed(change)
+    );
+    assert_eq!(
+        gov.execute_proposal(change, 111).unwrap(),
+        ProposalOutcome::Executed(change)
+    );
+    assert_eq!(gov.get_governance_params().unwrap().quorum_bps, 1000);
+
+    assert_eq!(
+        gov.finalize_proposal(running, 151).unwrap(),
+        ProposalOutcome::Rejected(running)
+    );
+}
+
+/// R18 test 4b: a `permanent_unlock_threshold_bps` change that passes
+/// mid-vote does not apply to a running PermanentUnlock: 60% for fails the
+/// 80% frozen at submit (the live 60% would pass it).
+#[test]
+fn r18_unlock_threshold_change_mid_vote_does_not_affect_running_proposal() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(600), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(400), U256::ZERO);
+    setup_voter(&staking, 5, validator, U256::ZERO, wei(10));
+
+    let change = gov
+        .submit_proposal(
+            addr(2),
+            "T".into(),
+            "D".into(),
+            Some(ExecutionPayload::ParameterChange {
+                param_key: "permanent_unlock_threshold_bps".into(),
+                new_value: "6000".into(),
+            }),
+            0,
+        )
+        .unwrap();
+    gov.cast_vote(addr(2), change, true, 1).unwrap();
+    gov.cast_vote(addr(3), change, true, 1).unwrap();
+
+    let running = gov
+        .submit_proposal(
+            addr(2),
+            "U".into(),
+            "D".into(),
+            Some(ExecutionPayload::PermanentUnlock {
+                staker: addr(5),
+                amount: wei(10),
+            }),
+            50,
+        )
+        .unwrap();
+    gov.cast_vote(addr(2), running, true, 51).unwrap();
+    gov.cast_vote(addr(3), running, false, 51).unwrap();
+
+    assert_eq!(
+        gov.finalize_proposal(change, 101).unwrap(),
+        ProposalOutcome::Passed(change)
+    );
+    assert_eq!(
+        gov.execute_proposal(change, 111).unwrap(),
+        ProposalOutcome::Executed(change)
+    );
+    assert_eq!(
+        gov.get_governance_params()
+            .unwrap()
+            .permanent_unlock_threshold_bps,
+        6000
+    );
+
+    assert_eq!(
+        gov.finalize_proposal(running, 151).unwrap(),
+        ProposalOutcome::Rejected(running)
+    );
+}
+
+/// R18 test 5: quorum is measured on the weighted scale (S1 a): the
+/// denominator is the sum of snapshot weights (permanent x 3/2), like the
+/// votes. addr(4): 200 permanent = weight 300; addr(3) delegates 700 + `extra`
+/// wei. quorum_bps 3000. With extra = 0 the quorum is exactly 300 (passes);
+/// with extra = 4 wei it is 300 + 1 wei (fails). An unweighted denominator
+/// (900 + extra) gives 270 and passes both.
+#[test]
+fn r18_mixed_quorum_is_on_the_weighted_scale_at_the_boundary() {
+    for (extra, want_pass) in [(0u64, true), (4, false)] {
+        let (_dir, gov, staking) = setup();
+        let mut params = gov.get_governance_params().unwrap();
+        params.quorum_bps = 3000;
+        gov.set_governance_params(&params).unwrap();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 4, validator, U256::ZERO, wei(200));
+        setup_voter(
+            &staking,
+            3,
+            validator,
+            wei(700) + U256::from(extra),
+            U256::ZERO,
+        );
+
+        let id = gov
+            .submit_proposal(addr(4), "P".into(), "D".into(), None, 0)
+            .unwrap();
+        gov.cast_vote(addr(4), id, true, 1).unwrap();
+        assert_eq!(
+            gov.get_vote(id, &addr(4)).unwrap().unwrap().weight,
+            wei(300)
+        );
+
+        let want = if want_pass {
+            ProposalOutcome::Passed(id)
+        } else {
+            ProposalOutcome::Rejected(id)
+        };
+        assert_eq!(
+            gov.finalize_proposal(id, 101).unwrap(),
+            want,
+            "extra {extra}"
+        );
+    }
+}
+
+/// Snapshot rows of proposal `id` in CF_GOVERNANCE_VOTES: the number of
+/// weight rows (`snap` ++ id ++ voter, 32 bytes) and whether the record
+/// (`snapmeta` ++ id) exists.
+fn snapshot_rows(db: &StateDb, id: u64) -> (usize, bool) {
+    let rows = db.iterate_cf(CF_GOVERNANCE_VOTES, None).unwrap();
+    let weights = rows
+        .iter()
+        .filter(|(k, _)| k.len() == 32 && k.starts_with(b"snap") && k[4..12] == id.to_be_bytes())
+        .count();
+    let mut meta = b"snapmeta".to_vec();
+    meta.extend_from_slice(&id.to_be_bytes());
+    let record = rows.iter().any(|(k, _)| *k == meta);
+    (weights, record)
+}
+
+/// R18 test 6 (S3): finalize deletes the proposal's snapshot weight rows and
+/// record; another running proposal keeps its own. Vote rows stay.
+#[test]
+fn r18_snapshot_rows_and_record_are_deleted_at_finalize() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    setup_voter(&staking, 3, validator, wei(100), wei(100));
+    let first = gov
+        .submit_proposal(addr(2), "P1".into(), "D".into(), None, 0)
+        .unwrap();
+    let second = gov
+        .submit_proposal(addr(2), "P2".into(), "D".into(), None, 50)
+        .unwrap();
+    assert_eq!(snapshot_rows(gov.state(), first), (2, true));
+    assert_eq!(snapshot_rows(gov.state(), second), (2, true));
+    gov.cast_vote(addr(2), first, true, 10).unwrap();
+
+    assert_eq!(
+        gov.process_pending_proposals(101).unwrap(),
+        vec![ProposalOutcome::Passed(first)]
+    );
+    assert_eq!(snapshot_rows(gov.state(), first), (0, false));
+    assert_eq!(snapshot_rows(gov.state(), second), (2, true));
+    assert!(gov.get_vote(first, &addr(2)).unwrap().is_some());
+    assert_eq!(gov.get_voter_history(&addr(2)).unwrap().len(), 1);
+
+    // A rejected proposal is cleaned up too.
+    assert_eq!(
+        gov.process_pending_proposals(151).unwrap(),
+        vec![ProposalOutcome::Rejected(second)]
+    );
+    assert_eq!(snapshot_rows(gov.state(), second), (0, false));
+}
+
+// ============================================================================
+// R18 / R02 (s111): a storage fault on a snapshot read fails-stop (a local
+// fault: `EconomicsError::is_local_fault`); a missing or undecodable snapshot
+// row is the same bytes on every validator and keeps a deterministic result.
+// ============================================================================
+
+/// `snap` ++ id ++ voter: a voter's snapshot weight row (32 bytes).
+fn snap_weight_key(id: u64, voter: &Address) -> Vec<u8> {
+    let mut k = b"snap".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k.extend_from_slice(voter.as_slice());
+    k
+}
+
+/// `snapmeta` ++ id: a proposal's snapshot record (16 bytes).
+fn snap_meta_key(id: u64) -> Vec<u8> {
+    let mut k = b"snapmeta".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `snap` ++ id: the prefix finalize iterates to delete the weight rows.
+fn snap_prefix(id: u64) -> Vec<u8> {
+    let mut k = b"snap".to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `StateDb` whose READ of one `(cf, key)` fails with an I/O error (an
+/// injected backend fault): `get_cf_raw` of that key, and `iterate_cf` with
+/// exactly that key as prefix. Writes go through.
+#[derive(Clone)]
+struct FailingRead {
+    inner: StateDb,
+    cf: &'static str,
+    key: Vec<u8>,
+}
+
+impl FailingRead {
+    fn new(inner: StateDb, cf: &'static str, key: &[u8]) -> Self {
+        Self {
+            inner,
+            cf,
+            key: key.to_vec(),
+        }
+    }
+    fn fail() -> StateError {
+        StateError::Io(std::io::Error::other("injected read failure"))
+    }
+}
+
+impl StateBackend for FailingRead {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if cf == self.cf && key == self.key.as_slice() {
+            return Err(Self::fail());
+        }
+        StateBackend::get_cf_raw(&self.inner, cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        StateBackend::put_cf_raw(&self.inner, cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        StateBackend::delete_cf_raw(&self.inner, cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        if cf == self.cf && prefix == Some(self.key.as_slice()) {
+            return Err(Self::fail());
+        }
+        StateBackend::iterate_cf(&self.inner, cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        StateBackend::atomic_write(&self.inner, ops)
+    }
+}
+
+/// Proposal 1 by addr(2) (500 delegated), addr(2) voted yes: it passes at
+/// block 101 on a healthy backend.
+fn setup_voted_proposal() -> (tempfile::TempDir, GovernanceManager, u64) {
+    let (dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 10).unwrap();
+    (dir, gov, id)
+}
+
+fn assert_local_fault<T: std::fmt::Debug>(r: Result<T, EconomicsError>, what: &str) {
+    match r {
+        Err(e) => {
+            assert!(e.is_local_fault(), "{what}: {e}");
+            assert!(e.to_string().contains("injected"), "{what}: {e}");
+        }
+        Ok(v) => panic!("{what}: expected a local fault, got Ok({v:?})"),
+    }
+}
+
+/// An I/O error reading the snapshot record is a local fault: finalize and
+/// the block step return it (the executor fail-stops); the proposal is NOT
+/// rejected and nothing is written. The healthy backend then passes it.
+#[test]
+fn r18_record_read_io_error_is_a_local_fault_not_a_reject() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    let before = dump_all(gov.state());
+    let faulty = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_meta_key(id),
+    ));
+    assert_local_fault(faulty.finalize_proposal(id, 101), "finalize");
+    assert_local_fault(faulty.process_pending_proposals(101), "process");
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+    assert_eq!(
+        gov.get_proposal(id).unwrap().unwrap().status,
+        ProposalStatus::Active
+    );
+    assert_eq!(
+        gov.finalize_proposal(id, 101).unwrap(),
+        ProposalOutcome::Passed(id)
+    );
+}
+
+/// A missing snapshot record is deterministic: the proposal is rejected (no
+/// error, no halt) and its remaining snapshot rows are deleted.
+#[test]
+fn r18_missing_record_rejects() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    gov.state()
+        .delete_cf_raw(CF_GOVERNANCE_VOTES, &snap_meta_key(id))
+        .unwrap();
+    assert_eq!(
+        gov.process_pending_proposals(101).unwrap(),
+        vec![ProposalOutcome::Rejected(id)]
+    );
+    assert_eq!(snapshot_rows(gov.state(), id), (0, false));
+}
+
+/// An undecodable snapshot record (wrong length) is deterministic too: read
+/// as absent, the proposal is rejected and the record deleted.
+#[test]
+fn r18_undecodable_record_rejects() {
+    for bad in [&b""[..], &b"\x01\x02\x03"[..], &[0u8; 49][..]] {
+        let (_dir, gov, id) = setup_voted_proposal();
+        gov.state()
+            .put_cf_raw(CF_GOVERNANCE_VOTES, &snap_meta_key(id), bad)
+            .unwrap();
+        assert_eq!(
+            gov.process_pending_proposals(101).unwrap(),
+            vec![ProposalOutcome::Rejected(id)],
+            "record {bad:?}"
+        );
+        assert_eq!(snapshot_rows(gov.state(), id), (0, false));
+    }
+}
+
+/// An I/O error reading a voter's snapshot weight row is a local fault for
+/// yes / no and abstain votes: no tally or vote row is written.
+#[test]
+fn r18_weight_read_io_error_is_a_local_fault_for_votes_and_abstain() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+        .unwrap();
+    let before = dump_all(gov.state());
+    let faulty = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_weight_key(id, &addr(2)),
+    ));
+    assert_local_fault(faulty.cast_vote(addr(2), id, true, 10), "yes");
+    assert_local_fault(faulty.cast_vote(addr(2), id, false, 10), "no");
+    assert_local_fault(faulty.cast_vote_abstain(addr(2), id, 10), "abstain");
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+}
+
+/// A missing or undecodable weight row is deterministic: NoVotingWeight for
+/// yes / no and abstain (not a local fault), nothing written.
+#[test]
+fn r18_missing_or_undecodable_weight_row_is_no_voting_weight() {
+    for bad in [None, Some(&b"\x01"[..]), Some(&[1u8; 33][..])] {
+        let (_dir, gov, staking) = setup();
+        let validator = setup_validator(&staking, 1);
+        setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+        let id = gov
+            .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
+            .unwrap();
+        let key = snap_weight_key(id, &addr(2));
+        match bad {
+            None => gov
+                .state()
+                .delete_cf_raw(CF_GOVERNANCE_VOTES, &key)
+                .unwrap(),
+            Some(b) => gov
+                .state()
+                .put_cf_raw(CF_GOVERNANCE_VOTES, &key, b)
+                .unwrap(),
+        }
+        let before = dump_all(gov.state());
+        for r in [
+            gov.cast_vote(addr(2), id, true, 10),
+            gov.cast_vote(addr(2), id, false, 10),
+            gov.cast_vote_abstain(addr(2), id, 10),
+        ] {
+            match r {
+                Err(e @ EconomicsError::NoVotingWeight(a)) => {
+                    assert_eq!(a, addr(2));
+                    assert!(!e.is_local_fault());
+                }
+                other => panic!("row {bad:?}: expected NoVotingWeight, got {other:?}"),
+            }
+        }
+        assert_eq!(dump_all(gov.state()), before, "row {bad:?}");
+    }
+}
+
+/// The finalize deletes: an I/O error listing the weight rows, or a write
+/// fault on the atomic status + delete batch, is a local fault; the
+/// proposal stays Active and nothing is written.
+#[test]
+fn r18_snapshot_delete_faults_are_local_faults() {
+    let (_dir, gov, id) = setup_voted_proposal();
+    let before = dump_all(gov.state());
+
+    let list_fault = GovernanceManager::new(FailingRead::new(
+        gov.state().clone(),
+        CF_GOVERNANCE_VOTES,
+        &snap_prefix(id),
+    ));
+    assert_local_fault(list_fault.finalize_proposal(id, 101), "iterate");
+
+    for key in [snap_meta_key(id), snap_weight_key(id, &addr(2))] {
+        let write_fault = GovernanceManager::new(PoisonedKey::new(
+            gov.state().clone(),
+            CF_GOVERNANCE_VOTES,
+            &key,
+        ));
+        assert_local_fault(write_fault.finalize_proposal(id, 101), "delete");
+    }
+
+    assert_eq!(dump_all(gov.state()), before, "nothing written");
+    assert_eq!(
+        gov.get_proposal(id).unwrap().unwrap().status,
+        ProposalStatus::Active
+    );
 }

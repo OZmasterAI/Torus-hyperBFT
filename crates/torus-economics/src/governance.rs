@@ -566,6 +566,49 @@ pub enum ProposalOutcome {
 }
 
 // ============================================================================
+// ProposalSnapshot (R18)
+// ============================================================================
+
+/// R18 (s111): what a proposal is measured against, fixed when it is
+/// submitted. Stored in CF_GOVERNANCE_VOTES under [`snapshot_meta_key`]
+/// next to the per-voter weight rows, and deleted with them at finalize.
+/// `Proposal`'s layout is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProposalSnapshot {
+    /// Quorum denominator: the sum of the snapshot weights (permanent stake
+    /// weighted like the votes, S1 a).
+    total_weight: U256,
+    /// `quorum_bps` at submit.
+    quorum_bps: u64,
+    /// `permanent_unlock_threshold_bps` at submit.
+    permanent_unlock_threshold_bps: u64,
+}
+
+impl ProposalSnapshot {
+    /// Fixed 48-byte row: total_weight (32 BE) ++ quorum_bps (8 BE) ++
+    /// permanent_unlock_threshold_bps (8 BE).
+    fn encode(&self) -> [u8; 48] {
+        let mut out = [0u8; 48];
+        out[..32].copy_from_slice(&self.total_weight.to_be_bytes::<32>());
+        out[32..40].copy_from_slice(&self.quorum_bps.to_be_bytes());
+        out[40..48].copy_from_slice(&self.permanent_unlock_threshold_bps.to_be_bytes());
+        out
+    }
+
+    /// Strict decode: any other length is `None` (absent).
+    fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != 48 {
+            return None;
+        }
+        Some(Self {
+            total_weight: U256::from_be_slice(&data[..32]),
+            quorum_bps: u64::from_be_bytes(data[32..40].try_into().ok()?),
+            permanent_unlock_threshold_bps: u64::from_be_bytes(data[40..48].try_into().ok()?),
+        })
+    }
+}
+
+// ============================================================================
 // GovernanceManager
 // ============================================================================
 
@@ -822,7 +865,20 @@ impl<T: StateBackend> GovernanceManager<T> {
 
         // FIX ECON-FIND-16: Snapshot all voter weights at proposal creation time.
         // Prevents flash-vote attacks by fixing voting power at snapshot_block.
-        self.snapshot_voter_weights(id, &params)?;
+        // R18 (s111): also record the quorum denominator (the sum of those
+        // weights) and the two thresholds, so nothing that happens during
+        // the vote moves what the proposal is measured against.
+        let total_weight = self.snapshot_voter_weights(id, &params)?;
+        let snapshot = ProposalSnapshot {
+            total_weight,
+            quorum_bps: params.quorum_bps,
+            permanent_unlock_threshold_bps: params.permanent_unlock_threshold_bps,
+        };
+        self.state.put_cf_raw(
+            CF_GOVERNANCE_VOTES,
+            &snapshot_meta_key(id),
+            &snapshot.encode(),
+        )?;
 
         tracing::info!(id, %proposer, "governance proposal submitted");
         Ok(id)
@@ -861,9 +917,9 @@ impl<T: StateBackend> GovernanceManager<T> {
         }
 
         // Compute vote weight (chain-computed, never user-supplied).
-        // FIX ECON-FIND-16: Use snapshotted weight from proposal creation time.
-        let params = self.get_governance_params()?;
-        let weight = self.compute_vote_weight_at(&voter, &params, proposal_id)?;
+        // FIX ECON-FIND-16 / R18: the weight snapshotted at submit; an address
+        // with no snapshot row has no weight on this proposal.
+        let weight = self.snapshot_weight(&voter, proposal_id)?;
         if weight.is_zero() {
             return Err(EconomicsError::NoVotingWeight(voter));
         }
@@ -921,8 +977,8 @@ impl<T: StateBackend> GovernanceManager<T> {
             return Err(EconomicsError::AlreadyVoted { voter, proposal_id });
         }
 
-        let params = self.get_governance_params()?;
-        let weight = self.compute_vote_weight(&voter, &params)?;
+        // R18: the snapshot weight, as for yes / no votes.
+        let weight = self.snapshot_weight(&voter, proposal_id)?;
         if weight.is_zero() {
             return Err(EconomicsError::NoVotingWeight(voter));
         }
@@ -968,11 +1024,21 @@ impl<T: StateBackend> GovernanceManager<T> {
             return Err(EconomicsError::VotingNotEnded(proposal_id));
         }
 
+        // Live params: only `timelock_blocks` is used (it applies after the
+        // vote). Read first, as before R18, so missing params still fail every
+        // finalize alike (GovernanceNotInitialized).
         let params = self.get_governance_params()?;
 
-        // Compute quorum: quorum_bps / 10000 of total staked supply.
-        let total_staked = self.total_staked_supply()?;
-        let quorum = total_staked * U256::from(params.quorum_bps) / U256::from(10_000u64);
+        // R18 (s111): quorum denominator and thresholds come from the record
+        // written at submit. Every proposal has a record (fresh genesis). A
+        // missing or undecodable one is read as absent (decode errors never
+        // halt the chain) and the proposal is rejected: nothing it would
+        // execute was measured against a known quorum.
+        let meta_key = snapshot_meta_key(proposal_id);
+        let snapshot = self
+            .state
+            .get_cf_raw(CF_GOVERNANCE_VOTES, &meta_key)?
+            .and_then(|data| ProposalSnapshot::decode(&data));
 
         // FIX 20: Use total vote weight (yes + no + abstain) for quorum check.
         let total_votes = self.total_vote_weight(proposal_id)?;
@@ -980,26 +1046,50 @@ impl<T: StateBackend> GovernanceManager<T> {
         // PermanentUnlock requires supermajority: votes_for / total_vote_weight >= threshold_bps.
         // Abstains count toward total_vote_weight (conservative: makes passage harder).
         // All other proposal types keep simple majority.
-        let passed = if proposal.proposal_type == ProposalType::PermanentUnlock {
-            let threshold = U256::from(params.permanent_unlock_threshold_bps);
-            total_votes >= quorum
-                && !total_votes.is_zero()
-                && proposal.votes_for * U256::from(10_000u64) >= threshold * total_votes
-        } else {
-            proposal.votes_for > proposal.votes_against && total_votes >= quorum
+        let passed = match snapshot {
+            None => {
+                tracing::error!(proposal_id, "proposal snapshot record missing, rejecting");
+                false
+            }
+            Some(snap) => {
+                // Quorum: quorum_bps / 10000 of the snapshot weight (S1 a:
+                // the same weighted scale as the votes).
+                let quorum =
+                    snap.total_weight * U256::from(snap.quorum_bps) / U256::from(10_000u64);
+                if proposal.proposal_type == ProposalType::PermanentUnlock {
+                    let threshold = U256::from(snap.permanent_unlock_threshold_bps);
+                    total_votes >= quorum
+                        && !total_votes.is_zero()
+                        && proposal.votes_for * U256::from(10_000u64) >= threshold * total_votes
+                } else {
+                    proposal.votes_for > proposal.votes_against && total_votes >= quorum
+                }
+            }
         };
 
-        if !passed {
+        if passed {
+            // FIX 15: Passed -- set timelock instead of immediate execution.
+            proposal.status = ProposalStatus::Passed;
+            proposal.executable_after = current_block + params.timelock_blocks;
+        } else {
             proposal.status = ProposalStatus::Rejected;
-            self.put_proposal(&proposal)?;
+        }
+
+        // R18 S3: the status change and the deletion of the proposal's
+        // snapshot (weight rows and record) land in one atomic write.
+        let mut writes = self.stage_snapshot_delete(proposal_id)?;
+        let row = borsh::to_vec(&proposal).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+        writes.push((
+            CF_GOVERNANCE_PROPOSALS,
+            proposal.id.to_be_bytes().to_vec(),
+            Some(row),
+        ));
+        apply_staged(&self.state, &writes)?;
+
+        if !passed {
             tracing::info!(proposal_id, "proposal rejected");
             return Ok(ProposalOutcome::Rejected(proposal_id));
         }
-
-        // FIX 15: Passed -- set timelock instead of immediate execution.
-        proposal.status = ProposalStatus::Passed;
-        proposal.executable_after = current_block + params.timelock_blocks;
-        self.put_proposal(&proposal)?;
         tracing::info!(
             proposal_id,
             executable_after = proposal.executable_after,
@@ -1391,43 +1481,36 @@ impl<T: StateBackend> GovernanceManager<T> {
     // Private helpers
     // ========================================================================
 
-    /// Compute vote weight: delegated + permanent * multiplier_num / multiplier_den.
-    /// FIX 14: Guards against division by zero in permanent_weight_multiplier_den.
-    fn compute_vote_weight(&self, voter: &Address, params: &GovernanceParams) -> Result<U256> {
-        let delegated = self.total_delegated_for(voter)?;
-        let permanent = self.permanent_stake_for(voter)?;
-        let den = params.permanent_weight_multiplier_den;
-        if den == 0 {
-            return Err(EconomicsError::InvalidParameterValue {
-                key: "permanent_weight_multiplier_den".to_string(),
-                reason: "denominator must not be zero".to_string(),
-            });
+    /// FIX ECON-FIND-16 / R18: the voter's weight on a proposal, read from
+    /// the snapshot row written at submit. No row (no stake at submit) or a
+    /// malformed one is weight 0: there is no fallback to live stake.
+    fn snapshot_weight(&self, voter: &Address, proposal_id: u64) -> Result<U256> {
+        let snap_key = snapshot_weight_key(proposal_id, voter);
+        match self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &snap_key)? {
+            Some(data) if data.len() == 32 => Ok(U256::from_be_slice(&data)),
+            _ => Ok(U256::ZERO),
         }
-        let weighted_permanent =
-            permanent * U256::from(params.permanent_weight_multiplier_num) / U256::from(den);
-        Ok(delegated + weighted_permanent)
     }
 
-    /// FIX ECON-FIND-16: Compute vote weight from the snapshot taken at proposal creation.
-    ///
-    /// Looks up the voter's snapshotted weight (stored in CF_GOVERNANCE_VOTES under a
-    /// `snap_` prefixed key). Falls back to live state for backward compatibility with
-    /// proposals created before the snapshot mechanism was added.
-    fn compute_vote_weight_at(
-        &self,
-        voter: &Address,
-        params: &GovernanceParams,
-        proposal_id: u64,
-    ) -> Result<U256> {
-        // Try to load snapshotted weight first.
-        let snap_key = snapshot_weight_key(proposal_id, voter);
-        if let Some(data) = self.state.get_cf_raw(CF_GOVERNANCE_VOTES, &snap_key)? {
-            if data.len() == 32 {
-                return Ok(U256::from_be_slice(&data));
-            }
-        }
-        // Fallback: compute from live state (pre-snapshot proposals).
-        self.compute_vote_weight(voter, params)
+    /// R18 S3: deletes of every snapshot row of `proposal_id`: the weight
+    /// rows (`snap` ++ id ++ voter) and the record (`snapmeta` ++ id).
+    fn stage_snapshot_delete(&self, proposal_id: u64) -> Result<Vec<StagedWrite>> {
+        let mut prefix = [0u8; 12];
+        prefix[..4].copy_from_slice(b"snap");
+        prefix[4..12].copy_from_slice(&proposal_id.to_be_bytes());
+        let mut writes: Vec<StagedWrite> = self
+            .state
+            .iterate_cf(CF_GOVERNANCE_VOTES, Some(&prefix))?
+            .into_iter()
+            .filter(|(key, _)| key.len() == 32)
+            .map(|(key, _)| (CF_GOVERNANCE_VOTES, key, None))
+            .collect();
+        writes.push((
+            CF_GOVERNANCE_VOTES,
+            snapshot_meta_key(proposal_id).to_vec(),
+            None,
+        ));
+        Ok(writes)
     }
 
     /// FIX ECON-FIND-16: Snapshot all voter weights at proposal creation time.
@@ -1439,7 +1522,9 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// Rate-limited by min_proposal_stake requirement. A lazy evaluation approach
     /// (compute weight on-demand at vote time) would eliminate this scan but requires
     /// a larger refactor of the voting flow.
-    fn snapshot_voter_weights(&self, proposal_id: u64, params: &GovernanceParams) -> Result<()> {
+    ///
+    /// Returns the sum of the weights written (R18: the quorum denominator).
+    fn snapshot_voter_weights(&self, proposal_id: u64, params: &GovernanceParams) -> Result<U256> {
         use std::collections::HashMap;
 
         let mut voter_delegated: HashMap<Address, U256> = HashMap::new();
@@ -1479,6 +1564,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             voter_delegated.keys().copied().collect();
         all_voters.extend(voter_permanent.keys());
 
+        let mut total = U256::ZERO;
         for voter in all_voters {
             let delegated = voter_delegated.get(&voter).copied().unwrap_or(U256::ZERO);
             let permanent = voter_permanent.get(&voter).copied().unwrap_or(U256::ZERO);
@@ -1486,6 +1572,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                 permanent * U256::from(params.permanent_weight_multiplier_num) / U256::from(den);
             let weight = delegated + weighted_permanent;
             if !weight.is_zero() {
+                total += weight;
                 let snap_key = snapshot_weight_key(proposal_id, &voter);
                 self.state.put_cf_raw(
                     CF_GOVERNANCE_VOTES,
@@ -1495,7 +1582,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             }
         }
 
-        Ok(())
+        Ok(total)
     }
 
     /// Total vote weight cast on a proposal (yes + no + abstain) (FIX 20).
@@ -1508,27 +1595,6 @@ impl<T: StateBackend> GovernanceManager<T> {
                 Vote::try_from_slice(value).map_err(|e| EconomicsError::Borsh(e.to_string()))?;
             total += vote.weight;
         }
-        Ok(total)
-    }
-
-    /// Sum total staked supply across all delegations and permanent stakes.
-    fn total_staked_supply(&self) -> Result<U256> {
-        let mut total = U256::ZERO;
-
-        let delegation_entries = self.state.iterate_cf(CF_STAKING_DELEGATIONS, None)?;
-        for (_key, value) in &delegation_entries {
-            let delegation = Delegation::try_from_slice(value)
-                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-            total += delegation.amount;
-        }
-
-        let permanent_entries = self.state.iterate_cf(CF_STAKING_PERMANENT, None)?;
-        for (_key, value) in &permanent_entries {
-            let info = PermanentStakeInfo::try_from_slice(value)
-                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
-            total += info.amount;
-        }
-
         Ok(total)
     }
 
@@ -1675,6 +1741,17 @@ fn snapshot_weight_key(proposal_id: u64, voter: &Address) -> [u8; 32] {
     key
 }
 
+/// R18: 16-byte key of a proposal's snapshot record:
+/// "snapmeta" ++ proposal_id(8 BE). Its length differs from the vote key (28)
+/// and the weight rows (32), and it starts with "snap" so voter-history scans
+/// skip it.
+fn snapshot_meta_key(proposal_id: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(b"snapmeta");
+    key[8..16].copy_from_slice(&proposal_id.to_be_bytes());
+    key
+}
+
 /// Build key for validator whitelist: "validator_whitelist:" ++ address(20).
 fn whitelist_key(candidate: &Address) -> Vec<u8> {
     let mut key = b"validator_whitelist:".to_vec();
@@ -1761,15 +1838,6 @@ mod tests {
             result,
             Err(EconomicsError::InvalidParameterValue { .. })
         ));
-    }
-
-    #[test]
-    fn div_by_zero_guard_in_vote_weight() {
-        let (_dir, gm) = setup();
-        let mut params = GovernanceParams::defaults(Address::ZERO);
-        params.permanent_weight_multiplier_den = 0;
-        let result = gm.compute_vote_weight(&addr(1), &params);
-        assert!(result.is_err());
     }
 
     #[test]
