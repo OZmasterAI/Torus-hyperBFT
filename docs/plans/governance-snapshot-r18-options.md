@@ -1,6 +1,6 @@
 # R18: governance snapshot — options (review fix #4)
 
-Status: options for an owner decision. No code. Base: main `d1b0d98d`.
+Status: decided by the owner in s111 (section 6). Options written against main `d1b0d98d`.
 
 Source findings: astra round 1, section 4 (`docs/audits/astra-round1-2026-09-24.md`):
 "Proposal voter snapshots are incomplete" and "Quorum denominator changes after votes are cast".
@@ -126,3 +126,29 @@ the better long-term design (no O(stakers) scan per proposal) and is worth doing
 paths are opened for another reason; it should not block R18.
 
 Decisions needed: option (A / B / C), S1, S2, S3, and fresh genesis vs activation height.
+
+## 6. Owner decision (s111)
+
+**A + S1 (a) + S2 + S3 delete + S4 as today, fresh genesis.** Built on `fix/r18-governance-snapshot`.
+
+- **A:** at submit, besides the weight rows, one snapshot record per proposal (`snapmeta ‖ id` in
+  `cf_governance_votes`): Σ snapshot weight, `quorum_bps`, `permanent_unlock_threshold_bps`. A voter with no weight
+  row has no weight (`NoVotingWeight`); abstain uses the snapshot weight; finalize uses the recorded denominator and
+  thresholds. `Proposal`'s borsh layout is unchanged.
+- **S1 (a):** the denominator is Σ snapshot **weights** (permanent × 3/2, the scale of the votes).
+- **S2:** `quorum_bps` and `permanent_unlock_threshold_bps` are frozen at submit; `timelock_blocks` stays live.
+- **S3:** finalize deletes the proposal's weight rows and record (in the same atomic write as the status change).
+- **S4:** the snapshot is the state when the submit action runs (as today).
+- **Fresh genesis:** there is no live chain; every launch is a fresh genesis. So no activation height, no legacy
+  path, and no fallback to live weight (the "no row → live weight (pre-snapshot proposals)" path is removed; S5 is moot).
+
+### Later upgrade (to decide)
+
+Two delegation-based models to compare with A when governance is revisited:
+- **HL-style:** only validators vote, weighted by the stake delegated to them; holders choose by delegating to a
+  validator whose votes they agree with; the tally is taken at a deadline. Trade-off: few voters and a cheap tally
+  (no per-staker snapshot) with Hyperliquid parity, against power concentrated in validators and redelegation
+  (unbonding) friction for a holder who disagrees.
+- **Cosmos-style:** validators vote on behalf of their delegators, and any delegator can override with their own
+  vote (their stake then leaves the validator's tally). Trade-off: holders keep a direct voice without redelegating,
+  against a costlier tally (per-delegator overrides) and the same default power concentration in validators.
