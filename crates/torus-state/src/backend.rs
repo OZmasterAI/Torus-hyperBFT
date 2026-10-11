@@ -1207,6 +1207,19 @@ impl NativeStateOverlay {
         self.inflight.clone()
     }
 
+    /// Item 6 Phase 3: the frozen layers under this overlay's own pending set,
+    /// newest first: parent, L (since-checkpoint layer), C (checkpoint in
+    /// flight). A read resolves in the first layer holding the key, then the
+    /// DB. Without L and C this is exactly the parent alone (bl2).
+    #[inline]
+    fn lower(&self) -> [Option<&PendingState>; 3] {
+        [
+            self.parent.as_deref().map(|p| &p.state),
+            self.layer.as_deref().map(|l| l.pending_state()),
+            self.inflight.as_deref().map(|c| c.pending_state()),
+        ]
+    }
+
     /// Height of the layered parent, if any (debug assertions / tests).
     pub fn parent_height(&self) -> Option<u64> {
         self.parent.as_ref().map(|p| p.height)
@@ -1989,7 +2002,7 @@ fn writes_under<'a>(
 #[allow(clippy::type_complexity)]
 fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     pending: &PendingState,
-    parent: Option<&PendingState>,
+    lower: [Option<&PendingState>; 3],
     id: CfId,
     start: &[u8],
     limit: usize,
@@ -1998,35 +2011,51 @@ fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     let mut out = Vec::new();
     let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
     let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
-    let mut aw = parent
-        .into_iter()
-        .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
-        .peekable();
+    // Item 6 Phase 3: one write range per lower layer (parent, L, C), newest
+    // first; with only a parent this is exactly the bl2 two-layer merge.
+    let mut aws: Vec<_> = lower
+        .iter()
+        .flatten()
+        .map(|s| s.cf(id).writes.range::<[u8], _>(range).peekable())
+        .collect();
     let mut bh = base.next().transpose()?;
     while out.len() < limit {
-        let heads = [
-            pw.peek().map(|(k, _)| k.as_slice()),
-            aw.peek().map(|(k, _)| k.as_slice()),
-            bh.as_ref().map(|(k, _)| k.as_ref()),
-        ];
-        let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
-            break;
+        let key = {
+            let mut min: Option<&[u8]> = pw.peek().map(|(k, _)| k.as_slice());
+            for aw in aws.iter_mut() {
+                if let Some((k, _)) = aw.peek() {
+                    if min.is_none_or(|m| k.as_slice() < m) {
+                        min = Some(k.as_slice());
+                    }
+                }
+            }
+            if let Some((k, _)) = bh.as_ref() {
+                if min.is_none_or(|m| k.as_ref() < m) {
+                    min = Some(k.as_ref());
+                }
+            }
+            match min {
+                Some(k) => k.to_vec(),
+                None => break,
+            }
         };
-        let value = match pending.lookup(id, &key) {
+        let value = match pending
+            .lookup(id, &key)
+            .or_else(|| lower.iter().flatten().find_map(|s| s.lookup(id, &key)))
+        {
             Some(hit) => hit.map(<[u8]>::to_vec),
-            None => match parent.and_then(|s| s.lookup(id, &key)) {
-                Some(hit) => hit.map(<[u8]>::to_vec),
-                None => bh
-                    .as_ref()
-                    .filter(|(k, _)| k.as_ref() == key.as_slice())
-                    .map(|(_, v)| v.as_ref().to_vec()),
-            },
+            None => bh
+                .as_ref()
+                .filter(|(k, _)| k.as_ref() == key.as_slice())
+                .map(|(_, v)| v.as_ref().to_vec()),
         };
         if pw.peek().is_some_and(|(k, _)| **k == key) {
             pw.next();
         }
-        if aw.peek().is_some_and(|(k, _)| **k == key) {
-            aw.next();
+        for aw in aws.iter_mut() {
+            if aw.peek().is_some_and(|(k, _)| **k == key) {
+                aw.next();
+            }
         }
         if bh.as_ref().is_some_and(|(k, _)| k.as_ref() == key.as_slice()) {
             bh = base.next().transpose()?;
@@ -2096,9 +2125,10 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).cloned());
             }
-            // bl2 exec pipeline: previous block's frozen set (read-your-writes).
-            if let Some(parent) = &self.parent {
-                if let Some(hit) = parent.state.lookup(id, key) {
+            // bl2 exec pipeline: previous block's frozen set (read-your-writes);
+            // item 6 Phase 3: then L and C.
+            for layer in self.lower().into_iter().flatten() {
+                if let Some(hit) = layer.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
@@ -2178,16 +2208,17 @@ impl StateBackend for NativeStateOverlay {
         // overlay's own pending set — each layer's tombstones remove and its
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let parent = self.parent.as_ref().map(|f| &f.state);
+        let lower = self.lower();
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
-        if !state.touches(id, p) && !parent.is_some_and(|s| s.touches(id, p)) {
+        if !state.touches(id, p) && !lower.iter().flatten().any(|s| s.touches(id, p)) {
             return Ok(db_entries);
         }
         let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
-        if let Some(parent) = parent {
-            parent.overlay_into(id, prefix, &mut merged);
+        // Oldest layer first (C, L, parent), each over what sits below.
+        for layer in lower.iter().rev().flatten() {
+            layer.overlay_into(id, prefix, &mut merged);
         }
         state.overlay_into(id, prefix, &mut merged);
         drop(state);
@@ -2220,9 +2251,9 @@ impl StateBackend for NativeStateOverlay {
             let base = rows
                 .range::<[u8], _>(range)
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, None, id, start, limit, base);
+            return merge_from(&pending, [None; 3], id, start, limit, base);
         }
-        let parent = self.parent.as_ref().map(|p| &p.state);
+        let lower = self.lower();
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2233,7 +2264,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, parent, id, start, limit, dbi)
+        merge_from(&pending, lower, id, start, limit, dbi)
     }
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
@@ -2248,8 +2279,8 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).map(Vec::len));
             }
-            if let Some(parent) = &self.parent {
-                if let Some(hit) = parent.state.lookup(id, key) {
+            for layer in self.lower().into_iter().flatten() {
+                if let Some(hit) = layer.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::len));
                 }
             }
@@ -2282,9 +2313,9 @@ impl StateBackend for NativeStateOverlay {
                 .range::<[u8], _>(range)
                 .take_while(|(k, _)| k.starts_with(prefix))
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, None, id, start, limit, base).map(cut);
+            return merge_from(&pending, [None; 3], id, start, limit, base).map(cut);
         }
-        let parent = self.parent.as_ref().map(|p| &p.state);
+        let lower = self.lower();
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2296,7 +2327,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, parent, id, start, limit, dbi).map(cut)
+        merge_from(&pending, lower, id, start, limit, dbi).map(cut)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
@@ -2310,12 +2341,13 @@ impl StateBackend for NativeStateOverlay {
         };
         // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
         let rows = self.resident_rows(id);
-        let parent = self.parent.as_ref().filter(|_| rows.is_none());
+        // Item 6 Phase 3: likewise L and C (parent, L, C newest first).
+        let lower = if rows.is_none() { self.lower() } else { [None; 3] };
         let live = |key: &[u8]| -> bool {
             if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
                 return hit.is_some();
             }
-            match parent.and_then(|p| p.state.lookup(id, key)) {
+            match lower.iter().flatten().find_map(|s| s.lookup(id, key)) {
                 Some(hit) => hit.is_some(),
                 None => true,
             }
@@ -2323,8 +2355,8 @@ impl StateBackend for NativeStateOverlay {
         if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
             return Ok(true);
         }
-        if let Some(parent) = parent {
-            if writes_under(&parent.state.cf(id).writes, prefix).any(|k| live(k)) {
+        for layer in lower.iter().flatten() {
+            if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
                 return Ok(true);
             }
         }

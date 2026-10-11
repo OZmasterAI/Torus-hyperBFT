@@ -46,7 +46,35 @@ impl CheckpointLayer {
 
     /// Fold `frozen` (the next block) on top: its writes replace earlier
     /// writes and tombstones, its tombstones replace earlier writes.
-    pub fn merge(&mut self, _frozen: &FrozenPending) {}
+    pub fn merge(&mut self, frozen: &FrozenPending) {
+        let src = frozen.pending_state();
+        for (dst, cfp) in self.state.cfs.iter_mut().zip(src.cfs.iter()) {
+            for (k, v) in &cfp.writes {
+                if dst.deletes.remove(k) {
+                    self.bytes -= k.len();
+                }
+                match dst.writes.get_mut(k) {
+                    Some(old) => {
+                        self.bytes = self.bytes - old.len() + v.len();
+                        old.clone_from(v);
+                    }
+                    None => {
+                        self.bytes += k.len() + v.len();
+                        dst.writes.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            for k in &cfp.deletes {
+                if let Some(old) = dst.writes.remove(k) {
+                    self.bytes -= k.len() + old.len();
+                }
+                if dst.deletes.insert(k.clone()) {
+                    self.bytes += k.len();
+                }
+            }
+        }
+        self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));
+    }
 
     /// Bytes held (key + value per write, key per tombstone).
     pub fn bytes(&self) -> usize {
