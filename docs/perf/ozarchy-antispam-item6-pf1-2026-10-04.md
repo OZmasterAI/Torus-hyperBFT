@@ -4872,6 +4872,178 @@ native block on the execution thread, so a pool is worth +0.5-1% matched/s at mo
 fills down" is still unreadable at cell resolution (the saving is ~3-9% of process sys, 1.7 CPU-s/1M).
 Read the fork count (perf task events, ~0 per block after warm-up) and matched/s instead.
 
+## 45. Phase 3 step 1 (checkpoint interval 15 s) vs control on shared NVMe and tmpfs (campaign ozarchy-p3c1, 2026-10-11)
+
+**Step 1 cuts node CPU-s/1M by 7.9% on the shared NVMe and 8.3% on tmpfs, and doubles native blocks/s. It
+lowers matched/s by 7.0% / 10.6%. The matched/s drop is a load-generator artifact of the known step 1 read lag,
+not lost node capacity.** Under step 1 `eth_blockNumber` advances only at checkpoint heights (in steps of 100
+blocks). The bench releases its in-flight cap from that block tail, so every sender stalls between
+checkpoints: no new submission for 37 s of each 120 s cell (control 2-3 s), and submit/s falls 13%. The node
+side is not the limit: the exec thread is less busy (0.89 vs 0.95) and node-side RPC submit latency barely moves. Against
+the revised gate: **CPU-s/1M down: met. Native blocks/s no regression: met (+96% / +86%). matched/s up: not met
+as measured, and cannot be judged with this load generator until step 2 makes RPC reads current (or the
+bench releases on another signal).** Restart (<= 60 s) and crash correctness are **not tested here** (no
+restart or crash cells). The tmpfs arms are an **UPPER BOUND** (no device I/O), not a separate-disk result.
+
+Owner request (s111, Phase 3 gate revised: matched/s up, CPU-s/1M down, native blocks/s no regression,
+restart <= 60 s, crash correctness): measure the real step 1 code (18c, `feat/item6-phase3-step1` `7c178637`,
+off main `2725e321`; plan `item6-phase3-impl.md` tasks 1.2-1.7) with the checkpoint interval on at 15 s, against
+its branch point, on the shared NVMe and on tmpfs, in the p3t shape (section 43).
+
+Setup as section 43 (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, fresh genesis
+and data dir per cell, RocksDB `LOG` copied per cell, harness `9b7e29b2`). **Two node binaries**, built the same
+way (fresh target dirs, frame pointers + line tables + mold): control = `2725e321` (node `18fb490d`, the step 1
+merge-base with origin/main, checked by the driver) and step 1 = `7c178637` (node `c161a337`). One bench for
+every arm (`c4559781`, from the control build). Arms:
+- **cd / sd:** control / step 1 with `TORUS_CHECKPOINT_INTERVAL_MS=15000` (`TORUS_CHECKPOINT_MAX_BYTES` unset),
+  data dirs on the shared NVMe (btrfs `/home`).
+- **cm / sm:** the same with all 3 data dirs on tmpfs (`/dev/shm/ozarchy-p3c1-devnet`, `run/` symlinked back,
+  as section 43).
+- Per-cell hard checks as section 43 (md5 per arm, env, book CF, codec/WAL, trie, WAL cap, zero trade rows, state
+  hash off, data-dir filesystem), plus: the interval knob on the 3 step 1 nodes only; the line `item 6 Phase 3:
+  coalesced state checkpoints ON` on every step 1 validator and on no control; `torus_exec_checkpoints` >= 1 per
+  step 1 node and absent on the control; `TORUS_EXEC_PIPELINE` not 0 (default on) with the `bl2 exec pipeline
+  ENABLED` line on every validator in every arm (the interval is ignored when the pipeline is off).
+- New sampler: the 3 validators' `/metrics` (ports 9161-9163) every 2 s for the checkpoint family and the
+  reject / failure counters (`ckpt-samples.txt`), and a per-cell post step (`ozarchy-p3c1-post.py`) that flags any
+  nonzero `torus_exec_checkpoint_layer_shared` as a hard finding.
+
+Cells 19:28-21:23 (driver `ozarchy-p3c1-campaign.sh`, analyst scripts `tools/ozarchy-p3c1-tools/a-*.py`): warm-up w0
+(cd, 60 s, excluded), then 120 s cells in the section 43 Williams square (sd for ad, sm for am). **Round 4 was
+rerun:** the harness worktree `wt/p3s0r-9b7e29b2` was removed by a worktree cleanup (`git worktree remove`) at
+20:48:08, during the first r4-sm. That cell's teardown found no `stop-3val.sh`, so the nodes ran on until the
+cell's systemd unit ended at 20:50:27 and stopped its cgroup. The watcher then logged a false "DEATH val0": all 3
+node logs stop together at an idle 1.3 s burst boundary, with no panic, no fail-stop and summary ACCEPT. r4-cd
+failed on the missing `detach.sh`. The worktree was recreated at the same commit, and round 4 was rerun as a
+warm-up w4 (cd, 60 s, excluded) + r4b-sm r4b-cd r4b-cm r4b-sd (same rotation). **The first r4-sm is excluded**
+(its files are kept). r1-r3 had ended before 20:48 (r3-cd at 20:44), so they used no file from the deleted dir.
+All 16 analysed cells are rc 0, PASS, AGREE, ACCEPT, with no deaths and every hard check OK (216 CHECK OK over the
+18 completed cells, no CHECK FAIL, no hard finding). No `cargo`, `rustc` or `rust-analyzer` ran before any cell.
+
+### 45.1 Per arm (r1, r2, r3, r4b; n = 4; ↓ lower is better, ↑ higher is better)
+
+Columns as section 43.1.
+
+| arm | matched/s ↑ mean (sd) | native blk/s ↑ mean (sd) | node CPU-s/1M ↓ mean (sd) | user / sys per 1M | device writes MB/s/val | wchar MB/s/val | RSS GB | data peak GB/val |
+|---|---|---|---|---|---|---|---|---|
+| cd (shared NVMe) | 198,992 (2,245) | 6.14 (0.09) | 25.311 (0.124) | 23.53 / 1.78 | 131.4 | 144.5 | 3.61 | 2.66 |
+| sd (shared NVMe) | 185,121 (1,941) | **12.03** (0.57) | **23.306** (0.188) | 21.81 / 1.50 | 56.1 | 68.3 | 3.76 | 2.61 |
+| cm (tmpfs, upper bound) | 210,267 (1,617) | 6.34 (0.23) | 25.216 (0.128) | 23.33 / 1.88 | 0 | 150.7 | 3.61 | 2.76 |
+| sm (tmpfs, upper bound) | 188,042 (1,512) | **11.82** (0.32) | **23.136** (0.051) | 21.58 / 1.56 | 0 | 68.6 | 3.84 | 2.61 |
+
+Per cell (r1, r2, r3, r4b): matched/s cd 195,668 / 200,586 / 199,969 / 199,746; sd 184,343 / 185,534 / 183,016 /
+187,590; cm 211,960 / 211,230 / 209,450 / 208,428; sm 187,171 / 187,192 / 190,298 / 187,509. Native blk/s cd 6.09 /
+6.07 / 6.25 / 6.16; sd 12.42 / 11.20 / 12.36 / 12.15; cm 6.61 / 6.24 / 6.46 / 6.07; sm 11.56 / 12.27 / 11.82 / 11.63.
+cd and cm reproduce section 43's cd / cm (25.09 / 25.07 CPU-s/1M, 200,770 / 211,117 matched/s) within noise.
+
+### 45.2 Step 1 vs control in each storage mode (Welch 95% intervals)
+
+| comparison | matched/s | native blk/s | node CPU-s/1M (whole run) | CPU at equal fills (ANCOVA) | wchar | RSS |
+|---|---|---|---|---|---|---|
+| sd vs cd, shared NVMe | -6.97% [-8.80, -5.15] | **+95.8%** [+81.0, +110.7] | **-7.92%** [-9.06, -6.78] | -9.67% [-13.10, -6.24] | -52.7% | +0.15 GB (+4.1%) |
+| sm vs cm, tmpfs UPPER BOUND | -10.57% [-11.86, -9.28] | **+86.3%** [+78.3, +94.4] | **-8.25%** [-9.00, -7.49] | -10.37% [-14.59, -6.15] | -54.5% | +0.23 GB (+6.2%) |
+| cm vs cd (control: tmpfs vs disk) | +5.67% [+3.88, +7.45] | +3.3% [-2.4, +8.9] | -0.38% [-1.24, +0.48] | +0.41% [-1.15, +1.97] | +4.2% | 0% |
+| sm vs sd (step 1: tmpfs vs disk) | +1.58% [-0.05, +3.20] | -1.8% [-8.7, +5.2] | -0.73% [-2.06, +0.60] | -0.52% [-1.66, +0.63] | +0.5% | +2.1% |
+| p3t prototype vs control, shared NVMe (section 43) | +5.77% | +14.0% | -5.19% | -2.98% | -45.7% | +0.89 GB |
+| p3t prototype vs control, tmpfs (section 43) | +3.14% | +1.6% | -4.82% | -4.19% | -47.0% | +1.09 GB |
+
+- **Paired by round (step 1 gain on tmpfs minus on disk, df 3):** matched/s -3.60 pp [-7.05, -0.15]; blocks/s -9.3 pp
+  [-36.6, +18.1]; CPU-s/1M -0.33 pp [-1.14, +0.48]. Per-round CPU gain: disk -6.8 / -8.8 / -7.5 / -8.6%, tmpfs -7.7 /
+  -8.6 / -8.1 / -8.7%.
+- **Equal fills:** common within-arm slope 21.0 ± 3.4 CPU-s per 1M fills, residual sd 3.10 CPU-s per node (df 11).
+  The step 1 arms ran 10-13% fewer fills (load-generator stalls, 45.4), so the adjustment extrapolates across that
+  gap. Read it as "at least the whole-run saving", not as a sharper number. Node CPU per validator per cell: cd 649,
+  sd 536, cm 678, sm 544 CPU-s.
+- **Where the CPU goes (per-thread CPU-s/1M, mean of the 4 disk cells, cd -> sd):** flush worker 0.97 -> 0.24, exec
+  thread 4.03 -> 3.65, RocksDB low (compaction) 0.98 -> 0.77, RocksDB high (flush) 0.45 -> 0.31, other threads 11.98
+  -> 11.29. Device writes per validator -57% (131.4 -> 56.1 MB/s), WAL `write()` 131 -> 57 MB/s.
+- **Exec / chain (mean of 4 cells, cd / sd / cm / sm):** exec-thread busy fraction 0.953 / 0.895 / 0.959 / 0.885;
+  chain_ms 124.1 / 63.8 / 122.9 / 65.7; pipelined_ms 30.2 / 3.4 / 30.9 / 3.7; hand-off wait 0.93 / 0.01 / 0.87 / 0.01 ms;
+  txs per block 128 / 68 / 134 / 71; commit interval 151 / 80 / 146 / 82 ms. The per-block flush hand-off is gone, so
+  blocks close in about half the time and carry about half the actions.
+- **Compared with the prototype (p3t):** step 1 removes more CPU (-7.9% vs -5.2% on disk, -8.3% vs -4.8% on tmpfs;
+  the CIs do not overlap the prototype's point estimates), writes about as much less (-53% vs -46% wchar), and costs
+  far less RAM (+0.15-0.23 GB RSS vs +0.9-1.1 GB). Blocks/s doubles where the prototype added +14% / +1.6%. matched/s
+  moves the other way (-7% / -11% vs +5.8% / +3.1%) because of the read lag below. The prototype did not hold back
+  the RPC head.
+
+### 45.3 Checkpoint metrics (step 1 arms; control arms export none, as expected)
+
+Per node per cell, from the harness's metrics before / after (whole cell incl. drain) and the 2 s series (bench window).
+
+| arm | checkpoints / node / cell | per min (bench window) | wait s / cell | wait ms / checkpoint | layer MB mean / peak | flush-worker checkpoint s / cell | s / checkpoint | layer_shared |
+|---|---|---|---|---|---|---|---|---|
+| sd | 19.8 (18-21) | 7.7 | 0.28 | 14.1 | 80.3 / 214 | 5.92 | 0.30 | **0** |
+| sm | 19.5 (19-20) | 7.4 | 0.17 | 8.7 | 82.8 / 226 | 6.24 | 0.32 | **0** |
+
+- **`torus_exec_checkpoint_layer_shared` stayed 0** in every sample of every step 1 cell (24 node-cells, ~2,700
+  scrapes): no hard finding.
+- Wait = `torus_exec_checkpoint_wait_seconds` (E blocked handing off a checkpoint while the previous one is still in
+  flight): 0.17-0.28 s per node per cell, < 0.3% of the bench window. Peak layer bytes = largest per-checkpoint layer
+  between two samples (the histogram has no max).
+- **Which trigger fires: the attest height (`h % 100 == 0`), not the 15 s interval.** In the bench window 351 of 375
+  checkpoints (94%) fall on a 100-block crossing. 24 (6%, about one per node per cell, at the start of the bench while
+  blocks are still slow) were fired by the 15 s interval. None came from a barrier or the byte cap (unset). The median
+  gap is 8.2 s (max 18.6 s). At ~12 native blocks/s, 100 blocks take ~8.3 s, under the 15 s interval, so the interval
+  only binds below ~6.7 blocks/s. This matches the design (`item6-phase3-impl.md` section 3: the triggers are the
+  interval, the byte cap, `n % 100 == 0` and shutdown; code: `checkpoint_upkeep` in `app.rs`,
+  `STATE_HASH_CHECKPOINT_INTERVAL` = 100). The prep smoke cell's 12 checkpoints per node in 60 s had the same cause.
+  The effective checkpoint interval here is 100 blocks, not 15 s.
+
+### 45.4 Rejections and the read lag
+
+Mean per cell (node counters: mean of the 3 nodes; deltas before -> after the bench).
+
+| count | cd | sd | cm | sm |
+|---|---|---|---|---|
+| bench submitted actions | 138,398 | 119,832 | 144,730 | 121,988 |
+| bench sent - accepted (place + cancel-all) | 1.0 | 0.2 | 2.0 | 0 |
+| in-flight released by RPC refusal / by timeout | 1.0 / 0 | 0.2 / 0 | 2.0 / 0 | 0 / 0 |
+| block-tail errors / missed bodies | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| mempool nonce-expired evictions (sum, 4 cells x 3 nodes) | 0 | 0 | 0 | 0 |
+| oracle rejected / stale marks at bench end | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| `torus_exec_action_rejections_total` | 356 | 291 | 353 | 331 |
+| `torus_orders_rejected_cancelled_total` | 21,378 | 21,161 | 21,317 | 21,873 |
+| `torus_rpc_submit_admit_rejects_total{backlog_preverify}` | 18,938 | 3,257 | 14,232 | 5,589 |
+| `torus_missing_action_rejections_total` | 0.8 | 0.6 | 0.9 | 0.8 |
+| RPC `torus_submitNativeActionsBin` status=error | 0.3 | 0.1 | 0.7 | 0 |
+| WARN "skipping duplicate/replayed native action on live commit path" per node | 4 | 62 | 51 | 51 |
+
+- **No new rejection class with step 1.** No nonce, balance or insufficient-funds errors appear anywhere (bench log,
+  RPC, node logs). Margin, open-limit, book and "other" order rejects are 0 in every arm. The backlog-preverify
+  admission rejects fall with step 1 because less load is offered.
+- **Flag (read lag, expected until step 2): the RPC head moves only at checkpoints.** The bench's progress lines
+  show `eth_blockNumber` advancing by a median of 99-100 blocks per step under step 1 (control: 2), i.e. at checkpoint
+  heights. The in-flight watcher (`in_flight.rs`: one `eth_blockNumber`, then every new body) therefore releases slots
+  in bursts. Submissions stop for 36.9 s per 120 s cell in both step 1 modes (control 2.2 / 3.0 s), submit/s falls
+  from 1,134 / 1,186 to 982 / 1,000, and matched/s follows. Node-side RPC barely changes (batch submit verify 9.2 -> 10.4 ms on disk, 9.3 -> 9.3 ms on
+  tmpfs; permit wait 4-6 ms in every arm), and the exec thread has more idle time.
+- **Flag (mempool lag, expected until step 2):** the deterministic duplicate-skip WARN (identical count on all 3
+  nodes) rises on the shared disk from ~4 to ~62 per node per cell with step 1 (~0.05% of actions). On tmpfs it is
+  unchanged (51 vs 51), and the tmpfs control is already high, so it tracks how fast committed actions leave the
+  mempool. It is not a correctness problem: the skipped actions are dropped at commit, the same on every node.
+
+### 45.5 Reading
+
+- **CPU-s/1M (gate: down): met.** -7.9% (disk, CI -9.1 to -6.8) and -8.3% (tmpfs, CI -9.0 to -7.5), equal within
+  noise across the two modes (paired difference -0.3 pp). It is work removed (flush worker, exec thread, RocksDB
+  flush and compaction), about 1.5-1.7 times the prototype's saving.
+- **Native blocks/s (gate: no regression): met.** +96% / +86%. Blocks close in half the time because the exec thread
+  no longer waits on the per-block flush hand-off; each block carries half the actions.
+- **matched/s (gate: up): not met as measured (-7.0% / -10.6%), and not decidable with this bench.** The drop follows
+  the offered load (submitted -13% / -16%), which the step 1 RPC head lag (one checkpoint, ~8 s) throttles through the
+  bench's in-flight cap. The node has headroom (exec busy 0.89 vs 0.95). To judge this gate, re-measure after step 2
+  (RPC and mempool reads current), or with a bench that releases in-flight slots on a signal that is not held back.
+  Inference, not measured: matched/s should then at least reach the control, since CPU per fill is 8% lower and the
+  exec thread is less busy.
+- **Disk:** device writes per validator -57% on the shared NVMe (131 -> 56 MB/s).
+- **RAM:** +0.15 GB (disk) / +0.23 GB (tmpfs) RSS per node; layer peak ~0.2 GB per checkpoint.
+- **Not tested here:** restart <= 60 s and crash correctness (no restart or crash cells; 18c's step 1 tests cover crash
+  and replay at interval > 0, task 1.7). A validator with its own disk was not available (ozarchy has one NVMe).
+- **Confidence:** high for CPU (every cell, both modes, tight CIs) and blocks/s. High that the matched/s drop is the
+  read-lag throttle (the submit stalls line up with the 100-block RPC head steps in every step 1 cell). Medium for the
+  equal-fills numbers (extrapolated across a 10-13% fills gap).
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
