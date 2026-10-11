@@ -263,6 +263,9 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
 - Code: knob `--trade-retention-blocks` (unset = keep all, today); the pruner deletes trade rows
   below `current - retention` (`pruner.rs:207-235` pattern).
 - Verify: `cargo nextest run -p torus-state -p torus-rpc $F -E 'test(trades)'`.
+- **Implemented** on `feat/trade-retention` (s111, standalone task after the core was shelved):
+  cutoff `min(current - N, applied)`, both trade CFs, RPC serves only `[cutoff, ..]`
+  (`DataPruned` for a block / range entirely below). Details: `docs/pruning-guide.md`.
 
 ### Step 4: gate campaign (archy)
 

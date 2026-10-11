@@ -205,6 +205,12 @@ pub const META_RUNNING_STATE_HASH_UNVERIFIED: &[u8] = b"running_state_hash_unver
 /// boot (`TORUS_STATE_HASH_FAILSTOP=1`); gone with the DB (resync).
 pub const META_STATE_HASH_DIVERGED: &[u8] = b"state_hash_diverged";
 
+/// Key in CF_CONSENSUS_META (node-local, never hashed): D13 trade-history cutoff, 8 BE. Trade
+/// rows of blocks below it are deleted or being deleted; written before a pruner pass deletes
+/// and never lowered, so RPC keeps answering `DataPruned` for them across a restart with a
+/// larger `--trade-retention-blocks` or without the flag. Absent = nothing pruned.
+pub const META_TRADES_PRUNED_HEIGHT: &[u8] = b"trades_pruned_height";
+
 /// Key prefix in CF_CONSENSUS_META (node-local): running-hash checkpoint
 /// `prefix ‖ height(8 BE)` -> hash(32), every `STATE_HASH_CHECKPOINT_INTERVAL` heights.
 pub const META_STATE_HASH_CHECKPOINT_PREFIX: &[u8] = b"state_hash_ckpt:";

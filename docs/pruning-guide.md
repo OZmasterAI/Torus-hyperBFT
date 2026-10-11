@@ -32,8 +32,54 @@ in batches to avoid latency spikes.
 
 ### Mutual Exclusion
 
-`--archive` and `--retention-blocks` cannot be used together. If neither is
-specified, the node defaults to archive mode.
+`--archive` cannot be combined with `--retention-blocks` or
+`--trade-retention-blocks`. If no retention flag is specified, the node
+defaults to archive mode.
+
+## Trade-History Retention (D13)
+
+Trade history (`cf_native_trades`, `cf_native_user_trades`) is written only
+when trade history is on (default on for `--rpc-only`, off on validators;
+`TORUS_TRADE_HISTORY` overrides). It is node-local: outside the consensus root
+and the running state hash. To bound it:
+
+```bash
+./torus-node --rpc-only ... --trade-retention-blocks 2000000
+```
+
+- **Unset** (default): every trade row is kept, as before.
+- **Set to N**: on each pruner pass (same 30 s tick and 1,000-block interval
+  as body pruning), trade rows of blocks below
+  `cutoff = min(current - N, applied)` are deleted, where `current` is the
+  latest committed height and `applied` the durable native applied height
+  (crash replay rewrites the rows of `(applied, committed]`, so those are never
+  pruned first).
+- Independent of `--retention-blocks`: either flag alone enables the pruner,
+  and each prunes only its own data.
+- Every pass deletes everything below its cutoff (not only what is new since
+  the last pass), so rows the background trade writer lands late, and rows
+  left by a pass before a restart, are removed by the next pass. The cutoff is
+  persisted node-locally (`cf_consensus_meta` key `trades_pruned_height`,
+  written before a pass deletes, never lowered, not hashed), and RPC loads it
+  at startup: if N is **raised** across a restart, or the flag is removed,
+  blocks below the old cutoff stay `DataPruned` (their rows are gone), not an
+  empty "no trades" result.
+- A pass runs on the blocking thread pool, not on a runtime worker.
+
+| CF | Key | How |
+|---|---|---|
+| `cf_native_trades` | `market u64 \| block u64 \| chunk u16` | skip-scan markets; one `delete_range` `[market\|0\|0, market\|cutoff\|0)` per market with old rows |
+| `cf_native_user_trades` | `address[20] \| !block u64` | skip-scan addresses; seek to the address's first row below the cutoff and point-delete to the end of the address |
+
+RPC on a node with trade retention (the cutoff is raised before a pass
+deletes, so a half-pruned range is never served):
+
+| Endpoint | Below the cutoff |
+|---|---|
+| `torus_getTradeHistory` | newest-first list stops at the cutoff |
+| `torus_getUserTrades` | newest-first list stops at the cutoff |
+| `torus_getTradeHistoryRange` | `to_block` below the cutoff: `DataPruned` error; a range reaching below it returns the kept part `[cutoff, to_block]` |
+| `torus_getBlockTrades` | `DataPruned` error |
 
 ## What Gets Pruned
 
@@ -73,11 +119,6 @@ deleted state roots. This is a research-level problem that Ethereum clients
 
 Trie pruning is planned for a future release.
 
-**Trade history** (`cf_native_trades`) is keyed by `market_id + block_number`,
-with market ID as the leading prefix. This makes efficient range deletion by
-block height impossible without scanning every market. Deferred to a future
-batch.
-
 **Slash records** and **jail votes** have similar key format issues (address
 is the leading prefix, not height).
 
@@ -105,7 +146,7 @@ a clear JSON-RPC error:
 | `eth_getTransactionByHash` | Error if transaction's block is pruned |
 | `eth_getTransactionReceipt` | Error if receipt's block is pruned |
 | `eth_getLogs` | Error if from_block is in pruned range |
-| `torus_getTradeHistory` | Returns empty (trade data not yet prunable) |
+| `torus_getTradeHistory` | Stops at the body prune height (trade rows are pruned only by `--trade-retention-blocks`, above) |
 
 ### Unaffected Endpoints
 

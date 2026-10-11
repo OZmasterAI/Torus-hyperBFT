@@ -1,6 +1,6 @@
 //! `torus_*` JSON-RPC namespace — native exchange, staking, governance endpoints.
 
-use std::sync::atomic::Ordering::{self, Relaxed};
+use std::sync::atomic::Ordering::{self, Relaxed, SeqCst};
 
 use alloy_primitives::keccak256;
 use borsh::BorshDeserialize;
@@ -561,6 +561,27 @@ enum SubmitSlot {
 }
 
 impl RpcState {
+    /// D13: run a trade-history read against a stable trade cutoff. The
+    /// pruner raises the cutoff before it deletes, so a read whose cutoff is
+    /// the same before and after saw no row of an in-progress pass (rows below
+    /// the cutoff are filtered by `read`). If a pass started meanwhile, the
+    /// read is redone at the new cutoff; a cutoff moving on every try (passes
+    /// are 1,000 blocks apart, so practically never) is an error, not a torn
+    /// result.
+    pub(crate) fn with_trade_floor<T>(
+        &self,
+        mut read: impl FnMut(u64) -> RpcResult<T>,
+    ) -> RpcResult<T> {
+        for _ in 0..4 {
+            let floor = self.trades_pruned_up_to.load(SeqCst);
+            let out = read(floor)?;
+            if self.trades_pruned_up_to.load(SeqCst) == floor {
+                return Ok(out);
+            }
+        }
+        Err(RpcError::Internal("trade history is being pruned; retry".into()).into())
+    }
+
     /// Item 2: the oracle aggregate of `mid` if USABLE ([`OraclePrice::usable`]:
     /// time-based, stale 60 s of block time after the last fresh aggregate)
     /// at the header timestamp of the EXECUTED head (s89): the aggregate is
@@ -1309,46 +1330,50 @@ impl TorusApiServer for RpcState {
             None => return Ok(vec![]),
         };
 
-        let pruned_up_to = self.pruned_up_to.load(Relaxed);
+        self.with_trade_floor(|trade_floor| {
+            // Rows below the body prune height (as before) or the D13 trade cutoff
+            // are not served.
+            let floor = self.pruned_up_to.load(Relaxed).max(trade_floor);
 
-        // Reverse-iterate from the upper bound of this market's key range.
-        // Key format: market_id(8) + block_number(8) + chunk(2) = 18 bytes;
-        // each row holds up to 1024 fills in trade_index order.
-        let mut upper = [0xFFu8; TRADE_KEY_LEN];
-        upper[..8].copy_from_slice(&prefix);
-        let iter = db.iterator_cf(
-            cf,
-            rocksdb::IteratorMode::From(&upper, rocksdb::Direction::Reverse),
-        );
-        let mut trades = Vec::with_capacity(limit);
+            // Reverse-iterate from the upper bound of this market's key range.
+            // Key format: market_id(8) + block_number(8) + chunk(2) = 18 bytes;
+            // each row holds up to 1024 fills in trade_index order.
+            let mut upper = [0xFFu8; TRADE_KEY_LEN];
+            upper[..8].copy_from_slice(&prefix);
+            let iter = db.iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(&upper, rocksdb::Direction::Reverse),
+            );
+            let mut trades = Vec::with_capacity(limit);
 
-        'rows: for item in iter {
-            let (key, value) = item
-                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
-                .map_err(ErrorObjectOwned::from)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
-                continue;
-            };
+            'rows: for item in iter {
+                let (key, value) = item
+                    .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                    .map_err(ErrorObjectOwned::from)?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
+                    continue;
+                };
 
-            // Since we iterate newest-first, once we hit a pruned block all
-            // remaining entries are older — stop immediately.
-            if pruned_up_to > 0 && block < pruned_up_to {
-                break;
-            }
+                // Since we iterate newest-first, once we hit a pruned block all
+                // remaining entries are older — stop immediately.
+                if block < floor {
+                    break;
+                }
 
-            for t in fills.iter().rev() {
-                trades.push(rpc_trade(&market_id, block, timestamp, t));
-                if trades.len() >= limit {
-                    break 'rows;
+                for t in fills.iter().rev() {
+                    trades.push(rpc_trade(&market_id, block, timestamp, t));
+                    if trades.len() >= limit {
+                        break 'rows;
+                    }
                 }
             }
-        }
 
-        // Already in descending order (most recent first) from reverse iteration.
-        Ok(trades)
+            // Already in descending order (most recent first) from reverse iteration.
+            Ok(trades)
+        })
     }
 
     // === 2.9.3: Staking ===
@@ -1810,7 +1835,17 @@ impl TorusApiServer for RpcState {
     // === Phase 7B: All trades in a single block ===
 
     async fn get_block_trades(&self, block_number: u64) -> RpcResult<Vec<RpcTrade>> {
-        let trades_json = crate::scan_trades_for_block(&self.state, block_number);
+        // D13: a block below the trade cutoff is pruned, not empty. The scan
+        // uses one iterator per market, so it must not overlap a pass.
+        let trades_json = self.with_trade_floor(|floor| {
+            if block_number < floor {
+                return Err(RpcError::DataPruned {
+                    block: block_number,
+                }
+                .into());
+            }
+            Ok(crate::scan_trades_for_block(&self.state, block_number))
+        })?;
         let mut trades = Vec::with_capacity(trades_json.len());
         for t in trades_json {
             trades.push(RpcTrade {
@@ -1874,39 +1909,48 @@ impl TorusApiServer for RpcState {
             None => return Ok(vec![]),
         };
 
-        // market_id(8) + block(8) + chunk(2): from (from_block, chunk 0) up to
-        // the first key of to_block + 1.
-        let start_key = trade_key(mid, from, 0);
-        let end_key = trade_key(mid, to.saturating_add(1), 0);
-
-        let iter = db.iterator_cf(
-            cf,
-            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
-        );
-        let mut trades = Vec::with_capacity(limit.min(256));
-
-        'rows: for item in iter {
-            let (key, value) = item
-                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
-                .map_err(ErrorObjectOwned::from)?;
-
-            // Stop if we've left this market or past the end block
-            if key.len() < 8 || key[..8] != mid.to_be_bytes() || key[..] >= end_key[..] {
-                break;
+        self.with_trade_floor(|floor| {
+            // D13: a range entirely below the trade cutoff is pruned; one reaching
+            // below it returns the kept part [cutoff, to].
+            if to < floor {
+                return Err(RpcError::DataPruned { block: to }.into());
             }
-            let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
-                continue;
-            };
+            let from = from.max(floor);
 
-            for t in &fills {
-                trades.push(rpc_trade(&market_id, block, timestamp, t));
-                if trades.len() >= limit {
-                    break 'rows;
+            // market_id(8) + block(8) + chunk(2): from (from_block, chunk 0) up to
+            // the first key of to_block + 1.
+            let start_key = trade_key(mid, from, 0);
+            let end_key = trade_key(mid, to.saturating_add(1), 0);
+
+            let iter = db.iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+            );
+            let mut trades = Vec::with_capacity(limit.min(256));
+
+            'rows: for item in iter {
+                let (key, value) = item
+                    .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                    .map_err(ErrorObjectOwned::from)?;
+
+                // Stop if we've left this market or past the end block
+                if key.len() < 8 || key[..8] != mid.to_be_bytes() || key[..] >= end_key[..] {
+                    break;
+                }
+                let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
+                    continue;
+                };
+
+                for t in &fills {
+                    trades.push(rpc_trade(&market_id, block, timestamp, t));
+                    if trades.len() >= limit {
+                        break 'rows;
+                    }
                 }
             }
-        }
 
-        Ok(trades)
+            Ok(trades)
+        })
     }
 
     // === Trading app endpoints ===
@@ -2105,58 +2149,66 @@ impl TorusApiServer for RpcState {
             None => return Ok(vec![]),
         };
 
-        // Forward prefix scan: keys encode descending block order via
-        // (u64::MAX - block), so forward iteration returns newest first.
-        let prefix = trader_addr.as_slice();
-        let iter = torus_state::db::prefix_iter(db, &cf, prefix);
+        // D13: rows below the trade cutoff are not served.
+        self.with_trade_floor(|floor| {
+            // Forward prefix scan: keys encode descending block order via
+            // (u64::MAX - block), so forward iteration returns newest first.
+            let prefix = trader_addr.as_slice();
+            let iter = torus_state::db::prefix_iter(db, &cf, prefix);
 
-        // Each row holds the trader's fills in one block, in trade_index order.
-        let mut trades = Vec::with_capacity(limit.min(256));
-        'rows: for item in iter {
-            let (key, value) = item
-                .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
-                .map_err(ErrorObjectOwned::from)?;
-            if !key.starts_with(prefix) {
-                break;
+            // Each row holds the trader's fills in one block, in trade_index order.
+            let mut trades = Vec::with_capacity(limit.min(256));
+            'rows: for item in iter {
+                let (key, value) = item
+                    .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
+                    .map_err(ErrorObjectOwned::from)?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                // Skip an undecodable row (e.g. leftover old format), as above.
+                let decoded = parse_user_trade_key(&key)
+                    .ok_or_else(|| format!("key length {}", key.len()))
+                    .and_then(|(_, block)| {
+                        let (timestamp, entries) =
+                            decode_user_row(&value).map_err(|e| e.to_string())?;
+                        Ok((block, timestamp, entries))
+                    });
+                let (block, timestamp, entries) = match decoded {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(key = %hex::encode(&key), "skipping user trade row: {e}");
+                        continue;
+                    }
+                };
+                // Newest first: every later row is older too.
+                if block < floor {
+                    break;
+                }
+
+                for trade in entries {
+                    if market_filter.is_some_and(|mf| trade.market != mf) {
+                        continue;
+                    }
+                    // s80: the user's own side (a maker is opposite the taker).
+                    let user_bought = (trade.taker_side == 0) == (trade.role == 1);
+                    trades.push(RpcUserTrade {
+                        trade_id: hex_u128(trade.trade_index as u128),
+                        market_id: hex_u64(trade.market),
+                        side: if user_bought { "buy" } else { "sell" }.to_string(),
+                        price: dec_fp(FixedPoint::from_raw(trade.price_raw)),
+                        quantity: dec_fp(FixedPoint::from_raw(trade.qty_raw)),
+                        role: if trade.role == 0 { "maker" } else { "taker" }.to_string(),
+                        block_number: hex_u64(block),
+                        timestamp: hex_u64(timestamp),
+                    });
+                    if trades.len() >= limit {
+                        break 'rows;
+                    }
+                }
             }
-            // Skip an undecodable row (e.g. leftover old format), as above.
-            let decoded = parse_user_trade_key(&key)
-                .ok_or_else(|| format!("key length {}", key.len()))
-                .and_then(|(_, block)| {
-                    let (timestamp, entries) = decode_user_row(&value).map_err(|e| e.to_string())?;
-                    Ok((block, timestamp, entries))
-                });
-            let (block, timestamp, entries) = match decoded {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(key = %hex::encode(&key), "skipping user trade row: {e}");
-                    continue;
-                }
-            };
 
-            for trade in entries {
-                if market_filter.is_some_and(|mf| trade.market != mf) {
-                    continue;
-                }
-                // s80: the user's own side (a maker is opposite the taker).
-                let user_bought = (trade.taker_side == 0) == (trade.role == 1);
-                trades.push(RpcUserTrade {
-                    trade_id: hex_u128(trade.trade_index as u128),
-                    market_id: hex_u64(trade.market),
-                    side: if user_bought { "buy" } else { "sell" }.to_string(),
-                    price: dec_fp(FixedPoint::from_raw(trade.price_raw)),
-                    quantity: dec_fp(FixedPoint::from_raw(trade.qty_raw)),
-                    role: if trade.role == 0 { "maker" } else { "taker" }.to_string(),
-                    block_number: hex_u64(block),
-                    timestamp: hex_u64(timestamp),
-                });
-                if trades.len() >= limit {
-                    break 'rows;
-                }
-            }
-        }
-
-        Ok(trades)
+            Ok(trades)
+        })
     }
 
     // === Phase 7B: Trade streaming subscription ===

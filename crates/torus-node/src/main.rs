@@ -152,6 +152,13 @@ struct Cli {
     #[arg(long)]
     retention_blocks: Option<u64>,
 
+    /// Trade-history retention (D13): keep only the trade rows (getTradeHistory,
+    /// getTradeHistoryRange, getBlockTrades, getUserTrades) of the last N blocks.
+    /// Unset = keep all trade history. Independent of --retention-blocks; never
+    /// prunes at or above the durable applied height. Cannot be used with --archive.
+    #[arg(long)]
+    trade_retention_blocks: Option<u64>,
+
     /// Metrics (Prometheus) listen address
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: SocketAddr,
@@ -274,6 +281,7 @@ struct ConfigFile {
     rpc_only: Option<bool>,
     archive: Option<bool>,
     retention_blocks: Option<u64>,
+    trade_retention_blocks: Option<u64>,
 }
 
 fn load_config_file(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::Error>> {
@@ -336,6 +344,31 @@ fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
     if cli.retention_blocks.is_none() {
         cli.retention_blocks = cfg.retention_blocks;
     }
+    if cli.trade_retention_blocks.is_none() {
+        cli.trade_retention_blocks = cfg.trade_retention_blocks;
+    }
+}
+
+/// The background pruner's settings from the retention flags, or `None` when
+/// neither `--retention-blocks` nor `--trade-retention-blocks` is set (archive:
+/// nothing pruned). Each flag prunes only its own data: bodies / receipts
+/// without `--retention-blocks` get `u64::MAX` (cutoff 0, kept), trade history
+/// without `--trade-retention-blocks` gets `None` (kept).
+fn pruner_config(cli: &Cli) -> Result<Option<PrunerConfig>, String> {
+    if cli.archive && cli.retention_blocks.is_some() {
+        return Err("cannot set both --archive and --retention-blocks".into());
+    }
+    if cli.archive && cli.trade_retention_blocks.is_some() {
+        return Err("cannot set both --archive and --trade-retention-blocks".into());
+    }
+    if cli.retention_blocks.is_none() && cli.trade_retention_blocks.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PrunerConfig {
+        retention_blocks: cli.retention_blocks.unwrap_or(u64::MAX),
+        trade_retention_blocks: cli.trade_retention_blocks,
+        ..PrunerConfig::default()
+    }))
 }
 
 fn default_chain_config() -> ChainConfig {
@@ -512,9 +545,7 @@ fn read_passphrase_stdin() -> String {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Validate pruning flags
-    if cli.archive && cli.retention_blocks.is_some() {
-        return Err("cannot set both --archive and --retention-blocks".into());
-    }
+    let pruner_settings = pruner_config(&cli)?;
     // 2. Load validator key (keystore preferred, raw hex deprecated)
     let signing_key = if let Some(keystore_path) = &cli.keystore {
         let passphrase = if let Some(pf) = &cli.passphrase_file {
@@ -1136,6 +1167,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();
     let pruned_up_to_handle = rpc_server.pruned_up_to();
+    let trades_pruned_handle = rpc_server.trades_pruned_up_to();
 
     // Spawn RPC on a dedicated tokio runtime so user traffic can never
     // starve the consensus/libp2p runtime (same idea as Hyperliquid sentries).
@@ -1225,15 +1257,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(%metrics_addr, "telemetry server started");
 
     // 11. Background pruner (if pruning enabled)
-    if let Some(retention) = cli.retention_blocks {
-        let pruner_config = PrunerConfig {
-            retention_blocks: retention,
-            ..PrunerConfig::default()
-        };
-        let mut pruner = StatePruner::new(state_db.clone(), pruner_config, pruned_up_to_handle);
+    if let Some(pruner_config) = pruner_settings {
+        info!(
+            retention_blocks = ?cli.retention_blocks,
+            trade_retention_blocks = ?cli.trade_retention_blocks,
+            "background pruner enabled"
+        );
+        let mut pruner = StatePruner::new(state_db.clone(), pruner_config, pruned_up_to_handle)
+            .with_trades_pruned_handle(trades_pruned_handle);
         let latest_for_pruner = latest_height_handle.clone();
         let metrics_for_pruner = metrics.clone();
-        info!(retention_blocks = retention, "background pruner enabled");
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -1242,7 +1275,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if current == 0 {
                     continue;
                 }
-                match pruner.maybe_prune(current) {
+                // A pass is blocking RocksDB work (the D13 trade pass scans
+                // every trader), so it runs on the blocking pool, never on a
+                // runtime worker that consensus / libp2p tasks need.
+                let pass = tokio::task::spawn_blocking(move || {
+                    let res = pruner.maybe_prune(current);
+                    (pruner, res)
+                })
+                .await;
+                let res = match pass {
+                    Ok((p, res)) => {
+                        pruner = p;
+                        res
+                    }
+                    Err(e) => {
+                        warn!(%e, "background pruner pass panicked; pruner stopped");
+                        return;
+                    }
+                };
+                match res {
                     Ok(0) => {}
                     Ok(n) => {
                         metrics_for_pruner.pruner_blocks_removed.inc_by(n);
@@ -1703,6 +1754,78 @@ mod tests {
         .unwrap();
         assert!(!cli.archive);
         assert_eq!(cli.retention_blocks, Some(50000));
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut all = vec!["torus-node", "--keystore", "k.keystore"];
+        all.extend_from_slice(args);
+        Cli::try_parse_from(all).unwrap()
+    }
+
+    /// D13: `--trade-retention-blocks` is unset by default (keep every trade
+    /// row, exactly today) and is its own pruner trigger.
+    #[test]
+    fn trade_retention_blocks_flag_and_pruner_config() {
+        // Neither: archive, no pruner.
+        assert!(cli(&[]).trade_retention_blocks.is_none());
+        assert!(pruner_config(&cli(&[])).unwrap().is_none());
+
+        // Bodies only: trade history kept.
+        let c = pruner_config(&cli(&["--retention-blocks", "5000"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.retention_blocks, c.trade_retention_blocks), (5000, None));
+
+        // Trades only: bodies kept (u64::MAX = cutoff 0).
+        let parsed = cli(&["--trade-retention-blocks", "200000"]);
+        assert_eq!(parsed.trade_retention_blocks, Some(200000));
+        let c = pruner_config(&parsed).unwrap().unwrap();
+        assert_eq!(
+            (c.retention_blocks, c.trade_retention_blocks),
+            (u64::MAX, Some(200000))
+        );
+        assert_eq!(
+            c.prune_interval_blocks,
+            PrunerConfig::default().prune_interval_blocks
+        );
+        assert_eq!(c.batch_size, PrunerConfig::default().batch_size);
+
+        // Both.
+        let c = pruner_config(&cli(&[
+            "--retention-blocks",
+            "5000",
+            "--trade-retention-blocks",
+            "100",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (c.retention_blocks, c.trade_retention_blocks),
+            (5000, Some(100))
+        );
+
+        // --archive keeps everything: either retention flag with it is an error.
+        let e = pruner_config(&cli(&["--archive", "--trade-retention-blocks", "100"])).unwrap_err();
+        assert!(
+            e.contains("--archive") && e.contains("--trade-retention-blocks"),
+            "{e}"
+        );
+        assert!(pruner_config(&cli(&["--archive", "--retention-blocks", "100"])).is_err());
+        assert!(pruner_config(&cli(&["--archive"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn trade_retention_blocks_from_config_file() {
+        let cfg: ConfigFile = toml::from_str("trade-retention-blocks = 7000").unwrap();
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, cfg);
+        assert_eq!(c.trade_retention_blocks, Some(7000));
+
+        // The command line wins over the file.
+        let cfg: ConfigFile = toml::from_str("trade-retention-blocks = 7000").unwrap();
+        let mut c = cli(&["--trade-retention-blocks", "9"]);
+        apply_config_defaults(&mut c, cfg);
+        assert_eq!(c.trade_retention_blocks, Some(9));
     }
 
     #[test]

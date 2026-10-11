@@ -33,8 +33,9 @@
 | `--restore-from-snapshot <path>` | PathBuf | none | Restore database from a snapshot directory before starting. The snapshot must have been created by the node's snapshot system. |
 | `--archive` | bool | false | Explicitly enable archive mode. Retains all historical data. Cannot be combined with `--retention-blocks`. |
 | `--retention-blocks <N>` | u64 | none | Enable pruning: keep the last N blocks of historical block bodies and receipts. Everything older is deleted to save disk space. Cannot be combined with `--archive`. |
+| `--trade-retention-blocks <N>` | u64 | none | Trade-history retention (D13): keep only the trade rows (`cf_native_trades`, `cf_native_user_trades`) of the last N blocks. Unset = keep all trade history. Independent of `--retention-blocks`; never prunes at or above the durable applied height. Config file key `trade-retention-blocks`. Cannot be combined with `--archive`. Node-local (no consensus or state-hash effect). See `pruning-guide.md`. |
 
-**Default behavior**: If neither `--archive` nor `--retention-blocks` is specified, the node runs in archive mode (no data is ever pruned).
+**Default behavior**: If neither `--archive` nor a retention flag is specified, the node runs in archive mode (no data is ever pruned).
 
 ### Subcommands
 
