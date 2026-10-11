@@ -1,6 +1,7 @@
 # Implementation Plan: item 6 Phase 3 (coalesced state checkpoints + replay)
 
-Status: plan (s109, 2026-10-11), nothing built. Design and options: `item6-phase3-design.md`
+Status: core shelved s111; equal-fills saving 2.1-2.5% < 5%; task 1.1 merged, step 3 continues
+separately (plan row 47, results doc section 42). Was: plan (s109, 2026-10-11). Design and options: `item6-phase3-design.md`
 (Option C, owner s109). Parent design: `market-scaling-in-memory-design.md` Phase 3, D5 b, D6 b,
 D7 c, D10 c for now, D11 a, D13 a. Short form: `item6-phases-2-5-plans.md` Phase 3.
 Code references are `file:function` with line numbers on main `fd9e5dfa`.
@@ -105,13 +106,22 @@ Inputs:
 - restart budget per interval;
 - CPU ceiling on tw (flush worker + state-row memtable / compaction CPU-s/1M).
 
-Results doc section 41, plan row 46.
+Results doc sections 41 and 42, plan rows 46 and 47.
 
 **Done (campaign `ozarchy-p3s`, 2026-10-11):** results doc section 41; review log row 46 is in
 `item6-phase2-impl.md` section 8 (rows 42-45 live there; this file has no review log). Coalescing
 (state bytes / keys) 5.95x / 1.58x at min(15 s, 100 blocks), 6.34x / 1.64x at min(30 s, 100 blocks);
 layer peak ~214-219 MB key + value; restart budget 21-22 s (gate 60 s); CPU ceiling 1.55 CPU-s/1M
 (6.2%), factor-scaled ~0.82 (3.3%): **owner decision needed before step 1** (stop rule).
+
+**Prototype measurement (campaign `ozarchy-p3p`, 2026-10-11; owner via 18c s111):** results doc
+section 42, review log row 47 (in `item6-phase2-impl.md`). The throwaway prototype `proto/p3-coalesce`
+`682a8df5` (one checkpoint per 100 blocks) cuts node CPU-s/1M by 4.90% (all rows vs control), 5.07%
+with the state hash on (pooled 4.99%), and 2.98% with book blobs only. At equal fills the cut is
+2.1-2.5% (all) / 1.0% (books). Disk per validator: -51% bytes written (all) / -45% (books). Digest
+measured ~0.3 CPU-s/1M. SIGKILL restart -> first commit 21.3 s mean (gate 60 s). **By the owner's
+rule: shelve Phase 3 and keep the disk-write numbers (borderline: the 5% line is inside both CIs;
+owner to confirm).** Steps 1-4 below are on hold.
 
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,

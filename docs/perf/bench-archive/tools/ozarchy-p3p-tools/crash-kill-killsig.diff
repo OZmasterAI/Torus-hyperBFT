@@ -1,0 +1,23 @@
+--- /home/oz/bench-results-matched/ozarchy-p3p-tools/crash-kill.orig.sh	2026-10-11 02:58:38.146533634 +0200
++++ /home/oz/bench-results-matched/ozarchy-p3p-tools/matched-bench/crash-kill.sh	2026-10-11 02:58:38.151029973 +0200
+@@ -258,9 +258,9 @@
+ PRE_M=$(snap torus_orders_matched_total)
+ LOG_BYTES=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+ 
+-echo "crash-kill: SIGKILL val$IDX pid=$PID (height=$PRE_H exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
++echo "crash-kill: SIG${KILL_SIG:-KILL} val$IDX pid=$PID (height=$PRE_H exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
+ T_KILL=$(date +%s.%N)
+-kill -9 "$PID" 2>/dev/null
++kill -"${KILL_SIG:-KILL}" "$PID" 2>/dev/null
+ for _ in $(seq 1 "$KILL_WAIT"); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+ if kill -0 "$PID" 2>/dev/null; then
+     echo "crash-kill: FATAL pid $PID survived SIGKILL" >&2; exit 1
+@@ -279,7 +279,7 @@
+ python3 - "$OUT/$REC" <<PY
+ import json, sys
+ json.dump({
+- "enabled": True, "kill_seq": $SEQ,
++ "enabled": True, "kill_signal": "${KILL_SIG:-KILL}", "kill_seq": $SEQ,
+  "kill_node": "val$IDX", "kill_idx": $IDX,
+  "killed_pid": $PID, "restarted_pid": $STARTED_PID,
+  "kill_ts": float("$T_KILL"), "restart_ts": float("$T_UP"), "down_s": float("$DOWN"),

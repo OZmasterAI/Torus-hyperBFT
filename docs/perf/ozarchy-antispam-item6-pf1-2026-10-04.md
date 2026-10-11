@@ -4448,6 +4448,215 @@ these threads matches the no-perf cells, and perf is used for shares only.
 - Shared-disk caveat as section 40. Perf inflates val0's CPU (tw-p1 / tw-p2 val0 28.9 / 28.3 vs
   24.1); only thread CPU of the flush / RocksDB threads and perf shares are used from them.
 
+## 42. Phase 3 checkpoint cost, measured with a throwaway prototype: all rows vs book blobs vs control (campaign ozarchy-p3p, 2026-10-11)
+
+**Owner rule outcome: shelve Phase 3 and keep the disk-write numbers on file. This is a borderline
+call.** The all-rows prototype cuts node CPU-s/1M by **4.90%** vs control (a vs c, n = 4, 95% CI
+about 2.4-7.4%) and by **5.07%** with the running state hash on (aS vs cS, CI about 4.0-6.1%). Both
+are well clear of zero. Neither is clear of the 5% line. Node CPU per 120 s cell is the same in every
+arm (655-661 CPU-s per validator), so most of the per-fill saving comes from **+4.7% matched/s**, which
+spreads the same CPU over more fills. At equal fills the all-rows saving is **2.1-2.5%** (42.2).
+That is the same order as section 41's model (3.3%), a little below it. Book blobs alone save 2.98% (1.0% at equal
+fills), so the books-only branch of the rule does not apply either. Disk: bytes written per
+validator **-51%** (all) / **-45%** (books).
+
+Owner request (18c s111, after section 41): measure the checkpoint cost with a throwaway prototype
+before step 1. Arm a (all state rows, one batch per 100 blocks), arm k (Classic book blobs only), and
+the same pair with the running state hash active, to measure the digest. Rule: all rows >= 5% node
+CPU vs control and clearing the noise -> start step 1; else if only books gets close -> re-scope Phase
+3 to book blobs; else shelve Phase 3 and keep the disk-write numbers.
+
+Setup as section 41 (tw baseline: trade history off + WAL 2048 MiB; Classic, cap 8, 300 markets,
+standard shape, fresh genesis and data dir per cell, RocksDB `LOG` copied per cell). **One node binary
+for every arm:** `proto/p3-coalesce` `682a8df5` (worktree `wt/p3proto`, off main `de6768cc`, not for
+merge), node `6e40fa3c`, bench `19f7ac94`, harness `9b7e29b2` (`crash-kill.sh` copy patched only for
+`KILL_SIG`). The prototype defers the state CFs into an in-memory layer inside `StateDb` (reads merge
+it) and writes the layer as one `WriteBatch` on a `p3-ckpt` thread at every height divisible by 100.
+`all` also defers META (marker + running hash), so a crash rewinds to the last checkpoint and replays
+from the bodies. `books` defers only `cf_native_order_books` and records its own checkpoint marker. Arms:
+- **c:** `TORUS_P3_PROTO` unset (control). **a:** `TORUS_P3_PROTO=all`. **k:** `TORUS_P3_PROTO=books`.
+- **cS / aS:** c / a with `STATE_HASH_ACTIVATION=1` in genesis (the running state hash active from
+  height 1; section 41 had it off).
+
+Cells 03:00-06:00 (driver `ozarchy-p3p-campaign.sh`, tables `ozarchy-p3p-run/handoff-tables.txt`,
+analyst scripts `tools/ozarchy-p3p-tools/a-*.py`): warm-up w0 (60 s, excluded), then 4 rotated rounds
+of 120 s cells (c a k cS aS / a k cS aS c / k cS aS c a / cS aS c a k), then the graceful restart
+cells g1-c g1-a g1-k g2-k g2-a g2-c (120 s, `SIGTERM` to val1 at bench + 60 s) and the multi-crash
+cells x1-c x1-a (420 s, `SIGKILL` to val1 at bench + 60 / 180 / 300 s).
+
+All 29 cells AGREE. Node md5 `6e40fa3c` on all 3 validators in every cell. Every cell passed its hard
+checks (9 per throughput cell, 11 per restart cell: p3 knob and layer-enable lines per arm, genesis
+`state_hash_activation` per arm, `max_total_wal_size` 2048 MiB, 0 trade rows, codec, book CF, trie).
+The host had no `cargo`, `rustc` or `rust-analyzer` running before any cell. The 21 throughput cells
+(w0 + r1-r4) are rc 0, PASS, ACCEPT. The 8 restart cells are rc 2 / INVALID / REJECT, and none is a node
+fault: in each restart the only panic / fail-stop match is the INFO config line `running state hash
+fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` (sections 39.3 / 40.3 / 41). x1-a also reads "rewind 58
+/ 66 blocks beyond the exec queue (max 2)". That is the all-arm design (rewind to the last checkpoint),
+not a fault. No cell is excluded from the analysis.
+
+### 42.1 Node CPU and throughput (r1-r4, n = 4 per arm; ↓ lower is better, ↑ higher is better)
+
+Node CPU-s/1M = val0-2 `proc_cpu` whole run / fills, mean of the 3 validators (sections 40 / 41).
+
+| arm | node CPU-s/1M ↓ mean (sd) | r1..r4 | vs control | step / pooled sd (paired t) | matched/s ↑ mean (sd) | vs control |
+|---|---|---|---|---|---|---|
+| c | 24.996 (0.412) | 25.45 / 24.82 / 24.52 / 25.20 | - | - | 204,486 (6,455) | - |
+| a | **23.770** (0.115) | 23.90 / 23.68 / 23.67 / 23.83 | **-1.226, -4.90%** | 4.1 (8.1) | **214,120** (517) | **+4.71%** (2.1 sd; every a cell above every c cell) |
+| k | 24.251 (0.071) | 24.26 / 24.33 / 24.16 / 24.26 | -0.745, -2.98% | 2.5 (3.8) | 210,382 (1,775) | +2.88% (1.2 sd, not resolved) |
+| cS | 25.335 (0.173) | 25.25 / 25.48 / 25.13 / 25.47 | (vs c) +0.339, +1.36% | 1.1 (1.7) | 200,994 (3,490) | (vs c) -1.71% (0.7 sd) |
+| aS | **24.049** (0.104) | 24.07 / 24.19 / 23.95 / 24.00 | **(vs cS) -1.285, -5.07%** | 9.0 (18.6) | **213,652** (2,346) | **(vs cS) +6.30%** (4.3 sd) |
+
+- c reproduces section 40's tw (24.93 CPU-s/1M, 203,992 matched/s) within its spread. c is the noisiest
+  arm (r1-c 25.45 / 196,916 is its slowest cell).
+- **Against the 5% line.** a vs c: -4.90%, Welch t 5.7 vs zero; the 95% interval (df ~3.4) is about
+  -2.4% to -7.4%. aS vs cS: -5.07%, t 12.7; interval about -4.0% to -6.1%. Pooled over both pairs:
+  -4.99%. The saving is resolved against zero, but **not** against the 5% line.
+- Load-window CPU (`proc_cpu` load, bench window only) reads a little higher: a vs c -5.56%, k vs c
+  -3.03%, aS vs cS -6.05%. Sections 40 / 41 use the whole run, so the whole run is the rule's figure.
+
+### 42.2 Where the saving comes from (load window; CPU-s per 1M val0 fills, per validator)
+
+Per-thread CPU from `io-threads-start/end.txt` (utime + stime, bench start -> bench exit, mean of
+val0-2). "Exited threads" = process load CPU minus the live threads. It holds the `p3-ckpt` threads
+(one per checkpoint) and the worker-pool threads.
+
+| arm | flush worker | `rocksdb:high` | `rocksdb:low` | exec thread | other live threads | exited threads | total (load) |
+|---|---|---|---|---|---|---|---|
+| c | 0.931 | 0.449 | 1.030 | 3.961 | 11.814 | 7.574 | 25.758 |
+| a | 0.478 | 0.287 | 0.842 | 3.820 | 11.238 | 7.660 | 24.326 |
+| k | 0.716 | 0.354 | 0.951 | 3.888 | 11.555 | 7.512 | 24.977 |
+| cS | 0.952 | 0.456 | 1.032 | 3.961 | 11.652 | 8.207 | 26.261 |
+| aS | 0.498 | 0.303 | 0.818 | 3.812 | 11.198 | 8.043 | 24.672 |
+
+- **Work Phase 3 removes** (flush worker + RocksDB memtable flush + compaction), a vs c: -0.453 -
+  0.162 - 0.188 = **-0.80 CPU-s/1M (3.1%)**; aS vs cS -0.82. The flush worker keeps ~0.48: the
+  prototype's per-block absorb into the layer (42.4) runs there. The checkpoint thread is not in
+  these columns. Its build + write wall time is 7.3 s per validator per cell (42.4), so at most ~0.27
+  CPU-s/1M. Net removed work: about **0.53-0.80 (2.1-3.1%)**. Section 41's model: 0.82 (3.3%), with a
+  ceiling of 1.55. About half the ceiling goes.
+- **The rest is throughput.** The exec thread (-0.14) and the other live threads (-0.58) do the same
+  work per second, spread over 4.7% more fills. Node CPU per cell is flat across the arms: c 656.2
+  (sd 5.6), a 655.3, k 658.7, cS 661.3, aS 656.8 CPU-s per validator. A common-slope fit over the 20
+  cells (CPU-s per validator vs fills, arm intercepts) gives a marginal cost of 10.1 ± 2.1 CPU-s per
+  1M extra fills (the average is ~24-25). At equal fills: **a vs c -0.51 ± 0.12 CPU-s/1M (-2.1%), k vs
+  c -0.24 ± 0.10 (-1.0%), aS vs cS -0.61 ± 0.11 (-2.5%), cS vs c +0.26**.
+- **Why matched/s rises** (a / k vs c): the harness's `pipelined_ms` per block 29.6 -> 17.7 / 21.2
+  (4.2 / 2.9 sd), native blocks/s 6.05 -> 6.42 / 6.53, commit interval 153.5 -> 145.9 / 142.7 ms. The
+  flush worker writes 78 MB/s less to storage (42.3), and **all 3 validators share one disk on the
+  bench host** (section 40.2). With a disk per validator the throughput gain, and the CPU-s/1M saving
+  that rides on it, may be smaller. Not measured.
+
+### 42.3 Disk (per validator, bench window; ↓ lower is better)
+
+All writes = process `write_bytes` from `io-ticks.txt` over `[t_bench0, t_bench1]`. WAL = process
+writes minus the `rocksdb:*` threads (from `io-threads-*.txt`). Flush + compaction = the `rocksdb:*`
+threads. These are the methods of section 40.2. They count total bytes written, not the
+end-of-cell `data-du.txt` snapshot.
+
+| arm | all writes MB/s (sd) | total written in the window GB | WAL MB/s | flush + compaction MB/s | flush worker MB/s | SST created per cell GB | peak RSS per node MB |
+|---|---|---|---|---|---|---|---|
+| c | 131.0 (7.0) | 16.0 | 115.8 | 18.7 | 78.4 | 2.21 | 3,517 |
+| a | **64.5** (0.6), **-50.8%** | 7.9 | **51.4, -55.6%** | 14.6, -21.8% | 0 | 1.81 | **4,331 (+814)** |
+| k | 72.4 (1.0), -44.8% | 8.9 | 57.4, -50.4% | 16.1, -14.1% | 18.7 | 1.93 | 3,563 |
+| cS | 128.7 (2.5) | 15.8 | 114.8 | 18.6 | 77.9 | 2.19 | 3,515 |
+| aS | 63.5 (1.0), -50.7% vs cS | 7.8 | 50.7, -55.8% | 14.5, -21.9% | 0 | 1.77 | 4,429 |
+
+- Every disk step is resolved (8-35 sd). Section 41.1 predicted all WAL writes -54% at plan 15 s
+  from the WAL decode. The prototype measures -55.6% at 100 blocks.
+- **Book blobs carry most of the bytes.** k gets 88% of a's cut in all writes (58.7 of 66.5 MB/s)
+  and 91% of its WAL cut, for 0.11 ms per block of absorb (42.4).
+- **RAM:** a holds ~0.8 GB more RSS per node (+23%): the active layer plus the flushing copy while a
+  checkpoint is written. That is section 41.2's estimate (214-219 MB payload + ~140-210 MB per-key
+  overhead per layer, up to two layers). k: +46 MB.
+
+### 42.4 Prototype stalls (`p3proto checkpoint` lines, val0-2 logs, load-window checkpoints of 100 blocks)
+
+| arm | checkpoints | rows min / median / max | MB min / median / max | build ms (median, max) | write ms (median, max) | absorb ms per block (median, max) | build + write per validator per cell |
+|---|---|---|---|---|---|---|---|
+| a | 111 | 0.20M / 1.22M / 1.42M | 43 / 188 / 233 | 262, 379 | 552, 692 | 9.5, 13.4 | 7.3 s |
+| aS | 108 | 0.34M / 1.30M / 1.40M | 58 / 192 / 211 | 261, 387 | 588, 1,289 | 9.9, 13.0 | 7.5 s |
+| k | 114 | 300 / 300 / 300 | 1.1 / 13.0 / 38.0 | 6.0, 26.5 | 17.1, 74.1 | 0.11, 0.18 | 0.29 s |
+
+- Build and write run on the `p3-ckpt` thread. Absorb runs on the flush worker, under the per-CF
+  write lock of the layer (all: ~9.5 ms per block; books: ~0.1 ms). The smoke test's figures (build
+  0.1-0.55 s, write 0.3-0.74 s, 120-230 MB, absorb 4-11 ms) hold under load, with one aS write at 1.29 s.
+- **Bias.** The absorb CPU is in the flush worker column and the checkpoint CPU is in the process
+  total, so both are in the measured CPU; neither favours the prototype. They do not cost throughput
+  either: a is the fastest arm. The exec -> flush handoff wait is higher in a (1.31 vs 0.76 ms per
+  block, 1.5 sd) and aS (2.35 vs 1.40, 1.2 sd); neither step is resolved. What the prototype leaves out
+  (task 1.1 pruner clamp, h(n-1) in memory on W, an interval setting) is small next to the 0.8 CPU-s/1M
+  moved here.
+
+### 42.5 Digest cost (running state hash on, vs off)
+
+- **cS - c: +0.339 CPU-s/1M (+1.36%; 1.1 sd, paired t 1.7; not resolved alone).** aS - a: +0.279
+  (+1.18%; 2.6 sd, paired t 3.5). Both pairs point the same way: **~0.3 CPU-s/1M (~1.2%)**. This
+  **replaces section 41's ~0.26 estimate** (consistent with it). At equal fills, cS - c is +0.26.
+- The cost lands mostly in exited (worker) threads (+0.63 cS vs c, +0.38 aS vs a), and it raises
+  the exec -> flush handoff wait (0.76 -> 1.40 ms per block, 3.4 sd).
+- Phase 3 keeps the digest. Against an aS-like chain the all-rows saving is the same size (-5.07% vs
+  -4.90%).
+
+### 42.6 Restart (val1; markers from `crash-restart-tail{,-2,-3}.log` as section 41.3; times from `crash-kill*.json`)
+
+| cell | signal | down s | DB open s | rewind / replay | replay s (blocks/s) | restart -> first commit s | kill -> first commit s |
+|---|---|---|---|---|---|---|---|
+| g1-c | TERM (= kill, see below) | 1.01 | 2.59 | 64 blocks (681 -> 745) | 10.07 (6.4) | 12.75 | 13.8 |
+| g2-c | TERM (= kill) | 1.01 | 2.54 | 64 (686 -> 750) | 9.77 (6.6) | 12.46 | 13.5 |
+| g1-a | TERM, graceful | 8.03 | 3.97 | 0 | - | 20.74 | 28.8 |
+| g2-a | TERM, graceful | 8.03 | 4.53 | 0 | - | 10.76 | 18.8 |
+| g1-k | TERM, graceful | 8.03 | 3.52 | 0 | - | 13.35 | 21.4 |
+| g2-k | TERM, graceful | 8.03 | 4.01 | 0 | - | 11.13 | 19.2 |
+| x1-c kill 1 / 2 / 3 | KILL | 1.01 | 2.48 / 3.54 / 2.94 | 64 / 52 / 44 | 9.47 / 7.68 / 9.77 (6.8 / 6.8 / 4.5) | 12.08 / 11.35 / 12.82 (mean 12.1) | 13.1 / 12.4 / 13.8 |
+| x1-a kill 1 / 2 / 3 | KILL | 1.01 | 4.28 / 2.80 / 5.29 | **120 / 130 / 34** (700 -> 820, 1500 -> 1630, 2300 -> 2334) | 21.59 / 21.88 / 7.12 (5.6 / 5.9 / 4.8) | **26.57 / 24.83 / 12.50 (mean 21.3)** | 27.6 / 25.8 / 13.5 |
+
+- **Control `SIGTERM` is a kill.** `torus-node` waits for SIGTERM only when the p3 layer is on, so
+  g*-c die at once and replay the 64-block exec queue, the same as `SIGKILL`.
+- **Graceful a / k:** the shutdown flush itself takes 1.04-1.09 s (all) / 0.06-0.08 s (books). Then the
+  node keeps executing its exec queue (64 blocks, written per block with the layer closed) before it
+  exits (g1-a: applied 666 at the signal, 730 at exit). That is why down is 8 s and no block is
+  replayed. The 3-validator devnet commits nothing while val1 is down (g1-a: val0's last commit before
+  the stop, height 730, is at 03:12:24 UTC, the next, 731, at 03:12:52), so the time to the first commit is
+  the chain's stall. Restart -> first commit 10.8-20.7 s (a) and 11.1-13.4 s (k); kill -> first
+  commit 18.8-28.8 s vs 13.5-13.8 s for the control's kill path. The graceful drain moves the queue's
+  execution in front of the exit, so it lengthens the outage instead of shortening it.
+- **SIGKILL, all rows:** the replay is the blocks since the last checkpoint plus the exec queue (58 +
+  62, 66 + 64, 1 + 33 blocks). It runs at 4.8-5.9 blocks/s, including a checkpoint written during
+  the replay of kills 1 and 2. Restart -> first commit is 21.3 s mean, 26.6 s max, vs 12.1 s for
+  control. That is inside section 41.4's budget (100 blocks + 66 exec lag: 35.2 s central, 45.3 s
+  pessimistic) and the 60 s gate.
+- DB open is ~1.3 s longer with the layer on (a 4.17 s mean of 5, k 3.77 of 2, c 2.82 of 5;
+  section 41.3: 2.68). This is not explained here; a possible cause is RocksDB recovering the
+  200 MB checkpoint batch from the WAL.
+- The harness's `restart-metrics.json` agrees within 0.1-0.4 s (it times the first commit from the
+  harness's own markers).
+
+### 42.7 Reading
+
+- **Rule:** all rows -4.90% / -5.07% node CPU-s/1M (pooled -4.99%). This clears the noise against
+  zero but sits on the 5% line, so the first branch ("≥ 5% and clears the noise") is not met. At equal
+  throughput the saving is 2.1-2.5%, a little below section 41's model (3.3%). Books only: -2.98% (-1.0% at
+  equal fills). It is below all rows, not close to 5%. **-> Shelve Phase 3; keep the disk-write
+  numbers** (all rows: bytes written per validator -51%, WAL -56%, flush + compaction -22%, ~0.8 GB
+  more RAM per node; books only: -45% / -50% / -14% for +46 MB). The owner may read the pooled
+  4.99% differently. The numbers above are the inputs for that call.
+- **Throughput:** all rows +4.7% matched/s (aS vs cS +6.3%), resolved. Its mechanism (less flush
+  worker work and fewer bytes written to a disk the 3 validators share) is plausible, but this host
+  cannot separate it from shared-disk contention.
+- **Digest:** ~0.3 CPU-s/1M (~1.2%) measured, replacing the 0.26 estimate.
+- **Restart:** SIGKILL with all rows 21.3 s mean / 26.6 s max to the first commit (control 12.1 s),
+  within the 60 s gate. A graceful stop replays nothing, but it drains the exec queue before the exit,
+  so the outage is longer (kill -> first commit 18.8-28.8 s vs 13.5-13.8 s).
+- **Confidence:** medium for the verdict. The 5% line falls inside both CIs; the equal-fills
+  analysis rests on a common slope fitted from small within-arm spreads (10.1 ± 2.1); the throughput
+  gain may be host-specific. High for the disk and stall numbers (8-35 sd, every cell). Medium for
+  restart (n = 3 + 2 per arm).
+- **If the owner wants the 5% line resolved** (not run): (1) 4 more interleaved c / a pairs (~50
+  min). The c spread (sd 0.41) dominates, so n = 8 puts the a vs c 95% interval at about ±1.4%;
+  this only helps if the true value is not ~5%. (2) A fixed-load pair: offered load capped below both
+  arms' capacity (e.g. ~190k matched/s), so CPU-s/1M is compared at equal fills without the fit (4
+  pairs, ~50 min). (3) A disk per validator: not possible on this host.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -4456,14 +4665,15 @@ these threads matches the no-perf cells, and perf is used for shares only.
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Phase 3 step 0 sizing on tw: owner decision needed before step 1** (section 41, plan review
-  log row 46). CPU ceiling (flush worker + state-row memtable flush + compaction; digest 0, the
-  bench does not activate the running state hash) 1.55 CPU-s/1M = 6.2% of tw node CPU, 0.06 above
-  the -6% gate; scaled by the measured coalescing factors ~0.82 (3.3%). Coalescing (state rows,
-  bytes / keys): 5.95x / 1.58x at the plan's 15 s, 6.34x / 1.64x at 30 s capped at 100 blocks
-  (state-row WAL bytes -83%). Layer / checkpoint ~214-219 MB payload at the peak. Restart budget
-  21-22 s central, <= 45 s pessimistic (gate 60 s). Options (plan stop rule): build for the disk and
-  W-ceiling gains with a lower CPU gate, or drop Phase 3.
+- **Phase 3: by the owner's rule, shelve (borderline; owner to confirm)** (sections 41 and 42, plan
+  review log rows 46-47). The throwaway prototype (`proto/p3-coalesce` `682a8df5`, one checkpoint
+  per 100 blocks) cuts node CPU-s/1M by 4.90% (all rows vs control) and by 5.07% (with the state hash
+  on), pooled 4.99%. That clears zero, not the 5% line. At equal fills the saving is 2.1-2.5%,
+  because most of the headline comes from +4.7% matched/s on a disk the 3 validators share. Books
+  only: -2.98%. Disk numbers kept on file: bytes written per validator -51% (all) / -45% (books),
+  WAL -56% / -50%; all rows hold ~0.8 GB more RAM per node. Digest measured ~0.3 CPU-s/1M. SIGKILL
+  restart with all rows 21.3 s mean to the first commit (gate 60 s). To resolve the 5% line instead:
+  4 more c / a pairs, or a fixed-load pair (section 42.7).
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b
