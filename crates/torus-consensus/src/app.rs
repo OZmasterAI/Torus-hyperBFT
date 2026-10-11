@@ -23522,4 +23522,177 @@ mod crash_recovery_tests {
             );
         }
     }
+
+    // ---- Item 6 Phase 3 step 2: validator ingress readers on a published view ----
+
+    /// The ingress-view fixture: real-time blocks (session expiry and the
+    /// gossip nonce window are checked against the wall clock). Heights:
+    ///   1  C TransferToPerp (C's whole EVM balance to perp; run serial,
+    ///      so it is durable)
+    ///   2  A TransferToPerp (native balance credited at n = 2),
+    ///      A CreateSession(S) (session created at n),
+    ///      C Withdraw to D (D's EVM balance credited at n; D is a fresh
+    ///      key, so the DB shows it unfunded until a checkpoint)
+    /// Returns the blocks and the keys `(A, S, C, D)`.
+    fn ingress_view_blocks() -> (
+        Vec<TorusBlock>,
+        k256::ecdsa::SigningKey,
+        ed25519_dalek::SigningKey,
+        k256::ecdsa::SigningKey,
+        k256::ecdsa::SigningKey,
+    ) {
+        let k_d = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let k_c = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
+        let s_key = ed25519_dalek::SigningKey::from_bytes(&[72u8; 32]);
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let base_s = now_s - 2;
+        let ms = |h: u64| (base_s + h) * 1000;
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![sign(NativeAction::TransferToPerp { amount: deposit }, ms(1), &k_c)],
+            ),
+            make_block(
+                2,
+                vec![
+                    sign(NativeAction::TransferToPerp { amount: deposit }, ms(2), &k_a),
+                    sign(
+                        NativeAction::CreateSession {
+                            session_pubkey: s_key.verifying_key().to_bytes(),
+                            expiry: ms(2) + 3_600_000,
+                            scope: torus_types::SessionScope::Trading,
+                        },
+                        ms(2) + 1,
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::Withdraw {
+                            amount: deposit,
+                            to: k256_address(&k_d),
+                        },
+                        ms(2),
+                        &k_c,
+                    ),
+                ],
+            ),
+        ];
+        for b in blocks.iter_mut() {
+            b.header.timestamp = base_s + b.header.height;
+        }
+        link_blocks(&mut blocks);
+        (blocks, k_a, s_key, k_c, k_d)
+    }
+
+    /// What gossip / RPC ingress admits at n + 1 after the fixture ran with
+    /// `policy` (`None` = interval 0, the per-block flush). Each entry is
+    /// `(what, result)`; `Ok` = admitted.
+    fn ingress_view_admissions(
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> Vec<(&'static str, Result<(), String>)> {
+        let (blocks, k_a, s_key, k_c, k_d) = ingress_view_blocks();
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000;
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        fund_evm_balance(&db, k256_address(&k_a), deposit);
+        fund_evm_balance(&db, k256_address(&k_c), deposit);
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                ingress_min_collateral_trs: 1,
+                ..Default::default()
+            },
+        ));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        // Block 1 serial (durable: C's EVM balance is 0 in the DB), then W.
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        ctx.checkpoint = policy;
+        ctx.attach_flush_worker(None);
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "{policy:?}: fixture must not fail-stop"
+        );
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        let durable = read_native_applied_height(&db).unwrap_or(0);
+        match policy {
+            None => assert_eq!(durable, 2, "interval 0: block 2 durable"),
+            Some(_) => assert_eq!(durable, 1, "{policy:?}: block 2 only in memory"),
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let order = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let a = k256_address(&k_a);
+        let d = k256_address(&k_d);
+        let session_order = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::PlaceOrder(order.clone()),
+            now,
+            &s_key,
+        );
+        let d_order = torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrder(order),
+            now + 1,
+            &k_d,
+        );
+        let evm = signed_eip1559_with_value(
+            &k_d,
+            0,
+            alloy_primitives::TxKind::Call(Address::repeat_byte(0x99)),
+            vec![],
+            U256::from(10u128.pow(18)),
+        );
+        let out = vec![
+            (
+                "session gossip (session + A's perp balance at n)",
+                mempool
+                    .add_native_action_from_gossip(a, session_order)
+                    .map_err(|e| e.to_string()),
+            ),
+            (
+                "D gossip (funded by the EVM credit at n)",
+                mempool
+                    .add_native_action_from_gossip(d, d_order)
+                    .map_err(|e| e.to_string()),
+            ),
+            (
+                "D add_evm_tx (balance = the EVM credit at n)",
+                mempool.add_evm_tx(evm).map(|_| ()).map_err(|e| e.to_string()),
+            ),
+        ];
+        drop(ctx);
+        out
+    }
+
+    /// Item 6 Phase 3 step 2 (plan "Step 2"): a session created at n, a perp
+    /// balance credited at n and an EVM credit at n are visible to ingress at
+    /// n + 1 with the interval "never" (nothing durable yet) exactly as with
+    /// interval 0 (per-block flush).
+    #[test]
+    fn ingress_view_matches_interval_zero() {
+        let zero = ingress_view_admissions(None);
+        for (what, r) in &zero {
+            assert!(r.is_ok(), "interval 0: {what}: {r:?}");
+        }
+        let never = ingress_view_admissions(Some(ckpt_never()));
+        assert_eq!(never, zero, "interval never vs interval 0");
+    }
 }
