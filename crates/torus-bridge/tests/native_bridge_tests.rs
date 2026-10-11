@@ -889,3 +889,21 @@ fn indexed_sort_matches_the_pre_cut_sort_and_maps_back() {
         }
     }
 }
+
+/// R02 branch 8 (B): `core_writer_due` reports the queue for exactly its
+/// height as `Ok` (a read error is `Err`; the caller fail-stops — driven in
+/// torus-consensus `r02_core_writer_due_read_fault_fail_stops_block`).
+#[test]
+fn core_writer_due_is_ok_per_height() {
+    use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+    let (_dir, db) = open_test_db();
+    assert!(!NativeExecutor::core_writer_due(&db, 2).unwrap(), "empty queue");
+    let qa = QueuedAction {
+        trader: addr(5),
+        kind: QueuedActionKind::LockboxDeposit { amount: fp(7) },
+        block_queued: 1,
+    };
+    CoreWriterQueue::enqueue(&db, &qa).unwrap();
+    assert!(NativeExecutor::core_writer_due(&db, 2).unwrap(), "queued for height 2");
+    assert!(!NativeExecutor::core_writer_due(&db, 3).unwrap(), "other heights not due");
+}
