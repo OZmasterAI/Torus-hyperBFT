@@ -78,9 +78,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::cf::{CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_RECEIPTS};
+use crate::cf::{
+    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_RECEIPTS,
+    META_TRADES_PRUNED_HEIGHT,
+};
 use crate::db::StateDb;
 use crate::error::StateError;
 
@@ -125,12 +128,16 @@ pub struct StatePruner {
     /// Height up to which data has been pruned (exclusive — data at this height exists).
     pruned_up_to: Arc<AtomicU64>,
     /// D13: trade rows of blocks below this height are deleted or being
-    /// deleted (0 = none). Raised before a pass deletes, so RPC readers sharing
-    /// it never serve a half-pruned range. In memory only (no on-disk marker):
-    /// after a restart the first pass prunes from scratch.
+    /// deleted (0 = none). Raised (and persisted, `META_TRADES_PRUNED_HEIGHT`)
+    /// before a pass deletes, so RPC readers sharing it never serve a
+    /// half-pruned range; loaded from disk at start and never lowered.
     trades_pruned_up_to: Arc<AtomicU64>,
-    /// Cutoff of the last trade pass that completed.
+    /// Cutoff of the last trade pass that completed (0 at start, so the first
+    /// pass after a restart re-deletes below the stored cutoff).
     trades_done: u64,
+    /// Cutoff last written to `META_TRADES_PRUNED_HEIGHT` (`None` = the
+    /// startup read failed: re-read before a pass writes, never lowered).
+    trades_persisted: Option<u64>,
     /// Last block height at which we ran pruning.
     last_prune_height: u64,
 }
@@ -140,11 +147,17 @@ impl StatePruner {
     pub fn new(db: StateDb, config: PrunerConfig, pruned_up_to: Arc<AtomicU64>) -> Self {
         let stored = read_prune_meta(&db).unwrap_or(0);
         pruned_up_to.store(stored, Ordering::Release);
+        let trades_read = read_trades_pruned_height(&db)
+            .map_err(|e| warn!(%e, "trade-history cutoff unreadable; re-read on the first pass"))
+            .ok();
+        let trades_stored = trades_read.unwrap_or(0);
 
         info!(
             retention_blocks = config.retention_blocks,
             prune_interval = config.prune_interval_blocks,
             pruned_up_to = stored,
+            trade_retention_blocks = ?config.trade_retention_blocks,
+            trades_pruned_up_to = trades_stored,
             "state pruner initialized"
         );
 
@@ -152,8 +165,9 @@ impl StatePruner {
             db,
             config,
             pruned_up_to,
-            trades_pruned_up_to: Arc::new(AtomicU64::new(0)),
+            trades_pruned_up_to: Arc::new(AtomicU64::new(trades_stored)),
             trades_done: 0,
+            trades_persisted: trades_read,
             last_prune_height: 0,
         }
     }
@@ -203,12 +217,31 @@ impl StatePruner {
         if let Some(keep) = self.config.trade_retention_blocks {
             let trade_cutoff = current_height.saturating_sub(keep).min(applied);
             if trade_cutoff > self.trades_done {
-                self.trades_pruned_up_to
-                    .fetch_max(trade_cutoff, Ordering::AcqRel);
-                let stats = prune_trades_below(&self.db, trade_cutoff, self.config.batch_size)?;
-                self.trades_done = trade_cutoff;
+                let persisted = match self.trades_persisted {
+                    Some(h) => h,
+                    None => {
+                        let h = read_trades_pruned_height(&self.db)?;
+                        self.trades_pruned_up_to.fetch_max(h, Ordering::AcqRel);
+                        self.trades_persisted = Some(h);
+                        h
+                    }
+                };
+                // Never below the stored cutoff (N raised across a restart):
+                // those rows are gone, RPC keeps them pruned.
+                let cutoff = self
+                    .trades_pruned_up_to
+                    .fetch_max(trade_cutoff, Ordering::AcqRel)
+                    .max(trade_cutoff);
+                // Persist before deleting: a crash in between leaves rows
+                // hidden, never deleted rows served as "no trades".
+                if cutoff > persisted {
+                    write_trades_pruned_height(&self.db, cutoff)?;
+                    self.trades_persisted = Some(cutoff);
+                }
+                let stats = prune_trades_below(&self.db, cutoff, self.config.batch_size)?;
+                self.trades_done = cutoff;
                 info!(
-                    cutoff = trade_cutoff,
+                    cutoff,
                     markets = stats.market_ranges,
                     user_rows = stats.user_rows,
                     "pruned trade history"
@@ -440,6 +473,24 @@ fn read_prune_meta(db: &StateDb) -> Result<u64, StateError> {
 /// Write the pruned-up-to height to the database.
 fn write_prune_meta(db: &StateDb, height: u64) -> Result<(), StateError> {
     db.put_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY, &height.to_be_bytes())
+}
+
+/// D13: the persisted trade-history cutoff (`META_TRADES_PRUNED_HEIGHT`):
+/// trade rows of blocks below it are pruned. 0 if absent (nothing pruned) or
+/// not 8 bytes.
+pub fn read_trades_pruned_height(db: &StateDb) -> Result<u64, StateError> {
+    match db.get_cf_raw(CF_CONSENSUS_META, META_TRADES_PRUNED_HEIGHT)? {
+        Some(data) if data.len() == 8 => Ok(u64::from_be_bytes(data[..8].try_into().unwrap())),
+        _ => Ok(0),
+    }
+}
+
+fn write_trades_pruned_height(db: &StateDb, height: u64) -> Result<(), StateError> {
+    db.put_cf_raw(
+        CF_CONSENSUS_META,
+        META_TRADES_PRUNED_HEIGHT,
+        &height.to_be_bytes(),
+    )
 }
 
 /// Compute the total size of a directory in bytes (recursive).
@@ -964,8 +1015,7 @@ mod tests {
 
     /// The background trade writer can land a block's rows after the pass
     /// that covered it; every pass deletes everything below its cutoff, so
-    /// the next pass removes them. A restart (cutoff in memory only) also
-    /// prunes from scratch.
+    /// the next pass removes them. A restart also prunes from scratch.
     #[test]
     fn pruner_trades_late_rows_and_restart_are_pruned() {
         let dir = TempDir::new().unwrap();
@@ -1003,6 +1053,60 @@ mod tests {
         let (m, u) = trade_blocks(&db);
         assert!(m.iter().all(|&(_, b)| b >= 10), "{m:?}");
         assert!(u.iter().all(|&(_, b)| b >= 10), "{u:?}");
+    }
+
+    /// The cutoff is persisted (`META_TRADES_PRUNED_HEIGHT`) and never lowered:
+    /// a restart with a larger N, or without the flag, keeps the old cutoff,
+    /// so blocks whose rows are gone stay pruned for RPC.
+    #[test]
+    fn pruner_trades_cutoff_persists_across_restart_with_larger_n() {
+        let dir = TempDir::new().unwrap();
+        let db = trade_db(dir.path(), 0..20);
+        set_applied(&db, 19);
+        assert_eq!(read_trades_pruned_height(&db).unwrap(), 0, "absent = 0");
+        let mut pruner = StatePruner::new(
+            db.clone(),
+            trade_cfg(u64::MAX, Some(10), 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        pruner.maybe_prune(19).unwrap();
+        assert_eq!(read_trades_pruned_height(&db).unwrap(), 9);
+        drop(pruner);
+
+        // Restart with N = 15: cutoff 5 < 9, the stored 9 stands.
+        let cut = Arc::new(AtomicU64::new(0));
+        let mut larger = StatePruner::new(
+            db.clone(),
+            trade_cfg(u64::MAX, Some(15), 100),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_trades_pruned_handle(cut.clone());
+        assert_eq!(
+            cut.load(Ordering::Acquire),
+            9,
+            "known before the first pass"
+        );
+        // A row the trade writer landed late below the stored cutoff.
+        write_trades(&db, 7, &[57], &traders(), 0);
+        larger.maybe_prune(20).unwrap();
+        assert_eq!(larger.trades_pruned_height(), 9);
+        assert_eq!(read_trades_pruned_height(&db).unwrap(), 9, "never lowered");
+        let (m, u) = trade_blocks(&db);
+        assert!(m.iter().all(|&(_, b)| b >= 9), "{m:?}");
+        assert!(u.iter().all(|&(_, b)| b >= 9), "{u:?}");
+        // Later passes raise it again once N = 15 passes the old cutoff.
+        set_applied(&db, 30);
+        larger.maybe_prune(30).unwrap();
+        assert_eq!(read_trades_pruned_height(&db).unwrap(), 15);
+        drop(larger);
+
+        // Restart without the flag (bodies only): the cutoff stays 15.
+        let p = StatePruner::new(
+            db.clone(),
+            trade_cfg(5, None, 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(p.trades_pruned_height(), 15);
     }
 
     /// Trade pruning follows the pruner's interval like bodies do.

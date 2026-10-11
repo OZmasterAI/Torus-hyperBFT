@@ -59,10 +59,11 @@ and the running state hash. To bound it:
 - Every pass deletes everything below its cutoff (not only what is new since
   the last pass), so rows the background trade writer lands late, and rows
   left by a pass before a restart, are removed by the next pass. The cutoff is
-  kept in memory only (no new on-disk marker), so after a restart RPC learns it
-  on the first pass (the first 30 s tick). Limitation: if N is **raised** across
-  a restart, or the flag is removed, blocks between the new and the old cutoff
-  were already deleted and are served as empty, not `DataPruned`.
+  persisted node-locally (`cf_consensus_meta` key `trades_pruned_height`,
+  written before a pass deletes, never lowered, not hashed), and RPC loads it
+  at startup: if N is **raised** across a restart, or the flag is removed,
+  blocks below the old cutoff stay `DataPruned` (their rows are gone), not an
+  empty "no trades" result.
 - A pass runs on the blocking thread pool, not on a runtime worker.
 
 | CF | Key | How |
