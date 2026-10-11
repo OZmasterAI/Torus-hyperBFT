@@ -2530,6 +2530,17 @@ impl ExecutionContext {
             if self.test_replay_fault == Some(ReplayFault::ResidentMarkerRead) {
                 resident_rows.test_inject_marker_fault(injected_fault("applied marker read"));
             }
+            // R02 branch 7: the rows slot's applied-marker read failed (a
+            // local fault): fail-stop, never "stale -> rebuild".
+            if let Some(e) = resident_rows.take_marker_fault() {
+                self.fail_stop_on_fault(
+                    torus_block,
+                    fold_header,
+                    "resident rows applied-marker read",
+                    &e,
+                );
+                return;
+            }
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -3003,7 +3014,13 @@ impl ExecutionContext {
                 } else {
                     put
                 };
-                let _ = put;
+                // R02 branch 7: the next block's staleness guards read this
+                // marker through the parent layer; a lost put fail-stops (the
+                // overlay put fails only on a code bug), like the nonce put.
+                if let Err(e) = put {
+                    self.fail_stop_on_fault(torus_block, fold_header, "applied marker put", &e);
+                    return;
+                }
                 let evm_addrs = overlay.dirty_evm_accounts();
                 drop(ctx);
                 let frozen = overlay.freeze(height);

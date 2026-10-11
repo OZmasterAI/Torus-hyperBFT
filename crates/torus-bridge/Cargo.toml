@@ -32,7 +32,8 @@ save-timings = []
 # Item 6 Phase 2 (plan 9.8): TEST-ONLY. Compiles the reference-path switches
 # of `NativeExecContext` (`test_cancel_all_full_scan`, `test_flush_per_row`)
 # into non-test builds, so torus-consensus's app-level differentials can flip
-# them (enabled from its dev-dependencies only). The switches default to off:
+# them (enabled from its dev-dependencies only); also the R02 fault seam
+# `ResidentBlock::test_inject_marker_fault`. The switches default to off:
 # turning the feature on changes no behaviour by itself. No node build reaches
 # it (`cargo tree -e features,no-dev -p torus-node -i torus-bridge`).
 test-reference-paths = ["torus-core/test-reference-paths"]

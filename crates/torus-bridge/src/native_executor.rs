@@ -3308,8 +3308,8 @@ fn latch_save_fault(fatal: &mut Option<String>, reason: String) {
 /// overlay: own pending -> parent layer -> DB). Staleness-guard input for the
 /// resident books and the resident rows. `Ok(None)`: no marker row (test
 /// envs / pre-marker DBs), or a row that is not 8 bytes (read as absent, as
-/// before). R02 branch 7: a failed read is the `Err`, never "no marker"
-/// ([`resident_marker_ok`]).
+/// before). R02 branch 7: a failed read is the `Err`, never "no marker":
+/// a local fault, the caller fail-stops the block.
 fn applied_marker<B: StateBackend>(
     state: &B,
 ) -> Result<Option<u64>, torus_state::error::StateError> {
@@ -3322,18 +3322,10 @@ fn applied_marker<B: StateBackend>(
 
 /// The applied-marker half of the resident staleness guards (books and
 /// rows): the marker agrees with the holder's height `held`, or there is no
-/// marker row (the height check is then the only guard). R02 branch 7: a
-/// marker read that failed means "stale" — the caller rebuilds from
-/// persisted state (where a real fault then fail-stops the load) — never
-/// "no marker".
-fn resident_marker_ok(
-    marker: &Result<Option<u64>, torus_state::error::StateError>,
-    held: u64,
-) -> bool {
-    match marker {
-        Ok(m) => m.is_none_or(|m| m == held),
-        Err(_) => false,
-    }
+/// marker row (the height check is then the only guard). A failed marker
+/// read never gets here (R02 branch 7: the callers fail-stop on it).
+fn resident_marker_ok(marker: Option<u64>, held: u64) -> bool {
+    marker.is_none_or(|m| m == held)
 }
 
 /// Item 6 Phase 1: [`begin_resident`]'s reuse decision for the rows slot
@@ -3342,16 +3334,17 @@ fn resident_marker_ok(
 /// with it when present, and C6a (B0): the overlay reads R's CFs without
 /// its parent layer, so R must already hold it — the parent (if any,
 /// `parent_height`) is the block R reflects. `Ok(false)`: stale (logged;
-/// the caller rebuilds R).
+/// the caller rebuilds R). R02 branch 7: `Err`, the marker read failed (a
+/// local fault): the block fail-stops, R is neither reused nor rebuilt.
 fn rows_slot_reusable<B: StateBackend>(
     state: &B,
     slot_height: u64,
     height: u64,
     parent_height: Option<u64>,
 ) -> Result<bool, torus_state::error::StateError> {
-    let marker = applied_marker(state);
+    let marker = applied_marker(state)?;
     let height_ok = slot_height + 1 == height;
-    let marker_ok = resident_marker_ok(&marker, slot_height);
+    let marker_ok = resident_marker_ok(marker, slot_height);
     let parent_ok = parent_height.is_none_or(|p| p == slot_height);
     if height_ok && marker_ok && parent_ok {
         return Ok(true);
@@ -3504,6 +3497,16 @@ pub fn begin_resident(
             }
         }
     });
+    // R02 branch 7: a failed marker read fail-stops the block (the caller
+    // checks `take_marker_fault`); nothing is built or attached.
+    if let Some(e) = &block.marker_fault {
+        tracing::error!(
+            %e,
+            height,
+            "item 6: resident rows applied-marker read failed — block fail-stops"
+        );
+        return block;
+    }
     let rows = match reused {
         Some(rows) => rows,
         None => {
@@ -4379,17 +4382,32 @@ impl<T: StateBackend> NativeExecContext<T> {
         // is re-read, so a stale holder can never leak into execution.
         let resident_mode = resident.is_some();
         let mut reused_inner: Option<ResidentInner> = None;
+        // R02 branch 7: a failed applied-marker read is a local fault: the
+        // block fail-stops (`fatal_error`, kept first), the holder is
+        // dropped; never "no marker" (reuse).
+        let mut marker_fault: Option<String> = None;
         if let Some(holder) = resident {
             if let Some(inner) = holder.inner.take() {
-                let applied_marker = Self::read_applied_marker(&state);
+                let applied_marker = match Self::read_applied_marker(&state) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::error!(
+                            %e,
+                            resident_height = inner.height,
+                            block_height,
+                            "rank8: resident books applied-marker read failed — block fail-stops"
+                        );
+                        marker_fault = Some(format!("book load: applied marker read: {e}"));
+                        None
+                    }
+                };
                 // No marker row (test envs / pre-marker DBs): the height
-                // sequence check below is the only guard available. R02
-                // branch 7: a failed marker read is "marker" (rebuild).
-                let marker_ok = resident_marker_ok(&applied_marker, inner.height);
+                // sequence check below is the only guard available.
+                let marker_ok = applied_marker.is_some_and(|m| resident_marker_ok(m, inner.height));
                 let height_ok = inner.height + 1 == block_height;
                 if height_ok && marker_ok {
                     reused_inner = Some(inner);
-                } else {
+                } else if marker_fault.is_none() {
                     // Attribute the trip: "height" = the holder is not the
                     // block's predecessor (a block advanced without the holder
                     // — see `ResidentBooks::advance_untouched`), "marker" =
@@ -4403,7 +4421,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                     tracing::warn!(
                         resident_height = inner.height,
                         block_height,
-                        applied_marker = ?applied_marker,
+                        applied_marker = ?applied_marker.flatten(),
                         reason,
                         "rank8: resident books stale (height/marker mismatch) — rebuilding from persisted state"
                     );
@@ -4421,7 +4439,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         // P2-1: the resident books bring their index; a load starts without
         // one (the first cancel-all builds it from the books).
         let mut trader_markets = None;
-        let (mut order_books, scanned_next_id, mut load_error) = match reused_inner {
+        let (mut order_books, scanned_next_id, load_error) = match reused_inner {
             Some(inner) => {
                 trader_markets = inner.trader_markets;
                 (inner.books, inner.next_global_order_id, None)
@@ -4439,6 +4457,8 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             },
         };
+        // R02 branch 7: the applied-marker fault came first.
+        let mut load_error = marker_fault.or(load_error);
         if trader_markets.is_none() {
             // P2-1: what the load inserted is in the books; the index build
             // scans them.
@@ -8798,15 +8818,21 @@ impl NativeExecutor {
     /// fail-stops); the pool reads `available` 0 meanwhile.
     /// D2: a checked taker's valuation price when Phase 2 left no
     /// `pre_pos` (unreachable: every checked taker passed an account check,
-    /// which reads it): its `position_px`, `0` when the read fails.
+    /// which reads it): its `position_px`. R02 branch 7: a local fault is
+    /// recorded on the reader fault channel (the block fail-stops) and
+    /// reads `0` meanwhile, like the other D2 reads.
     fn d2_taker_px<T: StateBackend>(
         reader: &AccountReader<'_, T>,
         sender: &Address,
         market_id: MarketId,
     ) -> FixedPoint {
-        reader
-            .position_px(sender, market_id)
-            .map_or(FixedPoint::ZERO, |(_, px)| px)
+        reader.position_px(sender, market_id).map_or_else(
+            |e| {
+                reader.note_fault("D2 taker position read", &e);
+                FixedPoint::ZERO
+            },
+            |(_, px)| px,
+        )
     }
 
     fn d2_pools<T: StateBackend>(
