@@ -6637,15 +6637,13 @@ impl NativeExecutor {
             m.sell_top_ups_partial.inc_by(partial);
             m.sell_top_ups_none.inc_by(none);
         }
-        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
-            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
-        for (&sender, &(market_id, pos_net)) in &pool_takers {
-            let available = bal_cache
-                .load(&ctx.positions, &sender)
-                .map_or(FixedPoint::ZERO, |b| b.available);
-            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
-            pools.insert((sender, market_id), available + pos_net - excess);
-        }
+        let pools = Self::d2_pools(
+            &ctx.positions,
+            &ctx.reader_fault,
+            &pool_takers,
+            &excess_by_sender,
+            &mut bal_cache,
+        );
 
         let margin_elapsed = margin_timer.elapsed();
         ctx.phase_accum.margin_ns += margin_elapsed.as_nanos();
@@ -8738,6 +8736,28 @@ impl NativeExecutor {
             torus_types::PRICE_BAND_DEFAULT_BPS
         });
         Self::price_band(&reader, ctx.order_books.get(&market_id), market_id, mark, bps)
+    }
+
+    /// F1 (s517, D2): each pooled sender's exclusive budget in its pool
+    /// market — `available + pos_net - excess` (see the caller). The sender
+    /// passed an account check, so Phase 2 cached its balance.
+    fn d2_pools<T: StateBackend>(
+        positions: &PositionManager<T>,
+        _fault: &std::sync::OnceLock<String>,
+        pool_takers: &HashMap<Address, (MarketId, FixedPoint)>,
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        bal_cache: &mut BalanceCache,
+    ) -> HashMap<(Address, MarketId), FixedPoint> {
+        let mut pools: HashMap<(Address, MarketId), FixedPoint> =
+            HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
+        for (&sender, &(market_id, pos_net)) in pool_takers {
+            let available = bal_cache
+                .load(positions, &sender)
+                .map_or(FixedPoint::ZERO, |b| b.available);
+            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
+            pools.insert((sender, market_id), available + pos_net - excess);
+        }
+        pools
     }
 
     /// B-blind (s92, owner decisions; replaces the s87 / s89 same-batch bid

@@ -12,6 +12,13 @@
 //!   level-row / stop-row / meta writes, the stop-row scan of the diff, the
 //!   next-id counter and mode-marker writes (were: logged, block went on).
 //!
+//! - the book actions: the maker snapshot's free margin (`maker_free`, was:
+//!   0), `exec_cancel_order`'s margin release (was: skipped / write
+//!   discarded), `exec_modify_order`'s position / account / balance reads
+//!   and balance write (were: an ordinary error result). The D2 pool
+//!   balance read is a unit test (`src/r02_load_save_unit_tests.rs`: Phase
+//!   2 always caches a pooled sender's balance).
+//!
 //! Absence and the deterministic decode policies are unchanged (an
 //! undecodable classic blob is skipped, a wrong-length marker / counter row
 //! reads as absent): the controls below pass before and after.
@@ -24,10 +31,10 @@ use torus_bridge::native_executor::{
     apply_deferred_book_save, BookMode, NativeExecContext, NativeExecutor, ResidentBooks,
 };
 use torus_core::book_rows::{book_meta_key, ROW_TAG_STOP};
-use torus_core::position::NativeBalance;
+use torus_core::position::{position_key, MarginType, NativeBalance, Position};
 use torus_state::cf::{
-    CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    META_NATIVE_APPLIED_HEIGHT,
+    CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS,
+    CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -649,5 +656,426 @@ fn r02_save_without_fault_unchanged() {
         assert_eq!(again.take_fatal_error(), None, "{mode:?}");
         assert_eq!(again.resting_order_count(), 2, "{mode:?}");
         assert_eq!(again.next_global_order_id, 4, "{mode:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Book actions: maker_free, exec_cancel_order, exec_modify_order.
+// ---------------------------------------------------------------------------
+
+/// How a block runs: `None` = the single-action path, `Some(t)` =
+/// `execute_batch_engine_mode(_, _, t)`.
+const EXEC_MODES: [Option<usize>; 4] = [None, Some(0), Some(2), Some(4)];
+
+/// Each action's `(success, error)`.
+type Outcome = Vec<(bool, Option<String>)>;
+
+fn exec(ctx: &mut Ctx, mode: Option<usize>, block: &[(Address, NativeAction)]) -> Outcome {
+    let r: Vec<_> = match mode {
+        None => block
+            .iter()
+            .map(|(s, a)| NativeExecutor::execute(ctx, s, a))
+            .collect(),
+        Some(t) => NativeExecutor::execute_batch_engine_mode(ctx, block, t).results,
+    };
+    r.into_iter()
+        .map(|a| (a.success, a.error.map(String::from)))
+        .collect()
+}
+
+/// Block 2 (Classic) over a fresh DB: traders 1..=4 rich, nothing armed.
+fn block2() -> (tempfile::TempDir, StateDb, Failing, Ctx) {
+    let (d, db, backend) = open();
+    let mut ctx = ctx_at(&backend, 2, BookMode::Classic, None);
+    assert_eq!(ctx.take_fatal_error(), None);
+    for t in 1..=4 {
+        ctx.positions
+            .put_native_balance(
+                &addr(t),
+                &NativeBalance {
+                    available: fp(1_000_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+    }
+    (d, db, backend, ctx)
+}
+
+/// `trader` holds `size` (signed) of market 1 at 100.
+fn put_position(ctx: &Ctx, trader: Address, size: i64) {
+    ctx.positions
+        .put_position(&Position {
+            trader,
+            market_id: M,
+            is_long: size > 0,
+            size: fp(size.abs()),
+            entry_price: fp(100),
+            cost_basis: fp(100 * size.abs()),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        })
+        .unwrap();
+}
+
+/// The maker snapshot's free margin (`maker_free`, through
+/// `MakerAccountSource::maker_account`): the maker's balance read fails.
+/// RED before R02: the maker snapshotted free margin 0 and the fill went
+/// on. (The maker's release / fill latch too, later in the block, on
+/// `fatal_error`; the snapshot's fault is the reader channel's first.)
+#[test]
+fn r02_maker_free_balance_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_d, _db, backend, mut ctx) = block2();
+        assert!(
+            exec(&mut ctx, None, &[gtc(2, false, 100, 1)])[0].0,
+            "maker rests"
+        );
+        backend.arm_read(CF_NATIVE_BALANCES, addr(2).as_slice());
+        exec(&mut ctx, mode, &[gtc(1, true, 100, 1)]);
+        assert!(backend.hits() > 0, "{mode:?}: fault injected");
+        let snap = ctx
+            .reader_fault
+            .get()
+            .cloned()
+            .unwrap_or_else(|| panic!("{mode:?}: maker free fault recorded"));
+        assert!(snap.starts_with("maker free read"), "{mode:?}: {snap}");
+        assert!(snap.contains(INJECTED), "{mode:?}: {snap}");
+        assert!(ctx.take_fatal_error().is_some(), "{mode:?}: must fail-stop");
+    }
+}
+
+/// An undecodable maker balance row (a local fault). RED before R02.
+#[test]
+fn r02_maker_free_undecodable_balance_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_d, db, _backend, mut ctx) = block2();
+        assert!(
+            exec(&mut ctx, None, &[gtc(2, false, 100, 1)])[0].0,
+            "maker rests"
+        );
+        db.put_cf_raw(CF_NATIVE_BALANCES, addr(2).as_slice(), b"x")
+            .unwrap();
+        exec(&mut ctx, mode, &[gtc(1, true, 100, 1)]);
+        let snap = ctx
+            .reader_fault
+            .get()
+            .cloned()
+            .unwrap_or_else(|| panic!("{mode:?}: maker free fault recorded"));
+        assert!(
+            snap.starts_with("maker free read: borsh"),
+            "{mode:?}: {snap}"
+        );
+    }
+}
+
+/// Control: without a fault the fill is the same in every mode, and
+/// nothing fail-stops.
+#[test]
+fn r02_maker_free_without_fault_unchanged() {
+    let mut seen = None;
+    for mode in EXEC_MODES {
+        let (_d, _db, backend, mut ctx) = block2();
+        assert!(
+            exec(&mut ctx, None, &[gtc(2, false, 100, 1)])[0].0,
+            "maker rests"
+        );
+        let r = exec(&mut ctx, mode, &[gtc(1, true, 100, 1)]);
+        assert!(r[0].0, "{mode:?}: {r:?}");
+        assert_eq!(ctx.take_fatal_error(), None, "{mode:?}");
+        assert_eq!(backend.hits(), 0);
+        let bals: Vec<_> = (1..=2)
+            .map(|t| ctx.positions.get_native_balance(&addr(t)).unwrap())
+            .map(|b| (b.available, b.order_margin))
+            .collect();
+        match &seen {
+            None => seen = Some((r, bals)),
+            Some(s) => assert_eq!(&(r, bals), s, "{mode:?}"),
+        }
+    }
+}
+
+fn cancel(trader: u8, order_id: u128) -> (Address, NativeAction) {
+    (addr(trader), NativeAction::CancelOrder { order_id })
+}
+
+/// `exec_cancel_order`: trader 1's bid (order 1) rests; `arm` applies;
+/// the cancel runs in `mode`. Returns the outcome and the fail-stop.
+fn cancel_with(
+    mode: Option<usize>,
+    arm: impl Fn(&StateDb, &Failing),
+) -> (Outcome, Option<String>, usize) {
+    let (_d, db, backend, mut ctx) = block2();
+    assert!(
+        exec(&mut ctx, None, &[gtc(1, true, 99, 2)])[0].0,
+        "bid rests"
+    );
+    assert!(
+        ctx.positions
+            .get_native_balance(&addr(1))
+            .unwrap()
+            .order_margin
+            > FixedPoint::ZERO,
+        "margin held"
+    );
+    arm(&db, &backend);
+    let r = exec(&mut ctx, mode, &[cancel(1, 1)]);
+    (r, ctx.take_fatal_error(), backend.hits())
+}
+
+/// The cancel's margin-release balance read fails. RED before R02: nothing
+/// released, the action `ok`, no fail-stop.
+#[test]
+fn r02_cancel_order_release_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (r, fatal, hits) = cancel_with(mode, |_, b| {
+            b.arm_read(CF_NATIVE_BALANCES, addr(1).as_slice())
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert!(r[0].0, "{mode:?}: result unchanged: {r:?}");
+        assert_injected(
+            fatal,
+            "release order margin balance read",
+            &format!("{mode:?}"),
+        );
+    }
+}
+
+/// The release write fails. RED before R02: `let _ =` discarded it.
+#[test]
+fn r02_cancel_order_release_write_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_r, fatal, hits) = cancel_with(mode, |_, b| {
+            b.arm_write(CF_NATIVE_BALANCES, Some(addr(1).as_slice()))
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert_injected(
+            fatal,
+            "release order margin balance write",
+            &format!("{mode:?}"),
+        );
+    }
+}
+
+/// An undecodable balance row on the release (a local fault). RED before.
+#[test]
+fn r02_cancel_order_undecodable_balance_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_r, fatal, _hits) = cancel_with(mode, |db, _| {
+            db.put_cf_raw(CF_NATIVE_BALANCES, addr(1).as_slice(), b"x")
+                .unwrap()
+        });
+        let reason = fatal.unwrap_or_else(|| panic!("{mode:?}: must fail-stop"));
+        assert!(
+            reason.starts_with("release order margin balance read: borsh"),
+            "{mode:?}: {reason}"
+        );
+    }
+}
+
+/// Control: the cancel releases the whole reservation; a cancel of an
+/// unknown order and of another trader's order keep their error results.
+#[test]
+fn r02_cancel_order_without_fault_unchanged() {
+    for mode in EXEC_MODES {
+        let (_d, _db, backend, mut ctx) = block2();
+        assert!(
+            exec(&mut ctx, None, &[gtc(1, true, 99, 2)])[0].0,
+            "bid rests"
+        );
+        let r = exec(&mut ctx, mode, &[cancel(2, 1), cancel(1, 7), cancel(1, 1)]);
+        assert!(
+            !r[0].0 && r[0].1.as_deref().unwrap().contains("belongs to"),
+            "{mode:?}: {r:?}"
+        );
+        assert!(
+            !r[1].0 && r[1].1.as_deref().unwrap().contains("not found"),
+            "{mode:?}: {r:?}"
+        );
+        assert!(r[2].0, "{mode:?}: {r:?}");
+        assert_eq!(ctx.take_fatal_error(), None, "{mode:?}");
+        assert_eq!(backend.hits(), 0);
+        let b = ctx.positions.get_native_balance(&addr(1)).unwrap();
+        assert_eq!(
+            (b.available, b.order_margin),
+            (fp(1_000_000), FixedPoint::ZERO),
+            "{mode:?}"
+        );
+    }
+}
+
+fn modify(trader: u8, order_id: u128, qty: i64) -> (Address, NativeAction) {
+    (
+        addr(trader),
+        NativeAction::ModifyOrder {
+            order_id,
+            new_price: None,
+            new_qty: Some(fp(qty)),
+        },
+    )
+}
+
+/// Trader 1's plain bid (order 1, 99 x 2), or trader 3's reduce-only ask
+/// (order 1, 105 x 1, long 2 held). Then `arm`, then the modify to qty 2
+/// / 3 (both raise the reservation). Returns the outcome and fail-stop.
+fn modify_with(
+    mode: Option<usize>,
+    reduce_only: bool,
+    arm: impl Fn(&StateDb, &Failing),
+) -> (Outcome, Option<String>, usize) {
+    let (_d, db, backend, mut ctx) = block2();
+    let (trader, qty) = if reduce_only {
+        put_position(&ctx, addr(3), 2);
+        let (s, mut a) = gtc(3, false, 105, 1);
+        if let NativeAction::PlaceOrder(p) = &mut a {
+            p.reduce_only = true;
+        }
+        assert!(
+            exec(&mut ctx, None, &[(s, a)])[0].0,
+            "reduce-only ask rests"
+        );
+        (3, 2)
+    } else {
+        assert!(
+            exec(&mut ctx, None, &[gtc(1, true, 99, 2)])[0].0,
+            "bid rests"
+        );
+        (1, 3)
+    };
+    assert_eq!(ctx.take_fatal_error(), None);
+    arm(&db, &backend);
+    let r = exec(&mut ctx, mode, &[modify(trader, 1, qty)]);
+    (r, ctx.take_fatal_error(), backend.hits())
+}
+
+/// The modify's account read (position / pos_net / balance) fails: the
+/// balance read. RED before R02: an ordinary error result. The result
+/// keeps its text.
+#[test]
+fn r02_modify_account_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (r, fatal, hits) = modify_with(mode, false, |_, b| {
+            b.arm_read(CF_NATIVE_BALANCES, addr(1).as_slice())
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert!(!r[0].0, "{mode:?}: {r:?}");
+        assert!(
+            r[0].1.as_deref().unwrap().contains(INJECTED),
+            "{mode:?}: result text kept: {r:?}"
+        );
+        assert_injected(fatal, "modify order account read", &format!("{mode:?}"));
+    }
+}
+
+/// The modify's position read for the account check fails.
+#[test]
+fn r02_modify_account_position_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_r, fatal, hits) = modify_with(mode, false, |_, b| {
+            b.arm_read(CF_NATIVE_POSITIONS, &position_key(&addr(1), M))
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert_injected(fatal, "modify order account read", &format!("{mode:?}"));
+    }
+}
+
+/// The modify's balance write (the raised reservation) fails.
+#[test]
+fn r02_modify_balance_write_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (r, fatal, hits) = modify_with(mode, false, |_, b| {
+            b.arm_write(CF_NATIVE_BALANCES, Some(addr(1).as_slice()))
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert!(!r[0].0, "{mode:?}: {r:?}");
+        assert_injected(fatal, "modify order balance write", &format!("{mode:?}"));
+    }
+}
+
+/// Reduce-only modify: the position read fails. RED before R02.
+#[test]
+fn r02_modify_reduce_only_position_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (r, fatal, hits) = modify_with(mode, true, |_, b| {
+            b.arm_read(CF_NATIVE_POSITIONS, &position_key(&addr(3), M))
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert!(!r[0].0, "{mode:?}: {r:?}");
+        assert_injected(
+            fatal,
+            "modify order reduce-only position read",
+            &format!("{mode:?}"),
+        );
+    }
+}
+
+/// Reduce-only modify (no account check): the balance read for the raised
+/// reservation fails. RED before R02.
+#[test]
+fn r02_modify_balance_read_fault_fail_stops() {
+    for mode in EXEC_MODES {
+        let (r, fatal, hits) = modify_with(mode, true, |_, b| {
+            b.arm_read(CF_NATIVE_BALANCES, addr(3).as_slice())
+        });
+        assert!(hits > 0, "{mode:?}: fault injected");
+        assert!(!r[0].0, "{mode:?}: {r:?}");
+        assert_injected(fatal, "modify order balance read", &format!("{mode:?}"));
+    }
+}
+
+/// An undecodable balance row on the modify's account read (local).
+#[test]
+fn r02_modify_undecodable_balance_fail_stops() {
+    for mode in EXEC_MODES {
+        let (_r, fatal, _hits) = modify_with(mode, false, |db, _| {
+            db.put_cf_raw(CF_NATIVE_BALANCES, addr(1).as_slice(), b"x")
+                .unwrap()
+        });
+        let reason = fatal.unwrap_or_else(|| panic!("{mode:?}: must fail-stop"));
+        assert!(
+            reason.starts_with("modify order account read: borsh"),
+            "{mode:?}: {reason}"
+        );
+    }
+}
+
+/// Control: both modifies succeed and raise the reservation; the
+/// deterministic rejects keep their results and never fail-stop.
+#[test]
+fn r02_modify_without_fault_unchanged() {
+    for mode in EXEC_MODES {
+        for reduce_only in [false, true] {
+            let (r, fatal, hits) = modify_with(mode, reduce_only, |_, _| {});
+            assert!(r[0].0, "{mode:?} ro {reduce_only}: {r:?}");
+            assert_eq!(fatal, None);
+            assert_eq!(hits, 0);
+        }
+        let (_d, _db, _backend, mut ctx) = block2();
+        assert!(
+            exec(&mut ctx, None, &[gtc(1, true, 99, 2)])[0].0,
+            "bid rests"
+        );
+        let r = exec(
+            &mut ctx,
+            mode,
+            &[modify(2, 1, 3), modify(1, 9, 3), modify(1, 1, 0)],
+        );
+        assert!(
+            r[0].1.as_deref().unwrap().contains("belongs to"),
+            "{mode:?}: {r:?}"
+        );
+        assert!(
+            r[1].1.as_deref().unwrap().contains("not found"),
+            "{mode:?}: {r:?}"
+        );
+        assert!(
+            r[2].1
+                .as_deref()
+                .unwrap()
+                .contains("quantity must be positive"),
+            "{mode:?}: {r:?}"
+        );
+        assert_eq!(ctx.take_fatal_error(), None, "{mode:?}");
     }
 }
