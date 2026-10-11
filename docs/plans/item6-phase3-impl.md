@@ -1,6 +1,7 @@
 # Implementation Plan: item 6 Phase 3 (coalesced state checkpoints + replay)
 
-Status: plan (s109, 2026-10-11), nothing built. Design and options: `item6-phase3-design.md`
+Status: core shelved s111; equal-fills saving 2.1-2.5% < 5%; task 1.1 merged, step 3 continues
+separately (plan row 47, results doc section 42). Was: plan (s109, 2026-10-11). Design and options: `item6-phase3-design.md`
 (Option C, owner s109). Parent design: `market-scaling-in-memory-design.md` Phase 3, D5 b, D6 b,
 D7 c, D10 c for now, D11 a, D13 a. Short form: `item6-phases-2-5-plans.md` Phase 3.
 Code references are `file:function` with line numbers on main `fd9e5dfa`.
