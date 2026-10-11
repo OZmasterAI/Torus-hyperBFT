@@ -5052,8 +5052,8 @@ Mean per cell (node counters: mean of the 3 nodes; deltas before -> after the be
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Phase 3: by the owner's rule, shelve (borderline; owner to confirm)** (sections 41 and 42, plan
-  review log rows 46-47). The throwaway prototype (`proto/p3-coalesce` `682a8df5`, one checkpoint
+- **Superseded (Phase 3 un-shelved by the owner, s111; see the entries below). Was: Phase 3: by the owner's rule, shelve
+  (borderline; owner to confirm)** (sections 41 and 42, plan review log rows 46-47). The throwaway prototype (`proto/p3-coalesce` `682a8df5`, one checkpoint
   per 100 blocks) cuts node CPU-s/1M by 4.90% (all rows vs control) and by 5.07% (with the state hash
   on), pooled 4.99%. That clears zero, not the 5% line. At equal fills the saving is 2.1-2.5%,
   because most of the headline comes from +4.7% matched/s on a disk the 3 validators share. Books
@@ -5066,6 +5066,12 @@ Mean per cell (node counters: mean of the 3 nodes; deltas before -> after the be
   prototype still saves 4.8% node CPU-s/1M (5.2% on the shared NVMe): the CPU saving is work removed.
   The matched/s gain shrinks from +5.8% to +3.1% (not resolved), and the blocks/s gain from +14% to
   +1.6% (disk contention). Inference: a validator with its own disk lands between the two.
+- **Phase 3 step 1: matched/s gate not decided yet** (section 45, plan review log row 50). Step 1 (`7c178637`,
+  interval 15 s) meets CPU-s/1M down (-7.9% shared NVMe / -8.3% tmpfs upper bound) and native blocks/s no
+  regression (+96% / +86%). matched/s measured -7.0% / -10.6%, but the bench is throttled by the step 1 RPC head
+  lag (`eth_blockNumber` moves only at checkpoints, ~100 blocks; submissions stall 37 s per 120 s cell). Re-measure
+  matched/s after step 2 (current RPC and mempool reads) or with a bench that releases in-flight slots on another
+  signal. Restart <= 60 s and crash correctness not benched yet.
 - **P2-3 worker pool (backlog): sized** (section 44, plan review log row 49). Main `4e7fa146` spawns 41
   threads per native block (exact perf FORK counts), all on the execution thread (match 32-way, settle,
   end-resident). A pool saves ~0.05-0.15 CPU-s/1M (ceiling 0.28) and ~0.9-1.4 ms per native block.
