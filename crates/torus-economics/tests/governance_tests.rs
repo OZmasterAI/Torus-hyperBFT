@@ -1976,7 +1976,9 @@ fn r18_vote_then_undelegate_keeps_denominator_and_outcome() {
         .submit_proposal(addr(2), "P".into(), "D".into(), None, 0)
         .unwrap();
     gov.cast_vote(addr(2), id, true, 10).unwrap();
-    staking.undelegate(addr(2), validator, wei(600), 11).unwrap();
+    staking
+        .undelegate(addr(2), validator, wei(600), 11)
+        .unwrap();
 
     assert_eq!(
         gov.get_vote(id, &addr(2)).unwrap().unwrap().weight,
