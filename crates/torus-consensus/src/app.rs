@@ -2142,8 +2142,12 @@ impl ExecutionContext {
             current.is_some(),
             "h{height}: the handed-off set is last_job"
         );
-        st.view_blocks.extend(current);
-        self.publish_ingress_view(&st, height);
+        // Step 2: only a wired mempool reads the view; without one, keep no
+        // frozen sets for it (they would pin every block until the checkpoint).
+        if self.mempool.is_some() {
+            st.view_blocks.extend(current);
+            self.publish_ingress_view(&st, height);
+        }
         if let Some(p) = fold {
             let mut layer = st.take_layer();
             let slice = self.mempool.is_some();
@@ -23927,5 +23931,28 @@ mod crash_recovery_tests {
                 assert_eq!(o.view, Some((Some(3), 0, true)), "C holds blocks 1-3");
             }
         }
+    }
+
+    /// Review fix (Codex, step 2): without a mempool nothing reads a view, so
+    /// E keeps no frozen sets for one (they would pin every block's book blobs
+    /// until the checkpoint).
+    #[test]
+    fn ingress_view_not_retained_without_mempool() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_never());
+        ctx.attach_flush_worker(None);
+        for b in &pipeline_fixture_blocks()[..3] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            read_native_applied_height(&db).unwrap_or(0),
+            0,
+            "blocks 1-3 in memory"
+        );
+        assert_eq!(ctx.ckpt.lock().unwrap().view_blocks.len(), 0);
     }
 }
