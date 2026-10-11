@@ -11141,6 +11141,10 @@ impl NativeExecutor {
     /// drained actions must have been queued in a strictly earlier block.
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.
+    ///
+    /// One result per queued row, in queue order. A-exception (owner s111): a
+    /// row that does not decode is a failed `core_writer` result (never
+    /// silently dropped); a storage fault in the drain is the `Err`.
     pub fn drain_core_writer<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Result<Vec<NativeActionResult>, torus_core::error::CoreError> {
@@ -11148,7 +11152,22 @@ impl NativeExecutor {
 
         let mut results = Vec::with_capacity(queued.len());
         for entry in &queued {
-            let Ok(qa) = entry else { continue };
+            // A-exception (owner s111): a present row that does not decode
+            // fails visibly at its queue position (decode-as-absent: never a
+            // fail-stop, the same bytes fail alike on every validator); the
+            // drain already deleted it with the rest of the block's queue.
+            let qa = match entry {
+                Ok(qa) => qa,
+                Err(bad) => {
+                    tracing::error!(
+                        height = ctx.block_height,
+                        %bad,
+                        "CoreWriter queue row does not decode — failed result, row deleted"
+                    );
+                    results.push(NativeActionResult::err("core_writer", bad.to_string()));
+                    continue;
+                }
+            };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
             // guards against bypass bugs).

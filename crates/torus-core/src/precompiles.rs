@@ -1461,9 +1461,12 @@ impl CoreWriterQueue {
         let mut keys_to_delete = Vec::new();
 
         for (key, value) in &entries {
-            if let Ok(action) = QueuedAction::try_from_slice(value) {
-                actions.push(Ok(action));
-            }
+            actions.push(QueuedAction::try_from_slice(value).map_err(|e| {
+                UndecodableQueuedAction {
+                    key: key.clone(),
+                    error: e.to_string(),
+                }
+            }));
             keys_to_delete.push(key.clone());
         }
 
