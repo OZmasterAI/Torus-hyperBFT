@@ -228,6 +228,10 @@ pub const DIGEST_QUEUE: usize = 128;
 #[derive(Default)]
 pub struct WorkerGate {
     held: Mutex<bool>,
+    /// Item 6 Phase 3: park W on checkpoint jobs only (digests pass).
+    hold_ckpt: AtomicBool,
+    /// The checkpoint height W is parked on (`hold_checkpoints`).
+    parked_ckpt: Mutex<Option<u64>>,
     cv: Condvar,
     fail_next: AtomicBool,
     /// Heights W has received (passed the gate) — observability for tests.
@@ -244,8 +248,24 @@ impl WorkerGate {
     }
 
     pub fn release(&self) {
-        *self.held.lock().unwrap() = false;
+        let mut held = self.held.lock().unwrap();
+        *held = false;
+        self.hold_ckpt.store(false, Ordering::SeqCst);
+        drop(held);
         self.cv.notify_all();
+    }
+
+    /// Item 6 Phase 3: park W on the next checkpoint job (its batch "in
+    /// flight": received, not written) until `release`; digest jobs pass.
+    pub fn hold_checkpoints(&self) {
+        let _held = self.held.lock().unwrap();
+        *self.parked_ckpt.lock().unwrap() = None;
+        self.hold_ckpt.store(true, Ordering::SeqCst);
+    }
+
+    /// The checkpoint height W is parked on, if any.
+    pub fn parked_checkpoint(&self) -> Option<u64> {
+        *self.parked_ckpt.lock().unwrap()
     }
 
     pub fn fail_next(&self) {
@@ -270,10 +290,17 @@ impl WorkerGate {
         false
     }
 
-    fn wait_open(&self, height: u64) -> bool {
+    fn wait_open(&self, height: u64, checkpoint: bool) -> bool {
         self.received.lock().unwrap().push(height);
         let mut held = self.held.lock().unwrap();
-        while *held {
+        loop {
+            let ckpt_held = checkpoint && self.hold_ckpt.load(Ordering::SeqCst);
+            if !*held && !ckpt_held {
+                break;
+            }
+            if ckpt_held {
+                *self.parked_ckpt.lock().unwrap() = Some(height);
+            }
             held = self.cv.wait(held).unwrap();
         }
         self.fail_next.swap(false, Ordering::SeqCst)
@@ -308,7 +335,10 @@ struct Shared {
 impl Shared {
     /// W's chain state for the next job (reloaded from META if a serial
     /// barrier ran since the last job). Only called with W idle or on W.
-    fn chain_for_next(&self, db: &StateDb) -> std::sync::MutexGuard<'_, torus_state::running_hash::ChainMemo> {
+    fn chain_for_next(
+        &self,
+        db: &StateDb,
+    ) -> std::sync::MutexGuard<'_, torus_state::running_hash::ChainMemo> {
         let mut memo = self.chain.lock().unwrap();
         if self.chain_stale.swap(false, Ordering::SeqCst) {
             *memo = torus_state::running_hash::ChainMemo::load(db);
@@ -534,7 +564,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         if let Some(m) = &env.metrics {
             m.flush_worker_depth.set(*shared.outstanding.lock().unwrap() as i64);
         }
-        let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height));
+        let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height, ckpt));
         let timer = std::time::Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if inject_fail {
@@ -622,7 +652,12 @@ enum JobError {
     TrieStale(String),
 }
 
-fn run_job(env: &WorkerEnv, shared: &Shared, window: &mut Window, job: &mut Job) -> Result<(), JobError> {
+fn run_job(
+    env: &WorkerEnv,
+    shared: &Shared,
+    window: &mut Window,
+    job: &mut Job,
+) -> Result<(), JobError> {
     let mut chain = shared.chain_for_next(&env.state_db);
     match job {
         Job::Marker { height, pending } => {
@@ -631,7 +666,14 @@ fn run_job(env: &WorkerEnv, shared: &Shared, window: &mut Window, job: &mut Job)
             // through the frozen 1-key set so the bytes are the SAME object the
             // exec thread layered under the next overlay.
             pending
-                .flush_on_worker(None, &env.state_db, Some(*height), None, None, Some(&mut chain))
+                .flush_on_worker(
+                    None,
+                    &env.state_db,
+                    Some(*height),
+                    None,
+                    None,
+                    Some(&mut chain),
+                )
                 .map(|_| ())
                 .map_err(|e| JobError::Write(e.to_string()))
         }
@@ -666,8 +708,12 @@ fn run_job(env: &WorkerEnv, shared: &Shared, window: &mut Window, job: &mut Job)
                 }
                 overlay.freeze(*height)
             });
-            let (entries, secs) =
-                pending.digest_on_worker(sidecar.as_deref(), &env.state_db, &mut chain, &mut window.rows);
+            let (entries, secs) = pending.digest_on_worker(
+                sidecar.as_deref(),
+                &env.state_db,
+                &mut chain,
+                &mut window.rows,
+            );
             if let Some(m) = &env.metrics {
                 m.state_hash_seconds.observe(secs);
                 m.state_hash_entries.inc_by(entries as u64);
@@ -689,10 +735,7 @@ fn run_job(env: &WorkerEnv, shared: &Shared, window: &mut Window, job: &mut Job)
                 )));
             }
             let flush_result = {
-                let mut trie_cache = env
-                    .trie_cache
-                    .lock()
-                    .expect("trie-cache mutex poisoned");
+                let mut trie_cache = env.trie_cache.lock().expect("trie-cache mutex poisoned");
                 let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
                     Some(&mut *trie_cache)
                 } else {
@@ -878,11 +921,13 @@ fn observe_flush_stats(env: &WorkerEnv, stats: &torus_state::NativeFlushStats) {
             .observe(stats.write_db_seconds);
         m.exec_state_write_batch_bytes
             .observe(stats.batch_bytes as f64);
-        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
+        m.exec_root_dirty_buckets
+            .observe(stats.dirty_buckets as f64);
         m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
         m.member_cache_hits.inc_by(stats.member_hits as u64);
         m.member_cache_misses.inc_by(stats.member_misses as u64);
-        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
+        m.member_cache_evictions
+            .inc_by(stats.member_evictions as u64);
         m.member_cache_resident_buckets
             .set(stats.member_resident_buckets as i64);
         for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
@@ -1098,7 +1143,12 @@ mod tests {
     fn dump_all(db: &StateDb) -> CfDump {
         torus_state::cf::ALL_CF_NAMES
             .iter()
-            .map(|cf| (*cf, torus_state::StateBackend::iterate_cf(db, cf, None).unwrap()))
+            .map(|cf| {
+                (
+                    *cf,
+                    torus_state::StateBackend::iterate_cf(db, cf, None).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -1115,7 +1165,10 @@ mod tests {
     fn ckpt_block(
         db: &StateDb,
         height: u64,
-    ) -> (Arc<FrozenPending>, Option<torus_state::action_status::BlockActionStatus>) {
+    ) -> (
+        Arc<FrozenPending>,
+        Option<torus_state::action_status::BlockActionStatus>,
+    ) {
         use torus_state::StateBackend;
         let o = torus_state::NativeStateOverlay::new(db.clone());
         let cfs = [
@@ -1127,10 +1180,11 @@ mod tests {
             let x = height.wrapping_mul(2_654_435_761).wrapping_add(i * 97);
             let cf = cfs[(x % 3) as usize];
             let key = [b'k', (x % 11) as u8];
-            if x % 5 == 0 {
+            if x.is_multiple_of(5) {
                 o.delete_cf_raw(cf, &key).unwrap();
             } else {
-                o.put_cf_raw(cf, &key, &[height as u8, i as u8, (x >> 8) as u8]).unwrap();
+                o.put_cf_raw(cf, &key, &[height as u8, i as u8, (x >> 8) as u8])
+                    .unwrap();
             }
         }
         o.put_cf_raw(
@@ -1139,16 +1193,20 @@ mod tests {
             &height.to_be_bytes(),
         )
         .unwrap();
-        let status = (height % 3 == 0).then(|| torus_state::action_status::BlockActionStatus {
+        let status = torus_state::action_status::BlockActionStatus {
             evm_skipped: vec![false, true],
-            native_skipped: vec![height % 2 == 0],
+            native_skipped: vec![height.is_multiple_of(2)],
             native_failed: Vec::new(),
-        });
+        };
+        let status = height.is_multiple_of(3).then_some(status);
         (o.freeze(height), status)
     }
 
     /// Per-block reference: the same frozen sets through `Job::Flush`.
-    fn reference_db(heights: std::ops::RangeInclusive<u64>, activation: u64) -> (StateDb, tempfile::TempDir) {
+    fn reference_db(
+        heights: std::ops::RangeInclusive<u64>,
+        activation: u64,
+    ) -> (StateDb, tempfile::TempDir) {
         let (env, dir) = temp_env(None);
         let db = env.state_db.clone();
         torus_state::running_hash::configure_activation(&db, Some(activation)).unwrap();
@@ -1213,8 +1271,13 @@ mod tests {
         assert_dumps_eq(&dump_all(&db), &before, "digests wrote nothing");
         assert_eq!(worker.durable_height(), 0, "digests are not durable");
         let (ref100, _r1) = reference_db(81..=100, 81);
-        let h100 = torus_state::running_hash::read_running_hash(&ref100).expect("reference hashed 100");
-        assert_eq!(worker.running_hash_prev(), Some(h100), "W chained h(100) in memory");
+        let h100 =
+            torus_state::running_hash::read_running_hash(&ref100).expect("reference hashed 100");
+        assert_eq!(
+            worker.running_hash_prev(),
+            Some(h100),
+            "W chained h(100) in memory"
+        );
 
         worker
             .submit(Job::Checkpoint {
@@ -1224,13 +1287,20 @@ mod tests {
             .unwrap();
         assert!(worker.wait_idle());
         assert_eq!(worker.durable_height(), 100);
-        assert!(torus_state::running_hash::read_checkpoint(&db, 100).is_some(), "attest row");
+        assert!(
+            torus_state::running_hash::read_checkpoint(&db, 100).is_some(),
+            "attest row"
+        );
         assert_dumps_eq(&dump_all(&db), &dump_all(&ref100), "checkpoint at 100");
 
         let before2 = dump_all(&db);
         let layer = digest_window(&worker, &db, 101..=120);
         assert!(worker.wait_idle());
-        assert_dumps_eq(&dump_all(&db), &before2, "second window: digests wrote nothing");
+        assert_dumps_eq(
+            &dump_all(&db),
+            &before2,
+            "second window: digests wrote nothing",
+        );
         worker
             .submit(Job::Checkpoint {
                 height: 120,
@@ -1265,7 +1335,10 @@ mod tests {
             .unwrap();
         assert!(!worker.wait_idle(), "wait_idle must report the failure");
         assert!(worker.failed());
-        assert!(exec_failed.load(Ordering::SeqCst), "shared fail-stop latched");
+        assert!(
+            exec_failed.load(Ordering::SeqCst),
+            "shared fail-stop latched"
+        );
         assert_eq!(worker.durable_height(), 0);
         assert_dumps_eq(&dump_all(&db), &before, "nothing of the window landed");
         let (pending, _) = ckpt_block(&db, 11);
@@ -1315,7 +1388,10 @@ mod tests {
             .unwrap();
         });
         std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(!sender.is_finished(), "checkpoint 10 must wait for checkpoint 5");
+        assert!(
+            !sender.is_finished(),
+            "checkpoint 10 must wait for checkpoint 5"
+        );
         assert_eq!(worker.durable_height(), 0);
         gate.release();
         sender.join().unwrap();

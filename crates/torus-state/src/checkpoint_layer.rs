@@ -191,7 +191,9 @@ mod tests {
             self.next() % n
         }
         fn bytes(&mut self, max: u64) -> Vec<u8> {
-            (0..self.below(max + 1)).map(|_| self.next() as u8).collect()
+            (0..self.below(max + 1))
+                .map(|_| self.next() as u8)
+                .collect()
         }
     }
 
@@ -225,11 +227,11 @@ mod tests {
     }
 
     fn seed_db(db: &StateDb, rng: &mut Rng, model: &mut Model) {
-        for c in 0..CFS.len() {
+        for (c, cf) in CFS.iter().enumerate() {
             for i in 0..40 {
                 if rng.below(2) == 0 {
                     let v = rng.bytes(12);
-                    db.put_cf_raw(CFS[c], &key(i), &v).unwrap();
+                    db.put_cf_raw(cf, &key(i), &v).unwrap();
                     model.insert((c, key(i)), v);
                 }
             }
@@ -252,9 +254,17 @@ mod tests {
                 .take_while(|((mc, _), _)| *mc == c)
                 .map(|((_, k), v)| (k.clone(), v.clone()))
                 .collect();
-            assert_eq!(StateBackend::iterate_cf(&o, cf, None).unwrap(), want, "{what}: iterate {cf}");
+            assert_eq!(
+                StateBackend::iterate_cf(&o, cf, None).unwrap(),
+                want,
+                "{what}: iterate {cf}"
+            );
             let pfx = [b'k', 2u8];
-            let want_p: Vec<_> = want.iter().filter(|(k, _)| k.starts_with(&pfx)).cloned().collect();
+            let want_p: Vec<_> = want
+                .iter()
+                .filter(|(k, _)| k.starts_with(&pfx))
+                .cloned()
+                .collect();
             assert_eq!(
                 StateBackend::iterate_cf(&o, cf, Some(&pfx)).unwrap(),
                 want_p,
@@ -266,7 +276,12 @@ mod tests {
                 "{what}: prefix_exists {cf}"
             );
             let from = key(13);
-            let want_f: Vec<_> = want.iter().filter(|(k, _)| *k >= from).take(5).cloned().collect();
+            let want_f: Vec<_> = want
+                .iter()
+                .filter(|(k, _)| *k >= from)
+                .take(5)
+                .cloned()
+                .collect();
             assert_eq!(
                 StateBackend::iterate_cf_from(&o, cf, &from, 5).unwrap(),
                 want_f,
@@ -335,17 +350,43 @@ mod tests {
         l.merge(&ol.freeze(2));
         assert_eq!(l.entry_count(), 3);
 
-        let o = NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), Some(Arc::new(c)));
-        assert_eq!(o.get_cf_raw(cf, b"a1").unwrap(), None, "L tombstone hides DB");
-        assert_eq!(o.get_cf_raw(cf, b"a2").unwrap(), None, "L tombstone hides C");
-        assert_eq!(o.get_cf_raw(cf, b"a3").unwrap(), Some(b"l".to_vec()), "L over DB");
-        assert_eq!(o.get_cf_raw(cf, b"a4").unwrap(), Some(b"c".to_vec()), "C over DB");
+        let o =
+            NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), Some(Arc::new(c)));
+        assert_eq!(
+            o.get_cf_raw(cf, b"a1").unwrap(),
+            None,
+            "L tombstone hides DB"
+        );
+        assert_eq!(
+            o.get_cf_raw(cf, b"a2").unwrap(),
+            None,
+            "L tombstone hides C"
+        );
+        assert_eq!(
+            o.get_cf_raw(cf, b"a3").unwrap(),
+            Some(b"l".to_vec()),
+            "L over DB"
+        );
+        assert_eq!(
+            o.get_cf_raw(cf, b"a4").unwrap(),
+            Some(b"c".to_vec()),
+            "C over DB"
+        );
         assert_eq!(o.get_cf_len(cf, b"a1").unwrap(), None);
-        let want = vec![(b"a3".to_vec(), b"l".to_vec()), (b"a4".to_vec(), b"c".to_vec())];
+        let want = vec![
+            (b"a3".to_vec(), b"l".to_vec()),
+            (b"a4".to_vec(), b"c".to_vec()),
+        ];
         assert_eq!(StateBackend::iterate_cf(&o, cf, None).unwrap(), want);
         assert_eq!(StateBackend::iterate_cf(&o, cf, Some(b"a")).unwrap(), want);
-        assert_eq!(StateBackend::iterate_cf_from(&o, cf, b"a", 10).unwrap(), want);
-        assert_eq!(StateBackend::iterate_cf_prefix_from(&o, cf, b"a", b"a", 10).unwrap(), want);
+        assert_eq!(
+            StateBackend::iterate_cf_from(&o, cf, b"a", 10).unwrap(),
+            want
+        );
+        assert_eq!(
+            StateBackend::iterate_cf_prefix_from(&o, cf, b"a", b"a", 10).unwrap(),
+            want
+        );
         assert!(!StateBackend::prefix_exists(&o, cf, b"a1").unwrap());
         assert!(!StateBackend::prefix_exists(&o, cf, b"a2").unwrap());
         assert!(StateBackend::prefix_exists(&o, cf, b"a4").unwrap());

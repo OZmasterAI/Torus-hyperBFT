@@ -645,7 +645,11 @@ impl PendingState {
     ///
     /// Semantics preserved from pre-C2: a missing CF errors on the WRITE path
     /// and is silently skipped on the DELETE path.
-    pub(crate) fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
+    pub(crate) fn append_to_batch(
+        &self,
+        db: &rocksdb::DB,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StateError> {
         for (idx, cfp) in self.cfs.iter().enumerate() {
             let name = CfId(idx as u8).name();
             if !cfp.writes.is_empty() {
@@ -1075,7 +1079,14 @@ impl FrozenPending {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
-        self.flush_on_worker(sidecar, target, applied_height, trie_cache, member_cache, None)
+        self.flush_on_worker(
+            sidecar,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            None,
+        )
     }
 
     /// Item 6 Phase 3: [`Self::flush_with_sidecar_native_trie_stats`] for the
@@ -1247,7 +1258,9 @@ impl NativeStateOverlay {
     }
 
     #[cfg(test)]
-    pub(crate) fn inflight_for_tests(&self) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
+    pub(crate) fn inflight_for_tests(
+        &self,
+    ) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
         self.inflight.clone()
     }
 
@@ -1754,7 +1767,7 @@ fn flush_pending_after_batch(
     maintain_trie: bool,
     chain: ChainSrc<'_>,
 ) -> Result<NativeFlushStats, StateError> {
-    let (mut memo, rows) = match chain {
+    let (memo, rows) = match chain {
         ChainSrc::Meta => (None, None),
         ChainSrc::Memo(m) => (Some(m), None),
         ChainSrc::Rows(r) => (None, Some(r)),
@@ -1977,7 +1990,7 @@ fn flush_pending_after_batch(
         match write_result {
             Ok(()) => {
                 // Batch durable: the in-memory chain state follows it.
-                if let (Some(m), Some((h, step, hash))) = (memo.as_deref_mut(), chain_advance) {
+                if let (Some(m), Some((h, step, hash))) = (memo, chain_advance) {
                     m.advance(h, step, hash.as_ref());
                 }
                 // Batch durable: fold the committed changes into the caches. A
@@ -2445,7 +2458,11 @@ impl StateBackend for NativeStateOverlay {
         // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
         let rows = self.resident_rows(id);
         // Item 6 Phase 3: likewise L and C (parent, L, C newest first).
-        let lower = if rows.is_none() { self.lower() } else { [None; 3] };
+        let lower = if rows.is_none() {
+            self.lower()
+        } else {
+            [None; 3]
+        };
         let live = |key: &[u8]| -> bool {
             if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
                 return hit.is_some();

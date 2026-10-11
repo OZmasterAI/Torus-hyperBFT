@@ -487,7 +487,10 @@ fn chain_rows(
 ) {
     match (step, hash) {
         (ChainStep::Unverified { first: true }, _) => {
-            emit(META_RUNNING_STATE_HASH_UNVERIFIED, Some(&height.to_be_bytes()));
+            emit(
+                META_RUNNING_STATE_HASH_UNVERIFIED,
+                Some(&height.to_be_bytes()),
+            );
         }
         (ChainStep::Start | ChainStep::Continue(_), Some(hash)) => {
             if step == ChainStep::Start {
@@ -496,7 +499,10 @@ fn chain_rows(
                     emit(&checkpoint_key(h), None);
                 }
                 emit(META_RUNNING_STATE_HASH_UNVERIFIED, None);
-                emit(META_RUNNING_STATE_HASH_ACTIVATION, Some(&height.to_be_bytes()));
+                emit(
+                    META_RUNNING_STATE_HASH_ACTIVATION,
+                    Some(&height.to_be_bytes()),
+                );
             }
             let mut v = Vec::with_capacity(40);
             v.extend_from_slice(&height.to_be_bytes());
@@ -528,7 +534,13 @@ pub struct ChainRows {
 impl ChainRows {
     /// Fold height `height`'s rows on top. A [`ChainStep::Start`] deletes
     /// every checkpoint row: the DB's and the ones kept here.
-    pub(crate) fn record(&mut self, db: &StateDb, height: u64, step: ChainStep, hash: Option<&[u8; 32]>) {
+    pub(crate) fn record(
+        &mut self,
+        db: &StateDb,
+        height: u64,
+        step: ChainStep,
+        hash: Option<&[u8; 32]>,
+    ) {
         let kept: Vec<u64> = self
             .rows
             .keys()
@@ -560,7 +572,11 @@ impl ChainRows {
     }
 
     /// Append the kept rows to `batch` (`CF_CONSENSUS_META`, key order).
-    pub(crate) fn append_to_batch(&self, db: &StateDb, batch: &mut rocksdb::WriteBatch) -> Result<(), crate::StateError> {
+    pub(crate) fn append_to_batch(
+        &self,
+        db: &StateDb,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), crate::StateError> {
         let cf = db.cf_handle(CF_CONSENSUS_META)?;
         for (key, value) in &self.rows {
             match value {

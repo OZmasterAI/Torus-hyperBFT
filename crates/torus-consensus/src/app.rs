@@ -1875,7 +1875,11 @@ impl ExecutionContext {
         };
         self.flush_worker = Some(match self.checkpoint {
             Some(policy) => {
-                tracing::info!(?policy, applied, "item 6 Phase 3: coalesced state checkpoints ON");
+                tracing::info!(
+                    ?policy,
+                    applied,
+                    "item 6 Phase 3: coalesced state checkpoints ON"
+                );
                 crate::exec_pipeline::FlushWorker::spawn_checkpointing(env, applied)
             }
             None => crate::exec_pipeline::FlushWorker::spawn(env, applied),
@@ -2029,10 +2033,17 @@ impl ExecutionContext {
         if !st.settle() {
             return Err(());
         }
-        if st.inflight.as_ref().is_some_and(|(h, _)| worker.durable_height() >= *h) {
+        if st
+            .inflight
+            .as_ref()
+            .is_some_and(|(h, _)| worker.durable_height() >= *h)
+        {
             st.inflight = None;
         }
-        Ok((st.layer.clone(), st.inflight.as_ref().map(|(_, c)| c.clone())))
+        Ok((
+            st.layer.clone(),
+            st.inflight.as_ref().map(|(_, c)| c.clone()),
+        ))
     }
 
     /// Item 6 Phase 3: end-of-block upkeep after the hand-off of block
@@ -2050,14 +2061,17 @@ impl ExecutionContext {
         let current = self.last_job.lock().unwrap().clone();
         let mut st = self.ckpt.lock().unwrap();
         if !st.settle() {
-            tracing::error!(height, "FATAL: since-checkpoint layer merge panicked — fail-stop");
+            tracing::error!(
+                height,
+                "FATAL: since-checkpoint layer merge panicked — fail-stop"
+            );
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
         let since = *st.since.get_or_insert_with(std::time::Instant::now);
         let fold = prev.filter(|p| p.height() > st.base);
         let bytes = st.layer.as_ref().map_or(0, |l| l.bytes()) as u64;
-        let due = height % torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL == 0
+        let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
             || policy
                 .every_blocks
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
@@ -2105,7 +2119,10 @@ impl ExecutionContext {
             return false;
         }
         let Some(top) = top.filter(|t| t.height() > st.base) else {
-            debug_assert!(st.layer.as_ref().is_none_or(|l| l.is_empty()), "L open without a digested top");
+            debug_assert!(
+                st.layer.as_ref().is_none_or(|l| l.is_empty()),
+                "L open without a digested top"
+            );
             return true;
         };
         let mut layer = st.take_layer();
@@ -2137,7 +2154,8 @@ impl ExecutionContext {
                 .observe(wait_timer.elapsed().as_secs_f64());
             m.exec_checkpoint_layer_bytes.observe(bytes as f64);
             m.exec_checkpoints.inc();
-            m.exec_checkpoint_layer_shared.inc_by(std::mem::take(&mut st.shared_fallbacks));
+            m.exec_checkpoint_layer_shared
+                .inc_by(std::mem::take(&mut st.shared_fallbacks));
         }
         if !sent {
             tracing::error!(
@@ -2601,7 +2619,10 @@ impl ExecutionContext {
             match self.checkpoint_read_layers() {
                 Ok(layers) => layers,
                 Err(()) => {
-                    tracing::error!(height, "FATAL: since-checkpoint layer merge panicked — fail-stop");
+                    tracing::error!(
+                        height,
+                        "FATAL: since-checkpoint layer merge panicked — fail-stop"
+                    );
                     self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
@@ -17171,7 +17192,11 @@ mod crash_recovery_tests {
                     if let Some(w) = ctx.flush_worker.as_ref() {
                         assert!(w.wait_idle(), "{mode:?} h{}: W failed", b.header.height);
                         let meta = torus_state::running_hash::read_running_hash(&state_db);
-                        assert!(meta.is_some(), "{mode:?} h{}: hash written", b.header.height);
+                        assert!(
+                            meta.is_some(),
+                            "{mode:?} h{}: hash written",
+                            b.header.height
+                        );
                         assert_eq!(
                             w.running_hash_prev(),
                             meta,
@@ -17189,7 +17214,10 @@ mod crash_recovery_tests {
                 drop(ctx);
                 finals.push(torus_state::running_hash::read_running_hash(&state_db).unwrap());
             }
-            assert!(finals.windows(2).all(|w| w[0] == w[1]), "{mode:?}: {finals:?}");
+            assert!(
+                finals.windows(2).all(|w| w[0] == w[1]),
+                "{mode:?}: {finals:?}"
+            );
         }
     }
 
@@ -22303,6 +22331,9 @@ mod crash_recovery_tests {
         /// Item 6 Phase 3: the most heights executed above the durable
         /// applied marker after any block (0 with a per-block flush).
         max_lag: u64,
+        /// Item 6 Phase 3: `(S, persisted native root)` each time the
+        /// durable marker moved (after a block, crash blocks excepted).
+        roots: Vec<(u64, torus_types::B256)>,
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -22326,6 +22357,15 @@ mod crash_recovery_tests {
         /// over the DB at b (holder behind the DB), the staleness guard trips
         /// (height and marker) and rebuilds.
         StaleHolder(Vec<(u64, u64)>),
+        /// Item 6 Phase 3 (pipelined, checkpoint policy set). For each
+        /// `(k, mid)`: a crash at block k. `mid = false`: W parks on its next
+        /// job, E runs k and k + 1 on top, then that job fails. `mid = true`:
+        /// W parks on the next checkpoint (batch in flight, not written), E
+        /// runs blocks from k until a checkpoint was handed off plus one
+        /// more, then the checkpoint fails. The fail-stop latches, nothing
+        /// more lands; a new context keeping the holder replays (S, last]
+        /// from the DB (`replay_committed`) and the run continues.
+        CkptCrash(Vec<(u64, bool)>),
     }
 
     /// V4's resting orders + pending stops in the classic book blobs of
@@ -22471,6 +22511,7 @@ mod crash_recovery_tests {
             ctx
         };
         let mut max_lag = 0;
+        let mut roots: Vec<(u64, torus_types::B256)> = Vec::new();
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -22487,7 +22528,84 @@ mod crash_recovery_tests {
                 P2Fault::CrashAfter(ks) => ks.contains(&(h - 1)),
                 _ => false,
             };
-            if crash {
+            let ckpt_crash = match fault {
+                P2Fault::CkptCrash(points) => points.iter().find(|p| p.0 == h).map(|p| p.1),
+                _ => None,
+            };
+            if let Some(mid) = ckpt_crash {
+                assert!(
+                    pipelined && ckpt.is_some(),
+                    "{what}: a checkpoint crash needs W and a policy"
+                );
+                if mid {
+                    gate.hold_checkpoints();
+                } else {
+                    gate.hold();
+                }
+                let blocks_t = blocks.to_vec();
+                let db_t = db.clone();
+                let t = std::thread::spawn(move || {
+                    let mut i = (h - 1) as usize;
+                    let mut handed_off = false;
+                    loop {
+                        let base = ctx.ckpt.lock().unwrap().base;
+                        dispatch_and_execute(&ctx, &db_t, &blocks_t[i]);
+                        let last = blocks_t[i].header.height;
+                        i += 1;
+                        let done = if mid { handed_off } else { last > h };
+                        if done || ctx.exec_failed.load(Ordering::SeqCst) {
+                            return (ctx, last);
+                        }
+                        handed_off |= ctx.ckpt.lock().unwrap().base != base;
+                    }
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !t.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if mid {
+                    assert!(
+                        gate.parked_checkpoint().is_some(),
+                        "{what}: W holds a checkpoint at {h}"
+                    );
+                }
+                gate.fail_next();
+                gate.release();
+                let (failed, last) = t.join().unwrap();
+                assert!(
+                    !failed.flush_worker.as_ref().unwrap().wait_idle(),
+                    "{what}: crash at {h}: W failed"
+                );
+                assert!(
+                    failed.exec_failed.load(Ordering::SeqCst),
+                    "{what}: crash at {h} latched"
+                );
+                let holder = std::mem::take(&mut *failed.resident_books.lock().unwrap());
+                drop(failed);
+                let durable = read_native_applied_height(&db).unwrap_or(0);
+                assert!(
+                    durable < last,
+                    "{what}: crash at {h}: {durable} < {last} (blocks lost)"
+                );
+                let mut replay = new_ctx(false);
+                *replay.resident_books.lock().unwrap() = holder;
+                let (_last, parked) = TorusApp::replay_committed(&db, &replay);
+                assert_eq!(parked, None, "{what}");
+                assert!(
+                    !replay.exec_failed.load(Ordering::SeqCst),
+                    "{what}: replay after {h}"
+                );
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(last),
+                    "{what}: replayed to {last}"
+                );
+                replay.attach_flush_worker(Some(gate.clone()));
+                ctx = replay;
+                faults += 1;
+                skip_to = last;
+            } else if crash {
                 // Blocks k + 1 = h and k + 2 = h + 1: W parks on k + 1, E runs
                 // k + 2 on top of it, then W's write fails.
                 assert!(pipelined, "{what}: a crash needs the flush worker");
@@ -22546,7 +22664,14 @@ mod crash_recovery_tests {
                 if let Some(w) = ctx.flush_worker.as_ref() {
                     assert!(w.wait_idle(), "{what}: W failed");
                 }
-                max_lag = max_lag.max(h - read_native_applied_height(&db).unwrap_or(0));
+                let durable = read_native_applied_height(&db).unwrap_or(0);
+                max_lag = max_lag.max(h - durable);
+                if durable > 0 && roots.last().is_none_or(|(s, _)| *s != durable) {
+                    roots.push((
+                        durable,
+                        torus_state::native_trie::persisted_native_root(&db).unwrap(),
+                    ));
+                }
             }
             let h = h.max(skip_to);
             v4_last = p2_v4_resting(&db);
@@ -22608,6 +22733,7 @@ mod crash_recovery_tests {
             ro_resting_max,
             ro_moved,
             max_lag,
+            roots,
         }
     }
 
@@ -22780,11 +22906,20 @@ mod crash_recovery_tests {
         assert_eq!(per_block.max_lag, 0, "per-block flush: every block durable");
         assert!(serial.hash.is_some());
         let all: Vec<u64> = (1..=P2_BLOCKS).collect();
-        for (name, policy, min_lag) in [("every 5", ckpt_every(5), 4), ("never", ckpt_never(), 40)] {
+        for (name, policy, min_lag) in [("every 5", ckpt_every(5), 4), ("never", ckpt_never(), 40)]
+        {
             let run = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(policy));
-            assert!(run.max_lag >= min_lag, "{name}: max lag {} < {min_lag}", run.max_lag);
+            assert!(
+                run.max_lag >= min_lag,
+                "{name}: max lag {} < {min_lag}",
+                run.max_lag
+            );
             for (what, base) in [("serial", &serial), ("per-block", &per_block)] {
-                assert_write_sets_equal(&base.captured, &run.captured, &format!("{name} vs {what}"));
+                assert_write_sets_equal(
+                    &base.captured,
+                    &run.captured,
+                    &format!("{name} vs {what}"),
+                );
                 assert_eq!(base.hash, run.hash, "{name} vs {what}: running hash");
                 assert_dumps_equal(&base.dump, &run.dump, &format!("{name} vs {what}"));
             }
@@ -22871,10 +23006,17 @@ mod crash_recovery_tests {
             .map(|h| [4u64, 6, 8, 10, 12].into_iter().filter(|b| *b <= h).max())
             .collect();
         assert_eq!(markers, expected, "durable marker after each block");
-        assert_eq!(read_native_applied_height(&db), Some(13), "shutdown checkpoint");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(13),
+            "shutdown checkpoint"
+        );
         let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         assert_eq!(
-            db.get_account(&k256_address(&evm_sender)).unwrap().unwrap().nonce,
+            db.get_account(&k256_address(&evm_sender))
+                .unwrap()
+                .unwrap()
+                .nonce,
             1,
             "the EVM tx executed"
         );
@@ -22886,7 +23028,11 @@ mod crash_recovery_tests {
                 torus_state::running_hash::read_running_hash(&db),
                 "{what}: running hash"
             );
-            assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), &format!("never vs {what}"));
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                &format!("never vs {what}"),
+            );
         }
     }
 
@@ -22922,12 +23068,19 @@ mod crash_recovery_tests {
             (db, markers)
         };
         let (db, markers) = run(Some(ckpt_never()));
-        let expected: Vec<Option<u64>> =
-            (1..=105u64).map(|h| (h >= 100).then_some(100)).collect();
+        let expected: Vec<Option<u64>> = (1..=105u64).map(|h| (h >= 100).then_some(100)).collect();
         assert_eq!(markers, expected, "durable marker after each block");
-        assert_eq!(read_native_applied_height(&db), Some(105), "shutdown checkpoint");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(105),
+            "shutdown checkpoint"
+        );
         let (db_ref, _) = run(None);
-        assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "never vs per-block");
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "never vs per-block",
+        );
     }
 
     /// The resident staleness guards read the applied marker through the
@@ -22940,17 +23093,165 @@ mod crash_recovery_tests {
         let (blocks, _fed) = p2_blocks(false);
         let mode = Some(BookMode::Classic);
         let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
-        let never = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()));
+        let never = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_never()),
+        );
         assert!(never.max_lag >= 40, "max lag {}", never.max_lag);
         for (what, run) in [("per-block", &per_block), ("never", &never)] {
-            assert_eq!(run.metrics.exec_resident_rows_rebuilds.get(), 1, "{what}: R builds");
-            assert_eq!(run.metrics.exec_resident_rebuilds.get(), 1, "{what}: book builds");
+            assert_eq!(
+                run.metrics.exec_resident_rows_rebuilds.get(),
+                1,
+                "{what}: R builds"
+            );
+            assert_eq!(
+                run.metrics.exec_resident_rebuilds.get(),
+                1,
+                "{what}: book builds"
+            );
         }
         // The layer is taken back unshared every block (no deep copies), and
         // checkpoints ran (attest height 100; barriers 50 / 100; shutdown).
         assert_eq!(never.metrics.exec_checkpoint_layer_shared.get(), 0);
         assert!(never.metrics.exec_checkpoints.get() >= 2);
         assert_eq!(per_block.metrics.exec_checkpoints.get(), 0);
+    }
+
+    // ---- Item 6 Phase 3 task 1.7: crash and replay at interval > 0 ----
+
+    /// `(k, mid_checkpoint)` crash points: no epoch boundary (50 / 100) in
+    /// the blocks each crash runs.
+    const CKPT_CRASHES: [(u64, bool); 6] = [
+        (12, false),
+        (23, true),
+        (37, false),
+        (61, true),
+        (78, true),
+        (112, false),
+    ];
+
+    /// A crashed run digests some heights twice (before the crash on W, then
+    /// in the replay): both write sets must agree. Returns one per height.
+    fn dedup_captured(captured: &CapturedWrites, what: &str) -> CapturedWrites {
+        let mut out: CapturedWrites = Vec::new();
+        for (h, w) in captured {
+            match out.iter().find(|(oh, _)| oh == h) {
+                Some((_, ow)) => assert!(
+                    ow == w,
+                    "{what}: height {h} digested twice, write sets differ"
+                ),
+                None => out.push((*h, w.clone())),
+            }
+        }
+        out.sort_by_key(|(h, _)| *h);
+        out
+    }
+
+    /// The 130 P2 blocks with a checkpoint every 5 blocks and 6 crashes
+    /// (3 with a checkpoint batch in flight): per-block `h_n`, running hash
+    /// and full CF dump equal the uncrashed per-block run; every crash lost
+    /// blocks, and the guard rebuilt the books once per crash.
+    fn ckpt_crash_replay(mode: torus_bridge::native_executor::BookMode) {
+        let (blocks, _) = p2_blocks(false);
+        let what = format!("{mode:?} checkpoint crashes");
+        let reference = p2_run(&blocks, true, Some(mode), false, &P2Fault::None);
+        let fault = P2Fault::CkptCrash(CKPT_CRASHES.to_vec());
+        let run = p2_run_with(
+            &blocks,
+            true,
+            Some(mode),
+            false,
+            &fault,
+            Some(ckpt_every(5)),
+        );
+        assert_eq!(run.faults, CKPT_CRASHES.len() as u64, "{what}");
+        let captured = dedup_captured(&run.captured, &what);
+        assert_eq!(
+            captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=P2_BLOCKS).collect::<Vec<_>>(),
+            "{what}: every height hashed"
+        );
+        assert_write_sets_equal(&reference.captured, &captured, &what);
+        assert!(run.hash.is_some());
+        assert_eq!(reference.hash, run.hash, "{what}: running hash");
+        assert_dumps_equal(&reference.dump, &run.dump, &what);
+        assert_eq!(
+            run.metrics.exec_resident_rebuilds.get(),
+            1 + CKPT_CRASHES.len() as u64,
+            "{what}: one guard rebuild per crash"
+        );
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_matches_uncrashed_classic() {
+        ckpt_crash_replay(torus_bridge::native_executor::BookMode::Classic);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_matches_uncrashed_order_rows() {
+        ckpt_crash_replay(torus_bridge::native_executor::BookMode::OrderRows);
+    }
+
+    /// Three replicas of the reduce-only P2 sequence (OrderRows) with
+    /// different intervals (per block, every 5 blocks, never by time) agree
+    /// on every `h_n`, the running hash and the full CF dump.
+    #[test]
+    fn three_replicas_different_intervals_identical() {
+        let (blocks, _) = p2_blocks(true);
+        let mode = Some(torus_bridge::native_executor::BookMode::OrderRows);
+        let a = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        for (name, policy) in [("every 5", ckpt_every(5)), ("never", ckpt_never())] {
+            let b = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(policy));
+            assert!(b.max_lag >= 4, "{name}: {}", b.max_lag);
+            assert_write_sets_equal(&a.captured, &b.captured, name);
+            assert_eq!(a.hash, b.hash, "{name}: running hash");
+            assert_dumps_equal(&a.dump, &b.dump, name);
+        }
+    }
+
+    /// With native trie maintenance on (forced for every test DB), the
+    /// persisted native root at each checkpoint S equals the per-block run's
+    /// root at S; the final persisted and fully recomputed roots match.
+    #[test]
+    fn checkpoint_trie_maintenance_root_equal() {
+        let (blocks, _) = p2_blocks(false);
+        let mode = Some(torus_bridge::native_executor::BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        assert_eq!(per_block.roots.len() as u64, P2_BLOCKS, "a root per block");
+        let run = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_every(7)),
+        );
+        assert!(run.roots.len() >= 10, "checkpoints: {}", run.roots.len());
+        assert!(run.roots.len() < per_block.roots.len());
+        for (s, root) in &run.roots {
+            let want = per_block
+                .roots
+                .iter()
+                .find(|(h, _)| h == s)
+                .map(|(_, r)| *r);
+            assert_eq!(Some(*root), want, "native root at checkpoint {s}");
+        }
+        // The fixture writes its genesis rows straight to the DB (no trie
+        // maintenance), so the persisted root is not a full recompute in
+        // either run (checked: per block differs too); both match between
+        // the runs.
+        let full = |db: &StateDb| torus_state::native_trie::native_root_full(db).unwrap();
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(
+            persisted(&run.db),
+            persisted(&per_block.db),
+            "final persisted root"
+        );
+        assert_eq!(full(&run.db), full(&per_block.db), "final full recompute");
     }
 
     #[test]
