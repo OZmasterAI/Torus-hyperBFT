@@ -1096,7 +1096,10 @@ impl EthApiServer for RpcState {
         } else {
             BlockEnvCfg::default()
         };
-        let mut lo: u64 = 21_000;
+        // Binary search invariant: `lo` fails, `hi` succeeds. Below the 21000
+        // intrinsic gas every tx fails, so 20999 is the failing bound and
+        // 21000 itself is tried (a plain transfer estimates exactly 21000).
+        let mut lo: u64 = 21_000 - 1;
         let mut hi: u64 = DEFAULT_BLOCK_GAS_LIMIT;
         let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
