@@ -136,7 +136,8 @@ between the two (about +3% to +6% matched/s, ~5% less CPU-s/1M; a blocks/s gain 
 `2725e321`, shared NVMe and tmpfs (upper bound), n = 4. CPU-s/1M -7.9% / -8.3% (gate met), native blocks/s +96% / +86% (met),
 matched/s -7.0% / -10.6%: the bench's in-flight release follows `eth_blockNumber`, which step 1 advances only at checkpoints
 (every 100 blocks), so offered load falls 13-16%. The matched/s gate is not decidable before step 2. Checkpoints fire at the
-100-block attest height (94%), not at 15 s; layer_shared 0. Restart and crash not measured there.
+100-block attest height (94%), not at 15 s; layer_shared 0. Restart and crash not measured there; they ride along
+with the step 2 bench. Also valid for `a44bdde6` (byte-cap fix only; `TORUS_CHECKPOINT_MAX_BYTES` unset in the bench).
 
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,

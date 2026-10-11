@@ -4885,6 +4885,10 @@ as measured, and cannot be judged with this load generator until step 2 makes RP
 bench releases on another signal).** Restart (<= 60 s) and crash correctness are **not tested here** (no
 restart or crash cells). The tmpfs arms are an **UPPER BOUND** (no device I/O), not a separate-disk result.
 
+**Also valid for step 1 `a44bdde6`** (18c, s111): its only change after `7c178637` is the byte-cap fix (the cap
+fired 2 blocks late; it now counts blocks n-1 and n), which acts only when `TORUS_CHECKPOINT_MAX_BYTES` is set; it
+was unset in every step 1 cell here. Restart and crash cells ride along with the step 2 bench.
+
 Owner request (s111, Phase 3 gate revised: matched/s up, CPU-s/1M down, native blocks/s no regression,
 restart <= 60 s, crash correctness): measure the real step 1 code (18c, `feat/item6-phase3-step1` `7c178637`,
 off main `2725e321`; plan `item6-phase3-impl.md` tasks 1.2-1.7) with the checkpoint interval on at 15 s, against
@@ -5071,7 +5075,8 @@ Mean per cell (node counters: mean of the 3 nodes; deltas before -> after the be
   regression (+96% / +86%). matched/s measured -7.0% / -10.6%, but the bench is throttled by the step 1 RPC head
   lag (`eth_blockNumber` moves only at checkpoints, ~100 blocks; submissions stall 37 s per 120 s cell). Re-measure
   matched/s after step 2 (current RPC and mempool reads) or with a bench that releases in-flight slots on another
-  signal. Restart <= 60 s and crash correctness not benched yet.
+  signal. Restart <= 60 s and crash correctness not benched yet (they ride along with the step 2 bench). Results
+  also valid for `a44bdde6` (byte-cap fix only; the cap was unset).
 - **P2-3 worker pool (backlog): sized** (section 44, plan review log row 49). Main `4e7fa146` spawns 41
   threads per native block (exact perf FORK counts), all on the execution thread (match 32-way, settle,
   end-resident). A pool saves ~0.05-0.15 CPU-s/1M (ceiling 0.28) and ~0.9-1.4 ms per native block.
