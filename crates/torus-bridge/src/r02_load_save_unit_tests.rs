@@ -1,13 +1,16 @@
-//! R02 branch 7: the applied-marker half of the resident staleness guards
-//! (`begin_resident`'s rows slot and the constructor's books holder share
-//! `resident_marker_ok`). A failed marker read means "stale" (rebuild),
-//! never "no marker" (reuse). `begin_resident` takes a concrete
-//! `NativeStateOverlay`, so the rule is pinned here on the shared helper;
-//! the constructor's path is driven end to end in
-//! `tests/r02_load_save_tests.rs`.
+//! R02 branch 7: the applied-marker read of the resident staleness guards
+//! (`begin_resident`'s rows slot, the constructor's books holder). A failed
+//! marker read is a local fault: the block fail-stops, never "no marker"
+//! (reuse) and never "stale" (rebuild). `begin_resident` takes a concrete
+//! `NativeStateOverlay`, so its decision is pinned here on
+//! `rows_slot_reusable` (generic over the backend); the constructor's path
+//! is driven end to end in `tests/r02_load_save_tests.rs`, the caller's
+//! fail-stop in torus-consensus `app.rs`.
 //!
 //! Also the D2 pools' balance read (`NativeExecutor::d2_pools`), which a
-//! real block never sends to the backend (Phase 2 cached the sender).
+//! real block never sends to the backend (Phase 2 cached the sender), and
+//! the D2 taker price fallback without `pre_pos` (`d2_taker_px`,
+//! unreachable in a real block).
 
 use super::*;
 use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
@@ -58,26 +61,32 @@ fn backend(marker: Option<&[u8]>, fail: bool) -> (tempfile::TempDir, FailMarker)
     (dir, FailMarker { inner, fail })
 }
 
-/// A failed marker read is the `Err` and fails the guard (rebuild).
+/// A failed marker read is the `Err` of the rows slot's guard: the caller
+/// fail-stops. RED before: read as "stale" (`Ok(false)`, R rebuilt and
+/// the block went on).
 #[test]
-fn r02_applied_marker_read_fault_is_stale() {
+fn r02_rows_slot_marker_read_fault_is_err() {
     let (_d, b) = backend(Some(&5u64.to_be_bytes()), true);
     let marker = applied_marker(&b);
     assert!(marker.is_err(), "{marker:?}");
+    let guard = rows_slot_reusable(&b, 5, 6, None);
     assert!(
-        !resident_marker_ok(&marker, 5),
-        "a fault never passes the guard"
+        guard.is_err(),
+        "a fault is neither reuse nor rebuild: {guard:?}"
     );
 }
 
 /// Unchanged: no row and a wrong-length row read as absent (the guard
 /// passes on the height check alone); a row equal to the held height
-/// passes, any other fails.
+/// passes, any other fails; a height or parent mismatch fails.
 #[test]
 fn r02_applied_marker_without_fault_unchanged() {
     let (_d, none) = backend(None, false);
     assert_eq!(applied_marker(&none).unwrap(), None);
-    assert!(resident_marker_ok(&applied_marker(&none), 5));
+    assert!(rows_slot_reusable(&none, 5, 6, None).unwrap());
+    assert!(!rows_slot_reusable(&none, 5, 7, None).unwrap(), "height");
+    assert!(!rows_slot_reusable(&none, 5, 6, Some(4)).unwrap(), "parent");
+    assert!(rows_slot_reusable(&none, 5, 6, Some(5)).unwrap());
 
     let (_d, short) = backend(Some(b"short"), false);
     assert_eq!(
@@ -85,12 +94,12 @@ fn r02_applied_marker_without_fault_unchanged() {
         None,
         "wrong length: absent"
     );
-    assert!(resident_marker_ok(&applied_marker(&short), 5));
+    assert!(rows_slot_reusable(&short, 5, 6, None).unwrap());
 
     let (_d, five) = backend(Some(&5u64.to_be_bytes()), false);
     assert_eq!(applied_marker(&five).unwrap(), Some(5));
-    assert!(resident_marker_ok(&applied_marker(&five), 5));
-    assert!(!resident_marker_ok(&applied_marker(&five), 4));
+    assert!(rows_slot_reusable(&five, 5, 6, None).unwrap());
+    assert!(!rows_slot_reusable(&five, 4, 5, None).unwrap(), "marker");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,4 +220,91 @@ fn r02_d2_pool_without_fault_unchanged() {
     let (pools, fatal) = pools(false);
     assert_eq!(fatal, None);
     assert_eq!(pools, vec![((TRADER, 1), fp(103))]);
+}
+
+// ---------------------------------------------------------------------------
+// D2 taker price without `pre_pos` (`d2_taker_px`): Phase 2 reads every
+// checked taker's position, so a real block never takes this fallback; the
+// test forces it.
+// ---------------------------------------------------------------------------
+
+/// Point reads of `CF_NATIVE_POSITIONS` fail once armed.
+#[derive(Clone)]
+struct FailPos {
+    inner: StateDb,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StateBackend for FailPos {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        if cf == torus_state::cf::CF_NATIVE_POSITIONS
+            && self.armed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StateError::Io(std::io::Error::other(
+                "injected position read failure",
+            )));
+        }
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// `d2_taker_px` for `TRADER` in market 1 (no position, no mark) and the
+/// block's fail-stop.
+fn taker_px(fault: bool) -> (FixedPoint, Option<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FailPos {
+        inner: StateDb::open(dir.path()).unwrap(),
+        armed: Arc::default(),
+    };
+    let mut ctx = NativeExecContext::new(
+        backend.clone(),
+        2,
+        1_001,
+        0,
+        1_000,
+        10,
+        Address::ZERO,
+        Address::ZERO,
+        Address::ZERO,
+    );
+    backend
+        .armed
+        .store(fault, std::sync::atomic::Ordering::SeqCst);
+    let px = NativeExecutor::d2_taker_px(&AccountReader::of(&ctx), &TRADER, 1);
+    (px, ctx.take_fatal_error())
+}
+
+/// The fallback's position read fails. RED before R02: read as price 0,
+/// no fail-stop.
+#[test]
+fn r02_d2_taker_px_position_read_fault_fail_stops() {
+    let (_px, fatal) = taker_px(true);
+    let reason = fatal.expect("must fail-stop");
+    assert!(reason.starts_with("D2 taker position read"), "{reason}");
+    assert!(
+        reason.contains("injected position read failure"),
+        "{reason}"
+    );
+}
+
+/// Control: no position, no mark: price 0, no fail-stop, as today.
+#[test]
+fn r02_d2_taker_px_without_fault_unchanged() {
+    assert_eq!(taker_px(false), (FixedPoint::ZERO, None));
 }

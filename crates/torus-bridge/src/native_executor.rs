@@ -3336,6 +3336,36 @@ fn resident_marker_ok(
     }
 }
 
+/// Item 6 Phase 1: [`begin_resident`]'s reuse decision for the rows slot
+/// held at `slot_height`: the slot is the post-state of `height - 1`, the
+/// applied marker read through `state` (pending -> parent -> DB) agrees
+/// with it when present, and C6a (B0): the overlay reads R's CFs without
+/// its parent layer, so R must already hold it — the parent (if any,
+/// `parent_height`) is the block R reflects. `Ok(false)`: stale (logged;
+/// the caller rebuilds R).
+fn rows_slot_reusable<B: StateBackend>(
+    state: &B,
+    slot_height: u64,
+    height: u64,
+    parent_height: Option<u64>,
+) -> Result<bool, torus_state::error::StateError> {
+    let marker = applied_marker(state);
+    let height_ok = slot_height + 1 == height;
+    let marker_ok = resident_marker_ok(&marker, slot_height);
+    let parent_ok = parent_height.is_none_or(|p| p == slot_height);
+    if height_ok && marker_ok && parent_ok {
+        return Ok(true);
+    }
+    tracing::warn!(
+        rows_height = slot_height,
+        height,
+        applied_marker = ?marker,
+        parent_height,
+        "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
+    );
+    Ok(false)
+}
+
 /// Item 6 Phase 1: one block's handle on the resident rows R, from
 /// [`begin_resident`] to [`end_resident`].
 #[derive(Debug)]
@@ -3355,6 +3385,10 @@ pub struct ResidentBlock {
     sums: Option<BlockSums>,
     /// Item 6 cut 5: [`Self::drop_later`].
     retired: Retired,
+    /// R02: the applied-marker read of the slot's staleness guard failed
+    /// (a local fault). The caller fail-stops the block
+    /// ([`Self::take_marker_fault`]).
+    marker_fault: Option<torus_state::error::StateError>,
     /// Step 2 tests: runs first inside the `end_resident` worker (hold it,
     /// or panic in it).
     #[cfg(test)]
@@ -3395,6 +3429,19 @@ impl ResidentBlock {
         self.rebuilt
     }
 
+    /// R02: the local fault of the rows slot's applied-marker read, if any.
+    /// `Some`: the block must fail-stop (R was neither reused nor built).
+    pub fn take_marker_fault(&mut self) -> Option<torus_state::error::StateError> {
+        self.marker_fault.take()
+    }
+
+    /// R02 test seam (bridge feature `test-reference-paths`, torus-consensus
+    /// dev-dependency only): record `e` as the applied-marker read fault.
+    #[cfg(feature = "test-reference-paths")]
+    pub fn test_inject_marker_fault(&mut self, e: torus_state::error::StateError) {
+        self.marker_fault = Some(e);
+    }
+
     /// Item 6 cut 5: drop `value` with this block's `end_resident` work — on
     /// its worker under [`end_resident_on_worker`] (off the execution
     /// thread), else where the block is dropped. For the block's large
@@ -3429,6 +3476,7 @@ pub fn begin_resident(
         marks: None,
         sums: None,
         retired: Retired::default(),
+        marker_fault: None,
         #[cfg(test)]
         worker_hook: None,
     };
@@ -3440,25 +3488,21 @@ pub fn begin_resident(
     holder.settle_rows();
     debug_assert!(!overlay.has_resident(), "begin_resident on an overlay that already has R");
     let reused = holder.rows.take().and_then(|slot| {
-        let marker = applied_marker(&*overlay);
-        let height_ok = slot.height + 1 == height;
-        let marker_ok = resident_marker_ok(&marker, slot.height);
-        // C6a (B0): the overlay reads R's CFs without its parent layer, so R
-        // must already hold it: the parent (if any) is the block R reflects.
-        let parent_ok = overlay.parent_height().is_none_or(|p| p == slot.height);
-        if height_ok && marker_ok && parent_ok {
-            block.marks = slot.marks;
-            block.sums = Some(BlockSums { records: Some(slot.positions), ..BlockSums::new(slot.sums) });
-            return Some(slot.rows);
+        match rows_slot_reusable(&*overlay, slot.height, height, overlay.parent_height()) {
+            Ok(true) => {
+                block.marks = slot.marks;
+                block.sums = Some(BlockSums {
+                    records: Some(slot.positions),
+                    ..BlockSums::new(slot.sums)
+                });
+                Some(slot.rows)
+            }
+            Ok(false) => None,
+            Err(e) => {
+                block.marker_fault = Some(e);
+                None
+            }
         }
-        tracing::warn!(
-            rows_height = slot.height,
-            height,
-            applied_marker = ?marker,
-            parent_height = overlay.parent_height(),
-            "item 6: resident rows stale (height/marker/parent mismatch) — rebuilding R"
-        );
-        None
     });
     let rows = match reused {
         Some(rows) => rows,
@@ -6729,7 +6773,7 @@ impl NativeExecutor {
                     // taker passed an account check, so it has `pre_pos`).
                     let px = match p.pre_pos {
                         Some((_, px)) => px,
-                        None => reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px),
+                        None => Self::d2_taker_px(&reader, &p.sender, market_id),
                     };
                     #[cfg(test)]
                     if let Some(s) = reader.sums.filter(|s| s.shadow) {
@@ -8752,6 +8796,19 @@ impl NativeExecutor {
     /// passed an account check, so Phase 2 cached its balance. R02 branch 7:
     /// a local fault on the balance read is recorded on `fault` (the block
     /// fail-stops); the pool reads `available` 0 meanwhile.
+    /// D2: a checked taker's valuation price when Phase 2 left no
+    /// `pre_pos` (unreachable: every checked taker passed an account check,
+    /// which reads it): its `position_px`, `0` when the read fails.
+    fn d2_taker_px<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        sender: &Address,
+        market_id: MarketId,
+    ) -> FixedPoint {
+        reader
+            .position_px(sender, market_id)
+            .map_or(FixedPoint::ZERO, |(_, px)| px)
+    }
+
     fn d2_pools<T: StateBackend>(
         positions: &PositionManager<T>,
         fault: &std::sync::OnceLock<String>,

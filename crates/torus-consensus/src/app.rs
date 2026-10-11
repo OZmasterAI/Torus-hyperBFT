@@ -763,6 +763,13 @@ enum ReplayFault {
     /// (torus-bridge `r02_load_save_tests` shows every save write gets
     /// there).
     BookSave,
+    /// R02 branch 7: the rows slot's applied-marker read in
+    /// `begin_resident` failed (torus-bridge `r02_load_save_unit_tests`
+    /// shows a real read gets there).
+    ResidentMarkerRead,
+    /// R02 branch 7: the pipelined path's applied-marker put into the
+    /// block's overlay failed.
+    AppliedMarkerPut,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2519,6 +2526,10 @@ impl ExecutionContext {
                 height,
                 self.metrics.as_deref(),
             );
+            #[cfg(test)]
+            if self.test_replay_fault == Some(ReplayFault::ResidentMarkerRead) {
+                resident_rows.test_inject_marker_fault(injected_fault("applied marker read"));
+            }
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -2981,11 +2992,18 @@ impl ExecutionContext {
                 // final key/value set is identical to the serial batch) so the
                 // next block's resident-book staleness guard reads N through the
                 // parent layer while W is still writing it (design F5/F7).
-                let _ = overlay.put_cf_raw(
+                let put = overlay.put_cf_raw(
                     CF_CONSENSUS_META,
                     META_NATIVE_APPLIED_HEIGHT,
                     &height.to_be_bytes(),
                 );
+                #[cfg(test)]
+                let put = if self.test_replay_fault == Some(ReplayFault::AppliedMarkerPut) {
+                    Err(injected_fault("applied marker put"))
+                } else {
+                    put
+                };
+                let _ = put;
                 let evm_addrs = overlay.dirty_evm_accounts();
                 drop(ctx);
                 let frozen = overlay.freeze(height);
@@ -20190,9 +20208,21 @@ mod crash_recovery_tests {
         fault: ReplayFault,
         check: &dyn Fn(&StateDb),
     ) {
+        r02_assert_fault_fail_stops_then_replays_on(&[false, true], blocks, setup, fault, check);
+    }
+
+    /// [`r02_assert_fault_fail_stops_then_replays`] for the exec-pipeline
+    /// settings `ons` only (a fault site on one path).
+    fn r02_assert_fault_fail_stops_then_replays_on(
+        ons: &[bool],
+        blocks: &[TorusBlock],
+        setup: &dyn Fn(&StateDb),
+        fault: ReplayFault,
+        check: &dyn Fn(&StateDb),
+    ) {
         let (last, prefix) = blocks.split_last().expect("at least one block");
         let top = last.header.height;
-        for on in [false, true] {
+        for &on in ons {
             let (_c, db_ref) = make_test_config_and_db();
             setup(&db_ref);
             let ctx = pipeline_ctx(&db_ref, on, None);
@@ -20574,6 +20604,57 @@ mod crash_recovery_tests {
             assert!(r02_nonce_consumed(db, &a));
             assert!(r02_nonce_consumed(db, &b));
         });
+    }
+
+    /// R02 branch 7: the rows slot's applied-marker read in `begin_resident`
+    /// fails: the block fail-stops (exec_failed, marker unchanged, nothing
+    /// flushed) and the restart's replay matches a run that never faulted.
+    /// RED before: the fault read as "stale" (R rebuilt), the block flushed.
+    #[test]
+    fn r02_resident_marker_read_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|_| {},
+            ReplayFault::ResidentMarkerRead,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &a));
+                assert!(r02_nonce_consumed(db, &b));
+            },
+        );
+    }
+
+    /// R02 branch 7 (inventory 1f "W"): the pipelined path's applied-marker
+    /// put into the overlay fails: the block fail-stops (nothing handed to
+    /// W, marker unchanged) and the restart's replay matches a run that
+    /// never faulted. Pipelined only (the serial path writes the marker in
+    /// its flush batch). RED before: `let _ =` dropped the error and the
+    /// block flushed without the overlay marker.
+    #[test]
+    fn r02_applied_marker_put_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays_on(
+            &[true],
+            &blocks,
+            &|_| {},
+            ReplayFault::AppliedMarkerPut,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &a));
+                assert!(r02_nonce_consumed(db, &b));
+            },
+        );
     }
 
     /// R02 branch 3: an oracle aggregate row that does not decode on this

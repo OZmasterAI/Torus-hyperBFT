@@ -6,8 +6,8 @@
 //!   `__book_mode__` marker read (was: no marker, check skipped, marker
 //!   rewritten), the `__next_global_order_id__` read (was: book-maxima scan,
 //!   order-id reuse);
-//! - the resident books' applied-marker guard: a failed marker read means
-//!   "stale" (rebuild from persisted state), never "no marker" (reuse);
+//! - the resident books' applied-marker guard: a failed marker read
+//!   fail-stops the block, never "no marker" (reuse) nor "stale" (rebuild);
 //! - save (every book mode): whole-book / order-row / node-local order-row /
 //!   level-row / stop-row / meta writes, the stop-row scan of the diff, the
 //!   next-id counter and mode-marker writes (were: logged, block went on).
@@ -382,26 +382,23 @@ fn resident_block1(backend: &Failing, mode: BookMode) -> ResidentBooks {
     holder
 }
 
-/// The applied-marker read fails at block 2. RED before R02: read as "no
-/// marker", which passes the staleness guard (the holder was reused).
+/// The applied-marker read fails at block 2: the block fail-stops and the
+/// holder is not reused. RED before R02: read as "no marker" (the holder
+/// was reused), then (first fix) as "stale" (rebuilt, the block went on).
 #[test]
-fn r02_resident_applied_marker_read_fault_rebuilds() {
+fn r02_resident_applied_marker_read_fault_fail_stops() {
     for mode in MODES {
         let (_d, _db, backend) = open();
         let mut holder = resident_block1(&backend, mode);
         backend.arm_read(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT);
         let mut ctx = ctx_at(&backend, 2, mode, Some(&mut holder));
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
-        assert!(
-            !ctx.resident_reused(),
-            "{mode:?}: stale -> rebuilt from persisted state"
-        );
-        assert_eq!(
+        assert!(!ctx.resident_reused(), "{mode:?}: never reused");
+        assert_injected(
             ctx.take_fatal_error(),
-            None,
-            "{mode:?}: the rebuild read the DB fine"
+            "book load: applied marker read",
+            &format!("{mode:?}"),
         );
-        assert_eq!(ctx.resting_order_count(), 2, "{mode:?}");
     }
 }
 
