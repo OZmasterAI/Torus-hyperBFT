@@ -26,7 +26,7 @@ Reply:
 | Field | Type | Meaning |
 |---|---|---|
 | `address` | hex string | The vault address. |
-| `availableBalance` | decimal string | Native available balance, **signed**, same format as `torus_getBalances` `availableBalance` (a negative value has a leading `-`). |
+| `availableBalance` | decimal string | The vault's ledger cash, **signed**: the same value and format as `torus_getBalances` `cashBalance` ([balances.md](balances.md)); a negative value has a leading `-`. |
 | `deficit` | decimal string | `-availableBalance` when it is negative, else `0.00000000`. Same definition as the `torus_liquidator_vault_deficit` gauge, but read from committed state, so it is also correct right after a restart. |
 | `openPositions` | number | Positions with a non-zero size the vault holds (all markets). |
 

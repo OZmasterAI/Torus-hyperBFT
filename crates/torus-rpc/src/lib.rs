@@ -6,6 +6,7 @@
 /// Anti-spam item B lives in `torus-mempool` (it counts on pool entry);
 /// re-exported here for existing callers.
 pub use torus_mempool::addr_rate;
+pub mod account;
 pub mod error;
 pub mod eth;
 pub mod ip_limit;
@@ -4222,7 +4223,9 @@ mod tests {
         );
         // total_margin_used = order_margin (no positions)
         assert_eq!(bal.total_margin_used, dec_fp(fp(500)));
-        assert_eq!(bal.available_balance, dec_fp(fp(10000)));
+        assert_eq!(bal.cash_balance, dec_fp(fp(10000)));
+        assert_eq!(bal.free_margin, dec_fp(fp(10000)));
+        assert_eq!(bal.account_value, dec_fp(fp(10500)));
         handle.stop().unwrap();
     }
 
@@ -4266,6 +4269,89 @@ mod tests {
             .unwrap();
         // total_margin_used = order_margin(1000) + isolated(500) = 1500
         assert_eq!(bal.total_margin_used, dec_fp(fp(1500)));
+        handle.stop().unwrap();
+    }
+
+    /// Review fix #3: the handler marks at the executed head's block time
+    /// and returns the engine's figures (`account::account_figures`); the
+    /// old `availableBalance` is gone. Cash 1000, cross long 10 @ 1000
+    /// marked at 1010: UPnL 100, IM 505, MM 252.5, transfer required 1010.
+    #[tokio::test]
+    async fn torus_get_balances_cross_margin_fields() {
+        let (_dir, state, mempool, executor) = setup();
+        let header = test_header(1, 0, 0);
+        store_header(&state, &header);
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &1u64.to_be_bytes(),
+            )
+            .unwrap();
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_MARKETS,
+                &1u64.to_be_bytes(),
+                b"listed",
+            )
+            .unwrap();
+        let (trader, other) = (Address::from([0x55; 20]), Address::from([0x66; 20]));
+        let pm = PositionManager::new(state.clone());
+        pm.put_native_balance(
+            &trader,
+            &NativeBalance {
+                available: fp(1000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+        pm.apply_fill(&trader, 1, true, fp(10), fp(1000), MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(&other, 1, false, fp(10), fp(1000), MarginType::Cross)
+            .unwrap();
+        let oracle = torus_core::oracle::OracleManager::new(state.clone(), Default::default());
+        let reporters = [
+            Address::from([0xa1; 20]),
+            Address::from([0xa2; 20]),
+            Address::from([0xa3; 20]),
+        ];
+        for v in &reporters {
+            oracle
+                .submit_price(v, 1, fp(1010), 1, header.timestamp)
+                .unwrap();
+        }
+        let stakes: Vec<_> = reporters.iter().map(|v| (*v, fp(1))).collect();
+        oracle
+            .aggregate_price(1, 1, header.timestamp, &stakes)
+            .unwrap();
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let v: serde_json::Value = client
+            .request(
+                "torus_getBalances",
+                jsonrpsee::rpc_params![hex_address(trader)],
+            )
+            .await
+            .unwrap();
+        let get = |k: &str| {
+            v[k].as_str()
+                .unwrap_or_else(|| panic!("{k} in {v}"))
+                .to_string()
+        };
+        assert_eq!(get("accountValue"), dec_fp(fp(1100)));
+        assert_eq!(get("totalMarginUsed"), dec_fp(fp(505)));
+        assert_eq!(
+            get("maintenanceMarginUsed"),
+            dec_fp(FixedPoint::from_raw(fp(10100).raw() / 40))
+        );
+        assert_eq!(get("cashBalance"), dec_fp(fp(1000)));
+        assert_eq!(get("withdrawable"), dec_fp(fp(90)));
+        assert_eq!(get("freeMargin"), dec_fp(fp(595)));
+        assert!(v.get("availableBalance").is_none(), "{v}");
         handle.stop().unwrap();
     }
 
@@ -4336,7 +4422,7 @@ mod tests {
             )
             .unwrap();
         let v = get_liquidator_vault(state, mempool, executor).await;
-        // Signed like torus_getBalances' availableBalance.
+        // Signed like torus_getBalances' cashBalance.
         assert_eq!(v.available_balance, "-200.00000000");
         assert_eq!(v.deficit, "200.00000000");
         assert_eq!(v.open_positions, 0);
