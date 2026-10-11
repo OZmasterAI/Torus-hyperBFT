@@ -1054,7 +1054,7 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
-            None,
+            ChainSrc::Meta,
         )
     }
 
@@ -1100,8 +1100,52 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
-            memo,
+            memo.map_or(ChainSrc::Meta, ChainSrc::Memo),
         )
+    }
+}
+
+impl FrozenPending {
+    /// Item 6 Phase 3 (`Job::Digest` on the flush worker): the running-hash
+    /// half of [`Self::flush_on_worker`] without the write. Chains `h_height`
+    /// from `memo` over exactly the layers the flush digests (out-of-batch
+    /// extras, this set, `sidecar`), records the rows the flush would have
+    /// appended into `rows`, and advances `memo` at once (the rows are kept
+    /// until the checkpoint; a failed checkpoint latches the fail-stop and
+    /// the restart reloads the chain from META). Returns the digest's
+    /// `(entries, seconds)`.
+    pub fn digest_on_worker(
+        &self,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        memo: &mut crate::running_hash::ChainMemo,
+        rows: &mut crate::running_hash::ChainRows,
+    ) -> (usize, f64) {
+        use crate::running_hash::ChainStep;
+        let height = self.height;
+        let step = memo.step(height);
+        let (hash, stats) = match step {
+            ChainStep::Start | ChainStep::Continue(_) => {
+                let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
+                layers.extend(self.state.hash_extras.as_deref());
+                layers.push(&self.state);
+                layers.extend(sidecar.map(|s| &s.state));
+                let (digest, capture, secs) = block_digest(&layers);
+                let entries = digest.entries();
+                if let Some(c) = capture {
+                    crate::running_hash::capture_record(target, height, c);
+                }
+                let prev = match step {
+                    ChainStep::Continue(prev) => prev,
+                    _ => [0; 32],
+                };
+                (Some(digest.chain(&prev, height)), (entries, secs))
+            }
+            _ => (None, (0, 0.0)),
+        };
+        rows.record(target, height, step, hash.as_ref());
+        memo.advance(height, step, hash.as_ref());
+        stats
     }
 }
 
@@ -1568,7 +1612,7 @@ impl NativeStateOverlay {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
-            None,
+            ChainSrc::Meta,
         )
     }
 }
@@ -1596,6 +1640,18 @@ fn native_dirty_counts(state: &PendingState, sidecar: Option<&PendingState>) -> 
         }
     }
     counts
+}
+
+/// Where a flush's running-hash step comes from.
+pub(crate) enum ChainSrc<'a> {
+    /// Read META (`chain_step`): the serial path.
+    Meta,
+    /// The flush worker's in-memory chain state; advanced once the batch is
+    /// durable.
+    Memo(&'a mut crate::running_hash::ChainMemo),
+    /// Item 6 Phase 3 checkpoint: no step of its own; the kept rows of the
+    /// digested window join the batch.
+    Rows(&'a crate::running_hash::ChainRows),
 }
 
 /// Running state hash: blocks with at least this many pending entries digest
@@ -1643,7 +1699,31 @@ fn flush_pending_with_native_trie_stats(
         trie_cache,
         member_cache,
         maintain_trie,
-        None,
+        ChainSrc::Meta,
+    )
+}
+
+/// Item 6 Phase 3: the checkpoint batch (see
+/// [`crate::CheckpointLayer::flush_checkpoint`]).
+pub(crate) fn flush_checkpoint_batch(
+    state: &PendingState,
+    side: Option<&PendingState>,
+    rows: &crate::running_hash::ChainRows,
+    target: &StateDb,
+    height: u64,
+    trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+) -> Result<NativeFlushStats, StateError> {
+    flush_pending_after_batch(
+        WriteBatch::default(),
+        state,
+        side,
+        target,
+        Some(height),
+        trie_cache,
+        member_cache,
+        crate::native_trie::native_trie_maintenance_enabled(),
+        ChainSrc::Rows(rows),
     )
 }
 
@@ -1659,9 +1739,13 @@ fn flush_pending_after_batch(
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     maintain_trie: bool,
-    memo: Option<&mut crate::running_hash::ChainMemo>,
+    chain: ChainSrc<'_>,
 ) -> Result<NativeFlushStats, StateError> {
-    let mut memo = memo;
+    let (mut memo, rows) = match chain {
+        ChainSrc::Meta => (None, None),
+        ChainSrc::Memo(m) => (Some(m), None),
+        ChainSrc::Rows(r) => (None, Some(r)),
+    };
     std::thread::scope(|scope| {
         let raw = target.inner();
 
@@ -1676,7 +1760,10 @@ fn flush_pending_after_batch(
         // only when this height extends a valid chain.
         // Item 6 Phase 3: the flush worker passes its in-memory chain state
         // (`memo`); the serial path reads META as before.
-        let step = applied_height.map(|h| {
+        // Item 6 Phase 3 checkpoint (`rows`): the window's blocks were
+        // digested one by one on W; this batch carries their kept rows
+        // instead of a step of its own.
+        let step = applied_height.filter(|_| rows.is_none()).map(|h| {
             let step = match memo.as_deref() {
                 Some(m) => m.step(h),
                 None => crate::running_hash::chain_step(target, h),
@@ -1859,6 +1946,9 @@ fn flush_pending_after_batch(
             };
             crate::running_hash::append_to_batch(target, &mut batch, height, step, hash.as_ref())?;
             chain_advance = Some((height, step, hash));
+        }
+        if let Some(rows) = rows {
+            rows.append_to_batch(target, &mut batch)?;
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were

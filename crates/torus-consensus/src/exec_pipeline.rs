@@ -270,6 +270,12 @@ struct Shared {
     /// Set by E at a barrier (W idle): the serial path is about to write
     /// META directly, so W reloads `chain` before its next job.
     chain_stale: AtomicBool,
+    /// Item 6 Phase 3: a checkpoint is handed off and not finished (at most
+    /// one in flight); `ckpt_done` wakes a hand-off waiting on it.
+    ckpt_inflight: Mutex<bool>,
+    ckpt_done: Condvar,
+    /// Checkpoint hand-offs that had to wait for the previous one.
+    ckpt_waits: AtomicU64,
 }
 
 impl Shared {
@@ -338,6 +344,9 @@ impl FlushWorker {
             durable_height: AtomicU64::new(durable_height_seed),
             chain: Mutex::new(torus_state::running_hash::ChainMemo::load(&db)),
             chain_stale: AtomicBool::new(false),
+            ckpt_inflight: Mutex::new(false),
+            ckpt_done: Condvar::new(),
+            ckpt_waits: AtomicU64::new(0),
         });
         let shared_w = shared.clone();
         let gate = env.gate.clone();
@@ -364,6 +373,22 @@ impl FlushWorker {
         let Some(tx) = &self.tx else {
             return Err(WorkerUnavailable);
         };
+        // Item 6 Phase 3: at most one checkpoint in flight. A second one
+        // waits (counted) until W finished the first, or W failed.
+        let ckpt = matches!(job, Job::Checkpoint { .. });
+        if ckpt {
+            let mut busy = self.shared.ckpt_inflight.lock().unwrap();
+            if *busy {
+                self.shared.ckpt_waits.fetch_add(1, Ordering::SeqCst);
+            }
+            while *busy && !self.failed() {
+                busy = self.shared.ckpt_done.wait(busy).unwrap();
+            }
+            if self.failed() {
+                return Err(WorkerUnavailable);
+            }
+            *busy = true;
+        }
         {
             let mut n = self.shared.outstanding.lock().unwrap();
             *n += 1;
@@ -374,6 +399,9 @@ impl FlushWorker {
                 let mut n = self.shared.outstanding.lock().unwrap();
                 *n -= 1;
                 self.shared.idle.notify_all();
+                if ckpt {
+                    release_checkpoint(&self.shared);
+                }
                 Err(WorkerUnavailable)
             }
         }
@@ -419,7 +447,7 @@ impl FlushWorker {
     /// Item 6 Phase 3: hand-offs of a checkpoint that waited for the
     /// previous one to become durable.
     pub fn checkpoint_waits(&self) -> u64 {
-        0
+        self.shared.ckpt_waits.load(Ordering::SeqCst)
     }
 }
 
@@ -445,10 +473,37 @@ fn finish_job(shared: &Shared, metrics: &Option<Arc<torus_telemetry::Metrics>>) 
     shared.idle.notify_all();
 }
 
+/// Item 6 Phase 3: the checkpoint in flight is finished (or never reached
+/// W); wake a hand-off waiting for it.
+fn release_checkpoint(shared: &Shared) {
+    *shared.ckpt_inflight.lock().unwrap() = false;
+    shared.ckpt_done.notify_all();
+}
+
+/// Item 6 Phase 3: what W keeps from the digested blocks since the last
+/// checkpoint, for the checkpoint's batch and its after-write work.
+#[derive(Default)]
+struct Window {
+    /// Running-hash META rows of the digested heights (last value per key).
+    rows: torus_state::running_hash::ChainRows,
+    /// Rows W itself produced for the window (action status).
+    side: torus_state::CheckpointLayer,
+    /// EVM accounts the window's native post-commit credited (resync after
+    /// the checkpoint is durable).
+    evm_addrs: std::collections::BTreeSet<Address>,
+    /// Order nonces observed `Durable` once the checkpoint lands.
+    order_nonces: Vec<u64>,
+    /// Last digested height.
+    last: Option<u64>,
+}
+
 fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
     tracing::info!("flush worker thread started (TORUS_EXEC_PIPELINE)");
+    let mut window = Window::default();
     while let Ok(mut job) = rx.recv() {
         let height = job.height();
+        let ckpt = matches!(job, Job::Checkpoint { .. });
+        let digest = matches!(job, Job::Digest { .. });
         if let Some(m) = &env.metrics {
             m.flush_worker_depth.set(*shared.outstanding.lock().unwrap() as i64);
         }
@@ -464,7 +519,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if env.exec_failed.load(Ordering::SeqCst) {
                 return Err(JobError::Write("fail-stop latched — refusing to write".into()));
             }
-            run_job(&env, &shared, &mut job)
+            run_job(&env, &shared, &mut window, &mut job)
         }));
         let wall = timer.elapsed().as_secs_f64();
         if let Some(m) = &env.metrics {
@@ -483,7 +538,13 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         }
         match result {
             Ok(Ok(())) => {
-                shared.durable_height.store(height, Ordering::SeqCst);
+                // A digest makes nothing durable.
+                if !digest {
+                    shared.durable_height.store(height, Ordering::SeqCst);
+                }
+                if ckpt {
+                    release_checkpoint(&shared);
+                }
                 finish_job(&shared, &env.metrics);
             }
             Ok(Err(JobError::TrieStale(e))) => {
@@ -492,6 +553,9 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 // block; caches were invalidated inside the flush. Keep going.
                 tracing::error!(%e, height, "flush worker: native trie maintenance failed (state + marker durable, root stale)");
                 shared.durable_height.store(height, Ordering::SeqCst);
+                if ckpt {
+                    release_checkpoint(&shared);
+                }
                 finish_job(&shared, &env.metrics);
             }
             Ok(Err(JobError::Write(e))) => {
@@ -504,6 +568,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 );
                 shared.failed.store(true, Ordering::SeqCst);
                 env.exec_failed.store(true, Ordering::SeqCst);
+                release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
             }
@@ -511,6 +576,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 tracing::error!(height, "FATAL: flush worker PANICKED — latching fail-stop");
                 shared.failed.store(true, Ordering::SeqCst);
                 env.exec_failed.store(true, Ordering::SeqCst);
+                release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
             }
@@ -526,7 +592,7 @@ enum JobError {
     TrieStale(String),
 }
 
-fn run_job(env: &WorkerEnv, shared: &Shared, job: &mut Job) -> Result<(), JobError> {
+fn run_job(env: &WorkerEnv, shared: &Shared, window: &mut Window, job: &mut Job) -> Result<(), JobError> {
     let mut chain = shared.chain_for_next(&env.state_db);
     match job {
         Job::Marker { height, pending } => {
@@ -539,8 +605,106 @@ fn run_job(env: &WorkerEnv, shared: &Shared, job: &mut Job) -> Result<(), JobErr
                 .map(|_| ())
                 .map_err(|e| JobError::Write(e.to_string()))
         }
-        // RED stub (task 1.5): not implemented yet.
-        Job::Digest { .. } | Job::Checkpoint { .. } => Ok(()),
+        Job::Digest {
+            height,
+            pending,
+            evm_addrs,
+            order_nonces,
+            action_status,
+        } => {
+            // The window is contiguous: E checkpoints before any serial
+            // block, so a gap here is a pipeline bug — never chain over it.
+            if let Some(last) = window.last {
+                if last + 1 != *height {
+                    return Err(JobError::Write(format!(
+                        "digest {height} does not follow the digested window (last {last})"
+                    )));
+                }
+            }
+            // v2 action status: encoded here as on a Flush job, kept in
+            // the window's side rows (and digested as the Flush sidecar).
+            let sidecar = action_status.take().map(|status| {
+                let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
+                let bytes = crate::action_results::encode_status(&status, env.metrics.as_deref());
+                if let Err(e) = torus_state::StateBackend::put_cf_raw(
+                    &overlay,
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &bytes,
+                ) {
+                    tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+                }
+                overlay.freeze(*height)
+            });
+            let (entries, secs) =
+                pending.digest_on_worker(sidecar.as_deref(), &env.state_db, &mut chain, &mut window.rows);
+            if let Some(m) = &env.metrics {
+                m.state_hash_seconds.observe(secs);
+                m.state_hash_entries.inc_by(entries as u64);
+            }
+            if let Some(side) = &sidecar {
+                window.side.merge(side);
+            }
+            window.evm_addrs.extend(evm_addrs.drain(..));
+            window.order_nonces.append(order_nonces);
+            window.last = Some(*height);
+            Ok(())
+        }
+        Job::Checkpoint { height, layer } => {
+            if window.last != Some(*height) || layer.top_height() != Some(*height) {
+                return Err(JobError::Write(format!(
+                    "checkpoint {height} does not close the digested window (last digest {:?}, layer top {:?})",
+                    window.last,
+                    layer.top_height()
+                )));
+            }
+            let flush_result = {
+                let mut trie_cache = env
+                    .trie_cache
+                    .lock()
+                    .expect("trie-cache mutex poisoned");
+                let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
+                    Some(&mut *trie_cache)
+                } else {
+                    None
+                };
+                let mut member_cache = env
+                    .member_cache
+                    .lock()
+                    .expect("member-cache mutex poisoned");
+                let member_opt = if member_cache.is_enabled() {
+                    Some(&mut *member_cache)
+                } else {
+                    None
+                };
+                layer.flush_checkpoint(
+                    (!window.side.is_empty()).then_some(&window.side),
+                    &window.rows,
+                    &env.state_db,
+                    *height,
+                    cache_opt,
+                    member_opt,
+                )
+            };
+            let landed = match flush_result {
+                Ok(stats) => {
+                    observe_flush_stats(env, &stats);
+                    Ok(())
+                }
+                Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
+                Err(e) => return Err(JobError::Write(e.to_string())),
+            };
+            // The window is durable: start the next one.
+            let done = std::mem::take(window);
+            if let Some(m) = &env.metrics {
+                m.observe_order_ages(
+                    torus_telemetry::OrderStage::Durable,
+                    done.order_nonces.iter().copied(),
+                );
+            }
+            resync_evm(env, *height, done.evm_addrs.into_iter().collect());
+            landed
+        }
         Job::Flush {
             height,
             pending,
@@ -623,68 +787,76 @@ fn run_job(env: &WorkerEnv, shared: &Shared, job: &mut Job) -> Result<(), JobErr
                 )
             };
             match flush_result {
-                Ok(stats) => {
-                    if let Some(m) = &env.metrics {
-                        m.exec_root_seconds.observe(stats.root_seconds);
-                        m.state_hash_seconds.observe(stats.state_hash_seconds);
-                        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
-                        m.exec_state_write_seconds.observe(stats.write_seconds);
-                        m.exec_state_write_build_seconds
-                            .observe(stats.write_build_seconds);
-                        m.exec_state_write_db_seconds
-                            .observe(stats.write_db_seconds);
-                        m.exec_state_write_batch_bytes
-                            .observe(stats.batch_bytes as f64);
-                        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
-                        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
-                        m.member_cache_hits.inc_by(stats.member_hits as u64);
-                        m.member_cache_misses.inc_by(stats.member_misses as u64);
-                        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
-                        m.member_cache_resident_buckets
-                            .set(stats.member_resident_buckets as i64);
-                        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
-                            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
-                        }
-                    }
-                }
+                Ok(stats) => observe_flush_stats(env, &stats),
                 Err(e) => {
                     // `flush_with_native_trie_stats` returns Err both when the
                     // write failed (nothing landed) and when the write landed but
                     // trie maintenance failed. The durable marker tells them apart.
-                    let landed = env
-                        .state_db
-                        .get_cf_raw(
-                            torus_state::cf::CF_CONSENSUS_META,
-                            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
-                        )
-                        .ok()
-                        .flatten()
-                        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-                        .map(u64::from_be_bytes)
-                        == Some(*height);
-                    return Err(if landed {
+                    return Err(if marker_is(env, *height) {
                         JobError::TrieStale(e.to_string())
                     } else {
                         JobError::Write(e.to_string())
                     });
                 }
             }
-            // Phase A: native post-commit credited EVM balances straight to
-            // CF_ACCOUNTS; resync the incremental mirror AFTER our own batch is
-            // durable (DB->DB, sequenced here — design F2). Best-effort, as today.
-            let resync_timer = std::time::Instant::now();
-            if !evm_addrs.is_empty() {
-                if let Err(e) =
-                    torus_state::incremental::resync_evm_accounts(&env.state_db, evm_addrs)
-                {
-                    tracing::error!(%e, height, "flush worker: failed to resync incremental trie after native post-commit");
-                }
-            }
-            if let Some(m) = &env.metrics {
-                m.exec_evm_resync_seconds
-                    .observe(resync_timer.elapsed().as_secs_f64());
-            }
+            resync_evm(env, *height, std::mem::take(evm_addrs));
             Ok(())
+        }
+    }
+}
+
+/// The durable applied marker equals `height` (a flush that returned Err
+/// landed: only trie maintenance failed).
+fn marker_is(env: &WorkerEnv, height: u64) -> bool {
+    env.state_db
+        .get_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+        )
+        .ok()
+        .flatten()
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_be_bytes)
+        == Some(height)
+}
+
+/// Phase A: native post-commit credited EVM balances straight to
+/// CF_ACCOUNTS; resync the incremental mirror AFTER the batch is durable
+/// (DB->DB, sequenced here — design F2). Best-effort, as today.
+fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
+    let resync_timer = std::time::Instant::now();
+    if !evm_addrs.is_empty() {
+        if let Err(e) = torus_state::incremental::resync_evm_accounts(&env.state_db, &evm_addrs) {
+            tracing::error!(%e, height, "flush worker: failed to resync incremental trie after native post-commit");
+        }
+    }
+    if let Some(m) = &env.metrics {
+        m.exec_evm_resync_seconds
+            .observe(resync_timer.elapsed().as_secs_f64());
+    }
+}
+
+fn observe_flush_stats(env: &WorkerEnv, stats: &torus_state::NativeFlushStats) {
+    if let Some(m) = &env.metrics {
+        m.exec_root_seconds.observe(stats.root_seconds);
+        m.state_hash_seconds.observe(stats.state_hash_seconds);
+        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
+        m.exec_state_write_seconds.observe(stats.write_seconds);
+        m.exec_state_write_build_seconds
+            .observe(stats.write_build_seconds);
+        m.exec_state_write_db_seconds
+            .observe(stats.write_db_seconds);
+        m.exec_state_write_batch_bytes
+            .observe(stats.batch_bytes as f64);
+        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
+        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
+        m.member_cache_hits.inc_by(stats.member_hits as u64);
+        m.member_cache_misses.inc_by(stats.member_misses as u64);
+        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
+        m.member_cache_resident_buckets
+            .set(stats.member_resident_buckets as i64);
+        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
+            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
         }
     }
 }

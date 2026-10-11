@@ -109,6 +109,33 @@ impl CheckpointLayer {
     pub fn append_to_batch(&self, db: &StateDb, batch: &mut WriteBatch) -> Result<(), StateError> {
         self.state.append_to_batch(db.inner(), batch)
     }
+
+    /// Item 6 Phase 3 (`Job::Checkpoint` on the flush worker): write the
+    /// layer as ONE atomic batch through the block flush
+    /// (`flush_pending_after_batch`): the layer's rows, then `side` (rows
+    /// the worker kept: action status), trie maintenance or the stale mark
+    /// over the layer's native entries, the applied marker = `height`, and
+    /// the window's kept running-hash rows. Same error contract as a block
+    /// flush (Err after a landed write = trie maintenance failed).
+    pub fn flush_checkpoint(
+        &self,
+        side: Option<&CheckpointLayer>,
+        rows: &crate::running_hash::ChainRows,
+        target: &StateDb,
+        height: u64,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<crate::NativeFlushStats, StateError> {
+        crate::backend::flush_checkpoint_batch(
+            &self.state,
+            side.map(|s| &s.state),
+            rows,
+            target,
+            height,
+            trie_cache,
+            member_cache,
+        )
+    }
 }
 
 #[cfg(test)]
