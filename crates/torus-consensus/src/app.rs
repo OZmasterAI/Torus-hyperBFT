@@ -4654,6 +4654,12 @@ impl TorusApp {
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
         // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
+        // Item 6 Phase 3 (task 1.2): a checkpoint interval needs a
+        // non-deferred book mode; refuse to start otherwise (owner s109).
+        crate::exec_pipeline::check_checkpoint_book_mode(
+            crate::exec_pipeline::checkpoint_interval(),
+            torus_bridge::native_executor::configured_book_mode(),
+        )?;
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.attach_flush_worker(None);
         }

@@ -66,22 +66,61 @@ pub fn checkpoint_max_bytes() -> Option<u64> {
     parse_checkpoint_max_bytes(std::env::var("TORUS_CHECKPOINT_MAX_BYTES").ok())
 }
 
-/// Pure parse of `TORUS_CHECKPOINT_INTERVAL_MS`.
-pub fn parse_checkpoint_interval(_v: Option<String>) -> Option<std::time::Duration> {
-    None
+/// Pure parse of `TORUS_CHECKPOINT_INTERVAL_MS` (milliseconds, trimmed). Unset
+/// or `0` -> `None` (per-block flush, exactly today); anything that is not a
+/// plain unsigned integer -> `None` with a warning (fail safe: today's path).
+pub fn parse_checkpoint_interval(v: Option<String>) -> Option<std::time::Duration> {
+    let raw = v?;
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                "TORUS_CHECKPOINT_INTERVAL_MS is not a whole number of milliseconds; \
+                 ignored (checkpoints off, per-block flush)"
+            );
+            None
+        }
+    }
 }
 
-/// Pure parse of `TORUS_CHECKPOINT_MAX_BYTES`.
-pub fn parse_checkpoint_max_bytes(_v: Option<String>) -> Option<u64> {
-    None
+/// Pure parse of `TORUS_CHECKPOINT_MAX_BYTES` (bytes, trimmed). Unset, `0` or
+/// garbage (warned) -> `None` (no byte cap from the setting).
+pub fn parse_checkpoint_max_bytes(v: Option<String>) -> Option<u64> {
+    let raw = v?;
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(b) => Some(b),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                "TORUS_CHECKPOINT_MAX_BYTES is not a whole number of bytes; ignored"
+            );
+            None
+        }
+    }
 }
 
-/// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1).
+/// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1): in
+/// modes 2/3 W applies the deferred book save reading the DB as "every height
+/// < N durable", which is false with a since-checkpoint layer. The node
+/// refuses to start; the error names both settings.
 pub fn check_checkpoint_book_mode(
-    _interval: Option<std::time::Duration>,
-    _mode: torus_bridge::native_executor::BookMode,
+    interval: Option<std::time::Duration>,
+    mode: torus_bridge::native_executor::BookMode,
 ) -> Result<(), String> {
-    Ok(())
+    use torus_bridge::native_executor::BookMode;
+    match (interval, mode) {
+        (Some(iv), BookMode::LevelAuthority | BookMode::LevelAuthorityChunked) => Err(format!(
+            "TORUS_CHECKPOINT_INTERVAL_MS={} needs a non-deferred book mode, but \
+             TORUS_BOOK_ROWS selects {:?} (deferred book save); unset \
+             TORUS_CHECKPOINT_INTERVAL_MS or use TORUS_BOOK_ROWS unset/0 (Classic) or 1 (OrderRows)",
+            iv.as_millis(),
+            mode
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// One unit of work for W, in commit order.

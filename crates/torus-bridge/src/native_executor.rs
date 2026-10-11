@@ -2338,6 +2338,13 @@ fn book_mode() -> BookMode {
     *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
 }
 
+/// The process's configured book mode (`TORUS_BOOK_ROWS`, read once), for
+/// node-start checks outside this crate (item 6 Phase 3: the checkpoint
+/// interval refuses the deferred modes 2/3).
+pub fn configured_book_mode() -> BookMode {
+    book_mode()
+}
+
 /// Pure parse of the `TORUS_BOOK_ROWS` value (same trim/strictness as C4).
 fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     match v.as_deref().map(str::trim) {
