@@ -1,7 +1,7 @@
 //! R02 branch 6b (audit main-chain-deep-review-2026-10-08, inventory
 //! section 1b, the session and oracle rows): a LOCAL storage fault (the
-//! read or write failed on this node, or a row it stored does not decode)
-//! on an action's own state must fail-stop the block (`take_fatal_error`,
+//! read or write failed on this node) on an action's own state must
+//! fail-stop the block (`take_fatal_error`,
 //! the committer's check), never become an ordinary rejected-action result
 //! that this node alone records:
 //! - `exec_create_session`: the owner's session count, the session read,
@@ -19,6 +19,12 @@
 //! every validator hits alike (session limit, duplicate key, not a
 //! validator, unlisted market, ...) keep today's result and never fail-stop;
 //! fault-free runs are unchanged.
+//!
+//! Owner decision (s111 follow-up): a committed row that does not DECODE is
+//! NOT a local fault at these sites. Every validator holds the same bytes,
+//! so a decode-triggered fail-stop would halt the whole chain: the action
+//! is rejected exactly as on main 969ab0c3 (same text) and the block goes
+//! on. Only backend storage / I-O errors fail-stop.
 
 use std::sync::{Arc, Mutex};
 
@@ -255,20 +261,28 @@ fn r02_create_session_read_fault_fail_stops() {
     assert_injected(&mut ctx, "create session read", INJECTED_READ);
 }
 
-/// The existing row under the key does not decode (a local fault: session
-/// rows are only written by `put_session`). The count skips it (its
-/// decode-as-absent policy, unchanged); the point read fails.
+/// The existing row under the key does not decode. The count skips it (its
+/// decode-as-absent policy, unchanged); the point read's decode error is the
+/// main reject ("state error: invalid data: ..."), never a fail-stop.
 #[test]
-fn r02_create_session_undecodable_row_fail_stops() {
-    let (_d, db, _backend, mut ctx) = setup();
+fn r02_create_session_undecodable_row_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = setup();
     db.put_cf_raw(CF_SESSIONS, &KEY, b"\xff").unwrap();
     let r = exec(&mut ctx, addr(OWNER), &create(KEY));
-    assert_rejected(&r, "state error: invalid data");
-    let reason = ctx.take_fatal_error().expect("must fail-stop");
-    assert!(
-        reason.starts_with("create session read: state error: invalid data"),
-        "{reason}"
-    );
+    assert_plain_reject(&mut ctx, &r, "state error: invalid data: ");
+    assert_eq!(db.get_cf_raw(CF_SESSIONS, &KEY).unwrap().unwrap(), b"\xff");
+    assert_eq!(backend.hits(), 0);
+}
+
+/// Revoke of an undecodable session row: the main reject, no fail-stop.
+#[test]
+fn r02_revoke_session_undecodable_row_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = setup();
+    db.put_cf_raw(CF_SESSIONS, &KEY, b"\xff").unwrap();
+    let r = exec(&mut ctx, addr(OWNER), &revoke(KEY));
+    assert_plain_reject(&mut ctx, &r, "state error: invalid data: ");
+    assert_eq!(db.get_cf_raw(CF_SESSIONS, &KEY).unwrap().unwrap(), b"\xff");
+    assert_eq!(backend.hits(), 0);
 }
 
 #[test]
@@ -461,19 +475,48 @@ fn r02_oracle_signer_validator_read_fault_fail_stops() {
     assert_injected(&mut ctx, "oracle signer validator read", INJECTED_READ);
 }
 
-/// An undecodable validator record (a local fault) fail-stops.
+/// What main prints for an undecodable validator record.
+const VALIDATOR_DECODE: &str = "borsh serialization error: ";
+
+/// The sender's own validator record does not decode: the main reject
+/// (the Borsh text), no fail-stop.
 #[test]
-fn r02_oracle_reporter_undecodable_validator_fail_stops() {
-    let (_d, db, _backend, mut ctx) = oracle_setup();
+fn r02_oracle_reporter_undecodable_validator_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
     db.put_cf_raw(CF_STAKING_VALIDATORS, addr(V1).as_slice(), b"\xff")
         .unwrap();
     let r = exec(&mut ctx, addr(V1), &submit(&[(1, 100)]));
-    assert!(!r.success, "{r:?}");
-    let reason = ctx.take_fatal_error().expect("must fail-stop");
-    assert!(
-        reason.starts_with("oracle reporter validator read: "),
-        "{reason}"
+    assert_plain_reject(&mut ctx, &r, VALIDATOR_DECODE);
+    assert_eq!(backend.hits(), 0);
+}
+
+/// The validator a hot signer's index row names does not decode: the main
+/// reject, no fail-stop.
+#[test]
+fn r02_oracle_signer_undecodable_validator_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
+    register_signer(&db);
+    db.put_cf_raw(CF_STAKING_VALIDATORS, addr(V1).as_slice(), b"\xff")
+        .unwrap();
+    let r = exec(&mut ctx, S, &submit(&[(1, 100)]));
+    assert_plain_reject(&mut ctx, &r, VALIDATOR_DECODE);
+    assert_eq!(backend.hits(), 0);
+}
+
+/// A signer-index row of the wrong length decodes as absent (as on main):
+/// "not a reporter", no fail-stop.
+#[test]
+fn r02_oracle_signer_index_wrong_length_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S), b"\xff")
+        .unwrap();
+    let r = exec(&mut ctx, S, &submit(&[(1, 100)]));
+    assert_plain_reject(
+        &mut ctx,
+        &r,
+        &format!("{S} is not a registered validator or oracle signer"),
     );
+    assert_eq!(backend.hits(), 0);
 }
 
 #[test]
@@ -494,16 +537,22 @@ fn r02_oracle_sample_read_fault_fail_stops() {
     assert_injected(&mut ctx, "oracle sample read", INJECTED_READ);
 }
 
-/// The stored submission row does not decode (a local fault).
+/// The stored submission row does not decode: the main reject
+/// ("borsh error: ..."), no fail-stop, nothing written.
 #[test]
-fn r02_oracle_undecodable_sample_fail_stops() {
-    let (_d, db, _backend, mut ctx) = oracle_setup();
+fn r02_oracle_undecodable_sample_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
     db.put_cf_raw(CF_NATIVE_ORACLE, &sub_key(1, addr(V1)), b"\xff")
         .unwrap();
     let r = exec(&mut ctx, addr(V1), &submit(&[(1, 100)]));
-    assert_rejected(&r, "borsh");
-    let reason = ctx.take_fatal_error().expect("must fail-stop");
-    assert!(reason.starts_with("oracle sample read: borsh"), "{reason}");
+    assert_plain_reject(&mut ctx, &r, "borsh error: ");
+    assert_eq!(
+        db.get_cf_raw(CF_NATIVE_ORACLE, &sub_key(1, addr(V1)))
+            .unwrap()
+            .unwrap(),
+        b"\xff"
+    );
+    assert_eq!(backend.hits(), 0);
 }
 
 /// The second market's submission write fails after the first was written
@@ -579,6 +628,40 @@ fn r02_set_oracle_signer_validator_read_fault_fail_stops() {
     let r = exec(&mut ctx, addr(V1), &set(V1, S));
     assert_rejected(&r, &format!("state error: io: {INJECTED_READ}"));
     assert_injected(&mut ctx, "set oracle signer validator read", INJECTED_READ);
+}
+
+/// The sender's validator record does not decode: the main reject, no
+/// fail-stop.
+#[test]
+fn r02_set_oracle_signer_undecodable_validator_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
+    db.put_cf_raw(CF_STAKING_VALIDATORS, addr(V1).as_slice(), b"\xff")
+        .unwrap();
+    let r = exec(&mut ctx, addr(V1), &set(V1, S));
+    assert_plain_reject(&mut ctx, &r, VALIDATOR_DECODE);
+    assert_eq!(
+        db.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S))
+            .unwrap(),
+        None
+    );
+    assert_eq!(backend.hits(), 0);
+}
+
+/// A validator row under the new signer's address does not decode: the main
+/// reject, no fail-stop.
+#[test]
+fn r02_set_oracle_signer_undecodable_signer_row_rejects_without_fail_stop() {
+    let (_d, db, backend, mut ctx) = oracle_setup();
+    db.put_cf_raw(CF_STAKING_VALIDATORS, S.as_slice(), b"\xff")
+        .unwrap();
+    let r = exec(&mut ctx, addr(V1), &set(V1, S));
+    assert_plain_reject(&mut ctx, &r, VALIDATOR_DECODE);
+    assert_eq!(
+        db.get_cf_raw(CF_NATIVE_ORACLE, &oracle_signer_key(&S))
+            .unwrap(),
+        None
+    );
+    assert_eq!(backend.hits(), 0);
 }
 
 /// The "is the signer a validator" read fails.
