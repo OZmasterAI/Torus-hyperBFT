@@ -455,6 +455,36 @@ async fn estimate_gas_charges_access_list_intrinsic_gas() {
     handle.stop().unwrap();
 }
 
+/// A plain transfer (no calldata) estimates exactly the 21000 intrinsic gas:
+/// the search's lower bound must be a limit that fails, so 21000 itself is
+/// tried (it returned 21001 when 21000 was taken as the failing bound).
+#[tokio::test]
+async fn estimate_gas_plain_transfer_is_exactly_21000() {
+    let (_dir, state, mempool, executor) = setup();
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    for call in [
+        serde_json::json!({
+            "from": "0x00000000000000000000000000000000000000ee",
+            "to": "0x00000000000000000000000000000000000000bb"
+        }),
+        serde_json::json!({
+            "from": "0x00000000000000000000000000000000000000ee",
+            "to": "0x00000000000000000000000000000000000000bb",
+            "data": "0x"
+        }),
+    ] {
+        let s: String = client
+            .request("eth_estimateGas", rpc_params![call.clone()])
+            .await
+            .unwrap();
+        assert_eq!(s, "0x5208", "plain transfer {call}");
+    }
+    handle.stop().unwrap();
+}
+
 /// An explicit unsupported type (blob / set-code) is refused as invalid params.
 #[tokio::test]
 async fn eth_call_rejects_unsupported_tx_type() {
