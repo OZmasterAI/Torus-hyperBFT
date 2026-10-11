@@ -127,33 +127,6 @@ pub fn compute_post_bundle_state_root_with_updates(
     ))
 }
 
-/// Compute the composite state root (EVM + native) with an explicit native root.
-///
-/// Used in Phase 2 when native execution produces actual state changes.
-/// The native root is computed by the caller (e.g. from native CF hashes).
-pub fn compute_full_composite_root(
-    state_db: &StateDb,
-    bundle: &BundleState,
-    native_root: B256,
-) -> Result<B256, StateError> {
-    Ok(compute_full_composite_root_with_updates(state_db, bundle, native_root)?.0)
-}
-
-/// [`compute_full_composite_root`] variant surfacing the incremental engine's
-/// `(evm_root, TrieUpdates)` pair when it ran — the native-pipeline twin of
-/// [`compute_post_bundle_state_root_with_updates`] (T4.1).
-pub fn compute_full_composite_root_with_updates(
-    state_db: &StateDb,
-    bundle: &BundleState,
-    native_root: B256,
-) -> Result<(B256, Option<(B256, TrieUpdates)>), StateError> {
-    let (evm_root, updates) = flagged_evm_root(state_db, bundle)?;
-    Ok((
-        compute_composite_root(evm_root, native_root),
-        updates.map(|u| (evm_root, u)),
-    ))
-}
-
 /// Compute a native state root by hashing key native column families.
 ///
 /// Iterates all entries in native balance and position CFs with length-framed

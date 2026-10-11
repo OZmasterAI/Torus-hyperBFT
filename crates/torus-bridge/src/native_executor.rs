@@ -11120,10 +11120,10 @@ impl NativeExecutor {
     /// for a block with no native actions and no fees. Queue entries for `height` are
     /// buffered by block `height - 1`'s EVM execution and committed in the SAME atomic
     /// batch as that block's EVM bundle (s515 F1), which lands before this block runs
-    /// — so a DB read is authoritative here. A read error errs on the side of running
-    /// the drain.
-    pub fn core_writer_due(state_db: &StateDb, height: u64) -> bool {
-        CoreWriterQueue::pending_count(state_db, height).map_or(true, |n| n > 0)
+    /// — so a DB read is authoritative here. R02 (C4): a read error is a local
+    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
+        Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
     }
 
     /// Item 2: whether this block must run the native phase for the oracle —

@@ -670,13 +670,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         trade_history,
         "trade history (TORUS_TRADE_HISTORY; default off on validators, on for --rpc-only)"
     );
-    let mut app = TorusApp::new(
+    // R02 branch 8 (D1): a startup storage fault (e.g. the validator rows
+    // cannot be read to resolve the proposer address) stops the node here.
+    let mut app = TorusApp::try_new(
         state_db.clone(),
         &chain_config,
         Some(metrics.clone()),
         Some(mempool.clone()),
         signing_key_for_app,
-    );
+    )?;
     let kv_store = RocksKVStore::new(state_db.db_arc()).with_metrics(metrics.clone());
 
     // EVM executor
