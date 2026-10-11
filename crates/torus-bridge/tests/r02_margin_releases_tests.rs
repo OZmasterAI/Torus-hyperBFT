@@ -377,7 +377,10 @@ fn r02_maker_release_read_fault_fail_stops() {
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
         assert_settle_path(&ctx, mode);
         let step = match mode {
-            Mode::Single => "release order margin balance read",
+            // R02 branch 7: on the single path the maker snapshot
+            // (`maker_free`) reads the same balance first, on the reader
+            // channel (the release's fault is the second; first kept).
+            Mode::Single => "maker free read",
             _ => "settle maker release balance read",
         };
         assert_injected(
@@ -418,13 +421,15 @@ fn r02_maker_release_undecodable_balance_fail_stops() {
         let reason = ctx
             .take_fatal_error()
             .unwrap_or_else(|| panic!("{mode:?}: must fail-stop"));
+        // R02 branch 7: single path, the maker snapshot (`maker_free`)
+        // reads the row first (reader channel, first kept).
         let step = if matches!(mode, Mode::Single) {
-            "release order margin"
+            "maker free read"
         } else {
-            "settle maker release"
+            "settle maker release balance read"
         };
         assert!(
-            reason.starts_with(&format!("{step} balance read: borsh")),
+            reason.starts_with(&format!("{step}: borsh")),
             "{mode:?}: {reason}"
         );
     }

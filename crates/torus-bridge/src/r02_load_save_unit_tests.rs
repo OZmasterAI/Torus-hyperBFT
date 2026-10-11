@@ -144,9 +144,12 @@ fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
 }
 
+/// Pools by `(sender, market)`, sorted.
+type Pools = Vec<((Address, MarketId), FixedPoint)>;
+
 /// `d2_pools` for `TRADER` (pool market 1, pos_net 5, excess 2, available
 /// 100) with a fresh balance cache. Returns the pools and the fail-stop.
-fn pools(fault: bool) -> (Vec<((Address, MarketId), FixedPoint)>, Option<String>) {
+fn pools(fault: bool) -> (Pools, Option<String>) {
     let dir = tempfile::tempdir().unwrap();
     let backend = FailBal {
         inner: StateDb::open(dir.path()).unwrap(),

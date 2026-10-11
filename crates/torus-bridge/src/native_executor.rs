@@ -1782,7 +1782,10 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
 
 impl<T: StateBackend> AccountReader<'_, T> {
     /// F1 (s517 #4): a maker's snapshot free margin — balance and positions
-    /// from the backend. A read error snapshots as 0 (deterministic).
+    /// from the backend. An error every validator hits alike snapshots as 0
+    /// (deterministic). R02 branch 7: a local fault (the read failed, a row
+    /// does not decode) is recorded on the reader fault channel (the block
+    /// fail-stops) and snapshots as 0 meanwhile.
     /// C6c: on a batch reader, once per maker per Phase 3 worker
     /// ([`MAKER_FREE`]).
     fn maker_free(&self, maker: &Address) -> FixedPoint {
@@ -1790,7 +1793,13 @@ impl<T: StateBackend> AccountReader<'_, T> {
             self.positions
                 .get_native_balance(maker)
                 .and_then(|b| self.view(maker, &b))
-                .map_or(FixedPoint::ZERO, |v| v.free())
+                .map_or_else(
+                    |e| {
+                        self.note_fault("maker free read", &e);
+                        FixedPoint::ZERO
+                    },
+                    |v| v.free(),
+                )
         };
         let Some(b) = self.batch else {
             return compute();
@@ -8740,10 +8749,12 @@ impl NativeExecutor {
 
     /// F1 (s517, D2): each pooled sender's exclusive budget in its pool
     /// market — `available + pos_net - excess` (see the caller). The sender
-    /// passed an account check, so Phase 2 cached its balance.
+    /// passed an account check, so Phase 2 cached its balance. R02 branch 7:
+    /// a local fault on the balance read is recorded on `fault` (the block
+    /// fail-stops); the pool reads `available` 0 meanwhile.
     fn d2_pools<T: StateBackend>(
         positions: &PositionManager<T>,
-        _fault: &std::sync::OnceLock<String>,
+        fault: &std::sync::OnceLock<String>,
         pool_takers: &HashMap<Address, (MarketId, FixedPoint)>,
         excess_by_sender: &HashMap<Address, FixedPoint>,
         bal_cache: &mut BalanceCache,
@@ -8751,10 +8762,17 @@ impl NativeExecutor {
         let mut pools: HashMap<(Address, MarketId), FixedPoint> =
             HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
         for (&sender, &(market_id, pos_net)) in pool_takers {
-            let available = bal_cache
-                .load(positions, &sender)
-                .map_or(FixedPoint::ZERO, |b| b.available);
-            let excess = excess_by_sender.get(&sender).copied().unwrap_or(FixedPoint::ZERO);
+            let available = match bal_cache.load(positions, &sender) {
+                Ok(b) => b.available,
+                Err(e) => {
+                    note_reader_fault(fault, "D2 pool balance read", &e);
+                    FixedPoint::ZERO
+                }
+            };
+            let excess = excess_by_sender
+                .get(&sender)
+                .copied()
+                .unwrap_or(FixedPoint::ZERO);
             pools.insert((sender, market_id), available + pos_net - excess);
         }
         pools
@@ -9587,32 +9605,32 @@ impl NativeExecutor {
                 break;
             }
         }
+        let mut found = None;
         for book in ctx.order_books.values_mut() {
             ctx.phase_accum.by_id_books_probed += 1;
             if let Ok(cancelled) = book.cancel_order(order_id) {
-                // FIX 2 (ECON-FIND-05): Release order margin on cancel.
-                let notional = cancelled.price * cancelled.remaining_qty;
-                let market_id = book.market_id;
-                ctx.dirty_books.insert(market_id);
-                let max_lev = ctx
-                    .margin_configs
-                    .get(&market_id)
-                    .map(|c| effective_max_leverage(&c.tiers, notional))
-                    .unwrap_or(20);
-                let margin_to_release = Self::margin_at_integer_leverage(notional, max_lev);
-
-                if margin_to_release > FixedPoint::ZERO {
-                    if let Ok(mut bal) = ctx.positions.get_native_balance(&cancelled.trader) {
-                        let release = margin_to_release.min(bal.order_margin);
-                        bal.order_margin -= release;
-                        bal.available += release;
-                        let _ = ctx.positions.put_native_balance(&cancelled.trader, &bal);
-                    }
-                }
-                return NativeActionResult::ok("cancel_order", 500);
+                found = Some((book.market_id, cancelled));
+                break;
             }
         }
-        NativeActionResult::err("cancel_order", format!("order {order_id} not found"))
+        let Some((market_id, cancelled)) = found else {
+            return NativeActionResult::err("cancel_order", format!("order {order_id} not found"));
+        };
+        // FIX 2 (ECON-FIND-05): Release order margin on cancel.
+        let notional = cancelled.price * cancelled.remaining_qty;
+        ctx.dirty_books.insert(market_id);
+        let max_lev = ctx
+            .margin_configs
+            .get(&market_id)
+            .map(|c| effective_max_leverage(&c.tiers, notional))
+            .unwrap_or(20);
+        let margin_to_release = Self::margin_at_integer_leverage(notional, max_lev);
+        // R02 branch 7: the shared release (`min(order_margin)`, nothing
+        // when <= 0): a local fault on its balance read, or a failed write,
+        // fail-stops the block (was: skipped / `let _ =`). The result stays
+        // `ok`.
+        Self::release_order_margin(ctx, &cancelled.trader, margin_to_release);
+        NativeActionResult::ok("cancel_order", 500)
     }
 
     fn exec_cancel_all<T: StateBackend>(
@@ -10014,7 +10032,11 @@ impl NativeExecutor {
         if old.reduce_only {
             let pos = match Self::signed_position(&ctx.positions, sender, market_id) {
                 Ok(pos) => pos,
-                Err(e) => return err(e.to_string()),
+                // R02 branch 7: a local fault fail-stops (result kept).
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order reduce-only position read", &e);
+                    return err(e.to_string());
+                }
             };
             let allowance = reduce_only_allowance(pos, is_buy);
             if allowance == FixedPoint::ZERO {
@@ -10052,14 +10074,20 @@ impl NativeExecutor {
         // margin (UPnL counts). No `available >= extra` gate: the debit below may
         // take `available` negative. Reduce-only orders only reduce.
         if !old.reduce_only {
-            let reader = AccountReader::of(ctx);
-            let acct = reader
-                .position_px(sender, market_id)
-                .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
-                .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)));
+            let acct = {
+                let reader = AccountReader::of(ctx);
+                reader
+                    .position_px(sender, market_id)
+                    .and_then(|(s, px)| Ok((s, px, reader.pos_net(sender)?)))
+                    .and_then(|a| Ok((a, ctx.positions.get_native_balance(sender)?)))
+            };
             let ((signed, px, pos_net), bal) = match acct {
                 Ok(a) => a,
-                Err(e) => return err(e.to_string()),
+                // R02 branch 7: a local fault fail-stops (result kept).
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order account read", &e);
+                    return err(e.to_string());
+                }
             };
             let px = if px > FixedPoint::ZERO { px } else { price };
             let tiers = cfg.map(|c| c.tiers.as_slice());
@@ -10086,13 +10114,19 @@ impl NativeExecutor {
             }
         }
         if extra > FixedPoint::ZERO {
+            // R02 branch 7: a local fault on the read, or a failed write,
+            // fail-stops (result kept).
             let mut bal = match ctx.positions.get_native_balance(sender) {
                 Ok(bal) => bal,
-                Err(e) => return err(e.to_string()),
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "modify order balance read", &e);
+                    return err(e.to_string());
+                }
             };
             bal.available -= extra;
             bal.order_margin += extra;
             if let Err(e) = ctx.positions.put_native_balance(sender, &bal) {
+                Self::latch_core_fault(ctx, "modify order balance write", &e);
                 return err(e.to_string());
             }
         }

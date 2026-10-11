@@ -576,9 +576,12 @@ fn r02_deferred_save_counter_and_marker_write_faults_fail_stop() {
 /// count and logged; now the first failure is the `Err` (exec_pipeline maps
 /// it to a failed job: W fail-stops, nothing of the block lands). GREEN-only
 /// test: the `Result` return is the fix.
+/// A named fault: what it breaks, and how to arm it.
+type NamedArm = (&'static str, fn(&Failing));
+
 #[test]
 fn r02_deferred_book_apply_write_fault_is_err() {
-    let arms: [(&str, fn(&Failing)); 4] = [
+    let arms: [NamedArm; 4] = [
         ("node-local order row", |b| {
             b.arm_write(CF_BOOK_ORDER_ROWS, None)
         }),
