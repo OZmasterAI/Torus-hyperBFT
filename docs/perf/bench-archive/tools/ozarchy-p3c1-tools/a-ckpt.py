@@ -6,7 +6,12 @@ import statistics as st
 
 R = "/home/oz/bench-results-matched/ozarchy-p3c1-300m-"
 ARMS = ("cd", "sd", "cm", "sm")
-RT = {1: "r1", 2: "r2", 3: "r3", 4: "r4b"}  # round 4 = the rerun (first r4-sm excluded: harness deleted mid-cell)
+RT = {
+    1: "r1",
+    2: "r2",
+    3: "r3",
+    4: "r4b",
+}  # round 4 = the rerun (first r4-sm excluded: harness deleted mid-cell)
 V = ("val0", "val1", "val2")
 
 
@@ -90,7 +95,7 @@ for a in ARMS:
             span = (inwin[-1][0] - inwin[0][0]) if len(inwin) >= 2 else float("nan")
             peak = 0.0
             shared = max([g(p[1], SH) for p in pts] + [g(e, SH)])
-            by100 = other = 0
+            by100 = interval = other = 0
             gaps = []
             lastck_ts = None
             for (ta, da), (tb, db) in zip(pts, pts[1:]):
@@ -107,16 +112,29 @@ for a in ARMS:
                         )
                         / dn,
                     )
-                if dc > 0 and "torus_block_height" in da and "torus_block_height" in db:
-                    cross = (
-                        int(db["torus_block_height"]) // 100
-                        - int(da["torus_block_height"]) // 100
-                    )
+                # Trigger attribution, BENCH WINDOW ONLY (t0 <= tb <= t1), as reported in section 45.3.
+                # A checkpoint at height x00 can be counted before the height gauge leaves x99, hence hb + 1.
+                # Not on a 100-block crossing: >= 14 s since the previous checkpoint (any time) = the 15 s
+                # interval, else other (barrier / byte cap / unexplained).
+                if (
+                    dc > 0
+                    and t0 <= tb <= t1
+                    and "torus_block_height" in da
+                    and "torus_block_height" in db
+                ):
+                    cross = (int(db["torus_block_height"]) + 1) // 100 - int(
+                        da["torus_block_height"]
+                    ) // 100
                     k = min(int(dc), max(cross, 0))
                     by100 += k
-                    other += int(dc) - k
-                if dc > 0 and t0 <= tb <= t1:
-                    if lastck_ts is not None:
+                    rest = int(dc) - k
+                    if rest:
+                        if lastck_ts is None or tb - lastck_ts >= 14:
+                            interval += rest
+                        else:
+                            other += rest
+                if dc > 0:
+                    if t0 <= tb <= t1 and lastck_ts is not None:
                         gaps.append(tb - lastck_ts)
                     lastck_ts = tb
             cell["nodes"][v] = dict(
@@ -131,6 +149,7 @@ for a in ARMS:
                 per_min=60 * nwin / span if span == span and span > 0 else None,
                 shared=shared,
                 by100=by100,
+                interval=interval,
                 other=other,
                 gap_max=max(gaps) if gaps else None,
             )
@@ -148,7 +167,7 @@ def m(xs):
 
 
 print(
-    "arm  ckpt/node/cell(before->after)  ckpt/min(bench)  wait s/cell  wait ms/ckpt  layer MB mean  layer MB peak  flush s/cell  flush s/ckpt  shared max  trig h%100/other  max gap s"
+    "arm  ckpt/node/cell(before->after)  ckpt/min(bench)  wait s/cell  wait ms/ckpt  layer MB mean  layer MB peak  flush s/cell  flush s/ckpt  shared max  trig (bench window) h%100/interval/other  max gap s"
 )
 for a in ARMS:
     nd = [res[f"{RT[i]}-{a}"]["nodes"][v] for i in range(1, 5) for v in V]
@@ -156,14 +175,14 @@ for a in ARMS:
         f"{a}  {m([x['n'] for x in nd]):6.1f}  {m([x['per_min'] for x in nd]):6.2f}  {m([x['wait_s'] for x in nd]):6.3f}  "
         f"{1000 * m([x['wait_per'] for x in nd]):7.1f}  {m([x['lb_mean'] for x in nd]) / 1e6:7.1f}  "
         f"{max([x['lb_peak'] or 0 for x in nd]) / 1e6:7.1f}  {m([x['flush_s'] for x in nd]):6.3f}  {m([x['flush_per'] for x in nd]):6.3f}  "
-        f"{max(x['shared'] for x in nd):.0f}  {sum(x['by100'] for x in nd)}/{sum(x['other'] for x in nd)}  "
+        f"{max(x['shared'] for x in nd):.0f}  {sum(x['by100'] for x in nd)}/{sum(x['interval'] for x in nd)}/{sum(x['other'] for x in nd)}  "
         f"{max([x['gap_max'] or 0 for x in nd]):.1f}"
     )
 for tag, c in res.items():
     print(
         tag,
         " ".join(
-            f"{v}:n={x['n']:.0f},win={x['nwin']},100/o={x['by100']}/{x['other']},sh={x['shared']:.0f}"
+            f"{v}:n={x['n']:.0f},win={x['nwin']},100/i/o={x['by100']}/{x['interval']}/{x['other']},sh={x['shared']:.0f}"
             for v, x in c["nodes"].items()
         ),
     )
@@ -176,7 +195,9 @@ for a in ARMS:
     for i in range(1, 5):
         P[f"{RT[i]}-{a}"] = json.load(open(R + f"{RT[i]}-{a}/p3c1-post.json"))
         for v in V:
-            keys |= {k for k, x in P[f"{RT[i]}-{a}"]["rejects"][f"node_{v}"].items() if x}
+            keys |= {
+                k for k, x in P[f"{RT[i]}-{a}"]["rejects"][f"node_{v}"].items() if x
+            }
 for k in sorted(keys):
     print(
         f"  {k:70s} "
