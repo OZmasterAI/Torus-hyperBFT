@@ -1,7 +1,10 @@
 # Implementation Plan: item 6 Phase 3 (coalesced state checkpoints + replay)
 
-Status: core shelved s111; equal-fills saving 2.1-2.5% < 5%; task 1.1 merged, step 3 continues
-separately (plan row 47, results doc section 42). Was: plan (s109, 2026-10-11). Design and options: `item6-phase3-design.md`
+Status: UN-SHELVED s111 (owner, same day): step 1 starts. The shelve judged Phase 3 on a CPU rule
+that misses its payoff; the prototype (plan row 47, results doc section 42) showed matched/s +4.7%,
+native blocks/s +6.1%, CPU -2.1% at equal fills, disk writes -51%, +0.8 GB RAM/node, restart <= 26.6 s,
+and Phases 4-5 build on Phase 3. Gate revised (section 1). Task 1.1 merged; step 3 built
+(feat/trade-retention). Was: shelved s111; plan (s109, 2026-10-11). Design and options: `item6-phase3-design.md`
 (Option C, owner s109). Parent design: `market-scaling-in-memory-design.md` Phase 3, D5 b, D6 b,
 D7 c, D10 c for now, D11 a, D13 a. Short form: `item6-phases-2-5-plans.md` Phase 3.
 Code references are `file:function` with line numbers on main `fd9e5dfa`.
@@ -30,10 +33,10 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 
 | gate | target | measured by |
 |---|---|---|
-| Phase gate, CPU | node CPU-s/1M <= -6% vs tw (24.93 -> <= 23.43) | interleaved cells, step 4 |
+| Phase gate, CPU | no node CPU-s/1M regression vs tw beyond noise (was <= -6%; revised owner s111) | interleaved cells, step 4 |
 | Phase gate, disk | state-row bytes written down by the coalescing factor archy measures (step 0) | iostat + RocksDB counters, step 4 |
 | Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
-| Phase gate, throughput | matched/s no loss vs tw beyond cell resolution | step 4 |
+| Phase gate, throughput | matched/s and native blocks/s UP vs tw beyond noise (prototype: +4.7% / +6.1%; owner s111) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
 | RAM | RSS growth within archy's layer-size figure + 25% | step 4 |
 
