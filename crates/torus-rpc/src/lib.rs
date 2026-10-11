@@ -321,7 +321,11 @@ impl RpcServer {
         .unwrap_or_else(|e| panic!("RpcServer startup failed: {e}"))
     }
 
-    /// Create a new RPC server. Scans the DB to find the latest block height.
+    /// Create a new RPC server. Scans the DB to find the latest block height
+    /// and loads the persisted trade-history cutoff. `Err` when that cutoff
+    /// cannot be read (a local storage fault): startup stops instead of
+    /// serving pruned blocks as "no trades". A missing or not-8-byte row is
+    /// cutoff 0 (nothing pruned).
     pub fn try_new(
         state_db: StateDb,
         mempool: Arc<Mempool>,
@@ -332,8 +336,11 @@ impl RpcServer {
     ) -> Result<Self, String> {
         let latest = find_latest_height(&state_db);
         // Persisted by the pruner: blocks pruned before a restart stay
-        // `DataPruned` whatever this run's flags (a read fault = 0).
-        let trades_cut = torus_state::read_trades_pruned_height(&state_db).unwrap_or(0);
+        // `DataPruned` whatever this run's flags. A read fault stops startup
+        // (owner rule: a storage fault never silently gives wrong answers).
+        let trades_cut = torus_state::read_trades_pruned_height(&state_db).map_err(|e| {
+            format!("cannot read the trade-history cutoff (trades_pruned_height): {e}")
+        })?;
         Ok(Self {
             state: RpcState {
                 state: state_db,
