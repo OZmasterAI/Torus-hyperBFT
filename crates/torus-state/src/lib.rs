@@ -31,7 +31,7 @@ pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, Rock
 pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
-pub use pruner::{dir_size_bytes, PrunerConfig, StatePruner};
+pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
 pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRows};
 pub use erasure::ErasureParams;
 pub use shard_store::{
