@@ -11,7 +11,7 @@ The suites:
 4. `ci/run-local.sh check`. Clippy and fmt carry old debt, so only findings that are new against the previous main are reported.
 5. `ci/run-local.sh uniswap` (devnet end to end, fresh genesis). It runs on 18c, which has Foundry;
    Foundry on ozarchy is optional (owner s99).
-6. `tools/matched-bench` Python tests (`python3 -m pytest tools/matched-bench`, not `-I`: on 18c pytest is only in ~/.local and the scripts import local modules, plus each `test_*.py` as a script as the README runs them)
+6. `tools/matched-bench` Python tests (`python3 -m pytest tools/matched-bench`, plus each `test_*.py` as a script as the README runs them). Plain `python3`, not `-I`: on 18c pytest is only in `~/.local`, and the scripts import local modules.
 
 Host: ozarchy (Ryzen 9 5950X, 32 threads, 62 GB). One cargo build at a time; each worktree has its own
 `CARGO_TARGET_DIR`.
