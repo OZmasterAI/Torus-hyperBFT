@@ -3,7 +3,7 @@
 
 Submits ONE signed TransferToPerp native action from a fresh hardhat account and
 measures:
-  (a) how many times it EXECUTED  -> native availableBalance delta / amount
+  (a) how many times it EXECUTED  -> native cashBalance delta / amount
   (b) how many blocks INCLUDED it -> blocks with nativeActionCount>0 in the window
       (on an otherwise-quiescent devnet, every such block is OUR single action).
 
@@ -184,11 +184,11 @@ def block_number(url):
 
 
 def get_balances(addr, url):
-    """Balances as raw ints: evmBalance is hex wei; the FixedPoint fields are
-    decimal strings (s80), scaled to raw 8-decimal units."""
+    """Balances as raw ints: evmBalance (wei) and permanentStake are hex; the
+    FixedPoint fields are decimal strings (s80), scaled to raw 8-decimal units."""
     r = rpc("torus_getBalances", [addr], url)["result"]
     return {
-        k: int(v, 16) if k == "evmBalance" else int(Decimal(v).scaleb(8))
+        k: int(v, 16) if k in ("evmBalance", "permanentStake") else int(Decimal(v).scaleb(8))
         for k, v in r.items()
     }
 
@@ -209,12 +209,12 @@ def load_key(idx):
 
 
 def settle(addr, url, base, deadline_s=20):
-    """Poll availableBalance until it stops changing after first moving."""
+    """Poll cashBalance until it stops changing after first moving."""
     stable, last = 0, base
     deadline = time.time() + deadline_s
     while time.time() < deadline:
         time.sleep(0.5)
-        cur = get_balances(addr, url)["availableBalance"]
+        cur = get_balances(addr, url)["cashBalance"]
         if cur != last:
             last, stable = cur, 0
         elif cur != base:
@@ -239,7 +239,7 @@ def main():
 
     before = get_balances(addr, url)
     log(
-        f"BEFORE: available={before['availableBalance']} "
+        f"BEFORE: cash={before['cashBalance']} "
         f"native={before['nativeBalance']} evm={before['evmBalance']}"
     )
 
@@ -250,17 +250,17 @@ def main():
     resp = rpc("torus_submitNativeAction", [payload], url)
     log(f"submit response: {json.dumps(resp)}")
 
-    settle(addr, url, before["availableBalance"])
+    settle(addr, url, before["cashBalance"])
 
     end_blk = block_number(url)
     after = get_balances(addr, url)
-    delta = after["availableBalance"] - before["availableBalance"]
+    delta = after["cashBalance"] - before["cashBalance"]
     exec_count = delta / amount if amount else 0
     log(
-        f"\nAFTER:  available={after['availableBalance']} "
+        f"\nAFTER:  cash={after['cashBalance']} "
         f"native={after['nativeBalance']} evm={after['evmBalance']}"
     )
-    log(f"DELTA available = {delta}  => EXECUTED {exec_count:g}x")
+    log(f"DELTA cash = {delta}  => EXECUTED {exec_count:g}x")
 
     # Block-level inclusion: scan the window. On a quiescent chain every block with
     # native actions is our single submission.

@@ -1148,12 +1148,6 @@ impl TorusApiServer for RpcState {
     async fn get_balances(&self, trader: String) -> RpcResult<RpcBalances> {
         let addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
 
-        let pm = PositionManager::new(self.state.clone());
-        let native_bal = pm
-            .get_native_balance(&addr)
-            .map_err(|e| RpcError::Internal(e.to_string()))
-            .map_err(ErrorObjectOwned::from)?;
-
         // EVM balance
         let evm_balance = self
             .state
@@ -1163,15 +1157,17 @@ impl TorusApiServer for RpcState {
             .map(|a| a.balance)
             .unwrap_or_default();
 
-        // Sum isolated margin from all open positions
-        let positions = pm
-            .positions_for_trader(&addr)
+        // Review fix #3: the engine's cross-margin figures, from DB reads only
+        // (`crate::account`), marked at the executed head's block time. Every
+        // native field comes from its one balance read (review: a block
+        // committing between two reads must not split them).
+        let executed = crate::eth::eth_head(self);
+        let now = crate::eth::get_header_with_hash(self, executed)
+            .map_err(ErrorObjectOwned::from)?
+            .map(|(h, _, _)| h.timestamp);
+        let f = crate::account::account_figures(&self.state, &addr, now)
             .map_err(|e| RpcError::Internal(e.to_string()))
             .map_err(ErrorObjectOwned::from)?;
-        let mut total_margin = native_bal.order_margin;
-        for pos in &positions {
-            total_margin += pos.isolated_margin;
-        }
 
         // Permanent stake from CF_STAKING_PERMANENT
         let permanent_stake = match self.state.get_cf_raw(CF_STAKING_PERMANENT, addr.as_slice()) {
@@ -1181,13 +1177,15 @@ impl TorusApiServer for RpcState {
             _ => "0x0".to_string(),
         };
 
-        let native_total = native_bal.available + native_bal.order_margin;
-
         Ok(RpcBalances {
-            native_balance: dec_fp(native_total),
+            native_balance: dec_fp(f.native_balance),
             evm_balance: hex_u256(evm_balance),
-            total_margin_used: dec_fp(total_margin),
-            available_balance: dec_fp(native_bal.available),
+            account_value: dec_fp(f.account_value),
+            total_margin_used: dec_fp(f.total_margin_used),
+            maintenance_margin_used: dec_fp(f.maintenance_margin_used),
+            cash_balance: dec_fp(f.cash_balance),
+            withdrawable: dec_fp(f.withdrawable),
+            free_margin: dec_fp(f.free_margin),
             permanent_stake,
         })
     }

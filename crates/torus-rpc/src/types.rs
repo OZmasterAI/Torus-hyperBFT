@@ -294,10 +294,16 @@ pub struct RpcPosition {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcBalances {
+    /// Native cash + order margin (collateral, no UPnL).
     pub native_balance: String,
     pub evm_balance: String,
+    /// Fields below: `crate::account::AccountFigures`, docs/api/balances.md.
+    pub account_value: String,
     pub total_margin_used: String,
-    pub available_balance: String,
+    pub maintenance_margin_used: String,
+    pub cash_balance: String,
+    pub withdrawable: String,
+    pub free_margin: String,
     pub permanent_stake: String,
 }
 
@@ -308,7 +314,7 @@ pub struct RpcBalances {
 pub struct RpcLiquidatorVault {
     /// `LIQUIDATOR_VAULT`, hex.
     pub address: String,
-    /// Native available balance, signed decimal string (as `torus_getBalances`).
+    /// Native ledger cash, signed decimal string (as `torus_getBalances` `cashBalance`).
     pub available_balance: String,
     /// `-availableBalance` when it is negative, else 0 (the
     /// `torus_liquidator_vault_deficit` gauge).
