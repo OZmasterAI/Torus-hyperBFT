@@ -1833,7 +1833,9 @@ impl ExecutionContext {
         }
         let pending = match &job {
             crate::exec_pipeline::Job::Flush { pending, .. }
-            | crate::exec_pipeline::Job::Marker { pending, .. } => pending.clone(),
+            | crate::exec_pipeline::Job::Marker { pending, .. }
+            | crate::exec_pipeline::Job::Digest { pending, .. } => Some(pending.clone()),
+            crate::exec_pipeline::Job::Checkpoint { .. } => None,
         };
         let books_deferred = matches!(
             &job,
@@ -1854,6 +1856,9 @@ impl ExecutionContext {
             m.exec_handoff_wait_seconds.observe(wait_secs);
             m.flush_worker_depth.set(worker.outstanding() as i64);
         }
+        let Some(pending) = pending else {
+            return true;
+        };
         self.exec_applied.store(height, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = Some(pending);
         self.last_job_books_deferred

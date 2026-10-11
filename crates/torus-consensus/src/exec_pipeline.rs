@@ -153,15 +153,46 @@ pub enum Job {
         height: u64,
         pending: Arc<FrozenPending>,
     },
+    /// Item 6 Phase 3 (checkpoint interval set): a block whose state rows
+    /// are NOT written now. W computes `h_height` from its in-memory
+    /// `h(height-1)` over exactly the layers a `Flush` would digest, and
+    /// keeps the block's running-hash rows, action-status row, EVM accounts
+    /// and order nonces for the next [`Job::Checkpoint`]. Nothing is written
+    /// and `durable_height` does not move.
+    Digest {
+        height: u64,
+        pending: Arc<FrozenPending>,
+        evm_addrs: Vec<Address>,
+        order_nonces: Vec<u64>,
+        action_status: Option<torus_state::action_status::BlockActionStatus>,
+    },
+    /// Item 6 Phase 3: write the since-checkpoint layer `layer` (blocks
+    /// S'+1..=height, last value per key) in ONE atomic batch with the
+    /// marker = `height`, the running-hash rows kept since the last
+    /// checkpoint and the kept action-status rows; then resync the EVM
+    /// mirror for the kept accounts. At most one checkpoint is in flight
+    /// ([`FlushWorker::submit`] waits for the previous one).
+    Checkpoint {
+        height: u64,
+        layer: Arc<torus_state::CheckpointLayer>,
+    },
 }
 
 impl Job {
     pub fn height(&self) -> u64 {
         match self {
-            Job::Flush { height, .. } | Job::Marker { height, .. } => *height,
+            Job::Flush { height, .. }
+            | Job::Marker { height, .. }
+            | Job::Digest { height, .. }
+            | Job::Checkpoint { height, .. } => *height,
         }
     }
 }
+
+/// Item 6 Phase 3: W's queue depth with a checkpoint interval set
+/// (**estimate**, plan task 1.5): digest jobs are small and E must not wait
+/// for a checkpoint write, so the rendezvous becomes a bounded buffer.
+pub const DIGEST_QUEUE: usize = 128;
 
 /// Test hook: a gate W passes through before EVERY job. `hold()` parks W (so a
 /// test can pin "batch(N) in flight"), `release()` lets it run; `fail_next()`
@@ -288,7 +319,17 @@ impl FlushWorker {
     /// Spawn W. `durable_height_seed` is the durable applied-height marker at
     /// construction (after boot replay — design §2.1 W.6).
     pub fn spawn(env: WorkerEnv, durable_height_seed: u64) -> Self {
-        let (tx, rx) = sync_channel::<Job>(0);
+        Self::spawn_with_queue(env, durable_height_seed, 0)
+    }
+
+    /// Item 6 Phase 3: W for a checkpoint interval (queue [`DIGEST_QUEUE`]).
+    pub fn spawn_checkpointing(env: WorkerEnv, durable_height_seed: u64) -> Self {
+        Self::spawn_with_queue(env, durable_height_seed, DIGEST_QUEUE)
+    }
+
+    /// `queue` 0 = the bl2 rendezvous (exactly today).
+    fn spawn_with_queue(env: WorkerEnv, durable_height_seed: u64, queue: usize) -> Self {
+        let (tx, rx) = sync_channel::<Job>(queue);
         let db = env.state_db.clone();
         let shared = Arc::new(Shared {
             outstanding: Mutex::new(0),
@@ -373,6 +414,12 @@ impl FlushWorker {
     /// reports).
     pub fn outstanding(&self) -> usize {
         *self.shared.outstanding.lock().unwrap()
+    }
+
+    /// Item 6 Phase 3: hand-offs of a checkpoint that waited for the
+    /// previous one to become durable.
+    pub fn checkpoint_waits(&self) -> u64 {
+        0
     }
 }
 
@@ -492,6 +539,8 @@ fn run_job(env: &WorkerEnv, shared: &Shared, job: &mut Job) -> Result<(), JobErr
                 .map(|_| ())
                 .map_err(|e| JobError::Write(e.to_string()))
         }
+        // RED stub (task 1.5): not implemented yet.
+        Job::Digest { .. } | Job::Checkpoint { .. } => Ok(()),
         Job::Flush {
             height,
             pending,
@@ -838,6 +887,241 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, None, "no marker written after the external latch");
+    }
+
+    // ---- Item 6 Phase 3 task 1.5: Digest and Checkpoint jobs ----
+
+    type CfDump = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+    fn dump_all(db: &StateDb) -> CfDump {
+        torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .map(|cf| (*cf, torus_state::StateBackend::iterate_cf(db, cf, None).unwrap()))
+            .collect()
+    }
+
+    fn assert_dumps_eq(a: &CfDump, b: &CfDump, what: &str) {
+        for ((cf, x), (_, y)) in a.iter().zip(b.iter()) {
+            assert_eq!(x, y, "{what}: CF {cf} diverged");
+        }
+    }
+
+    /// One block's frozen set: rewrites / tombstones over a small key space
+    /// in hashed CFs (so blocks overwrite each other's rows), the applied
+    /// marker put as E's fast path does, and every third block an action
+    /// status record.
+    fn ckpt_block(
+        db: &StateDb,
+        height: u64,
+    ) -> (Arc<FrozenPending>, Option<torus_state::action_status::BlockActionStatus>) {
+        use torus_state::StateBackend;
+        let o = torus_state::NativeStateOverlay::new(db.clone());
+        let cfs = [
+            torus_state::cf::CF_NATIVE_ORDERS,
+            torus_state::cf::CF_NATIVE_BALANCES,
+            torus_state::cf::CF_SESSIONS,
+        ];
+        for i in 0..6u64 {
+            let x = height.wrapping_mul(2_654_435_761).wrapping_add(i * 97);
+            let cf = cfs[(x % 3) as usize];
+            let key = [b'k', (x % 11) as u8];
+            if x % 5 == 0 {
+                o.delete_cf_raw(cf, &key).unwrap();
+            } else {
+                o.put_cf_raw(cf, &key, &[height as u8, i as u8, (x >> 8) as u8]).unwrap();
+            }
+        }
+        o.put_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            &height.to_be_bytes(),
+        )
+        .unwrap();
+        let status = (height % 3 == 0).then(|| torus_state::action_status::BlockActionStatus {
+            evm_skipped: vec![false, true],
+            native_skipped: vec![height % 2 == 0],
+            native_failed: Vec::new(),
+        });
+        (o.freeze(height), status)
+    }
+
+    /// Per-block reference: the same frozen sets through `Job::Flush`.
+    fn reference_db(heights: std::ops::RangeInclusive<u64>, activation: u64) -> (StateDb, tempfile::TempDir) {
+        let (env, dir) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(activation)).unwrap();
+        let worker = FlushWorker::spawn(env, 0);
+        for h in heights {
+            let (pending, action_status) = ckpt_block(&db, h);
+            worker
+                .submit(Job::Flush {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    books: None,
+                    order_nonces: Vec::new(),
+                    action_status,
+                })
+                .unwrap();
+        }
+        assert!(worker.wait_idle());
+        drop(worker);
+        (db, dir)
+    }
+
+    /// Hand blocks `heights` to `worker` as digest jobs and return the
+    /// since-checkpoint layer E would hold for them.
+    fn digest_window(
+        worker: &FlushWorker,
+        db: &StateDb,
+        heights: std::ops::RangeInclusive<u64>,
+    ) -> torus_state::CheckpointLayer {
+        let mut layer = torus_state::CheckpointLayer::new();
+        for h in heights {
+            let (pending, action_status) = ckpt_block(db, h);
+            layer.merge(&pending);
+            worker
+                .submit(Job::Digest {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status,
+                })
+                .unwrap();
+        }
+        layer
+    }
+
+    /// 20 blocks as digest jobs leave the DB untouched; the checkpoint at
+    /// 100 then writes ONE batch after which the DB equals the per-block
+    /// flush DB at 100 (state, marker, running hash, activation record,
+    /// attest checkpoint row, action status). A second window (101..=120)
+    /// chains from W's in-memory h(100) and matches again.
+    #[test]
+    fn digest_jobs_then_checkpoint_writes_one_batch() {
+        let (env, _dir) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(81)).unwrap();
+        let before = dump_all(&db);
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+
+        let layer = digest_window(&worker, &db, 81..=100);
+        assert!(worker.wait_idle());
+        assert_dumps_eq(&dump_all(&db), &before, "digests wrote nothing");
+        assert_eq!(worker.durable_height(), 0, "digests are not durable");
+        let (ref100, _r1) = reference_db(81..=100, 81);
+        let h100 = torus_state::running_hash::read_running_hash(&ref100).expect("reference hashed 100");
+        assert_eq!(worker.running_hash_prev(), Some(h100), "W chained h(100) in memory");
+
+        worker
+            .submit(Job::Checkpoint {
+                height: 100,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 100);
+        assert!(torus_state::running_hash::read_checkpoint(&db, 100).is_some(), "attest row");
+        assert_dumps_eq(&dump_all(&db), &dump_all(&ref100), "checkpoint at 100");
+
+        let before2 = dump_all(&db);
+        let layer = digest_window(&worker, &db, 101..=120);
+        assert!(worker.wait_idle());
+        assert_dumps_eq(&dump_all(&db), &before2, "second window: digests wrote nothing");
+        worker
+            .submit(Job::Checkpoint {
+                height: 120,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let (ref120, _r2) = reference_db(81..=120, 81);
+        assert_dumps_eq(&dump_all(&db), &dump_all(&ref120), "checkpoint at 120");
+    }
+
+    /// A failed checkpoint write latches W and the shared fail-stop; nothing
+    /// of the window lands and no later job is accepted.
+    #[test]
+    fn checkpoint_write_failure_latches() {
+        let gate = WorkerGate::new();
+        let (env, _dir) = temp_env(Some(gate.clone()));
+        let db = env.state_db.clone();
+        let exec_failed = env.exec_failed.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let before = dump_all(&db);
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let layer = digest_window(&worker, &db, 1..=10);
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 0, "digests are not durable");
+        gate.fail_next();
+        worker
+            .submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(!worker.wait_idle(), "wait_idle must report the failure");
+        assert!(worker.failed());
+        assert!(exec_failed.load(Ordering::SeqCst), "shared fail-stop latched");
+        assert_eq!(worker.durable_height(), 0);
+        assert_dumps_eq(&dump_all(&db), &before, "nothing of the window landed");
+        let (pending, _) = ckpt_block(&db, 11);
+        assert!(
+            worker
+                .submit(Job::Digest {
+                    height: 11,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                })
+                .is_err(),
+            "no job may be accepted after the latch"
+        );
+    }
+
+    /// At most one checkpoint in flight: while W holds checkpoint 5, digest
+    /// jobs still queue without blocking E, but handing off checkpoint 10
+    /// blocks until 5 is durable. The end state equals the per-block DB.
+    #[test]
+    fn second_checkpoint_waits_for_first() {
+        let gate = WorkerGate::new();
+        let (env, _dir) = temp_env(Some(gate.clone()));
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = Arc::new(FlushWorker::spawn_checkpointing(env, 0));
+
+        let layer = digest_window(&worker, &db, 1..=5);
+        assert!(worker.wait_idle());
+        gate.hold();
+        worker
+            .submit(Job::Checkpoint {
+                height: 5,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(gate.wait_received(5), "W holds checkpoint 5");
+        // Digest jobs do not wait for the checkpoint (buffered queue).
+        let layer2 = digest_window(&worker, &db, 6..=10);
+        let w2 = worker.clone();
+        let sender = std::thread::spawn(move || {
+            w2.submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer2),
+            })
+            .unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!sender.is_finished(), "checkpoint 10 must wait for checkpoint 5");
+        assert_eq!(worker.durable_height(), 0);
+        gate.release();
+        sender.join().unwrap();
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 10);
+        assert!(worker.checkpoint_waits() >= 1, "the wait is counted");
+        let (reference, _r) = reference_db(1..=10, 1);
+        assert_dumps_eq(&dump_all(&db), &dump_all(&reference), "two checkpoints");
     }
 
     /// Drop drains: a job handed off right before drop is durable after drop.
