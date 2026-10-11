@@ -22559,12 +22559,18 @@ mod crash_recovery_tests {
                         handed_off |= ctx.ckpt.lock().unwrap().base != base;
                     }
                 });
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                // E's blocks never wait here (digests queue; one checkpoint
+                // in flight); bounded so a regression fails, never hangs.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
                 while !t.is_finished() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(t.is_finished(), "{what}: crash at {h}: E blocked");
                 if mid {
+                    while gate.parked_checkpoint().is_none() && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                     assert!(
                         gate.parked_checkpoint().is_some(),
                         "{what}: W holds a checkpoint at {h}"
