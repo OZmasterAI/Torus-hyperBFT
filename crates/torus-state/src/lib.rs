@@ -14,6 +14,7 @@ pub mod native_da;
 pub mod native_trie;
 pub mod overlay;
 pub mod pruner;
+pub mod read_view;
 pub mod resident_rows;
 pub mod running_hash;
 pub mod shard_store;
@@ -34,6 +35,7 @@ pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
+pub use read_view::ReadView;
 pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRows};
 pub use erasure::ErasureParams;
 pub use shard_store::{

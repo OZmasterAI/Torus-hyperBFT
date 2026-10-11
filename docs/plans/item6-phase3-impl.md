@@ -257,6 +257,32 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   at n, an EVM credit at n; gossip admission at n+1 accepts with interval "never" exactly as with
   interval 0. Fails before (session not found).
 - Verify: `cargo nextest run -p torus-mempool -p torus-consensus $F -E 'test(ingress_view)'`.
+- **Built** (`feat/item6-phase3-step2`, off step 1 `a44bdde6`, s111): `torus_state::ReadView`
+  (`read_view.rs`: frozen blocks above S newest first -> C -> DB; no layers = every call the
+  `StateDb` call; writes refused). E keeps the frozen sets above S (`CkptState.view_blocks`) and
+  publishes after each pipelined block (`publish_ingress_view`, after the hand-off and the
+  trigger: a checkpoint here clears them, C holds them); a barrier and a fresh W publish `None`
+  (all durable, the DB). **Memory (checked against step 0):** whole frozen sets would pin the
+  un-coalesced state bytes, ~885 MB per plan-15 s window on tw (section 41: 7,966 MB / 9
+  windows; Classic book blobs 77%), vs ~150 MB for L. So the view answers only the ingress CFs
+  (`read_view::INGRESS_CFS`: sessions, native balances, accounts, positions, validators,
+  oracle; other CFs read the DB) and the end-of-block merge thread also cuts block n-1 down to
+  those CFs (`FrozenPending::slice`), swapped in at `settle`: full sets only for the newest two
+  blocks. What is left is mostly positions (~23% of written state bytes, 1.5x coalescing), so
+  **estimate** ~150-200 MB per window on tw; archy to measure RSS in step 4.
+  The mempool reads `ingress_state()` (published view, else the DB) for the gossip session lookup, funded check, duty exemption, oracle reporter, `add_evm_tx`
+  (nonce + balance: one account row), `pending_nonce` and the item B volume read. The
+  post-commit EVM nonce prunes stay on the DB (EVM blocks are barriers, so DB nonces are
+  current). Tests: `ingress_view_matches_interval_zero` (RED first: session not found, D
+  unfunded, D balance 0), `ingress_view_follows_checkpoints_and_barriers` (ingress CFs equal
+  interval 0 after every block without waiting for W, at every 3 / never / C parked in
+  flight; barriers drop the view), `ingress_view_serves_duty_oracle_and_funded_checks`,
+  `read_view_*` (random model, newest layer wins, DB-only, ingress CFs only, slices).
+- Still on the DB (plan: validator RPC stays): RPC-submit checks in `torus.rs`
+  `verify_one_action_with` (markets, price band, session lookup), and `eth_head`
+  (`eth.rs` `eth_head`: durable marker), so `eth_blockNumber` moves in checkpoint steps. The
+  step 1 bench stall (section 45: the in-flight tail polls `eth_blockNumber` on val2) is NOT
+  removed by step 2; owner options in the step 2 report.
 
 ### Step 3: D13 trade-history retention (RPC node)
 

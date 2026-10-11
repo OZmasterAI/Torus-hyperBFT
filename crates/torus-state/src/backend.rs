@@ -178,7 +178,7 @@ pub trait StateBackend: Clone + Send + Sync {
 
 /// Read options whose iterate upper bound is the end of `prefix` (the smallest
 /// key above every key starting with it); none when no such key exists.
-fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
+pub(crate) fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
     let mut opts = rocksdb::ReadOptions::default();
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
@@ -491,7 +491,7 @@ impl PendingState {
     /// Layered point lookup: `Some(Some(v))` = pending write, `Some(None)` =
     /// tombstone, `None` = not in this layer (fall through).
     #[inline]
-    fn lookup(&self, id: CfId, key: &[u8]) -> Option<Option<&[u8]>> {
+    pub(crate) fn lookup(&self, id: CfId, key: &[u8]) -> Option<Option<&[u8]>> {
         let cfp = self.cf(id);
         if let Some(value) = cfp.writes.get(key) {
             return Some(Some(value.as_slice()));
@@ -542,14 +542,14 @@ impl PendingState {
     }
 
     /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
-    fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
+    pub(crate) fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
         writes_under(&self.cf(id).writes, prefix).next().is_some()
             || self.deletes_under(id, prefix).next().is_some()
     }
 
     /// Apply this layer's writes/tombstones (under `prefix`) on top of `merged`.
     /// Fix 3 (s87): visits only the layer's keys under `prefix` (range lookup).
-    fn overlay_into(
+    pub(crate) fn overlay_into(
         &self,
         id: CfId,
         prefix: Option<&[u8]>,
@@ -578,7 +578,7 @@ impl PendingState {
     }
 
     #[inline]
-    fn cf(&self, id: CfId) -> &CfPending {
+    pub(crate) fn cf(&self, id: CfId) -> &CfPending {
         &self.cfs[id.0 as usize]
     }
 
@@ -992,6 +992,34 @@ impl FrozenPending {
                     + c.deletes.iter().map(Vec::len).sum::<usize>()
             })
             .sum()
+    }
+
+    /// Item 6 Phase 3 step 2: a copy of this set restricted to `cfs` (same
+    /// height; no hash extras). The ingress read view keeps such slices for
+    /// the blocks under the newest two, so it does not pin every block's book
+    /// blobs until the checkpoint.
+    pub fn slice(&self, cfs: &[&str]) -> FrozenPending {
+        let mut state = PendingState::new();
+        for id in cfs.iter().filter_map(|cf| intern_cf(cf)) {
+            let (dst, src) = (&mut state.cfs[id.0 as usize], self.state.cf(id));
+            dst.writes.clone_from(&src.writes);
+            dst.deletes.clone_from(&src.deletes);
+        }
+        FrozenPending {
+            height: self.height,
+            state,
+        }
+    }
+
+    /// Whether every write and tombstone of this set is in one of `cfs`
+    /// (hash extras excluded).
+    pub fn touches_only(&self, cfs: &[&str]) -> bool {
+        let keep: Vec<CfId> = cfs.iter().filter_map(|cf| intern_cf(cf)).collect();
+        self.state
+            .cfs
+            .iter()
+            .enumerate()
+            .all(|(i, c)| c.is_empty() || keep.contains(&CfId(i as u8)))
     }
 
     /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
@@ -2118,7 +2146,7 @@ pub struct NativeFlushStats {
 }
 
 /// A layer's pending-write keys starting with `prefix`, in key order.
-fn writes_under<'a>(
+pub(crate) fn writes_under<'a>(
     writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
     prefix: &'a [u8],
 ) -> impl Iterator<Item = &'a Vec<u8>> {
@@ -2134,9 +2162,9 @@ fn writes_under<'a>(
 /// (pending, then parent, then `base`), so tombstones in either layer hide it.
 /// Reads at most `limit` live rows plus the tombstoned base keys in between.
 #[allow(clippy::type_complexity)]
-fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+pub(crate) fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     pending: &PendingState,
-    lower: [Option<&PendingState>; 3],
+    lower: &[Option<&PendingState>],
     id: CfId,
     start: &[u8],
     limit: usize,
@@ -2385,7 +2413,7 @@ impl StateBackend for NativeStateOverlay {
             let base = rows
                 .range::<[u8], _>(range)
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, [None; 3], id, start, limit, base);
+            return merge_from(&pending, &[], id, start, limit, base);
         }
         let lower = self.lower();
         let db = self.db.inner();
@@ -2398,7 +2426,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, lower, id, start, limit, dbi)
+        merge_from(&pending, &lower, id, start, limit, dbi)
     }
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
@@ -2447,7 +2475,7 @@ impl StateBackend for NativeStateOverlay {
                 .range::<[u8], _>(range)
                 .take_while(|(k, _)| k.starts_with(prefix))
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, [None; 3], id, start, limit, base).map(cut);
+            return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
         let lower = self.lower();
         let db = self.db.inner();
@@ -2461,7 +2489,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, lower, id, start, limit, dbi).map(cut)
+        merge_from(&pending, &lower, id, start, limit, dbi).map(cut)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key

@@ -76,8 +76,10 @@ struct CkptState {
     /// L. `None` = empty.
     layer: Option<Arc<torus_state::CheckpointLayer>>,
     /// The merge of the previous parent into L, running off E since the end
-    /// of the previous block; joined before L is read or taken.
-    merging: Option<std::thread::JoinHandle<torus_state::CheckpointLayer>>,
+    /// of the previous block; joined before L is read or taken. Step 2: with
+    /// a mempool wired it also returns that block's ingress slice, which
+    /// replaces the full frozen set in `view_blocks`.
+    merging: Option<std::thread::JoinHandle<CkptMerged>>,
     /// C: `(height, layer)` handed to W, dropped once W's durable height
     /// reaches it.
     inflight: Option<(u64, Arc<torus_state::CheckpointLayer>)>,
@@ -88,6 +90,11 @@ struct CkptState {
     since: Option<std::time::Instant>,
     /// L was still shared when E took it back (deep copy instead).
     shared_fallbacks: u64,
+    /// Step 2: the frozen sets of the blocks above `base` (oldest first),
+    /// which the published ingress view layers over C and the DB; each is
+    /// swapped for its ingress slice once merged into L (`settle`). Cleared
+    /// when a checkpoint closes them (C then holds them) and at a barrier.
+    view_blocks: Vec<Arc<torus_state::FrozenPending>>,
 }
 
 impl CkptState {
@@ -98,8 +105,19 @@ impl CkptState {
             return true;
         };
         match handle.join() {
-            Ok(layer) => {
+            Ok((layer, slice)) => {
                 self.layer = Some(Arc::new(layer));
+                // Step 2: the merged block's ingress slice stands in for its
+                // full set in the view (gone already if a barrier cleared it).
+                if let Some(slice) = slice {
+                    if let Some(b) = self
+                        .view_blocks
+                        .iter_mut()
+                        .find(|b| b.height() == slice.height())
+                    {
+                        *b = slice;
+                    }
+                }
                 true
             }
             Err(_) => false,
@@ -129,6 +147,14 @@ struct PendingSlash {
     reason: SlashReason,
     tombstone: bool,
 }
+
+/// Item 6 Phase 3: what the end-of-block merge thread returns: L with the
+/// previous parent folded in, and (step 2, mempool wired) that block's
+/// ingress slice for the published view.
+type CkptMerged = (
+    torus_state::CheckpointLayer,
+    Option<Arc<torus_state::FrozenPending>>,
+);
 
 /// Item 6 Phase 3: (L, C) under a pipelined overlay's parent.
 type CkptLayers = (
@@ -1888,6 +1914,11 @@ impl ExecutionContext {
             base: applied,
             ..Default::default()
         };
+        // Step 2: a fresh W starts at the durable marker; ingress reads the DB
+        // until E publishes a view after its first pipelined block.
+        if let (Some(_), Some(m)) = (&self.checkpoint, &self.mempool) {
+            m.publish_read_view(None);
+        }
         self.exec_applied.store(applied, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
@@ -1921,6 +1952,11 @@ impl ExecutionContext {
             st.inflight = None;
             st.since = None;
             st.base = st.base.max(worker.durable_height());
+            // Step 2: everything handed off is durable; ingress reads the DB.
+            st.view_blocks.clear();
+            if let Some(m) = &self.mempool {
+                m.publish_read_view(None);
+            }
         }
         // The serial path writes META (running hash) itself from here.
         worker.mark_chain_stale();
@@ -2094,15 +2130,30 @@ impl ExecutionContext {
             if let Some(c) = &current {
                 layer.merge(c);
             }
-            return self.checkpoint_submit(&mut st, height, layer);
+            if !self.checkpoint_submit(&mut st, height, layer) {
+                return false;
+            }
+            // C (in flight) now holds every block up to `height`.
+            st.view_blocks.clear();
+            self.publish_ingress_view(&st, height);
+            return true;
         }
+        debug_assert!(
+            current.is_some(),
+            "h{height}: the handed-off set is last_job"
+        );
+        st.view_blocks.extend(current);
+        self.publish_ingress_view(&st, height);
         if let Some(p) = fold {
             let mut layer = st.take_layer();
+            let slice = self.mempool.is_some();
             let spawned = std::thread::Builder::new()
                 .name("torus-ckpt-merge".into())
                 .spawn(move || {
                     layer.merge(&p);
-                    layer
+                    let slice =
+                        slice.then(|| Arc::new(p.slice(&torus_state::read_view::INGRESS_CFS)));
+                    (layer, slice)
                 });
             match spawned {
                 Ok(handle) => st.merging = Some(handle),
@@ -2115,6 +2166,27 @@ impl ExecutionContext {
             }
         }
         true
+    }
+
+    /// Item 6 Phase 3 step 2: publish the ingress read view after block
+    /// `height`: the frozen sets above S (newest first; ingress slices below
+    /// the newest two, swapped in by `settle`), then C (the checkpoint in
+    /// flight, if any), then the DB. One swap in the mempool;
+    /// a layer leaves the view only once durable (C is dropped from `st`
+    /// after W reports it durable, the blocks when C or a barrier covers
+    /// them), so a view never answers older than `height`.
+    fn publish_ingress_view(&self, st: &CkptState, height: u64) {
+        let Some(m) = &self.mempool else {
+            return;
+        };
+        let blocks = st.view_blocks.iter().rev().cloned().collect();
+        let inflight = st.inflight.as_ref().map(|(_, c)| c.clone());
+        m.publish_read_view(Some(torus_state::ReadView::new(
+            self.state_db.clone(),
+            height,
+            blocks,
+            inflight,
+        )));
     }
 
     /// Item 6 Phase 3: close the open window at a barrier / shutdown: L +
@@ -23558,12 +23630,20 @@ mod crash_recovery_tests {
         let mut blocks = vec![
             make_block(
                 1,
-                vec![sign(NativeAction::TransferToPerp { amount: deposit }, ms(1), &k_c)],
+                vec![sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    ms(1),
+                    &k_c,
+                )],
             ),
             make_block(
                 2,
                 vec![
-                    sign(NativeAction::TransferToPerp { amount: deposit }, ms(2), &k_a),
+                    sign(
+                        NativeAction::TransferToPerp { amount: deposit },
+                        ms(2),
+                        &k_a,
+                    ),
                     sign(
                         NativeAction::CreateSession {
                             session_pubkey: s_key.verifying_key().to_bytes(),
@@ -23648,11 +23728,8 @@ mod crash_recovery_tests {
             now,
             &s_key,
         );
-        let d_order = torus_types::eip712::sign_native_action(
-            NativeAction::PlaceOrder(order),
-            now + 1,
-            &k_d,
-        );
+        let d_order =
+            torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(order), now + 1, &k_d);
         let evm = signed_eip1559_with_value(
             &k_d,
             0,
@@ -23675,7 +23752,10 @@ mod crash_recovery_tests {
             ),
             (
                 "D add_evm_tx (balance = the EVM credit at n)",
-                mempool.add_evm_tx(evm).map(|_| ()).map_err(|e| e.to_string()),
+                mempool
+                    .add_evm_tx(evm)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
             ),
         ];
         drop(ctx);
@@ -23694,5 +23774,158 @@ mod crash_recovery_tests {
         }
         let never = ingress_view_admissions(Some(ckpt_never()));
         assert_eq!(never, zero, "interval never vs interval 0");
+    }
+
+    fn ingress_dump<S: StateBackend>(s: &S) -> Vec<CfDump> {
+        torus_state::read_view::INGRESS_CFS
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(s, cf, None).unwrap()))
+            .collect()
+    }
+
+    /// One observation after a block: the ingress CFs as the mempool reads
+    /// them, the published view's `(height, blocks, C held)` (`None`: DB
+    /// alone), whether every view block below the newest two is an ingress
+    /// slice, and the durable marker.
+    struct IngressObs {
+        dump: Vec<CfDump>,
+        view: Option<(Option<u64>, usize, bool)>,
+        sliced: bool,
+        durable: u64,
+    }
+
+    /// `pipeline_fixture_blocks` (epoch length 4) with an EVM tx in block 6:
+    /// barriers at 4, 6, 8, 12. Runs pipelined with `policy` and a mempool
+    /// wired; after each block observes what ingress reads WITHOUT waiting
+    /// for W (interval 0: after `wait_idle`, the DB). `hold_at`: W parks on
+    /// the checkpoint handed off at that height until the observation.
+    fn ingress_view_fixture_run(
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        hold_at: Option<u64>,
+    ) -> Vec<IngressObs> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let mut blocks = pipeline_fixture_blocks();
+        blocks[5].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[5].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        ctx.checkpoint = policy;
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        ctx.attach_flush_worker(Some(gate.clone()));
+        let mut out = Vec::new();
+        for b in &blocks {
+            let h = b.header.height;
+            if hold_at == Some(h) {
+                gate.hold_checkpoints();
+            }
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            if policy.is_none() {
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            }
+            if hold_at == Some(h) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while gate.parked_checkpoint().is_none() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_eq!(gate.parked_checkpoint(), Some(h), "W holds checkpoint {h}");
+            }
+            let durable = read_native_applied_height(&db).unwrap_or(0);
+            let view = mempool.ingress_state();
+            let published = view
+                .height()
+                .is_some()
+                .then(|| (view.height(), view.block_count(), view.has_inflight()));
+            let sliced = view
+                .blocks()
+                .iter()
+                .skip(2)
+                .all(|b| b.touches_only(&torus_state::read_view::INGRESS_CFS));
+            out.push(IngressObs {
+                dump: ingress_dump(&view),
+                view: published,
+                sliced,
+                durable,
+            });
+            if hold_at == Some(h) {
+                gate.release();
+            }
+        }
+        drop(ctx);
+        out
+    }
+
+    /// Item 6 Phase 3 step 2: after EVERY block, without waiting for the
+    /// flush worker, the ingress view answers exactly what interval 0 (DB
+    /// after the per-block flush) answers, at interval "every 3 blocks" and
+    /// "never", and with a checkpoint parked in flight (C not durable). A
+    /// barrier (EVM 6, epoch boundaries 4 / 8 / 12) drops the view: every
+    /// block is durable and ingress reads the DB.
+    #[test]
+    fn ingress_view_follows_checkpoints_and_barriers() {
+        let reference = ingress_view_fixture_run(None, None);
+        assert!(
+            reference.iter().all(|o| o.view.is_none()),
+            "interval 0 never publishes"
+        );
+        let barriers = [4u64, 6, 8, 12];
+        for (name, policy, hold_at) in [
+            ("every 3", ckpt_every(3), None),
+            ("every 3, C parked at 3", ckpt_every(3), Some(3)),
+            ("never", ckpt_never(), None),
+        ] {
+            let run = ingress_view_fixture_run(Some(policy), hold_at);
+            let mut ahead = 0;
+            for (i, (got, want)) in run.iter().zip(reference.iter()).enumerate() {
+                let h = i as u64 + 1;
+                assert_dumps_equal(&want.dump, &got.dump, &format!("{name} h{h}"));
+                if barriers.contains(&h) {
+                    assert_eq!(got.view, None, "{name} h{h}: barrier -> DB");
+                    assert_eq!(got.durable, h, "{name} h{h}: barrier durable");
+                } else {
+                    let (height, _, _) = got.view.expect("view published");
+                    assert_eq!(height, Some(h), "{name} h{h}: view height");
+                }
+                if got.durable < h {
+                    ahead += 1;
+                }
+                assert!(
+                    got.sliced,
+                    "{name} h{h}: blocks under the newest two are slices"
+                );
+            }
+            assert!(
+                ahead >= 3,
+                "{name}: blocks above the durable marker: {ahead}"
+            );
+            if name == "never" {
+                // 9, 10, 11 above S = 8: two full sets and one slice.
+                assert_eq!(run[10].view, Some((Some(11), 3, false)), "{name} h11");
+            }
+            if hold_at.is_some() {
+                let o = &run[2];
+                assert!(
+                    o.durable < 3,
+                    "C parked: block 3 not durable ({})",
+                    o.durable
+                );
+                assert_eq!(o.view, Some((Some(3), 0, true)), "C holds blocks 1-3");
+            }
+        }
     }
 }
