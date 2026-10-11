@@ -20,11 +20,14 @@ use std::sync::{Arc, Mutex};
 
 use alloy_primitives::Address;
 
-use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor, ResidentBooks};
+use torus_bridge::native_executor::{
+    apply_deferred_book_save, BookMode, NativeExecContext, NativeExecutor, ResidentBooks,
+};
 use torus_core::book_rows::{book_meta_key, ROW_TAG_STOP};
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
-    CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, META_NATIVE_APPLIED_HEIGHT,
+    CF_BOOK_ORDER_ROWS, CF_CONSENSUS_META, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
+    META_NATIVE_APPLIED_HEIGHT,
 };
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -48,7 +51,10 @@ const INJECTED: &str = "injected book storage failure";
 
 impl Failing {
     fn new(db: &StateDb) -> Self {
-        Self { inner: Some(db.clone()), ..Self::default() }
+        Self {
+            inner: Some(db.clone()),
+            ..Self::default()
+        }
     }
     fn db(&self) -> &StateDb {
         self.inner.as_ref().unwrap()
@@ -57,18 +63,26 @@ impl Failing {
         self.reads.lock().unwrap().push((cf, Some(key.to_vec())));
     }
     fn arm_scan(&self, cf: &'static str, prefix: Option<&[u8]>) {
-        self.scans.lock().unwrap().push((cf, prefix.map(<[u8]>::to_vec)));
+        self.scans
+            .lock()
+            .unwrap()
+            .push((cf, prefix.map(<[u8]>::to_vec)));
     }
     fn arm_write(&self, cf: &'static str, key: Option<&[u8]>) {
-        self.writes.lock().unwrap().push((cf, key.map(<[u8]>::to_vec)));
+        self.writes
+            .lock()
+            .unwrap()
+            .push((cf, key.map(<[u8]>::to_vec)));
     }
     fn hits(&self) -> usize {
         *self.hits.lock().unwrap()
     }
     fn hit(&self, list: &Armed, cf: &str, key: Option<&[u8]>) -> Result<(), StateError> {
-        let armed = list.lock().unwrap().iter().any(|(c, k)| {
-            *c == cf && (k.is_none() || k.as_deref() == key)
-        });
+        let armed = list
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(c, k)| *c == cf && (k.is_none() || k.as_deref() == key));
         if armed {
             *self.hits.lock().unwrap() += 1;
             return Err(StateError::Io(std::io::Error::other(INJECTED)));
@@ -90,10 +104,19 @@ impl StateBackend for Failing {
         self.hit(&self.writes, cf, Some(key))?;
         self.db().delete_cf_raw(cf, key)
     }
-    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         // A scan armed with a prefix fails for exactly that prefix; armed
         // without one, every scan of the CF fails.
-        let armed = self.scans.lock().unwrap().iter().any(|(c, k)| *c == cf && (k.is_none() || k.as_deref() == prefix));
+        let armed = self
+            .scans
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(c, k)| *c == cf && (k.is_none() || k.as_deref() == prefix));
         if armed {
             *self.hits.lock().unwrap() += 1;
             return Err(StateError::Io(std::io::Error::other(INJECTED)));
@@ -110,9 +133,17 @@ const M: MarketId = 1;
 const NEXT_ID_KEY: &[u8] = b"__next_global_order_id__";
 const MODE_MARKER_KEY: &[u8] = b"__book_mode__";
 
-const MODES: [BookMode; 4] =
-    [BookMode::Classic, BookMode::OrderRows, BookMode::LevelAuthority, BookMode::LevelAuthorityChunked];
-const ROW_MODES: [BookMode; 3] = [BookMode::OrderRows, BookMode::LevelAuthority, BookMode::LevelAuthorityChunked];
+const MODES: [BookMode; 4] = [
+    BookMode::Classic,
+    BookMode::OrderRows,
+    BookMode::LevelAuthority,
+    BookMode::LevelAuthorityChunked,
+];
+const ROW_MODES: [BookMode; 3] = [
+    BookMode::OrderRows,
+    BookMode::LevelAuthority,
+    BookMode::LevelAuthorityChunked,
+];
 const LEVEL_MODES: [BookMode; 2] = [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked];
 
 fn addr(n: u8) -> Address {
@@ -132,7 +163,12 @@ fn open() -> (tempfile::TempDir, StateDb, Failing) {
     (dir, db, backend)
 }
 
-fn ctx_at(backend: &Failing, height: u64, mode: BookMode, resident: Option<&mut ResidentBooks>) -> Ctx {
+fn ctx_at(
+    backend: &Failing,
+    height: u64,
+    mode: BookMode,
+    resident: Option<&mut ResidentBooks>,
+) -> Ctx {
     NativeExecContext::new_with_mode(
         backend.clone(),
         height,
@@ -173,7 +209,10 @@ fn stop(trader: u8) -> (Address, NativeAction) {
             is_buy: true,
             price: fp(121),
             quantity: fp(1),
-            order_type: OrderType::StopLimit { trigger: fp(120), limit: fp(121) },
+            order_type: OrderType::StopLimit {
+                trigger: fp(120),
+                limit: fp(121),
+            },
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
             client_order_id: None,
@@ -183,12 +222,23 @@ fn stop(trader: u8) -> (Address, NativeAction) {
 
 /// Block 1 in `mode`: traders 1..=3 funded, a bid (trader 1) and an ask
 /// (trader 2) rest on market 1, plus `extra`. Nothing saved yet.
-fn block1(backend: &Failing, mode: BookMode, resident: Option<&mut ResidentBooks>, extra: &[(Address, NativeAction)]) -> Ctx {
+fn block1(
+    backend: &Failing,
+    mode: BookMode,
+    resident: Option<&mut ResidentBooks>,
+    extra: &[(Address, NativeAction)],
+) -> Ctx {
     let mut ctx = ctx_at(backend, 1, mode, resident);
     assert_eq!(ctx.take_fatal_error(), None, "{mode:?}: clean load");
     for t in 1..=3 {
         ctx.positions
-            .put_native_balance(&addr(t), &NativeBalance { available: fp(1_000_000), order_margin: FixedPoint::ZERO })
+            .put_native_balance(
+                &addr(t),
+                &NativeBalance {
+                    available: fp(1_000_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
             .unwrap();
     }
     let mut actions = vec![gtc(1, true, 99, 2), gtc(2, false, 101, 3)];
@@ -214,7 +264,10 @@ fn seeded(mode: BookMode) -> (tempfile::TempDir, StateDb, Failing) {
 #[track_caller]
 fn assert_injected(reason: Option<String>, step: &str, what: &str) {
     let reason = reason.unwrap_or_else(|| panic!("{what}: must fail-stop"));
-    assert!(reason.starts_with(step), "{what}: recorded by {step}: {reason}");
+    assert!(
+        reason.starts_with(step),
+        "{what}: recorded by {step}: {reason}"
+    );
     assert!(reason.contains(INJECTED), "{what}: {reason}");
 }
 
@@ -242,7 +295,11 @@ fn r02_book_mode_marker_read_fault_fail_stops() {
         backend.arm_read(CF_NATIVE_MARKETS, MODE_MARKER_KEY);
         let mut ctx = ctx_at(&backend, 2, mode, None);
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
-        assert_injected(ctx.take_fatal_error(), "book load: book-mode marker read", &format!("{mode:?}"));
+        assert_injected(
+            ctx.take_fatal_error(),
+            "book load: book-mode marker read",
+            &format!("{mode:?}"),
+        );
     }
 }
 
@@ -284,7 +341,8 @@ fn r02_load_without_fault_unchanged() {
 fn r02_load_decode_policies_unchanged() {
     // Undecodable classic blob: the market has no book.
     let (_d, db, backend) = seeded(BookMode::Classic);
-    db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &M.to_be_bytes(), b"garbage").unwrap();
+    db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &M.to_be_bytes(), b"garbage")
+        .unwrap();
     let mut ctx = ctx_at(&backend, 2, BookMode::Classic, None);
     assert_eq!(ctx.take_fatal_error(), None, "undecodable blob: skipped");
     assert_eq!(ctx.resting_order_count(), 0);
@@ -293,8 +351,10 @@ fn r02_load_decode_policies_unchanged() {
     // Wrong-length marker / counter rows read as absent.
     for mode in MODES {
         let (_d, db, backend) = seeded(mode);
-        db.put_cf_raw(CF_NATIVE_MARKETS, MODE_MARKER_KEY, b"xx").unwrap();
-        db.put_cf_raw(CF_NATIVE_MARKETS, NEXT_ID_KEY, b"short").unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, MODE_MARKER_KEY, b"xx")
+            .unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, NEXT_ID_KEY, b"short")
+            .unwrap();
         let mut ctx = ctx_at(&backend, 2, mode, None);
         assert_eq!(ctx.take_fatal_error(), None, "{mode:?}");
         assert_eq!(ctx.next_global_order_id, 3, "{mode:?}: book-maxima scan");
@@ -325,8 +385,15 @@ fn r02_resident_applied_marker_read_fault_rebuilds() {
         backend.arm_read(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT);
         let mut ctx = ctx_at(&backend, 2, mode, Some(&mut holder));
         assert!(backend.hits() > 0, "{mode:?}: fault injected");
-        assert!(!ctx.resident_reused(), "{mode:?}: stale -> rebuilt from persisted state");
-        assert_eq!(ctx.take_fatal_error(), None, "{mode:?}: the rebuild read the DB fine");
+        assert!(
+            !ctx.resident_reused(),
+            "{mode:?}: stale -> rebuilt from persisted state"
+        );
+        assert_eq!(
+            ctx.take_fatal_error(),
+            None,
+            "{mode:?}: the rebuild read the DB fine"
+        );
         assert_eq!(ctx.resting_order_count(), 2, "{mode:?}");
     }
 }
@@ -344,7 +411,12 @@ fn r02_resident_applied_marker_without_fault_unchanged() {
 
         let (_d2, db2, backend2) = open();
         let mut holder = resident_block1(&backend2, mode);
-        db2.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &7u64.to_be_bytes()).unwrap();
+        db2.put_cf_raw(
+            CF_CONSENSUS_META,
+            META_NATIVE_APPLIED_HEIGHT,
+            &7u64.to_be_bytes(),
+        )
+        .unwrap();
         let ctx = ctx_at(&backend2, 2, mode, Some(&mut holder));
         assert!(!ctx.resident_reused(), "{mode:?}: marker mismatch rebuilds");
         let _ = db;
@@ -356,7 +428,11 @@ fn r02_resident_applied_marker_without_fault_unchanged() {
 // ---------------------------------------------------------------------------
 
 /// Block 1 with `arm` applied right before the save; returns the fail-stop.
-fn save_with(mode: BookMode, extra: &[(Address, NativeAction)], arm: impl Fn(&Failing)) -> (Option<String>, usize) {
+fn save_with(
+    mode: BookMode,
+    extra: &[(Address, NativeAction)],
+    arm: impl Fn(&Failing),
+) -> (Option<String>, usize) {
     let (_d, _db, backend) = open();
     let mut ctx = block1(&backend, mode, None, extra);
     arm(&backend);
@@ -367,7 +443,9 @@ fn save_with(mode: BookMode, extra: &[(Address, NativeAction)], arm: impl Fn(&Fa
 /// Classic: the whole-book put fails. RED before R02: logged only.
 #[test]
 fn r02_classic_book_write_fault_fail_stops() {
-    let (fatal, hits) = save_with(BookMode::Classic, &[], |b| b.arm_write(CF_NATIVE_ORDER_BOOKS, Some(&M.to_be_bytes())));
+    let (fatal, hits) = save_with(BookMode::Classic, &[], |b| {
+        b.arm_write(CF_NATIVE_ORDER_BOOKS, Some(&M.to_be_bytes()))
+    });
     assert!(hits > 0, "fault injected");
     assert_injected(fatal, "book save", "classic");
 }
@@ -397,7 +475,9 @@ fn r02_node_local_order_row_write_fault_fail_stops() {
 #[test]
 fn r02_meta_row_write_fault_fail_stops() {
     for mode in ROW_MODES {
-        let (fatal, hits) = save_with(mode, &[], |b| b.arm_write(CF_NATIVE_ORDER_BOOKS, Some(&book_meta_key(M))));
+        let (fatal, hits) = save_with(mode, &[], |b| {
+            b.arm_write(CF_NATIVE_ORDER_BOOKS, Some(&book_meta_key(M)))
+        });
         assert!(hits > 0, "{mode:?}: fault injected");
         assert_injected(fatal, "book save", &format!("{mode:?}"));
     }
@@ -414,7 +494,9 @@ fn stop_prefix() -> Vec<u8> {
 #[test]
 fn r02_stop_rows_scan_fault_fail_stops() {
     for mode in ROW_MODES {
-        let (fatal, hits) = save_with(mode, &[], |b| b.arm_scan(CF_NATIVE_ORDER_BOOKS, Some(&stop_prefix())));
+        let (fatal, hits) = save_with(mode, &[], |b| {
+            b.arm_scan(CF_NATIVE_ORDER_BOOKS, Some(&stop_prefix()))
+        });
         assert!(hits > 0, "{mode:?}: fault injected");
         assert_injected(fatal, "book save", &format!("{mode:?}"));
     }
@@ -439,7 +521,9 @@ fn r02_stop_row_write_fault_fail_stops() {
 #[test]
 fn r02_next_order_id_write_fault_fail_stops() {
     for mode in MODES {
-        let (fatal, hits) = save_with(mode, &[], |b| b.arm_write(CF_NATIVE_MARKETS, Some(NEXT_ID_KEY)));
+        let (fatal, hits) = save_with(mode, &[], |b| {
+            b.arm_write(CF_NATIVE_MARKETS, Some(NEXT_ID_KEY))
+        });
         assert!(hits > 0, "{mode:?}: fault injected");
         assert_injected(fatal, "book save", &format!("{mode:?}"));
     }
@@ -449,7 +533,9 @@ fn r02_next_order_id_write_fault_fail_stops() {
 #[test]
 fn r02_book_mode_marker_write_fault_fail_stops() {
     for mode in MODES {
-        let (fatal, hits) = save_with(mode, &[], |b| b.arm_write(CF_NATIVE_MARKETS, Some(MODE_MARKER_KEY)));
+        let (fatal, hits) = save_with(mode, &[], |b| {
+            b.arm_write(CF_NATIVE_MARKETS, Some(MODE_MARKER_KEY))
+        });
         assert!(hits > 0, "{mode:?}: fault injected");
         assert_injected(fatal, "book save", &format!("{mode:?}"));
     }
@@ -464,9 +550,77 @@ fn r02_deferred_save_counter_and_marker_write_faults_fail_stop() {
             let (_d, _db, backend) = open();
             let mut ctx = block1(&backend, mode, None, &[]);
             backend.arm_write(CF_NATIVE_MARKETS, Some(key));
-            assert!(ctx.save_order_books_deferred().is_some(), "{mode:?}: deferred");
+            assert!(
+                ctx.save_order_books_deferred().is_some(),
+                "{mode:?}: deferred"
+            );
             assert!(backend.hits() > 0, "{mode:?}: fault injected");
-            assert_injected(ctx.take_fatal_error(), "book save", &format!("{mode:?} {key:?}"));
+            assert_injected(
+                ctx.take_fatal_error(),
+                "book save",
+                &format!("{mode:?} {key:?}"),
+            );
+        }
+    }
+}
+
+/// Deferred save (modes 2/3, pipelined): the flush worker's pass 2 (order
+/// rows, level rows, stop diff, meta) fails. Before R02 it returned a write
+/// count and logged; now the first failure is the `Err` (exec_pipeline maps
+/// it to a failed job: W fail-stops, nothing of the block lands). GREEN-only
+/// test: the `Result` return is the fix.
+#[test]
+fn r02_deferred_book_apply_write_fault_is_err() {
+    let arms: [(&str, fn(&Failing)); 4] = [
+        ("node-local order row", |b| {
+            b.arm_write(CF_BOOK_ORDER_ROWS, None)
+        }),
+        ("level row", |b| b.arm_write(CF_NATIVE_ORDER_BOOKS, None)),
+        ("stop rows scan", |b| {
+            b.arm_scan(CF_NATIVE_ORDER_BOOKS, Some(&stop_prefix()))
+        }),
+        ("meta row", |b| {
+            b.arm_write(CF_NATIVE_ORDER_BOOKS, Some(&book_meta_key(M)))
+        }),
+    ];
+    for mode in LEVEL_MODES {
+        for (what, arm) in arms {
+            let (_d, _db, backend) = open();
+            let mut ctx = block1(&backend, mode, None, &[]);
+            let save = ctx.save_order_books_deferred().expect("deferred");
+            assert_eq!(
+                ctx.take_fatal_error(),
+                None,
+                "{mode:?} {what}: exec-thread half clean"
+            );
+            arm(&backend);
+            let e = apply_deferred_book_save(&backend, None, save).expect_err(what);
+            assert!(backend.hits() > 0, "{mode:?} {what}: fault injected");
+            assert!(e.starts_with("book save"), "{mode:?} {what}: {e}");
+            assert!(e.contains(INJECTED), "{mode:?} {what}: {e}");
+        }
+    }
+}
+
+/// Control: the deferred apply without a fault writes what the serial save
+/// writes (same count, same rows).
+#[test]
+fn r02_deferred_book_apply_without_fault_unchanged() {
+    for mode in LEVEL_MODES {
+        let (_d, db_a, backend_a) = open();
+        let mut a = block1(&backend_a, mode, None, &[stop(1)]);
+        let serial = a.save_order_books();
+        let (_d2, db_b, backend_b) = open();
+        let mut b = block1(&backend_b, mode, None, &[stop(1)]);
+        let save = b.save_order_books_deferred().expect("deferred");
+        let deferred = apply_deferred_book_save(&backend_b, None, save).expect("no fault");
+        assert_eq!(serial, deferred, "{mode:?}: write count");
+        for cf in [CF_NATIVE_ORDER_BOOKS, CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS] {
+            assert_eq!(
+                db_a.iterate_cf(cf, None).unwrap(),
+                db_b.iterate_cf(cf, None).unwrap(),
+                "{mode:?} {cf}"
+            );
         }
     }
 }
@@ -484,7 +638,9 @@ fn r02_save_without_fault_unchanged() {
         assert_eq!(backend.hits(), 0);
         if mode != BookMode::Classic {
             assert_eq!(
-                db.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&stop_prefix())).unwrap().len(),
+                db.iterate_cf(CF_NATIVE_ORDER_BOOKS, Some(&stop_prefix()))
+                    .unwrap()
+                    .len(),
                 1,
                 "{mode:?}: the stop row"
             );

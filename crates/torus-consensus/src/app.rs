@@ -759,6 +759,10 @@ enum ReplayFault {
     /// error (`EvmError::Internal`), which keeps today's "logged, EVM section
     /// skipped" handling.
     EvmSectionError,
+    /// R02 branch 7: the block's book save latched a failed book write
+    /// (torus-bridge `r02_load_save_tests` shows every save write gets
+    /// there).
+    BookSave,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2866,6 +2870,26 @@ impl ExecutionContext {
             };
             if deferred_books.is_none() {
                 ctx.save_order_books();
+            }
+            #[cfg(test)]
+            if self.test_replay_fault == Some(ReplayFault::BookSave) {
+                ctx.fatal_error
+                    .get_or_insert_with(|| "book save: injected book write failure (test)".into());
+            }
+            // R02 branch 7: a failed book write (or the stop-row scan) of the
+            // save fail-stops exactly like the checks above: nothing flushed,
+            // the resident books not stashed (the next block rebuilds).
+            if let Some(reason) = ctx.take_fatal_error() {
+                tracing::error!(
+                    height,
+                    %reason,
+                    "FATAL: native book save failed — halting execution pipeline (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if header_folded {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
             }
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
@@ -20529,6 +20553,27 @@ mod crash_recovery_tests {
                 assert!(r02_nonce_consumed(db, &b));
             },
         );
+    }
+
+    /// R02 branch 7: the block's book save latched a failed book write
+    /// (torus-bridge `r02_load_save_tests` drives every save write there):
+    /// the block fail-stops (exec_failed, marker unchanged, nothing flushed)
+    /// and the restart's replay matches a run that never faulted. RED
+    /// before: no check after the save, the block flushed without its book
+    /// rows.
+    #[test]
+    fn r02_book_save_fault_fail_stops_block() {
+        let ms = block_time_ms(1);
+        let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::BookSave, &|db| {
+            assert!(r02_nonce_consumed(db, &a));
+            assert!(r02_nonce_consumed(db, &b));
+        });
     }
 
     /// R02 branch 3: an oracle aggregate row that does not decode on this

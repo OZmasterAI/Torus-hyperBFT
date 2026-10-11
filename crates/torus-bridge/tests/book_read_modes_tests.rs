@@ -444,7 +444,8 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
         );
         match ctx.save_order_books_deferred() {
             Some(save) => {
-                torus_bridge::native_executor::apply_deferred_book_save(&db, None, save);
+                torus_bridge::native_executor::apply_deferred_book_save(&db, None, save)
+                    .expect("deferred book save");
             }
             None => {
                 ctx.save_order_books();

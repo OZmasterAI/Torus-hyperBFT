@@ -403,15 +403,18 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             // block: E observes it on the serial save, W observes it here.
             // v2 action status: encoded here, off the exec thread, and put in
             // the same sidecar (a non-hashed, non-root CF: no root input).
-            let sidecar = (books.is_some() || action_status.is_some()).then(|| {
+            let sidecar = if books.is_some() || action_status.is_some() {
                 let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
                 if let Some(b) = books.take() {
                     let t = std::time::Instant::now();
+                    // R02 branch 7: a failed book write fails the job (W
+                    // latches the fail-stop; nothing of the block lands).
                     torus_bridge::native_executor::apply_deferred_book_save(
                         &overlay,
                         env.metrics.as_deref(),
                         b,
-                    );
+                    )
+                    .map_err(|e| JobError::Write(format!("deferred book save: {e}")))?;
                     if let Some(m) = &env.metrics {
                         m.exec_save_books_write_seconds
                             .observe(t.elapsed().as_secs_f64());
@@ -429,8 +432,10 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
                         tracing::error!(%e, height, "flush worker: failed to stage the action status record");
                     }
                 }
-                overlay.freeze(*height)
-            });
+                Some(overlay.freeze(*height))
+            } else {
+                None
+            };
             let flush_result = {
                 let mut trie_cache = env
                     .trie_cache

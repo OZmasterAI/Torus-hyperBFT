@@ -254,7 +254,7 @@ fn run_universe(mode: BookMode, leg: Leg, seed: u64) -> RunResult {
                      book_dumps: &mut Vec<Vec<(&'static str, Vec<u8>, Vec<u8>)>>| {
         let sidecar = save.map(|save| {
             let side_overlay = NativeStateOverlay::new(db.clone());
-            written.push(apply_deferred_book_save(&side_overlay, None, save));
+            written.push(apply_deferred_book_save(&side_overlay, None, save).expect("deferred book save"));
             side_overlay.freeze(height)
         });
         frozen
