@@ -20281,6 +20281,92 @@ mod crash_recovery_tests {
         }
     }
 
+    /// A-exception (owner s111): an undecodable CoreWriter queue row due in
+    /// block 2, between two valid lockbox deposits, does not stop the chain:
+    /// on three replicas (serial, pipelined, serial) block 2 applies, both
+    /// deposits are credited, every queue row is deleted (the bad one in the
+    /// same flush) and the running state hash and every CF are identical.
+    /// The failed result itself is asserted in torus-bridge
+    /// `corewriter_undecodable_tests.rs`.
+    #[test]
+    fn undecodable_core_writer_row_applies_identically_on_three_replicas() {
+        use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let credit = |n: i128| FixedPoint::from_raw(n * FixedPoint::SCALE);
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        let replica = |on: bool| {
+            let (_cfg, db) = make_test_config_and_db();
+            for (trader, amount) in [(0x5A, 7), (0x5B, 3)] {
+                if trader == 0x5B {
+                    // seq 1: present, not a QueuedAction.
+                    let mut key = 2u64.to_be_bytes().to_vec();
+                    key.extend_from_slice(&1u64.to_be_bytes());
+                    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[0xFF, 0x00, 0x01])
+                        .unwrap();
+                }
+                CoreWriterQueue::enqueue(
+                    &db,
+                    &QueuedAction {
+                        trader: Address::repeat_byte(trader),
+                        kind: QueuedActionKind::LockboxDeposit {
+                            amount: credit(amount),
+                        },
+                        block_queued: 1,
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            let ctx = pipeline_ctx(&db, on, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: no fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            for (trader, amount) in [(0x5A, 7), (0x5B, 3)] {
+                assert_eq!(
+                    pm.get_native_balance(&Address::repeat_byte(trader))
+                        .unwrap()
+                        .available,
+                    credit(amount),
+                    "on={on}: neighbour {trader:#x} credited"
+                );
+            }
+            assert!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None)
+                    .unwrap()
+                    .is_empty(),
+                "on={on}: every row deleted"
+            );
+            db
+        };
+        let dbs = [replica(false), replica(true), replica(false)];
+        let hash = torus_state::running_hash::read_running_hash(&dbs[0]);
+        assert_eq!(hash.map(|(h, _)| h), Some(2));
+        for db in &dbs[1..] {
+            assert_eq!(
+                torus_state::running_hash::read_running_hash(db),
+                hash,
+                "running state hash"
+            );
+            assert_dumps_equal(&dump_all_cfs(&dbs[0]), &dump_all_cfs(db), "replica");
+        }
+    }
+
     /// R02 branch 8 (B; owner s111): the CoreWriter due-check's queue read
     /// (`NativeExecutor::core_writer_due` -> `CoreWriterQueue::pending_count`)
     /// failing fail-stops the block, as the oracle / liquidation due-checks

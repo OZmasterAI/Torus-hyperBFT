@@ -11147,7 +11147,8 @@ impl NativeExecutor {
         let queued = CoreWriterQueue::drain(&ctx.state, ctx.block_height)?;
 
         let mut results = Vec::with_capacity(queued.len());
-        for qa in &queued {
+        for entry in &queued {
+            let Ok(qa) = entry else { continue };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
             // guards against bypass bugs).
