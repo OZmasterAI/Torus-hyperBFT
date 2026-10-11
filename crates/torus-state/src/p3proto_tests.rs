@@ -334,3 +334,29 @@ fn p3proto_merged_iter_orders_and_hides_tombstones_across_both_layers() {
     assert_eq!(db.get_cf_raw(CF_NATIVE_POSITIONS, b"e").unwrap(), None);
     assert_eq!(db.get_cf_raw(CF_NATIVE_POSITIONS, b"b").unwrap(), Some(b"fl".to_vec()));
 }
+
+/// Codex stop review: `iterate_cf` does not report range deletes, so a batch
+/// rebuilt from it dropped them (the startup trade-history wipe kept its rows).
+#[test]
+fn p3proto_range_deletes_survive_on_uncovered_and_covered_cfs() {
+    let (db, _d) = temp_db();
+    db.put_cf_raw(CF_NATIVE_TRADES, b"legacy", b"legacy").unwrap();
+    db.put_cf_raw(CF_NATIVE_POSITIONS, b"pos:old", b"db").unwrap();
+    db.enable_p3_proto(Mode::All, 100).unwrap();
+    // Uncovered CF (trades): the range delete lands.
+    let mut b = WriteBatch::default();
+    b.delete_range_cf(db.cf_handle(CF_NATIVE_TRADES).unwrap(), &[][..], &[0xFFu8; 64][..]);
+    db.write_with(b, &rocksdb::WriteOptions::default()).unwrap();
+    assert_eq!(db.get_cf_raw(CF_NATIVE_TRADES, b"legacy").unwrap(), None);
+    // Covered CF with a buffered row in the range: neither layer nor DB row survives.
+    flush_block(&db, 1);
+    db.put_cf_raw(CF_NATIVE_POSITIONS, b"pos:new", b"layer").unwrap();
+    let mut b = WriteBatch::default();
+    b.delete_range_cf(db.cf_handle(CF_NATIVE_POSITIONS).unwrap(), b"pos:".as_slice(), b"pos;".as_slice());
+    db.write(b).unwrap();
+    assert_eq!(db.get_cf_raw(CF_NATIVE_POSITIONS, b"pos:old").unwrap(), None);
+    assert_eq!(db.get_cf_raw(CF_NATIVE_POSITIONS, b"pos:new").unwrap(), None);
+    assert!(StateBackend::iterate_cf(&db, CF_NATIVE_POSITIONS, Some(b"pos:")).unwrap().is_empty());
+    // The layer was checkpointed first: block 1's marker is durable.
+    assert_eq!(applied_durable(&db), Some(1));
+}

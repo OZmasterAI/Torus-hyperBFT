@@ -297,6 +297,13 @@ impl Deferred {
         }
         let mut d = Decoder(Vec::with_capacity(batch.len()));
         batch.iterate_cf(&mut d);
+        if d.0.len() != batch.len() {
+            // `iterate_cf` reports puts / deletes / merges only: the batch
+            // also holds range deletes, which a rebuilt batch would drop.
+            return Err(StateError::InvalidData(
+                "p3proto: range delete in a per-block state batch (unsupported)".into(),
+            ));
+        }
         for (id, key, value) in d.0 {
             match self.cf_ids.get(&id) {
                 Some(&i) if self.covered[i] => staged.push((i, key, value)),
@@ -355,10 +362,37 @@ impl Deferred {
     /// into the layer, the rest written now. Returns `false` when the layer is
     /// closed (the caller writes everything itself).
     pub(crate) fn generic_write(&self, db: &StateDb, batch: &WriteBatch, opts: Option<&rocksdb::WriteOptions>) -> Result<bool, StateError> {
-        let _g = self.block.lock().unwrap();
+        let mut st = self.block.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let raw = |b: &WriteBatch| -> Result<(), StateError> {
+            // Write the caller's batch itself (exact bytes, range deletes kept).
+            let copy = WriteBatch::from_data(b.data());
+            match opts {
+                Some(o) => db.raw_write_opt(copy, o),
+                None => db.raw_write(copy),
+            }
+        };
+        let mut d = Decoder(Vec::with_capacity(batch.len()));
+        batch.iterate_cf(&mut d);
+        if d.0.len() != batch.len() {
+            // Range deletes (invisible to `iterate_cf`; e.g. the startup
+            // trade-history wipe): empty the layer first so no buffered row
+            // can shadow the deleted range, then write the batch as is.
+            self.checkpoint(db, &mut st, true)?;
+            raw(batch)?;
+            return Ok(true);
+        }
+        let covered_any = d
+            .0
+            .iter()
+            .any(|(id, _, _)| self.cf_ids.get(id).is_some_and(|&i| self.covered[i]));
+        if !covered_any {
+            raw(batch)?;
+            return Ok(true);
+        }
+        drop(d);
         let mut staged = Vec::new();
         let mut rest = WriteBatch::default();
         self.split(db, batch, &mut staged, &mut rest)?;
@@ -401,6 +435,11 @@ impl Deferred {
             let mut all = prefix;
             let mut d = Decoder(Vec::new());
             batch.iterate_cf(&mut d);
+            if d.0.len() != batch.len() {
+                return Err(StateError::InvalidData(
+                    "p3proto: range delete in a per-block state batch (unsupported)".into(),
+                ));
+            }
             for (i, k, v) in staged {
                 let cf = db.cf_handle(ALL_CF_NAMES[i])?;
                 match v {
