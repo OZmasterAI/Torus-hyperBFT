@@ -231,6 +231,26 @@ struct Shared {
     failed: AtomicBool,
     /// Highest height W has made durable (seeded from the marker at spawn).
     durable_height: AtomicU64,
+    /// Item 6 Phase 3 (task 1.3): the running-hash chain state W digests
+    /// from — `h(n-1)` in memory instead of a META read per block. Seeded
+    /// from META at spawn; reloaded from META after a serial barrier
+    /// (`chain_stale`), when E flushed blocks itself.
+    chain: Mutex<torus_state::running_hash::ChainMemo>,
+    /// Set by E at a barrier (W idle): the serial path is about to write
+    /// META directly, so W reloads `chain` before its next job.
+    chain_stale: AtomicBool,
+}
+
+impl Shared {
+    /// W's chain state for the next job (reloaded from META if a serial
+    /// barrier ran since the last job). Only called with W idle or on W.
+    fn chain_for_next(&self, db: &StateDb) -> std::sync::MutexGuard<'_, torus_state::running_hash::ChainMemo> {
+        let mut memo = self.chain.lock().unwrap();
+        if self.chain_stale.swap(false, Ordering::SeqCst) {
+            *memo = torus_state::running_hash::ChainMemo::load(db);
+        }
+        memo
+    }
 }
 
 /// `submit` error: W has failed (latched) or its thread is gone.
@@ -247,6 +267,8 @@ pub struct FlushWorker {
     /// Test gate (None in production); released on drop so a failing test
     /// that leaves W parked fails instead of hanging the join.
     gate: Option<Arc<WorkerGate>>,
+    /// The worker's DB (chain-state reload in [`Self::running_hash_prev`]).
+    db: StateDb,
 }
 
 /// Everything W needs to run a job; owned by the worker thread.
@@ -267,11 +289,14 @@ impl FlushWorker {
     /// construction (after boot replay — design §2.1 W.6).
     pub fn spawn(env: WorkerEnv, durable_height_seed: u64) -> Self {
         let (tx, rx) = sync_channel::<Job>(0);
+        let db = env.state_db.clone();
         let shared = Arc::new(Shared {
             outstanding: Mutex::new(0),
             idle: Condvar::new(),
             failed: AtomicBool::new(false),
             durable_height: AtomicU64::new(durable_height_seed),
+            chain: Mutex::new(torus_state::running_hash::ChainMemo::load(&db)),
+            chain_stale: AtomicBool::new(false),
         });
         let shared_w = shared.clone();
         let gate = env.gate.clone();
@@ -284,6 +309,7 @@ impl FlushWorker {
             handle: Some(handle),
             shared,
             gate,
+            db,
         }
     }
 
@@ -333,7 +359,14 @@ impl FlushWorker {
     /// Item 6 Phase 3: W's in-memory `(height, h_height)` of the last hashed
     /// block (what the next digest chains from).
     pub fn running_hash_prev(&self) -> Option<(u64, [u8; 32])> {
-        None
+        self.shared.chain_for_next(&self.db).prev()
+    }
+
+    /// Called by E at a barrier, after `wait_idle`: the serial path writes
+    /// META itself from here, so W reloads its chain state before its next
+    /// job.
+    pub fn mark_chain_stale(&self) {
+        self.shared.chain_stale.store(true, Ordering::SeqCst);
     }
 
     /// Jobs handed off and not yet durable (what `torus_flush_worker_depth`
@@ -384,7 +417,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if env.exec_failed.load(Ordering::SeqCst) {
                 return Err(JobError::Write("fail-stop latched — refusing to write".into()));
             }
-            run_job(&env, &mut job)
+            run_job(&env, &shared, &mut job)
         }));
         let wall = timer.elapsed().as_secs_f64();
         if let Some(m) = &env.metrics {
@@ -446,7 +479,8 @@ enum JobError {
     TrieStale(String),
 }
 
-fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
+fn run_job(env: &WorkerEnv, shared: &Shared, job: &mut Job) -> Result<(), JobError> {
+    let mut chain = shared.chain_for_next(&env.state_db);
     match job {
         Job::Marker { height, pending } => {
             // Exactly today's `write_native_applied_height` bytes, sequenced
@@ -454,7 +488,7 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             // through the frozen 1-key set so the bytes are the SAME object the
             // exec thread layered under the next overlay.
             pending
-                .flush_with_native_trie_stats(&env.state_db, Some(*height), None, None)
+                .flush_on_worker(None, &env.state_db, Some(*height), None, None, Some(&mut chain))
                 .map(|_| ())
                 .map_err(|e| JobError::Write(e.to_string()))
         }
@@ -530,12 +564,13 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
                 } else {
                     None
                 };
-                pending.flush_with_sidecar_native_trie_stats(
+                pending.flush_on_worker(
                     sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
                     cache_opt,
                     member_opt,
+                    Some(&mut chain),
                 )
             };
             match flush_result {

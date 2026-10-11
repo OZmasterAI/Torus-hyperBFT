@@ -1049,6 +1049,7 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            None,
         )
     }
 
@@ -1069,7 +1070,24 @@ impl FrozenPending {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
-        flush_pending_with_native_trie_stats(
+        self.flush_on_worker(sidecar, target, applied_height, trie_cache, member_cache, None)
+    }
+
+    /// Item 6 Phase 3: [`Self::flush_with_sidecar_native_trie_stats`] for the
+    /// flush worker, chaining the running hash from `memo` (W's in-memory
+    /// chain state) instead of META, and advancing `memo` once the batch is
+    /// durable. `memo: None` is exactly the sidecar flush. Same batch bytes.
+    pub fn flush_on_worker(
+        &self,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+        memo: Option<&mut crate::running_hash::ChainMemo>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_after_batch(
+            WriteBatch::default(),
             &self.state,
             sidecar.map(|s| &s.state),
             target,
@@ -1077,6 +1095,7 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            memo,
         )
     }
 }
@@ -1501,6 +1520,7 @@ impl NativeStateOverlay {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            None,
         )
     }
 }
@@ -1554,7 +1574,9 @@ fn block_digest(
 
 /// The one flush implementation, over a borrowed pending set: shared by the live
 /// overlay (serial path, read guard held by the caller) and by [`FrozenPending`]
-/// (flush worker). Byte-identical batch content either way.
+/// (flush worker). Byte-identical batch content either way. Production goes
+/// through [`flush_pending_after_batch`] directly; the tests use this form.
+#[cfg(test)]
 fn flush_pending_with_native_trie_stats(
     state: &PendingState,
     sidecar: Option<&PendingState>,
@@ -1573,6 +1595,7 @@ fn flush_pending_with_native_trie_stats(
         trie_cache,
         member_cache,
         maintain_trie,
+        None,
     )
 }
 
@@ -1588,7 +1611,9 @@ fn flush_pending_after_batch(
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     maintain_trie: bool,
+    memo: Option<&mut crate::running_hash::ChainMemo>,
 ) -> Result<NativeFlushStats, StateError> {
+    let mut memo = memo;
     std::thread::scope(|scope| {
         let raw = target.inner();
 
@@ -1601,7 +1626,15 @@ fn flush_pending_after_batch(
         // the SAME batch as the applied-height marker.
         // Chain-wide activation + validity (review findings 1 / 5): digest
         // only when this height extends a valid chain.
-        let step = applied_height.map(|h| (h, crate::running_hash::chain_step(target, h)));
+        // Item 6 Phase 3: the flush worker passes its in-memory chain state
+        // (`memo`); the serial path reads META as before.
+        let step = applied_height.map(|h| {
+            let step = match memo.as_deref() {
+                Some(m) => m.step(h),
+                None => crate::running_hash::chain_step(target, h),
+            };
+            (h, step)
+        });
         let hashing = matches!(
             step,
             Some((_, crate::running_hash::ChainStep::Start | crate::running_hash::ChainStep::Continue(_)))
@@ -1753,6 +1786,7 @@ fn flush_pending_after_batch(
 
         // Running state hash: join the digest and append h_n (+ checkpoint),
         // or the unverified marker, to the batch.
+        let mut chain_advance = None;
         if let Some((height, step)) = step {
             let hash = match digest_job {
                 Some(job) => {
@@ -1776,6 +1810,7 @@ fn flush_pending_after_batch(
                 None => None,
             };
             crate::running_hash::append_to_batch(target, &mut batch, height, step, hash.as_ref())?;
+            chain_advance = Some((height, step, hash));
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were
@@ -1790,6 +1825,10 @@ fn flush_pending_after_batch(
 
         match write_result {
             Ok(()) => {
+                // Batch durable: the in-memory chain state follows it.
+                if let (Some(m), Some((h, step, hash))) = (memo.as_deref_mut(), chain_advance) {
+                    m.advance(h, step, hash.as_ref());
+                }
                 // Batch durable: fold the committed changes into the caches. A
                 // trie-maintenance ERROR left the persisted trie stale — the
                 // images must not pretend otherwise (invalidate both, which

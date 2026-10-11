@@ -370,6 +370,86 @@ pub(crate) fn chain_step(db: &StateDb, height: u64) -> ChainStep {
     }
 }
 
+/// Item 6 Phase 3: the running-hash chain state [`chain_step`] reads from
+/// META, held in memory by the flush worker W so its digests chain from the
+/// previous block without a META read (and, with a checkpoint interval,
+/// across blocks whose rows are not durable yet). Loaded from META at W's
+/// spawn and after every serial barrier; advanced after each durable batch
+/// exactly as [`append_to_batch`] changes the rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainMemo {
+    configured: Option<u64>,
+    start: Option<u64>,
+    unverified: Option<u64>,
+    prev: Option<(u64, [u8; 32])>,
+}
+
+impl ChainMemo {
+    /// The chain state as stored in `db` (the reads [`chain_step`] does).
+    pub fn load(db: &StateDb) -> Self {
+        Self {
+            configured: read_configured_activation(db),
+            start: read_activation_height(db),
+            unverified: read_unverified_since(db),
+            prev: read_running_hash(db),
+        }
+    }
+
+    /// `(height, h_height)` of the last hashed block (= [`read_running_hash`]
+    /// once every advanced batch is durable).
+    pub fn prev(&self) -> Option<(u64, [u8; 32])> {
+        self.prev
+    }
+
+    /// [`chain_step`] over this memo instead of META. Same decisions.
+    pub(crate) fn step(&self, height: u64) -> ChainStep {
+        let Some(activation) = self.configured else {
+            return ChainStep::Off;
+        };
+        if height < activation {
+            return ChainStep::Off;
+        }
+        if height == activation {
+            return ChainStep::Start;
+        }
+        if self.unverified.is_some() {
+            return ChainStep::Unverified { first: false };
+        }
+        match self.prev {
+            Some((stored, hash)) if self.start == Some(activation) && stored + 1 == height => {
+                ChainStep::Continue(hash)
+            }
+            stored => {
+                tracing::error!(
+                    height,
+                    activation,
+                    stored_height = ?stored.map(|(h, _)| h),
+                    stored_chain_start = ?self.start,
+                    "running state hash: no valid h(height-1) — node is HASH-UNVERIFIED from here on \
+                     (no hashes, checkpoints, attestations or fail-stop decisions)"
+                );
+                ChainStep::Unverified { first: true }
+            }
+        }
+    }
+
+    /// Apply what [`append_to_batch`] wrote for `height` (call once the batch
+    /// is durable).
+    pub(crate) fn advance(&mut self, height: u64, step: ChainStep, hash: Option<&[u8; 32]>) {
+        match (step, hash) {
+            (ChainStep::Unverified { first: true }, _) => self.unverified = Some(height),
+            (ChainStep::Start | ChainStep::Continue(_), Some(hash)) => {
+                if step == ChainStep::Start {
+                    self.unverified = None;
+                    self.start = Some(height);
+                }
+                self.prev = Some((height, *hash));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Append the flush's running-hash rows to its atomic batch: `h_height` (+
 /// activation record and stale-row cleanup on [`ChainStep::Start`],
 /// checkpoint and checkpoint pruning), or the unverified marker.

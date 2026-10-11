@@ -1810,6 +1810,8 @@ impl ExecutionContext {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
+        // The serial path writes META (running hash) itself from here.
+        worker.mark_chain_stale();
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
         true
