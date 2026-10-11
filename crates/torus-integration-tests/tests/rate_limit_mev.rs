@@ -199,7 +199,7 @@ fn core_writer_delay_enforced() {
         1,
         "action queued in block 10 must execute in block 11"
     );
-    assert_eq!(in_block_11[0].block_queued, 10);
+    assert_eq!(in_block_11[0].as_ref().unwrap().block_queued, 10);
 }
 
 #[test]

@@ -684,7 +684,7 @@ fn queue_enqueue_and_drain() {
     assert_eq!(CoreWriterQueue::pending_count(&db, 102).unwrap(), 0);
 
     // Drain block 101
-    let drained = CoreWriterQueue::drain(&db, 101).unwrap();
+    let drained = drain_ok(&db, 101);
     assert_eq!(drained.len(), 2);
 
     // Verify first action
@@ -724,12 +724,83 @@ fn queue_drain_correct_block_only() {
     CoreWriterQueue::enqueue(&db, &action_block_6).unwrap();
 
     // Drain block 5 only
-    let drained = CoreWriterQueue::drain(&db, 5).unwrap();
+    let drained = drain_ok(&db, 5);
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].trader, addr(1));
 
     // Block 6 still has its action
     assert_eq!(CoreWriterQueue::pending_count(&db, 6).unwrap(), 1);
+}
+
+/// Drain `block`, every row expected to decode.
+fn drain_ok(db: &StateDb, block: u64) -> Vec<QueuedAction> {
+    CoreWriterQueue::drain(db, block)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.expect("decodable queue row"))
+        .collect()
+}
+
+/// Queue key: target block (8 BE) ‖ sequence (8 BE).
+fn queue_key(block: u64, seq: u64) -> Vec<u8> {
+    let mut key = block.to_be_bytes().to_vec();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// A-exception (owner s111): an undecodable row in `CF_CORE_WRITER_QUEUE`
+/// is drained as an `Err` entry at its sequence position (never silently
+/// dropped), its valid neighbours keep their order, and every row of the
+/// block (the bad one included) is deleted. RED before: the drain skipped
+/// the row (2 entries) and deleted it without a trace.
+#[test]
+fn queue_drain_reports_an_undecodable_row_in_place_and_deletes_it() {
+    use torus_state::cf::CF_CORE_WRITER_QUEUE;
+    let (_dir, db) = setup();
+    let qa = |n: u8| QueuedAction {
+        trader: addr(n),
+        kind: QueuedActionKind::ClaimRewards,
+        block_queued: 6,
+    };
+    assert_eq!(CoreWriterQueue::enqueue(&db, &qa(1)).unwrap(), 0);
+    // seq 1: present, but not a QueuedAction (3 bytes < a 20-byte trader).
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(7, 1), &[0xFF, 0x00, 0x01])
+        .unwrap();
+    assert_eq!(CoreWriterQueue::enqueue(&db, &qa(3)).unwrap(), 2);
+    // A row of the next block is untouched.
+    CoreWriterQueue::enqueue(
+        &db,
+        &QueuedAction {
+            block_queued: 7,
+            ..qa(4)
+        },
+    )
+    .unwrap();
+
+    let drained = CoreWriterQueue::drain(&db, 7).unwrap();
+    assert_eq!(drained.len(), 3, "one entry per row: {drained:?}");
+    assert_eq!(drained[0].as_ref().unwrap().trader, addr(1));
+    let bad = drained[1].as_ref().expect_err("seq 1 does not decode");
+    assert_eq!(bad.key, queue_key(7, 1));
+    assert!(!bad.error.is_empty());
+    assert!(
+        bad.to_string()
+            .starts_with("undecodable queued action (block 7, seq 1): "),
+        "{bad}"
+    );
+    assert_eq!(drained[2].as_ref().unwrap().trader, addr(3));
+
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, 7).unwrap(),
+        0,
+        "all deleted"
+    );
+    assert_eq!(CoreWriterQueue::pending_count(&db, 8).unwrap(), 1);
+    // Deterministic: the same bytes give the same entry.
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(9, 0), &[0xFF, 0x00, 0x01])
+        .unwrap();
+    let again = CoreWriterQueue::drain(&db, 9).unwrap();
+    assert_eq!(again[0].as_ref().unwrap_err().error, bad.error);
 }
 
 // ============================================================================
@@ -830,7 +901,7 @@ fn lockbox_precompile_deposit() {
     assert_eq!(pm.get_native_balance(&trader).unwrap().available, FixedPoint::ZERO);
 
     // Native credit queued for the next block, dust floored away.
-    let queued = CoreWriterQueue::drain(&db, 101).unwrap();
+    let queued = drain_ok(&db, 101);
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].trader, trader);
     assert!(matches!(
@@ -913,7 +984,7 @@ fn lockbox_precompile_withdraw() {
     assert_eq!(get_evm_balance(&db, &trader), U256::ZERO);
 
     // ... the native debit / EVM credit is queued for the next block.
-    let queued = CoreWriterQueue::drain(&db, 101).unwrap();
+    let queued = drain_ok(&db, 101);
     assert_eq!(queued.len(), 1);
     assert!(matches!(
         queued[0].kind,

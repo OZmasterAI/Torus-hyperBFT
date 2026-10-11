@@ -1442,12 +1442,18 @@ impl CoreWriterQueue {
         Ok(seq)
     }
 
-    /// Drain all actions queued for the given block_number.
-    /// Returns the actions and deletes them from state.
+    /// Drain all rows queued for the given block_number, in key (sequence)
+    /// order, and delete them from state.
+    ///
+    /// A-exception (owner s111): one entry per row. A present row that does
+    /// not decode is an `Err(UndecodableQueuedAction)` entry at its position
+    /// (never silently dropped); the caller turns it into a failed result.
+    /// It is still deleted, in the same write as the drain. A storage fault
+    /// (the scan or a delete) is an `Err` of the whole call (fail-stop).
     pub fn drain(
         state: &impl StateBackend,
         block_number: u64,
-    ) -> Result<Vec<QueuedAction>, CoreError> {
+    ) -> Result<Vec<DrainedAction>, CoreError> {
         let prefix = block_number.to_be_bytes();
         let entries = state.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
 
@@ -1455,9 +1461,12 @@ impl CoreWriterQueue {
         let mut keys_to_delete = Vec::new();
 
         for (key, value) in &entries {
-            if let Ok(action) = QueuedAction::try_from_slice(value) {
-                actions.push(action);
-            }
+            actions.push(QueuedAction::try_from_slice(value).map_err(|e| {
+                UndecodableQueuedAction {
+                    key: key.clone(),
+                    error: e.to_string(),
+                }
+            }));
             keys_to_delete.push(key.clone());
         }
 
@@ -1517,6 +1526,40 @@ impl CoreWriterQueue {
 // ============================================================================
 // Queued Action Types
 // ============================================================================
+
+/// One drained queue row: the action, or why its row did not decode.
+pub type DrainedAction = Result<QueuedAction, UndecodableQueuedAction>;
+
+/// A-exception (owner s111): a `CF_CORE_WRITER_QUEUE` row that was present
+/// but did not decode as a [`QueuedAction`]. Deterministic (a pure function
+/// of the row's bytes), so every validator reports the same failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndecodableQueuedAction {
+    /// The row's key: target block (8 BE) ‖ sequence (8 BE).
+    pub key: Vec<u8>,
+    /// The decode error.
+    pub error: String,
+}
+
+impl std::fmt::Display for UndecodableQueuedAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match <[u8; 16]>::try_from(self.key.as_slice()) {
+            Ok(k) => write!(
+                f,
+                "undecodable queued action (block {}, seq {}): {}",
+                u64::from_be_bytes(k[..8].try_into().expect("8 bytes")),
+                u64::from_be_bytes(k[8..].try_into().expect("8 bytes")),
+                self.error
+            ),
+            Err(_) => write!(
+                f,
+                "undecodable queued action (key 0x{}): {}",
+                alloy_primitives::hex::encode(&self.key),
+                self.error
+            ),
+        }
+    }
+}
 
 /// A CoreWriter action queued for delayed execution.
 #[derive(Clone, Debug)]
