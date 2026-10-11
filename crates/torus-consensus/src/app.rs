@@ -2070,19 +2070,28 @@ impl ExecutionContext {
         }
         let since = *st.since.get_or_insert_with(std::time::Instant::now);
         let fold = prev.filter(|p| p.height() > st.base);
-        let bytes = st.layer.as_ref().map_or(0, |l| l.bytes()) as u64;
+        let current = current.filter(|c| c.height() == height);
+        // The byte cap counts what a checkpoint here would close: L (up to
+        // n-2 once settled) + the folded n-1 + n. Overlapping keys count
+        // twice, so this bounds the merged size from above: early, never late.
+        // Summed only with a cap set (it walks both blocks' sets on E).
+        let bytes = || {
+            (st.layer.as_ref().map_or(0, |l| l.bytes())
+                + fold.as_ref().map_or(0, |p| p.state_bytes())
+                + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
+        };
         let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
             || policy
                 .every_blocks
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
             || policy.interval.is_some_and(|iv| since.elapsed() >= iv)
-            || policy.max_bytes.is_some_and(|cap| bytes >= cap);
+            || policy.max_bytes.is_some_and(|cap| bytes() >= cap);
         if due {
             let mut layer = st.take_layer();
             if let Some(p) = &fold {
                 layer.merge(p);
             }
-            if let Some(c) = current.as_ref().filter(|c| c.height() == height) {
+            if let Some(c) = &current {
                 layer.merge(c);
             }
             return self.checkpoint_submit(&mut st, height, layer);
@@ -23086,6 +23095,47 @@ mod crash_recovery_tests {
             &dump_all_cfs(&db_ref),
             &dump_all_cfs(&db),
             "never vs per-block",
+        );
+    }
+
+    /// The byte cap counts the blocks a checkpoint at `n` would close (L +
+    /// the folded n-1 + n), not only L: with a 1-byte cap every block's own
+    /// rows (at least the applied marker) exceed it, so every block
+    /// checkpoints at its own height (durable marker == h after each block),
+    /// as with a per-block flush. Before the fix, L held only up to n-2 at
+    /// the check, so the cap fired two blocks late. Same dump as per block.
+    #[test]
+    fn checkpoint_byte_cap_counts_folded_blocks() {
+        let mut blocks: Vec<TorusBlock> = (1..=10).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let run = |policy: Option<crate::exec_pipeline::CheckpointPolicy>| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 1_000;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = policy;
+            ctx.attach_flush_worker(None);
+            let mut markers = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                markers.push(read_native_applied_height(&db));
+            }
+            drop(ctx);
+            (db, markers)
+        };
+        let cap = crate::exec_pipeline::CheckpointPolicy {
+            max_bytes: Some(1),
+            ..Default::default()
+        };
+        let (db, markers) = run(Some(cap));
+        let expected: Vec<Option<u64>> = (1..=10u64).map(Some).collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        let (db_ref, _) = run(None);
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "1-byte cap vs per-block",
         );
     }
 

@@ -976,6 +976,24 @@ impl FrozenPending {
         self.height
     }
 
+    /// Item 6 Phase 3: the set's state-row bytes in the checkpoint layer's
+    /// measure (key + value per write, key per tombstone; out-of-batch hash
+    /// extras excluded, as the layer excludes them). Merging this set into a
+    /// layer grows it by at most this much (the byte cap's estimate).
+    pub fn state_bytes(&self) -> usize {
+        self.state
+            .cfs
+            .iter()
+            .map(|c| {
+                c.writes
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>()
+                    + c.deletes.iter().map(Vec::len).sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
     /// CFs — exactly [`NativeStateOverlay::own_pending_delta`] taken just
     /// before [`NativeStateOverlay::freeze`] (freeze moves the pending set

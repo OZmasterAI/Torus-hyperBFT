@@ -449,4 +449,25 @@ mod tests {
         assert_eq!(l.entry_count(), 3);
         assert_eq!(l.top_height(), Some(6));
     }
+
+    /// `FrozenPending::state_bytes()` uses the layer's measure (an empty
+    /// layer merged with the block holds exactly that), and merging a block
+    /// never grows a layer by more than it: `L.bytes + block.state_bytes`
+    /// bounds the merged layer (the checkpoint byte cap's estimate).
+    #[test]
+    fn frozen_state_bytes_bound_the_merge() {
+        let (db, _dir) = temp_db();
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let mut model = Model::new();
+        let mut layer = CheckpointLayer::new();
+        for h in 1..=300u64 {
+            let frozen = frozen_block(&db, h, &mut rng, &mut model);
+            let mut alone = CheckpointLayer::new();
+            alone.merge(&frozen);
+            assert_eq!(alone.bytes(), frozen.state_bytes(), "h{h}: same measure");
+            let bound = layer.bytes() + frozen.state_bytes();
+            layer.merge(&frozen);
+            assert!(layer.bytes() <= bound, "h{h}: {} > {bound}", layer.bytes());
+        }
+    }
 }
