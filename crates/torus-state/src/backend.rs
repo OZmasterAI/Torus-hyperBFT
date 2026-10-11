@@ -1264,6 +1264,19 @@ impl NativeStateOverlay {
         ]
     }
 
+    /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
+    pub fn parent(&self) -> Option<&Arc<FrozenPending>> {
+        self.parent.as_ref()
+    }
+
+    /// Item 6 Phase 3: drop this overlay's handles on L and C (the end of the
+    /// block takes L back with `Arc::try_unwrap` to merge into it). Reads
+    /// through this overlay no longer see them; call after the hand-off.
+    pub fn detach_layers(&mut self) {
+        self.layer = None;
+        self.inflight = None;
+    }
+
     /// Height of the layered parent, if any (debug assertions / tests).
     pub fn parent_height(&self) -> Option<u64> {
         self.parent.as_ref().map(|p| p.height)

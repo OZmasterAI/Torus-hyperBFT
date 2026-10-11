@@ -76,6 +76,21 @@ impl CheckpointLayer {
         self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));
     }
 
+    /// A deep copy (the fallback when another handle on a shared layer is
+    /// still alive where the exec thread takes it back to merge into it).
+    pub fn duplicate(&self) -> Self {
+        let mut state = PendingState::new();
+        for (dst, src) in state.cfs.iter_mut().zip(self.state.cfs.iter()) {
+            dst.writes.clone_from(&src.writes);
+            dst.deletes.clone_from(&src.deletes);
+        }
+        Self {
+            state,
+            bytes: self.bytes,
+            top: self.top,
+        }
+    }
+
     /// Bytes held (key + value per write, key per tombstone).
     pub fn bytes(&self) -> usize {
         self.bytes

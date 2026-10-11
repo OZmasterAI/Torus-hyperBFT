@@ -66,6 +66,62 @@ fn refused_proposal() -> ProduceBlockResponse {
     }
 }
 
+/// Item 6 Phase 3: the exec thread's checkpoint bookkeeping (plan section
+/// 3). At the start of pipelined block n the overlay reads own pending -> R
+/// -> parent (frozen n-1) -> `layer` (L: S+1..=n-2, last value per key) ->
+/// `inflight` (C) -> DB, where S = `base` is the last checkpoint handed to
+/// W.
+#[derive(Default)]
+struct CkptState {
+    /// L. `None` = empty.
+    layer: Option<Arc<torus_state::CheckpointLayer>>,
+    /// The merge of the previous parent into L, running off E since the end
+    /// of the previous block; joined before L is read or taken.
+    merging: Option<std::thread::JoinHandle<torus_state::CheckpointLayer>>,
+    /// C: `(height, layer)` handed to W, dropped once W's durable height
+    /// reaches it.
+    inflight: Option<(u64, Arc<torus_state::CheckpointLayer>)>,
+    /// S: the height the last checkpoint closed (blocks at or below it are
+    /// never merged into L again).
+    base: u64,
+    /// When the current window started (armed at its first block).
+    since: Option<std::time::Instant>,
+    /// L was still shared when E took it back (deep copy instead).
+    shared_fallbacks: u64,
+}
+
+impl CkptState {
+    /// Join a running merge into L. `false`: the merge panicked — L is
+    /// lost, the caller must fail-stop.
+    fn settle(&mut self) -> bool {
+        let Some(handle) = self.merging.take() else {
+            return true;
+        };
+        match handle.join() {
+            Ok(layer) => {
+                self.layer = Some(Arc::new(layer));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Take L back as an owned layer (empty if none). Call after `settle`.
+    fn take_layer(&mut self) -> torus_state::CheckpointLayer {
+        match self.layer.take() {
+            None => torus_state::CheckpointLayer::new(),
+            Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|shared| {
+                self.shared_fallbacks += 1;
+                tracing::warn!(
+                    fallbacks = self.shared_fallbacks,
+                    "item 6 Phase 3: since-checkpoint layer still shared at the end of the block — copying it"
+                );
+                shared.duplicate()
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingSlash {
     validator: Address,
@@ -73,6 +129,12 @@ struct PendingSlash {
     reason: SlashReason,
     tombstone: bool,
 }
+
+/// Item 6 Phase 3: (L, C) under a pipelined overlay's parent.
+type CkptLayers = (
+    Option<Arc<torus_state::CheckpointLayer>>,
+    Option<Arc<torus_state::CheckpointLayer>>,
+);
 
 struct CommittedBlockMsg {
     torus_block: TorusBlock,
@@ -652,6 +714,10 @@ struct ExecutionContext {
     /// or 0, the default) = today's per-block `Job::Flush`, byte for byte.
     /// Read by `attach_flush_worker`; set before it.
     checkpoint: Option<crate::exec_pipeline::CheckpointPolicy>,
+    /// Item 6 Phase 3: E's since-checkpoint layer L, the checkpoint in
+    /// flight C and the window bookkeeping (E-only; the mutex is
+    /// uncontended). Unused while `checkpoint` is `None`.
+    ckpt: std::sync::Mutex<CkptState>,
     /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
     /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
     /// every native context in `mode` with the resident holder attached.
@@ -1707,6 +1773,21 @@ fn unix_now_secs() -> u64 {
 
 // ---- Execution pipeline ----
 
+/// Item 6 Phase 3: shutdown closes the open window into a final checkpoint
+/// before the flush worker (dropped with the fields) drains and joins. A
+/// latched fail-stop writes nothing (the restart replays from S).
+impl Drop for ExecutionContext {
+    fn drop(&mut self) {
+        if self.checkpoint.is_some()
+            && self.flush_worker.is_some()
+            && !self.exec_failed.load(Ordering::SeqCst)
+            && !self.pipeline_barrier()
+        {
+            tracing::error!("item 6 Phase 3: final checkpoint at shutdown failed (restart replays from the durable marker)");
+        }
+    }
+}
+
 impl ExecutionContext {
     /// Execute a committed block whose durable rows are NOT known to be on disk
     /// (boot crash-replay, tests): the exec-time header/body writes run, exactly
@@ -1792,7 +1873,17 @@ impl ExecutionContext {
             exec_failed: self.exec_failed.clone(),
             gate,
         };
-        self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn(env, applied));
+        self.flush_worker = Some(match self.checkpoint {
+            Some(policy) => {
+                tracing::info!(?policy, applied, "item 6 Phase 3: coalesced state checkpoints ON");
+                crate::exec_pipeline::FlushWorker::spawn_checkpointing(env, applied)
+            }
+            None => crate::exec_pipeline::FlushWorker::spawn(env, applied),
+        });
+        *self.ckpt.lock().unwrap() = CkptState {
+            base: applied,
+            ..Default::default()
+        };
         self.exec_applied.store(applied, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
@@ -1810,9 +1901,22 @@ impl ExecutionContext {
         let Some(worker) = &self.flush_worker else {
             return true;
         };
+        // Item 6 Phase 3: a barrier first closes the window (L + the last
+        // digested block) into a checkpoint, so after it everything handed
+        // to W is durable and the serial path runs on the DB as today.
+        if self.checkpoint.is_some() && !self.checkpoint_drain() {
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
         if !worker.wait_idle() {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
+        }
+        if self.checkpoint.is_some() {
+            let mut st = self.ckpt.lock().unwrap();
+            st.inflight = None;
+            st.since = None;
+            st.base = st.base.max(worker.durable_height());
         }
         // The serial path writes META (running hash) itself from here.
         worker.mark_chain_stale();
@@ -1835,6 +1939,49 @@ impl ExecutionContext {
             tracing::error!(height, "fail-stop latched mid-block — block not handed off");
             return false;
         }
+        // Item 6 Phase 3: with a checkpoint interval a block's rows are not
+        // written now: W digests it and keeps its side rows for the next
+        // checkpoint. Deferred book saves never reach here (task 1.2 refuses
+        // modes 2/3 with an interval); one would be a code bug: fail-stop.
+        let job = match (self.checkpoint.is_some(), job) {
+            (
+                true,
+                crate::exec_pipeline::Job::Flush {
+                    height,
+                    pending,
+                    evm_addrs,
+                    books,
+                    order_nonces,
+                    action_status,
+                },
+            ) => {
+                if books.is_some() {
+                    tracing::error!(
+                        height,
+                        "FATAL: deferred book save with a checkpoint interval — fail-stop"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                crate::exec_pipeline::Job::Digest {
+                    height,
+                    pending,
+                    evm_addrs,
+                    order_nonces,
+                    action_status,
+                }
+            }
+            (true, crate::exec_pipeline::Job::Marker { height, pending }) => {
+                crate::exec_pipeline::Job::Digest {
+                    height,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                }
+            }
+            (_, job) => job,
+        };
         let pending = match &job {
             crate::exec_pipeline::Job::Flush { pending, .. }
             | crate::exec_pipeline::Job::Marker { pending, .. }
@@ -1867,6 +2014,142 @@ impl ExecutionContext {
         *self.last_job.lock().unwrap() = Some(pending);
         self.last_job_books_deferred
             .store(books_deferred, Ordering::SeqCst);
+        true
+    }
+
+    /// Item 6 Phase 3: the layers the next pipelined overlay reads under its
+    /// parent: (L, C). Joins a running merge; drops C once durable.
+    /// `(None, None)` without a checkpoint interval. `Err`: the merge
+    /// panicked (fail-stop).
+    fn checkpoint_read_layers(&self) -> Result<CkptLayers, ()> {
+        let (Some(_), Some(worker)) = (&self.checkpoint, &self.flush_worker) else {
+            return Ok((None, None));
+        };
+        let mut st = self.ckpt.lock().unwrap();
+        if !st.settle() {
+            return Err(());
+        }
+        if st.inflight.as_ref().is_some_and(|(h, _)| worker.durable_height() >= *h) {
+            st.inflight = None;
+        }
+        Ok((st.layer.clone(), st.inflight.as_ref().map(|(_, c)| c.clone())))
+    }
+
+    /// Item 6 Phase 3: end-of-block upkeep after the hand-off of block
+    /// `height` (its frozen set is `last_job`). Folds the previous parent
+    /// (n-1) into L off E, or, when a trigger fires, closes L + n-1 + n into
+    /// a checkpoint at `height`. Triggers: attest height (`h % 100 == 0`),
+    /// the policy's interval / byte cap / block count. `false`: fail-stop
+    /// latched (the caller returns).
+    fn checkpoint_upkeep(&self, overlay: &mut NativeStateOverlay, height: u64) -> bool {
+        let Some(policy) = self.checkpoint else {
+            return true;
+        };
+        let prev = overlay.parent().cloned();
+        overlay.detach_layers();
+        let current = self.last_job.lock().unwrap().clone();
+        let mut st = self.ckpt.lock().unwrap();
+        if !st.settle() {
+            tracing::error!(height, "FATAL: since-checkpoint layer merge panicked — fail-stop");
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        let since = *st.since.get_or_insert_with(std::time::Instant::now);
+        let fold = prev.filter(|p| p.height() > st.base);
+        let bytes = st.layer.as_ref().map_or(0, |l| l.bytes()) as u64;
+        let due = height % torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL == 0
+            || policy
+                .every_blocks
+                .is_some_and(|n| height.saturating_sub(st.base) >= n)
+            || policy.interval.is_some_and(|iv| since.elapsed() >= iv)
+            || policy.max_bytes.is_some_and(|cap| bytes >= cap);
+        if due {
+            let mut layer = st.take_layer();
+            if let Some(p) = &fold {
+                layer.merge(p);
+            }
+            if let Some(c) = current.as_ref().filter(|c| c.height() == height) {
+                layer.merge(c);
+            }
+            return self.checkpoint_submit(&mut st, height, layer);
+        }
+        if let Some(p) = fold {
+            let mut layer = st.take_layer();
+            let spawned = std::thread::Builder::new()
+                .name("torus-ckpt-merge".into())
+                .spawn(move || {
+                    layer.merge(&p);
+                    layer
+                });
+            match spawned {
+                Ok(handle) => st.merging = Some(handle),
+                Err(e) => {
+                    // The layer moved into the failed closure: L is lost.
+                    tracing::error!(%e, height, "FATAL: since-checkpoint merge thread spawn failed — fail-stop");
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Item 6 Phase 3: close the open window at a barrier / shutdown: L +
+    /// the last digested block (`last_job`, if above S) into a checkpoint.
+    /// Nothing open: nothing to do. `false`: fail-stop.
+    fn checkpoint_drain(&self) -> bool {
+        let top = self.last_job.lock().unwrap().clone();
+        let mut st = self.ckpt.lock().unwrap();
+        if !st.settle() {
+            tracing::error!("FATAL: since-checkpoint layer merge panicked — fail-stop");
+            return false;
+        }
+        let Some(top) = top.filter(|t| t.height() > st.base) else {
+            debug_assert!(st.layer.as_ref().is_none_or(|l| l.is_empty()), "L open without a digested top");
+            return true;
+        };
+        let mut layer = st.take_layer();
+        layer.merge(&top);
+        self.checkpoint_submit(&mut st, top.height(), layer)
+    }
+
+    /// Hand checkpoint `height` to W (waits while the previous one is in
+    /// flight) and make it C. `false`: W failed (fail-stop latched).
+    fn checkpoint_submit(
+        &self,
+        st: &mut CkptState,
+        height: u64,
+        layer: torus_state::CheckpointLayer,
+    ) -> bool {
+        let Some(worker) = &self.flush_worker else {
+            return false;
+        };
+        let layer = Arc::new(layer);
+        let bytes = layer.bytes();
+        let job = crate::exec_pipeline::Job::Checkpoint {
+            height,
+            layer: layer.clone(),
+        };
+        let wait_timer = std::time::Instant::now();
+        let sent = worker.submit(job).is_ok();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_wait_seconds
+                .observe(wait_timer.elapsed().as_secs_f64());
+            m.exec_checkpoint_layer_bytes.observe(bytes as f64);
+            m.exec_checkpoints.inc();
+            m.exec_checkpoint_layer_shared.inc_by(std::mem::take(&mut st.shared_fallbacks));
+        }
+        if !sent {
+            tracing::error!(
+                height,
+                "FATAL: flush worker unavailable/failed at checkpoint hand-off — fail-stop (restart replays from the durable marker)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        st.inflight = Some((height, layer));
+        st.base = height;
+        st.since = Some(std::time::Instant::now());
         true
     }
 
@@ -2313,7 +2596,21 @@ impl ExecutionContext {
             "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
             parent.as_ref().map(|p| p.height())
         );
-        let mut overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        // Item 6 Phase 3: under the parent, L and C (checkpoint interval only).
+        let (layer, inflight) = if pipelined {
+            match self.checkpoint_read_layers() {
+                Ok(layers) => layers,
+                Err(()) => {
+                    tracing::error!(height, "FATAL: since-checkpoint layer merge panicked — fail-stop");
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let mut overlay =
+            NativeStateOverlay::with_layers(self.state_db.clone(), parent, layer, inflight);
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
@@ -3107,6 +3404,9 @@ impl ExecutionContext {
                 }) {
                     return;
                 }
+                if !self.checkpoint_upkeep(&mut overlay, height) {
+                    return;
+                }
                 resident_ok = true;
             } else {
             if let Some(status) = &action_status {
@@ -3430,6 +3730,9 @@ impl ExecutionContext {
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                    return;
+                }
+                if !self.checkpoint_upkeep(&mut overlay, height) {
                     return;
                 }
             } else if let Some(prefix) = evm_batch.take() {
@@ -4573,6 +4876,7 @@ impl TorusApp {
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
+            ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -4675,6 +4979,11 @@ impl TorusApp {
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.checkpoint = crate::exec_pipeline::CheckpointPolicy::from_env();
             exec_ctx.attach_flush_worker(None);
+        } else if crate::exec_pipeline::checkpoint_interval().is_some() {
+            tracing::warn!(
+                "TORUS_CHECKPOINT_INTERVAL_MS is set but TORUS_EXEC_PIPELINE=0: checkpoints need \
+                 the flush worker; every block is written as today"
+            );
         }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
@@ -11644,6 +11953,7 @@ mod crash_recovery_tests {
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
+            ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -22636,6 +22946,11 @@ mod crash_recovery_tests {
             assert_eq!(run.metrics.exec_resident_rows_rebuilds.get(), 1, "{what}: R builds");
             assert_eq!(run.metrics.exec_resident_rebuilds.get(), 1, "{what}: book builds");
         }
+        // The layer is taken back unshared every block (no deep copies), and
+        // checkpoints ran (attest height 100; barriers 50 / 100; shutdown).
+        assert_eq!(never.metrics.exec_checkpoint_layer_shared.get(), 0);
+        assert!(never.metrics.exec_checkpoints.get() >= 2);
+        assert_eq!(per_block.metrics.exec_checkpoints.get(), 0);
     }
 
     #[test]

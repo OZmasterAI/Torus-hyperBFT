@@ -557,6 +557,9 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if matches!(job, Job::Flush { .. }) {
                 m.exec_flush_seconds.observe(wall);
             }
+            if ckpt {
+                m.flush_worker_checkpoint_seconds.observe(wall);
+            }
         }
         if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), Some(m), Job::Flush { order_nonces, .. }) =
             (&result, &env.metrics, &job)

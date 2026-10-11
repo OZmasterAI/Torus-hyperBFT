@@ -606,6 +606,21 @@ pub struct Metrics {
     /// serial binary; the bench harness waits for 0 on every node before
     /// taking the 3-validator determinism digest.
     pub flush_worker_depth: Gauge,
+    /// Item 6 Phase 3: checkpoints the exec thread handed to the flush
+    /// worker (0 without a checkpoint interval).
+    pub exec_checkpoints: Counter,
+    /// Item 6 Phase 3: time the exec thread blocked handing off a checkpoint
+    /// (waiting for the previous one to become durable), per checkpoint.
+    pub exec_checkpoint_wait_seconds: Histogram,
+    /// Item 6 Phase 3: since-checkpoint layer bytes (keys + values, a
+    /// tombstone counts its key) per checkpoint.
+    pub exec_checkpoint_layer_bytes: Histogram,
+    /// Item 6 Phase 3: the layer was still shared when the exec thread took
+    /// it back to merge (deep copy instead; expected 0).
+    pub exec_checkpoint_layer_shared: Counter,
+    /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
+    /// batch: build, root, write, EVM resync).
+    pub flush_worker_checkpoint_seconds: Histogram,
     /// s77 order latency: age `now - nonce` of every native action at each
     /// stage (see [`OrderStage`]). The bench stamps `nonce = now_ms` when it
     /// signs, so on the bench this is time since submission.
@@ -2173,6 +2188,37 @@ impl Metrics {
             flush_worker_depth.clone(),
         );
 
+        let exec_checkpoints = Counter::default();
+        registry.register(
+            "torus_exec_checkpoints",
+            "Item 6 Phase 3: state checkpoints handed to the flush worker (0 without a checkpoint interval)",
+            exec_checkpoints.clone(),
+        );
+        let exec_checkpoint_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_wait_seconds",
+            "Item 6 Phase 3: exec thread blocked handing off a checkpoint (previous one still in flight)",
+            exec_checkpoint_wait_seconds.clone(),
+        );
+        let exec_checkpoint_layer_bytes = Histogram::new(exponential_buckets(65_536.0, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_layer_bytes",
+            "Item 6 Phase 3: since-checkpoint layer bytes per checkpoint",
+            exec_checkpoint_layer_bytes.clone(),
+        );
+        let exec_checkpoint_layer_shared = Counter::default();
+        registry.register(
+            "torus_exec_checkpoint_layer_shared",
+            "Item 6 Phase 3: layer still shared at the end of a block (deep copy; expected 0)",
+            exec_checkpoint_layer_shared.clone(),
+        );
+        let flush_worker_checkpoint_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        registry.register(
+            "torus_flush_worker_checkpoint_seconds",
+            "Item 6 Phase 3: flush worker wall time per checkpoint job",
+            flush_worker_checkpoint_seconds.clone(),
+        );
+
         // s77 order latency: 5 ms .. ~11 min. Under overload an order can wait
         // well past the 60 s nonce window (s77 cell: exec queue pinned at 64
         // blocks, fills beyond 82 s), so the top bucket must not clip it.
@@ -2686,6 +2732,11 @@ impl Metrics {
             exec_handoff_wait_seconds,
             flush_worker_seconds,
             flush_worker_depth,
+            exec_checkpoints,
+            exec_checkpoint_wait_seconds,
+            exec_checkpoint_layer_bytes,
+            exec_checkpoint_layer_shared,
+            flush_worker_checkpoint_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
             order_age_exec_seconds,
@@ -3159,6 +3210,11 @@ mod tests {
             "torus_exec_handoff_wait_seconds",
             "torus_flush_worker_seconds",
             "torus_flush_worker_depth",
+            "torus_exec_checkpoints",
+            "torus_exec_checkpoint_wait_seconds",
+            "torus_exec_checkpoint_layer_bytes",
+            "torus_exec_checkpoint_layer_shared",
+            "torus_flush_worker_checkpoint_seconds",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
             "torus_exec_native_blocks",
