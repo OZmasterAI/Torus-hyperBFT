@@ -20315,7 +20315,12 @@ mod crash_recovery_tests {
             }
             self.0.get_cf_raw(cf, key)
         }
-        fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), torus_state::StateError> {
+        fn put_cf_raw(
+            &self,
+            cf: &str,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<(), torus_state::StateError> {
             self.0.put_cf_raw(cf, key, value)
         }
         fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::StateError> {
@@ -20380,9 +20385,15 @@ mod crash_recovery_tests {
 
         // Control: no read at height 1; a missing / truncated parent allows.
         let latch = AtomicBool::new(false);
-        let genesis =
-            alloy_primitives::keccak256(torus_bridge::genesis_parent_header().canonical_header_bytes());
-        assert!(!detect_parent_link_violation(&R02FailHeaders(db.clone()), 1, &genesis, &latch));
+        let genesis = alloy_primitives::keccak256(
+            torus_bridge::genesis_parent_header().canonical_header_bytes(),
+        );
+        assert!(!detect_parent_link_violation(
+            &R02FailHeaders(db.clone()),
+            1,
+            &genesis,
+            &latch
+        ));
         assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
         db.put_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes(), &[0u8; 8])
             .unwrap();

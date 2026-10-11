@@ -795,13 +795,22 @@ fn indexed_sort_matches_the_pre_cut_sort_and_maps_back() {
 fn core_writer_due_is_ok_per_height() {
     use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
     let (_dir, db) = open_test_db();
-    assert!(!NativeExecutor::core_writer_due(&db, 2).unwrap(), "empty queue");
+    assert!(
+        !NativeExecutor::core_writer_due(&db, 2).unwrap(),
+        "empty queue"
+    );
     let qa = QueuedAction {
         trader: addr(5),
         kind: QueuedActionKind::LockboxDeposit { amount: fp(7) },
         block_queued: 1,
     };
     CoreWriterQueue::enqueue(&db, &qa).unwrap();
-    assert!(NativeExecutor::core_writer_due(&db, 2).unwrap(), "queued for height 2");
-    assert!(!NativeExecutor::core_writer_due(&db, 3).unwrap(), "other heights not due");
+    assert!(
+        NativeExecutor::core_writer_due(&db, 2).unwrap(),
+        "queued for height 2"
+    );
+    assert!(
+        !NativeExecutor::core_writer_due(&db, 3).unwrap(),
+        "other heights not due"
+    );
 }
