@@ -4225,6 +4225,229 @@ the same data dir with the same env. No timing was scored (owner); the numbers a
 - Not measured: a disk per validator; production-like growth; matched/s of the warm-up cell. About 4
   more interleaved tw / twd pairs (~25 min) would bring the matched/s standard error near 1,500.
 
+## 41. Phase 3 step 0 sizing on tw: coalescing factor, layer size, restart budget, CPU ceiling (campaign ozarchy-p3s, 2026-10-11)
+
+**Owner decision needed before step 1.** The CPU ceiling as the plan defines it (flush worker +
+state-row memtable flush + state-row compaction, digest excluded) is 1.55 CPU-s/1M = **6.2%** of tw
+node CPU. That is above the ~5% stop rule and only 0.06 CPU-s/1M above the -6% gate (1.50). It counts
+all of that work as removed. Phase 3 still writes one checkpoint per window, and the measured
+coalescing factors (15 s: bytes 5.95x, keys 1.58x) scale the removable part to about **0.82 CPU-s/1M
+= 3.3%**, below 5% and below the gate (41.5). Disk (-83% state-row WAL bytes) and restart (41.4) pass.
+
+Owner request (via 18c, plan `item6-phase3-impl.md` step 0 plus three add-ons): on the owner-chosen
+baseline tw (`TORUS_TRADE_HISTORY=0` + `TORUS_ROCKSDB_MAX_TOTAL_WAL_MB=2048`; WAL compression and
+append-CF codec unset), measure (1) the coalescing factor per window (1 block, 5 s, 15 s, 30 s, 100
+blocks) per CF with Classic book blobs separate, and the disk-write gate; (2) the in-memory layer /
+checkpoint batch size per window, capped at 100 blocks; (3) the restart budget from serial replay
+speed against the <= 60 s gate; (4) the CPU ceiling on tw, with the per-block state-hash digest as its
+own line.
+
+Setup as section 40 (Classic, cap 8, 300 markets, standard shape, fresh genesis and data dir per
+cell, RocksDB `LOG` copied per cell). Node `fb460a0c` / bench `af556aec` built from main `fd9e5dfa`
+(stage `ozarchy-p3s-stage/n`); `fd9e5dfa` differs from the acc3 node (`fa8b646f`, `2ede76eb`) only in
+`crates/torus-bridge/src/native_executor.rs`. Cells 00:06-01:08 (driver `ozarchy-p3s-campaign.sh`,
+tables `ozarchy-p3s-run/handoff-tables.txt`, analysis scripts `ozarchy-p3s-tools/a-*.py` and
+`waldec/waldec.c`, outputs `ozarchy-p3s-run/analyst/`):
+- **tw-r1, tw-r2:** 120 s, no perf; tw-r1 keeps val0's WAL (118 files hard-linked as they appear,
+  `wal-val0-keep/`, 14.63 GB, no file missed).
+- **tw-old1:** same-day control on the acc3 node `2ede76eb` (bench `a33d82f5`), 120 s.
+- **tw-c1..c3:** 420 s, `SIGKILL` of val1 at bench + 60 / 180 / 300 s, restart on the same data dir
+  (9 restarts).
+- **tw-p1, tw-p2:** perf (`cycles:u` 499 Hz, val0 whole process, 45 s from bench + 35 s).
+
+All 8 cells AGREE (block hash and state digest equal on all 3 validators), 0 ERROR / panic lines,
+node md5 as staged in every cell, 6-7 hard checks OK each, knobs and `max_total_wal_size` 2048 MiB
+verified on every validator, 0 trade data rows. The 5 throughput / perf cells are rc 0, PASS, ACCEPT.
+The 3 crash cells end rc 2 / INVALID / REJECT: the crash gate's fail-stop pattern matches the INFO
+config line `running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` once per restart (the
+only match; sections 39.3 / 40.3), so this is not a node fault. tw-c2 kill 3 also reads "rewind 9 blocks
+beyond the exec queue (max 2)": 41 blocks rewound against an exec queue of 32 sampled just before the
+kill. That is a harness heuristic; the digests agree. No cell is excluded.
+
+Throughput and CPU match the acc3 reference: node CPU-s/1M (val0-2 `proc_cpu`, whole run, as
+section 40) tw-r1 / tw-r2 24.90 / 24.94, tw-old1 24.84, acc3 tw 24.93 (sd 0.07); matched/s 202,804
+/ 204,384, tw-old1 206,283, acc3 tw 203,992 (sd 1,144). The `fd9e5dfa` vs `2ede76eb` difference is
+not resolved on either metric. **The -6% gate is taken against section 40's tw 24.93 (-> 23.43, a
+step of 1.50)**; the same-day control (24.84 -> 1.49) gives the same answer.
+
+### 41.1 Coalescing factor (tw-r1, val0 WAL)
+
+Method. A RocksDB WAL decoder (`waldec.c`, C; `ldb` is not installed) read all 118 kept WAL files:
+237,376 WAL records, 17,680,190 entries, 0 CRC errors, every record's entry count equal to its header,
+sequence numbers continuous from 1 to 17,680,190 across all files (no file or record missing). Each
+block's state batch carries `cf_consensus_meta/native_applied_height` = h. 2,518 records carry it,
+heights 1-2,518 consecutive, one per `execution pipeline: block done` line in `val0.log.gz`. Other
+records (bodies, headers, commit manifest, DA `cf_native_pending`, hotstuff meta) are assigned to the
+last state batch before them. Windows run on execution time (`block done` timestamps), tumbling from
+`t_bench0`, complete windows of the load window only (heights 374-1,143, 770 blocks). The "plan"
+windows follow the plan's trigger: checkpoint at the end of block n when the window's execution time
+reaches the interval or n % 100 == 0, i.e. min(window, 100 blocks). Bytes = key + value, a delete
+counts its key; last-value = the last write of each distinct (CF, key) in the window; factor =
+written / last-value. Phase 3 coalesces state rows only, so the factors below are for the state
+batches (65% of val0's WAL bytes in the load window: 9,130 of 14,011 MB).
+
+| window | windows | blocks / window | state keys written -> distinct (factor) | state bytes written -> last (factor) | book blobs | positions | balances | oracle | nonces | state excl. books | all WAL bytes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 block | 770 | 1 | 16.11M -> 16.11M (1.00) | 9,130 -> 9,130 MB (1.00) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.02 |
+| 5 s | 24 | 31.5 | 15.84M -> 12.15M (1.30) | 8,995 -> 2,038 MB (4.41) | 18.3 | 1.23 | 4.95 | 6.32 | 1.00 | 1.25 | 2.39 |
+| 15 s | 8 | 94.6 | 15.84M -> 10.06M (1.57) | 8,995 -> 1,563 MB (**5.75**) | 37.2 | 1.48 | 9.13 | 19.0 | 1.00 | 1.51 | 2.71 |
+| 30 s | 4 | 189.2 | 15.84M -> 6.04M (2.62) | 8,995 -> 905 MB (9.93) | 83.5 | 2.48 | 18.0 | 37.9 | 1.00 | 2.53 | 3.11 |
+| 100 blocks (h / 100) | 7 | 100 | 13.74M -> 8.38M (1.64) | 8,002 -> 1,255 MB (6.38) | 56.9 | 1.54 | 9.04 | 20.0 | 1.00 | 1.57 | 2.86 |
+| plan 15 s = min(15 s, 100 blocks) | 9 | 77.8 | 13.69M -> 8.65M (1.58) | 7,966 -> 1,338 MB (**5.95**) | 39.7 | 1.49 | 8.09 | 19.1 | 1.00 | 1.52 | 2.79 |
+| plan 30 s = min(30 s, 100 blocks) | 7 | 100 | 13.69M -> 8.36M (1.64) | 7,966 -> 1,256 MB (**6.34**) | 54.7 | 1.54 | 9.02 | 19.9 | 1.00 | 1.57 | 2.85 |
+
+- **Book blobs carry the byte factor.** `cf_native_order_books` (Classic, one ~44 KB blob per market,
+  ~199 written per block) is 77% of the state bytes (7,016 of 9,130 MB) and coalesces 37-83x; at most
+  300 distinct keys per window.
+- **Positions carry the key count.** `cf_native_positions` (139 B per entry) is 92% of the state
+  entries (14.8M of 16.1M) and 23% of the bytes, and coalesces only 1.48x at 15 s and 1.54x at 100
+  blocks. So the state key factor stays at 1.57-1.64.
+- Nonces never coalesce (a new key per action). Balances 8-9x and oracle ~19x at 15 s / 100 blocks.
+  Markets, liquidation and meta coalesce 10-100x but are < 0.2 MB per window.
+- **The 100-block cap binds at 30 s.** At tw's 6.33 native blocks/s (tw-r1 / tw-r2), 15 s is ~95
+  blocks, so the cap barely changes 15 s (5.75 -> 5.95). 30 s is ~190 blocks, so the capped 30 s
+  window is the 100-block window (6.34, vs 9.93 uncapped). The plan's "~23 s per 100 blocks" assumed
+  4.3 blocks/s; on tw 100 blocks is ~15.8 s.
+- **Disk-write gate** (plan step 4: state-row bytes written down by the factor): val0 state-row WAL
+  writes 74.8 MB/s in the load window (9,130 MB / 122 s) -> 12.6 MB/s at plan 15 s (/ 5.95), 11.8 MB/s
+  at plan 30 s (/ 6.34), a cut of 83-84%. All WAL writes 115.4 MB/s -> 53.2 / 52.4 MB/s (-54% /
+  -55%). Bodies, DA (`cf_native_pending`, 3,085 MB, 1.7x within a window) and headers are not in
+  Phase 3. Memtable flush and compaction of the state CFs fall too (41.5).
+- One cell, one validator, one load shape. The state batches are consensus writes, identical on every
+  validator. RocksDB's group commit merged a few small non-state records into state records (0.3 MB of
+  `cf_native_pending` counted as state, 0.003%).
+
+### 41.2 In-memory layer and checkpoint batch (state last-value bytes per window, tw-r1 val0)
+
+| window | peak MB | mean MB | min MB | peak distinct keys | written per window, peak MB |
+|---|---|---|---|---|---|
+| 1 block | 51.0 | 11.9 | 0.0 | 92k | 51.0 |
+| 5 s | 125.6 | 84.9 | 54.5 | 617k | 574 |
+| 15 s | **216.5** | 195.4 | 177.3 | 1.36M | 1,342 |
+| 30 s (uncapped) | **235.1** | 226.4 | 217.9 | 1.52M | 2,619 |
+| 100 blocks | **218.3** | 179.2 | 138.6 | 1.38M | 1,441 |
+| plan 15 s = min(15 s, 100 blocks) | **213.9** | 148.7 | 44.2 | 1.37M | 1,332 |
+| plan 30 s = min(30 s, 100 blocks) | **219.4** | 179.4 | 138.6 | 1.39M | 1,468 |
+
+- Layer L and one checkpoint batch are ~214-219 MB of key + value at the peak with the 100-block
+  cap; positions are ~185 MB of it, book blobs up to ~41 MB. Uncapped 30 s adds only ~16 MB, because
+  the set of touched keys saturates.
+- These are payload bytes. Per-entry map and allocation overhead for ~1.4M keys is not in them.
+  **(estimate)** ~100-150 B per key adds ~140-210 MB per layer, and C (one checkpoint in flight) can
+  hold a second copy. Size the plan's RAM gate ("layer-size figure + 25%") against the step 4 RSS,
+  not against 214 MB alone.
+
+### 41.3 Restart today on tw (9 kills of val1, n = 3 cells)
+
+Markers from val1's restart tails (`crash-restart-tail{,-2,-3}.log`), times from `crash-kill*.json`.
+DB open = `loaded node key` -> `state database opened`. Replay = WARN `execution gap detected,
+replaying ... gap=G` -> INFO `exec pipeline ENABLED ... after replay applied=H`. **The replay end is an
+inference** (no replay-complete line in `fd9e5dfa`). It is backed in every kill: `applied=` equals the
+committed height, every replayed height has a `block done` line with `pipelined=false` (serial), and the
+last one comes 0-6 ms before the ENABLED line. First commit = first `on_committed_block: sending to
+execution pipeline` (height H + 1).
+
+| cell | kill | committed / applied / gap | DB open s | replay s | blocks/s | 1st replayed block s | restart -> first commit s |
+|---|---|---|---|---|---|---|---|
+| tw-c1 | 1 | 764 / 698 / 66 | 2.38 | 8.51 | 7.76 | 2.45 | 11.87 |
+| tw-c1 | 2 | 1748 / 1687 / 61 | 2.08 | 12.46 | 4.89 | 2.38 | 14.64 |
+| tw-c1 | 3 | 2580 / 2521 / 59 | 2.26 | 10.47 | 5.63 | 2.52 | 12.82 |
+| tw-c2 | 1 | 772 / 707 / 65 | 1.82 | 10.54 | 6.17 | 2.31 | 12.50 |
+| tw-c2 | 2 | 1703 / 1639 / 64 | 3.62 | 11.80 | 5.42 | 2.35 | 15.52 |
+| tw-c2 | 3 | 2499 / 2458 / 41 | 2.52 | 11.13 | 3.68 | 2.21 | 13.75 |
+| tw-c3 | 1 | 808 / 744 / 64 | 2.11 | 11.05 | 5.79 | 2.50 | 13.29 |
+| tw-c3 | 2 | 1759 / 1720 / 39 | 3.67 | 11.22 | 3.47 | 2.59 | 16.44 |
+| tw-c3 | 3 | 2531 / 2503 / 28 | 3.68 | 7.10 | 3.94 | 2.03 | 10.91 |
+| **mean (sd)** | | gap 54.1 | **2.68** (0.76) | 10.48 (1.67) | 5.20 (1.37) | 2.37 | **13.53** (1.77) |
+
+- **Serial replay speed:** pooled 487 blocks in 94.29 s = **5.16 blocks/s** (194 ms per block). The
+  first replayed block is cold (2.03-2.59 s, mean 2.37 s), so short gaps replay slower. Without it,
+  the pooled steady rate is 6.55 blocks/s (slowest kill 4.40). Replayed blocks average 174 native
+  actions (84,613 / 487) vs 135 transactions per block under load (tw-r1 `txs_per_block_avg`), so this
+  rate is conservative for average blocks.
+- Restart -> replay start (process start + DB open + 0.08 s) is 2.77 s mean (max 3.77). Replay end ->
+  first commit is 0.28 s mean (max 1.46). Today's 13.5 s restart -> first commit is mostly the replay
+  of the exec queue (28-66 blocks). The harness's `crash-freeze.json` (from val0's log) reads 0.2 s
+  lower for kill 1 (11.66 vs 11.87 s in tw-c1).
+
+### 41.4 Restart budget per interval (vs restart -> ready <= 60 s)
+
+Budget = restart -> replay start + replay of the window's blocks at the serial speed above + replay
+end -> first commit. Blocks per window from tw's native rate (6.33 blocks/s). Central = pooled 5.16
+blocks/s and mean overheads. Pessimistic = max overheads + the slowest cold first block + the slowest
+steady rate (4.40 blocks/s). After a Phase 3 crash the replay is (S, committed]: the window since the
+last checkpoint **plus** the exec-queue lag that is replayed today (up to 66 blocks here), so both rows
+are shown.
+
+| window | blocks replayed | replay at 5.16 blocks/s | total central | total pessimistic | gate 60 s |
+|---|---|---|---|---|---|
+| 15 s | 95 | 18.4 s | **21.4 s** | 29.2 s | pass |
+| 15 s + 66 exec lag | 161 | 31.2 s | 34.2 s | 44.1 s | pass |
+| min(30 s, 100 blocks) = 100 blocks | 100 | 19.4 s | **22.4 s** | 30.3 s | pass |
+| 100 blocks + 66 exec lag | 166 | 32.1 s | 35.2 s | 45.3 s | pass |
+| 30 s uncapped | 190 | 36.8 s | 39.8 s | 50.7 s | pass |
+| 30 s uncapped + 66 exec lag | 256 | 49.6 s | 52.6 s | **65.7 s** | pass central, over pessimistic |
+
+- With the plan's 100-block cap every interval passes, even in the pessimistic case (<= 45 s). Only an
+  uncapped 30 s plus a full exec queue at the slowest replay rate goes over 60 s.
+- DB open may get shorter with Phase 3 (less WAL to recover: 41.1). Not measured.
+
+### 41.5 CPU ceiling on tw
+
+Method as section 37 (p3s0cf), on val0 over `[t_bench0, t_drain]`, CPU-s per 1M val0 fills.
+Flush worker = `torus-flush-wor` thread (`tasks.txt`). State-row memtable flush = `rocksdb:high` x the
+state CFs' share of flush wall time (RocksDB `LOG` flush jobs). State-row compaction = the state CFs'
+`compaction_time_cpu_micros` (LOG compaction jobs; the LOG total matches the `rocksdb:low` thread
+within ~1% in every cell). The acc3 tw cells hold no perf data, so tw-p1 / tw-p2 were run. Their thread CPU for
+these threads matches the no-perf cells, and perf is used for shares only.
+
+| cells | flush worker | state memtable flush | state compaction | **ceiling** | % of 24.93 | factor-scaled (plan 15 s) | % |
+|---|---|---|---|---|---|---|---|
+| fd9e5dfa tw-r1, tw-r2 | 0.939 | 0.282 | 0.334 | **1.556** | 6.24% | 0.818 | 3.28% |
+| fd9e5dfa incl. tw-p1, tw-p2 (n = 4) | 0.929 (sd 0.016) | 0.285 | 0.339 | **1.553** (sd 0.026) | 6.23% | 0.818 | 3.28% |
+| acc3 tw-r1..r4 (`2ede76eb`) | 0.956 | 0.279 | 0.337 | 1.572 (sd 0.047) | 6.30% | 0.826 | 3.31% |
+| tw-old1 (`2ede76eb`, same day) | 0.918 | 0.258 | 0.352 | 1.528 | 6.13% | 0.787 | 3.16% |
+
+- **Digest line (block_digest / chain_step running hash): 0.00 CPU-s/1M measured.** The bench genesis
+  does not activate the running state hash (`running state hash activation (chain config)
+  activation=None` in every node log; `torus_state_hash_seconds_sum` 0.0 over 1,099 flushes; no
+  `block_digest` / `Sha256` sample in either perf cell). So the digest is not inside the ceiling, and
+  removable = ceiling - 0 = **1.55 CPU-s/1M = 6.2%** of tw node CPU. On a chain with the hash active,
+  **(estimate)** SHA-256 over the hashed state writes (~9.3 GB per 24.7M fills in tw-r1 at 1.67 GB/s on
+  this host, plus per-entry framing) costs ~0.26 CPU-s/1M (~1%). It is added on W, Phase 3 keeps it,
+  and the removable part is unchanged (6.1% of a 25.2 node).
+- **What the flush worker does** (perf, tw-p1 / tw-p2): 76-77% RocksDB write (WAL CRC32C 37-38%,
+  memtable insert 35-36%), 23% batch build (`append_to_batch`). About 46% of it scales with bytes (CRC,
+  string append), the rest with entries.
+- **Factor-scaled estimate** (what Phase 3 can remove when it still writes the coalesced
+  checkpoint): flush worker x (1 - (0.46 / byte factor + 0.54 / key factor)) + per-CF state flush and
+  compaction x (1 - 1 / CF byte factor). Plan 15 s: 0.54 + 0.13 + 0.14 = **0.82 CPU-s/1M (3.3%)**.
+  100 blocks / plan 30 s 0.85 (3.4%); uncapped 30 s 1.11 (4.5%). Positions set the limit: 92% of
+  the entries coalesce only ~1.5x. Not counted (each lowers the saving further): E-side merging into L
+  and the bounded W channel. Not measured: whether memtable flush and compaction of positions shrink
+  by the full factor (RocksDB already drops overwritten versions within a memtable).
+- **Against the -6% gate (1.50 CPU-s/1M):** the ceiling clears it by 0.06 (4% margin), with all of
+  the work removed. The factor-scaled estimate (0.82) is about half the gate. The step 0 estimate
+  before tw (Classic, 1.76) is lower on tw (1.55) because flush worker and state compaction did not
+  change while node CPU fell 13%.
+
+### 41.6 Reading
+
+- **Coalescing:** state bytes 5.95x at the plan's 15 s, 6.34x at 30 s capped (= 100 blocks), 9.93x
+  only without the cap. Keys 1.58-1.64x. Disk gate: state-row WAL writes -83%, all WAL writes -54%.
+- **Layer / checkpoint:** ~214 MB (15 s) and ~219 MB (30 s capped / 100 blocks) payload at the peak,
+  plus per-key overhead.
+- **Restart:** serial replay 5.16 blocks/s; DB open 2.7 s; restart -> first commit today 13.5 s. The
+  budget is 21-22 s central and <= 45 s pessimistic for every capped interval, so the 60 s gate passes.
+- **CPU:** ceiling 1.55 CPU-s/1M (6.2%, digest 0 in bench) is just above the -6% gate (1.50); factor-
+  scaled 0.82 (3.3%) is not. **Owner decision needed before step 1** (plan stop rule options: build
+  for the disk and W-ceiling gains with a lower CPU gate, or drop Phase 3).
+- Confidence: coalescing and layer size high for this shape (exact decode, validated; one cell);
+  restart medium (n = 9, extrapolated from 28-66 to 95-190 blocks); CPU ceiling high (9 cells,
+  1.53-1.62); factor-scaled estimate low-medium (model, not a measurement).
+- Shared-disk caveat as section 40. Perf inflates val0's CPU (tw-p1 / tw-p2 val0 28.9 / 28.3 vs
+  24.1); only thread CPU of the flush / RocksDB threads and perf shares are used from them.
+
 ## Open
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
@@ -4233,13 +4456,18 @@ the same data dir with the same env. No timing was scored (owner); the numbers a
   300 (not resolved); mode 3's flush per 1k fills 1.95x / 1.66x (off-chain; exec-thread handoff
   wait +0.95 / +2.9 ms per native block); save_books per fill flat. A mode 3 default then needs
   the book mode in genesis and the s450 mode-2 test gaps checked against mode 3.
-- **Phase 3 baseline: WAL compression decision pending** (sections 37-40, plan review log rows
-  42-45; owner s108: option 3). Owner (after section 39): validators run trade history off, WAL
-  budget 2048 MiB; ZSTD level 1 dropped. Section 40 (n = 4, vs b 28.75 CPU-s/1M): tw -13.3% node
-  CPU / +9.0% matched/s; twd -11.2% / +10.9% and -83% bytes written. twd vs tw: +2.4% CPU
-  (resolved), +1.8% matched/s (not resolved), 4.7x fewer bytes written, 3.4x smaller data dir.
-  Recovery check on twd passed. Next: owner picks tw or twd as the Phase 3 baseline (twd needs
-  `perf/append-cf-compaction` merged); optional ~4 more tw / twd pairs for matched/s.
+- **Phase 3 step 0 sizing on tw: owner decision needed before step 1** (section 41, plan review
+  log row 46). CPU ceiling (flush worker + state-row memtable flush + compaction; digest 0, the
+  bench does not activate the running state hash) 1.55 CPU-s/1M = 6.2% of tw node CPU, 0.06 above
+  the -6% gate; scaled by the measured coalescing factors ~0.82 (3.3%). Coalescing (state rows,
+  bytes / keys): 5.95x / 1.58x at the plan's 15 s, 6.34x / 1.64x at 30 s capped at 100 blocks
+  (state-row WAL bytes -83%). Layer / checkpoint ~214-219 MB payload at the peak. Restart budget
+  21-22 s central, <= 45 s pessimistic (gate 60 s). Options (plan stop rule): build for the disk and
+  W-ceiling gains with a lower CPU gate, or drop Phase 3.
+- **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
+  trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
+  it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b
+  28.75 CPU-s/1M): tw -13.3% node CPU / +9.0% matched/s.
 - **Unresolved: ~1% matched/s drift `1b389700` -> `3efff0d6`** (sections 34-35, plan review log
   rows 38-39): p3s0 0.9886x (-0.9 sd), p3s1 C / A 0.9857x (-1.3 sd), about -0.7% at each of the
   two steps, inside noise in each campaign. `3efff0d6` is accepted as the Phase 3 step 0 baseline
