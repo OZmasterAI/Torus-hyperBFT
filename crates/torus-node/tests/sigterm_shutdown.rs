@@ -306,11 +306,21 @@ fn sigterm_exits_within_the_bound_when_stdout_is_blocked() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    let took = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
     let st = exited.expect("node still running 30 s after SIGTERM with stdout blocked");
+    // The deadline itself ended the stop: 2 s timeout + 8 s slack for a
+    // loaded host (the 30 s above only guards against a hang).
     assert!(
-        st.code().is_some(),
-        "killed by a signal, not a shutdown: {st}"
+        took <= Duration::from_secs(2 + 8),
+        "exit {took:?} after SIGTERM; the 2 s shutdown timeout was not enforced"
+    );
+    // Every stop step logs, so with stdout blocked the stop cannot finish:
+    // only the forced-timeout path (exit 1) can end the process.
+    assert_eq!(
+        st.code(),
+        Some(1),
+        "expected the forced-timeout exit 1, got {st} after {took:?}"
     );
 }

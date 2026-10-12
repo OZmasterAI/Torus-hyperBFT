@@ -1383,12 +1383,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // restart replays neither blocks nor WAL. A second signal, or the bound
     // (`TORUS_SHUTDOWN_TIMEOUT_SECS`, default 60), exits at once; recovery
     // after that is the same as after a kill.
+    // Logged before the handlers are installed: if stdout is blocked (a full
+    // pipe), the default action still kills the node.
+    info!("node is running — SIGINT (Ctrl+C) or SIGTERM shuts it down");
     // One pair of receivers for both waits, so a second signal sent while
     // the first is handled is queued, not lost.
     let mut signals = ShutdownSignals::new()?;
-    info!("node is running — SIGINT (Ctrl+C) or SIGTERM shuts it down");
     let signal = signals.recv().await;
-    info!(%signal, "shutdown signal received, stopping...");
+    // From here no log is waited for (a blocked stdout would otherwise hold
+    // off the deadline and the second-signal wait).
+    log_with_grace(
+        move || info!(%signal, "shutdown signal received, stopping..."),
+        Duration::ZERO,
+    );
     let limit = shutdown_timeout(std::env::var("TORUS_SHUTDOWN_TIMEOUT_SECS").ok());
     let started = std::time::Instant::now();
     let db = state_db.clone();
@@ -1401,7 +1408,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let second_signal = async {
         let s = signals.recv().await;
-        warn!(signal = %s, "second signal during shutdown");
+        log_with_grace(
+            move || warn!(signal = %s, "second signal during shutdown"),
+            Duration::ZERO,
+        );
     };
     let outcome = bounded_stop(shutdown_worker, stop, limit, second_signal).await;
     // Every outcome ends with `_exit`: `exit()` would run RocksDB's exit
