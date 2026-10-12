@@ -348,18 +348,22 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
     thread, and no phase timer covers that wait (the pipelined path never observes its
     `flush_timer`). The join also waited for step 2's ingress `slice` and, in step 1, for the drop of
     block n-1. E itself freed the sets a slice replaces (step 2: in the mempool's view swap, under its
-    lock), C once durable, and the block handles of a checkpoint-time merge. 18c probe at section-41
-    sizes x2, loaded host (**estimate**): merge ~92 ms, slice ~25 ms, full-set free ~32 ms per block,
-    L free ~200 ms per checkpoint (~4.5 ms per block).
+    lock), C once durable, and the block handles of a checkpoint-time merge. Ranking (throwaway
+    probe, synthetic blocks of section-41 size x2, thread CPU time; **18c-local, loaded host,
+    ranking only**, not for sizing): merge first; then the ingress slice and freeing a block's full
+    set, about equal; then freeing L at a checkpoint (per block, smallest).
     New series: `torus_exec_checkpoint_settle_wait_seconds` (the join) and
-    `torus_exec_checkpoint_upkeep_seconds` (end-of-block upkeep), each once per pipelined block. The
-    harness counts both in `residual_untimed` until `summarize.py` `PHASES` lists them.
+    `torus_exec_checkpoint_upkeep_seconds` (end-of-block upkeep), each once per pipelined block, and
+    the counter `torus_exec_checkpoint_drop_inline` (items E freed itself because the free thread's
+    queue was full; 0 while it keeps up). The harness counts both series in `residual_untimed`
+    until `summarize.py` `PHASES` lists them.
     Built (no change to L, slices, the view's answers, state or replay): the merge thread hands L
     back first, then slices and lets go of the block. Slices are installed at the end of the next
     block (`install_slices`). A `torus-ckpt-drop` thread (queue 2, past it E frees inline) frees C,
-    replaced sets and the previous view. **Estimate**: ~-35-40% of the Phase 3 untimed time in step
-    2 (slice + frees), ~-25% in step 1 (drop of n-1). Left: the merge itself (~60% of it). It
-    overlaps block n+1 only if L can be read while it is merged. Option: per-CF `RwLock` on L with
+    replaced sets and the previous view. Expected effect (qualitative; archy measures it): the
+    settle wait drops by the slice (step 2) and the drop of n-1 (step 1), and E no longer frees
+    full sets, old views or C (`upkeep` / settle smaller) unless `drop_inline` counts. Left: the
+    merge itself, the largest item. It overlaps block n+1 only if L can be read while it is merged. Option: per-CF `RwLock` on L with
     batched merges, block n-1 read as its own layer above L (a read is then correct at any point of
     the merge). Read path: consensus-adjacent, needs its own tests. Other options: move the
     entries instead of cloning when the frozen set is unique (step 1 only), or a persistent map.
