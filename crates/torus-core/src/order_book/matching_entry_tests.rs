@@ -132,7 +132,7 @@ fn order(id: u128, trader: u8, side: Side, price: i128, qty: i128) -> Order {
         time_in_force: TimeInForce::GTC,
         timestamp: 17,
         reduce_only: false,
-        client_order_id: Some(id as u128),
+        client_order_id: Some(id),
     }
 }
 

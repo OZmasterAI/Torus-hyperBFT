@@ -15,7 +15,9 @@
 
 use alloy_primitives::Address;
 
-use torus_bridge::native_executor::{BookMode, NativeActionResult, NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{
+    BookMode, NativeActionResult, NativeExecContext, NativeExecutor,
+};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::NativeBalance;
 use torus_state::action_status::FailureReason;
@@ -39,7 +41,11 @@ fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
 }
 
-const MODES: [BookMode; 3] = [BookMode::Classic, BookMode::OrderRows, BookMode::LevelAuthority];
+const MODES: [BookMode; 3] = [
+    BookMode::Classic,
+    BookMode::OrderRows,
+    BookMode::LevelAuthority,
+];
 
 fn make_ctx(db: StateDb, height: u64, mode: BookMode) -> NativeExecContext {
     NativeExecContext::new_with_mode(
@@ -66,10 +72,19 @@ fn fund(ctx: &NativeExecContext, trader: &Address) {
 }
 
 fn margin(ctx: &NativeExecContext, trader: &Address) -> FixedPoint {
-    ctx.positions.get_native_balance(trader).unwrap().order_margin
+    ctx.positions
+        .get_native_balance(trader)
+        .unwrap()
+        .order_margin
 }
 
-fn order(market_id: MarketId, is_buy: bool, price: i64, ot: OrderType, cloid: Option<u128>) -> PlaceOrderParams {
+fn order(
+    market_id: MarketId,
+    is_buy: bool,
+    price: i64,
+    ot: OrderType,
+    cloid: Option<u128>,
+) -> PlaceOrderParams {
     PlaceOrderParams {
         market_id,
         is_buy,
@@ -96,7 +111,9 @@ fn stop(market_id: MarketId, trigger: i64, cloid: Option<u128>) -> NativeAction 
         market_id,
         true,
         trigger + 5,
-        OrderType::StopMarket { trigger: fp(trigger) },
+        OrderType::StopMarket {
+            trigger: fp(trigger),
+        },
         cloid,
     ))
 }
@@ -114,12 +131,21 @@ enum Path {
 
 const PATHS: [Path; 3] = [Path::Single, Path::Batch, Path::BatchCancelMode];
 
-fn run(ctx: &mut NativeExecContext, path: Path, sender: Address, action: NativeAction) -> NativeActionResult {
+fn run(
+    ctx: &mut NativeExecContext,
+    path: Path,
+    sender: Address,
+    action: NativeAction,
+) -> NativeActionResult {
     match path {
         Path::Single => NativeExecutor::execute(ctx, &sender, &action),
-        Path::Batch => NativeExecutor::execute_batch(ctx, &[(sender, action)]).results.remove(0),
+        Path::Batch => NativeExecutor::execute_batch(ctx, &[(sender, action)])
+            .results
+            .remove(0),
         Path::BatchCancelMode => {
-            NativeExecutor::execute_batch_cancel_mode(ctx, &[(sender, action)], true).results.remove(0)
+            NativeExecutor::execute_batch_cancel_mode(ctx, &[(sender, action)], true)
+                .results
+                .remove(0)
         }
     }
 }
@@ -129,12 +155,22 @@ fn ok(r: &NativeActionResult, what: &str) {
 }
 
 fn dup(r: &NativeActionResult, what: &str) {
-    assert!(!r.success, "{what}: expected a duplicate-cloid reject, got {r:?}");
+    assert!(
+        !r.success,
+        "{what}: expected a duplicate-cloid reject, got {r:?}"
+    );
     assert_eq!(r.reason, FailureReason::DuplicateCloid, "{what}: {r:?}");
 }
 
-fn live(ctx: &NativeExecContext, market_id: MarketId, trader: &Address, cloid: u128) -> Option<u128> {
-    ctx.order_books.get(&market_id).and_then(|b| b.order_id_by_cloid(trader, cloid))
+fn live(
+    ctx: &NativeExecContext,
+    market_id: MarketId,
+    trader: &Address,
+    cloid: u128,
+) -> Option<u128> {
+    ctx.order_books
+        .get(&market_id)
+        .and_then(|b| b.order_id_by_cloid(trader, cloid))
 }
 
 #[test]
@@ -152,16 +188,33 @@ fn a_live_cloid_rejects_a_placement_in_any_market() {
         dup(&run(&mut ctx, path, addr(1), stop(3, 900, Some(C))), &what);
         // Another trader, another cloid, or none: fine.
         ok(&run(&mut ctx, path, addr(2), buy(2, 100, Some(C))), &what);
-        ok(&run(&mut ctx, path, addr(1), buy(2, 100, Some(C + 1))), &what);
+        ok(
+            &run(&mut ctx, path, addr(1), buy(2, 100, Some(C + 1))),
+            &what,
+        );
         ok(&run(&mut ctx, path, addr(1), buy(2, 100, None)), &what);
         // A live stop holds its cloid across markets too.
-        ok(&run(&mut ctx, path, addr(1), stop(3, 900, Some(C + 2))), &what);
-        dup(&run(&mut ctx, path, addr(1), buy(1, 80, Some(C + 2))), &what);
+        ok(
+            &run(&mut ctx, path, addr(1), stop(3, 900, Some(C + 2))),
+            &what,
+        );
+        dup(
+            &run(&mut ctx, path, addr(1), buy(1, 80, Some(C + 2))),
+            &what,
+        );
         // Nothing the rejects did is left behind: one order per live cloid.
         assert_eq!(ctx.order_books[&1].open_order_count(&addr(1)), 1, "{what}");
         // Cancelled -> free again, in any market.
         let id = live(&ctx, 1, &addr(1), C).unwrap();
-        ok(&run(&mut ctx, path, addr(1), NativeAction::CancelOrder { order_id: id }), &what);
+        ok(
+            &run(
+                &mut ctx,
+                path,
+                addr(1),
+                NativeAction::CancelOrder { order_id: id },
+            ),
+            &what,
+        );
         ok(&run(&mut ctx, path, addr(1), sell(2, 500, Some(C))), &what);
     }
 }
@@ -173,7 +226,10 @@ fn a_batch_checks_after_its_cancels_and_lets_the_first_placement_win() {
     let (_d, db) = open_test_db();
     let mut ctx = make_ctx(db, 1, BookMode::Classic);
     fund(&ctx, &addr(1));
-    ok(&run(&mut ctx, Path::Single, addr(1), buy(1, 100, Some(C))), "setup");
+    ok(
+        &run(&mut ctx, Path::Single, addr(1), buy(1, 100, Some(C))),
+        "setup",
+    );
     let r = NativeExecutor::execute_batch(
         &mut ctx,
         &[
@@ -212,16 +268,28 @@ fn cancel_by_cloid_cancels_a_resting_order_and_releases_its_margin() {
         ok(&run(&mut ctx, path, addr(1), buy(1, 100, Some(C))), &what);
         assert!(margin(&ctx, &addr(1)) > FixedPoint::ZERO, "{what}");
         // Wrong market, unknown cloid, another trader: nothing to cancel.
-        assert!(!run(&mut ctx, path, addr(1), by_cloid(2, C)).success, "{what}");
-        assert!(!run(&mut ctx, path, addr(1), by_cloid(1, C + 9)).success, "{what}");
-        assert!(!run(&mut ctx, path, addr(2), by_cloid(1, C)).success, "{what}");
+        assert!(
+            !run(&mut ctx, path, addr(1), by_cloid(2, C)).success,
+            "{what}"
+        );
+        assert!(
+            !run(&mut ctx, path, addr(1), by_cloid(1, C + 9)).success,
+            "{what}"
+        );
+        assert!(
+            !run(&mut ctx, path, addr(2), by_cloid(1, C)).success,
+            "{what}"
+        );
         assert!(live(&ctx, 1, &addr(1), C).is_some(), "{what}");
 
         ok(&run(&mut ctx, path, addr(1), by_cloid(1, C)), &what);
         assert!(live(&ctx, 1, &addr(1), C).is_none(), "{what}");
         assert_eq!(ctx.order_books[&1].order_count(), 0, "{what}");
         assert_eq!(margin(&ctx, &addr(1)), FixedPoint::ZERO, "{what}");
-        assert!(!run(&mut ctx, path, addr(1), by_cloid(1, C)).success, "{what}: twice");
+        assert!(
+            !run(&mut ctx, path, addr(1), by_cloid(1, C)).success,
+            "{what}: twice"
+        );
     }
 }
 
@@ -240,7 +308,11 @@ fn cancel_by_cloid_cancels_a_pending_stop_and_releases_its_margin() {
 
         ok(&run(&mut ctx, path, addr(1), by_cloid(1, C)), &what);
         assert_eq!(ctx.order_books[&1].pending_stop_count(), 1, "{what}");
-        assert_eq!(margin(&ctx, &addr(1)), other, "{what}: its reservation came back");
+        assert_eq!(
+            margin(&ctx, &addr(1)),
+            other,
+            "{what}: its reservation came back"
+        );
         assert!(live(&ctx, 1, &addr(1), C).is_none(), "{what}");
         ok(&run(&mut ctx, path, addr(1), stop(2, 800, Some(C))), &what);
     }
@@ -256,7 +328,12 @@ fn cancel_order_cancels_a_pending_stop_by_id_for_its_owner_only() {
         fund(&ctx, &addr(2));
         ok(&run(&mut ctx, path, addr(1), stop(1, 800, Some(C))), &what);
         let id = live(&ctx, 1, &addr(1), C).expect("stop indexed");
-        let r = run(&mut ctx, path, addr(2), NativeAction::CancelOrder { order_id: id });
+        let r = run(
+            &mut ctx,
+            path,
+            addr(2),
+            NativeAction::CancelOrder { order_id: id },
+        );
         assert!(!r.success, "{what}: a stranger cancelled the stop");
         assert!(
             r.error.as_deref().unwrap_or("").contains("belongs to"),
@@ -264,7 +341,15 @@ fn cancel_order_cancels_a_pending_stop_by_id_for_its_owner_only() {
         );
         assert_eq!(ctx.order_books[&1].pending_stop_count(), 1, "{what}");
 
-        ok(&run(&mut ctx, path, addr(1), NativeAction::CancelOrder { order_id: id }), &what);
+        ok(
+            &run(
+                &mut ctx,
+                path,
+                addr(1),
+                NativeAction::CancelOrder { order_id: id },
+            ),
+            &what,
+        );
         assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{what}");
         assert_eq!(margin(&ctx, &addr(1)), FixedPoint::ZERO, "{what}");
         assert!(live(&ctx, 1, &addr(1), C).is_none(), "{what}");
@@ -284,16 +369,32 @@ fn a_triggered_stop_keeps_its_cloid() {
         1,
         true,
         90,
-        OrderType::StopLimit { trigger: fp(105), limit: fp(90) },
+        OrderType::StopLimit {
+            trigger: fp(105),
+            limit: fp(90),
+        },
         Some(C),
     ));
     ok(&NativeExecutor::execute(&mut ctx, &addr(1), &sl), "stop");
     let stop_id = live(&ctx, 1, &addr(1), C).unwrap();
-    ok(&NativeExecutor::execute(&mut ctx, &addr(2), &sell(1, 106, None)), "ask");
-    ok(&NativeExecutor::execute(&mut ctx, &addr(3), &buy(1, 106, None)), "trade at 106");
+    ok(
+        &NativeExecutor::execute(&mut ctx, &addr(2), &sell(1, 106, None)),
+        "ask",
+    );
+    ok(
+        &NativeExecutor::execute(&mut ctx, &addr(3), &buy(1, 106, None)),
+        "trade at 106",
+    );
     assert_eq!(ctx.order_books[&1].pending_stop_count(), 0);
-    assert_eq!(live(&ctx, 1, &addr(1), C), Some(stop_id), "rests under its stop id");
-    dup(&NativeExecutor::execute(&mut ctx, &addr(1), &buy(2, 50, Some(C))), "after trigger");
+    assert_eq!(
+        live(&ctx, 1, &addr(1), C),
+        Some(stop_id),
+        "rests under its stop id"
+    );
+    dup(
+        &NativeExecutor::execute(&mut ctx, &addr(1), &buy(2, 50, Some(C))),
+        "after trigger",
+    );
 }
 
 /// Block 1 places cloids (a resting order and a stop) and saves; a fresh
@@ -305,8 +406,14 @@ fn the_index_is_rebuilt_on_restart() {
         let (_d, db) = open_test_db();
         let mut ctx = make_ctx(db.clone(), 1, mode);
         fund(&ctx, &addr(1));
-        ok(&NativeExecutor::execute(&mut ctx, &addr(1), &buy(1, 100, Some(C))), &what);
-        ok(&NativeExecutor::execute(&mut ctx, &addr(1), &stop(2, 900, Some(C + 1))), &what);
+        ok(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &buy(1, 100, Some(C))),
+            &what,
+        );
+        ok(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &stop(2, 900, Some(C + 1))),
+            &what,
+        );
         ctx.save_order_books();
         drop(ctx);
 
@@ -314,10 +421,22 @@ fn the_index_is_rebuilt_on_restart() {
         assert!(ctx.take_fatal_error().is_none(), "{what}");
         assert!(live(&ctx, 1, &addr(1), C).is_some(), "{what}");
         assert!(live(&ctx, 2, &addr(1), C + 1).is_some(), "{what}");
-        dup(&NativeExecutor::execute(&mut ctx, &addr(1), &buy(3, 100, Some(C))), &what);
-        dup(&NativeExecutor::execute(&mut ctx, &addr(1), &buy(3, 100, Some(C + 1))), &what);
-        ok(&NativeExecutor::execute(&mut ctx, &addr(1), &by_cloid(2, C + 1)), &what);
-        ok(&NativeExecutor::execute(&mut ctx, &addr(1), &by_cloid(1, C)), &what);
+        dup(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &buy(3, 100, Some(C))),
+            &what,
+        );
+        dup(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &buy(3, 100, Some(C + 1))),
+            &what,
+        );
+        ok(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &by_cloid(2, C + 1)),
+            &what,
+        );
+        ok(
+            &NativeExecutor::execute(&mut ctx, &addr(1), &by_cloid(1, C)),
+            &what,
+        );
     }
 }
 
@@ -345,7 +464,11 @@ fn script() -> Vec<Vec<(Address, NativeAction)>> {
     ]
 }
 
-fn run_script(db: StateDb, mode: BookMode, restart_after: Option<usize>) -> (Vec<Vec<(bool, FailureReason)>>, alloy_primitives::B256) {
+fn run_script(
+    db: StateDb,
+    mode: BookMode,
+    restart_after: Option<usize>,
+) -> (Vec<Vec<(bool, FailureReason)>>, alloy_primitives::B256) {
     let mut out = Vec::new();
     let mut ctx = make_ctx(db.clone(), 1, mode);
     fund(&ctx, &addr(1));
@@ -379,7 +502,15 @@ fn replicas_and_a_restart_agree_on_results_and_state_root() {
         assert_eq!(one, restarted, "{what}: restart before block 3");
         let r = &one.0;
         assert_eq!(r[0][3], (true, FailureReason::Other), "{what}: b's own C");
-        assert_eq!(r[2][0], (true, FailureReason::Other), "{what}: C free after the fill");
-        assert_eq!(r[2][2], (false, FailureReason::DuplicateCloid), "{what}: dup of a stop");
+        assert_eq!(
+            r[2][0],
+            (true, FailureReason::Other),
+            "{what}: C free after the fill"
+        );
+        assert_eq!(
+            r[2][2],
+            (false, FailureReason::DuplicateCloid),
+            "{what}: dup of a stop"
+        );
     }
 }

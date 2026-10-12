@@ -650,7 +650,9 @@ impl BlockActionStatus {
                         if ext & bit == 0 {
                             return Some(None);
                         }
-                        Some(Some(u128::from_be_bytes(take(&mut rest, 16)?.try_into().ok()?)))
+                        Some(Some(u128::from_be_bytes(
+                            take(&mut rest, 16)?.try_into().ok()?,
+                        )))
                     };
                     oid = u128_field(CW_EXT_OID)?;
                     cloid = u128_field(CW_EXT_CLOID)?;
@@ -1485,7 +1487,13 @@ mod tests {
         };
         let cancel = CoreWriterResult {
             cloid: Some(u128::MAX),
-            ..cw(1, K::CancelByCloid, Outcome::Failed, R::Other, "no such order")
+            ..cw(
+                1,
+                K::CancelByCloid,
+                Outcome::Failed,
+                R::Other,
+                "no such order",
+            )
         };
         let dup = CoreWriterResult {
             cloid: Some(cloid),
@@ -1507,7 +1515,11 @@ mod tests {
         assert_eq!(one[one.len() - 33], 0x03, "ext: oid and cloid");
         assert_eq!(&one[one.len() - 32..one.len() - 16], &7u128.to_be_bytes());
         assert_eq!(&one[one.len() - 16..], &cloid.to_be_bytes());
-        assert_eq!(BlockActionStatus::decode(&one[..one.len() - 1]), None, "cut cloid");
+        assert_eq!(
+            BlockActionStatus::decode(&one[..one.len() - 1]),
+            None,
+            "cut cloid"
+        );
     }
 
     #[test]

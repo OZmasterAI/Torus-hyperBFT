@@ -81,11 +81,23 @@ fn seed(dir: &TempDir, mode: BookMode) -> StateDb {
         .unwrap();
     let block = vec![
         (addr(1), order(1, 100, OrderType::Limit, Some(C))),
-        (addr(1), order(2, 210, OrderType::StopMarket { trigger: fp(200) }, Some(C + 1))),
+        (
+            addr(1),
+            order(
+                2,
+                210,
+                OrderType::StopMarket { trigger: fp(200) },
+                Some(C + 1),
+            ),
+        ),
         (addr(1), order(1, 90, OrderType::Limit, None)),
     ];
     let r = NativeExecutor::execute_batch(&mut ctx, &block);
-    assert!(r.results.iter().all(|x| x.success), "{mode:?}: {:?}", r.results);
+    assert!(
+        r.results.iter().all(|x| x.success),
+        "{mode:?}: {:?}",
+        r.results
+    );
     ctx.save_order_books();
     db
 }
@@ -104,7 +116,11 @@ async fn start_server(state: StateDb) -> (ServerHandle, SocketAddr) {
     .unwrap()
 }
 
-const MODES: [BookMode; 3] = [BookMode::Classic, BookMode::OrderRows, BookMode::LevelAuthority];
+const MODES: [BookMode; 3] = [
+    BookMode::Classic,
+    BookMode::OrderRows,
+    BookMode::LevelAuthority,
+];
 
 #[tokio::test]
 async fn open_orders_and_order_by_cloid_serve_every_mode() {
@@ -112,13 +128,16 @@ async fn open_orders_and_order_by_cloid_serve_every_mode() {
         let dir = TempDir::new().unwrap();
         let state = seed(&dir, mode);
         let (handle, sock) = start_server(state).await;
-        let client = HttpClientBuilder::default().build(format!("http://{sock}")).unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{sock}"))
+            .unwrap();
 
         let open: Vec<RpcOpenOrder> = client
             .request("torus_getOpenOrders", rpc_params![hex_addr(1)])
             .await
             .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
-        let mut cloids: Vec<Option<String>> = open.iter().map(|o| o.client_order_id.clone()).collect();
+        let mut cloids: Vec<Option<String>> =
+            open.iter().map(|o| o.client_order_id.clone()).collect();
         cloids.sort();
         assert_eq!(cloids, vec![None, Some(C_HEX.to_string())], "{mode:?}");
 
@@ -134,15 +153,24 @@ async fn open_orders_and_order_by_cloid_serve_every_mode() {
                     .await
             }
         };
-        let rest = get(hex_addr(1), C_HEX).await.unwrap().expect("resting order found");
+        let rest = get(hex_addr(1), C_HEX)
+            .await
+            .unwrap()
+            .expect("resting order found");
         assert_eq!(rest["status"], "open", "{mode:?}: {rest}");
         assert_eq!(rest["order"]["marketId"], "0x1", "{mode:?}");
         assert_eq!(rest["order"]["clientOrderId"], C_HEX, "{mode:?}");
         assert_eq!(rest["order"]["price"], dec_fp(fp(100)), "{mode:?}");
         assert_eq!(rest["order"]["orderType"], "limit", "{mode:?}");
-        assert!(rest.get("triggerPrice").is_none_or(|v| v.is_null()), "{mode:?}: {rest}");
+        assert!(
+            rest.get("triggerPrice").is_none_or(|v| v.is_null()),
+            "{mode:?}: {rest}"
+        );
 
-        let stop = get(hex_addr(1), STOP_HEX).await.unwrap().expect("stop found");
+        let stop = get(hex_addr(1), STOP_HEX)
+            .await
+            .unwrap()
+            .expect("stop found");
         assert_eq!(stop["status"], "triggerPending", "{mode:?}: {stop}");
         assert_eq!(stop["order"]["marketId"], "0x2", "{mode:?}");
         assert_eq!(stop["order"]["clientOrderId"], STOP_HEX, "{mode:?}");
@@ -155,7 +183,12 @@ async fn open_orders_and_order_by_cloid_serve_every_mode() {
         assert!(get(hex_addr(2), C_HEX).await.unwrap().is_none(), "{mode:?}");
         // A malformed cloid is an error, not null.
         assert!(get(hex_addr(1), "nope").await.is_err(), "{mode:?}");
-        assert!(get(hex_addr(1), "0x1ffffffffffffffffffffffffffffffff").await.is_err(), "{mode:?}");
+        assert!(
+            get(hex_addr(1), "0x1ffffffffffffffffffffffffffffffff")
+                .await
+                .is_err(),
+            "{mode:?}"
+        );
         handle.stop().unwrap();
     }
 }

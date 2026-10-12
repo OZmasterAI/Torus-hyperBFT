@@ -932,7 +932,11 @@ mod tests {
         let r = parse_native_action_row(&serde_json::to_value(&action).unwrap(), 5, 3);
         assert_eq!(r.action_type, "CancelByCloid");
         assert_eq!(r.market_id, Some(4));
-        assert!(r.payload.contains("0xffffffffffffffffffffffffffffffff"), "{}", r.payload);
+        assert!(
+            r.payload.contains("0xffffffffffffffffffffffffffffffff"),
+            "{}",
+            r.payload
+        );
     }
 
     #[test]

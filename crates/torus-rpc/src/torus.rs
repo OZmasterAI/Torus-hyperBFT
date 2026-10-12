@@ -3566,7 +3566,9 @@ mod shed_peek_tests {
             }
             assert_eq!(
                 torus_mempool::is_cancel(&a),
-                idx == TAG_CANCEL_ORDER || idx == TAG_CANCEL_ALL_ORDERS || idx == TAG_CANCEL_BY_CLOID
+                idx == TAG_CANCEL_ORDER
+                    || idx == TAG_CANCEL_ALL_ORDERS
+                    || idx == TAG_CANCEL_BY_CLOID
             );
             assert_eq!(
                 torus_mempool::is_oracle_submission(&a),

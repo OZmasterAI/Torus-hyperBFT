@@ -30,7 +30,19 @@ fn fp(v: i64) -> FixedPoint {
 }
 
 fn make_ctx(db: StateDb, height: u64, mode: BookMode) -> NativeExecContext {
-    NativeExecContext::new_with_mode(db, height, 1000 + height, 0, 100, 10, addr(99), addr(100), addr(101), mode, None)
+    NativeExecContext::new_with_mode(
+        db,
+        height,
+        1000 + height,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        mode,
+        None,
+    )
 }
 
 fn fund(ctx: &NativeExecContext, trader: &Address) {
@@ -41,23 +53,42 @@ fn fund(ctx: &NativeExecContext, trader: &Address) {
     ctx.positions.put_native_balance(trader, &bal).unwrap();
 }
 
-fn live(ctx: &NativeExecContext, market_id: MarketId, trader: &Address, cloid: u128) -> Option<u128> {
-    ctx.order_books.get(&market_id).and_then(|b| b.order_id_by_cloid(trader, cloid))
+fn live(
+    ctx: &NativeExecContext,
+    market_id: MarketId,
+    trader: &Address,
+    cloid: u128,
+) -> Option<u128> {
+    ctx.order_books
+        .get(&market_id)
+        .and_then(|b| b.order_id_by_cloid(trader, cloid))
 }
 
 // ---------------------------------------------------------------------------
 // CoreWriter: placeOrder with a cloid, cancelByCloid
 // ---------------------------------------------------------------------------
 
-fn cw_enqueue(db: &StateDb, trader: Address, kind: torus_core::precompiles::QueuedActionKind) -> u64 {
+fn cw_enqueue(
+    db: &StateDb,
+    trader: Address,
+    kind: torus_core::precompiles::QueuedActionKind,
+) -> u64 {
     torus_core::precompiles::CoreWriterQueue::enqueue(
         db,
-        &torus_core::precompiles::QueuedAction { trader, kind, block_queued: 1 },
+        &torus_core::precompiles::QueuedAction {
+            trader,
+            kind,
+            block_queued: 1,
+        },
     )
     .unwrap()
 }
 
-fn cw_place(market_id: MarketId, price: i64, cloid: Option<u128>) -> torus_core::precompiles::QueuedActionKind {
+fn cw_place(
+    market_id: MarketId,
+    price: i64,
+    cloid: Option<u128>,
+) -> torus_core::precompiles::QueuedActionKind {
     torus_core::precompiles::QueuedActionKind::PlaceOrder {
         market_id,
         side: 0,
@@ -85,7 +116,10 @@ fn core_writer_places_and_cancels_by_cloid() {
     for kind in [
         cw_place(1, 100, Some(C)),
         cw_place(2, 100, Some(C)),
-        QueuedActionKind::CancelByCloid { market_id: 1, cloid: C },
+        QueuedActionKind::CancelByCloid {
+            market_id: 1,
+            cloid: C,
+        },
         cw_place(1, 90, None),
     ] {
         cw_enqueue(&db, t, kind);
@@ -95,15 +129,47 @@ fn core_writer_places_and_cancels_by_cloid() {
     assert_eq!(ctx.take_fatal_error(), None);
     let got: Vec<_> = e
         .iter()
-        .map(|e| (e.kind, e.result.success, e.result.reason, e.cloid, e.oid.is_some()))
+        .map(|e| {
+            (
+                e.kind,
+                e.result.success,
+                e.result.reason,
+                e.cloid,
+                e.oid.is_some(),
+            )
+        })
         .collect();
     assert_eq!(
         got,
         vec![
-            (CoreWriterKind::PlaceOrder, true, FailureReason::Other, Some(C), true),
-            (CoreWriterKind::PlaceOrder, false, FailureReason::DuplicateCloid, Some(C), false),
-            (CoreWriterKind::CancelByCloid, true, FailureReason::Other, Some(C), false),
-            (CoreWriterKind::PlaceOrder, true, FailureReason::Other, None, true),
+            (
+                CoreWriterKind::PlaceOrder,
+                true,
+                FailureReason::Other,
+                Some(C),
+                true
+            ),
+            (
+                CoreWriterKind::PlaceOrder,
+                false,
+                FailureReason::DuplicateCloid,
+                Some(C),
+                false
+            ),
+            (
+                CoreWriterKind::CancelByCloid,
+                true,
+                FailureReason::Other,
+                Some(C),
+                false
+            ),
+            (
+                CoreWriterKind::PlaceOrder,
+                true,
+                FailureReason::Other,
+                None,
+                true
+            ),
         ]
     );
     assert!(live(&ctx, 1, &t, C).is_none());

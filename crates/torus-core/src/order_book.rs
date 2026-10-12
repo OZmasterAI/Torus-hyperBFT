@@ -1946,7 +1946,12 @@ impl OrderBook {
         if order.reduce_only {
             self.reduce_only_index.remove(&(order.trader, order_id));
         }
-        Self::forget_cloid(&mut self.cloids, order.trader, order.client_order_id, order_id);
+        Self::forget_cloid(
+            &mut self.cloids,
+            order.trader,
+            order.client_order_id,
+            order_id,
+        );
 
         if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
             ids.remove(order_id);
@@ -2404,10 +2409,17 @@ impl OrderBook {
             .chain(self.asks.values())
             .flatten()
             .map(|o| (o.trader, o.client_order_id, o.id))
-            .chain(self.pending_stops.iter().map(|s| (s.trader, s.client_order_id, s.id)));
+            .chain(
+                self.pending_stops
+                    .iter()
+                    .map(|s| (s.trader, s.client_order_id, s.id)),
+            );
         for (trader, cloid, id) in open {
             if let Some(c) = cloid {
-                assert!(want.insert((trader, c), id).is_none(), "cloid {c:#x} of {trader} is live twice");
+                assert!(
+                    want.insert((trader, c), id).is_none(),
+                    "cloid {c:#x} of {trader} is live twice"
+                );
             }
         }
         assert_eq!(self.cloids, want, "cloid index != open orders' cloids");
@@ -2591,7 +2603,12 @@ impl OrderBook {
             if maker.trader == taker.trader {
                 let cancelled = queue.pop_front().unwrap();
                 order_index.remove(&cancelled.id);
-                Self::forget_cloid(cloids, cancelled.trader, cancelled.client_order_id, cancelled.id);
+                Self::forget_cloid(
+                    cloids,
+                    cancelled.trader,
+                    cancelled.client_order_id,
+                    cancelled.id,
+                );
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.remove(cancelled.id);
                 }
@@ -6129,7 +6146,11 @@ mod level_preimage_characterization {
             },
             timestamp: m >> 17,
             reduce_only: (m >> 5) & 1 == 1,
-            client_order_id: if (m >> 6) & 1 == 1 { Some(m as u128) } else { None },
+            client_order_id: if (m >> 6) & 1 == 1 {
+                Some(m as u128)
+            } else {
+                None
+            },
         }
     }
 

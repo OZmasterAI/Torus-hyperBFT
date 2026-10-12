@@ -38,8 +38,8 @@ use torus_state::action_status::{CoreWriterKind, FailureReason};
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
-    Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
-    SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
+    Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, SessionScope,
+    Side, TimeInForce, ValidatorSet, VoteOption, U256,
 };
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
@@ -6576,7 +6576,10 @@ impl NativeExecutor {
                 if let Some(m) = metrics {
                     m.orders_rejected_other.inc();
                 }
-                results[i] = NativeActionResult::rejected("place_order", (FailureReason::DuplicateCloid, msg));
+                results[i] = NativeActionResult::rejected(
+                    "place_order",
+                    (FailureReason::DuplicateCloid, msg),
+                );
                 false
             });
         }
@@ -9242,7 +9245,10 @@ impl NativeExecutor {
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
             }
-            return NativeActionResult::rejected("place_order", (FailureReason::DuplicateCloid, msg));
+            return NativeActionResult::rejected(
+                "place_order",
+                (FailureReason::DuplicateCloid, msg),
+            );
         }
         let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
         if let Err((reason, msg)) = Self::take_open_slot(
@@ -9793,8 +9799,12 @@ impl NativeExecutor {
                     "cancel_order",
                     format!("order {order_id} belongs to {owner}, not sender {sender}"),
                 ),
-                Some((market_id, _)) => Self::cancel_stop_in(ctx, "cancel_order", market_id, order_id),
-                None => NativeActionResult::err("cancel_order", format!("order {order_id} not found")),
+                Some((market_id, _)) => {
+                    Self::cancel_stop_in(ctx, "cancel_order", market_id, order_id)
+                }
+                None => {
+                    NativeActionResult::err("cancel_order", format!("order {order_id} not found"))
+                }
             };
         };
         Self::release_cancelled(ctx, market_id, &cancelled);
@@ -9833,7 +9843,11 @@ impl NativeExecutor {
         market_id: MarketId,
         id: OrderId,
     ) -> NativeActionResult {
-        let Some(stop) = ctx.order_books.get_mut(&market_id).and_then(|b| b.cancel_stop(id)) else {
+        let Some(stop) = ctx
+            .order_books
+            .get_mut(&market_id)
+            .and_then(|b| b.cancel_stop(id))
+        else {
             return NativeActionResult::err(action_type, format!("order {id} not found"));
         };
         ctx.dirty_books.insert(market_id);

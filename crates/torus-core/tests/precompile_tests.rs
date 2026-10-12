@@ -1224,9 +1224,16 @@ fn cloid_queue_rows_round_trip() {
     for kind in [
         place(Some(CW_CLOID)),
         place(None),
-        QueuedActionKind::CancelByCloid { market_id: 9, cloid: CW_CLOID },
+        QueuedActionKind::CancelByCloid {
+            market_id: 9,
+            cloid: CW_CLOID,
+        },
     ] {
-        let qa = QueuedAction { trader: addr(3), kind, block_queued: 42 };
+        let qa = QueuedAction {
+            trader: addr(3),
+            kind,
+            block_queued: 42,
+        };
         let bytes = borsh::to_vec(&qa).unwrap();
         let back = QueuedAction::try_from_slice(&bytes).unwrap();
         assert_eq!(format!("{qa:?}"), format!("{back:?}"));
@@ -1236,7 +1243,9 @@ fn cloid_queue_rows_round_trip() {
                 tail.extend_from_slice(&c.to_be_bytes());
                 assert!(bytes.ends_with(&tail));
             }
-            QueuedActionKind::PlaceOrder { cloid: None, .. } => assert_eq!(*bytes.last().unwrap(), 0),
+            QueuedActionKind::PlaceOrder { cloid: None, .. } => {
+                assert_eq!(*bytes.last().unwrap(), 0)
+            }
             QueuedActionKind::CancelByCloid { .. } => {
                 let mut want = vec![8u8];
                 want.extend_from_slice(&9u64.to_be_bytes());
