@@ -71,10 +71,20 @@ fn refused_proposal() -> ProduceBlockResponse {
 /// -> parent (frozen n-1) -> `layer` (L: S+1..=n-2, last value per key) ->
 /// `inflight` (C) -> DB, where S = `base` is the last checkpoint handed to
 /// W.
+///
+/// p3 merge wait: between blocks L is in two parts. `layer` holds every CF
+/// but [`torus_state::DEFERRED_CFS`] (positions, balances: ~92% of a
+/// block's keys, read by a native block from R only); `deferred` holds
+/// those, merged by the merge thread after it hands `layer` back, so E
+/// waits at the start of a block only for the small part. A read of a
+/// deferred CF through L waits for its part (same answer as a whole L);
+/// E joins it at the end of the block, before L is read whole or taken.
 #[derive(Default)]
 struct CkptState {
-    /// L. `None` = empty.
+    /// L, the main part (all of L when `deferred` is `None`). `None` = empty.
     layer: Option<Arc<torus_state::CheckpointLayer>>,
+    /// p3 merge wait: L's deferred part, possibly still being merged.
+    deferred: Option<Arc<torus_state::DeferredLayer>>,
     /// The merge of the previous parent into L, running off E since the end
     /// of the previous block; L is received before it is read or taken.
     /// Step 2: with a mempool wired the thread then cuts that block's
@@ -105,13 +115,18 @@ struct CkptState {
     /// p3s2g 47.1: frees released layers / sets / views off E (`None`:
     /// interval 0, or the thread could not start: E frees them itself).
     dropper: Option<Dropper>,
+    /// p3 merge wait test seam: holds each merge's deferred half (see
+    /// [`DeferredGate`]).
+    #[cfg(test)]
+    test_gate: Option<Arc<DeferredGate>>,
 }
 
 impl CkptState {
-    /// Receive L from a running merge. Only L: the merge thread hands it
-    /// back before it cuts the ingress slice and lets go of the merged
-    /// block (p3s2g 47.1). `false`: the merge panicked — L is lost, the
-    /// caller must fail-stop.
+    /// Receive L's main part from a running merge. Only that: the merge
+    /// thread hands it back before it merges the deferred part, cuts the
+    /// ingress slice and lets go of the merged block (p3s2g 47.1, p3 merge
+    /// wait); the deferred part becomes `deferred` (still arriving).
+    /// `false`: the merge panicked — L is lost, the caller must fail-stop.
     fn settle(&mut self) -> bool {
         let Some(merge) = self.merging.take() else {
             return true;
@@ -119,11 +134,38 @@ impl CkptState {
         match merge.layer.recv() {
             Ok(layer) => {
                 self.layer = Some(Arc::new(layer));
+                debug_assert!(self.deferred.is_none(), "the merge took L whole");
+                let part = torus_state::DeferredLayer::pending(merge.deferred);
+                #[cfg(test)]
+                let part = match &self.test_gate {
+                    Some(g) => {
+                        let g = g.clone();
+                        part.on_block(move || g.release())
+                    }
+                    None => part,
+                };
+                self.deferred = Some(Arc::new(part));
                 self.slicing.extend(merge.slice);
                 true
             }
             Err(_) => false,
         }
+    }
+
+    /// [`Self::settle`], then wait for the deferred part: L is whole after
+    /// it. `false`: a merge panicked (fail-stop).
+    fn settle_all(&mut self) -> bool {
+        self.settle() && self.deferred.as_ref().is_none_or(|d| d.join().is_some())
+    }
+
+    /// Bytes of L (both parts). Call after [`Self::settle_all`].
+    fn layer_bytes(&self) -> usize {
+        self.layer.as_ref().map_or(0, |l| l.bytes())
+            + self
+                .deferred
+                .as_ref()
+                .and_then(|d| d.join())
+                .map_or(0, |l| l.bytes())
     }
 
     /// Step 2: the merged blocks' ingress slices stand in for their full
@@ -167,9 +209,11 @@ impl CkptState {
         }
     }
 
-    /// Take L back as an owned layer (empty if none). Call after `settle`.
+    /// Take L back whole as an owned layer (empty if none): the main part
+    /// with the deferred part folded back in (moved, not copied). Call
+    /// after `settle_all`.
     fn take_layer(&mut self) -> torus_state::CheckpointLayer {
-        match self.layer.take() {
+        let mut layer = match self.layer.take() {
             None => torus_state::CheckpointLayer::new(),
             Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|shared| {
                 self.shared_fallbacks += 1;
@@ -179,7 +223,88 @@ impl CkptState {
                 );
                 shared.duplicate()
             }),
+        };
+        if let Some(d) = self.deferred.take() {
+            let part = match Arc::try_unwrap(d) {
+                Ok(d) => d.into_layer(),
+                Err(shared) => {
+                    self.shared_fallbacks += 1;
+                    tracing::warn!(
+                        fallbacks = self.shared_fallbacks,
+                        "item 6 Phase 3: deferred layer part still shared at the end of the block — copying it"
+                    );
+                    shared.join().map(torus_state::CheckpointLayer::duplicate)
+                }
+            };
+            debug_assert!(part.is_some(), "take_layer before settle_all");
+            if let Some(part) = part {
+                layer.absorb(part);
+            }
         }
+        layer
+    }
+}
+
+/// p3 merge wait test seam: the deferred half of each layer merge waits
+/// until E reaches a point that may need it (the end-of-block upkeep, a
+/// drain) or a read blocks on it, all of which release it. A hold that
+/// times out means E waited for the deferred half where nothing should:
+/// it is counted and the gate opens for the rest of the run.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DeferredGate {
+    state: std::sync::Mutex<DeferredGateState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct DeferredGateState {
+    /// Merges started (each takes the next ticket).
+    spawned: u64,
+    /// Every ticket up to here is released.
+    released: u64,
+    /// Holds that ended by a release.
+    held: u64,
+    /// Holds that timed out (then `open`).
+    timeouts: u64,
+    open: bool,
+}
+
+#[cfg(test)]
+impl DeferredGate {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn ticket(&self) -> u64 {
+        let mut s = self.state.lock().unwrap();
+        s.spawned += 1;
+        s.spawned
+    }
+
+    /// The merge thread, before the deferred half of merge `ticket`.
+    fn hold(&self, ticket: u64) {
+        let s = self.state.lock().unwrap();
+        let (mut s, _) = self
+            .cv
+            .wait_timeout_while(s, Self::TIMEOUT, |s| !s.open && s.released < ticket)
+            .unwrap();
+        if s.released >= ticket {
+            s.held += 1;
+        } else if !s.open {
+            s.timeouts += 1;
+            s.open = true;
+        }
+    }
+
+    /// Release every merge started so far.
+    fn release(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.released = s.spawned;
+        self.cv.notify_all();
+    }
+
+    fn stats(&self) -> DeferredGateState {
+        *self.state.lock().unwrap()
     }
 }
 
@@ -191,43 +316,58 @@ struct PendingSlash {
     tombstone: bool,
 }
 
-/// Item 6 Phase 3: (L, C) under a pipelined overlay's parent.
+/// Item 6 Phase 3: (L, L's deferred part, C) under a pipelined overlay's
+/// parent.
 type CkptLayers = (
     Option<Arc<torus_state::CheckpointLayer>>,
+    Option<Arc<torus_state::DeferredLayer>>,
     Option<Arc<torus_state::CheckpointLayer>>,
 );
 
 /// Item 6 Phase 3: the end-of-block merge of the previous parent into L,
 /// running off E (see [`spawn_layer_merge`]).
 struct LayerMerge {
-    /// L with the block folded in. Disconnected without a value: the
-    /// merge panicked (L is lost; fail-stop).
+    /// L's main part with the block folded in. Disconnected without a
+    /// value: the merge panicked (L is lost; fail-stop).
     layer: std::sync::mpsc::Receiver<torus_state::CheckpointLayer>,
+    /// p3 merge wait: L's deferred part with the block folded in, sent
+    /// after `layer` (same failure rule).
+    deferred: std::sync::mpsc::Receiver<torus_state::CheckpointLayer>,
     /// Step 2 (mempool wired): the block's ingress slice for the view.
     slice: Option<std::sync::mpsc::Receiver<Arc<torus_state::FrozenPending>>>,
 }
 
-/// Item 6 Phase 3: merge `block` into `layer` on a `torus-ckpt-merge`
-/// thread; with `slice`, also cut the block's ingress slice
-/// (`before_slice` runs first: a test seam, a no-op in production).
+/// Item 6 Phase 3: merge `block` into `layer` (whole L) on a
+/// `torus-ckpt-merge` thread; with `slice`, also cut the block's ingress
+/// slice (`before_deferred` / `before_slice` run first: test seams, no-ops
+/// in production).
 /// p3s2g 47.1: the thread hands L back first; the slice and the release
 /// of its handle on `block` follow, so E (waiting for L at the start of
 /// the next block) does not wait for them.
+/// p3 merge wait: "L" there is L's main part. The thread splits off the
+/// deferred CFs (positions, balances), merges the rest, hands that back,
+/// then merges the deferred part and sends it on `deferred`.
 fn spawn_layer_merge(
     mut layer: torus_state::CheckpointLayer,
     block: Arc<torus_state::FrozenPending>,
     slice: bool,
+    before_deferred: impl FnOnce() + Send + 'static,
     before_slice: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<LayerMerge> {
     let (layer_tx, layer_rx) = std::sync::mpsc::sync_channel(1);
+    let (deferred_tx, deferred_rx) = std::sync::mpsc::sync_channel(1);
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("torus-ckpt-merge".into())
         .spawn(move || {
-            layer.merge(&block);
+            let mut part = layer.split_deferred();
+            layer.merge_part(&block, torus_state::LayerPart::Main);
+            before_deferred();
+            part.merge_part(&block, torus_state::LayerPart::Deferred);
             if layer_tx.send(layer).is_err() {
                 return;
             }
+            let _ = deferred_tx.send(part);
             if slice {
                 before_slice();
                 let cut = Arc::new(block.slice(&torus_state::read_view::INGRESS_CFS));
@@ -237,6 +377,7 @@ fn spawn_layer_merge(
         })?;
     Ok(LayerMerge {
         layer: layer_rx,
+        deferred: deferred_rx,
         slice: slice.then_some(slice_rx),
     })
 }
@@ -2219,12 +2360,12 @@ impl ExecutionContext {
     }
 
     /// Item 6 Phase 3: the layers the next pipelined overlay reads under its
-    /// parent: (L, C). Joins a running merge; drops C once durable.
-    /// `(None, None)` without a checkpoint interval. `Err`: the merge
-    /// panicked (fail-stop).
+    /// parent: (L, L's deferred part, C). Joins a running merge's main part
+    /// only (p3 merge wait); drops C once durable. `(None, None, None)`
+    /// without a checkpoint interval. `Err`: the merge panicked (fail-stop).
     fn checkpoint_read_layers(&self) -> Result<CkptLayers, ()> {
         let (Some(_), Some(worker)) = (&self.checkpoint, &self.flush_worker) else {
-            return Ok((None, None));
+            return Ok((None, None, None));
         };
         let mut st = self.ckpt.lock().unwrap();
         // p3s2g 47.1: the previous block's end spawned the merge of its
@@ -2249,6 +2390,7 @@ impl ExecutionContext {
         }
         Ok((
             st.layer.clone(),
+            st.deferred.clone(),
             st.inflight.as_ref().map(|(_, c)| c.clone()),
         ))
     }
@@ -2284,7 +2426,22 @@ impl ExecutionContext {
         overlay.detach_layers();
         let current = self.last_job.lock().unwrap().clone();
         let mut st = self.ckpt.lock().unwrap();
-        if !st.settle() {
+        #[cfg(test)]
+        if let Some(g) = &st.test_gate {
+            g.release();
+        }
+        // p3 merge wait: the deferred part had the whole block to merge;
+        // the trigger, a checkpoint and the next merge need L whole.
+        let read_waits = st.deferred.as_ref().map(|d| d.take_read_waits().0);
+        let join_timer = std::time::Instant::now();
+        let settled = st.settle_all();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_deferred_join_seconds
+                .observe(join_timer.elapsed().as_secs_f64());
+            m.exec_checkpoint_deferred_read_waits
+                .inc_by(read_waits.unwrap_or(0));
+        }
+        if !settled {
             tracing::error!(
                 height,
                 "FATAL: since-checkpoint layer merge panicked — fail-stop"
@@ -2303,7 +2460,7 @@ impl ExecutionContext {
         // twice, so this bounds the merged size from above: early, never late.
         // Summed only with a cap set (it walks both blocks' sets on E).
         let bytes = || {
-            (st.layer.as_ref().map_or(0, |l| l.bytes())
+            (st.layer_bytes()
                 + fold.as_ref().map_or(0, |p| p.state_bytes())
                 + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
         };
@@ -2343,7 +2500,19 @@ impl ExecutionContext {
         }
         if let Some(p) = fold {
             let layer = st.take_layer();
-            match spawn_layer_merge(layer, p, self.mempool.is_some(), || {}) {
+            #[cfg(test)]
+            let before_deferred = {
+                let gate = st.test_gate.clone();
+                let ticket = gate.as_ref().map(|g| g.ticket());
+                move || {
+                    if let (Some(g), Some(t)) = (gate, ticket) {
+                        g.hold(t);
+                    }
+                }
+            };
+            #[cfg(not(test))]
+            let before_deferred = || {};
+            match spawn_layer_merge(layer, p, self.mempool.is_some(), before_deferred, || {}) {
                 Ok(merge) => st.merging = Some(merge),
                 Err(e) => {
                     // The layer moved into the failed closure: L is lost.
@@ -2385,13 +2554,22 @@ impl ExecutionContext {
     fn checkpoint_drain(&self) -> bool {
         let top = self.last_job.lock().unwrap().clone();
         let mut st = self.ckpt.lock().unwrap();
-        if !st.settle() {
+        #[cfg(test)]
+        if let Some(g) = &st.test_gate {
+            g.release();
+        }
+        if !st.settle_all() {
             tracing::error!("FATAL: since-checkpoint layer merge panicked — fail-stop");
             return false;
         }
         let Some(top) = top.filter(|t| t.height() > st.base) else {
             debug_assert!(
-                st.layer.as_ref().is_none_or(|l| l.is_empty()),
+                st.layer.as_ref().is_none_or(|l| l.is_empty())
+                    && st
+                        .deferred
+                        .as_ref()
+                        .and_then(|d| d.join())
+                        .is_none_or(|l| l.is_empty()),
                 "L open without a digested top"
             );
             return true;
@@ -2887,8 +3065,9 @@ impl ExecutionContext {
             "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
             parent.as_ref().map(|p| p.height())
         );
-        // Item 6 Phase 3: under the parent, L and C (checkpoint interval only).
-        let (layer, inflight) = if pipelined {
+        // Item 6 Phase 3: under the parent, L (two parts) and C (checkpoint
+        // interval only).
+        let (layer, deferred, inflight) = if pipelined {
             match self.checkpoint_read_layers() {
                 Ok(layers) => layers,
                 Err(()) => {
@@ -2901,10 +3080,15 @@ impl ExecutionContext {
                 }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
-        let mut overlay =
-            NativeStateOverlay::with_layers(self.state_db.clone(), parent, layer, inflight);
+        let mut overlay = NativeStateOverlay::with_split_layers(
+            self.state_db.clone(),
+            parent,
+            layer,
+            deferred,
+            inflight,
+        );
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
@@ -22869,6 +23053,10 @@ mod crash_recovery_tests {
         /// more lands; a new context keeping the holder replays (S, last]
         /// from the DB (`replay_committed`) and the run continues.
         CkptCrash(Vec<(u64, bool)>),
+        /// p3 merge wait (pipelined, checkpoint policy set): every layer
+        /// merge's deferred half waits on the gate until E's next upkeep or
+        /// drain, or a read blocking on it, releases it.
+        DeferredGate(Arc<DeferredGate>),
     }
 
     /// V4's resting orders + pending stops in the classic book blobs of
@@ -23010,6 +23198,9 @@ mod crash_recovery_tests {
             ctx.checkpoint = ckpt;
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
+                if let P2Fault::DeferredGate(g) = fault {
+                    ctx.ckpt.lock().unwrap().test_gate = Some(g.clone());
+                }
             }
             ctx
         };
@@ -23715,6 +23906,54 @@ mod crash_recovery_tests {
         }
     }
 
+    /// p3 merge wait (results doc 49: E waited 23.9 ms per native block at
+    /// the start of the block for the previous block's merge into L). The
+    /// merge hands L back without positions and balances (~92% of a block's
+    /// keys), which a native block reads from R only; E joins that part at
+    /// the end of the block. Over the 130 P2 blocks, checkpoints never by
+    /// time, every merge's deferred half is held until E's next upkeep (or
+    /// a drain, or a read blocking on it): no hold times out (E never
+    /// waited for it mid-block), no read blocked on it, and the write sets,
+    /// running hash and CF dump equal the per-block run.
+    #[test]
+    fn exec_does_not_wait_for_the_deferred_layer_merge() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let gate = Arc::new(DeferredGate::default());
+        let run = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::DeferredGate(gate.clone()),
+            Some(ckpt_never()),
+        );
+        let stats = gate.stats();
+        assert_eq!(
+            stats.timeouts, 0,
+            "E waited for a held deferred merge: {stats:?}"
+        );
+        assert!(stats.held >= 100, "merges held until upkeep: {stats:?}");
+        assert_eq!(
+            run.metrics.exec_checkpoint_deferred_read_waits.get(),
+            0,
+            "no read blocked on the deferred part"
+        );
+        let v = |name: &str| metric_value(&run.metrics.encode(), name);
+        assert_eq!(
+            v("torus_exec_checkpoint_deferred_join_seconds_count"),
+            v("torus_exec_checkpoint_upkeep_seconds_count"),
+            "the join is observed once per upkeep"
+        );
+        assert!(run.max_lag >= 40, "max lag {}", run.max_lag);
+        assert_write_sets_equal(&per_block.captured, &run.captured, "gated vs per-block");
+        assert_eq!(per_block.hash, run.hash, "running hash");
+        assert_dumps_equal(&per_block.dump, &run.dump, "gated vs per-block");
+        assert_eq!(run.metrics.exec_checkpoint_layer_shared.get(), 0);
+    }
+
     // ---- Item 6 Phase 3 task 1.7: crash and replay at interval > 0 ----
 
     /// `(k, mid_checkpoint)` crash points: no epoch boundary (50 / 100) in
@@ -24414,6 +24653,7 @@ mod crash_recovery_tests {
             torus_state::CheckpointLayer::new(),
             block.clone(),
             true,
+            || {},
             move || {
                 let _ = held.recv();
             },
@@ -24423,8 +24663,14 @@ mod crash_recovery_tests {
             .layer
             .recv_timeout(Duration::from_secs(5))
             .expect("L handed back while the slice is still being cut");
-        assert_eq!(layer.entry_count(), 2);
+        let deferred = merge
+            .deferred
+            .recv_timeout(Duration::from_secs(5))
+            .expect("deferred part sent before the slice");
+        assert_eq!(layer.entry_count(), 1, "main part: the book");
+        assert_eq!(deferred.entry_count(), 1, "deferred part: the position");
         assert_eq!(layer.top_height(), Some(7));
+        assert_eq!(deferred.top_height(), Some(7));
         let slice = merge.slice.expect("slice requested");
         assert!(slice.try_recv().is_err(), "slice still held");
         release.send(()).unwrap();

@@ -621,7 +621,18 @@ pub struct Metrics {
     /// Item 6 Phase 3 (p3s2g 47.1): exec thread blocked at the start of a
     /// pipelined block joining the previous block's merge into the
     /// since-checkpoint layer. Once per pipelined block at interval > 0.
+    /// p3 merge wait: only the main part (every CF but positions and
+    /// balances); the deferred part is joined at the end of the block.
     pub exec_checkpoint_settle_wait_seconds: Histogram,
+    /// Item 6 Phase 3 (p3 merge wait): exec thread blocked at the end of a
+    /// pipelined block joining the deferred part (positions, balances) of
+    /// the merge started at the end of the previous block. Inside
+    /// `exec_checkpoint_upkeep_seconds`. Once per pipelined block.
+    pub exec_checkpoint_deferred_join_seconds: Histogram,
+    /// Item 6 Phase 3 (p3 merge wait): reads that blocked on the deferred
+    /// part of the layer while it was still being merged (any thread; a
+    /// native block reads those CFs from R, so expected ~0).
+    pub exec_checkpoint_deferred_read_waits: Counter,
     /// Item 6 Phase 3 (p3s2g 47.1): exec thread time in the end-of-block
     /// checkpoint upkeep (trigger, checkpoint-time merges and hand-off, which
     /// includes `exec_checkpoint_wait_seconds`, and the ingress view publish).
@@ -2232,6 +2243,19 @@ impl Metrics {
             "Item 6 Phase 3: exec thread blocked joining the previous block's since-checkpoint layer merge (once per pipelined block)",
             exec_checkpoint_settle_wait_seconds.clone(),
         );
+        let exec_checkpoint_deferred_join_seconds =
+            Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_deferred_join_seconds",
+            "Item 6 Phase 3: exec thread blocked at the end of a pipelined block joining the deferred (positions, balances) part of the layer merge (inside upkeep; once per pipelined block)",
+            exec_checkpoint_deferred_join_seconds.clone(),
+        );
+        let exec_checkpoint_deferred_read_waits = Counter::default();
+        registry.register(
+            "torus_exec_checkpoint_deferred_read_waits",
+            "Item 6 Phase 3: reads that blocked on the deferred part of the since-checkpoint layer while it was being merged",
+            exec_checkpoint_deferred_read_waits.clone(),
+        );
         let exec_checkpoint_upkeep_seconds = Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
         registry.register(
             "torus_exec_checkpoint_upkeep_seconds",
@@ -2769,6 +2793,8 @@ impl Metrics {
             exec_checkpoint_layer_bytes,
             exec_checkpoint_layer_shared,
             exec_checkpoint_settle_wait_seconds,
+            exec_checkpoint_deferred_join_seconds,
+            exec_checkpoint_deferred_read_waits,
             exec_checkpoint_upkeep_seconds,
             exec_checkpoint_drop_inline,
             flush_worker_checkpoint_seconds,
@@ -3250,6 +3276,8 @@ mod tests {
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
             "torus_exec_checkpoint_settle_wait_seconds",
+            "torus_exec_checkpoint_deferred_join_seconds",
+            "torus_exec_checkpoint_deferred_read_waits",
             "torus_exec_checkpoint_upkeep_seconds",
             "torus_exec_checkpoint_drop_inline",
             "torus_flush_worker_checkpoint_seconds",
