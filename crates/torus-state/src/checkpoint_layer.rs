@@ -878,4 +878,120 @@ mod tests {
         assert!(StateBackend::iterate_cf(&lost, pos, None).is_err());
         assert_eq!(lost.get_cf_raw(books, b"b1").unwrap(), None);
     }
+
+    /// Codex P3 (merge wait r1): a point read of a deferred CF whose key the
+    /// parent holds (a write or a tombstone) answers from the parent at once,
+    /// without waiting for L's deferred part, and is not counted as a wait.
+    /// A key the parent lacks still waits and then reads L. Answers are the
+    /// ones the whole layer gives.
+    #[test]
+    fn parent_hit_does_not_wait_for_the_deferred_part() {
+        use std::time::Duration;
+        let (db, _dir) = temp_db();
+        let pos = crate::cf::CF_NATIVE_POSITIONS;
+        let bal = crate::cf::CF_NATIVE_BALANCES;
+        db.put_cf_raw(pos, b"gone", b"db").unwrap();
+        db.put_cf_raw(pos, b"lower", b"db").unwrap();
+        // L (deferred part): every key written at height 5.
+        let o = NativeStateOverlay::new(db.clone());
+        for (cf, k) in [(pos, &b"p1"[..]), (pos, b"gone"), (pos, b"lower"), (bal, b"b1")] {
+            o.put_cf_raw(cf, k, b"L").unwrap();
+        }
+        let mut main = CheckpointLayer::new();
+        let mut part = main.split_deferred();
+        let block = o.freeze(5);
+        main.merge_part(&block, LayerPart::Main);
+        part.merge_part(&block, LayerPart::Deferred);
+        // Parent (height 6): writes p1 and b1, tombstones `gone`.
+        let p = NativeStateOverlay::new(db.clone());
+        p.put_cf_raw(pos, b"p1", b"parent").unwrap();
+        p.put_cf_raw(bal, b"b1", b"parent").unwrap();
+        p.delete_cf_raw(pos, b"gone").unwrap();
+        let parent = p.freeze(6);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let deferred = Arc::new(DeferredLayer::pending(rx));
+        let ov = NativeStateOverlay::with_split_layers(
+            db.clone(),
+            Some(parent),
+            Some(Arc::new(main)),
+            Some(deferred.clone()),
+            None,
+        );
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = ov.clone();
+        std::thread::spawn(move || {
+            let r = (
+                reader.get_cf_raw(pos, b"p1").unwrap(),
+                reader.get_cf_raw(bal, b"b1").unwrap(),
+                reader.get_cf_raw(pos, b"gone").unwrap(),
+                reader.get_cf_len(pos, b"p1").unwrap(),
+                reader.get_cf_len(pos, b"gone").unwrap(),
+            );
+            let _ = done_tx.send(r);
+        });
+        let got = done.recv_timeout(Duration::from_secs(2));
+        // Unblock a reader stuck on the part before asserting (no leak).
+        let _ = tx.send(part);
+        let (p1, b1, gone, p1_len, gone_len) =
+            got.expect("a parent hit does not wait for the deferred part");
+        assert_eq!(p1, Some(b"parent".to_vec()));
+        assert_eq!(b1, Some(b"parent".to_vec()));
+        assert_eq!(gone, None, "the parent's tombstone wins over L and the DB");
+        assert_eq!(p1_len, Some(6));
+        assert_eq!(gone_len, None);
+        assert_eq!(deferred.take_read_waits().0, 0, "parent hits are not waits");
+        assert_eq!(
+            ov.get_cf_raw(pos, b"lower").unwrap(),
+            Some(b"L".to_vec()),
+            "a parent miss reads L"
+        );
+    }
+
+    /// Codex P3 (merge wait r1): every read that blocks on the deferred
+    /// part is counted, including one waiting while another thread receives
+    /// it (two blocked readers record 2). Reads after it arrived, and the
+    /// exec join, are not counted.
+    #[test]
+    fn concurrent_blocked_reads_are_each_counted() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let seen = blocked.clone();
+        let d = Arc::new(DeferredLayer::pending(rx).on_block(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let d = d.clone();
+                std::thread::spawn(move || d.read().map(|l| l.top_height()))
+            })
+            .collect();
+        // Both readers announce they block (bounded: a reader that never
+        // announces it fails the count below rather than hanging).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while blocked.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut part = CheckpointLayer::new();
+        part.top = Some(9);
+        tx.send(part).unwrap();
+        for r in readers {
+            assert_eq!(r.join().unwrap(), Some(Some(9)));
+        }
+        assert_eq!(blocked.load(Ordering::SeqCst), 2, "each blocked read announced");
+        let (waits, time) = d.take_read_waits();
+        assert_eq!(waits, 2, "two blocked reads, two waits");
+        assert!(time > Duration::ZERO);
+        assert!(d.read().is_some() && d.join().is_some());
+        assert_eq!(d.take_read_waits().0, 0, "settled: no more waits");
+
+        // Arrived before the first read: no wait.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(CheckpointLayer::new()).unwrap();
+        let d = DeferredLayer::pending(rx);
+        assert!(d.read().is_some());
+        assert_eq!(d.take_read_waits().0, 0, "already merged: no wait");
+    }
 }
