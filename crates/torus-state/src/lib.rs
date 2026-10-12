@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bg_writer;
 pub mod block_body;
 pub mod cf;
+pub mod corewriter_tx;
 pub mod db;
 pub mod erasure;
 pub mod error;

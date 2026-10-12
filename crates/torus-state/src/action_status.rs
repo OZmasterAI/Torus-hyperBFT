@@ -58,7 +58,13 @@
 //! drain height, `seq`): the queue row key is `drain height ‖ seq`. An
 //! undecodable row ([`CoreWriterKind::Undecodable`]) has a zero `trader` and
 //! `queued_block`. A block that drained CoreWriter rows has a record even
-//! without native actions or EVM txs (both counts 0).
+//! without native actions or EVM txs (both counts 0). Read only since v5.
+//!
+//! Encoding v5 (s114, written instead of v4): v4 with each result followed
+//! by `ext u8` and the fields its bits announce: bit 0 (`0x01`) = `oid u128
+//! BE`, the order id an executed `PlaceOrder` row's order got (resting or
+//! filled). Every other row has `ext = 0` (one byte). An unknown bit does not
+//! decode (its field's size is unknown).
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
@@ -66,8 +72,14 @@ const ACTION_STATUS_V1: u8 = 0x01;
 const ACTION_STATUS_V2: u8 = 0x02;
 /// First byte of a v3 record (v2 + outcome per entry + per-order statuses).
 const ACTION_STATUS_V3: u8 = 0x03;
-/// First byte of a v4 record (v3 + the block's CoreWriter drain results).
+/// First byte of a v4 record (v3 + the block's CoreWriter drain results;
+/// read only since v5).
 const ACTION_STATUS_V4: u8 = 0x04;
+/// First byte of a v5 record (v4 + an ext byte per CoreWriter result: the
+/// order id of an executed `PlaceOrder` row).
+const ACTION_STATUS_V5: u8 = 0x05;
+/// v5 CoreWriter result ext flag: an order id (u128 BE) follows.
+const CW_EXT_OID: u8 = 0x01;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -334,6 +346,9 @@ pub struct CoreWriterResult {
     /// Empty for an executed row; for a `Rejected` one, empty stands for its
     /// reason's [`FailureReason::book_reject_message`] (as in v3).
     pub message: String,
+    /// s114 (v5): the order id an executed `PlaceOrder` row's order got
+    /// (resting or filled); `None` for every other row (and in v4 records).
+    pub oid: Option<u128>,
 }
 
 /// Row 50 (v3): one order's status inside an entry (see
@@ -477,7 +492,7 @@ fn take_message(bytes: &mut &[u8], outcome: Outcome, reason: FailureReason) -> O
 
 impl BlockActionStatus {
     /// v1 when nothing failed or was rejected and no CoreWriter row was
-    /// drained (the s84 bytes exactly), v4 when a CoreWriter row was
+    /// drained (the s84 bytes exactly), v5 when a CoreWriter row was
     /// drained, else v3.
     pub fn encode(&self) -> Vec<u8> {
         let core_writer = !self.core_writer.is_empty();
@@ -486,7 +501,7 @@ impl BlockActionStatus {
             9 + self.evm_skipped.len().div_ceil(8) + self.native_skipped.len().div_ceil(8),
         );
         out.push(if core_writer {
-            ACTION_STATUS_V4
+            ACTION_STATUS_V5
         } else if failures {
             ACTION_STATUS_V3
         } else {
@@ -523,6 +538,13 @@ impl BlockActionStatus {
                 out.push(r.outcome as u8);
                 out.push(r.reason as u8);
                 push_message(&mut out, r.outcome, r.reason, &r.message);
+                match r.oid {
+                    Some(oid) => {
+                        out.push(CW_EXT_OID);
+                        out.extend_from_slice(&oid.to_be_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
         }
         out
@@ -533,7 +555,11 @@ impl BlockActionStatus {
         let (&version, mut rest) = bytes.split_first()?;
         if !matches!(
             version,
-            ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3 | ACTION_STATUS_V4
+            ACTION_STATUS_V1
+                | ACTION_STATUS_V2
+                | ACTION_STATUS_V3
+                | ACTION_STATUS_V4
+                | ACTION_STATUS_V5
         ) {
             return None;
         }
@@ -584,7 +610,7 @@ impl BlockActionStatus {
             }
         }
         let mut core_writer = Vec::new();
-        if version == ACTION_STATUS_V4 {
+        if version >= ACTION_STATUS_V4 {
             for _ in 0..take_u32(&mut rest)? {
                 let seq = u64::from_be_bytes(take(&mut rest, 8)?.try_into().ok()?);
                 let kind = CoreWriterKind::from_u8(take_u8(&mut rest)?);
@@ -593,6 +619,18 @@ impl BlockActionStatus {
                 let outcome = Outcome::from_u8(take_u8(&mut rest)?);
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
                 let message = take_message(&mut rest, outcome, reason)?;
+                let mut oid = None;
+                if version == ACTION_STATUS_V5 {
+                    let ext = take_u8(&mut rest)?;
+                    // A bit this reader does not know: its field's size is
+                    // unknown, so the record does not decode.
+                    if ext & !CW_EXT_OID != 0 {
+                        return None;
+                    }
+                    if ext & CW_EXT_OID != 0 {
+                        oid = Some(u128::from_be_bytes(take(&mut rest, 16)?.try_into().ok()?));
+                    }
+                }
                 core_writer.push(CoreWriterResult {
                     seq,
                     kind,
@@ -601,6 +639,7 @@ impl BlockActionStatus {
                     outcome,
                     reason,
                     message,
+                    oid,
                 });
             }
         }
@@ -1110,6 +1149,7 @@ mod tests {
             outcome,
             reason,
             message: msg.to_string(),
+            oid: None,
         }
     }
 
@@ -1181,8 +1221,8 @@ mod tests {
                 core_writer: results.clone(),
             };
             let bytes = status.encode();
-            assert_eq!(bytes[0], ACTION_STATUS_V4, "CoreWriter results write v4");
-            let back = BlockActionStatus::decode(&bytes).expect("v4 decodes");
+            assert_eq!(bytes[0], ACTION_STATUS_V5, "CoreWriter results write v5");
+            let back = BlockActionStatus::decode(&bytes).expect("v5 decodes");
             assert_eq!(back, status);
             let seqs: Vec<u64> = back.core_writer.iter().map(|r| r.seq).collect();
             assert_eq!(seqs, [0, 1, 2, 3, 4, 5, 9]);
@@ -1208,8 +1248,8 @@ mod tests {
         };
         assert_eq!(one(ioc), one(""));
         // version 1 + counts 8 + failure_count 4 + cw count 4 + seq 8 + kind 1
-        // + trader 20 + queued_block 8 + outcome, reason, msg_len 3.
-        assert_eq!(one(""), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3);
+        // + trader 20 + queued_block 8 + outcome, reason, msg_len 3 + ext 1.
+        assert_eq!(one(""), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3 + 1);
     }
 
     /// v4: no CoreWriter result keeps the v1 / v3 bytes exactly.
@@ -1277,6 +1317,105 @@ mod tests {
         );
     }
 
+    /// s114 (v5): an executed CoreWriter `PlaceOrder` row carries the order
+    /// id its order got: an ext flags byte after the message (bit 0 = oid)
+    /// and the oid, 16 B BE. Every other row carries the flags byte (0)
+    /// only. An unknown ext bit (a newer writer) or a cut oid does not
+    /// decode.
+    #[test]
+    fn v5_place_order_rows_carry_their_order_id() {
+        use CoreWriterKind as K;
+        use FailureReason as R;
+        let placed = CoreWriterResult {
+            oid: Some(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            ..cw(0, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let max = CoreWriterResult {
+            oid: Some(u128::MAX),
+            ..cw(1, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let other = cw(
+            2,
+            K::CancelOrder,
+            Outcome::Failed,
+            R::Other,
+            "no such order",
+        );
+        let status = BlockActionStatus {
+            core_writer: vec![placed.clone(), max, other],
+            ..Default::default()
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V5);
+        assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
+
+        let one = |r: CoreWriterResult| {
+            BlockActionStatus {
+                core_writer: vec![r],
+                ..Default::default()
+            }
+            .encode()
+        };
+        let plain = one(cw(0, K::PlaceOrder, Outcome::Rejected, R::IocCancel, ""));
+        assert_eq!(plain.len(), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3 + 1);
+        assert_eq!(*plain.last().unwrap(), 0x00, "no oid: ext 0");
+        let with = one(placed.clone());
+        assert_eq!(with.len(), plain.len() + 16);
+        assert_eq!(with[with.len() - 17], 0x01, "ext bit 0: oid follows");
+        assert_eq!(&with[with.len() - 16..], &placed.oid.unwrap().to_be_bytes());
+
+        let mut unknown = plain.clone();
+        *unknown.last_mut().unwrap() = 0x02;
+        assert_eq!(BlockActionStatus::decode(&unknown), None, "unknown ext bit");
+        assert_eq!(
+            BlockActionStatus::decode(&with[..with.len() - 1]),
+            None,
+            "cut oid"
+        );
+        assert_eq!(
+            BlockActionStatus::decode(&plain[..plain.len() - 1]),
+            None,
+            "no ext"
+        );
+    }
+
+    /// s114: v4 records (s112, no ext byte per row) still read, every oid
+    /// `None`.
+    #[test]
+    fn v4_records_written_before_v5_still_read() {
+        use CoreWriterKind as K;
+        let rows = vec![
+            cw(
+                0,
+                K::LockboxDeposit,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                3,
+                K::Delegate,
+                Outcome::Failed,
+                FailureReason::Other,
+                "no stake",
+            ),
+        ];
+        // A v4 record by hand: version, counts 0/0, failure_count 0, then
+        // each row's v5 bytes without its ext byte.
+        let mut v4 = vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for r in &rows {
+            let one = BlockActionStatus {
+                core_writer: vec![r.clone()],
+                ..Default::default()
+            }
+            .encode();
+            v4.extend_from_slice(&one[17..one.len() - 1]);
+        }
+        let back = BlockActionStatus::decode(&v4).expect("v4 decodes");
+        assert_eq!(back.core_writer, rows);
+        assert!(back.core_writer.iter().all(|r| r.oid.is_none()));
+    }
+
     /// The stored CoreWriter kind codes and names are a format.
     #[test]
     fn core_writer_kind_codes_and_names_are_stable() {
@@ -1319,7 +1458,7 @@ mod tests {
         }
         .encode();
         let mut wrong_version = bytes.clone();
-        wrong_version[0] = 0x05;
+        wrong_version[0] = 0x06;
         assert_eq!(BlockActionStatus::decode(&wrong_version), None);
         assert_eq!(BlockActionStatus::decode(&bytes[..bytes.len() - 1]), None);
         let mut overlong = bytes.clone();

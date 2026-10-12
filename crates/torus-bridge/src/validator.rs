@@ -26,6 +26,10 @@ pub struct ValidatedBlock {
     /// in the SAME batch as `bundle` and the block's native flush
     /// (`torus_state::incremental::evm_block_batch_incremental`, consensus bug (c)).
     pub native_writes: torus_state::NativeStateOverlay,
+    /// s114 (CoreWriter follow-up 1): for each queue row in `native_writes`,
+    /// its key `(target block, seq)` and the EVM tx that queued it — the
+    /// node-local `CF_CORE_WRITER_TX` rows, written in the same batch.
+    pub core_writer_links: Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
     /// Computed state root (matches the block header).
     pub state_root: B256,
     /// EVM `(root, TrieUpdates)` pair from this validation's single incremental StateRoot run
@@ -208,9 +212,11 @@ impl BlockValidator {
             });
         }
 
+        let core_writer_links = core_writer_links(&exec_result);
         Ok(ValidatedBlock {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
+            core_writer_links,
             native_writes: exec_result.native_writes,
             state_root: computed_root,
             evm_root_updates,
@@ -314,9 +320,11 @@ impl BlockValidator {
             });
         }
 
+        let core_writer_links = core_writer_links(&exec_result);
         Ok(ValidatedBlock {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
+            core_writer_links,
             native_writes: exec_result.native_writes,
             state_root: computed_root,
             // Root computed over the MERGED multi-block bundle — its TrieUpdates are not
@@ -326,6 +334,28 @@ impl BlockValidator {
             native_consumed_nonces: vec![],
         })
     }
+}
+
+/// s114 (CoreWriter follow-up 1): the block's queue rows with the EVM tx
+/// that queued each (`receipts` must already carry the tx hashes,
+/// [`align_receipts`]).
+fn core_writer_links(
+    exec: &torus_evm::executor::BlockExecResult,
+) -> Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)> {
+    exec.core_writer_origins
+        .iter()
+        .filter_map(|o| {
+            let receipt = exec.receipts.get(o.receipt)?;
+            Some((
+                o.target_block,
+                o.seq,
+                torus_state::corewriter_tx::CoreWriterTxLink {
+                    tx_hash: receipt.tx_hash,
+                    call_index: o.call_index,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// D5 (S392): map executor receipts back to the txs that produced them.
