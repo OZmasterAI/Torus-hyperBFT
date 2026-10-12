@@ -1020,6 +1020,40 @@ mod tests {
         assert_eq!(candles[0].trade_count, 1, "trade counted exactly once");
     }
 
+    /// R30 follow-up (owner s112): a trade fetch error fails the block (no
+    /// row at all, cursor not moved), like every other fetch error, instead
+    /// of storing it without its candle trades. The retry indexes it whole
+    /// and counts its trade once.
+    #[tokio::test]
+    async fn trade_fetch_error_fails_the_block_and_the_retry_counts_it_once() {
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockTrades",
+            json!(1),
+            json!({"__error": "trades unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "trade error is an error"
+        );
+        assert!(indexer.backfill().await.is_err(), "backfill stops on it");
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert!(db.get_block_transactions(1).unwrap().is_empty());
+        assert!(db.get_candles(1, "1m", None, None, 10).unwrap().is_empty());
+        assert_eq!(db.get_last_indexed_height().unwrap(), None);
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(1)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        r30_assert_block1_complete(&db);
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        handle.stop().unwrap();
+    }
+
     /// R30: a body fetch error fails the block (no row at all, cursor not
     /// moved) instead of storing it without its native actions.
     #[tokio::test]
