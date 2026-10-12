@@ -36,7 +36,7 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 | Phase gate, CPU | no node CPU-s/1M regression vs tw beyond noise (was <= -6%; revised owner s111) | interleaved cells, step 4 |
 | Phase gate, disk | state-row bytes written down by the coalescing factor archy measures (step 0) | iostat + RocksDB counters, step 4 |
 | Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
-| Phase gate, throughput | matched/s and native blocks/s UP vs tw beyond noise (prototype: +4.7% / +6.1%; owner s111) | step 4 |
+| Phase gate, throughput | matched/s UP vs tw beyond noise; native blocks/s no regression (owner s111 after p3t, section 43: on tmpfs the prototype's blocks/s gain is +1.6%, not resolved, so "up" is not required) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
 | RAM | RSS growth within archy's layer-size figure + 25% | step 4 |
 
@@ -126,11 +126,30 @@ measured ~0.3 CPU-s/1M. SIGKILL restart -> first commit 21.3 s mean (gate 60 s).
 rule: shelve Phase 3 and keep the disk-write numbers (borderline: the 5% line is inside both CIs;
 owner to confirm).** Steps 1-4 below are on hold.
 
+**Disk isolation (campaign `ozarchy-p3t`, 2026-10-11):** results doc section 43, review log row 48. Same prototype node, with all
+3 data dirs on tmpfs as an UPPER BOUND (no device I/O; not a separate-disk result, ozarchy has one NVMe) next to the shared NVMe.
+CPU-s/1M -5.2% (shared NVMe) / -4.8% (tmpfs): the CPU saving is work removed. matched/s +5.8% / +3.1% (tmpfs not resolved),
+native blocks/s +14.0% / +1.6%: most of the blocks/s gain was disk contention. Inference: a validator with its own disk lands
+between the two (about +3% to +6% matched/s, ~5% less CPU-s/1M; a blocks/s gain above +2% only on a busy disk).
+
+**Step 1 measured (campaign `ozarchy-p3c1`, 2026-10-11):** results doc section 45, review log row 50. `7c178637`, interval 15 s, vs
+`2725e321`, shared NVMe and tmpfs (upper bound), n = 4. CPU-s/1M -7.9% / -8.3% (gate met), native blocks/s +96% / +86% (met),
+matched/s -7.0% / -10.6%: the bench's in-flight release follows `eth_blockNumber`, which step 1 advances only at checkpoints
+(every 100 blocks), so offered load falls 13-16%. The matched/s gate is not decidable before step 2. Checkpoints fire at the
+100-block attest height (94%), not at 15 s; layer_shared 0. Restart and crash not measured there; they ride along
+with the step 2 bench. Also valid for `a44bdde6` (byte-cap fix only; `TORUS_CHECKPOINT_MAX_BYTES` unset in the bench).
+
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,
 or drop Phase 3.
 
 ### Step 1: core behind the interval setting
+
+**Step 1 restart and crash cells (campaign `ozarchy-p3r1`, 2026-10-12):** results doc section 46, review log row 51.
+`a44bdde6`, interval 15 s vs unset, state hash on, 48 val1 kills (KILL / TERM / INT, 8 per arm x signal). Restart
+gate met: SIGKILL kill -> first commit 14.4 s mean / 23.2 s max (unset: 14.3 / 16.9); rewind from the last
+checkpoint 7-162 blocks. Crash correctness: no finding (replay from marker + 1, complete, every checkpoint hash
+equal on 3 validators). SIGTERM is a hard kill on this binary (main.rs waits only on SIGINT): owner to decide.
 
 Each task: test first (fails before), then code, then verify with
 `F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"`.
@@ -278,6 +297,10 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   checkpoint wall p50 / p99 and the E wait on a second checkpoint, block-time p99 around
   checkpoints and epoch boundaries, RSS.
 - Plus multi-crash restart cells: SIGKILL val1 at random points, n = 3; restart -> ready.
+- **Measured for step 2** (campaign `ozarchy-p3s2g`, results doc section 47, plan-2 row 52; 18c s112): step 2
+  `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
+  device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
+  (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

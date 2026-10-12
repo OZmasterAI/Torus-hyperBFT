@@ -1791,20 +1791,28 @@ impl TorusApiServer for RpcState {
             .iter()
             .map(|a| serde_json::to_value(a).unwrap_or_default())
             .collect();
-        // s84 executed/skipped record (written by execution; a block with no
-        // actions has none and reports empty lists).
-        let status = if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
-            Some(torus_state::action_status::BlockActionStatus::default())
-        } else {
-            self.state
-                .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
-                .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
-                .and_then(|bytes| torus_state::action_status::BlockActionStatus::decode(&bytes))
-                .filter(|s| {
-                    s.native_skipped.len() == body.native_actions.len()
-                        && s.evm_skipped.len() == body.evm_transactions.len()
-                })
-        };
+        // s84 executed/skipped record (written by execution). A block with
+        // no actions has none and reports empty lists, unless it drained
+        // CoreWriter rows (s112 v4: a record with only those results).
+        // Codex review (P2): an empty block reports empty lists only once
+        // executed (`null` before, like any block: its queued rows may still
+        // drain). The applied-height marker is read FIRST: it lands in the
+        // same atomic batch as the record, so a record that exists is then
+        // visible to the read below.
+        let empty_body = body.native_actions.is_empty() && body.evm_transactions.is_empty();
+        let executed = empty_body
+            && torus_state::running_hash::read_applied_height(&self.state)
+                .is_some_and(|applied| applied >= block_number);
+        let status = self
+            .state
+            .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
+            .and_then(|bytes| torus_state::action_status::BlockActionStatus::decode(&bytes))
+            .filter(|s| {
+                s.native_skipped.len() == body.native_actions.len()
+                    && s.evm_skipped.len() == body.evm_transactions.len()
+            })
+            .or_else(|| executed.then(Default::default));
         let labels = |skipped: &[bool]| -> Vec<String> {
             skipped
                 .iter()
@@ -1829,6 +1837,7 @@ impl TorusApiServer for RpcState {
             native_action_failures: status.as_ref().map(crate::types::native_action_failures),
             evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
+            core_writer_results: status.as_ref().map(crate::types::core_writer_results),
         }))
     }
 

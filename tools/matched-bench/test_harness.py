@@ -318,8 +318,27 @@ class SummarizeTest(unittest.TestCase):
                 "tail_fetched": 3600,
                 "tail_errors": 12,
                 "tail_missed": 1,
+                "tail_mode": "head",
             },
         )
+
+    def test_commit_tail_cell_records_the_tail_mode(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n"))
+        s, _ = run_summarize(
+            self.d, extra=["--max-in-flight", "1", "--in-flight-tail", "commit"]
+        )
+        self.assertEqual(s["cell"]["in_flight_tail"], "commit")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "commit")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_missed"], 1)
+        # A capped cell without the knob: the bench default, head.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        self.assertIsNone(s["cell"]["in_flight_tail"], "unset = flag omitted")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
 
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
@@ -339,6 +358,7 @@ class SummarizeTest(unittest.TestCase):
         write_agreement(self.d, ["same"] * 3)
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["cell"]["max_in_flight"])
+        self.assertIsNone(s["cell"]["in_flight_tail"])
         self.assertIsNone(s["cell"]["open_order_budget"])
         self.assertIsNone(s["ingest"]["bench_submit_rate"])
         self.assertIsNone(s["ingest"]["econ_mix"])
@@ -884,6 +904,68 @@ class CrashKillGuardTest(unittest.TestCase):
             r = run(MAX_IN_FLIGHT=bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
             self.assertIn("FATAL", r.stderr)
+
+    def test_in_flight_tail_reaches_the_bench_only_when_set(self):
+        """IN_FLIGHT_TAIL=head|commit -> bench --in-flight-tail (how the
+        in-flight block tail finds new bodies). Unset (default) = flag
+        omitted = the bench default, head (eth_blockNumber), so prior cells
+        reproduce. commit needs MAX_IN_FLIGHT. Validated, logged, allowlisted
+        in campaign/run_cell.py, recorded as cell.in_flight_tail (also on
+        resummarize)."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("IN_FLIGHT_TAIL=${IN_FLIGHT_TAIL:-}", src)
+        self.assertIn("in_flight_tail='${IN_FLIGHT_TAIL:-unset}'", src)
+        self.assertIn('--in-flight-tail "${IN_FLIGHT_TAIL:-}"', src)
+        self.assertLess(src.index("#   IN_FLIGHT_TAIL="), src.index("set -uo pipefail"))
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"IN_FLIGHT_TAIL",', f.read())
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            self.assertIn(
+                '--in-flight-tail "$(j \'.cell.in_flight_tail // ""\')"', f.read()
+            )
+        lines = [
+            l
+            for l in src.splitlines()
+            if "IN_FLIGHT_TAIL" in l
+            and not l.lstrip().startswith(("#", "log ", "--", "python3", "if "))
+        ]
+        snippet = (
+            "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
+            "MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-}\nBENCH_CMD=()\n"
+            + "\n".join(lines)
+            + '\necho "${BENCH_CMD[*]}"'
+        )
+
+        def run(**env):
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("MAX_IN_FLIGHT", "IN_FLIGHT_TAIL")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
+
+        r = run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        r = run(MAX_IN_FLIGHT="4")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+        for mode in ("head", "commit"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=mode)
+            self.assertEqual(
+                (r.returncode, r.stdout.strip()), (0, f"--in-flight-tail {mode}"), r.stderr
+            )
+        for bad in ("x", "applied", "1"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+        r = run(IN_FLIGHT_TAIL="commit")
+        self.assertEqual(r.returncode, 2, "commit tail without MAX_IN_FLIGHT")
+        self.assertIn("FATAL", r.stderr)
 
     def test_max_in_flight_raises_the_node_rpc_response_cap(self):
         """Loaded torus_getBlockBody replies pass jsonrpsee's 10 MiB default

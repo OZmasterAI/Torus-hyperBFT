@@ -138,3 +138,27 @@ fn drain_core_writer_surfaces_a_queue_read_fault_as_a_local_fault() {
         "nothing drained"
     );
 }
+
+/// A-exception (owner s111): an undecodable queued row becomes a failed
+/// result, but a storage fault in the same drain still fails-stop — the
+/// queue read error is returned (a local fault) and nothing is deleted, the
+/// undecodable row included.
+#[test]
+fn drain_core_writer_read_fault_with_an_undecodable_row_still_fails_stop() {
+    let (_dir, db) = open_test_db();
+    let mut key = 2u64.to_be_bytes().to_vec();
+    key.extend_from_slice(&0u64.to_be_bytes());
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[0xFF]).unwrap();
+    let state = FailingScan {
+        inner: db.clone(),
+        cf: CF_CORE_WRITER_QUEUE,
+    };
+    let mut ctx = make_ctx(state, 2);
+    let err = NativeExecutor::drain_core_writer(&mut ctx).expect_err("the queue read failed");
+    assert!(err.is_local_fault(), "{err}");
+    assert_eq!(
+        StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None).unwrap(),
+        vec![(key, vec![0xFF])],
+        "nothing drained"
+    );
+}
