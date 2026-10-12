@@ -23483,6 +23483,44 @@ mod crash_recovery_tests {
         assert_eq!(per_block.metrics.exec_checkpoints.get(), 0);
     }
 
+    /// p3s2g (results doc 47.1): Phase 3's exec-thread work sat outside every
+    /// phase timer (`residual_untimed` 4.8 -> 18.8 ms per 100 actions). Two
+    /// series time it, each once per pipelined block: the join of the
+    /// previous block's layer merge at the start of the block
+    /// (`exec_checkpoint_settle_wait_seconds`) and the end-of-block upkeep
+    /// (`exec_checkpoint_upkeep_seconds`: trigger, checkpoint-time merges and
+    /// hand-off, view publish). Interval 0 observes neither.
+    #[test]
+    fn checkpoint_exec_thread_work_is_timed() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let every = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_every(5)),
+        );
+        let v = |run: &P2Run, name: &str| metric_value(&run.metrics.encode(), name);
+        let pipelined = v(&every, "torus_exec_handoff_wait_seconds_count");
+        assert!(pipelined >= 100.0, "pipelined blocks: {pipelined}");
+        for name in [
+            "torus_exec_checkpoint_settle_wait_seconds",
+            "torus_exec_checkpoint_upkeep_seconds",
+        ] {
+            assert_eq!(v(&every, &format!("{name}_count")), pipelined, "{name}");
+            assert!(v(&every, &format!("{name}_sum")) > 0.0, "{name}: timed");
+            assert_eq!(
+                v(&per_block, &format!("{name}_count")),
+                0.0,
+                "{name}: interval 0"
+            );
+        }
+    }
+
     // ---- Item 6 Phase 3 task 1.7: crash and replay at interval > 0 ----
 
     /// `(k, mid_checkpoint)` crash points: no epoch boundary (50 / 100) in
