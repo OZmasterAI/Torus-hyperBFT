@@ -1794,7 +1794,15 @@ impl TorusApiServer for RpcState {
         // s84 executed/skipped record (written by execution). A block with
         // no actions has none and reports empty lists, unless it drained
         // CoreWriter rows (s112 v4: a record with only those results).
+        // Codex review (P2): an empty block reports empty lists only once
+        // executed (`null` before, like any block: its queued rows may still
+        // drain). The applied-height marker is read FIRST: it lands in the
+        // same atomic batch as the record, so a record that exists is then
+        // visible to the read below.
         let empty_body = body.native_actions.is_empty() && body.evm_transactions.is_empty();
+        let executed = empty_body
+            && torus_state::running_hash::read_applied_height(&self.state)
+                .is_some_and(|applied| applied >= block_number);
         let status = self
             .state
             .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
@@ -1804,7 +1812,7 @@ impl TorusApiServer for RpcState {
                 s.native_skipped.len() == body.native_actions.len()
                     && s.evm_skipped.len() == body.evm_transactions.len()
             })
-            .or_else(|| empty_body.then(Default::default));
+            .or_else(|| executed.then(Default::default));
         let labels = |skipped: &[bool]| -> Vec<String> {
             skipped
                 .iter()
