@@ -1408,10 +1408,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // The stop is still running (e.g. a flush stalled on I/O):
         // `exit()` would run RocksDB's exit handlers, which join its
         // background threads and block on the same work. Skip them.
-        error!(?outcome, ?limit, "shutdown abandoned; exiting now (exit 1)");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
+        log_with_grace(
+            move || error!(?outcome, ?limit, "shutdown abandoned; exiting now (exit 1)"),
+            Duration::from_millis(500),
+        );
         // SAFETY: `_exit` only ends the process; no Rust state is touched.
         unsafe { libc::_exit(1) };
     }
@@ -1429,6 +1429,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         StopOutcome::Interrupted => Err("shutdown interrupted by a second signal".into()),
     }
+}
+
+/// Run `log` (the last line before `_exit`). Returns whether it finished.
+fn log_with_grace(log: impl FnOnce() + Send + 'static, _grace: Duration) -> bool {
+    use std::io::Write;
+    log();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    true
 }
 
 /// SIGINT and SIGTERM receivers. Kept for the node's lifetime: a signal
@@ -1800,6 +1809,20 @@ mod tests {
         assert!(StopOutcome::Interrupted.exits_at_once());
         assert!(!StopOutcome::Clean.exits_at_once());
         assert!(!StopOutcome::Failed("flush".into()).exits_at_once());
+    }
+
+    /// Codex stop review: the last log line before `_exit` must not hold up
+    /// the exit (the stdout lock may be held by a thread stuck writing).
+    #[test]
+    fn last_log_before_exit_is_bounded() {
+        let t = std::time::Instant::now();
+        let done = log_with_grace(
+            || std::thread::sleep(Duration::from_secs(5)),
+            Duration::from_millis(200),
+        );
+        assert!(!done, "a stuck log reported as finished");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(log_with_grace(|| {}, Duration::from_secs(5)));
     }
 
     #[test]
