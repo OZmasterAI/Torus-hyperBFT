@@ -123,16 +123,20 @@ impl Indexer {
         if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
             for (i, tx) in txs.iter().enumerate() {
                 let tx_hash = val_str(tx, "hash");
-                let receipt = self.rpc.get_receipt(&tx_hash).await?;
+                // The eth block lists executed txs only (s84), so each has a
+                // receipt; one the node does not return fails the block.
+                let receipt =
+                    self.rpc
+                        .get_receipt(&tx_hash)
+                        .await?
+                        .ok_or_else(|| -> RpcError {
+                            format!("node has no receipt for tx {tx_hash} in block {height}").into()
+                        })?;
                 let tx_index = body_position.get(&tx_hash).copied().unwrap_or(i as i32);
                 write
                     .transactions
-                    .push(parse_tx_row(tx, h, tx_index, receipt.as_ref()));
-                if let Some(logs) = receipt
-                    .as_ref()
-                    .and_then(|r| r.get("logs"))
-                    .and_then(|v| v.as_array())
-                {
+                    .push(parse_tx_row(tx, h, tx_index, Some(&receipt)));
+                if let Some(logs) = receipt.get("logs").and_then(|v| v.as_array()) {
                     write
                         .logs
                         .extend(logs.iter().map(|log| parse_log_row(log, h)));
