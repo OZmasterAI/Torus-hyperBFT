@@ -1470,46 +1470,52 @@ enum StopOutcome {
     Interrupted,
 }
 
-/// The thread that runs the shutdown (RED stub: still spawned at stop time).
+type StopJob = Box<dyn FnOnce() -> Result<(), String> + Send>;
+type StopReply = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// The thread that runs the shutdown, spawned at startup before consensus
+/// starts: stopping never needs a new thread, whose failed spawn would drop
+/// the stop (and the replica in it) on the async caller with no bound.
 struct ShutdownWorker {
-    gone: bool,
+    jobs: std::sync::mpsc::SyncSender<(StopJob, StopReply)>,
 }
 
 impl ShutdownWorker {
     fn spawn() -> std::io::Result<Self> {
-        Ok(Self { gone: false })
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<(StopJob, StopReply)>(1);
+        std::thread::Builder::new()
+            .name("node-shutdown".into())
+            .spawn(move || {
+                if let Ok((job, reply)) = rx.recv() {
+                    let _ = reply.send(job());
+                }
+            })?;
+        Ok(Self { jobs })
     }
 
-    /// A worker whose thread could not run the stop.
+    /// A worker whose thread is gone.
     #[cfg(test)]
     fn gone() -> Self {
-        Self { gone: true }
+        let (jobs, _) = std::sync::mpsc::sync_channel(1);
+        Self { jobs }
     }
 }
 
-/// Run the blocking `stop` on its own thread and wait for it, at most `limit`
-/// or until `interrupt` completes. A `stop` still running is left behind (the
-/// caller exits the process).
+/// Run the blocking `stop` on the shutdown thread and wait for it, at most
+/// `limit` or until `interrupt` completes. A `stop` still running is left
+/// behind (the caller exits the process).
 async fn bounded_stop(
     worker: ShutdownWorker,
     stop: impl FnOnce() -> Result<(), String> + Send + 'static,
     limit: Duration,
     interrupt: impl std::future::Future<Output = ()>,
 ) -> StopOutcome {
-    if worker.gone {
-        // What a failed `Builder::spawn` does today: the closure is dropped
-        // here, on the caller.
-        drop(stop);
-        return StopOutcome::Failed("spawn shutdown thread failed".into());
-    }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name("node-shutdown".into())
-        .spawn(move || {
-            let _ = tx.send(stop());
-        });
-    if let Err(e) = spawned {
-        return StopOutcome::Failed(format!("spawn shutdown thread: {e}"));
+    if let Err(std::sync::mpsc::SendError((job, _))) = worker.jobs.send((Box::new(stop), tx)) {
+        // Neither run nor drop it here (that blocks this thread with no
+        // bound); the process exits next.
+        std::mem::forget(job);
+        return StopOutcome::Failed("shutdown thread is gone".into());
     }
     tokio::select! {
         done = tokio::time::timeout(limit, rx) => match done {
