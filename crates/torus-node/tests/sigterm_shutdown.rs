@@ -36,30 +36,36 @@ struct Node {
     log: PathBuf,
 }
 
+/// The node command (1-validator devnet in `work`), stdio not yet set.
+fn node_command(work: &Path, genesis: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_torus-node"));
+    cmd.arg("--genesis")
+        .arg(genesis)
+        .arg("--data-dir")
+        .arg(work.join("data"))
+        .args([
+            "--validator-key",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "--p2p-listen",
+            "/ip4/127.0.0.1/udp/0/quic-v1",
+            "--rpc-addr",
+            "127.0.0.1:0",
+            "--metrics-addr",
+            "127.0.0.1:0",
+            "--log-level",
+            "info",
+        ])
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null());
+    cmd
+}
+
 impl Node {
     fn start(work: &Path, genesis: &Path, run: &str) -> Node {
         let log = work.join(format!("node-{run}.log"));
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_torus-node"))
-            .arg("--genesis")
-            .arg(genesis)
-            .arg("--data-dir")
-            .arg(work.join("data"))
-            .args([
-                "--validator-key",
-                "0100000000000000000000000000000000000000000000000000000000000000",
-                "--p2p-listen",
-                "/ip4/127.0.0.1/udp/0/quic-v1",
-                "--rpc-addr",
-                "127.0.0.1:0",
-                "--metrics-addr",
-                "127.0.0.1:0",
-                "--log-level",
-                "info",
-            ])
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
+        let child = node_command(work, genesis)
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -269,4 +275,42 @@ fn restart_after_sigterm_resumes_from_the_same_applied_state() {
         "header at height {head} changed across the restart"
     );
     assert!(torus_rpc::find_latest_height(&db) >= resumed);
+}
+
+/// Codex round 5: with stdout blocked (a full pipe nobody reads, e.g. a
+/// stalled log shipper), every log call blocks. SIGTERM must still end the
+/// process within the shutdown bound: no log may stand between the signal
+/// and the deadline / second-signal wait.
+#[test]
+fn sigterm_exits_within_the_bound_when_stdout_is_blocked() {
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let mut child = node_command(work.path(), &genesis)
+        .env("TORUS_SHUTDOWN_TIMEOUT_SECS", "2")
+        .stdout(Stdio::piped()) // never read: fills, then every write blocks
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn torus-node");
+    // Running, logging every block: the 64 KiB pipe is full well before this.
+    std::thread::sleep(Duration::from_secs(15));
+    assert!(child.try_wait().unwrap().is_none(), "node exited early");
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+    let start = Instant::now();
+    let exited = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let st = exited.expect("node still running 30 s after SIGTERM with stdout blocked");
+    assert!(
+        st.code().is_some(),
+        "killed by a signal, not a shutdown: {st}"
+    );
 }
