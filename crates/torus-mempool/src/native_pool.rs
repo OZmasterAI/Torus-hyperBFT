@@ -2096,6 +2096,55 @@ mod tests {
         assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
     }
 
+    /// ozarchy-p3s2g section 47.3 (step 2 arm): 0.8-2.6% of the bench's
+    /// cancel-alls aged out of the 60 s nonce window in the pool, never
+    /// selected. Mechanism: the item C cancel prefix walks cancels in
+    /// `(sender, nonce)` order and is capped at `cancel_share_pct` of the
+    /// block; while the orders fill the rest of every block (phase 3 never
+    /// runs) and the cancel demand per block is at the cap, a younger cancel
+    /// of a lower-address sender passes an older cancel of a higher-address
+    /// sender every block, for as long as the load lasts. Blocks of 8 at
+    /// 25%: 2 cancel slots; each block 2 fresh cancels from 0x01/0x02 and 6
+    /// orders; one cancel-all from 0xF0, older than all of them.
+    ///
+    /// The fix changes block content (selection order), a design choice for
+    /// the owner (see the s66 note on [`SortKey`]); ignored until decided.
+    #[test]
+    #[ignore = "p3s2g cancel-all expiry: owner decision on cancel selection order pending"]
+    fn cancel_share_never_starves_an_older_cancel() {
+        let mut pool = NativePool::new(10_000, 512, 64);
+        pool.set_cancel_share_pct(25);
+        let cancel_all = |n| make_action(n, NativeAction::CancelAllOrders { market_id: None });
+        let late = Address::repeat_byte(0xF0);
+        let starved = pool.insert(late, cancel_all(1)).unwrap();
+        let mut taken_at = None;
+        for round in 0..20u64 {
+            let nonce = 10 + round * 100;
+            for (i, s) in [0x01u8, 0x02].into_iter().enumerate() {
+                pool.insert(Address::repeat_byte(s), cancel_all(nonce + i as u64))
+                    .unwrap();
+            }
+            for i in 0..6u8 {
+                pool.insert(
+                    Address::repeat_byte(0x40 + i),
+                    make_action(nonce + u64::from(i), NativeAction::ClaimRewards),
+                )
+                .unwrap();
+            }
+            let sel = pool.select_for_block_with_senders(8);
+            assert_eq!(sel.len(), 8, "round {round}: a full block");
+            let hashes: Vec<B256> = sel.iter().map(|(_, a)| compute_action_hash(a)).collect();
+            if taken_at.is_none() && hashes.contains(&starved) {
+                taken_at = Some(round);
+            }
+            pool.remove_committed(&hashes);
+        }
+        assert!(
+            taken_at.is_some_and(|r| r <= 1),
+            "the oldest cancel waits behind younger ones: selected at {taken_at:?}"
+        );
+    }
+
     #[test]
     fn parse_cancel_block_share_pct_default_clamp_and_off() {
         use crate::rate_limit::parse_cancel_block_share_pct as p;
