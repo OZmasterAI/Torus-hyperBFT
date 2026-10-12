@@ -20,8 +20,7 @@ pub use eip1559::calc_next_block_base_fee;
 pub use error::EvmError;
 pub use executor::{
     BlockEnvCfg, BlockExecResult, CoreWriterOrigin, EvmExecutor, TxExecResult,
-    DEFAULT_BLOCK_GAS_LIMIT,
-    TORUS_CHAIN_ID,
+    DEFAULT_BLOCK_GAS_LIMIT, TORUS_CHAIN_ID,
 };
 pub use precompile_provider::TorusPrecompiles;
 

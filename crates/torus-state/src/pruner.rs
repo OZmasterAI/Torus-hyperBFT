@@ -81,8 +81,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::cf::{
-    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_RECEIPTS,
-    META_TRADES_PRUNED_HEIGHT,
+    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META,
+    CF_CORE_WRITER_TX, CF_RECEIPTS, META_TRADES_PRUNED_HEIGHT,
 };
 use crate::db::StateDb;
 use crate::error::StateError;
@@ -317,6 +317,18 @@ impl StatePruner {
         // Key format: height(8 BE), same range as the bodies it describes.
         if let Some(cf) = db.cf_handle(CF_BLOCK_ACTION_STATUS) {
             db.delete_range_cf(&cf, from_height.to_be_bytes(), to_height.to_be_bytes())?;
+        }
+
+        // --- Prune cf_core_writer_tx (s114 queue row -> EVM tx links) ---
+        // Key format: target block(8 BE) + seq(8 BE): the links of every
+        // target block in [from, to), with the bodies whose CoreWriter results
+        // they annotate.
+        if let Some(cf) = db.cf_handle(CF_CORE_WRITER_TX) {
+            db.delete_range_cf(
+                &cf,
+                crate::corewriter_tx::key(from_height, 0),
+                crate::corewriter_tx::key(to_height, 0),
+            )?;
         }
 
         // --- Prune cf_receipts ---

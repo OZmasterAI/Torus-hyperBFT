@@ -2191,6 +2191,18 @@ impl ExecutionContext {
                             )
                         }
                     };
+                    // s114 (CoreWriter follow-up 1): the node-local link of
+                    // each queued row to its EVM tx rides the same batch as
+                    // the row itself (nothing when the block queued nothing).
+                    let built = built.and_then(|mut batch| {
+                        torus_state::corewriter_tx::append_links(
+                            &self.state_db,
+                            &mut batch,
+                            &validated.core_writer_links,
+                        )
+                        .map_err(torus_bridge::BridgeError::from)?;
+                        Ok(batch)
+                    });
                     match built {
                         Ok(batch) => {
                             bundle_extras.add_evm_bundle(&validated.bundle);
@@ -18006,7 +18018,8 @@ mod crash_recovery_tests {
             (Address::repeat_byte(0xC1), reverts),
             (Address::repeat_byte(0xC2), twice),
         ];
-        let mut calldata = alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        let mut calldata =
+            alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
         calldata.extend_from_slice(&[0u8; 31]);
         calldata.push(42);
         let to = |i: usize| alloy_primitives::TxKind::Call(contracts[i].0);
@@ -18015,7 +18028,7 @@ mod crash_recovery_tests {
             signed_eip1559(&key, 1, to(1), calldata.clone()),
             signed_eip1559(&key, 2, to(2), calldata.clone()),
         ];
-        let hash = |i: usize| alloy_primitives::keccak256(&txs[i]);
+        let hash = |i: usize| torus_bridge::decode_rlp_tx(&txs[i]).unwrap().tx_hash;
         let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
         blocks[0].evm_transactions = txs.clone();
         blocks[0].header.evm_tx_count = 3;
@@ -18040,12 +18053,16 @@ mod crash_recovery_tests {
         let mut dumps = Vec::new();
         for on in [false, true] {
             let (_cfg, db) = make_test_config_and_db();
-            db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
-                .unwrap();
+            db.put_account(
+                &k256_address(&key),
+                &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))),
+            )
+            .unwrap();
             for (addr, code) in &contracts {
                 let code_hash = alloy_primitives::keccak256(code);
                 db.put_code(&code_hash, code).unwrap();
-                db.put_account(addr, &account(code_hash, U256::ZERO)).unwrap();
+                db.put_account(addr, &account(code_hash, U256::ZERO))
+                    .unwrap();
             }
             let ctx = pipeline_ctx(&db, on, None);
             dispatch_and_execute(&ctx, &db, &blocks[0]);
@@ -18072,10 +18089,18 @@ mod crash_recovery_tests {
             );
             let status = action_status(&db, 2).expect("block 2 drained rows: a record");
             let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
-            assert_eq!(seqs, vec![0, 1, 2], "on={on}: the linked rows drained in block 2");
+            assert_eq!(
+                seqs,
+                vec![0, 1, 2],
+                "on={on}: the linked rows drained in block 2"
+            );
             dumps.push(dump_all_cfs(&db));
         }
-        assert_dumps_equal(&dumps[0], &dumps[1], "core writer tx links: serial vs pipelined");
+        assert_dumps_equal(
+            &dumps[0],
+            &dumps[1],
+            "core writer tx links: serial vs pipelined",
+        );
     }
 
     /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:

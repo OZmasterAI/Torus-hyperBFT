@@ -9,6 +9,7 @@ use revm::{Context, InspectCommitEvm, Inspector, MainBuilder, MainContext};
 
 use crate::precompile_provider::TorusPrecompiles;
 
+use torus_state::cf::CF_CORE_WRITER_QUEUE;
 use torus_state::{NativeStateOverlay, StateDb, StateOverlay};
 use torus_types::{Log as TorusLog, Receipt};
 
@@ -315,6 +316,7 @@ impl EvmExecutor {
         let mut block_bloom = Bloom::ZERO;
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
+        let mut core_writer_origins = Vec::new();
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
@@ -353,8 +355,10 @@ impl EvmExecutor {
             let success = result.is_success();
 
             // T4.4: revert must revert writer-precompile side effects too.
+            // s114: a kept tx's queue rows are linked to its receipt.
             if success {
-                journal.keep_tx();
+                let queued = journal.keep_tx_written_keys(CF_CORE_WRITER_QUEUE);
+                push_core_writer_origins(&mut core_writer_origins, queued, receipts.len());
             } else {
                 journal.revert_tx();
             }
@@ -412,7 +416,7 @@ impl EvmExecutor {
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
-            core_writer_origins: Vec::new(),
+            core_writer_origins,
         })
     }
 
@@ -459,6 +463,7 @@ impl EvmExecutor {
         let mut block_bloom = Bloom::ZERO;
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
+        let mut core_writer_origins = Vec::new();
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
@@ -497,8 +502,10 @@ impl EvmExecutor {
             let success = result.is_success();
 
             // T4.4: revert must revert writer-precompile side effects too.
+            // s114: a kept tx's queue rows are linked to its receipt.
             if success {
-                journal.keep_tx();
+                let queued = journal.keep_tx_written_keys(CF_CORE_WRITER_QUEUE);
+                push_core_writer_origins(&mut core_writer_origins, queued, receipts.len());
             } else {
                 journal.revert_tx();
             }
@@ -554,7 +561,7 @@ impl EvmExecutor {
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
-            core_writer_origins: Vec::new(),
+            core_writer_origins,
         })
     }
 }
@@ -562,6 +569,26 @@ impl EvmExecutor {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// s114: one [`CoreWriterOrigin`] per queue row key a kept tx wrote (`keys`,
+/// its call order), for the receipt at index `receipt`. Every key the queue
+/// writes is `target (8 BE) ‖ seq (8 BE)`; any other shape is not a queue row
+/// `enqueue` wrote and is not linked.
+fn push_core_writer_origins(out: &mut Vec<CoreWriterOrigin>, keys: Vec<Vec<u8>>, receipt: usize) {
+    let mut call_index = 0u32;
+    for key in keys {
+        let Ok(k) = <[u8; 16]>::try_from(key.as_slice()) else {
+            continue;
+        };
+        out.push(CoreWriterOrigin {
+            target_block: u64::from_be_bytes(k[..8].try_into().expect("8 bytes")),
+            seq: u64::from_be_bytes(k[8..].try_into().expect("8 bytes")),
+            receipt,
+            call_index,
+        });
+        call_index += 1;
+    }
+}
 
 /// Apply [`BlockEnvCfg`] to revm's [`RevmBlockEnv`].
 fn apply_block_env(b: &mut RevmBlockEnv, cfg: &BlockEnvCfg) {

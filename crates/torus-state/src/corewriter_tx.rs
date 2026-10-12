@@ -63,6 +63,28 @@ impl CoreWriterTxLink {
     }
 }
 
+/// Append one link row per `(target block, seq, link)` to `batch` (the
+/// queuing block's flush batch). Nothing for an empty list.
+pub fn append_links(
+    db: &crate::db::StateDb,
+    batch: &mut rocksdb::WriteBatch,
+    links: &[(u64, u64, CoreWriterTxLink)],
+) -> Result<(), crate::error::StateError> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let cf = db
+        .inner()
+        .cf_handle(crate::cf::CF_CORE_WRITER_TX)
+        .ok_or_else(|| {
+            crate::error::StateError::MissingColumnFamily(crate::cf::CF_CORE_WRITER_TX.to_string())
+        })?;
+    for (target, seq, link) in links {
+        batch.put_cf(cf, key(*target, *seq), link.encode());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

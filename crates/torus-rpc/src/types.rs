@@ -686,13 +686,13 @@ pub fn core_writer_results(
     s: &torus_state::action_status::BlockActionStatus,
     link: impl Fn(u64) -> Option<torus_state::corewriter_tx::CoreWriterTxLink>,
 ) -> Vec<RpcCoreWriterResult> {
-    let _ = &link;
     use torus_state::action_status::CoreWriterKind;
     s.core_writer
         .iter()
         .map(|r| {
             let known = r.kind != CoreWriterKind::Undecodable;
             let executed = r.outcome == Outcome::Executed;
+            let tx = known.then(|| link(r.seq)).flatten();
             RpcCoreWriterResult {
                 seq: r.seq,
                 kind: r.kind.as_str().to_string(),
@@ -710,8 +710,8 @@ pub fn core_writer_results(
                     _ => None,
                 },
                 message: r.message.clone(),
-                tx_hash: None,
-                call_index: None,
+                tx_hash: tx.map(|l| hex_b256(l.tx_hash)),
+                call_index: tx.map(|l| l.call_index),
             }
         })
         .collect()

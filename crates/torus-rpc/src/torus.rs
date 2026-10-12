@@ -1813,6 +1813,24 @@ impl TorusApiServer for RpcState {
                     && s.evm_skipped.len() == body.evm_transactions.len()
             })
             .or_else(|| executed.then(Default::default));
+        // s114: each drained row's EVM tx (node-local `cf_core_writer_tx`,
+        // keyed like the queue row: this block ‖ seq); `null` for a row this
+        // node has no link for.
+        let mut links = std::collections::HashMap::new();
+        for r in status.iter().flat_map(|s| &s.core_writer) {
+            let link = self
+                .state
+                .get_cf_raw(
+                    torus_state::cf::CF_CORE_WRITER_TX,
+                    &torus_state::corewriter_tx::key(block_number, r.seq),
+                )
+                .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
+                .and_then(|bytes| torus_state::corewriter_tx::CoreWriterTxLink::decode(&bytes));
+            if let Some(link) = link {
+                links.insert(r.seq, link);
+            }
+        }
+        let core_writer_link = |seq: u64| links.get(&seq).copied();
         let labels = |skipped: &[bool]| -> Vec<String> {
             skipped
                 .iter()
@@ -1839,7 +1857,7 @@ impl TorusApiServer for RpcState {
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
             core_writer_results: status
                 .as_ref()
-                .map(|s| crate::types::core_writer_results(s, |_| None)),
+                .map(|s| crate::types::core_writer_results(s, core_writer_link)),
         }))
     }
 

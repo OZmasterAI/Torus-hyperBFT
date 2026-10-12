@@ -1234,7 +1234,11 @@ fn block_execution_reports_the_tx_and_call_of_each_queued_row() {
     install_contract(&db, &stopper, &core_writer_proxy_code(&[0x00]));
     install_contract(&db, &reverter, &core_writer_proxy_code(&[0x5f, 0x5f, 0xfd]));
     // Two CoreWriter calls, then STOP.
-    install_contract(&db, &twice, &core_writer_proxy_code(&core_writer_proxy_code(&[0x00])));
+    install_contract(
+        &db,
+        &twice,
+        &core_writer_proxy_code(&core_writer_proxy_code(&[0x00])),
+    );
     // Calls the reverter, swallows its revert, STOPs: a caught inner revert.
     install_contract(&db, &outer, &call_and_swallow_revert_code(&reverter));
 
@@ -1274,7 +1278,12 @@ fn block_execution_reports_the_tx_and_call_of_each_queued_row() {
     };
     assert_eq!(
         result.core_writer_origins,
-        vec![origin(0, 0, 0), origin(1, 2, 0), origin(2, 2, 1), origin(3, 4, 0)]
+        vec![
+            origin(0, 0, 0),
+            origin(1, 2, 0),
+            origin(2, 2, 1),
+            origin(3, 4, 0)
+        ]
     );
     // The origins describe exactly the queue rows the block's batch writes.
     let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(

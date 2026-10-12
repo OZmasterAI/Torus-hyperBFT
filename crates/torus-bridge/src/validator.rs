@@ -212,11 +212,12 @@ impl BlockValidator {
             });
         }
 
+        let core_writer_links = core_writer_links(&exec_result);
         Ok(ValidatedBlock {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
+            core_writer_links,
             native_writes: exec_result.native_writes,
-            core_writer_links: Vec::new(),
             state_root: computed_root,
             evm_root_updates,
             native_sender_actions: vec![],
@@ -319,11 +320,12 @@ impl BlockValidator {
             });
         }
 
+        let core_writer_links = core_writer_links(&exec_result);
         Ok(ValidatedBlock {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
+            core_writer_links,
             native_writes: exec_result.native_writes,
-            core_writer_links: Vec::new(),
             state_root: computed_root,
             // Root computed over the MERGED multi-block bundle — its TrieUpdates are not
             // reusable for a single-block commit.
@@ -332,6 +334,28 @@ impl BlockValidator {
             native_consumed_nonces: vec![],
         })
     }
+}
+
+/// s114 (CoreWriter follow-up 1): the block's queue rows with the EVM tx
+/// that queued each (`receipts` must already carry the tx hashes,
+/// [`align_receipts`]).
+fn core_writer_links(
+    exec: &torus_evm::executor::BlockExecResult,
+) -> Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)> {
+    exec.core_writer_origins
+        .iter()
+        .filter_map(|o| {
+            let receipt = exec.receipts.get(o.receipt)?;
+            Some((
+                o.target_block,
+                o.seq,
+                torus_state::corewriter_tx::CoreWriterTxLink {
+                    tx_hash: receipt.tx_hash,
+                    call_index: o.call_index,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// D5 (S392): map executor receipts back to the txs that produced them.

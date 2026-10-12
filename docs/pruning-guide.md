@@ -90,6 +90,7 @@ deletes, so a half-pruned range is never served):
 | **Block bodies** (`cf_block_bodies`) | height(8 BE) | Full transaction data for old blocks unavailable |
 | **Receipts** (`cf_receipts`) | height(8 BE) + tx_index(4 BE) | Transaction receipts and logs for old blocks unavailable |
 | **Action status** (`cf_block_action_status`) | height(8 BE) | Per-action executed / skipped / failed / rejected status and the block's CoreWriter results (`torus_getBlockBody`) unavailable for old blocks |
+| **CoreWriter tx links** (`cf_core_writer_tx`) | target block(8 BE) + seq(8 BE) | `txHash` / `callIndex` of the CoreWriter results of old blocks (pruned with the drain block's body) |
 
 These are the largest disk consumers. Block bodies contain full transaction
 data; receipts contain execution results and event logs.
