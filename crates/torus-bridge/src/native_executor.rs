@@ -11234,12 +11234,24 @@ impl NativeExecutor {
 
             // HL-parity: a stop order type (a row queued before the precompile
             // rejected them) fails instead of running as a plain Limit order.
+            // s114 (follow-up 2): a placement that reaches the book takes the
+            // next global order id (`place_order_inner` hands the book
+            // `next_global_order_id` and keeps what it allocated; stops it
+            // triggers keep their own ids), so an executed CoreWriter
+            // placement that advanced the counter got the id it read before.
+            let next_oid = ctx.next_global_order_id;
             let result = match core_writer_to_native(qa) {
                 Ok(Some(action)) => Self::execute(ctx, &qa.trader, &action),
                 Ok(None) => Self::exec_settle_lockbox_deposit(ctx, qa),
                 Err(e) => NativeActionResult::err("core_writer", e),
             };
-            entries.push(drained(result));
+            let placed = matches!(qa.kind, QueuedActionKind::PlaceOrder { .. })
+                && result.success
+                && ctx.next_global_order_id > next_oid;
+            entries.push(CoreWriterDrained {
+                oid: placed.then_some(next_oid),
+                ..drained(result)
+            });
         }
         Ok(entries)
     }

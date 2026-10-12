@@ -20777,6 +20777,101 @@ mod crash_recovery_tests {
         }
     }
 
+    /// s114 (CoreWriter follow-up 2): block 2 drains CoreWriter placements —
+    /// a GTC buy that rests, a GTC buy that an IOC sell after it fills, and
+    /// a cancel of a missing order. The v5 record holds the order id each
+    /// executed placement got: the resting one is the id of its order in the
+    /// persisted book, the filled maker's and the IOC's follow it, the
+    /// cancel has none. Same bytes serial and pipelined.
+    #[test]
+    fn core_writer_placements_record_the_order_id_they_got() {
+        use borsh::BorshDeserialize;
+        use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+        let fp = |n: i128| FixedPoint::from_raw(n * FixedPoint::SCALE);
+        let order = |side: u8, price: i128, time_in_force: u8| QueuedActionKind::PlaceOrder {
+            market_id: 1,
+            side,
+            order_type: 0,
+            price: fp(price),
+            quantity: fp(1),
+            time_in_force,
+        };
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            let (_cfg, db) = make_test_config_and_db();
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            for t in [0x31, 0x32, 0x33] {
+                pm.put_native_balance(
+                    &Address::repeat_byte(t),
+                    &torus_core::position::NativeBalance {
+                        available: fp(1_000_000),
+                        order_margin: FixedPoint::ZERO,
+                    },
+                )
+                .unwrap();
+            }
+            for (trader, kind) in [
+                (0x31, order(0, 90, 0)),
+                (0x32, order(0, 91, 0)),
+                (0x33, order(1, 91, 1)),
+                (0x31, QueuedActionKind::CancelOrder { order_id: 999 }),
+            ] {
+                CoreWriterQueue::enqueue(
+                    &db,
+                    &QueuedAction {
+                        trader: Address::repeat_byte(trader),
+                        kind,
+                        block_queued: 1,
+                    },
+                )
+                .unwrap();
+            }
+            let ctx = pipeline_ctx(&db, on, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            drop(ctx);
+            let status = action_status(&db, 2).expect("block 2 has a record");
+            let got: Vec<_> = status.core_writer.iter().map(|r| (r.seq, r.oid)).collect();
+            let book = torus_core::order_book::OrderBook::try_from_slice(
+                &db.get_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes())
+                    .unwrap()
+                    .expect("market 1 book"),
+            )
+            .unwrap();
+            let resting = book.orders_for_trader(&Address::repeat_byte(0x31));
+            assert_eq!(resting.len(), 1, "on={on}: the 90 bid rests");
+            let id = resting[0].id;
+            assert!(
+                book.orders_for_trader(&Address::repeat_byte(0x32))
+                    .is_empty(),
+                "on={on}"
+            );
+            assert_eq!(
+                got,
+                vec![
+                    (0, Some(id)),
+                    (1, Some(id + 1)),
+                    (2, Some(id + 2)),
+                    (3, None)
+                ],
+                "on={on}"
+            );
+            dumps.push(dump_all_cfs(&db));
+        }
+        assert_dumps_equal(
+            &dumps[0],
+            &dumps[1],
+            "CoreWriter order ids: serial vs pipelined",
+        );
+    }
+
     /// R02 branch 8 (B; owner s111): the CoreWriter due-check's queue read
     /// (`NativeExecutor::core_writer_due` -> `CoreWriterQueue::pending_count`)
     /// failing fail-stops the block, as the oracle / liquidation due-checks

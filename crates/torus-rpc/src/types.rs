@@ -714,7 +714,7 @@ pub fn core_writer_results(
                     _ => None,
                 },
                 message: r.message.clone(),
-                oid: None,
+                oid: r.oid.map(hex_u128),
                 tx_hash: tx.map(|l| hex_b256(l.tx_hash)),
                 call_index: tx.map(|l| l.call_index),
             }

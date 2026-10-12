@@ -274,7 +274,7 @@ pub fn core_writer_results(
                 outcome,
                 reason,
                 message,
-                oid: None,
+                oid: e.oid,
             }
         })
         .collect()

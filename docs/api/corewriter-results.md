@@ -7,7 +7,7 @@ of block `N`'s native phase. An action queued by block `N - 1`'s EVM runs in
 block `N`.
 
 Every drained queue row has a result in block `N`'s action status record
-(`cf_block_action_status`, record v4). `torus_getBlockBody(N)` returns these
+(`cf_block_action_status`, record v5; v4 before s114). `torus_getBlockBody(N)` returns these
 results in `coreWriterResults`, in queue order. This includes blocks that
 have no native action and no EVM tx.
 
@@ -29,7 +29,10 @@ have no native action and no EVM tx.
    "txHash": "0x5c…e1", "callIndex": 1},
   {"seq": 3, "kind": "lockbox_withdraw", "trader": "0x09…09", "queuedBlock": "0xb",
    "status": "failed", "reason": "margin", "message": "…",
-   "txHash": "0x77…02", "callIndex": 0}
+   "txHash": "0x77…02", "callIndex": 0},
+  {"seq": 4, "kind": "place_order", "trader": "0x0a…0a", "queuedBlock": "0xb",
+   "status": "executed", "message": "", "oid": "0x2a",
+   "txHash": "0x77…02", "callIndex": 1}
 ]
 ```
 
@@ -43,6 +46,7 @@ have no native action and no EVM tx.
 | `reason` | Stable lowercase reason (`margin`, `tick`, `ioc_cancel`, `other`, ...), as in `nativeActionFailures`. Absent for `executed`. |
 | `rejectStatus` | The HL `*Rejected` name. Present only for `rejected`. |
 | `message` | The executor's message (at most 96 bytes). Empty for `executed`. |
+| `oid` | The order id an executed `place_order` row's order got (hex, like every order id), whether it rests or filled. CoreWriter `cancelOrder(bytes32)` takes it. Present only for an executed `place_order`. |
 | `txHash`, `callIndex` | The EVM tx that queued the row, see below. |
 
 Failed rows include: the one-block delay guard (`action queued in block X

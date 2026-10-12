@@ -58,7 +58,13 @@
 //! drain height, `seq`): the queue row key is `drain height ‖ seq`. An
 //! undecodable row ([`CoreWriterKind::Undecodable`]) has a zero `trader` and
 //! `queued_block`. A block that drained CoreWriter rows has a record even
-//! without native actions or EVM txs (both counts 0).
+//! without native actions or EVM txs (both counts 0). Read only since v5.
+//!
+//! Encoding v5 (s114, written instead of v4): v4 with each result followed
+//! by `ext u8` and the fields its bits announce: bit 0 (`0x01`) = `oid u128
+//! BE`, the order id an executed `PlaceOrder` row's order got (resting or
+//! filled). Every other row has `ext = 0` (one byte). An unknown bit does not
+//! decode (its field's size is unknown).
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
@@ -72,6 +78,8 @@ const ACTION_STATUS_V4: u8 = 0x04;
 /// First byte of a v5 record (v4 + an ext byte per CoreWriter result: the
 /// order id of an executed `PlaceOrder` row).
 const ACTION_STATUS_V5: u8 = 0x05;
+/// v5 CoreWriter result ext flag: an order id (u128 BE) follows.
+const CW_EXT_OID: u8 = 0x01;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -484,7 +492,7 @@ fn take_message(bytes: &mut &[u8], outcome: Outcome, reason: FailureReason) -> O
 
 impl BlockActionStatus {
     /// v1 when nothing failed or was rejected and no CoreWriter row was
-    /// drained (the s84 bytes exactly), v4 when a CoreWriter row was
+    /// drained (the s84 bytes exactly), v5 when a CoreWriter row was
     /// drained, else v3.
     pub fn encode(&self) -> Vec<u8> {
         let core_writer = !self.core_writer.is_empty();
@@ -493,7 +501,7 @@ impl BlockActionStatus {
             9 + self.evm_skipped.len().div_ceil(8) + self.native_skipped.len().div_ceil(8),
         );
         out.push(if core_writer {
-            ACTION_STATUS_V4
+            ACTION_STATUS_V5
         } else if failures {
             ACTION_STATUS_V3
         } else {
@@ -530,6 +538,13 @@ impl BlockActionStatus {
                 out.push(r.outcome as u8);
                 out.push(r.reason as u8);
                 push_message(&mut out, r.outcome, r.reason, &r.message);
+                match r.oid {
+                    Some(oid) => {
+                        out.push(CW_EXT_OID);
+                        out.extend_from_slice(&oid.to_be_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
         }
         out
@@ -540,7 +555,11 @@ impl BlockActionStatus {
         let (&version, mut rest) = bytes.split_first()?;
         if !matches!(
             version,
-            ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3 | ACTION_STATUS_V4
+            ACTION_STATUS_V1
+                | ACTION_STATUS_V2
+                | ACTION_STATUS_V3
+                | ACTION_STATUS_V4
+                | ACTION_STATUS_V5
         ) {
             return None;
         }
@@ -591,7 +610,7 @@ impl BlockActionStatus {
             }
         }
         let mut core_writer = Vec::new();
-        if version == ACTION_STATUS_V4 {
+        if version >= ACTION_STATUS_V4 {
             for _ in 0..take_u32(&mut rest)? {
                 let seq = u64::from_be_bytes(take(&mut rest, 8)?.try_into().ok()?);
                 let kind = CoreWriterKind::from_u8(take_u8(&mut rest)?);
@@ -600,6 +619,18 @@ impl BlockActionStatus {
                 let outcome = Outcome::from_u8(take_u8(&mut rest)?);
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
                 let message = take_message(&mut rest, outcome, reason)?;
+                let mut oid = None;
+                if version == ACTION_STATUS_V5 {
+                    let ext = take_u8(&mut rest)?;
+                    // A bit this reader does not know: its field's size is
+                    // unknown, so the record does not decode.
+                    if ext & !CW_EXT_OID != 0 {
+                        return None;
+                    }
+                    if ext & CW_EXT_OID != 0 {
+                        oid = Some(u128::from_be_bytes(take(&mut rest, 16)?.try_into().ok()?));
+                    }
+                }
                 core_writer.push(CoreWriterResult {
                     seq,
                     kind,
@@ -608,7 +639,7 @@ impl BlockActionStatus {
                     outcome,
                     reason,
                     message,
-                    oid: None,
+                    oid,
                 });
             }
         }
