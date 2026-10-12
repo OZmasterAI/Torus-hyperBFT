@@ -199,7 +199,7 @@ def run(cell):
         )
     print(
         f"  process CPU in window: user {pu:.2f} s sys {ps:.2f} s; threads not alive at both snapshots: user {exu:.2f} s sys {exs:.2f} s "
-        f"(= {1e6 * exu / n:.1f} us user, {1e6 * exs / n:.1f} us sys per spawned thread)"
+        f"(= {(1e6 * exu / n) if n else float("nan"):.1f} us user, {(1e6 * exs / n) if n else float("nan"):.1f} us sys per spawned thread)"
     )
     print(
         f"  exec thread(s) live: user {execu:.2f} s sys {execs:.2f} s = {1e3 * (execu + execs) / blk:.2f} ms CPU/blk"
