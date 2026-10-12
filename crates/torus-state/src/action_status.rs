@@ -80,6 +80,9 @@ const ACTION_STATUS_V4: u8 = 0x04;
 const ACTION_STATUS_V5: u8 = 0x05;
 /// v5 CoreWriter result ext flag: an order id (u128 BE) follows.
 const CW_EXT_OID: u8 = 0x01;
+/// s114: v5 CoreWriter result ext bit 1 — `cloid` u128 BE follows (after the
+/// oid when both are set).
+const CW_EXT_CLOID: u8 = 0x02;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -288,6 +291,8 @@ pub enum CoreWriterKind {
     ClaimRewards = 5,
     LockPermanent = 6,
     ClaimUnbonded = 7,
+    /// s114: CoreWriter `cancelByCloid`.
+    CancelByCloid = 8,
     LockboxDeposit = 0x20,
     LockboxWithdraw = 0x21,
     /// A code this reader does not know (a newer writer).
@@ -308,6 +313,7 @@ impl CoreWriterKind {
             5 => Self::ClaimRewards,
             6 => Self::LockPermanent,
             7 => Self::ClaimUnbonded,
+            8 => Self::CancelByCloid,
             0x20 => Self::LockboxDeposit,
             0x21 => Self::LockboxWithdraw,
             0xFF => Self::Undecodable,
@@ -326,6 +332,7 @@ impl CoreWriterKind {
             Self::ClaimRewards => "claim_rewards",
             Self::LockPermanent => "lock_permanent",
             Self::ClaimUnbonded => "claim_unbonded",
+            Self::CancelByCloid => "cancel_by_cloid",
             Self::LockboxDeposit => "lockbox_deposit",
             Self::LockboxWithdraw => "lockbox_withdraw",
             Self::Unknown => "unknown",
@@ -358,6 +365,9 @@ pub struct CoreWriterResult {
     /// s114 (v5): the order id an executed `PlaceOrder` row's order got
     /// (resting or filled); `None` for every other row (and in v4 records).
     pub oid: Option<u128>,
+    /// s114 (v5 ext bit 1): the client order id the row carried (a
+    /// `place_order` with one, a `cancel_by_cloid`), whatever its outcome.
+    pub cloid: Option<u128>,
 }
 
 /// Row 50 (v3): one order's status inside an entry (see
@@ -547,12 +557,11 @@ impl BlockActionStatus {
                 out.push(r.outcome as u8);
                 out.push(r.reason as u8);
                 push_message(&mut out, r.outcome, r.reason, &r.message);
-                match r.oid {
-                    Some(oid) => {
-                        out.push(CW_EXT_OID);
-                        out.extend_from_slice(&oid.to_be_bytes());
-                    }
-                    None => out.push(0),
+                let ext = if r.oid.is_some() { CW_EXT_OID } else { 0 }
+                    | if r.cloid.is_some() { CW_EXT_CLOID } else { 0 };
+                out.push(ext);
+                for v in [r.oid, r.cloid].into_iter().flatten() {
+                    out.extend_from_slice(&v.to_be_bytes());
                 }
             }
         }
@@ -629,16 +638,22 @@ impl BlockActionStatus {
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
                 let message = take_message(&mut rest, outcome, reason)?;
                 let mut oid = None;
+                let mut cloid = None;
                 if version == ACTION_STATUS_V5 {
                     let ext = take_u8(&mut rest)?;
                     // A bit this reader does not know: its field's size is
                     // unknown, so the record does not decode.
-                    if ext & !CW_EXT_OID != 0 {
+                    if ext & !(CW_EXT_OID | CW_EXT_CLOID) != 0 {
                         return None;
                     }
-                    if ext & CW_EXT_OID != 0 {
-                        oid = Some(u128::from_be_bytes(take(&mut rest, 16)?.try_into().ok()?));
-                    }
+                    let mut u128_field = |bit| -> Option<Option<u128>> {
+                        if ext & bit == 0 {
+                            return Some(None);
+                        }
+                        Some(Some(u128::from_be_bytes(take(&mut rest, 16)?.try_into().ok()?)))
+                    };
+                    oid = u128_field(CW_EXT_OID)?;
+                    cloid = u128_field(CW_EXT_CLOID)?;
                 }
                 core_writer.push(CoreWriterResult {
                     seq,
@@ -649,6 +664,7 @@ impl BlockActionStatus {
                     reason,
                     message,
                     oid,
+                    cloid,
                 });
             }
         }

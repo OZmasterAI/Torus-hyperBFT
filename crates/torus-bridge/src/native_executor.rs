@@ -152,6 +152,9 @@ pub struct CoreWriterDrained {
     /// s114: the order id an executed `PlaceOrder` row's order got
     /// (resting or filled); `None` for every other row.
     pub oid: Option<OrderId>,
+    /// s114: the cloid the row carried (a placement with one, a cancel by
+    /// cloid), whatever its outcome.
+    pub cloid: Option<Cloid>,
 }
 
 /// Result of executing a batch of native actions.
@@ -11347,6 +11350,7 @@ impl NativeExecutor {
                         queued_block: 0,
                         result: NativeActionResult::err("core_writer", bad.to_string()),
                         oid: None,
+                        cloid: None,
                     });
                     continue;
                 }
@@ -11358,6 +11362,11 @@ impl NativeExecutor {
                 queued_block: qa.block_queued,
                 result,
                 oid: None,
+                cloid: match qa.kind {
+                    QueuedActionKind::PlaceOrder { cloid, .. } => cloid,
+                    QueuedActionKind::CancelByCloid { cloid, .. } => Some(cloid),
+                    _ => None,
+                },
             };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
@@ -11817,6 +11826,7 @@ fn core_writer_to_native(qa: &QueuedAction) -> Result<Option<NativeAction>, Stri
             price,
             quantity,
             time_in_force,
+            cloid,
         } => NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: *market_id,
             is_buy: *side == 0,
@@ -11826,13 +11836,17 @@ fn core_writer_to_native(qa: &QueuedAction) -> Result<Option<NativeAction>, Stri
                 .ok_or_else(|| format!("unsupported CoreWriter order_type {order_type}"))?,
             time_in_force: decode_time_in_force(*time_in_force),
             reduce_only: false,
-            client_order_id: None,
+            client_order_id: *cloid,
         }),
         QueuedActionKind::CancelOrder { order_id } => NativeAction::CancelOrder {
             order_id: *order_id,
         },
         QueuedActionKind::CancelAll { market_id } => NativeAction::CancelAllOrders {
             market_id: Some(*market_id),
+        },
+        QueuedActionKind::CancelByCloid { market_id, cloid } => NativeAction::CancelByCloid {
+            market_id: *market_id,
+            cloid: *cloid,
         },
         QueuedActionKind::Delegate { validator, amount } => NativeAction::Delegate {
             validator: *validator,
@@ -11870,6 +11884,7 @@ mod core_writer_conversion_tests {
                 price: FixedPoint::from_raw(100),
                 quantity: FixedPoint::from_raw(1),
                 time_in_force: 0,
+                cloid: None,
             },
             block_queued: 1,
         }
@@ -11896,6 +11911,10 @@ mod core_writer_conversion_tests {
             QueuedActionKind::ClaimRewards,
             QueuedActionKind::LockPermanent { amount: fp },
             QueuedActionKind::ClaimUnbonded,
+            QueuedActionKind::CancelByCloid {
+                market_id: 1,
+                cloid: 2,
+            },
             QueuedActionKind::LockboxDeposit { amount: fp },
             QueuedActionKind::LockboxWithdraw { amount: fp },
         ];
@@ -11939,6 +11958,7 @@ fn queued_kind(kind: &QueuedActionKind) -> CoreWriterKind {
         QueuedActionKind::ClaimRewards => CoreWriterKind::ClaimRewards,
         QueuedActionKind::LockPermanent { .. } => CoreWriterKind::LockPermanent,
         QueuedActionKind::ClaimUnbonded => CoreWriterKind::ClaimUnbonded,
+        QueuedActionKind::CancelByCloid { .. } => CoreWriterKind::CancelByCloid,
         QueuedActionKind::LockboxDeposit { .. } => CoreWriterKind::LockboxDeposit,
         QueuedActionKind::LockboxWithdraw { .. } => CoreWriterKind::LockboxWithdraw,
     }

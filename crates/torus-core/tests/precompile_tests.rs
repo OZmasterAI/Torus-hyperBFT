@@ -665,6 +665,7 @@ fn queue_enqueue_and_drain() {
             price: fp(50_000),
             quantity: fp(5),
             time_in_force: 0,
+            cloid: None,
         },
         block_queued: 100,
     };

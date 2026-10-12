@@ -275,6 +275,7 @@ pub fn core_writer_results(
                 reason,
                 message,
                 oid: e.oid,
+                cloid: e.cloid,
             }
         })
         .collect()

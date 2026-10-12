@@ -675,6 +675,11 @@ pub struct RpcCoreWriterResult {
     /// (resting or filled), hex like every order id; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oid: Option<String>,
+    /// s114: the client order id the row carried (a `place_order` with one,
+    /// a `cancel_by_cloid`), `0x` + 32 hex digits, whatever its status;
+    /// absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<String>,
     /// s114: hash of the EVM tx (in `queuedBlock`) whose precompile call
     /// queued this row (node-local `cf_core_writer_tx`); `null` when this
     /// node has no link (an undecodable row, or a row queued without one).
@@ -715,6 +720,7 @@ pub fn core_writer_results(
                 },
                 message: r.message.clone(),
                 oid: r.oid.map(hex_u128),
+                cloid: r.cloid.map(torus_types::cloid_serde::to_hex),
                 tx_hash: tx.map(|l| hex_b256(l.tx_hash)),
                 call_index: tx.map(|l| l.call_index),
             }
