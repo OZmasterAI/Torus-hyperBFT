@@ -163,7 +163,11 @@ fn worker_slot_equals_inline_slot_after_every_block() {
     assert_eq!(worker.rows_shared_fallbacks(), 0);
     // P2-3: one long-lived end-resident thread per holder, not one per
     // block (this thread's count: exact).
-    assert_eq!(spawned(), spawned_before + 1, "16 worker blocks, one thread");
+    assert_eq!(
+        spawned(),
+        spawned_before + 1,
+        "16 worker blocks, one thread"
+    );
 }
 
 /// Ordering: `begin_resident` of the next block waits for the worker, then

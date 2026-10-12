@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// A place on the execution path that spawns threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpawnSite {
-    /// `MarketWorkerPool::match_parallel_capped_with`: matching.
+    /// `MarketWorkerPool::match_parallel_capped_with`: matching (P2-3: runs
+    /// on the exec pool, spawns nothing).
     Match,
-    /// `settle_market_results_parallel`: settle pass A.
+    /// `settle_market_results_parallel`: settle pass A (P2-3: runs on the
+    /// exec pool, spawns nothing).
     Settle,
     /// `drain_books_parallel`: save books, pass 1.
     SaveBooks,
@@ -20,7 +22,8 @@ pub enum SpawnSite {
     MarginPrepare,
     /// `torus_core::order_book::open_order_counts`: margin phase.
     OpenOrders,
-    /// `end_resident_on_worker`: one named thread per native block.
+    /// `end_resident_on_worker`: its long-lived thread (P2-3: one per
+    /// holder; was one per native block).
     EndResident,
     /// `flush_pending_after_batch`: the running-hash digest of a large block.
     FlushDigest,
@@ -84,9 +87,17 @@ mod tests {
     fn thread_totals_count_the_calling_thread_only() {
         let before = thread_totals();
         add(SpawnSite::Settle, 4);
-        std::thread::spawn(|| add(SpawnSite::Settle, 100)).join().unwrap();
+        std::thread::spawn(|| add(SpawnSite::Settle, 100))
+            .join()
+            .unwrap();
         let after = thread_totals();
-        assert_eq!(after[SpawnSite::Settle as usize], before[SpawnSite::Settle as usize] + 4);
-        assert_eq!(after[SpawnSite::Match as usize], before[SpawnSite::Match as usize]);
+        assert_eq!(
+            after[SpawnSite::Settle as usize],
+            before[SpawnSite::Settle as usize] + 4
+        );
+        assert_eq!(
+            after[SpawnSite::Match as usize],
+            before[SpawnSite::Match as usize]
+        );
     }
 }

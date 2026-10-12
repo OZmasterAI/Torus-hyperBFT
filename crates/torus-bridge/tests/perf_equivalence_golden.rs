@@ -918,8 +918,16 @@ fn pooled_engine_spawns_nothing_per_block_and_keeps_the_digests() {
             check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
             check("GOLDEN_A", &digests, &GOLDEN_A);
             let spawned = |s: SpawnSite| after[s as usize] - before[s as usize];
-            assert_eq!(spawned(SpawnSite::Match), 0, "threads={threads} {r:?}: match spawned per block");
-            assert_eq!(spawned(SpawnSite::Settle), 0, "threads={threads} {r:?}: settle spawned per block");
+            assert_eq!(
+                spawned(SpawnSite::Match),
+                0,
+                "threads={threads} {r:?}: match spawned per block"
+            );
+            assert_eq!(
+                spawned(SpawnSite::Settle),
+                0,
+                "threads={threads} {r:?}: settle spawned per block"
+            );
             assert!(
                 spawned(SpawnSite::EndResident) <= 1,
                 "threads={threads} {r:?}: end_resident spawned {} threads for {} blocks",
