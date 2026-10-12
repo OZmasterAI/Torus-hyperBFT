@@ -24436,6 +24436,52 @@ mod crash_recovery_tests {
         assert_eq!(dropper.dropped(), 1);
     }
 
+    /// Review (Codex, p3s2g gate fix): a dropper that falls behind must not
+    /// pile up retired layers / views (each up to a checkpoint window). With
+    /// it stalled, at most two items wait; the next is freed by the caller.
+    #[test]
+    fn dropper_retains_at_most_two_items_when_behind() {
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::time::Duration;
+        struct Stall(Sender<()>, Receiver<()>);
+        impl Drop for Stall {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                let _ = self.1.recv();
+            }
+        }
+        struct Probe(Sender<Option<String>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(String::from));
+            }
+        }
+        let dropper = Dropper::spawn().expect("dropper thread");
+        let (started_tx, started) = channel();
+        let (release, held) = channel();
+        dropper.drop_later(Stall(started_tx, held));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropper busy with the stall");
+        let (tx, names) = channel();
+        for _ in 0..3 {
+            dropper.drop_later(Probe(tx.clone()));
+        }
+        let here = std::thread::current().name().map(String::from);
+        assert_eq!(
+            names.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(here),
+            "the third item is freed by the caller"
+        );
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                names.recv_timeout(Duration::from_secs(5)).unwrap().as_deref(),
+                Some("torus-ckpt-drop")
+            );
+        }
+    }
+
     /// p3s2g 47.1: with an interval and a mempool, E hands what it releases
     /// at block boundaries (C once durable, the previous ingress view, the
     /// sets a slice or a checkpoint replaces) to the dropper; interval 0
