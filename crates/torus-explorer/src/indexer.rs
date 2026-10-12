@@ -16,6 +16,8 @@ pub struct Indexer {
     pub rpc: NodeRpcClient,
     pub db: ExplorerDb,
     pub batch_size: u32,
+    /// R30: the pruned-trade-history warning was logged (once per run).
+    warned_pruned_trades: std::sync::atomic::AtomicBool,
 }
 
 impl Indexer {
@@ -24,6 +26,7 @@ impl Indexer {
             rpc,
             db,
             batch_size,
+            warned_pruned_trades: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -167,15 +170,33 @@ impl Indexer {
         // Trades into OHLCV candles (Phase 7B). Written with the block, so a
         // retried block never counts a trade twice. A trade fetch error fails
         // the block like every other fetch error (owner s112): it is retried,
-        // never stored without its trades. A legacy partial block's trades
+        // never stored without its trades, except DataPruned (permanent). A legacy partial block's trades
         // may already be in the candles (the old binary wrote them before its
         // cursor); candles keep only totals, so they are never replayed: no
         // trade is counted twice (owner s112: it may undercount).
         if legacy_rebuild {
             warn!("Block {height}: candle trades not replayed on rebuild");
         } else {
-            let trades = self.rpc.get_block_trades(height).await?;
-            write.candle_trades = candle_trades(height, &trades);
+            match self.rpc.get_block_trades(height).await {
+                Ok(trades) => write.candle_trades = candle_trades(height, &trades),
+                // Pruned trade history never comes back: index the block
+                // without its candle trades (stored complete, so they are
+                // never fetched or counted later) instead of retrying it
+                // forever. Warned once per run.
+                Err(e) if is_data_pruned(&*e) => {
+                    if !self
+                        .warned_pruned_trades
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            "Block {height}: the node pruned its trade history ({e}); \
+                             blocks below its trade retention floor are indexed without \
+                             candle trades (warned once)"
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         self.db.write_block(&write).map_err(db_err)?;
@@ -508,10 +529,16 @@ pub fn parse_native_action_row(
     }
 }
 
-/// R30: whether `e` is the node's DataPruned answer (permanent: the trade
-/// history below its retention floor is gone). RED stub.
-fn is_data_pruned(_e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    false
+/// R30: whether `e` is the node's DataPruned answer (torus-rpc
+/// `RpcError::DataPruned`: code -32000, "... has been pruned ..."; pinned by
+/// torus-rpc `data_pruned_wire_shape_is_what_the_explorer_matches`). It is
+/// permanent: the trade history below the node's retention floor is gone.
+fn is_data_pruned(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        e.downcast_ref::<jsonrpsee::core::ClientError>(),
+        Some(jsonrpsee::core::ClientError::Call(obj))
+            if obj.code() == -32000 && obj.message().contains("has been pruned")
+    )
 }
 
 /// One block's `torus_getBlockTrades` rows as candle trades. A trade whose
