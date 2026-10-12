@@ -254,6 +254,9 @@ struct Dropper {
     /// Items handed over, the thread's and the inline frees (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     handed: std::sync::atomic::AtomicU64,
+    /// `torus_exec_checkpoint_drop_inline`: items E freed itself.
+    #[allow(dead_code)]
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
 impl Dropper {
@@ -266,7 +269,7 @@ impl Dropper {
     const QUEUE: usize = 2;
 
     /// `None`: the thread could not start (E frees everything itself).
-    fn spawn() -> Option<Self> {
+    fn spawn(metrics: Option<Arc<torus_telemetry::Metrics>>) -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(Self::QUEUE);
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let count = dropped.clone();
@@ -284,6 +287,7 @@ impl Dropper {
             tx,
             dropped,
             handed: std::sync::atomic::AtomicU64::new(0),
+            metrics,
         })
     }
 
@@ -2059,7 +2063,9 @@ impl ExecutionContext {
         });
         *self.ckpt.lock().unwrap() = CkptState {
             base: applied,
-            dropper: self.checkpoint.and_then(|_| Dropper::spawn()),
+            dropper: self
+                .checkpoint
+                .and_then(|_| Dropper::spawn(self.metrics.clone())),
             ..Default::default()
         };
         // Step 2: a fresh W starts at the durable marker; ingress reads the DB
@@ -24441,7 +24447,7 @@ mod crash_recovery_tests {
                 let _ = self.0.send(std::thread::current().name().map(String::from));
             }
         }
-        let dropper = Dropper::spawn().expect("dropper thread");
+        let dropper = Dropper::spawn(None).expect("dropper thread");
         let (tx, rx) = std::sync::mpsc::channel();
         dropper.drop_later(Probe(tx));
         assert_eq!(
@@ -24475,7 +24481,8 @@ mod crash_recovery_tests {
                 let _ = self.0.send(std::thread::current().name().map(String::from));
             }
         }
-        let dropper = Dropper::spawn().expect("dropper thread");
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let dropper = Dropper::spawn(Some(metrics.clone())).expect("dropper thread");
         let (started_tx, started) = channel();
         let (release, held) = channel();
         dropper.drop_later(Stall(started_tx, held));
@@ -24491,6 +24498,11 @@ mod crash_recovery_tests {
             names.recv_timeout(Duration::from_secs(2)).ok(),
             Some(here),
             "the third item is freed by the caller"
+        );
+        assert_eq!(
+            metrics.exec_checkpoint_drop_inline.get(),
+            1,
+            "torus_exec_checkpoint_drop_inline"
         );
         release.send(()).unwrap();
         for _ in 0..2 {
