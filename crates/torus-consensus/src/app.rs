@@ -20675,6 +20675,189 @@ mod crash_recovery_tests {
         }
     }
 
+    // ---- Investigation (test/corewriter-due-overlay): can an EVM-queued
+    // CoreWriter row be stranded because `core_writer_due` reads the raw DB
+    // (`CoreWriterQueue::pending_count` -> `state_db.inner()`) and not the
+    // block overlay (DB + pipelined parent layer) as `oracle_due` does? ----
+
+    /// Block 1: a native order (pipelined when the worker is on, so a parent
+    /// layer exists). Block 2: an EVM lockbox deposit (0x0820) -> one queue
+    /// row keyed for height 3. Block 3: EMPTY (no native action, no EVM, no
+    /// fee, not an epoch boundary), so `core_writer_due` alone decides
+    /// whether its native phase (and so the drain) runs.
+    fn cw_due_blocks() -> (k256::ecdsa::SigningKey, Address, Vec<TorusBlock>) {
+        let key = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
+        let trader = k256_address(&key);
+        let amount_wei: u128 = 1_000 * 10u128.pow(18);
+        let mut calldata =
+            alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&U256::from(amount_wei).to_be_bytes::<32>());
+        let lockbox =
+            torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let order = NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(90 * FixedPoint::SCALE),
+            quantity: FixedPoint::ONE,
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        });
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![torus_types::eip712::sign_native_action(
+                    order,
+                    NONCE_BASE + 1,
+                    &key,
+                )],
+            ),
+            make_block(2, vec![]),
+            make_block(3, vec![]),
+        ];
+        blocks[1].evm_transactions = vec![signed_eip1559_with_value(
+            &key,
+            0,
+            alloy_primitives::TxKind::Call(lockbox),
+            calldata,
+            U256::from(amount_wei),
+        )];
+        blocks[1].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        (key, trader, blocks)
+    }
+
+    /// Phase 3 step 2 variant of the main-branch test: a real EVM tx queues
+    /// a CoreWriter row in block 2; block 3 has no other native work. Per
+    /// configuration: pipeline off; pipeline on with interval 0 (per-block
+    /// flush); interval 15000 ms; "never" by time (attest heights, barriers,
+    /// shutdown only). The EVM block 2 is a barrier: it first closes the
+    /// window (block 1 in L) into a checkpoint and waits for W, then runs
+    /// serially and lands its queue row in its own synchronous flush batch, so
+    /// the row is in the RAW DB before block 3's due-check. Block 3 takes the
+    /// fast path whenever the worker is on (with an interval it stays in the
+    /// since-checkpoint layer, above the durable marker), its drain credits
+    /// the deposit, and after shutdown the queue CF is empty. Same final
+    /// state in every configuration.
+    #[test]
+    fn corewriter_evm_row_drains_in_empty_next_block_with_interval() {
+        use torus_core::precompiles::CoreWriterQueue;
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let (_key, trader, blocks) = cw_due_blocks();
+        let ckpt_15000 = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(15_000)),
+            ..Default::default()
+        };
+        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>); 4] = [
+            ("pipeline off", false, None),
+            ("interval 0", true, None),
+            ("interval 15000", true, Some(ckpt_15000)),
+            ("interval never", true, Some(ckpt_never())),
+        ];
+        let mut dumps = Vec::new();
+        for (what, on, ckpt) in configs {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(
+                &trader,
+                &revm::state::AccountInfo {
+                    balance: U256::from(10u128.pow(22)),
+                    nonce: 0,
+                    code_hash: KECCAK_EMPTY_CODE,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = ckpt;
+            if on {
+                ctx.attach_flush_worker(None);
+            }
+            let last_job =
+                |ctx: &ExecutionContext| ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 1");
+            assert_eq!(
+                last_job(&ctx),
+                on.then_some(1),
+                "{what}: block 1 fast path iff on"
+            );
+            if ckpt.is_some() {
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    None,
+                    "{what}: block 1 in memory (L)"
+                );
+            }
+
+            dispatch_and_execute(&ctx, &db, &blocks[1]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2");
+            assert_eq!(
+                last_job(&ctx),
+                None,
+                "{what}: the EVM block is a barrier (serial)"
+            );
+            // The invariant the raw-DB due-check relies on.
+            assert_eq!(
+                CoreWriterQueue::pending_count(&db, 3).unwrap(),
+                1,
+                "{what}: block 2's queue row (target 3) is in the raw DB"
+            );
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(2),
+                "{what}: barrier made 1-2 durable"
+            );
+
+            dispatch_and_execute(&ctx, &db, &blocks[2]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3");
+            assert_eq!(
+                last_job(&ctx),
+                on.then_some(3),
+                "{what}: empty block 3 fast path iff on"
+            );
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            if ckpt.is_some() {
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(2),
+                    "{what}: block 3 still above the durable marker (in L)"
+                );
+            }
+            // Shutdown closes the window into a final checkpoint (interval
+            // runs); then everything block 3 did is durable.
+            drop(ctx);
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            let bal = pm.get_native_balance(&trader).unwrap();
+            assert_eq!(
+                bal.available + bal.order_margin,
+                FixedPoint::from_raw(1_000 * FixedPoint::SCALE),
+                "{what}: block 3's drain credited the deposit (not stranded)"
+            );
+            assert!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None)
+                    .unwrap()
+                    .is_empty(),
+                "{what}: queue CF empty"
+            );
+            assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
+            dumps.push((what, dump_all_cfs(&db)));
+        }
+        for (what, d) in &dumps[1..] {
+            assert_dumps_equal(
+                &dumps[0].1,
+                d,
+                &format!("CoreWriter due: pipeline off vs {what}"),
+            );
+        }
+    }
+
     /// R02 (audit option A, branch 1; APP:2409): a block whose CoreWriter
     /// queue read fails fail-stops — `exec_failed`, applied marker unchanged,
     /// nothing of the block flushed (every CF as before it ran; the queued
