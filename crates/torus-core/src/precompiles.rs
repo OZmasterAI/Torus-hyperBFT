@@ -1454,6 +1454,20 @@ impl CoreWriterQueue {
         state: &impl StateBackend,
         block_number: u64,
     ) -> Result<Vec<DrainedAction>, CoreError> {
+        Ok(Self::drain_keyed(state, block_number)?
+            .into_iter()
+            .map(|(_, action)| action)
+            .collect())
+    }
+
+    /// [`Self::drain`] with each entry's queue sequence (the row key's low
+    /// 8 bytes; `u64::MAX` for a key that is not `block ‖ seq`, which
+    /// `enqueue` never writes). s112: the v4 action status record keys a
+    /// CoreWriter result by (drain block, seq).
+    pub fn drain_keyed(
+        state: &impl StateBackend,
+        block_number: u64,
+    ) -> Result<Vec<(u64, DrainedAction)>, CoreError> {
         let prefix = block_number.to_be_bytes();
         let entries = state.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
 
@@ -1461,12 +1475,13 @@ impl CoreWriterQueue {
         let mut keys_to_delete = Vec::new();
 
         for (key, value) in &entries {
-            actions.push(QueuedAction::try_from_slice(value).map_err(|e| {
-                UndecodableQueuedAction {
+            actions.push((
+                queue_seq(key),
+                QueuedAction::try_from_slice(value).map_err(|e| UndecodableQueuedAction {
                     key: key.clone(),
                     error: e.to_string(),
-                }
-            }));
+                }),
+            ));
             keys_to_delete.push(key.clone());
         }
 
@@ -1521,6 +1536,14 @@ impl CoreWriterQueue {
         }
         Ok(0)
     }
+}
+
+/// The sequence of a queue row key `block (8 BE) ‖ seq (8 BE)`; `u64::MAX`
+/// for any other length.
+fn queue_seq(key: &[u8]) -> u64 {
+    <[u8; 16]>::try_from(key)
+        .map(|k| u64::from_be_bytes(k[8..].try_into().expect("8 bytes")))
+        .unwrap_or(u64::MAX)
 }
 
 // ============================================================================

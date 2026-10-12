@@ -2758,21 +2758,27 @@ impl ExecutionContext {
                     )),
                 ))
             } else {
-                NativeExecutor::drain_core_writer(&mut ctx)
+                NativeExecutor::drain_core_writer_entries(&mut ctx)
             };
             #[cfg(not(test))]
-            let drained = NativeExecutor::drain_core_writer(&mut ctx);
+            let drained = NativeExecutor::drain_core_writer_entries(&mut ctx);
             // R02: a failed drain latches the fail-stop (checked after the
             // liquidation step below), never a silently skipped queue.
             // `CoreWriterQueue::drain` fails only on a state read / delete
             // (`CoreError::State`, a local fault). Any other Err cannot occur
             // today; it would still leave the queue undrained, so it is fatal
             // too (the `get_or_insert_with`).
-            if let Err(e) = drained {
-                NativeExecutor::latch_core_fault(&mut ctx, "core_writer drain", &e);
-                ctx.fatal_error
-                    .get_or_insert_with(|| format!("core_writer drain: {e}"));
-            }
+            // s112 (owner option b): every drained row's result goes to the
+            // block's action status record (v4), in queue order.
+            let core_writer_drained = match drained {
+                Ok(entries) => entries,
+                Err(e) => {
+                    NativeExecutor::latch_core_fault(&mut ctx, "core_writer drain", &e);
+                    ctx.fatal_error
+                        .get_or_insert_with(|| format!("core_writer drain: {e}"));
+                    Vec::new()
+                }
+            };
             // Item 3: the liquidation step — end of the block, on the block-start
             // mark (`begin_block_oracle` above). The EVM ran before this phase:
             // precompile readers see a block's liquidations from the next block.
@@ -2886,8 +2892,12 @@ impl ExecutionContext {
             #[cfg(test)]
             let oracle_results = (pre_results.clone(), post_results.clone());
             let action_status_timer = std::time::Instant::now();
-            let action_status = (has_native || has_evm).then(|| {
+            let core_writer = crate::action_results::core_writer_results(core_writer_drained);
+            // s112: a block that drained CoreWriter rows has a record even
+            // without a body action (its results are only there).
+            let action_status = (has_native || has_evm || !core_writer.is_empty()).then(|| {
                 torus_state::action_status::BlockActionStatus {
+                    core_writer,
                     evm_skipped: std::mem::take(&mut evm_skipped),
                     native_failed: crate::action_results::native_failures(
                         &sender_body_index,
@@ -3390,6 +3400,7 @@ impl ExecutionContext {
         // section failed and executed nothing). EVM blocks are never pipelined.
         if !run_native && has_evm {
             let status = torus_state::action_status::BlockActionStatus {
+                core_writer: vec![],
                 evm_skipped: std::mem::take(&mut evm_skipped),
                 native_skipped: vec![],
                 native_failed: vec![],
@@ -12070,6 +12081,7 @@ mod crash_recovery_tests {
             assert_eq!(
                 action_status(&state_db, 1),
                 Some(torus_state::action_status::BlockActionStatus {
+                    core_writer: vec![],
                     evm_skipped: vec![],
                     native_skipped: vec![false],
                     native_failed: vec![no_rewards(0, k256_address(&key_a))],
@@ -12078,6 +12090,7 @@ mod crash_recovery_tests {
             assert_eq!(
                 action_status(&state_db, 2),
                 Some(torus_state::action_status::BlockActionStatus {
+                    core_writer: vec![],
                     evm_skipped: vec![true, false],
                     native_skipped: vec![true, true, true, false],
                     native_failed: vec![no_rewards(3, k256_address(&key_c))],
@@ -12948,6 +12961,7 @@ mod crash_recovery_tests {
         assert_eq!(
             action_status(&state_db, 1),
             Some(torus_state::action_status::BlockActionStatus {
+                core_writer: vec![],
                 evm_skipped: vec![true],
                 native_skipped: vec![],
                 native_failed: vec![],
@@ -20352,6 +20366,136 @@ mod crash_recovery_tests {
                     .is_empty(),
                 "on={on}: every row deleted"
             );
+            db
+        };
+        let dbs = [replica(false), replica(true), replica(false)];
+        let hash = torus_state::running_hash::read_running_hash(&dbs[0]);
+        assert_eq!(hash.map(|(h, _)| h), Some(2));
+        for db in &dbs[1..] {
+            assert_eq!(
+                torus_state::running_hash::read_running_hash(db),
+                hash,
+                "running state hash"
+            );
+            assert_dumps_equal(&dump_all_cfs(&dbs[0]), &dump_all_cfs(db), "replica");
+        }
+    }
+
+    /// s112 (owner option b): block 2 (no native action, no EVM tx) drains
+    /// six CoreWriter rows with mixed outcomes — a lockbox deposit
+    /// (executes), an undecodable row, a delay-guard row, a stop order (does
+    /// not convert), a lockbox withdraw without balance, a cancel of a
+    /// missing order. On three replicas (serial, pipelined, serial) block 2's
+    /// action status record is v4 with one result per row in queue order,
+    /// and the running state hash and every CF are identical. RED before:
+    /// the drain results were dropped, block 2 had no record.
+    #[test]
+    fn core_writer_results_are_recorded_identically_on_three_replicas() {
+        use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+        use torus_state::action_status::{CoreWriterKind as K, FailureReason, Outcome};
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let fp = |n: i128| FixedPoint::from_raw(n * FixedPoint::SCALE);
+        let key = |block: u64, seq: u64| {
+            let mut k = block.to_be_bytes().to_vec();
+            k.extend_from_slice(&seq.to_be_bytes());
+            k
+        };
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        let replica = |on: bool| {
+            let (_cfg, db) = make_test_config_and_db();
+            let enqueue = |trader: u8, kind, block_queued| {
+                CoreWriterQueue::enqueue(
+                    &db,
+                    &QueuedAction {
+                        trader: Address::repeat_byte(trader),
+                        kind,
+                        block_queued,
+                    },
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                enqueue(7, QueuedActionKind::LockboxDeposit { amount: fp(5) }, 1),
+                0
+            );
+            db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 1), &[0xFF, 0x00, 0x01])
+                .unwrap();
+            assert_eq!(
+                enqueue(12, QueuedActionKind::CancelAll { market_id: 1 }, 2),
+                0
+            );
+            let bytes = db
+                .get_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0))
+                .unwrap()
+                .unwrap();
+            db.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
+            db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 2), &bytes)
+                .unwrap();
+            let stop = QueuedActionKind::PlaceOrder {
+                market_id: 1,
+                side: 0,
+                order_type: 2,
+                price: fp(100),
+                quantity: fp(1),
+                time_in_force: 0,
+            };
+            assert_eq!(enqueue(11, stop, 1), 3);
+            assert_eq!(
+                enqueue(9, QueuedActionKind::LockboxWithdraw { amount: fp(100) }, 1),
+                4
+            );
+            assert_eq!(
+                enqueue(10, QueuedActionKind::CancelOrder { order_id: 12_345 }, 1),
+                5
+            );
+            let ctx = pipeline_ctx(&db, on, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: no fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            let status = action_status(&db, 2).expect("block 2 has a record");
+            assert!(status.native_skipped.is_empty() && status.evm_skipped.is_empty());
+            let got: Vec<_> = status
+                .core_writer
+                .iter()
+                .map(|r| (r.seq, r.kind, r.trader, r.queued_block, r.outcome))
+                .collect();
+            let a = Address::repeat_byte;
+            assert_eq!(
+                got,
+                vec![
+                    (0, K::LockboxDeposit, a(7), 1, Outcome::Executed),
+                    (1, K::Undecodable, Address::ZERO, 0, Outcome::Failed),
+                    (2, K::CancelAll, a(12), 2, Outcome::Failed),
+                    (3, K::PlaceOrder, a(11), 1, Outcome::Failed),
+                    (4, K::LockboxWithdraw, a(9), 1, Outcome::Failed),
+                    (5, K::CancelOrder, a(10), 1, Outcome::Failed),
+                ],
+                "on={on}"
+            );
+            assert_eq!(status.core_writer[0].message, "");
+            assert_eq!(status.core_writer[0].reason, FailureReason::Other);
+            assert!(status.core_writer[1]
+                .message
+                .starts_with("undecodable queued action (block 2, seq 1): "));
+            assert_eq!(
+                status.core_writer[2].message,
+                "action queued in block 2 cannot execute in block 2"
+            );
+            assert!(status.core_writer[3..]
+                .iter()
+                .all(|r| !r.message.is_empty()));
+            // Block 1 drained nothing and has no body action: no record.
+            assert_eq!(action_status(&db, 1), None, "on={on}");
             db
         };
         let dbs = [replica(false), replica(true), replica(false)];
