@@ -1119,6 +1119,35 @@ mod tests {
         assert_eq!(resolve_block_tag("earliest", 100).unwrap(), 0);
         assert_eq!(resolve_block_tag("pending", 100).unwrap(), 100);
         assert_eq!(resolve_block_tag("0xa", 100).unwrap(), 10);
+        // HotStuff BFT: a committed block is final, so "safe" and
+        // "finalized" are the head.
+        assert_eq!(resolve_block_tag("safe", 100).unwrap(), 100);
+        assert_eq!(resolve_block_tag("finalized", 100).unwrap(), 100);
+    }
+
+    /// Ethereum JSON-RPC QUANTITY: compact hex, no leading zero digits, "0x0"
+    /// for zero (DATA encodings keep their fixed width).
+    #[test]
+    fn hex_u256_is_compact_quantity() {
+        assert_eq!(hex_u256(U256::ZERO), "0x0");
+        assert_eq!(hex_u256(U256::from(7u64)), "0x7");
+        assert_eq!(hex_u256(U256::from(15u64)), "0xf");
+        assert_eq!(hex_u256(U256::from(255u64)), "0xff");
+        assert_eq!(hex_u256(U256::from(256u64)), "0x100");
+        assert_eq!(hex_u256(U256::from(0x1000u64)), "0x1000");
+        assert_eq!(
+            hex_u256(U256::from(2_000_000_000_000_000_000u128)),
+            "0x1bc16d674ec80000"
+        );
+        assert_eq!(hex_u256(U256::from(1u64) << 255), format!("0x8{}", "0".repeat(63)));
+        assert_eq!(hex_u256(U256::MAX), format!("0x{}", "f".repeat(64)));
+        assert_eq!(hex_u64(0), "0x0");
+        assert_eq!(hex_u64(7), "0x7");
+        assert_eq!(hex_u128(0), "0x0");
+        assert_eq!(hex_u128(255), "0xff");
+        // DATA keeps its width.
+        assert_eq!(hex_b256(B256::ZERO), format!("0x{}", "0".repeat(64)));
+        assert_eq!(hex_address(Address::ZERO), format!("0x{}", "0".repeat(40)));
     }
 
     #[tokio::test]
@@ -5908,7 +5937,7 @@ mod tests {
             }
         };
         let want = [
-            ("eth_getBalance", hex_u256(U256::from(7u64))),
+            ("eth_getBalance", "0x7".to_string()),
             ("eth_getCode", "0x60806040".to_string()),
             (
                 "eth_getStorageAt",
@@ -5917,7 +5946,7 @@ mod tests {
             ("eth_getTransactionCount", hex_u64(5)),
         ];
         for (method, value) in &want {
-            for tag in ["latest", "0x3"] {
+            for tag in ["latest", "0x3", "safe", "finalized"] {
                 assert_eq!(&read(method, tag).await.unwrap(), value, "{method} {tag}");
             }
             if *method != "eth_getTransactionCount" {
@@ -5933,7 +5962,18 @@ mod tests {
 
         let call =
             serde_json::json!({ "from": who_s, "to": hex_address(Address::from([0x22; 20])) });
-        for tag in ["0x2", "earliest", "0x4", "0x5", "0x63", "safe", "finalized"] {
+        // HotStuff BFT: committed = final, so "safe" and "finalized" are the
+        // head for eth_call too.
+        for tag in ["latest", "0x3", "safe", "finalized"] {
+            assert!(
+                client
+                    .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                    .await
+                    .is_ok(),
+                "eth_call at {tag}"
+            );
+        }
+        for tag in ["0x2", "earliest", "0x4", "0x5", "0x63"] {
             let call_err = client
                 .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
                 .await
