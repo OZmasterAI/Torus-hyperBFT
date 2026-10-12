@@ -393,10 +393,43 @@ impl Genesis {
                 }
             }
         }
-        for validator in &self.validators {
+        // R19 follow-up (owner s112): an address in both accounts[] and
+        // evm_alloc is refused instead of evm_alloc overwriting the account.
+        let alloc: std::collections::BTreeMap<Address, &String> = self
+            .evm_alloc
+            .keys()
+            .map(|k| Ok((parse_address(k)?, k)))
+            .collect::<Result<_, GenesisError>>()?;
+        for (i, account) in self.accounts.iter().enumerate() {
+            let address = parse_address(&account.address)?;
+            if let Some(alloc_key) = alloc.get(&address) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "address {address:#x} is in both accounts[{i}] (\"{}\") and evm_alloc \
+                     (\"{alloc_key}\")",
+                    account.address
+                )));
+            }
+        }
+        // Validators are keyed by address (CF_STAKING_VALIDATORS) and by
+        // consensus key (the hotstuff set): both must be unique.
+        let mut by_address = std::collections::BTreeMap::new();
+        let mut by_pubkey = std::collections::BTreeMap::new();
+        for (i, validator) in self.validators.iter().enumerate() {
+            let address = parse_address(&validator.address)?;
             let pubkey = decode_hex(&validator.pubkey)?;
             if pubkey.len() != 32 {
                 return Err(GenesisError::InvalidPubkey(validator.pubkey.clone()));
+            }
+            if let Some(j) = by_address.insert(address, i) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "validator address {address:#x} is in validators[{j}] and validators[{i}]"
+                )));
+            }
+            if let Some(j) = by_pubkey.insert(pubkey.clone(), i) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "validator pubkey 0x{} is in validators[{j}] and validators[{i}]",
+                    alloy_primitives::hex::encode(&pubkey)
+                )));
             }
         }
         Ok(())
