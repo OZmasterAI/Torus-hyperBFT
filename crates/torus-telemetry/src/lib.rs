@@ -618,6 +618,15 @@ pub struct Metrics {
     /// Item 6 Phase 3: the layer was still shared when the exec thread took
     /// it back to merge (deep copy instead; expected 0).
     pub exec_checkpoint_layer_shared: Counter,
+    /// Item 6 Phase 3 (p3s2g 47.1): exec thread blocked at the start of a
+    /// pipelined block joining the previous block's merge into the
+    /// since-checkpoint layer. Once per pipelined block at interval > 0.
+    pub exec_checkpoint_settle_wait_seconds: Histogram,
+    /// Item 6 Phase 3 (p3s2g 47.1): exec thread time in the end-of-block
+    /// checkpoint upkeep (trigger, checkpoint-time merges and hand-off, which
+    /// includes `exec_checkpoint_wait_seconds`, and the ingress view publish).
+    /// Once per pipelined block at interval > 0.
+    pub exec_checkpoint_upkeep_seconds: Histogram,
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
@@ -2212,6 +2221,19 @@ impl Metrics {
             "Item 6 Phase 3: layer still shared at the end of a block (deep copy; expected 0)",
             exec_checkpoint_layer_shared.clone(),
         );
+        let exec_checkpoint_settle_wait_seconds =
+            Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_settle_wait_seconds",
+            "Item 6 Phase 3: exec thread blocked joining the previous block's since-checkpoint layer merge (once per pipelined block)",
+            exec_checkpoint_settle_wait_seconds.clone(),
+        );
+        let exec_checkpoint_upkeep_seconds = Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_upkeep_seconds",
+            "Item 6 Phase 3: exec thread time in the end-of-block checkpoint upkeep (once per pipelined block)",
+            exec_checkpoint_upkeep_seconds.clone(),
+        );
         let flush_worker_checkpoint_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         registry.register(
             "torus_flush_worker_checkpoint_seconds",
@@ -2736,6 +2758,8 @@ impl Metrics {
             exec_checkpoint_wait_seconds,
             exec_checkpoint_layer_bytes,
             exec_checkpoint_layer_shared,
+            exec_checkpoint_settle_wait_seconds,
+            exec_checkpoint_upkeep_seconds,
             flush_worker_checkpoint_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3214,6 +3238,8 @@ mod tests {
             "torus_exec_checkpoint_wait_seconds",
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
+            "torus_exec_checkpoint_settle_wait_seconds",
+            "torus_exec_checkpoint_upkeep_seconds",
             "torus_flush_worker_checkpoint_seconds",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",

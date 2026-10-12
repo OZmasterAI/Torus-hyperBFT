@@ -2066,7 +2066,15 @@ impl ExecutionContext {
             return Ok((None, None));
         };
         let mut st = self.ckpt.lock().unwrap();
-        if !st.settle() {
+        // p3s2g 47.1: the previous block's end spawned the merge of its
+        // parent into L just before this, so the join is mostly a wait.
+        let settle_timer = std::time::Instant::now();
+        let settled = st.settle();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_settle_wait_seconds
+                .observe(settle_timer.elapsed().as_secs_f64());
+        }
+        if !settled {
             return Err(());
         }
         if st
@@ -2092,6 +2100,23 @@ impl ExecutionContext {
         let Some(policy) = self.checkpoint else {
             return true;
         };
+        // p3s2g 47.1: exec-thread time no phase timer covered.
+        let upkeep_timer = std::time::Instant::now();
+        let ok = self.checkpoint_upkeep_with(policy, overlay, height);
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_upkeep_seconds
+                .observe(upkeep_timer.elapsed().as_secs_f64());
+        }
+        ok
+    }
+
+    /// [`Self::checkpoint_upkeep`] under `policy` (untimed body).
+    fn checkpoint_upkeep_with(
+        &self,
+        policy: crate::exec_pipeline::CheckpointPolicy,
+        overlay: &mut NativeStateOverlay,
+        height: u64,
+    ) -> bool {
         let prev = overlay.parent().cloned();
         overlay.detach_layers();
         let current = self.last_job.lock().unwrap().clone();
@@ -23505,8 +23530,14 @@ mod crash_recovery_tests {
             Some(ckpt_every(5)),
         );
         let v = |run: &P2Run, name: &str| metric_value(&run.metrics.encode(), name);
-        let pipelined = v(&every, "torus_exec_handoff_wait_seconds_count");
-        assert!(pipelined >= 100.0, "pipelined blocks: {pipelined}");
+        // Hand-offs count the pipelined blocks plus a 0 per serial native
+        // (barrier) block, so they bound the pipelined count from above.
+        let handoffs = v(&every, "torus_exec_handoff_wait_seconds_count");
+        let pipelined = v(&every, "torus_exec_checkpoint_upkeep_seconds_count");
+        assert!(
+            (100.0..=handoffs).contains(&pipelined),
+            "pipelined blocks: {pipelined} of {handoffs} hand-offs"
+        );
         for name in [
             "torus_exec_checkpoint_settle_wait_seconds",
             "torus_exec_checkpoint_upkeep_seconds",
